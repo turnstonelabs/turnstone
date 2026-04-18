@@ -425,6 +425,36 @@ class StorageBackend(Protocol):
         """
         ...
 
+    def count_workstreams_by_state(
+        self,
+        *,
+        parent_ws_id: str | None = None,
+        user_id: str | None = None,
+    ) -> dict[str, int]:
+        """Return ``{state: count}`` for workstreams matching the filters.
+
+        Cheaper than ``list_workstreams`` when the caller only needs
+        the histogram (e.g. per-coordinator metrics).  Filters are
+        additive; empty kwargs mean cluster-wide (caller must gate on
+        their own authz).
+        """
+        ...
+
+    def count_workstreams_since(
+        self,
+        since: str,
+        *,
+        parent_ws_id: str | None = None,
+        user_id: str | None = None,
+    ) -> int:
+        """Return the count of workstream rows whose ``created`` is >= ``since``.
+
+        ``since`` is an ISO-8601 string matching the storage format
+        (``YYYY-MM-DDTHH:MM:SS`` in UTC).  Lex compare is safe for the
+        same-offset timestamps storage writes.
+        """
+        ...
+
     # -- Conversation search ---------------------------------------------------
 
     def search_history(self, query: str, limit: int = 20, offset: int = 0) -> list[Any]:
@@ -1046,6 +1076,15 @@ class StorageBackend(Protocol):
 
     def list_skill_versions(self, skill_id: str) -> list[dict[str, Any]]:
         """List version history for a skill, ordered by version DESC."""
+        ...
+
+    def count_skill_versions(self, skill_id: str) -> int:
+        """Return the count of version snapshots for ``skill_id``.
+
+        Cheaper than ``list_skill_versions`` when the caller only needs
+        the count (e.g. computing the next version number on the
+        coordinator create path).
+        """
         ...
 
     def delete_skill_versions(self, skill_id: str) -> int:

@@ -885,6 +885,46 @@ class PostgreSQLBackend:
                 q = q.where(workstreams.c.user_id == user_id)
             return list(conn.execute(q).fetchall())
 
+    def count_workstreams_by_state(
+        self,
+        *,
+        parent_ws_id: str | None = None,
+        user_id: str | None = None,
+    ) -> dict[str, int]:
+        """Return ``{state: count}`` for workstreams matching the filters.
+
+        See the SQLite backend's docstring (#perf-1).
+        """
+        with self._conn() as conn:
+            q = sa.select(workstreams.c.state, sa.func.count()).group_by(workstreams.c.state)
+            if parent_ws_id is not None:
+                q = q.where(workstreams.c.parent_ws_id == parent_ws_id)
+            if user_id is not None:
+                q = q.where(workstreams.c.user_id == user_id)
+            rows = conn.execute(q).fetchall()
+        return {str(state or ""): int(count) for state, count in rows}
+
+    def count_workstreams_since(
+        self,
+        since: str,
+        *,
+        parent_ws_id: str | None = None,
+        user_id: str | None = None,
+    ) -> int:
+        """Return the count of workstream rows whose ``created`` is >= ``since``."""
+        with self._conn() as conn:
+            q = (
+                sa.select(sa.func.count())
+                .select_from(workstreams)
+                .where(workstreams.c.created >= since)
+            )
+            if parent_ws_id is not None:
+                q = q.where(workstreams.c.parent_ws_id == parent_ws_id)
+            if user_id is not None:
+                q = q.where(workstreams.c.user_id == user_id)
+            row = conn.execute(q).fetchone()
+        return int(row[0]) if row else 0
+
     # -- Conversation search ---------------------------------------------------
 
     def search_history(self, query: str, limit: int = 20, offset: int = 0) -> list[Any]:
@@ -2652,6 +2692,19 @@ class PostgreSQLBackend:
                 .order_by(skill_versions.c.version.desc())
             ).fetchall()
             return [_row_to_dict(r) for r in rows]
+
+    def count_skill_versions(self, skill_id: str) -> int:
+        """Return the count of skill-version rows for ``skill_id``.
+
+        See the SQLite backend's docstring for context (#perf-2).
+        """
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(sa.func.count())
+                .select_from(skill_versions)
+                .where(skill_versions.c.skill_id == skill_id)
+            ).fetchone()
+        return int(row[0]) if row else 0
 
     def delete_skill_versions(self, skill_id: str) -> int:
         with self._conn() as conn:

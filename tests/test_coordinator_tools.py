@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 
 import pytest
 
@@ -399,8 +399,13 @@ def test_wait_exec_dispatches_raw_args_to_client(coord_session):
     item = sess._prepare_tool(_tc("wait_for_workstream", {"ws_ids": ["a"], "timeout": 30}))
     _call_id, output = sess._exec_wait_for_workstream(item)
     # Args forwarded raw (timeout int, default mode="any") — client
-    # handles the float coerce + clamp.
-    coord.wait_for_workstream.assert_called_once_with(["a"], timeout=30, mode="any")
+    # handles the float coerce + clamp.  ``since`` + ``progress_callback``
+    # are optional observability kwargs added for the wait dashboard /
+    # diff-hint items (#14, #18); match them via ANY so this assertion
+    # stays focused on the raw dispatch.
+    coord.wait_for_workstream.assert_called_once_with(
+        ["a"], timeout=30, mode="any", since=None, progress_callback=ANY
+    )
     parsed = json.loads(output)
     assert parsed["complete"] is True
     assert parsed["mode"] == "any"
@@ -419,7 +424,9 @@ def test_wait_exec_default_timeout_when_omitted(coord_session):
     }
     item = sess._prepare_tool(_tc("wait_for_workstream", {"ws_ids": ["a"]}))
     sess._exec_wait_for_workstream(item)
-    coord.wait_for_workstream.assert_called_once_with(["a"], timeout=60.0, mode="any")
+    coord.wait_for_workstream.assert_called_once_with(
+        ["a"], timeout=60.0, mode="any", since=None, progress_callback=ANY
+    )
 
 
 def test_wait_exec_preserves_explicit_zero_timeout(coord_session):
@@ -433,7 +440,9 @@ def test_wait_exec_preserves_explicit_zero_timeout(coord_session):
     }
     item = sess._prepare_tool(_tc("wait_for_workstream", {"ws_ids": ["a"], "timeout": 0}))
     sess._exec_wait_for_workstream(item)
-    coord.wait_for_workstream.assert_called_once_with(["a"], timeout=0, mode="any")
+    coord.wait_for_workstream.assert_called_once_with(
+        ["a"], timeout=0, mode="any", since=None, progress_callback=ANY
+    )
 
 
 def test_delete_prepare_needs_approval(coord_session):

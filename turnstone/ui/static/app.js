@@ -172,23 +172,23 @@ Pane.prototype._createDOM = function () {
 
   // Input area
   var inputArea = document.createElement("div");
-  inputArea.className = "pane-input-area ts-composer";
+  inputArea.className = "ts-composer";
 
   // Attachment chips row — above the textarea, hidden unless populated
   this.attachChipsEl = document.createElement("div");
-  this.attachChipsEl.className = "pane-attach-chips ts-composer-chips";
+  this.attachChipsEl.className = "ts-composer-chips";
   this.attachChipsEl.setAttribute("role", "list");
   this.attachChipsEl.setAttribute("aria-label", "Pending attachments");
   inputArea.appendChild(this.attachChipsEl);
 
   var inputRow = document.createElement("div");
-  inputRow.className = "pane-input-row ts-composer-row";
+  inputRow.className = "ts-composer-row";
   inputArea.appendChild(inputRow);
 
   // Paperclip button — opens the file picker
   this.attachBtn = document.createElement("button");
   this.attachBtn.type = "button";
-  this.attachBtn.className = "pane-attach ts-composer-attach";
+  this.attachBtn.className = "ts-composer-attach";
   this.attachBtn.setAttribute("aria-label", "Attach files");
   this.attachBtn.setAttribute("title", "Attach files");
   this.attachBtn.textContent = "\ud83d\udcce"; // 📎
@@ -217,7 +217,7 @@ Pane.prototype._createDOM = function () {
   inputRow.appendChild(this.attachInput);
 
   this.inputEl = document.createElement("textarea");
-  this.inputEl.className = "pane-input ts-composer-input";
+  this.inputEl.className = "ts-composer-input";
   this.inputEl.rows = 1;
   this._isTouch = window.matchMedia(
     "(hover: none) and (pointer: coarse)",
@@ -346,30 +346,30 @@ Pane.prototype._renderAttachmentChip = function (info) {
   var self = this;
   var chip = document.createElement("span");
   chip.className =
-    "pane-attach-chip pane-attach-chip-" + (info.kind || "other");
+    "ts-composer-chip ts-composer-chip-" + (info.kind || "other");
   chip.setAttribute("role", "listitem");
   chip.dataset.attachmentId = info.attachment_id;
 
   var icon = document.createElement("span");
-  icon.className = "pane-attach-chip-icon";
+  icon.className = "ts-composer-chip-icon";
   icon.setAttribute("aria-hidden", "true");
   icon.textContent = info.kind === "image" ? "\ud83d\uddbc" : "\ud83d\udcc4";
   chip.appendChild(icon);
 
   var label = document.createElement("span");
-  label.className = "pane-attach-chip-name";
+  label.className = "ts-composer-chip-name";
   label.textContent = info.filename || "(unnamed)";
   label.title = info.filename || "";
   chip.appendChild(label);
 
   var size = document.createElement("span");
-  size.className = "pane-attach-chip-size";
+  size.className = "ts-composer-chip-size";
   size.textContent = _formatAttachSize(info.size_bytes || 0);
   chip.appendChild(size);
 
   var remove = document.createElement("button");
   remove.type = "button";
-  remove.className = "pane-attach-chip-remove";
+  remove.className = "ts-composer-chip-remove";
   remove.setAttribute(
     "aria-label",
     "Remove attachment " + (info.filename || ""),
@@ -462,12 +462,12 @@ Pane.prototype._swapPlaceholderChip = function (placeholderId, info) {
   );
   if (chip) {
     chip.dataset.attachmentId = info.attachment_id;
-    var name = chip.querySelector(".pane-attach-chip-name");
+    var name = chip.querySelector(".ts-composer-chip-name");
     if (name) {
       name.textContent = info.filename || "(unnamed)";
       name.title = info.filename || "";
     }
-    var size = chip.querySelector(".pane-attach-chip-size");
+    var size = chip.querySelector(".ts-composer-chip-size");
     if (size) size.textContent = _formatAttachSize(info.size_bytes || 0);
   } else {
     // Chip missing (user removed it mid-upload?); render fresh.
@@ -749,8 +749,7 @@ Pane.prototype.handleEvent = function (evt) {
       this.removeThinkingIndicator();
       if (!this.currentReasoningEl) {
         this.currentReasoningEl = document.createElement("div");
-        this.currentReasoningEl.className =
-          "msg msg-assistant reasoning ts-msg ts-msg--reasoning";
+        this.currentReasoningEl.className = "ts-msg ts-msg--reasoning";
         this.messagesEl.appendChild(this.currentReasoningEl);
       }
       this.currentReasoningEl.textContent += evt.text;
@@ -764,14 +763,12 @@ Pane.prototype.handleEvent = function (evt) {
       }
       if (!this.currentAssistantEl) {
         this.currentAssistantEl = document.createElement("div");
-        this.currentAssistantEl.className =
-          "msg msg-assistant ts-msg ts-msg--assistant";
+        this.currentAssistantEl.className = "ts-msg ts-msg--assistant";
         // streamingRender targets a .ts-msg-body inner wrapper so the
         // shared markdown rules in chat.css (h1/h2/h3/code/blockquote
-        // scoped to .ts-msg-body *) actually match on this page —
-        // without the wrapper they'd fall through to the legacy
-        // .msg-assistant * vocabulary and diverge from the coordinator
-        // page, which already wraps in .coord-body.ts-msg-body.
+        // scoped to .ts-msg-body *) actually match on this page — the
+        // coordinator page uses the same .ts-msg-body wrapper so the
+        // two chat views stay visually aligned.
         this.currentAssistantBodyEl = document.createElement("div");
         this.currentAssistantBodyEl.className = "ts-msg-body";
         this.currentAssistantEl.appendChild(this.currentAssistantBodyEl);
@@ -996,7 +993,7 @@ Pane.prototype.removeThinkingIndicator = function () {
 Pane.prototype.addUserMessage = function (text, attachments) {
   this.removeEmptyState();
   var el = document.createElement("div");
-  el.className = "msg msg-user ts-msg ts-msg--user";
+  el.className = "ts-msg ts-msg--user";
   var textEl = document.createElement("div");
   textEl.className = "msg-user-text";
   textEl.textContent = text;
@@ -1031,7 +1028,7 @@ Pane.prototype.addQueuedMessage = function (text, priority) {
   this.removeEmptyState();
   var self = this;
   var el = document.createElement("div");
-  el.className = "msg msg-user msg-queued ts-msg ts-msg--user";
+  el.className = "ts-msg ts-msg--user msg-queued";
   el.setAttribute("role", "status");
   if (priority === "important") {
     el.classList.add("msg-queued-important");
@@ -1176,7 +1173,7 @@ Pane.prototype._rewindToMessage = function (msgEl) {
   if (this.busy) return;
   var self = this;
   // Count how many user messages come at or after this one
-  var userMsgs = this.messagesEl.querySelectorAll(".msg-user");
+  var userMsgs = this.messagesEl.querySelectorAll(".ts-msg--user");
   var idx = Array.prototype.indexOf.call(userMsgs, msgEl);
   if (idx < 0) return;
   var turnsToRewind = userMsgs.length - idx;
@@ -1260,7 +1257,7 @@ Pane.prototype._editAndResend = function (msgEl, newText) {
   if (this.busy) return;
   var self = this;
   // Count turns to rewind (from this message onward)
-  var userMsgs = this.messagesEl.querySelectorAll(".msg-user");
+  var userMsgs = this.messagesEl.querySelectorAll(".ts-msg--user");
   var idx = Array.prototype.indexOf.call(userMsgs, msgEl);
   if (idx < 0) return;
   var turnsToRewind = userMsgs.length - idx;
@@ -1313,11 +1310,11 @@ Pane.prototype.replayHistory = function (messages) {
           var wasDenied = !!msg.denied;
           var block = document.createElement("div");
           block.className =
-            "msg approval-block ts-msg ts-approval ts-approval--inline " +
+            "ts-msg ts-approval ts-approval--inline " +
             (wasDenied ? "denied" : "approved");
           msg.tool_calls.forEach(function (tc) {
             var div = document.createElement("div");
-            div.className = "approval-tool ts-approval-tool";
+            div.className = "ts-approval-tool";
             div.dataset.funcName = tc.name;
             div.dataset.callId = tc.id || "";
             var nameEl = document.createElement("div");
@@ -1355,12 +1352,10 @@ Pane.prototype.replayHistory = function (messages) {
           var badge = document.createElement("div");
           badge.setAttribute("role", "status");
           if (wasDenied) {
-            badge.className =
-              "approval-badge badge-denied ts-approval-badge ts-approval-badge--denied";
+            badge.className = "ts-approval-badge ts-approval-badge--denied";
             badge.textContent = "\u2717 denied";
           } else {
-            badge.className =
-              "approval-badge badge-approved ts-approval-badge ts-approval-badge--approved";
+            badge.className = "ts-approval-badge ts-approval-badge--approved";
             badge.textContent = "\u2713 approved";
           }
           block.appendChild(badge);
@@ -1370,7 +1365,7 @@ Pane.prototype.replayHistory = function (messages) {
       }
       if (msg.content) {
         var el = document.createElement("div");
-        el.className = "msg msg-assistant ts-msg ts-msg--assistant";
+        el.className = "ts-msg ts-msg--assistant";
         var bodyEl = document.createElement("div");
         bodyEl.className = "ts-msg-body";
         var rendered = renderMarkdown(msg.content);
@@ -1392,7 +1387,7 @@ Pane.prototype.replayHistory = function (messages) {
           var media = !isToolError ? tryParseMedia(stripped) : null;
           if (media) {
             var embed = buildMediaEmbed(media, stripped);
-            var bdg = lastToolBlock.querySelector(".approval-badge");
+            var bdg = lastToolBlock.querySelector(".ts-approval-badge");
             if (bdg) lastToolBlock.insertBefore(embed, bdg);
             else lastToolBlock.appendChild(embed);
           } else {
@@ -1400,17 +1395,16 @@ Pane.prototype.replayHistory = function (messages) {
             if (out.textContent.split("\n").length > 10) {
               makeCollapsible(out);
             }
-            var bdg = lastToolBlock.querySelector(".approval-badge");
+            var bdg = lastToolBlock.querySelector(".ts-approval-badge");
             if (bdg) lastToolBlock.insertBefore(out, bdg);
             else lastToolBlock.appendChild(out);
           }
         }
         if (isToolError && !lastToolBlock.classList.contains("denied")) {
           lastToolBlock.classList.add("error");
-          var errorBdg = lastToolBlock.querySelector(".approval-badge");
+          var errorBdg = lastToolBlock.querySelector(".ts-approval-badge");
           if (errorBdg) {
-            errorBdg.className =
-              "approval-badge badge-error ts-approval-badge ts-approval-badge--error";
+            errorBdg.className = "ts-approval-badge ts-approval-badge--error";
             errorBdg.textContent = "\u2717 error";
           }
         }
@@ -1423,16 +1417,15 @@ Pane.prototype.replayHistory = function (messages) {
 
 Pane.prototype._attachRetryToLastAssistant = function () {
   // Remove any previous retry buttons
-  var old = this.messagesEl.querySelectorAll(".msg-assistant .msg-actions");
+  var old = this.messagesEl.querySelectorAll(".ts-msg--assistant .msg-actions");
   for (var i = 0; i < old.length; i++) old[i].parentNode.removeChild(old[i]);
-  // Find the last assistant message with content and add retry
-  var assistants = this.messagesEl.querySelectorAll(".msg-assistant");
+  // Find the last assistant message with content and add retry.
+  // Reasoning blocks emit as .ts-msg--reasoning (distinct modifier)
+  // so the .ts-msg--assistant selector already excludes them — no
+  // extra guard needed.
+  var assistants = this.messagesEl.querySelectorAll(".ts-msg--assistant");
   if (assistants.length) {
-    var last = assistants[assistants.length - 1];
-    // Only add if it's not a reasoning block
-    if (!last.classList.contains("reasoning")) {
-      this._addRetryAction(last);
-    }
+    this._addRetryAction(assistants[assistants.length - 1]);
   }
 };
 
@@ -1444,7 +1437,7 @@ Pane.prototype.showInlineToolBlock = function (
   var self = this;
   var block = document.createElement("div");
   block.className =
-    "msg approval-block ts-msg ts-approval ts-approval--inline" +
+    "ts-msg ts-approval ts-approval--inline" +
     (autoApproved ? " approved" : "");
   if (!autoApproved) {
     block.setAttribute("role", "alertdialog");
@@ -1476,19 +1469,20 @@ Pane.prototype.showInlineToolBlock = function (
   if (autoApproved) {
     var badge = document.createElement("div");
     badge.setAttribute("role", "status");
-    badge.className =
-      "approval-badge badge-approved ts-approval-badge ts-approval-badge--approved";
+    badge.className = "ts-approval-badge ts-approval-badge--approved";
     badge.textContent = "\u2713 auto-approved";
     block.appendChild(badge);
   } else {
     var prompt = document.createElement("div");
-    prompt.className = "approval-prompt ts-approval-body";
+    prompt.className = "ts-approval-body";
 
     // Apply verdict glow on initial heuristic verdict
     if (glowRec) {
-      if (glowRec === "approve") prompt.classList.add("verdict-glow-approve");
-      else if (glowRec === "deny") prompt.classList.add("verdict-glow-deny");
-      else prompt.classList.add("verdict-glow-review");
+      if (glowRec === "approve")
+        prompt.classList.add("ts-verdict-glow--approve");
+      else if (glowRec === "deny")
+        prompt.classList.add("ts-verdict-glow--deny");
+      else prompt.classList.add("ts-verdict-glow--review");
     }
 
     var alwaysNames = items
@@ -1509,11 +1503,10 @@ Pane.prototype.showInlineToolBlock = function (
       : "Always approve this tool type";
 
     var actionsDiv = document.createElement("div");
-    actionsDiv.className = "approval-actions ts-approval-actions";
+    actionsDiv.className = "ts-approval-actions";
 
     var approveBtn = document.createElement("button");
-    approveBtn.className =
-      "approval-btn btn-approve ts-approval-btn ts-approval-btn--approve";
+    approveBtn.className = "ts-approval-btn ts-approval-btn--approve";
     approveBtn.innerHTML = '<span class="key">y</span> Approve';
     approveBtn.onclick = function () {
       self.resolveApproval(true, false, self.getFeedback());
@@ -1521,8 +1514,7 @@ Pane.prototype.showInlineToolBlock = function (
     actionsDiv.appendChild(approveBtn);
 
     var denyBtn = document.createElement("button");
-    denyBtn.className =
-      "approval-btn btn-deny ts-approval-btn ts-approval-btn--deny";
+    denyBtn.className = "ts-approval-btn ts-approval-btn--deny";
     denyBtn.innerHTML = '<span class="key">n</span> Deny';
     denyBtn.onclick = function () {
       self.resolveApproval(false, false, self.getFeedback());
@@ -1531,8 +1523,7 @@ Pane.prototype.showInlineToolBlock = function (
 
     if (alwaysNames.length) {
       var alwaysBtn = document.createElement("button");
-      alwaysBtn.className =
-        "approval-btn btn-always ts-approval-btn ts-approval-btn--always";
+      alwaysBtn.className = "ts-approval-btn ts-approval-btn--always";
       alwaysBtn.title = alwaysTitle;
       alwaysBtn.setAttribute("aria-label", alwaysTitle);
       alwaysBtn.innerHTML = '<span class="key">a</span> Always';
@@ -1546,7 +1537,7 @@ Pane.prototype.showInlineToolBlock = function (
 
     var fbInput = document.createElement("input");
     fbInput.type = "text";
-    fbInput.className = "approval-feedback-input ts-approval-feedback";
+    fbInput.className = "ts-approval-feedback";
     fbInput.placeholder = "feedback (optional)";
     prompt.appendChild(fbInput);
 
@@ -1574,15 +1565,14 @@ Pane.prototype.resolveApproval = function (
   this.pendingApproval = false;
 
   // Remove prompt
-  var prompt = this.approvalBlockEl.querySelector(".approval-prompt");
+  var prompt = this.approvalBlockEl.querySelector(".ts-approval-body");
   if (prompt) prompt.remove();
 
   // Add badge
   var badge = document.createElement("div");
   badge.setAttribute("role", "status");
   if (approved) {
-    badge.className =
-      "approval-badge badge-approved ts-approval-badge ts-approval-badge--approved";
+    badge.className = "ts-approval-badge ts-approval-badge--approved";
     var label = "\u2713 approved";
     if (always) {
       var raw = this.approvalBlockEl.dataset.alwaysNames;
@@ -1594,8 +1584,7 @@ Pane.prototype.resolveApproval = function (
     badge.textContent = feedback ? label + ": " + feedback : label;
     this.approvalBlockEl.classList.add("approved");
   } else {
-    badge.className =
-      "approval-badge badge-denied ts-approval-badge ts-approval-badge--denied";
+    badge.className = "ts-approval-badge ts-approval-badge--denied";
     badge.textContent = "\u2717 denied" + (feedback ? ": " + feedback : "");
     this.approvalBlockEl.classList.add("denied");
   }
@@ -1629,7 +1618,7 @@ Pane.prototype.resolveApproval = function (
 
 Pane.prototype.getFeedback = function () {
   if (!this.approvalBlockEl) return null;
-  var inp = this.approvalBlockEl.querySelector(".approval-feedback-input");
+  var inp = this.approvalBlockEl.querySelector(".ts-approval-feedback");
   return inp && inp.value.trim() ? inp.value.trim() : null;
 };
 
@@ -1647,19 +1636,19 @@ Pane.prototype.appendToolOutputChunk = function (callId, chunk) {
   if (!el) {
     var target = escapedId
       ? this.messagesEl.querySelector(
-          '.approval-tool[data-call-id="' + escapedId + '"]',
+          '.ts-approval-tool[data-call-id="' + escapedId + '"]',
         )
       : null;
     if (!target) {
-      var blocks = this.messagesEl.querySelectorAll(".approval-block");
+      var blocks = this.messagesEl.querySelectorAll(".ts-approval");
       if (!blocks.length) return;
       var block = blocks[blocks.length - 1];
       var tools = block.querySelectorAll(
-        '.approval-tool[data-func-name="bash"]',
+        '.ts-approval-tool[data-func-name="bash"]',
       );
       target = tools.length ? tools[tools.length - 1] : null;
       if (!target) {
-        var allTools = block.querySelectorAll(".approval-tool");
+        var allTools = block.querySelectorAll(".ts-approval-tool");
         target = allTools.length ? allTools[allTools.length - 1] : null;
       }
     }
@@ -1683,14 +1672,14 @@ Pane.prototype.appendToolOutput = function (callId, name, output, isError) {
   var escapedId = callId ? CSS.escape(callId) : "";
   var target = escapedId
     ? this.messagesEl.querySelector(
-        '.approval-tool[data-call-id="' + escapedId + '"]',
+        '.ts-approval-tool[data-call-id="' + escapedId + '"]',
       )
     : null;
   if (!target) {
-    var blocks = this.messagesEl.querySelectorAll(".approval-block");
+    var blocks = this.messagesEl.querySelectorAll(".ts-approval");
     if (!blocks.length) return;
     var block = blocks[blocks.length - 1];
-    var tools = block.querySelectorAll(".approval-tool");
+    var tools = block.querySelectorAll(".ts-approval-tool");
     for (var i = tools.length - 1; i >= 0; i--) {
       if (tools[i].dataset.funcName === name) {
         target = tools[i];
@@ -1733,13 +1722,12 @@ Pane.prototype.appendToolOutput = function (callId, name, output, isError) {
 
   // Mark the parent approval block as errored
   if (isError) {
-    var parentBlock = target.closest(".approval-block");
+    var parentBlock = target.closest(".ts-approval");
     if (parentBlock && !parentBlock.classList.contains("denied")) {
       parentBlock.classList.add("error");
-      var badge = parentBlock.querySelector(".approval-badge");
+      var badge = parentBlock.querySelector(".ts-approval-badge");
       if (badge) {
-        badge.className =
-          "approval-badge badge-error ts-approval-badge ts-approval-badge--error";
+        badge.className = "ts-approval-badge ts-approval-badge--error";
         badge.textContent = "\u2717 error";
       }
     }
@@ -1757,7 +1745,7 @@ Pane.prototype.showOutputWarning = function (evt) {
   if (!evt.call_id || evt.risk_level === "none") return;
   var escapedId = CSS.escape(evt.call_id);
   var toolDiv = this.messagesEl.querySelector(
-    '.approval-tool[data-call-id="' + escapedId + '"]',
+    '.ts-approval-tool[data-call-id="' + escapedId + '"]',
   );
   if (!toolDiv) return;
   var risk = evt.risk_level || "medium";
@@ -1852,7 +1840,7 @@ Pane.prototype.updateVerdictBadge = function (verdict) {
 
 Pane.prototype.updateVerdictGlow = function (recommendation) {
   if (!this.approvalBlockEl) return;
-  var prompt = this.approvalBlockEl.querySelector(".approval-prompt");
+  var prompt = this.approvalBlockEl.querySelector(".ts-approval-body");
   if (!prompt) return;
 
   // Collect all verdict badges currently visible in this approval block
@@ -1871,18 +1859,18 @@ Pane.prototype.updateVerdictGlow = function (recommendation) {
   }
 
   prompt.classList.remove(
-    "verdict-glow-approve",
-    "verdict-glow-deny",
-    "verdict-glow-review",
+    "ts-verdict-glow--approve",
+    "ts-verdict-glow--deny",
+    "ts-verdict-glow--review",
   );
-  if (worst === "approve") prompt.classList.add("verdict-glow-approve");
-  else if (worst === "deny") prompt.classList.add("verdict-glow-deny");
-  else prompt.classList.add("verdict-glow-review");
+  if (worst === "approve") prompt.classList.add("ts-verdict-glow--approve");
+  else if (worst === "deny") prompt.classList.add("ts-verdict-glow--deny");
+  else prompt.classList.add("ts-verdict-glow--review");
 };
 
 Pane.prototype.addInfoMessage = function (text) {
   var el = document.createElement("div");
-  el.className = "msg msg-info ts-msg ts-msg--info";
+  el.className = "ts-msg ts-msg--info";
   el.textContent = stripAnsi(text);
   this.messagesEl.appendChild(el);
   this.scrollToBottom();
@@ -1890,7 +1878,7 @@ Pane.prototype.addInfoMessage = function (text) {
 
 Pane.prototype.addErrorMessage = function (text) {
   var el = document.createElement("div");
-  el.className = "msg msg-error ts-msg ts-msg--error";
+  el.className = "ts-msg ts-msg--error";
   el.setAttribute("role", "alert");
   el.textContent = stripAnsi(text);
   this.messagesEl.appendChild(el);
@@ -4970,7 +4958,7 @@ function stripAnsi(s) {
 
 function buildToolDiv(item) {
   var div = document.createElement("div");
-  div.className = "approval-tool ts-approval-tool";
+  div.className = "ts-approval-tool";
   div.dataset.funcName = item.func_name || "";
   div.dataset.callId = item.call_id || "";
 
@@ -5930,7 +5918,7 @@ document.addEventListener("keydown", function (e) {
   if (pane && pane.pendingApproval) {
     var fbInput =
       pane.approvalBlockEl &&
-      pane.approvalBlockEl.querySelector(".approval-feedback-input");
+      pane.approvalBlockEl.querySelector(".ts-approval-feedback");
     if (fbInput && document.activeElement === fbInput) {
       if (e.key === "Enter") {
         e.preventDefault();

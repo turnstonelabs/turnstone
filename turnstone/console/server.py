@@ -833,6 +833,122 @@ async def cluster_ws_detail(request: Request) -> JSONResponse:
     )
 
 
+# Upper bound on ids per bulk request.  Matches the per-coordinator
+# fanout cap + leaves headroom; larger batches would defeat the per-node
+# /v1/api/dashboard cache's batching benefit once the id set spans many
+# nodes, at which point the caller should paginate client-side.
+_CLUSTER_WS_LIVE_BULK_CAP = 50
+
+
+async def cluster_ws_live_bulk(request: Request) -> JSONResponse:
+    """GET /v1/api/cluster/ws/live?ids=a,b,c — bulk live-block fetch.
+
+    Returns ``{results: {ws_id: live | null}, denied: [ws_id, ...],
+    truncated: bool}``.
+
+    Collapses the per-row fan-out that tree UIs with 30+ visible
+    children produce — one HTTP round-trip per TTL window instead of
+    one-per-row.  Reuses the same ``_fetch_live_block`` path as
+    ``cluster_ws_detail`` so node-dashboard cache behaviour, coordinator
+    in-process snapshots, and ownership masking stay consistent.
+
+    Permission + ownership semantics match ``cluster_ws_detail``:
+    gated on ``admin.cluster.inspect`` and rows the caller doesn't
+    own surface in ``denied`` rather than ``results`` (so the endpoint
+    can't be used as an existence oracle).  Missing ids also route to
+    ``denied`` for the same reason.  ``ids`` over the cap is truncated
+    with ``truncated=true`` so the model / frontend knows to paginate.
+    """
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    err = require_permission(request, "admin.cluster.inspect")
+    if err is not None:
+        return err
+    storage, err503 = require_storage_or_503(request)
+    if err503 is not None:
+        return err503
+
+    raw_ids = request.query_params.get("ids", "") or ""
+    # Split on comma; strip whitespace; drop empty / invalid entries.
+    # Dedupe while preserving order so a caller passing the same id
+    # twice doesn't double-bill the round-trip budget.
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for chunk in raw_ids.split(","):
+        wid = chunk.strip()
+        if not wid or not _VALID_WS_ID_RE.match(wid):
+            continue
+        if wid in seen:
+            continue
+        seen.add(wid)
+        cleaned.append(wid)
+    truncated = False
+    if len(cleaned) > _CLUSTER_WS_LIVE_BULK_CAP:
+        truncated = True
+        cleaned = cleaned[:_CLUSTER_WS_LIVE_BULK_CAP]
+    if not cleaned:
+        return JSONResponse({"results": {}, "denied": [], "truncated": False})
+
+    caller_uid = _auth_user_id(request)
+    is_admin = _is_admin(request)
+
+    try:
+        rows = await asyncio.to_thread(storage.get_workstreams_batch, cleaned)
+    except Exception:
+        correlation_id = secrets.token_hex(4)
+        log.warning(
+            "cluster_ws_live_bulk.storage_failed correlation_id=%s count=%d",
+            correlation_id,
+            len(cleaned),
+            exc_info=True,
+        )
+        return JSONResponse(
+            {"error": f"storage error (internal). correlation_id={correlation_id}"},
+            status_code=500,
+        )
+
+    results: dict[str, dict[str, Any] | None] = {}
+    denied: list[str] = []
+    owned_rows: list[tuple[str, dict[str, Any]]] = []
+    for wid in cleaned:
+        row = rows.get(wid)
+        if row is None:
+            denied.append(wid)
+            continue
+        # Empty-string defense — matches _check_row_owner_or_404 so
+        # an orphan / migration-artifact row (row_owner="") doesn't
+        # leak to a (hypothetical) caller whose JWT carries an empty
+        # sub claim.  Either side being empty → denied.  Admin bypass
+        # is applied via the ``is_admin`` flag below.
+        row_owner = row.get("user_id") or ""
+        if not is_admin and (not caller_uid or not row_owner or row_owner != caller_uid):
+            denied.append(wid)
+            continue
+        owned_rows.append((wid, row))
+
+    # Fetch live blocks concurrently — ``_fetch_live_block`` already
+    # routes node-backed reads through the per-node dashboard cache,
+    # so N concurrent fetches against the same node collapse to a
+    # single upstream call per TTL window.
+    async def _one(wid: str, row: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+        try:
+            live = await _fetch_live_block(request, row, wid)
+        except Exception:
+            log.debug(
+                "cluster_ws_live_bulk.one_failed ws=%s",
+                wid[:8],
+                exc_info=True,
+            )
+            live = None
+        return wid, live
+
+    gathered = await asyncio.gather(*(_one(wid, row) for wid, row in owned_rows))
+    for wid, live in gathered:
+        results[wid] = live
+    return JSONResponse({"results": results, "denied": denied, "truncated": truncated})
+
+
 async def cluster_node_detail(request: Request) -> JSONResponse:
     collector: ClusterCollector = request.app.state.collector
     node_id = request.path_params["node_id"]
@@ -2207,7 +2323,14 @@ async def coordinator_create(request: Request) -> JSONResponse:
     skill = (body.get("skill") or "").strip() or None
     initial_message = (body.get("initial_message") or "").strip()
     try:
-        ws = coord_mgr.create(
+        # Offload to a worker thread — coord_mgr.create runs blocking
+        # storage calls (register_workstream, get_skill_by_name,
+        # count_skill_versions) and the session-factory invocation.
+        # Running inline on the async event loop stalled the SSE
+        # manager + every other async handler for the duration of the
+        # create (#perf-4).
+        ws = await asyncio.to_thread(
+            coord_mgr.create,
             user_id=user_id,
             name=name,
             skill=skill,
@@ -2766,6 +2889,129 @@ async def coordinator_children(request: Request) -> JSONResponse:
         if len(items) >= _CHILDREN_PAGE_LIMIT:
             break
     return JSONResponse({"items": items, "truncated": truncated})
+
+
+async def coordinator_metrics(request: Request) -> JSONResponse:
+    """GET /v1/api/coordinator/{ws_id}/metrics — per-coordinator health snapshot.
+
+    Aggregates cheap, already-persisted signals into a one-shot "is
+    this coordinator healthy?" answer for operators (#16).  No new
+    persistence — everything derives from ``list_workstreams``
+    (children) and ``list_intent_verdicts`` (judge telemetry).
+
+    Fields:
+
+    - ``spawns_total`` — children ever created under this coordinator
+      (closed / deleted children included; the row persists through
+      close and hard-delete cascades the row out but is rare).
+    - ``spawns_last_hour`` — subset of the above whose ``created``
+      timestamp is within the last 3600s.
+    - ``child_state_counts`` — ``{state: count}`` grouped on the live
+      children's state column.  Useful for spotting a coordinator
+      whose children are all stuck in ``attention`` (approval queue).
+    - ``judge_fallback_rate`` — fraction of recent intent verdicts
+      whose ``tier`` contained ``fallback`` — indicates the judge's
+      primary path is unavailable or misconfigured.  0.0 when no
+      verdicts have been recorded.
+    - ``wait_completions`` / ``wait_timeouts`` / ``wait_avg_elapsed``
+      — placeholders returning 0 / 0 / 0.0; these require explicit
+      wait-tool instrumentation (future work — the SSE events from
+      #14 carry the data live but aren't persisted yet).
+
+    Ownership / authz: same gate as ``coordinator_detail`` — 404-mask
+    rows the caller doesn't own (no existence-oracle leak).
+    """
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    err = _require_admin_coordinator(request)
+    if err is not None:
+        return err
+    coord_mgr, err503 = _require_coord_mgr(request)
+    if err503 is not None:
+        return err503
+    storage, err503s = require_storage_or_503(request)
+    if err503s is not None:
+        return err503s
+
+    ws_id = request.path_params.get("ws_id", "")
+    if not _VALID_WS_ID_RE.match(ws_id):
+        return JSONResponse({"error": "invalid ws_id"}, status_code=400)
+    user_id = _auth_user_id(request)
+    _ws, err404 = _resolve_coordinator_or_404(request, coord_mgr, storage, ws_id, user_id)
+    if err404 is not None:
+        return err404
+
+    # Children metrics derived from aggregate SQL — avoids pulling
+    # every hydrated row just to group by state and filter on created
+    # (#perf-1).  Two cheap queries instead of a ``list_workstreams``
+    # scan up to 10k rows.
+    from datetime import UTC, datetime
+
+    now_epoch = time.time()
+    hour_ago_iso = datetime.fromtimestamp(now_epoch - 3600, tz=UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        state_counts = await asyncio.to_thread(
+            storage.count_workstreams_by_state,
+            parent_ws_id=ws_id,
+        )
+    except Exception:
+        log.debug("coordinator_metrics.state_counts_failed ws=%s", ws_id[:8], exc_info=True)
+        state_counts = {}
+    spawns_total = sum(state_counts.values())
+    try:
+        spawns_last_hour = await asyncio.to_thread(
+            storage.count_workstreams_since,
+            hour_ago_iso,
+            parent_ws_id=ws_id,
+        )
+    except Exception:
+        log.debug(
+            "coordinator_metrics.spawns_last_hour_failed ws=%s",
+            ws_id[:8],
+            exc_info=True,
+        )
+        spawns_last_hour = 0
+
+    # Intent verdicts — scoped to the coordinator itself (child verdicts
+    # would require iterating every child's verdicts; deferred).  Small
+    # cap (last 200) keeps this a cheap query; enough to compute a
+    # meaningful rate for a busy coordinator.
+    try:
+        verdicts = await asyncio.to_thread(storage.list_intent_verdicts, ws_id=ws_id, limit=200)
+    except Exception:
+        log.debug("coordinator_metrics.list_verdicts_failed ws=%s", ws_id[:8], exc_info=True)
+        verdicts = []
+    total_verdicts = len(verdicts)
+    fallback_count = 0
+    for v in verdicts:
+        tier = ""
+        if isinstance(v, dict):
+            tier = str(v.get("tier") or "")
+        else:
+            try:
+                tier = str(v._mapping.get("tier") or "")
+            except AttributeError:
+                tier = ""
+        if "fallback" in tier.lower():
+            fallback_count += 1
+    judge_fallback_rate = round(fallback_count / total_verdicts, 3) if total_verdicts > 0 else 0.0
+
+    return JSONResponse(
+        {
+            "ws_id": ws_id,
+            "spawns_total": spawns_total,
+            "spawns_last_hour": spawns_last_hour,
+            "child_state_counts": state_counts,
+            "judge_fallback_rate": judge_fallback_rate,
+            "intent_verdicts_sample": total_verdicts,
+            # Wait-tool metrics require explicit persistence the harness
+            # doesn't have yet — exposed as zero placeholders so
+            # downstream scrapers can key on the shape without failing.
+            "wait_completions": 0,
+            "wait_timeouts": 0,
+            "wait_avg_elapsed": 0.0,
+        }
+    )
 
 
 async def coordinator_tasks(request: Request) -> JSONResponse:
@@ -9166,6 +9412,7 @@ def create_app(
                     Route("/api/cluster/nodes", cluster_nodes),
                     Route("/api/cluster/workstreams", cluster_workstreams),
                     Route("/api/cluster/workstreams/new", create_workstream, methods=["POST"]),
+                    Route("/api/cluster/ws/live", cluster_ws_live_bulk),
                     Route("/api/cluster/ws/{ws_id}/detail", cluster_ws_detail),
                     Route("/api/cluster/node/{node_id}", cluster_node_detail),
                     Route("/api/cluster/snapshot", cluster_snapshot),
@@ -9252,6 +9499,11 @@ def create_app(
                     Route(
                         "/api/coordinator/{ws_id}/tasks",
                         coordinator_tasks,
+                        methods=["GET"],
+                    ),
+                    Route(
+                        "/api/coordinator/{ws_id}/metrics",
+                        coordinator_metrics,
                         methods=["GET"],
                     ),
                     Route(

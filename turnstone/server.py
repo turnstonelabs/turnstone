@@ -1887,7 +1887,16 @@ async def plan_feedback(request: Request) -> JSONResponse:
 
 
 async def cancel_generation(request: Request) -> JSONResponse:
-    """POST /v1/api/cancel — cancel the active generation in a workstream."""
+    """POST /v1/api/cancel — cancel the active generation in a workstream.
+
+    Returns ``{status, dropped}`` where ``dropped`` captures a forensic
+    snapshot of what was in flight at cancel time: any pending approval's
+    tool names, queued-message count and a short preview, and whether a
+    worker thread was actively generating.  The model-invoked
+    ``cancel_workstream`` tool passes this through so a coordinator can
+    tell operators what it just killed instead of a bare ``{cancelled:
+    true}``.  Absent keys mean "nothing observable in that lane".
+    """
     from turnstone.core.web_helpers import read_json_or_400
 
     body = await read_json_or_400(request)
@@ -1905,8 +1914,10 @@ async def cancel_generation(request: Request) -> JSONResponse:
     if session is None:
         return JSONResponse({"error": "No session"}, status_code=400)
     force = body.get("force", False) is True
+    was_running = bool(ws.worker_thread and ws.worker_thread.is_alive())
+    dropped = _capture_cancel_forensics(session, ui, was_running=was_running)
     # Only act if generation is actually in progress
-    if ws.worker_thread and ws.worker_thread.is_alive():
+    if was_running:
         # Set the cooperative cancel flag (worker thread checks at checkpoints)
         session.cancel()
         # Unblock any pending approval/plan review waits
@@ -1925,7 +1936,63 @@ async def cancel_generation(request: Request) -> JSONResponse:
         else:
             # Emit cancelled SSE event so SDK consumers get a typed signal
             ui._enqueue({"type": "cancelled"})
-    return JSONResponse({"status": "ok"})
+    return JSONResponse({"status": "ok", "dropped": dropped})
+
+
+def _capture_cancel_forensics(session: Any, ui: Any, *, was_running: bool) -> dict[str, Any]:
+    """Snapshot in-flight session state for the cancel response.
+
+    Pure read — never mutates ``session`` or ``ui``.  Fields are
+    best-effort: any attribute miss (test double, alternate UI) falls
+    through to "not observable".  Kept short so a coordinator surfacing
+    the dropped dict doesn't bloat the tool-result payload.
+    """
+    out: dict[str, Any] = {"was_running": was_running}
+    pending = getattr(ui, "_pending_approval", None)
+    if isinstance(pending, dict):
+        tool_names: list[str] = []
+        first_call_id = ""
+        for item in pending.get("items", []) or []:
+            if not isinstance(item, dict):
+                continue
+            if not item.get("needs_approval"):
+                continue
+            name = item.get("approval_label") or item.get("func_name") or ""
+            if name:
+                tool_names.append(str(name))
+            if not first_call_id:
+                first_call_id = str(item.get("call_id") or "")
+        if tool_names:
+            out["pending_approval"] = {
+                "tool_names": tool_names,
+                "call_id": first_call_id,
+            }
+    queued = getattr(session, "_queued_messages", None)
+    if queued:
+        try:
+            count = len(queued)
+        except TypeError:
+            count = 0
+        preview = ""
+        try:
+            first = next(iter(queued.values()))
+            if isinstance(first, tuple) and first:
+                # Run through the credential-redactor before truncating so
+                # pasted secrets / connection strings / JWTs in the queued
+                # message don't land verbatim in the cancel_workstream
+                # tool result (which gets persisted to the coordinator's
+                # conversation history AND fanned out via SSE).  Matches
+                # the close_workstream.reason persistence path (phase 5).
+                from turnstone.core.output_guard import redact_credentials
+
+                preview = redact_credentials(str(first[0]))[:120]
+        except StopIteration:
+            pass
+        except Exception:
+            preview = ""
+        if count:
+            out["queued_messages"] = {"count": count, "first_preview": preview}
+    return out
 
 
 async def command(request: Request) -> JSONResponse:

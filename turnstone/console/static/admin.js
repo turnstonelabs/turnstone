@@ -48,9 +48,6 @@ function showAdmin() {
   }
 
   currentView = "admin";
-  if (typeof _stopActiveCoordsPolling === "function") {
-    _stopActiveCoordsPolling();
-  }
   var homeView = document.getElementById("view-home");
   if (homeView) homeView.style.display = "none";
   document.getElementById("view-node").style.display = "none";

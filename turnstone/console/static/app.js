@@ -16,17 +16,10 @@ window.onLoginSuccess = function () {
   if (typeof _probeCoordSubsystem === "function") {
     _probeCoordSubsystem();
   }
-  // Restart the active-coordinators poller: the initial load fired
-  // before auth resolved and 401'd, leaving the list empty.
-  if (typeof _stopActiveCoordsPolling === "function") {
-    _stopActiveCoordsPolling();
-  }
-  if (
-    currentView === "home" &&
-    typeof _startActiveCoordsPolling === "function"
-  ) {
-    _startActiveCoordsPolling();
-  }
+  // Active-coordinators list is SSE-driven via the console pseudo-node
+  // (#9) — no poller to restart after login.  The home-view renderer
+  // reads from clusterState.nodes["console"].workstreams on every SSE
+  // patch, so authenticating just unblocks the normal event stream.
 };
 window.onLogout = function () {
   if (evtSource) {
@@ -202,6 +195,11 @@ function recomputeOverview() {
     mcpPrompts = 0;
   var versions = {};
   Object.keys(clusterState.nodes).forEach(function (nid) {
+    // Skip the "console" pseudo-node — coordinators aren't compute-
+    // node workstreams, and counting them here would inflate the
+    // cluster-summary totals the home view renders.  The
+    // active-coordinators list surfaces them separately.
+    if (nid === "console") return;
     var node = clusterState.nodes[nid];
     var nodeWsTokens = 0;
     (node.workstreams || []).forEach(function (ws) {
@@ -220,8 +218,14 @@ function recomputeOverview() {
     mcpPrompts += mcp.prompts || 0;
   });
   var versionList = Object.keys(versions).sort();
+  // Count only real compute nodes for the cluster summary — the
+  // "console" pseudo-node hosts coordinators, which are surfaced
+  // separately by the active-coordinators list.
+  var realNodeCount = Object.keys(clusterState.nodes).filter(function (nid) {
+    return nid !== "console";
+  }).length;
   clusterState.overview = {
-    nodes: Object.keys(clusterState.nodes).length,
+    nodes: realNodeCount,
     workstreams: totalWs,
     states: states,
     aggregate: {
@@ -279,9 +283,15 @@ function renderFromState() {
     // Home view also hosts the inline node-list (cluster details);
     // render it so expanding the cluster-summary reveals the current
     // state without waiting for the next SSE tick.
-    var nodesList = Object.keys(clusterState.nodes).map(function (nid) {
-      return buildNodeInfoFromSnapshot(clusterState.nodes[nid]);
-    });
+    var nodesList = Object.keys(clusterState.nodes)
+      .filter(function (nid) {
+        // Exclude the "console" pseudo-node from the nodes list — it's
+        // a synthetic carrier for coordinators, not a compute node.
+        return nid !== "console";
+      })
+      .map(function (nid) {
+        return buildNodeInfoFromSnapshot(clusterState.nodes[nid]);
+      });
     nodesList.sort(function (a, b) {
       var d = b.ws_running + b.ws_attention - (a.ws_running + a.ws_attention);
       return d !== 0 ? d : a.node_id.localeCompare(b.node_id);
@@ -454,7 +464,6 @@ function showHome() {
   if (clusterState) renderFromState();
   else loadOverview();
   _ensureHomeComposerInit();
-  _startActiveCoordsPolling();
   if (!_navigatingFromPopstate) history.pushState({ view: "home" }, "");
 }
 
@@ -519,7 +528,6 @@ function showOverview() {
   document.getElementById("breadcrumb").style.display = "none";
   if (clusterState) renderFromState();
   else loadOverview();
-  _startActiveCoordsPolling();
   if (!_navigatingFromPopstate) history.pushState({ view: "home" }, "");
   // Scroll the details section into view so the click produces a
   // visible reaction — the user expands the summary expecting to see
@@ -1057,7 +1065,6 @@ function drillDownToNode(nodeId, serverUrl) {
   currentView = "node";
   currentNodeId = nodeId;
   currentServerUrl = serverUrl || "";
-  _stopActiveCoordsPolling();
   _setLandingView("node");
   var adminView = document.getElementById("view-admin");
   if (adminView) adminView.style.display = "none";
@@ -1111,7 +1118,6 @@ function loadNodeDetail(nodeId) {
 function drillDownByState(state) {
   currentView = "filtered";
   currentFilter = { state: state, node: null, page: 1, per_page: 50 };
-  _stopActiveCoordsPolling();
   _setLandingView("filtered");
   var adminView = document.getElementById("view-admin");
   if (adminView) adminView.style.display = "none";
@@ -1137,7 +1143,6 @@ function drillDownByState(state) {
 function drillDownByNode(nodeId) {
   currentView = "filtered";
   currentFilter = { state: null, node: nodeId, page: 1, per_page: 50 };
-  _stopActiveCoordsPolling();
   _setLandingView("filtered");
   var adminView = document.getElementById("view-admin");
   if (adminView) adminView.style.display = "none";
@@ -1990,93 +1995,29 @@ document.addEventListener("keydown", function (e) {
 var _homeCoordsFingerprint = "";
 var _homeSummaryFingerprint = "";
 
-// Active-coordinators list, kept separate from clusterState.nodes.
-// Coordinators live on the console process (node="console") and don't
-// flow through the per-node SSE streams the collector tracks, so the
-// cluster-snapshot -> clusterState.nodes path never surfaces them.
-// _loadActiveCoords fetches them directly from cluster_workstreams
-// (which merges _coordinator_rows via extra_rows).  Polling uses
-// recursive setTimeout with exponential backoff on failure — matches
-// the rest of turnstone's SSE reconnect pattern so a persistent
-// outage doesn't hammer the console with a fixed-interval retry.
-var _activeCoords = [];
-var _activeCoordsTimer = null;
-var _activeCoordsBackoff = 0;
-var _ACTIVE_COORDS_POLL_MS = 5000;
-var _ACTIVE_COORDS_MAX_BACKOFF_MS = 30000;
+// Active-coordinators list is SSE-driven — the console collector
+// registers a "console" pseudo-node and the coordinator manager fans
+// out ws_created / ws_closed / cluster_state / ws_rename events when
+// coordinators come, go, or change state.  The browser's
+// patchClusterState handler routes those events into
+// clusterState.nodes["console"].workstreams, so every home-view render
+// reads a live mirror without polling.
 
-function _loadActiveCoords() {
-  // In-flight guard not required — authFetch is stateless and the
-  // response is just replaced — but cancel any pending timer so
-  // we don't double-schedule.
-  if (_activeCoordsTimer) {
-    clearTimeout(_activeCoordsTimer);
-    _activeCoordsTimer = null;
-  }
-  authFetch("/v1/api/cluster/workstreams?node=console&per_page=200")
-    .then(function (r) {
-      if (r.status === 401 && typeof showLogin === "function") {
-        // Session expired — prompt for re-auth via the shared overlay.
-        // onLoginSuccess at the top of this file restarts the poller
-        // when the view is still home.
-        showLogin();
-        return null;
-      }
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      return r.json();
-    })
-    .then(function (data) {
-      if (data == null) return;
-      // Narrow to coord rows even though node=console should produce
-      // them exclusively — defensive in case a future server-side
-      // collector change surfaces other console-origin rows.
-      var rows = (data.workstreams || []).filter(function (ws) {
-        return ws.kind === "coordinator";
-      });
-      _activeCoords = rows;
-      _activeCoordsBackoff = 0;
-      if (currentView === "home") {
-        _renderHomeView();
-      }
-      _scheduleNextActiveCoordsPoll(_ACTIVE_COORDS_POLL_MS);
-    })
-    .catch(function () {
-      // Exponential backoff capped at _ACTIVE_COORDS_MAX_BACKOFF_MS.
-      // Reset on the next successful response above.
-      _activeCoordsBackoff = _activeCoordsBackoff
-        ? Math.min(_activeCoordsBackoff * 2, _ACTIVE_COORDS_MAX_BACKOFF_MS)
-        : _ACTIVE_COORDS_POLL_MS * 2;
-      _scheduleNextActiveCoordsPoll(_activeCoordsBackoff);
-    });
-}
-
-function _scheduleNextActiveCoordsPoll(ms) {
-  if (currentView !== "home") return;
-  _activeCoordsTimer = setTimeout(_loadActiveCoords, ms);
-}
-
-function _startActiveCoordsPolling() {
-  _activeCoordsBackoff = 0;
-  if (_activeCoordsTimer) {
-    clearTimeout(_activeCoordsTimer);
-    _activeCoordsTimer = null;
-  }
-  _loadActiveCoords();
-}
-
-function _stopActiveCoordsPolling() {
-  if (_activeCoordsTimer) {
-    clearTimeout(_activeCoordsTimer);
-    _activeCoordsTimer = null;
-  }
+function _activeCoordsFromClusterState() {
+  if (!clusterState) return [];
+  var node = clusterState.nodes && clusterState.nodes["console"];
+  if (!node) return [];
+  return (node.workstreams || []).filter(function (ws) {
+    return ws && ws.kind === "coordinator";
+  });
 }
 
 function _renderHomeView() {
-  // Active coordinators come from _loadActiveCoords (cluster_workstreams
-  // with node=console filter); clusterState.nodes never surfaces them
-  // because coordinators run on the console process, not on a cluster
-  // node that feeds the collector's SSE streams.
-  var coords = (_activeCoords || []).slice();
+  // Active coordinators are sourced live from clusterState.nodes["console"]
+  // — the coordinator manager fans out ws_created / ws_closed /
+  // cluster_state via the collector's pseudo-node so the home view
+  // stays in sync without polling.
+  var coords = _activeCoordsFromClusterState();
   coords.sort(function (a, b) {
     // Most-recently-active first.  updated is absent on freshly-created
     // rows; fall back to id so the ordering is stable either way.
@@ -2206,14 +2147,12 @@ function _ensureSSE() {
 }
 history.replaceState({ view: "home" }, "");
 initLogin();
-// loadOverview fetches the cluster snapshot for the cluster summary
-// aggregates; the active-coordinators list lives on a separate
-// cluster_workstreams fetch started by _startActiveCoordsPolling
-// because coordinator rows don't flow through the per-node SSE
-// streams the collector watches.
+// loadOverview fetches the cluster snapshot — both the cluster-summary
+// aggregates AND the active-coordinators list come from the same
+// snapshot + SSE patch pipeline (#9); the console pseudo-node carries
+// coordinator ws_created / ws_closed / cluster_state events.
 loadOverview();
 _ensureHomeComposerInit();
-_startActiveCoordsPolling();
 // Refresh the coord button visibility after initial whoami lands in
 // sessionStorage (auth.js populates it asynchronously).  A short delay
 // is good enough — the shared pattern for permission-gated UI.

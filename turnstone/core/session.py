@@ -5128,11 +5128,33 @@ class ChatSession:
             msg = f"Error: {result['error']}"
             self._report_tool_result(call_id, "cancel_workstream", msg, is_error=True)
             return call_id, msg
-        output = json.dumps(
-            {"ws_id": item["ws_id"], "cancelled": True, "status": result.get("status")},
-            separators=(",", ":"),
-        )
-        self._report_tool_result(call_id, "cancel_workstream", f"cancelled {item['ws_id']}")
+        # ``dropped`` — forensic snapshot captured by the node's cancel
+        # handler before it invokes session.cancel().  Carries pending
+        # approval tool names, queued-message count/preview, and whether
+        # a worker was running.  Empty dict when nothing was in flight.
+        out_payload: dict[str, Any] = {
+            "ws_id": item["ws_id"],
+            "cancelled": True,
+            "status": result.get("status"),
+        }
+        dropped = result.get("dropped")
+        if isinstance(dropped, dict) and dropped:
+            out_payload["dropped"] = dropped
+        output = json.dumps(out_payload, separators=(",", ":"))
+        summary = f"cancelled {item['ws_id']}"
+        if isinstance(dropped, dict):
+            hints: list[str] = []
+            pa = dropped.get("pending_approval")
+            if isinstance(pa, dict):
+                names = pa.get("tool_names") or []
+                if names:
+                    hints.append(f"approval={','.join(str(n) for n in names)}")
+            qm = dropped.get("queued_messages")
+            if isinstance(qm, dict) and qm.get("count"):
+                hints.append(f"queued={qm['count']}")
+            if hints:
+                summary += " (" + "; ".join(hints) + ")"
+        self._report_tool_result(call_id, "cancel_workstream", summary)
         return call_id, output
 
     def _prepare_delete_workstream(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -5573,6 +5595,8 @@ class ChatSession:
         header = (
             f"\u2699 wait_for_workstream: {ws_count} ws (mode={mode_label}, timeout={to_label}s)"
         )
+        raw_since = args.get("since")
+        since_hint = raw_since if isinstance(raw_since, dict) else None
         return {
             "call_id": call_id,
             "func_name": "wait_for_workstream",
@@ -5583,25 +5607,91 @@ class ChatSession:
             "ws_ids": raw_ids if isinstance(raw_ids, list) else [],
             "timeout": args.get("timeout"),
             "mode": args.get("mode"),
+            "since": since_hint,
         }
 
     def _exec_wait_for_workstream(self, item: dict[str, Any]) -> tuple[str, str]:
         call_id = item["call_id"]
+        clean_ws_ids = item["ws_ids"]
+        timeout_val = item["timeout"] if item["timeout"] is not None else 60.0
+        mode_val = item["mode"] if item["mode"] is not None else "any"
+        # Emit a ``wait_started`` SSE event so the coordinator sidebar
+        # can show a "waiting on N children, T elapsed" indicator while
+        # the worker thread blocks inside wait_for_workstream (the tool
+        # can otherwise pin the worker for up to 600s with no UI
+        # signal).  Best-effort — swallow failures so a broken UI never
+        # blocks a model-invoked wait (#14).
+        self._emit_wait_event(
+            "wait_started",
+            {
+                "call_id": call_id,
+                "ws_ids": clean_ws_ids,
+                "mode": mode_val,
+                "timeout": timeout_val,
+            },
+        )
+
+        # Throttle wait_progress emission (#perf-3).  The wait loop polls
+        # every 0.5s; emitting on every tick with the full results dict
+        # would flood each SSE listener's maxsize=500 queue — a 600s
+        # wait produces 1200 events per listener, pushing out unrelated
+        # state_change / content events via put_nowait drop.  Emit only
+        # when the polled snapshot actually differs from the last
+        # emitted snapshot, OR when at least ~5s has elapsed since the
+        # last emission (so a stuck wait still shows a heartbeat for
+        # the operator).  The sidebar indicator only needs
+        # seconds-granularity elapsed; the full results dict is only
+        # useful on transitions, so dropping redundant ticks is free.
+        progress_state: dict[str, Any] = {
+            "last_snap": None,
+            "last_emit_mono": 0.0,
+        }
+        progress_heartbeat_s = 5.0
+
+        def _progress(snap: dict[str, Any], elapsed: float) -> None:
+            now = time.monotonic()
+            changed = snap != progress_state["last_snap"]
+            heartbeat_due = (now - progress_state["last_emit_mono"]) >= progress_heartbeat_s
+            if not changed and not heartbeat_due:
+                return
+            payload: dict[str, Any] = {
+                "call_id": call_id,
+                "elapsed": round(elapsed, 3),
+            }
+            # Attach the full results dict only on transitions — a
+            # heartbeat-only tick reports progress (liveness) without
+            # the per-listener payload cost.
+            if changed:
+                payload["results"] = snap
+            self._emit_wait_event("wait_progress", payload)
+            progress_state["last_snap"] = snap
+            progress_state["last_emit_mono"] = now
+
         try:
             result = self._coord_client.wait_for_workstream(
-                item["ws_ids"],
-                timeout=item["timeout"] if item["timeout"] is not None else 60.0,
-                mode=item["mode"] if item["mode"] is not None else "any",
+                clean_ws_ids,
+                timeout=timeout_val,
+                mode=mode_val,
+                since=item.get("since"),
+                progress_callback=_progress,
             )
         except Exception as e:
             msg = f"Error: wait_for_workstream failed: {e}"
             self._report_tool_result(call_id, "wait_for_workstream", msg, is_error=True)
+            self._emit_wait_event(
+                "wait_ended",
+                {"call_id": call_id, "complete": False, "error": str(e)},
+            )
             return call_id, msg
         # Surface client-side validation errors as tool errors rather
         # than rendering them as a "successful" wait result.
         if result.get("error"):
             msg = f"Error: {result['error']}"
             self._report_tool_result(call_id, "wait_for_workstream", msg, is_error=True)
+            self._emit_wait_event(
+                "wait_ended",
+                {"call_id": call_id, "complete": False, "error": result["error"]},
+            )
             return call_id, msg
         output = json.dumps(result, separators=(",", ":"), default=str)
         elapsed = result.get("elapsed", 0.0)
@@ -5613,21 +5703,49 @@ class ChatSession:
         # Inline import — ``turnstone.core`` shouldn't import from
         # ``turnstone.console`` at module load (layering), so the
         # tool-exec read pulls the canonical state set lazily.
-        from turnstone.console.coordinator_client import CoordinatorClient
+        from turnstone.console.coordinator_client import WAIT_REAL_TERMINAL_STATES
 
         results_dict = result.get("results") or {}
         resolved_count = sum(
             1
             for snap in results_dict.values()
-            if isinstance(snap, dict)
-            and snap.get("state") in CoordinatorClient._WAIT_REAL_TERMINAL_STATES
+            if isinstance(snap, dict) and snap.get("state") in WAIT_REAL_TERMINAL_STATES
         )
         verb = "complete" if complete else "timeout"
         # Denominator = polled set (not raw item['ws_ids']) so the ratio
         # stays coherent with what the client actually tracked after dedup.
         summary = f"{verb} after {elapsed}s ({resolved_count}/{len(results_dict)} resolved)"
         self._report_tool_result(call_id, "wait_for_workstream", summary)
+        self._emit_wait_event(
+            "wait_ended",
+            {
+                "call_id": call_id,
+                "complete": complete,
+                "elapsed": elapsed,
+                "results": results_dict,
+                "resolved": resolved_count,
+            },
+        )
         return call_id, self._truncate_output(output)
+
+    def _emit_wait_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        """Fan out a ``wait_*`` SSE event via the session UI.
+
+        Used by the coordinator-side wait dashboard (#14) so the sidebar
+        can render a "waiting on N children, T elapsed" indicator while
+        the worker thread blocks inside wait_for_workstream.  Best-effort:
+        no UI, no ``_enqueue`` method, or a raising enqueue all swallow
+        silently — the wait itself must never break because of observer
+        plumbing.
+        """
+        ui = getattr(self, "ui", None)
+        enqueue = getattr(ui, "_enqueue", None)
+        if enqueue is None:
+            return
+        try:
+            enqueue({"type": event_type, **payload})
+        except Exception:
+            log.debug("wait_event.enqueue_failed type=%s", event_type, exc_info=True)
 
     def _prepare_memory(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Prepare a memory tool action (save/get/search/delete/list)."""

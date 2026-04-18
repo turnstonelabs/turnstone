@@ -37,6 +37,43 @@ from turnstone.core.auth import JWT_AUD_CONSOLE, create_jwt
 from turnstone.core.log import get_logger
 from turnstone.core.workstream import WorkstreamKind
 
+# ---------------------------------------------------------------------------
+# wait_for_workstream constants — module-level so ``turnstone.core.session``
+# can import them without reading a class internal (see #12).  The
+# ``CoordinatorClient`` ClassVar aliases below are kept so external callers
+# that still import via the class surface don't break.
+# ---------------------------------------------------------------------------
+
+# Real terminal states for the wait_for_workstream tool — these drive the
+# any/all completion condition.  A workstream in one of these states has
+# actually finished work the coordinator can observe.
+WAIT_REAL_TERMINAL_STATES: frozenset[str] = frozenset({"idle", "error", "closed", "deleted"})
+
+# Reportable terminal states — superset of the real ones, also includes the
+# ``denied`` short-circuit shape returned for foreign / missing ws_ids.  Used
+# by the resolved-count summary so the operator-facing "X/Y resolved" matches
+# what they see in the results dict.  NOT used for the any/all condition: a
+# single typo'd / foreign id shouldn't satisfy ``mode="any"`` and let the
+# model declare a wait complete while every real child is still running.
+WAIT_TERMINAL_STATES: frozenset[str] = WAIT_REAL_TERMINAL_STATES | frozenset({"denied"})
+
+# Hard cap on ws_ids per call.  Polling happens once per ws_id per tick, so a
+# runaway list would amplify storage load without giving the model anything
+# useful — coordinators rarely fan out past a handful of children at once.
+WAIT_MAX_WS_IDS: int = 32
+
+# Cap on the total wait so a stuck child can't pin a coordinator worker
+# thread indefinitely.  Coordinators that need a longer wait call
+# wait_for_workstream again with the same ws_ids — each call re-arms freshly.
+WAIT_MAX_TIMEOUT: float = 600.0
+
+# Storage-poll cadence.  500ms is short enough that the wait terminates
+# promptly after a child finishes (well under the human-perceptible-latency
+# floor), and long enough that a 60s wait incurs at most 120 cheap row
+# reads — still cheaper than the 20+ inspect_workstream model turns the
+# tool replaces.
+WAIT_POLL_INTERVAL: float = 0.5
+
 _TASK_STATUSES = frozenset({"pending", "in_progress", "done", "blocked"})
 # Hard cap on tasks per coordinator — the full list is read and re-serialized
 # on every mutation, so unbounded growth is both a storage and a tool-output-size
@@ -378,40 +415,15 @@ class CoordinatorClient:
 
     # -- model-invoked block-wait -----------------------------------------
 
-    # Real terminal states for the wait_for_workstream tool — these
-    # drive the any/all completion condition.  A workstream in one of
-    # these states has actually finished work the coordinator can
-    # observe.
-    _WAIT_REAL_TERMINAL_STATES: ClassVar[frozenset[str]] = frozenset(
-        {"idle", "error", "closed", "deleted"}
-    )
-    # Reportable terminal states — superset of the real ones, also
-    # includes the ``denied`` short-circuit shape returned for foreign
-    # / missing ws_ids.  Used by the resolved-count summary so the
-    # operator-facing "X/Y resolved" matches what they see in the
-    # results dict.  NOT used for the any/all condition: a single
-    # typo'd / foreign id shouldn't satisfy ``mode="any"`` and let
-    # the model declare a wait complete while every real child is
-    # still running.
-    _WAIT_TERMINAL_STATES: ClassVar[frozenset[str]] = _WAIT_REAL_TERMINAL_STATES | frozenset(
-        {"denied"}
-    )
-    # Hard cap on ws_ids per call.  Polling happens once per ws_id per
-    # tick, so a runaway list would amplify storage load without
-    # giving the model anything useful — coordinators rarely fan out
-    # past a handful of children at once.
-    _WAIT_MAX_WS_IDS: ClassVar[int] = 32
-    # Cap on the total wait so a stuck child can't pin a coordinator
-    # worker thread indefinitely.  Coordinators that need a longer wait
-    # call wait_for_workstream again with the same ws_ids — each call
-    # re-arms freshly.
-    _WAIT_MAX_TIMEOUT: ClassVar[float] = 600.0
-    # Storage-poll cadence.  500ms is short enough that the wait
-    # terminates promptly after a child finishes (well under the
-    # human-perceptible-latency floor), and long enough that a 60s
-    # wait incurs at most 120 cheap row reads — still cheaper than
-    # the 20+ inspect_workstream model turns the tool replaces.
-    _WAIT_POLL_INTERVAL: ClassVar[float] = 0.5
+    # ClassVar aliases for the module-level wait_for_workstream constants.
+    # Kept so existing callers that read ``CoordinatorClient._WAIT_*`` keep
+    # working; prefer the module-level ``WAIT_*`` constants in new code
+    # (see #12 — the class-nesting was an inline-import smell).
+    _WAIT_REAL_TERMINAL_STATES: ClassVar[frozenset[str]] = WAIT_REAL_TERMINAL_STATES
+    _WAIT_TERMINAL_STATES: ClassVar[frozenset[str]] = WAIT_TERMINAL_STATES
+    _WAIT_MAX_WS_IDS: ClassVar[int] = WAIT_MAX_WS_IDS
+    _WAIT_MAX_TIMEOUT: ClassVar[float] = WAIT_MAX_TIMEOUT
+    _WAIT_POLL_INTERVAL: ClassVar[float] = WAIT_POLL_INTERVAL
 
     def wait_for_workstream(
         self,
@@ -419,6 +431,8 @@ class CoordinatorClient:
         *,
         timeout: float = 60.0,
         mode: str = "any",
+        since: dict[str, dict[str, Any]] | None = None,
+        progress_callback: Callable[[dict[str, dict[str, Any]], float], None] | None = None,
     ) -> dict[str, Any]:
         """Block until child workstreams reach a terminal state.
 
@@ -435,6 +449,17 @@ class CoordinatorClient:
         False when the timeout fired (results carry whatever last state
         was observed).
 
+        ``since`` — optional prior snapshot (typically the ``results``
+        dict from an earlier ``wait_for_workstream`` call).  When
+        provided, the wait short-circuits as soon as ANY polled ws_id's
+        snapshot differs from its ``since`` entry (``state`` / ``tokens``
+        / ``updated``), regardless of ``mode``.  Lets a follow-up wait
+        skip re-counting already-completed children — the classic
+        "spawn 3, wait for the first, then wait for the next change"
+        loop turns into two calls instead of spinning the timeout on
+        the still-terminal first child.  An entry missing from
+        ``since`` counts as changed on first observation.
+
         Cross-tenant guard: a ws_id that's neither the coordinator
         itself nor one of its own children appears with
         ``state="denied"`` and never blocks the wait — a model that
@@ -442,6 +467,13 @@ class CoordinatorClient:
         until timeout.  A ws_id that doesn't exist at all collapses
         into the same ``denied`` shape so wait can't be used as an
         existence oracle.
+
+        ``progress_callback`` is invoked once per poll cycle with the
+        current snapshot dict + elapsed seconds.  Swallows callback
+        errors so a buggy observer can't break the wait loop.  Used
+        by the coordinator-side wait dashboard (#14) to emit
+        ``wait_progress`` SSE events; tests pass it to assert loop
+        cadence.
 
         Performance: each tick issues exactly two storage calls
         (``get_workstreams_batch`` + ``sum_workstream_tokens_batch``),
@@ -499,6 +531,15 @@ class CoordinatorClient:
         except (TypeError, ValueError):
             timeout_f = 60.0
         timeout_f = max(0.0, min(timeout_f, self._WAIT_MAX_TIMEOUT))
+        # Normalize since into a per-ws_id dict of the fields we diff
+        # against.  Hostile / malformed entries silently drop — the
+        # wait is advisory, not a gatekeeper, so an invalid hint
+        # degrades to "no diff signal" rather than failing the call.
+        since_map: dict[str, dict[str, Any]] = {}
+        if isinstance(since, dict):
+            for wid, prev in since.items():
+                if isinstance(wid, str) and isinstance(prev, dict):
+                    since_map[wid] = prev
         start = time.monotonic()
         deadline = start + timeout_f
 
@@ -553,13 +594,41 @@ class CoordinatorClient:
             # one has already finished).
             return snap.get("state", "") in self._WAIT_TERMINAL_STATES
 
+        def _diff_since(snap: dict[str, Any], prev: dict[str, Any]) -> bool:
+            """True when ``snap`` differs from the ``since`` hint on any
+            of the diffed fields.  Called only for ws_ids that appear in
+            ``since_map`` — callers handling missing entries is the
+            wrong default (it would make a disjoint since-dict exit
+            the wait on tick one with complete=True)."""
+            return any(snap.get(key) != prev.get(key) for key in ("state", "tokens", "updated"))
+
         last_results: dict[str, dict[str, Any]] = {}
         complete = False
         while True:
             results = _snapshot_all()
             last_results = results
+            if progress_callback is not None:
+                try:
+                    progress_callback(results, time.monotonic() - start)
+                except Exception:
+                    log.debug("coord_client.wait.progress_cb_failed", exc_info=True)
             real_terminal = [_is_real_terminal(snap) for snap in results.values()]
             settled = [_is_settled(snap) for snap in results.values()]
+            # ``since`` — orthogonal to mode.  If the caller supplied a
+            # prior snapshot, any diff on a ws_id that IS in ``since_map``
+            # exits the wait so a follow-up call doesn't re-count
+            # already-terminal children.  ws_ids absent from ``since_map``
+            # are ignored for the diff-exit check — they fall through to
+            # the normal mode='any' / mode='all' conditions below.  This
+            # prevents a disjoint since-dict from exiting on tick one
+            # with complete=True (previous shape did, silently).
+            if since_map and any(
+                _diff_since(snap, since_map[wid])
+                for wid, snap in results.items()
+                if wid in since_map
+            ):
+                complete = True
+                break
             if mode == "any":
                 if any(real_terminal):
                     complete = True
@@ -1049,6 +1118,71 @@ class CoordinatorClient:
                 return {"error": f"task not found: {task_id}"}
             self._save_task_list(ws_id, envelope)
             return {"ok": True, "task_id": task_id}
+
+    def cleanup_dead_task_child_refs(self, ws_id: str) -> int:
+        """Clear ``child_ws_id`` pointers on tasks whose referenced
+        workstream no longer exists in storage.  Returns the number of
+        links blanked (0 if nothing needed doing, envelope was corrupt,
+        or the lookup failed).
+
+        Called by :meth:`CoordinatorManager.close` after the state
+        transition — the task envelope is a per-coordinator planning
+        structure, so cross-coord scope guards don't apply the same way
+        they do for add/update/remove.  Held under the same per-ws
+        ``_task_lock`` as add/update/remove/reorder so a close racing
+        an in-flight mutation can't lose the mutation (#bug-6).
+        """
+        with self._task_lock(ws_id):
+            envelope, corrupt = load_task_envelope(self._storage, ws_id)
+            if corrupt:
+                return 0
+            tasks = envelope.get("tasks") or []
+            if not tasks:
+                return 0
+            candidate_ids = sorted(
+                {
+                    str(t.get("child_ws_id") or "")
+                    for t in tasks
+                    if isinstance(t, dict) and t.get("child_ws_id")
+                }
+            )
+            if not candidate_ids:
+                return 0
+            try:
+                existing_rows = self._storage.get_workstreams_batch(candidate_ids)
+            except Exception:
+                log.debug(
+                    "coord_client.task_ref_batch_failed ws=%s",
+                    ws_id,
+                    exc_info=True,
+                )
+                return 0
+            dead_ids = {cid for cid in candidate_ids if existing_rows.get(cid) is None}
+            if not dead_ids:
+                return 0
+            blanked = 0
+            for t in tasks:
+                if isinstance(t, dict) and str(t.get("child_ws_id") or "") in dead_ids:
+                    t["child_ws_id"] = ""
+                    blanked += 1
+            if not blanked:
+                return 0
+            try:
+                self._save_task_list(ws_id, envelope)
+            except Exception:
+                # Write-side divergence — the task envelope on disk
+                # now disagrees with what the close path intended.
+                # Bump to warning (not debug) so operators see it;
+                # read-side corruption (already silent on load) stays
+                # at debug.  #q-6.
+                log.warning(
+                    "coord_client.task_ref_save_failed ws=%s blanked=%d",
+                    ws_id,
+                    blanked,
+                    exc_info=True,
+                )
+                return 0
+            return blanked
 
     def task_list_reorder(self, ws_id: str, *, task_ids: list[str]) -> dict[str, Any]:
         """Reject unless ``task_ids`` is an exact permutation of the

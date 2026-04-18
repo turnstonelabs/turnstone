@@ -1452,3 +1452,254 @@ def test_live_cache_touch_on_hit_moves_to_end(tmp_path):
     client._store_live_cache("ws-new", 0.0, None)
     assert "ws-0000" in client._live_cache
     assert "ws-0001" not in client._live_cache
+
+
+# ---------------------------------------------------------------------------
+# wait_for_workstream — since= hint + progress_callback (#bug-5, #18, #perf-3)
+# ---------------------------------------------------------------------------
+
+
+def test_wait_since_missing_entry_does_not_force_early_exit(populated_storage):
+    """Regression for #bug-5: a ``since`` dict that does NOT contain
+    the polled ws_id must not short-circuit the wait with
+    complete=True on tick one.  Only ws_ids present in since_map are
+    considered for the diff-exit check — others fall through to the
+    normal mode='any'/'all' conditions.
+
+    Scenario: single running child (``child-b``) + a ``since`` dict
+    keyed on a disjoint id (``unrelated``).  mode='all' forces a full
+    wait so the run can't early-return on a real terminal — we expect
+    the wait to time out with complete=False, not exit immediately
+    with complete=True because the previous (broken) _diff_since
+    treated ``prev is None`` as changed for every polled wid.
+    """
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(
+        ["child-b"],
+        timeout=1.0,
+        mode="all",
+        since={"unrelated": {"state": "idle", "tokens": 0, "updated": "prior"}},
+    )
+    assert result["complete"] is False
+    assert result["elapsed"] >= 1.0
+    assert result["results"]["child-b"]["state"] == "running"
+
+
+def test_wait_since_matching_snapshot_falls_through_to_mode(populated_storage):
+    """A ``since`` entry that exactly matches the current snapshot
+    (state + tokens + updated all unchanged) does not trigger the
+    diff-exit — the wait falls through to the normal mode condition
+    for that wid."""
+    client = _make_read_client(populated_storage)
+    # First, grab the current snapshot.
+    first = client.wait_for_workstream(["child-a"], timeout=1.0, mode="any")
+    assert first["complete"] is True
+    snap = first["results"]
+    # Re-issue with since=<current snapshot> — nothing changed, but
+    # child-a is real-terminal ('idle') so mode='any' completes again.
+    second = client.wait_for_workstream(
+        ["child-a"],
+        timeout=1.0,
+        mode="any",
+        since=snap,
+    )
+    assert second["complete"] is True
+    # Elapsed should be sub-second: the mode='any' condition fired on
+    # tick one, not a tick-one false-positive from _diff_since.
+    assert second["elapsed"] < 1.0
+
+
+def test_wait_since_malformed_input_drops_silently(populated_storage):
+    """Hostile / malformed since hints (non-dict top-level, non-dict
+    values) degrade to empty since_map rather than raising — the wait
+    is advisory, not a gatekeeper."""
+    client = _make_read_client(populated_storage)
+    # Non-dict since — coerced to empty.
+    result = client.wait_for_workstream(
+        ["child-a"],
+        timeout=1.0,
+        mode="any",
+        since=["not", "a", "dict"],  # type: ignore[arg-type]
+    )
+    assert "error" not in result
+    assert result["complete"] is True
+
+    # Dict with non-dict values — those entries silently drop.
+    result = client.wait_for_workstream(
+        ["child-a"],
+        timeout=1.0,
+        mode="any",
+        since={"child-a": "not-a-dict"},  # type: ignore[dict-item]
+    )
+    assert "error" not in result
+    assert result["complete"] is True
+
+
+def test_wait_progress_callback_invoked_per_tick(populated_storage):
+    """The progress_callback is invoked once per poll tick with the
+    current snapshot + elapsed seconds.  Snapshots carry state/tokens/
+    updated for each polled ws_id."""
+    client = _make_read_client(populated_storage)
+    ticks: list[tuple[dict, float]] = []
+
+    def _cb(snap, elapsed):  # type: ignore[no-untyped-def]
+        ticks.append((dict(snap), elapsed))
+
+    result = client.wait_for_workstream(
+        ["child-a"],
+        timeout=1.0,
+        mode="any",
+        progress_callback=_cb,
+    )
+    assert result["complete"] is True
+    assert len(ticks) >= 1
+    first_snap, _ = ticks[0]
+    assert "child-a" in first_snap
+    assert first_snap["child-a"]["state"] == "idle"
+
+
+def test_wait_progress_callback_errors_dont_break_loop(populated_storage):
+    """A buggy progress_callback must not break the wait — exceptions
+    are swallowed so a broken observer can't wedge the model's tool call."""
+    client = _make_read_client(populated_storage)
+
+    def _bad_cb(snap, elapsed):  # type: ignore[no-untyped-def]
+        raise RuntimeError("observer exploded")
+
+    result = client.wait_for_workstream(
+        ["child-a"],
+        timeout=1.0,
+        mode="any",
+        progress_callback=_bad_cb,
+    )
+    # Wait itself still returns normally.
+    assert result["complete"] is True
+
+
+# ---------------------------------------------------------------------------
+# cleanup_dead_task_child_refs (#bug-6, #13)
+# ---------------------------------------------------------------------------
+
+
+def _save_tasks(storage: SQLiteBackend, ws_id: str, tasks: list[dict[str, Any]]) -> None:
+    """Helper: persist a minimal task envelope for a coordinator."""
+    storage.save_workstream_config(
+        ws_id,
+        {"tasks": json.dumps({"version": 1, "tasks": tasks}, separators=(",", ":"))},
+    )
+
+
+def test_cleanup_dead_task_child_refs_blanks_dead_links(populated_storage):
+    """Tasks whose child_ws_id references a missing workstream get the
+    link blanked; tasks with live links (or no link) are untouched."""
+    client = _make_read_client(populated_storage)
+    _save_tasks(
+        populated_storage,
+        "coord-1",
+        [
+            {"id": "t1", "title": "alive-linked", "status": "done", "child_ws_id": "child-a"},
+            {"id": "t2", "title": "dead-linked", "status": "done", "child_ws_id": "ghost-xyz"},
+            {"id": "t3", "title": "unlinked", "status": "pending", "child_ws_id": ""},
+        ],
+    )
+    blanked = client.cleanup_dead_task_child_refs("coord-1")
+    assert blanked == 1
+    envelope = client.task_list_get("coord-1")
+    tasks_by_id = {t["id"]: t for t in envelope["tasks"]}
+    # Live link preserved.
+    assert tasks_by_id["t1"]["child_ws_id"] == "child-a"
+    # Dead link blanked.
+    assert tasks_by_id["t2"]["child_ws_id"] == ""
+    # Unlinked task untouched.
+    assert tasks_by_id["t3"]["child_ws_id"] == ""
+
+
+def test_cleanup_dead_task_child_refs_all_alive_is_noop(populated_storage):
+    """When every child_ws_id resolves, the cleanup returns 0 and does
+    not rewrite the envelope (we verify via a no-op save spy)."""
+    client = _make_read_client(populated_storage)
+    _save_tasks(
+        populated_storage,
+        "coord-1",
+        [{"id": "t1", "title": "alive", "status": "done", "child_ws_id": "child-a"}],
+    )
+    saves: list[dict[str, str]] = []
+    real_save = populated_storage.save_workstream_config
+
+    def _spy_save(ws_id, cfg):  # type: ignore[no-untyped-def]
+        saves.append(cfg)
+        return real_save(ws_id, cfg)
+
+    populated_storage.save_workstream_config = _spy_save  # type: ignore[method-assign]
+    try:
+        blanked = client.cleanup_dead_task_child_refs("coord-1")
+    finally:
+        populated_storage.save_workstream_config = real_save  # type: ignore[method-assign]
+    assert blanked == 0
+    assert saves == []
+
+
+def test_cleanup_dead_task_child_refs_empty_envelope(populated_storage):
+    """A coordinator with no task_list persisted returns 0 without
+    raising — the cleanup runs on every close, including those that
+    never used the task_list tool."""
+    client = _make_read_client(populated_storage)
+    blanked = client.cleanup_dead_task_child_refs("coord-1")
+    assert blanked == 0
+
+
+def test_cleanup_dead_task_child_refs_corrupt_envelope_skips(populated_storage):
+    """A corrupt envelope (unparseable JSON in workstream_config.tasks)
+    returns 0 rather than raising — the cleanup is best-effort and
+    must not block the close flow."""
+    populated_storage.save_workstream_config("coord-1", {"tasks": "{not json"})
+    client = _make_read_client(populated_storage)
+    assert client.cleanup_dead_task_child_refs("coord-1") == 0
+
+
+def test_cleanup_dead_task_child_refs_uses_task_lock(populated_storage):
+    """The cleanup must acquire the same per-ws _task_lock that
+    task_list_add/update/remove/reorder hold, so a close racing an
+    in-flight mutation can't lose writes (#bug-6).  Verified by
+    swapping the cached lock for a stand-in that records acquisition."""
+    client = _make_read_client(populated_storage)
+
+    class _RecordingLock:
+        """Mimics threading.Lock — counts __enter__ / __exit__ pairs."""
+
+        def __init__(self) -> None:
+            self.acquired = 0
+            self.released = 0
+
+        def __enter__(self) -> _RecordingLock:
+            self.acquired += 1
+            return self
+
+        def __exit__(self, *exc: Any) -> None:
+            self.released += 1
+
+    recording = _RecordingLock()
+    # Prime the cache under the cache-lock so the client's _task_lock()
+    # lookup returns our stand-in instead of allocating a real Lock.
+    with client._task_lock_cache_lock:
+        client._task_lock_cache["coord-1"] = recording  # type: ignore[assignment]
+    client.cleanup_dead_task_child_refs("coord-1")
+    assert recording.acquired == 1
+    assert recording.released == 1
+
+
+def test_cleanup_dead_task_child_refs_storage_batch_failure_swallows(populated_storage):
+    """If get_workstreams_batch raises, the cleanup returns 0 rather
+    than propagating — close flow is resilient to storage hiccups."""
+    client = _make_read_client(populated_storage)
+    _save_tasks(
+        populated_storage,
+        "coord-1",
+        [{"id": "t1", "title": "dead", "status": "done", "child_ws_id": "ghost"}],
+    )
+
+    def _boom(ws_ids):  # type: ignore[no-untyped-def]
+        raise RuntimeError("storage down")
+
+    populated_storage.get_workstreams_batch = _boom  # type: ignore[method-assign]
+    assert client.cleanup_dead_task_child_refs("coord-1") == 0

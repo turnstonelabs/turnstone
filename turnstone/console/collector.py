@@ -401,8 +401,17 @@ class ClusterCollector:
                     self._nodes[nid].server_url = url or self._nodes[nid].server_url
                     self._nodes[nid].max_ws = meta.get("max_ws", self._nodes[nid].max_ws)
 
-            # Remove nodes whose heartbeats expired
-            lost = [nid for nid in self._nodes if nid not in active_ids]
+            # Remove nodes whose heartbeats expired — the ``console``
+            # pseudo-node is permanent (hosts coordinator workstreams,
+            # not a real service-registered node) so it's exempt from
+            # eviction.  Without this guard, every discovery tick
+            # deleted the pseudo-node + fanned out a spurious
+            # node_lost, breaking the home-view coordinator list (#9).
+            lost = [
+                nid
+                for nid in self._nodes
+                if nid not in active_ids and nid != self.CONSOLE_PSEUDO_NODE_ID
+            ]
             for nid in lost:
                 del self._nodes[nid]
                 pending_events.append({"type": "node_lost", "node_id": nid})
@@ -648,7 +657,13 @@ class ClusterCollector:
     # -- query methods (thread-safe) -----------------------------------------
 
     def get_overview(self) -> dict[str, Any]:
-        """Return cluster overview: state counts, totals, aggregate stats."""
+        """Return cluster overview: state counts, totals, aggregate stats.
+
+        Excludes the ``"console"`` pseudo-node — coordinators are not
+        compute-node workstreams and counting them would inflate the
+        cluster summary.  The home view surfaces coordinators via the
+        active-coordinators list instead.
+        """
         states = {"running": 0, "thinking": 0, "attention": 0, "idle": 0, "error": 0}
         total_tokens = 0
         total_tool_calls = 0
@@ -658,7 +673,9 @@ class ClusterCollector:
         mcp_prompts = 0
         versions: set[str] = set()
         with self._lock:
-            for node in self._nodes.values():
+            for nid, node in self._nodes.items():
+                if nid == self.CONSOLE_PSEUDO_NODE_ID:
+                    continue
                 for ws in node.workstreams.values():
                     state = ws.get("state", "idle")
                     states[state] = states.get(state, 0) + 1
@@ -672,7 +689,7 @@ class ClusterCollector:
                 mcp_servers += mcp.get("servers", 0)
                 mcp_resources += mcp.get("resources", 0)
                 mcp_prompts += mcp.get("prompts", 0)
-            node_count = len(self._nodes)
+            node_count = sum(1 for nid in self._nodes if nid != self.CONSOLE_PSEUDO_NODE_ID)
         result: dict[str, Any] = {
             "nodes": node_count,
             "workstreams": total_ws,
@@ -720,6 +737,11 @@ class ClusterCollector:
         with self._lock:
             items = []
             for node in self._nodes.values():
+                # Hide the ``"console"`` pseudo-node from compute-node
+                # listings — it's a synthetic carrier for coordinator
+                # workstreams, not a real node operators target.
+                if node.node_id == self.CONSOLE_PSEUDO_NODE_ID:
+                    continue
                 if node_ids is not None and node.node_id not in node_ids:
                     continue
                 ws_states = {
@@ -796,6 +818,13 @@ class ClusterCollector:
         with self._lock:
             all_ws = []
             for n in self._nodes.values():
+                # Skip the ``"console"`` pseudo-node — coordinator rows
+                # are contributed by the ``_coordinator_rows`` caller
+                # (via ``extra_rows``) which applies tenancy filtering.
+                # Without this skip, non-admin callers would see every
+                # tenant's coordinators via ``/v1/api/cluster/workstreams``.
+                if n.node_id == self.CONSOLE_PSEUDO_NODE_ID:
+                    continue
                 for ws in n.workstreams.values():
                     all_ws.append(dict(ws))
             if extra_rows:
@@ -961,3 +990,149 @@ class ClusterCollector:
         with self._listeners_lock:
             if q in self._listeners:
                 self._listeners.remove(q)
+
+    # ------------------------------------------------------------------
+    # Console pseudo-node — coordinator workstreams live here (#9)
+    # ------------------------------------------------------------------
+    #
+    # Coordinators run on the console process, not on a cluster node,
+    # so the SSE stream the collector manages for real nodes never
+    # surfaces them.  To avoid a parallel polling channel the home view
+    # had to drive itself, the coordinator manager drives a pseudo-node
+    # here: register the node on startup, upsert workstream entries on
+    # create / close / state-change, and fan out matching ws_created /
+    # ws_closed / cluster_state events so the browser's existing
+    # clusterState machinery picks them up live.
+
+    CONSOLE_PSEUDO_NODE_ID = "console"
+
+    def ensure_console_pseudo_node(self) -> None:
+        """Install the ``"console"`` pseudo-node in the snapshot map.
+
+        Idempotent — a second call is a no-op.  No SSE task is started
+        for this node (it has no real server URL and no remote state to
+        mirror); the coordinator manager feeds events directly via
+        :meth:`emit_console_ws_created` / :meth:`emit_console_ws_closed`
+        / :meth:`emit_console_ws_state`.
+        """
+        with self._lock:
+            if self.CONSOLE_PSEUDO_NODE_ID in self._nodes:
+                return
+            self._nodes[self.CONSOLE_PSEUDO_NODE_ID] = NodeSnapshot(
+                node_id=self.CONSOLE_PSEUDO_NODE_ID,
+                server_url="",
+                started=time.time(),
+                last_seen=time.monotonic(),
+                max_ws=0,
+                reachable=True,
+            )
+
+    def emit_console_ws_created(
+        self,
+        ws_id: str,
+        *,
+        name: str,
+        user_id: str,
+        kind: str,
+        state: str = "idle",
+        parent_ws_id: str | None = None,
+    ) -> None:
+        """Record a new coordinator row on the console pseudo-node + fan out.
+
+        Best-effort: if the pseudo-node doesn't exist yet the call is
+        dropped rather than raising.  Matches the shape
+        :func:`_apply_delta` produces for real-node ``ws_created`` events
+        so the browser's ``patchClusterState`` handler stays uniform.
+        """
+        self.ensure_console_pseudo_node()
+        pending: list[dict[str, Any]] = []
+        now = time.time()
+        with self._lock:
+            node = self._nodes.get(self.CONSOLE_PSEUDO_NODE_ID)
+            if node is None:
+                return
+            if ws_id not in node.workstreams:
+                node.workstreams[ws_id] = {
+                    "id": ws_id,
+                    "name": name,
+                    "state": state,
+                    "node": self.CONSOLE_PSEUDO_NODE_ID,
+                    "server_url": "",
+                    "tokens": 0,
+                    "context_ratio": 0.0,
+                    "activity": "",
+                    "activity_state": "",
+                    "tool_calls": 0,
+                    "title": "",
+                    "kind": kind,
+                    "parent_ws_id": parent_ws_id,
+                    "user_id": user_id or "",
+                    "updated": now,
+                }
+            pending.append(
+                {
+                    "type": "ws_created",
+                    "ws_id": ws_id,
+                    "name": name,
+                    "title": "",
+                    "node_id": self.CONSOLE_PSEUDO_NODE_ID,
+                    "kind": kind,
+                    "parent_ws_id": parent_ws_id,
+                    "user_id": user_id or "",
+                }
+            )
+        for event in pending:
+            self._fanout(event)
+
+    def emit_console_ws_closed(self, ws_id: str) -> None:
+        """Drop the coordinator row from the console pseudo-node + fan out."""
+        with self._lock:
+            node = self._nodes.get(self.CONSOLE_PSEUDO_NODE_ID)
+            if node is None:
+                return
+            node.workstreams.pop(ws_id, None)
+        self._fanout({"type": "ws_closed", "ws_id": ws_id})
+
+    def emit_console_ws_state(self, ws_id: str, state: str) -> None:
+        """Update the coordinator row's state on the console pseudo-node + fan out.
+
+        Coordinators don't surface live-token counts the way real-node
+        workstreams do (the collector reads aggregate tokens from the
+        node's ``/v1/api/dashboard`` feed, which the console doesn't
+        expose).  Emit state transitions only — downstream rendering
+        gracefully handles the absent ``tokens`` field.
+        """
+        with self._lock:
+            node = self._nodes.get(self.CONSOLE_PSEUDO_NODE_ID)
+            if node is None:
+                return
+            entry = node.workstreams.get(ws_id)
+            if entry is None:
+                return
+            entry["state"] = state
+        self._fanout(
+            {
+                "type": "cluster_state",
+                "ws_id": ws_id,
+                "state": state,
+                "node_id": self.CONSOLE_PSEUDO_NODE_ID,
+                "tokens": 0,
+                "content": "",
+                "kind": WorkstreamKind.COORDINATOR.value,
+                "parent_ws_id": None,
+            }
+        )
+
+    def emit_console_ws_rename(self, ws_id: str, name: str) -> None:
+        """Rename the coordinator row + fan out ``ws_rename``."""
+        if not name:
+            return
+        with self._lock:
+            node = self._nodes.get(self.CONSOLE_PSEUDO_NODE_ID)
+            if node is None:
+                return
+            entry = node.workstreams.get(ws_id)
+            if entry is None:
+                return
+            entry["name"] = name
+        self._fanout({"type": "ws_rename", "ws_id": ws_id, "name": name})

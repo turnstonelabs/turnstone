@@ -159,7 +159,12 @@
 .home-cluster-summary-caret { color: var(--fg-dim); font-size: 10px; transition: transform 0.12s; }
 .home-cluster-summary:hover .home-cluster-summary-caret { transform: translateX(2px); }
 
-/* Sub-700px: collapse the composer row and tighten padding. */
+/* Sub-700px: collapse the composer row and tighten padding.  The
+   phase-4 designer-review "composer wrap 340-699px" observation is
+   fully covered by this full-stack rule — the flex math at ≥701px
+   (name 1 1 220/160min + skill 0 0 180 + submit 0 0 auto/90min +
+   2×8px gap ≈ 500-540px preferred) fits comfortably in every
+   desktop viewport, so a mid-zone break rule is unnecessary. */
 @media (max-width: 700px) {
   #main { padding: 14px 12px 48px; }
   #view-home { gap: 16px; }

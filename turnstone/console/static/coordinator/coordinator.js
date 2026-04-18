@@ -25,7 +25,7 @@
   const wsId = document.documentElement.dataset.wsId || "";
   if (!wsId) {
     document.getElementById("coord-messages").innerHTML =
-      '<div class="coord-msg role-error">Missing ws_id on &lt;html&gt; tag.</div>';
+      '<div class="ts-msg ts-msg--error">Missing ws_id on &lt;html&gt; tag.</div>';
     return;
   }
 
@@ -140,7 +140,7 @@
     opts = opts || {};
     const el = document.createElement("div");
     const variant = _TS_ROLE_VARIANTS[role] || "ts-msg--assistant";
-    el.className = "coord-msg role-" + role + " ts-msg " + variant;
+    el.className = "ts-msg " + variant;
     // role="article" makes aria-label reliably announced by screen
     // readers — a generic <div> with no implicit role doesn't expose
     // aria-label on its own.  "article" fits: each message is a
@@ -156,7 +156,7 @@
       el.setAttribute("aria-label", opts.label);
     }
     const body = document.createElement("div");
-    body.className = "coord-body ts-msg-body";
+    body.className = "ts-msg-body";
     body.innerHTML = html;
     el.appendChild(body);
     messagesEl.appendChild(el);
@@ -210,7 +210,7 @@
     // token so the user sees live-formatted markdown instead of a final
     // "pop" on stream_end.  Heavy post-processing (syntax highlighting,
     // mermaid, KaTeX) stays deferred to streamingRenderFinalize below.
-    const body = currentAssistantEl.querySelector(".coord-body");
+    const body = currentAssistantEl.querySelector(".ts-msg-body");
     if (body && typeof streamingRender === "function") {
       try {
         streamingRender(body, currentAssistantBuf);
@@ -236,7 +236,7 @@
       messagesEl.setAttribute("aria-live", "off");
     }
     currentReasoningBuf += text;
-    const body = currentReasoningEl.querySelector(".coord-body");
+    const body = currentReasoningEl.querySelector(".ts-msg-body");
     if (body) body.textContent = currentReasoningBuf;
     messagesEl.scrollTop = messagesEl.scrollHeight;
   }
@@ -248,7 +248,7 @@
     // the innerHTML assignment inside the helper is XSS-safe as long as
     // renderer.js is trusted — same contract as ui/static/app.js.
     if (currentAssistantEl && currentAssistantBuf) {
-      const body = currentAssistantEl.querySelector(".coord-body");
+      const body = currentAssistantEl.querySelector(".ts-msg-body");
       if (body && typeof streamingRenderFinalize === "function") {
         try {
           streamingRenderFinalize(body, currentAssistantBuf);
@@ -275,7 +275,7 @@
     // approval applies to every row, not just the focused one.
     if (pending.length > 0) {
       const header = document.createElement("div");
-      header.className = "tool-row approval-header ts-approval-header";
+      header.className = "ts-approval-header";
       header.textContent =
         pending.length === 1
           ? "Approve 1 tool call:"
@@ -286,7 +286,7 @@
     pending.forEach((it, idx) => {
       if (!firstCallId) firstCallId = it.call_id;
       const row = document.createElement("div");
-      row.className = "tool-row ts-approval-tool";
+      row.className = "ts-approval-tool";
       const label =
         it.header || it.approval_label || it.func_name || "(unknown tool)";
       row.textContent = pending.length > 1 ? idx + 1 + ". " + label : label;
@@ -488,6 +488,17 @@
         // disconnect are stale.
         loadChildren({ replace: true });
         loadTasks();
+        // Drop any in-flight wait entries — a wait_ended dropped
+        // during the SSE gap would otherwise pin the header badge
+        // forever.  The server's SSE replay doesn't cover our
+        // per-call wait_* events, so we clear and let fresh events
+        // repopulate.  #bug-4.
+        if (typeof activeWaits !== "undefined") {
+          activeWaits.clear();
+          if (typeof _renderWaitIndicator === "function") {
+            _renderWaitIndicator();
+          }
+        }
       }
     };
     evtSource.onerror = function () {
@@ -576,7 +587,7 @@
           if (
             it.call_id &&
             document.querySelector(
-              '.coord-msg[data-call-id="' + cssEscape(it.call_id) + '"]',
+              '.ts-msg[data-call-id="' + cssEscape(it.call_id) + '"]',
             )
           ) {
             return; // already rendered in this pane — skip
@@ -643,10 +654,109 @@
       case "child_ws_rename":
         handleChildRename(ev);
         break;
+      // wait_for_workstream observability (#14) — the worker thread
+      // can block up to 600s inside the tool; these events drive a
+      // sidebar indicator so operators see the coordinator is alive.
+      case "wait_started":
+        handleWaitStarted(ev);
+        break;
+      case "wait_progress":
+        handleWaitProgress(ev);
+        break;
+      case "wait_ended":
+        handleWaitEnded(ev);
+        break;
       default:
         // Unknown event type — ignore silently.
         break;
     }
+  }
+
+  // ------------------------------------------------------------------
+  // wait_for_workstream progress indicator (#14)
+  // ------------------------------------------------------------------
+  //
+  // In-flight waits keyed by call_id so overlapping / nested waits
+  // each get their own badge.  Cleared on wait_ended, and on SSE
+  // reconnect (see evtSource.onopen above) — a wait_ended dropped
+  // during the gap would otherwise pin the badge indefinitely.
+  const activeWaits = new Map();
+
+  function _waitIndicatorEl() {
+    let el = document.getElementById("coord-wait-indicator");
+    if (el) return el;
+    // Only attach to the coord header vocabulary — don't fall back to
+    // document.body, which would plant a floating badge at the page
+    // root on any template variant where the header hasn't rendered
+    // yet (#q-7).  Return null so callers skip rendering; the next
+    // event will retry.
+    const host =
+      document.getElementById("coord-status") ||
+      document.getElementById("coord-header");
+    if (!host) return null;
+    el = document.createElement("span");
+    el.id = "coord-wait-indicator";
+    el.className = "ts-header-status coord-wait-indicator";
+    el.setAttribute("role", "status");
+    el.setAttribute("aria-live", "polite");
+    el.style.display = "none";
+    el.style.marginLeft = "0.5em";
+    host.appendChild(el);
+    return el;
+  }
+
+  function _renderWaitIndicator() {
+    const el = _waitIndicatorEl();
+    if (!el) return; // header not rendered yet — retry on next event
+    if (activeWaits.size === 0) {
+      el.style.display = "none";
+      el.textContent = "";
+      return;
+    }
+    let totalWs = 0;
+    let maxElapsed = 0;
+    activeWaits.forEach((w) => {
+      totalWs += Array.isArray(w.ws_ids) ? w.ws_ids.length : 0;
+      if (typeof w.elapsed === "number" && w.elapsed > maxElapsed) {
+        maxElapsed = w.elapsed;
+      }
+    });
+    const fragments = [];
+    if (activeWaits.size > 1) fragments.push(activeWaits.size + " waits");
+    if (totalWs > 0) fragments.push(totalWs + " ws");
+    if (maxElapsed > 0) fragments.push(Math.round(maxElapsed) + "s");
+    el.textContent =
+      "\u29D7 waiting" +
+      (fragments.length ? " · " + fragments.join(" · ") : "");
+    el.style.display = "";
+  }
+
+  function handleWaitStarted(ev) {
+    const cid = ev.call_id;
+    if (!cid) return;
+    activeWaits.set(cid, {
+      ws_ids: Array.isArray(ev.ws_ids) ? ev.ws_ids.slice() : [],
+      mode: ev.mode || "any",
+      timeout: typeof ev.timeout === "number" ? ev.timeout : 60,
+      elapsed: 0,
+    });
+    _renderWaitIndicator();
+  }
+
+  function handleWaitProgress(ev) {
+    const cid = ev.call_id;
+    if (!cid) return;
+    const entry = activeWaits.get(cid);
+    if (!entry) return;
+    if (typeof ev.elapsed === "number") entry.elapsed = ev.elapsed;
+    _renderWaitIndicator();
+  }
+
+  function handleWaitEnded(ev) {
+    const cid = ev.call_id;
+    if (!cid) return;
+    activeWaits.delete(cid);
+    _renderWaitIndicator();
   }
 
   // ------------------------------------------------------------------
@@ -658,8 +768,6 @@
   const childrenState = new Map();
   // ws_id -> {live: <dict>, fetched: <ms>} for the 5s TTL live-badge cache.
   const liveBadgeCache = new Map();
-  // ws_id -> timeout id, for 250ms debounce on live-inspect fetches.
-  const liveBadgeDebounce = new Map();
   // ws_ids currently visible in the viewport — only these trigger
   // live-fetch on SSE state changes.  Populated by an
   // IntersectionObserver attached to each rendered .ch-row so a
@@ -990,6 +1098,19 @@
     }, TASKS_REFRESH_DEBOUNCE_MS);
   }
 
+  // Upper bound on ids per bulk request — matches the server-side
+  // cap in cluster_ws_live_bulk.  A viewport with more visible rows
+  // than the cap splits into multiple bulk calls, each ~one round-trip
+  // per TTL window; still far cheaper than one-per-row.
+  const LIVE_BADGE_BULK_CAP = 50;
+  // Coalesce window — debounced per-row scheduling enqueues into
+  // pendingLiveIds; the flush runs after this idle window collapses
+  // into a single bulk request.  Matches the per-row debounce so a
+  // burst of SSE ticks lands in one flush.
+  const LIVE_BADGE_BULK_FLUSH_MS = LIVE_BADGE_DEBOUNCE_MS;
+  const pendingLiveIds = new Set();
+  let liveBadgeFlushTimer = null;
+
   function scheduleLiveFetch(childWsId) {
     if (!childWsId) return;
     // Skip terminal-state children entirely — their live block will
@@ -1013,49 +1134,73 @@
       if (cached.permanent) return;
       if (Date.now() - cached.fetched < LIVE_BADGE_TTL_MS) return;
     }
-    if (liveBadgeDebounce.has(childWsId)) return;
-    const tid = setTimeout(() => {
-      liveBadgeDebounce.delete(childWsId);
-      fetchLiveBadge(childWsId);
-    }, LIVE_BADGE_DEBOUNCE_MS);
-    liveBadgeDebounce.set(childWsId, tid);
+    if (!WS_ID_RE.test(childWsId)) return;
+    pendingLiveIds.add(childWsId);
+    if (liveBadgeFlushTimer !== null) return;
+    liveBadgeFlushTimer = setTimeout(() => {
+      liveBadgeFlushTimer = null;
+      flushLiveFetches();
+    }, LIVE_BADGE_BULK_FLUSH_MS);
   }
 
-  async function fetchLiveBadge(childWsId) {
-    if (!WS_ID_RE.test(childWsId)) return;
+  async function flushLiveFetches() {
+    if (pendingLiveIds.size === 0) return;
+    const ids = Array.from(pendingLiveIds).slice(0, LIVE_BADGE_BULK_CAP);
+    ids.forEach((id) => pendingLiveIds.delete(id));
+    // Reschedule a follow-up flush if we overflowed the cap so the
+    // excess ids still land — without this, a viewport bigger than the
+    // cap would silently drop the tail every tick.
+    if (pendingLiveIds.size > 0 && liveBadgeFlushTimer === null) {
+      liveBadgeFlushTimer = setTimeout(() => {
+        liveBadgeFlushTimer = null;
+        flushLiveFetches();
+      }, LIVE_BADGE_BULK_FLUSH_MS);
+    }
     try {
-      const body = await getJSON(
-        "/v1/api/cluster/ws/" + encodeURIComponent(childWsId) + "/detail",
-      );
-      liveBadgeCache.set(childWsId, {
-        live: body && body.live ? body.live : null,
-        fetched: Date.now(),
-      });
-      const row = childrenTreeEl.querySelector(
-        '.ch-row[data-ws-id="' + cssEscape(childWsId) + '"]',
-      );
-      if (row) {
-        const entry = childrenState.get(childWsId);
-        if (entry) {
-          const replacement = renderChildRow(entry);
-          row.replaceWith(replacement);
+      const url =
+        "/v1/api/cluster/ws/live?ids=" + ids.map(encodeURIComponent).join(",");
+      const body = await getJSON(url);
+      const results = (body && body.results) || {};
+      const denied = Array.isArray(body && body.denied) ? body.denied : [];
+      const now = Date.now();
+      ids.forEach((id) => {
+        const live = Object.prototype.hasOwnProperty.call(results, id)
+          ? results[id]
+          : null;
+        const wasDenied = denied.indexOf(id) !== -1;
+        liveBadgeCache.set(id, {
+          live: live,
+          fetched: now,
+          // Denied ids are permission/identity misses — mark permanent
+          // so SSE state ticks on those rows don't retry every window.
+          permanent: wasDenied,
+        });
+        const row = childrenTreeEl.querySelector(
+          '.ch-row[data-ws-id="' + cssEscape(id) + '"]',
+        );
+        if (row) {
+          const entry = childrenState.get(id);
+          if (entry) {
+            const replacement = renderChildRow(entry);
+            row.replaceWith(replacement);
+          }
         }
-      }
-    } catch (e) {
-      // Cache failures too — otherwise 403 / 404 paths burn one HTTP
-      // round-trip per SSE child_ws_state event.  403/404 are marked
-      // permanent (permission/identity won't change mid-session); 5xx
-      // + network errors take the normal 5s TTL so transient blips
-      // recover on the next schedule.
-      const isTerminal = e && /HTTP 40[34]/.test(e.message || "");
-      liveBadgeCache.set(childWsId, {
-        live: null,
-        fetched: Date.now(),
-        permanent: isTerminal,
       });
-      if (!isTerminal) {
-        console.warn("fetchLiveBadge failed", e);
-      }
+    } catch (e) {
+      // 403 = caller lacks admin.cluster.inspect → mark every pending
+      // id permanent so we don't retry every window.  Other failures
+      // (5xx, network) take the normal TTL and recover on the next
+      // schedule.
+      const isPermanent = e && /HTTP 403/.test(e.message || "");
+      const now = Date.now();
+      ids.forEach((id) => {
+        liveBadgeCache.set(id, {
+          live: null,
+          fetched: now,
+          permanent: isPermanent,
+        });
+      });
+      if (!isPermanent) console.warn("flushLiveFetches failed", e);
     }
   }
 

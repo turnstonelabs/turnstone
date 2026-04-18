@@ -33,6 +33,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
+from turnstone.console.collector import ClusterCollector
 from turnstone.core.log import get_logger
 from turnstone.core.workstream import (
     Workstream,
@@ -44,7 +45,6 @@ from turnstone.core.workstream import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
-    from turnstone.console.collector import ClusterCollector
     from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
     from turnstone.core.session import ChatSession
     from turnstone.core.storage._protocol import StorageBackend
@@ -59,7 +59,10 @@ class CoordinatorManager:
     # stays non-NULL and list / audit surfaces can distinguish coordinators
     # from real-node workstreams.  The hash-ring router treats it as an
     # unroutable sentinel — coordinators never land on real nodes.
-    NODE_ID = "console"
+    # Bound from ``ClusterCollector.CONSOLE_PSEUDO_NODE_ID`` so the two
+    # literals can't drift (the collector's eviction + query filters
+    # key off the same string).
+    NODE_ID = ClusterCollector.CONSOLE_PSEUDO_NODE_ID
 
     def __init__(
         self,
@@ -165,6 +168,59 @@ class CoordinatorManager:
             self._cleanup(evicted)
             with self._children_lock:
                 self._pop_coord_registry_locked(evicted.id)
+            # Fan out a console-pseudo-node ``ws_closed`` for the evicted
+            # coordinator so the home view drops it live (see #9).  The
+            # eviction path otherwise has no observable signal — the row
+            # would linger on other tabs' home views until the next hard
+            # refresh.
+            if self._collector is not None:
+                try:
+                    self._collector.emit_console_ws_closed(evicted.id)
+                except Exception:
+                    log.debug(
+                        "coord_mgr.collector_evict_fanout_failed ws=%s",
+                        evicted.id[:8],
+                        exc_info=True,
+                    )
+
+        # Resolve skill name -> (template_id, applied_version) so the
+        # workstreams row persists what was applied, not what was
+        # requested.  Mirrors ``turnstone/server.py`` interactive-workstream
+        # create; surfaced by ``inspect_workstream`` on coordinator rows so
+        # operators can tell which skill the session is running.  A missing
+        # / unknown skill name falls back to empty (no skill binding)
+        # rather than raising — the session factory tolerates None.
+        skill_id_resolved = ""
+        skill_version_resolved = 0
+        if skill:
+            try:
+                from turnstone.core.memory import get_skill_by_name
+
+                skill_data = get_skill_by_name(skill)
+            except Exception:
+                log.debug(
+                    "coord_mgr.skill_lookup_failed ws=%s skill=%s",
+                    ws_id[:8],
+                    skill,
+                    exc_info=True,
+                )
+                skill_data = None
+            if skill_data and skill_data.get("template_id"):
+                skill_id_resolved = str(skill_data["template_id"])
+                try:
+                    # COUNT query avoids pulling every version row just
+                    # for its length on the create hot path (#perf-2).
+                    skill_version_resolved = (
+                        self._storage.count_skill_versions(skill_id_resolved) + 1
+                    )
+                except Exception:
+                    log.debug(
+                        "coord_mgr.skill_version_failed ws=%s skill=%s",
+                        ws_id[:8],
+                        skill,
+                        exc_info=True,
+                    )
+                    skill_version_resolved = 1
 
         # Persist before constructing the session so lazy rehydration on
         # restart can find the row even if the ChatSession build fails.
@@ -180,6 +236,8 @@ class CoordinatorManager:
                 name=ws.name,
                 kind=WorkstreamKind.COORDINATOR,
                 parent_ws_id=None,
+                skill_id=skill_id_resolved,
+                skill_version=skill_version_resolved,
             )
         except Exception:
             log.warning(
@@ -221,6 +279,27 @@ class CoordinatorManager:
 
         if initial_message:
             self._spawn_worker(ws, initial_message)
+
+        # Fan out a console-pseudo-node ``ws_created`` so the home view
+        # sees the new coordinator live (no more polling — see #9).
+        # Failure here must not break the create path — worst case the
+        # view lags one refresh cycle until the next SSE tick.
+        if self._collector is not None:
+            try:
+                self._collector.emit_console_ws_created(
+                    ws_id,
+                    name=ws.name,
+                    user_id=user_id,
+                    kind=WorkstreamKind.COORDINATOR.value,
+                    state=ws.state.value,
+                    parent_ws_id=None,
+                )
+            except Exception:
+                log.debug(
+                    "coord_mgr.collector_create_fanout_failed ws=%s",
+                    ws_id[:8],
+                    exc_info=True,
+                )
 
         # Seed the known-children registry with an empty set so the
         # fan-out filter recognises this coordinator immediately when a
@@ -319,6 +398,20 @@ class CoordinatorManager:
                     # index entries forever.
                     with self._children_lock:
                         self._pop_coord_registry_locked(evicted.id)
+                    # Fan out a console-pseudo-node ``ws_closed`` for the
+                    # evicted coordinator so other tabs drop the row
+                    # live — without this, the rehydrate-path eviction
+                    # was silent on the home view and stale rows
+                    # lingered until a hard refresh (#9 follow-up).
+                    if self._collector is not None:
+                        try:
+                            self._collector.emit_console_ws_closed(evicted.id)
+                        except Exception:
+                            log.debug(
+                                "coord_mgr.collector_open_evict_fanout_failed ws=%s",
+                                evicted.id[:8],
+                                exc_info=True,
+                            )
 
                 try:
                     ws.session = self._session_factory(
@@ -341,6 +434,27 @@ class CoordinatorManager:
                     except Exception:
                         log.debug(
                             "coord_mgr.resume_failed ws=%s",
+                            ws_id[:8],
+                            exc_info=True,
+                        )
+                # Rehydration: fan out a console-pseudo-node
+                # ``ws_created`` so a tab that opens a persisted-but-
+                # unloaded coordinator sees it live on every other
+                # open home view (see #9).  Harmless re-emit —
+                # clusterState's patch loop ignores duplicates.
+                if self._collector is not None:
+                    try:
+                        self._collector.emit_console_ws_created(
+                            ws_id,
+                            name=ws.name,
+                            user_id=ws.user_id or "",
+                            kind=WorkstreamKind.COORDINATOR.value,
+                            state=ws.state.value,
+                            parent_ws_id=None,
+                        )
+                    except Exception:
+                        log.debug(
+                            "coord_mgr.collector_open_fanout_failed ws=%s",
                             ws_id[:8],
                             exc_info=True,
                         )
@@ -504,6 +618,35 @@ class CoordinatorManager:
             self._storage.update_workstream_state(ws_id, "closed")
         except Exception:
             log.debug("coord_mgr.state_update_failed ws=%s", ws_id[:8], exc_info=True)
+        # Fan out a console-pseudo-node ``ws_closed`` so the home view
+        # drops the row live (see #9).  Best-effort; swallow failures.
+        if self._collector is not None:
+            try:
+                self._collector.emit_console_ws_closed(ws_id)
+            except Exception:
+                log.debug(
+                    "coord_mgr.collector_close_fanout_failed ws=%s",
+                    ws_id[:8],
+                    exc_info=True,
+                )
+        # Best-effort sweep: task_list rows may carry child_ws_id
+        # pointers to workstreams that have since been hard-deleted.
+        # Clearing the dead links keeps the persisted task envelope
+        # honest and prevents v2 kanban from rendering broken arrows.
+        # Routed through the CoordinatorClient so it acquires the same
+        # per-ws ``_task_lock`` the add/update/remove/reorder paths
+        # hold — a close() racing an in-flight task_list mutation
+        # would otherwise lose the mutation (#bug-6).
+        coord_client = getattr(getattr(ws, "session", None), "_coord_client", None)
+        if coord_client is not None and hasattr(coord_client, "cleanup_dead_task_child_refs"):
+            try:
+                coord_client.cleanup_dead_task_child_refs(ws_id)
+            except Exception:
+                log.debug(
+                    "coord_mgr.task_ref_cleanup_failed ws=%s",
+                    ws_id[:8],
+                    exc_info=True,
+                )
         return True
 
     def cancel(self, ws_id: str) -> bool:
@@ -586,6 +729,47 @@ class CoordinatorManager:
         # lock means every observer of the placeholder sees a non-None
         # ui; only ``session`` lags behind.
         ws.ui = self._ui_factory(ws_id, user_id)
+        # Wire state/rename observers so the cluster collector's
+        # console pseudo-node mirrors every state transition and rename
+        # that reaches the UI (see #9).  Bind ``ws_id`` by default-arg
+        # so the closure captures the concrete id — ``ws`` changes
+        # across concurrent installs.
+        collector = self._collector
+        if collector is not None:
+
+            def _state_fanout(state: str, _wid: str = ws_id) -> None:
+                if collector is None:
+                    return
+                try:
+                    collector.emit_console_ws_state(_wid, state)
+                except Exception:
+                    log.debug(
+                        "coord_mgr.state_fanout_failed ws=%s",
+                        _wid[:8],
+                        exc_info=True,
+                    )
+
+            def _rename_fanout(name: str, _wid: str = ws_id) -> None:
+                if collector is None:
+                    return
+                try:
+                    collector.emit_console_ws_rename(_wid, name)
+                except Exception:
+                    log.debug(
+                        "coord_mgr.rename_fanout_failed ws=%s",
+                        _wid[:8],
+                        exc_info=True,
+                    )
+
+            try:
+                ws.ui._on_state_observer = _state_fanout
+                ws.ui._on_rename_observer = _rename_fanout
+            except Exception:
+                log.debug(
+                    "coord_mgr.attach_observers_failed ws=%s",
+                    ws_id[:8],
+                    exc_info=True,
+                )
         self._workstreams[ws_id] = ws
         self._order.append(ws_id)
         # Track the evicted coordinator's id for the active-coords
@@ -806,6 +990,10 @@ class CoordinatorManager:
             return
         self._collector = collector
         self._collector_queue = queue.Queue(maxsize=1000)
+        # Ensure the "console" pseudo-node exists in the snapshot map so
+        # emit_console_ws_* calls from create / close / open land on a
+        # real node entry the snapshot will surface (see #9).
+        collector.ensure_console_pseudo_node()
         # Register with the collector — use the existing listener channel
         # the browser SSE fan-out uses; the collector treats our queue as
         # just another subscriber.
@@ -815,6 +1003,28 @@ class CoordinatorManager:
         # children without waiting for the next ``ws_state`` tick to
         # discover them via the fan-out path.
         self._prime_children_from_snapshot(snapshot)
+        # Seed the pseudo-node with any coordinators already loaded in
+        # memory when the collector binds.  Prevents a race where early
+        # creates happened before the collector was wired up and their
+        # rows never showed on the snapshot.
+        with self._lock:
+            active = [(w.id, w) for w in self._workstreams.values()]
+        for wid, ws in active:
+            try:
+                collector.emit_console_ws_created(
+                    wid,
+                    name=ws.name,
+                    user_id=ws.user_id or "",
+                    kind=WorkstreamKind.COORDINATOR.value,
+                    state=ws.state.value,
+                    parent_ws_id=None,
+                )
+            except Exception:
+                log.debug(
+                    "coord_mgr.collector_seed_failed ws=%s",
+                    wid[:8],
+                    exc_info=True,
+                )
         self._fanout_stop.clear()
         t = threading.Thread(
             target=self._fanout_loop,

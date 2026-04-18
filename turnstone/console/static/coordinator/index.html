@@ -56,7 +56,7 @@
     overflow-y: auto;
     padding: 1rem 1.5rem;
   }
-  .coord-msg .coord-ws-link {
+  .ts-msg .coord-ws-link {
     color: var(--accent);
     text-decoration: underline;
   }
@@ -89,6 +89,15 @@
     align-items: baseline;
   }
   .ch-row a.ws-link:hover { color: var(--accent); }
+  /* Keyboard-focus indicators — match the accent-ring pattern the
+     rest of the console uses so tab-nav through the sidebar rows
+     stays visible on both light + dark themes. */
+  .ch-row a.ws-link:focus-visible,
+  .task-row:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+    border-radius: 4px;
+  }
   /* glyph treatment (.ui-glyph / .ui-glyph-<state>) comes from
      shared_static/ui-base.css; stateGlyph() emits those classes. */
   .ch-row .name { font-weight: 500; flex: 1; overflow: hidden; text-overflow: ellipsis; }
@@ -204,9 +213,9 @@
          reachable in normal tab order.  role=alertdialog implies a modal
          focus trap per WAI-ARIA. -->
     <div id="coord-approval-bar" class="ts-approval ts-approval--batch" role="region" aria-label="Approval required" aria-live="assertive">
-      <div id="coord-approval-label" class="label ts-approval-header">Approval required</div>
+      <div id="coord-approval-label" class="ts-approval-header">Approval required</div>
       <div id="coord-approval-tools"></div>
-      <div class="btn-row ts-approval-actions">
+      <div class="ts-approval-actions">
         <button id="coord-approve-btn" class="ts-approval-btn ts-approval-btn--approve" onclick="coordApprove(true, false)">Approve</button>
         <button id="coord-approve-always-btn" class="ts-approval-btn ts-approval-btn--always" onclick="coordApprove(true, true)">Approve (always)</button>
         <button id="coord-deny-btn" class="ts-approval-btn ts-approval-btn--deny" onclick="coordApprove(false, false)">Deny</button>
