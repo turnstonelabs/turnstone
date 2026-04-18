@@ -30,9 +30,54 @@ if TYPE_CHECKING:
             *,
             skill: str | None = ...,
             client_type: str = ...,
-            kind: str = ...,
+            kind: WorkstreamKind = ...,
             parent_ws_id: str | None = ...,
         ) -> ChatSession: ...
+
+
+# ---------------------------------------------------------------------------
+# Kind enum — single source of truth for the workstream dispatch classifier
+# ---------------------------------------------------------------------------
+
+
+class WorkstreamKind(enum.StrEnum):
+    """Classifier for which manager hosts a workstream.
+
+    StrEnum so members are drop-in ``str`` replacements for the DB column,
+    JSON payloads, and existing ``==`` comparisons against raw strings.
+    Narrow internal annotations to this type; wide boundaries (HTTP body,
+    DB row) stay ``str`` and parse via ``WorkstreamKind(raw)`` / ``from_raw``
+    at the edge.
+    """
+
+    INTERACTIVE = "interactive"  # hosted by turnstone-server.WorkstreamManager
+    COORDINATOR = "coordinator"  # hosted by turnstone-console.CoordinatorManager
+
+    @classmethod
+    def from_raw(
+        cls,
+        value: WorkstreamKind | str | None,
+        *,
+        default: WorkstreamKind | None = None,
+    ) -> WorkstreamKind:
+        """Parse an externally-supplied kind value with a fallback for missing data.
+
+        Handles the three shapes that arrive from storage rows and wire
+        payloads — already-an-enum, non-empty string, None/empty — so the
+        ``WorkstreamKind(x or WorkstreamKind.INTERACTIVE.value)`` dance
+        (``or`` short-circuits on a truthy enum member and skips the
+        default, forcing every caller to reach for ``.value``) collapses
+        into a single predictable call.
+
+        ``default`` defaults to ``INTERACTIVE`` when omitted.  Raises
+        ``ValueError`` for a non-empty string that doesn't match any
+        known kind — callers that want to coerce unknowns to the default
+        should catch and fall back explicitly.
+        """
+        effective_default = default if default is not None else cls.INTERACTIVE
+        if value is None or value == "":
+            return effective_default
+        return cls(value)
 
 
 # ---------------------------------------------------------------------------
@@ -70,9 +115,9 @@ class Workstream:
     # Owning user_id.  Populated by the console's CoordinatorManager so
     # attribution survives across restarts / lazy rehydration.
     user_id: str = ""
-    # "interactive" (default) or "coordinator".  Reused by both
-    # WorkstreamManager and CoordinatorManager — no parallel type hierarchy.
-    kind: str = "interactive"
+    # Classifier reused by both WorkstreamManager and CoordinatorManager —
+    # no parallel type hierarchy.
+    kind: WorkstreamKind = WorkstreamKind.INTERACTIVE
     # Non-None for children spawned by a coordinator.
     parent_ws_id: str | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -152,7 +197,7 @@ class WorkstreamManager:
         client_type: str = "",
         judge_model: str | None = None,
         user_id: str = "",
-        kind: str = "interactive",
+        kind: WorkstreamKind = WorkstreamKind.INTERACTIVE,
         parent_ws_id: str | None = None,
     ) -> Workstream:
         """Create a new workstream.  Returns the new ws.
@@ -170,16 +215,26 @@ class WorkstreamManager:
             ws_id: Optional workstream ID.  If non-empty, used as-is instead of
                 generating a new UUID.
             user_id: Owning user id, persisted on the dataclass + storage row.
-            kind: Workstream kind — must be ``"interactive"``.  Coordinator
-                workstreams live on the console process and are created
-                via ``CoordinatorManager``; routing one through
+            kind: Workstream kind — must be ``WorkstreamKind.INTERACTIVE``.
+                Coordinator workstreams live on the console process and are
+                created via ``CoordinatorManager``; routing one through
                 ``WorkstreamManager`` silently builds a coordinator-kind
                 session with ``coord_client=None``, so this guard refuses
                 at the boundary rather than failing deep inside tool
                 execution.
             parent_ws_id: Optional parent workstream id (coordinator children).
         """
-        if kind != "interactive":
+        # Kind validation lives in three layers.  This one is the
+        # in-process guard: direct callers (tests, CLI factory, any
+        # future non-HTTP entry point) land here without passing
+        # through the server's body_kind parser, so a defensive raise
+        # stops a bug upstream from silently constructing a coord-kind
+        # session with coord_client=None.  The HTTP layer
+        # (server.py POST /v1/api/workstreams/new) returns 400 for
+        # user-facing feedback; the storage layer (register_workstream
+        # in both backends) re-checks via WorkstreamKind(kind).value so
+        # restore paths and SDK inserts can't corrupt the column.
+        if kind != WorkstreamKind.INTERACTIVE:
             raise ValueError(
                 f"WorkstreamManager only hosts interactive workstreams; refusing kind={kind!r}",
             )

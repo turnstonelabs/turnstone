@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 from turnstone.core.log import get_logger
 from turnstone.core.session import ChatSession
+from turnstone.core.workstream import WorkstreamKind
 from turnstone.prompts import ClientType
 
 if TYPE_CHECKING:
@@ -86,13 +87,13 @@ def build_console_session_factory(
         *,
         skill: str | None = None,
         client_type: str = "web",
-        kind: str = "coordinator",
+        kind: WorkstreamKind = WorkstreamKind.COORDINATOR,
         parent_ws_id: str | None = None,
     ) -> ChatSession:
         assert ui is not None, "console session_factory requires a non-None UI"
-        if kind != "coordinator":
+        if kind != WorkstreamKind.COORDINATOR:
             raise ValueError(
-                f"console session factory only supports kind='coordinator', got {kind!r}"
+                f"console session factory only supports kind=COORDINATOR, got {kind!r}"
             )
 
         # Resolve coordinator.model_alias from settings if caller didn't
@@ -196,7 +197,7 @@ def build_console_session_factory(
             if client_type in {ct.value for ct in ClientType}
             else ClientType.WEB,
             username=_username,
-            kind="coordinator",
+            kind=WorkstreamKind.COORDINATOR,
             parent_ws_id=parent_ws_id,
             coord_client=coord_client,
         )

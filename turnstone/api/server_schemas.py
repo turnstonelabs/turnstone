@@ -6,6 +6,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from turnstone.core.workstream import WorkstreamKind
+
 # ---------------------------------------------------------------------------
 # Workstream management
 # ---------------------------------------------------------------------------
@@ -140,8 +142,8 @@ class CreateWorkstreamRequest(BaseModel):
             "lands. Auto-generated when omitted."
         ),
     )
-    kind: str = Field(
-        default="interactive",
+    kind: WorkstreamKind = Field(
+        default=WorkstreamKind.INTERACTIVE,
         description=(
             "Workstream kind — 'interactive' (default) or 'coordinator'. "
             "Coordinator workstreams are created by the console's own "

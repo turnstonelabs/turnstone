@@ -23,7 +23,7 @@ interface "StorageBackend" as SB <<protocol>> {
     +resolve_workstream(alias_or_id) → str | None
     +delete_workstream(ws_id) → bool
     +prune_workstreams(retention_days) → (int, int)
-    +list_workstreams(node_id, limit) → list
+    +list_workstreams(node_id, limit, *, parent_ws_id, kind, user_id) → list
     +save_workstream_config(ws_id, config)
     +load_workstream_config(ws_id) → dict
     +kv_get(key) → str | None

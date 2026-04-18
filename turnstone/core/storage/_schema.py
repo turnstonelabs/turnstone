@@ -54,8 +54,9 @@ workstreams = sa.Table(
     sa.Column("state", sa.Text, nullable=False, server_default="idle"),
     sa.Column("skill_id", sa.Text, nullable=False, server_default=""),
     sa.Column("skill_version", sa.Integer, nullable=False, server_default="0"),
-    # kind: "interactive" (default) | "coordinator" | future kinds.
-    # Added in migration 039.  Coordinator entries live only on the console.
+    # kind: "interactive" (default) | "coordinator".  See WorkstreamKind in
+    # turnstone.core.workstream.  Added in migration 039; coordinator entries
+    # live only on the console.
     sa.Column("kind", sa.Text, nullable=False, server_default="interactive"),
     # parent_ws_id: non-NULL for children spawned by a coordinator.  NULL for
     # top-level workstreams (including the coordinators themselves).  See

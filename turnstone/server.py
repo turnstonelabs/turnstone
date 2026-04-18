@@ -49,7 +49,12 @@ from turnstone.core.ratelimit import resolve_client_ip
 from turnstone.core.session import ChatSession, GenerationCancelled, SessionUI  # noqa: F401
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
 from turnstone.core.web_helpers import version_html as _version_html
-from turnstone.core.workstream import Workstream, WorkstreamManager, WorkstreamState
+from turnstone.core.workstream import (
+    Workstream,
+    WorkstreamKind,
+    WorkstreamManager,
+    WorkstreamState,
+)
 from turnstone.prompts import ClientType
 
 if TYPE_CHECKING:
@@ -102,7 +107,7 @@ class WebUI:
         ws_id: str = "",
         user_id: str = "",
         *,
-        kind: str = "interactive",
+        kind: WorkstreamKind = WorkstreamKind.INTERACTIVE,
         parent_ws_id: str | None = None,
     ) -> None:
         self.ws_id = ws_id
@@ -111,7 +116,11 @@ class WebUI:
         # the lifetime of the workstream, so locking the manager on
         # every state/activity tick to re-read them burns lock budget.
         self._kind = kind
-        self._parent_ws_id = parent_ws_id
+        # Normalize empty string to None at the UI boundary so the
+        # invariant "parent_ws_id is either a non-empty string or None"
+        # holds in every ws_state/ws_activity event payload — mirrors
+        # the storage-layer normalization at register_workstream.
+        self._parent_ws_id = parent_ws_id if parent_ws_id else None
         self._listeners: list[queue.Queue[dict[str, Any]]] = []
         self._listeners_lock = threading.Lock()
         self._approval_event = threading.Event()
@@ -170,7 +179,7 @@ class WebUI:
         with self._listeners_lock, contextlib.suppress(ValueError):
             self._listeners.remove(client_queue)
 
-    def _ws_kind_and_parent(self) -> tuple[str, str | None]:
+    def _ws_kind_and_parent(self) -> tuple[WorkstreamKind, str | None]:
         """Return cached (kind, parent_ws_id) for broadcast event payloads.
 
         Stored on the UI at construction time — both fields are
@@ -2370,12 +2379,21 @@ async def create_workstream(request: Request) -> JSONResponse:
         )
     # Kind + parent relationship: coordinator-spawned children forward
     # these from the console's CoordinatorClient.  Default kind is
-    # "interactive"; coordinators themselves are created by the console's
+    # ``INTERACTIVE``; coordinators themselves are created by the console's
     # own CoordinatorManager and never land in this handler.  Only
-    # ``"interactive"`` is accepted here — requests that try to create a
-    # coordinator via the generic workstream endpoint are rejected.
-    body_kind = body.get("kind", "interactive") or "interactive"
-    if body_kind != "interactive":
+    # ``INTERACTIVE`` is accepted here — requests that try to create a
+    # coordinator via the generic workstream endpoint are rejected, and
+    # unknown kinds (typos, future-only values) are 400 rather than being
+    # silently coerced.  User-facing edge: the storage_edge and manager
+    # layers below re-validate, see comments at those sites for why.
+    try:
+        body_kind = WorkstreamKind.from_raw(body.get("kind"))
+    except ValueError:
+        return JSONResponse(
+            {"error": f"unknown workstream kind {body.get('kind')!r}"},
+            status_code=400,
+        )
+    if body_kind != WorkstreamKind.INTERACTIVE:
         return JSONResponse(
             {"error": "coordinator workstreams must be created via /v1/api/coordinator/new"},
             status_code=400,
@@ -2401,7 +2419,10 @@ async def create_workstream(request: Request) -> JSONResponse:
                 {"error": "parent_ws_id does not reference a known workstream"},
                 status_code=400,
             )
-        if parent_row.get("kind") != "coordinator" or (parent_row.get("user_id") or "") != uid:
+        if (
+            parent_row.get("kind") != WorkstreamKind.COORDINATOR
+            or (parent_row.get("user_id") or "") != uid
+        ):
             return JSONResponse(
                 {"error": "parent_ws_id must reference a coordinator you own"},
                 status_code=403,
@@ -3144,7 +3165,7 @@ async def open_workstream(request: Request) -> JSONResponse:
     # Coordinator workstreams live on the console process, not on server
     # nodes.  Refuse to rehydrate one here so we don't silently build a
     # coordinator-kind ChatSession with coord_client=None (A/S1 guard).
-    if ws_row.get("kind") != "interactive":
+    if ws_row.get("kind") != WorkstreamKind.INTERACTIVE:
         return JSONResponse(
             {"error": "Workstream is not an interactive kind"},
             status_code=400,
@@ -3164,7 +3185,7 @@ async def open_workstream(request: Request) -> JSONResponse:
             ui_factory=lambda wid, **kw: WebUI(ws_id=wid, user_id=owner_uid, **kw),
             ws_id=resolved_id,
             user_id=owner_uid,
-            kind=ws_row.get("kind") or "interactive",
+            kind=WorkstreamKind.from_raw(ws_row.get("kind")),
             parent_ws_id=ws_row.get("parent_ws_id"),
         )
     except Exception as e:
@@ -4676,7 +4697,7 @@ def main() -> None:
         skill: str | None = None,
         client_type: str = "",
         judge_model: str | None = None,
-        kind: str = "interactive",
+        kind: WorkstreamKind = WorkstreamKind.INTERACTIVE,
         parent_ws_id: str | None = None,
     ) -> ChatSession:
         assert ui is not None

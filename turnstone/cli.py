@@ -17,7 +17,12 @@ from typing import TYPE_CHECKING, Any
 
 from turnstone.core.judge import JudgeConfig
 from turnstone.core.session import ChatSession, SessionUI
-from turnstone.core.workstream import Workstream, WorkstreamManager, WorkstreamState
+from turnstone.core.workstream import (
+    Workstream,
+    WorkstreamKind,
+    WorkstreamManager,
+    WorkstreamState,
+)
 from turnstone.ui.colors import (
     BOLD,
     DIM,
@@ -1130,7 +1135,7 @@ def main() -> None:
         *,
         skill: str | None = None,
         client_type: str = "",
-        kind: str = "interactive",
+        kind: WorkstreamKind = WorkstreamKind.INTERACTIVE,
         parent_ws_id: str | None = None,
     ) -> ChatSession:
         assert ui is not None, "session_factory requires a non-None UI"

@@ -35,6 +35,7 @@ import httpx
 
 from turnstone.core.auth import JWT_AUD_CONSOLE, create_jwt
 from turnstone.core.log import get_logger
+from turnstone.core.workstream import WorkstreamKind
 
 _TASK_STATUSES = frozenset({"pending", "in_progress", "done", "blocked"})
 # Hard cap on tasks per coordinator — the full list is read and re-serialized
@@ -284,7 +285,7 @@ class CoordinatorClient:
     ) -> dict[str, Any]:
         """Create a child workstream via the routing proxy."""
         body: dict[str, Any] = {
-            "kind": "interactive",
+            "kind": WorkstreamKind.INTERACTIVE.value,
             "parent_ws_id": parent_ws_id,
             "user_id": user_id,
             "initial_message": initial_message,
@@ -372,10 +373,16 @@ class CoordinatorClient:
         """
         if parent_ws_id != self._coord_ws_id:
             return {"children": [], "truncated": False}
+        # Tenant filter: push the coord's owner into SQL.  Children of a
+        # coord share its owner by construction (the create-path
+        # parent_ws_id gate at server.py enforces this), but the filter
+        # is defense-in-depth for migration-era rows where that gate
+        # didn't exist yet.
         raw = self._storage.list_workstreams(
             limit=limit,
             parent_ws_id=parent_ws_id,
-            kind="interactive",
+            kind=WorkstreamKind.INTERACTIVE,
+            user_id=self._user_id or None,
         )
         _terminal_states = {"closed", "deleted"}
         children: list[dict[str, Any]] = []
@@ -395,7 +402,7 @@ class CoordinatorClient:
                     "state": row[3],
                     "created": row[4],
                     "updated": row[5],
-                    "kind": row[6] if len(row) > 6 else "interactive",
+                    "kind": WorkstreamKind.from_raw(row[6] if len(row) > 6 else None),
                     "parent_ws_id": row[7] if len(row) > 7 else None,
                     "skill_id": row[8] if len(row) > 8 else None,
                     "skill_version": row[9] if len(row) > 9 else None,

@@ -51,6 +51,7 @@ from turnstone.core.auth import (
     jwt_version_slot,
 )
 from turnstone.core.hash_ring import NoAvailableNodeError
+from turnstone.core.workstream import WorkstreamKind
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -414,7 +415,7 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
                 "activity": "",
                 "activity_state": "",
                 "tool_calls": 0,
-                "kind": "coordinator",
+                "kind": WorkstreamKind.COORDINATOR.value,
                 "parent_ws_id": None,
             }
         )
@@ -586,14 +587,14 @@ async def _fetch_live_block(
     handler; internal degradations stay silent.
     """
     row_node_id = row.get("node_id") or ""
-    row_kind = row.get("kind") or "interactive"
+    row_kind = WorkstreamKind.from_raw(row.get("kind"))
 
     # Kind is the authoritative discriminator; the `"console"` node_id
     # sentinel is paired with coordinator rows only (see
     # ``CoordinatorManager.NODE_ID``).  Branching purely on kind avoids
     # a subtle collision if a real node ever registers with
     # ``node_id="console"``.
-    if row_kind == "coordinator":
+    if row_kind == WorkstreamKind.COORDINATOR:
         coord_mgr = getattr(request.app.state, "coord_mgr", None)
         if coord_mgr is None:
             return None
@@ -2069,7 +2070,7 @@ def _resolve_coordinator_or_404(
         except Exception:
             log.debug("resolve_coordinator.storage_failed ws=%s", ws_id[:8], exc_info=True)
             return None, miss
-        if row is None or row.get("kind") != "coordinator":
+        if row is None or row.get("kind") != WorkstreamKind.COORDINATOR:
             return None, miss
         err = _check_row_owner_or_404(
             request,
@@ -2586,7 +2587,7 @@ def _coord_children_row(row: Any) -> dict[str, Any]:
             "state": row[3],
             "created": row[4],
             "updated": row[5],
-            "kind": row[6] if len(row) > 6 else "interactive",
+            "kind": WorkstreamKind.from_raw(row[6] if len(row) > 6 else None),
             "parent_ws_id": row[7] if len(row) > 7 else None,
             "skill_id": row[8] if len(row) > 8 else None,
             "skill_version": row[9] if len(row) > 9 else None,
@@ -2667,7 +2668,7 @@ async def coordinator_children(request: Request) -> JSONResponse:
         # produce them (WorkstreamManager rejects kind!=interactive), but
         # the filter keeps the tree UI contract stable across schema
         # changes.
-        if serialized.get("kind") == "coordinator":
+        if serialized.get("kind") == WorkstreamKind.COORDINATOR:
             continue
         items.append(serialized)
         if len(items) >= _CHILDREN_PAGE_LIMIT:

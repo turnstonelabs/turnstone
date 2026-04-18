@@ -99,6 +99,7 @@ from turnstone.core.storage._utils import sanitize_text
 from turnstone.core.storage._utils import (
     scan_skill_content as _scan_skill_content,
 )
+from turnstone.core.workstream import WorkstreamKind
 
 log = get_logger(__name__)
 
@@ -638,10 +639,17 @@ class SQLiteBackend:
         title: str | None = None,
         skill_id: str = "",
         skill_version: int = 0,
-        kind: str = "interactive",
+        kind: WorkstreamKind | str = WorkstreamKind.INTERACTIVE,
         parent_ws_id: str | None = None,
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        # Kind validation at the storage edge — third of three layers
+        # (HTTP handler in server.py returns 400, WorkstreamManager.create
+        # raises for in-process callers, here we reject direct storage
+        # callers: SDK inserts, restore paths, test doubles).  Each layer
+        # targets a different audience; trimming any one of them opens a
+        # corresponding path to silently corrupt the NOT NULL column.
+        norm_kind = WorkstreamKind(kind).value
         # Normalize empty-string parent to NULL so WHERE parent_ws_id IS NULL
         # filters remain correct.
         norm_parent = parent_ws_id if parent_ws_id else None
@@ -658,7 +666,7 @@ class SQLiteBackend:
                     "state": state,
                     "skill_id": skill_id,
                     "skill_version": skill_version,
-                    "kind": kind,
+                    "kind": norm_kind,
                     "parent_ws_id": norm_parent,
                     "created": now,
                     "updated": now,
@@ -957,7 +965,8 @@ class SQLiteBackend:
         limit: int = 100,
         *,
         parent_ws_id: str | None = None,
-        kind: str | None = None,
+        kind: WorkstreamKind | str | None = None,
+        user_id: str | None = None,
     ) -> list[Any]:
         with self._conn() as conn:
             q = (
@@ -982,7 +991,9 @@ class SQLiteBackend:
             if parent_ws_id is not None:
                 q = q.where(workstreams.c.parent_ws_id == parent_ws_id)
             if kind is not None:
-                q = q.where(workstreams.c.kind == kind)
+                q = q.where(workstreams.c.kind == WorkstreamKind(kind).value)
+            if user_id is not None:
+                q = q.where(workstreams.c.user_id == user_id)
             return list(conn.execute(q).fetchall())
 
     # -- Conversation search ---------------------------------------------------

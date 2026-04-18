@@ -15,6 +15,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from turnstone.core.workstream import WorkstreamKind
+
 log = logging.getLogger(__name__)
 
 _PROMPTS_DIR = Path(__file__).resolve().parent  # turnstone/prompts/
@@ -88,7 +90,7 @@ def compose_system_message(
     available_tools: frozenset[str],
     policies: list[str] | None = None,
     db_policies: list[dict[str, Any]] | None = None,
-    kind: str = "interactive",
+    kind: WorkstreamKind = WorkstreamKind.INTERACTIVE,
 ) -> str:
     """Compose a system message from modular components.
 
@@ -125,7 +127,7 @@ def compose_system_message(
     #    model as an IC engineer ("you read before you edit, commits
     #    you make..."); coordinators need an orchestrator framing
     #    instead ("you decompose, delegate, monitor, synthesise").
-    base_module = "base_coordinator.md" if kind == "coordinator" else "base.md"
+    base_module = "base_coordinator.md" if kind == WorkstreamKind.COORDINATOR else "base.md"
     parts.append(_load(base_module))
 
     # 2. ENV — exactly one, selected by client type
@@ -140,7 +142,7 @@ def compose_system_message(
     # 4. TOOLS — kind-specific patterns.  Coordinators get the
     #    orchestrator block; interactive sessions get the IC block.
     if available_tools:
-        tools_module = "tools_coordinator.md" if kind == "coordinator" else "tools.md"
+        tools_module = "tools_coordinator.md" if kind == WorkstreamKind.COORDINATOR else "tools.md"
         parts.append(_load(tools_module))
 
     # 5. POLICIES — resolve from DB first, fall back to files

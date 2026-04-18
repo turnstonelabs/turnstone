@@ -18,6 +18,7 @@ import sqlalchemy as sa
 from turnstone.core.hash_ring import bucket_of as _bucket_of
 from turnstone.core.log import get_logger
 from turnstone.core.storage import get_storage
+from turnstone.core.workstream import WorkstreamKind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -272,7 +273,7 @@ def register_workstream(
     skill_id: str = "",
     skill_version: int = 0,
     user_id: str | None = None,
-    kind: str = "interactive",
+    kind: WorkstreamKind | str = WorkstreamKind.INTERACTIVE,
     parent_ws_id: str | None = None,
 ) -> None:
     """Persist a new workstream (no-op if already exists)."""
@@ -343,10 +344,23 @@ def update_workstream_name(ws_id: str, name: str) -> None:
         log.warning("Failed to update workstream name ws=%s", ws_id, exc_info=True)
 
 
-def list_workstreams(node_id: str | None = None, limit: int = 100) -> list[Any]:
-    """List workstreams, optionally filtered by node_id."""
+def list_workstreams(
+    node_id: str | None = None,
+    limit: int = 100,
+    *,
+    parent_ws_id: str | None = None,
+    kind: WorkstreamKind | str | None = None,
+    user_id: str | None = None,
+) -> list[Any]:
+    """List workstreams, optionally filtered by node/parent/kind/user."""
     try:
-        return get_storage().list_workstreams(node_id, limit)
+        return get_storage().list_workstreams(
+            node_id,
+            limit,
+            parent_ws_id=parent_ws_id,
+            kind=kind,
+            user_id=user_id,
+        )
     except Exception:
         log.warning("Failed to list workstreams", exc_info=True)
         return []
