@@ -1304,6 +1304,12 @@ async def dashboard(request: Request) -> JSONResponse:
 async def list_saved_workstreams(request: Request) -> JSONResponse:
     """GET /v1/api/workstreams/saved — list saved workstreams with conversation history.
 
+    Tenant-scoped — service-scoped callers (console collector, cluster
+    tooling) see cluster-wide rows; end-user callers see only their
+    own workstreams (matching ``_visible_workstreams``).  A non-service
+    call with a blank ``user_id`` returns an empty list rather than
+    leaking orphan rows.
+
     Restricted to ``kind="interactive"`` — the interactive UI's "saved
     workstreams" sidebar is not a coordinator surface, and coordinator
     rows (which persist conversation history too) would otherwise leak
@@ -1312,7 +1318,24 @@ async def list_saved_workstreams(request: Request) -> JSONResponse:
     from turnstone.core.memory import list_workstreams_with_history
     from turnstone.core.workstream import WorkstreamKind
 
-    rows = list_workstreams_with_history(limit=50, kind=WorkstreamKind.INTERACTIVE)
+    scopes = _auth_scopes(request)
+    if "service" in scopes:
+        # Cluster-wide visibility for service-scoped callers.
+        user_filter: str | None = None
+    else:
+        caller_uid = _auth_user_id(request)
+        if not caller_uid:
+            # Blank sub on a non-service token — fail closed instead of
+            # matching every orphan / migration-artifact row with empty
+            # user_id.  Mirrors _visible_workstreams.
+            return JSONResponse({"workstreams": []})
+        user_filter = caller_uid
+
+    rows = list_workstreams_with_history(
+        limit=50,
+        kind=WorkstreamKind.INTERACTIVE,
+        user_id=user_filter,
+    )
     result = [
         {
             "ws_id": wid,

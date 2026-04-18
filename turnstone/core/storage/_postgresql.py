@@ -305,13 +305,18 @@ class PostgreSQLBackend:
         limit: int = 20,
         *,
         kind: WorkstreamKind | str | None = None,
+        user_id: str | None = None,
     ) -> list[Any]:
-        # See SQLite sibling for the rationale on the kind filter.
+        # See SQLite sibling for the rationale on the kind + user_id filters.
         params: dict[str, Any] = {"limit": limit}
         kind_clause = ""
+        user_clause = ""
         if kind is not None:
             params["kind"] = WorkstreamKind(kind).value
             kind_clause = "AND w.kind = :kind "
+        if user_id is not None:
+            params["user_id"] = user_id
+            user_clause = "AND w.user_id = :user_id "
         with self._conn() as conn:
             return list(
                 conn.execute(
@@ -324,6 +329,7 @@ class PostgreSQLBackend:
                         "WHERE EXISTS "
                         "  (SELECT 1 FROM conversations c WHERE c.ws_id = w.ws_id) "
                         f"{kind_clause}"
+                        f"{user_clause}"
                         "ORDER BY w.updated DESC LIMIT :limit"
                     ),
                     params,

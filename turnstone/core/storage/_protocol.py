@@ -212,6 +212,7 @@ class StorageBackend(Protocol):
         limit: int = 20,
         *,
         kind: WorkstreamKind | str | None = None,
+        user_id: str | None = None,
     ) -> list[Any]:
         """List workstreams that have messages, ordered by updated DESC.
 
@@ -219,6 +220,13 @@ class StorageBackend(Protocol):
         from the interactive "saved workstreams" sidebar so coordinator rows
         (which also persist conversation history) don't leak into that
         surface.  Default ``None`` preserves the legacy all-kinds behaviour.
+
+        ``user_id`` pushes ``WHERE user_id = :user_id`` into SQL so tenant
+        scoping is enforced server-side rather than relying on handlers to
+        remember a client-side filter.  Pass the authenticated caller's
+        uid from any tenant-visible endpoint; pass ``None`` for
+        service-scoped callers that legitimately need cluster-wide
+        visibility.  Mirrors the same contract on ``list_workstreams``.
         """
         ...
 

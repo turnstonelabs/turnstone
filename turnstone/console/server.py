@@ -454,19 +454,13 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
         return rows
 
     for row in persisted:
-        try:
-            m = row._mapping  # SQLAlchemy Row
-        except AttributeError:
-            # Test-double fallback.
-            if len(row) < 2:
-                continue
-            m = {
-                "ws_id": row[0],
-                "node_id": row[1] if len(row) > 1 else "",
-                "name": row[2] if len(row) > 2 else "",
-                "state": row[3] if len(row) > 3 else "",
-                "user_id": row[10] if len(row) > 10 else "",
-            }
+        # SQLAlchemy Row — access via _mapping so future SELECT reorders
+        # / new columns don't silently corrupt the projection (per the
+        # storage-protocol guidance on list_workstreams).  Test doubles
+        # must expose the same ._mapping attribute; positional indexing
+        # was removed because it hard-coded column offsets that drift
+        # with migrations.
+        m = row._mapping
         row_id = m.get("ws_id") or ""
         if not row_id or row_id in seen:
             continue

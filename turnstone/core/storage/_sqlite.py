@@ -388,17 +388,26 @@ class SQLiteBackend:
         limit: int = 20,
         *,
         kind: WorkstreamKind | str | None = None,
+        user_id: str | None = None,
     ) -> list[Any]:
         # ``kind`` filter applied at the SQL layer so coordinator rows
         # (which persist conversation history the same way interactive
         # workstreams do) don't leak into the interactive UI's "saved
         # workstreams" sidebar.  Default None preserves legacy
         # all-kinds behaviour for callers that want both.
+        # ``user_id`` pushes tenancy into SQL so the "saved" endpoint
+        # can't accidentally leak another tenant's workstreams.  None
+        # = cluster-wide (service callers); empty string is a separate
+        # filter value the caller chose deliberately.
         params: dict[str, Any] = {"limit": limit}
         kind_clause = ""
+        user_clause = ""
         if kind is not None:
             params["kind"] = WorkstreamKind(kind).value
             kind_clause = "AND w.kind = :kind "
+        if user_id is not None:
+            params["user_id"] = user_id
+            user_clause = "AND w.user_id = :user_id "
         with self._conn() as conn:
             return list(
                 conn.execute(
@@ -411,6 +420,7 @@ class SQLiteBackend:
                         "WHERE EXISTS "
                         "  (SELECT 1 FROM conversations c WHERE c.ws_id = w.ws_id) "
                         f"{kind_clause}"
+                        f"{user_clause}"
                         "ORDER BY w.updated DESC LIMIT :limit"
                     ),
                     params,

@@ -410,6 +410,101 @@ class TestDashboardFiltered:
         assert owners == {"user-b"}
 
 
+class TestSavedWorkstreamsTenantScoping:
+    """Regression for Copilot review on #380: /v1/api/workstreams/saved
+    used to call list_workstreams_with_history with no tenant filter,
+    so every authenticated user could see every other user's saved
+    workstream aliases / titles / names.  Fix tightens to
+    ``list_workstreams_with_history(user_id=caller)`` with the
+    service-scope bypass matching _visible_workstreams."""
+
+    def _seed(self, client):
+        """Create two workstreams per user, each with a message so they
+        land in list_workstreams_with_history (the SQL gates on an
+        EXISTS conversation)."""
+        from turnstone.core.storage import get_storage
+
+        storage = get_storage()
+        assert storage is not None
+        _register_ws(storage, "alice-saved", "alice")
+        storage.save_message("alice-saved", "user", "alice's plan")
+        _register_ws(storage, "bob-saved", "bob")
+        storage.save_message("bob-saved", "user", "bob's plan")
+        return storage
+
+    def test_non_service_caller_sees_only_own_rows(self, app_client):
+        client, _mgr = app_client
+        self._seed(client)
+        resp = client.get("/v1/api/workstreams/saved", headers=_auth("alice"))
+        assert resp.status_code == 200
+        rows = resp.json()["workstreams"]
+        ids = {r["ws_id"] for r in rows}
+        assert ids == {"alice-saved"}, f"alice must not see bob's saved rows: {ids}"
+
+    def test_service_scope_sees_all_rows(self, app_client):
+        """Cluster-wide visibility is preserved for service callers
+        (console collector, cluster tooling) so they can still hydrate
+        cross-tenant state when needed."""
+        client, _mgr = app_client
+        self._seed(client)
+        resp = client.get(
+            "/v1/api/workstreams/saved",
+            headers=_auth("cluster-collector", scopes=frozenset({"read", "service"})),
+        )
+        assert resp.status_code == 200
+        rows = resp.json()["workstreams"]
+        ids = {r["ws_id"] for r in rows}
+        assert {"alice-saved", "bob-saved"}.issubset(ids)
+
+    def test_blank_sub_non_service_returns_empty(self, app_client):
+        """Defense-in-depth — a non-service token with an empty ``sub``
+        claim (orphan / migration-artifact auth path) must not match
+        every workstream with empty ``user_id``.  Fail closed."""
+        client, _mgr = app_client
+        storage = self._seed(client)
+        # Also seed an orphan row so the test would fail loudly if the
+        # handler leaked it.
+        _register_ws(storage, "orphan-saved", "")
+        storage.save_message("orphan-saved", "user", "orphan content")
+        resp = client.get(
+            "/v1/api/workstreams/saved",
+            headers=_auth("", scopes=frozenset({"read"})),
+        )
+        assert resp.status_code == 200
+        assert resp.json()["workstreams"] == []
+
+    def test_coordinator_rows_excluded_even_for_service(self, app_client):
+        """kind filter is orthogonal to the user_id filter — even a
+        service caller (cluster-wide) must not see coordinator rows on
+        the interactive 'saved workstreams' endpoint."""
+        from turnstone.core.storage import get_storage
+        from turnstone.core.workstream import WorkstreamKind
+
+        client, _mgr = app_client
+        storage = get_storage()
+        assert storage is not None
+        storage.register_workstream(
+            "coord-row",
+            node_id="console",
+            user_id="alice",
+            name="alice-coord",
+            kind=WorkstreamKind.COORDINATOR,
+            parent_ws_id=None,
+        )
+        storage.save_message("coord-row", "user", "planning")
+        _register_ws(storage, "alice-interactive", "alice")
+        storage.save_message("alice-interactive", "user", "interactive")
+
+        resp = client.get(
+            "/v1/api/workstreams/saved",
+            headers=_auth("alice", scopes=frozenset({"read", "service"})),
+        )
+        assert resp.status_code == 200
+        ids = {r["ws_id"] for r in resp.json()["workstreams"]}
+        assert "alice-interactive" in ids
+        assert "coord-row" not in ids
+
+
 class TestGlobalEventsServiceGate:
     def test_non_service_rejected(self, app_client):
         client, _mgr = app_client
