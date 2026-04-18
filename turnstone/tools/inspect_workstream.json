@@ -1,6 +1,6 @@
 {
   "name": "inspect_workstream",
-  "description": "Read the persisted state of a workstream you previously spawned: state, title, skill, timestamps, and the last N messages. Auto-approved — safe, read-only. A `live` block from the owning node is merged when available (current tokens, activity, pending_approval). Provider-native content blocks are stripped by default to keep the response compact; pass include_provider_content=true if you need the full fidelity payload for replay tooling.",
+  "description": "Read the persisted state of a workstream you previously spawned: state, title, skill, timestamps, and the last N messages. Auto-approved — safe, read-only. A `live` block from the owning node is merged when available (current tokens, activity, pending_approval). The `node_id` here is the CURRENT binding (storage-authoritative) — if the rebalancer migrated the workstream after a prior spawn_workstream call, this read reflects the new node. Provider-native content blocks are stripped by default to keep the response compact; pass include_provider_content=true if you need the full fidelity payload for replay tooling.",
   "parameters": {
     "type": "object",
     "properties": {

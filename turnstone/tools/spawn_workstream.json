@@ -1,6 +1,6 @@
 {
   "name": "spawn_workstream",
-  "description": "Create a new child workstream and optionally dispatch an initial message. Use this to kick off a focused sub-task on a separate workstream (different skill, model, or node) while your coordinator remains in charge of orchestration. The child runs independently; use send_to_workstream / inspect_workstream / close_workstream to drive and observe it.",
+  "description": "Create a new child workstream and optionally dispatch an initial message. Use this to kick off a focused sub-task on a separate workstream (different skill, model, or node) while your coordinator remains in charge of orchestration. The child runs independently; use send_to_workstream / inspect_workstream / close_workstream to drive and observe it. The returned `node_id` is a POINT-IN-TIME snapshot of the binding at spawn — the cluster rebalancer can migrate a workstream to a different node later, so don't cache the value for long-running callbacks; re-read with inspect_workstream when you need the current binding.",
   "parameters": {
     "type": "object",
     "properties": {
