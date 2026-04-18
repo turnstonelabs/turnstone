@@ -35,8 +35,7 @@ Key components:
 
 - **ChannelAdapter protocol** (`turnstone/channels/_protocol.py`) — generic
   interface for any messaging platform. Defines `start()`, `stop()`,
-  `send()`, `send_notification()`, `edit_message()`,
-  `send_approval_request()`, `send_plan_review()`, and `create_thread()`.
+  `send()`, and `send_notification()`.
 - **ChannelRouter** (`turnstone/channels/_routing.py`) — maps
   channel/thread IDs to turnstone workstream IDs. Handles workstream
   creation via HTTP, stale route detection, and user identity resolution.
@@ -425,16 +424,17 @@ class ChannelAdapter(Protocol):
     async def stop(self) -> None: ...
     async def send(self, channel_id: str, content: str) -> str: ...
     async def send_notification(self, channel_id: str, content: str, ws_id: str) -> str: ...
-    async def edit_message(self, channel_id: str, message_id: str, content: str) -> None: ...
-    async def send_approval_request(self, channel_id: str, ws_id: str, correlation_id: str, items: list[dict]) -> None: ...
-    async def send_plan_review(self, channel_id: str, ws_id: str, correlation_id: str, content: str) -> None: ...
-    async def create_thread(self, parent_channel_id: str, name: str, message_id: str = "") -> str: ...
 ```
 
 `send_notification()` is like `send()` but associates the outgoing
 message with a `ws_id` so that user replies can be routed back to the
 originating workstream. Adapters must track the mapping from outgoing
 message ID to `(ws_id, target_user_id)` and handle DM replies.
+
+Platform-specific concerns — approval prompts, plan reviews, message
+edits, thread creation — live inside the adapter implementation and are
+not part of the protocol surface. Each adapter drives those via its
+own `_on_ws_event` dispatcher using SDK-native APIs.
 
 To add a new platform:
 

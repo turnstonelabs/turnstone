@@ -1,55 +1,13 @@
-"""Tests for turnstone.channels._protocol and turnstone.channels._formatter."""
+"""Tests for turnstone.channels._formatter."""
 
 from __future__ import annotations
 
 from turnstone.channels._formatter import (
     chunk_message,
     format_approval_request,
-    format_plan_review,
     format_verdict,
     truncate,
 )
-from turnstone.channels._protocol import ChannelEvent
-
-# ---------------------------------------------------------------------------
-# ChannelEvent
-# ---------------------------------------------------------------------------
-
-
-class TestChannelEvent:
-    def test_construction(self) -> None:
-        evt = ChannelEvent(
-            channel_type="discord",
-            channel_id="ch-1",
-            channel_user_id="u-42",
-            message="hello",
-            parent_channel_id="parent",
-            metadata={"key": "val"},
-        )
-        assert evt.channel_type == "discord"
-        assert evt.channel_id == "ch-1"
-        assert evt.channel_user_id == "u-42"
-        assert evt.message == "hello"
-        assert evt.parent_channel_id == "parent"
-        assert evt.metadata == {"key": "val"}
-
-    def test_defaults(self) -> None:
-        evt = ChannelEvent(
-            channel_type="slack",
-            channel_id="ch-2",
-            channel_user_id="u-7",
-            message="hi",
-        )
-        assert evt.parent_channel_id == ""
-        assert evt.metadata == {}
-
-    def test_metadata_independence(self) -> None:
-        """Default metadata dicts are independent across instances."""
-        a = ChannelEvent(channel_type="x", channel_id="1", channel_user_id="u", message="m")
-        b = ChannelEvent(channel_type="x", channel_id="2", channel_user_id="u", message="m")
-        a.metadata["key"] = "val"
-        assert "key" not in b.metadata
-
 
 # ---------------------------------------------------------------------------
 # chunk_message
@@ -170,18 +128,6 @@ class TestFormatApprovalRequest:
         result = format_approval_request(items)
         assert "`read_file`" in result
         assert "/etc/hosts" in result
-
-
-# ---------------------------------------------------------------------------
-# format_plan_review
-# ---------------------------------------------------------------------------
-
-
-class TestFormatPlanReview:
-    def test_format(self) -> None:
-        result = format_plan_review("Step 1: do stuff")
-        assert result.startswith("**Plan review requested:**")
-        assert "Step 1: do stuff" in result
 
 
 # ---------------------------------------------------------------------------

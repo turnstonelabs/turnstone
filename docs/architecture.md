@@ -85,7 +85,7 @@ turnstone/
     static/           Cluster dashboard web UI (page-specific HTML, CSS, JS)
   channels/
     cli.py            Unified channel gateway entry point (turnstone-channel)
-    _protocol.py      ChannelAdapter protocol, ChannelEvent dataclass
+    _protocol.py      ChannelAdapter protocol
     _routing.py       ChannelRouter — channel/thread ↔ workstream mapping via HTTP
     _config.py        Base ChannelConfig dataclass
     discord/          Discord adapter (bot, cog, views, streaming, config)

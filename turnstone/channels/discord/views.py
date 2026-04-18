@@ -19,15 +19,32 @@ if TYPE_CHECKING:
 log = get_logger(__name__)
 
 
-def _parse_footer(interaction: discord.Interaction) -> tuple[str, str] | None:
-    """Extract ``(ws_id, correlation_id)`` from the first embed's footer."""
+def _parse_footer(interaction: discord.Interaction) -> tuple[str, str, str] | None:
+    """Extract ``(ws_id, correlation_id, owner_id)`` from the first embed's footer.
+
+    Footer format is ``"{ws_id}|{correlation_id}|{owner_id}"``.  Older
+    posts that pre-date the owner-check upgrade may have only two
+    fields; in that case ``owner_id`` is returned as an empty string
+    and the caller rejects the interaction (fail-closed).
+    """
     if not interaction.message or not interaction.message.embeds:
         return None
     footer = interaction.message.embeds[0].footer.text
     if not footer or "|" not in footer:
         return None
-    parts = footer.split("|", 1)
-    return parts[0], parts[1]
+    parts = footer.split("|", 2)
+    ws_id = parts[0]
+    correlation_id = parts[1] if len(parts) > 1 else ""
+    owner_id = parts[2] if len(parts) > 2 else ""
+    return ws_id, correlation_id, owner_id
+
+
+async def _deny_non_owner(interaction: discord.Interaction, verb: str) -> None:
+    """Reply with an ephemeral non-owner rejection."""
+    await interaction.response.send_message(
+        f"Only the session owner can {verb} this.",
+        ephemeral=True,
+    )
 
 
 async def disable_message_buttons(message: discord.Message, label: str) -> None:
@@ -137,10 +154,19 @@ class ApprovalView:
             )
             return
 
-        ws_id, correlation_id = parsed
+        ws_id, correlation_id, owner_id = parsed
 
-        # Verify user is linked.  Scope enforcement (approve) happens
-        # server-side when the tool approval is executed.
+        # Owner check: the gateway forwards approvals using its own
+        # service-scoped JWT, and the server short-circuits scope checks
+        # for service tokens — so the adapter is the only place this
+        # can be enforced.  Reject any other clicker, including linked
+        # users, with an ephemeral message.
+        if not owner_id or str(interaction.user.id) != owner_id:
+            verb = "always-approve" if always else ("approve" if approved else "reject")
+            await _deny_non_owner(interaction, verb)
+            return
+
+        # Verify user is linked (session owner should already be linked).
         user_id = await self.bot.router.resolve_user("discord", str(interaction.user.id))
         if user_id is None:
             await interaction.response.send_message(
@@ -254,7 +280,11 @@ class PlanReviewView:
             )
             return
 
-        ws_id, correlation_id = parsed
+        ws_id, correlation_id, owner_id = parsed
+
+        if not owner_id or str(interaction.user.id) != owner_id:
+            await _deny_non_owner(interaction, "approve")
+            return
 
         user_id = await self.bot.router.resolve_user("discord", str(interaction.user.id))
         if user_id is None:
@@ -291,7 +321,12 @@ class PlanReviewView:
             )
             return
 
-        ws_id, correlation_id = parsed
+        ws_id, correlation_id, owner_id = parsed
+
+        if not owner_id or str(interaction.user.id) != owner_id:
+            await _deny_non_owner(interaction, "request changes on")
+            return
+
         modal = self._modal_cls(ws_id, correlation_id)
         await interaction.response.send_modal(modal)
 

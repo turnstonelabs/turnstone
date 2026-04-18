@@ -7,6 +7,8 @@ Handles ``on_message`` events and slash commands (``/link``, ``/unlink``,
 from __future__ import annotations
 
 import asyncio
+import time
+from collections import OrderedDict, deque
 from typing import TYPE_CHECKING
 
 from turnstone.core.log import get_logger
@@ -23,6 +25,13 @@ log = get_logger(__name__)
 _THREAD_NAME_MAX = 100
 _DM_REPLY_MAX_LENGTH = 4096  # Discord's own message limit
 
+# /link is the only flow that reads Turnstone API tokens out of user
+# input; throttle aggressively so an attacker with throw-away Discord
+# accounts can't online-enumerate valid tokens.
+_LINK_RATE_WINDOW_S: float = 3600.0
+_LINK_RATE_LIMIT: int = 5
+_LINK_RATE_CAP: int = 2048
+
 
 class MessageCog:
     """Cog that processes messages and registers slash commands.
@@ -37,6 +46,10 @@ class MessageCog:
 
         self.bot = bot
         self.ts: TurnstoneBot = bot.turnstone  # type: ignore[attr-defined]
+
+        # Per-Discord-user sliding-window rate limit on /link, to block
+        # online enumeration of Turnstone API tokens.
+        self._link_buckets: OrderedDict[str, deque[float]] = OrderedDict()
 
         # -- Cog wiring (manual since we can't use decorators with guarded imports) --
 
@@ -132,12 +145,34 @@ class MessageCog:
             if not self.ts._is_allowed_channel(parent_id):
                 return
 
-            # Check if this thread has an existing route.
-            route = await asyncio.to_thread(
-                self.ts.storage.get_channel_route, "discord", str(channel.id)
-            )
-            if route is None:
+            # Check if this thread has an existing route (TTL-cached).
+            existing_ws_id = await self.ts.router.lookup_ws_id("discord", str(channel.id))
+            if existing_ws_id is None:
                 # Not our thread — ignore.
+                return
+
+            # Owner check: only the thread creator (who initiated the
+            # workstream) can inject messages. Without this gate, any
+            # linked user in a public / multi-member thread could
+            # redirect someone else's assistant and bill their quota,
+            # because the gateway forwards with its service-scoped JWT
+            # and the server bypasses ownership on service scope.
+            #
+            # We prefer the explicitly-recorded invoker over
+            # `thread.owner_id`: `/ask` creates threads via
+            # `channel.create_thread(...)` which reports the bot as
+            # owner, so the Discord-reported value alone would reject
+            # every legitimate follow-up.
+            effective_owner_id = self.ts.get_thread_invoker(channel.id)
+            if effective_owner_id is None:
+                effective_owner_id = channel.owner_id
+            if effective_owner_id is None or message.author.id != effective_owner_id:
+                log.debug(
+                    "discord.thread_message_rejected_non_owner",
+                    thread_id=channel.id,
+                    author_id=message.author.id,
+                    owner_id=effective_owner_id,
+                )
                 return
 
             # Resolve user.
@@ -199,6 +234,9 @@ class MessageCog:
                 name=thread_name,
                 auto_archive_duration=self.ts.config.thread_auto_archive,  # type: ignore[arg-type]
             )
+            # Record invoker so the sec-3 gate admits follow-ups even if
+            # Discord's reported thread.owner_id diverges.
+            self.ts.register_thread_invoker(thread.id, message.author.id)
 
             # Create workstream WITHOUT initial_message — subscribe to events
             # first, then send the message.  With SSE the event stream is
@@ -288,9 +326,47 @@ class MessageCog:
 
     # -- slash commands ------------------------------------------------------
 
+    def _allow_link_attempt(self, discord_user_id: str) -> bool:
+        """Return True when this Discord user is under the /link rate limit.
+
+        Sliding window: up to ``_LINK_RATE_LIMIT`` attempts per
+        ``_LINK_RATE_WINDOW_S`` seconds.  Each attempt — success or
+        failure — consumes a slot.  The bucket map is LRU-bounded.
+        """
+        now = time.monotonic()
+        window_start = now - _LINK_RATE_WINDOW_S
+        bucket = self._link_buckets.get(discord_user_id)
+        if bucket is None:
+            bucket = deque()
+            self._link_buckets[discord_user_id] = bucket
+            while len(self._link_buckets) > _LINK_RATE_CAP:
+                self._link_buckets.popitem(last=False)
+        else:
+            self._link_buckets.move_to_end(discord_user_id)
+        while bucket and bucket[0] < window_start:
+            bucket.popleft()
+        if len(bucket) >= _LINK_RATE_LIMIT:
+            return False
+        bucket.append(now)
+        return True
+
     async def _cmd_link(self, interaction: discord.Interaction, token: str) -> None:
         """Link a Discord user to a turnstone account via API token."""
         from turnstone.core.auth import hash_token
+
+        if not self._allow_link_attempt(str(interaction.user.id)):
+            log.warning(
+                "discord.link_rate_limited",
+                discord_user=str(interaction.user),
+            )
+            await interaction.response.send_message(
+                (
+                    f"Too many /link attempts.  Try again later — limit is "
+                    f"{_LINK_RATE_LIMIT} per hour."
+                ),
+                ephemeral=True,
+            )
+            return
 
         # Check if already linked.
         existing = await asyncio.to_thread(
@@ -381,6 +457,10 @@ class MessageCog:
                 auto_archive_duration=self.ts.config.thread_auto_archive,  # type: ignore[arg-type]
                 type=discord.ChannelType.public_thread,
             )
+            # `channel.create_thread` without a starter message makes the
+            # bot the thread owner, so the sec-3 gate needs to see the
+            # real invoker here — otherwise `/ask` follow-ups get dropped.
+            self.ts.register_thread_invoker(thread.id, interaction.user.id)
         else:
             await interaction.followup.send(
                 "Cannot create a thread in this channel type.",

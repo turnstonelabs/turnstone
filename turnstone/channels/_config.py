@@ -4,6 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+# Shared adapter constants.
+SSE_RECONNECT_DELAY: float = 2.0
+SSE_MAX_RECONNECT_DELAY: float = 30.0
+MAX_NOTIFY_TRACKING: int = 100
+CREATE_LOCK_CAP: int = 1024  # LRU bound on ChannelRouter per-channel creation locks
+
 
 @dataclass
 class ChannelConfig:

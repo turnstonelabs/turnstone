@@ -9,12 +9,38 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import TYPE_CHECKING, Any
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Literal
 
+from turnstone.channels._config import CREATE_LOCK_CAP
 from turnstone.core.log import get_logger
 from turnstone.sdk._types import TurnstoneAPIError
 from turnstone.sdk.console import AsyncTurnstoneConsole
 from turnstone.sdk.server import AsyncTurnstoneServer
+
+
+@dataclass
+class PolicyVerdict:
+    """Outcome of evaluating admin tool policies for an approval request.
+
+    ``kind`` is one of:
+
+    - ``"none"``: no tool needed approval evaluation (e.g. all items are
+      errors or already resolved). Adapter should fall through to the
+      auto-approve branch.
+    - ``"deny"``: at least one tool was denied by policy. Adapter should
+      notify the user and forward ``approved=False`` with the feedback.
+    - ``"allow"``: every tool was allowed by policy. Adapter should
+      notify the user and forward ``approved=True``.
+    - ``"defer"``: mixed or unknown verdict. Adapter should fall through
+      to interactive approval.
+    """
+
+    kind: Literal["none", "deny", "allow", "defer"]
+    denied_tools: list[str] = field(default_factory=list)
+    tool_names: list[str] = field(default_factory=list)
+
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -26,6 +52,8 @@ log = get_logger(__name__)
 _WS_CREATE_TIMEOUT = 30.0  # seconds
 _CHANNEL_DEFAULT_TTL = 300.0  # cache channel default alias for 5 minutes
 _MODELS_CACHE_TTL = 30.0  # cache model list for autocomplete
+_ROUTE_CACHE_TTL = 30.0  # cache (channel_type, channel_id) → ws_id lookups
+_ROUTE_CACHE_CAP = 4096  # LRU bound on the lookup cache
 
 
 class ChannelRouter:
@@ -62,7 +90,7 @@ class ChannelRouter:
         self._auto_approve = auto_approve
         self._auto_approve_tools: list[str] = auto_approve_tools or []
         self._skill = skill
-        self._create_locks: dict[str, asyncio.Lock] = {}
+        self._create_locks: OrderedDict[str, asyncio.Lock] = OrderedDict()
         # Per-workstream node URLs from console routing responses.
         # Populated when console_url is set and the create response
         # includes node_url.
@@ -92,6 +120,9 @@ class ChannelRouter:
         # Cached model list for autocomplete (shorter TTL).
         self._models_cache: dict[str, Any] = {}
         self._models_cache_ts: float = 0.0
+        # TTL cache for (channel_type, channel_id) → ws_id so hot inbound
+        # paths don't hit storage on every message. Bounded LRU.
+        self._route_cache: OrderedDict[tuple[str, str], tuple[str, float]] = OrderedDict()
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -137,11 +168,15 @@ class ChannelRouter:
             return self._channel_default_alias
         # Mark refresh window before awaiting so concurrent callers
         # reuse the cached value instead of triggering duplicate fetches.
+        prev_ts = self._channel_default_ts
         self._channel_default_ts = now
         try:
             data = await self.list_models()
             self._channel_default_alias = data.get("channel_default_alias", "")
         except Exception:
+            # Roll the timestamp back so the next caller retries instead of
+            # serving a stale/empty alias for the full TTL window.
+            self._channel_default_ts = prev_ts
             log.debug("channel_router.channel_default_fetch_failed", exc_info=True)
         return self._channel_default_alias
 
@@ -184,9 +219,29 @@ class ChannelRouter:
         completes.
         """
         key = f"{channel_type}:{channel_id}"
-        lock = self._create_locks.setdefault(key, asyncio.Lock())
-
-        old_ws_id: str | None = None
+        lock = self._create_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._create_locks[key] = lock
+            # Bound the map: once a route is persisted, the lock is no longer
+            # needed on future requests, so evicting the LRU entry is safe —
+            # UNLESS that entry is currently held by a task awaiting I/O
+            # inside the critical section.  Evicting a held lock breaks
+            # mutual exclusion because a subsequent cache miss for the
+            # same key would create a fresh lock and run the create path
+            # concurrently (→ duplicate server-side workstreams).  Scan
+            # from oldest to newest and pop the first unheld entry; if
+            # every entry is held we leave the map slightly over-cap
+            # rather than corrupt ordering.
+            if len(self._create_locks) > CREATE_LOCK_CAP:
+                for candidate_key, candidate_lock in list(self._create_locks.items()):
+                    if candidate_key == key:
+                        continue
+                    if not candidate_lock.locked():
+                        del self._create_locks[candidate_key]
+                        break
+        else:
+            self._create_locks.move_to_end(key)
 
         async with lock:
             # 1. Check for existing route.
@@ -324,6 +379,47 @@ class ChannelRouter:
             await self._server.send(message, ws_id)
         log.debug("channel_router.send_message", ws_id=ws_id)
 
+    async def evaluate_tool_policies(
+        self,
+        items: list[dict[str, Any]],
+    ) -> PolicyVerdict:
+        """Evaluate admin tool policies for an ApproveRequestEvent batch.
+
+        Returns a :class:`PolicyVerdict` summarising the outcome so each
+        adapter only has to translate the verdict into platform-specific
+        chat messages.
+        """
+        tool_names = [
+            it.get("approval_label", "") or it.get("func_name", "")
+            for it in items
+            if it.get("needs_approval") and it.get("func_name") and not it.get("error")
+        ]
+        tool_names = [n for n in tool_names if n]
+        if not tool_names:
+            return PolicyVerdict(kind="none")
+
+        try:
+            from turnstone.core.policy import evaluate_tool_policies_batch
+
+            verdicts = await asyncio.to_thread(
+                evaluate_tool_policies_batch,
+                self._storage,
+                tool_names,
+            )
+        except Exception:
+            # Fail-open: freezing every workstream on a storage hiccup is worse
+            # than letting the approval fall through to interactive review.
+            # Log at WARNING so the policy-DB outage is still auditable.
+            log.warning("channel_router.policy_evaluation_failed", exc_info=True)
+            return PolicyVerdict(kind="defer", tool_names=tool_names)
+
+        denied = [n for n, v in verdicts.items() if v == "deny"]
+        if denied:
+            return PolicyVerdict(kind="deny", denied_tools=denied, tool_names=tool_names)
+        if all(verdicts.get(n) == "allow" for n in tool_names):
+            return PolicyVerdict(kind="allow", tool_names=tool_names)
+        return PolicyVerdict(kind="defer", tool_names=tool_names)
+
     async def send_approval(
         self,
         ws_id: str,
@@ -364,8 +460,36 @@ class ChannelRouter:
 
     # -- route management ----------------------------------------------------
 
+    async def lookup_ws_id(self, channel_type: str, channel_id: str) -> str | None:
+        """Return the ws_id bound to (channel_type, channel_id), or None.
+
+        TTL-cached so the hot inbound-message path (thread replies,
+        DM replies) doesn't hit storage on every token.
+        """
+        key = (channel_type, channel_id)
+        now = time.monotonic()
+        cached = self._route_cache.get(key)
+        if cached is not None:
+            ws_id, expires_at = cached
+            if now < expires_at:
+                self._route_cache.move_to_end(key)
+                return ws_id
+            # Expired — fall through to a fresh lookup.
+            del self._route_cache[key]
+
+        route = await asyncio.to_thread(self._storage.get_channel_route, channel_type, channel_id)
+        if route is None:
+            return None
+
+        ws_id = route["ws_id"]
+        self._route_cache[key] = (ws_id, now + _ROUTE_CACHE_TTL)
+        if len(self._route_cache) > _ROUTE_CACHE_CAP:
+            self._route_cache.popitem(last=False)
+        return ws_id
+
     async def delete_route(self, channel_type: str, channel_id: str) -> None:
         """Remove a channel-to-workstream mapping."""
+        self._route_cache.pop((channel_type, channel_id), None)
         deleted = await asyncio.to_thread(
             self._storage.delete_channel_route, channel_type, channel_id
         )

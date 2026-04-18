@@ -25,7 +25,26 @@ def chunk_message(text: str, max_length: int = 2000) -> list[str]:
     if len(text) <= max_length:
         return [text]
 
-    chunks: list[str] = []
+    # Fast path: plain text with no code fences.  Skips per-iteration
+    # fence bookkeeping for the common streaming-response case.
+    if "```" not in text:
+        chunks: list[str] = []
+        remaining = text
+        while remaining:
+            if len(remaining) <= max_length:
+                chunks.append(remaining)
+                break
+            candidate = remaining[:max_length]
+            split_idx = candidate.rfind("\n")
+            if split_idx <= 0:
+                split_idx = candidate.rfind(" ")
+            if split_idx <= 0:
+                split_idx = max_length
+            chunks.append(remaining[:split_idx])
+            remaining = remaining[split_idx:].lstrip("\n")
+        return chunks
+
+    chunks = []
     remaining = text
     in_code_block = False
 
@@ -94,8 +113,6 @@ def format_approval_request(items: list[dict[str, Any]]) -> str:
         if not preview:
             args = item.get("function", {}).get("arguments", "")
             if isinstance(args, dict):
-                import json
-
                 args = json.dumps(args, ensure_ascii=False)
             preview = str(args)
         preview = truncate(preview)
@@ -137,11 +154,6 @@ def format_verdict(verdict: dict[str, Any]) -> str:
     if summary:
         parts.append(f"_{summary}_")
     return "\n".join(parts)
-
-
-def format_plan_review(content: str) -> str:
-    """Format a plan-review prompt with a header."""
-    return f"**Plan review requested:**\n\n{content}"
 
 
 def format_tool_result(output: str) -> str:
@@ -202,15 +214,38 @@ def try_parse_media(output: str) -> dict[str, Any] | None:
 
 _BLOCKED_HOSTNAMES = frozenset({"localhost", "metadata.google.internal"})
 
+# Cloud-metadata deny-list applied *before* the `is_private` allowance so
+# ULA-hosted vendor metadata endpoints don't slip through the "private IPs
+# are fine, we trust the LAN" exception.  IPv4 169.254.169.254 is caught
+# by `is_link_local`; IPv6 ULA metadata (AWS Nitro IMDS at fd00:ec2::254,
+# ECS task metadata at fd00:ec2::23) is `is_private` and needs explicit
+# blocking.  Add new vendor prefixes here as they're published.
+_BLOCKED_IP_NETWORKS: tuple[str, ...] = (
+    "fd00:ec2::/32",  # AWS Nitro IMDS / ECS task metadata over IPv6
+)
 
-def _is_safe_image_url(url: str) -> bool:
+
+async def _is_safe_image_url(url: str) -> bool:
     """Validate that *url* uses http(s), has no embedded credentials, and does
-    not target loopback or cloud metadata endpoints.
+    not target loopback, link-local (incl. cloud metadata 169.254.169.254),
+    or reserved ranges — even after DNS resolution.
 
-    Private/LAN IPs are intentionally allowed (media servers are typically
-    on the local network).
+    Resolves the hostname and checks every returned address so a DNS
+    rebinding attack cannot swap a safe-looking public IP for an
+    internal one between validation and fetch.  Private/LAN IPs are
+    still allowed (media servers typically live on the local network),
+    so only loopback + link-local + multicast + reserved are rejected.
+
+    NOTE: there is a residual TOCTOU gap because httpx resolves the
+    hostname again when it actually issues the GET.  A 0-TTL rebinding
+    resolver could still slip an internal IP in between validation and
+    fetch.  Fully closing the gap requires pinning the validated IP on
+    the connection (a custom httpx transport) — out of scope for this
+    backfill pass.
     """
+    import asyncio
     import ipaddress
+    import socket
     from urllib.parse import urlparse
 
     try:
@@ -226,12 +261,41 @@ def _is_safe_image_url(url: str) -> bool:
         return False
     if hostname in _BLOCKED_HOSTNAMES:
         return False
+
+    # Collect candidate IPs: either an IP literal in the URL, or every
+    # A/AAAA record the resolver returns for a hostname.
+    candidates: list[str] = []
     try:
-        ip = ipaddress.ip_address(hostname)
-        if ip.is_loopback or ip.is_link_local:
-            return False
+        ipaddress.ip_address(hostname)
+        candidates.append(hostname)
     except ValueError:
-        pass  # Not an IP literal — hostname is fine
+        try:
+            infos = await asyncio.to_thread(socket.getaddrinfo, hostname, None, socket.AF_UNSPEC)
+        except socket.gaierror:
+            return False
+        # Strip IPv6 zone IDs (e.g. ``fe80::1%eth0``) before parsing —
+        # ipaddress.ip_address would raise on them and we'd drop the host
+        # on unrelated metadata.
+        candidates = [str(info[4][0]).partition("%")[0] for info in infos]
+        if not candidates:
+            return False
+
+    blocked_networks = [ipaddress.ip_network(cidr) for cidr in _BLOCKED_IP_NETWORKS]
+    for raw in candidates:
+        try:
+            ip = ipaddress.ip_address(raw)
+        except ValueError:
+            return False
+        if (
+            ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            return False
+        if any(ip in net for net in blocked_networks):
+            return False
     return True
 
 
@@ -249,7 +313,7 @@ async def _fetch_thumbnail(
     are typically on the local network), but scheme is restricted to
     http(s) and userinfo is rejected.
     """
-    if not _is_safe_image_url(url):
+    if not await _is_safe_image_url(url):
         return None
     try:
         async with http.stream("GET", url, timeout=timeout) as resp:

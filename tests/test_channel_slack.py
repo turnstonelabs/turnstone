@@ -62,12 +62,20 @@ def _make_bot() -> tuple[object, MagicMock, MagicMock]:
     storage = MagicMock()
     storage.list_channel_routes_by_type = MagicMock(return_value=[])
 
+    from turnstone.channels._routing import PolicyVerdict
+
     router = MagicMock()
     router.get_or_create_workstream = AsyncMock(return_value=("ws-1", True))
     router.send_message = AsyncMock()
     router.send_approval = AsyncMock()
     router.send_plan_feedback = AsyncMock()
     router.get_node_url = AsyncMock(return_value="http://localhost:8080")
+    router.evaluate_tool_policies = AsyncMock(return_value=PolicyVerdict(kind="none"))
+    router.delete_route = AsyncMock()
+    router.close_workstream = AsyncMock()
+    # Default: every test Slack user is already linked. Tests that
+    # exercise the unlinked path override this per-instance.
+    router.resolve_user = AsyncMock(return_value="turnstone-user-1")
     router.aclose = AsyncMock()
 
     client = AsyncMock()
@@ -185,6 +193,98 @@ class TestSlackRoute:
             == "C123:U456:111.222"
         )
 
+    def test_round_trip(self) -> None:
+        """Every shape emitted by to_channel_id must round-trip through parse."""
+        from turnstone.channels.slack.routes import SlackRoute
+
+        shapes = [
+            SlackRoute(channel="C123"),
+            SlackRoute(channel="C123", user_id="U456"),
+            SlackRoute(channel="C123", user_id="U456", thread_ts="111.222"),
+        ]
+        for route in shapes:
+            assert SlackRoute.parse(route.to_channel_id()) == route
+
+    def test_parse_trailing_colon_normalizes(self) -> None:
+        """``"C123:"`` should normalize to ``SlackRoute("C123")``."""
+        from turnstone.channels.slack.routes import SlackRoute
+
+        assert SlackRoute.parse("C123:") == SlackRoute(channel="C123")
+        assert SlackRoute.parse("C123:U456:") == SlackRoute(channel="C123", user_id="U456")
+
+    def test_parse_extra_colons_folded_into_thread_ts(self) -> None:
+        """Extra ``:`` past the third field fold into ``thread_ts`` verbatim.
+
+        Slack IDs and timestamps never contain ``:`` so this is safe in
+        practice; the test locks the documented behaviour.
+        """
+        from turnstone.channels.slack.routes import SlackRoute
+
+        route = SlackRoute.parse("C1:U1:ts:extra")
+        assert route.channel == "C1"
+        assert route.user_id == "U1"
+        assert route.thread_ts == "ts:extra"
+
+
+# ---------------------------------------------------------------------------
+# Route recovery + session archival
+# ---------------------------------------------------------------------------
+
+
+class TestRecoverRoutes:
+    """Tests for TurnstoneSlackBot._recover_routes on bot startup."""
+
+    def test_latest_ts_per_user_wins(self) -> None:
+        """When multiple routes exist for the same (channel, user), the
+        newest thread_ts populates _channel_sessions."""
+        bot, _router, _client = _make_bot()
+        bot.storage.list_channel_routes_by_type = MagicMock(  # type: ignore[attr-defined]
+            return_value=[
+                {"ws_id": "ws-old", "channel_id": "C1:U1:1000000.000001"},
+                {"ws_id": "ws-new", "channel_id": "C1:U1:2000000.000001"},
+            ]
+        )
+        bot.subscribe_ws = AsyncMock()  # type: ignore[attr-defined]
+
+        _run(bot._recover_routes())  # type: ignore[attr-defined]
+
+        assert bot._channel_sessions == {("C1", "U1"): ("ws-new", "2000000.000001")}  # type: ignore[attr-defined]
+        # Both routes get resubscribed so their SSE streams stay active.
+        assert bot.subscribe_ws.await_count == 2  # type: ignore[attr-defined]
+
+    def test_non_threaded_routes_skip_session_table(self) -> None:
+        """A route without a thread_ts still gets subscribed but never
+        populates _channel_sessions (DMs fall into this shape)."""
+        bot, _router, _client = _make_bot()
+        bot.storage.list_channel_routes_by_type = MagicMock(  # type: ignore[attr-defined]
+            return_value=[{"ws_id": "ws-dm", "channel_id": "D1:U9"}]
+        )
+        bot.subscribe_ws = AsyncMock()  # type: ignore[attr-defined]
+
+        _run(bot._recover_routes())  # type: ignore[attr-defined]
+
+        assert bot._channel_sessions == {}  # type: ignore[attr-defined]
+        bot.subscribe_ws.assert_awaited_once_with("ws-dm", "D1:U9")  # type: ignore[attr-defined]
+
+
+class TestArchiveSession:
+    """Tests for TurnstoneSlackBot._archive_session cleanup."""
+
+    def test_archive_drops_route_and_closes_workstream(self) -> None:
+        bot, router, client = _make_bot()
+        bot._channel_sessions[("C1", "U1")] = ("ws-old", "1000000.000001")  # type: ignore[attr-defined]
+        bot._subscribed_ws.add("ws-old")  # type: ignore[attr-defined]
+
+        _run(bot._archive_session("C1", "U1", "ws-old", "1000000.000001"))  # type: ignore[attr-defined]
+
+        router.delete_route.assert_awaited_once_with(  # type: ignore[attr-defined]
+            "slack", "C1:U1:1000000.000001"
+        )
+        router.close_workstream.assert_awaited_once_with("ws-old")  # type: ignore[attr-defined]
+        assert ("C1", "U1") not in bot._channel_sessions  # type: ignore[attr-defined]
+        # archive notice posted in the old thread
+        client.chat_postMessage.assert_awaited()  # type: ignore[attr-defined]
+
 
 # ---------------------------------------------------------------------------
 # Preview sanitization
@@ -241,7 +341,7 @@ class TestStreamingMessage:
         _run(sm.append("hello "))
         _run(sm.append("world"))
 
-        assert "".join(sm._buffer) == "hello world"
+        assert sm.accumulated_text == "hello world"
 
     def test_finalize_sends_when_no_prior_message(self) -> None:
         from turnstone.channels.slack.bot import StreamingMessage
@@ -264,7 +364,7 @@ class TestStreamingMessage:
         sm = StreamingMessage(client=client, channel="C1", edit_interval=0.0)
 
         _run(sm.append("hi"))
-        assert sm._ts == "123"
+        assert sm.message_ts == "123"
 
         _run(sm.finalize())
         client.chat_update.assert_awaited()
@@ -489,7 +589,7 @@ class TestApprovalOwnership:
             "container": {"channel_id": "C01SAPU5414", "message_ts": "111.222"},
         }
 
-        _run(bot._on_approve(AsyncMock(), body))  # type: ignore[attr-defined]
+        _run(bot._resolve_approval(AsyncMock(), body, approved=True))  # type: ignore[attr-defined]
 
         client.chat_postEphemeral.assert_awaited_once()
         router.send_approval.assert_not_awaited()
@@ -511,7 +611,7 @@ class TestApprovalOwnership:
             "container": {"channel_id": "C01SAPU5414", "message_ts": "111.222"},
         }
 
-        _run(bot._on_deny(AsyncMock(), body))  # type: ignore[attr-defined]
+        _run(bot._resolve_approval(AsyncMock(), body, approved=False))  # type: ignore[attr-defined]
 
         client.chat_postEphemeral.assert_awaited_once()
         router.send_approval.assert_not_awaited()
@@ -533,7 +633,7 @@ class TestApprovalOwnership:
             "container": {"channel_id": "C01SAPU5414", "message_ts": "111.222"},
         }
 
-        _run(bot._on_approve(AsyncMock(), body))  # type: ignore[attr-defined]
+        _run(bot._resolve_approval(AsyncMock(), body, approved=True))  # type: ignore[attr-defined]
 
         router.send_approval.assert_awaited_once_with(ws_id, "corr-1", approved=True)
         client.chat_update.assert_awaited_once()
@@ -548,6 +648,7 @@ class TestWsEventDispatch:
     """Tests for SSE event handling in the Slack bot."""
 
     def _make_ws_bot(self) -> tuple[object, MagicMock]:
+        from turnstone.channels._routing import PolicyVerdict
         from turnstone.channels.slack.bot import TurnstoneSlackBot
         from turnstone.channels.slack.config import SlackConfig
 
@@ -560,6 +661,8 @@ class TestWsEventDispatch:
         router = MagicMock()
         router.send_approval = AsyncMock()
         router.send_plan_feedback = AsyncMock()
+        router.evaluate_tool_policies = AsyncMock(return_value=PolicyVerdict(kind="none"))
+        router.resolve_user = AsyncMock(return_value="turnstone-user-1")
         client = AsyncMock()
         client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": "123"})
         client.chat_update = AsyncMock(return_value={"ok": True})
@@ -633,6 +736,7 @@ class TestWsEventDispatch:
         assert "Something went wrong" in text
 
     def test_approve_request_auto_approve(self) -> None:
+        from turnstone.channels._routing import PolicyVerdict
         from turnstone.channels.slack.bot import TurnstoneSlackBot
         from turnstone.channels.slack.config import SlackConfig
         from turnstone.channels.slack.routes import SlackRoute
@@ -642,6 +746,7 @@ class TestWsEventDispatch:
         storage = MagicMock()
         router = MagicMock()
         router.send_approval = AsyncMock()
+        router.evaluate_tool_policies = AsyncMock(return_value=PolicyVerdict(kind="none"))
         client = AsyncMock()
         client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": "123"})
 
@@ -749,8 +854,11 @@ class TestWsEventDispatch:
 
     def test_plan_approve_sends_feedback_and_updates_message(self) -> None:
         bot, client = self._make_ws_bot()
+        # Register pending review with an owner so the new sec-2 gate passes.
+        bot._pending_plan_review_ts["ws-1"] = ("C1", "111.222", "U_OWNER")  # type: ignore[attr-defined]
         body = {
             "actions": [{"value": "ws-1"}],
+            "user": {"id": "U_OWNER"},
             "container": {"channel_id": "C1", "message_ts": "111.222"},
         }
 
@@ -759,9 +867,23 @@ class TestWsEventDispatch:
         bot.router.send_plan_feedback.assert_awaited_once_with("ws-1", "", "")  # type: ignore[attr-defined]
         client.chat_update.assert_awaited_once()
 
+    def test_plan_approve_rejects_non_owner(self) -> None:
+        bot, client = self._make_ws_bot()
+        bot._pending_plan_review_ts["ws-1"] = ("C1", "111.222", "U_OWNER")  # type: ignore[attr-defined]
+        body = {
+            "actions": [{"value": "ws-1"}],
+            "user": {"id": "U_OTHER"},
+            "container": {"channel_id": "C1", "message_ts": "111.222"},
+        }
+
+        _run(bot._on_plan_approve(AsyncMock(), body))  # type: ignore[attr-defined]
+
+        bot.router.send_plan_feedback.assert_not_awaited()  # type: ignore[attr-defined]
+        client.chat_postEphemeral.assert_awaited_once()
+
     def test_plan_feedback_modal_sends_feedback_and_updates_message(self) -> None:
         bot, client = self._make_ws_bot()
-        bot._pending_plan_review_ts["ws-1"] = ("C1", "111.222")  # type: ignore[attr-defined]
+        bot._pending_plan_review_ts["ws-1"] = ("C1", "111.222", "U_OWNER")  # type: ignore[attr-defined]
 
         view = {
             "private_metadata": "ws-1",
@@ -769,8 +891,9 @@ class TestWsEventDispatch:
                 "values": {"feedback_block": {"feedback_input": {"value": "please revise step 2"}}}
             },
         }
+        body = {"user": {"id": "U_OWNER"}}
 
-        _run(bot._on_plan_feedback_modal(AsyncMock(), {}, view))  # type: ignore[attr-defined]
+        _run(bot._on_plan_feedback_modal(AsyncMock(), body, view))  # type: ignore[attr-defined]
 
         bot.router.send_plan_feedback.assert_awaited_once_with(  # type: ignore[attr-defined]
             "ws-1",
@@ -778,6 +901,49 @@ class TestWsEventDispatch:
             "please revise step 2",
         )
         client.chat_update.assert_awaited_once()
+
+    def test_link_prefix_does_not_hijack_regular_prompt(self) -> None:
+        """`/turnstone linking up the docs` must not misroute into
+        _handle_link with `"ing up the docs"` as the token."""
+        bot, router, client = _make_bot()
+        bot._handle_link = AsyncMock()  # type: ignore[attr-defined]
+        # Force the linked-user gate to pass so the natural-language
+        # prompt can flow through to the session-start branch.
+        router.get_or_create_workstream = AsyncMock(return_value=("ws-new", True))
+        body = {
+            "channel_id": "C01SAPU5414",
+            "user_id": "U111",
+            "text": "linking up the docs",
+        }
+        _run(bot._on_slash_command(AsyncMock(), body))  # type: ignore[attr-defined]
+        bot._handle_link.assert_not_awaited()  # type: ignore[attr-defined]
+
+    def test_link_rate_limit_blocks_after_cap(self) -> None:
+        """Sec-3: /turnstone link must throttle at _LINK_RATE_LIMIT/hour."""
+        from turnstone.channels.slack.bot import _LINK_RATE_LIMIT
+
+        bot, _router, client = _make_bot()
+        # Make the user already linked so _handle_link skips past the
+        # rate limit check would otherwise take a slot on a successful
+        # storage hit; we still want to exercise the throttle directly.
+        for _ in range(_LINK_RATE_LIMIT):
+            assert bot._allow_link_attempt("U111")  # type: ignore[attr-defined]
+        # Next attempt is blocked.
+        assert not bot._allow_link_attempt("U111")  # type: ignore[attr-defined]
+
+    def test_plan_feedback_modal_rejects_non_owner(self) -> None:
+        bot, _client = self._make_ws_bot()
+        bot._pending_plan_review_ts["ws-1"] = ("C1", "111.222", "U_OWNER")  # type: ignore[attr-defined]
+
+        view = {
+            "private_metadata": "ws-1",
+            "state": {"values": {"feedback_block": {"feedback_input": {"value": "please revise"}}}},
+        }
+        body = {"user": {"id": "U_OTHER"}}
+
+        _run(bot._on_plan_feedback_modal(AsyncMock(), body, view))  # type: ignore[attr-defined]
+
+        bot.router.send_plan_feedback.assert_not_awaited()  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
@@ -969,6 +1135,9 @@ class TestChannelCLI:
             async def start(self) -> None:
                 return None
 
+            async def stop(self) -> None:
+                return None
+
         class FakeServer:
             def __init__(self, _config) -> None:
                 pass
@@ -980,7 +1149,7 @@ class TestChannelCLI:
             created_adapters.update(adapters)
             return MagicMock()
 
-        async def _fake_gather(*aws):  # type: ignore[no-untyped-def]
+        async def _fake_gather(*aws, return_exceptions=False):  # type: ignore[no-untyped-def]
             for aw in aws:
                 await aw
             return []
@@ -1035,6 +1204,9 @@ class TestChannelCLI:
             async def start(self) -> None:
                 return None
 
+            async def stop(self) -> None:
+                return None
+
         class FakeDiscordBot:
             channel_type = "discord"
 
@@ -1042,6 +1214,9 @@ class TestChannelCLI:
                 pass
 
             async def start(self) -> None:
+                return None
+
+            async def stop(self) -> None:
                 return None
 
         class FakeServer:
@@ -1055,7 +1230,7 @@ class TestChannelCLI:
             created_adapters.update(adapters)
             return MagicMock()
 
-        async def _fake_gather(*aws):  # type: ignore[no-untyped-def]
+        async def _fake_gather(*aws, return_exceptions=False):  # type: ignore[no-untyped-def]
             for aw in aws:
                 await aw
             return []

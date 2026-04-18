@@ -59,6 +59,16 @@ def _check_auth(request: Request) -> JSONResponse | None:
 
         result = validate_jwt(token, jwt_secret, audience=JWT_AUD_CHANNEL)
         if result is not None:
+            # Scope check: a valid ``turnstone-channel``-audience token is
+            # not sufficient on its own — require ``write`` so a low-scope
+            # service token can't drive notification delivery.
+            if "write" not in result.scopes:
+                log.warning(
+                    "notify.auth_insufficient_scope",
+                    user_id=result.user_id,
+                    scopes=sorted(result.scopes),
+                )
+                return JSONResponse({"error": "insufficient scope"}, status_code=403)
             return None
 
     return JSONResponse({"error": "Unauthorized"}, status_code=401)

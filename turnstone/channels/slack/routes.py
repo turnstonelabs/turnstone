@@ -1,3 +1,11 @@
+"""Slack channel-routing key dataclass.
+
+A :class:`SlackRoute` is the triple that uniquely identifies where a Slack
+conversation lives: ``(channel, user_id?, thread_ts?)``.  It round-trips
+through a ``channel:user_id:thread_ts`` string so it can be used as the
+opaque ``channel_id`` value stored in ``channel_routes``.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -5,6 +13,24 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class SlackRoute:
+    """Routing key for a Slack conversation (channel / DM / thread).
+
+    ``to_channel_id`` and ``parse`` are inverses only for values the
+    parser is willing to emit:
+
+    - ``SlackRoute("C1")`` ↔ ``"C1"``
+    - ``SlackRoute("C1", "U1")`` ↔ ``"C1:U1"``
+    - ``SlackRoute("C1", "U1", "ts")`` ↔ ``"C1:U1:ts"``
+
+    Lax cases (not produced by ``to_channel_id`` but accepted by
+    ``parse``):
+
+    - Trailing colons drop to ``None`` — ``"C1:"`` → ``SlackRoute("C1")``.
+    - Extra colons fold into ``thread_ts`` via ``split(":", 2)``, so
+      ``"C1:U1:ts:extra"`` → ``thread_ts="ts:extra"``.  No Slack ts or
+      channel/user ID contains ``:`` so this is safe in practice.
+    """
+
     channel: str
     user_id: str | None = None
     thread_ts: str | None = None

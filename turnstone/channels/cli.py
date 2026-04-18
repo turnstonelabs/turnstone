@@ -9,15 +9,35 @@ Run as: ``turnstone-channel --discord-token $TURNSTONE_DISCORD_TOKEN``
 
 from __future__ import annotations
 
+import argparse
+import asyncio
+import contextlib
 import os
 import socket
 import sys
+import time
+from typing import TYPE_CHECKING, cast
+
+from turnstone.core.log import add_log_args, configure_logging_from_args, get_logger
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
+    from turnstone.channels._protocol import ChannelAdapter
+    from turnstone.core.storage import StorageBackend
+
+    # uvicorn ASGIApp is unions of several protocols; use a loose alias here.
+    _ASGIApp = Callable[..., Awaitable[None]]
+
+log = get_logger(__name__)
+
+_DISCOVERY_BUDGET_S = 30.0  # cap total wall-clock wait on startup discovery
+_DISCOVERY_INITIAL_DELAY_S = 1.0  # first retry delay
+_DISCOVERY_MAX_DELAY_S = 8.0  # cap per-attempt sleep
 
 
-def main() -> None:
-    """Parse arguments, initialize storage, and run adapters."""
-    import argparse
-
+def _build_parser() -> argparse.ArgumentParser:
+    """Construct the CLI argument parser."""
     parser = argparse.ArgumentParser(
         description="turnstone channel gateway — bridges messaging platforms to the turnstone cluster"
     )
@@ -107,136 +127,106 @@ def main() -> None:
     )
 
     # -- Logging -------------------------------------------------------------
-    from turnstone.core.log import add_log_args
-
     add_log_args(parser)
 
-    args = parser.parse_args()
+    return parser
 
-    # -- Logging setup -------------------------------------------------------
-    from turnstone.core.log import configure_logging_from_args
 
-    configure_logging_from_args(args, "channel")
+def _build_token_factories(
+    jwt_secret: str,
+) -> tuple[Callable[[], str] | None, Callable[[], str] | None]:
+    """Return ``(console_factory, server_factory)`` when a JWT secret is set."""
+    if not jwt_secret:
+        return None, None
 
-    from turnstone.core.log import get_logger
+    from turnstone.core.auth import JWT_AUD_CONSOLE, JWT_AUD_SERVER, ServiceTokenManager
 
-    log = get_logger(__name__)
-
-    # -- Storage -------------------------------------------------------------
-    from turnstone.core.storage._registry import get_storage, init_storage
-
-    db_backend = os.environ.get("TURNSTONE_DB_BACKEND", "sqlite")
-    db_url = os.environ.get("TURNSTONE_DB_URL", "")
-    db_path = os.environ.get("TURNSTONE_DB_PATH", "")
-
-    init_storage(
-        backend=db_backend,
-        url=db_url,
-        path=db_path,
+    scopes = frozenset({"read", "write", "approve", "service"})
+    console_mgr = ServiceTokenManager(
+        user_id="channel-gateway",
+        scopes=scopes,
+        source="channel",
+        secret=jwt_secret,
+        audience=JWT_AUD_CONSOLE,
+        expiry_hours=1,
+    )
+    server_mgr = ServiceTokenManager(
+        user_id="channel-gateway",
+        scopes=scopes,
+        source="channel",
+        secret=jwt_secret,
+        audience=JWT_AUD_SERVER,
+        expiry_hours=1,
     )
 
-    # -- Auth config ---------------------------------------------------------
-    jwt_secret = os.environ.get("TURNSTONE_JWT_SECRET", "").strip()
+    def console_factory() -> str:
+        return console_mgr.token
 
-    # Prefer auto-rotating service JWTs when jwt_secret is available.
-    # Two separate token factories: one for console (aud=turnstone-console)
-    # and one for server nodes (aud=turnstone-server, used for SSE).
-    _console_token_factory = None
-    _server_token_factory = None
-    if jwt_secret:
-        from turnstone.core.auth import JWT_AUD_CONSOLE, JWT_AUD_SERVER, ServiceTokenManager
+    def server_factory() -> str:
+        return server_mgr.token
 
-        _scopes = frozenset({"read", "write", "approve", "service"})
-        _console_mgr = ServiceTokenManager(
-            user_id="channel-gateway",
-            scopes=_scopes,
-            source="channel",
-            secret=jwt_secret,
-            audience=JWT_AUD_CONSOLE,
-            expiry_hours=1,
-        )
-        _server_mgr = ServiceTokenManager(
-            user_id="channel-gateway",
-            scopes=_scopes,
-            source="channel",
-            secret=jwt_secret,
-            audience=JWT_AUD_SERVER,
-            expiry_hours=1,
-        )
-        _console_token_factory = lambda: _console_mgr.token  # noqa: E731
-        _server_token_factory = lambda: _server_mgr.token  # noqa: E731
+    return console_factory, server_factory
 
-    server_url: str = args.server_url
-    console_url: str = args.console_url
 
-    # Auto-discover console and server from services table.
-    # Retry until at least one is found — the console/servers may still be
-    # starting up.  If the DB is down the cluster isn't functional anyway.
-    if not console_url or not server_url:
-        import time as _time
+def _resolve_service_urls(
+    storage: StorageBackend,
+    console_url: str,
+    server_url: str,
+) -> tuple[str, str]:
+    """Fill in missing console / server URLs from the service registry.
 
-        try:
-            from turnstone.core.storage._registry import get_storage as _get_st
+    Retries with exponential backoff up to ``_DISCOVERY_BUDGET_S`` seconds
+    since the console / servers may still be starting up.  Returns
+    ``(console_url, server_url)``.
+    """
+    if console_url and server_url:
+        return console_url, server_url
 
-            _disc_storage = _get_st()
-            log.info("channel.discovering_services")
-            for _attempt in range(30):  # up to 30s
-                if not console_url:
-                    consoles = _disc_storage.list_services("console", max_age_seconds=3600)
-                    if consoles:
-                        console_url = consoles[0]["url"]
-                        log.info("channel.discovered_console", url=console_url)
-                if not server_url:
-                    servers = _disc_storage.list_services("server", max_age_seconds=120)
-                    if servers:
-                        server_url = servers[0]["url"]
-                        log.info("channel.discovered_server", url=server_url)
-                if console_url or server_url:
-                    break
-                _time.sleep(1)
-            else:
+    try:
+        log.info("channel.discovering_services")
+        deadline = time.monotonic() + _DISCOVERY_BUDGET_S
+        delay = _DISCOVERY_INITIAL_DELAY_S
+        while True:
+            if not console_url:
+                consoles = storage.list_services("console", max_age_seconds=3600)
+                if consoles:
+                    console_url = consoles[0]["url"]
+                    log.info("channel.discovered_console", url=console_url)
+            if not server_url:
+                servers = storage.list_services("server", max_age_seconds=120)
+                if servers:
+                    server_url = servers[0]["url"]
+                    log.info("channel.discovered_server", url=server_url)
+            if console_url or server_url:
+                break
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 log.warning(
                     "channel.discovery_timeout",
                     console_url=console_url,
                     server_url=server_url,
                 )
-        except Exception:
-            log.warning("channel.discovery_failed", exc_info=True)
+                break
 
-    if not console_url and not server_url:
-        print(
-            "Error: no console or server URL available. Set --server-url, "
-            "--console-url, or ensure the database is reachable and services "
-            "are registered.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, _DISCOVERY_MAX_DELAY_S)
+    except Exception:
+        log.warning("channel.discovery_failed", exc_info=True)
 
-    # -- Adapter selection ---------------------------------------------------
-    if not args.discord_token and not args.slack_token:
-        print(
-            "Error: no channel adapters configured. "
-            "Set --discord-token / $TURNSTONE_DISCORD_TOKEN "
-            "or --slack-token / $TURNSTONE_SLACK_TOKEN.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    return console_url, server_url
 
-    # Slack config validation (fail fast)
-    if bool(args.slack_token) != bool(args.slack_app_token):
-        raise SystemExit("--slack-token and --slack-app-token must be provided together")
 
-    # -- Run -----------------------------------------------------------------
-    import asyncio
-    import contextlib
-    from typing import TYPE_CHECKING, cast
-
-    from turnstone.channels._http import _get_service_id, create_channel_app
-
-    if TYPE_CHECKING:
-        from turnstone.channels._protocol import ChannelAdapter
-
-    storage = get_storage()
+def _build_adapters(
+    args: argparse.Namespace,
+    storage: StorageBackend,
+    *,
+    server_url: str,
+    console_url: str,
+    console_token_factory: Callable[[], str] | None,
+    server_token_factory: Callable[[], str] | None,
+) -> dict[str, ChannelAdapter]:
+    """Instantiate the channel adapters selected by the provided args."""
     adapters: dict[str, ChannelAdapter] = {}
 
     if args.discord_token:
@@ -262,8 +252,8 @@ def main() -> None:
             server_url,
             storage,
             console_url=console_url,
-            console_token_factory=_console_token_factory,
-            server_token_factory=_server_token_factory,
+            console_token_factory=console_token_factory,
+            server_token_factory=server_token_factory,
         )
         adapters[discord_bot.channel_type] = cast("ChannelAdapter", discord_bot)
 
@@ -284,16 +274,154 @@ def main() -> None:
             server_url=server_url,
             storage=storage,
             console_url=console_url,
-            console_token_factory=_console_token_factory,
-            server_token_factory=_server_token_factory,
+            console_token_factory=console_token_factory,
+            server_token_factory=server_token_factory,
         )
         adapters[slack_bot.channel_type] = cast("ChannelAdapter", slack_bot)
 
-    channel_app = create_channel_app(
-        adapters,
-        storage,
-        jwt_secret=jwt_secret,
+    return adapters
+
+
+def _resolve_advertise_url(args: argparse.Namespace) -> str:
+    """Compute the URL the gateway should advertise in the service registry."""
+    override = os.environ.get("TURNSTONE_CHANNEL_ADVERTISE_URL", "").strip()
+    if override:
+        return override
+
+    advertise_host = socket.gethostname() if args.http_host in ("0.0.0.0", "::") else args.http_host
+    scheme = "https" if args.ssl_certfile else "http"
+    return f"{scheme}://{advertise_host}:{args.http_port}"
+
+
+async def _heartbeat_loop(storage: StorageBackend, service_id: str) -> None:
+    """Periodically update the channel service heartbeat."""
+    from turnstone.core.storage._registry import StorageUnavailableError
+
+    while True:
+        await asyncio.sleep(30)
+        try:
+            await asyncio.to_thread(storage.heartbeat_service, "channel", service_id)
+        except StorageUnavailableError:
+            pass  # already logged by storage layer
+        except Exception:
+            log.exception("channel.heartbeat_failed")
+
+
+async def _run_gateway(
+    adapters: dict[str, ChannelAdapter],
+    channel_app: _ASGIApp,
+    storage: StorageBackend,
+    args: argparse.Namespace,
+) -> None:
+    """Run all adapters + HTTP server + service heartbeat concurrently."""
+    import uvicorn
+
+    from turnstone.channels._http import _get_service_id
+
+    service_id = _get_service_id()
+    service_url = _resolve_advertise_url(args)
+
+    storage.register_service("channel", service_id, service_url)
+    log.info("channel.service_registered", service_id=service_id, url=service_url)
+
+    if bool(args.ssl_certfile) != bool(args.ssl_keyfile):
+        print(
+            "Both --ssl-certfile and --ssl-keyfile are required for TLS",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    uv_config = uvicorn.Config(
+        channel_app,
+        host=args.http_host,
+        port=args.http_port,
+        log_level="warning",
+        ssl_certfile=args.ssl_certfile,
+        ssl_keyfile=args.ssl_keyfile,
+        ssl_ca_certs=args.ssl_ca_certs,
     )
+    server = uvicorn.Server(uv_config)
+
+    heartbeat_task = asyncio.create_task(_heartbeat_loop(storage, service_id))
+    try:
+        await asyncio.gather(
+            *(adapter.start() for adapter in adapters.values()),
+            server.serve(),
+        )
+    finally:
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
+
+        # Stop adapters so SSE tasks, httpx clients, and Slack socket
+        # handlers close cleanly before we deregister from the service
+        # registry.
+        await asyncio.gather(
+            *(adapter.stop() for adapter in adapters.values()),
+            return_exceptions=True,
+        )
+
+        await asyncio.to_thread(storage.deregister_service, "channel", service_id)
+        log.info("channel.service_deregistered", service_id=service_id)
+
+
+def main() -> None:
+    """Parse arguments, initialize storage, and run adapters."""
+    from turnstone.channels._http import create_channel_app
+    from turnstone.core.storage._registry import get_storage, init_storage
+
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    configure_logging_from_args(args, "channel")
+
+    init_storage(
+        backend=os.environ.get("TURNSTONE_DB_BACKEND", "sqlite"),
+        url=os.environ.get("TURNSTONE_DB_URL", ""),
+        path=os.environ.get("TURNSTONE_DB_PATH", ""),
+    )
+    storage = get_storage()
+
+    jwt_secret = os.environ.get("TURNSTONE_JWT_SECRET", "").strip()
+    console_token_factory, server_token_factory = _build_token_factories(jwt_secret)
+
+    console_url, server_url = _resolve_service_urls(
+        storage,
+        args.console_url,
+        args.server_url,
+    )
+
+    if not console_url and not server_url:
+        print(
+            "Error: no console or server URL available. Set --server-url, "
+            "--console-url, or ensure the database is reachable and services "
+            "are registered.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if not args.discord_token and not args.slack_token:
+        print(
+            "Error: no channel adapters configured. "
+            "Set --discord-token / $TURNSTONE_DISCORD_TOKEN "
+            "or --slack-token / $TURNSTONE_SLACK_TOKEN.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if bool(args.slack_token) != bool(args.slack_app_token):
+        raise SystemExit("--slack-token and --slack-app-token must be provided together")
+
+    adapters = _build_adapters(
+        args,
+        storage,
+        server_url=server_url,
+        console_url=console_url,
+        console_token_factory=console_token_factory,
+        server_token_factory=server_token_factory,
+    )
+
+    channel_app = create_channel_app(adapters, storage, jwt_secret=jwt_secret)
 
     log.info(
         "channel.starting",
@@ -302,83 +430,8 @@ def main() -> None:
         server_url=server_url,
     )
 
-    async def _run_all() -> None:
-        """Run all adapters + HTTP server + service heartbeat concurrently."""
-        import uvicorn
-
-        service_id = _get_service_id()
-
-        # Resolve advertise URL — env override for Docker/K8s,
-        # otherwise derive from bind address.
-        advertise_url = os.environ.get("TURNSTONE_CHANNEL_ADVERTISE_URL", "").strip()
-        if not advertise_url:
-            if args.http_host in ("0.0.0.0", "::"):
-                advertise_host = socket.gethostname()
-            else:
-                advertise_host = args.http_host
-            scheme = "https" if args.ssl_certfile else "http"
-            advertise_url = f"{scheme}://{advertise_host}:{args.http_port}"
-        service_url = advertise_url
-
-        # Register in service registry
-        storage.register_service("channel", service_id, service_url)
-        log.info(
-            "channel.service_registered",
-            service_id=service_id,
-            url=service_url,
-        )
-
-        async def _heartbeat_loop() -> None:
-            """Periodically update service heartbeat."""
-            from turnstone.core.storage._registry import StorageUnavailableError
-
-            while True:
-                await asyncio.sleep(30)
-                try:
-                    await asyncio.to_thread(storage.heartbeat_service, "channel", service_id)
-                except StorageUnavailableError:
-                    pass  # already logged by storage layer
-                except Exception:
-                    log.exception("channel.heartbeat_failed")
-
-        # TLS: use cert files if available (from bootstrap or TLSClient)
-        ssl_certfile = getattr(args, "ssl_certfile", None)
-        ssl_keyfile = getattr(args, "ssl_keyfile", None)
-        ssl_ca_certs = getattr(args, "ssl_ca_certs", None)
-        if bool(ssl_certfile) != bool(ssl_keyfile):
-            print(
-                "Both --ssl-certfile and --ssl-keyfile are required for TLS",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
-        uv_config = uvicorn.Config(
-            channel_app,
-            host=args.http_host,
-            port=args.http_port,
-            log_level="warning",
-            ssl_certfile=ssl_certfile,
-            ssl_keyfile=ssl_keyfile,
-            ssl_ca_certs=ssl_ca_certs,
-        )
-        server = uvicorn.Server(uv_config)
-
-        heartbeat_task = asyncio.create_task(_heartbeat_loop())
-        try:
-            await asyncio.gather(
-                *(adapter.start() for adapter in adapters.values()),
-                server.serve(),
-            )
-        finally:
-            heartbeat_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await heartbeat_task
-
-            await asyncio.to_thread(storage.deregister_service, "channel", service_id)
-            log.info("channel.service_deregistered", service_id=service_id)
-
     with contextlib.suppress(KeyboardInterrupt):
-        asyncio.run(_run_all())
+        asyncio.run(_run_gateway(adapters, channel_app, storage, args))
 
 
 if __name__ == "__main__":

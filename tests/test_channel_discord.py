@@ -28,6 +28,21 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+def _bind_ws_event_handlers(bot, cls):
+    """Bind ``_on_ws_event`` + every ``_handle_*`` method from *cls* to *bot*.
+
+    ``MagicMock(spec=cls)`` stubs async methods as ``AsyncMock`` no-ops,
+    so dispatcher tests that invoke the real ``_on_ws_event`` must also
+    bind the per-event handlers it delegates to.
+    """
+    bot._on_ws_event = cls._on_ws_event.__get__(bot, cls)
+    for name in dir(cls):
+        if name.startswith("_handle_"):
+            attr = getattr(cls, name)
+            if callable(attr):
+                setattr(bot, name, attr.__get__(bot, cls))
+
+
 def _make_message(*, bot=False, guild=True, content="hello", channel=None, reference=None):
     """Build a mock ``discord.Message``."""
     msg = MagicMock(spec=discord.Message)
@@ -128,7 +143,7 @@ class TestStreamingMessage:
         _run(sm.append("hello "))
         _run(sm.append("world"))
 
-        assert "".join(sm._buffer) == "hello world"
+        assert sm.accumulated_text == "hello world"
 
     def test_finalize_sends_when_no_prior_message(self):
         from turnstone.channels.discord.bot import StreamingMessage
@@ -153,7 +168,7 @@ class TestStreamingMessage:
 
         # First append triggers flush (interval=0) which creates the message.
         _run(sm.append("hi"))
-        assert sm._message is sent_msg
+        assert sm.message is sent_msg
 
         _run(sm.append(" there"))
         _run(sm.finalize())
@@ -352,20 +367,20 @@ class TestAskModelSelection:
 class TestParseFooter:
     """Tests for _parse_footer in views.py."""
 
-    def test_valid_footer(self):
+    def test_valid_footer_with_owner(self):
         from turnstone.channels.discord.views import _parse_footer
 
+        interaction = _make_interaction(footer_text="ws_abc|corr_123|12345")
+        result = _parse_footer(interaction)
+        assert result == ("ws_abc", "corr_123", "12345")
+
+    def test_footer_without_owner_returns_empty_owner(self):
+        from turnstone.channels.discord.views import _parse_footer
+
+        # Legacy footer without an owner field (pre-upgrade posts).
         interaction = _make_interaction(footer_text="ws_abc|corr_123")
         result = _parse_footer(interaction)
-        assert result == ("ws_abc", "corr_123")
-
-    def test_footer_with_pipe_in_correlation(self):
-        from turnstone.channels.discord.views import _parse_footer
-
-        interaction = _make_interaction(footer_text="ws_abc|corr|extra")
-        result = _parse_footer(interaction)
-        # split("|", 1) means the second part includes everything after first pipe.
-        assert result == ("ws_abc", "corr|extra")
+        assert result == ("ws_abc", "corr_123", "")
 
     def test_no_message_returns_none(self):
         from turnstone.channels.discord.views import _parse_footer
@@ -428,7 +443,7 @@ class TestWsEventFinalization:
         bot._notify_reply_channels = {}
 
         # Use the real _on_ws_event method
-        bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
+        _bind_ws_event_handlers(bot, TurnstoneBot)
 
         thread = AsyncMock()
 
@@ -457,7 +472,7 @@ class TestWsEventFinalization:
         bot._tool_info_msgs = {}
         bot._pending_approval_msgs = {}
         bot._notify_reply_channels = {}
-        bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
+        _bind_ws_event_handlers(bot, TurnstoneBot)
 
         thread = AsyncMock()
 
@@ -478,6 +493,7 @@ class TestApprovalVerdictDisplay:
 
     def _make_bot(self):
         """Build a mock TurnstoneBot with _on_ws_event bound."""
+        from turnstone.channels._routing import PolicyVerdict
         from turnstone.channels.discord.bot import TurnstoneBot
 
         bot = MagicMock(spec=TurnstoneBot)
@@ -493,7 +509,9 @@ class TestApprovalVerdictDisplay:
         bot._pending_approval_msgs = {}
         bot._notify_reply_channels = {}
         bot._should_auto_approve = MagicMock(return_value=False)
-        bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
+        bot.router = MagicMock()
+        bot.router.evaluate_tool_policies = AsyncMock(return_value=PolicyVerdict(kind="none"))
+        _bind_ws_event_handlers(bot, TurnstoneBot)
         return bot
 
     def test_approval_with_heuristic_verdict(self):
@@ -612,7 +630,7 @@ class TestApprovalVerdictDisplay:
         bot._tool_info_msgs = {}
         bot._pending_approval_msgs = {"ws-1": MagicMock()}
         bot._notify_reply_channels = {}
-        bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
+        _bind_ws_event_handlers(bot, TurnstoneBot)
 
         thread = AsyncMock()
         event = StreamEndEvent(ws_id="ws-1")
@@ -638,7 +656,7 @@ class TestStreamEndBehavior:
         bot._tool_info_msgs = {}
         bot._pending_approval_msgs = {}
         bot._notify_reply_channels = {}
-        bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
+        _bind_ws_event_handlers(bot, TurnstoneBot)
         return bot
 
     def test_stream_end_no_streaming_no_send(self):
@@ -674,38 +692,88 @@ class TestStreamEndBehavior:
 class TestNotificationTracking:
     """Tests for notification message tracking and DM reply routing."""
 
-    def test_send_notification_tracks_message(self):
-        """send_notification should store message_id -> (ws_id, target_user) mapping."""
+    def _make_dm_bot(self, *, sent_message_id: int):
+        """Build a MagicMock bot whose notification target resolves to a DM."""
         from turnstone.channels.discord.bot import TurnstoneBot
 
         bot = MagicMock(spec=TurnstoneBot)
+        bot.config = MagicMock()
+        bot.config.max_message_length = 2000
+
+        sent_msg = MagicMock()
+        sent_msg.id = sent_message_id
+
+        dm_channel = MagicMock()
+        dm_channel.send = AsyncMock(return_value=sent_msg)
+
+        user = MagicMock()
+        user.id = 7777
+        user.create_dm = AsyncMock(return_value=dm_channel)
+
+        inner_bot = MagicMock()
+        inner_bot.get_channel = MagicMock(return_value=None)
+        inner_bot.fetch_user = AsyncMock(return_value=user)
+        bot._bot = inner_bot
+
+        bot.send_notification = TurnstoneBot.send_notification.__get__(bot, TurnstoneBot)
+        bot._track_notification = TurnstoneBot._track_notification.__get__(bot, TurnstoneBot)
+        return bot
+
+    def test_send_notification_tracks_dm_with_user_id(self):
+        """send_notification for a DM records (ws_id, resolved_user_id)."""
+        bot = self._make_dm_bot(sent_message_id=12345)
         bot._notify_ws_map = {}
         bot._MAX_NOTIFY_TRACKING = 100
-        bot.send = AsyncMock(return_value="12345")
+
+        _run(bot.send_notification("7777", "Hello", "ws-abc"))
+
+        # Tracked under the resolved Discord user ID, not the raw argument.
+        assert 12345 in bot._notify_ws_map
+        assert bot._notify_ws_map[12345] == ("ws-abc", "7777")
+
+    def test_send_notification_to_guild_channel_is_not_tracked(self):
+        """Notifications delivered to a guild channel must not register reply tracking.
+
+        The reply-channel_id check treats the stored value as a Discord
+        user ID, so storing a channel ID would reject every legitimate
+        reply.
+        """
+        from turnstone.channels.discord.bot import TurnstoneBot
+
+        bot = MagicMock(spec=TurnstoneBot)
+        bot.config = MagicMock()
+        bot.config.max_message_length = 2000
+        bot._notify_ws_map = {}
+        bot._MAX_NOTIFY_TRACKING = 100
+
+        sent_msg = MagicMock()
+        sent_msg.id = 99999
+
+        channel = MagicMock()
+        channel.send = AsyncMock(return_value=sent_msg)
+
+        inner_bot = MagicMock()
+        inner_bot.get_channel = MagicMock(return_value=channel)
+        bot._bot = inner_bot
+
         bot.send_notification = TurnstoneBot.send_notification.__get__(bot, TurnstoneBot)
         bot._track_notification = TurnstoneBot._track_notification.__get__(bot, TurnstoneBot)
 
-        _run(bot.send_notification("chan-1", "Hello", "ws-abc"))
+        _run(bot.send_notification("888888", "Hello", "ws-abc"))
 
-        assert 12345 in bot._notify_ws_map
-        assert bot._notify_ws_map[12345] == ("ws-abc", "chan-1")
+        assert bot._notify_ws_map == {}
 
     def test_send_notification_evicts_old_entries(self):
         """Oldest notification tracking entries are evicted when cap is reached."""
-        from turnstone.channels.discord.bot import TurnstoneBot
-
-        bot = MagicMock(spec=TurnstoneBot)
+        bot = self._make_dm_bot(sent_message_id=4)
         bot._MAX_NOTIFY_TRACKING = 3
         bot._notify_ws_map = {
             1: ("ws-1", "u1"),
             2: ("ws-2", "u2"),
             3: ("ws-3", "u3"),
         }
-        bot.send = AsyncMock(return_value="4")
-        bot.send_notification = TurnstoneBot.send_notification.__get__(bot, TurnstoneBot)
-        bot._track_notification = TurnstoneBot._track_notification.__get__(bot, TurnstoneBot)
 
-        _run(bot.send_notification("chan-1", "Hello", "ws-4"))
+        _run(bot.send_notification("7777", "Hello", "ws-4"))
 
         assert 4 in bot._notify_ws_map
         assert 1 not in bot._notify_ws_map  # oldest evicted
@@ -878,7 +946,7 @@ class TestNotificationTracking:
         sent_msg.id = 88888
         dm_channel.send = AsyncMock(return_value=sent_msg)
         bot._notify_reply_channels = {"ws-1": (dm_channel, "u123")}
-        bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
+        _bind_ws_event_handlers(bot, TurnstoneBot)
         bot._track_notification = TurnstoneBot._track_notification.__get__(bot, TurnstoneBot)
 
         thread = AsyncMock()
@@ -913,7 +981,7 @@ class TestNotificationTracking:
 
         dm_channel = AsyncMock()
         bot._notify_reply_channels = {"ws-1": (dm_channel, "u123")}
-        bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
+        _bind_ws_event_handlers(bot, TurnstoneBot)
 
         thread = AsyncMock()
 
@@ -1052,40 +1120,83 @@ class TestTryParseMedia:
 class TestIsSafeImageUrl:
     """Tests for _is_safe_image_url in _formatter.py."""
 
-    def test_http_url(self):
+    @staticmethod
+    def _patch_resolver(monkeypatch, ips):
+        """Replace socket.getaddrinfo with a stub returning *ips*."""
+        import socket
+
+        def fake(host, port, family=0, *args, **kwargs):  # noqa: ARG001
+            return [(family, 0, 0, "", (ip, 0)) for ip in ips]
+
+        monkeypatch.setattr(socket, "getaddrinfo", fake)
+
+    def test_http_url(self, monkeypatch):
         from turnstone.channels._formatter import _is_safe_image_url
 
-        assert _is_safe_image_url("http://jellyfin:8096/Items/abc/Images/Primary") is True
+        self._patch_resolver(monkeypatch, ["203.0.113.5"])
+        assert _run(_is_safe_image_url("http://jellyfin:8096/Items/abc/Images/Primary")) is True
 
-    def test_https_url(self):
+    def test_https_url(self, monkeypatch):
         from turnstone.channels._formatter import _is_safe_image_url
 
-        assert _is_safe_image_url("https://jellyfin.example.com/Items/abc/Images/Primary") is True
+        self._patch_resolver(monkeypatch, ["203.0.113.5"])
+        assert (
+            _run(_is_safe_image_url("https://jellyfin.example.com/Items/abc/Images/Primary"))
+            is True
+        )
 
     def test_ftp_rejected(self):
         from turnstone.channels._formatter import _is_safe_image_url
 
-        assert _is_safe_image_url("ftp://evil.com/image.jpg") is False
+        assert _run(_is_safe_image_url("ftp://evil.com/image.jpg")) is False
 
     def test_file_rejected(self):
         from turnstone.channels._formatter import _is_safe_image_url
 
-        assert _is_safe_image_url("file:///etc/passwd") is False
+        assert _run(_is_safe_image_url("file:///etc/passwd")) is False
 
     def test_userinfo_rejected(self):
         from turnstone.channels._formatter import _is_safe_image_url
 
-        assert _is_safe_image_url("http://user:pass@jellyfin:8096/image") is False
+        assert _run(_is_safe_image_url("http://user:pass@jellyfin:8096/image")) is False
 
     def test_empty_rejected(self):
         from turnstone.channels._formatter import _is_safe_image_url
 
-        assert _is_safe_image_url("") is False
+        assert _run(_is_safe_image_url("")) is False
 
     def test_private_ip_allowed(self):
         from turnstone.channels._formatter import _is_safe_image_url
 
-        assert _is_safe_image_url("http://192.168.0.6:8096/Items/abc/Images/Primary") is True
+        assert _run(_is_safe_image_url("http://192.168.0.6:8096/Items/abc/Images/Primary")) is True
+
+    def test_dns_rebinding_rejected(self, monkeypatch):
+        """Hostname that resolves to a loopback IP must be rejected."""
+        from turnstone.channels._formatter import _is_safe_image_url
+
+        self._patch_resolver(monkeypatch, ["127.0.0.1"])
+        assert _run(_is_safe_image_url("http://rebind.example.com/image")) is False
+
+    def test_metadata_endpoint_rejected(self):
+        """AWS/GCP metadata IP is link-local → rejected."""
+        from turnstone.channels._formatter import _is_safe_image_url
+
+        assert _run(_is_safe_image_url("http://169.254.169.254/latest/meta-data/")) is False
+
+    def test_ipv6_aws_nitro_metadata_rejected(self, monkeypatch):
+        """fd00:ec2::254 is IPv6 ULA (is_private) but must be blocked —
+        the IPv4 169.254.169.254 check left this analogue open."""
+        from turnstone.channels._formatter import _is_safe_image_url
+
+        self._patch_resolver(monkeypatch, ["fd00:ec2::254"])
+        assert _run(_is_safe_image_url("http://nitro.example.com/")) is False
+
+    def test_ipv6_ecs_task_metadata_rejected(self, monkeypatch):
+        """ECS Task Metadata lives in the same fd00:ec2::/32 prefix."""
+        from turnstone.channels._formatter import _is_safe_image_url
+
+        self._patch_resolver(monkeypatch, ["fd00:ec2::23"])
+        assert _run(_is_safe_image_url("http://ecs-meta.example.com/")) is False
 
 
 class TestBuildMediaEmbed:
@@ -1187,7 +1298,7 @@ class TestThinkingIndicator:
         bot._pending_approval_msgs = {}
         bot._notify_reply_channels = {}
         bot._should_auto_approve = MagicMock(return_value=False)
-        bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
+        _bind_ws_event_handlers(bot, TurnstoneBot)
         return bot
 
     def test_thinking_start_sends_message(self):
@@ -1244,7 +1355,7 @@ class TestThinkingIndicator:
         # Thinking message becomes the StreamingMessage base — no delete.
         assert "ws-1" not in bot._thinking_msgs
         sm = bot._streaming["ws-1"]
-        assert sm._message is thinking_msg
+        assert sm.message is thinking_msg
 
     def test_stream_end_clears_thinking_message(self):
         from turnstone.sdk.events import StreamEndEvent
@@ -1287,7 +1398,7 @@ class TestToolInfoEvent:
         bot._pending_approval_msgs = {}
         bot._notify_reply_channels = {}
         bot._should_auto_approve = MagicMock(return_value=False)
-        bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
+        _bind_ws_event_handlers(bot, TurnstoneBot)
         return bot
 
     def test_sends_per_item_embed(self):
@@ -1382,7 +1493,7 @@ class TestToolResultEvent:
         bot._notify_reply_channels = {}
         bot._http_client = MagicMock()
         bot._should_auto_approve = MagicMock(return_value=False)
-        bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
+        _bind_ws_event_handlers(bot, TurnstoneBot)
         return bot
 
     def test_marks_info_done_and_sends_result(self):
@@ -1537,7 +1648,7 @@ class TestApprovalResolved:
         bot._pending_approval_msgs = {}
         bot._notify_reply_channels = {}
         bot._should_auto_approve = MagicMock(return_value=False)
-        bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
+        _bind_ws_event_handlers(bot, TurnstoneBot)
         return bot
 
     def test_disables_buttons_on_timeout(self):
@@ -1605,3 +1716,226 @@ class TestChannelCLI:
             main()
 
         assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# Approval / plan-review interaction views — owner-check regression tests
+# ---------------------------------------------------------------------------
+
+
+def _make_view_interaction(user_id: int, footer: str | None) -> MagicMock:
+    """Build a minimal interaction for ApprovalView / PlanReviewView tests."""
+    interaction = MagicMock(spec=discord.Interaction)
+    interaction.user = MagicMock()
+    interaction.user.id = user_id
+    interaction.response = MagicMock()
+    interaction.response.send_message = AsyncMock()
+    interaction.response.defer = AsyncMock()
+    interaction.response.send_modal = AsyncMock()
+    interaction.followup = MagicMock()
+    interaction.followup.send = AsyncMock()
+    interaction.message = MagicMock()
+    if footer is None:
+        interaction.message.embeds = []
+    else:
+        embed = MagicMock()
+        embed.footer.text = footer
+        interaction.message.embeds = [embed]
+    return interaction
+
+
+def _make_view_bot() -> MagicMock:
+    """Build a TurnstoneBot double with just the surface the views read."""
+    from turnstone.channels.discord.bot import TurnstoneBot
+
+    bot = MagicMock(spec=TurnstoneBot)
+    bot.router = MagicMock()
+    bot.router.resolve_user = AsyncMock(return_value="turnstone-user-1")
+    bot.router.send_approval = AsyncMock()
+    bot.router.send_plan_feedback = AsyncMock()
+    bot._pending_approval_msgs = {}
+    return bot
+
+
+class TestApprovalViewOwnerCheck:
+    """ApprovalView rejects clicks from anyone other than the session owner."""
+
+    def test_owner_approve_allowed(self, monkeypatch):
+        from turnstone.channels.discord.views import ApprovalView
+
+        # Avoid real disable_message_buttons (touches discord.ui internals).
+        monkeypatch.setattr(
+            "turnstone.channels.discord.views._disable_buttons",
+            AsyncMock(),
+        )
+        view = ApprovalView(_make_view_bot())
+        interaction = _make_view_interaction(user_id=42, footer="ws-1|corr-1|42")
+
+        _run(view._handle(interaction, approved=True, always=False))
+
+        view.bot.router.send_approval.assert_awaited_once_with(
+            ws_id="ws-1",
+            correlation_id="corr-1",
+            approved=True,
+            always=False,
+        )
+
+    def test_non_owner_rejected(self):
+        from turnstone.channels.discord.views import ApprovalView
+
+        view = ApprovalView(_make_view_bot())
+        interaction = _make_view_interaction(user_id=999, footer="ws-1|corr-1|42")
+
+        _run(view._handle(interaction, approved=True, always=False))
+
+        view.bot.router.send_approval.assert_not_awaited()
+        interaction.response.send_message.assert_awaited_once()
+        msg_kwargs = interaction.response.send_message.call_args
+        assert "Only the session owner" in msg_kwargs.args[0]
+        assert msg_kwargs.kwargs.get("ephemeral") is True
+
+    def test_legacy_footer_without_owner_rejected(self):
+        from turnstone.channels.discord.views import ApprovalView
+
+        view = ApprovalView(_make_view_bot())
+        # Pre-upgrade footer with only ws_id|correlation_id — fail closed.
+        interaction = _make_view_interaction(user_id=42, footer="ws-1|corr-1")
+
+        _run(view._handle(interaction, approved=True, always=False))
+
+        view.bot.router.send_approval.assert_not_awaited()
+
+
+class TestPlanReviewViewOwnerCheck:
+    """PlanReviewView rejects clicks from anyone other than the session owner."""
+
+    def test_owner_approve_allowed(self, monkeypatch):
+        from turnstone.channels.discord.views import PlanReviewView
+
+        monkeypatch.setattr(
+            "turnstone.channels.discord.views._disable_buttons",
+            AsyncMock(),
+        )
+        view = PlanReviewView(_make_view_bot())
+        interaction = _make_view_interaction(user_id=42, footer="ws-1|corr-1|42")
+
+        _run(view._handle_approve(interaction))
+
+        view.bot.router.send_plan_feedback.assert_awaited_once_with(
+            ws_id="ws-1",
+            correlation_id="corr-1",
+            feedback="",
+        )
+
+    def test_non_owner_approve_rejected(self):
+        from turnstone.channels.discord.views import PlanReviewView
+
+        view = PlanReviewView(_make_view_bot())
+        interaction = _make_view_interaction(user_id=999, footer="ws-1|corr-1|42")
+
+        _run(view._handle_approve(interaction))
+
+        view.bot.router.send_plan_feedback.assert_not_awaited()
+        interaction.response.send_message.assert_awaited_once()
+
+    def test_non_owner_changes_modal_rejected(self):
+        from turnstone.channels.discord.views import PlanReviewView
+
+        view = PlanReviewView(_make_view_bot())
+        interaction = _make_view_interaction(user_id=999, footer="ws-1|corr-1|42")
+
+        _run(view._handle_changes(interaction))
+
+        interaction.response.send_modal.assert_not_awaited()
+        interaction.response.send_message.assert_awaited_once()
+
+
+class TestDiscordThreadOwnerCheck:
+    """Sec-3 gate: only the thread creator can send messages into the workstream."""
+
+    @staticmethod
+    def _make_cog_and_ts():
+        """Build a MessageCog wired to a minimal TurnstoneBot double."""
+        from turnstone.channels.discord.cog import MessageCog
+
+        bot = MagicMock()
+        bot.user = MagicMock()
+        bot.user.id = 99999
+        bot.user.mentioned_in = MagicMock(return_value=False)
+
+        ts = MagicMock()
+        ts._is_allowed_channel = MagicMock(return_value=True)
+        ts.storage = MagicMock()
+        ts.router = MagicMock()
+        ts.router.lookup_ws_id = AsyncMock(return_value="ws-1")
+        ts.router.resolve_user = AsyncMock(return_value="turnstone-user-1")
+        ts.router.send_message = AsyncMock()
+        ts.router.get_or_create_workstream = AsyncMock(return_value=("ws-1", False))
+        ts.config = MagicMock()
+        ts._ws_tasks = {}
+        ts._subscribed_ws = {"ws-1"}
+        ts._notify_ws_map = {}
+        ts._notify_reply_channels = {}
+        ts.get_thread_invoker = MagicMock(return_value=None)
+        ts.subscribe_ws = AsyncMock()
+        bot.turnstone = ts
+
+        return MessageCog(bot), ts
+
+    def test_non_owner_thread_message_dropped(self):
+        """A linked user who is NOT the thread creator gets their message
+        silently dropped — router.send_message must not fire."""
+        cog, ts = self._make_cog_and_ts()
+
+        # Build a thread whose owner_id is different from the message author.
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 555
+        thread.parent_id = 111
+        thread.owner_id = 42  # thread creator
+        thread.name = "some-thread"
+
+        msg = _make_message(guild=True, channel=thread)
+        msg.author.id = 999  # non-owner trying to inject
+
+        _run(cog._on_message(msg))
+
+        ts.router.send_message.assert_not_awaited()
+        ts.router.get_or_create_workstream.assert_not_awaited()
+
+    def test_ask_thread_followup_allowed_when_invoker_registered(self):
+        """/ask creates threads with owner_id=bot; follow-ups from the
+        registered invoker must still reach the workstream."""
+        cog, ts = self._make_cog_and_ts()
+        # Simulate what _cmd_ask does after channel.create_thread().
+        ts.get_thread_invoker = MagicMock(return_value=111)
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 555
+        thread.parent_id = 222
+        thread.owner_id = 99999  # bot owns the thread after channel.create_thread
+        thread.name = "ask-thread"
+
+        msg = _make_message(guild=True, channel=thread)
+        msg.author.id = 111  # the human who ran /ask
+
+        _run(cog._on_message(msg))
+
+        ts.router.send_message.assert_awaited_once_with("ws-1", msg.content)
+
+    def test_ask_thread_rejects_other_user_even_when_invoker_registered(self):
+        """Registered invoker lock: only that user's follow-ups pass."""
+        cog, ts = self._make_cog_and_ts()
+        ts.get_thread_invoker = MagicMock(return_value=111)
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 555
+        thread.parent_id = 222
+        thread.owner_id = 99999  # bot-owned
+        thread.name = "ask-thread"
+
+        msg = _make_message(guild=True, channel=thread)
+        msg.author.id = 222  # someone other than the recorded invoker
+
+        _run(cog._on_message(msg))
+
+        ts.router.send_message.assert_not_awaited()
