@@ -50,11 +50,15 @@ from turnstone.core.workstream import WorkstreamKind
 WAIT_REAL_TERMINAL_STATES: frozenset[str] = frozenset({"idle", "error", "closed", "deleted"})
 
 # Reportable terminal states — superset of the real ones, also includes the
-# ``denied`` short-circuit shape returned for foreign / missing ws_ids.  Used
-# by the resolved-count summary so the operator-facing "X/Y resolved" matches
-# what they see in the results dict.  NOT used for the any/all condition: a
-# single typo'd / foreign id shouldn't satisfy ``mode="any"`` and let the
-# model declare a wait complete while every real child is still running.
+# ``denied`` short-circuit shape returned for foreign / missing ws_ids.
+# Used inside ``wait_for_workstream`` to decide when ``mode='any'`` on a
+# pure-denied list should short-circuit with ``complete=False`` (no real
+# work to wait for) and when ``mode='all'`` has fully settled.  NOT used
+# for the ``mode='any'`` real-terminal completion condition and NOT used
+# by the resolved-count summary (which counts only real terminals —
+# ``denied`` is a rejection, not a resolution).  A single typo'd /
+# foreign id shouldn't satisfy ``mode="any"`` and let the model declare
+# a wait complete while every real child is still running.
 WAIT_TERMINAL_STATES: frozenset[str] = WAIT_REAL_TERMINAL_STATES | frozenset({"denied"})
 
 # Hard cap on ws_ids per call.  Polling happens once per ws_id per tick, so a
@@ -451,14 +455,18 @@ class CoordinatorClient:
 
         ``since`` — optional prior snapshot (typically the ``results``
         dict from an earlier ``wait_for_workstream`` call).  When
-        provided, the wait short-circuits as soon as ANY polled ws_id's
-        snapshot differs from its ``since`` entry (``state`` / ``tokens``
-        / ``updated``), regardless of ``mode``.  Lets a follow-up wait
-        skip re-counting already-completed children — the classic
-        "spawn 3, wait for the first, then wait for the next change"
-        loop turns into two calls instead of spinning the timeout on
-        the still-terminal first child.  An entry missing from
-        ``since`` counts as changed on first observation.
+        provided, the wait short-circuits as soon as ANY polled ws_id
+        that ALSO has a ``since`` entry differs from that prior
+        snapshot (``state`` / ``tokens`` / ``updated``), regardless of
+        ``mode``.  Lets a follow-up wait skip re-counting
+        already-completed children — the classic "spawn 3, wait for
+        the first, then wait for the next change" loop turns into two
+        calls instead of spinning the timeout on the still-terminal
+        first child.  ws_ids absent from ``since`` do NOT themselves
+        trigger the diff-based early exit — they fall back to the
+        normal ``mode`` condition.  This prevents a disjoint ``since``
+        dict from silently exiting on tick one (which the naive
+        missing-entry-counts-as-changed rule would cause).
 
         Cross-tenant guard: a ws_id that's neither the coordinator
         itself nor one of its own children appears with

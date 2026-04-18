@@ -2945,14 +2945,24 @@ async def coordinator_metrics(request: Request) -> JSONResponse:
     # every hydrated row just to group by state and filter on created
     # (#perf-1).  Two cheap queries instead of a ``list_workstreams``
     # scan up to 10k rows.
+    #
+    # Tenant filter on the aggregates — matches the coordinator_children
+    # pattern where user_id is pushed into SQL so a non-admin caller
+    # can't observe cross-tenant counts via forged / migration-era
+    # rows sharing parent_ws_id.  Admin callers see the raw aggregate
+    # (no filter).  The 404-mask above already rejected foreign
+    # coord_ws_id, so the filter here is defense-in-depth against
+    # child rows with drifted user_id.
     from datetime import UTC, datetime
 
+    filter_user_id: str | None = None if _is_admin(request) else (user_id or "")
     now_epoch = time.time()
     hour_ago_iso = datetime.fromtimestamp(now_epoch - 3600, tz=UTC).strftime("%Y-%m-%dT%H:%M:%S")
     try:
         state_counts = await asyncio.to_thread(
             storage.count_workstreams_by_state,
             parent_ws_id=ws_id,
+            user_id=filter_user_id,
         )
     except Exception:
         log.debug("coordinator_metrics.state_counts_failed ws=%s", ws_id[:8], exc_info=True)
@@ -2963,6 +2973,7 @@ async def coordinator_metrics(request: Request) -> JSONResponse:
             storage.count_workstreams_since,
             hour_ago_iso,
             parent_ws_id=ws_id,
+            user_id=filter_user_id,
         )
     except Exception:
         log.debug(

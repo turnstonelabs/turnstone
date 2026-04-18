@@ -342,16 +342,36 @@ def test_metrics_empty_coordinator_defaults(storage):
 
 def test_metrics_spawns_and_state_counts(storage):
     """spawns_total counts ALL children (including closed); state
-    histogram groups by current state."""
+    histogram groups by current state.  All children share the
+    coordinator's owner so the non-admin tenant filter on the
+    aggregate queries counts them all (see next test for the
+    cross-tenant filter behaviour)."""
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="user-1")
-    # Seed children directly in storage so we control state/created
-    # without going through routing.
-    _seed_workstream(storage, ws_id="aa" * 16, node_id="node-a", parent_ws_id=ws.id, state="idle")
     _seed_workstream(
-        storage, ws_id="bb" * 16, node_id="node-a", parent_ws_id=ws.id, state="running"
+        storage,
+        ws_id="aa" * 16,
+        node_id="node-a",
+        user_id="user-1",
+        parent_ws_id=ws.id,
+        state="idle",
     )
-    _seed_workstream(storage, ws_id="cc" * 16, node_id="node-a", parent_ws_id=ws.id, state="closed")
+    _seed_workstream(
+        storage,
+        ws_id="bb" * 16,
+        node_id="node-a",
+        user_id="user-1",
+        parent_ws_id=ws.id,
+        state="running",
+    )
+    _seed_workstream(
+        storage,
+        ws_id="cc" * 16,
+        node_id="node-a",
+        user_id="user-1",
+        parent_ws_id=ws.id,
+        state="closed",
+    )
     client = _make_client(storage, coord_mgr=mgr)
     resp = client.get(
         f"/v1/api/coordinator/{ws.id}/metrics",
@@ -361,6 +381,65 @@ def test_metrics_spawns_and_state_counts(storage):
     body = resp.json()
     assert body["spawns_total"] == 3
     assert body["child_state_counts"] == {"idle": 1, "running": 1, "closed": 1}
+
+
+def test_metrics_tenant_filter_excludes_forged_cross_tenant_child(storage):
+    """Defense-in-depth: a non-admin caller's aggregate counts must
+    exclude children whose parent_ws_id matches the coord but whose
+    user_id drifted to another tenant (forged / migration-era rows).
+    The primary defense is the 404-mask on coord ownership; this is
+    the secondary defense inside the aggregate queries (Copilot
+    review finding on PR #381).
+
+    Admin bypass sees the raw aggregate (no tenant filter) — same
+    pattern coordinator_children follows.
+    """
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="alice")
+    # Legitimate child owned by alice.
+    _seed_workstream(
+        storage,
+        ws_id="aa" * 16,
+        node_id="node-a",
+        user_id="alice",
+        parent_ws_id=ws.id,
+        state="idle",
+    )
+    # Forged / drifted child — same parent_ws_id but foreign owner.
+    _seed_workstream(
+        storage,
+        ws_id="bb" * 16,
+        node_id="node-a",
+        user_id="bob",
+        parent_ws_id=ws.id,
+        state="running",
+    )
+    client = _make_client(storage, coord_mgr=mgr)
+
+    # Alice (non-admin) — counts must exclude bob's forged row.
+    resp = client.get(
+        f"/v1/api/coordinator/{ws.id}/metrics",
+        headers={"X-Test-User": "alice", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["spawns_total"] == 1
+    assert body["child_state_counts"] == {"idle": 1}
+    # "running" (bob's forged child) filtered out.
+    assert "running" not in body["child_state_counts"]
+
+    # Admin sees both.
+    resp_admin = client.get(
+        f"/v1/api/coordinator/{ws.id}/metrics",
+        headers={
+            "X-Test-User": "admin-1",
+            "X-Test-Perms": "admin.coordinator,admin.users",
+        },
+    )
+    assert resp_admin.status_code == 200
+    body_admin = resp_admin.json()
+    assert body_admin["spawns_total"] == 2
+    assert body_admin["child_state_counts"] == {"idle": 1, "running": 1}
 
 
 def test_metrics_judge_fallback_rate_substring_match(storage):

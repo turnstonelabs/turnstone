@@ -492,13 +492,12 @@
         // during the SSE gap would otherwise pin the header badge
         // forever.  The server's SSE replay doesn't cover our
         // per-call wait_* events, so we clear and let fresh events
-        // repopulate.  #bug-4.
-        if (typeof activeWaits !== "undefined") {
-          activeWaits.clear();
-          if (typeof _renderWaitIndicator === "function") {
-            _renderWaitIndicator();
-          }
-        }
+        // repopulate.  #bug-4.  Both ``activeWaits`` and
+        // ``_renderWaitIndicator`` are defined below in the same
+        // IIFE — hoisted function decl + const-in-outer-scope — so
+        // they're always reachable by the time onopen fires.
+        activeWaits.clear();
+        _renderWaitIndicator();
       }
     };
     evtSource.onerror = function () {

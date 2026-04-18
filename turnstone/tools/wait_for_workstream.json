@@ -21,7 +21,7 @@
       },
       "since": {
         "type": "object",
-        "description": "Optional prior snapshot (typically the `results` dict from an earlier wait_for_workstream call). When provided, the wait exits as soon as ANY polled ws_id's state/tokens/updated differs from its `since` entry, regardless of mode. Skip re-counting already-terminal children on follow-up waits. A missing entry counts as changed on first observation. Omit for the default terminal-state behaviour.",
+        "description": "Optional prior snapshot (typically the `results` dict from an earlier wait_for_workstream call). When provided, the wait exits as soon as ANY polled ws_id that ALSO has a `since` entry differs from that prior snapshot (state/tokens/updated), regardless of mode. Skip re-counting already-terminal children on follow-up waits. ws_ids absent from `since` do NOT trigger the diff-based early exit — they fall back to the normal `mode` condition, so a disjoint `since` dict doesn't silently exit on tick one. Omit for the default terminal-state behaviour.",
         "additionalProperties": {
           "type": "object",
           "properties": {
