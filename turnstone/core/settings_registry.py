@@ -676,6 +676,47 @@ def _build_registry() -> dict[str, SettingDef]:
             "this short (5 minutes default) to limit blast radius if the process "
             "is compromised; longer values reduce JWT re-mint frequency at minor risk.",
         ),
+        SettingDef(
+            "coordinator.spawn_budget",
+            "int",
+            20,
+            "Max concurrent active children per coordinator (hard quota)",
+            "coordinator",
+            min_value=1,
+            max_value=500,
+            help="Hard cap on how many children a single coordinator session can "
+            "own at once (counts non-terminal children only — closed / deleted rows "
+            "free a slot). Once at the cap, `spawn_workstream` returns a tool error "
+            "guiding the model to close idle children first. The per-session value "
+            "can be overridden at runtime via POST /v1/api/coordinator/{ws_id}/quota.",
+        ),
+        SettingDef(
+            "coordinator.spawn_rate.tokens_per_minute",
+            "float",
+            5.0,
+            "Token-bucket refill rate for coordinator spawns (tokens/minute)",
+            "coordinator",
+            min_value=0.0,
+            max_value=600.0,
+            help="Soft pacing limit — how fast a coordinator can sustain spawns once "
+            "the initial burst is exhausted. A rate-limited spawn returns a tool error "
+            "with a `retry_after_seconds` hint so the model backs off before trying "
+            "again. Set to 0 to disable the refill (bucket still honors the initial "
+            "burst on a fresh session).",
+        ),
+        SettingDef(
+            "coordinator.spawn_rate.burst",
+            "int",
+            10,
+            "Token-bucket burst ceiling for coordinator spawns",
+            "coordinator",
+            min_value=1,
+            max_value=500,
+            help="Max tokens the spawn-rate bucket can accrue — the initial fan-out "
+            "size a fresh or long-idle coordinator can issue back-to-back before the "
+            "`tokens_per_minute` refill rate takes over. Larger values trade slower "
+            "convergence to steady state for more elastic first-wave fan-outs.",
+        ),
     ]
     return {d.key: d for d in defs}
 
