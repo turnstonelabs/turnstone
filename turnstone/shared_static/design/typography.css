@@ -1,0 +1,90 @@
+/* turnstone design system — typography
+   Source: design_ideas/README.md (Claude Design handoff)
+
+   UI:   Inter 400/500/600/700 + ss01/cv11 features
+   Mono: JetBrains Mono 400/500/600 + zero/ss01
+   Base: 14px / 1.45 */
+
+/* NOTE for DS-B wiring: @import here is parser-blocking and serialized —
+   prefer <link rel="preconnect" href="https://fonts.googleapis.com"> plus
+   <link rel="stylesheet" ...> in each opting view's <head>. Kept as @import
+   here only so DS-A stands alone with zero HTML edits. */
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap");
+
+:root {
+  --font-ui:   "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", "IBM Plex Mono", Consolas, monospace;
+}
+
+/* Applies defaults on the opt-in root (the element carrying data-design="v1").
+   font-family and color inherit to descendants; background does not — panels
+   set their own --panel background in DS-B. Existing views are untouched
+   until they add the attribute. */
+[data-design="v1"] {
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.45;
+  font-feature-settings: "ss01", "cv11";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  color: var(--ink);
+  background: var(--bg);
+}
+
+[data-design="v1"] code,
+[data-design="v1"] pre,
+[data-design="v1"] kbd,
+[data-design="v1"] .t-mono {
+  font-family: var(--font-mono);
+  font-feature-settings: "zero", "ss01";
+}
+
+/* Six-step scale — values per README. Use these utility classes or compose
+   the same declarations inside view-specific selectors. */
+
+/* --ink-4 on light --panel is ~4.05:1 — fails WCAG AA for 10px text. Spec-
+   inherited from Claude Design; DS-B can swap to --ink-3 on white panels
+   if accessibility audit requires. Dark mode passes (~5.8:1). */
+.t-kicker {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-4);
+}
+
+.t-meta {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-3);
+}
+
+.t-btn {
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.t-row {
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.t-body {
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.t-stat {
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
+
+.t-h1 {
+  font-size: 24px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--ink);
+}

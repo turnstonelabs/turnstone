@@ -1,0 +1,80 @@
+/* turnstone design system — tokens
+   Source: design_ideas/README.md (Claude Design handoff)
+
+   Accent customised: warm amber (hue 70) — preserves turnstone's signature
+   colour from the prior "Instrument Panel" palette. All other values follow
+   Claude Design spec verbatim.
+
+   Hard rules (do not drift):
+     - color-mix always uses `in srgb`, never `oklch`/`oklab`
+       (oklch interpolation takes the shortest hue arc and paints pink-tinted
+       borders between warm + cool neutrals)
+     - --warn is amber (hue 78), never 90+ (yellow-green)
+     - --ok is green (hue 150), never 155 (tips teal in dark)
+     - approve UI is warn-tinted, never green (approvals signal "needs
+       attention"; approving resolves amber rather than creating green) */
+
+:root {
+  /* Accent — warm amber (turnstone signature).
+     Tunable via these three vars without touching downstream primitives. */
+  --accent-h: 70;
+  --accent-c: 0.13;
+  --accent-l: 0.62;
+  --density: 1;
+
+  /* Neutrals (light) */
+  --bg:      #f7f7f4;
+  --panel:   #ffffff;
+  --panel-2: #fbfbf8;
+  --ink:     #101316;
+  --ink-2:   #2d3238;
+  --ink-3:   #565b63;
+  --ink-4:   #7a7f87;
+  --hair:    #dcdbd4;
+  --hair-2:  #e7e5dc;
+
+  /* Semantic */
+  --accent:      oklch(var(--accent-l) var(--accent-c) var(--accent-h));
+  --accent-soft: oklch(0.94 0.03 var(--accent-h));
+  --ok:          oklch(0.52 0.13 150);
+  --ok-soft:     oklch(0.93 0.05 150);
+  --warn:        oklch(0.62 0.13 78);
+  --warn-soft:   oklch(0.95 0.05 78);
+  --err:         oklch(0.50 0.18 25);
+  --err-soft:    oklch(0.93 0.06 25);
+  --think:       oklch(0.48 0.12 260);
+  --think-soft:  oklch(0.94 0.04 260);
+
+  /* Shape */
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 8px;
+  --shadow-sm: 0 1px 0 rgba(21, 24, 27, 0.03),
+               0 1px 2px rgba(21, 24, 27, 0.04);
+
+  /* Rhythm */
+  --gap:   calc(12px * var(--density));
+  --row-h: calc(32px * var(--density));
+}
+
+[data-theme="dark"] {
+  --bg:      #0e1013;
+  --panel:   #15181c;
+  --panel-2: #1a1e23;
+  --ink:     #f2f3f5;
+  --ink-2:   #d4d7db;
+  --ink-3:   #a6abb3;
+  --ink-4:   #808690;
+  --hair:    #2a2e35;
+  --hair-2:  #333842;
+
+  --accent-soft: oklch(0.28 0.05 var(--accent-h));
+  --ok:          oklch(0.75 0.14 150);
+  --ok-soft:     oklch(0.28 0.06 150);
+  --warn:        oklch(0.72 0.12 78);
+  --warn-soft:   oklch(0.28 0.06 78);
+  --err:         oklch(0.72 0.17 25);
+  --err-soft:    oklch(0.30 0.09 25);
+  --think:       oklch(0.72 0.13 260);
+  --think-soft:  oklch(0.28 0.06 260);
+}
