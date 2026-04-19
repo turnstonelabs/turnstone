@@ -4951,40 +4951,25 @@ class ChatSession:
             }
         return state
 
-    # List-call sizing for the active-children count: budget + slack
-    # so we can still accurately report "N over cap" for a few rows
-    # past the limit, floored at a comfortable minimum for tiny budgets
-    # (budget=0 would otherwise emit a 5-row query).  Neither number is
-    # load-bearing — the count is only compared against the budget for
-    # allow/deny; anything beyond "over cap" only matters for the
-    # user-facing error message.
-    _ACTIVE_COUNT_SLACK = 5
-    _ACTIVE_COUNT_MIN_LIMIT = 25
-
     def _count_active_children(self) -> int:
         """Current active-child count for the budget check.
 
-        Routes through ``CoordinatorClient.list_children(include_closed=False)``
-        so closed / deleted children (which the budget shouldn't count)
-        free a slot as soon as the state transition lands in storage.
-        Returns 0 on any lookup error so the budget fails *open* rather
-        than pinning a coordinator to zero spawns on a transient
-        storage blip (the budget is operator-level safety, not a
-        security gate).
+        Routes through ``CoordinatorClient.count_active_children`` —
+        an aggregate SQL count excluding ``closed`` / ``deleted`` —
+        so the budget stays accurate even when the coord has a long
+        tail of closed rows that would otherwise push live rows past
+        the ``list_children`` LIMIT and silently undercount.  Returns
+        0 on any lookup error so the budget fails *open* rather than
+        pinning the coord at zero spawns on a transient storage blip
+        (the budget is operator-level safety, not a security gate).
         """
         if self._coord_client is None or self._spawn_budget is None:
             return 0
         try:
-            budget = self._spawn_budget.budget
-            limit = max(budget + self._ACTIVE_COUNT_SLACK, self._ACTIVE_COUNT_MIN_LIMIT)
-            resp = self._coord_client.list_children(self._ws_id, limit=limit)
+            return int(self._coord_client.count_active_children(self._ws_id))
         except Exception:
             log.debug("coord_quota.count_active_failed", exc_info=True)
             return 0
-        children = resp.get("children") if isinstance(resp, dict) else None
-        if not isinstance(children, list):
-            return 0
-        return len(children)
 
     def _eval_spawn_quota(self, active: int) -> str | None:
         """Core budget + rate gate — shared by single-spawn and batch paths.

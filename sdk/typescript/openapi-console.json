@@ -7497,7 +7497,7 @@
           "spawn_rate": {
             "anyOf": [
               {
-                "$ref": "#/components/schemas/CoordinatorSpawnRateState"
+                "$ref": "#/components/schemas/CoordinatorSpawnRateInput"
               },
               {
                 "type": "null"
@@ -7540,8 +7540,74 @@
         "title": "CoordinatorQuotaRequest",
         "type": "object"
       },
+      "CoordinatorSpawnRateInput": {
+        "description": "Nested rate-bucket sub-object of the quota REQUEST body.\n\nIntentionally excludes the response-only ``tokens_available`` field\nso generated SDK input types don't imply clients can POST a\nlive-bucket reading \u2014 the server ignores it on input.",
+        "properties": {
+          "tokens_per_minute": {
+            "anyOf": [
+              {
+                "maximum": 600.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "New refill rate in tokens per minute.",
+            "title": "Tokens Per Minute"
+          },
+          "burst": {
+            "anyOf": [
+              {
+                "maximum": 500,
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "New burst ceiling.",
+            "title": "Burst"
+          }
+        },
+        "title": "CoordinatorSpawnRateInput",
+        "type": "object"
+      },
+      "CoordinatorQuotaResponse": {
+        "description": "Response body for GET/POST /v1/api/coordinator/{ws_id}/quota.",
+        "properties": {
+          "status": {
+            "default": "ok",
+            "title": "Status",
+            "type": "string"
+          },
+          "spawn_budget": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Active-children cap.  None on a non-coordinator session.",
+            "title": "Spawn Budget"
+          },
+          "spawn_rate": {
+            "$ref": "#/components/schemas/CoordinatorSpawnRateState",
+            "description": "Rate-bucket state.  Fields are None on non-coordinator sessions."
+          }
+        },
+        "title": "CoordinatorQuotaResponse",
+        "type": "object"
+      },
       "CoordinatorSpawnRateState": {
-        "description": "Nested rate-bucket sub-object of the quota response.",
+        "description": "Nested rate-bucket sub-object of the quota RESPONSE body.\n\nExtends the input shape with the read-only ``tokens_available``\nsnapshot so the admin UI can render a \"rate status\" badge.",
         "properties": {
           "tokens_per_minute": {
             "anyOf": [
@@ -7579,40 +7645,11 @@
               }
             ],
             "default": null,
-            "description": "Current post-refill token count \u2014 advisory only; the bucket refills continuously so this snapshot is stale the moment it's read.  Useful for the admin UI's 'rate status' badge.",
+            "description": "Current post-refill token count \u2014 advisory only; the bucket refills continuously so this snapshot is stale the moment it's read.  Useful for the admin UI's 'rate status' badge.  Response-only: the server ignores this field on input.",
             "title": "Tokens Available"
           }
         },
         "title": "CoordinatorSpawnRateState",
-        "type": "object"
-      },
-      "CoordinatorQuotaResponse": {
-        "description": "Response body for GET/POST /v1/api/coordinator/{ws_id}/quota.",
-        "properties": {
-          "status": {
-            "default": "ok",
-            "title": "Status",
-            "type": "string"
-          },
-          "spawn_budget": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "description": "Active-children cap.  None on a non-coordinator session.",
-            "title": "Spawn Budget"
-          },
-          "spawn_rate": {
-            "$ref": "#/components/schemas/CoordinatorSpawnRateState",
-            "description": "Rate-bucket state.  Fields are None on non-coordinator sessions."
-          }
-        },
-        "title": "CoordinatorQuotaResponse",
         "type": "object"
       },
       "CoordinatorRestrictRequest": {

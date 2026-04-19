@@ -1265,18 +1265,10 @@ def test_close_all_children_prepare_errors_when_coord_client_unavailable(coord_s
 # ---------------------------------------------------------------------------
 
 
-def _fake_active_children(count: int) -> dict[str, Any]:
-    """Helper: build a list_children() response with ``count`` active rows."""
-    return {
-        "children": [{"ws_id": f"c-{i}", "state": "running"} for i in range(count)],
-        "truncated": False,
-    }
-
-
 def test_spawn_prepare_rejects_when_budget_reached(coord_session):
     sess, coord, _ui = coord_session
     sess.set_spawn_budget(3)
-    coord.list_children.return_value = _fake_active_children(3)
+    coord.count_active_children.return_value = 3
     item = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "hi"}))
     assert "error" in item
     assert "spawn budget reached" in item["error"]
@@ -1287,7 +1279,7 @@ def test_spawn_prepare_rejects_when_budget_reached(coord_session):
 def test_spawn_prepare_allowed_when_below_budget(coord_session):
     sess, coord, _ui = coord_session
     sess.set_spawn_budget(5)
-    coord.list_children.return_value = _fake_active_children(2)
+    coord.count_active_children.return_value = 2
     item = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "hi"}))
     assert "error" not in item
     assert item["needs_approval"] is True
@@ -1321,7 +1313,7 @@ def test_spawn_batch_partial_success_when_budget_overflows(coord_session):
     """Budget 4, active 3, batch of 3: first 1 passes, remaining 2 → denied."""
     sess, coord, _ui = coord_session
     sess.set_spawn_budget(4)
-    coord.list_children.return_value = _fake_active_children(3)
+    coord.count_active_children.return_value = 3
 
     counter = {"n": 0}
 
@@ -1362,7 +1354,7 @@ def test_spawn_batch_all_denied_by_budget_returns_tool_error(coord_session):
     """Budget fully consumed → batch rejected without approval flow."""
     sess, coord, _ui = coord_session
     sess.set_spawn_budget(2)
-    coord.list_children.return_value = _fake_active_children(2)
+    coord.count_active_children.return_value = 2
     item = sess._prepare_tool(
         _tc(
             "spawn_batch",
@@ -1420,7 +1412,7 @@ def test_spawn_batch_partial_success_when_rate_bucket_empties(coord_session):
 def test_set_spawn_budget_mutates_live_session(coord_session):
     sess, coord, _ui = coord_session
     sess.set_spawn_budget(0)  # no room for anything
-    coord.list_children.return_value = _fake_active_children(0)
+    coord.count_active_children.return_value = 0
     item = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "hi"}))
     assert "error" in item
     assert "spawn budget reached" in item["error"]
@@ -1438,12 +1430,13 @@ def test_get_quota_state_snapshot_shape(coord_session):
     assert 0 <= state["spawn_rate"]["tokens_available"] <= 4
 
 
-def test_count_active_children_returns_zero_on_non_dict_response(coord_session):
-    """MagicMock default returns a MagicMock, not a dict.  The helper
-    must fail *open* (return 0) so a broken storage path doesn't pin
-    the coord to zero spawns."""
-    sess, _coord, _ui = coord_session
-    # No return_value set → MagicMock auto-creates a child MagicMock.
+def test_count_active_children_fails_open_on_storage_error(coord_session):
+    """The helper must fail *open* (return 0) so a broken storage path
+    doesn't pin the coord to zero spawns — the budget is operator
+    safety, not a security gate.
+    """
+    sess, coord, _ui = coord_session
+    coord.count_active_children.side_effect = RuntimeError("storage down")
     assert sess._count_active_children() == 0
 
 

@@ -843,6 +843,44 @@ class CoordinatorClient:
         truncated = len(raw) >= limit
         return {"children": children, "truncated": truncated}
 
+    # Terminal states that free a coordinator's spawn-budget slot — a
+    # row in one of these has wound down (either soft-closed or
+    # hard-deleted, whatever the enum the migration happens to use at
+    # the time).  Must match ``list_children``'s include_closed=False
+    # filter so the budget and the UI's active-child view count the
+    # same set.
+    _BUDGET_TERMINAL_STATES: ClassVar[frozenset[str]] = frozenset({"closed", "deleted"})
+
+    def count_active_children(self, parent_ws_id: str) -> int:
+        """Return the count of non-terminal direct children.
+
+        Uses ``storage.count_workstreams_by_state`` (a SQL aggregate)
+        rather than ``list_children``'s LIMIT-then-filter path — a
+        fan-out with many recently-closed children would otherwise
+        push live rows past the SQL LIMIT and silently undercount,
+        letting spawn slots leak.
+
+        Tenant-guarded: a coord's LLM can't drive a count of someone
+        else's subtree.  Returns 0 on any storage error so the budget
+        fails *open* rather than pinning the coord at zero spawns on a
+        transient blip (operator-level safety, not a security gate).
+        """
+        if parent_ws_id != self._coord_ws_id:
+            return 0
+        try:
+            counts = self._storage.count_workstreams_by_state(
+                parent_ws_id=parent_ws_id,
+                user_id=self._user_id or None,
+            )
+        except Exception:
+            log.debug(
+                "coord_client.count_active_children.failed ws=%s",
+                parent_ws_id[:8],
+                exc_info=True,
+            )
+            return 0
+        return sum(n for state, n in counts.items() if state not in self._BUDGET_TERMINAL_STATES)
+
     # Auto-metadata keys that expose internal network topology (RFC 1918
     # addresses, interface maps) without contributing to any routing
     # decision a coordinator makes.  Stripped from the default response

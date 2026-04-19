@@ -1231,27 +1231,6 @@ class CoordinatorCloseAllChildrenResponse(BaseModel):
     )
 
 
-class CoordinatorSpawnRateState(BaseModel):
-    """Nested rate-bucket sub-object of the quota response."""
-
-    tokens_per_minute: float | None = Field(
-        default=None,
-        description="Current refill rate (tokens/minute).  None on a non-coordinator session.",
-    )
-    burst: int | None = Field(
-        default=None,
-        description="Current burst ceiling.  None on a non-coordinator session.",
-    )
-    tokens_available: float | None = Field(
-        default=None,
-        description=(
-            "Current post-refill token count — advisory only; the bucket "
-            "refills continuously so this snapshot is stale the moment "
-            "it's read.  Useful for the admin UI's 'rate status' badge."
-        ),
-    )
-
-
 # Quota-range bounds pulled from the settings registry so the OpenAPI
 # schema, the handler validator, and the admin UI all advertise the
 # same limits — one source of truth, no drift when an operator bumps a
@@ -1270,6 +1249,54 @@ _TPM_LO, _TPM_HI = _quota_field_bounds("coordinator.spawn_rate.tokens_per_minute
 _BURST_LO, _BURST_HI = _quota_field_bounds("coordinator.spawn_rate.burst")
 
 
+class CoordinatorSpawnRateInput(BaseModel):
+    """Nested rate-bucket sub-object of the quota REQUEST body.
+
+    Intentionally excludes the response-only ``tokens_available`` field
+    so generated SDK input types don't imply clients can POST a
+    live-bucket reading — the server ignores it on input.
+    """
+
+    tokens_per_minute: float | None = Field(
+        default=None,
+        ge=_TPM_LO,
+        le=_TPM_HI,
+        description="New refill rate in tokens per minute.",
+    )
+    burst: int | None = Field(
+        default=None,
+        ge=int(_BURST_LO),
+        le=int(_BURST_HI),
+        description="New burst ceiling.",
+    )
+
+
+class CoordinatorSpawnRateState(BaseModel):
+    """Nested rate-bucket sub-object of the quota RESPONSE body.
+
+    Extends the input shape with the read-only ``tokens_available``
+    snapshot so the admin UI can render a "rate status" badge.
+    """
+
+    tokens_per_minute: float | None = Field(
+        default=None,
+        description="Current refill rate (tokens/minute).  None on a non-coordinator session.",
+    )
+    burst: int | None = Field(
+        default=None,
+        description="Current burst ceiling.  None on a non-coordinator session.",
+    )
+    tokens_available: float | None = Field(
+        default=None,
+        description=(
+            "Current post-refill token count — advisory only; the bucket "
+            "refills continuously so this snapshot is stale the moment "
+            "it's read.  Useful for the admin UI's 'rate status' badge.  "
+            "Response-only: the server ignores this field on input."
+        ),
+    )
+
+
 class CoordinatorQuotaRequest(BaseModel):
     """Body for POST /v1/api/coordinator/{ws_id}/quota.
 
@@ -1286,7 +1313,7 @@ class CoordinatorQuotaRequest(BaseModel):
         le=int(_BUDGET_HI),
         description=f"New active-children cap ({int(_BUDGET_LO)}..{int(_BUDGET_HI)}).",
     )
-    spawn_rate: CoordinatorSpawnRateState | None = Field(
+    spawn_rate: CoordinatorSpawnRateInput | None = Field(
         default=None,
         description=(
             "Nested rate-bucket overrides.  Use this OR the flat "

@@ -3621,8 +3621,15 @@ _QUOTA_MIN_BURST, _QUOTA_MAX_BURST = _quota_range("coordinator.spawn_rate.burst"
 
 
 async def coordinator_quota_get(request: Request) -> JSONResponse:
-    """GET /v1/api/coordinator/{ws_id}/quota — read live spawn-quota state."""
-    resolved = await _resolve_coord_session(request)
+    """GET /v1/api/coordinator/{ws_id}/quota — read live spawn-quota state.
+
+    ``allow_service_bypass=False`` so a service token whose ``user_id``
+    matches the coord owner still needs an explicit ``admin.coordinator``
+    grant.  Consistent with the POST below and with the other
+    destructive / capability-visibility coordinator endpoints
+    (``/restrict``, ``/stop_cascade``, ``/close_all_children``).
+    """
+    resolved = await _resolve_coord_session(request, allow_service_bypass=False)
     if isinstance(resolved, JSONResponse):
         return resolved
     session, _storage, _user_id, _ws_id = resolved
@@ -3639,8 +3646,15 @@ async def coordinator_quota_post(request: Request) -> JSONResponse:
     keep their current values.  Overrides are in-memory only — a
     session reopen re-seeds from the global settings, matching the
     /trust and /restrict contract.
+
+    Gated with ``allow_service_bypass=False`` because this endpoint
+    can RAISE a coord's spawn capacity — a service token whose
+    ``user_id`` matches the coord owner still needs an explicit
+    ``admin.coordinator`` grant, matching how ``/restrict`` and the
+    cascade endpoints treat destructive / capability-escalating
+    surfaces.
     """
-    resolved = await _resolve_coord_session(request)
+    resolved = await _resolve_coord_session(request, allow_service_bypass=False)
     if isinstance(resolved, JSONResponse):
         return resolved
     session, storage, user_id, ws_id = resolved

@@ -481,6 +481,66 @@ def test_list_children_skill_filter_avoids_n_plus_one(populated_storage, monkeyp
     assert call_count["n"] == 0
 
 
+def test_count_active_children_counts_non_terminal_states(populated_storage):
+    """Budget count must use an aggregate SQL query so a tail of
+    recently-closed children can't push live rows past a LIMIT and
+    silently undercount (Copilot #3 on PR #387).
+
+    populated_storage has:
+      - coord-1 (coordinator, excluded)
+      - child-a (interactive, idle)      → counted
+      - child-b (interactive, running)   → counted
+      - child-coord (coordinator child)  → excluded (kind filter doesn't apply
+                                            to count_workstreams_by_state, but
+                                            it still matches parent_ws_id+user_id)
+      - unrelated (no parent)             → excluded (parent filter)
+      - cross-tenant-child (user-2)       → excluded (user_id filter)
+
+    child-coord DOES count against count_workstreams_by_state because
+    the aggregate doesn't filter by kind — the budget is per-coord
+    across any descendant type.  That's fine semantically: a
+    coordinator that spawns a nested coord still occupies a slot.
+    """
+    client = _make_read_client(populated_storage)
+    count = client.count_active_children("coord-1")
+    # child-a (idle) + child-b (running) + child-coord (running/default) = 3
+    assert count == 3
+
+
+def test_count_active_children_excludes_closed_and_deleted(populated_storage):
+    """A closed tail must not count toward the active-children budget —
+    this is the whole reason for switching off list_children's
+    LIMIT-then-filter path.
+    """
+    # Close child-a and mark child-b deleted.  child-coord stays active.
+    populated_storage.update_workstream_state("child-a", "closed")
+    populated_storage.update_workstream_state("child-b", "deleted")
+    client = _make_read_client(populated_storage)
+    count = client.count_active_children("coord-1")
+    assert count == 1  # only child-coord survives
+
+
+def test_count_active_children_rejects_foreign_parent(populated_storage):
+    """Tenant guard — a crafted parent_ws_id other than the coord's own
+    returns 0 without hitting storage."""
+    client = _make_read_client(populated_storage)
+    # The client's coord_ws_id is "coord-1" (see _make_read_client).
+    # Counting against a different id must not leak anyone else's count.
+    assert client.count_active_children("other-coord") == 0
+
+
+def test_count_active_children_fails_open_on_storage_error(populated_storage, monkeypatch):
+    """Budget is operator safety, not a security gate — a broken storage
+    path must return 0 so the coord still makes progress."""
+    client = _make_read_client(populated_storage)
+
+    def _boom(**_kwargs):
+        raise RuntimeError("storage broken")
+
+    monkeypatch.setattr(populated_storage, "count_workstreams_by_state", _boom)
+    assert client.count_active_children("coord-1") == 0
+
+
 def test_list_children_signals_truncation_when_page_full_and_filter_drops(
     populated_storage,
 ):
