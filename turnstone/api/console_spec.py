@@ -1074,7 +1074,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
     EndpointSpec(
         "/v1/api/route/workstreams/new",
         "POST",
-        "Create workstream via hash-ring routing proxy",
+        "Create workstream via rendezvous routing proxy",
         response_model=RouteCreateResponse,
         error_codes=[400, 503],
         tags=["Routing"],

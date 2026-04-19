@@ -43,7 +43,7 @@ An MCP server that exposes tools for executing commands across a Turnstone clust
 
 This server uses the Turnstone console SDK (`TurnstoneConsole`) for node discovery and routing, and `TurnstoneServer` for per-node SSE streaming. The dispatch flow for each command is:
 
-1. **Route** — `TurnstoneConsole.route_create_workstream(target_node=..., auto_approve=True)` creates a workstream pinned to the target node via the console's hash-ring routing proxy, returning `ws_id` and `node_url`.
+1. **Route** — `TurnstoneConsole.route_create_workstream(target_node=..., auto_approve=True)` creates a workstream pinned to the target node via the console's rendezvous routing proxy, returning `ws_id` and `node_url`.
 2. **Execute** — `TurnstoneServer(node_url, token=...)` connects directly to the node's SSE stream using the same `TURNSTONE_API_TOKEN`. `send_and_wait(prompt, ws_id)` runs the command and the raw bash output is captured from the `ToolResultEvent` — bypassing the costly "agent reads output then re-generates output as completion tokens" round-trip.
 3. **Cleanup** — `TurnstoneConsole.route_close(ws_id)` closes the workstream.
 

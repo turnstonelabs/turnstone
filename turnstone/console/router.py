@@ -1,150 +1,151 @@
 """Console routing layer — routes workstream requests to server nodes.
 
-Maintains an in-memory flat array of 65536 bucket->NodeRef entries populated
-from the hash_ring_buckets table.  Routing is O(1): cache[int(ws_id[:4], 16)].
+Uses rendezvous (HRW) hashing over the live ``services`` table.  The
+routing function is a pure function of ``(ws_id, live_nodes)``: every
+reader given the same membership list produces the same answer, and
+``services.last_heartbeat`` is the single source of truth for both
+liveness and routing.
+
+**Cache ownership**: the router's cache is push-driven by the
+collector's background discovery thread.  ``route()`` and ``is_ready()``
+are pure in-memory lookups — they do not touch storage on the hot path.
+The collector calls ``refresh_cache()`` on every discovery tick and
+again immediately on observed membership changes (node_joined /
+node_lost).  ``force_refresh()`` exists for the 404-retry path;
+callers must wrap it in ``asyncio.to_thread`` when invoking from an
+async handler so its DB read doesn't stall the event loop.
+
+Per-route cost is O(N) hash computes — microseconds at typical cluster
+sizes, dwarfed by every downstream HTTP round-trip.
 """
 
 from __future__ import annotations
 
 import json
-import logging
 import secrets
 import threading
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from turnstone.core.hash_ring import RING_SIZE, NoAvailableNodeError
+from turnstone.core.rendezvous import NoAvailableNodeError, NodeRef, select
 
 if TYPE_CHECKING:
     from turnstone.core.storage._protocol import StorageBackend
 
-log = logging.getLogger("turnstone.console.router")
+# Brute-force attempt cap for ``generate_ws_id_for_node``.  Expected
+# attempts for a weight-w_t target in a cluster with total weight W is
+# W/w_t (the target wins w_t/W of keys).  At typical scale (N≤50,
+# weights ∈ {1..4}) the worst case is ~200 attempts; the cap is well
+# above that to absorb pathologically-skewed configurations without
+# spurious failures.
+_GENERATE_ATTEMPT_CAP = 65_536
 
 
-@dataclass(frozen=True, slots=True)
-class NodeRef:
-    """A server node that can receive proxied requests."""
+def _parse_weight(metadata_json: str) -> int:
+    """Pull the ``weight`` key out of a service-registry metadata blob.
 
-    node_id: str
-    url: str
+    A single corrupt row must not abort the cache refresh — fall back to
+    weight=1 on any parse / type / value error, including JSON shapes
+    that aren't dicts (``null``, lists, scalars).
+    """
+    try:
+        meta = json.loads(metadata_json or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return 1
+    if not isinstance(meta, dict):
+        return 1
+    try:
+        weight = int(meta.get("weight", 1))
+    except (TypeError, ValueError):
+        return 1
+    return max(weight, 1)
 
 
 class ConsoleRouter:
     """Routes workstream operations to the correct server node.
 
-    Maintains an in-memory flat array of 65536 bucket->NodeRef entries,
-    populated from the hash_ring_buckets table.  All routing is a
-    single O(1) array lookup: ``cache[int(ws_id[:4], 16)]``.
+    Thread-safe.  All state mutation goes through ``_lock``; lookups
+    snapshot the node list under the lock and run the rendezvous select
+    outside it (the select is a pure function over an immutable list).
     """
 
     def __init__(self, storage: StorageBackend) -> None:
         self._storage = storage
-        self._cache: list[NodeRef | None] = [None] * RING_SIZE
+        self._lock = threading.Lock()
+        self._nodes: list[NodeRef] = []
         self._overrides: dict[str, NodeRef] = {}
-        self._version: int = 0
         self._refresh_lock = threading.Lock()
+        # Monotonic counter bumped on every successful refresh — used by
+        # the metrics gauge.  Strictly increasing so dashboards can
+        # detect when membership stops being refreshed.
+        self._refresh_counter: int = 0
 
     # ------------------------------------------------------------------
     # Cache management
     # ------------------------------------------------------------------
 
     def refresh_cache(self) -> bool:
-        """Reload the assignment cache from DB.
+        """Reload live-node list + overrides from storage.
 
         Thread-safe: if another thread is already refreshing, this call
-        returns False immediately (the other thread's refresh will apply).
-        Returns True if the cache changed compared to the previous load.
+        returns False immediately (the in-flight refresh will publish
+        the latest state).  Returns True if the membership changed
+        compared to the previous load.
+
+        Called by the collector's discovery thread on every tick — never
+        invoke from an async event-loop handler (this is a blocking DB
+        read).  Use ``force_refresh`` if you need a guaranteed-fresh
+        view, and wrap that in ``asyncio.to_thread``.
         """
         if not self._refresh_lock.acquire(blocking=False):
-            return False  # another thread is refreshing
+            return False
         try:
-            return self._refresh_cache_locked()
+            return self._refresh_locked()
         finally:
             self._refresh_lock.release()
 
-    def _refresh_cache_locked(self) -> bool:
-        """Inner refresh — must be called with _refresh_lock held."""
-        # Load node URLs from services table
-        members = self._storage.list_services("server", max_age_seconds=120)
-        nodes: dict[str, NodeRef] = {
-            m["service_id"]: NodeRef(m["service_id"], m["url"]) for m in members
-        }
+    def force_refresh(self) -> bool:
+        """Refresh now, blocking if another refresh is in progress.
 
-        # Load bucket assignments into flat array
-        buckets = self._storage.list_ring_buckets()
-        new_cache: list[NodeRef | None] = [None] * RING_SIZE
-        for row in buckets:
-            ref = nodes.get(row["node_id"])
-            if ref is not None:
-                new_cache[row["bucket"]] = ref
+        Used by the 404-retry path in the routing proxy when ``route()``
+        sent the request to a node that doesn't have the workstream —
+        the retry needs a guaranteed-fresh view of membership +
+        overrides before giving up.
 
-        # Load per-workstream overrides (pinned workstreams)
-        overrides = self._storage.list_workstream_overrides()
-        new_overrides: dict[str, NodeRef] = {}
-        for row in overrides:
-            ref = nodes.get(row["node_id"])
-            if ref is not None:
-                new_overrides[row["ws_id"]] = ref
-
-        changed = new_cache != self._cache or new_overrides != self._overrides
-
-        # Atomic swap
-        self._overrides = new_overrides
-        self._cache = new_cache
-
-        return changed
-
-    def populate_from_assignments(
-        self,
-        assignments: list[tuple[int, str]],
-        nodes: dict[str, NodeRef],
-        *,
-        version: int = 0,
-    ) -> None:
-        """Populate cache directly from computed assignments (no DB round-trip).
-
-        Used during initial seed to avoid a read-back of 65 536 rows.
-        Overrides are loaded from DB since they may exist from a prior run
-        (e.g. table was cleared but overrides survive).  Setting *version*
-        prevents ``check_version()`` from triggering an immediate refresh.
+        Async callers must wrap this in ``asyncio.to_thread`` — the
+        method takes a blocking lock and issues storage queries.
         """
-        new_cache: list[NodeRef | None] = [None] * RING_SIZE
-        for bucket, node_id in assignments:
-            ref = nodes.get(node_id)
-            if ref is not None:
-                new_cache[bucket] = ref
-
-        overrides = self._storage.list_workstream_overrides()
-        new_overrides: dict[str, NodeRef] = {}
-        for row in overrides:
-            ref = nodes.get(row["node_id"])
-            if ref is not None:
-                new_overrides[row["ws_id"]] = ref
-
         with self._refresh_lock:
-            self._cache = new_cache
+            return self._refresh_locked()
+
+    def _refresh_locked(self) -> bool:
+        services = self._storage.list_services("server", max_age_seconds=120)
+        new_nodes = sorted(
+            (
+                NodeRef(
+                    node_id=s["service_id"],
+                    url=s["url"],
+                    weight=_parse_weight(s.get("metadata", "{}")),
+                )
+                for s in services
+                if s.get("service_id") and s.get("url")
+            ),
+            key=lambda n: n.node_id,
+        )
+        nodes_by_id = {n.node_id: n for n in new_nodes}
+
+        overrides_rows = self._storage.list_workstream_overrides()
+        new_overrides: dict[str, NodeRef] = {}
+        for row in overrides_rows:
+            ref = nodes_by_id.get(row["node_id"])
+            if ref is not None:
+                new_overrides[row["ws_id"]] = ref
+
+        with self._lock:
+            changed = new_nodes != self._nodes or new_overrides != self._overrides
+            self._nodes = new_nodes
             self._overrides = new_overrides
-            self._version = version
-
-    def check_version(self) -> bool:
-        """Poll the rebalancer version and refresh if it changed.
-
-        Returns True if a refresh was triggered.
-        """
-        setting = self._storage.get_system_setting("rebalancer_version", node_id="")
-        if setting is not None:
-            try:
-                version = int(json.loads(setting.get("value", "0")))
-            except (json.JSONDecodeError, TypeError, ValueError):
-                version = 0
-        else:
-            version = 0
-
-        if version != self._version:
-            self.refresh_cache()
-            self._version = version
-            return True
-        return False
+            self._refresh_counter += 1
+        return changed
 
     # ------------------------------------------------------------------
     # Routing
@@ -155,21 +156,21 @@ class ConsoleRouter:
 
         Priority:
         1. Per-workstream override (pinned to a specific node)
-        2. Bucket assignment (first 4 hex chars -> array index)
+        2. Rendezvous (HRW) selection over the live-node list
+
+        Pure in-memory lookup — does not touch storage.  Cache freshness
+        is the collector's responsibility (see module docstring).
         """
-        ref = self._overrides.get(ws_id)
-        if ref is not None:
-            return ref
-        if len(ws_id) < 4:
-            raise NoAvailableNodeError(f"invalid ws_id: {ws_id!r}")
-        try:
-            bucket = int(ws_id[:4], 16)
-        except ValueError:
-            raise NoAvailableNodeError(f"invalid ws_id prefix: {ws_id[:4]!r}") from None
-        ref = self._cache[bucket]
-        if ref is None:
-            raise NoAvailableNodeError(f"bucket {bucket} not assigned")
-        return ref
+        with self._lock:
+            ref = self._overrides.get(ws_id)
+            if ref is not None:
+                return ref
+            nodes = self._nodes  # snapshot — list is replaced wholesale on refresh
+        if not nodes:
+            raise NoAvailableNodeError("no live nodes")
+        if not ws_id:
+            raise NoAvailableNodeError("invalid ws_id: empty")
+        return select(ws_id, nodes)
 
     def route_url(self, ws_id: str) -> str:
         """Convenience — return just the URL for the target node."""
@@ -180,29 +181,50 @@ class ConsoleRouter:
     # ------------------------------------------------------------------
 
     def is_ready(self) -> bool:
-        """Return True if at least one bucket is assigned."""
-        return any(ref is not None for ref in self._cache)
+        """True if the router knows about at least one live node."""
+        with self._lock:
+            return bool(self._nodes)
+
+    def node_count(self) -> int:
+        """Number of distinct live nodes in the current view."""
+        with self._lock:
+            return len(self._nodes)
 
     @property
     def version(self) -> int:
-        """The last seen rebalancer version."""
-        return self._version
+        """Monotonic counter bumped on every successful cache refresh.
 
-    def node_count(self) -> int:
-        """Count distinct nodes present in the cache."""
-        return len({ref.node_id for ref in self._cache if ref is not None})
+        Surfaced by the collector's ``set_ring_info`` gauge so a
+        dashboard can detect when membership stops being refreshed.
+        Strictly increasing across the process lifetime.
+        """
+        with self._lock:
+            return self._refresh_counter
 
     # ------------------------------------------------------------------
     # Workstream ID generation
     # ------------------------------------------------------------------
 
     def generate_ws_id_for_node(self, node_id: str) -> str:
-        """Generate a routable workstream ID targeting *node_id*.
+        """Generate a 32-hex-char ws_id where rendezvous selects *node_id*.
 
-        The first 4 hex chars encode a bucket owned by the node; the
-        remaining 28 hex chars are random (32 chars total).
+        Brute-force loop: pick a random candidate, check whether HRW
+        picks the target.  Expected attempts ≈ ``W/w_t`` where ``W`` is
+        total cluster weight and ``w_t`` is the target's weight.  Cap
+        at ``_GENERATE_ATTEMPT_CAP`` to bound worst case for skewed
+        configurations.
         """
-        for bucket, ref in enumerate(self._cache):
-            if ref is not None and ref.node_id == node_id:
-                return f"{bucket:04x}" + secrets.token_hex(14)
-        raise NoAvailableNodeError(f"no bucket assigned to node {node_id!r}")
+        with self._lock:
+            nodes = list(self._nodes)
+        if not nodes:
+            raise NoAvailableNodeError(f"no live node {node_id!r}")
+        if not any(n.node_id == node_id for n in nodes):
+            raise NoAvailableNodeError(f"no live node {node_id!r}")
+
+        for _ in range(_GENERATE_ATTEMPT_CAP):
+            candidate = secrets.token_hex(16)
+            if select(candidate, nodes).node_id == node_id:
+                return candidate
+        raise NoAvailableNodeError(
+            f"could not generate ws_id targeting {node_id!r} after {_GENERATE_ATTEMPT_CAP} attempts"
+        )

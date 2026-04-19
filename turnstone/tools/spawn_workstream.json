@@ -1,6 +1,6 @@
 {
   "name": "spawn_workstream",
-  "description": "Create a new child workstream and optionally dispatch an initial message. Use this to kick off a focused sub-task on a separate workstream (different skill, model, or node) while your coordinator remains in charge of orchestration. The child runs independently; use send_to_workstream / inspect_workstream / close_workstream to drive and observe it. The returned `node_id` is a POINT-IN-TIME snapshot of the binding at spawn — the cluster rebalancer can migrate a workstream to a different node later, so don't cache the value for long-running callbacks; re-read with inspect_workstream when you need the current binding.",
+  "description": "Create a new child workstream and optionally dispatch an initial message. Use this to kick off a focused sub-task on a separate workstream (different skill, model, or node) while your coordinator remains in charge of orchestration. The child runs independently; use send_to_workstream / inspect_workstream / close_workstream to drive and observe it. The returned `node_id` is the routing target chosen at spawn time and stays canonical for this workstream's lifetime; re-read with inspect_workstream if you want the live state.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -22,7 +22,7 @@
       },
       "target_node": {
         "type": "string",
-        "description": "Optional node_id hint. When provided, the routing proxy pins the workstream to that node via generate_ws_id_for_node. Otherwise the hash ring picks. CAVEAT: pinning is a hard constraint — if the named node has dropped out of the 120s service-registry heartbeat window between your `list_nodes` call and this spawn, the spawn fails with \"No available node for routing\" rather than falling back. Omit `target_node` if you can tolerate landing on any node; pin only when the workload truly requires that specific node's capabilities/region/tenancy."
+        "description": "Optional node_id hint. When provided, the routing proxy pins the workstream to that node by generating a ws_id that rendezvous-hashes onto it. Otherwise rendezvous picks deterministically from the live-node set. CAVEAT: pinning is a hard constraint — if the named node has dropped out of the 120s service-registry heartbeat window between your `list_nodes` call and this spawn, the spawn fails with \"No available node for routing\" rather than falling back. Omit `target_node` if you can tolerate landing on any node; pin only when the workload truly requires that specific node's capabilities/region/tenancy."
       }
     },
     "required": []

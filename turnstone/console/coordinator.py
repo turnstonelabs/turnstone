@@ -57,7 +57,7 @@ class CoordinatorManager:
 
     # Pseudo-node id persisted on coordinator rows so ``workstreams.node_id``
     # stays non-NULL and list / audit surfaces can distinguish coordinators
-    # from real-node workstreams.  The hash-ring router treats it as an
+    # from real-node workstreams.  Routed through the router as an
     # unroutable sentinel — coordinators never land on real nodes.
     # Bound from ``ClusterCollector.CONSOLE_PSEUDO_NODE_ID`` so the two
     # literals can't drift (the collector's eviction + query filters

@@ -1,35 +1,27 @@
 # Consistent Hash Ring — Reference Design
 
-**Status**: Reference (not currently in the hot path)
-**Date**: 2026-03-30
+**Status**: Reference — alternative routing strategy
 
-## Overview
+Live routing uses **rendezvous (HRW) hashing** in
+`turnstone/core/rendezvous.py` and `turnstone/console/router.py`.  This
+document captures a vnode-ring approach as a reference for future
+evaluation if the cluster outgrows rendezvous's O(N)-per-route
+characteristic.
 
-This document describes a consistent hash ring algorithm evaluated during
-the design of the direct HTTP transport routing system. The current
-implementation uses weight-proportional bucket assignment with a
-donor/recipient rebalancing algorithm (see the routing section of
-[../architecture.md](../architecture.md)).
-The consistent hash ring is documented here as a reference for future
-scalability work — if the cluster grows beyond the point where the
-weight-proportional approach is sufficient, the ring provides a
-proven alternative with stronger stability guarantees.
+The FNV-1a-32 hash function specified below is bit-identical to the
+hash used by the live rendezvous implementation; cross-language clients
+can rely on these test vectors.
 
-## When to consider the ring approach
+## When the ring approach becomes interesting
 
-The current weight-proportional seeding + donor/recipient rebalancer works
-well when:
-- Cluster size is moderate (< 50 nodes)
-- Nodes join/leave infrequently
-- The rebalancer runs centrally (in the console)
+The vnode ring becomes preferable to rendezvous hashing when:
 
-The consistent hash ring becomes advantageous when:
-- Cluster size grows large (50+ nodes) and frequent membership changes
-  cause the donor/recipient algorithm to churn
-- Decentralized routing is needed (each node computes the ring locally,
-  no central console required)
-- Cross-language determinism is important (multiple implementations must
-  agree on the same assignment without sharing state)
+- Cluster size grows large (50+ nodes) and the per-route O(N) hash
+  computation becomes visible against downstream HTTP cost.
+- Decentralised routing is needed (each node computes the ring locally,
+  no central console required).
+- A precomputed flat-array lookup is desired so the routing hot path
+  avoids hashing entirely.
 
 ## Algorithm
 
@@ -134,16 +126,17 @@ class HashRing:
         # Precompute all 65536 bucket assignments
 ```
 
-## Comparison with current approach
+## Comparison with rendezvous (HRW) hashing
 
-| Aspect | Weight-proportional (current) | Consistent hash ring |
-|--------|------------------------------|---------------------|
-| Seeding | Exact weight split, deterministic | Hash-based, ~3% variance |
-| Node addition | Donor/recipient moves only excess | Ring moves ~1/N buckets |
-| Node removal | Dead buckets → most underloaded | Ring redistributes to clockwise neighbors |
-| Cross-node churn | Zero (only donor→recipient) | Zero (ring stability guarantee) |
-| Decentralized | No (needs central rebalancer) | Yes (each node computes locally) |
-| Complexity | Simple weight arithmetic | Virtual node construction + bisect |
+| Aspect | Rendezvous (live) | Consistent hash ring (this doc) |
+|--------|-------------------|---------------------------------|
+| Per-route cost | O(N) hash computes | O(log V) bisect against precomputed array |
+| Seeding | None — pure function | Build vnode array on every membership change |
+| Node addition | Pure function moves ~1/N keys | Ring moves ~1/N buckets |
+| Node removal | Surviving nodes' keys unchanged | Surviving nodes' buckets unchanged |
+| Decentralised | Yes — pure function over services | Yes — each node computes locally |
+| Persistent state | None | None on the hot path; precomputed array in memory |
+| Complexity | ~20 LOC | Virtual-node construction + bisect |
 
 ## Test vectors
 

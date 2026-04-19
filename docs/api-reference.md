@@ -2121,15 +2121,15 @@ turnstone_tool_calls_total{tool="read_file"} 3
 ## Console Routing Proxy Endpoints
 
 These endpoints are served by the console (`turnstone-console`) and proxy
-requests to the correct server node via the hash ring bucket cache. In
-multi-node deployments, clients (SDK, channel gateway) talk to the console
-instead of individual server nodes.
+requests to the correct server node via rendezvous (HRW) hashing over the
+live service registry. In multi-node deployments, clients (SDK, channel
+gateway) talk to the console instead of individual server nodes.
 
 ### `POST /v1/api/route/workstreams/new`
 
-Create a workstream via hash-ring routing. The console generates the `ws_id`,
-routes to the assigned node, and includes `node_url` in the response for
-direct SSE connections.
+Create a workstream via rendezvous routing. The console generates the `ws_id`,
+routes to the rendezvous-selected node, and includes `node_url` in the
+response for direct SSE connections.
 
 ### `POST /v1/api/route/send`
 
@@ -2164,5 +2164,4 @@ Used by channel adapters to open direct SSE connections to the correct server no
 
 Prometheus metrics for the console routing layer. Includes:
 `turnstone_router_requests_total`, `turnstone_router_request_duration_seconds`,
-`turnstone_ring_membership_size`, `turnstone_ring_version`,
-`turnstone_ring_rebalance_total`, `turnstone_ring_migrations_total`.
+`turnstone_router_membership_size`, `turnstone_router_refresh_total`.

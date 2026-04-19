@@ -787,39 +787,7 @@ class StorageBackend(Protocol):
         """Return node_ids where ALL key=value filters match (exact match)."""
         ...
 
-    # -- Hash ring routing ---
-
-    def list_ring_buckets(self) -> list[dict[str, Any]]:
-        """Return all rows from hash_ring_buckets. Empty if not seeded."""
-        ...
-
-    def seed_ring_buckets(self, assignments: list[tuple[int, str]]) -> None:
-        """Insert (bucket, node_id) rows. Idempotent (ON CONFLICT DO NOTHING)."""
-        ...
-
-    def assign_buckets(self, buckets: list[int], node_id: str) -> int:
-        """Reassign buckets to a node. Returns rows updated."""
-        ...
-
-    def increment_bucket_count(self, bucket: int, active: bool = False) -> None:
-        """Increment ws_count (and active_count if active) in bucket_stats. Upserts."""
-        ...
-
-    def decrement_bucket_count(self, bucket: int, active: bool = False) -> None:
-        """Decrement ws_count (and active_count if active). Clamps at zero."""
-        ...
-
-    def adjust_bucket_active(self, bucket: int, delta: int) -> None:
-        """Adjust active_count only (not ws_count). For state transitions."""
-        ...
-
-    def list_bucket_stats(self) -> list[dict[str, Any]]:
-        """Return all bucket_stats rows with ws_count > 0."""
-        ...
-
-    def set_bucket_stat(self, bucket: int, ws_count: int, active_count: int) -> None:
-        """Set bucket_stats to exact values. Upserts the row."""
-        ...
+    # -- Routing overrides ---
 
     def set_workstream_override(self, ws_id: str, node_id: str, reason: str = "targeted") -> None:
         """Pin a workstream to a specific node. Upserts."""
@@ -831,10 +799,6 @@ class StorageBackend(Protocol):
 
     def list_workstream_overrides(self) -> list[dict[str, str]]:
         """Return all overrides."""
-        ...
-
-    def list_workstream_routing_data(self) -> list[tuple[str, str]]:
-        """Return (ws_id, state) for all non-override workstreams."""
         ...
 
     # -- Roles (RBAC) ----------------------------------------------------------

@@ -146,7 +146,7 @@ export class TurnstoneConsole extends BaseClient {
   // -- Routing proxy --------------------------------------------------------
 
   /**
-   * Create a workstream via the console hash-ring router.
+   * Create a workstream via the console rendezvous router.
    *
    * When `attachments` is non-empty the request is sent as
    * multipart/form-data and the console routes via `?ws_id=<hex>`

@@ -90,7 +90,7 @@ Built-in tools for shell, files, search, web, memory, notifications, and autonom
 
 **Single-node**: Client → Server (direct HTTP + SSE). No external dependencies beyond the database.
 
-**Multi-node**: Client → Console (hash ring routing proxy) → Server nodes. The console maintains a 65536-entry bucket cache for O(1) workstream routing. A rebalancer daemon redistributes buckets when nodes join or leave.
+**Multi-node**: Client → Console (rendezvous routing proxy) → Server nodes. The console picks the target node for each workstream via rendezvous (HRW) hashing over the live service registry — pure function of `(ws_id, live_nodes)`, no stored bucket state, deterministic across readers. A node join or drop only re-routes the keys that score highest on the affected node.
 
 | Component | Purpose |
 |-----------|---------|

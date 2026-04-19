@@ -16,11 +16,9 @@ from turnstone.core.log import get_logger
 from turnstone.core.storage._schema import (
     api_tokens,
     audit_events,
-    bucket_stats,
     channel_routes,
     channel_users,
     conversations,
-    hash_ring_buckets,
     heuristic_rules,
     intent_verdicts,
     mcp_servers,
@@ -1851,122 +1849,7 @@ class PostgreSQLBackend:
             rows = conn.execute(stmt).fetchall()
             return {r[0] for r in rows}
 
-    # -- Hash ring routing -----------------------------------------------------
-
-    def list_ring_buckets(self) -> list[dict[str, Any]]:
-        with self._conn() as conn:
-            rows = conn.execute(
-                sa.select(hash_ring_buckets).order_by(hash_ring_buckets.c.bucket)
-            ).fetchall()
-            return [dict(r._mapping) for r in rows]
-
-    def seed_ring_buckets(self, assignments: list[tuple[int, str]]) -> None:
-        from sqlalchemy.dialects.postgresql import insert as pg_insert
-
-        chunk_size = 16_000  # 2 params/row × 16k = 32k, within psycopg 65 535 limit
-        with self._conn() as conn:
-            for i in range(0, len(assignments), chunk_size):
-                chunk = assignments[i : i + chunk_size]
-                stmt = pg_insert(hash_ring_buckets).values(
-                    [{"bucket": b, "node_id": n} for b, n in chunk]
-                )
-                stmt = stmt.on_conflict_do_nothing(index_elements=[hash_ring_buckets.c.bucket])
-                conn.execute(stmt)
-            conn.commit()
-
-    def assign_buckets(self, buckets: list[int], node_id: str) -> int:
-        if not buckets:
-            return 0
-        # De-duplicate so rowcount stays accurate across chunks.
-        buckets = list(dict.fromkeys(buckets))
-        # psycopg limits query parameters to 65 535; chunk to stay well under.
-        chunk_size = 10_000
-        total = 0
-        with self._conn() as conn:
-            for i in range(0, len(buckets), chunk_size):
-                chunk = buckets[i : i + chunk_size]
-                result = conn.execute(
-                    sa.update(hash_ring_buckets)
-                    .where(hash_ring_buckets.c.bucket.in_(chunk))
-                    .values(node_id=node_id)
-                )
-                total += result.rowcount
-            conn.commit()
-            return total
-
-    def increment_bucket_count(self, bucket: int, active: bool = False) -> None:
-        from sqlalchemy.dialects.postgresql import insert as pg_insert
-
-        with self._conn() as conn:
-            stmt = pg_insert(bucket_stats).values(
-                bucket=bucket,
-                ws_count=1,
-                active_count=1 if active else 0,
-            )
-            set_: dict[str, Any] = {"ws_count": bucket_stats.c.ws_count + 1}
-            if active:
-                set_["active_count"] = bucket_stats.c.active_count + 1
-            stmt = stmt.on_conflict_do_update(index_elements=[bucket_stats.c.bucket], set_=set_)
-            conn.execute(stmt)
-            conn.commit()
-
-    def decrement_bucket_count(self, bucket: int, active: bool = False) -> None:
-        vals: dict[str, Any] = {
-            "ws_count": sa.case(
-                (bucket_stats.c.ws_count > 0, bucket_stats.c.ws_count - 1),
-                else_=0,
-            )
-        }
-        if active:
-            vals["active_count"] = sa.case(
-                (bucket_stats.c.active_count > 0, bucket_stats.c.active_count - 1),
-                else_=0,
-            )
-        with self._conn() as conn:
-            conn.execute(
-                sa.update(bucket_stats).where(bucket_stats.c.bucket == bucket).values(**vals)
-            )
-            conn.commit()
-
-    def adjust_bucket_active(self, bucket: int, delta: int) -> None:
-        with self._conn() as conn:
-            conn.execute(
-                sa.update(bucket_stats)
-                .where(bucket_stats.c.bucket == bucket)
-                .values(
-                    active_count=sa.case(
-                        (
-                            bucket_stats.c.active_count + sa.literal(delta) >= 0,
-                            bucket_stats.c.active_count + sa.literal(delta),
-                        ),
-                        else_=0,
-                    )
-                )
-            )
-            conn.commit()
-
-    def list_bucket_stats(self) -> list[dict[str, Any]]:
-        with self._conn() as conn:
-            rows = conn.execute(
-                sa.select(bucket_stats)
-                .where(bucket_stats.c.ws_count > 0)
-                .order_by(bucket_stats.c.bucket)
-            ).fetchall()
-            return [dict(r._mapping) for r in rows]
-
-    def set_bucket_stat(self, bucket: int, ws_count: int, active_count: int) -> None:
-        from sqlalchemy.dialects.postgresql import insert as pg_insert
-
-        stmt = pg_insert(bucket_stats).values(
-            bucket=bucket, ws_count=ws_count, active_count=active_count
-        )
-        stmt = stmt.on_conflict_do_update(
-            index_elements=[bucket_stats.c.bucket],
-            set_={"ws_count": ws_count, "active_count": active_count},
-        )
-        with self._conn() as conn:
-            conn.execute(stmt)
-            conn.commit()
+    # -- Routing overrides -----------------------------------------------------
 
     def set_workstream_override(self, ws_id: str, node_id: str, reason: str = "targeted") -> None:
         from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -1997,16 +1880,6 @@ class PostgreSQLBackend:
                 sa.select(workstream_overrides).order_by(workstream_overrides.c.ws_id)
             ).fetchall()
             return [dict(r._mapping) for r in rows]
-
-    def list_workstream_routing_data(self) -> list[tuple[str, str]]:
-        with self._conn() as conn:
-            rows = conn.execute(
-                sa.text(
-                    "SELECT w.ws_id, w.state FROM workstreams w "
-                    "WHERE w.ws_id NOT IN (SELECT ws_id FROM workstream_overrides)"
-                )
-            ).fetchall()
-            return [(r[0], r[1]) for r in rows]
 
     # -- Roles -----------------------------------------------------------------
 

@@ -11,7 +11,7 @@ from starlette.testclient import TestClient
 
 from turnstone.console.collector import ClusterCollector
 from turnstone.console.router import ConsoleRouter, NodeRef
-from turnstone.core.hash_ring import NoAvailableNodeError
+from turnstone.core.rendezvous import NoAvailableNodeError
 
 # Shared test auth — JWT-based
 _TEST_JWT_SECRET = "test-jwt-secret-minimum-32-chars!"
@@ -102,7 +102,7 @@ def _wire_proxy(app: Any, mock_post: MagicMock | None = None) -> None:
 
 
 class TestRouteCreate:
-    """POST /v1/api/route/workstreams/new — create via hash-ring routing."""
+    """POST /v1/api/route/workstreams/new — create via rendezvous routing."""
 
     @pytest.fixture()
     def client(self):
@@ -178,17 +178,17 @@ class TestRouteCreate:
         router.generate_ws_id_for_node.assert_called_with("node-c")
         client.close()
 
-    def test_route_create_routing_strategy_hash_ring(self, client):
+    def test_route_create_routing_strategy_rendezvous(self, client):
         """Default fan-out (no resume_ws / no target_node) reports
-        routing_strategy='hash_ring' so the coordinator's spawn tool can
-        explain why the node was chosen."""
+        routing_strategy='rendezvous' so the coordinator's spawn tool
+        can explain why the node was chosen."""
         resp = client.post(
             "/v1/api/route/workstreams/new",
             json={"name": "test-ws"},
             headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 200
-        assert resp.json()["routing_strategy"] == "hash_ring"
+        assert resp.json()["routing_strategy"] == "rendezvous"
 
     def test_route_create_routing_strategy_target_node(self):
         router = _make_mock_router()

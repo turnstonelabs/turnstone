@@ -8,10 +8,10 @@ from collections import defaultdict
 
 
 class ConsoleMetrics:
-    """Collects console routing and ring metrics in Prometheus text exposition format.
+    """Collects console routing and membership metrics in Prometheus text exposition format.
 
-    Lighter-weight than the server's MetricsCollector — tracks only router
-    request counters, ring membership gauges, and rebalancer activity.
+    Lighter-weight than the server's MetricsCollector — tracks router
+    request counters and live-membership gauges.
     """
 
     def __init__(self) -> None:
@@ -19,10 +19,8 @@ class ConsoleMetrics:
         self._router_requests: dict[tuple[str, str], int] = defaultdict(int)
         self._router_duration_sum: dict[str, float] = defaultdict(float)
         self._router_duration_count: dict[str, int] = defaultdict(int)
-        self._ring_membership: int = 0
-        self._ring_version: int = 0
-        self._rebalance_total: dict[str, int] = defaultdict(int)
-        self._migrations_total: int = 0
+        self._router_membership: int = 0
+        self._router_refresh_count: int = 0
         self._start_time: float = time.monotonic()
 
     def record_route(self, method: str, status: int, duration: float) -> None:
@@ -33,21 +31,11 @@ class ConsoleMetrics:
             self._router_duration_sum[method] += duration
             self._router_duration_count[method] += 1
 
-    def set_ring_info(self, membership: int, version: int) -> None:
-        """Update the current ring membership size and version."""
+    def set_router_info(self, membership: int, refresh_count: int) -> None:
+        """Update current live-node count + the router's refresh counter."""
         with self._lock:
-            self._ring_membership = membership
-            self._ring_version = version
-
-    def record_rebalance(self, result: str) -> None:
-        """Record a rebalance pass outcome (noop/seeded/rebalanced)."""
-        with self._lock:
-            self._rebalance_total[result] += 1
-
-    def record_migrations(self, count: int) -> None:
-        """Record eager migration count from a rebalance pass."""
-        with self._lock:
-            self._migrations_total += count
+            self._router_membership = membership
+            self._router_refresh_count = refresh_count
 
     def generate_text(self) -> str:
         """Return Prometheus text exposition format (v0.0.4)."""
@@ -57,10 +45,8 @@ class ConsoleMetrics:
             router_requests = dict(self._router_requests)
             duration_sum = dict(self._router_duration_sum)
             duration_count = dict(self._router_duration_count)
-            ring_membership = self._ring_membership
-            ring_version = self._ring_version
-            rebalance_total = dict(self._rebalance_total)
-            migrations_total = self._migrations_total
+            router_membership = self._router_membership
+            router_refresh_count = self._router_refresh_count
 
         # turnstone_router_requests_total
         lines.append("# HELP turnstone_router_requests_total Console-routed requests")
@@ -85,26 +71,17 @@ class ConsoleMetrics:
                 f" {duration_count[method]}"
             )
 
-        # turnstone_ring_membership_size
-        lines.append("# HELP turnstone_ring_membership_size Current ring node count")
-        lines.append("# TYPE turnstone_ring_membership_size gauge")
-        lines.append(f"turnstone_ring_membership_size {ring_membership}")
+        # turnstone_router_membership_size
+        lines.append("# HELP turnstone_router_membership_size Current live-node count")
+        lines.append("# TYPE turnstone_router_membership_size gauge")
+        lines.append(f"turnstone_router_membership_size {router_membership}")
 
-        # turnstone_ring_version
-        lines.append("# HELP turnstone_ring_version Current ring version")
-        lines.append("# TYPE turnstone_ring_version gauge")
-        lines.append(f"turnstone_ring_version {ring_version}")
-
-        # turnstone_ring_rebalance_total
-        lines.append("# HELP turnstone_ring_rebalance_total Rebalancer runs by result")
-        lines.append("# TYPE turnstone_ring_rebalance_total counter")
-        for result, count in sorted(rebalance_total.items()):
-            lines.append(f'turnstone_ring_rebalance_total{{result="{result}"}} {count}')
-
-        # turnstone_ring_migrations_total
-        lines.append("# HELP turnstone_ring_migrations_total Workstream migrations from rebalancer")
-        lines.append("# TYPE turnstone_ring_migrations_total counter")
-        lines.append(f"turnstone_ring_migrations_total {migrations_total}")
+        # turnstone_router_refresh_total — bumped on every successful
+        # cache refresh.  A flat counter under churn means the
+        # collector's discovery loop is stuck.
+        lines.append("# HELP turnstone_router_refresh_total Router cache refresh counter")
+        lines.append("# TYPE turnstone_router_refresh_total counter")
+        lines.append(f"turnstone_router_refresh_total {router_refresh_count}")
 
         lines.append("")  # trailing newline
         return "\n".join(lines)

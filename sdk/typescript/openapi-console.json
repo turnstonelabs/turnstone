@@ -4286,7 +4286,7 @@
     },
     "/v1/api/route/workstreams/new": {
       "post": {
-        "summary": "Create workstream via hash-ring routing proxy",
+        "summary": "Create workstream via rendezvous routing proxy",
         "operationId": "v1_api_route_workstreams_new_post",
         "tags": [
           "Routing"

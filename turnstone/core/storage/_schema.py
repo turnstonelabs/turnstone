@@ -262,25 +262,8 @@ node_metadata = sa.Table(
 sa.Index("idx_node_metadata_key", node_metadata.c.key)
 
 # ---------------------------------------------------------------------------
-# Hash ring routing tables
+# Routing — per-workstream pinning overrides
 # ---------------------------------------------------------------------------
-
-hash_ring_buckets = sa.Table(
-    "hash_ring_buckets",
-    metadata,
-    sa.Column("bucket", sa.Integer, primary_key=True),
-    sa.Column("node_id", sa.Text, nullable=False),
-)
-
-sa.Index("idx_ring_buckets_node", hash_ring_buckets.c.node_id)
-
-bucket_stats = sa.Table(
-    "bucket_stats",
-    metadata,
-    sa.Column("bucket", sa.Integer, primary_key=True),
-    sa.Column("ws_count", sa.Integer, nullable=False, server_default="0"),
-    sa.Column("active_count", sa.Integer, nullable=False, server_default="0"),
-)
 
 workstream_overrides = sa.Table(
     "workstream_overrides",

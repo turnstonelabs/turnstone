@@ -55,7 +55,7 @@ from turnstone.core.auth import (
     jwt_version_slot,
     require_permission,
 )
-from turnstone.core.hash_ring import NoAvailableNodeError
+from turnstone.core.rendezvous import NoAvailableNodeError
 from turnstone.core.skill_kind import SkillKind
 from turnstone.core.web_helpers import (
     read_json_or_400,
@@ -1371,7 +1371,7 @@ async def create_workstream(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
-# Route handlers — workstream routing proxy (hash-ring)
+# Route handlers — workstream routing proxy (rendezvous)
 # ---------------------------------------------------------------------------
 
 
@@ -1386,7 +1386,7 @@ def _record_route(
 
 
 async def route_create(request: Request) -> Response:
-    """POST /v1/api/route/workstreams/new — create via hash-ring routing.
+    """POST /v1/api/route/workstreams/new — create via rendezvous routing.
 
     Accepts both `application/json` and `multipart/form-data`. Multipart
     callers must include ``?ws_id=<hex>`` in the URL query string so the
@@ -1397,9 +1397,9 @@ async def route_create(request: Request) -> Response:
     router: ConsoleRouter | None = request.app.state.router
     ring_ready = router is not None and router.is_ready()
     if not ring_ready:
-        # Ring not yet populated (rebalancer hasn't run or is disabled).
-        # Try a one-shot refresh before giving up — the rebalancer may
-        # have written buckets since the last collector poll.
+        # Router cache empty — the collector hasn't published a
+        # services list yet.  One-shot refresh off the event loop
+        # before giving up.
         if router is not None:
             await asyncio.to_thread(router.refresh_cache)
             ring_ready = router.is_ready()
@@ -1426,7 +1426,7 @@ async def route_create(request: Request) -> Response:
     # Routing strategy is surfaced on the response so callers (the
     # coordinator's spawn_workstream tool especially) can explain why a
     # given node was chosen.  Set on every branch below.
-    routing_strategy = "hash_ring"
+    routing_strategy = "rendezvous"
 
     if is_multipart:
         # Multipart: caller must pass ws_id as a query param so we can
@@ -1501,7 +1501,9 @@ async def route_create(request: Request) -> Response:
                 ref = router.route(body["resume_ws"])
                 routing_strategy = "resume"
             elif body.get("target_node"):
-                ws_id = router.generate_ws_id_for_node(body["target_node"])
+                # Brute-force HRW search can take up to _GENERATE_ATTEMPT_CAP
+                # iterations for skewed weights; off the event loop.
+                ws_id = await asyncio.to_thread(router.generate_ws_id_for_node, body["target_node"])
                 body["ws_id"] = ws_id
                 ref = router.route(ws_id)
                 pin = True
@@ -1595,12 +1597,12 @@ async def route_create(request: Request) -> Response:
             audit_ws_id = body.get("ws_id") or body.get("resume_ws", "") or ""
         # Return the storage-authoritative node_id so subsequent
         # inspect / list calls agree on the binding.  ``ref.node_id`` is
-        # the hash-ring target AT SPAWN TIME — stale once the
-        # rebalancer runs or a node comes/goes, and the node's own
-        # create handler is the source of truth for what node_id got
-        # persisted on the workstream row.  Fall back to ref.node_id
-        # only when the storage lookup fails, matching the previous
-        # behaviour so this change is strictly additive.
+        # the rendezvous target AT SPAWN TIME — stale once membership
+        # changes — and the node's own create handler is the source of
+        # truth for what node_id got persisted on the workstream row.
+        # Fall back to ref.node_id only when the storage lookup fails,
+        # matching the previous behaviour so this change is strictly
+        # additive.
         bound_node_id = ref.node_id
         storage = getattr(request.app.state, "auth_storage", None)
         if storage is not None and audit_ws_id:
@@ -1633,7 +1635,7 @@ async def route_create(request: Request) -> Response:
 
 
 async def route_attachment_proxy(request: Request) -> Response:
-    """Proxy ws-id-keyed attachment endpoints through the hash-ring router.
+    """Proxy ws-id-keyed attachment endpoints through the router.
 
     Handles all four shapes mounted under
     ``/v1/api/route/workstreams/{ws_id}/attachments[/...]``:
@@ -1846,19 +1848,16 @@ async def route_proxy(request: Request) -> Response:
 
     # Transparent retry on 404 (at most once):
     #
-    # The bucket-routed node doesn't have the workstream.  Refresh the
-    # cache (reloads overrides + bucket assignments from DB) and re-route.
-    # If the route changed (e.g., a local-create override was added since
-    # the last cache load), retry on the new node.  If the route is the
-    # same, return the 404 as-is — no loop, no scan.
+    # The rendezvous-selected node doesn't have the workstream.  Refresh
+    # membership + overrides and re-route.  If the route changed (e.g., a
+    # local-create override was added since the last cache load, or a
+    # node has joined / dropped), retry on the new node.  If the route
+    # is the same, return the 404 as-is — no loop, no scan.
     if resp.status_code == 404:
-        # Blocking refresh — wait for any in-progress refresh to finish
-        # so the retry uses the latest data, not stale cache.
-        router._refresh_lock.acquire()
-        try:
-            router._refresh_cache_locked()
-        finally:
-            router._refresh_lock.release()
+        # Off the event loop — force_refresh takes a blocking lock and
+        # issues two storage queries.  Coalesces internally so a 404
+        # stampede after a node churn doesn't N×-multiply DB reads.
+        await asyncio.to_thread(router.force_refresh)
         try:
             new_ref = router.route(ws_id)
         except (NoAvailableNodeError, ValueError):
@@ -3764,7 +3763,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     audit_exec = ThreadPoolExecutor(max_workers=4, thread_name_prefix="coord-audit")
     app.state.audit_executor = audit_exec
     _set_audit_executor(audit_exec)
-    # Populate hash-ring routing cache if a router is configured
+    # Populate the router's services cache if a router is configured
     _router: ConsoleRouter | None = getattr(app.state, "router", None)
     if _router is not None:
         _router.refresh_cache()
@@ -3779,10 +3778,6 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     scheduler = getattr(app.state, "scheduler", None)
     if scheduler is not None:
         scheduler.start()
-    # Start rebalancer if configured
-    _rebalancer = getattr(app.state, "rebalancer", None)
-    if _rebalancer is not None:
-        _rebalancer.start()
     # OIDC discovery (if configured)
     oidc_config = app.state.oidc_config
     if oidc_config.enabled:
@@ -3982,9 +3977,6 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         await tls_mgr.stop_renewal()
     if scheduler is not None:
         scheduler.stop()
-    _rebalancer = getattr(app.state, "rebalancer", None)
-    if _rebalancer is not None:
-        _rebalancer.stop()
     coord_mgr_shutdown = getattr(app.state, "coord_mgr", None)
     if coord_mgr_shutdown is not None:
         try:
@@ -9912,35 +9904,6 @@ async def admin_delete_node_metadata_key(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
-async def admin_ring_status(request: Request) -> JSONResponse:
-    """GET /v1/api/admin/ring/status — hash ring rebalancer status."""
-    from turnstone.core.auth import require_permission
-
-    err = require_permission(request, "admin.settings")
-    if err:
-        return err
-    rebalancer = getattr(request.app.state, "rebalancer", None)
-    if rebalancer is None:
-        return JSONResponse({"enabled": False})
-    return JSONResponse({"enabled": True, **rebalancer.get_status()})
-
-
-async def admin_ring_rebalance(request: Request) -> JSONResponse:
-    """POST /v1/api/admin/ring/rebalance — trigger an immediate rebalance."""
-    from turnstone.core.auth import require_permission
-
-    err = require_permission(request, "admin.settings")
-    if err:
-        return err
-    rebalancer = getattr(request.app.state, "rebalancer", None)
-    if rebalancer is None:
-        return JSONResponse(
-            {"status": "error", "reason": "rebalancer not enabled"}, status_code=503
-        )
-    rebalancer.trigger()
-    return JSONResponse({"status": "ok"})
-
-
 async def tls_ca_status(request: Request) -> JSONResponse:
     """GET /v1/api/admin/tls/ca — CA status."""
     from turnstone.core.auth import require_permission
@@ -10089,7 +10052,6 @@ def create_app(
     tls_manager: Any = None,
     console_url: str = "",
     router: ConsoleRouter | None = None,
-    rebalancer: Any = None,
     console_metrics: ConsoleMetrics | None = None,
 ) -> Starlette:
     """Build the Starlette ASGI application for the console dashboard."""
@@ -10112,7 +10074,7 @@ def create_app(
                     Route("/api/cluster/node/{node_id}", cluster_node_detail),
                     Route("/api/cluster/snapshot", cluster_snapshot),
                     Route("/api/cluster/events", cluster_events_sse),
-                    # Workstream routing (proxy to server nodes via hash ring)
+                    # Workstream routing (rendezvous proxy to server nodes)
                     Route("/api/route/workstreams/new", route_create, methods=["POST"]),
                     Route("/api/route/send", route_proxy, methods=["POST"]),
                     Route("/api/route/approve", route_proxy, methods=["POST"]),
@@ -10564,13 +10526,6 @@ def create_app(
                         admin_set_node_metadata,
                         methods=["PUT"],
                     ),
-                    # Hash ring
-                    Route("/api/admin/ring/status", admin_ring_status),
-                    Route(
-                        "/api/admin/ring/rebalance",
-                        admin_ring_rebalance,
-                        methods=["POST"],
-                    ),
                     # TLS / ACME
                     Route("/api/admin/tls/ca", tls_ca_status),
                     Route("/api/admin/tls/ca.pem", tls_ca_cert),
@@ -10630,7 +10585,6 @@ def create_app(
     app.state.console_url = console_url
     app.state.tls_manager = tls_manager
     app.state.router = router
-    app.state.rebalancer = rebalancer
     app.state.console_metrics = console_metrics or ConsoleMetrics()
 
     # Mount ACME responder whenever a TLS manager is configured.
@@ -10861,32 +10815,6 @@ def main() -> None:
         except Exception:
             log.debug("Failed to sync TLS state to ConfigStore", exc_info=True)
 
-    # Rebalancer — create if enabled in ConfigStore
-    rebalancer = None
-    if auth_storage:
-        try:
-            from turnstone.core.config_store import ConfigStore
-
-            _rcs = ConfigStore(auth_storage)
-            if _rcs.get("rebalancer.enabled"):
-                from turnstone.console.rebalancer import Rebalancer
-
-                rebalancer = Rebalancer(
-                    storage=auth_storage,
-                    router=router,
-                    collector=collector,
-                    console_metrics=console_metrics,
-                    interval=_rcs.get("rebalancer.interval", 60),
-                    threshold=_rcs.get("rebalancer.threshold", 0.10),
-                    vnodes_per_unit=_rcs.get("ring.vnodes_per_unit", 150),
-                    eager_migrate=_rcs.get("rebalancer.eager_migrate", False),
-                    api_token="",
-                    token_manager=proxy_token_mgr,
-                )
-                log.info("rebalancer.configured")
-        except Exception:
-            log.warning("Failed to configure rebalancer", exc_info=True)
-
     app = create_app(
         collector=collector,
         jwt_secret=jwt_secret,
@@ -10896,7 +10824,6 @@ def main() -> None:
         tls_manager=tls_mgr,
         console_url=console_url,
         router=router,
-        rebalancer=rebalancer,
         console_metrics=console_metrics,
     )
 

@@ -612,75 +612,18 @@ def _build_registry() -> dict[str, SettingDef]:
             "directory) to get a publicly trusted certificate for the console's HTTPS endpoint. "
             "Leave empty to self-issue from the internal CA (use when behind a reverse proxy).",
         ),
-        # -- ring ---------------------------------------------------------------
-        SettingDef(
-            "ring.vnodes_per_unit",
-            "int",
-            150,
-            "Virtual nodes per unit weight on the hash ring",
-            "ring",
-            min_value=10,
-            max_value=1000,
-            help="Controls the granularity of the consistent hash ring. Higher values give a "
-            "more uniform distribution of buckets to nodes at the cost of slightly more memory. "
-            "Each physical node gets weight * vnodes_per_unit virtual positions on the ring.",
-        ),
-        # -- rebalancer ---------------------------------------------------------
-        SettingDef(
-            "rebalancer.enabled",
-            "bool",
-            True,
-            "Enable the hash ring rebalancer daemon",
-            "rebalancer",
-            help="When enabled, the console runs a background thread that monitors cluster "
-            "membership and automatically redistributes hash ring buckets when nodes join "
-            "or leave. Required for the channel gateway and multi-node routing.",
-        ),
-        SettingDef(
-            "rebalancer.interval",
-            "int",
-            60,
-            "Rebalancer check interval in seconds",
-            "rebalancer",
-            min_value=10,
-            max_value=3600,
-            help="How often the rebalancer wakes up to check whether bucket assignments "
-            "need updating. It also wakes immediately on membership changes.",
-        ),
-        SettingDef(
-            "rebalancer.threshold",
-            "float",
-            0.10,
-            "Imbalance threshold before rebalancing (0.0\u20131.0)",
-            "rebalancer",
-            min_value=0.01,
-            max_value=0.50,
-            help="Minimum deviation from the ideal distribution before buckets are moved. "
-            "A value of 0.10 means 10% deviation triggers rebalancing. Lower values keep "
-            "the cluster more balanced but cause more frequent bucket moves.",
-        ),
-        SettingDef(
-            "rebalancer.eager_migrate",
-            "bool",
-            False,
-            "Eagerly migrate active workstreams after rebalance",
-            "rebalancer",
-            help="When enabled, the rebalancer asks source nodes to evict workstreams whose "
-            "buckets have been reassigned. When disabled (default), workstreams migrate lazily "
-            "on the next request — the old copy is eventually evicted by idle timeout.",
-        ),
         # -- node ---------------------------------------------------------------
         SettingDef(
             "node.weight",
             "int",
             1,
-            "Node weight for hash ring distribution",
+            "Node weight for rendezvous routing",
             "node",
             min_value=1,
             max_value=100,
-            help="Relative capacity of this server node. A node with weight 2 receives "
-            "roughly twice as many bucket assignments (and therefore workstreams) as a "
-            "node with weight 1.",
+            help="Relative capacity of this server node. A node with weight 2 wins "
+            "roughly twice as many ws_id rendezvous selections (and therefore "
+            "receives twice as many workstreams) as a node with weight 1.",
         ),
         # -- coordinator --------------------------------------------------------
         SettingDef(

@@ -1,17 +1,13 @@
-"""Tests for turnstone.console.router."""
+"""Tests for turnstone.console.router (rendezvous routing)."""
 
 from __future__ import annotations
 
-from typing import Any
+import secrets
 
 import pytest
 
 from turnstone.console.router import ConsoleRouter, NodeRef
-from turnstone.core.hash_ring import RING_SIZE, NoAvailableNodeError
-
-# ---------------------------------------------------------------------------
-# Fake storage
-# ---------------------------------------------------------------------------
+from turnstone.core.rendezvous import NoAvailableNodeError
 
 
 class FakeStorage:
@@ -19,26 +15,14 @@ class FakeStorage:
 
     def __init__(self) -> None:
         self.services: list[dict[str, str]] = []
-        self.buckets: list[dict[str, Any]] = []
         self.overrides: list[dict[str, str]] = []
-        self.settings: dict[str, dict[str, Any]] = {}
 
     def list_services(self, service_type: str, max_age_seconds: int = 120) -> list[dict[str, str]]:
         return list(self.services)
 
-    def list_ring_buckets(self) -> list[dict[str, Any]]:
-        return list(self.buckets)
-
     def list_workstream_overrides(self) -> list[dict[str, str]]:
         return list(self.overrides)
 
-    def get_system_setting(self, key: str, node_id: str = "") -> dict[str, Any] | None:
-        return self.settings.get(key)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 NODE_A = {"service_id": "node-a", "url": "http://a:8080", "metadata": "{}"}
 NODE_B = {"service_id": "node-b", "url": "http://b:8080", "metadata": "{}"}
@@ -50,260 +34,262 @@ def _make_router(storage: FakeStorage | None = None) -> tuple[ConsoleRouter, Fak
     return ConsoleRouter(s), s  # type: ignore[arg-type]
 
 
-def _ws_id_for_bucket(bucket: int) -> str:
-    """Build a 32-char hex ws_id whose first 4 chars encode *bucket*."""
-    return f"{bucket:04x}" + "0" * 28
-
-
-# ---------------------------------------------------------------------------
-# TestRouteBasic
-# ---------------------------------------------------------------------------
+def _random_ws_id() -> str:
+    return secrets.token_hex(16)
 
 
 class TestRouteBasic:
-    """Basic routing through the bucket cache."""
-
-    def test_route_returns_correct_node(self) -> None:
+    def test_route_returns_a_live_node(self) -> None:
         router, storage = _make_router()
         storage.services = [NODE_A, NODE_B, NODE_C]
-        storage.buckets = [
-            {"bucket": 0x0000, "node_id": "node-a"},
-            {"bucket": 0x0001, "node_id": "node-b"},
-            {"bucket": 0x0002, "node_id": "node-c"},
-        ]
         router.refresh_cache()
 
-        assert router.route(_ws_id_for_bucket(0x0000)) == NodeRef("node-a", "http://a:8080")
-        assert router.route(_ws_id_for_bucket(0x0001)) == NodeRef("node-b", "http://b:8080")
-        assert router.route(_ws_id_for_bucket(0x0002)) == NodeRef("node-c", "http://c:8080")
+        ref = router.route(_random_ws_id())
+        assert ref.node_id in {"node-a", "node-b", "node-c"}
+
+    def test_route_is_deterministic_for_same_ws_id(self) -> None:
+        """Same ws_id + same membership → same target every time."""
+        router, storage = _make_router()
+        storage.services = [NODE_A, NODE_B, NODE_C]
+        router.refresh_cache()
+
+        ws_id = _random_ws_id()
+        first = router.route(ws_id)
+        for _ in range(50):
+            assert router.route(ws_id) == first
 
     def test_route_override_priority(self) -> None:
         router, storage = _make_router()
         storage.services = [NODE_A, NODE_B]
-        storage.buckets = [{"bucket": 0x0000, "node_id": "node-a"}]
-        ws_id = _ws_id_for_bucket(0x0000)
+        ws_id = _random_ws_id()
         storage.overrides = [{"ws_id": ws_id, "node_id": "node-b"}]
         router.refresh_cache()
 
-        # Override wins over bucket assignment
+        # Override wins regardless of HRW score.
         assert router.route(ws_id) == NodeRef("node-b", "http://b:8080")
 
-    def test_route_empty_cache_raises(self) -> None:
+    def test_route_empty_membership_raises(self) -> None:
         router, _ = _make_router()
+        with pytest.raises(NoAvailableNodeError):
+            router.route(_random_ws_id())
 
-        with pytest.raises(NoAvailableNodeError, match="not assigned"):
-            router.route(_ws_id_for_bucket(0x0000))
+    def test_route_empty_ws_id_raises(self) -> None:
+        router, storage = _make_router()
+        storage.services = [NODE_A]
+        router.refresh_cache()
+        with pytest.raises(NoAvailableNodeError, match="empty"):
+            router.route("")
 
     def test_route_url_convenience(self) -> None:
         router, storage = _make_router()
         storage.services = [NODE_A]
-        storage.buckets = [{"bucket": 0x0010, "node_id": "node-a"}]
+        router.refresh_cache()
+        assert router.route_url(_random_ws_id()) == "http://a:8080"
+
+
+class TestMembershipConvergence:
+    """Rendezvous gives the minimal-moves property; pin it."""
+
+    def test_node_join_only_steals_some_keys(self) -> None:
+        """Adding a 4th node moves ~1/4 of keys to it; the other 3
+        nodes' kept keys are unchanged."""
+        router, storage = _make_router()
+        storage.services = [NODE_A, NODE_B, NODE_C]
         router.refresh_cache()
 
-        assert router.route_url(_ws_id_for_bucket(0x0010)) == "http://a:8080"
+        sample = [_random_ws_id() for _ in range(2000)]
+        before = {ws: router.route(ws).node_id for ws in sample}
 
+        storage.services = [
+            NODE_A,
+            NODE_B,
+            NODE_C,
+            {"service_id": "node-d", "url": "http://d:8080", "metadata": "{}"},
+        ]
+        router.refresh_cache()
+        after = {ws: router.route(ws).node_id for ws in sample}
 
-# ---------------------------------------------------------------------------
-# TestRefreshCache
-# ---------------------------------------------------------------------------
+        moved = sum(1 for ws in sample if before[ws] != after[ws])
+        moved_to_new = sum(1 for ws in sample if after[ws] == "node-d")
+        # Every move must be onto the new node — no churn between
+        # existing nodes.
+        assert moved == moved_to_new
+        # Should be roughly 1/4 of keys; allow a wide band for variance.
+        assert 0.15 < moved / len(sample) < 0.35
 
-
-class TestRefreshCache:
-    """Cache loading from storage."""
-
-    def test_refresh_loads_from_storage(self) -> None:
+    def test_node_leave_only_redistributes_dead_node_keys(self) -> None:
+        """Removing node-a sends node-a's keys to b/c only; keys that
+        were on b/c stay put."""
         router, storage = _make_router()
-        storage.services = [NODE_A]
-        storage.buckets = [{"bucket": 100, "node_id": "node-a"}]
+        storage.services = [NODE_A, NODE_B, NODE_C]
         router.refresh_cache()
 
-        ref = router.route(_ws_id_for_bucket(100))
-        assert ref.node_id == "node-a"
+        sample = [_random_ws_id() for _ in range(2000)]
+        before = {ws: router.route(ws).node_id for ws in sample}
 
-    def test_refresh_handles_dead_nodes(self) -> None:
+        storage.services = [NODE_B, NODE_C]
+        router.refresh_cache()
+        after = {ws: router.route(ws).node_id for ws in sample}
+
+        for ws in sample:
+            if before[ws] in ("node-b", "node-c"):
+                assert after[ws] == before[ws], (
+                    f"key {ws} moved from {before[ws]} to {after[ws]} "
+                    "even though its old owner is still live"
+                )
+            else:  # was on node-a
+                assert after[ws] in ("node-b", "node-c")
+
+
+class TestWeights:
+    def test_weight_2_node_gets_more_keys_than_weight_1(self) -> None:
         router, storage = _make_router()
-        # node-b is in buckets but not in services (dead/expired)
-        storage.services = [NODE_A]
-        storage.buckets = [
-            {"bucket": 0x0000, "node_id": "node-a"},
-            {"bucket": 0x0001, "node_id": "node-b"},
+        storage.services = [
+            {"service_id": "node-a", "url": "http://a:8080", "metadata": '{"weight": 2}'},
+            {"service_id": "node-b", "url": "http://b:8080", "metadata": '{"weight": 1}'},
         ]
         router.refresh_cache()
 
-        assert router.route(_ws_id_for_bucket(0x0000)).node_id == "node-a"
-        with pytest.raises(NoAvailableNodeError):
-            router.route(_ws_id_for_bucket(0x0001))
+        sample = [_random_ws_id() for _ in range(5000)]
+        on_a = sum(1 for ws in sample if router.route(ws).node_id == "node-a")
+        # Heavier node should win clearly more than half; exact ratio
+        # depends on the simple hash×weight formulation but a/b > 1.4
+        # for weight 2:1 across 5k samples is reliable.
+        assert on_a / len(sample) > 0.55
 
-    def test_refresh_returns_true_on_change(self) -> None:
+    def test_invalid_metadata_falls_back_to_weight_1(self) -> None:
         router, storage = _make_router()
-        storage.services = [NODE_A]
-        storage.buckets = [{"bucket": 0, "node_id": "node-a"}]
-
-        assert router.refresh_cache() is True
-
-    def test_refresh_returns_false_on_no_change(self) -> None:
-        router, storage = _make_router()
-        storage.services = [NODE_A]
-        storage.buckets = [{"bucket": 0, "node_id": "node-a"}]
-
+        storage.services = [
+            {"service_id": "node-a", "url": "http://a:8080", "metadata": "not json"},
+        ]
         router.refresh_cache()
-        assert router.refresh_cache() is False
+        # Just confirms it doesn't blow up.
+        router.route(_random_ws_id())
 
 
-# ---------------------------------------------------------------------------
-# TestCheckVersion
-# ---------------------------------------------------------------------------
-
-
-class TestCheckVersion:
-    """Version-gated refresh."""
-
-    def test_version_change_triggers_refresh(self) -> None:
+class TestRefreshLifecycle:
+    def test_refresh_cache_publishes_new_membership_immediately(self) -> None:
+        """refresh_cache() reloads on the calling thread — the next
+        route() sees the new membership without any further trigger."""
         router, storage = _make_router()
         storage.services = [NODE_A]
-        storage.buckets = [{"bucket": 0, "node_id": "node-a"}]
-        storage.settings["rebalancer_version"] = {"value": "1"}
+        router.refresh_cache()
+        assert router.node_count() == 1
 
-        assert router.check_version() is True
-        assert router.is_ready()
+        storage.services = [NODE_A, NODE_B]
+        router.refresh_cache()
+        assert router.node_count() == 2
 
-    def test_same_version_skips(self) -> None:
+    def test_concurrent_refresh_returns_false_on_lock_contention(self) -> None:
+        """refresh_cache uses a non-blocking lock acquire — if another
+        thread is already refreshing, the second caller bails so the
+        in-flight refresh's result is the one that publishes."""
+
         router, storage = _make_router()
-        # Default version is 0; setting absent also means 0
         storage.services = [NODE_A]
-        storage.buckets = [{"bucket": 0, "node_id": "node-a"}]
 
-        # First call: version=0 matches self._version=0 -> no refresh
-        assert router.check_version() is False
-        assert not router.is_ready()  # cache was never loaded
+        with router._refresh_lock:
+            # Lock held by this thread → the call below can't acquire.
+            assert router.refresh_cache() is False
 
-    def test_version_none_treated_as_zero(self) -> None:
+    def test_force_refresh_blocks_until_in_flight_refresh_releases(self) -> None:
+        """force_refresh acquires the refresh lock blocking — used by the
+        404-retry path to guarantee a fresh view even under contention."""
+        import threading
+
         router, storage = _make_router()
-        # settings dict is empty -> get_system_setting returns None
-        assert router.check_version() is False
+        storage.services = [NODE_A]
 
+        # Hold the refresh lock from another thread.
+        lock_held = threading.Event()
+        release = threading.Event()
 
-# ---------------------------------------------------------------------------
-# TestGenerateWsId
-# ---------------------------------------------------------------------------
+        def hold_lock() -> None:
+            with router._refresh_lock:
+                lock_held.set()
+                release.wait(timeout=2)
+
+        holder = threading.Thread(target=hold_lock, daemon=True)
+        holder.start()
+        assert lock_held.wait(timeout=1)
+
+        # force_refresh should block, not bail.
+        result_box: list[bool] = []
+
+        def call_force() -> None:
+            result_box.append(router.force_refresh())
+
+        caller = threading.Thread(target=call_force, daemon=True)
+        caller.start()
+        caller.join(timeout=0.2)
+        assert caller.is_alive(), "force_refresh returned without acquiring lock"
+
+        release.set()
+        holder.join(timeout=1)
+        caller.join(timeout=1)
+        assert not caller.is_alive()
+        # Membership changed from empty → 1 live node.
+        assert result_box == [True]
+        assert router.node_count() == 1
+
+    def test_force_refresh_always_reloads(self) -> None:
+        """force_refresh skips the non-blocking-lock bail and always
+        publishes a fresh view — back-to-back calls each pick up the
+        latest storage state."""
+        router, storage = _make_router()
+        storage.services = [NODE_A]
+        router.force_refresh()
+        assert router.node_count() == 1
+
+        storage.services = [NODE_A, NODE_B]
+        router.force_refresh()
+        assert router.node_count() == 2
+
+    def test_version_is_monotonic_across_refreshes(self) -> None:
+        router, storage = _make_router()
+        storage.services = [NODE_A]
+        router.refresh_cache()
+        v1 = router.version
+        router.refresh_cache()
+        v2 = router.version
+        assert v2 > v1
+        router.force_refresh()
+        assert router.version > v2
 
 
 class TestGenerateWsId:
-    """Workstream ID generation targeting a specific node."""
-
     def test_generates_routable_id(self) -> None:
         router, storage = _make_router()
-        storage.services = [NODE_A, NODE_B]
-        storage.buckets = [
-            {"bucket": 0x00FF, "node_id": "node-a"},
-            {"bucket": 0x0100, "node_id": "node-b"},
-        ]
+        storage.services = [NODE_A, NODE_B, NODE_C]
         router.refresh_cache()
 
-        ws_id = router.generate_ws_id_for_node("node-a")
+        ws_id = router.generate_ws_id_for_node("node-b")
         assert len(ws_id) == 32
-        assert router.route(ws_id).node_id == "node-a"
+        assert router.route(ws_id).node_id == "node-b"
 
     def test_unknown_node_raises(self) -> None:
         router, storage = _make_router()
         storage.services = [NODE_A]
-        storage.buckets = [{"bucket": 0, "node_id": "node-a"}]
         router.refresh_cache()
-
         with pytest.raises(NoAvailableNodeError, match="node-z"):
             router.generate_ws_id_for_node("node-z")
 
 
-# ---------------------------------------------------------------------------
-# TestIsReady
-# ---------------------------------------------------------------------------
-
-
 class TestIsReady:
-    """Readiness checks."""
-
     def test_false_when_empty(self) -> None:
         router, _ = _make_router()
         assert router.is_ready() is False
 
-    def test_true_after_refresh(self) -> None:
+    def test_true_after_membership_loads(self) -> None:
         router, storage = _make_router()
         storage.services = [NODE_A]
-        storage.buckets = [{"bucket": 0, "node_id": "node-a"}]
         router.refresh_cache()
-
         assert router.is_ready() is True
 
 
-# ---------------------------------------------------------------------------
-# TestPopulateFromAssignments
-# ---------------------------------------------------------------------------
-
-
-class TestPopulateFromAssignments:
-    """Direct cache population without DB round-trip."""
-
-    def test_populate_makes_router_ready(self) -> None:
-        router, _ = _make_router()
-        assignments = [(b, "node-a") for b in range(RING_SIZE)]
-        nodes = {"node-a": NodeRef("node-a", "http://a:8080")}
-        router.populate_from_assignments(assignments, nodes)
-
-        assert router.is_ready()
-        assert router.node_count() == 1
-        assert router.route(_ws_id_for_bucket(0)).node_id == "node-a"
-
-    def test_populate_multi_node(self) -> None:
-        router, _ = _make_router()
-        assignments = [(0, "node-a"), (1, "node-b"), (2, "node-a")]
-        nodes = {
-            "node-a": NodeRef("node-a", "http://a:8080"),
-            "node-b": NodeRef("node-b", "http://b:8080"),
-        }
-        router.populate_from_assignments(assignments, nodes)
-
-        assert router.route(_ws_id_for_bucket(0)).node_id == "node-a"
-        assert router.route(_ws_id_for_bucket(1)).node_id == "node-b"
-        assert router.route(_ws_id_for_bucket(2)).node_id == "node-a"
-
-    def test_populate_loads_overrides_from_db(self) -> None:
-        router, storage = _make_router()
-        ws_id = _ws_id_for_bucket(0)
-        storage.overrides = [{"ws_id": ws_id, "node_id": "node-b"}]
-        nodes = {
-            "node-a": NodeRef("node-a", "http://a:8080"),
-            "node-b": NodeRef("node-b", "http://b:8080"),
-        }
-        router.populate_from_assignments([(0, "node-a")], nodes)
-
-        # Override should route bucket 0 to node-b despite assignment to node-a
-        assert router.route(ws_id) == NodeRef("node-b", "http://b:8080")
-
-    def test_populate_no_overrides_when_table_empty(self) -> None:
-        router, storage = _make_router()
-        # No overrides in storage
-        router.populate_from_assignments(
-            [(0, "node-a")],
-            {"node-a": NodeRef("node-a", "http://a:8080")},
-        )
-        assert len(router._overrides) == 0
-
-
-# ---------------------------------------------------------------------------
-# TestNodeCount
-# ---------------------------------------------------------------------------
-
-
 class TestNodeCount:
-    """Distinct node counting."""
-
-    def test_count_distinct_nodes(self) -> None:
+    def test_count_matches_live_services(self) -> None:
         router, storage = _make_router()
         storage.services = [NODE_A, NODE_B, NODE_C]
-        # Spread all 65536 buckets across 3 nodes
-        storage.buckets = [
-            {"bucket": b, "node_id": f"node-{['a', 'b', 'c'][b % 3]}"} for b in range(RING_SIZE)
-        ]
         router.refresh_cache()
-
         assert router.node_count() == 3

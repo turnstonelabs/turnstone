@@ -427,16 +427,17 @@ class ClusterCollector:
             for nid in lost_nodes:
                 asyncio.run_coroutine_threadsafe(self._stop_node(nid), self._sse_loop)
 
-        # Notify the routing layer so it can refresh its hash-ring cache
-        # when the rebalancer has published a new version.
+        # Drive the router's cache from the collector's discovery
+        # thread so the async route() handlers stay pure-in-memory.
+        # The unconditional refresh also picks up admin-written
+        # workstream_overrides between membership events.
         if self._router is not None:
             try:
-                self._router.check_version()
+                self._router.refresh_cache()
             except Exception:
-                log.debug("Router version check failed", exc_info=True)
-            # Update ring gauge metrics after version check
+                log.debug("Router refresh failed", exc_info=True)
             if self._console_metrics is not None:
-                self._console_metrics.set_ring_info(
+                self._console_metrics.set_router_info(
                     self._router.node_count(),
                     self._router.version,
                 )

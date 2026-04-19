@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any
 
 import sqlalchemy as sa
 
-from turnstone.core.hash_ring import bucket_of as _bucket_of
 from turnstone.core.log import get_logger
 from turnstone.core.storage import get_storage
 from turnstone.core.workstream import WorkstreamKind
@@ -299,33 +298,6 @@ def update_workstream_state(ws_id: str, state: str) -> None:
         get_storage().update_workstream_state(ws_id, state)
     except Exception:
         log.warning("Failed to update workstream state ws=%s state=%s", ws_id, state, exc_info=True)
-
-
-# -- Hash ring bucket counts --------------------------------------------------
-
-
-def increment_bucket_count(ws_id: str, active: bool = False) -> None:
-    """Fire-and-forget bucket count increment."""
-    try:
-        get_storage().increment_bucket_count(_bucket_of(ws_id), active)
-    except Exception:
-        log.warning("bucket count increment failed for %s", ws_id[:8], exc_info=True)
-
-
-def decrement_bucket_count(ws_id: str, active: bool = False) -> None:
-    """Fire-and-forget bucket count decrement."""
-    try:
-        get_storage().decrement_bucket_count(_bucket_of(ws_id), active)
-    except Exception:
-        log.warning("bucket count decrement failed for %s", ws_id[:8], exc_info=True)
-
-
-def adjust_bucket_active(ws_id: str, delta: int) -> None:
-    """Fire-and-forget active count adjustment."""
-    try:
-        get_storage().adjust_bucket_active(_bucket_of(ws_id), delta)
-    except Exception:
-        log.warning("bucket active adjust failed for %s", ws_id[:8], exc_info=True)
 
 
 def delete_workstream_override(ws_id: str) -> None:
