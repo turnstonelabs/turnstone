@@ -111,9 +111,18 @@ the skill should end on.
 ## `task_list` integration
 
 `task_list` is the coordinator's scratchpad — a persisted, ordered
-list of `{task_id, title, status, notes}` rows that only this
-coordinator sees.  Children don't see it; the user does via the
-sidebar.  Actions: `add`, `update`, `remove`, `list`.
+list of rows with fields `{id, title, status, child_ws_id, created,
+updated}` that only this coordinator sees.  Children don't see it;
+the user does via the sidebar.  Five actions: `add`, `update`,
+`remove`, `reorder`, `list` (only `list` is auto-approved; the
+mutators go through the approval flow).
+
+The input schema refers to rows by `task_id`; the persisted row
+object exposes the same id as `id`.  The `child_ws_id` field is a
+free-form label the skill sets to link a task to a spawned
+workstream — it is NOT validated against the workstreams table, so
+a skill can set it to a placeholder before `spawn_workstream`
+returns or keep it pointing at a closed child for later audit.
 
 A skill's initial prompt can seed the task list by calling
 `task_list(action="add", title=...)` as its very first tool calls —
@@ -121,7 +130,15 @@ the user gets a visible plan before any child is spawned, and the
 coordinator's future self has something concrete to iterate on.
 Status transitions (`pending` → `in_progress` → `done` / `blocked`)
 are the skill's main feedback loop: mutate the task when the child
-covering it finishes, not when the child starts.
+covering it finishes, not when the child starts.  Use
+`task_list(action="update", task_id=..., child_ws_id=<ws_id>)` to
+link a task to the child that owns it once spawn returns.
+
+A final gotcha: parallel tool dispatch does NOT serialise reads
+after writes in the same batch.  If a skill issues an `update` and
+a `list` in one parallel tool batch, the `list` response may reflect
+the pre-update state.  Dispatch mutate and list serially (one
+tool_use turn each) when the list must observe the mutation.
 
 Keep the tasks coarse-grained — one per child, roughly.  A 20-task
 list for a 3-child fan-out is noise; a 1-task list for a 5-child
@@ -135,9 +152,21 @@ mental model of "what the coord thinks it's doing".
 Every ws_id returned by `spawn_workstream` / `spawn_batch` is a
 **full 32-char hex string**.  The skill's system prompt must not
 invent ws_ids — a model that hallucinates `"child-1"` or `"ws-abc"`
-will hit the tenant guard in `CoordinatorClient._is_own_subtree`
-and get an empty result (the guard validates ws_id against
-`parent_ws_id=coord_ws_id` AND `user_id=owner` in storage).
+hits the tenant guard in `CoordinatorClient._is_own_subtree`, which
+validates ws_id against `parent_ws_id=coord_ws_id` AND
+`user_id=owner` in storage.  The rejection shape varies by tool:
+
+- **Mutating ops** (`send_to_workstream`, `close_workstream`,
+  `cancel_workstream`, `delete_workstream`) return
+  `{"error": "workstream not in coordinator subtree: <ws_id>", "status": 404}`
+  — the skill should treat this as a tool error, not an empty result.
+- **`inspect_workstream`** returns `{"error": "workstream not found: <ws_id>"}`
+  (same shape as a genuinely missing row, so the guard can't be
+  used as an existence oracle).
+- **`wait_for_workstream`** reports the offending id with
+  `state="denied"` in its `results` dict; `mode="any"` won't
+  satisfy on a pure-denied list, so a hallucinated id won't trick
+  the wait into reporting "complete".
 
 Pattern: capture each spawn result in the next tool call's input.
 The JSON tool-result carries `{"ws_id": "...", "name": "...",

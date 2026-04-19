@@ -101,13 +101,14 @@ with a `type` field.  The recurring shapes a UI has to handle:
 | `approve_request`   | One or more tool calls need operator approval                                              | `items: [{call_id, header, preview, func_name, approval_label, needs_approval}]` |
 | `approval_resolved` | Operator answered the approval prompt                                                      | `approved`, `feedback` |
 | `state_change`      | Worker-thread state transition                                                             | `state` ∈ `running`, `thinking`, `attention`, `idle`, `error` |
+| `status`            | Token usage + context-window snapshot (fires on every streaming tick)                      | `prompt_tokens`, `completion_tokens`, `total_tokens`, `context_window`, `pct`, `effort`, `cache_creation_tokens`, `cache_read_tokens` |
 | `rename`            | Session's display name changed                                                             | `name` |
 | `intent_verdict`    | Intent judge produced a verdict on a pending tool call                                     | `risk_level`, `recommendation`, `reasons` |
 | `output_warning`    | Output guard flagged a tool result                                                         | `call_id`, `risk_level`, `flags` |
-| `child_ws_created`  | A direct child of this coord was just created (fan-out from the cluster bus)              | `ws_id`, `node_id`, `name`, `parent_ws_id` |
-| `child_ws_state`    | A direct child transitioned state                                                          | `ws_id`, `state` |
-| `child_ws_closed`   | A direct child closed                                                                      | `ws_id` |
-| `child_ws_rename`   | A direct child's name changed                                                              | `ws_id`, `name` |
+| `child_ws_created`  | A direct child of this coord was just created (fan-out from the cluster bus)              | `child_ws_id`, `node_id`, `name`, `parent_ws_id` (`ws_id` in the envelope is always the coord's own id) |
+| `child_ws_state`    | A direct child transitioned state                                                          | `child_ws_id`, `state` |
+| `child_ws_closed`   | A direct child closed                                                                      | `child_ws_id` |
+| `child_ws_rename`   | A direct child's name changed                                                              | `child_ws_id`, `name` |
 | `wait_started` / `wait_progress` / `wait_ended` | `wait_for_workstream` tool lifecycle (see §6)                  | `call_id`, `ws_ids`, `elapsed`, `results`, `complete` |
 | `batch_started` / `batch_ended` | `spawn_batch` / `close_all_children` tool lifecycle                            | `call_id`, `op`, `total`/`succeeded`/`denied`/`closed`/`failed`/`skipped` |
 | `info` / `error`    | Operational messages                                                                       | `message` |
@@ -151,7 +152,7 @@ GET /v1/api/coordinator/{ws_id}/children HTTP/1.1
 
 ```json
 {
-  "children": [
+  "items": [
     {"ws_id": "d4e5f6...", "name": "csrf-audit", "state": "running", "node_id": "gpu-3"},
     {"ws_id": "e1f2a3...", "name": "xss-audit",  "state": "idle",    "node_id": "gpu-1"}
   ],
@@ -159,10 +160,15 @@ GET /v1/api/coordinator/{ws_id}/children HTTP/1.1
 }
 ```
 
-Same shape as the `list_workstreams` coordinator tool so the UI and
-the model's own introspection stay in sync.  Closed / deleted rows
-are filtered out by default; pass an explicit `state=closed` query
-param to include them.
+The response key is `items`, not `children` — the endpoint shape
+follows the cluster-wide workstream-list idiom rather than the
+coordinator `list_workstreams` tool's (which uses `children`).
+Rows include every state stored for the parent (`running`, `idle`,
+`closed`, ...); the endpoint does not accept a state query param,
+so clients should inspect each row's `state` field and filter
+locally if they want to hide closed/deleted children.  Nested
+coordinator rows are dropped server-side so only interactive
+descendants appear.
 
 ---
 
