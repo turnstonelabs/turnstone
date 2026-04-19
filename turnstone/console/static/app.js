@@ -1903,6 +1903,12 @@ function _mountHomeCoordComposer() {
     placeholder: "What should this coordinator orchestrate?",
     ariaLabel: "Initial task",
     sendLabel: "Start",
+    busyLabel: "Starting\u2026",
+    // The submit button's disabled flag is owned by
+    // _refreshHomeCoordSubmitEnabled, which combines busy state with
+    // the subsystem-ready probe.  Tell the composer to skip writing
+    // sendBtn.disabled so the reconciler has a single owner.
+    externalDisable: true,
     // Ctrl/Cmd+Enter submit stays in the document keydown handler
     // below — it wants to also work when focus is outside the
     // composer (e.g. just after the admin banner dismisses).
@@ -2015,10 +2021,7 @@ function submitHomeCoord(textFromComposer) {
     errEl: document.getElementById("home-coord-error"),
     setBusy: function (b) {
       _homeCoordBusy = b;
-      if (_homeCoordComposer) {
-        _homeCoordComposer.setBusy(b);
-        _homeCoordComposer.setSendLabel("Start", "Starting\u2026");
-      }
+      if (_homeCoordComposer) _homeCoordComposer.setBusy(b);
       _refreshHomeCoordSubmitEnabled();
     },
     on503: function () {

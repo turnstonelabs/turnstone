@@ -435,16 +435,11 @@ Pane.prototype.disconnectSSE = function () {
 Pane.prototype.setBusy = function (b) {
   this.busy = b;
   this.messagesEl.dataset.busy = b ? "true" : "false";
-  // Composer owns send/stop button display + busy-mode placeholder swap.
+  // Composer owns send/stop button display, label rotation, and the
+  // stop button's "■ Stop" / aria-label / dataset reset on every
+  // transition (so cancelGeneration's transient "Cancelling…" label
+  // doesn't persist into the next busy cycle).
   this.composer.setBusy(b);
-  // Reset stop button content on every transition so a previous
-  // "Cancelling…" or "⚠ Force Stop" label doesn't persist into the
-  // next busy cycle.  cancelGeneration() mutates these fields when the
-  // user clicks stop; we reset here so the composer's standard "■ Stop"
-  // is what the next busy=true transition shows.
-  this.stopBtn.textContent = "\u25a0 Stop";
-  this.stopBtn.setAttribute("aria-label", "Stop generation");
-  delete this.stopBtn.dataset.forceCancel;
   if (!b) this._promoteQueuedMessages();
 };
 

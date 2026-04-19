@@ -94,11 +94,18 @@
    *              summary?: (values) => string | null } | null
    *     — renders a collapsible "Options ▾" panel.  Fields support
    *       type:"input" (text) and type:"select" (dropdown with
-   *       {choices: [{value, text}]}).  getOptionValues() returns the
-   *       current {id: value} map; setOptionChoices(id, choices)
-   *       populates a select later (for async-loaded lists).  When
-   *       storageKey is provided the open/closed state persists to
-   *       localStorage under that key.
+   *       {choices: [{value, text}]}).  Any other type is rendered
+   *       as a text input.  getOptionValues() returns the current
+   *       {id: value} map; setOptionChoices(id, choices) populates
+   *       a select later (for async-loaded lists).  When storageKey
+   *       is provided the open/closed state persists to localStorage
+   *       under that key.
+   *   externalDisable: boolean (default false) — when true, setBusy()
+   *     still rotates the send button's label / aria / placeholder
+   *     + toggles the stop button, but does NOT write sendBtn.disabled.
+   *     The caller owns the disabled flag and combines busy state
+   *     with any other disable inputs (e.g. a subsystem-down probe)
+   *     via its own reconciler function.
    */
   function Composer(mount, opts) {
     if (!(this instanceof Composer)) return new Composer(mount, opts);
@@ -338,8 +345,18 @@
       // on-screen Return key should behave as the OS expects).
       // touchEnterSends=true overrides for callers that want Enter to
       // send on touch too.  isComposing guards against eating Enter
-      // mid-IME (CJK input).
-      if (e.key === "Enter" && !e.shiftKey && !e.isComposing && enterSends) {
+      // mid-IME (CJK input).  The sendBtn.disabled check mirrors the
+      // click-path semantics: when the send button is disabled (busy
+      // non-queue / subsystem-down), Enter also must not submit, or
+      // a rapid double-press before the first POST resolves would
+      // create duplicate requests.
+      if (
+        e.key === "Enter" &&
+        !e.shiftKey &&
+        !e.isComposing &&
+        enterSends &&
+        !self.sendBtn.disabled
+      ) {
         e.preventDefault();
         self._fireSend();
       }
@@ -461,13 +478,10 @@
   };
 
   Composer.prototype.autoResize = function () {
+    if (!this._autoResizeEnabled) return;
     this.inputEl.style.height = "auto";
     this.inputEl.style.height =
       Math.min(this.inputEl.scrollHeight, AUTO_RESIZE_MAX_PX) + "px";
-  };
-
-  Composer.prototype._maybeAutoResize = function () {
-    if (this._autoResizeEnabled) this.autoResize();
   };
 
   Object.defineProperty(Composer.prototype, "value", {
@@ -476,7 +490,7 @@
     },
     set: function (v) {
       this.inputEl.value = v == null ? "" : String(v);
-      this._maybeAutoResize();
+      this.autoResize();
     },
   });
 
@@ -486,52 +500,62 @@
 
   Composer.prototype.clear = function () {
     this.inputEl.value = "";
-    this._maybeAutoResize();
+    this.autoResize();
   };
 
+  // setBusy rotates the send button label between sendLabel and
+  // busyLabel, swaps the busy placeholder, and (when stopBtn is
+  // configured) toggles the stop button visibility + resets its label
+  // to the configured stopLabel on every transition so a
+  // cancelGeneration-set "Cancelling…" text doesn't persist into the
+  // next busy cycle.
+  //
+  // The send button's disabled attribute follows this matrix:
+  //   externalDisable=true  → composer never writes sendBtn.disabled
+  //                           (caller manages it via its own reconciler).
+  //   queueWhileBusy=true   → sendBtn.disabled = false (queue stays
+  //                           clickable during busy to accept queued sends).
+  //   otherwise             → sendBtn.disabled = !!b (disable on busy to
+  //                           prevent duplicate-click submits).
   Composer.prototype.setBusy = function (b) {
     this._busy = !!b;
     var opts = this._opts;
-    if (opts.queueWhileBusy) {
-      // Busy → button reads "Queue" but stays enabled; placeholder swap.
-      this.sendBtn.disabled = false;
-      this.sendBtn.textContent = b ? this._busyLabel : this._sendLabel;
-      this.sendBtn.setAttribute(
-        "aria-label",
-        b
-          ? "Queue message for delivery after current execution"
-          : "Send message",
-      );
-      this.sendBtn.classList.toggle("ts-composer-send--queue", !!b);
-      this.inputEl.placeholder = b
-        ? this._busyPlaceholder
-        : this._idlePlaceholder;
-    } else {
-      // Busy → send disabled to prevent duplicate sends.
-      this.sendBtn.disabled = !!b;
+
+    // Label + aria-label rotation — universal so callers can supply a
+    // busyLabel regardless of queueWhileBusy mode.
+    this.sendBtn.textContent = b ? this._busyLabel : this._sendLabel;
+    var queueAriaLabel = b
+      ? "Queue message for delivery after current execution"
+      : "Send message";
+    this.sendBtn.setAttribute(
+      "aria-label",
+      opts.queueWhileBusy
+        ? queueAriaLabel
+        : (b ? this._busyLabel : this._sendLabel) + " message",
+    );
+
+    // --queue class + busy-placeholder swap are queue-specific.
+    this.sendBtn.classList.toggle(
+      "ts-composer-send--queue",
+      !!(b && opts.queueWhileBusy),
+    );
+    this.inputEl.placeholder =
+      b && opts.queueWhileBusy ? this._busyPlaceholder : this._idlePlaceholder;
+
+    // Disabled state — composer owns it unless caller opted out.
+    if (!opts.externalDisable) {
+      this.sendBtn.disabled = !!b && !opts.queueWhileBusy;
     }
+
+    // Stop button visibility + label reset — reset every transition so
+    // cancelGeneration's transient "Cancelling…" label doesn't stick.
     if (this.stopBtn) {
       this.stopBtn.style.display = b ? "" : "none";
       this.stopBtn.disabled = !b;
+      this.stopBtn.textContent = this._stopLabel;
+      this.stopBtn.setAttribute("aria-label", "Stop generation");
+      delete this.stopBtn.dataset.forceCancel;
     }
-  };
-
-  // ---------------------------------------------------------------------
-  // Send button label
-  // ---------------------------------------------------------------------
-
-  // Change the send button's idle/busy labels at runtime.  Useful for
-  // creation forms where the caller wants "Start" / "Starting…" without
-  // owning the DOM directly.  busyLabel is optional — when omitted the
-  // existing busy label stays.
-  Composer.prototype.setSendLabel = function (idleLabel, busyLabel) {
-    if (idleLabel != null) this._sendLabel = String(idleLabel);
-    if (busyLabel != null) this._busyLabel = String(busyLabel);
-    this.sendBtn.textContent = this._busy ? this._busyLabel : this._sendLabel;
-    this.sendBtn.setAttribute(
-      "aria-label",
-      (this._busy ? this._busyLabel : this._sendLabel) + " message",
-    );
   };
 
   // ---------------------------------------------------------------------
@@ -653,6 +677,19 @@
     if (this.el && this.el.parentNode) {
       this.el.parentNode.removeChild(this.el);
     }
+    // Null out DOM back-references so post-destroy access fails
+    // loudly rather than silently mutating detached nodes.
+    this.inputEl = null;
+    this.sendBtn = null;
+    this.stopBtn = null;
+    this.chipsEl = null;
+    this.attachBtn = null;
+    this.attachInput = null;
+    this.optionsBtn = null;
+    this.optionsPanel = null;
+    this.optionsSummaryEl = null;
+    this._optionFields = {};
+    this.el = null;
   };
 
   root.Composer = Composer;
