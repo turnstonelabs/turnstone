@@ -3919,6 +3919,8 @@ class ChatSession:
             # Coordinator tools: only reachable when this session was
             # constructed with kind="coordinator" (COORDINATOR_TOOLS set).
             "spawn_workstream": self._prepare_spawn_workstream,
+            "spawn_batch": self._prepare_spawn_batch,
+            "close_all_children": self._prepare_close_all_children,
             "inspect_workstream": self._prepare_inspect_workstream,
             "send_to_workstream": self._prepare_send_to_workstream,
             "close_workstream": self._prepare_close_workstream,
@@ -4995,6 +4997,172 @@ class ChatSession:
         self._report_tool_result(call_id, "spawn_workstream", f"spawned {result.get('ws_id', '?')}")
         return call_id, summary
 
+    # Cap per batch call.  Matches the ``wait_for_workstream`` ws_ids
+    # intuition (small enough to fit an operator's eyes in one approval
+    # card; if the model wants more, make a second call).  Hard error
+    # rather than silent truncation — a silently-dropped child is much
+    # harder to notice than an explicit retry prompt.
+    _SPAWN_BATCH_MAX_CHILDREN = 10
+
+    def _prepare_spawn_batch(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        if self._coord_client is None:
+            return self._coord_tool_error(call_id, "spawn_batch", "coordinator client unavailable")
+        raw_children = args.get("children")
+        if not isinstance(raw_children, list) or not raw_children:
+            return self._coord_tool_error(
+                call_id, "spawn_batch", "children must be a non-empty list"
+            )
+        if len(raw_children) > self._SPAWN_BATCH_MAX_CHILDREN:
+            return self._coord_tool_error(
+                call_id,
+                "spawn_batch",
+                f"children exceeds cap ({len(raw_children)} > "
+                f"{self._SPAWN_BATCH_MAX_CHILDREN}); split across multiple calls",
+            )
+
+        # Per-item normalisation.  Invalid items surface in ``denied`` at
+        # exec time rather than failing the whole batch — we want
+        # partial-success semantics so a single malformed row doesn't
+        # poison the other approved spawns.
+        normalised: list[dict[str, Any]] = []
+        preview_rows: list[str] = []
+        for idx, raw in enumerate(raw_children):
+            if not isinstance(raw, dict):
+                normalised.append({"idx": idx, "_error": "child spec must be an object"})
+                preview_rows.append(f"  {idx}. [invalid — not an object]")
+                continue
+            initial_message = self._coord_str_arg(raw, "initial_message").strip()
+            skill = self._coord_str_arg(raw, "skill").strip()
+            name = self._coord_str_arg(raw, "name").strip()
+            model = self._coord_str_arg(raw, "model").strip()
+            target_node = self._coord_str_arg(raw, "target_node").strip()
+            spec: dict[str, Any] = {
+                "idx": idx,
+                "initial_message": initial_message,
+                "skill": skill,
+                "name": name,
+                "model": model,
+                "target_node": target_node,
+            }
+            normalised.append(spec)
+            if initial_message:
+                first_line = initial_message.splitlines()[0]
+                preview_line = first_line[:80] + ("..." if len(first_line) > 80 else "")
+                tag_bits = []
+                if skill:
+                    tag_bits.append(f"skill={skill}")
+                if target_node:
+                    tag_bits.append(f"node={target_node}")
+                tags = (" [" + ", ".join(tag_bits) + "]") if tag_bits else ""
+                preview_rows.append(f"  {idx}. {preview_line}{tags}")
+            else:
+                preview_rows.append(f"  {idx}. (idle)")
+
+        header = f"\u2699 spawn_batch: {len(normalised)} children"
+        preview_body = f"{DIM}{chr(10).join(preview_rows)}{RESET}"
+        return {
+            "call_id": call_id,
+            "func_name": "spawn_batch",
+            "header": header,
+            "preview": preview_body,
+            "needs_approval": True,
+            "approval_label": "spawn_batch",
+            "execute": self._exec_spawn_batch,
+            "children": normalised,
+        }
+
+    def _exec_spawn_batch(self, item: dict[str, Any]) -> tuple[str, str]:
+        call_id = item["call_id"]
+        children: list[dict[str, Any]] = item["children"]
+        total = len(children)
+
+        # Emit ``batch_started`` so the coordinator sidebar can show a
+        # "spawning N children" indicator.  Mirrors wait_for_workstream's
+        # _emit_wait_event plumbing (best-effort via ui._enqueue).
+        self._emit_batch_event(
+            "batch_started",
+            {"call_id": call_id, "op": "spawn_batch", "total": total},
+        )
+
+        results: dict[str, dict[str, Any]] = {}
+        denied: list[dict[str, Any]] = []
+        spawned_ids: list[str] = []
+        for spec in children:
+            idx = spec["idx"]
+            # Validation failures from _prepare surface here as denied
+            # rows — partial-success: don't abort the rest of the batch.
+            if "_error" in spec:
+                denied.append({"idx": idx, "reason": spec["_error"]})
+                continue
+            try:
+                result = self._coord_client.spawn(
+                    initial_message=spec["initial_message"],
+                    parent_ws_id=self._ws_id,
+                    user_id=self._user_id,
+                    skill=spec["skill"],
+                    name=spec["name"],
+                    model=spec["model"],
+                    target_node=spec["target_node"],
+                )
+            except Exception as e:
+                denied.append({"idx": idx, "reason": f"spawn failed: {e}"})
+                continue
+            if result.get("error"):
+                denied.append({"idx": idx, "reason": str(result["error"])})
+                continue
+            ws_id = str(result.get("ws_id") or "")
+            if not ws_id:
+                denied.append({"idx": idx, "reason": "spawn returned no ws_id"})
+                continue
+            spawned_ids.append(ws_id)
+            results[str(idx)] = {
+                "ws_id": ws_id,
+                "name": result.get("name", ""),
+                "node_id": result.get("node_id", ""),
+                "status": result.get("status"),
+            }
+
+        # ``truncated`` intentionally omitted — the prepare step
+        # hard-errors on >10 children rather than silent truncation,
+        # so the bulk-shape flag would always be false and just pads
+        # the LLM's tool-result payload.
+        summary_payload = {
+            "results": results,
+            "denied": denied,
+        }
+        output = json.dumps(summary_payload, separators=(",", ":"), default=str)
+        desc = f"spawned {len(results)}/{total}"
+        if denied:
+            desc += f" ({len(denied)} denied)"
+        self._report_tool_result(call_id, "spawn_batch", desc)
+        self._emit_batch_event(
+            "batch_ended",
+            {
+                "call_id": call_id,
+                "op": "spawn_batch",
+                "total": total,
+                "succeeded": len(results),
+                "denied": len(denied),
+            },
+        )
+        return call_id, output
+
+    def _emit_batch_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        """Fan out a ``batch_*`` SSE event via the session UI.  Best-effort.
+
+        Matches the ``_emit_wait_event`` pattern — the batch itself must
+        never fail because of observer plumbing.  The sidebar keys on
+        ``call_id`` to pair started/ended into a single indicator.
+        """
+        ui = getattr(self, "ui", None)
+        enqueue = getattr(ui, "_enqueue", None)
+        if enqueue is None:
+            return
+        try:
+            enqueue({"type": event_type, **payload})
+        except Exception:
+            log.debug("batch_event.enqueue_failed type=%s", event_type, exc_info=True)
+
     def _prepare_inspect_workstream(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         if self._coord_client is None:
             return self._coord_tool_error(
@@ -5163,6 +5331,84 @@ class ChatSession:
         if reason:
             desc += f" ({reason[:60]})"
         self._report_tool_result(call_id, "close_workstream", desc)
+        return call_id, output
+
+    def _prepare_close_all_children(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        if self._coord_client is None:
+            return self._coord_tool_error(
+                call_id, "close_all_children", "coordinator client unavailable"
+            )
+        reason = self._coord_str_arg(args, "reason").strip()
+        header = "\u2699 close_all_children"
+        if reason:
+            header += f": {reason[:80]}"
+        return {
+            "call_id": call_id,
+            "func_name": "close_all_children",
+            "header": header,
+            "preview": "",
+            "needs_approval": True,
+            "approval_label": "close_all_children",
+            "execute": self._exec_close_all_children,
+            "reason": reason,
+        }
+
+    def _exec_close_all_children(self, item: dict[str, Any]) -> tuple[str, str]:
+        call_id = item["call_id"]
+        reason = item.get("reason", "") or ""
+        self._emit_batch_event(
+            "batch_started",
+            {"call_id": call_id, "op": "close_all_children"},
+        )
+        try:
+            result = self._coord_client.close_all_children(reason=reason)
+        except Exception as e:
+            msg = f"Error: close_all_children failed: {e}"
+            self._report_tool_result(call_id, "close_all_children", msg, is_error=True)
+            self._emit_batch_event(
+                "batch_ended",
+                {"call_id": call_id, "op": "close_all_children", "error": str(e)},
+            )
+            return call_id, msg
+        if result.get("error"):
+            msg = f"Error: {result['error']}"
+            self._report_tool_result(call_id, "close_all_children", msg, is_error=True)
+            self._emit_batch_event(
+                "batch_ended",
+                {
+                    "call_id": call_id,
+                    "op": "close_all_children",
+                    "error": str(result["error"]),
+                },
+            )
+            return call_id, msg
+        closed = [str(x) for x in result.get("closed") or [] if x]
+        failed = [str(x) for x in result.get("failed") or [] if x]
+        skipped = [str(x) for x in result.get("skipped") or [] if x]
+        summary_payload: dict[str, Any] = {
+            "closed": closed,
+            "failed": failed,
+            "skipped": skipped,
+        }
+        if reason:
+            summary_payload["reason"] = reason
+        output = json.dumps(summary_payload, separators=(",", ":"))
+        desc = f"closed {len(closed)}"
+        if failed:
+            desc += f", {len(failed)} failed"
+        if skipped:
+            desc += f", {len(skipped)} skipped"
+        self._report_tool_result(call_id, "close_all_children", desc)
+        self._emit_batch_event(
+            "batch_ended",
+            {
+                "call_id": call_id,
+                "op": "close_all_children",
+                "closed": len(closed),
+                "failed": len(failed),
+                "skipped": len(skipped),
+            },
+        )
         return call_id, output
 
     def _prepare_cancel_workstream(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:

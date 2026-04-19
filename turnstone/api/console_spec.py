@@ -25,6 +25,8 @@ from turnstone.api.console_schemas import (
     CoordinatorApproveRequest,
     CoordinatorChildInfo,
     CoordinatorChildrenResponse,
+    CoordinatorCloseAllChildrenRequest,
+    CoordinatorCloseAllChildrenResponse,
     CoordinatorCreateRequest,
     CoordinatorCreateResponse,
     CoordinatorDetailResponse,
@@ -1360,6 +1362,27 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
+        "/v1/api/coordinator/{ws_id}/close_all_children",
+        "POST",
+        "Soft-close every direct child of the coordinator",
+        description=(
+            "Reads the in-memory child registry and dispatches "
+            "``close_workstream`` via the routing proxy for every direct "
+            "child under a bounded (16-concurrency) semaphore.  Unlike "
+            "``stop_cascade`` this does not touch grandchildren — the "
+            "model-facing tool asks for a bounded teardown of its own "
+            "fan-out.  Returns ``{closed, failed, skipped}`` where "
+            "``skipped`` distinguishes already-gone (404) from dispatch-"
+            "broken (``failed``).  The optional ``reason`` propagates to "
+            "every closed child's audit + workstream_config.  Writes "
+            "``coordinator.closed_all_children`` at the coord level."
+        ),
+        request_model=CoordinatorCloseAllChildrenRequest,
+        response_model=CoordinatorCloseAllChildrenResponse,
+        error_codes=[400, 403, 404, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
         "/v1/api/cluster/ws/{ws_id}/detail",
         "GET",
         "Cluster-wide live workstream detail (storage + live block + tail)",
@@ -1425,6 +1448,8 @@ _ALL_MODELS: list[type[BaseModel]] = [
     CoordinatorApproveRequest,
     CoordinatorChildInfo,
     CoordinatorChildrenResponse,
+    CoordinatorCloseAllChildrenRequest,
+    CoordinatorCloseAllChildrenResponse,
     CoordinatorCreateRequest,
     CoordinatorCreateResponse,
     CoordinatorDetailResponse,

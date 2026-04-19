@@ -64,7 +64,7 @@ from turnstone.core.web_helpers import (
 from turnstone.core.workstream import WorkstreamKind
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Callable
 
     from starlette.requests import Request
 
@@ -3239,10 +3239,68 @@ async def coordinator_metrics(request: Request) -> JSONResponse:
 
 _RESTRICT_MAX_TOOLS = 256
 _RESTRICT_MAX_TOOL_NAME_LEN = 128
-# Bounded concurrency on the cascade dispatch.  Upstream coord_client
-# cancels have a 30s timeout; a 100-child cascade at this cap finishes
-# in ~200s worst case, comfortably inside typical 300s proxy limits.
-_STOP_CASCADE_MAX_CONCURRENCY = 16
+# Bounded concurrency on bulk coordinator fan-out (stop_cascade,
+# close_all_children).  Upstream coord_client calls have a 30s timeout;
+# a 100-child cascade at this cap finishes in ~200s worst case,
+# comfortably inside typical 300s proxy limits.
+_COORD_FANOUT_MAX_CONCURRENCY = 16
+
+
+async def _fanout_on_children(
+    child_ids: list[str],
+    coord_client: Any,
+    action: Callable[[str], Any],
+    *,
+    log_tag: str,
+    concurrency: int = _COORD_FANOUT_MAX_CONCURRENCY,
+) -> tuple[list[str], list[str], list[str]]:
+    """Bounded-concurrency fan-out over a coordinator's children.
+
+    Returns ``(ok, failed, skipped)`` — ``ok`` = action succeeded,
+    ``skipped`` = upstream 404 (already gone), ``failed`` = everything
+    else (dispatch errors, exceptions, non-dict returns).  Routes all
+    ids to ``failed`` when ``coord_client`` is None so the operator
+    sees the unexpected state rather than a silent no-op.  Callers map
+    the three buckets to endpoint-specific response keys (cancelled /
+    closed / ...).
+    """
+    ok: list[str] = []
+    failed: list[str] = []
+    skipped: list[str] = []
+    if not child_ids:
+        return ok, failed, skipped
+    if coord_client is None:
+        return ok, list(child_ids), skipped
+
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _one(cid: str) -> tuple[str, str]:
+        async with sem:
+            try:
+                result = await asyncio.to_thread(action, cid)
+                if not isinstance(result, dict):
+                    return cid, "failed"
+                if not result.get("error"):
+                    return cid, "ok"
+                # Stale registry entry (child row deleted) or upstream
+                # 404 both mean "already gone".  Route to skipped so
+                # operators can distinguish from dispatch failures.
+                if result.get("status") == 404:
+                    return cid, "skipped"
+                return cid, "failed"
+            except Exception:
+                log.debug("%s.child_failed ws=%s", log_tag, cid[:8], exc_info=True)
+                return cid, "failed"
+
+    outcomes = await asyncio.gather(*(_one(cid) for cid in child_ids), return_exceptions=False)
+    for cid, bucket in outcomes:
+        if bucket == "ok":
+            ok.append(cid)
+        elif bucket == "skipped":
+            skipped.append(cid)
+        else:
+            failed.append(cid)
+    return ok, failed, skipped
 
 
 async def _require_json_object(request: Request) -> dict[str, Any] | JSONResponse:
@@ -3440,51 +3498,15 @@ async def coordinator_stop_cascade(request: Request) -> JSONResponse:
     child_ids = list(coord_mgr.children_snapshot(ws_id))
     coord_mgr.cancel(ws_id)
 
-    coord_client = getattr(session, "_coord_client", None)
-    cancelled: list[str] = []
-    failed: list[str] = []
-    skipped: list[str] = []
-
-    if not child_ids:
-        pass
-    elif coord_client is None:
-        failed = list(child_ids)
-    else:
-        sem = asyncio.Semaphore(_STOP_CASCADE_MAX_CONCURRENCY)
-
-        async def _cancel_one(cid: str) -> tuple[str, str]:
-            async with sem:
-                try:
-                    result = await asyncio.to_thread(coord_client.cancel, cid)
-                    if not isinstance(result, dict):
-                        return cid, "failed"
-                    if not result.get("error"):
-                        return cid, "cancelled"
-                    # A subtree-miss (stale _children entry after the
-                    # child's storage row was deleted) and an upstream
-                    # 404 both mean "already gone".  Route to skipped so
-                    # operators can distinguish from dispatch failures.
-                    if result.get("status") == 404:
-                        return cid, "skipped"
-                    return cid, "failed"
-                except Exception:
-                    log.debug(
-                        "coordinator_stop_cascade.child_failed ws=%s",
-                        cid[:8],
-                        exc_info=True,
-                    )
-                    return cid, "failed"
-
-        outcomes = await asyncio.gather(
-            *(_cancel_one(cid) for cid in child_ids), return_exceptions=False
-        )
-        for cid, bucket in outcomes:
-            if bucket == "cancelled":
-                cancelled.append(cid)
-            elif bucket == "skipped":
-                skipped.append(cid)
-            else:
-                failed.append(cid)
+    coord_client: Any = getattr(session, "_coord_client", None)
+    # ``action`` is only called when coord_client is live — the helper
+    # short-circuits on None before invoking it.
+    cancelled, failed, skipped = await _fanout_on_children(
+        child_ids,
+        coord_client,
+        lambda cid: coord_client.cancel(cid),
+        log_tag="coordinator_stop_cascade",
+    )
 
     await _emit_coord_audit(
         storage,
@@ -3503,6 +3525,78 @@ async def coordinator_stop_cascade(request: Request) -> JSONResponse:
         {
             "status": "ok",
             "cancelled": cancelled,
+            "failed": failed,
+            "skipped": skipped,
+        }
+    )
+
+
+_CLOSE_ALL_CHILDREN_MAX_REASON_LEN = 512
+
+
+async def coordinator_close_all_children(request: Request) -> JSONResponse:
+    """POST /v1/api/coordinator/{ws_id}/close_all_children — soft-close the direct children.
+
+    Near-twin of ``coordinator_stop_cascade`` — both fan out over
+    ``children_snapshot`` via ``_fanout_on_children``.  Returns
+    ``{closed, failed, skipped}``.  Unlike ``stop_cascade``, this does
+    NOT recurse into grandchildren (the coordinator's model tool asks
+    for a bounded teardown of its own fan-out; operator-level cascade
+    stays behind ``stop_cascade``).
+    """
+    resolved = await _resolve_coord_session(request, allow_service_bypass=False)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    session, storage, user_id, ws_id = resolved
+
+    coord_mgr, err503 = _require_coord_mgr(request)
+    if err503 is not None:
+        return err503  # pragma: no cover — _resolve_coord_session already gated this
+
+    body = await _require_json_object(request)
+    if isinstance(body, JSONResponse):
+        return body
+    raw_reason = body.get("reason", "")
+    if raw_reason is not None and not isinstance(raw_reason, str):
+        return JSONResponse(
+            {"error": "reason must be a string"},
+            status_code=400,
+        )
+    reason = (raw_reason or "").strip()
+    if len(reason) > _CLOSE_ALL_CHILDREN_MAX_REASON_LEN:
+        return JSONResponse(
+            {"error": f"reason exceeds {_CLOSE_ALL_CHILDREN_MAX_REASON_LEN} chars"},
+            status_code=400,
+        )
+
+    child_ids = list(coord_mgr.children_snapshot(ws_id))
+
+    coord_client: Any = getattr(session, "_coord_client", None)
+    closed, failed, skipped = await _fanout_on_children(
+        child_ids,
+        coord_client,
+        lambda cid: coord_client.close_workstream(cid, reason),
+        log_tag="coordinator_close_all_children",
+    )
+
+    await _emit_coord_audit(
+        storage,
+        user_id,
+        "coordinator.closed_all_children",
+        ws_id,
+        {
+            "src": "coordinator",
+            "reason": reason,
+            "closed": closed,
+            "failed": failed,
+            "skipped": skipped,
+        },
+        request.client.host if request.client else "",
+    )
+    return JSONResponse(
+        {
+            "status": "ok",
+            "closed": closed,
             "failed": failed,
             "skipped": skipped,
         }
@@ -10176,6 +10270,11 @@ def create_app(
                     Route(
                         "/api/coordinator/{ws_id}/stop_cascade",
                         coordinator_stop_cascade,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/coordinator/{ws_id}/close_all_children",
+                        coordinator_close_all_children,
                         methods=["POST"],
                     ),
                     Route(

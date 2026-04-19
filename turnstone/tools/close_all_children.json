@@ -1,0 +1,16 @@
+{
+  "name": "close_all_children",
+  "description": "Soft-close every direct child of this coordinator in a single approval. Reads the in-memory child registry, then fans out close requests with bounded concurrency. Returns {closed: [ws_id...], failed: [ws_id...], skipped: [ws_id...]} — `skipped` holds children already gone (404 / missing row), `failed` holds transient dispatch errors worth retrying. Indirect descendants (children of children) are NOT closed — run `stop_cascade` from the operator UI for a full-subtree teardown. The optional `reason` is propagated to every closed child's audit + workstream_config for postmortem.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "reason": {
+        "type": "string",
+        "description": "Optional human-readable reason — propagated to every closed child's audit + workstream_config."
+      }
+    },
+    "required": []
+  },
+  "coordinator": true,
+  "primary_key": "reason"
+}

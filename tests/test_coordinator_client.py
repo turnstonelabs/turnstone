@@ -176,6 +176,9 @@ def test_route_map_matches_console_routes():
     assert _ROUTE_PATHS["cancel"] == "/v1/api/route/cancel"
     assert _ROUTE_PATHS["close"] == "/v1/api/route/workstreams/close"
     assert _ROUTE_PATHS["delete"] == "/v1/api/route/workstreams/delete"
+    # Cascade endpoint lives on the console itself (not a node), so the
+    # path slots in the coord ws_id rather than routing through a proxy.
+    assert _ROUTE_PATHS["close_all_children"] == "/v1/api/coordinator/{ws_id}/close_all_children"
 
 
 def test_spawn_posts_to_routing_proxy_with_bearer_token():
@@ -235,6 +238,57 @@ def test_close_workstream_includes_reason_when_provided():
     client.close_workstream("ws-x", reason="done")
     body = json.loads(captured[0].content)
     assert body == {"ws_id": "ws-x", "reason": "done"}
+
+
+def test_close_all_children_posts_to_console_endpoint():
+    """Targets the console directly (not the routing proxy).  The URL
+    embeds the coord's own ws_id so the server can resolve the session.
+    """
+    client, captured = _mock_client(
+        _ok_json(
+            {
+                "status": "ok",
+                "closed": ["c-1", "c-2"],
+                "failed": [],
+                "skipped": [],
+            }
+        )
+    )
+    result = client.close_all_children(reason="batch done")
+    assert result["closed"] == ["c-1", "c-2"]
+    assert captured[0].url.path == "/v1/api/coordinator/coord-1/close_all_children"
+    assert captured[0].headers["Authorization"] == "Bearer test-token"
+    body = json.loads(captured[0].content)
+    assert body == {"reason": "batch done"}
+
+
+def test_close_all_children_omits_empty_reason():
+    client, captured = _mock_client(
+        _ok_json({"status": "ok", "closed": [], "failed": [], "skipped": []})
+    )
+    client.close_all_children()
+    body = json.loads(captured[0].content)
+    assert body == {}
+
+
+def test_close_all_children_surfaces_http_error():
+    def _boom(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "internal"})
+
+    client, _captured = _mock_client(_boom)
+    result = client.close_all_children()
+    assert result["status"] == 500
+    assert "error" in result
+
+
+def test_close_all_children_surfaces_transport_error():
+    def _raise(_req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    client, _captured = _mock_client(_raise)
+    result = client.close_all_children()
+    assert result["status"] == 0
+    assert "upstream unreachable" in result["error"]
 
 
 def test_delete_workstream_posts_to_delete_route():

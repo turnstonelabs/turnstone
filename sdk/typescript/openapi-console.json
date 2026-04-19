@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Console API",
-    "version": "1.5.0a1",
+    "version": "1.5.0a2",
     "description": "Cluster-wide visibility and control across all turnstone nodes."
   },
   "paths": {
@@ -5650,6 +5650,88 @@
         }
       }
     },
+    "/v1/api/coordinator/{ws_id}/close_all_children": {
+      "post": {
+        "summary": "Soft-close every direct child of the coordinator",
+        "operationId": "v1_api_coordinator_{ws_id}_close_all_children_post",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Reads the in-memory child registry and dispatches ``close_workstream`` via the routing proxy for every direct child under a bounded (16-concurrency) semaphore.  Unlike ``stop_cascade`` this does not touch grandchildren \u2014 the model-facing tool asks for a bounded teardown of its own fan-out.  Returns ``{closed, failed, skipped}`` where ``skipped`` distinguishes already-gone (404) from dispatch-broken (``failed``).  The optional ``reason`` propagates to every closed child's audit + workstream_config.  Writes ``coordinator.closed_all_children`` at the coord level.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CoordinatorCloseAllChildrenRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CoordinatorCloseAllChildrenResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/api/cluster/ws/{ws_id}/detail": {
       "get": {
         "summary": "Cluster-wide live workstream detail (storage + live block + tail)",
@@ -7007,6 +7089,55 @@
           }
         },
         "title": "CoordinatorChildrenResponse",
+        "type": "object"
+      },
+      "CoordinatorCloseAllChildrenRequest": {
+        "description": "Body for POST /v1/api/coordinator/{ws_id}/close_all_children.",
+        "properties": {
+          "reason": {
+            "default": "",
+            "description": "Optional human-readable reason \u2014 propagated to every closed child's audit + workstream_config for postmortem.  Capped at 512 chars.",
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "title": "CoordinatorCloseAllChildrenRequest",
+        "type": "object"
+      },
+      "CoordinatorCloseAllChildrenResponse": {
+        "description": "Response body for POST /v1/api/coordinator/{ws_id}/close_all_children.",
+        "properties": {
+          "status": {
+            "default": "ok",
+            "title": "Status",
+            "type": "string"
+          },
+          "closed": {
+            "description": "Child ws_ids that accepted the close dispatch.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Closed",
+            "type": "array"
+          },
+          "failed": {
+            "description": "Child ws_ids whose close dispatch returned an error other than an already-gone 404 \u2014 the cascade continues on per-child failure so a single unreachable node doesn't abort the whole batch.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Failed",
+            "type": "array"
+          },
+          "skipped": {
+            "description": "Child ws_ids that returned 404 on close (already gone).  Reported separately from ``failed`` so operators can distinguish already-done from dispatch-broken.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Skipped",
+            "type": "array"
+          }
+        },
+        "title": "CoordinatorCloseAllChildrenResponse",
         "type": "object"
       },
       "CoordinatorCreateRequest": {

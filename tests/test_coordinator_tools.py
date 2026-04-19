@@ -119,6 +119,8 @@ def test_coordinator_session_uses_coordinator_tools(coord_session):
     names = {t["function"]["name"] for t in sess._tools}
     assert names == {
         "spawn_workstream",
+        "spawn_batch",
+        "close_all_children",
         "inspect_workstream",
         "send_to_workstream",
         "close_workstream",
@@ -988,3 +990,267 @@ def test_inspect_workstream_include_provider_content_opt_in(coord_session):
     sess._exec_inspect_workstream(item)
     kwargs = coord.inspect.call_args.kwargs
     assert kwargs.get("include_provider_content") is True
+
+
+# ---------------------------------------------------------------------------
+# spawn_batch
+# ---------------------------------------------------------------------------
+
+
+def _three_children() -> list[dict[str, Any]]:
+    return [
+        {"initial_message": "benchmark A", "skill": "researcher"},
+        {"initial_message": "benchmark B", "skill": "researcher", "target_node": "n-1"},
+        {"initial_message": "", "name": "idle-child"},
+    ]
+
+
+def test_spawn_batch_prepare_rejects_non_list(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": "not-a-list"}))
+    assert "error" in item
+    assert "non-empty list" in item["error"]
+
+
+def test_spawn_batch_prepare_rejects_empty_list(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": []}))
+    assert "error" in item
+
+
+def test_spawn_batch_prepare_rejects_over_cap(coord_session):
+    sess, _coord, _ui = coord_session
+    too_many = [{"initial_message": f"msg-{i}"} for i in range(11)]
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": too_many}))
+    assert "error" in item
+    assert "cap" in item["error"].lower()
+
+
+def test_spawn_batch_prepare_builds_approval_card(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": _three_children()}))
+    assert "error" not in item
+    assert item["needs_approval"] is True
+    assert item["func_name"] == "spawn_batch"
+    assert "3 children" in item["header"]
+    # Each row shows up in the preview (dim-wrapped).
+    for idx in (0, 1, 2):
+        assert f"{idx}." in item["preview"]
+    assert "skill=researcher" in item["preview"]
+    assert "node=n-1" in item["preview"]
+    # Idle row renders as "(idle)".
+    assert "(idle)" in item["preview"]
+
+
+def test_spawn_batch_exec_serialises_spawns_and_returns_results(coord_session):
+    sess, coord, _ui = coord_session
+    spawned: list[dict[str, Any]] = []
+
+    def _spawn(**kwargs):
+        n = len(spawned)
+        ws = {
+            "ws_id": f"child-{n}",
+            "name": kwargs.get("name") or f"auto-{n}",
+            "node_id": kwargs.get("target_node") or "node-auto",
+            "status": 200,
+        }
+        spawned.append(kwargs)
+        return ws
+
+    coord.spawn.side_effect = _spawn
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": _three_children()}))
+    _call_id, output = sess._exec_spawn_batch(item)
+
+    # Three serial spawn() calls, in input order.
+    assert len(spawned) == 3
+    assert [s["initial_message"] for s in spawned] == ["benchmark A", "benchmark B", ""]
+    assert spawned[0]["skill"] == "researcher"
+    assert spawned[1]["target_node"] == "n-1"
+    assert spawned[2]["name"] == "idle-child"
+
+    body = json.loads(output)
+    assert "truncated" not in body  # prepare hard-errors >10, no truncate state
+    assert body["denied"] == []
+    # Keyed by input index (stringified).
+    assert set(body["results"].keys()) == {"0", "1", "2"}
+    assert body["results"]["0"]["ws_id"] == "child-0"
+    assert body["results"]["1"]["node_id"] == "n-1"
+    assert body["results"]["2"]["ws_id"] == "child-2"
+
+
+def test_spawn_batch_exec_surfaces_per_item_errors_in_denied(coord_session):
+    sess, coord, _ui = coord_session
+
+    counter = {"n": 0}
+
+    def _spawn(**kwargs):
+        msg = kwargs.get("initial_message", "")
+        if msg == "benchmark B":
+            return {"error": "skill not found: researcher", "status": 400}
+        counter["n"] += 1
+        return {
+            "ws_id": f"child-{counter['n']}",
+            "name": "n",
+            "node_id": "node-auto",
+            "status": 200,
+        }
+
+    coord.spawn.side_effect = _spawn
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": _three_children()}))
+    _call_id, output = sess._exec_spawn_batch(item)
+    body = json.loads(output)
+    assert set(body["results"].keys()) == {"0", "2"}
+    assert len(body["denied"]) == 1
+    assert body["denied"][0]["idx"] == 1
+    assert "skill not found" in body["denied"][0]["reason"]
+
+
+def test_spawn_batch_exec_continues_past_client_exception(coord_session):
+    sess, coord, _ui = coord_session
+
+    def _spawn(**kwargs):
+        if kwargs.get("initial_message") == "benchmark A":
+            raise RuntimeError("transient network error")
+        return {
+            "ws_id": "ok",
+            "name": "n",
+            "node_id": "node",
+            "status": 200,
+        }
+
+    coord.spawn.side_effect = _spawn
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": _three_children()}))
+    _call_id, output = sess._exec_spawn_batch(item)
+    body = json.loads(output)
+    # First item raised; other two succeed — partial-success semantics.
+    assert "0" not in body["results"]
+    assert "1" in body["results"] and "2" in body["results"]
+    assert any(d["idx"] == 0 and "transient network error" in d["reason"] for d in body["denied"])
+
+
+def test_spawn_batch_exec_emits_batch_started_and_ended(coord_session):
+    sess, coord, _ui = coord_session
+    events: list[dict[str, Any]] = []
+    # Attach a minimal _enqueue on the UI so _emit_batch_event fires.
+    sess.ui._enqueue = events.append  # type: ignore[attr-defined]
+    coord.spawn.return_value = {
+        "ws_id": "c-x",
+        "name": "n",
+        "node_id": "node",
+        "status": 200,
+    }
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": [{"initial_message": "solo"}]}))
+    sess._exec_spawn_batch(item)
+    types = [e["type"] for e in events]
+    assert types[0] == "batch_started"
+    assert types[-1] == "batch_ended"
+    assert events[0]["op"] == "spawn_batch"
+    assert events[0]["total"] == 1
+    assert events[-1]["succeeded"] == 1
+    assert events[-1]["denied"] == 0
+
+
+# ---------------------------------------------------------------------------
+# close_all_children
+# ---------------------------------------------------------------------------
+
+
+def test_close_all_children_prepare_builds_approval_card(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("close_all_children", {"reason": "batch done"}))
+    assert "error" not in item
+    assert item["needs_approval"] is True
+    assert item["func_name"] == "close_all_children"
+    assert "batch done" in item["header"]
+    assert item["reason"] == "batch done"
+
+
+def test_close_all_children_prepare_accepts_empty_reason(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("close_all_children", {}))
+    assert "error" not in item
+    assert item["reason"] == ""
+
+
+def test_close_all_children_exec_posts_to_endpoint_and_summarises(coord_session):
+    sess, coord, _ui = coord_session
+    coord.close_all_children.return_value = {
+        "status": "ok",
+        "closed": ["c-1", "c-2"],
+        "failed": [],
+        "skipped": ["c-3"],
+    }
+    item = sess._prepare_tool(_tc("close_all_children", {"reason": "done"}))
+    _call_id, output = sess._exec_close_all_children(item)
+    coord.close_all_children.assert_called_once_with(reason="done")
+    body = json.loads(output)
+    assert body == {
+        "closed": ["c-1", "c-2"],
+        "failed": [],
+        "skipped": ["c-3"],
+        "reason": "done",
+    }
+
+
+def test_close_all_children_exec_surfaces_client_error(coord_session):
+    sess, coord, ui = coord_session
+    coord.close_all_children.return_value = {
+        "error": "upstream unreachable",
+        "status": 502,
+    }
+    item = sess._prepare_tool(_tc("close_all_children", {}))
+    _call_id, output = sess._exec_close_all_children(item)
+    assert "upstream unreachable" in output
+    assert ui.tool_results[-1][3] is True  # is_error=True
+
+
+def test_close_all_children_exec_surfaces_client_exception(coord_session):
+    sess, coord, ui = coord_session
+    coord.close_all_children.side_effect = RuntimeError("boom")
+    item = sess._prepare_tool(_tc("close_all_children", {}))
+    _call_id, output = sess._exec_close_all_children(item)
+    assert "boom" in output
+    assert ui.tool_results[-1][3] is True
+
+
+def test_close_all_children_exec_emits_batch_events(coord_session):
+    sess, coord, _ui = coord_session
+    events: list[dict[str, Any]] = []
+    sess.ui._enqueue = events.append  # type: ignore[attr-defined]
+    coord.close_all_children.return_value = {
+        "status": "ok",
+        "closed": ["c-1"],
+        "failed": [],
+        "skipped": [],
+    }
+    item = sess._prepare_tool(_tc("close_all_children", {"reason": "r"}))
+    sess._exec_close_all_children(item)
+    types = [e["type"] for e in events]
+    assert types[0] == "batch_started"
+    assert types[-1] == "batch_ended"
+    assert events[0]["op"] == "close_all_children"
+    assert events[-1]["closed"] == 1
+
+
+# ---------------------------------------------------------------------------
+# _coord_client=None guard — covers the first-line bail-out in both new
+# prepare methods.  The branch matters because a coord session hitting
+# this state signals a construction bug, and the LLM needs a clean tool
+# error (not a crashing tool-exec).
+# ---------------------------------------------------------------------------
+
+
+def test_spawn_batch_prepare_errors_when_coord_client_unavailable(coord_session):
+    sess, _coord, _ui = coord_session
+    sess._coord_client = None
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": [{"initial_message": "hi"}]}))
+    assert "error" in item
+    assert "unavailable" in item["error"]
+
+
+def test_close_all_children_prepare_errors_when_coord_client_unavailable(coord_session):
+    sess, _coord, _ui = coord_session
+    sess._coord_client = None
+    item = sess._prepare_tool(_tc("close_all_children", {}))
+    assert "error" in item
+    assert "unavailable" in item["error"]

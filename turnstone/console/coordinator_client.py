@@ -233,6 +233,12 @@ _ROUTE_PATHS: dict[str, str] = {
     "cancel": "/v1/api/route/cancel",
     "close": "/v1/api/route/workstreams/close",
     "delete": "/v1/api/route/workstreams/delete",
+    # The cascade endpoints live on the console itself (not a node), so
+    # the path uses the coordinator ws_id in the URL rather than a
+    # routing-proxy prefix.  ``_post`` still formats against
+    # ``_base_url``; formatting of the ``{ws_id}`` slot happens at call
+    # time in ``close_all_children``.
+    "close_all_children": "/v1/api/coordinator/{ws_id}/close_all_children",
 }
 
 
@@ -303,11 +309,28 @@ class CoordinatorClient:
 
     def _post(self, path_key: str, body: dict[str, Any]) -> dict[str, Any]:
         path = _ROUTE_PATHS[path_key]
-        url = f"{self._base_url}{path}"
+        return self._post_url(f"{self._base_url}{path}", body, log_path=path)
+
+    def _post_url(
+        self,
+        url: str,
+        body: dict[str, Any],
+        *,
+        log_path: str,
+    ) -> dict[str, Any]:
+        """POST a pre-built URL with the canonical error handling.
+
+        Split out so endpoints whose path slots in runtime data (e.g.
+        the coord's own ``ws_id`` for cascade ops) can reuse the same
+        transport-error / JSON-fallback / setdefault-status shape
+        without duplicating the body of ``_post``.  ``log_path`` is a
+        stable key for telemetry grouping — the URL itself embeds
+        per-session ids that would fragment log aggregation.
+        """
         try:
             resp = self._http.post(url, json=body, headers=self._headers())
         except httpx.HTTPError as exc:
-            log.warning("coord_client.http_error path=%s err=%s", path, exc)
+            log.warning("coord_client.http_error path=%s err=%s", log_path, exc)
             return {"error": f"upstream unreachable: {exc}", "status": 0}
         try:
             data = resp.json() if resp.content else {}
@@ -413,6 +436,21 @@ class CoordinatorClient:
         if reason:
             body["reason"] = reason
         return self._post("close", body)
+
+    def close_all_children(self, reason: str = "") -> dict[str, Any]:
+        """Soft-close every direct child of this coordinator (console-side fan-out).
+
+        Returns ``{closed, failed, skipped}`` — mirrors ``stop_cascade``.
+        The console does the Semaphore-bounded gather so the model-side
+        tool call stays a single HTTP round-trip regardless of fan-out
+        size.  No tenant guard here: ownership is enforced on the
+        endpoint via ``_resolve_coord_session``.
+        """
+        path = _ROUTE_PATHS["close_all_children"].format(ws_id=self._coord_ws_id)
+        body: dict[str, Any] = {}
+        if reason:
+            body["reason"] = reason
+        return self._post_url(f"{self._base_url}{path}", body, log_path=path)
 
     def delete(self, ws_id: str) -> dict[str, Any]:
         if not self._is_own_subtree(ws_id):

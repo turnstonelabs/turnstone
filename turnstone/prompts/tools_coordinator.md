@@ -10,6 +10,13 @@ Delegate a task → spawn_workstream (required: skill, initial_message):
    spawn_workstream(skill='engineer', initial_message='audit auth.py for CSRF handling', name='csrf-audit')
    spawn_workstream(skill='researcher', initial_message='compare FastAPI vs Starlette for async websockets', node_id='flat-blck-io_43a3')
 
+Fan out to multiple children in one approval → spawn_batch (up to 10):
+   spawn_batch(children=[
+     {'skill': 'researcher', 'initial_message': 'benchmark A'},
+     {'skill': 'researcher', 'initial_message': 'benchmark B'},
+     {'skill': 'engineer', 'initial_message': 'prototype the winner'},
+   ])
+
 Check on a child → inspect_workstream:
    inspect_workstream(ws_id='a1b2c3d4')
 
@@ -30,6 +37,9 @@ Cancel a stuck or runaway child → cancel_workstream (drops the in-flight call,
 Wind a child down → close_workstream (soft; session stops, storage kept) or delete_workstream (hard; removes all traces):
    close_workstream(ws_id='a1b2c3d4', reason='task complete')
    delete_workstream(ws_id='a1b2c3d4')
+
+Wind all direct children down at once → close_all_children (soft-close cascade, single approval):
+   close_all_children(reason='batch complete, synthesising results')
 
 Plan and track work → task_list (your scratchpad; children don't see it):
    task_list(action='add', title='audit auth.py for CSRF')

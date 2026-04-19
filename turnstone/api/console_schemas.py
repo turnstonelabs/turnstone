@@ -1190,6 +1190,46 @@ class CoordinatorStopCascadeResponse(BaseModel):
     )
 
 
+class CoordinatorCloseAllChildrenRequest(BaseModel):
+    """Body for POST /v1/api/coordinator/{ws_id}/close_all_children."""
+
+    reason: str = Field(
+        default="",
+        description=(
+            "Optional human-readable reason — propagated to every closed "
+            "child's audit + workstream_config for postmortem.  Capped at "
+            "512 chars."
+        ),
+    )
+
+
+class CoordinatorCloseAllChildrenResponse(BaseModel):
+    """Response body for POST /v1/api/coordinator/{ws_id}/close_all_children."""
+
+    status: str = Field(default="ok")
+    closed: list[str] = Field(
+        default_factory=list,
+        description="Child ws_ids that accepted the close dispatch.",
+    )
+    failed: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Child ws_ids whose close dispatch returned an error other "
+            "than an already-gone 404 — the cascade continues on per-"
+            "child failure so a single unreachable node doesn't abort "
+            "the whole batch."
+        ),
+    )
+    skipped: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Child ws_ids that returned 404 on close (already gone).  "
+            "Reported separately from ``failed`` so operators can "
+            "distinguish already-done from dispatch-broken."
+        ),
+    )
+
+
 class ClusterWsDetailResponse(BaseModel):
     """Response body for GET /v1/api/cluster/ws/{ws_id}/detail.
 
