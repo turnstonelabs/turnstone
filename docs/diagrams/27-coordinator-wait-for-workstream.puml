@@ -1,0 +1,89 @@
+@startuml
+title Turnstone - coordinator wait_for_workstream lifecycle
+
+skinparam sequenceArrowThickness 1.5
+skinparam noteBackgroundColor #FDF6E3
+
+participant "Coordinator\nLLM" as LLM
+participant "ChatSession\n(worker thread)" as CS
+participant "CoordinatorClient" as CC
+participant "SessionUI\n(SSE fanout)" as UI
+participant "Console routing\nproxy" as RP
+database "Storage\n(workstreams row)" as DB
+participant "Child\nnode" as NODE
+
+== Spawn ==
+
+LLM -> CS : tool_call spawn_workstream(...)
+activate CS
+CS -> CC : spawn(initial_message=...,\nparent_ws_id=coord, user_id=...)
+CC -> RP : POST /v1/api/route/workstreams/new
+RP -> NODE : dispatch (rendezvous)
+NODE -> DB : insert workstreams row\nstate='running'
+RP --> CC : {ws_id, node_id, name, status: 200}
+CC --> CS : {ws_id, ...}
+CS -> UI : on_tool_result\n("spawn_workstream", ws_id)
+deactivate CS
+
+note right of LLM
+  Model now knows the child ws_id.
+  It can inspect / send / wait, and
+  the parent registry tracks it.
+end note
+
+== Wait (blocking) ==
+
+LLM -> CS : tool_call wait_for_workstream\n(ws_ids=[child], mode="any", timeout=60)
+activate CS
+CS -> CS : _prepare_wait_for_workstream\n(validate ws_ids, timeout, mode)
+CS -> UI : emit wait_started\n{call_id, ws_ids, mode, timeout}
+
+CS -> CC : wait_for_workstream(ws_ids, timeout,\nmode, progress_callback)
+activate CC
+
+loop every 500ms up to timeout
+    CC -> DB : read workstreams row(s)
+    DB --> CC : {state, updated, tokens, ...}
+    alt state in {idle, error, closed, deleted}
+        note over CC
+          real-terminal state ->
+          completion condition met
+        end note
+    else still running / thinking / attention
+        CC -> CS : progress_callback(snap)\n(diff-on-change or 5s heartbeat)
+        CS -> UI : emit wait_progress\n{call_id, elapsed, results?}
+    end
+end
+
+CC --> CS : {complete, elapsed,\nresults: {ws_id: snap}}
+deactivate CC
+
+CS -> UI : emit wait_ended\n{call_id, complete, elapsed, results}
+CS -> UI : on_tool_result\n("wait_for_workstream",\n"complete after Ns (R/N resolved)")
+CS --> LLM : tool_result (full results dict)
+deactivate CS
+
+note left of UI
+  Sidebar "waiting on N children" indicator
+  keys on call_id - started / progress / ended
+  scope to a single wait invocation so
+  nested waits render independent badges.
+end note
+
+== After wait: inspect + close ==
+
+LLM -> CS : tool_call inspect_workstream(ws_id=child)
+CS -> CC : inspect(ws_id)
+CC -> DB : read row + tail
+CC --> CS : {state, messages, tokens, ...}
+CS --> LLM : tool_result (serialised)
+
+LLM -> CS : tool_call close_workstream\n(ws_id=child, reason="...")
+CS -> CC : close_workstream(ws_id, reason)
+CC -> RP : POST /v1/api/route/workstreams/close
+RP -> NODE : dispatch
+NODE -> DB : state='closed',\nclose_reason='...'
+RP --> CC : {status: 200}
+CC --> CS : {closed: true, status: 200, reason: ...}
+CS --> LLM : tool_result
+@enduml
