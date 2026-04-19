@@ -906,20 +906,9 @@ body { position: static; }
 }
 
 /* ==========================================================================
-   Input area — shared shell lives in /shared/chat.css (.ts-composer /
-   .ts-composer-row / .ts-composer-input / .ts-composer-send /
-   .ts-composer-attach).  Interactive UI only keeps the page-specific
-   bits below: the .pane-send queue-mode colour flip and the .pane-stop
-   button (cancel generation — doesn't exist on the coordinator).
+   Input area — composer DOM + styling lives in /shared/composer.js +
+   /shared/chat.css.  No page-specific overrides needed.
    ========================================================================== */
-.pane-send.queue-mode {
-  background: transparent;
-  color: var(--accent);
-  border: 1px solid var(--accent);
-}
-.pane-stop { background: var(--red, #c94040); min-width: 120px; text-align: center; white-space: nowrap; color: var(--on-color); border: 1px solid var(--red); border-radius: var(--radius-sm); padding: 6px 16px; font-family: var(--font-mono); font-size: 12px; font-weight: 600; cursor: pointer; height: 32px; }
-.pane-stop:focus-visible { outline: 2px solid var(--fg-bright, #e8ecf4); outline-offset: 2px; }
-[data-theme="light"] .pane-stop { color: #fff; }
 
 /* Attachment chips — pill cluster above the textarea */
 .ts-composer-chips {

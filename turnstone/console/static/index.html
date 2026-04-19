@@ -9,6 +9,7 @@
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/shared/base.css">
 <link rel="stylesheet" href="/shared/ui-base.css">
+<link rel="stylesheet" href="/shared/chat.css">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -45,7 +46,6 @@
              class="home-panel"
              style="display:none"
              aria-label="Start a new orchestration task">
-      <h2 class="home-panel-title">Start a new orchestration task</h2>
       <div id="coord-composer-503"
            class="home-composer-banner"
            role="status"
@@ -54,27 +54,11 @@
         <a href="#" onclick="showAdmin(); switchAdminTab('models'); return false">open Admin → Models</a>
         to set <code>coordinator.model_alias</code> or a registry default.
       </div>
-      <label for="home-coord-task" class="sr-only">Initial task</label>
-      <textarea id="home-coord-task"
-                class="ui-textarea home-composer-task"
-                rows="3"
-                placeholder="What should this coordinator orchestrate?"></textarea>
-      <div class="home-composer-row">
-        <label for="home-coord-name" class="sr-only">Name</label>
-        <input id="home-coord-name"
-               class="ui-input home-composer-name"
-               type="text"
-               autocomplete="off"
-               placeholder="Name (optional)">
-        <label for="home-coord-skill" class="sr-only">Skill</label>
-        <select id="home-coord-skill" class="ui-select home-composer-skill">
-          <option value="">Use defaults</option>
-        </select>
-        <button id="home-coord-submit"
-                type="button"
-                class="ui-btn ui-btn--primary home-composer-submit"
-                onclick="submitHomeCoord()">Start</button>
-      </div>
+      <!-- Composer DOM is built by shared_static/composer.js into this
+           mount — stacked layout (textarea above, options toggle +
+           Start button below) with Name + Skill in an Options
+           dropdown to match the webui dashboard composer's shape. -->
+      <div id="home-coord-composer-mount"></div>
       <div id="home-coord-error"
            class="home-composer-error"
            role="alert"
@@ -879,6 +863,7 @@ window.TURNSTONE_KB_SHORTCUTS = [
 <script src="/shared/theme.js"></script>
 <script src="/shared/auth.js"></script>
 <script src="/shared/kb.js"></script>
+<script src="/shared/composer.js"></script>
 
 <div id="new-ws-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="new-ws-title">
   <div id="new-ws-box">

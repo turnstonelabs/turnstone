@@ -35,8 +35,6 @@ function Pane(wsId) {
   this._pendingEditSend = null;
   // Map<attachment_id, {filename, size_bytes, mime_type, kind}>
   this.pendingAttachments = new Map();
-  this.attachBtn = null;
-  this.attachInput = null;
   this.attachChipsEl = null;
   this._createDOM();
 }
@@ -170,149 +168,31 @@ Pane.prototype._createDOM = function () {
   this.statusBarEl.appendChild(this._sbTurns);
   this.el.appendChild(this.statusBarEl);
 
-  // Input area
-  var inputArea = document.createElement("div");
-  inputArea.className = "ts-composer";
-
-  // Attachment chips row — above the textarea, hidden unless populated
-  this.attachChipsEl = document.createElement("div");
-  this.attachChipsEl.className = "ts-composer-chips";
-  this.attachChipsEl.setAttribute("role", "list");
-  this.attachChipsEl.setAttribute("aria-label", "Pending attachments");
-  inputArea.appendChild(this.attachChipsEl);
-
-  var inputRow = document.createElement("div");
-  inputRow.className = "ts-composer-row";
-  inputArea.appendChild(inputRow);
-
-  // Paperclip button — opens the file picker
-  this.attachBtn = document.createElement("button");
-  this.attachBtn.type = "button";
-  this.attachBtn.className = "ts-composer-attach";
-  this.attachBtn.setAttribute("aria-label", "Attach files");
-  this.attachBtn.setAttribute("title", "Attach files");
-  this.attachBtn.textContent = "\ud83d\udcce"; // 📎
-  this.attachBtn.onclick = function () {
-    self.attachInput.click();
-  };
-  inputRow.appendChild(this.attachBtn);
-
-  // Hidden file input
-  this.attachInput = document.createElement("input");
-  this.attachInput.type = "file";
-  this.attachInput.multiple = true;
-  this.attachInput.style.display = "none";
-  this.attachInput.accept =
-    "image/png,image/jpeg,image/gif,image/webp,text/*," +
-    ".md,.py,.js,.ts,.tsx,.jsx,.json,.yaml,.yml,.toml,.html,.css,.sh," +
-    ".rs,.go,.java,.c,.cpp,.h,.hpp,.sql,.xml,.ini,.conf";
-  this.attachInput.addEventListener("change", function (e) {
-    var files = Array.from(e.target.files || []);
-    files.forEach(function (f) {
-      self.uploadAttachment(f);
-    });
-    // Reset so selecting the same file again still fires change
-    self.attachInput.value = "";
-  });
-  inputRow.appendChild(this.attachInput);
-
-  this.inputEl = document.createElement("textarea");
-  this.inputEl.className = "ts-composer-input";
-  this.inputEl.rows = 1;
-  this._isTouch = window.matchMedia(
-    "(hover: none) and (pointer: coarse)",
-  ).matches;
-  this.inputEl.placeholder = this._isTouch
-    ? "Type a message\u2026"
-    : "Type a message\u2026 (Shift+Enter for newline)";
-  this.inputEl.setAttribute("aria-label", "Message input");
-  this.inputEl.addEventListener("input", function () {
-    self._autoResize();
-  });
-  this.inputEl.addEventListener("keydown", function (e) {
-    // On touch devices, let Enter insert newlines — users tap Send button.
-    // On desktop, Enter sends and Shift+Enter inserts a newline.
-    if (e.key === "Enter" && !e.shiftKey && !self._isTouch) {
-      e.preventDefault();
+  // Input area — DOM + behavior comes from shared/composer.js.  The
+  // pane keeps the attachment-upload pipeline (because attachments are
+  // pane-specific state) and routes file events through the composer's
+  // attach/paste/drop callbacks.
+  this.composer = new Composer(this.el, {
+    attachments: {
+      onAttach: function (file) {
+        self.uploadAttachment(file);
+      },
+    },
+    stopBtn: true,
+    queueWhileBusy: true,
+    busyPlaceholder: "Queue a message\u2026 (!!! for urgent)",
+    onSend: function () {
       self.sendMessage();
-    }
+    },
+    onStop: function () {
+      self.cancelGeneration();
+    },
+    dragDrop: { targetEl: this.el, dropClass: "pane-drop-target" },
   });
-  // Paste: pull image blobs out of the clipboard and treat as uploads
-  this.inputEl.addEventListener("paste", function (e) {
-    var items = (e.clipboardData && e.clipboardData.items) || [];
-    var uploaded = 0;
-    for (var i = 0; i < items.length; i++) {
-      var it = items[i];
-      if (it.kind === "file") {
-        var f = it.getAsFile();
-        if (f) {
-          self.uploadAttachment(f);
-          uploaded += 1;
-        }
-      }
-    }
-    if (uploaded > 0) {
-      // Prevent the raw image data from also landing in the textarea
-      e.preventDefault();
-    }
-  });
-  inputRow.appendChild(this.inputEl);
-
-  this.sendBtn = document.createElement("button");
-  this.sendBtn.className = "pane-send ts-composer-send";
-  this.sendBtn.textContent = "Send";
-  this.sendBtn.onclick = function () {
-    self.sendMessage();
-  };
-  inputRow.appendChild(this.sendBtn);
-
-  this.stopBtn = document.createElement("button");
-  this.stopBtn.className = "pane-stop";
-  this.stopBtn.style.display = "none";
-  this.stopBtn.textContent = "\u25a0 Stop";
-  this.stopBtn.setAttribute("aria-label", "Stop generation");
-  this.stopBtn.onclick = function () {
-    self.cancelGeneration();
-  };
-  inputRow.appendChild(this.stopBtn);
-
-  this.el.appendChild(inputArea);
-
-  // Drag/drop attachments onto the pane.  dragover is required to
-  // opt-into the drop target; without it the browser blocks drop.
-  this.el.addEventListener("dragover", function (e) {
-    if (
-      e.dataTransfer &&
-      Array.from(e.dataTransfer.types || []).indexOf("Files") !== -1
-    ) {
-      e.preventDefault();
-      self.el.classList.add("pane-drop-target");
-    }
-  });
-  this.el.addEventListener("dragleave", function (e) {
-    // Only clear the hover state when leaving the pane entirely.
-    // e.target fires for every child the cursor crosses (textarea,
-    // buttons), so use relatedTarget — the element being entered —
-    // and clear only when it's outside the pane.
-    var related = e.relatedTarget;
-    if (!related || !self.el.contains(related)) {
-      self.el.classList.remove("pane-drop-target");
-    }
-  });
-  this.el.addEventListener("dragend", function () {
-    // Fallback: cancelled drags don't always emit dragleave on the pane.
-    self.el.classList.remove("pane-drop-target");
-  });
-  this.el.addEventListener("drop", function (e) {
-    self.el.classList.remove("pane-drop-target");
-    var files = Array.from((e.dataTransfer && e.dataTransfer.files) || []);
-    if (files.length > 0) {
-      e.preventDefault();
-      files.forEach(function (f) {
-        self.uploadAttachment(f);
-      });
-    }
-  });
+  this.attachChipsEl = this.composer.chipsEl;
+  this.inputEl = this.composer.inputEl;
+  this.sendBtn = this.composer.sendBtn;
+  this.stopBtn = this.composer.stopBtn;
 };
 
 Pane.prototype.reset = function () {
@@ -555,30 +435,17 @@ Pane.prototype.disconnectSSE = function () {
 Pane.prototype.setBusy = function (b) {
   this.busy = b;
   this.messagesEl.dataset.busy = b ? "true" : "false";
-  // Keep send button enabled during busy — allows queuing messages
-  this.sendBtn.disabled = false;
-  this.sendBtn.style.display = "";
-  if (b) {
-    this.sendBtn.textContent = "Queue";
-    this.sendBtn.setAttribute(
-      "aria-label",
-      "Queue message for delivery after current execution",
-    );
-    this.sendBtn.classList.add("queue-mode");
-    this.inputEl.placeholder = "Queue a message\u2026 (!!! for urgent)";
-  } else {
-    this.sendBtn.textContent = "Send";
-    this.sendBtn.setAttribute("aria-label", "Send message");
-    this.sendBtn.classList.remove("queue-mode");
-    this.inputEl.placeholder = "Type a message\u2026";
-    // Promote queued messages to normal appearance on idle
-    this._promoteQueuedMessages();
-  }
-  this.stopBtn.style.display = b ? "" : "none";
-  this.stopBtn.disabled = !b;
+  // Composer owns send/stop button display + busy-mode placeholder swap.
+  this.composer.setBusy(b);
+  // Reset stop button content on every transition so a previous
+  // "Cancelling…" or "⚠ Force Stop" label doesn't persist into the
+  // next busy cycle.  cancelGeneration() mutates these fields when the
+  // user clicks stop; we reset here so the composer's standard "■ Stop"
+  // is what the next busy=true transition shows.
   this.stopBtn.textContent = "\u25a0 Stop";
   this.stopBtn.setAttribute("aria-label", "Stop generation");
   delete this.stopBtn.dataset.forceCancel;
+  if (!b) this._promoteQueuedMessages();
 };
 
 Pane.prototype._promoteQueuedMessages = function () {
@@ -1941,8 +1808,7 @@ Pane.prototype.sendMessage = function () {
       body: JSON.stringify({ command: text, ws_id: this.wsId }),
     });
     this.addUserMessage(text);
-    this.inputEl.value = "";
-    this._autoResize();
+    this.composer.clear();
     return;
   }
 
@@ -1975,8 +1841,7 @@ Pane.prototype.sendMessage = function () {
     this.setBusy(true);
     this.addUserMessage(text, attachmentList);
   }
-  this.inputEl.value = "";
-  this._autoResize();
+  this.composer.clear();
 
   authFetch("/v1/api/send", {
     method: "POST",
@@ -2081,11 +1946,6 @@ Pane.prototype.cancelGeneration = function () {
       self.addErrorMessage("Cancel error: " + err.message);
       self.stopBtn.disabled = false;
     });
-};
-
-Pane.prototype._autoResize = function () {
-  this.inputEl.style.height = "auto";
-  this.inputEl.style.height = Math.min(this.inputEl.scrollHeight, 200) + "px";
 };
 
 // ===========================================================================

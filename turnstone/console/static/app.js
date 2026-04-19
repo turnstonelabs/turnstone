@@ -1805,29 +1805,23 @@ function _hasCoordPermission() {
   return perms.split(",").indexOf("admin.coordinator") !== -1;
 }
 
-// POST /v1/api/coordinator/new.  Used by the home-landing composer
-// (submitHomeCoord).  Caller supplies the DOM elements + idle/busy
-// labels; on success we redirect to /coordinator/{ws_id}, on 503 we
-// invoke on503 so the caller can surface a "subsystem not configured"
-// remediation banner.
+// POST /v1/api/coordinator/new.  Accepts the three request fields
+// directly + an errEl / setBusy callback so the caller owns the
+// loading-state UX (button label swap, composer disabled flag, etc.).
+// On success redirects to /coordinator/{ws_id}; on 503 invokes on503
+// so the caller can surface the "subsystem not configured" banner.
 function _createCoordinator(opts) {
-  var nameEl = opts.nameEl;
-  var skillEl = opts.skillEl;
-  var taskEl = opts.taskEl;
+  var name = (opts.name || "").trim();
+  var skill = opts.skill || "";
+  var task = (opts.task || "").trim();
   var errEl = opts.errEl;
-  var btn = opts.btn;
-  var idleLabel = opts.idleLabel;
-  var busyLabel = opts.busyLabel;
+  var setBusy = opts.setBusy || function () {};
   var on503 = opts.on503 || function () {};
   var onSuccess = opts.onSuccess || function () {};
 
-  var name = (nameEl.value || "").trim();
-  var skill = skillEl.value || "";
-  var task = (taskEl.value || "").trim();
   errEl.style.display = "none";
   errEl.textContent = "";
-  btn.disabled = true;
-  btn.textContent = busyLabel;
+  setBusy(true);
 
   var body = {};
   if (name) body.name = name;
@@ -1845,8 +1839,7 @@ function _createCoordinator(opts) {
       });
     })
     .then(function (res) {
-      btn.disabled = false;
-      btn.textContent = idleLabel;
+      setBusy(false);
       if (res.status === 503) {
         on503(res);
         return;
@@ -1862,8 +1855,7 @@ function _createCoordinator(opts) {
         "/coordinator/" + encodeURIComponent(res.data.ws_id);
     })
     .catch(function () {
-      btn.disabled = false;
-      btn.textContent = idleLabel;
+      setBusy(false);
       errEl.textContent = "Request failed";
       errEl.style.display = "block";
     });
@@ -1879,33 +1871,85 @@ function _createCoordinator(opts) {
 
 var _homeComposerInit = false;
 var _homeCoordReady = null; // tri-state: null = unknown, true = ready, false = 503
+var _homeCoordComposer = null; // shared Composer instance
+var _homeCoordBusy = false;
+
+// Single owner for sendBtn.disabled: disabled if EITHER busy OR the
+// subsystem probe flipped to 503.  Every setter for _homeCoordBusy /
+// _homeCoordReady ends with a call here so the two inputs can't drift
+// out of sync (and a probe resolving mid-submit can't re-enable the
+// button under an in-flight request).
+function _refreshHomeCoordSubmitEnabled() {
+  if (!_homeCoordComposer) return;
+  _homeCoordComposer.sendBtn.disabled =
+    _homeCoordBusy || _homeCoordReady === false;
+}
 
 function _ensureHomeComposerInit() {
   if (_homeComposerInit) return;
   _homeComposerInit = true;
+  _mountHomeCoordComposer();
   _populateHomeSkillDropdown();
   _probeCoordSubsystem();
   _refreshHomeComposerVisibility();
 }
 
+function _mountHomeCoordComposer() {
+  var mount = document.getElementById("home-coord-composer-mount");
+  if (!mount || _homeCoordComposer) return;
+  _homeCoordComposer = new Composer(mount, {
+    layout: "stacked",
+    rows: 3,
+    placeholder: "What should this coordinator orchestrate?",
+    ariaLabel: "Initial task",
+    sendLabel: "Start",
+    // Ctrl/Cmd+Enter submit stays in the document keydown handler
+    // below — it wants to also work when focus is outside the
+    // composer (e.g. just after the admin banner dismisses).
+    options: {
+      storageKey: "turnstone.console.home_coord.options_open",
+      summary: function (v) {
+        var bits = [];
+        if (v.name) bits.push(v.name);
+        if (v.skill) bits.push(v.skill);
+        return bits.join(" \u00b7 ");
+      },
+      fields: [
+        {
+          id: "name",
+          label: "Name",
+          type: "input",
+          placeholder: "Auto-generated if empty",
+          autocomplete: "off",
+        },
+        {
+          id: "skill",
+          label: "Skill",
+          type: "select",
+          choices: [{ value: "", text: "Use defaults" }],
+        },
+      ],
+    },
+    onSend: function (text) {
+      submitHomeCoord(text);
+    },
+  });
+}
+
 function _populateHomeSkillDropdown() {
-  var sel = document.getElementById("home-coord-skill");
-  if (!sel) return;
+  if (!_homeCoordComposer) return;
   authFetch("/v1/api/skills")
     .then(function (r) {
       return r.ok ? r.json() : { skills: [] };
     })
     .then(function (data) {
-      // Reset to just the fixed "Use defaults" first option so repeat
-      // calls (onLoginSuccess after an initial pre-auth run that
-      // 401'd) don't accumulate duplicate entries.
-      sel.replaceChildren(sel.options[0]);
-      (data.skills || []).forEach(function (t) {
-        var opt = document.createElement("option");
-        opt.value = t.name;
-        opt.textContent = t.is_default ? t.name + " (default)" : t.name;
-        sel.appendChild(opt);
+      var choices = (data.skills || []).map(function (t) {
+        return {
+          value: t.name,
+          text: t.is_default ? t.name + " (default)" : t.name,
+        };
       });
+      _homeCoordComposer.setOptionChoices("skill", choices);
     })
     .catch(function () {
       /* defaults still work even without the dropdown populated */
@@ -1938,9 +1982,8 @@ function _probeCoordSubsystem() {
         return;
       }
       var banner = document.getElementById("coord-composer-503");
-      var submitBtn = document.getElementById("home-coord-submit");
       if (banner) banner.style.display = _homeCoordReady ? "none" : "";
-      if (submitBtn) submitBtn.disabled = !_homeCoordReady;
+      _refreshHomeCoordSubmitEnabled();
     })
     .catch(function () {
       /* network error — leave banner hidden; submit will surface a retryable error */
@@ -1953,37 +1996,55 @@ function _refreshHomeComposerVisibility() {
   panel.style.display = _hasCoordPermission() ? "" : "none";
 }
 
-function submitHomeCoord() {
+function submitHomeCoord(textFromComposer) {
   if (!_hasCoordPermission()) {
     showToast("admin.coordinator permission required");
     return;
   }
+  if (!_homeCoordComposer) return;
+  // text arg is passed when the Composer's Enter-key handler fires;
+  // direct callers (Ctrl/Cmd+Enter) invoke with no argument and we
+  // read from the composer.
+  var task =
+    textFromComposer != null ? textFromComposer : _homeCoordComposer.value;
+  var opts = _homeCoordComposer.getOptionValues();
   _createCoordinator({
-    nameEl: document.getElementById("home-coord-name"),
-    skillEl: document.getElementById("home-coord-skill"),
-    taskEl: document.getElementById("home-coord-task"),
+    name: opts.name || "",
+    skill: opts.skill || "",
+    task: task,
     errEl: document.getElementById("home-coord-error"),
-    btn: document.getElementById("home-coord-submit"),
-    idleLabel: "Start",
-    busyLabel: "Starting\u2026",
+    setBusy: function (b) {
+      _homeCoordBusy = b;
+      if (_homeCoordComposer) {
+        _homeCoordComposer.setBusy(b);
+        _homeCoordComposer.setSendLabel("Start", "Starting\u2026");
+      }
+      _refreshHomeCoordSubmitEnabled();
+    },
     on503: function () {
       _homeCoordReady = false;
       var banner = document.getElementById("coord-composer-503");
       if (banner) banner.style.display = "";
-      var btn = document.getElementById("home-coord-submit");
-      if (btn) btn.disabled = true;
+      _refreshHomeCoordSubmitEnabled();
     },
   });
 }
 
-// Ctrl/Cmd+Enter inside the composer textarea submits — consistent with
-// the modal's Enter-submits-when-focused-outside-textarea shortcut.
+// Ctrl/Cmd+Enter anywhere on the home page submits the coordinator
+// composer — consistent with the modal's keyboard-shortcut convention.
+// The Composer's own Enter handler already fires submitHomeCoord when
+// focus is in the textarea; this covers the case when focus sits on
+// the attach / options buttons.
 document.addEventListener("keydown", function (e) {
   if (e.key !== "Enter" || !(e.ctrlKey || e.metaKey)) return;
-  if (!e.target || e.target.id !== "home-coord-task") return;
+  if (!_homeCoordComposer) return;
+  var mount = document.getElementById("home-coord-composer-mount");
+  if (!mount || !mount.contains(e.target)) return;
   e.preventDefault();
-  var btn = document.getElementById("home-coord-submit");
-  if (btn && !btn.disabled) submitHomeCoord();
+  // sendBtn.disabled is the single reconciler of busy + 503-ready —
+  // checking it here is enough to avoid double-submits or submits
+  // while the subsystem is down.
+  if (!_homeCoordComposer.sendBtn.disabled) submitHomeCoord();
 });
 
 // Fingerprints of the last home-view render — skip DOM rebuilds when

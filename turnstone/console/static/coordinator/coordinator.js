@@ -30,8 +30,23 @@
   }
 
   const messagesEl = document.getElementById("coord-messages");
-  const inputEl = document.getElementById("coord-input");
-  const sendBtn = document.getElementById("coord-send-btn");
+  const composerMount = document.getElementById("coord-composer-mount");
+  const composer = new Composer(composerMount, {
+    placeholder: "Message the coordinator\u2026",
+    ariaLabel: "Coordinator input",
+    onSend: function (text) {
+      coordSend(text);
+    },
+    // Preserve the coordinator's pre-refactor Enter-on-touch behaviour
+    // — coordinator sessions are short and tap-to-send via the
+    // on-screen Return key is a quicker workflow than tapping a Send
+    // button.
+    touchEnterSends: true,
+    // No attachments yet — coordinator-side attach mid-conversation
+    // requires a backend ingest path that doesn't exist; defer.
+    // No stopBtn — coordinator already has a header-mounted cancel
+    // button (#coord-cancel-btn) that fires coordCancel().
+  });
   const statusEl = document.getElementById("coord-status");
   const sseEl = document.getElementById("coord-sse-status");
   const nameEl = document.getElementById("coord-name");
@@ -320,7 +335,7 @@
       approvalBar.contains(document.activeElement)
     ) {
       try {
-        inputEl.focus();
+        composer.focus();
       } catch (_) {
         /* noop */
       }
@@ -366,12 +381,11 @@
   // Send / cancel / close
   // ------------------------------------------------------------------
 
-  window.coordSend = function (evt) {
-    if (evt && evt.preventDefault) evt.preventDefault();
-    const msg = (inputEl.value || "").trim();
+  window.coordSend = function (text) {
+    const msg = (text || "").trim();
     if (!msg) return false;
-    inputEl.value = "";
-    sendBtn.disabled = true;
+    composer.clear();
+    composer.setBusy(true);
     postJSON("/v1/api/coordinator/" + encodeURIComponent(wsId) + "/send", {
       message: msg,
     })
@@ -388,7 +402,7 @@
         else console.error(e);
       })
       .finally(() => {
-        sendBtn.disabled = false;
+        composer.setBusy(false);
       });
     return false;
   };
@@ -1407,13 +1421,6 @@
     connectSSE();
   };
 
-  // Plain Enter submits; Shift+Enter inserts a newline.  IME composition
-  // (isComposing) is respected so users typing in CJK/other IMEs aren't
-  // cut off mid-word.
-  inputEl.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
-      e.preventDefault();
-      coordSend(e);
-    }
-  });
+  // Enter-to-send / Shift-Enter newline / IME-safe handling lives in
+  // shared/composer.js; no duplicate listener here.
 })();

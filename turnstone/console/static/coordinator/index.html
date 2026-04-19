@@ -222,12 +222,11 @@
       </div>
     </div>
 
-    <form id="coord-composer" class="ts-composer" onsubmit="return coordSend(event)">
-      <div class="ts-composer-row">
-        <textarea id="coord-input" class="ts-composer-input" rows="1" placeholder="Message the coordinator…" aria-label="Coordinator input"></textarea>
-        <button id="coord-send-btn" class="ts-composer-send" type="submit">send</button>
-      </div>
-    </form>
+    <!-- Composer DOM is built by shared_static/composer.js into this mount.
+         Keeping the mount here (rather than inside coord-main's first child)
+         preserves the existing flex layout that puts the composer below the
+         message log + approval bar. -->
+    <div id="coord-composer-mount"></div>
   </div>
 
   <aside id="coord-sidebar" class="ts-sidebar" aria-expanded="true" aria-label="Coordinator children and tasks">
@@ -282,6 +281,7 @@
 <script src="/shared/theme.js"></script>
 <script src="/shared/auth.js"></script>
 <script src="/shared/kb.js"></script>
+<script src="/shared/composer.js"></script>
 <script src="/shared/katex-0.16.45/katex.min.js"></script>
 <script src="/shared/hljs-11.11.1/highlight.min.js"></script>
 <script src="/shared/renderer.js"></script>

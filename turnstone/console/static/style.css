@@ -87,18 +87,6 @@
   text-decoration-thickness: 2px;
 }
 
-.home-composer-task { width: 100%; font-size: 13px; }
-
-.home-composer-row {
-  display: flex;
-  gap: 8px;
-  align-items: stretch;
-  flex-wrap: wrap;
-}
-.home-composer-name { flex: 1 1 220px; min-width: 160px; }
-.home-composer-skill { flex: 0 0 180px; }
-.home-composer-submit { flex: 0 0 auto; min-width: 90px; }
-
 .home-composer-error {
   color: var(--red);
   font-size: 12px;
@@ -169,8 +157,6 @@
   #main { padding: 14px 12px 48px; }
   #view-home { gap: 16px; }
   .home-panel { padding: 12px 12px; }
-  .home-composer-row { flex-direction: column; gap: 6px; }
-  .home-composer-name, .home-composer-skill, .home-composer-submit { flex: none; width: 100%; }
 }
 
 @media (prefers-reduced-motion: reduce) {
