@@ -446,11 +446,16 @@ class CoordinatorClient:
         size.  No tenant guard here: ownership is enforced on the
         endpoint via ``_resolve_coord_session``.
         """
-        path = _ROUTE_PATHS["close_all_children"].format(ws_id=self._coord_ws_id)
+        # Pass the unformatted template as ``log_path`` so telemetry
+        # aggregates cleanly — the baked-in ws_id would fragment log
+        # grouping across sessions.  The URL itself still embeds the
+        # real ws_id.
+        log_path = _ROUTE_PATHS["close_all_children"]
+        path = log_path.format(ws_id=self._coord_ws_id)
         body: dict[str, Any] = {}
         if reason:
             body["reason"] = reason
-        return self._post_url(f"{self._base_url}{path}", body, log_path=path)
+        return self._post_url(f"{self._base_url}{path}", body, log_path=log_path)
 
     def delete(self, ws_id: str) -> dict[str, Any]:
         if not self._is_own_subtree(ws_id):

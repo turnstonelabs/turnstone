@@ -1,12 +1,13 @@
 {
   "name": "close_all_children",
-  "description": "Soft-close every direct child of this coordinator in a single approval. Reads the in-memory child registry, then fans out close requests with bounded concurrency. Returns {closed: [ws_id...], failed: [ws_id...], skipped: [ws_id...]} — `skipped` holds children already gone (404 / missing row), `failed` holds transient dispatch errors worth retrying. Indirect descendants (children of children) are NOT closed — run `stop_cascade` from the operator UI for a full-subtree teardown. The optional `reason` is propagated to every closed child's audit + workstream_config for postmortem.",
+  "description": "Soft-close every direct child of this coordinator in a single approval. Reads the in-memory child registry, then fans out close requests with bounded concurrency. Returns {closed: [ws_id...], failed: [ws_id...], skipped: [ws_id...], reason?: str} — `skipped` holds children already gone (404 / missing row), `failed` holds transient dispatch errors worth retrying, and `reason` is echoed back in the response when supplied. Indirect descendants (children of children) are NOT closed — run `stop_cascade` from the operator UI for a full-subtree teardown. The optional `reason` is propagated to every closed child's audit + workstream_config for postmortem; the server rejects reasons longer than 512 chars with a tool error.",
   "parameters": {
     "type": "object",
     "properties": {
       "reason": {
         "type": "string",
-        "description": "Optional human-readable reason — propagated to every closed child's audit + workstream_config."
+        "maxLength": 512,
+        "description": "Optional human-readable reason (max 512 chars) — propagated to every closed child's audit + workstream_config, and echoed back in the response payload when provided."
       }
     },
     "required": []

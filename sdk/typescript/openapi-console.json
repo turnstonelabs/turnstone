@@ -7096,7 +7096,8 @@
         "properties": {
           "reason": {
             "default": "",
-            "description": "Optional human-readable reason \u2014 propagated to every closed child's audit + workstream_config for postmortem.  Capped at 512 chars.",
+            "description": "Optional human-readable reason \u2014 propagated to every closed child's audit + workstream_config for postmortem.  Capped at 512 chars; the handler returns 400 on overflow.",
+            "maxLength": 512,
             "title": "Reason",
             "type": "string"
           }

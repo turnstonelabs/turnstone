@@ -5086,7 +5086,6 @@ class ChatSession:
 
         results: dict[str, dict[str, Any]] = {}
         denied: list[dict[str, Any]] = []
-        spawned_ids: list[str] = []
         for spec in children:
             idx = spec["idx"]
             # Validation failures from _prepare surface here as denied
@@ -5114,7 +5113,6 @@ class ChatSession:
             if not ws_id:
                 denied.append({"idx": idx, "reason": "spawn returned no ws_id"})
                 continue
-            spawned_ids.append(ws_id)
             results[str(idx)] = {
                 "ws_id": ws_id,
                 "name": result.get("name", ""),

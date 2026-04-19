@@ -1195,10 +1195,11 @@ class CoordinatorCloseAllChildrenRequest(BaseModel):
 
     reason: str = Field(
         default="",
+        max_length=512,
         description=(
             "Optional human-readable reason — propagated to every closed "
             "child's audit + workstream_config for postmortem.  Capped at "
-            "512 chars."
+            "512 chars; the handler returns 400 on overflow."
         ),
     )
 
