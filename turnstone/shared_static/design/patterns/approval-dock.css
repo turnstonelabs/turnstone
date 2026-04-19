@@ -1,0 +1,237 @@
+/* turnstone design system — approval dock pattern
+   Bottom-pinned strip that appears when pending approvals exist. The
+   signature product pattern: a neutral dock (not a modal, not inline) that
+   surfaces the approval contract without hijacking focus.
+
+   Layout:
+     .approval-dock        position: fixed bottom
+       .dhead              11px uppercase warn kicker + count on right
+       .dcall              risk pill + function name + arg preview
+       .dctx               context code snippets
+       .drow               right-aligned action cluster + nav spacer
+
+   Actions (action cluster):
+     button.act           neutral default ("dismiss" / "view")
+     button.act.primary   warn-tinted amber — primary "Approve" action
+                          (NEVER green; amber signals "needs attention →
+                          resolving"). 1.5px border, --r-md squared.
+     button.act.always    dashed border — "Always approve for this rule"
+     button.act.danger    err-tinted red — "Deny"
+
+   Keyboard shortcuts (wired in coordinator.js):
+     Enter  → primary approve
+     D      → deny
+     ⇧A     → always approve
+
+   Focus policy: when the dock opens, move focus to button.act.primary so
+   keyboard users can confirm without hunting. Do NOT trap focus. */
+
+[data-design="v1"] .approval-dock {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 22px; /* clears the statusbar if one is present */
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 20px;
+  background: var(--panel);
+  border-top: 1px solid var(--hair);
+  box-shadow: 0 -6px 24px -12px rgba(21, 24, 27, 0.18);
+}
+
+[data-design="v1"] .approval-dock::before {
+  content: "";
+  position: absolute;
+  top: -1px;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(
+    to right,
+    transparent,
+    color-mix(in srgb, var(--warn) 50%, transparent),
+    transparent
+  );
+}
+
+[data-design="v1"] .approval-dock .dhead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--warn);
+}
+
+[data-design="v1"] .approval-dock .dhead::before {
+  content: "⚠";
+  font-size: 12px;
+}
+
+[data-design="v1"] .approval-dock .dhead .dcount {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--ink-3);
+}
+
+/* Inline code-panel framing — the .dcall row reads as "the exact call you
+   are approving," so we frame it like a mini inspectable code line rather
+   than bare text on the dock surface. */
+[data-design="v1"] .approval-dock .dcall {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 6px 10px;
+  background: var(--panel);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-sm);
+}
+
+[data-design="v1"] .approval-dock .dcall .risk { flex-shrink: 0; }
+
+[data-design="v1"] .approval-dock .dcall .dfn {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--ink);
+}
+
+[data-design="v1"] .approval-dock .dcall .dargs {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+[data-design="v1"] .approval-dock .dctx {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--ink-3);
+}
+
+[data-design="v1"] .approval-dock .dctx code {
+  padding: 0 4px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-2);
+  background: var(--panel-2);
+  border: 1px solid var(--hair);
+  border-radius: 3px;
+}
+
+[data-design="v1"] .approval-dock .drow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+[data-design="v1"] .approval-dock .drow .spacer { flex: 1; }
+
+[data-design="v1"] .approval-dock .drow .nav {
+  padding: 4px 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-3);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+[data-design="v1"] .approval-dock .drow .nav:hover {
+  background: var(--panel-2);
+  color: var(--ink);
+}
+
+/* Action buttons — 1.5px border, --r-md squared (NOT pill — these are
+   primary-action surfaces, not inline buttons). */
+[data-design="v1"] .approval-dock button.act {
+  padding: 7px 16px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ink-2);
+  background: var(--panel);
+  border: 1.5px solid var(--hair-2);
+  border-radius: var(--r-md);
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+[data-design="v1"] .approval-dock button.act:hover {
+  color: var(--ink);
+  border-color: var(--ink-4);
+}
+
+[data-design="v1"] .approval-dock button.act:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+[data-design="v1"] .approval-dock button.act.primary {
+  background: color-mix(in srgb, var(--warn) 22%, var(--panel));
+  /* Same darkening pattern as .btn.approve — warn-on-warn-tint needs ink
+     to pass AA. */
+  color: color-mix(in srgb, var(--warn) 55%, var(--ink));
+  border-color: color-mix(in srgb, var(--warn) 60%, var(--hair));
+  font-weight: 600;
+}
+
+[data-design="v1"] .approval-dock button.act.primary:hover {
+  background: color-mix(in srgb, var(--warn) 32%, var(--panel));
+  color: var(--ink);
+  border-color: var(--warn);
+}
+
+[data-design="v1"] .approval-dock button.act.always {
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--ink-3) 45%, var(--hair));
+  color: var(--ink-3);
+}
+
+[data-design="v1"] .approval-dock button.act.always:hover {
+  color: var(--ink);
+  border-color: var(--ink-3);
+}
+
+[data-design="v1"] .approval-dock button.act.danger {
+  color: var(--err);
+  border-color: color-mix(in srgb, var(--err) 42%, var(--hair));
+}
+
+[data-design="v1"] .approval-dock button.act.danger:hover {
+  background: var(--err-soft);
+  color: var(--err);
+  border-color: var(--err);
+}
+
+/* Match .btn .kbd (primitives/buttons.css) — --ink-3 clears AA at 10px,
+   --ink-4 is borderline on light panels. */
+[data-design="v1"] .approval-dock button.act .kbd {
+  margin-left: 6px;
+  padding: 0 3px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-3);
+  border: 1px solid var(--hair);
+  border-radius: 2px;
+}
+
+[data-design="v1"] .approval-dock button.act.primary .kbd {
+  color: color-mix(in srgb, var(--warn) 70%, var(--ink-3));
+  border-color: color-mix(in srgb, var(--warn) 40%, var(--hair));
+}

@@ -1,0 +1,97 @@
+/* turnstone design system — fleet grid pattern
+   14-column grid of .node squares. Each node carries a state modifier
+   (.s-ok / .s-thinking / .s-attn / .s-err / .s-idle / .s-unreach) and a
+   --pct CSS var driving a bottom-filling load gradient on ::after.
+
+   The grid lives inside a .panel; a .fleet-legend below the grid explains
+   state colours using the same swatches.
+
+   Interaction: hover uses `outline`, never `box-shadow` — the bleed into
+   adjacent cells is the intended look (fleet density visualization). */
+
+[data-design="v1"] .fleet {
+  display: grid;
+  grid-template-columns: repeat(14, 1fr);
+  gap: 4px;
+  padding: 14px;
+}
+
+[data-design="v1"] .fleet .node {
+  position: relative;
+  aspect-ratio: 1;
+  background: var(--ok-soft);
+  border: 1px solid transparent;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+[data-design="v1"] .fleet .node::after {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  border-radius: 1px;
+  background: linear-gradient(
+    to top,
+    var(--fill, var(--ok)) var(--pct, 30%),
+    transparent var(--pct, 30%)
+  );
+  opacity: 0.75;
+}
+
+[data-design="v1"] .fleet .node.s-ok       { --fill: var(--ok);    background: var(--ok-soft); }
+[data-design="v1"] .fleet .node.s-thinking { --fill: var(--think); background: var(--think-soft); }
+[data-design="v1"] .fleet .node.s-attn     { --fill: var(--warn);  background: var(--warn-soft); border-color: var(--warn); }
+[data-design="v1"] .fleet .node.s-err      { --fill: var(--err);   background: var(--err-soft);  border-color: var(--err); }
+[data-design="v1"] .fleet .node.s-idle     { --fill: var(--ink-4); background: var(--hair-2); }
+
+/* .s-unreach — unreachable nodes use a hatch pattern; no load fill. */
+[data-design="v1"] .fleet .node.s-unreach {
+  background: repeating-linear-gradient(
+    -45deg,
+    var(--hair) 0 3px,
+    var(--hair-2) 3px 6px
+  );
+  opacity: 0.6;
+}
+
+/* Hover + focus — outline, not shadow. Bleed into neighbours is deliberate;
+   the outline overlaps adjacent cells and that's how the density visual
+   reads. */
+[data-design="v1"] .fleet .node:hover,
+[data-design="v1"] .fleet .node:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  z-index: 2;
+}
+
+/* Legend row below the grid */
+[data-design="v1"] .fleet-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  padding: 10px 14px;
+  font-size: 11px;
+  color: var(--ink-3);
+  border-top: 1px solid var(--hair);
+}
+
+[data-design="v1"] .fleet-legend .k {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+[data-design="v1"] .fleet-legend .sw {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
+
+[data-design="v1"] .fleet-legend .sw.ok       { background: var(--ok); }
+[data-design="v1"] .fleet-legend .sw.thinking { background: var(--think); }
+[data-design="v1"] .fleet-legend .sw.attn     { background: var(--warn); }
+[data-design="v1"] .fleet-legend .sw.err      { background: var(--err); }
+[data-design="v1"] .fleet-legend .sw.idle     { background: var(--ink-4); }
+[data-design="v1"] .fleet-legend .sw.unreach {
+  background: repeating-linear-gradient(-45deg, var(--hair) 0 2px, var(--hair-2) 2px 4px);
+}

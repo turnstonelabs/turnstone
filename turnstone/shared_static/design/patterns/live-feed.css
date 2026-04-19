@@ -1,0 +1,38 @@
+/* turnstone design system — live feed pattern
+   Thin wrapper around .feed-item that adds the scrollable container and
+   the streaming polite aria-live region. Mounts inside a .panel.
+
+   Use this when rendering an SSE stream or any chronological event log.
+   Keep individual rows as .feed-item (primitive) so structure stays
+   consistent with standalone event lists. */
+
+[data-design="v1"] .live-feed {
+  display: flex;
+  flex-direction: column;
+  max-height: 560px;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+
+/* Fade the top edge as new entries push older ones up — signals that the
+   stream is live without requiring animation. */
+[data-design="v1"] .live-feed::before {
+  content: "";
+  position: sticky;
+  top: 0;
+  display: block;
+  height: 18px;
+  margin-bottom: -18px;
+  pointer-events: none;
+  background: linear-gradient(to bottom, var(--panel), transparent);
+  z-index: 1;
+}
+
+/* Empty state — centred mono hint. */
+[data-design="v1"] .live-feed .feed-empty {
+  padding: 40px 14px;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-4);
+}

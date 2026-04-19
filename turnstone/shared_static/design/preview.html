@@ -13,6 +13,9 @@
   <link rel="stylesheet" href="./primitives/pills.css" />
   <link rel="stylesheet" href="./primitives/stats.css" />
   <link rel="stylesheet" href="./primitives/feed.css" />
+  <link rel="stylesheet" href="./patterns/approval-dock.css" />
+  <link rel="stylesheet" href="./patterns/fleet-grid.css" />
+  <link rel="stylesheet" href="./patterns/live-feed.css" />
   <style>
     /* preview-page-only styles — not part of the design system */
     body { margin: 0; min-width: 1280px; }
@@ -41,39 +44,10 @@
       border-radius: var(--r-sm);
       margin-bottom: 6px;
     }
-    .fleet-demo {
-      display: grid;
-      grid-template-columns: repeat(14, 1fr);
-      gap: 4px;
-      padding: 14px;
-      max-width: 600px;
-    }
-    .fleet-demo .node {
-      aspect-ratio: 1;
-      border-radius: 3px;
-      background: var(--ok-soft);
-      position: relative;
-      border: 1px solid transparent;
-      cursor: pointer;
-    }
-    .fleet-demo .node::after {
-      content: "";
-      position: absolute;
-      inset: 2px;
-      border-radius: 1px;
-      background: linear-gradient(to top, var(--fill, var(--ok)) var(--pct, 30%), transparent var(--pct, 30%));
-      opacity: 0.75;
-    }
-    .fleet-demo .node.s-ok       { --fill: var(--ok);    background: var(--ok-soft); }
-    .fleet-demo .node.s-thinking { --fill: var(--think); background: var(--think-soft); }
-    .fleet-demo .node.s-attn     { --fill: var(--warn);  background: var(--warn-soft); border-color: var(--warn); }
-    .fleet-demo .node.s-err      { --fill: var(--err);   background: var(--err-soft);  border-color: var(--err); }
-    .fleet-demo .node.s-idle     { --fill: var(--ink-4); background: var(--hair-2); }
-    .fleet-demo .node.s-unreach {
-      background: repeating-linear-gradient(-45deg, var(--hair) 0 3px, var(--hair-2) 3px 6px);
-      opacity: 0.6;
-    }
-    .fleet-demo .node:hover { outline: 2px solid var(--accent); outline-offset: 1px; z-index: 2; }
+    /* Keep the preview's fleet grid compact for inline viewing. */
+    .fleet-demo-wrap .fleet { max-width: 600px; }
+    /* Room below the last section for the fixed approval dock. */
+    main { padding-bottom: 220px; }
   </style>
 </head>
 <body>
@@ -221,27 +195,37 @@
               <span class="meta">42 nodes</span>
               <div class="tools"><button class="ghost on">Grid</button><button class="ghost">List</button></div>
             </div>
-            <div class="fleet-demo">
-              <div class="node s-ok" style="--pct: 30%;"></div>
-              <div class="node s-ok" style="--pct: 45%;"></div>
-              <div class="node s-ok" style="--pct: 60%;"></div>
-              <div class="node s-thinking" style="--pct: 75%;"></div>
-              <div class="node s-attn" style="--pct: 50%;"></div>
-              <div class="node s-ok" style="--pct: 20%;"></div>
-              <div class="node s-ok" style="--pct: 35%;"></div>
-              <div class="node s-idle" style="--pct: 10%;"></div>
-              <div class="node s-ok" style="--pct: 90%;"></div>
-              <div class="node s-err" style="--pct: 0%;"></div>
-              <div class="node s-ok" style="--pct: 55%;"></div>
-              <div class="node s-ok" style="--pct: 40%;"></div>
-              <div class="node s-thinking" style="--pct: 65%;"></div>
-              <div class="node s-unreach"></div>
-              <div class="node s-ok" style="--pct: 25%;"></div>
-              <div class="node s-ok" style="--pct: 50%;"></div>
-              <div class="node s-idle" style="--pct: 5%;"></div>
-              <div class="node s-ok" style="--pct: 70%;"></div>
-              <div class="node s-attn" style="--pct: 80%;"></div>
-              <div class="node s-ok" style="--pct: 45%;"></div>
+            <div class="fleet-demo-wrap">
+              <div class="fleet">
+                <div class="node s-ok" style="--pct: 30%;"></div>
+                <div class="node s-ok" style="--pct: 45%;"></div>
+                <div class="node s-ok" style="--pct: 60%;"></div>
+                <div class="node s-thinking" style="--pct: 75%;"></div>
+                <div class="node s-attn" style="--pct: 50%;"></div>
+                <div class="node s-ok" style="--pct: 20%;"></div>
+                <div class="node s-ok" style="--pct: 35%;"></div>
+                <div class="node s-idle" style="--pct: 10%;"></div>
+                <div class="node s-ok" style="--pct: 90%;"></div>
+                <div class="node s-err" style="--pct: 0%;"></div>
+                <div class="node s-ok" style="--pct: 55%;"></div>
+                <div class="node s-ok" style="--pct: 40%;"></div>
+                <div class="node s-thinking" style="--pct: 65%;"></div>
+                <div class="node s-unreach"></div>
+                <div class="node s-ok" style="--pct: 25%;"></div>
+                <div class="node s-ok" style="--pct: 50%;"></div>
+                <div class="node s-idle" style="--pct: 5%;"></div>
+                <div class="node s-ok" style="--pct: 70%;"></div>
+                <div class="node s-attn" style="--pct: 80%;"></div>
+                <div class="node s-ok" style="--pct: 45%;"></div>
+              </div>
+              <div class="fleet-legend">
+                <div class="k"><span class="sw ok"></span>ok</div>
+                <div class="k"><span class="sw thinking"></span>thinking</div>
+                <div class="k"><span class="sw attn"></span>attention</div>
+                <div class="k"><span class="sw err"></span>error</div>
+                <div class="k"><span class="sw idle"></span>idle</div>
+                <div class="k"><span class="sw unreach"></span>unreachable</div>
+              </div>
             </div>
           </div>
         </div>
@@ -300,6 +284,50 @@
       </section>
 
       <section class="section">
+        <h2>Live feed (pattern)</h2>
+        <div class="panel">
+          <div class="live-feed" role="log" aria-live="polite">
+            <div class="feed-item">
+              <div class="ts">10:42:18</div>
+              <div class="body">
+                <div class="hd">
+                  <span class="k-badge k-tools">tools</span>
+                  <span class="fn">spawn_batch</span>
+                  <span class="target">ws_a1b2c3d4</span>
+                </div>
+                <div class="sum">Fanning out 6 child workstreams to shard log triage.</div>
+              </div>
+              <div class="acts"><span class="conf">0.94</span></div>
+            </div>
+            <div class="feed-item">
+              <div class="ts">10:42:19</div>
+              <div class="body">
+                <div class="hd">
+                  <span class="k-badge k-judge">judge</span>
+                  <span class="fn">score</span>
+                  <span class="target">child ws_ff11</span>
+                </div>
+                <div class="sum">Scored child output: 0.88 confidence.</div>
+              </div>
+              <div class="acts"><span class="conf">0.88</span></div>
+            </div>
+            <div class="feed-item">
+              <div class="ts">10:42:20</div>
+              <div class="body">
+                <div class="hd">
+                  <span class="k-badge k-policy">policy</span>
+                  <span class="fn">allow</span>
+                  <span class="target">role:operator</span>
+                </div>
+                <div class="sum">Policy bundle v4 applied.</div>
+              </div>
+              <div class="acts"><span class="judged"><span class="spin" aria-hidden="true"></span>judging</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section">
         <h2>Semantic token swatches</h2>
         <div class="swatches">
           <div class="sw"><div class="band" style="background: var(--accent);"></div>accent</div>
@@ -312,6 +340,36 @@
       </section>
     </main>
   </div>
+
+  <!-- Approval dock (pattern) — bottom-pinned demo. Only visible when
+       pending approvals exist; in production this is toggled by JS. -->
+  <!-- aria-live="polite" so screen readers announce when a new approval
+       queues while focus is elsewhere. Don't use "assertive" — the dock
+       intentionally does NOT hijack focus. -->
+  <aside class="approval-dock" role="region" aria-label="Approval required" aria-live="polite">
+    <div class="dhead">
+      Approval required
+      <span class="dcount">2 pending</span>
+    </div>
+    <div class="dcall">
+      <span class="risk med">med</span>
+      <span class="dfn">exec</span>
+      <span class="dargs">node-12 / rm -rf /tmp/cache</span>
+    </div>
+    <div class="dctx">
+      <code>ws_a1b2c3d4</code>
+      <code>role:operator</code>
+      <code>judge: 0.88</code>
+    </div>
+    <div class="drow">
+      <button class="nav" type="button">← prev</button>
+      <button class="nav" type="button">next →</button>
+      <div class="spacer"></div>
+      <button class="act danger" type="button">Deny<span class="kbd">D</span></button>
+      <button class="act always" type="button">Always<span class="kbd">⇧A</span></button>
+      <button class="act primary" type="button">Approve<span class="kbd">⏎</span></button>
+    </div>
+  </aside>
 
   <script>
     (function () {
