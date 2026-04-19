@@ -69,14 +69,19 @@
    *     instead of disabling the send button
    *   autoResize: boolean (default true)
    *   placeholder: string | null (default touch-aware "Type a message…")
-   *   busyPlaceholder: string | null
+   *   busyPlaceholder: string | null — shown on the textarea whenever
+   *     setBusy(true) is called.  Defaults to placeholder (no visible
+   *     swap) when omitted.
    *   ariaLabel: string (default "Message input")
    *   pasteFiles: boolean (default true if attachments enabled)
    *   dragDrop: { targetEl: HTMLElement, dropClass: string } | null
    *     — dropClass is the CSS class applied to targetEl during a
    *       drag-over; the page must define the corresponding rule.
    *   sendLabel: string (default "Send")
-   *   busyLabel: string (default "Queue")
+   *   busyLabel: string — label shown on the send button whenever
+   *     setBusy(true) is called.  Default is context-sensitive:
+   *     "Queue" when queueWhileBusy=true, sendLabel otherwise (no
+   *     rotation for non-queue consumers that don't opt in).
    *   stopLabel: string (default "■ Stop")
    *   touchEnterSends: boolean (default false) — when true, Enter sends
    *     even on touch devices (default makes Enter insert a newline on
@@ -90,16 +95,25 @@
    *     "stacked" puts the textarea on its own row with the attach +
    *     options + send row below (creation-form composers where the
    *     input area is visually dominant).
-   *   options: { fields: [{id, label, type, ...}], storageKey?: string,
-   *              summary?: (values) => string | null } | null
+   *   options: {
+   *     fields: [{id, label, type, placeholder?, autocomplete?,
+   *               choices?, initial?}],
+   *     toggleLabel?: string (default "Options"),
+   *     summary?: (values) => string | null,
+   *     onChange?: (values) => void,
+   *     storageKey?: string,
+   *   } | null
    *     — renders a collapsible "Options ▾" panel.  Fields support
    *       type:"input" (text) and type:"select" (dropdown with
    *       {choices: [{value, text}]}).  Any other type is rendered
-   *       as a text input.  getOptionValues() returns the current
-   *       {id: value} map; setOptionChoices(id, choices) populates
-   *       a select later (for async-loaded lists).  When storageKey
-   *       is provided the open/closed state persists to localStorage
-   *       under that key.
+   *       as a text input.  toggleLabel sets the button text before
+   *       the caret; onChange fires whenever a field's change event
+   *       fires; summary returns an inline summary string shown beside
+   *       the toggle (return "" / null to hide).  getOptionValues()
+   *       returns the current {id: value} map; setOptionChoices(id,
+   *       choices) populates a select later (for async-loaded lists).
+   *       When storageKey is provided the open/closed state persists
+   *       to localStorage under that key.
    *   externalDisable: boolean (default false) — when true, setBusy()
    *     still rotates the send button's label / aria / placeholder
    *     + toggles the stop button, but does NOT write sendBtn.disabled.
@@ -212,7 +226,18 @@
 
   Composer.prototype._buildSendButton = function (row, opts) {
     this._sendLabel = opts.sendLabel || "Send";
-    this._busyLabel = opts.busyLabel || "Queue";
+    // busyLabel default is context-sensitive: "Queue" only makes sense
+    // when queueWhileBusy=true (the send button stays clickable during
+    // busy to accept queued messages).  Non-queue consumers that omit
+    // busyLabel fall back to sendLabel — no label rotation on busy —
+    // so the disabled button doesn't misleadingly read "Queue" when
+    // queueing isn't actually supported by the caller.
+    this._busyLabel =
+      opts.busyLabel != null
+        ? opts.busyLabel
+        : opts.queueWhileBusy
+          ? "Queue"
+          : this._sendLabel;
     this.sendBtn = makeButton({
       className: "ts-composer-send",
       text: this._sendLabel,
@@ -534,13 +559,18 @@
         : (b ? this._busyLabel : this._sendLabel) + " message",
     );
 
-    // --queue class + busy-placeholder swap are queue-specific.
+    // --queue class is queue-specific (the colour flip signals "this
+    // button now queues rather than sends").
     this.sendBtn.classList.toggle(
       "ts-composer-send--queue",
       !!(b && opts.queueWhileBusy),
     );
-    this.inputEl.placeholder =
-      b && opts.queueWhileBusy ? this._busyPlaceholder : this._idlePlaceholder;
+    // Placeholder swap applies whenever busy, not only in queue mode —
+    // callers that don't set busyPlaceholder see no visible change
+    // because it defaults to idlePlaceholder.
+    this.inputEl.placeholder = b
+      ? this._busyPlaceholder
+      : this._idlePlaceholder;
 
     // Disabled state — composer owns it unless caller opted out.
     if (!opts.externalDisable) {
