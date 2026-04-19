@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="en" data-design="v1">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>turnstone — design system preview</title>
+  <link rel="stylesheet" href="./tokens.css" />
+  <link rel="stylesheet" href="./typography.css" />
+  <link rel="stylesheet" href="./chrome/topbar.css" />
+  <link rel="stylesheet" href="./chrome/sidebar.css" />
+  <link rel="stylesheet" href="./primitives/panel.css" />
+  <link rel="stylesheet" href="./primitives/buttons.css" />
+  <link rel="stylesheet" href="./primitives/pills.css" />
+  <link rel="stylesheet" href="./primitives/stats.css" />
+  <link rel="stylesheet" href="./primitives/feed.css" />
+  <style>
+    /* preview-page-only styles — not part of the design system */
+    body { margin: 0; min-width: 1280px; }
+    .section { padding: 18px 22px; border-top: 1px solid var(--hair); }
+    .section h2 {
+      margin: 0 0 12px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--ink-3);
+    }
+    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .row + .row { margin-top: 10px; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .swatches { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; }
+    .swatches .sw {
+      padding: 10px;
+      border: 1px solid var(--hair);
+      border-radius: var(--r-md);
+      background: var(--panel);
+      font-size: 11px;
+    }
+    .swatches .sw .band {
+      height: 40px;
+      border-radius: var(--r-sm);
+      margin-bottom: 6px;
+    }
+    .fleet-demo {
+      display: grid;
+      grid-template-columns: repeat(14, 1fr);
+      gap: 4px;
+      padding: 14px;
+      max-width: 600px;
+    }
+    .fleet-demo .node {
+      aspect-ratio: 1;
+      border-radius: 3px;
+      background: var(--ok-soft);
+      position: relative;
+      border: 1px solid transparent;
+      cursor: pointer;
+    }
+    .fleet-demo .node::after {
+      content: "";
+      position: absolute;
+      inset: 2px;
+      border-radius: 1px;
+      background: linear-gradient(to top, var(--fill, var(--ok)) var(--pct, 30%), transparent var(--pct, 30%));
+      opacity: 0.75;
+    }
+    .fleet-demo .node.s-ok       { --fill: var(--ok);    background: var(--ok-soft); }
+    .fleet-demo .node.s-thinking { --fill: var(--think); background: var(--think-soft); }
+    .fleet-demo .node.s-attn     { --fill: var(--warn);  background: var(--warn-soft); border-color: var(--warn); }
+    .fleet-demo .node.s-err      { --fill: var(--err);   background: var(--err-soft);  border-color: var(--err); }
+    .fleet-demo .node.s-idle     { --fill: var(--ink-4); background: var(--hair-2); }
+    .fleet-demo .node.s-unreach {
+      background: repeating-linear-gradient(-45deg, var(--hair) 0 3px, var(--hair-2) 3px 6px);
+      opacity: 0.6;
+    }
+    .fleet-demo .node:hover { outline: 2px solid var(--accent); outline-offset: 1px; z-index: 2; }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark"></span>
+      <span>turnstone<span class="v">v1.5.0a2</span></span>
+    </div>
+    <nav class="topnav">
+      <a class="active">Coordinator</a>
+      <a>Cluster</a>
+      <a>Skills</a>
+      <a>Policies</a>
+      <a>Audit</a>
+    </nav>
+    <div class="top-right">
+      <span class="dot" aria-label="live"></span>
+      <span class="chip">env: prod-eu</span>
+      <button class="btn" id="themeToggle" aria-label="Toggle theme">
+        <span id="themeLabel">Dark</span>
+      </button>
+    </div>
+  </header>
+
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="side-section">
+        <div class="side-label">Workstreams</div>
+        <div class="side-item active"><span class="lead"><span class="swatch ok"></span>Active</span><span class="count">14</span></div>
+        <div class="side-item"><span class="lead"><span class="swatch think"></span>Thinking</span><span class="count">3</span></div>
+        <div class="side-item"><span class="lead"><span class="swatch warn"></span>Awaiting approval</span><span class="count">2</span></div>
+        <div class="side-item"><span class="lead"><span class="swatch err"></span>Errored</span><span class="count">1</span></div>
+        <div class="side-item"><span class="lead"><span class="swatch"></span>Idle</span><span class="count">8</span></div>
+      </div>
+      <div class="side-section">
+        <div class="side-label">Fleet</div>
+        <div class="side-item"><span class="lead">All nodes</span><span class="count">42</span></div>
+        <div class="side-item"><span class="lead"><span class="swatch ok"></span>Healthy</span><span class="count">39</span></div>
+        <div class="side-item"><span class="lead"><span class="swatch warn"></span>Attention</span><span class="count">3</span></div>
+      </div>
+    </aside>
+
+    <main>
+      <section class="section">
+        <h2>Buttons</h2>
+        <div class="row">
+          <button class="btn">Default</button>
+          <button class="btn primary">Primary</button>
+          <button class="btn deny">Deny</button>
+          <button class="btn approve">Approve <span class="kbd">⏎</span></button>
+          <button class="ghost">Ghost</button>
+          <button class="ghost on">Ghost on</button>
+        </div>
+      </section>
+
+      <section class="section">
+        <h2>Pills (status — what something is DOING)</h2>
+        <div class="row">
+          <span class="pill running"><span class="d"></span>running</span>
+          <span class="pill thinking"><span class="d"></span>thinking</span>
+          <span class="pill attn"><span class="d"></span>needs approval</span>
+          <span class="pill idle"><span class="d"></span>idle</span>
+          <span class="pill err"><span class="d"></span>errored</span>
+        </div>
+      </section>
+
+      <section class="section">
+        <h2>K-badges (kind — what something IS)</h2>
+        <div class="row">
+          <span class="k-badge k-tools">tools</span>
+          <span class="k-badge k-approval">approval</span>
+          <span class="k-badge k-policy">policy</span>
+          <span class="k-badge k-role">role</span>
+          <span class="k-badge k-judge">judge</span>
+          <span class="k-badge k-query">query</span>
+          <span class="k-badge k-workstream">workstream</span>
+          <span class="k-badge k-session">session</span>
+        </div>
+      </section>
+
+      <section class="section">
+        <h2>Chips + risks</h2>
+        <div class="row">
+          <span class="chip">ws_a1b2c3d4</span>
+          <span class="chip">tok_f00bar</span>
+          <span class="chip">node-04</span>
+          <span class="risk low">low</span>
+          <span class="risk med">med</span>
+          <span class="risk high">high</span>
+          <span class="risk crit">crit</span>
+        </div>
+      </section>
+
+      <section class="section">
+        <h2>Typography scale</h2>
+        <div class="t-h1">t-h1 — heading (24px)</div>
+        <div class="t-stat">42,195</div>
+        <div class="t-kicker">t-kicker — section label</div>
+        <div class="t-body">t-body — base 14px / 1.45 for prose.</div>
+        <div class="t-row">t-row — 13px for table rows and sidebar items.</div>
+        <div class="t-btn">t-btn — 12px for button labels.</div>
+        <div class="t-meta">t-meta — 11px mono for counts, timestamps, kbd hints.</div>
+      </section>
+
+      <section class="section">
+        <h2>Stat row</h2>
+        <div class="stat-row">
+          <div class="stat all"><div class="lbl">Workstreams</div><div class="val">28</div><div class="delta">+3 / 24h</div></div>
+          <div class="stat running"><div class="lbl">Running</div><div class="val">14</div><div class="delta">steady</div></div>
+          <div class="stat thinking"><div class="lbl">Thinking</div><div class="val">3</div><div class="delta">-1</div></div>
+          <div class="stat attention"><div class="lbl">Attention</div><div class="val">2</div><div class="delta">+2</div></div>
+          <div class="stat idle"><div class="lbl">Idle</div><div class="val">8</div><div class="delta">—</div></div>
+          <div class="stat error"><div class="lbl">Errored</div><div class="val">1</div><div class="delta">+1</div></div>
+        </div>
+      </section>
+
+      <section class="section">
+        <h2>Panels + mini-bar + spark</h2>
+        <div class="grid-2">
+          <div class="panel">
+            <div class="panel-head">
+              <h3>Load</h3>
+              <span class="meta">node-04</span>
+              <div class="tools"><button class="ghost">Live</button><button class="ghost">1h</button></div>
+            </div>
+            <div style="padding: 14px;">
+              <div class="t-kicker" style="margin-bottom: 8px;">CPU</div>
+              <span class="mini-bar"><i style="--pct: 72%;"></i></span>
+              <span class="t-meta" style="margin-left: 8px;">72%</span>
+              <div class="t-kicker" style="margin-top: 12px; margin-bottom: 8px;">Memory</div>
+              <span class="mini-bar warn"><i style="--pct: 88%;"></i></span>
+              <span class="t-meta" style="margin-left: 8px;">88%</span>
+              <div class="spark" style="margin-top: 12px;">
+                <i style="--h: 30%;"></i><i style="--h: 55%;"></i><i style="--h: 40%;"></i>
+                <i style="--h: 70%;"></i><i style="--h: 65%;"></i><i style="--h: 80%;"></i>
+                <i style="--h: 50%;"></i><i style="--h: 90%;"></i><i style="--h: 72%;"></i>
+                <i style="--h: 45%;"></i><i style="--h: 60%;"></i><i style="--h: 78%;"></i>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <h3>Fleet</h3>
+              <span class="meta">42 nodes</span>
+              <div class="tools"><button class="ghost on">Grid</button><button class="ghost">List</button></div>
+            </div>
+            <div class="fleet-demo">
+              <div class="node s-ok" style="--pct: 30%;"></div>
+              <div class="node s-ok" style="--pct: 45%;"></div>
+              <div class="node s-ok" style="--pct: 60%;"></div>
+              <div class="node s-thinking" style="--pct: 75%;"></div>
+              <div class="node s-attn" style="--pct: 50%;"></div>
+              <div class="node s-ok" style="--pct: 20%;"></div>
+              <div class="node s-ok" style="--pct: 35%;"></div>
+              <div class="node s-idle" style="--pct: 10%;"></div>
+              <div class="node s-ok" style="--pct: 90%;"></div>
+              <div class="node s-err" style="--pct: 0%;"></div>
+              <div class="node s-ok" style="--pct: 55%;"></div>
+              <div class="node s-ok" style="--pct: 40%;"></div>
+              <div class="node s-thinking" style="--pct: 65%;"></div>
+              <div class="node s-unreach"></div>
+              <div class="node s-ok" style="--pct: 25%;"></div>
+              <div class="node s-ok" style="--pct: 50%;"></div>
+              <div class="node s-idle" style="--pct: 5%;"></div>
+              <div class="node s-ok" style="--pct: 70%;"></div>
+              <div class="node s-attn" style="--pct: 80%;"></div>
+              <div class="node s-ok" style="--pct: 45%;"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section">
+        <h2>Live feed</h2>
+        <div class="panel">
+          <div class="feed-item">
+            <div class="ts">10:42:18</div>
+            <div class="body">
+              <div class="hd">
+                <span class="k-badge k-tools">tools</span>
+                <span class="fn">spawn_batch</span>
+                <span class="target">workstream ws_a1b2c3d4</span>
+              </div>
+              <div class="sum">Created 6 child workstreams to fan out log-triage across shards.</div>
+              <div class="evi">{"shard": "eu-1", "count": 6, "budget_remaining": 18}</div>
+            </div>
+            <div class="acts">
+              <span class="conf">0.94</span>
+            </div>
+          </div>
+          <div class="feed-item">
+            <div class="ts">10:42:21</div>
+            <div class="body">
+              <div class="hd">
+                <span class="k-badge k-approval">approval</span>
+                <span class="fn">exec</span>
+                <span class="target">node-12 / rm -rf /tmp/cache</span>
+              </div>
+              <div class="sum">Requesting approval to clear cache on node-12 — low risk.</div>
+            </div>
+            <div class="acts">
+              <div class="buttons">
+                <button class="btn deny">Deny</button>
+                <button class="btn approve">Approve</button>
+              </div>
+            </div>
+          </div>
+          <div class="feed-item decided">
+            <div class="ts">10:41:02</div>
+            <div class="body">
+              <div class="hd">
+                <span class="k-badge k-policy">policy</span>
+                <span class="fn">allow</span>
+                <span class="target">role:operator</span>
+              </div>
+              <div class="sum">Applied policy bundle v4 (3 deny rules, 2 step-up requirements).</div>
+            </div>
+            <div class="acts">
+              <span class="judged"><span class="spin" aria-hidden="true"></span>judging</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section">
+        <h2>Semantic token swatches</h2>
+        <div class="swatches">
+          <div class="sw"><div class="band" style="background: var(--accent);"></div>accent</div>
+          <div class="sw"><div class="band" style="background: var(--accent-soft);"></div>accent-soft</div>
+          <div class="sw"><div class="band" style="background: var(--ok);"></div>ok</div>
+          <div class="sw"><div class="band" style="background: var(--warn);"></div>warn</div>
+          <div class="sw"><div class="band" style="background: var(--err);"></div>err</div>
+          <div class="sw"><div class="band" style="background: var(--think);"></div>think</div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    (function () {
+      var btn = document.getElementById("themeToggle");
+      var label = document.getElementById("themeLabel");
+      function apply(theme) {
+        if (theme === "dark") {
+          document.documentElement.dataset.theme = "dark";
+          label.textContent = "Light";
+        } else {
+          delete document.documentElement.dataset.theme;
+          label.textContent = "Dark";
+        }
+      }
+      // Respect system pref on first load, no localStorage write (preview page).
+      var mql = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)");
+      apply(mql && mql.matches ? "dark" : "light");
+      btn.addEventListener("click", function () {
+        var current = document.documentElement.dataset.theme === "dark" ? "dark" : "light";
+        apply(current === "dark" ? "light" : "dark");
+      });
+      if (mql && mql.addEventListener) {
+        mql.addEventListener("change", function (e) { apply(e.matches ? "dark" : "light"); });
+      }
+    })();
+  </script>
+</body>
+</html>

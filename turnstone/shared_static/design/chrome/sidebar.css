@@ -1,0 +1,88 @@
+/* turnstone design system — sidebar
+   240px sticky left column under the topbar. Section labels are 10px
+   uppercase; items show a leading 6px swatch (semantic dot) and a
+   trailing mono count. */
+
+[data-design="v1"] .shell {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  min-height: calc(100vh - 48px);
+}
+
+[data-design="v1"] .sidebar {
+  position: sticky;
+  top: 48px;
+  align-self: start;
+  height: calc(100vh - 48px);
+  padding: 16px 10px;
+  background: var(--panel);
+  border-right: 1px solid var(--hair);
+  overflow: auto;
+}
+
+[data-design="v1"] .side-section {
+  margin-bottom: 18px;
+}
+
+[data-design="v1"] .side-label {
+  padding: 0 8px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-4);
+}
+
+[data-design="v1"] .side-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 8px;
+  font-size: 13px;
+  color: var(--ink-2);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+
+[data-design="v1"] .side-item:hover {
+  background: var(--hair-2);
+}
+
+[data-design="v1"] .side-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+[data-design="v1"] .side-item.active {
+  background: var(--accent-soft);
+  color: color-mix(in srgb, var(--accent) 60%, var(--ink));
+  font-weight: 500;
+}
+
+[data-design="v1"] .side-item .lead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+[data-design="v1"] .side-item .swatch {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ink-4);
+}
+
+[data-design="v1"] .side-item .swatch.ok    { background: var(--ok); }
+[data-design="v1"] .side-item .swatch.warn  { background: var(--warn); }
+[data-design="v1"] .side-item .swatch.err   { background: var(--err); }
+[data-design="v1"] .side-item .swatch.think { background: var(--think); }
+
+[data-design="v1"] .side-item .count {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-4);
+}
+
+[data-design="v1"] .side-item.active .count {
+  color: color-mix(in srgb, var(--accent) 60%, var(--ink));
+}

@@ -1,0 +1,86 @@
+/* turnstone design system — panel primitive
+   Container card used everywhere: data tables, stat tiles, side pages.
+   Optional .panel-head has an 11px uppercase title and a .tools slot for
+   .ghost actions. Panels do not nest — callouts inside a panel use the
+   .feed-item .evi evidence-block pattern. */
+
+[data-design="v1"] .panel {
+  background: var(--panel);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+}
+
+[data-design="v1"] .panel + .panel {
+  margin-top: var(--gap);
+}
+
+[data-design="v1"] .panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 14px;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--hair);
+}
+
+[data-design="v1"] .panel-head h3 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+}
+
+[data-design="v1"] .panel-head .meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-3);
+}
+
+/* Pin .tools to the right regardless of how many head children are present,
+   so two-child heads (h3 + tools) and three-child heads (h3 + meta + tools)
+   both read right-aligned on the trailing edge. */
+[data-design="v1"] .panel-head .tools {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+}
+
+/* .ghost — low-emphasis tool button; lives in panel heads or toolbars */
+[data-design="v1"] .ghost {
+  height: 22px;
+  padding: 0 8px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--ink-3);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+
+[data-design="v1"] .ghost:hover {
+  background: var(--hair-2);
+  color: var(--ink);
+}
+
+[data-design="v1"] .ghost:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Darker accent on accent-soft — raw --accent on pale --accent-soft in
+   light mode falls below WCAG AA at 12px; mix 60% accent + 40% ink to
+   land comfortably above 4.5:1 in both themes. */
+[data-design="v1"] .ghost.on {
+  background: var(--accent-soft);
+  color: color-mix(in srgb, var(--accent) 60%, var(--ink));
+}

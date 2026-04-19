@@ -1,0 +1,99 @@
+/* turnstone design system — topbar
+   48px sticky header: 240px brand cell / flex nav / right metadata cluster.
+   Brand mark is a 20x20 conic-gradient checker — no image, no icon font. */
+
+[data-design="v1"] .topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: grid;
+  grid-template-columns: 240px 1fr auto;
+  align-items: center;
+  height: 48px;
+  padding: 0 16px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--hair);
+}
+
+[data-design="v1"] .brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+}
+
+[data-design="v1"] .brand-mark {
+  position: relative;
+  width: 20px;
+  height: 20px;
+  background: var(--ink);
+  border-radius: 3px;
+}
+
+[data-design="v1"] .brand-mark::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 3px;
+  background: conic-gradient(
+    from 45deg at 50% 50%,
+    var(--ink) 0 25%,
+    var(--accent) 25% 50%,
+    var(--ink) 50% 75%,
+    var(--accent) 75% 100%
+  );
+}
+
+[data-design="v1"] .brand .v {
+  margin-left: 4px;
+  font-weight: 400;
+  font-size: 11px;
+  color: var(--ink-4);
+}
+
+[data-design="v1"] .topnav {
+  display: flex;
+  gap: 2px;
+}
+
+[data-design="v1"] .topnav a {
+  padding: 6px 10px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink-2);
+  text-decoration: none;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+
+[data-design="v1"] .topnav a:hover:not(.active) {
+  background: var(--hair-2);
+}
+
+[data-design="v1"] .topnav a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+[data-design="v1"] .topnav a.active {
+  background: var(--accent-soft);
+  color: color-mix(in srgb, var(--accent) 60%, var(--ink));
+}
+
+[data-design="v1"] .top-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+[data-design="v1"] .top-right .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 20%, transparent);
+}

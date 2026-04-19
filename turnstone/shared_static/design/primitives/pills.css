@@ -1,0 +1,178 @@
+/* turnstone design system — pill / k-badge / chip / risk
+   Three shapes, three semantics — do not cross-use:
+     .pill     what this thing is DOING right now. Pulses on active states.
+     .k-badge  what KIND of thing this is. Glyph-prefixed (WCAG 1.4.1
+               non-colour-only signaling). Static.
+     .chip     a literal identifier or tag. Static. */
+
+[data-design="v1"] .pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.4;
+  white-space: nowrap;
+  border-radius: 999px;
+  /* Fallback surface for plain `<span class="pill">` without a state
+     modifier — every .pill.X variant supplies its own bg+color. */
+  background: var(--hair-2);
+  color: var(--ink-3);
+}
+
+[data-design="v1"] .pill .d {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+[data-design="v1"] .pill.running {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+[data-design="v1"] .pill.running .d {
+  background: var(--ok);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent);
+  animation: ts-pulse 1.8s infinite;
+}
+
+[data-design="v1"] .pill.thinking {
+  background: var(--think-soft);
+  color: var(--think);
+}
+[data-design="v1"] .pill.thinking .d {
+  background: var(--think);
+  animation: ts-pulse 1.2s infinite;
+}
+
+[data-design="v1"] .pill.attn {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+[data-design="v1"] .pill.attn .d { background: var(--warn); }
+
+[data-design="v1"] .pill.idle {
+  background: var(--hair-2);
+  color: var(--ink-3);
+}
+[data-design="v1"] .pill.idle .d { background: var(--ink-4); }
+
+[data-design="v1"] .pill.err {
+  background: var(--err-soft);
+  color: var(--err);
+}
+[data-design="v1"] .pill.err .d { background: var(--err); }
+
+@keyframes ts-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
+}
+
+/* Respect prefers-reduced-motion — disable pulses for users who opt out. */
+@media (prefers-reduced-motion: reduce) {
+  [data-design="v1"] .pill.running .d,
+  [data-design="v1"] .pill.thinking .d {
+    animation: none;
+  }
+}
+
+/* k-badge — "what kind of thing". Glyph-prefixed; colour reinforces but
+   does not carry the signal alone (WCAG 1.4.1). */
+[data-design="v1"] .k-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 18px;
+  padding: 0 6px 0 5px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: lowercase;
+  white-space: nowrap;
+  background: var(--panel-2);
+  color: var(--ink-2);
+  border: 1px solid var(--hair);
+  border-radius: 2px;
+}
+
+[data-design="v1"] .k-badge::before {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  color: inherit;
+  opacity: 0.9;
+}
+
+[data-design="v1"] .k-badge.k-tools,
+[data-design="v1"] .k-badge.k-approval {
+  background: color-mix(in srgb, var(--warn) 14%, var(--panel));
+  color: color-mix(in srgb, var(--warn) 70%, var(--ink-2));
+  border-color: color-mix(in srgb, var(--warn) 38%, var(--hair));
+}
+[data-design="v1"] .k-badge.k-tools::before,
+[data-design="v1"] .k-badge.k-approval::before { content: "▲"; }
+
+[data-design="v1"] .k-badge.k-policy,
+[data-design="v1"] .k-badge.k-role,
+[data-design="v1"] .k-badge.k-oidc,
+[data-design="v1"] .k-badge.k-token,
+[data-design="v1"] .k-badge.k-step-up {
+  background: color-mix(in srgb, var(--accent) 14%, var(--panel));
+  color: color-mix(in srgb, var(--accent) 70%, var(--ink-2));
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--hair));
+}
+[data-design="v1"] .k-badge.k-policy::before,
+[data-design="v1"] .k-badge.k-role::before,
+[data-design="v1"] .k-badge.k-oidc::before,
+[data-design="v1"] .k-badge.k-token::before,
+[data-design="v1"] .k-badge.k-step-up::before { content: "◆"; }
+
+[data-design="v1"] .k-badge.k-judge {
+  background: color-mix(in srgb, var(--think) 14%, var(--panel));
+  color: color-mix(in srgb, var(--think) 70%, var(--ink-2));
+  border-color: color-mix(in srgb, var(--think) 38%, var(--hair));
+}
+[data-design="v1"] .k-badge.k-judge::before { content: "◇"; }
+
+[data-design="v1"] .k-badge.k-query::before { content: "■"; }
+
+[data-design="v1"] .k-badge.k-session::before,
+[data-design="v1"] .k-badge.k-skill::before,
+[data-design="v1"] .k-badge.k-workstream::before,
+[data-design="v1"] .k-badge.k-fanout::before,
+[data-design="v1"] .k-badge.k-default::before { content: "•"; }
+
+/* chip — literal id or tag */
+[data-design="v1"] .chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 7px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-2);
+  background: var(--panel);
+  border: 1px solid var(--hair);
+  border-radius: 999px;
+}
+
+/* risk — tiny uppercase mono tag */
+[data-design="v1"] .risk {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 6px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border-radius: 3px;
+}
+
+[data-design="v1"] .risk.low  { background: var(--ok-soft);   color: var(--ok); }
+[data-design="v1"] .risk.med  { background: var(--warn-soft); color: var(--warn); }
+[data-design="v1"] .risk.high { background: var(--err-soft);  color: var(--err); }
+/* .risk.crit always-white — dark-mode --panel (#15181c) on bright err falls
+   to ~3:1 and fails AA; white stays high-contrast in both themes. */
+[data-design="v1"] .risk.crit { background: var(--err);       color: #fff; }

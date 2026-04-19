@@ -1,0 +1,86 @@
+/* turnstone design system — button primitive
+   Default shape is pill (999px) per the prototype; approval-dock buttons
+   get a 6px-radius squared shape in patterns/approval-dock.css.
+
+   Variants:
+     .btn           neutral (hair border, panel bg)
+     .btn.primary   accent-tinted (used for key ok/continue actions)
+     .btn.deny      err-tinted (destructive secondary)
+     .btn.approve   warn-tinted (approval actions — NEVER green; amber is
+                    the product signal for "needs attention → resolved") */
+
+[data-design="v1"] .btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 12px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ink-2);
+  background: var(--panel);
+  border: 1px solid var(--hair);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+[data-design="v1"] .btn:hover {
+  background: var(--panel-2);
+  color: var(--ink);
+  border-color: color-mix(in srgb, var(--ink-3) 30%, var(--hair));
+}
+
+[data-design="v1"] .btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+[data-design="v1"] .btn.primary {
+  background: var(--accent-soft);
+  /* Raw --accent on pale --accent-soft is borderline AA at 12px; darken
+     with ink to push contrast > 4.5:1 in both themes. */
+  color: color-mix(in srgb, var(--accent) 60%, var(--ink));
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--hair));
+}
+
+[data-design="v1"] .btn.primary:hover {
+  background: color-mix(in srgb, var(--accent-soft) 70%, var(--panel));
+  border-color: var(--accent);
+  color: var(--ink);
+}
+
+[data-design="v1"] .btn.deny {
+  color: var(--err);
+  border-color: color-mix(in srgb, var(--err) 28%, var(--hair));
+}
+
+[data-design="v1"] .btn.deny:hover {
+  background: var(--err-soft);
+  border-color: var(--err);
+}
+
+[data-design="v1"] .btn.approve {
+  background: color-mix(in srgb, var(--warn) 22%, var(--panel));
+  /* Warn-on-warn-tinted is borderline AA; darken resting text so the
+     primary approval call-to-action is readable without hover. */
+  color: color-mix(in srgb, var(--warn) 55%, var(--ink));
+  border-color: color-mix(in srgb, var(--warn) 60%, var(--hair));
+  font-weight: 600;
+}
+
+[data-design="v1"] .btn.approve:hover {
+  background: color-mix(in srgb, var(--warn) 32%, var(--panel));
+  color: var(--ink);
+  border-color: var(--warn);
+}
+
+[data-design="v1"] .btn .kbd {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-3);
+  padding: 1px 4px;
+  border: 1px solid var(--hair);
+  border-radius: 3px;
+}

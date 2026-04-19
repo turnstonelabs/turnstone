@@ -1,0 +1,118 @@
+/* turnstone design system — live feed
+   Vertical stream of rows, each a three-column grid: timestamp / body /
+   actions. Evidence blocks inside the body use a 2px left-border callout
+   pattern, not nested panels. */
+
+[data-design="v1"] .feed-item {
+  display: grid;
+  grid-template-columns: 44px 1fr auto;
+  gap: 10px;
+  align-items: start;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--hair-2);
+}
+
+[data-design="v1"] .feed-item:last-child { border-bottom: none; }
+[data-design="v1"] .feed-item:hover      { background: var(--panel-2); }
+
+[data-design="v1"] .feed-item .ts {
+  margin-top: 2px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-4);
+}
+
+[data-design="v1"] .feed-item .body { min-width: 0; }
+
+[data-design="v1"] .feed-item .hd {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+[data-design="v1"] .feed-item .hd .fn {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--ink);
+}
+
+[data-design="v1"] .feed-item .hd .target {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-3);
+}
+
+[data-design="v1"] .feed-item .sum {
+  margin-top: 4px;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--ink-2);
+}
+
+[data-design="v1"] .feed-item .evi {
+  margin-top: 6px;
+  padding: 6px 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-3);
+  background: var(--panel-2);
+  border-left: 2px solid var(--hair);
+  border-radius: 0 3px 3px 0;
+  white-space: pre-wrap;
+}
+
+[data-design="v1"] .feed-item .acts {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: flex-end;
+}
+
+[data-design="v1"] .feed-item .acts .conf {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-4);
+}
+
+[data-design="v1"] .feed-item .acts .buttons {
+  display: flex;
+  gap: 4px;
+}
+
+/* Compact action buttons inside feed-item .acts — only for plain <button>
+   without a .btn class. .btn-classed buttons keep their pill shape so
+   approval-dock / pattern-level styles can square them deliberately. */
+[data-design="v1"] .feed-item .acts button:not(.btn) {
+  height: 24px;
+  padding: 0 8px;
+  font-size: 11px;
+  border-radius: 3px;
+}
+
+[data-design="v1"] .feed-item.decided { opacity: 0.55; }
+
+[data-design="v1"] .feed-item .judged {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-3);
+}
+
+[data-design="v1"] .feed-item .judged .spin {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1.5px solid var(--accent);
+  border-top-color: transparent;
+  animation: ts-spin 0.9s linear infinite;
+}
+
+@keyframes ts-spin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+  [data-design="v1"] .feed-item .judged .spin { animation: none; }
+}
