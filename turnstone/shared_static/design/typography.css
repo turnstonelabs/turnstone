@@ -11,16 +11,13 @@
    here only so DS-A stands alone with zero HTML edits. */
 @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap");
 
-:root {
-  --font-ui:   "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --font-mono: "JetBrains Mono", "SF Mono", "IBM Plex Mono", Consolas, monospace;
-}
-
 /* Applies defaults on the opt-in root (the element carrying data-design="v1").
    font-family and color inherit to descendants; background does not — panels
    set their own --panel background in DS-B. Existing views are untouched
    until they add the attribute. */
 [data-design="v1"] {
+  --font-ui:   "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", "IBM Plex Mono", Consolas, monospace;
   font-family: var(--font-ui);
   font-size: 14px;
   line-height: 1.45;
