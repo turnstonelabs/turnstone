@@ -24,8 +24,12 @@
 
   const wsId = document.documentElement.dataset.wsId || "";
   if (!wsId) {
-    document.getElementById("coord-messages").innerHTML =
-      '<div class="ts-msg ts-msg--error">Missing ws_id on &lt;html&gt; tag.</div>';
+    // Static literal — class-name migration only; no XSS surface.
+    const missing = document.createElement("div");
+    missing.className = "msg error";
+    missing.textContent = "Missing ws_id on <html> tag.";
+    const host = document.getElementById("coord-messages");
+    if (host) host.replaceChildren(missing);
     return;
   }
 
@@ -139,23 +143,25 @@
   // Message append helpers
   // ------------------------------------------------------------------
 
-  // Map raw role → ts-msg modifier.  "error" overloads the role slot
-  // for styling; opts.label still carries the tool name so SR text
-  // like "error · bash" stays meaningful on the data-ts-role /
-  // aria-label attributes when labels stop rendering as DOM text.
-  const _TS_ROLE_VARIANTS = {
-    user: "ts-msg--user",
-    assistant: "ts-msg--assistant",
-    reasoning: "ts-msg--reasoning",
-    tool: "ts-msg--tool",
-    error: "ts-msg--error",
+  // Map raw role → .msg variant (DS primitives/message.css).  "error"
+  // overloads the role slot for styling; opts.label still carries the
+  // tool name so SR text like "error · bash" stays meaningful on the
+  // data-ts-role / aria-label attributes when labels stop rendering
+  // as DOM text.
+  const _MSG_VARIANTS = {
+    user: "user",
+    assistant: "assistant",
+    reasoning: "reasoning",
+    tool: "tool",
+    error: "error",
+    info: "info",
   };
 
   function appendMsg(role, html, opts) {
     opts = opts || {};
     const el = document.createElement("div");
-    const variant = _TS_ROLE_VARIANTS[role] || "ts-msg--assistant";
-    el.className = "ts-msg " + variant;
+    const variant = _MSG_VARIANTS[role] || "assistant";
+    el.className = "msg " + variant;
     // role="article" makes aria-label reliably announced by screen
     // readers — a generic <div> with no implicit role doesn't expose
     // aria-label on its own.  "article" fits: each message is a
@@ -171,7 +177,7 @@
       el.setAttribute("aria-label", opts.label);
     }
     const body = document.createElement("div");
-    body.className = "ts-msg-body";
+    body.className = "msg-body";
     body.innerHTML = html;
     el.appendChild(body);
     messagesEl.appendChild(el);
@@ -225,7 +231,7 @@
     // token so the user sees live-formatted markdown instead of a final
     // "pop" on stream_end.  Heavy post-processing (syntax highlighting,
     // mermaid, KaTeX) stays deferred to streamingRenderFinalize below.
-    const body = currentAssistantEl.querySelector(".ts-msg-body");
+    const body = currentAssistantEl.querySelector(".msg-body");
     if (body && typeof streamingRender === "function") {
       try {
         streamingRender(body, currentAssistantBuf);
@@ -251,7 +257,7 @@
       messagesEl.setAttribute("aria-live", "off");
     }
     currentReasoningBuf += text;
-    const body = currentReasoningEl.querySelector(".ts-msg-body");
+    const body = currentReasoningEl.querySelector(".msg-body");
     if (body) body.textContent = currentReasoningBuf;
     messagesEl.scrollTop = messagesEl.scrollHeight;
   }
@@ -263,7 +269,7 @@
     // the innerHTML assignment inside the helper is XSS-safe as long as
     // renderer.js is trusted — same contract as ui/static/app.js.
     if (currentAssistantEl && currentAssistantBuf) {
-      const body = currentAssistantEl.querySelector(".ts-msg-body");
+      const body = currentAssistantEl.querySelector(".msg-body");
       if (body && typeof streamingRenderFinalize === "function") {
         try {
           streamingRenderFinalize(body, currentAssistantBuf);
@@ -286,32 +292,46 @@
   function showApproval(items) {
     approvalTools.replaceChildren();
     const pending = (items || []).filter((it) => it.needs_approval);
-    // Header row — "Approve N tool calls" clarifies that the batch
-    // approval applies to every row, not just the focused one.
-    if (pending.length > 0) {
-      const header = document.createElement("div");
-      header.className = "ts-approval-header";
-      header.textContent =
-        pending.length === 1
-          ? "Approve 1 tool call:"
-          : "Approve " + pending.length + " tool calls (batch):";
-      approvalTools.appendChild(header);
+    // Count badge — shown in the .dhead row's trailing .dcount slot.
+    // The "Approval required" kicker is static in the HTML so the
+    // screen-reader label stays stable across open/close cycles.
+    const countEl = document.getElementById("coord-approval-count");
+    if (countEl) {
+      countEl.textContent = pending.length ? pending.length + " pending" : "";
     }
     let firstCallId = null;
     pending.forEach((it, idx) => {
       if (!firstCallId) firstCallId = it.call_id;
+      // Each pending tool call renders as a .dcall row — the DS pattern
+      // frames this like a mini inspectable call line.  Risk pill is
+      // .low by default (no per-item risk yet — that's a later PR);
+      // function name + preview args round out the row.
       const row = document.createElement("div");
-      row.className = "ts-approval-tool";
-      const label =
-        it.header || it.approval_label || it.func_name || "(unknown tool)";
-      row.textContent = pending.length > 1 ? idx + 1 + ". " + label : label;
+      row.className = "dcall";
+      if (pending.length > 1) {
+        const idx_ = document.createElement("span");
+        idx_.className = "risk low";
+        idx_.textContent = idx + 1 + "/" + pending.length;
+        row.appendChild(idx_);
+      }
+      const fn = document.createElement("span");
+      fn.className = "dfn";
+      fn.textContent = it.func_name || "(unknown tool)";
+      row.appendChild(fn);
+      const args = document.createElement("span");
+      args.className = "dargs";
+      const preview = it.header || it.approval_label || it.preview || "";
+      args.textContent = preview;
+      row.appendChild(args);
       approvalTools.appendChild(row);
     });
     pendingApprovalCallId = firstCallId;
-    approvalBar.classList.add("visible");
+    approvalBar.hidden = false;
     // Move focus to the approve button — non-modal region, so keyboard
     // users don't have to Shift+Tab back from the composer.  One-time
-    // focus shift; subsequent Tab/Shift+Tab navigates normally.
+    // focus shift; subsequent Tab/Shift+Tab navigates normally.  Also
+    // delivers the preserved "Enter approves" behaviour: the primary
+    // button has focus, so Enter fires its click handler.
     const approveBtn = document.getElementById("coord-approve-btn");
     if (approveBtn) {
       try {
@@ -323,8 +343,10 @@
   }
 
   function hideApproval() {
-    approvalBar.classList.remove("visible");
+    approvalBar.hidden = true;
     approvalTools.replaceChildren();
+    const countEl = document.getElementById("coord-approval-count");
+    if (countEl) countEl.textContent = "";
     pendingApprovalCallId = null;
     setApprovalButtonsDisabled(false);
     // Return focus to the composer for keyboard users.  Only if the
@@ -465,12 +487,18 @@
     // alone (WCAG 1.4.1).  ● connected, ○ connecting, ⚠ disconnected.
     const glyph = cls === "ok" ? "● " : cls === "err" ? "⚠ " : "○ ";
     sseEl.textContent = glyph + text;
-    // Preserve the base .ts-header-status class + add the BEM modifier
-    // variant so chat.css's .ts-header-status--ok / --err colour rules
-    // actually win; setting className to just "ok"/"err" drops the
-    // base class and the green / red colour never applies.
-    var base = "ts-header-status";
-    sseEl.className = cls ? base + " " + base + "--" + cls : base;
+    // Keep .appbar-status (DS: mono 11px --ink-3) as the base; layer the
+    // semantic colour via a data-state attribute so the glyph-prefixed
+    // label remains high-contrast while the text colour tracks OK / ERR.
+    sseEl.className = "appbar-status";
+    sseEl.dataset.state = cls || "";
+    if (cls === "ok") {
+      sseEl.style.color = "var(--ok)";
+    } else if (cls === "err") {
+      sseEl.style.color = "var(--err)";
+    } else {
+      sseEl.style.color = "";
+    }
   }
 
   function connectSSE() {
@@ -600,7 +628,7 @@
           if (
             it.call_id &&
             document.querySelector(
-              '.ts-msg[data-call-id="' + cssEscape(it.call_id) + '"]',
+              '.msg[data-call-id="' + cssEscape(it.call_id) + '"]',
             )
           ) {
             return; // already rendered in this pane — skip
@@ -709,7 +737,7 @@
     if (!host) return null;
     el = document.createElement("span");
     el.id = "coord-wait-indicator";
-    el.className = "ts-header-status coord-wait-indicator";
+    el.className = "appbar-status coord-wait-indicator";
     el.setAttribute("role", "status");
     el.setAttribute("aria-live", "polite");
     el.style.display = "none";
