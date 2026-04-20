@@ -14,7 +14,7 @@
      - approve UI is warn-tinted, never green (approvals signal "needs
        attention"; approving resolves amber rather than creating green) */
 
-:root {
+[data-design="v1"] {
   /* Accent — warm amber (turnstone signature).
      Tunable via these three vars without touching downstream primitives. */
   --accent-h: 70;
@@ -57,7 +57,7 @@
   --row-h: calc(32px * var(--density));
 }
 
-[data-theme="dark"] {
+[data-design="v1"][data-theme="dark"] {
   --bg:      #0e1013;
   --panel:   #15181c;
   --panel-2: #1a1e23;
