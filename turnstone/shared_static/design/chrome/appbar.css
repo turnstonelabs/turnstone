@@ -1,0 +1,99 @@
+/* turnstone design system — appbar
+   Chat-app header variant. Distinct from .topbar (which is admin-style
+   with brand mark + nav + env metadata) — the appbar is for per-session
+   chat surfaces that need a back-link, title, session metadata, and a
+   right-cluster of action buttons (end / cancel / theme-toggle).
+
+   Shape:
+     [back]  title [subtitle/chip]              [status] [btn] [btn]
+     ←────┘  ├─ 14px 600                        └── --ink-3 11px mono
+             └─ optional 12px --ink-3 subtitle
+
+   Used in ui/static (server chat) and console coordinator. */
+
+[data-design="v1"] .appbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 48px;
+  padding: 0 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--hair);
+}
+
+[data-design="v1"] .appbar-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--ink-3);
+  text-decoration: none;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+
+[data-design="v1"] .appbar-back:hover {
+  background: var(--hair-2);
+  color: var(--ink);
+}
+
+[data-design="v1"] .appbar-back:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+[data-design="v1"] .appbar-back-arrow {
+  font-family: var(--font-mono);
+  font-size: 14px;
+}
+
+/* Title block — bold title + optional secondary label on the same line.
+   min-width: 0 is required for .dim's ellipsis to fire under a narrow
+   appbar — without it the flex container refuses to shrink below its
+   content's intrinsic width. */
+[data-design="v1"] .appbar-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  flex-shrink: 1;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+  letter-spacing: -0.01em;
+}
+
+[data-design="v1"] .appbar-title .dim {
+  font-weight: 400;
+  font-size: 13px;
+  color: var(--ink-3);
+  letter-spacing: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Spacer pushes the right cluster to the edge. Use as a flex filler
+   between the title and the action row. */
+[data-design="v1"] .appbar-spacer { flex: 1; }
+
+/* Status text (SSE connection state, streaming indicator). Polite
+   aria-live lives on this span; the typography here intentionally
+   doesn't pulse so screen readers don't see layout churn. */
+[data-design="v1"] .appbar-status {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-3);
+}
+
+/* Right cluster of action buttons. Match .btn sizing (28px / 12px) but
+   the pill shape optionally squares off when grouped tightly. */
+[data-design="v1"] .appbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}

@@ -13,6 +13,9 @@
   <link rel="stylesheet" href="./primitives/pills.css" />
   <link rel="stylesheet" href="./primitives/stats.css" />
   <link rel="stylesheet" href="./primitives/feed.css" />
+  <link rel="stylesheet" href="./primitives/message.css" />
+  <link rel="stylesheet" href="./primitives/field.css" />
+  <link rel="stylesheet" href="./chrome/appbar.css" />
   <link rel="stylesheet" href="./patterns/approval-dock.css" />
   <link rel="stylesheet" href="./patterns/fleet-grid.css" />
   <link rel="stylesheet" href="./patterns/live-feed.css" />
@@ -324,6 +327,100 @@
               <div class="acts"><span class="judged"><span class="spin" aria-hidden="true"></span>judging</span></div>
             </div>
           </div>
+        </div>
+      </section>
+
+      <section class="section">
+        <h2>Messages (chat primitive)</h2>
+        <div style="max-width: 680px;">
+          <div class="msg user">
+            <div class="msg-body">
+              Can you fan out a log-triage across the three eu shards and tell me which one had the most 5xx in the last hour?
+            </div>
+          </div>
+          <div class="msg assistant" data-streaming="true">
+            <div class="msg-actions">
+              <button class="msg-action-btn" type="button">Copy</button>
+              <button class="msg-action-btn" type="button">Retry</button>
+            </div>
+            <div class="msg-meta">
+              <span>assistant</span><span>·</span><span>10:42:19</span><span>·</span><span>claude-opus-4-7</span>
+            </div>
+            <div class="msg-body">
+              <p>Spawning six child workstreams (two per shard) to grep the last hour's access logs. Will aggregate the <code>status &gt;= 500</code> counts and report back.</p>
+              <pre><code>{"shards": ["eu-1", "eu-2", "eu-3"], "lookback": "1h", "filter": "5xx"}</code></pre>
+            </div>
+          </div>
+          <div class="msg reasoning">
+            <div class="msg-body">
+              Let me think about how to partition this — per-shard, or per-node inside each shard?
+            </div>
+          </div>
+          <div class="msg tool">
+            <div class="msg-body">spawn_batch → 6 children created, budget: 18 remaining</div>
+          </div>
+          <div class="msg info">
+            <div class="msg-body">Policy bundle v4 applied to this session.</div>
+          </div>
+          <div class="msg error">
+            <div class="msg-body">node-04 did not respond within 5s; retrying with backoff.</div>
+          </div>
+          <div class="msg system">
+            <div class="msg-body">Session ended by operator.</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section">
+        <h2>Form fields (primitive)</h2>
+        <div style="max-width: 420px;">
+          <label class="field">
+            <span class="field-label">Workstream name</span>
+            <input type="text" placeholder="eu-triage-2026-04-20" />
+            <span class="field-help">Shown in the dashboard and audit log.</span>
+          </label>
+          <label class="field">
+            <span class="field-label">System prompt</span>
+            <textarea placeholder="You are an operator…"></textarea>
+          </label>
+          <label class="field">
+            <span class="field-label">Model</span>
+            <select>
+              <option>claude-opus-4-7</option>
+              <option>claude-sonnet-4-6</option>
+              <option>gpt-5</option>
+            </select>
+          </label>
+          <label class="field invalid">
+            <span class="field-label">Budget (tokens)</span>
+            <input type="number" aria-invalid="true" value="-500" />
+            <span class="field-help">Budget must be a positive integer.</span>
+          </label>
+          <label class="field inline">
+            <input type="checkbox" checked />
+            <span class="field-label">Allow tool use</span>
+          </label>
+        </div>
+      </section>
+
+      <section class="section">
+        <h2>Appbar (chat header chrome)</h2>
+        <div style="border: 1px solid var(--hair); border-radius: var(--r-md); overflow: hidden;">
+          <header class="appbar" style="position: static;">
+            <a class="appbar-back" tabindex="0">
+              <span class="appbar-back-arrow" aria-hidden="true">←</span>
+              <span>Console</span>
+            </a>
+            <div class="appbar-title">
+              turnstone <span class="dim">coordinator · ws_a1b2c3d4</span>
+            </div>
+            <div class="appbar-spacer"></div>
+            <span class="appbar-status">streaming…</span>
+            <div class="appbar-actions">
+              <button class="btn">Cancel</button>
+              <button class="btn deny">End</button>
+            </div>
+          </header>
         </div>
       </section>
 
