@@ -407,10 +407,13 @@
         <h2>Appbar (chat header chrome)</h2>
         <div style="border: 1px solid var(--hair); border-radius: var(--r-md); overflow: hidden;">
           <header class="appbar" style="position: static;">
-            <a class="appbar-back" tabindex="0">
+            <!-- Prefer <button type="button"> (this preview) or <a href="...">
+                 in production. Tabindex-only anchors without href have
+                 inconsistent focus + screen-reader semantics. -->
+            <button class="appbar-back" type="button">
               <span class="appbar-back-arrow" aria-hidden="true">←</span>
               <span>Console</span>
-            </a>
+            </button>
             <div class="appbar-title">
               turnstone <span class="dim">coordinator · ws_a1b2c3d4</span>
             </div>

@@ -190,7 +190,11 @@
   color: var(--ink-3);
 }
 
-/* Hover-revealed action row — copy / regenerate / feedback buttons. */
+/* Hover-revealed action row — copy / regenerate / feedback buttons.
+   pointer-events toggles alongside opacity so the invisible toolbar
+   doesn't intercept clicks in the top-right corner of the message
+   (would otherwise break text selection on the last word of a short
+   one-line msg). */
 [data-design="v1"] .msg-actions {
   position: absolute;
   top: 4px;
@@ -198,11 +202,15 @@
   display: flex;
   gap: 2px;
   opacity: 0;
+  pointer-events: none;
   transition: opacity 120ms ease;
 }
 
 [data-design="v1"] .msg:hover .msg-actions,
-[data-design="v1"] .msg:focus-within .msg-actions { opacity: 1; }
+[data-design="v1"] .msg:focus-within .msg-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
 
 [data-design="v1"] .msg-action-btn {
   height: 22px;
@@ -234,6 +242,6 @@
    shared_static/chat.css:146. Keyboard users are handled by
    :focus-within on .msg above. */
 @media (hover: none) and (pointer: coarse) {
-  [data-design="v1"] .msg-actions { opacity: 1; }
+  [data-design="v1"] .msg-actions { opacity: 1; pointer-events: auto; }
   [data-design="v1"] .msg-action-btn { padding: 4px 8px; font-size: 12px; }
 }

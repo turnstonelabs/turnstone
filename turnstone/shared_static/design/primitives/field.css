@@ -119,8 +119,10 @@
   box-shadow: none;
 }
 
-/* Inline layout when wrapping a checkbox/radio with a label — the .field
-   stays flex-column but the inner row stays inline. */
+/* Inline layout for checkbox/radio fields — flips the wrapper to flex-row
+   so the checkbox + its label sit on one line (the base .field is
+   flex-column for stacked label / control / help). Used for "Allow tool
+   use" toggles, consent checkboxes, etc. */
 [data-design="v1"] .field.inline {
   flex-direction: row;
   align-items: center;
