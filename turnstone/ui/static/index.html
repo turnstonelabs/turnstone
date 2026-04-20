@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-design="v1">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -11,15 +11,28 @@
 <link rel="stylesheet" href="/shared/ui-base.css">
 <link rel="stylesheet" href="/shared/chat.css">
 <link rel="stylesheet" href="/shared/katex-0.16.45/katex.min.css">
+<!-- Design system v1 — opt-in via data-design="v1" on <html>. Tokens
+     + primitives scope under the attribute selector so legacy styles
+     below continue to own anything not yet migrated. -->
+<link rel="stylesheet" href="/shared/design/tokens.css">
+<link rel="stylesheet" href="/shared/design/typography.css">
+<link rel="stylesheet" href="/shared/design/chrome/appbar.css">
+<link rel="stylesheet" href="/shared/design/primitives/panel.css">
+<link rel="stylesheet" href="/shared/design/primitives/buttons.css">
+<link rel="stylesheet" href="/shared/design/primitives/pills.css">
+<link rel="stylesheet" href="/shared/design/primitives/message.css">
+<link rel="stylesheet" href="/shared/design/primitives/field.css">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-<div id="header" class="ts-header">
-  <h1 class="ts-header-title">turnstone</h1>
-  <span id="mcp-status" role="status" aria-live="polite"></span>
-  <span id="health-indicator" class="health-ok" role="status" aria-live="polite" aria-atomic="true"></span>
-  <span class="header-spacer"></span>
-  <button id="theme-toggle" class="header-btn" onclick="toggleTheme()" aria-label="Toggle light/dark theme" title="Switch to light theme">&#9790;</button>
+<div id="header" class="ts-header appbar">
+  <h1 class="ts-header-title appbar-title">turnstone</h1>
+  <span id="mcp-status" class="appbar-status" role="status" aria-live="polite"></span>
+  <span id="health-indicator" class="health-ok appbar-status" role="status" aria-live="polite" aria-atomic="true"></span>
+  <span class="header-spacer appbar-spacer"></span>
+  <span class="appbar-actions">
+    <button id="theme-toggle" class="header-btn btn" onclick="toggleTheme()" aria-label="Toggle light/dark theme" title="Switch to light theme">&#9790;</button>
+  </span>
 </div>
 
 <div id="tab-bar" role="toolbar" aria-label="Workstreams">

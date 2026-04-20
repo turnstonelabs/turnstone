@@ -611,7 +611,8 @@ Pane.prototype.handleEvent = function (evt) {
       this.removeThinkingIndicator();
       if (!this.currentReasoningEl) {
         this.currentReasoningEl = document.createElement("div");
-        this.currentReasoningEl.className = "ts-msg ts-msg--reasoning";
+        this.currentReasoningEl.className =
+          "ts-msg ts-msg--reasoning msg reasoning";
         this.messagesEl.appendChild(this.currentReasoningEl);
       }
       this.currentReasoningEl.textContent += evt.text;
@@ -625,14 +626,15 @@ Pane.prototype.handleEvent = function (evt) {
       }
       if (!this.currentAssistantEl) {
         this.currentAssistantEl = document.createElement("div");
-        this.currentAssistantEl.className = "ts-msg ts-msg--assistant";
+        this.currentAssistantEl.className =
+          "ts-msg ts-msg--assistant msg assistant";
         // streamingRender targets a .ts-msg-body inner wrapper so the
         // shared markdown rules in chat.css (h1/h2/h3/code/blockquote
         // scoped to .ts-msg-body *) actually match on this page — the
         // coordinator page uses the same .ts-msg-body wrapper so the
         // two chat views stay visually aligned.
         this.currentAssistantBodyEl = document.createElement("div");
-        this.currentAssistantBodyEl.className = "ts-msg-body";
+        this.currentAssistantBodyEl.className = "ts-msg-body msg-body";
         this.currentAssistantEl.appendChild(this.currentAssistantBodyEl);
         this.messagesEl.appendChild(this.currentAssistantEl);
       }
@@ -855,7 +857,7 @@ Pane.prototype.removeThinkingIndicator = function () {
 Pane.prototype.addUserMessage = function (text, attachments) {
   this.removeEmptyState();
   var el = document.createElement("div");
-  el.className = "ts-msg ts-msg--user";
+  el.className = "ts-msg ts-msg--user msg user";
   var textEl = document.createElement("div");
   textEl.className = "msg-user-text";
   textEl.textContent = text;
@@ -890,7 +892,7 @@ Pane.prototype.addQueuedMessage = function (text, priority) {
   this.removeEmptyState();
   var self = this;
   var el = document.createElement("div");
-  el.className = "ts-msg ts-msg--user msg-queued";
+  el.className = "ts-msg ts-msg--user msg user msg-queued";
   el.setAttribute("role", "status");
   if (priority === "important") {
     el.classList.add("msg-queued-important");
@@ -1227,9 +1229,9 @@ Pane.prototype.replayHistory = function (messages) {
       }
       if (msg.content) {
         var el = document.createElement("div");
-        el.className = "ts-msg ts-msg--assistant";
+        el.className = "ts-msg ts-msg--assistant msg assistant";
         var bodyEl = document.createElement("div");
-        bodyEl.className = "ts-msg-body";
+        bodyEl.className = "ts-msg-body msg-body";
         var rendered = renderMarkdown(msg.content);
         bodyEl.innerHTML = rendered;
         el.appendChild(bodyEl);
@@ -1732,7 +1734,7 @@ Pane.prototype.updateVerdictGlow = function (recommendation) {
 
 Pane.prototype.addInfoMessage = function (text) {
   var el = document.createElement("div");
-  el.className = "ts-msg ts-msg--info";
+  el.className = "ts-msg ts-msg--info msg info";
   el.textContent = stripAnsi(text);
   this.messagesEl.appendChild(el);
   this.scrollToBottom();
@@ -1740,7 +1742,7 @@ Pane.prototype.addInfoMessage = function (text) {
 
 Pane.prototype.addErrorMessage = function (text) {
   var el = document.createElement("div");
-  el.className = "ts-msg ts-msg--error";
+  el.className = "ts-msg ts-msg--error msg error";
   el.setAttribute("role", "alert");
   el.textContent = stripAnsi(text);
   this.messagesEl.appendChild(el);
