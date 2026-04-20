@@ -380,7 +380,7 @@
           document.documentElement.dataset.theme = "dark";
           label.textContent = "Light";
         } else {
-          delete document.documentElement.dataset.theme;
+          document.documentElement.dataset.theme = "light";
           label.textContent = "Dark";
         }
       }

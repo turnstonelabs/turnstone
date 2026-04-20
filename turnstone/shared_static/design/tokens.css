@@ -57,6 +57,8 @@
   --row-h: calc(32px * var(--density));
 }
 
+[data-design="v1"]:not([data-theme]),
+[data-design="v1"][data-theme=""],
 [data-design="v1"][data-theme="dark"] {
   --bg:      #0e1013;
   --panel:   #15181c;
