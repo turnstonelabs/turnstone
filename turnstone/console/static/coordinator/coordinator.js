@@ -77,11 +77,11 @@
 
   // Approval focus is deferred until the judge returns a verdict so the
   // Approve button doesn't pre-emptively light up (could read as "already
-  // approved").  Fallback timeout covers the case where the judge is
-  // disabled or slow.
+  // approved").  No fallback — if the judge never responds (disabled /
+  // slow), focus simply never moves; keyboard users tab from the
+  // composer to reach the buttons manually.  A fallback would produce
+  // an ambiguous focus ring that could be misread as "judge approved."
   let approvalFocusClaimed = false;
-  let approvalFocusTimer = null;
-  const APPROVAL_FOCUS_FALLBACK_MS = 3000;
 
   // ------------------------------------------------------------------
   // HTML escaping and safe ws_id linkification
@@ -351,23 +351,12 @@
     });
     pendingApprovalCallId = firstCallId;
     approvalBar.hidden = false;
-    // Defer focus until the judge returns a verdict — lighting up the
-    // Approve button before the reviewer has decision context reads as
-    // "already approved."  If the verdict is already cached (rare race),
-    // claim focus immediately.  Otherwise wait for intent_verdict or
-    // fall back after APPROVAL_FOCUS_FALLBACK_MS (covers disabled judge).
+    // Defer focus until the judge returns a verdict.  If the verdict is
+    // already cached (rare race), claim focus immediately.  Otherwise
+    // wait for intent_verdict — no fallback.
     approvalFocusClaimed = false;
-    if (approvalFocusTimer) {
-      clearTimeout(approvalFocusTimer);
-      approvalFocusTimer = null;
-    }
     if (firstCallId && judgeVerdicts.has(firstCallId)) {
       claimApprovalFocusForVerdict(judgeVerdicts.get(firstCallId));
-    } else {
-      approvalFocusTimer = setTimeout(() => {
-        approvalFocusTimer = null;
-        claimApprovalFocus("coord-approve-btn");
-      }, APPROVAL_FOCUS_FALLBACK_MS);
     }
   }
 
@@ -377,10 +366,6 @@
   function claimApprovalFocus(btnId) {
     if (approvalFocusClaimed) return;
     approvalFocusClaimed = true;
-    if (approvalFocusTimer) {
-      clearTimeout(approvalFocusTimer);
-      approvalFocusTimer = null;
-    }
     const btn = document.getElementById(btnId);
     if (btn) {
       try {
@@ -487,10 +472,6 @@
     if (countEl) countEl.textContent = "";
     pendingApprovalCallId = null;
     approvalFocusClaimed = false;
-    if (approvalFocusTimer) {
-      clearTimeout(approvalFocusTimer);
-      approvalFocusTimer = null;
-    }
     setApprovalButtonsDisabled(false);
     // Return focus to the composer for keyboard users.  Only if the
     // approval bar itself was the focus holder — don't steal focus from
