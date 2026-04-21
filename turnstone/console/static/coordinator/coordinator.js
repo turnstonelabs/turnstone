@@ -472,6 +472,12 @@
     if (countEl) countEl.textContent = "";
     pendingApprovalCallId = null;
     approvalFocusClaimed = false;
+    // Prune the verdict cache — verdicts are only used while the dock
+    // is visible, so keeping them across resolve cycles would leak
+    // memory over long sessions.
+    if (judgeVerdicts && typeof judgeVerdicts.clear === "function") {
+      judgeVerdicts.clear();
+    }
     setApprovalButtonsDisabled(false);
     // Return focus to the composer for keyboard users.  Only if the
     // approval bar itself was the focus holder — don't steal focus from
@@ -819,7 +825,10 @@
         });
         break;
       case "info":
-        appendText("tool", ev.message || "", { label: "info" });
+        // .msg.info (think-indigo) is the intended variant for info
+        // events; prior routing to "tool" gave them accent-tinted tool
+        // styling which mis-categorised them as tool calls.
+        appendText("info", ev.message || "", { label: "info" });
         break;
       case "state_change":
         statusEl.textContent = ev.state || "";
@@ -882,10 +891,12 @@
     // document.body, which would plant a floating badge at the page
     // root on any template variant where the header hasn't rendered
     // yet (#q-7).  Return null so callers skip rendering; the next
-    // event will retry.
-    const host =
-      document.getElementById("coord-status") ||
-      document.getElementById("coord-header");
+    // event will retry.  Mount into #coord-header (appbar container)
+    // NOT #coord-status — statusEl.textContent = ev.state on every
+    // state_change event clobbers all children of #coord-status, which
+    // would delete the wait indicator on the next state tick.  As a
+    // sibling inside the appbar it stays alive across state updates.
+    const host = document.getElementById("coord-header");
     if (!host) return null;
     el = document.createElement("span");
     el.id = "coord-wait-indicator";

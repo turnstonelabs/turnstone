@@ -279,9 +279,13 @@
     background: color-mix(in srgb, var(--err) 12%, var(--panel-2));
   }
 
+  /* Local @keyframes ts-spin — primitives/feed.css owns the canonical
+     definition but this page doesn't link feed.css (no .feed-item
+     usage).  Defined here so the .judging .spin chip below animates. */
+  @keyframes ts-spin { to { transform: rotate(360deg); } }
+
   /* "judge evaluating…" spinner chip — shown while a .dcall is
-     pending a verdict.  Reuses the @keyframes ts-spin keyframe
-     defined in primitives/feed.css. */
+     pending a verdict. */
   [data-design="v1"] #coord-approval-bar .dctx code.judging {
     display: inline-flex;
     align-items: center;
@@ -440,7 +444,7 @@
     </button>
     <div id="coord-children-wrap" class="side-section">
       <div class="coord-sidebar-head">
-        <span id="coord-children-heading" class="side-label">Children</span>
+        <h2 id="coord-children-heading" class="side-label">Children</h2>
         <span id="coord-children-count" class="side-count"></span>
         <button type="button" class="ghost" id="coord-children-refresh" aria-label="Refresh children list" title="Refresh children">&#8635;</button>
       </div>
@@ -455,7 +459,7 @@
     </div>
     <div id="coord-tasks-wrap" class="side-section">
       <div class="coord-sidebar-head">
-        <span id="coord-tasks-heading" class="side-label">Tasks</span>
+        <h2 id="coord-tasks-heading" class="side-label">Tasks</h2>
         <span id="coord-tasks-count" class="side-count"></span>
         <button type="button" class="ghost" id="coord-tasks-refresh" aria-label="Refresh task list" title="Refresh tasks">&#8635;</button>
       </div>
