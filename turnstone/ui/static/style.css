@@ -2234,9 +2234,15 @@ audio.media-player {
    ========================================================================== */
 
 [data-design="v1"] .ts-msg.ts-approval--inline {
-  /* Accent (teal) for tool-call kind — matches .msg.tool convention. */
+  /* Accent (teal) for tool-call kind — matches .msg.tool convention.
+     width: 100% forces consistent card width across tool calls; without
+     it, cards shrink to content width (short-output cards read narrow,
+     long-output cards read full-width → jagged column). */
   border-left-color: var(--accent);
   background: var(--panel-2);
+  width: 100%;
+  box-sizing: border-box;
+  align-self: stretch;
 }
 
 [data-design="v1"] .ts-approval-tool {
@@ -2371,32 +2377,36 @@ audio.media-player {
 [data-design="v1"] .verdict-detail .verdict-evidence  { color: var(--ink-4); font-style: italic; margin-bottom: 4px; }
 [data-design="v1"] .verdict-detail .verdict-tier      { color: var(--ink-4); font-size: 10px; }
 
-/* Auto-approved / denied badges — pill shape matching the DS approve
-   button family (green fill, ink-darkened text).  max-width: max-content
-   so the pill hugs its text instead of stretching the block. */
+/* Auto-approved / denied badges — flat badge aesthetic (matches the DS
+   .risk primitive), not a button.  Uppercase mono label on a soft
+   semantic-coloured background, no border — reads as "status tag" not
+   "click me." */
 [data-design="v1"] .ts-approval-badge {
-  padding: 4px 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
   margin-top: 6px;
-  font-size: 11px;
-  font-weight: 500;
-  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border-radius: 3px;
   max-width: max-content;
-  border: 1px solid var(--hair);
+  border: none;
 }
 [data-design="v1"] .ts-approval-badge--approved {
-  color: var(--ok-text);
-  background: color-mix(in srgb, var(--ok) 20%, var(--panel-2));
-  border-color: color-mix(in srgb, var(--ok) 50%, var(--hair));
+  color: var(--ok);
+  background: var(--ok-soft);
 }
 [data-design="v1"] .ts-approval-badge--denied {
-  color: color-mix(in srgb, var(--err) 70%, var(--ink-2));
-  background: color-mix(in srgb, var(--err) 15%, var(--panel-2));
-  border-color: color-mix(in srgb, var(--err) 45%, var(--hair));
+  color: var(--err);
+  background: var(--err-soft);
 }
 [data-design="v1"] .ts-approval-badge--error {
-  color: color-mix(in srgb, var(--err) 70%, var(--ink-2));
-  background: color-mix(in srgb, var(--err) 20%, var(--panel-2));
-  border-color: var(--err);
+  color: #fff;
+  background: var(--err-fill);
 }
 
 /* Tool output (streamed command/fetch result).  Map legacy --code-bg /
