@@ -2213,11 +2213,13 @@ audio.media-player {
 /* ==========================================================================
    DS migration — tool call + approval block overrides
    Scoped under [data-design="v1"] so only applies under the opt-in root.
-   The outer .ts-msg.ts-approval--inline wrapper already picks up DS .msg
-   styling via the dual-class approach in app.js, but the inner structure
-   (.ts-approval-tool, .verdict-badge, .ts-approval-badge) was still
-   rendering with legacy yellow/green/red palette. These overrides map
-   the legacy vocabulary onto DS semantic tokens.
+   Approval blocks render on the legacy .ts-msg.ts-approval.ts-approval
+   --inline wrapper (NOT a DS .msg primitive — the dual-class approach
+   used for user/assistant/reasoning messages wasn't extended to approval
+   blocks).  These overrides give that outer card a DS-aligned surface
+   + accent treatment, then remap the inner approval structure
+   (.ts-approval-tool, .verdict-badge, .ts-approval-badge) away from the
+   legacy yellow/green/red palette onto DS semantic tokens.
 
    DOM shape rendered by buildToolDiv() + renderVerdictBadge():
      .ts-msg.ts-approval.ts-approval--inline[.approved]  ← DS .msg styled
@@ -2245,6 +2247,15 @@ audio.media-player {
   align-self: stretch;
 }
 
+/* Legacy .ts-msg rule forces font-family: var(--font-mono) on every
+   chat turn.  Override for user/assistant/reasoning/info/error where
+   body prose is meant to be UI font.  .msg.tool keeps mono via the
+   primitive's own rule (higher specificity inside [data-design=v1]). */
+[data-design="v1"] .ts-msg.msg:not(.tool) {
+  font-family: var(--font-ui);
+}
+[data-design="v1"] .ts-msg-body.msg-body { font-family: inherit; }
+
 [data-design="v1"] .ts-approval-tool {
   padding: 8px 12px;
   background: var(--panel);
@@ -2262,6 +2273,11 @@ audio.media-player {
   margin-bottom: 4px;
   letter-spacing: 0;
 }
+
+/* Error variant of the tool name (replaces the prior inline
+   name.style.color = "var(--red)" in buildToolDiv — inline styles win
+   over CSS and broke the DS token mapping). */
+[data-design="v1"] .ts-approval-tool .tool-name--error { color: var(--err); }
 
 [data-design="v1"] .ts-approval-tool .tool-cmd {
   color: var(--ink-2);

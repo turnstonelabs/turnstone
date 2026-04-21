@@ -4820,9 +4820,8 @@ function buildToolDiv(item) {
   div.dataset.callId = item.call_id || "";
 
   var name = document.createElement("div");
-  name.className = "tool-name";
+  name.className = "tool-name" + (item.error ? " tool-name--error" : "");
   name.textContent = item.func_name || "";
-  if (item.error) name.style.color = "var(--red)";
   div.appendChild(name);
 
   var cmd = document.createElement("div");

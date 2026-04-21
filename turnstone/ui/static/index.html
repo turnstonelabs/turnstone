@@ -6,7 +6,9 @@
 <title>turnstone</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+<!-- DS typography.css @imports Inter + JetBrains Mono from Google Fonts;
+     no separate font link for legacy Outfit/IBM Plex Mono (those were
+     removed to avoid loading two font stacks under data-design="v1"). -->
 <link rel="stylesheet" href="/shared/base.css">
 <link rel="stylesheet" href="/shared/ui-base.css">
 <link rel="stylesheet" href="/shared/chat.css">
@@ -26,7 +28,7 @@
 </head>
 <body>
 <div id="header" class="ts-header appbar">
-  <h1 class="ts-header-title appbar-title">turnstone</h1>
+  <h1 class="appbar-title">turnstone</h1>
   <span id="mcp-status" class="appbar-status" role="status" aria-live="polite"></span>
   <span id="health-indicator" class="health-ok appbar-status" role="status" aria-live="polite" aria-atomic="true"></span>
   <span class="header-spacer appbar-spacer"></span>
