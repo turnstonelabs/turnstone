@@ -108,11 +108,6 @@
     flex: 1;
     overflow-y: auto;
     padding: 1rem 1.5rem;
-    /* Extra bottom padding so the fixed .approval-dock (position: fixed
-       bottom: 22px, ~3 rows ≈ 140px tall) never occludes the tail of the
-       message log when open.  Dock hides via [hidden], so when collapsed
-       the user just gets generous scroll padding — harmless. */
-    padding-bottom: 160px;
   }
   [data-design="v1"] .msg .coord-ws-link {
     color: var(--accent);
@@ -238,12 +233,30 @@
     [data-design="v1"] .ch-row.highlight { transition: none; }
   }
 
-  /* Hide the approval dock when no approval is pending.  The DS
-     .approval-dock pattern is position: fixed and always-rendered; we
-     use [hidden] as the toggle since the pattern ships no default
-     display: none rule (its intended use is an always-visible bottom
-     dock when opened).  !important guards against inline display
-     fights from the JS show/hide path. */
+  /* Override the DS .approval-dock pattern's viewport-pinned
+     positioning.  The pattern defaults to position: fixed bottom:22px
+     (designed for the fleet dashboard overlay case); in the coordinator
+     chat we need it inline above the composer so it doesn't cover the
+     input area.  Dock sits as the second flex child inside #coord-main
+     between messages and composer, with a hair top border as the
+     separator. */
+  [data-design="v1"] #coord-approval-bar.approval-dock {
+    position: static;
+    bottom: auto;
+    left: auto;
+    right: auto;
+    z-index: auto;
+    box-shadow: none;
+    flex: 0 0 auto;
+  }
+  /* Keep the warm top-stripe cue; just make it hug the top edge of the
+     in-flow dock instead of the top of a fixed viewport bar. */
+  [data-design="v1"] #coord-approval-bar.approval-dock::before {
+    top: -1px;
+  }
+  /* Hide the dock when no approval is pending.  [hidden] toggle; the
+     approval-dock pattern defines display: flex so we need the
+     !important override to win specificity. */
   [data-design="v1"] .approval-dock[hidden] { display: none !important; }
 
   /* Sidebar mobile toggle (desktop hides; mobile shows via media query
@@ -274,7 +287,7 @@
      appbar wraps its right cluster; composer tightens. */
   @media (max-width: 700px) {
     .appbar { flex-wrap: wrap; height: auto; padding: 8px 12px; }
-    #coord-messages { padding: 12px 14px 160px; }
+    #coord-messages { padding: 12px 14px; }
     #coord-body { flex-direction: column; }
     [data-design="v1"] #coord-sidebar.sidebar {
       max-height: 50vh;
@@ -319,12 +332,39 @@
          don't re-announce partial content on every token. -->
     <div id="coord-messages" role="log" aria-live="polite"></div>
 
-    <!-- Composer DOM is built by shared_static/composer.js into this mount.
-         Keeping the mount here (rather than inside coord-main's first child)
-         preserves the existing flex layout that puts the composer below the
-         message log.  The approval dock lives outside coord-main so its
-         position: fixed bottom rule is measured against the viewport rather
-         than the scroll container. -->
+    <!-- Approval dock — DS pattern, overridden to inline positioning (see
+         the position: static override in the style block above).  Sits
+         between the message log and the composer so it doesn't occlude
+         the user input. role="region" (not alertdialog) because we do
+         not trap focus; buttons are reachable in normal tab order.
+         aria-live="assertive" preserves the pre-DS announce-on-queue
+         behaviour. -->
+    <aside id="coord-approval-bar"
+           class="approval-dock"
+           role="region"
+           aria-label="Approval required"
+           aria-live="assertive"
+           hidden>
+      <div id="coord-approval-label" class="dhead">
+        Approval required
+        <span id="coord-approval-count" class="dcount"></span>
+      </div>
+      <div id="coord-approval-tools"></div>
+      <div class="drow">
+        <div class="spacer"></div>
+        <button id="coord-deny-btn" class="act danger" type="button" onclick="coordApprove(false, false)">
+          Deny<span class="kbd">D</span>
+        </button>
+        <button id="coord-approve-always-btn" class="act always" type="button" onclick="coordApprove(true, true)">
+          Always<span class="kbd">⇧A</span>
+        </button>
+        <button id="coord-approve-btn" class="act primary" type="button" onclick="coordApprove(true, false)">
+          Approve<span class="kbd">⏎</span>
+        </button>
+      </div>
+    </aside>
+
+    <!-- Composer DOM is built by shared_static/composer.js into this mount. -->
     <div id="coord-composer-mount"></div>
   </div>
 
@@ -367,30 +407,6 @@
     </div>
   </aside>
 </div>
-
-<!-- Approval dock — DS pattern.  Bottom-pinned (position: fixed) and
-     always-rendered; [hidden] toggles visibility.  role="region" (not
-     alertdialog) because we do not trap focus; buttons are reachable
-     in normal tab order.  aria-live="assertive" preserves the existing
-     pre-DS behaviour of announcing the approval the moment it queues. -->
-<aside id="coord-approval-bar"
-       class="approval-dock"
-       role="region"
-       aria-label="Approval required"
-       aria-live="assertive"
-       hidden>
-  <div id="coord-approval-label" class="dhead">
-    Approval required
-    <span id="coord-approval-count" class="dcount"></span>
-  </div>
-  <div id="coord-approval-tools"></div>
-  <div class="drow">
-    <div class="spacer"></div>
-    <button id="coord-deny-btn" class="act danger" type="button" onclick="coordApprove(false, false)">Deny<span class="kbd">D</span></button>
-    <button id="coord-approve-always-btn" class="act always" type="button" onclick="coordApprove(true, true)">Always<span class="kbd">&#8679;A</span></button>
-    <button id="coord-approve-btn" class="act primary" type="button" onclick="coordApprove(true, false)">Approve<span class="kbd">&#9166;</span></button>
-  </div>
-</aside>
 
 <!-- Shared-static import order matches the console dashboard
      (console/static/index.html) so global shortcuts (kb.js) and helpers
