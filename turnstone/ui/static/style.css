@@ -2209,3 +2209,225 @@ audio.media-player {
   .pane-ctx-item, .ws-tab-dropdown-item { transition: none; }
   .ws-tab-dropdown { animation: none; }
 }
+
+/* ==========================================================================
+   DS migration — tool call + approval block overrides
+   Scoped under [data-design="v1"] so only applies under the opt-in root.
+   The outer .ts-msg.ts-approval--inline wrapper already picks up DS .msg
+   styling via the dual-class approach in app.js, but the inner structure
+   (.ts-approval-tool, .verdict-badge, .ts-approval-badge) was still
+   rendering with legacy yellow/green/red palette. These overrides map
+   the legacy vocabulary onto DS semantic tokens.
+
+   DOM shape rendered by buildToolDiv() + renderVerdictBadge():
+     .ts-msg.ts-approval.ts-approval--inline[.approved]  ← DS .msg styled
+       .ts-approval-tool
+         .tool-name                   ← tool function name
+         .tool-cmd                    ← header / command
+         .tool-diff .diff-[del|add|warn]
+         (.tool-output appended dynamically by appendToolOutput)
+       .verdict-badge.verdict-[low|medium|high|critical]
+         .verdict-risk, .verdict-rec, .verdict-conf
+         button.verdict-expand
+       .verdict-detail (hidden until expand)
+       .ts-approval-badge[--approved|--denied]          ← auto-approved pill
+   ========================================================================== */
+
+[data-design="v1"] .ts-msg.ts-approval--inline {
+  /* Accent (teal) for tool-call kind — matches .msg.tool convention. */
+  border-left-color: var(--accent);
+  background: var(--panel-2);
+}
+
+[data-design="v1"] .ts-approval-tool {
+  padding: 8px 12px;
+  background: var(--panel);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-sm);
+}
+
+[data-design="v1"] .ts-approval-tool + .ts-approval-tool { margin-top: 6px; }
+
+[data-design="v1"] .ts-approval-tool .tool-name {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  margin-bottom: 4px;
+  letter-spacing: 0;
+}
+
+[data-design="v1"] .ts-approval-tool .tool-cmd {
+  color: var(--ink-2);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+[data-design="v1"] .ts-approval-tool .tool-cmd .dollar { color: var(--ok); }
+
+[data-design="v1"] .ts-approval-tool .tool-diff { white-space: pre-wrap; font-size: 12px; margin-top: 4px; }
+[data-design="v1"] .ts-approval-tool .tool-diff .diff-del  { color: var(--err); }
+[data-design="v1"] .ts-approval-tool .tool-diff .diff-add  { color: var(--ok); }
+[data-design="v1"] .ts-approval-tool .tool-diff .diff-warn { color: var(--warn); }
+
+/* Verdict badge — map to DS semantic colours using the same color-mix
+   pattern as DS k-badge (12% bg / 38% border / 70% text).  Risk level
+   drives the hue: low=ok, medium=warn, high/critical=err. */
+[data-design="v1"] .verdict-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  margin-top: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  border: 1px solid var(--hair);
+  border-radius: 3px;
+  background: var(--panel-2);
+  color: var(--ink-2);
+  border-left-width: 3px;
+  max-width: max-content;
+}
+
+[data-design="v1"] .verdict-badge.verdict-low {
+  color: color-mix(in srgb, var(--ok) 70%, var(--ink-2));
+  border-color: color-mix(in srgb, var(--ok) 38%, var(--hair));
+  border-left-color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 12%, var(--panel-2));
+}
+[data-design="v1"] .verdict-badge.verdict-medium {
+  color: color-mix(in srgb, var(--warn) 70%, var(--ink-2));
+  border-color: color-mix(in srgb, var(--warn) 38%, var(--hair));
+  border-left-color: var(--warn);
+  background: var(--warn-tint);
+}
+[data-design="v1"] .verdict-badge.verdict-high,
+[data-design="v1"] .verdict-badge.verdict-critical {
+  color: color-mix(in srgb, var(--err) 70%, var(--ink-2));
+  border-color: color-mix(in srgb, var(--err) 38%, var(--hair));
+  border-left-color: var(--err);
+  background: color-mix(in srgb, var(--err) 12%, var(--panel-2));
+}
+
+[data-design="v1"] .verdict-badge .verdict-risk {
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 10px;
+}
+[data-design="v1"] .verdict-badge .verdict-rec  { color: inherit; }
+[data-design="v1"] .verdict-badge .verdict-conf { color: var(--ink-3); font-size: 10px; }
+
+[data-design="v1"] .verdict-judge-spinner {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--ink-3);
+  font-size: 10px;
+}
+[data-design="v1"] .verdict-judge-spinner .judge-spinner-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: ts-pulse 1.2s infinite;
+}
+/* ts-pulse keyframe + prefers-reduced-motion guard are defined in
+   primitives/pills.css; no local duplicate needed. */
+
+[data-design="v1"] .verdict-expand {
+  background: transparent;
+  border: none;
+  padding: 0 4px;
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+[data-design="v1"] .verdict-expand:hover         { color: var(--ink); }
+[data-design="v1"] .verdict-expand:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+[data-design="v1"] .verdict-detail {
+  margin-top: 6px;
+  padding: 8px 12px;
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--ink-3);
+  background: var(--panel-2);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-sm);
+}
+[data-design="v1"] .verdict-detail .verdict-summary   { color: var(--ink-2); font-weight: 600; margin-bottom: 4px; }
+[data-design="v1"] .verdict-detail .verdict-reasoning { color: var(--ink-3); margin-bottom: 4px; }
+[data-design="v1"] .verdict-detail .verdict-evidence  { color: var(--ink-4); font-style: italic; margin-bottom: 4px; }
+[data-design="v1"] .verdict-detail .verdict-tier      { color: var(--ink-4); font-size: 10px; }
+
+/* Auto-approved / denied badges — pill shape matching the DS approve
+   button family (green fill, ink-darkened text).  max-width: max-content
+   so the pill hugs its text instead of stretching the block. */
+[data-design="v1"] .ts-approval-badge {
+  padding: 4px 10px;
+  margin-top: 6px;
+  font-size: 11px;
+  font-weight: 500;
+  border-radius: 999px;
+  max-width: max-content;
+  border: 1px solid var(--hair);
+}
+[data-design="v1"] .ts-approval-badge--approved {
+  color: var(--ok-text);
+  background: color-mix(in srgb, var(--ok) 20%, var(--panel-2));
+  border-color: color-mix(in srgb, var(--ok) 50%, var(--hair));
+}
+[data-design="v1"] .ts-approval-badge--denied {
+  color: color-mix(in srgb, var(--err) 70%, var(--ink-2));
+  background: color-mix(in srgb, var(--err) 15%, var(--panel-2));
+  border-color: color-mix(in srgb, var(--err) 45%, var(--hair));
+}
+[data-design="v1"] .ts-approval-badge--error {
+  color: color-mix(in srgb, var(--err) 70%, var(--ink-2));
+  background: color-mix(in srgb, var(--err) 20%, var(--panel-2));
+  border-color: var(--err);
+}
+
+/* Tool output (streamed command/fetch result).  Map legacy --code-bg /
+   --fg-dim to DS panel / ink tokens. */
+[data-design="v1"] .tool-output {
+  background: var(--panel);
+  color: var(--ink-2);
+  border-radius: var(--r-sm);
+  border: 1px solid var(--hair);
+}
+[data-design="v1"] .tool-output-error  { color: var(--err); }
+[data-design="v1"] .tool-output-stream { border-left: 2px solid var(--accent); }
+
+[data-design="v1"] .tool-output.collapsed::after {
+  background: linear-gradient(transparent, var(--panel) 70%);
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  padding-top: 14px;
+}
+
+/* Verdict-glow halo on action buttons — soft coloured ring when the
+   heuristic verdict suggests an action. */
+[data-design="v1"] .ts-verdict-glow--approve .ts-approval-btn--approve {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ok) 25%, transparent);
+}
+[data-design="v1"] .ts-verdict-glow--deny .ts-approval-btn--deny {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--err) 25%, transparent);
+}
+[data-design="v1"] .ts-verdict-glow--review .ts-approval-btn--approve,
+[data-design="v1"] .ts-verdict-glow--review .ts-approval-btn--deny {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--warn) 25%, transparent);
+}
