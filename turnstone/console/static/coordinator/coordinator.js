@@ -69,6 +69,12 @@
   let reconnectAttempts = 0;
   let reconnectTimer = null;
 
+  // Cache of judge verdicts keyed by call_id.  Judge events (intent_verdict)
+  // and approval events (approve_request) are async and can arrive in either
+  // order; the cache lets each handler apply data to the other without
+  // assuming ordering.
+  const judgeVerdicts = new Map();
+
   // ------------------------------------------------------------------
   // HTML escaping and safe ws_id linkification
   // ------------------------------------------------------------------
@@ -303,11 +309,12 @@
     pending.forEach((it, idx) => {
       if (!firstCallId) firstCallId = it.call_id;
       // Each pending tool call renders as a .dcall row — the DS pattern
-      // frames this like a mini inspectable call line.  Risk pill is
-      // .low by default (no per-item risk yet — that's a later PR);
-      // function name + preview args round out the row.
+      // frames this like a mini inspectable call line.  If we've already
+      // received a judge verdict for this call_id, its risk_level takes
+      // precedence; otherwise default to "low" until a verdict arrives.
       const row = document.createElement("div");
       row.className = "dcall";
+      if (it.call_id) row.dataset.callId = it.call_id;
       if (pending.length > 1) {
         const idx_ = document.createElement("span");
         idx_.className = "risk low";
@@ -324,6 +331,11 @@
       args.textContent = preview;
       row.appendChild(args);
       approvalTools.appendChild(row);
+      // If the judge already delivered a verdict for this call before the
+      // approval surfaced, render it into the dock immediately.
+      if (it.call_id && judgeVerdicts.has(it.call_id)) {
+        applyJudgeVerdictToRow(row, judgeVerdicts.get(it.call_id));
+      }
     });
     pendingApprovalCallId = firstCallId;
     approvalBar.hidden = false;
@@ -339,6 +351,39 @@
       } catch (_) {
         /* noop */
       }
+    }
+  }
+
+  // Render a judge verdict into a specific .dcall row's .dctx sibling.
+  // Creates the .dctx if it doesn't exist yet, or updates it if the
+  // verdict arrives a second time (re-evaluation).  Adds a judge chip
+  // showing the recommendation + risk level; attaches reasoning as a
+  // title tooltip for hover discovery.
+  function applyJudgeVerdictToRow(row, verdict) {
+    if (!row || !verdict) return;
+    const callId = row.dataset.callId;
+    let dctx = row.nextElementSibling;
+    if (
+      !dctx ||
+      !dctx.classList.contains("dctx") ||
+      dctx.dataset.forCall !== callId
+    ) {
+      dctx = document.createElement("div");
+      dctx.className = "dctx";
+      if (callId) dctx.dataset.forCall = callId;
+      row.insertAdjacentElement("afterend", dctx);
+    }
+    dctx.replaceChildren();
+    const chip = document.createElement("code");
+    const rec = verdict.recommendation || "?";
+    const risk = verdict.risk_level || "?";
+    chip.textContent = "judge: " + rec + " (risk: " + risk + ")";
+    if (verdict.reasoning) chip.title = verdict.reasoning;
+    dctx.appendChild(chip);
+    if (verdict.confidence != null) {
+      const conf = document.createElement("code");
+      conf.textContent = "confidence: " + verdict.confidence;
+      dctx.appendChild(conf);
     }
   }
 
@@ -640,7 +685,29 @@
         hideApproval();
         break;
       case "intent_verdict":
-        // Minimal surfacing — risk_level + recommendation.
+        // Prefer rendering the verdict inside the approval dock — the
+        // judge always evaluates a specific call_id, and the verdict is
+        // decision context for that pending approval, not a chat
+        // message.  Cache the verdict so late-arriving approve_request
+        // events can also pick it up (see showApproval).
+        if (ev.call_id) {
+          judgeVerdicts.set(ev.call_id, {
+            recommendation: ev.recommendation,
+            risk_level: ev.risk_level,
+            confidence: ev.confidence,
+            reasoning: ev.reasoning,
+          });
+          const row = approvalTools.querySelector(
+            '.dcall[data-call-id="' + cssEscape(ev.call_id) + '"]',
+          );
+          if (row) {
+            applyJudgeVerdictToRow(row, judgeVerdicts.get(ev.call_id));
+            break;
+          }
+        }
+        // Fallback — no matching pending row (approval already resolved
+        // or call_id missing).  Surface as a chat message so the verdict
+        // isn't silently dropped.
         appendText(
           "tool",
           "[judge] " +
