@@ -75,6 +75,14 @@
   // assuming ordering.
   const judgeVerdicts = new Map();
 
+  // Approval focus is deferred until the judge returns a verdict so the
+  // Approve button doesn't pre-emptively light up (could read as "already
+  // approved").  Fallback timeout covers the case where the judge is
+  // disabled or slow.
+  let approvalFocusClaimed = false;
+  let approvalFocusTimer = null;
+  const APPROVAL_FOCUS_FALLBACK_MS = 3000;
+
   // ------------------------------------------------------------------
   // HTML escaping and safe ws_id linkification
   // ------------------------------------------------------------------
@@ -343,19 +351,52 @@
     });
     pendingApprovalCallId = firstCallId;
     approvalBar.hidden = false;
-    // Move focus to the approve button — non-modal region, so keyboard
-    // users don't have to Shift+Tab back from the composer.  One-time
-    // focus shift; subsequent Tab/Shift+Tab navigates normally.  Also
-    // delivers the preserved "Enter approves" behaviour: the primary
-    // button has focus, so Enter fires its click handler.
-    const approveBtn = document.getElementById("coord-approve-btn");
-    if (approveBtn) {
+    // Defer focus until the judge returns a verdict — lighting up the
+    // Approve button before the reviewer has decision context reads as
+    // "already approved."  If the verdict is already cached (rare race),
+    // claim focus immediately.  Otherwise wait for intent_verdict or
+    // fall back after APPROVAL_FOCUS_FALLBACK_MS (covers disabled judge).
+    approvalFocusClaimed = false;
+    if (approvalFocusTimer) {
+      clearTimeout(approvalFocusTimer);
+      approvalFocusTimer = null;
+    }
+    if (firstCallId && judgeVerdicts.has(firstCallId)) {
+      claimApprovalFocusForVerdict(judgeVerdicts.get(firstCallId));
+    } else {
+      approvalFocusTimer = setTimeout(() => {
+        approvalFocusTimer = null;
+        claimApprovalFocus("coord-approve-btn");
+      }, APPROVAL_FOCUS_FALLBACK_MS);
+    }
+  }
+
+  // Claim approval-bar focus for a specific button.  Idempotent — further
+  // calls after the first are noops so we don't bounce focus across
+  // multiple buttons as verdicts arrive for a batch.
+  function claimApprovalFocus(btnId) {
+    if (approvalFocusClaimed) return;
+    approvalFocusClaimed = true;
+    if (approvalFocusTimer) {
+      clearTimeout(approvalFocusTimer);
+      approvalFocusTimer = null;
+    }
+    const btn = document.getElementById(btnId);
+    if (btn) {
       try {
-        approveBtn.focus({ preventScroll: false });
+        btn.focus({ preventScroll: false });
       } catch (_) {
         /* noop */
       }
     }
+  }
+
+  // Focus the appropriate action based on the judge's recommendation:
+  // deny → Deny button (judge is warning; reviewer should default to
+  // blocking), approve/review/other → Approve button.
+  function claimApprovalFocusForVerdict(verdict) {
+    const rec = (verdict && verdict.recommendation) || "";
+    claimApprovalFocus(rec === "deny" ? "coord-deny-btn" : "coord-approve-btn");
   }
 
   // Ensure a .dctx sibling exists for the given .dcall row, tagged with
@@ -445,6 +486,11 @@
     const countEl = document.getElementById("coord-approval-count");
     if (countEl) countEl.textContent = "";
     pendingApprovalCallId = null;
+    approvalFocusClaimed = false;
+    if (approvalFocusTimer) {
+      clearTimeout(approvalFocusTimer);
+      approvalFocusTimer = null;
+    }
     setApprovalButtonsDisabled(false);
     // Return focus to the composer for keyboard users.  Only if the
     // approval bar itself was the focus holder — don't steal focus from
@@ -754,6 +800,12 @@
           );
           if (row) {
             applyJudgeVerdictToRow(row, judgeVerdicts.get(ev.call_id));
+            // Claim focus now that the reviewer has context to act on.
+            // Only for the first-pending call so batch approvals don't
+            // fight over focus as verdicts trickle in.
+            if (ev.call_id === pendingApprovalCallId && !approvalFocusClaimed) {
+              claimApprovalFocusForVerdict(judgeVerdicts.get(ev.call_id));
+            }
             break;
           }
         }
