@@ -259,6 +259,65 @@
      !important override to win specificity. */
   [data-design="v1"] .approval-dock[hidden] { display: none !important; }
 
+  /* Judge verdict chips — colour-code by recommendation so the
+     reviewer can triage at a glance without reading the chip text.
+     approve=ok, review=warn, deny=err.  Uses the same 12/38/70% mix
+     scheme as the primitive k-badge tokens. */
+  [data-design="v1"] #coord-approval-bar .dctx code.rec-approve {
+    color: color-mix(in srgb, var(--ok) 70%, var(--ink-2));
+    border-color: color-mix(in srgb, var(--ok) 38%, var(--hair));
+    background: color-mix(in srgb, var(--ok) 12%, var(--panel-2));
+  }
+  [data-design="v1"] #coord-approval-bar .dctx code.rec-review {
+    color: color-mix(in srgb, var(--warn) 70%, var(--ink-2));
+    border-color: color-mix(in srgb, var(--warn) 38%, var(--hair));
+    background: var(--warn-tint);
+  }
+  [data-design="v1"] #coord-approval-bar .dctx code.rec-deny {
+    color: color-mix(in srgb, var(--err) 70%, var(--ink-2));
+    border-color: color-mix(in srgb, var(--err) 38%, var(--hair));
+    background: color-mix(in srgb, var(--err) 12%, var(--panel-2));
+  }
+
+  /* "judge evaluating…" spinner chip — shown while a .dcall is
+     pending a verdict.  Reuses the @keyframes ts-spin keyframe
+     defined in primitives/feed.css. */
+  [data-design="v1"] #coord-approval-bar .dctx code.judging {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: var(--ink-3);
+  }
+  [data-design="v1"] #coord-approval-bar .dctx code.judging .spin {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    border: 1.5px solid var(--accent);
+    border-top-color: transparent;
+    animation: ts-spin 0.9s linear infinite;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    [data-design="v1"] #coord-approval-bar .dctx code.judging .spin {
+      animation: none;
+    }
+  }
+
+  /* Judge rationale — the judge's reasoning text, rendered below the
+     dctx chips as a block quote.  Full text wraps; no truncation —
+     justification is the whole point of showing this. */
+  [data-design="v1"] #coord-approval-bar .drationale {
+    margin-top: 4px;
+    padding: 6px 10px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--ink-3);
+    background: var(--panel-2);
+    border-left: 2px solid var(--hair);
+    border-radius: 0 3px 3px 0;
+    white-space: pre-wrap;
+  }
+
   /* Sidebar mobile toggle (desktop hides; mobile shows via media query
      below). */
   #coord-sidebar-toggle {
