@@ -664,19 +664,6 @@ def _build_registry() -> dict[str, SettingDef]:
             "semantics) or returns 429 if every slot is non-idle.",
         ),
         SettingDef(
-            "coordinator.session_jwt_ttl_seconds",
-            "int",
-            300,
-            "TTL (seconds) of the per-session coordinator JWT",
-            "coordinator",
-            min_value=30,
-            max_value=3600,
-            help="Lifetime of the JWT the console mints for each coordinator session's "
-            "outbound tool calls. The token is refreshed lazily before expiry. Keep "
-            "this short (5 minutes default) to limit blast radius if the process "
-            "is compromised; longer values reduce JWT re-mint frequency at minor risk.",
-        ),
-        SettingDef(
             "coordinator.spawn_budget",
             "int",
             20,

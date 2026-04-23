@@ -42,13 +42,13 @@ def build_console_session_factory(
     registry: ModelRegistry,
     config_store: ConfigStore,
     node_id: str,
-    coord_client_factory: Callable[[str, str], CoordinatorClient],
+    coord_client_factory: Callable[[str, str, str], CoordinatorClient],
 ) -> Callable[..., ChatSession]:
     """Return a session factory that builds coordinator-kind ChatSessions.
 
     The factory signature matches :class:`turnstone.core.workstream._SessionFactory`.
     ``coord_client_factory`` is called at session-create time with
-    ``(ws_id, user_id)`` and returns a prepared :class:`CoordinatorClient`.
+    ``(ws_id, user_id, user_token)`` and returns a prepared :class:`CoordinatorClient`.
 
     Only ``kind="coordinator"`` is supported here — the console doesn't
     host interactive workstreams.  The factory rejects any other kind
@@ -88,6 +88,7 @@ def build_console_session_factory(
         client_type: str = "web",
         kind: WorkstreamKind = WorkstreamKind.COORDINATOR,
         parent_ws_id: str | None = None,
+        user_token: str = "",
     ) -> ChatSession:
         assert ui is not None, "console session_factory requires a non-None UI"
         if kind != WorkstreamKind.COORDINATOR:
@@ -156,7 +157,7 @@ def build_console_session_factory(
             )
         )
 
-        coord_client = coord_client_factory(ws_id or "", uid)
+        coord_client = coord_client_factory(ws_id or "", uid, user_token)
 
         return ChatSession(
             client=r_client,

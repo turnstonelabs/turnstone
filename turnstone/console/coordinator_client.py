@@ -16,9 +16,8 @@ channels:
 
 The client is **synchronous by design** — coordinator tool execs run
 on the ChatSession's worker thread, not on the event loop — so it uses
-``httpx.Client`` rather than the async client.  A per-session
-:class:`CoordinatorTokenManager` mints short-lived console-audience
-JWTs carrying the real user's identity + scopes.
+``httpx.Client`` rather than the async client.  The user's normal
+console JWT (24h expiry) is threaded through via ``token_factory``.
 """
 
 from __future__ import annotations
@@ -33,7 +32,6 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import httpx
 
-from turnstone.core.auth import JWT_AUD_CONSOLE, create_jwt
 from turnstone.core.log import get_logger
 from turnstone.core.workstream import WorkstreamKind
 
@@ -152,73 +150,6 @@ log = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Per-session coordinator JWT
-# ---------------------------------------------------------------------------
-
-
-class CoordinatorTokenManager:
-    """Auto-rotating console-audience JWT for a single coordinator session.
-
-    Mints a token with:
-
-    - ``sub`` — the coordinator's real creator ``user_id``.
-    - ``scopes`` — the creator's scopes (narrowed in the creator's identity
-      already; the coordinator inherits without escalation).
-    - ``src`` — ``"coordinator"`` so server-side audit can attribute tool
-      calls to a coordinator session.
-    - ``aud`` — :data:`JWT_AUD_CONSOLE` because the issued token is
-      consumed by the console's own routing-proxy auth middleware.
-    - ``coord_ws_id`` — the coordinator session's ``ws_id`` for forensics.
-
-    Thread-safe: :attr:`token` re-mints on demand when the current JWT is
-    within the refresh margin of expiry.
-    """
-
-    def __init__(
-        self,
-        user_id: str,
-        scopes: frozenset[str],
-        permissions: frozenset[str],
-        secret: str,
-        coord_ws_id: str,
-        ttl_seconds: int = 300,
-        refresh_margin: float = 0.2,
-    ) -> None:
-        if ttl_seconds <= 0:
-            raise ValueError("ttl_seconds must be positive")
-        self._user_id = user_id
-        self._scopes = scopes
-        self._permissions = permissions
-        self._secret = secret
-        self._coord_ws_id = coord_ws_id
-        self._ttl = ttl_seconds
-        self._margin = ttl_seconds * refresh_margin
-        self._token: str = ""
-        self._expires_at: float = 0.0
-        self._lock = threading.Lock()
-
-    def _mint(self) -> None:
-        self._token = create_jwt(
-            user_id=self._user_id,
-            scopes=self._scopes,
-            source="coordinator",
-            secret=self._secret,
-            audience=JWT_AUD_CONSOLE,
-            permissions=self._permissions,
-            expiry_seconds=self._ttl,
-            extra_claims={"coord_ws_id": self._coord_ws_id},
-        )
-        self._expires_at = time.time() + self._ttl
-
-    @property
-    def token(self) -> str:
-        with self._lock:
-            if time.time() >= self._expires_at - self._margin:
-                self._mint()
-            return self._token
-
-
-# ---------------------------------------------------------------------------
 # Coordinator client
 # ---------------------------------------------------------------------------
 
@@ -305,7 +236,10 @@ class CoordinatorClient:
     # -- internal helpers ---------------------------------------------------
 
     def _headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self._token_factory()}"}
+        return {
+            "Authorization": f"Bearer {self._token_factory()}",
+            "X-Coordinator-Session": self._coord_ws_id,
+        }
 
     def _post(self, path_key: str, body: dict[str, Any]) -> dict[str, Any]:
         path = _ROUTE_PATHS[path_key]
@@ -1415,9 +1349,8 @@ class CoordinatorClient:
         model-facing tool schema is unchanged — the returned dict just
         gains an optional ``live`` key when available.
 
-        Permission inheritance: the coordinator's per-session JWT carries
-        the creator's scopes and permissions (see
-        :class:`CoordinatorTokenManager`).  The cluster-inspect endpoint
+        Permission inheritance: the coordinator reuses the creator's JWT,
+        which carries the creator's scopes and permissions.  The cluster-inspect endpoint
         is gated on ``admin.cluster.inspect`` — creators without that
         permission get a 403 here and ``inspect`` silently degrades to
         storage-only.  This is correct behavior (the coordinator cannot

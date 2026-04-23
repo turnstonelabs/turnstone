@@ -21,7 +21,7 @@ from turnstone.core.auth import JWT_AUD_SERVER, AuthResult
 _SECRET = "x" * 64
 
 
-def _build_request(auth_result: AuthResult | None):
+def _build_request(auth_result: AuthResult | None, headers: dict[str, str] | None = None):
     """Minimal Request-alike for _proxy_auth_headers."""
     state = SimpleNamespace(auth_result=auth_result)
     app_state = SimpleNamespace(jwt_secret=_SECRET, proxy_token_mgr=None)
@@ -30,6 +30,9 @@ def _build_request(auth_result: AuthResult | None):
     req = MagicMock()
     req.state = state
     req.app = app
+    _headers = headers or {}
+    req.headers = MagicMock()
+    req.headers.get = lambda key, default="": _headers.get(key.lower(), default)
     return req
 
 

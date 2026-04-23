@@ -24,16 +24,17 @@ from turnstone.core.auth import JWT_AUD_CONSOLE, create_jwt
 _TEST_JWT_SECRET = "test-jwt-secret-minimum-32-chars!"
 
 
-def _coordinator_jwt(coord_ws_id: str = "coord-42") -> str:
-    """Mint a JWT shaped like CoordinatorTokenManager would produce."""
+def _coordinator_jwt() -> str:
+    """Mint a normal user JWT — the coordinator now reuses the user's token
+    and sends coord_ws_id via the X-Coordinator-Session header instead of
+    embedding it as a JWT claim."""
     return create_jwt(
         user_id="user-real-creator",
         scopes=frozenset({"read", "write", "approve"}),
-        source="coordinator",
+        source="jwt",
         secret=_TEST_JWT_SECRET,
         audience=JWT_AUD_CONSOLE,
         permissions=frozenset({"admin.coordinator"}),
-        extra_claims={"coord_ws_id": coord_ws_id},
     )
 
 
@@ -48,7 +49,10 @@ def _plain_jwt() -> str:
     )
 
 
-_COORD_HEADERS: dict[str, str] = {"Authorization": f"Bearer {_coordinator_jwt()}"}
+_COORD_HEADERS: dict[str, str] = {
+    "Authorization": f"Bearer {_coordinator_jwt()}",
+    "X-Coordinator-Session": "coord-42",
+}
 _PLAIN_HEADERS: dict[str, str] = {"Authorization": f"Bearer {_plain_jwt()}"}
 
 

@@ -144,6 +144,7 @@ class CoordinatorManager:
         skill: str | None = None,
         initial_message: str = "",
         ws_id: str = "",
+        user_token: str = "",
     ) -> Workstream:
         """Construct a new coordinator workstream and register it.
 
@@ -257,6 +258,7 @@ class CoordinatorManager:
                 skill=skill,
                 kind=WorkstreamKind.COORDINATOR,
                 parent_ws_id=None,
+                user_token=user_token,
             )
         except Exception:
             # Roll back the slot + persisted row on construction failure
@@ -315,20 +317,20 @@ class CoordinatorManager:
     # open — lazy rehydration for a persisted coordinator
     # ------------------------------------------------------------------
 
-    def open(self, ws_id: str, user_id: str) -> Workstream | None:
+    def open(self, ws_id: str, user_id: str, *, user_token: str = "") -> Workstream | None:
         """Rehydrate a persisted coordinator session on demand.
 
         Returns ``None`` if the row doesn't exist or doesn't belong to
         ``user_id``.  Callers that need ownership bypass (admin view)
         should call ``open_admin`` instead.
         """
-        return self._open_impl(ws_id, user_id=user_id, admin=False)
+        return self._open_impl(ws_id, user_id=user_id, admin=False, user_token=user_token)
 
-    def open_admin(self, ws_id: str) -> Workstream | None:
+    def open_admin(self, ws_id: str, *, user_token: str = "") -> Workstream | None:
         """Rehydrate regardless of ownership — admin paths only."""
-        return self._open_impl(ws_id, user_id="", admin=True)
+        return self._open_impl(ws_id, user_id="", admin=True, user_token=user_token)
 
-    def _open_impl(self, ws_id: str, *, user_id: str, admin: bool) -> Workstream | None:
+    def _open_impl(self, ws_id: str, *, user_id: str, admin: bool, user_token: str = "") -> Workstream | None:
         """Serialize concurrent open() for the same ws_id.
 
         Two concurrent GET /v1/api/coordinator/{ws_id} requests for the
@@ -421,6 +423,7 @@ class CoordinatorManager:
                         skill=None,
                         kind=WorkstreamKind.COORDINATOR,
                         parent_ws_id=None,
+                        user_token=user_token,
                     )
                 except Exception:
                     with self._lock:

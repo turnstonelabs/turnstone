@@ -260,12 +260,19 @@ def _proxy_auth_headers(request: Request) -> dict[str, str]:
         # every upstream call from a coordinator session would be
         # indistinguishable from a human-originated console proxy call.
         is_coord = auth_result.token_source == "coordinator"
+        # Also detect coordinator calls via the X-Coordinator-Session
+        # header (the coordinator client sends the user's normal JWT
+        # alongside this header instead of minting its own JWT).
+        coord_header = request.headers.get("x-coordinator-session", "")
+        if coord_header:
+            is_coord = True
         source = "coordinator" if is_coord else "console-proxy"
         extra: dict[str, Any] = {}
-        if is_coord:
-            coord_ws_id = auth_result.extra_claims.get("coord_ws_id")
-            if coord_ws_id:
-                extra["coord_ws_id"] = coord_ws_id
+        coord_ws_id = coord_header or (
+            auth_result.extra_claims.get("coord_ws_id") if is_coord else ""
+        )
+        if coord_ws_id:
+            extra["coord_ws_id"] = coord_ws_id
         token = create_jwt(
             user_id=auth_result.user_id,
             scopes=auth_result.scopes,
@@ -323,9 +330,16 @@ def _emit_route_audit(
     auth = getattr(getattr(request, "state", None), "auth_result", None)
     user_id: str = (getattr(auth, "user_id", "") or "") if auth is not None else ""
     src: str = (getattr(auth, "token_source", "") or "") if auth is not None else ""
-    coord_ws_id: str = ""
-    if auth is not None:
-        coord_ws_id = (getattr(auth, "extra_claims", None) or {}).get("coord_ws_id", "") or ""
+    # Check for coordinator session header — the coordinator client sends
+    # the user's normal JWT alongside this header for tracing.
+    coord_header: str = request.headers.get("x-coordinator-session", "") or ""
+    if coord_header:
+        src = "coordinator"
+    coord_ws_id: str = coord_header or (
+        ((getattr(auth, "extra_claims", None) or {}).get("coord_ws_id", "") or "")
+        if auth is not None
+        else ""
+    )
     detail: dict[str, Any] = {"src": src, "node_id": node_id}
     if coord_ws_id:
         detail["coord_ws_id"] = coord_ws_id
@@ -2160,7 +2174,17 @@ async def proxy_api(request: Request) -> Response:
 
     # SSE detection: GET requests to events endpoints
     if request.method == "GET" and path in ("events", "events/global"):
-        return await _proxy_sse(request, server_url, path, api_prefix=api_prefix)
+        auth_override = None
+        if path == "events/global":
+            # The upstream endpoint requires ``service`` scope which
+            # browser-originated user tokens lack.  Use the console's
+            # own service token so the proxy succeeds.
+            mgr = getattr(request.app.state, "proxy_token_mgr", None)
+            if mgr is not None:
+                auth_override = dict(mgr.bearer_header)
+        return await _proxy_sse(
+            request, server_url, path, api_prefix=api_prefix, auth_override=auth_override
+        )
 
     if request.method in ("POST", "PUT", "DELETE"):
         return await _proxy_post(request, server_url, path, api_prefix=api_prefix)
@@ -2226,19 +2250,28 @@ async def _proxy_post(
 
 
 async def _proxy_sse(
-    request: Request, server_url: str, path: str, *, api_prefix: str = "api"
+    request: Request,
+    server_url: str,
+    path: str,
+    *,
+    api_prefix: str = "api",
+    auth_override: dict[str, str] | None = None,
 ) -> Response:
     """Proxy an SSE stream from the target server to the browser.
 
     Relays raw bytes verbatim so server-side ping comments, event framing,
     and keepalives all pass through unchanged.
+
+    If *auth_override* is provided it replaces the default
+    ``_proxy_auth_headers`` derivation — used when the upstream endpoint
+    requires service-scoped credentials (e.g. ``/v1/api/events/global``).
     """
     target = f"{server_url}/{api_prefix}/{path}"
     if request.url.query:
         target += f"?{request.url.query}"
 
     sse_client: httpx.AsyncClient = request.app.state.proxy_sse_client
-    sse_auth = _proxy_auth_headers(request)
+    sse_auth = auth_override if auth_override is not None else _proxy_auth_headers(request)
 
     async def raw_stream() -> AsyncGenerator[bytes, None]:
         try:
@@ -2502,6 +2535,12 @@ async def coordinator_create(request: Request) -> JSONResponse:
     user_id = _auth_user_id(request)
     if not user_id:
         return JSONResponse({"error": "authentication required"}, status_code=401)
+    # Extract the caller's raw JWT so the coordinator session can reuse it
+    # for internal HTTP calls back to the console API (avoids minting a
+    # separate short-lived token that can expire while a tab is backgrounded).
+    user_token = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+    if not user_token:
+        user_token = request.cookies.get("turnstone_auth", "")
     name = (body.get("name") or "").strip()
     skill = (body.get("skill") or "").strip() or None
     initial_message = (body.get("initial_message") or "").strip()
@@ -2518,6 +2557,7 @@ async def coordinator_create(request: Request) -> JSONResponse:
             name=name,
             skill=skill,
             initial_message=initial_message,
+            user_token=user_token,
         )
     except RuntimeError as exc:
         return JSONResponse({"error": str(exc)}, status_code=429)
@@ -2858,6 +2898,9 @@ async def coordinator_detail(request: Request) -> JSONResponse:
         return err503
     ws_id = request.path_params.get("ws_id", "")
     user_id = _auth_user_id(request)
+    user_token = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+    if not user_token:
+        user_token = request.cookies.get("turnstone_auth", "")
     ws = coord_mgr.get(ws_id)
     if ws is None:
         # Lazy rehydration goes through the session factory, which can
@@ -2866,9 +2909,9 @@ async def coordinator_detail(request: Request) -> JSONResponse:
         # the detail endpoint either.
         try:
             ws = (
-                coord_mgr.open_admin(ws_id)
+                coord_mgr.open_admin(ws_id, user_token=user_token)
                 if _is_admin(request)
-                else coord_mgr.open(ws_id, user_id)
+                else coord_mgr.open(ws_id, user_id, user_token=user_token)
             )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=503)
@@ -2924,13 +2967,20 @@ async def coordinator_open(request: Request) -> JSONResponse:
     if not ws_id:
         return JSONResponse({"error": "ws_id is required"}, status_code=400)
     user_id = _auth_user_id(request)
+    user_token = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+    if not user_token:
+        user_token = request.cookies.get("turnstone_auth", "")
     ws = coord_mgr.get(ws_id)
     if ws is not None:
         if ws.user_id != user_id and not _is_admin(request):
             return JSONResponse({"error": "coordinator not found"}, status_code=404)
         return JSONResponse({"ws_id": ws.id, "name": ws.name, "already_loaded": True})
     try:
-        ws = coord_mgr.open_admin(ws_id) if _is_admin(request) else coord_mgr.open(ws_id, user_id)
+        ws = (
+            coord_mgr.open_admin(ws_id, user_token=user_token)
+            if _is_admin(request)
+            else coord_mgr.open(ws_id, user_id, user_token=user_token)
+        )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=503)
     except Exception:
@@ -4167,7 +4217,6 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                 from turnstone.console.coordinator import CoordinatorManager
                 from turnstone.console.coordinator_client import (
                     CoordinatorClient,
-                    CoordinatorTokenManager,
                 )
                 from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
                 from turnstone.console.session_factory import (
@@ -4182,24 +4231,11 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                 def _ui_factory(ws_id: str, user_id: str) -> ConsoleCoordinatorUI:
                     return ConsoleCoordinatorUI(ws_id=ws_id, user_id=user_id)
 
-                def _coord_client_factory(ws_id: str, user_id: str) -> CoordinatorClient:
-                    ttl = int(config_store.get("coordinator.session_jwt_ttl_seconds"))
-                    tm = CoordinatorTokenManager(
-                        user_id=user_id or "system",
-                        scopes=frozenset({"read", "write", "approve"}),
-                        permissions=frozenset({"admin.coordinator"}),
-                        secret=jwt_secret,
-                        coord_ws_id=ws_id,
-                        ttl_seconds=ttl,
-                    )
-
-                    def _token_factory() -> str:
-                        return tm.token
-
+                def _coord_client_factory(ws_id: str, user_id: str, user_token: str) -> CoordinatorClient:
                     return CoordinatorClient(
                         console_base_url=console_bind_url,
                         storage=storage,
-                        token_factory=_token_factory,
+                        token_factory=lambda: user_token,
                         coord_ws_id=ws_id,
                         user_id=user_id,
                     )

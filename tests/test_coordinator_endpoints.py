@@ -473,7 +473,10 @@ def test_open_rehydrates_when_not_in_memory(storage, monkeypatch):
     assert body["ws_id"] == "coord-rehy"
     assert body["name"] == "rehydrated"
     assert "already_loaded" not in body
-    mgr.open.assert_called_once_with("coord-rehy", "user-1")
+    mgr.open.assert_called_once()
+    args, kwargs = mgr.open.call_args
+    assert args == ("coord-rehy", "user-1")
+    assert "user_token" in kwargs
 
 
 def test_open_admin_uses_open_admin(storage, monkeypatch):
@@ -492,7 +495,10 @@ def test_open_admin_uses_open_admin(storage, monkeypatch):
         },
     )
     assert resp.status_code == 200
-    mgr.open_admin.assert_called_once_with("coord-rehy")
+    mgr.open_admin.assert_called_once()
+    args, kwargs = mgr.open_admin.call_args
+    assert args == ("coord-rehy",)
+    assert "user_token" in kwargs
 
 
 def test_open_returns_404_when_unknown_ws_id(storage, monkeypatch):

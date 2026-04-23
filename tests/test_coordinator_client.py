@@ -17,95 +17,11 @@ import pytest
 from turnstone.console.coordinator_client import (
     _ROUTE_PATHS,
     CoordinatorClient,
-    CoordinatorTokenManager,
 )
-from turnstone.core.auth import JWT_AUD_CONSOLE, validate_jwt
 from turnstone.core.storage._sqlite import SQLiteBackend
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-_SECRET = "x" * 64
-
-
-# ---------------------------------------------------------------------------
-# CoordinatorTokenManager
-# ---------------------------------------------------------------------------
-
-
-def test_token_manager_mints_valid_console_jwt():
-    tm = CoordinatorTokenManager(
-        user_id="user-1",
-        scopes=frozenset({"read", "write", "approve"}),
-        permissions=frozenset({"admin.coordinator"}),
-        secret=_SECRET,
-        coord_ws_id="coord-123",
-        ttl_seconds=300,
-    )
-    token = tm.token
-    result = validate_jwt(token, _SECRET, audience=JWT_AUD_CONSOLE)
-    assert result is not None
-    assert result.user_id == "user-1"
-    assert "approve" in result.scopes
-    assert result.token_source == "coordinator"
-
-
-def test_token_manager_embeds_coord_ws_id_claim():
-    import jwt
-
-    tm = CoordinatorTokenManager(
-        user_id="user-1",
-        scopes=frozenset({"read"}),
-        permissions=frozenset(),
-        secret=_SECRET,
-        coord_ws_id="coord-42",
-    )
-    token = tm.token
-    decoded = jwt.decode(token, _SECRET, algorithms=["HS256"], audience=JWT_AUD_CONSOLE)
-    assert decoded["coord_ws_id"] == "coord-42"
-    assert decoded["src"] == "coordinator"
-
-
-def test_token_manager_refreshes_near_expiry(monkeypatch):
-    """Force the expiry guard to fire and confirm _mint runs again."""
-    tm = CoordinatorTokenManager(
-        user_id="u",
-        scopes=frozenset({"read"}),
-        permissions=frozenset(),
-        secret=_SECRET,
-        coord_ws_id="c",
-        ttl_seconds=10,
-    )
-    calls = {"count": 0}
-    real_mint = tm._mint
-
-    def _counting_mint() -> None:
-        calls["count"] += 1
-        real_mint()
-
-    monkeypatch.setattr(tm, "_mint", _counting_mint)
-    _ = tm.token
-    assert calls["count"] == 1
-    # Not expired yet → no re-mint.
-    _ = tm.token
-    assert calls["count"] == 1
-    # Force expiry.
-    tm._expires_at = 0.0  # type: ignore[attr-defined]
-    _ = tm.token
-    assert calls["count"] == 2
-
-
-def test_token_manager_rejects_nonpositive_ttl():
-    with pytest.raises(ValueError):
-        CoordinatorTokenManager(
-            user_id="u",
-            scopes=frozenset(),
-            permissions=frozenset(),
-            secret=_SECRET,
-            coord_ws_id="c",
-            ttl_seconds=0,
-        )
-
 
 # ---------------------------------------------------------------------------
 # CoordinatorClient — URL map + header plumbing via MockTransport
@@ -203,6 +119,16 @@ def test_spawn_posts_to_routing_proxy_with_bearer_token():
     assert body["initial_message"] == "hi"
     assert body["skill"] == "my-skill"
     assert body["target_node"] == "n1"
+
+
+def test_headers_include_coordinator_session():
+    """Every request must carry X-Coordinator-Session with the coord ws_id
+    so the proxy layer can attribute calls without relying on JWT claims."""
+    client, captured = _mock_client(_ok_json({"ws_id": "child-1"}))
+    client.spawn(initial_message="hi", parent_ws_id="coord-1", user_id="user-1")
+    assert len(captured) == 1
+    req = captured[0]
+    assert req.headers["X-Coordinator-Session"] == "coord-1"
 
 
 def test_spawn_omits_optional_empty_fields():
