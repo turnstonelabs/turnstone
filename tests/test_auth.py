@@ -941,6 +941,135 @@ class TestServerLogin:
         resp = self.test_client.get("/v1/api/workstreams")
         assert resp.status_code == 401
 
+    def test_whoami_includes_exp(self):
+        """whoami exposes the JWT exp so the frontend can schedule refresh."""
+        import time
+
+        self.test_client.post(
+            "/v1/api/auth/login",
+            json={"username": "testuser", "password": "testpass"},
+        )
+        resp = self.test_client.get("/v1/api/auth/whoami")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "exp" in data
+        # Default JWT TTL is 24h; exp should be > now and < now + 25h.
+        now = int(time.time())
+        assert now < data["exp"] < now + 25 * 3600
+
+    def test_refresh_returns_new_jwt_and_cookie(self):
+        """POST /api/auth/refresh re-mints the cookie with a fresh exp."""
+        from turnstone.core.auth import AUTH_COOKIE
+
+        # Storage needs get_user_permissions for the refresh re-resolve path.
+        # Mock is shared across tests in the class — re-arm here in case a
+        # prior test left it default.
+        self.test_client.app.state.auth_storage.get_user_permissions.return_value = {
+            "read",
+            "write",
+            "approve",
+        }
+
+        login = self.test_client.post(
+            "/v1/api/auth/login",
+            json={"username": "testuser", "password": "testpass"},
+        )
+        assert login.status_code == 200
+
+        refresh = self.test_client.post("/v1/api/auth/refresh")
+        assert refresh.status_code == 200
+        body = refresh.json()
+        assert body["status"] == "ok"
+        assert body["user_id"] == "uid_test"
+        assert "jwt" in body
+        # Set-Cookie header must be present so the browser updates.  Don't
+        # assert the new JWT differs from the original — sub-second login
+        # and refresh produce identical iat/exp claims and therefore an
+        # identical token, which is fine: the cookie still gets re-set.
+        cookie_hdr = refresh.headers.get("set-cookie", "")
+        assert AUTH_COOKIE in cookie_hdr
+        assert "HttpOnly" in cookie_hdr
+
+        # The refreshed cookie must keep working.
+        resp = self.test_client.get("/v1/api/workstreams")
+        assert resp.status_code == 200
+
+    def test_refresh_unauthenticated_401(self):
+        """Refresh requires a currently-valid cookie — no cookie → 401."""
+        # Clear cookies on the test client
+        self.test_client.cookies.clear()
+        resp = self.test_client.post("/v1/api/auth/refresh")
+        assert resp.status_code == 401
+
+    def test_refresh_storage_failure_falls_back(self):
+        """Transient storage error → fall back to in-token claims, not 403.
+
+        The earlier implementation called _load_user_permissions() which
+        swallows exceptions and returns set(); that path was
+        indistinguishable from a deleted user (legitimate 403).  The
+        handler now calls storage.get_user_permissions() directly so
+        DB hiccups fall through to in-token perms.
+        """
+        # Re-arm the storage so login works first
+        self.test_client.app.state.auth_storage.get_user_permissions.return_value = {
+            "read",
+            "write",
+            "approve",
+        }
+        login = self.test_client.post(
+            "/v1/api/auth/login",
+            json={"username": "testuser", "password": "testpass"},
+        )
+        assert login.status_code == 200
+
+        # Now make storage raise on the refresh re-resolve
+        self.test_client.app.state.auth_storage.get_user_permissions.side_effect = RuntimeError(
+            "db down"
+        )
+        try:
+            resp = self.test_client.post("/v1/api/auth/refresh")
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            # Permissions should still be present (fell back to in-token claims)
+            assert body.get("permissions"), body
+        finally:
+            # Restore for any subsequent tests
+            self.test_client.app.state.auth_storage.get_user_permissions.side_effect = None
+            self.test_client.app.state.auth_storage.get_user_permissions.return_value = {
+                "read",
+                "write",
+                "approve",
+            }
+
+    def test_refresh_user_with_no_perms_403(self):
+        """Storage returns empty (user deleted/role-stripped) → 403.
+
+        Distinguished from the storage-failure case above because
+        get_user_permissions returned a value (the empty set) without
+        raising — that's an authoritative "no roles", not a hiccup.
+        """
+        self.test_client.app.state.auth_storage.get_user_permissions.return_value = {
+            "read",
+            "write",
+            "approve",
+        }
+        login = self.test_client.post(
+            "/v1/api/auth/login",
+            json={"username": "testuser", "password": "testpass"},
+        )
+        assert login.status_code == 200
+
+        self.test_client.app.state.auth_storage.get_user_permissions.return_value = set()
+        try:
+            resp = self.test_client.post("/v1/api/auth/refresh")
+            assert resp.status_code == 403
+        finally:
+            self.test_client.app.state.auth_storage.get_user_permissions.return_value = {
+                "read",
+                "write",
+                "approve",
+            }
+
 
 class TestConsoleLogin:
     """Test login/logout cookie flow on turnstone-console."""
@@ -1127,6 +1256,56 @@ class TestJWTAudienceIssuer:
         token = create_jwt("user1", frozenset({"read"}), "test", self.SECRET)
         result = validate_jwt(token, self.SECRET, audience="")
         assert result is not None
+
+    def test_validate_jwt_accepts_within_leeway_after_expiry(self):
+        """validate_jwt has 30s leeway for clock skew across hosts/processes."""
+        import time
+
+        import jwt as pyjwt
+
+        from turnstone.core.auth import JWT_ISSUER, validate_jwt
+
+        # Mint a token that "expired" 10 seconds ago — still within 30s leeway.
+        now = int(time.time())
+        token = pyjwt.encode(
+            {
+                "sub": "user1",
+                "scopes": "read",
+                "src": "test",
+                "iss": JWT_ISSUER,
+                "iat": now - 100,
+                "exp": now - 10,
+            },
+            self.SECRET,
+            algorithm="HS256",
+        )
+        result = validate_jwt(token, self.SECRET, audience="")
+        assert result is not None
+        assert result.user_id == "user1"
+
+    def test_validate_jwt_rejects_past_leeway(self):
+        """Tokens expired beyond the 30s leeway must still be rejected."""
+        import time
+
+        import jwt as pyjwt
+
+        from turnstone.core.auth import JWT_ISSUER, validate_jwt
+
+        now = int(time.time())
+        token = pyjwt.encode(
+            {
+                "sub": "user1",
+                "scopes": "read",
+                "src": "test",
+                "iss": JWT_ISSUER,
+                "iat": now - 200,
+                "exp": now - 60,
+            },
+            self.SECRET,
+            algorithm="HS256",
+        )
+        result = validate_jwt(token, self.SECRET, audience="")
+        assert result is None
 
     def test_create_jwt_expiry_seconds(self):
         import jwt as pyjwt
