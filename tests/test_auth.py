@@ -1001,6 +1001,75 @@ class TestServerLogin:
         resp = self.test_client.post("/v1/api/auth/refresh")
         assert resp.status_code == 401
 
+    def test_refresh_storage_failure_falls_back(self):
+        """Transient storage error → fall back to in-token claims, not 403.
+
+        The earlier implementation called _load_user_permissions() which
+        swallows exceptions and returns set(); that path was
+        indistinguishable from a deleted user (legitimate 403).  The
+        handler now calls storage.get_user_permissions() directly so
+        DB hiccups fall through to in-token perms.
+        """
+        # Re-arm the storage so login works first
+        self.test_client.app.state.auth_storage.get_user_permissions.return_value = {
+            "read",
+            "write",
+            "approve",
+        }
+        login = self.test_client.post(
+            "/v1/api/auth/login",
+            json={"username": "testuser", "password": "testpass"},
+        )
+        assert login.status_code == 200
+
+        # Now make storage raise on the refresh re-resolve
+        self.test_client.app.state.auth_storage.get_user_permissions.side_effect = RuntimeError(
+            "db down"
+        )
+        try:
+            resp = self.test_client.post("/v1/api/auth/refresh")
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            # Permissions should still be present (fell back to in-token claims)
+            assert body.get("permissions"), body
+        finally:
+            # Restore for any subsequent tests
+            self.test_client.app.state.auth_storage.get_user_permissions.side_effect = None
+            self.test_client.app.state.auth_storage.get_user_permissions.return_value = {
+                "read",
+                "write",
+                "approve",
+            }
+
+    def test_refresh_user_with_no_perms_403(self):
+        """Storage returns empty (user deleted/role-stripped) → 403.
+
+        Distinguished from the storage-failure case above because
+        get_user_permissions returned a value (the empty set) without
+        raising — that's an authoritative "no roles", not a hiccup.
+        """
+        self.test_client.app.state.auth_storage.get_user_permissions.return_value = {
+            "read",
+            "write",
+            "approve",
+        }
+        login = self.test_client.post(
+            "/v1/api/auth/login",
+            json={"username": "testuser", "password": "testpass"},
+        )
+        assert login.status_code == 200
+
+        self.test_client.app.state.auth_storage.get_user_permissions.return_value = set()
+        try:
+            resp = self.test_client.post("/v1/api/auth/refresh")
+            assert resp.status_code == 403
+        finally:
+            self.test_client.app.state.auth_storage.get_user_permissions.return_value = {
+                "read",
+                "write",
+                "approve",
+            }
+
 
 class TestConsoleLogin:
     """Test login/logout cookie flow on turnstone-console."""

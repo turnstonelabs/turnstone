@@ -93,8 +93,17 @@ var _REFRESH_MIN_DELAY_MS = 30 * 1000;
 var _REFRESH_MAX_DELAY_MS = 24 * 60 * 60 * 1000;
 var _refreshTimer = null;
 var _refreshInFlight = null;
+// Logout race guard: a refresh in flight when the user clicks Logout
+// can land AFTER /logout and re-set the cookie, silently undoing the
+// logout.  _loggedOut is set synchronously in logout() and the
+// refresh path bails on its post-fetch effects when it sees the flag.
+// _refreshAbort is the AbortController for any in-flight /refresh.
+var _loggedOut = false;
+var _refreshAbort = null;
 
 async function _tryRefresh() {
+  // Don't start a refresh if logout already won the race.
+  if (_loggedOut) return false;
   // De-dupe concurrent callers — many parallel authFetch'es hitting
   // 401 at once should still only fire one /refresh request.
   if (_refreshInFlight) {
@@ -104,12 +113,15 @@ async function _tryRefresh() {
       return false;
     }
   }
+  _refreshAbort =
+    typeof AbortController !== "undefined" ? new AbortController() : null;
   _refreshInFlight = (async function () {
     try {
       var r = await fetch("/v1/api/auth/refresh", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "same-origin",
+        signal: _refreshAbort ? _refreshAbort.signal : undefined,
       });
       if (!r.ok) return false;
       var data = null;
@@ -118,6 +130,12 @@ async function _tryRefresh() {
       } catch (_e) {
         /* empty body — still successful refresh */
       }
+      // If logout fired while the refresh was in flight, drop all
+      // post-fetch effects: don't store perms (already cleared), don't
+      // reschedule a timer, don't broadcast (would re-arm sibling tabs).
+      // The new cookie is harmless — logout's clear-cookie response
+      // already overwrote it on the way back from this fetch.
+      if (_loggedOut) return false;
       if (data) _storePermissions(data);
       _scheduleRefreshFromWhoami(); // reschedule based on the new exp
       if (_authChannel) _authChannel.postMessage("refresh");
@@ -126,6 +144,7 @@ async function _tryRefresh() {
       return false;
     } finally {
       _refreshInFlight = null;
+      _refreshAbort = null;
     }
   })();
   return await _refreshInFlight;
@@ -617,6 +636,9 @@ function _onSuccess() {
     window.location.reload();
     return;
   }
+  // Successful re-login clears the logged-out latch so subsequent
+  // refreshes work again.
+  _loggedOut = false;
   hideLogin();
   var logoutBtn = document.getElementById("logout-btn");
   if (logoutBtn) logoutBtn.style.display = "";
@@ -627,9 +649,21 @@ function _onSuccess() {
 }
 
 function logout() {
+  // Set flag + abort in-flight refresh BEFORE the network call so any
+  // concurrent _tryRefresh() bails its post-fetch effects (see
+  // _loggedOut handling above).  Without this, a refresh already in
+  // flight can land after /logout and re-set the cookie.
+  _loggedOut = true;
+  _cancelRefreshTimer();
+  if (_refreshAbort) {
+    try {
+      _refreshAbort.abort();
+    } catch (_e) {
+      /* AbortController not available; the _loggedOut flag handles it */
+    }
+  }
   fetch("/v1/api/auth/logout", { method: "POST" }).then(function () {
     sessionStorage.removeItem("turnstone_permissions");
-    _cancelRefreshTimer();
     if (_authChannel) _authChannel.postMessage("logout");
     if (typeof window.onLogout === "function") window.onLogout();
     showLogin();

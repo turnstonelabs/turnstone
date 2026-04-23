@@ -1279,18 +1279,25 @@ async def handle_auth_refresh(request: Request, audience: str) -> Response:
     storage = getattr(request.app.state, "auth_storage", None)
 
     # Re-resolve permissions so revoked / promoted users see the change
-    # within one refresh cycle.  If storage is unavailable, fall back to
-    # the in-token claims (better to extend stale than fail-closed mid-
-    # session for a transient storage hiccup).
+    # within one refresh cycle.  Call storage.get_user_permissions
+    # directly (not _load_user_permissions) so we can distinguish a
+    # genuine empty result (user deleted / role-stripped → 403) from a
+    # transient storage failure (fall back to in-token claims, better
+    # than logging the session out mid-flight).
     user_id = auth_result.user_id
     perms: frozenset[str] = auth_result.permissions
     scopes: frozenset[str] = auth_result.scopes
     if storage is not None:
         try:
-            fresh_perms = _load_user_permissions(storage, user_id)
-            # Empty set after a successful storage call means the user
-            # was deleted or has no roles — refuse to refresh rather
-            # than mint a token with no permissions.
+            fresh_perms = storage.get_user_permissions(user_id)
+        except Exception:
+            log.warning(
+                "Refresh: storage unavailable for permission re-resolve; "
+                "falling back to in-token claims for %s",
+                user_id,
+                exc_info=True,
+            )
+        else:
             if not fresh_perms and not auth_result.has_scope("service"):
                 return JSONResponse(
                     {"error": "User has no active permissions"},
@@ -1298,8 +1305,6 @@ async def handle_auth_refresh(request: Request, audience: str) -> Response:
                 )
             perms = frozenset(fresh_perms)
             scopes = _permissions_to_scopes(set(perms))
-        except Exception:
-            log.warning("Refresh: failed to reload permissions for %s", user_id, exc_info=True)
 
     if not jwt_secret:
         return JSONResponse({"error": "JWT signing not configured"}, status_code=503)
