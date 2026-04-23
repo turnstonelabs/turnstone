@@ -30,7 +30,7 @@ def _build_request(auth_result: AuthResult | None, headers: dict[str, str] | Non
     req = MagicMock()
     req.state = state
     req.app = app
-    _headers = headers or {}
+    _headers = {k.lower(): v for k, v in (headers or {}).items()}
     req.headers = MagicMock()
     req.headers.get = lambda key, default="": _headers.get(key.lower(), default)
     return req

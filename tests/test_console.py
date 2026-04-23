@@ -1730,6 +1730,7 @@ class TestProxyAuthHeaders:
         class _Request:
             state = _State()
             app = _App()
+            headers = {}
 
         req = _Request()
         req.state.auth_result = auth_result

@@ -2461,6 +2461,17 @@ def _resolve_coordinator_or_404(
     return ws, None
 
 
+def _extract_user_token(request: Request) -> str:
+    """Extract the caller's raw JWT from Authorization header or auth cookie."""
+    raw = request.headers.get("authorization", "")
+    # Case-insensitive prefix strip per RFC 7235
+    if raw.lower().startswith("bearer "):
+        token = raw[7:].strip()
+        if token:
+            return token
+    return request.cookies.get("turnstone_auth", "")
+
+
 def _auth_user_id(request: Request) -> str:
     auth = getattr(getattr(request, "state", None), "auth_result", None)
     return getattr(auth, "user_id", "") or ""
@@ -2538,9 +2549,7 @@ async def coordinator_create(request: Request) -> JSONResponse:
     # Extract the caller's raw JWT so the coordinator session can reuse it
     # for internal HTTP calls back to the console API (avoids minting a
     # separate short-lived token that can expire while a tab is backgrounded).
-    user_token = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
-    if not user_token:
-        user_token = request.cookies.get("turnstone_auth", "")
+    user_token = _extract_user_token(request)
     name = (body.get("name") or "").strip()
     skill = (body.get("skill") or "").strip() or None
     initial_message = (body.get("initial_message") or "").strip()
@@ -2898,9 +2907,7 @@ async def coordinator_detail(request: Request) -> JSONResponse:
         return err503
     ws_id = request.path_params.get("ws_id", "")
     user_id = _auth_user_id(request)
-    user_token = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
-    if not user_token:
-        user_token = request.cookies.get("turnstone_auth", "")
+    user_token = _extract_user_token(request)
     ws = coord_mgr.get(ws_id)
     if ws is None:
         # Lazy rehydration goes through the session factory, which can
@@ -2967,9 +2974,7 @@ async def coordinator_open(request: Request) -> JSONResponse:
     if not ws_id:
         return JSONResponse({"error": "ws_id is required"}, status_code=400)
     user_id = _auth_user_id(request)
-    user_token = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
-    if not user_token:
-        user_token = request.cookies.get("turnstone_auth", "")
+    user_token = _extract_user_token(request)
     ws = coord_mgr.get(ws_id)
     if ws is not None:
         if ws.user_id != user_id and not _is_admin(request):
@@ -4223,7 +4228,6 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                     build_console_session_factory,
                 )
 
-                jwt_secret: str = getattr(app.state, "jwt_secret", "")
                 console_bind_url: str = getattr(app.state, "console_url", "") or (
                     "http://127.0.0.1:8001"
                 )
@@ -4231,7 +4235,9 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                 def _ui_factory(ws_id: str, user_id: str) -> ConsoleCoordinatorUI:
                     return ConsoleCoordinatorUI(ws_id=ws_id, user_id=user_id)
 
-                def _coord_client_factory(ws_id: str, user_id: str, user_token: str) -> CoordinatorClient:
+                def _coord_client_factory(
+                    ws_id: str, user_id: str, user_token: str
+                ) -> CoordinatorClient:
                     return CoordinatorClient(
                         console_base_url=console_bind_url,
                         storage=storage,

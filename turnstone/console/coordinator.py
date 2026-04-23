@@ -330,7 +330,9 @@ class CoordinatorManager:
         """Rehydrate regardless of ownership — admin paths only."""
         return self._open_impl(ws_id, user_id="", admin=True, user_token=user_token)
 
-    def _open_impl(self, ws_id: str, *, user_id: str, admin: bool, user_token: str = "") -> Workstream | None:
+    def _open_impl(
+        self, ws_id: str, *, user_id: str, admin: bool, user_token: str = ""
+    ) -> Workstream | None:
         """Serialize concurrent open() for the same ws_id.
 
         Two concurrent GET /v1/api/coordinator/{ws_id} requests for the
