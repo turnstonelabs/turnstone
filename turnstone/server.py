@@ -3848,6 +3848,17 @@ async def auth_whoami(request: Request) -> Response:
     return await handle_auth_whoami(request)
 
 
+async def auth_refresh(request: Request) -> Response:
+    """POST /v1/api/auth/refresh — extend the auth cookie's expiry.
+
+    Requires a currently-valid cookie (auth middleware enforces).  Re-
+    resolves user permissions from storage so role changes propagate.
+    """
+    from turnstone.core.auth import handle_auth_refresh
+
+    return await handle_auth_refresh(request, JWT_AUD_SERVER)
+
+
 async def oidc_authorize(request: Request) -> Response:
     """GET /v1/api/auth/oidc/authorize — redirect to OIDC provider."""
     from turnstone.core.auth import handle_oidc_authorize
@@ -4664,6 +4675,7 @@ def create_app(
                     Route("/api/auth/status", auth_status),
                     Route("/api/auth/setup", auth_setup, methods=["POST"]),
                     Route("/api/auth/whoami", auth_whoami),
+                    Route("/api/auth/refresh", auth_refresh, methods=["POST"]),
                     Route("/api/auth/oidc/authorize", oidc_authorize),
                     Route("/api/auth/oidc/callback", oidc_callback),
                     Route("/api/admin/settings", list_interface_settings),

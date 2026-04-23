@@ -444,12 +444,17 @@ def validate_jwt(token: str, secret: str, audience: str = "") -> AuthResult | No
     if not audience:
         decode_opts = {"verify_aud": False}
     try:
+        # leeway=30 absorbs small clock skew between hosts (multi-replica
+        # console deployments) and minor drift between mint-time and
+        # validate-time within the same process.  Standard tolerance for
+        # short-lived tokens; revisit if clocks are NTP-drift-prone.
         payload = jwt.decode(
             token,
             secret,
             algorithms=["HS256"],
             audience=audience if audience else None,
             options=decode_opts,
+            leeway=30,
         )
     except jwt.InvalidTokenError:
         return None
@@ -1212,19 +1217,118 @@ async def handle_auth_setup(request: Request, audience: str) -> Response:
 
 
 async def handle_auth_whoami(request: Request) -> Response:
-    """Shared ``GET /api/auth/whoami`` handler — return authenticated user info."""
+    """Shared ``GET /api/auth/whoami`` handler — return authenticated user info.
+
+    Includes the JWT ``exp`` claim (epoch seconds) so the frontend can
+    schedule a pre-emptive refresh before the cookie expires.  HttpOnly
+    on the cookie itself means JS can't read the JWT body directly; the
+    server has to surface ``exp`` separately.
+    """
     from starlette.responses import JSONResponse
 
     auth_result: AuthResult | None = getattr(request.state, "auth_result", None)
     if not auth_result or not auth_result.user_id:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
 
-    resp: dict[str, str] = {
+    resp: dict[str, Any] = {
         "user_id": auth_result.user_id,
     }
     if auth_result.permissions:
         resp["permissions"] = ",".join(sorted(auth_result.permissions))
+    # Surface the cookie/JWT expiry so the client can schedule refresh.
+    # Decoded without re-validating (auth middleware already validated).
+    cookie_token = request.cookies.get(AUTH_COOKIE, "")
+    if cookie_token:
+        try:
+            import jwt as _jwt
+
+            unverified = _jwt.decode(cookie_token, options={"verify_signature": False})
+            exp_value = unverified.get("exp")
+            if isinstance(exp_value, int | float):
+                resp["exp"] = int(exp_value)
+        except Exception:
+            # Best-effort surfacing; absence just disables proactive refresh.
+            pass
     return JSONResponse(resp)
+
+
+async def handle_auth_refresh(request: Request, audience: str) -> Response:
+    """Shared ``POST /api/auth/refresh`` handler — re-mint the auth cookie.
+
+    Requires a currently-valid auth cookie (auth middleware enforces).
+    Re-resolves the user's permissions from storage so a role change
+    propagates within one refresh cycle (rather than persisting until
+    the original token's natural expiry).  Returns the same JSON shape
+    as ``/api/auth/login`` so clients can reuse the success-path code,
+    and sets a fresh ``Set-Cookie`` header.
+
+    Sliding-window: each successful refresh extends the session by the
+    full default TTL.  An attacker who steals the cookie can keep
+    extending it as long as the user record exists — same exposure as
+    a stolen long-lived cookie, just with the refresh hop.  Mitigated
+    by short-lived original cookies + standard cookie hygiene
+    (HttpOnly, Secure, SameSite=Lax) which we already set.
+    """
+    from starlette.responses import JSONResponse
+
+    auth_result: AuthResult | None = getattr(request.state, "auth_result", None)
+    if not auth_result or not auth_result.user_id:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+
+    jwt_secret = getattr(request.app.state, "jwt_secret", "")
+    storage = getattr(request.app.state, "auth_storage", None)
+
+    # Re-resolve permissions so revoked / promoted users see the change
+    # within one refresh cycle.  If storage is unavailable, fall back to
+    # the in-token claims (better to extend stale than fail-closed mid-
+    # session for a transient storage hiccup).
+    user_id = auth_result.user_id
+    perms: frozenset[str] = auth_result.permissions
+    scopes: frozenset[str] = auth_result.scopes
+    if storage is not None:
+        try:
+            fresh_perms = _load_user_permissions(storage, user_id)
+            # Empty set after a successful storage call means the user
+            # was deleted or has no roles — refuse to refresh rather
+            # than mint a token with no permissions.
+            if not fresh_perms and not auth_result.has_scope("service"):
+                return JSONResponse(
+                    {"error": "User has no active permissions"},
+                    status_code=403,
+                )
+            perms = frozenset(fresh_perms)
+            scopes = _permissions_to_scopes(set(perms))
+        except Exception:
+            log.warning("Refresh: failed to reload permissions for %s", user_id, exc_info=True)
+
+    if not jwt_secret:
+        return JSONResponse({"error": "JWT signing not configured"}, status_code=503)
+
+    new_token = create_jwt(
+        user_id=user_id,
+        scopes=scopes,
+        source=auth_result.token_source or "refresh",
+        secret=jwt_secret,
+        audience=audience,
+        permissions=perms,
+        version=jwt_version_slot(),
+    )
+
+    role = "full" if "write" in scopes else "read"
+    resp_body: dict[str, str] = {
+        "status": "ok",
+        "role": role,
+        "scopes": ",".join(sorted(scopes)),
+        "user_id": user_id,
+        "jwt": new_token,
+    }
+    if perms:
+        resp_body["permissions"] = ",".join(sorted(perms))
+
+    response = JSONResponse(resp_body)
+    secure = is_secure_request(dict(request.headers), request.url.scheme)
+    response.headers["Set-Cookie"] = make_set_cookie(new_token, secure=secure)
+    return response
 
 
 def _build_oidc_redirect_uri(request: Request, oidc_config: OIDCConfig) -> str:

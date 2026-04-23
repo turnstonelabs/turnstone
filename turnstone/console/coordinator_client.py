@@ -209,6 +209,16 @@ class CoordinatorTokenManager:
             extra_claims={"coord_ws_id": self._coord_ws_id},
         )
         self._expires_at = time.time() + self._ttl
+        # Observability — without this, mint races + premature-401
+        # diagnostics require ad-hoc logging.  Mirrors the pattern in
+        # ServiceTokenManager._mint (turnstone/core/auth.py).
+        log.debug(
+            "coordinator.token_mint coord_ws_id=%s user=%s ttl=%ds expires_at=%.1f",
+            self._coord_ws_id,
+            self._user_id,
+            self._ttl,
+            self._expires_at,
+        )
 
     @property
     def token(self) -> str:

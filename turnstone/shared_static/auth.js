@@ -24,8 +24,14 @@ if (_authChannel) {
     if (e.data === "login") {
       hideLogin();
       if (typeof window.onLoginSuccess === "function") window.onLoginSuccess();
+      _scheduleRefreshFromWhoami();
     } else if (e.data === "logout") {
+      _cancelRefreshTimer();
       showLogin();
+    } else if (e.data === "refresh") {
+      // Another tab refreshed; reschedule based on the new exp so we
+      // don't redundantly hit /refresh ourselves.
+      _scheduleRefreshFromWhoami();
     }
   };
 }
@@ -45,6 +51,13 @@ async function authFetch(url, opts) {
       } catch (e) {
         if (e.message === "auth") throw e;
       }
+      // Reactive refresh — try once before falling through to login.
+      // Covers cases where the proactive refresh timer didn't fire
+      // (tab restored from disk-cache after expiry, system clock jump,
+      // page first-load with a stale cookie).
+      if (attempt === 0 && (await _tryRefresh())) {
+        continue; // retry the original request with the new cookie
+      }
       showLogin();
       throw new Error("auth");
     }
@@ -61,6 +74,104 @@ async function authFetch(url, opts) {
     if (_lb) _lb.style.display = "";
     if (typeof _ensureSSE === "function") _ensureSSE();
     return r;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Cookie refresh — proactive timer + reactive on-401 fallback
+// ---------------------------------------------------------------------------
+
+// Pre-emptive refresh fires at REFRESH_AT_FRACTION of remaining cookie life
+// (90% by default).  Keeps the cookie fresh ahead of expiry without
+// hammering the server for every authFetch.  The reactive _tryRefresh()
+// path above covers cases where the timer didn't fire (tab restored from
+// disk cache after expiry, system clock jump, etc).
+var _REFRESH_AT_FRACTION = 0.9;
+// Floor so we don't spin on tiny lifetimes; ceil so very long-lived
+// cookies still refresh once a day for permission re-resolution.
+var _REFRESH_MIN_DELAY_MS = 30 * 1000;
+var _REFRESH_MAX_DELAY_MS = 24 * 60 * 60 * 1000;
+var _refreshTimer = null;
+var _refreshInFlight = null;
+
+async function _tryRefresh() {
+  // De-dupe concurrent callers — many parallel authFetch'es hitting
+  // 401 at once should still only fire one /refresh request.
+  if (_refreshInFlight) {
+    try {
+      return await _refreshInFlight;
+    } catch (_e) {
+      return false;
+    }
+  }
+  _refreshInFlight = (async function () {
+    try {
+      var r = await fetch("/v1/api/auth/refresh", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+      });
+      if (!r.ok) return false;
+      var data = null;
+      try {
+        data = await r.json();
+      } catch (_e) {
+        /* empty body — still successful refresh */
+      }
+      if (data) _storePermissions(data);
+      _scheduleRefreshFromWhoami(); // reschedule based on the new exp
+      if (_authChannel) _authChannel.postMessage("refresh");
+      return true;
+    } catch (_e) {
+      return false;
+    } finally {
+      _refreshInFlight = null;
+    }
+  })();
+  return await _refreshInFlight;
+}
+
+function _scheduleRefreshAt(epochSeconds) {
+  if (_refreshTimer) {
+    clearTimeout(_refreshTimer);
+    _refreshTimer = null;
+  }
+  if (typeof epochSeconds !== "number" || !isFinite(epochSeconds)) return;
+  var nowMs = Date.now();
+  var expMs = epochSeconds * 1000;
+  var remaining = expMs - nowMs;
+  if (remaining <= 0) return; // already expired; reactive path handles it
+  var delay = Math.floor(remaining * _REFRESH_AT_FRACTION);
+  if (delay < _REFRESH_MIN_DELAY_MS) delay = _REFRESH_MIN_DELAY_MS;
+  if (delay > _REFRESH_MAX_DELAY_MS) delay = _REFRESH_MAX_DELAY_MS;
+  _refreshTimer = setTimeout(function () {
+    _refreshTimer = null;
+    _tryRefresh();
+  }, delay);
+}
+
+function _scheduleRefreshFromWhoami() {
+  // Best-effort — failure here just means no proactive refresh; the
+  // reactive on-401 path still works.  Uses fetch (not authFetch) to
+  // avoid recursion through the on-401 trap.
+  fetch("/v1/api/auth/whoami", { credentials: "same-origin" })
+    .then(function (r) {
+      return r.ok ? r.json() : null;
+    })
+    .then(function (data) {
+      if (data && typeof data.exp === "number") {
+        _scheduleRefreshAt(data.exp);
+      }
+    })
+    .catch(function () {
+      /* silent — proactive refresh is optional */
+    });
+}
+
+function _cancelRefreshTimer() {
+  if (_refreshTimer) {
+    clearTimeout(_refreshTimer);
+    _refreshTimer = null;
   }
 }
 
@@ -511,13 +622,24 @@ function _onSuccess() {
   if (logoutBtn) logoutBtn.style.display = "";
   if (_authChannel) _authChannel.postMessage("login");
   if (typeof window.onLoginSuccess === "function") window.onLoginSuccess();
+  // Schedule pre-emptive cookie refresh based on the new token's exp.
+  _scheduleRefreshFromWhoami();
 }
 
 function logout() {
   fetch("/v1/api/auth/logout", { method: "POST" }).then(function () {
     sessionStorage.removeItem("turnstone_permissions");
+    _cancelRefreshTimer();
     if (_authChannel) _authChannel.postMessage("logout");
     if (typeof window.onLogout === "function") window.onLogout();
     showLogin();
   });
+}
+
+// Schedule on initial load if already authenticated.  The whoami
+// request silently fails if the cookie is missing or expired, which
+// is the right behaviour — the first authFetch will trigger the
+// login overlay via the existing on-401 path.
+if (typeof window !== "undefined") {
+  _scheduleRefreshFromWhoami();
 }
