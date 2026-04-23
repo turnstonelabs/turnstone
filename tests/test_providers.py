@@ -1776,6 +1776,31 @@ class TestOpenAIParameterGating:
         assert "temperature" not in kwargs
         assert kwargs["reasoning_effort"] == "medium"  # fell back from unsupported "low"
 
+    def test_gpt55_1m_context_and_effort(self) -> None:
+        """GPT-5.5: 1M context, temperature when effort=none, xhigh supported."""
+        caps = self.provider.get_capabilities("gpt-5.5")
+        assert caps.context_window == 1050000
+        assert caps.supports_tool_search is True
+        assert caps.supports_vision is True
+        kwargs: dict[str, Any] = {}
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="none")
+        assert kwargs["temperature"] == 0.7
+        assert "reasoning_effort" not in kwargs
+        kwargs2: dict[str, Any] = {}
+        apply_temperature_and_effort(kwargs2, caps, temperature=0.7, reasoning_effort="xhigh")
+        assert "temperature" not in kwargs2
+        assert kwargs2["reasoning_effort"] == "xhigh"
+
+    def test_gpt55_pro_no_temperature_always_reasoning(self) -> None:
+        """GPT-5.5 pro: no temperature, medium/high/xhigh only."""
+        caps = self.provider.get_capabilities("gpt-5.5-pro")
+        assert caps.context_window == 1050000
+        assert caps.supports_tool_search is True
+        kwargs: dict[str, Any] = {}
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="low")
+        assert "temperature" not in kwargs
+        assert kwargs["reasoning_effort"] == "medium"  # fell back from unsupported "low"
+
 
 class TestAnthropicOrphanedToolUse:
     """Verify _convert_messages synthesizes tool_results for orphaned tool_use."""
@@ -3401,7 +3426,17 @@ class TestOpenAIPromptCaching:
 
     def test_cache_retention_set_for_gpt5(self) -> None:
         """GPT-5.x models get prompt_cache_retention=24h."""
-        for model in ("gpt-5", "gpt-5.1", "gpt-5.2", "gpt-5.4", "gpt-5-mini", "gpt-5-pro"):
+        for model in (
+            "gpt-5",
+            "gpt-5.1",
+            "gpt-5.2",
+            "gpt-5.4",
+            "gpt-5.4-pro",
+            "gpt-5.5",
+            "gpt-5.5-pro",
+            "gpt-5-mini",
+            "gpt-5-pro",
+        ):
             kwargs: dict[str, Any] = {}
             apply_cache_retention(kwargs, model)
             assert kwargs.get("prompt_cache_retention") == "24h", f"Failed for {model}"

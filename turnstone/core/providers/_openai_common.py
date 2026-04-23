@@ -111,6 +111,25 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_tool_search=True,
         supports_vision=True,
     ),
+    # GPT-5.5 — 1M context, native tool search, stronger agentic/tool use
+    "gpt-5.5": ModelCapabilities(
+        context_window=1050000,
+        max_output_tokens=128000,
+        reasoning_effort_values=("none", "low", "medium", "high", "xhigh"),
+        default_reasoning_effort="none",
+        supports_tool_search=True,
+        supports_vision=True,
+    ),
+    # GPT-5.5 pro — always-reasoning, 1M context, native tool search
+    "gpt-5.5-pro": ModelCapabilities(
+        context_window=1050000,
+        max_output_tokens=128000,
+        supports_temperature=False,
+        reasoning_effort_values=("medium", "high", "xhigh"),
+        default_reasoning_effort="medium",
+        supports_tool_search=True,
+        supports_vision=True,
+    ),
     # O-series reasoning models
     "o1": ModelCapabilities(
         context_window=200000,
