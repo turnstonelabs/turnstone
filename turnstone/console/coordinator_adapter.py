@@ -77,13 +77,15 @@ class CoordinatorAdapter:
         self._collector_queue: queue.Queue[dict[str, Any]] | None = None
         self._fanout_thread: threading.Thread | None = None
         self._fanout_stop = threading.Event()
-        # Lock-free presence cache for the fan-out dispatch path:
-        # coord_ws_id -> (user_id, ui). The dict is swapped by reference
-        # (copy-on-write) under self._children_lock on every install /
-        # remove so dispatch can read it without acquiring any lock.
-        # An in-flight dispatch that observes a stale snapshot either
-        # sees the coordinator or doesn't — both are safe outcomes.
-        self._active_coords: dict[str, tuple[str, Any]] = {}
+        # Coord-ws-id → UI map for the fan-out dispatch path. Read
+        # and written under ``self._children_lock`` alongside the
+        # forward/reverse child maps. (Previously the value was
+        # ``(user_id, ui)`` with a copy-on-write dict swap so the
+        # dispatch could read it lock-free — but _dispatch_child_event
+        # already re-validates the parent under _children_lock anyway,
+        # so the lock-free snapshot was premature. The user_id half is
+        # also dead after a46dab1 dropped row-level ownership gates.)
+        self._active_coords: dict[str, Any] = {}
 
     def attach(self, manager: SessionManager) -> None:
         """Late-bind the owning :class:`SessionManager`.
@@ -118,7 +120,7 @@ class CoordinatorAdapter:
         self._fanout_console_ws_created(ws)
 
     def _install_coord_registry(self, ws: Workstream) -> None:
-        """Seed the children registry + lock-free presence cache for ``ws``.
+        """Seed the children registry + presence map for ``ws``.
 
         Shared by ``emit_created`` and ``emit_rehydrated`` — the
         difference between the two is purely whether we then rebuild
@@ -126,9 +128,7 @@ class CoordinatorAdapter:
         """
         with self._children_lock:
             self._children.setdefault(ws.id, set())
-            new_active = dict(self._active_coords)
-            new_active[ws.id] = (ws.user_id or "", ws.ui)
-            self._active_coords = new_active
+            self._active_coords[ws.id] = ws.ui
 
     def _fanout_console_ws_created(self, ws: Workstream) -> None:
         try:
@@ -156,17 +156,14 @@ class CoordinatorAdapter:
         # real-node (interactive) ws_closed events.
         del reason
         # Drop the coordinator's children-registry entries AND its
-        # lock-free presence slot. Mirrors the eviction/close paths
-        # from the old CoordinatorManager (which did the same under
-        # _children_lock + _lock respectively). A plain _children.pop
-        # without clearing the reverse index would leak every evicted
-        # coordinator's child→parent pointers forever.
+        # presence slot. Mirrors the eviction/close paths from the old
+        # CoordinatorManager (which did the same under _children_lock
+        # + _lock respectively). A plain _children.pop without clearing
+        # the reverse index would leak every evicted coordinator's
+        # child→parent pointers forever.
         with self._children_lock:
             self._pop_coord_registry_locked(ws_id)
-            if ws_id in self._active_coords:
-                new_active = dict(self._active_coords)
-                new_active.pop(ws_id, None)
-                self._active_coords = new_active
+            self._active_coords.pop(ws_id, None)
         try:
             self._collector.emit_console_ws_closed(ws_id)
         except Exception:
@@ -615,44 +612,23 @@ class CoordinatorAdapter:
             parent = event.get("parent_ws_id") or ""
             if not parent:
                 return
-            # Lock-free presence + tenant check via the atomically-
-            # swapped _active_coords snapshot. The adapter updates this
-            # dict by reference under _children_lock on every install /
-            # remove, so an in-flight dispatch that reads a stale
-            # snapshot either sees the coord or doesn't — both outcomes
-            # are safe.
-            active = self._active_coords
-            meta = active.get(parent)
-            if meta is None:
-                return
-            coord_user_id, coord_ui = meta
-            # Tenant-isolation gate: cross-tenant fan-out is the vuln
-            # the server-side create endpoint also gates against.
-            # Defense-in-depth here means a spoofed parent_ws_id still
-            # can't route a child's real-time events into a foreign
-            # coordinator's SSE stream. Empty user_id on either side
-            # fails closed.
-            event_user = event.get("user_id") or ""
-            if not event_user or event_user != coord_user_id:
-                return
-            # Re-check the active-coords snapshot INSIDE the lock before
-            # mutating: a concurrent close()/eviction can pop the entry
-            # between the lock-free read and the lock acquisition, after
-            # which setdefault would resurrect the entry — leaking the
-            # registry key and enqueuing onto the closed coordinator's UI.
-            newly_added = False
+            # Presence check + registry mutation under the same lock:
+            # a concurrent close()/eviction can pop the entry between
+            # the check and the mutation, after which a bare setdefault
+            # would resurrect the entry — leaking the registry key and
+            # enqueuing onto the closed coordinator's UI. Trusted-team
+            # posture (#400 / a46dab1) means no per-event tenant gate
+            # here; scope-level auth at the SSE endpoint is the only
+            # boundary.
             with self._children_lock:
-                if parent not in self._active_coords:
+                coord_ui = self._active_coords.get(parent)
+                if coord_ui is None:
                     return
                 existing = self._children.setdefault(parent, set())
-                if ws_id not in existing:
-                    existing.add(ws_id)
-                    self._child_to_coord[ws_id] = parent
-                    newly_added = True
-            if not newly_added:
-                return
-            if coord_ui is None:
-                return
+                if ws_id in existing:
+                    return
+                existing.add(ws_id)
+                self._child_to_coord[ws_id] = parent
             payload = {
                 "type": "child_ws_created",
                 "ws_id": ws_id,
@@ -711,8 +687,10 @@ def _enqueue_on_ui(ui: Any, coord_ws_id: str, payload: dict[str, Any]) -> None:
     enqueue = getattr(ui, "_enqueue", None)
     if enqueue is None:
         return
-    body = {**payload, "ws_id": coord_ws_id}
+    # Mutate in place — the dispatch path owns ``payload`` and doesn't
+    # reuse it after the enqueue call (perf-6).
+    payload["ws_id"] = coord_ws_id
     try:
-        enqueue(body)
+        enqueue(payload)
     except Exception:
         log.debug("coord_adapter.enqueue_failed ws=%s", coord_ws_id[:8], exc_info=True)
