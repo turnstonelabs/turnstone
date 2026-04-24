@@ -228,9 +228,7 @@ class WebUI(SessionUIBase):
         self._enqueue({"type": "stream_end"})
 
     def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]:
-        self._last_verdict_decision = ""  # reset for new approval cycle
-        with self._ws_lock:
-            self._llm_verdicts.clear()  # clear stale verdicts from prior cycle
+        self._reset_approval_cycle()
         pending = [it for it in items if it.get("needs_approval") and not it.get("error")]
 
         # Always send tool info to the browser
@@ -2776,7 +2774,7 @@ async def delete_workstream_endpoint(request: Request) -> JSONResponse:
             if storage is not None:
                 record_audit(
                     storage,
-                    owner_uid,
+                    _auth_user_id(request),
                     "workstream.deleted",
                     "workstream",
                     ws_id,
@@ -3363,7 +3361,7 @@ async def open_workstream(request: Request) -> JSONResponse:
         _, _audit_ip = _audit_context(request)
         _record_audit(
             _audit_storage,
-            owner_uid,
+            _auth_user_id(request),
             "workstream.opened",
             "workstream",
             ws.id,

@@ -142,6 +142,19 @@ class SessionUIBase:
     # Approval / plan blocking gates
     # ------------------------------------------------------------------
 
+    def _reset_approval_cycle(self) -> None:
+        """Clear per-round verdict state at the start of a new approval.
+
+        Subclasses call this at the top of ``approve_tools`` so late
+        verdicts from the previous round can't leak their
+        ``user_decision`` onto the next round's verdicts, and the SSE
+        reconnect replay cache doesn't serve stale tool verdicts to a
+        client that just switched tabs mid-approval.
+        """
+        with self._ws_lock:
+            self._last_verdict_decision = ""
+            self._llm_verdicts.clear()
+
     def resolve_approval(self, approved: bool, feedback: str | None = None) -> None:
         """Unblock a pending approval with the caller's decision.
 

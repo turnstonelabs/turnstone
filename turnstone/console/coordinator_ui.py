@@ -81,6 +81,7 @@ class ConsoleCoordinatorUI(SessionUIBase):
     # ------------------------------------------------------------------
 
     def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]:
+        self._reset_approval_cycle()
         pending = [it for it in items if it.get("needs_approval") and not it.get("error")]
 
         serialized = []
