@@ -32,6 +32,7 @@ class _Event:
     kind: str  # "created" | "state" | "closed"
     ws_id: str
     state: WorkstreamState | None = None
+    reason: str | None = None
 
 
 class FakeUI:
@@ -97,9 +98,9 @@ class FakeAdapter:
         with self._events_lock:
             self.events.append(_Event("state", ws.id, state=state))
 
-    def emit_closed(self, ws_id: str) -> None:
+    def emit_closed(self, ws_id: str, *, reason: str = "closed") -> None:
         with self._events_lock:
-            self.events.append(_Event("closed", ws_id))
+            self.events.append(_Event("closed", ws_id, reason=reason))
 
     def cleanup_ui(self, ws: Workstream) -> None:
         self.cleaned_up.append(ws.id)
@@ -527,8 +528,17 @@ def test_eviction_fires_emit_closed_to_adapter_transport() -> None:
     mgr.create(user_id="u1")
     mgr.create(user_id="u1")  # triggers eviction of 'a'
     closed_events = adapter.events_of("closed")
-    assert any(e.ws_id == a.id for e in closed_events)
+    evicted = [e for e in closed_events if e.ws_id == a.id]
+    assert evicted and evicted[0].reason == "evicted"
     assert a.id in adapter.cleaned_up
+
+
+def test_manual_close_uses_closed_reason() -> None:
+    mgr, adapter, _ = _make_manager()
+    ws = mgr.create(user_id="u1")
+    mgr.close(ws.id)
+    closed_events = [e for e in adapter.events_of("closed") if e.ws_id == ws.id]
+    assert closed_events and closed_events[0].reason == "closed"
 
 
 # ---------------------------------------------------------------------------

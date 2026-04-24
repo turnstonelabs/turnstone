@@ -12,7 +12,7 @@ from __future__ import annotations
 import threading
 import time
 import uuid
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from turnstone.core.log import get_logger
 from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamState
@@ -47,7 +47,11 @@ class SessionKindAdapter(Protocol):
 
     def emit_created(self, ws: Workstream) -> None: ...
     def emit_state(self, ws: Workstream, state: WorkstreamState) -> None: ...
-    def emit_closed(self, ws_id: str) -> None: ...
+    def emit_closed(self, ws_id: str, *, reason: str = "closed") -> None:
+        """Fire the close event. ``reason`` is "closed" for manual close,
+        "evicted" for capacity eviction (frontend shows a distinct
+        toast). "idle" collapses into "closed" — frontend doesn't
+        differentiate."""
 
     def cleanup_ui(self, ws: Workstream) -> None:
         """Unblock per-UI events on close; cancel + close the session."""
@@ -62,8 +66,15 @@ class SessionKindAdapter(Protocol):
         skill: str | None = None,
         model: str | None = None,
         client_type: str = "",
+        **extra: Any,
     ) -> ChatSession:
-        """Construct the ``ChatSession`` for a workstream whose ``ui`` is already attached."""
+        """Construct the ``ChatSession`` for a workstream whose ``ui`` is already attached.
+
+        ``**extra`` is the pass-through for kind-specific per-call
+        options (e.g. interactive's ``judge_model``). Each adapter
+        ignores what it doesn't recognise; the manager stays
+        kind-agnostic.
+        """
 
 
 class SessionManager:
@@ -129,6 +140,7 @@ class SessionManager:
         model: str | None = None,
         client_type: str = "",
         parent_ws_id: str | None = None,
+        **extra_session_kwargs: Any,
     ) -> Workstream:
         """Construct a new workstream, persist, and register.
 
@@ -152,7 +164,7 @@ class SessionManager:
 
         if evicted is not None:
             self._adapter.cleanup_ui(evicted)
-            self._adapter.emit_closed(evicted.id)
+            self._adapter.emit_closed(evicted.id, reason="evicted")
 
         # Persist before session construction. Fail-closed: if the row
         # can't be written, the in-memory session would be invisible to
@@ -176,7 +188,11 @@ class SessionManager:
 
         try:
             ws.session = self._adapter.build_session(
-                ws, skill=skill, model=model, client_type=client_type
+                ws,
+                skill=skill,
+                model=model,
+                client_type=client_type,
+                **extra_session_kwargs,
             )
         except Exception:
             with self._lock:
