@@ -3,7 +3,10 @@
    live light + dark previews.
 
    Hue map:
-     --accent   182 (teal, brand)
+     --accent   75  (amber/gold, brand — original turnstone hue;
+                     deliberately near --warn at 80 so the brand and
+                     attention tones read as one warm family, matching
+                     the pre-v1 palette)
      --ok       150 (green; approve / success / liveness)
      --warn     80  (gold; attention / k-tools / risk-med)
      --err      25  (red; deny / errors / risk-high / risk-crit)
@@ -23,25 +26,26 @@
        panel mud that produces brown for low-L warm mixes */
 
 [data-design="v1"] {
-  /* Accent — teal (Claude Design default hue).
-     Tunable via these three vars without touching downstream primitives.
-     Lightness + chroma held at the amber values so both themes retain
-     the same visual weight — only the hue changes. */
-  --accent-h: 182;
-  --accent-c: 0.10;
-  --accent-l: 0.62;
+  /* Accent — amber/gold (turnstone's original brand hue, restored after
+     the Claude Design handoff briefly swapped it for teal at hue 182).
+     Tunable via these three vars without touching downstream primitives;
+     lightness + chroma stay at the unified palette values so light/dark
+     visual weight matches the rest of the semantic family. */
+  --accent-h: 75;
+  --accent-c: 0.13;
+  --accent-l: 0.7;
   --density: 1;
 
   /* Neutrals (light) */
-  --bg:      #f7f7f4;
-  --panel:   #ffffff;
+  --bg: #f7f7f4;
+  --panel: #ffffff;
   --panel-2: #fbfbf8;
-  --ink:     #101316;
-  --ink-2:   #2d3238;
-  --ink-3:   #565b63;
-  --ink-4:   #7a7f87;
-  --hair:    #dcdbd4;
-  --hair-2:  #e7e5dc;
+  --ink: #101316;
+  --ink-2: #2d3238;
+  --ink-3: #565b63;
+  --ink-4: #7a7f87;
+  --hair: #dcdbd4;
+  --hair-2: #e7e5dc;
 
   /* Semantic palette — unified L and C so ok / warn / err / think feel
      like siblings, hue is the only discriminator. Darkened from 0.58
@@ -49,79 +53,82 @@
      backgrounds. err holds higher chroma (0.17) because red reads washed
      at 0.15; warn holds lower chroma (0.13) because gold at higher
      chroma + low L turns mustard. */
-  --accent:      oklch(var(--accent-l) var(--accent-c) var(--accent-h));
+  --accent: oklch(var(--accent-l) var(--accent-c) var(--accent-h));
   --accent-soft: oklch(0.94 0.05 var(--accent-h));
-  --ok:          oklch(0.50 0.15 150);
-  --ok-live:     oklch(0.58 0.19 150);  /* brighter/more saturated — running / liveness */
-  --ok-soft:     oklch(0.94 0.05 150);
+  --ok: oklch(0.5 0.15 150);
+  --ok-live: oklch(
+    0.58 0.19 150
+  ); /* brighter/more saturated — running / liveness */
+  --ok-soft: oklch(0.94 0.05 150);
   /* Theme-aware text colour for tinted ok surfaces (approve button, etc).
      Light needs a dark green for contrast against pale bg; dark needs a
      bright green for contrast against dark forest bg. Hard to express
      cleanly as a single color-mix, so defined directly per theme. */
-  --ok-text:     oklch(0.36 0.15 150);
-  --warn:        oklch(0.58 0.13 80);
-  --warn-soft:   oklch(0.94 0.05 80);
+  --ok-text: oklch(0.36 0.15 150);
+  --warn: oklch(0.58 0.13 80);
+  --warn-soft: oklch(0.94 0.05 80);
   /* warn tints for k-tools k-badge — pale gold surface (k-approval now
      uses the ok family for semantic coherence with the Approve button). */
-  --warn-tint:        oklch(0.92 0.10 80);
+  --warn-tint: oklch(0.92 0.1 80);
   --warn-tint-border: oklch(0.64 0.15 80);
-  --err:         oklch(0.50 0.17 25);
-  --err-soft:    oklch(0.94 0.05 25);
+  --err: oklch(0.5 0.17 25);
+  --err-soft: oklch(0.94 0.05 25);
   /* --err-fill — darker err for filled destructive surfaces like
      .risk.crit; bright --err as a fill reads as alarm-loud. Text on
      top is always #fff so we don't need a matching --err-fill-text. */
-  --err-fill:    oklch(0.45 0.17 25);
-  --think:       oklch(0.50 0.15 260);
-  --think-soft:  oklch(0.94 0.05 260);
+  --err-fill: oklch(0.45 0.17 25);
+  --think: oklch(0.5 0.15 260);
+  --think-soft: oklch(0.94 0.05 260);
 
   /* Shape */
   --r-sm: 4px;
   --r-md: 6px;
   --r-lg: 8px;
-  --shadow-sm: 0 1px 0 rgba(21, 24, 27, 0.03),
-               0 1px 2px rgba(21, 24, 27, 0.04);
+  --shadow-sm: 0 1px 0 rgba(21, 24, 27, 0.03), 0 1px 2px rgba(21, 24, 27, 0.04);
 
   /* Rhythm */
-  --gap:   calc(12px * var(--density));
+  --gap: calc(12px * var(--density));
   --row-h: calc(32px * var(--density));
 }
 
 [data-design="v1"]:not([data-theme]),
 [data-design="v1"][data-theme=""],
 [data-design="v1"][data-theme="dark"] {
-  --bg:      #0e1013;
-  --panel:   #15181c;
+  --bg: #0e1013;
+  --panel: #15181c;
   --panel-2: #1a1e23;
-  --ink:     #f2f3f5;
-  --ink-2:   #d4d7db;
-  --ink-3:   #a6abb3;
-  --ink-4:   #808690;
-  --hair:    #2a2e35;
-  --hair-2:  #333842;
+  --ink: #f2f3f5;
+  --ink-2: #d4d7db;
+  --ink-3: #a6abb3;
+  --ink-4: #808690;
+  --hair: #2a2e35;
+  --hair-2: #333842;
 
   /* Dark semantic palette — unified L (0.68) and C matching light. L
      came down from 0.73 so the colours read as richer/darker jewel
      tones rather than pastels on the dark panel. */
   --accent-soft: oklch(0.29 0.07 var(--accent-h));
-  --ok:          oklch(0.68 0.15 150);
-  --ok-live:     oklch(0.78 0.20 150);  /* brighter/more saturated — running / liveness */
-  --ok-soft:     oklch(0.29 0.07 150);
+  --ok: oklch(0.68 0.15 150);
+  --ok-live: oklch(
+    0.78 0.2 150
+  ); /* brighter/more saturated — running / liveness */
+  --ok-soft: oklch(0.29 0.07 150);
   /* Dark --ok-text — bright mint-green for ~7.5:1 on the dark forest
      approve-button bg. Brighter than --ok to compensate for the
      pale-on-dark-forest that the color-mix-with-ink pattern produced. */
-  --ok-text:     oklch(0.86 0.18 150);
-  --warn:        oklch(0.70 0.13 80);
-  --warn-soft:   oklch(0.29 0.07 80);
+  --ok-text: oklch(0.86 0.18 150);
+  --warn: oklch(0.7 0.13 80);
+  --warn-soft: oklch(0.29 0.07 80);
   /* Dark-mode warn-tint — dropped L to 0.22 so the fill reads as a
      subtle warm whisper rather than dark-gold-reads-as-brown. The gold
      signal lives in the border + text, not the bg surface. */
-  --warn-tint:        oklch(0.22 0.05 80);
+  --warn-tint: oklch(0.22 0.05 80);
   --warn-tint-border: oklch(0.58 0.15 80);
-  --err:         oklch(0.68 0.17 25);
-  --err-soft:    oklch(0.29 0.07 25);
+  --err: oklch(0.68 0.17 25);
+  --err-soft: oklch(0.29 0.07 25);
   /* Dark --err-fill — pulled down from 0.68 to 0.56 so .risk.crit reads
      as "deeply concerning" instead of "screaming bright." */
-  --err-fill:    oklch(0.56 0.17 25);
-  --think:       oklch(0.68 0.15 260);
-  --think-soft:  oklch(0.29 0.07 260);
+  --err-fill: oklch(0.56 0.17 25);
+  --think: oklch(0.68 0.15 260);
+  --think-soft: oklch(0.29 0.07 260);
 }
