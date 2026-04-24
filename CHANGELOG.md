@@ -15,6 +15,29 @@ Three release tracks are maintained:
 
 ## [Unreleased]
 
+### Changed
+
+- **Coordinator HTTP surface unified under `/v1/api/workstreams/`**
+  ([Stage 2 Priority 0]). The experimental `/v1/api/coordinator/*`
+  URL tree from 1.5.0aN is removed; coord verbs now mount at the
+  same shape as interactive workstreams via a shared route
+  registrar (`turnstone.core.session_routes`). Path mapping:
+
+  | Was (1.5.0aN)                                    | Now                                              |
+  |--------------------------------------------------|--------------------------------------------------|
+  | `POST /v1/api/coordinator/new`                   | `POST /v1/api/workstreams/new`                   |
+  | `GET  /v1/api/coordinator`                       | `GET  /v1/api/workstreams`                       |
+  | `GET  /v1/api/coordinator/saved`                 | `GET  /v1/api/workstreams/saved`                 |
+  | `GET  /v1/api/coordinator/{ws_id}`               | `GET  /v1/api/workstreams/{ws_id}`               |
+  | `POST /v1/api/coordinator/{ws_id}/{verb}`        | `POST /v1/api/workstreams/{ws_id}/{verb}`        |
+
+  Permission scopes, request / response bodies, and SSE event shapes
+  are unchanged. Callers on the experimental 1.5.0aN coord SDK must
+  swap their URL prefix; the legacy paths are gone with no compat
+  shim. Stable releases (1.0 / 1.3 / 1.4) never exposed
+  `/v1/api/coordinator/`, so this change is a no-op for anyone
+  upgrading from a stable line.
+
 ## [1.4.0]
 
 User-visible additions: a full attachment system (images + text documents,
