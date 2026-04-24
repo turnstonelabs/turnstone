@@ -55,6 +55,7 @@ from turnstone.core.metrics import metrics as _metrics
 from turnstone.core.ratelimit import resolve_client_ip
 from turnstone.core.session import ChatSession, GenerationCancelled, SessionUI  # noqa: F401
 from turnstone.core.session_manager import SessionManager
+from turnstone.core.session_ui_base import SessionUIBase
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
 from turnstone.core.web_helpers import version_html as _version_html
 from turnstone.core.workstream import (
@@ -97,7 +98,7 @@ _ORPHAN_SWEEP_INTERVAL_S = 30 * 60
 _ORPHAN_SWEEP_THRESHOLD_S = 1 * 3600
 
 
-class WebUI:
+class WebUI(SessionUIBase):
     """Browser-based UI using SSE for streaming and HTTP POST for actions.
 
     Implements the SessionUI protocol from turnstone.core.session.
@@ -117,8 +118,7 @@ class WebUI:
         kind: WorkstreamKind = WorkstreamKind.INTERACTIVE,
         parent_ws_id: str | None = None,
     ) -> None:
-        self.ws_id = ws_id
-        self._user_id = user_id
+        super().__init__(ws_id=ws_id, user_id=user_id)
         # Cached for broadcast event payloads — both are immutable for
         # the lifetime of the workstream, so locking the manager on
         # every state/activity tick to re-read them burns lock budget.
@@ -128,16 +128,6 @@ class WebUI:
         # holds in every ws_state/ws_activity event payload — mirrors
         # the storage-layer normalization at register_workstream.
         self._parent_ws_id = parent_ws_id if parent_ws_id else None
-        self._listeners: list[queue.Queue[dict[str, Any]]] = []
-        self._listeners_lock = threading.Lock()
-        self._approval_event = threading.Event()
-        self._approval_result: tuple[bool, str | None] = (False, None)
-        self._pending_approval: dict[str, Any] | None = None  # re-sent on SSE reconnect
-        self._plan_event = threading.Event()
-        self._plan_result: str = ""
-        self._pending_plan_review: dict[str, Any] | None = None  # re-sent on SSE reconnect
-        self.auto_approve = False
-        self.auto_approve_tools: set[str] = set()
         # Per-workstream metrics accumulators (written by worker thread, read by metrics handler)
         self._ws_lock = threading.Lock()
         self._ws_prompt_tokens: int = 0
@@ -162,29 +152,8 @@ class WebUI:
         # so tab-switching doesn't lose the final judge result.
         self._llm_verdicts: dict[str, dict[str, Any]] = {}
 
-    def _enqueue(self, data: dict[str, Any]) -> None:
-        # Stamp ws_id on every per-workstream event so the client can
-        # validate it belongs to the pane's current workstream.
-        # Shallow copy to avoid mutating caller's dict (e.g. _pending_approval).
-        if "ws_id" not in data:
-            data = {**data, "ws_id": self.ws_id}
-        with self._listeners_lock:
-            snapshot = list(self._listeners)
-        for lq in snapshot:
-            with contextlib.suppress(queue.Full):
-                lq.put_nowait(data)
-
-    def _register_listener(self) -> queue.Queue[dict[str, Any]]:
-        """Create a per-client queue and register it as a listener."""
-        client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=500)
-        with self._listeners_lock:
-            self._listeners.append(client_queue)
-        return client_queue
-
-    def _unregister_listener(self, client_queue: queue.Queue[dict[str, Any]]) -> None:
-        """Remove a client queue from the listeners list."""
-        with self._listeners_lock, contextlib.suppress(ValueError):
-            self._listeners.remove(client_queue)
+    # ``_enqueue`` / ``_register_listener`` / ``_unregister_listener``
+    # inherited from :class:`SessionUIBase`.
 
     def _ws_kind_and_parent(self) -> tuple[WorkstreamKind, str | None]:
         """Return cached (kind, parent_ws_id) for broadcast event payloads.
@@ -659,20 +628,21 @@ class WebUI:
             log.debug("Failed to persist output assessment", exc_info=True)
 
     def resolve_approval(self, approved: bool, feedback: str | None = None) -> None:
-        """Resolve a pending approval, whether triggered by the HTTP handler
-        (user approves/denies in the browser) or by server-initiated flows
-        such as cancellations or timeouts."""
-        self._approval_result = (approved, feedback)
-        self._enqueue(
-            {
-                "type": "approval_resolved",
-                "approved": approved,
-                "feedback": feedback or "",
-            }
-        )
-        # Update user_decision on all tracked verdicts (fire-and-forget).
-        # Swap-and-clear + set decision under lock to avoid racing with
-        # the daemon judge thread's on_intent_verdict() appends.
+        """Resolve a pending approval, whether triggered by the HTTP
+        handler (user approves/denies in the browser) or by
+        server-initiated flows like cancellations / timeouts.
+
+        Extends :meth:`SessionUIBase.resolve_approval` with intent-
+        verdict bookkeeping: after the worker unblocks, every judge
+        verdict that fired during this approval round gets its
+        ``user_decision`` updated so the audit trail reflects what
+        the user chose.
+        """
+        # Update user_decision on all tracked verdicts BEFORE the
+        # worker wakes up so the audit row is consistent by the time
+        # the next pending_verdict fires. Swap-and-clear + set
+        # decision under lock to avoid racing with the daemon judge
+        # thread's on_intent_verdict() appends.
         decision_str = "approved" if approved else "denied"
         with self._ws_lock:
             pending = self._pending_verdicts
@@ -690,25 +660,9 @@ class WebUI:
                             storage.update_intent_verdict(vid, user_decision=decision_str)
             except Exception:
                 log.debug("Failed to update verdict user_decision", exc_info=True)
-        self._approval_event.set()
+        super().resolve_approval(approved, feedback)
 
-    def resolve_plan(self, feedback: str) -> None:
-        """Called by the HTTP handler when the user responds to a plan."""
-        self._plan_result = feedback
-        if self._pending_plan_review is None:
-            # cancel_generation calls us unconditionally to unblock any wait.
-            # No plan pending — just signal and skip the broadcast frame.
-            self._plan_event.set()
-            return
-        # Clear pending BEFORE broadcasting so a client reconnecting in the
-        # window between enqueue and clear cannot receive both the replayed
-        # plan_review (SSE re-injection at the connect handler) AND the live
-        # plan_resolved.  Broadcast lets other clients (e.g. desktop while
-        # phone approved) dismiss their plan modals in sync — mirrors the
-        # approval_resolved pattern used by resolve_approval().
-        self._pending_plan_review = None
-        self._enqueue({"type": "plan_resolved", "feedback": feedback})
-        self._plan_event.set()
+    # ``resolve_plan`` inherited from :class:`SessionUIBase`.
 
 
 # ---------------------------------------------------------------------------

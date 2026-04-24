@@ -16,12 +16,10 @@ Contract: this class must conform to :class:`turnstone.core.session.SessionUI`.
 
 from __future__ import annotations
 
-import contextlib
-import queue
-import threading
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core.log import get_logger
+from turnstone.core.session_ui_base import SessionUIBase
 from turnstone.core.workstream import WorkstreamState
 
 if TYPE_CHECKING:
@@ -30,10 +28,6 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 
-# Per-queue cap keeps a slow SSE consumer from bloating memory.  Matches
-# WebUI's listener queue size.
-_LISTENER_QUEUE_MAX = 500
-
 # Hard cap on how long a worker thread blocks waiting for an approval /
 # plan-review decision.  Exported as a constant so both blocking paths
 # stay in lockstep and a future `coordinator.approval_timeout_seconds`
@@ -41,7 +35,7 @@ _LISTENER_QUEUE_MAX = 500
 _APPROVAL_WAIT_TIMEOUT = 3600
 
 
-class ConsoleCoordinatorUI:
+class ConsoleCoordinatorUI(SessionUIBase):
     """SessionUI for a single coordinator session in the console.
 
     Thread-safe: the ChatSession worker thread calls the ``on_*`` methods;
@@ -62,54 +56,6 @@ class ConsoleCoordinatorUI:
     # with CoordinatorManager; this replaces it without reviving the
     # closure-per-install pattern).
     _collector: ClusterCollector | None = None
-
-    def __init__(self, ws_id: str = "", user_id: str = "") -> None:
-        self.ws_id = ws_id
-        self._user_id = user_id
-        # SSE listener fan-out — one per connected browser tab.
-        self._listeners: list[queue.Queue[dict[str, Any]]] = []
-        self._listeners_lock = threading.Lock()
-        # Approval blocking — the worker thread calls approve_tools which
-        # waits on _approval_event; the /approve endpoint sets it via
-        # resolve_approval.
-        self._approval_event = threading.Event()
-        self._approval_result: tuple[bool, str | None] = (False, None)
-        # Pending approval shape — re-sent on SSE reconnect so a user
-        # switching tabs still sees the prompt.
-        self._pending_approval: dict[str, Any] | None = None
-        self._plan_event = threading.Event()
-        self._plan_result: str = ""
-        self._pending_plan_review: dict[str, Any] | None = None
-        self.auto_approve = False
-        self.auto_approve_tools: set[str] = set()
-        # Foreground event — compatible with _cleanup_ui's hasattr check.
-        self._fg_event = threading.Event()
-        self._fg_event.set()
-
-    # ------------------------------------------------------------------
-    # Listener plumbing (SSE)
-    # ------------------------------------------------------------------
-
-    def _enqueue(self, data: dict[str, Any]) -> None:
-        """Fan an event out to all registered SSE listener queues."""
-        if "ws_id" not in data:
-            data = {**data, "ws_id": self.ws_id}
-        with self._listeners_lock:
-            snapshot = list(self._listeners)
-        for lq in snapshot:
-            with contextlib.suppress(queue.Full):
-                lq.put_nowait(data)
-
-    def _register_listener(self) -> queue.Queue[dict[str, Any]]:
-        """Create and register a per-client queue."""
-        client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=_LISTENER_QUEUE_MAX)
-        with self._listeners_lock:
-            self._listeners.append(client_queue)
-        return client_queue
-
-    def _unregister_listener(self, client_queue: queue.Queue[dict[str, Any]]) -> None:
-        with self._listeners_lock, contextlib.suppress(ValueError):
-            self._listeners.remove(client_queue)
 
     # ------------------------------------------------------------------
     # SessionUI protocol — streaming
@@ -196,17 +142,7 @@ class ConsoleCoordinatorUI:
 
         return approved, feedback
 
-    def resolve_approval(self, approved: bool, feedback: str | None = None) -> None:
-        """Called by the POST /v1/api/coordinator/{ws_id}/approve handler."""
-        self._approval_result = (approved, feedback)
-        self._enqueue(
-            {
-                "type": "approval_resolved",
-                "approved": approved,
-                "feedback": feedback or "",
-            }
-        )
-        self._approval_event.set()
+    # ``resolve_approval`` inherited from :class:`SessionUIBase`.
 
     def on_plan_review(self, content: str) -> str:
         # Coordinator sessions don't fire plan_agent (AGENT_TOOLS is []
@@ -221,14 +157,7 @@ class ConsoleCoordinatorUI:
         self._pending_plan_review = None
         return self._plan_result
 
-    def resolve_plan(self, feedback: str) -> None:
-        self._plan_result = feedback
-        if self._pending_plan_review is None:
-            self._plan_event.set()
-            return
-        self._pending_plan_review = None
-        self._enqueue({"type": "plan_resolved", "feedback": feedback})
-        self._plan_event.set()
+    # ``resolve_plan`` inherited from :class:`SessionUIBase`.
 
     # ------------------------------------------------------------------
     # SessionUI protocol — tool results + status + misc
