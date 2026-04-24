@@ -2388,6 +2388,33 @@ def _auth_scopes(request: Request) -> set[str]:
     return set(getattr(auth, "scopes", []) or [])
 
 
+def _audit_close_coordinator(
+    request: Request,
+    ws_id: str,
+    ws_before: Workstream,  # noqa: ARG001 — coord audit detail doesn't use it yet
+    reason: str,  # noqa: ARG001 — coord doesn't expose close_reason yet
+) -> None:
+    """Record the ``coordinator.close`` audit event.
+
+    Passed to :func:`make_close_handler` as the ``audit_emit``
+    callable. ``storage`` is guaranteed non-``None`` by the lifted
+    handler's upstream gate; the ``getattr`` fallback is defensive
+    consistency with the rest of the storage access pattern.
+    """
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return
+    record_audit(
+        storage,
+        _auth_user_id(request),
+        "coordinator.close",
+        "workstream",
+        ws_id,
+        {"coord_ws_id": ws_id, "src": "coordinator"},
+        request.client.host if request.client else "",
+    )
+
+
 async def coordinator_create(request: Request) -> JSONResponse:
     """POST /v1/api/workstreams/new — create a new coordinator session."""
     from turnstone.core.audit import record_audit
@@ -10093,24 +10120,6 @@ def create_app(
         not_found_label="coordinator not found",
         audit_action_prefix="coordinator",
     )
-
-    def _audit_close_coordinator(
-        request: Request,
-        ws_id: str,
-        ws_before: Workstream,
-        reason: str,  # noqa: ARG001 — coord doesn't expose close_reason yet
-    ) -> None:
-        storage = request.app.state.auth_storage
-        record_audit(
-            storage,
-            _auth_user_id(request),
-            "coordinator.close",
-            "workstream",
-            ws_id,
-            {"coord_ws_id": ws_id, "src": "coordinator"},
-            request.client.host if request.client else "",
-        )
-
     coord_workstream_routes: list[Any] = []
     register_session_routes(
         coord_workstream_routes,
@@ -10122,11 +10131,12 @@ def create_app(
             detail=coordinator_detail,
             open=coordinator_open,
             close=make_close_handler(  # lifted: shared body
+                coord_endpoint_config,
                 audit_emit=_audit_close_coordinator,
                 supports_close_reason=False,
             ),
             send=coordinator_send,
-            approve=make_approve_handler(),  # lifted: shared body
+            approve=make_approve_handler(coord_endpoint_config),  # lifted: shared body
             cancel=coordinator_cancel,
             events=coordinator_events,
             history=coordinator_history,

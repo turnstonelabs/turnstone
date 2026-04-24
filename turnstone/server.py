@@ -804,6 +804,72 @@ def _audit_context(request: Request) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Per-kind policies passed to the lifted session_routes handlers
+# ---------------------------------------------------------------------------
+
+
+def _interactive_manager_lookup(
+    request: Request,
+) -> tuple[SessionManager | None, JSONResponse | None]:
+    """Return the interactive ``SessionManager`` from app.state.
+
+    Interactive always has the manager loaded (it's constructed
+    synchronously at server startup), so the 503 branch is unused
+    on this side. Match the :data:`SessionRouteHandlers` signature
+    so the lifted handler bodies can call it uniformly.
+    """
+    return request.app.state.workstreams, None
+
+
+def _interactive_tenant_check(
+    request: Request, ws_id: str, mgr: SessionManager
+) -> JSONResponse | None:
+    """Cross-tenant gate for the lifted session handlers.
+
+    Forwards to :func:`_require_ws_access`, which returns 404 on
+    owner mismatch (the interactive trusted-team model).
+    """
+    _owner, err = _require_ws_access(request, ws_id, mgr=mgr)
+    return err
+
+
+def _audit_close_workstream(
+    request: Request,
+    ws_id: str,
+    ws_before: Workstream,
+    reason: str,
+) -> None:
+    """Record the ``workstream.closed`` audit event for interactive close.
+
+    Passed to :func:`make_close_handler` as the ``audit_emit``
+    callable. ``storage`` is guaranteed non-``None`` by the lifted
+    handler's upstream gate; the ``getattr`` fallback is defensive
+    consistency with the rest of the storage access pattern.
+    """
+    from turnstone.core.audit import record_audit
+
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return
+    _, ip = _audit_context(request)
+    detail: dict[str, Any] = {
+        "kind": str(ws_before.kind),
+        "parent_ws_id": ws_before.parent_ws_id,
+    }
+    if reason:
+        detail["reason"] = reason
+    record_audit(
+        storage,
+        _auth_user_id(request),
+        "workstream.closed",
+        "workstream",
+        ws_id,
+        detail,
+        ip,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Route handlers — all async
 # ---------------------------------------------------------------------------
 
@@ -4305,51 +4371,17 @@ def create_app(
     # ``turnstone.core.session_routes`` so the console mounts the same
     # shape against its coord manager. ``session_endpoint_config``
     # carries the kind-specific policy (auth, manager lookup, audit
-    # prefix) the lifted handler bodies consult at request time.
-    def _interactive_tenant_check(
-        request: Request, ws_id: str, mgr: SessionManager
-    ) -> JSONResponse | None:
-        # ``_require_ws_access`` returns ``(owner_uid, err)``; only the
-        # err matters for the gate.
-        _owner, err = _require_ws_access(request, ws_id, mgr=mgr)
-        return err
-
+    # prefix) the lifted handler bodies consult.
     interactive_endpoint_config = SessionEndpointConfig(
         permission_gate=None,  # interactive auth is enforced at the middleware layer
-        manager_lookup=lambda r: (r.app.state.workstreams, None),
+        manager_lookup=_interactive_manager_lookup,
         tenant_check=_interactive_tenant_check,
         not_found_label="Workstream not found",
         audit_action_prefix="workstream",
     )
-    approve_handler = make_approve_handler()
-
-    def _audit_close_workstream(
-        request: Request,
-        ws_id: str,
-        ws_before: Workstream,
-        reason: str,
-    ) -> None:
-        from turnstone.core.audit import record_audit
-
-        storage = request.app.state.auth_storage
-        _, ip = _audit_context(request)
-        detail: dict[str, Any] = {
-            "kind": str(ws_before.kind),
-            "parent_ws_id": ws_before.parent_ws_id,
-        }
-        if reason:
-            detail["reason"] = reason
-        record_audit(
-            storage,
-            _auth_user_id(request),
-            "workstream.closed",
-            "workstream",
-            ws_id,
-            detail,
-            ip,
-        )
-
+    approve_handler = make_approve_handler(interactive_endpoint_config)
     close_handler = make_close_handler(
+        interactive_endpoint_config,
         audit_emit=_audit_close_workstream,
         supports_close_reason=True,
     )

@@ -3,12 +3,14 @@
 Builds a minimal Starlette app wiring only the coordinator routes and
 an auth-injector middleware.  Verifies the permission gate, 503
 remediation when coord_mgr / model alias is missing, ownership
-enforcement, and lazy rehydration on GET /{ws_id}.
+enforcement, and lazy rehydration on GET /{ws_id}. Also exercises
+the lifted ``approve`` and ``close`` handlers from
+``turnstone.core.session_routes`` wired through the coord
+``SessionEndpointConfig`` — same code path the live console uses.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
 import httpx
@@ -29,7 +31,7 @@ from tests._coord_test_helpers import (
 )
 from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 from turnstone.console.server import (
-    _auth_user_id,
+    _audit_close_coordinator,
     _require_admin_coordinator,
     _require_coord_mgr,
     cluster_ws_detail,
@@ -44,7 +46,6 @@ from turnstone.console.server import (
     coordinator_send,
     coordinator_tasks,
 )
-from turnstone.core.audit import record_audit
 from turnstone.core.auth import AuthResult
 from turnstone.core.session_routes import (
     SessionEndpointConfig,
@@ -53,31 +54,21 @@ from turnstone.core.session_routes import (
 )
 from turnstone.core.storage._sqlite import SQLiteBackend
 
-if TYPE_CHECKING:
-    from turnstone.core.workstream import Workstream
-
-
-def _audit_close_coordinator_for_test(
-    request,
-    ws_id: str,
-    ws_before: Workstream,  # noqa: ARG001
-    reason: str,  # noqa: ARG001
-) -> None:
-    storage = request.app.state.auth_storage
-    record_audit(
-        storage,
-        _auth_user_id(request),
-        "coordinator.close",
-        "workstream",
-        ws_id,
-        {"coord_ws_id": ws_id, "src": "coordinator"},
-        request.client.host if request.client else "",
-    )
-
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+# Per-kind config the lifted handler factories capture by closure.
+# Mirrors the production console wiring so tests exercise the same
+# code path as the live server.
+_coord_endpoint_config = SessionEndpointConfig(
+    permission_gate=_require_admin_coordinator,
+    manager_lookup=_require_coord_mgr,
+    tenant_check=None,
+    not_found_label="coordinator not found",
+    audit_action_prefix="coordinator",
+)
 
 
 @pytest.fixture
@@ -115,7 +106,7 @@ def _make_client(
             ),
             Route(
                 "/v1/api/workstreams/{ws_id}/approve",
-                make_approve_handler(),
+                make_approve_handler(_coord_endpoint_config),
                 methods=["POST"],
             ),
             Route(
@@ -126,7 +117,8 @@ def _make_client(
             Route(
                 "/v1/api/workstreams/{ws_id}/close",
                 make_close_handler(
-                    audit_emit=_audit_close_coordinator_for_test,
+                    _coord_endpoint_config,
+                    audit_emit=_audit_close_coordinator,
                     supports_close_reason=False,
                 ),
                 methods=["POST"],
@@ -171,14 +163,6 @@ def _make_client(
     app.state.coord_registry_error = "" if coord_mgr else "registry missing"
     app.state.auth_storage = storage
     app.state.jwt_secret = "x" * 64
-    # Wire the per-kind endpoint config the lifted handlers consult.
-    app.state.session_endpoint_config = SessionEndpointConfig(
-        permission_gate=_require_admin_coordinator,
-        manager_lookup=_require_coord_mgr,
-        tenant_check=None,
-        not_found_label="coordinator not found",
-        audit_action_prefix="coordinator",
-    )
     return TestClient(app)
 
 

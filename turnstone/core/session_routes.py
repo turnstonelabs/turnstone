@@ -30,10 +30,12 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from starlette.responses import JSONResponse
 from starlette.routing import Route
+
+from turnstone.core.log import get_logger
 
 if TYPE_CHECKING:
     from starlette.requests import Request
@@ -41,6 +43,9 @@ if TYPE_CHECKING:
     from starlette.routing import BaseRoute
 
     from turnstone.core.session_manager import SessionManager
+    from turnstone.core.workstream import Workstream
+
+log = get_logger(__name__)
 
 
 Handler = Callable[["Request"], Awaitable["Response"]]
@@ -316,7 +321,7 @@ def register_coord_verbs(
 # ---------------------------------------------------------------------------
 
 
-def make_approve_handler() -> Handler:
+def make_approve_handler(cfg: SessionEndpointConfig) -> Handler:
     """Lifted body for ``POST {prefix}/{ws_id}/approve``.
 
     Resolves a pending tool approval on the workstream's UI. Both
@@ -329,15 +334,18 @@ def make_approve_handler() -> Handler:
     from turnstone.core.web_helpers import read_json_or_400
 
     async def approve(request: Request) -> Response:
-        cfg: SessionEndpointConfig = request.app.state.session_endpoint_config
         if cfg.permission_gate is not None:
             err = cfg.permission_gate(request)
             if err is not None:
                 return err
-        mgr, err503 = cfg.manager_lookup(request)
+        mgr_opt, err503 = cfg.manager_lookup(request)
         if err503 is not None:
             return err503
-        assert mgr is not None  # narrowed by the err503 None-check
+        # ``manager_lookup`` returns ``(None, JSONResponse)`` when the
+        # subsystem is unavailable (returned above) or
+        # ``(SessionManager, None)`` otherwise; ``cast`` makes the
+        # type-checker-only narrowing explicit and survives ``python -O``.
+        mgr = cast("SessionManager", mgr_opt)
         body = await read_json_or_400(request)
         if isinstance(body, JSONResponse):
             return body
@@ -423,6 +431,7 @@ CloseAuditEmitter = Callable[
 
 
 def make_close_handler(
+    cfg: SessionEndpointConfig,
     *,
     audit_emit: CloseAuditEmitter | None = None,
     supports_close_reason: bool = False,
@@ -437,6 +446,9 @@ def make_close_handler(
     the workstream's config row.
 
     Args:
+        cfg: per-kind policy bundle (auth, manager lookup, tenant
+            check, error labels). Captured by closure so the request-
+            time handler doesn't reach into ``app.state``.
         audit_emit: kind's audit emitter for the close event.
             Receives ``(request, ws_id, ws_before, reason)``; ``reason``
             is the empty string when ``supports_close_reason`` is
@@ -450,18 +462,30 @@ def make_close_handler(
             ``workstream_config`` from unbounded growth on a model-
             generated dump; the redact protects audit logs from
             captured-secret leakage under prompt injection.
+
+    Behavior change vs the pre-lift handlers:
+
+    - The interactive handler previously let ``record_audit`` failures
+      surface as HTTP 500 (no try/except). The lifted body wraps
+      ``audit_emit`` in try/except and demotes failures to a
+      ``warning`` log, returning 200 to the caller. Coord previously
+      already swallowed; convergence is intentional — operators
+      monitor the audit-fail log line in both kinds the same way.
+    - The coord ``mgr.close()`` race-loss returned 500; standardized
+      to 404 ("popped between ``.get()`` and ``.close()``" is a
+      not-found semantic, not a server error).
     """
 
     async def close(request: Request) -> Response:
-        cfg: SessionEndpointConfig = request.app.state.session_endpoint_config
         if cfg.permission_gate is not None:
             err = cfg.permission_gate(request)
             if err is not None:
                 return err
-        mgr, err503 = cfg.manager_lookup(request)
+        mgr_opt, err503 = cfg.manager_lookup(request)
         if err503 is not None:
             return err503
-        assert mgr is not None
+        # See ``make_approve_handler`` for the cast rationale.
+        mgr = cast("SessionManager", mgr_opt)
         ws_id = request.path_params.get("ws_id", "")
 
         reason = ""
@@ -478,9 +502,7 @@ def make_close_handler(
                 # payload can't sneak past at 3-4x the documented budget.
                 # ``errors="ignore"`` drops any partial code point left
                 # at the truncation boundary.
-                capped = raw_reason.strip().encode("utf-8")[:512].decode(
-                    "utf-8", errors="ignore"
-                )
+                capped = raw_reason.strip().encode("utf-8")[:512].decode("utf-8", errors="ignore")
                 reason = redact_credentials(capped)
 
         if cfg.tenant_check is not None:
@@ -492,10 +514,6 @@ def make_close_handler(
         if ws_before is None:
             return JSONResponse({"error": cfg.not_found_label}, status_code=404)
         if not mgr.close(ws_id):
-            # Standardized to 404 (was 500 on the legacy coord path —
-            # overly pessimistic; close-failure here means the ws was
-            # popped between the .get() check and the .close() call,
-            # which is a "not found" semantic).
             return JSONResponse({"error": cfg.not_found_label}, status_code=404)
 
         storage = getattr(request.app.state, "auth_storage", None)
@@ -503,9 +521,7 @@ def make_close_handler(
             try:
                 storage.save_workstream_config(ws_id, {"close_reason": reason})
             except Exception:
-                from turnstone.core.log import get_logger as _gl
-
-                _gl(__name__).debug(
+                log.warning(
                     "ws.close.reason_persist_failed ws=%s",
                     ws_id[:8] if ws_id else "",
                     exc_info=True,
@@ -515,9 +531,11 @@ def make_close_handler(
             try:
                 audit_emit(request, ws_id, ws_before, reason)
             except Exception:
-                from turnstone.core.log import get_logger as _gl
-
-                _gl(__name__).debug(
+                # Audit-write failure is a compliance signal —
+                # ``warning`` so it surfaces in ops logs. Behavior change
+                # vs the original interactive handler (which would have
+                # 500'd here); see the function docstring.
+                log.warning(
                     "ws.close.audit_failed ws=%s",
                     ws_id[:8] if ws_id else "",
                     exc_info=True,
@@ -526,7 +544,3 @@ def make_close_handler(
         return JSONResponse({"status": "ok"})
 
     return close
-
-
-if TYPE_CHECKING:
-    from turnstone.core.workstream import Workstream  # noqa: F401 — used in type alias above
