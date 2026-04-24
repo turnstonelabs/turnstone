@@ -470,24 +470,63 @@ class SessionManager:
         Returns the list of closed ws_ids. Unlike the old WSM version,
         this does NOT skip the last workstream — the default-startup
         relic is gone, callers can handle the 0-workstream case.
+
+        Atomic pop per victim under ``self._lock`` (bug-5): a pending
+        tool result can flip state IDLE→RUNNING between the snapshot
+        and the close, so the state test + pop must run together.
+        Batches every pop under one ``self._lock`` acquisition (perf-5)
+        rather than locking once per victim.
         """
         now = time.monotonic()
+        popped: list[Workstream] = []
         with self._lock:
-            to_close = [
+            # Collect candidate ids first to avoid mutating
+            # ``self._workstreams`` while iterating it.
+            victims = [
                 ws.id
                 for ws in self._workstreams.values()
                 if ws.state == WorkstreamState.IDLE and (now - ws.last_active) > max_age_seconds
             ]
+            for ws_id in victims:
+                ws = self._close_if_idle_locked(ws_id)
+                if ws is not None:
+                    popped.append(ws)
 
-        closed: list[str] = []
-        for ws_id in to_close:
-            ws = self.get(ws_id)
-            # Re-check state to guard against a race between collection
-            # and close — a pending tool call could have flipped the
-            # state to RUNNING since the snapshot.
-            if ws is not None and ws.state == WorkstreamState.IDLE and self.close(ws_id):
-                closed.append(ws_id)
-        return closed
+        closed_ids: list[str] = []
+        for ws in popped:
+            self._adapter.cleanup_ui(ws)
+            # Mirrors ``close``: set ``ws._closed`` inside ws._lock
+            # before the storage write so any concurrent set_state sees
+            # the tombstone and skips its own write.
+            with ws._lock:
+                ws._closed = True
+                try:
+                    self._storage.update_workstream_state(ws.id, "closed")
+                except Exception:
+                    log.debug("session_mgr.state_update_failed ws=%s", ws.id[:8], exc_info=True)
+            self._adapter.emit_closed(ws.id)
+            closed_ids.append(ws.id)
+        return closed_ids
+
+    def _close_if_idle_locked(self, ws_id: str) -> Workstream | None:
+        """Pop the workstream atomically if it's still IDLE.
+
+        Caller must hold ``self._lock``. Returns the popped ws on
+        success, ``None`` if it wasn't IDLE or not tracked. Used by
+        :meth:`close_idle` so the state-check and pop happen under one
+        lock acquisition — a pending tool result can flip state to
+        RUNNING between an out-of-lock re-check and ``close`` picking
+        up ``self._lock`` again.
+        """
+        ws = self._workstreams.get(ws_id)
+        if ws is None or ws.state != WorkstreamState.IDLE:
+            return None
+        self._workstreams.pop(ws_id, None)
+        if ws_id in self._order:
+            self._order.remove(ws_id)
+        if self._active_id == ws_id:
+            self._active_id = self._order[0] if self._order else None
+        return ws
 
     # ------------------------------------------------------------------
     # Lookup
