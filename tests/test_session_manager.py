@@ -94,6 +94,15 @@ class FakeAdapter:
         with self._events_lock:
             self.events.append(_Event("created", ws.id))
 
+    def emit_rehydrated(self, ws: Workstream) -> None:
+        # Record as a plain "created" event — the test suite treats
+        # create + rehydrate as indistinguishable on the interactive
+        # transport. The coord-side adapter uses emit_rehydrated for
+        # its storage-seeded subtree rebuild; the fake doesn't need a
+        # separate event type.
+        with self._events_lock:
+            self.events.append(_Event("created", ws.id))
+
     def emit_state(self, ws: Workstream, state: WorkstreamState) -> None:
         with self._events_lock:
             self.events.append(_Event("state", ws.id, state=state))

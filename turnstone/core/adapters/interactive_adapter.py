@@ -107,6 +107,12 @@ class InteractiveAdapter:
             }
         )
 
+    def emit_rehydrated(self, ws: Workstream) -> None:
+        # No children-registry on the interactive side — a
+        # rehydrated workstream is indistinguishable from a fresh
+        # create for the transport layer. Delegate.
+        self.emit_created(ws)
+
     def emit_closed(self, ws_id: str, *, reason: str = "closed") -> None:
         self._enqueue({"type": "ws_closed", "ws_id": ws_id, "reason": reason})
 

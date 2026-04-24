@@ -49,6 +49,16 @@ class SessionKindAdapter(Protocol):
     kind: WorkstreamKind
 
     def emit_created(self, ws: Workstream) -> None: ...
+    def emit_rehydrated(self, ws: Workstream) -> None:
+        """Fire the lifecycle event for a lazy-rehydrated workstream.
+
+        Distinct from ``emit_created`` so coord-side adapters can
+        perform storage-seeded registry rebuilds only on the resurrect
+        path. A freshly-created workstream provably has zero children,
+        so the rebuild query is wasted. Interactive adapters with no
+        such registry just delegate to ``emit_created``.
+        """
+
     def emit_state(self, ws: Workstream, state: WorkstreamState) -> None: ...
     def emit_closed(self, ws_id: str, *, reason: str = "closed") -> None:
         """Fire the close event. ``reason`` is "closed" for manual close,
@@ -345,7 +355,7 @@ class SessionManager:
                 # last close(). The next set_state() call syncs it
                 # naturally; writing 'idle' here could race a concurrent
                 # close() that writes 'closed' under self._lock.
-                self._adapter.emit_created(ws)
+                self._adapter.emit_rehydrated(ws)
                 return ws
         finally:
             self._release_open_lock(ws_id)

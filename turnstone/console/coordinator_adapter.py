@@ -100,18 +100,37 @@ class CoordinatorAdapter:
     # ------------------------------------------------------------------
 
     def emit_created(self, ws: Workstream) -> None:
-        # Seed the children registry and lock-free presence cache so the
-        # cluster fan-out filter recognises this coordinator immediately.
-        # For a freshly-created coordinator no persisted children exist
-        # yet; for a rehydrated one, pull the subtree from storage after
-        # the seed so a ``ws_created`` for an already-spawned child that
-        # fires mid-rebuild merges cleanly.
+        # Fresh create: no persisted children exist yet, so skip the
+        # storage-seeded rebuild (perf-3). The fan-out registry still
+        # needs the empty forward/presence entries so
+        # ``_dispatch_child_event`` recognises this coordinator when
+        # its first child is spawned.
+        self._install_coord_registry(ws)
+        self._fanout_console_ws_created(ws)
+
+    def emit_rehydrated(self, ws: Workstream) -> None:
+        # Resurrected coordinator: the subtree IS persisted, so pull
+        # it from storage after the registry seed so a ``ws_created``
+        # for an already-spawned child that fires mid-rebuild merges
+        # cleanly.
+        self._install_coord_registry(ws)
+        self._rebuild_children_registry(ws.id)
+        self._fanout_console_ws_created(ws)
+
+    def _install_coord_registry(self, ws: Workstream) -> None:
+        """Seed the children registry + lock-free presence cache for ``ws``.
+
+        Shared by ``emit_created`` and ``emit_rehydrated`` — the
+        difference between the two is purely whether we then rebuild
+        from storage.
+        """
         with self._children_lock:
             self._children.setdefault(ws.id, set())
             new_active = dict(self._active_coords)
             new_active[ws.id] = (ws.user_id or "", ws.ui)
             self._active_coords = new_active
-        self._rebuild_children_registry(ws.id)
+
+    def _fanout_console_ws_created(self, ws: Workstream) -> None:
         try:
             self._collector.emit_console_ws_created(
                 ws.id,
