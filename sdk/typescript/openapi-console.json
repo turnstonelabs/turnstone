@@ -4497,10 +4497,10 @@
         }
       }
     },
-    "/v1/api/coordinator/new": {
+    "/v1/api/workstreams/new": {
       "post": {
         "summary": "Create a new coordinator workstream",
-        "operationId": "v1_api_coordinator_new_post",
+        "operationId": "v1_api_workstreams_new_post",
         "tags": [
           "Coordinator"
         ],
@@ -4589,10 +4589,10 @@
         }
       }
     },
-    "/v1/api/coordinator": {
+    "/v1/api/workstreams": {
       "get": {
         "summary": "List coordinator workstreams visible to the caller",
-        "operationId": "v1_api_coordinator_get",
+        "operationId": "v1_api_workstreams_get",
         "tags": [
           "Coordinator"
         ],
@@ -4631,10 +4631,10 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}": {
+    "/v1/api/workstreams/{ws_id}": {
       "get": {
         "summary": "Get coordinator detail (rehydrates lazily on miss)",
-        "operationId": "v1_api_coordinator_{ws_id}_get",
+        "operationId": "v1_api_workstreams_{ws_id}_get",
         "tags": [
           "Coordinator"
         ],
@@ -4713,10 +4713,10 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}/open": {
+    "/v1/api/workstreams/{ws_id}/open": {
       "post": {
         "summary": "Open (rehydrate) a coordinator workstream by ws_id",
-        "operationId": "v1_api_coordinator_{ws_id}_open_post",
+        "operationId": "v1_api_workstreams_{ws_id}_open_post",
         "tags": [
           "Coordinator"
         ],
@@ -4795,10 +4795,10 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}/send": {
+    "/v1/api/workstreams/{ws_id}/send": {
       "post": {
         "summary": "Queue a user message onto the coordinator session",
-        "operationId": "v1_api_coordinator_{ws_id}_send_post",
+        "operationId": "v1_api_workstreams_{ws_id}_send_post",
         "tags": [
           "Coordinator"
         ],
@@ -4897,10 +4897,10 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}/approve": {
+    "/v1/api/workstreams/{ws_id}/approve": {
       "post": {
         "summary": "Resolve a pending tool approval on the coordinator session",
-        "operationId": "v1_api_coordinator_{ws_id}_approve_post",
+        "operationId": "v1_api_workstreams_{ws_id}_approve_post",
         "tags": [
           "Coordinator"
         ],
@@ -4989,10 +4989,10 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}/cancel": {
+    "/v1/api/workstreams/{ws_id}/cancel": {
       "post": {
         "summary": "Cancel in-flight generation on the coordinator session",
-        "operationId": "v1_api_coordinator_{ws_id}_cancel_post",
+        "operationId": "v1_api_workstreams_{ws_id}_cancel_post",
         "tags": [
           "Coordinator"
         ],
@@ -5051,10 +5051,10 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}/close": {
+    "/v1/api/workstreams/{ws_id}/close": {
       "post": {
         "summary": "Soft-close the coordinator (unload from memory; storage preserved)",
-        "operationId": "v1_api_coordinator_{ws_id}_close_post",
+        "operationId": "v1_api_workstreams_{ws_id}_close_post",
         "tags": [
           "Coordinator"
         ],
@@ -5123,10 +5123,10 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}/events": {
+    "/v1/api/workstreams/{ws_id}/events": {
       "get": {
         "summary": "Subscribe to the coordinator's SSE event stream",
-        "operationId": "v1_api_coordinator_{ws_id}_events_get",
+        "operationId": "v1_api_workstreams_{ws_id}_events_get",
         "tags": [
           "Coordinator"
         ],
@@ -5188,10 +5188,10 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}/history": {
+    "/v1/api/workstreams/{ws_id}/history": {
       "get": {
         "summary": "Read the coordinator's reconstructed message history",
-        "operationId": "v1_api_coordinator_{ws_id}_history_get",
+        "operationId": "v1_api_workstreams_{ws_id}_history_get",
         "tags": [
           "Coordinator"
         ],
@@ -5260,10 +5260,10 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}/children": {
+    "/v1/api/workstreams/{ws_id}/children": {
       "get": {
         "summary": "List the coordinator's spawned child workstreams",
-        "operationId": "v1_api_coordinator_{ws_id}_children_get",
+        "operationId": "v1_api_workstreams_{ws_id}_children_get",
         "tags": [
           "Coordinator"
         ],
@@ -5342,10 +5342,10 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}/tasks": {
+    "/v1/api/workstreams/{ws_id}/tasks": {
       "get": {
         "summary": "Read the coordinator's task list envelope",
-        "operationId": "v1_api_coordinator_{ws_id}_tasks_get",
+        "operationId": "v1_api_workstreams_{ws_id}_tasks_get",
         "tags": [
           "Coordinator"
         ],
@@ -5414,10 +5414,10 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}/trust": {
+    "/v1/api/workstreams/{ws_id}/trust": {
       "post": {
         "summary": "Toggle trusted-session mode for send_to_workstream",
-        "operationId": "v1_api_coordinator_{ws_id}_trust_post",
+        "operationId": "v1_api_workstreams_{ws_id}_trust_post",
         "tags": [
           "Coordinator"
         ],
@@ -5496,10 +5496,10 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}/restrict": {
+    "/v1/api/workstreams/{ws_id}/restrict": {
       "post": {
         "summary": "Revoke tool access on a live coordinator session",
-        "operationId": "v1_api_coordinator_{ws_id}_restrict_post",
+        "operationId": "v1_api_workstreams_{ws_id}_restrict_post",
         "tags": [
           "Coordinator"
         ],
@@ -5578,10 +5578,10 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}/stop_cascade": {
+    "/v1/api/workstreams/{ws_id}/stop_cascade": {
       "post": {
         "summary": "Cancel the coordinator and every direct child",
-        "operationId": "v1_api_coordinator_{ws_id}_stop_cascade_post",
+        "operationId": "v1_api_workstreams_{ws_id}_stop_cascade_post",
         "tags": [
           "Coordinator"
         ],
@@ -5650,10 +5650,10 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}/close_all_children": {
+    "/v1/api/workstreams/{ws_id}/close_all_children": {
       "post": {
         "summary": "Soft-close every direct child of the coordinator",
-        "operationId": "v1_api_coordinator_{ws_id}_close_all_children_post",
+        "operationId": "v1_api_workstreams_{ws_id}_close_all_children_post",
         "tags": [
           "Coordinator"
         ],
@@ -6916,7 +6916,7 @@
         "type": "object"
       },
       "CoordinatorApproveRequest": {
-        "description": "Body for POST /v1/api/coordinator/{ws_id}/approve.",
+        "description": "Body for POST /v1/api/workstreams/{ws_id}/approve.",
         "properties": {
           "approved": {
             "description": "True approves the pending tool call(s); False denies.",
@@ -7072,7 +7072,7 @@
         "type": "object"
       },
       "CoordinatorChildrenResponse": {
-        "description": "Response body for GET /v1/api/coordinator/{ws_id}/children.",
+        "description": "Response body for GET /v1/api/workstreams/{ws_id}/children.",
         "properties": {
           "items": {
             "items": {
@@ -7092,7 +7092,7 @@
         "type": "object"
       },
       "CoordinatorCloseAllChildrenRequest": {
-        "description": "Body for POST /v1/api/coordinator/{ws_id}/close_all_children.",
+        "description": "Body for POST /v1/api/workstreams/{ws_id}/close_all_children.",
         "properties": {
           "reason": {
             "default": "",
@@ -7106,7 +7106,7 @@
         "type": "object"
       },
       "CoordinatorCloseAllChildrenResponse": {
-        "description": "Response body for POST /v1/api/coordinator/{ws_id}/close_all_children.",
+        "description": "Response body for POST /v1/api/workstreams/{ws_id}/close_all_children.",
         "properties": {
           "status": {
             "default": "ok",
@@ -7142,7 +7142,7 @@
         "type": "object"
       },
       "CoordinatorCreateRequest": {
-        "description": "Body for POST /v1/api/coordinator/new.",
+        "description": "Body for POST /v1/api/workstreams/new.",
         "properties": {
           "name": {
             "default": "",
@@ -7174,7 +7174,7 @@
         "type": "object"
       },
       "CoordinatorCreateResponse": {
-        "description": "Response body for POST /v1/api/coordinator/new (201).",
+        "description": "Response body for POST /v1/api/workstreams/new (201).",
         "properties": {
           "ws_id": {
             "title": "Ws Id",
@@ -7193,7 +7193,7 @@
         "type": "object"
       },
       "CoordinatorDetailResponse": {
-        "description": "Response body for GET /v1/api/coordinator/{ws_id}.",
+        "description": "Response body for GET /v1/api/workstreams/{ws_id}.",
         "properties": {
           "ws_id": {
             "title": "Ws Id",
@@ -7227,7 +7227,7 @@
         "type": "object"
       },
       "CoordinatorHistoryResponse": {
-        "description": "Response body for GET /v1/api/coordinator/{ws_id}/history.",
+        "description": "Response body for GET /v1/api/workstreams/{ws_id}/history.",
         "properties": {
           "ws_id": {
             "title": "Ws Id",
@@ -7279,7 +7279,7 @@
         "type": "object"
       },
       "CoordinatorListResponse": {
-        "description": "Response body for GET /v1/api/coordinator.",
+        "description": "Response body for GET /v1/api/workstreams.",
         "properties": {
           "coordinators": {
             "items": {
@@ -7293,7 +7293,7 @@
         "type": "object"
       },
       "CoordinatorOpenResponse": {
-        "description": "Response body for POST /v1/api/coordinator/{ws_id}/open.",
+        "description": "Response body for POST /v1/api/workstreams/{ws_id}/open.",
         "properties": {
           "ws_id": {
             "title": "Ws Id",
@@ -7325,7 +7325,7 @@
         "type": "object"
       },
       "CoordinatorRestrictRequest": {
-        "description": "Body for POST /v1/api/coordinator/{ws_id}/restrict.",
+        "description": "Body for POST /v1/api/workstreams/{ws_id}/restrict.",
         "properties": {
           "revoke": {
             "description": "Tool names to add to the session's revoked set.  Once revoked the coordinator cannot invoke the named tools on subsequent turns without closing and re-opening the session.",
@@ -7343,7 +7343,7 @@
         "type": "object"
       },
       "CoordinatorRestrictResponse": {
-        "description": "Response body for POST /v1/api/coordinator/{ws_id}/restrict.",
+        "description": "Response body for POST /v1/api/workstreams/{ws_id}/restrict.",
         "properties": {
           "status": {
             "default": "ok",
@@ -7366,7 +7366,7 @@
         "type": "object"
       },
       "CoordinatorSendRequest": {
-        "description": "Body for POST /v1/api/coordinator/{ws_id}/send.",
+        "description": "Body for POST /v1/api/workstreams/{ws_id}/send.",
         "properties": {
           "message": {
             "description": "User message to queue onto the coordinator's worker.",
@@ -7381,7 +7381,7 @@
         "type": "object"
       },
       "CoordinatorStopCascadeResponse": {
-        "description": "Response body for POST /v1/api/coordinator/{ws_id}/stop_cascade.",
+        "description": "Response body for POST /v1/api/workstreams/{ws_id}/stop_cascade.",
         "properties": {
           "status": {
             "default": "ok",
@@ -7457,7 +7457,7 @@
         "type": "object"
       },
       "CoordinatorTasksResponse": {
-        "description": "Response body for GET /v1/api/coordinator/{ws_id}/tasks.\n\nMirrors the envelope the ``task_list(action='list')`` model tool returns.",
+        "description": "Response body for GET /v1/api/workstreams/{ws_id}/tasks.\n\nMirrors the envelope the ``task_list(action='list')`` model tool returns.",
         "properties": {
           "version": {
             "default": 1,
@@ -7476,7 +7476,7 @@
         "type": "object"
       },
       "CoordinatorTrustRequest": {
-        "description": "Body for POST /v1/api/coordinator/{ws_id}/trust.",
+        "description": "Body for POST /v1/api/workstreams/{ws_id}/trust.",
         "properties": {
           "send": {
             "description": "When true, ``send_to_workstream`` calls that target a ws_id in the coordinator's own subtree skip the approval prompt.  Foreign ws_ids continue to require approval \u2014 trust only relaxes the guard for work the orchestrator itself spawned.",
@@ -7491,7 +7491,7 @@
         "type": "object"
       },
       "CoordinatorTrustResponse": {
-        "description": "Response body for POST /v1/api/coordinator/{ws_id}/trust.",
+        "description": "Response body for POST /v1/api/workstreams/{ws_id}/trust.",
         "properties": {
           "status": {
             "default": "ok",

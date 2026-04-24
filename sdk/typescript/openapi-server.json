@@ -1931,7 +1931,7 @@
           "kind": {
             "$ref": "#/components/schemas/WorkstreamKind",
             "default": "interactive",
-            "description": "Workstream kind \u2014 'interactive' (default) or 'coordinator'. Coordinator workstreams are created by the console's own /v1/api/coordinator/new endpoint; clients hitting /v1/api/workstreams/new should leave this at the default."
+            "description": "Workstream kind \u2014 'interactive' (default) or 'coordinator'. Coordinator workstreams are created by the console's own /v1/api/workstreams/new endpoint; clients hitting /v1/api/workstreams/new should leave this at the default."
           },
           "parent_ws_id": {
             "anyOf": [
