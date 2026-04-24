@@ -418,8 +418,10 @@ def test_open_refuses_deleted_coordinator(built_mgr):
     ws = mgr.create(user_id="u1")
     mgr.close(ws.id)
     storage.update_workstream_state(ws.id, "deleted")
-    assert mgr.open(ws.id, "u1") is None
-    assert mgr.open_admin(ws.id) is None
+    user_open = mgr.open(ws.id, "u1")
+    assert user_open is None
+    admin_open = mgr.open_admin(ws.id)
+    assert admin_open is None
 
 
 def test_open_refuses_empty_owner_for_non_admin(built_mgr):

@@ -302,7 +302,8 @@ def _seed_closed_coord_with_history(
     """
     ws = mgr.create(user_id=user_id, name=name)
     storage.save_message(ws.id, role="user", content="seed")
-    assert mgr.close(ws.id)
+    closed = mgr.close(ws.id)
+    assert closed
     return ws.id
 
 
