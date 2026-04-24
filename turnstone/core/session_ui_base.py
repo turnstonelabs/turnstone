@@ -251,15 +251,22 @@ class SessionUIBase:
                 self._llm_verdicts[call_id] = verdict
         self._enqueue({"type": "intent_verdict", **verdict})
         self._persist_intent_verdict(verdict)
-        # If approval already resolved, stamp the decision now.
-        # Otherwise queue for resolve_approval to pick up.
+        # Decision check + either queue or flag-for-persist happen
+        # under ONE lock acquisition so resolve_approval can't swap-
+        # and-clear _pending_verdicts between our read and our
+        # append. Without this: decide "no decision yet" → release
+        # lock → resolve_approval swaps the list + sets decision →
+        # we re-acquire and append to the fresh (empty) list; verdict
+        # sits queued until the next round, gets stamped with the
+        # WRONG decision.  Storage UPDATE happens outside the lock
+        # on the already-resolved path — no contention with other
+        # ws-scoped work.
         with self._ws_lock:
             decision = self._last_verdict_decision
+            if not decision:
+                self._pending_verdicts.append(verdict)
         if decision:
             self._persist_verdict_decisions([verdict], decision)
-        else:
-            with self._ws_lock:
-                self._pending_verdicts.append(verdict)
 
     def _persist_intent_verdict(self, verdict: dict[str, Any]) -> None:
         try:

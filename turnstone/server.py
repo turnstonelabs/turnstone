@@ -2732,10 +2732,12 @@ async def close_workstream(request: Request) -> JSONResponse:
                 ip,
             )
         return JSONResponse({"status": "ok"})
-    # close() returned False — the ws was popped between mgr.get() and
-    # mgr.close() (racing close). Treat as already-closed success
-    # rather than surfacing the old "Cannot close last workstream"
-    # 400 (that guard went away with the default-startup workstream).
+    # close() returned False — the ws was popped between the mgr.get()
+    # check above and our mgr.close() call (another close racing in).
+    # Return 404 so the API contract matches a "not found" caller
+    # experience; the old "Cannot close last workstream" 400 went away
+    # with the default-startup workstream and there's no scenario where
+    # this branch means anything other than "the ws isn't tracked here".
     return JSONResponse({"error": "Workstream not found"}, status_code=404)
 
 

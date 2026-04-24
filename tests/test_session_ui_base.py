@@ -18,8 +18,6 @@ import threading
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from turnstone.core.session_ui_base import SessionUIBase
 
 
@@ -264,9 +262,9 @@ def test_both_subclasses_call_reset_from_approve_tools() -> None:
     import turnstone.server
     from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 
-    WebUI = turnstone.server.WebUI
+    webui = turnstone.server.WebUI
 
-    for cls in (WebUI, ConsoleCoordinatorUI):
+    for cls in (webui, ConsoleCoordinatorUI):
         ui = cls(ws_id="ws-x", user_id="u1")
         # Stage state as if a prior approval round already finished.
         ui._last_verdict_decision = "approved"
@@ -283,6 +281,56 @@ def test_both_subclasses_call_reset_from_approve_tools() -> None:
         assert ui._llm_verdicts == {}, (
             f"{cls.__name__}.approve_tools did not clear the LLM verdict cache"
         )
+
+
+def test_on_intent_verdict_decision_check_and_queue_are_atomic() -> None:
+    """Regression for the on_intent_verdict ↔ resolve_approval race.
+
+    Prior implementation acquired ``_ws_lock`` twice: once to read
+    ``_last_verdict_decision``, once to append to
+    ``_pending_verdicts``. Between those two acquisitions
+    ``resolve_approval`` could swap-and-clear the pending list and
+    set the decision — our verdict then got appended to the fresh
+    list and stamped with the NEXT round's decision.
+
+    Fix: decision check + append happen under a single lock
+    acquisition. This test counts lock acquisitions during one
+    ``on_intent_verdict`` and fails if the release-then-reacquire
+    pattern returns.
+    """
+    ui = _make_ui()
+    acquire_count = 0
+    original_lock = ui._ws_lock
+
+    class _CountingLock:
+        def __init__(self, inner: threading.Lock) -> None:
+            self._inner = inner
+
+        def __enter__(self) -> None:
+            nonlocal acquire_count
+            acquire_count += 1
+            self._inner.acquire()
+
+        def __exit__(self, *a: Any) -> None:
+            self._inner.release()
+
+        def acquire(self, *a: Any, **kw: Any) -> bool:
+            return self._inner.acquire(*a, **kw)
+
+        def release(self) -> None:
+            self._inner.release()
+
+    ui._ws_lock = _CountingLock(original_lock)  # type: ignore[assignment]
+    with _patch_get_storage(MagicMock()):
+        ui.on_intent_verdict({"verdict_id": "v1", "call_id": "c1"})
+    # Two acquisitions: one for the cache write (call_id is truthy),
+    # one for decision-check + pending-append. Before the fix there
+    # were three, with a window resolve_approval could slip into.
+    assert acquire_count == 2, (
+        f"on_intent_verdict acquired _ws_lock {acquire_count} times; "
+        "decision-check + pending-append must happen under ONE acquisition "
+        "to avoid a race with resolve_approval"
+    )
 
 
 def test_resolve_approval_stamps_all_pending_verdicts() -> None:
@@ -355,8 +403,9 @@ def test_concurrent_enqueue_and_listener_registration() -> None:
     producer.join()
     for s in subscribers:
         s.join()
-    # No assertion beyond "didn't crash" — the concurrent registration
-    # path is exercised. With fast-failing asserts in _enqueue /
-    # _register_listener removed, this test's job is to surface any
-    # RuntimeError / lock inversion.
-    pytest.assume = lambda *_args, **_kw: None  # type: ignore[attr-defined]
+    # Test's job is to surface any RuntimeError / lock inversion
+    # during concurrent enqueue + register/unregister. If we got
+    # here every thread completed cleanly — assert explicitly so the
+    # intent survives optimization-mode assertion stripping.
+    assert not producer.is_alive()
+    assert all(not s.is_alive() for s in subscribers)

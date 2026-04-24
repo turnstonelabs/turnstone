@@ -348,7 +348,8 @@ def test_concurrent_create_does_not_exceed_max_active() -> None:
 
 def test_open_returns_none_for_missing_row() -> None:
     mgr, _, _ = _make_manager()
-    assert mgr.open("missing") is None
+    opened = mgr.open("missing")
+    assert opened is None
 
 
 def test_open_blocks_deleted_state() -> None:
@@ -357,7 +358,8 @@ def test_open_blocks_deleted_state() -> None:
     mgr.close(ws.id)
     # Flip the row to the tombstone state — open must refuse it.
     storage.rows[ws.id].state = "deleted"
-    assert mgr.open(ws.id) is None
+    opened = mgr.open(ws.id)
+    assert opened is None
 
 
 def test_open_resurrects_closed_state() -> None:
@@ -396,7 +398,8 @@ def test_open_rejects_wrong_kind() -> None:
     # Storage row claims a different kind than our adapter's.
     storage.rows[ws.id].kind = WorkstreamKind.COORDINATOR.value
     mgr.close(ws.id)
-    assert mgr.open(ws.id) is None
+    opened = mgr.open(ws.id)
+    assert opened is None
 
 
 def test_concurrent_open_for_same_ws_id_returns_same_session() -> None:
@@ -440,7 +443,8 @@ def test_close_unblocks_ui_and_emits_closed() -> None:
     ws = mgr.create(user_id="u1")
     ws_id = ws.id
 
-    assert mgr.close(ws_id) is True
+    closed = mgr.close(ws_id)
+    assert closed is True
     assert mgr.get(ws_id) is None
     assert ws_id in adapter.cleaned_up
     assert ws_id in [e.ws_id for e in adapter.events_of("closed")]
@@ -463,13 +467,15 @@ def test_close_last_workstream_succeeds() -> None:
     """
     mgr, _, _ = _make_manager()
     ws = mgr.create(user_id="u1")
-    assert mgr.close(ws.id) is True
+    closed = mgr.close(ws.id)
+    assert closed is True
     assert mgr.count == 0
 
 
 def test_close_unknown_returns_false() -> None:
     mgr, _, _ = _make_manager()
-    assert mgr.close("not-there") is False
+    closed = mgr.close("not-there")
+    assert closed is False
 
 
 # ---------------------------------------------------------------------------
