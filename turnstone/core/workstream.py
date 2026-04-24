@@ -101,6 +101,16 @@ class Workstream:
     kind: WorkstreamKind = WorkstreamKind.INTERACTIVE
     # Non-None for children spawned by a coordinator.
     parent_ws_id: str | None = None
+    # Tombstone: set by ``SessionManager.close`` under ``_lock`` so a
+    # racing ``set_state`` can detect the close before it overwrites
+    # the persisted ``state='closed'`` row. Guarded by ``_lock``.
+    _closed: bool = field(default=False, repr=False)
+    # True while a coordinator worker thread is actively running
+    # ``ChatSession.send``. Toggled under ``_lock`` by the adapter's
+    # ``_spawn_worker`` so concurrent ``send()`` calls can safely
+    # decide queue-vs-spawn without racing ``Thread.is_alive()``.
+    # Interactive workstreams ignore this field.
+    _worker_running: bool = field(default=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def __post_init__(self) -> None:

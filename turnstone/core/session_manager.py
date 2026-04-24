@@ -417,10 +417,17 @@ class SessionManager:
                 self._active_id = self._order[0] if self._order else None
 
         self._adapter.cleanup_ui(ws)
-        try:
-            self._storage.update_workstream_state(ws_id, "closed")
-        except Exception:
-            log.debug("session_mgr.state_update_failed ws=%s", ws_id[:8], exc_info=True)
+        # Serialize the storage write against any in-flight set_state
+        # via ws._lock. Setting ``_closed`` inside the lock makes the
+        # close visible to set_state before we release — any set_state
+        # that acquires ws._lock after us sees _closed=True and skips
+        # its storage write.
+        with ws._lock:
+            ws._closed = True
+            try:
+                self._storage.update_workstream_state(ws_id, "closed")
+            except Exception:
+                log.debug("session_mgr.state_update_failed ws=%s", ws_id[:8], exc_info=True)
         self._adapter.emit_closed(ws_id)
         return True
 
@@ -432,15 +439,20 @@ class SessionManager:
     ) -> None:
         """Update a workstream's state + fire the adapter's state event.
 
-        Per-ws_lock serializes the in-memory mutation. Storage write
-        happens under the same lock so the persisted + in-memory views
-        can't invert order. Adapter ``emit_state`` fires after the
-        write so listeners see a value consistent with storage.
+        Serializes against ``close()`` via ``ws._lock``: if close ran
+        first, it set ``ws._closed=True`` and wrote ``state='closed'``
+        to storage under the same lock — set_state sees the tombstone
+        and skips its own write to avoid resurrecting a closed row.
         """
-        ws = self._workstreams.get(ws_id)
-        if ws is None:
-            return
+        with self._lock:
+            ws = self._workstreams.get(ws_id)
+            if ws is None:
+                return
         with ws._lock:
+            if ws._closed:
+                # close() already ran; don't overwrite 'closed' in
+                # storage with a lagging set_state write.
+                return
             ws.state = state
             ws.last_active = time.monotonic()
             ws.error_message = error_msg

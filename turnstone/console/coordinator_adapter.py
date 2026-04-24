@@ -255,48 +255,56 @@ class CoordinatorAdapter:
         queue is full — must NOT spawn a second concurrent worker on the
         same ChatSession (mutates messages, queued_messages, streaming
         state, LLM client cursors, approvals).
+
+        Queue-vs-spawn decided under ``ws._lock`` using the
+        ``_worker_running`` flag (set by ``_run`` before calling send,
+        cleared in the finally block). Using ``Thread.is_alive()`` as
+        the gate was racy: the worker could exit between the
+        ``is_alive()`` check and a ``queue_message`` call, stranding
+        the message with no consumer. The flag transitions atomically
+        inside the same lock ``_spawn_worker`` uses.
         """
         session = ws.session
         if session is None:
             return False
-        # If a worker is already running for this ws, enqueue instead of
-        # spawning a duplicate — ChatSession.queue_message handles FIFO.
-        if (
-            ws.worker_thread is not None
-            and ws.worker_thread.is_alive()
-            and hasattr(session, "queue_message")
-        ):
-            try:
-                session.queue_message(message)
-                return True
-            except queue.Full:
-                # Queue is at capacity AND a worker is still running.
-                # Spawning a second thread on the same ChatSession would
-                # corrupt history / cursors / approvals — return False so
-                # the caller can surface backpressure (HTTP 429).
-                log.warning(
-                    "coord_adapter.queue_full ws=%s — message dropped (worker still busy)",
-                    ws.id[:8],
-                )
-                return False
-            except Exception:
-                log.warning(
-                    "coord_adapter.queue_message_failed ws=%s",
-                    ws.id[:8],
-                    exc_info=True,
-                )
-                return False
+        with ws._lock:
+            if ws._worker_running and hasattr(session, "queue_message"):
+                try:
+                    session.queue_message(message)
+                    return True
+                except queue.Full:
+                    # Queue is at capacity AND a worker is still
+                    # running. Spawning a second thread on the same
+                    # ChatSession would corrupt history / cursors /
+                    # approvals — return False so the caller surfaces
+                    # backpressure (HTTP 429).
+                    log.warning(
+                        "coord_adapter.queue_full ws=%s — message dropped (worker still busy)",
+                        ws.id[:8],
+                    )
+                    return False
+                except Exception:
+                    log.warning(
+                        "coord_adapter.queue_message_failed ws=%s",
+                        ws.id[:8],
+                        exc_info=True,
+                    )
+                    return False
+            # Mark before release so any concurrent _spawn_worker
+            # acquiring ws._lock next observes the running state and
+            # enqueues instead of spawning a second worker.
+            ws._worker_running = True
 
         def _run() -> None:
             try:
                 session.send(message)
             except Exception as exc:
                 log.exception("coord_adapter.worker_failed ws=%s", ws.id[:8])
-                # Surface the failure to the coordinator's SSE stream so
-                # the operator sees what broke instead of a bare "error"
-                # badge — most common cause is a model-alias misconfig
-                # (wrong provider for the model) which the raw traceback
-                # narrows down quickly.
+                # Surface the failure to the coordinator's SSE stream
+                # so the operator sees what broke instead of a bare
+                # "error" badge — most common cause is a model-alias
+                # misconfig (wrong provider for the model) which the
+                # raw traceback narrows down quickly.
                 ui = ws.ui
                 if ui is not None and hasattr(ui, "on_error"):
                     try:
@@ -318,6 +326,9 @@ class CoordinatorAdapter:
                             ws.id[:8],
                             exc_info=True,
                         )
+            finally:
+                with ws._lock:
+                    ws._worker_running = False
 
         t = threading.Thread(
             target=_run,
