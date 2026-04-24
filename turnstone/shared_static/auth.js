@@ -228,6 +228,25 @@ function _scheduleRefreshFromWhoami() {
   // _loggedOut guards the post-fetch effects; _whoamiAbort lets logout
   // cancel the in-flight request directly so the network roundtrip
   // doesn't even complete.
+  //
+  // Same-call superseding: this function is invoked from several places
+  // (initial page load, _onSuccess, BroadcastChannel "login"/"refresh",
+  // _tryRefresh fallback).  Two of those firing in quick succession —
+  // e.g. an old slow whoami still in flight when login completes and
+  // schedules a fresh one — could let the older response land last and
+  // clobber the newer one's effects (clearing permissions right after a
+  // successful login, or rescheduling off a stale exp).  We abort the
+  // prior in-flight whoami before starting a new one AND guard the
+  // post-fetch effects with `_whoamiAbort === ctrl` so a late arrival
+  // from a superseded call is fully neutralised.
+  var prior = _whoamiAbort;
+  if (prior) {
+    try {
+      prior.abort();
+    } catch (_e) {
+      /* AbortController not available; the equality check below covers it */
+    }
+  }
   var ctrl =
     typeof AbortController !== "undefined" ? new AbortController() : null;
   _whoamiAbort = ctrl;
@@ -240,6 +259,9 @@ function _scheduleRefreshFromWhoami() {
     })
     .then(function (data) {
       if (_loggedOut) return;
+      // Bail if a newer call has superseded us — its eventual effects
+      // are the authoritative ones; ours would only clobber.
+      if (_whoamiAbort !== ctrl) return;
       // Treat a non-OK whoami (data === null) as an explicit clear.
       // _storePermissions(null) removes the key so stale UI gating
       // disappears when the server-side identity is gone (user
