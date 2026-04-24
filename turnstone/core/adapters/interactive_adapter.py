@@ -73,48 +73,44 @@ class InteractiveAdapter:
     # ------------------------------------------------------------------
 
     def emit_created(self, ws: Workstream) -> None:
-        model = ""
-        model_alias = ""
-        if ws.session is not None:
-            model = getattr(ws.session, "model", "") or ""
-            model_alias = getattr(ws.session, "model_alias", "") or ""
-        self._enqueue(
-            {
-                "type": "ws_created",
-                "ws_id": ws.id,
-                "name": ws.name,
-                "model": model,
-                "model_alias": model_alias,
-                "kind": ws.kind,
-                "parent_ws_id": ws.parent_ws_id,
-                "user_id": ws.user_id,
-            }
-        )
+        # No-op on interactive. The create_workstream HTTP handler
+        # (turnstone/server.py) fires ws_created to the global queue
+        # AFTER attachment validation so a rejected upload doesn't
+        # surface a phantom create→close pair. Firing here would
+        # duplicate the event and reintroduce the phantom.
+        pass
 
     def emit_state(self, ws: Workstream, state: WorkstreamState) -> None:
-        # WebUI._broadcast_state already emits richer payloads (tokens,
-        # context_ratio, activity) from inside the session's normal
-        # flow — that path is preserved. This hook is the
-        # manager-level state-flip signal for observers that only care
-        # about the transition itself; keep it minimal.
-        self._enqueue(
-            {
-                "type": "ws_state",
-                "ws_id": ws.id,
-                "state": state.value,
-                "kind": ws.kind,
-                "parent_ws_id": ws.parent_ws_id,
-            }
-        )
+        # No-op on interactive. WebUI._broadcast_state emits the full
+        # ws_state payload (tokens + context_ratio + activity) via the
+        # SessionUI.on_state_change callback chain; firing here would
+        # duplicate the event with a thinner payload.
+        pass
 
     def emit_rehydrated(self, ws: Workstream) -> None:
-        # No children-registry on the interactive side — a
-        # rehydrated workstream is indistinguishable from a fresh
-        # create for the transport layer. Delegate.
-        self.emit_created(ws)
+        # No-op on interactive (mirrors emit_created).
+        pass
 
-    def emit_closed(self, ws_id: str, *, reason: str = "closed") -> None:
-        self._enqueue({"type": "ws_closed", "ws_id": ws_id, "reason": reason})
+    def emit_closed(
+        self,
+        ws_id: str,
+        *,
+        reason: str = "closed",
+        name: str = "",
+    ) -> None:
+        # Sole transport path for ws_closed on interactive. The old
+        # create_workstream HTTP handler used to fire this inline (with
+        # name + reason="evicted" on the eviction path) — Stage 1
+        # consolidated that here so there's exactly one emission point.
+        # ``name`` powers the frontend eviction toast.
+        self._enqueue(
+            {
+                "type": "ws_closed",
+                "ws_id": ws_id,
+                "reason": reason,
+                "name": name,
+            }
+        )
 
     def _enqueue(self, event: dict[str, Any]) -> None:
         with contextlib.suppress(queue.Full):

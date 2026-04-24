@@ -149,12 +149,18 @@ class CoordinatorAdapter:
         except Exception:
             log.debug("coord_adapter.state_fanout_failed ws=%s", ws.id[:8], exc_info=True)
 
-    def emit_closed(self, ws_id: str, *, reason: str = "closed") -> None:
-        # ``reason`` is accepted for Protocol compatibility but the
-        # collector's emit_console_ws_closed doesn't propagate it —
-        # the console frontend's "evicted" special-case only fires for
-        # real-node (interactive) ws_closed events.
-        del reason
+    def emit_closed(
+        self,
+        ws_id: str,
+        *,
+        reason: str = "closed",
+        name: str = "",
+    ) -> None:
+        # ``reason`` / ``name`` accepted for Protocol compatibility but
+        # the collector's emit_console_ws_closed doesn't propagate
+        # them — the console frontend's "evicted" special-case + name
+        # toast only fire for real-node (interactive) ws_closed events.
+        del reason, name
         # Drop the coordinator's children-registry entries AND its
         # presence slot. Mirrors the eviction/close paths from the old
         # CoordinatorManager (which did the same under _children_lock

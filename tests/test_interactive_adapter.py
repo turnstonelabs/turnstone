@@ -75,57 +75,58 @@ def _make_ws(**overrides: Any) -> Workstream:
 # ---------------------------------------------------------------------------
 
 
-def test_emit_created_pushes_full_payload_to_global_queue() -> None:
+def test_emit_created_is_noop_on_interactive() -> None:
+    """The create_workstream HTTP handler fires ws_created after
+    attachment validation; the adapter intentionally no-ops so the
+    event isn't duplicated (and so failed-attachment creates don't
+    surface a phantom create→close pair)."""
     adapter, gq = _make_adapter()
     ws = _make_ws()
     adapter.emit_created(ws)
-    event = gq.get_nowait()
-    assert event["type"] == "ws_created"
-    assert event["ws_id"] == "ws-1"
-    assert event["name"] == "hello"
-    assert event["model"] == "gpt-5"
-    assert event["model_alias"] == "default"
-    assert event["kind"] == WorkstreamKind.INTERACTIVE
-    assert event["user_id"] == "u1"
-    assert event["parent_ws_id"] is None
+    assert gq.empty()
 
 
-def test_emit_created_handles_missing_session() -> None:
-    """A workstream whose session failed to build still emits a
-    sensible ws_created — no crash, model fields blank."""
+def test_emit_rehydrated_is_noop_on_interactive() -> None:
     adapter, gq = _make_adapter()
     ws = _make_ws()
-    ws.session = None
-    adapter.emit_created(ws)
-    event = gq.get_nowait()
-    assert event["model"] == ""
-    assert event["model_alias"] == ""
+    adapter.emit_rehydrated(ws)
+    assert gq.empty()
 
 
-def test_emit_state_pushes_state_event() -> None:
+def test_emit_state_is_noop_on_interactive() -> None:
+    """WebUI._broadcast_state emits the full ws_state payload (tokens,
+    context_ratio, activity). The adapter no-ops to avoid duplicating
+    that with a thinner payload."""
     adapter, gq = _make_adapter()
     ws = _make_ws()
     adapter.emit_state(ws, WorkstreamState.RUNNING)
-    event = gq.get_nowait()
-    assert event == {
-        "type": "ws_state",
-        "ws_id": "ws-1",
-        "state": "running",
-        "kind": WorkstreamKind.INTERACTIVE,
-        "parent_ws_id": None,
-    }
+    assert gq.empty()
 
 
 def test_emit_closed_defaults_to_closed_reason() -> None:
     adapter, gq = _make_adapter()
-    adapter.emit_closed("ws-1")
-    assert gq.get_nowait() == {"type": "ws_closed", "ws_id": "ws-1", "reason": "closed"}
+    adapter.emit_closed("ws-1", name="my-ws")
+    event = gq.get_nowait()
+    assert event == {
+        "type": "ws_closed",
+        "ws_id": "ws-1",
+        "reason": "closed",
+        "name": "my-ws",
+    }
 
 
-def test_emit_closed_propagates_evicted_reason() -> None:
+def test_emit_closed_propagates_evicted_reason_and_name() -> None:
     adapter, gq = _make_adapter()
-    adapter.emit_closed("ws-1", reason="evicted")
-    assert gq.get_nowait()["reason"] == "evicted"
+    adapter.emit_closed("ws-1", reason="evicted", name="my-ws")
+    event = gq.get_nowait()
+    assert event["reason"] == "evicted"
+    assert event["name"] == "my-ws"
+
+
+def test_emit_closed_default_name_is_empty_string() -> None:
+    adapter, gq = _make_adapter()
+    adapter.emit_closed("ws-1")
+    assert gq.get_nowait()["name"] == ""
 
 
 def test_emit_swallows_queue_full_without_raising() -> None:

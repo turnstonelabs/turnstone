@@ -25,6 +25,7 @@ from turnstone.core.log import get_logger
 from turnstone.core.workstream import WorkstreamState
 
 if TYPE_CHECKING:
+    from turnstone.console.collector import ClusterCollector
     from turnstone.core.session_manager import SessionManager
 
 log = get_logger(__name__)
@@ -55,6 +56,12 @@ class ConsoleCoordinatorUI:
     # ``mgr.set_state`` (which owns the storage write + adapter
     # emit_state fan-out).  Mirrors ``WebUI._workstream_mgr``.
     _coord_mgr: SessionManager | None = None
+    # Shared reference to the :class:`ClusterCollector`. Set at
+    # console startup so ``on_rename`` can fan out to the cluster
+    # dashboard (the old ``_on_rename_observer`` plumbing went away
+    # with CoordinatorManager; this replaces it without reviving the
+    # closure-per-install pattern).
+    _collector: ClusterCollector | None = None
 
     def __init__(self, ws_id: str = "", user_id: str = "") -> None:
         self.ws_id = ws_id
@@ -293,9 +300,22 @@ class ConsoleCoordinatorUI:
 
     def on_rename(self, name: str) -> None:
         self._enqueue({"type": "rename", "name": name})
-        # The CoordinatorAdapter's emit_console_ws_rename fan-out runs
-        # from whichever code path renames the workstream; the UI
-        # itself doesn't need to observe rename events.
+        # Fan out to the cluster collector so the dashboard's coord
+        # row updates live. Previously routed through an
+        # ``_on_rename_observer`` closure the old CoordinatorManager
+        # installed; now the UI reaches the collector directly via a
+        # class attribute set at console startup. None during tests
+        # that don't spin up a real collector.
+        collector = ConsoleCoordinatorUI._collector
+        if collector is not None:
+            try:
+                collector.emit_console_ws_rename(self.ws_id, name)
+            except Exception:
+                log.debug(
+                    "coord_ui.rename_fanout_failed ws=%s",
+                    self.ws_id,
+                    exc_info=True,
+                )
 
     def on_intent_verdict(self, verdict: dict[str, Any]) -> None:
         # Coordinator sessions use the intent judge like any other session.

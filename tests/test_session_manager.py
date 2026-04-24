@@ -33,6 +33,7 @@ class _Event:
     ws_id: str
     state: WorkstreamState | None = None
     reason: str | None = None
+    name: str | None = None
 
 
 class FakeUI:
@@ -107,9 +108,15 @@ class FakeAdapter:
         with self._events_lock:
             self.events.append(_Event("state", ws.id, state=state))
 
-    def emit_closed(self, ws_id: str, *, reason: str = "closed") -> None:
+    def emit_closed(
+        self,
+        ws_id: str,
+        *,
+        reason: str = "closed",
+        name: str = "",
+    ) -> None:
         with self._events_lock:
-            self.events.append(_Event("closed", ws_id, reason=reason))
+            self.events.append(_Event("closed", ws_id, reason=reason, name=name))
 
     def cleanup_ui(self, ws: Workstream) -> None:
         self.cleaned_up.append(ws.id)

@@ -4010,9 +4010,11 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                 # ``_rebuild_children_registry`` / ``send`` /
                 # fan-out dispatch can call ``mgr.get(ws_id)``.
                 coord_adapter.attach(coord_mgr)
-                # Shared ref so ConsoleCoordinatorUI.on_state_change flows
-                # state transitions through the unified manager.
+                # Shared refs so ConsoleCoordinatorUI.on_state_change
+                # flows state transitions through the unified manager
+                # and on_rename fans out to the cluster dashboard.
                 ConsoleCoordinatorUI._coord_mgr = coord_mgr
+                ConsoleCoordinatorUI._collector = app.state.collector
                 app.state.coord_mgr = coord_mgr
                 app.state.coord_adapter = coord_adapter
                 # Wire the cluster-event subscription so the coordinator's
@@ -4051,15 +4053,16 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
             coord_adapter_shutdown.shutdown()
         except Exception:
             log.debug("console.coord_adapter_shutdown_failed", exc_info=True)
-    # Drop the shared ConsoleCoordinatorUI._coord_mgr ref on teardown so
-    # tests that spin up multiple lifespan instances don't carry stale
-    # manager references across them.
+    # Drop the shared ConsoleCoordinatorUI refs on teardown so tests
+    # that spin up multiple lifespan instances don't carry stale
+    # manager/collector references across them.
     try:
         from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 
         ConsoleCoordinatorUI._coord_mgr = None
+        ConsoleCoordinatorUI._collector = None
     except Exception:
-        log.debug("console.coord_ui_mgr_reset_failed", exc_info=True)
+        log.debug("console.coord_ui_refs_reset_failed", exc_info=True)
     await app.state.proxy_sse_client.aclose()
     await app.state.proxy_client.aclose()
     app.state.collector.stop()

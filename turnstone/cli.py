@@ -608,14 +608,16 @@ def _handle_ws_command(
         ws_name = ws_obj.name if ws_obj else "?"
         if manager.close(ws_id):
             print(f"Closed workstream {ws_name}")
-            # Ensure new active is foregrounded
+            # Ensure new active is foregrounded if any remain.
             new_active = manager.get_active()
             if new_active and isinstance(new_active.ui, WorkstreamTerminalUI):
                 new_active.ui.set_foreground(True)
             return True
-        else:
-            print(red("Cannot close the last workstream"))
-            return False
+        # close() returned False — the ws was already closed or
+        # unknown. The old "last workstream" guard went away with the
+        # default-startup workstream.
+        print(red(f"Workstream {ws_name} not found or already closed"))
+        return False
 
     elif sub == "rename":
         new_name = " ".join(parts[2:]) if len(parts) > 2 else ""

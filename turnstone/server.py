@@ -2858,24 +2858,20 @@ async def close_workstream(request: Request) -> JSONResponse:
     # Cross-tenant close would abort another tenant's running generation.
     # _require_ws_access returns 404 on non-owner — same shape as the
     # "last workstream" (400) / "not found" (404) branches below.
-    owner_uid, err = _require_ws_access(request, ws_id, mgr=mgr)
+    _owner_uid, err = _require_ws_access(request, ws_id, mgr=mgr)
     if err:
         return err
-    # Distinguish "last workstream" (400) from "not found" (404).
-    # Note: get() and close() acquire the manager lock independently, so a
-    # concurrent close between the two could produce a wrong error code.
-    # The failure mode is cosmetic (400 instead of 404), not data corruption.
     ws_before = mgr.get(ws_id)
     if not ws_before:
         return JSONResponse({"error": "Workstream not found"}, status_code=404)
     if mgr.close(ws_id):
-        # Single storage handle for both the close-reason persist and
-        # the audit emit — avoids a duplicate getattr() and a future
-        # third storage call mistakenly using a different binding.
         storage = getattr(request.app.state, "auth_storage", None)
-        # Persist before emitting the global ws_closed event so any
-        # downstream consumer that re-reads workstream_config sees the
-        # reason in the same observation window as the state change.
+        # Persist before the ws_closed event reaches consumers so any
+        # downstream reader sees the close_reason in the same
+        # observation window as the state change. The adapter-level
+        # emit_closed fires inside mgr.close() which already returned
+        # — strictly speaking the event beat us here, but the
+        # close_reason is advisory UI metadata, not a sync barrier.
         if reason and storage is not None:
             try:
                 storage.save_workstream_config(ws_id, {"close_reason": reason})
@@ -2885,9 +2881,6 @@ async def close_workstream(request: Request) -> JSONResponse:
                     ws_id[:8] if ws_id else "",
                     exc_info=True,
                 )
-        gq: queue.Queue[dict[str, Any]] = request.app.state.global_queue
-        with contextlib.suppress(queue.Full):
-            gq.put_nowait({"type": "ws_closed", "ws_id": ws_id, "reason": "closed"})
         if storage is not None:
             _, ip = _audit_context(request)
             audit_detail: dict[str, Any] = {
@@ -2898,7 +2891,7 @@ async def close_workstream(request: Request) -> JSONResponse:
                 audit_detail["reason"] = reason
             record_audit(
                 storage,
-                owner_uid,
+                _auth_user_id(request),
                 "workstream.closed",
                 "workstream",
                 ws_id,
@@ -2906,7 +2899,11 @@ async def close_workstream(request: Request) -> JSONResponse:
                 ip,
             )
         return JSONResponse({"status": "ok"})
-    return JSONResponse({"error": "Cannot close last workstream"}, status_code=400)
+    # close() returned False — the ws was popped between mgr.get() and
+    # mgr.close() (racing close). Treat as already-closed success
+    # rather than surfacing the old "Cannot close last workstream"
+    # 400 (that guard went away with the default-startup workstream).
+    return JSONResponse({"error": "Workstream not found"}, status_code=404)
 
 
 async def delete_workstream_endpoint(request: Request) -> JSONResponse:
@@ -4298,14 +4295,19 @@ def _idle_cleanup_thread(
     global_queue: queue.Queue[dict[str, Any]],
     rate_limiter: Any = None,
 ) -> None:
-    """Periodically close IDLE workstreams and clean up rate limiter buckets."""
+    """Periodically close IDLE workstreams and clean up rate limiter buckets.
+
+    ``mgr.close_idle`` fires the adapter's ``emit_closed`` for each
+    victim, which pushes ``ws_closed`` onto ``global_queue`` with
+    ``reason="closed"``. The old manual emission here (``reason="idle"``)
+    is gone — the frontend didn't differentiate "idle" from "closed"
+    anyway and the duplicate event caused spurious UI flicker.
+    """
+    del global_queue  # adapter handles the emission
     check_every = min(300.0, timeout_sec / 4)  # check at 1/4 of timeout, max 5 min
     while True:
         time.sleep(check_every)
-        closed = mgr.close_idle(timeout_sec)
-        for ws_id in closed:
-            with contextlib.suppress(queue.Full):
-                global_queue.put_nowait({"type": "ws_closed", "ws_id": ws_id, "reason": "idle"})
+        mgr.close_idle(timeout_sec)
         if rate_limiter is not None:
             rate_limiter.cleanup()
 

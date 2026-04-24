@@ -60,11 +60,18 @@ class SessionKindAdapter(Protocol):
         """
 
     def emit_state(self, ws: Workstream, state: WorkstreamState) -> None: ...
-    def emit_closed(self, ws_id: str, *, reason: str = "closed") -> None:
-        """Fire the close event. ``reason`` is "closed" for manual close,
-        "evicted" for capacity eviction (frontend shows a distinct
-        toast). "idle" collapses into "closed" — frontend doesn't
-        differentiate."""
+    def emit_closed(
+        self,
+        ws_id: str,
+        *,
+        reason: str = "closed",
+        name: str = "",
+    ) -> None:
+        """Fire the close event. ``reason`` is "closed" for manual
+        close, "evicted" for capacity eviction (frontend shows a
+        distinct toast). ``name`` is the workstream's display name —
+        the frontend eviction toast includes it so the user sees
+        which workstream was evicted."""
 
     def cleanup_ui(self, ws: Workstream) -> None:
         """Unblock per-UI events on close; cancel + close the session."""
@@ -238,7 +245,7 @@ class SessionManager:
 
         if evicted is not None:
             self._adapter.cleanup_ui(evicted)
-            self._adapter.emit_closed(evicted.id, reason="evicted")
+            self._adapter.emit_closed(evicted.id, reason="evicted", name=evicted.name)
 
         # Persist before session construction. Fail-closed: if the row
         # can't be written, the in-memory session would be invisible to
@@ -332,7 +339,7 @@ class SessionManager:
 
                 if evicted is not None:
                     self._adapter.cleanup_ui(evicted)
-                    self._adapter.emit_closed(evicted.id)
+                    self._adapter.emit_closed(evicted.id, reason="evicted", name=evicted.name)
 
                 try:
                     ws.session = self._adapter.build_session(ws)
@@ -413,7 +420,11 @@ class SessionManager:
                 self._storage.update_workstream_state(ws_id, "closed")
             except Exception:
                 log.debug("session_mgr.state_update_failed ws=%s", ws_id[:8], exc_info=True)
-        self._adapter.emit_closed(ws_id)
+            try:
+                self._storage.delete_workstream_override(ws_id)
+            except Exception:
+                log.debug("session_mgr.override_delete_failed ws=%s", ws_id[:8], exc_info=True)
+        self._adapter.emit_closed(ws_id, name=ws.name)
         return True
 
     def set_state(
@@ -514,7 +525,11 @@ class SessionManager:
                     self._storage.update_workstream_state(ws.id, "closed")
                 except Exception:
                     log.debug("session_mgr.state_update_failed ws=%s", ws.id[:8], exc_info=True)
-            self._adapter.emit_closed(ws.id)
+                try:
+                    self._storage.delete_workstream_override(ws.id)
+                except Exception:
+                    log.debug("session_mgr.override_delete_failed ws=%s", ws.id[:8], exc_info=True)
+            self._adapter.emit_closed(ws.id, name=ws.name)
             closed_ids.append(ws.id)
         return closed_ids
 
@@ -600,6 +615,12 @@ class SessionManager:
             if self._active_id == oldest.id:
                 self._active_id = self._order[0] if self._order else None
             self._eviction_count += 1
+            try:
+                from turnstone.core.metrics import metrics as _m
+
+                _m.record_eviction()
+            except Exception:
+                log.debug("session_mgr.metrics_eviction_failed", exc_info=True)
             evicted = oldest
 
         ws = Workstream(id=ws_id, name=name)
@@ -615,7 +636,7 @@ class SessionManager:
             # subscribers.
             if evicted is not None:
                 self._adapter.cleanup_ui(evicted)
-                self._adapter.emit_closed(evicted.id, reason="evicted")
+                self._adapter.emit_closed(evicted.id, reason="evicted", name=evicted.name)
             raise
         self._workstreams[ws_id] = ws
         self._order.append(ws_id)
