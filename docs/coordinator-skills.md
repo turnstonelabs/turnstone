@@ -290,7 +290,8 @@ For a new coordinator skill:
    `coord_session` fixture's `skill=` kwarg (see
    `tests/test_coordinator_tools.py` for the pattern).
 2. Build a small fake cluster: one node + two children via
-   `mgr.register_children(coord.id, ["child-1", "child-2"])`.
+   the `_seed_children` helper in `tests/_coord_test_helpers.py`
+   (``_seed_children(mgr._adapter, coord.id, ["child-1", "child-2"])``).
 3. Drive the session with seeded tool_call dicts matching the
    provider layer's shape.  The unit-level tests in
    `tests/test_coordinator_tools.py` show the helper (`_tc(name,

@@ -14,6 +14,7 @@ import contextlib
 import queue
 from typing import TYPE_CHECKING, Any
 
+from turnstone.core.adapters._ui_cleanup import cleanup_session_ui
 from turnstone.core.log import get_logger
 from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamState
 
@@ -94,50 +95,11 @@ class InteractiveAdapter:
     def cleanup_ui(self, ws: Workstream) -> None:
         """Unblock pending approval / plan / foreground events + close session.
 
-        Ported from the old ``WorkstreamManager._cleanup_ui``. The
-        ``hasattr`` checks guard stub UIs used in tests — the real
-        ``WebUI`` always has these attributes.
+        Ported from the old ``WorkstreamManager._cleanup_ui``. Delegates
+        to :func:`cleanup_session_ui` — the coordinator adapter runs
+        the identical sequence.
         """
-        if ws.session is not None and hasattr(ws.session, "cancel"):
-            ws.session.cancel()
-        ui = ws.ui
-        if ui is not None:
-            if hasattr(ui, "_approval_event"):
-                ui._approval_result = False, None  # type: ignore[attr-defined]
-                ui._approval_event.set()
-            if hasattr(ui, "_plan_event"):
-                ui._plan_result = "reject"  # type: ignore[attr-defined]
-                ui._plan_event.set()
-            if hasattr(ui, "_fg_event"):
-                ui._fg_event.set()
-            if hasattr(ui, "_listeners_lock"):
-                self._broadcast_ws_closed_to_listeners(ui)
-        if ws.session is not None and hasattr(ws.session, "close"):
-            ws.session.close()
-
-    @staticmethod
-    def _broadcast_ws_closed_to_listeners(ui: SessionUI) -> None:
-        """Push ``ws_closed`` into every per-UI listener queue so SSE
-        generators unwind promptly.
-
-        Eviction-safe: on ``queue.Full``, drop the oldest event and
-        retry rather than failing open. Listeners are cleared after so
-        subsequent events don't re-fire on a closed workstream.
-        """
-        listeners = getattr(ui, "_listeners", None)
-        listeners_lock = getattr(ui, "_listeners_lock", None)
-        if listeners is None or listeners_lock is None:
-            return
-        with listeners_lock:
-            for lq in listeners:
-                try:
-                    lq.put_nowait({"type": "ws_closed"})
-                except queue.Full:
-                    with contextlib.suppress(queue.Empty):
-                        lq.get_nowait()
-                    with contextlib.suppress(queue.Full):
-                        lq.put_nowait({"type": "ws_closed"})
-            listeners.clear()
+        cleanup_session_ui(ws)
 
     # ------------------------------------------------------------------
     # Construction

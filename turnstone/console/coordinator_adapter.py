@@ -15,11 +15,11 @@ for the storage-seeded children rebuild.
 
 from __future__ import annotations
 
-import contextlib
 import queue
 import threading
 from typing import TYPE_CHECKING, Any
 
+from turnstone.core.adapters._ui_cleanup import cleanup_session_ui
 from turnstone.core.log import get_logger
 from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamState
 
@@ -161,43 +161,11 @@ class CoordinatorAdapter:
         """Unblock pending events + close the session.
 
         Mirrors the old ``CoordinatorManager._cleanup`` (which itself
-        delegated to ``WorkstreamManager._cleanup_ui``). Listener
-        broadcast evicts the oldest event on ``queue.Full`` so an
-        unresponsive browser tab can't block close.
+        delegated to ``WorkstreamManager._cleanup_ui``). Delegates to
+        :func:`cleanup_session_ui` — shared with the interactive
+        adapter which runs the identical sequence.
         """
-        if ws.session is not None and hasattr(ws.session, "cancel"):
-            ws.session.cancel()
-        ui = ws.ui
-        if ui is not None:
-            if hasattr(ui, "_approval_event"):
-                ui._approval_result = False, None  # type: ignore[attr-defined]
-                ui._approval_event.set()
-            if hasattr(ui, "_plan_event"):
-                ui._plan_result = "reject"  # type: ignore[attr-defined]
-                ui._plan_event.set()
-            if hasattr(ui, "_fg_event"):
-                ui._fg_event.set()
-            if hasattr(ui, "_listeners_lock"):
-                self._broadcast_ws_closed_to_listeners(ui)
-        if ws.session is not None and hasattr(ws.session, "close"):
-            ws.session.close()
-
-    @staticmethod
-    def _broadcast_ws_closed_to_listeners(ui: SessionUI) -> None:
-        listeners = getattr(ui, "_listeners", None)
-        listeners_lock = getattr(ui, "_listeners_lock", None)
-        if listeners is None or listeners_lock is None:
-            return
-        with listeners_lock:
-            for lq in listeners:
-                try:
-                    lq.put_nowait({"type": "ws_closed"})
-                except queue.Full:
-                    with contextlib.suppress(queue.Empty):
-                        lq.get_nowait()
-                    with contextlib.suppress(queue.Full):
-                        lq.put_nowait({"type": "ws_closed"})
-            listeners.clear()
+        cleanup_session_ui(ws)
 
     # ------------------------------------------------------------------
     # Construction
@@ -457,11 +425,6 @@ class CoordinatorAdapter:
             child_set = self._children.get(coord_ws_id)
             return list(child_set) if child_set else []
 
-    def register_children(self, coord_ws_id: str, child_ws_ids: Iterable[str]) -> None:
-        """Merge ``child_ws_ids`` into the coordinator's child set.  Idempotent."""
-        with self._children_lock:
-            self._merge_child_ids_locked(coord_ws_id, child_ws_ids)
-
     def _pop_coord_registry_locked(self, coord_ws_id: str) -> None:
         """Remove a coordinator's forward set + reverse-index entries.
 
@@ -479,21 +442,6 @@ class CoordinatorAdapter:
             # orphan the new owner's entry.
             if self._child_to_coord.get(cid) == coord_ws_id:
                 self._child_to_coord.pop(cid, None)
-
-    def _add_child(self, coord_ws_id: str, child_ws_id: str) -> bool:
-        """Record a new child_ws_id for ``coord_ws_id``.
-
-        Returns True when the child is newly added (first observation),
-        False when it was already tracked. Caller uses the return to
-        decide whether to re-emit a ``child_ws_created`` event.
-        """
-        with self._children_lock:
-            existing = self._children.setdefault(coord_ws_id, set())
-            if child_ws_id in existing:
-                return False
-            existing.add(child_ws_id)
-            self._child_to_coord[child_ws_id] = coord_ws_id
-            return True
 
     # ------------------------------------------------------------------
     # Cluster-event fan-out thread

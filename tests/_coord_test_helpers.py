@@ -12,7 +12,7 @@ list differs per file.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -22,6 +22,24 @@ from turnstone.console.coordinator_adapter import CoordinatorAdapter
 from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 from turnstone.core.auth import AuthResult
 from turnstone.core.session_manager import SessionManager
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+
+def _seed_children(
+    adapter: CoordinatorAdapter, coord_ws_id: str, child_ws_ids: Iterable[str]
+) -> None:
+    """Seed the coordinator adapter's children registry directly.
+
+    The production path populates the registry via the cluster-event
+    fan-out thread observing ``ws_created`` events. These tests just
+    need a known-children set for the endpoint handlers to iterate —
+    inject directly under ``_children_lock`` rather than spinning up
+    the collector + fan-out plumbing.
+    """
+    with adapter._children_lock:
+        adapter._merge_child_ids_locked(coord_ws_id, child_ws_ids)
 
 
 class _AuthMiddleware(BaseHTTPMiddleware):

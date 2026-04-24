@@ -21,6 +21,7 @@ from tests._coord_test_helpers import (
     _build_mgr,
     _fake_registry,
     _FakeConfigStore,
+    _seed_children,
 )
 from turnstone.console.server import coordinator_close_all_children
 from turnstone.core.storage._sqlite import SQLiteBackend
@@ -58,7 +59,7 @@ def _make_client(storage, *, coord_mgr, alias="my-model", registry=None) -> Test
 def test_close_all_children_closes_each_child_and_audits(storage):
     mgr = _build_mgr(storage)
     coord = mgr.create(user_id="user-1", name="coord-a")
-    mgr._adapter.register_children(coord.id, ["child-1", "child-2", "child-3"])
+    _seed_children(mgr._adapter, coord.id, ["child-1", "child-2", "child-3"])
 
     def _close(wid, reason):
         if wid == "child-2":
@@ -109,7 +110,7 @@ def test_close_all_children_routes_404_to_skipped_bucket(storage):
     is 'already gone', not a dispatch failure.  Route to skipped."""
     mgr = _build_mgr(storage)
     coord = mgr.create(user_id="user-1", name="coord-a")
-    mgr._adapter.register_children(coord.id, ["stale-child"])
+    _seed_children(mgr._adapter, coord.id, ["stale-child"])
 
     coord_client = MagicMock()
     coord_client.close_workstream.return_value = {
@@ -155,7 +156,7 @@ def test_close_all_children_empty_children_still_audits(storage):
 def test_close_all_children_without_coord_client_marks_all_failed(storage):
     mgr = _build_mgr(storage)
     coord = mgr.create(user_id="user-1", name="coord-a")
-    mgr._adapter.register_children(coord.id, ["child-a", "child-b"])
+    _seed_children(mgr._adapter, coord.id, ["child-a", "child-b"])
     coord.session = MagicMock()
     coord.session._coord_client = None
 
