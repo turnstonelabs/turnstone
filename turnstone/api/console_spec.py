@@ -34,13 +34,9 @@ from turnstone.api.console_schemas import (
     CoordinatorInfo,
     CoordinatorListResponse,
     CoordinatorOpenResponse,
-    CoordinatorQuotaRequest,
-    CoordinatorQuotaResponse,
     CoordinatorRestrictRequest,
     CoordinatorRestrictResponse,
     CoordinatorSendRequest,
-    CoordinatorSpawnRateInput,
-    CoordinatorSpawnRateState,
     CoordinatorStopCascadeResponse,
     CoordinatorTaskInfo,
     CoordinatorTasksResponse,
@@ -1387,40 +1383,6 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/quota",
-        "GET",
-        "Read the coordinator session's live spawn-quota state",
-        description=(
-            "Returns the current ``spawn_budget`` (active-children cap) and "
-            "``spawn_rate`` bucket (``tokens_per_minute``, ``burst``, "
-            "``tokens_available``).  Values reflect the in-memory override "
-            "when an admin has mutated the session via POST; otherwise they "
-            "reflect the global defaults baked in at session construction."
-        ),
-        response_model=CoordinatorQuotaResponse,
-        error_codes=[400, 403, 404, 503],
-        tags=["Coordinator"],
-    ),
-    EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/quota",
-        "POST",
-        "Mutate the coordinator session's spawn quota (partial update)",
-        description=(
-            "Updates any subset of ``spawn_budget``, "
-            "``spawn_rate.tokens_per_minute``, and ``spawn_rate.burst``.  "
-            "Nested ``spawn_rate`` and flat ``tokens_per_minute`` / ``burst`` "
-            "aliases are both accepted.  Missing fields keep their current "
-            "values.  Overrides are in-memory only — a session reopen "
-            "re-seeds from the global settings, matching the /trust and "
-            "/restrict contract.  Writes ``coordinator.quota.updated`` "
-            "with the before/after snapshot."
-        ),
-        request_model=CoordinatorQuotaRequest,
-        response_model=CoordinatorQuotaResponse,
-        error_codes=[400, 403, 404, 503],
-        tags=["Coordinator"],
-    ),
-    EndpointSpec(
         "/v1/api/cluster/ws/{ws_id}/detail",
         "GET",
         "Cluster-wide live workstream detail (storage + live block + tail)",
@@ -1495,13 +1457,9 @@ _ALL_MODELS: list[type[BaseModel]] = [
     CoordinatorInfo,
     CoordinatorListResponse,
     CoordinatorOpenResponse,
-    CoordinatorQuotaRequest,
-    CoordinatorQuotaResponse,
     CoordinatorRestrictRequest,
     CoordinatorRestrictResponse,
     CoordinatorSendRequest,
-    CoordinatorSpawnRateInput,
-    CoordinatorSpawnRateState,
     CoordinatorStopCascadeResponse,
     CoordinatorTaskInfo,
     CoordinatorTasksResponse,

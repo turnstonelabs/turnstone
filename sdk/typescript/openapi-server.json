@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Server API",
-    "version": "1.5.0a2",
+    "version": "1.5.0a4",
     "description": "Single-node workstream management, chat interaction, and real-time streaming."
   },
   "paths": {

@@ -89,7 +89,6 @@ from turnstone.core.metacognition import (
 from turnstone.core.providers import create_provider
 from turnstone.core.safety import is_command_blocked, sanitize_command
 from turnstone.core.sandbox import execute_math_sandboxed
-from turnstone.core.spawn_quota import SpawnBudget, TokenBucket
 from turnstone.core.storage._registry import get_storage
 from turnstone.core.tool_search import ToolSearchManager
 from turnstone.core.tools import (
@@ -347,11 +346,6 @@ class ChatSession:
         self._trust_send: bool = False
         self._revoked_tools: frozenset[str] = frozenset()
         self._governance_lock = threading.Lock()
-        # Spawn quota state — populated post-config-store init when
-        # ``kind == COORDINATOR``.  Non-coord sessions leave these at
-        # None; the ``_prepare_spawn_*`` gates short-circuit on that.
-        self._spawn_budget: SpawnBudget | None = None
-        self._spawn_bucket: TokenBucket | None = None
         self._registry = registry
         self._model_alias = model_alias
         self._health_registry = health_registry
@@ -387,35 +381,6 @@ class ChatSession:
         self._username = username
         self._client_type = client_type
         self._config_store = config_store
-        # Coordinator-only: spawn quota state.  Global defaults live in
-        # ``settings_registry``; per-session overrides land via
-        # /v1/api/coordinator/{ws_id}/quota (in-memory, dies on session
-        # reopen — matches the /trust and /restrict contract).
-        if kind == WorkstreamKind.COORDINATOR:
-            budget_default = 20
-            tpm_default = 5.0
-            burst_default = 10
-            if config_store is not None:
-                try:
-                    # Explicit None-check instead of ``or fallback`` so a
-                    # legitimate ``tokens_per_minute=0`` (the "disable
-                    # refill" operator knob) doesn't silently become the
-                    # default.  The same pattern on budget / burst is
-                    # safe today (min_value=1 in the registry) but kept
-                    # consistent against a future range relaxation.
-                    raw_budget = config_store.get("coordinator.spawn_budget")
-                    if raw_budget is not None:
-                        budget_default = int(raw_budget)
-                    raw_tpm = config_store.get("coordinator.spawn_rate.tokens_per_minute")
-                    if raw_tpm is not None:
-                        tpm_default = float(raw_tpm)
-                    raw_burst = config_store.get("coordinator.spawn_rate.burst")
-                    if raw_burst is not None:
-                        burst_default = int(raw_burst)
-                except (TypeError, ValueError):
-                    log.debug("coord_quota.config_read_failed", exc_info=True)
-            self._spawn_budget = SpawnBudget(budget_default)
-            self._spawn_bucket = TokenBucket(tpm_default, burst_default)
         # Initialize rule registry for configurable judge rules
         self._rule_registry = None
         if config_store is not None:
@@ -4920,100 +4885,6 @@ class ChatSession:
     def get_revoked_tools(self) -> frozenset[str]:
         return self._revoked_tools
 
-    # -- Coordinator spawn quota (budget + rate) -------------------------
-    #
-    # Admin endpoint POST /v1/api/coordinator/{ws_id}/quota mutates the
-    # live session state via ``set_spawn_budget`` / ``set_spawn_rate``.
-    # Overrides are in-memory only; a session reopen re-seeds from the
-    # global settings (mirrors /trust + /restrict).
-
-    def set_spawn_budget(self, budget: int) -> None:
-        if self._spawn_budget is not None:
-            self._spawn_budget.set_budget(int(budget))
-
-    def set_spawn_rate(self, tokens_per_minute: float, burst: int) -> None:
-        if self._spawn_bucket is not None:
-            self._spawn_bucket.set_rate(float(tokens_per_minute), int(burst))
-
-    def get_quota_state(self) -> dict[str, Any]:
-        """Snapshot of the coord-session quota for /quota GET + audit."""
-        state: dict[str, Any] = {
-            "spawn_budget": None,
-            "spawn_rate": {"tokens_per_minute": None, "burst": None, "tokens_available": None},
-        }
-        if self._spawn_budget is not None:
-            state["spawn_budget"] = self._spawn_budget.budget
-        if self._spawn_bucket is not None:
-            state["spawn_rate"] = {
-                "tokens_per_minute": self._spawn_bucket.tokens_per_minute,
-                "burst": self._spawn_bucket.burst,
-                "tokens_available": self._spawn_bucket.tokens,
-            }
-        return state
-
-    def _count_active_children(self) -> int:
-        """Current active-child count for the budget check.
-
-        Routes through ``CoordinatorClient.count_active_children`` —
-        an aggregate SQL count excluding ``closed`` / ``deleted`` —
-        so the budget stays accurate even when the coord has a long
-        tail of closed rows that would otherwise push live rows past
-        the ``list_children`` LIMIT and silently undercount.  Returns
-        0 on any lookup error so the budget fails *open* rather than
-        pinning the coord at zero spawns on a transient storage blip
-        (the budget is operator-level safety, not a security gate).
-        """
-        if self._coord_client is None or self._spawn_budget is None:
-            return 0
-        try:
-            return int(self._coord_client.count_active_children(self._ws_id))
-        except Exception:
-            log.debug("coord_quota.count_active_failed", exc_info=True)
-            return 0
-
-    def _eval_spawn_quota(self, active: int) -> str | None:
-        """Core budget + rate gate — shared by single-spawn and batch paths.
-
-        Runs the budget check against ``active`` (caller's running tally
-        including any in-batch approvals) then consumes a token from
-        the rate bucket.  Returns a flat denial reason on failure, or
-        ``None`` on pass.  A pass consumes a rate token, so callers
-        must NOT re-evaluate the same attempt.  Single source of truth
-        for the error wording so the single-spawn path and the batch
-        ``_error`` rows stay in lockstep.
-        """
-        if self._spawn_budget is not None:
-            res = self._spawn_budget.check(active)
-            if not res.allowed:
-                return (
-                    f"spawn budget reached ({res.active}/{res.budget}); "
-                    "close idle children with close_workstream(ws_id) "
-                    "before spawning more"
-                )
-        if self._spawn_bucket is not None:
-            ack = self._spawn_bucket.acquire()
-            if not ack.allowed:
-                hint = (
-                    f"retry after {ack.retry_after_seconds:.1f}s"
-                    if ack.retry_after_seconds != float("inf")
-                    else "rate limit disabled (tokens_per_minute=0)"
-                )
-                return f"spawn rate limited; {hint}"
-        return None
-
-    def _check_spawn_quota(self, call_id: str, func_name: str) -> dict[str, Any] | None:
-        """Single-spawn gate wrapper.
-
-        Counts active children, evaluates the quota, and wraps any
-        denial reason in ``_coord_tool_error`` so the preparer can
-        return it directly.  A pass consumes a rate token, so callers
-        must NOT re-check.
-        """
-        reason = self._eval_spawn_quota(self._count_active_children())
-        if reason is None:
-            return None
-        return self._coord_tool_error(call_id, func_name, reason)
-
     @staticmethod
     def _coord_str_arg(args: dict[str, Any], key: str, default: str = "") -> str:
         """Return ``args[key]`` if it's a string, else ``default``.
@@ -5054,15 +4925,6 @@ class ChatSession:
             return self._coord_tool_error(
                 call_id, "spawn_workstream", "coordinator client unavailable"
             )
-        # Quota gate runs before approval so the model sees a budget /
-        # rate error immediately — avoids the operator having to reject
-        # an approval that would have been denied anyway.  The bucket
-        # token is consumed here; a later operator-deny does NOT refund
-        # it (the model burnt an ask, the pacing limit should reflect
-        # that).
-        quota_err = self._check_spawn_quota(call_id, "spawn_workstream")
-        if quota_err is not None:
-            return quota_err
         # Empty initial_message is allowed — creates an idle child
         # workstream ready to receive the first turn via
         # send_to_workstream.  The tool JSON advertises this explicitly.
@@ -5196,28 +5058,12 @@ class ChatSession:
             else:
                 preview_rows.append(f"  {idx}. (idle)")
 
-        # Partial-success quota gate via the shared ``_eval_spawn_quota``
-        # helper — single source of truth with ``_prepare_spawn_workstream``
-        # for the error wording + consume-on-ask semantics.  Denied rows
-        # get an ``_error`` field so the exec loop routes them to
-        # ``denied[]`` without re-checking.  Tokens consumed here are
-        # NOT refunded on operator-deny — matches single-spawn semantics.
-        active_count = self._count_active_children()
-        approved_in_batch = 0
-        for spec in normalised:
-            if "_error" in spec:
-                continue
-            reason = self._eval_spawn_quota(active_count + approved_in_batch)
-            if reason is not None:
-                spec["_error"] = reason
-                continue
-            approved_in_batch += 1
-
-        # If every row was denied by the quota gate (or invalid at
-        # normalisation), skip the approval round — operators shouldn't
-        # approve a batch with nothing to spawn.  Surface the first
-        # denial reason directly so the model gets actionable feedback.
-        if approved_in_batch == 0:
+        # If every row was invalid at normalisation, skip the approval
+        # round — operators shouldn't approve a batch with nothing to
+        # spawn.  Surface the first denial reason directly so the model
+        # gets actionable feedback.
+        valid_count = sum(1 for spec in normalised if "_error" not in spec)
+        if valid_count == 0:
             first_err = next(
                 (s.get("_error") for s in normalised if s.get("_error")), "batch rejected"
             )
