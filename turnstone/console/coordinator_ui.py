@@ -25,8 +25,6 @@ from turnstone.core.log import get_logger
 from turnstone.core.workstream import WorkstreamState
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from turnstone.core.session_manager import SessionManager
 
 log = get_logger(__name__)
@@ -64,14 +62,6 @@ class ConsoleCoordinatorUI:
         # SSE listener fan-out — one per connected browser tab.
         self._listeners: list[queue.Queue[dict[str, Any]]] = []
         self._listeners_lock = threading.Lock()
-        # External observers for state/rename events — set by the
-        # CoordinatorManager on install so the cluster collector's
-        # console pseudo-node sees state transitions without the
-        # manager needing to wrap the UI methods.  Both callables
-        # take a single string (new state / new name); a failing
-        # observer is swallowed (see on_state_change / on_rename).
-        self._on_state_observer: Callable[[str], None] | None = None
-        self._on_rename_observer: Callable[[str], None] | None = None
         # Approval blocking — the worker thread calls approve_tools which
         # waits on _approval_event; the /approve endpoint sets it via
         # resolve_approval.
@@ -300,21 +290,12 @@ class ConsoleCoordinatorUI:
                         exc_info=True,
                     )
         self._enqueue({"type": "state_change", "state": state})
-        observer = self._on_state_observer
-        if observer is not None:
-            try:
-                observer(state)
-            except Exception:
-                log.debug("coord_ui.state_observer_failed ws=%s", self.ws_id, exc_info=True)
 
     def on_rename(self, name: str) -> None:
         self._enqueue({"type": "rename", "name": name})
-        observer = self._on_rename_observer
-        if observer is not None:
-            try:
-                observer(name)
-            except Exception:
-                log.debug("coord_ui.rename_observer_failed ws=%s", self.ws_id, exc_info=True)
+        # The CoordinatorAdapter's emit_console_ws_rename fan-out runs
+        # from whichever code path renames the workstream; the UI
+        # itself doesn't need to observe rename events.
 
     def on_intent_verdict(self, verdict: dict[str, Any]) -> None:
         # Coordinator sessions use the intent judge like any other session.

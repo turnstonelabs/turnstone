@@ -19,6 +19,8 @@ from turnstone.core.log import get_logger
 from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamState
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from turnstone.core.session import ChatSession, SessionUI
     from turnstone.core.storage._protocol import StorageBackend
 
@@ -114,6 +116,13 @@ class SessionManager:
         # manager never reads them.
         self._active_id: str | None = None
         self._eviction_count: int = 0
+        # Optional state-change observer. The CLI sets this to a
+        # callback that prints a background-attention notification
+        # when a non-focused workstream transitions to ATTENTION.
+        # Web/coord paths use the adapter's emit_state for their own
+        # fan-out; this is a second, manager-level hook for callers
+        # that don't consume SSE.
+        self._on_state_change: Callable[[str, WorkstreamState], None] | None = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -441,6 +450,9 @@ class SessionManager:
             except Exception:
                 log.debug("session_mgr.state_update_failed ws=%s", ws_id[:8], exc_info=True)
         self._adapter.emit_state(ws, state)
+        if self._on_state_change is not None:
+            with contextlib.suppress(Exception):
+                self._on_state_change(ws_id, state)
 
     def cancel(self, ws_id: str) -> bool:
         """Cancel in-flight generation and unblock any pending approval / plan.
