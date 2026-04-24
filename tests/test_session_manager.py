@@ -1,12 +1,20 @@
-"""Stage 1 scaffolding tests for the unified SessionManager.
+"""Smoke tests for the unified SessionManager.
 
-These cover construction only — the real lifecycle tests
-(``test_create_evicts_oldest_idle_at_capacity``, etc.) land alongside
-the Step 2 port of ``create`` / ``open`` / ``close`` / ``set_state``.
+Cover the concurrency-sensitive paths that historically diverged
+between ``WorkstreamManager`` and ``CoordinatorManager`` — slot
+reservation, eviction, per-ws lock serialization on lazy rehydrate,
+state flips, close-unblocks-UI. All exercised through a
+``FakeAdapter`` that records ``emit_*`` / ``cleanup_ui`` calls so
+tests can assert the transport contract without spinning up real
+WebUI / ClusterCollector pipelines.
 """
 
 from __future__ import annotations
 
+import threading
+import time
+from dataclasses import dataclass
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -14,53 +22,522 @@ import pytest
 from turnstone.core.session_manager import SessionKindAdapter, SessionManager
 from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamState
 
+# ---------------------------------------------------------------------------
+# Test fixtures
+# ---------------------------------------------------------------------------
 
-class _NoopAdapter:
-    """Structural implementation of SessionKindAdapter for construction tests."""
 
-    def __init__(self, kind: WorkstreamKind = WorkstreamKind.INTERACTIVE) -> None:
+@dataclass
+class _Event:
+    kind: str  # "created" | "state" | "closed"
+    ws_id: str
+    state: WorkstreamState | None = None
+
+
+class FakeUI:
+    """Minimal UI stand-in with the events close() needs to unblock."""
+
+    def __init__(self) -> None:
+        self.approval_unblocked = False
+        self.plan_unblocked = False
+        self.fg_unblocked = False
+        self.closed_broadcast = False
+
+    def _unblock(self) -> None:
+        self.approval_unblocked = True
+        self.plan_unblocked = True
+        self.fg_unblocked = True
+
+    def broadcast_ws_closed(self) -> None:
+        self.closed_broadcast = True
+
+
+class FakeSession:
+    """Minimal ChatSession stand-in; exposes cancel / close / resume."""
+
+    def __init__(self, ws_id: str) -> None:
+        self.ws_id = ws_id
+        self.cancelled = False
+        self.closed = False
+        self.resumed = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def close(self) -> None:
+        self.closed = True
+
+    def resume(self, ws_id: str) -> None:
+        self.resumed = True
+
+
+class FakeAdapter:
+    """Records events + builds FakeUI / FakeSession for tests."""
+
+    def __init__(
+        self,
+        kind: WorkstreamKind = WorkstreamKind.INTERACTIVE,
+        *,
+        build_session_raises: bool = False,
+    ) -> None:
         self.kind = kind
+        self.events: list[_Event] = []
+        self._events_lock = threading.Lock()
+        self.cleaned_up: list[str] = []
+        self.build_session_calls = 0
+        self.build_session_raises = build_session_raises
+        # Slow down session build so concurrent tests can race.
+        self.build_session_delay = 0.0
 
     def emit_created(self, ws: Workstream) -> None:
-        pass
+        with self._events_lock:
+            self.events.append(_Event("created", ws.id))
 
     def emit_state(self, ws: Workstream, state: WorkstreamState) -> None:
-        pass
+        with self._events_lock:
+            self.events.append(_Event("state", ws.id, state=state))
 
     def emit_closed(self, ws_id: str) -> None:
-        pass
+        with self._events_lock:
+            self.events.append(_Event("closed", ws_id))
 
     def cleanup_ui(self, ws: Workstream) -> None:
-        pass
+        self.cleaned_up.append(ws.id)
+        if ws.session is not None:
+            ws.session.cancel()
+            ws.session.close()
+        if ws.ui is not None:
+            ws.ui._unblock()
+            ws.ui.broadcast_ws_closed()
 
-    def build_ui(self, ws: Workstream):  # type: ignore[no-untyped-def]
-        return MagicMock()
+    def build_ui(self, ws: Workstream) -> Any:
+        return FakeUI()
 
-    def build_session(self, ws: Workstream, **_: object):  # type: ignore[no-untyped-def]
-        return MagicMock()
+    def build_session(self, ws: Workstream, **_: object) -> Any:
+        self.build_session_calls += 1
+        if self.build_session_delay:
+            time.sleep(self.build_session_delay)
+        if self.build_session_raises:
+            raise RuntimeError("build_session forced failure")
+        return FakeSession(ws.id)
+
+    def events_of(self, kind: str) -> list[_Event]:
+        with self._events_lock:
+            return [e for e in self.events if e.kind == kind]
+
+
+@dataclass
+class _Row:
+    ws_id: str
+    user_id: str
+    name: str
+    kind: str
+    state: str = "idle"
+    parent_ws_id: str | None = None
+
+
+class FakeStorage:
+    """In-memory storage that mirrors the StorageBackend surface the manager uses."""
+
+    def __init__(self) -> None:
+        self.rows: dict[str, _Row] = {}
+        self.state_updates: list[tuple[str, str]] = []
+        self.register_raises = False
+        self.lock = threading.Lock()
+
+    def register_workstream(
+        self,
+        ws_id: str,
+        *,
+        node_id: str | None = None,
+        user_id: str | None = None,
+        name: str = "",
+        kind: WorkstreamKind | str = WorkstreamKind.INTERACTIVE,
+        parent_ws_id: str | None = None,
+        skill_id: str = "",
+        skill_version: int = 0,
+    ) -> None:
+        if self.register_raises:
+            raise RuntimeError("register forced failure")
+        kind_str = kind.value if isinstance(kind, WorkstreamKind) else str(kind)
+        with self.lock:
+            self.rows[ws_id] = _Row(
+                ws_id=ws_id,
+                user_id=user_id or "",
+                name=name,
+                kind=kind_str,
+                parent_ws_id=parent_ws_id,
+            )
+
+    def update_workstream_state(self, ws_id: str, state: str) -> None:
+        with self.lock:
+            self.state_updates.append((ws_id, state))
+            if ws_id in self.rows:
+                self.rows[ws_id].state = state
+
+    def get_workstream(self, ws_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            row = self.rows.get(ws_id)
+            if row is None:
+                return None
+            return {
+                "ws_id": row.ws_id,
+                "user_id": row.user_id,
+                "name": row.name,
+                "kind": row.kind,
+                "state": row.state,
+                "parent_ws_id": row.parent_ws_id,
+            }
+
+    def delete_workstream(self, ws_id: str) -> None:
+        with self.lock:
+            self.rows.pop(ws_id, None)
+
+    def count_skill_versions(self, template_id: str) -> int:
+        return 0
+
+
+def _make_manager(
+    adapter: FakeAdapter | None = None,
+    *,
+    max_active: int = 5,
+    storage: FakeStorage | None = None,
+) -> tuple[SessionManager, FakeAdapter, FakeStorage]:
+    adapter = adapter or FakeAdapter()
+    storage = storage or FakeStorage()
+    mgr = SessionManager(adapter, storage=storage, max_active=max_active)
+    return mgr, adapter, storage
+
+
+# ---------------------------------------------------------------------------
+# Construction
+# ---------------------------------------------------------------------------
 
 
 def test_session_manager_constructs_with_adapter() -> None:
-    adapter = _NoopAdapter(kind=WorkstreamKind.INTERACTIVE)
-    mgr = SessionManager(adapter, storage=MagicMock(), max_active=5)
+    mgr, adapter, _ = _make_manager()
     assert mgr.max_active == 5
-    assert mgr.kind == WorkstreamKind.INTERACTIVE
+    assert mgr.kind == adapter.kind
 
 
 def test_session_manager_rejects_invalid_max_active() -> None:
-    adapter = _NoopAdapter()
     with pytest.raises(ValueError, match="max_active must be >= 1"):
-        SessionManager(adapter, storage=MagicMock(), max_active=0)
-
-
-def test_session_manager_kind_reflects_adapter() -> None:
-    adapter = _NoopAdapter(kind=WorkstreamKind.COORDINATOR)
-    mgr = SessionManager(adapter, storage=MagicMock(), max_active=3)
-    assert mgr.kind == WorkstreamKind.COORDINATOR
+        SessionManager(FakeAdapter(), storage=FakeStorage(), max_active=0)
 
 
 def test_noop_adapter_satisfies_protocol() -> None:
-    """Structural check — a class with the right methods should satisfy
-    the Protocol without explicit inheritance."""
-    adapter: SessionKindAdapter = _NoopAdapter()
+    adapter: SessionKindAdapter = FakeAdapter()
     assert adapter.kind == WorkstreamKind.INTERACTIVE
+
+
+# ---------------------------------------------------------------------------
+# create
+# ---------------------------------------------------------------------------
+
+
+def test_create_persists_and_emits_created() -> None:
+    mgr, adapter, storage = _make_manager()
+    ws = mgr.create(user_id="u1", name="hello")
+    assert ws.user_id == "u1"
+    assert ws.name == "hello"
+    assert ws.session is not None
+    assert ws.ui is not None
+    assert ws.id in storage.rows
+    assert storage.rows[ws.id].kind == WorkstreamKind.INTERACTIVE.value
+    assert [e.ws_id for e in adapter.events_of("created")] == [ws.id]
+
+
+def test_create_evicts_oldest_idle_at_capacity() -> None:
+    mgr, adapter, _ = _make_manager(max_active=2)
+    first = mgr.create(user_id="u1")
+    # Nudge the timestamp so 'first' is the clear eviction candidate.
+    first.last_active = time.monotonic() - 100
+    mgr.create(user_id="u1")
+    # Third create triggers eviction of the oldest IDLE (= first).
+    third = mgr.create(user_id="u1")
+    assert mgr.get(first.id) is None
+    assert mgr.get(third.id) is not None
+    # Adapter transport saw the eviction and the new create.
+    assert first.id in [e.ws_id for e in adapter.events_of("closed")]
+    assert third.id in [e.ws_id for e in adapter.events_of("created")]
+    assert first.id in adapter.cleaned_up
+
+
+def test_create_raises_when_all_active_and_no_idle() -> None:
+    mgr, _, _ = _make_manager(max_active=1)
+    ws = mgr.create(user_id="u1")
+    ws.state = WorkstreamState.RUNNING  # block eviction
+    with pytest.raises(RuntimeError, match="slots are active"):
+        mgr.create(user_id="u1")
+
+
+def test_create_rolls_back_slot_on_session_failure() -> None:
+    adapter = FakeAdapter(build_session_raises=True)
+    mgr, _, storage = _make_manager(adapter=adapter)
+    with pytest.raises(RuntimeError, match="build_session forced failure"):
+        mgr.create(user_id="u1")
+    # Slot freed, row deleted, no dangling capacity consumption.
+    assert mgr.count == 0
+    assert len(storage.rows) == 0
+
+
+def test_create_rolls_back_slot_on_persist_failure() -> None:
+    storage = FakeStorage()
+    storage.register_raises = True
+    mgr, _, _ = _make_manager(storage=storage)
+    with pytest.raises(RuntimeError, match="register forced failure"):
+        mgr.create(user_id="u1")
+    assert mgr.count == 0
+
+
+def test_concurrent_create_does_not_exceed_max_active() -> None:
+    mgr, _, _ = _make_manager(max_active=3)
+    adapter = mgr._adapter  # type: ignore[attr-defined]
+    assert isinstance(adapter, FakeAdapter)
+    adapter.build_session_delay = 0.02  # widen the race window
+
+    results: list[Workstream | Exception] = []
+    lock = threading.Lock()
+
+    def _create() -> None:
+        try:
+            ws = mgr.create(user_id="u1")
+            with lock:
+                results.append(ws)
+        except Exception as e:
+            with lock:
+                results.append(e)
+
+    threads = [threading.Thread(target=_create) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Manager holds at most max_active; overflow creates must raise
+    # (5 overflows raise, 3 succeed — no silent exceed).
+    assert mgr.count <= 3
+    successes = [r for r in results if isinstance(r, Workstream)]
+    assert len(successes) <= 3
+
+
+# ---------------------------------------------------------------------------
+# open — lazy rehydrate
+# ---------------------------------------------------------------------------
+
+
+def test_open_returns_none_for_missing_row() -> None:
+    mgr, _, _ = _make_manager()
+    assert mgr.open("missing", user_id="u1") is None
+
+
+def test_open_blocks_deleted_state() -> None:
+    mgr, _, storage = _make_manager()
+    ws = mgr.create(user_id="u1")
+    mgr.close(ws.id)
+    # Flip the row to the tombstone state — open must refuse it.
+    storage.rows[ws.id].state = "deleted"
+    assert mgr.open(ws.id, user_id="u1") is None
+
+
+def test_open_resurrects_closed_state() -> None:
+    mgr, adapter, _ = _make_manager()
+    ws = mgr.create(user_id="u1")
+    ws_id = ws.id
+    mgr.close(ws_id)
+    assert mgr.get(ws_id) is None
+
+    reopened = mgr.open(ws_id, user_id="u1")
+    assert reopened is not None
+    assert reopened.id == ws_id
+    assert reopened.session is not None
+    assert reopened.session.resumed is True  # type: ignore[attr-defined]
+    # Open fires a fresh emit_created so observers see the rehydrate.
+    assert ws_id in [e.ws_id for e in adapter.events_of("created")]
+
+
+def test_open_rejects_non_matching_user_when_not_admin() -> None:
+    mgr, _, _ = _make_manager()
+    ws = mgr.create(user_id="u1")
+    mgr.close(ws.id)
+    assert mgr.open(ws.id, user_id="u2", admin=False) is None
+    # Admin bypass works.
+    assert mgr.open(ws.id, user_id="u2", admin=True) is not None
+
+
+def test_open_rejects_wrong_kind() -> None:
+    mgr, _, storage = _make_manager()
+    ws = mgr.create(user_id="u1")
+    # Storage row claims a different kind than our adapter's.
+    storage.rows[ws.id].kind = WorkstreamKind.COORDINATOR.value
+    mgr.close(ws.id)
+    assert mgr.open(ws.id, user_id="u1") is None
+
+
+def test_concurrent_open_for_same_ws_id_returns_same_session() -> None:
+    mgr, adapter, _ = _make_manager()
+    ws = mgr.create(user_id="u1")
+    ws_id = ws.id
+    mgr.close(ws_id)
+    adapter.build_session_calls = 0
+    adapter.build_session_delay = 0.02
+
+    results: list[Workstream | None] = []
+    lock = threading.Lock()
+
+    def _open() -> None:
+        r = mgr.open(ws_id, user_id="u1")
+        with lock:
+            results.append(r)
+
+    threads = [threading.Thread(target=_open) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    loaded = [r for r in results if r is not None]
+    assert len(loaded) == 6
+    # All threads got the same Workstream instance — no duplicate session.
+    sessions = {id(r.session) for r in loaded}
+    assert len(sessions) == 1
+    # build_session ran exactly once — the per-ws lock serialized the rest.
+    assert adapter.build_session_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# close
+# ---------------------------------------------------------------------------
+
+
+def test_close_unblocks_ui_and_emits_closed() -> None:
+    mgr, adapter, storage = _make_manager()
+    ws = mgr.create(user_id="u1")
+    ws_id = ws.id
+
+    assert mgr.close(ws_id) is True
+    assert mgr.get(ws_id) is None
+    assert ws_id in adapter.cleaned_up
+    assert ws_id in [e.ws_id for e in adapter.events_of("closed")]
+    # Storage reflects the close.
+    assert (ws_id, "closed") in storage.state_updates
+    # UI events unblocked.
+    assert ws.ui.approval_unblocked is True  # type: ignore[attr-defined]
+    assert ws.ui.plan_unblocked is True  # type: ignore[attr-defined]
+    assert ws.ui.closed_broadcast is True  # type: ignore[attr-defined]
+    # Session cancelled + closed.
+    assert ws.session.cancelled is True  # type: ignore[attr-defined]
+    assert ws.session.closed is True  # type: ignore[attr-defined]
+
+
+def test_close_last_workstream_succeeds() -> None:
+    """The WSM 'refuse to close last workstream' guard is gone (#400 follow-up).
+
+    The default startup workstream relic is deleted; the dashboard
+    handles the 0-workstream state and callers can close freely.
+    """
+    mgr, _, _ = _make_manager()
+    ws = mgr.create(user_id="u1")
+    assert mgr.close(ws.id) is True
+    assert mgr.count == 0
+
+
+def test_close_unknown_returns_false() -> None:
+    mgr, _, _ = _make_manager()
+    assert mgr.close("not-there") is False
+
+
+# ---------------------------------------------------------------------------
+# set_state
+# ---------------------------------------------------------------------------
+
+
+def test_set_state_updates_storage_and_fires_observer() -> None:
+    mgr, adapter, storage = _make_manager()
+    ws = mgr.create(user_id="u1")
+    mgr.set_state(ws.id, WorkstreamState.RUNNING)
+    assert ws.state == WorkstreamState.RUNNING
+    assert (ws.id, WorkstreamState.RUNNING.value) in storage.state_updates
+    state_events = adapter.events_of("state")
+    assert any(e.ws_id == ws.id and e.state == WorkstreamState.RUNNING for e in state_events)
+
+
+def test_set_state_unknown_ws_is_noop() -> None:
+    mgr, adapter, _ = _make_manager()
+    mgr.set_state("ghost", WorkstreamState.RUNNING)
+    assert adapter.events_of("state") == []
+
+
+# ---------------------------------------------------------------------------
+# close_idle / list_all / get / count
+# ---------------------------------------------------------------------------
+
+
+def test_close_idle_closes_old_idle_and_keeps_active() -> None:
+    mgr, _, _ = _make_manager()
+    old = mgr.create(user_id="u1")
+    fresh = mgr.create(user_id="u1")
+    running = mgr.create(user_id="u1")
+    old.last_active = time.monotonic() - 100
+    running.state = WorkstreamState.RUNNING
+    running.last_active = time.monotonic() - 100
+
+    closed = mgr.close_idle(max_age_seconds=10.0)
+    assert old.id in closed
+    assert mgr.get(old.id) is None
+    # Fresh stays (not old enough).
+    assert mgr.get(fresh.id) is not None
+    # Running stays (wrong state).
+    assert mgr.get(running.id) is not None
+
+
+def test_close_idle_on_empty_manager_returns_empty_list() -> None:
+    mgr, _, _ = _make_manager()
+    assert mgr.close_idle(max_age_seconds=1.0) == []
+
+
+def test_list_all_returns_creation_order() -> None:
+    mgr, _, _ = _make_manager()
+    a = mgr.create(user_id="u1")
+    b = mgr.create(user_id="u1")
+    c = mgr.create(user_id="u1")
+    assert [ws.id for ws in mgr.list_all()] == [a.id, b.id, c.id]
+
+
+def test_count_reflects_live_workstreams() -> None:
+    mgr, _, _ = _make_manager()
+    assert mgr.count == 0
+    a = mgr.create(user_id="u1")
+    assert mgr.count == 1
+    mgr.create(user_id="u1")
+    assert mgr.count == 2
+    mgr.close(a.id)
+    assert mgr.count == 1
+
+
+# ---------------------------------------------------------------------------
+# Eviction transport — adapter contract
+# ---------------------------------------------------------------------------
+
+
+def test_eviction_fires_emit_closed_to_adapter_transport() -> None:
+    mgr, adapter, _ = _make_manager(max_active=2)
+    a = mgr.create(user_id="u1")
+    a.last_active = time.monotonic() - 100
+    mgr.create(user_id="u1")
+    mgr.create(user_id="u1")  # triggers eviction of 'a'
+    closed_events = adapter.events_of("closed")
+    assert any(e.ws_id == a.id for e in closed_events)
+    assert a.id in adapter.cleaned_up
+
+
+# ---------------------------------------------------------------------------
+# Storage access patterns with mocks (defensive coverage)
+# ---------------------------------------------------------------------------
+
+
+def test_create_uses_configured_node_id() -> None:
+    storage = MagicMock()
+    mgr = SessionManager(FakeAdapter(), storage=storage, max_active=3, node_id="node-xyz")
+    mgr.create(user_id="u1")
+    assert storage.register_workstream.call_args.kwargs["node_id"] == "node-xyz"
