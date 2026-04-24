@@ -154,6 +154,16 @@ class SessionManager:
         return self._adapter.kind
 
     @property
+    def adapter(self) -> SessionKindAdapter:
+        """The kind adapter this manager was constructed with.
+
+        Exposed so callers (e.g. the HTTP route registrar) that already
+        hold a manager don't have to re-thread the adapter through every
+        construction layer.
+        """
+        return self._adapter
+
+    @property
     def count(self) -> int:
         with self._lock:
             return len(self._workstreams)
