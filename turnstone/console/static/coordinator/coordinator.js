@@ -1585,7 +1585,28 @@
             content,
             false,
           );
+        } else if (role === "assistant" || role === "reasoning") {
+          // Run assistant + reasoning content through the markdown
+          // pipeline (renderMarkdown + post-render hljs / mermaid / KaTeX)
+          // so a reconnect / page-reload renders the same way a live
+          // stream does.  appendText would only escape and dump the raw
+          // text — markdown tables, code fences, math, and links would
+          // all render as literal characters.
+          const el = appendMsg(role, "", { label: role });
+          const body = el.querySelector(".msg-body");
+          if (body && typeof streamingRenderFinalize === "function") {
+            try {
+              streamingRenderFinalize(body, content);
+            } catch (e) {
+              console.warn("coordinator history render failed", e);
+              body.textContent = content;
+            }
+          } else if (body) {
+            body.textContent = content;
+          }
         } else {
+          // user / system / other roles render as plain text — they're
+          // typed verbatim and don't carry markdown structure.
           appendText(role, content, { label: role });
         }
       });
