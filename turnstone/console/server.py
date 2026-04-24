@@ -54,6 +54,11 @@ from turnstone.core.auth import (
     require_permission,
 )
 from turnstone.core.rendezvous import NoAvailableNodeError
+from turnstone.core.session_routes import (
+    SessionRouteConfig,
+    SessionRouteHandlers,
+    register_session_routes,
+)
 from turnstone.core.skill_kind import SkillKind
 from turnstone.core.web_helpers import (
     read_json_or_400,
@@ -10139,12 +10144,41 @@ def create_app(
     _openapi_handler = make_openapi_handler(_spec)
     _docs_handler = make_docs_handler()
 
+    # Coord verbs mounted under the unified ``/api/workstreams/`` shape
+    # via the shared registrar. The legacy ``/api/coordinator/...`` routes
+    # below stay live during the Step 0.2 transition; Step 0.4 deletes
+    # them once the frontend (Step 0.6) and tests (Step 0.7) move off.
+    # ``mgr`` / ``adapter`` are built in the lifespan (after this app
+    # construction), so handlers continue to look them up via
+    # ``request.app.state.coord_mgr`` for now — they only become
+    # registrar-arguments in the body-convergence follow-on.
+    coord_workstream_routes: list[Any] = []
+    register_session_routes(
+        coord_workstream_routes,
+        prefix="/api/workstreams",
+        config=SessionRouteConfig(),
+        handlers=SessionRouteHandlers(
+            list_workstreams=coordinator_list,
+            list_saved=coordinator_saved,
+            create=coordinator_create,
+            detail=coordinator_detail,
+            open=coordinator_open,
+            close=coordinator_close,
+            send=coordinator_send,
+            approve=coordinator_approve,
+            cancel=coordinator_cancel,
+            events=coordinator_events,
+            history=coordinator_history,
+        ),
+    )
+
     app = Starlette(
         routes=[
             Route("/", index),
             Mount(
                 "/v1",
                 routes=[
+                    *coord_workstream_routes,
                     Route("/api/cluster/overview", cluster_overview),
                     Route("/api/cluster/nodes", cluster_nodes),
                     Route("/api/cluster/workstreams", cluster_workstreams),

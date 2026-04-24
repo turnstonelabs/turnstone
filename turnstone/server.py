@@ -4434,10 +4434,7 @@ def create_app(
         prefix="/api/workstreams",
         mgr=workstreams,
         adapter=adapter,
-        config=SessionRouteConfig(
-            supports_attachments=True,
-            supports_legacy_close=True,
-        ),
+        config=SessionRouteConfig(supports_legacy_close=True),
         handlers=SessionRouteHandlers(
             list_workstreams=list_workstreams,
             list_saved=list_saved_workstreams,
