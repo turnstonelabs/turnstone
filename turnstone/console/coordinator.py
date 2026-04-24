@@ -360,11 +360,17 @@ class CoordinatorManager:
                 row = self._storage.get_workstream(ws_id)
                 if row is None or row.get("kind") != WorkstreamKind.COORDINATOR:
                     return None
-                # close()/delete() only soft-mark the row — refuse to
-                # resurrect those sessions on any subsequent GET, or the
-                # Close button becomes silently reversible on URL revisit
-                # and burns max_active capacity.
-                if row.get("state") in {"closed", "deleted"}:
+                # ``deleted`` is a tombstone — the row is on its way out
+                # and must never resurrect.  ``closed`` used to be in the
+                # same bucket (so a stray URL revisit couldn't silently
+                # reverse a Close), but the Saved Coordinators landing UI
+                # makes restore an explicit user action: clicking a saved
+                # card calls POST /open and the user is consenting to
+                # reload.  ``_reserve_and_install_locked`` still enforces
+                # ``max_active`` (evicting an idle peer or 429-ing) so the
+                # safety the old guard provided now lives in the slot
+                # accounting, not in a flat-refusal.
+                if row.get("state") == "deleted":
                     return None
                 row_owner = row.get("user_id") or ""
                 # Strict equality (not short-circuit on empty row_owner)
@@ -437,6 +443,23 @@ class CoordinatorManager:
                             ws_id[:8],
                             exc_info=True,
                         )
+
+                # No DB state-flip on resurrect.  The in-memory session
+                # is now IDLE; the DB row may still say 'closed' from the
+                # last close().  We deliberately don't write 'idle' here
+                # because:
+                #   (a) it would race a concurrent close() (which writes
+                #       'closed' under self._lock without acquiring this
+                #       per-ws open_lock) and could overwrite the
+                #       authoritative close;
+                #   (b) the next set_state() call (any state transition
+                #       — running, attention, idle-after-running) syncs
+                #       the DB naturally;
+                #   (c) the saved-coordinators list filters by state +
+                #       excludes coordinators currently loaded into
+                #       coord_mgr, so the stale 'closed' state on disk
+                #       doesn't make a still-loaded coordinator appear
+                #       as a saved card.
                 # Rehydration: fan out a console-pseudo-node
                 # ``ws_created`` so a tab that opens a persisted-but-
                 # unloaded coordinator sees it live on every other

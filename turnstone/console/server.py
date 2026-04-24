@@ -2834,6 +2834,93 @@ async def coordinator_list(request: Request) -> JSONResponse:
     )
 
 
+async def coordinator_saved(request: Request) -> JSONResponse:
+    """GET /v1/api/coordinator/saved — list saved (closed-but-persisted) coordinator
+    sessions for the caller.
+
+    Mirrors :func:`turnstone.server.list_saved_workstreams` for the
+    coordinator surface so the frontend can render a "saved coordinators"
+    card grid identically to the interactive "saved workstreams" sidebar.
+    Same response item shape, same tenant/admin scoping.
+
+    Returns ONLY rows with ``state='closed'`` — explicitly closed
+    coordinators that the user can re-open via the saved card.  Active /
+    in-flight rows live in the active list above; deleted rows are
+    tombstones that ``_open_impl`` refuses to resurrect.
+
+    Also filters out coordinators currently loaded into ``coord_mgr``
+    (defence-in-depth: a coordinator could be 'closed' on disk but
+    still in the warm pool right after a restart of the close-emit
+    sequence races the in-memory pop).
+    """
+    from turnstone.core.memory import list_workstreams_with_history
+    from turnstone.core.workstream import WorkstreamKind
+
+    err = _require_admin_coordinator(request)
+    if err is not None:
+        return err
+
+    if _is_admin(request):
+        user_filter: str | None = None
+    else:
+        caller_uid = _auth_user_id(request)
+        if not caller_uid:
+            # Blank sub on a non-service / non-admin token — fail closed
+            # rather than match every orphan / migration row with empty
+            # user_id.  Mirrors list_saved_workstreams.
+            return JSONResponse({"coordinators": []})
+        user_filter = caller_uid
+
+    # Offload the blocking storage call + the lock-acquiring list_all
+    # off the event loop, matching coordinator_create's pattern (#perf-2
+    # from the saved-coordinators review).  list_workstreams_with_history
+    # runs a correlated COUNT subquery; coord_mgr.list_all() takes the
+    # manager lock.  Either can stall every other async handler if run
+    # inline.
+    rows = await asyncio.to_thread(
+        list_workstreams_with_history,
+        limit=50,
+        kind=WorkstreamKind.COORDINATOR,
+        user_id=user_filter,
+        state="closed",
+    )
+
+    coord_mgr = getattr(request.app.state, "coord_mgr", None)
+    loaded: set[str] = set()
+    if coord_mgr is not None:
+        try:
+            loaded = await asyncio.to_thread(
+                lambda: {ws.id for ws in coord_mgr.list_all()},
+            )
+        except Exception:
+            log.debug("coordinator_saved.list_all_failed", exc_info=True)
+
+    # Column order from list_workstreams_with_history is
+    # (ws_id, alias, title, name, created, updated, count, node_id) — see
+    # the SELECT in turnstone/core/storage/_sqlite.py:list_workstreams_with_history.
+    # ``*_extra`` swallows the trailing node_id (and any future columns
+    # appended at the tail); keep this comment in sync if the SELECT
+    # changes the prefix order.
+    result = [
+        {
+            "ws_id": wid,
+            "alias": alias,
+            "title": title,
+            "name": name,
+            "created": created,
+            "updated": updated,
+            "message_count": count,
+        }
+        for wid, alias, title, name, created, updated, count, *_extra in rows
+        if wid not in loaded
+    ]
+    # Key is ``coordinators`` (not ``workstreams``) for consistency with
+    # the sibling coordinator_list endpoint.  Item shape matches the
+    # interactive saved-workstreams response so the frontend card renderer
+    # stays a 1:1 mirror.
+    return JSONResponse({"coordinators": result})
+
+
 async def coordinator_page(request: Request) -> Response:
     """GET /coordinator/{ws_id} — serve the one-pane coordinator HTML.
 
@@ -10393,6 +10480,13 @@ def create_app(
                         methods=["POST"],
                     ),
                     Route("/api/coordinator", coordinator_list, methods=["GET"]),
+                    # Literal path BEFORE the /{ws_id} routes below so
+                    # Starlette doesn't match "saved" as a ws_id.
+                    Route(
+                        "/api/coordinator/saved",
+                        coordinator_saved,
+                        methods=["GET"],
+                    ),
                     Route(
                         "/api/coordinator/{ws_id}/send",
                         coordinator_send,

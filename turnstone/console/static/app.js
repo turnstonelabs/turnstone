@@ -20,6 +20,9 @@ window.onLoginSuccess = function () {
   // (#9) — no poller to restart after login.  The home-view renderer
   // reads from clusterState.nodes["console"].workstreams on every SSE
   // patch, so authenticating just unblocks the normal event stream.
+  if (typeof loadSavedCoordinators === "function") {
+    loadSavedCoordinators();
+  }
 };
 window.onLogout = function () {
   if (evtSource) {
@@ -141,12 +144,30 @@ function patchClusterState(data) {
       });
     }
   } else if (t === "ws_closed") {
+    // Peek BEFORE the filter so we can tell whether the closed ws was a
+    // coordinator (lives on the console pseudo-node, kind="coordinator")
+    // and only then refetch the saved list.  ws_closed payloads from
+    // real-node interactive closes don't carry kind on the wire, but
+    // they're already typed in clusterState from the matching ws_created
+    // event.  Skipping interactive closes avoids per-close fan-out into
+    // /v1/api/coordinator/saved on busy clusters.
+    var wasCoordinator = false;
+    Object.keys(clusterState.nodes).forEach(function (nid) {
+      (clusterState.nodes[nid].workstreams || []).forEach(function (ws) {
+        if (ws.id === data.ws_id && ws.kind === "coordinator") {
+          wasCoordinator = true;
+        }
+      });
+    });
     Object.keys(clusterState.nodes).forEach(function (nid) {
       var n = clusterState.nodes[nid];
       n.workstreams = (n.workstreams || []).filter(function (ws) {
         return ws.id !== data.ws_id;
       });
     });
+    if (wasCoordinator && typeof loadSavedCoordinators === "function") {
+      loadSavedCoordinators();
+    }
   } else if (t === "ws_rename") {
     Object.keys(clusterState.nodes).forEach(function (nid) {
       (clusterState.nodes[nid].workstreams || []).forEach(function (ws) {
@@ -2199,6 +2220,114 @@ function _renderHomeView() {
   if (line) line.textContent = summaryText;
 }
 
+// ---------------------------------------------------------------------------
+// Saved coordinators — closed sessions persisted on disk.  Mirrors the
+// interactive UI's "Saved Workstreams" card grid (same /shared/cards.css
+// primitives, same /shared/cards.js renderSessionCard helper, same
+// response item shape from /v1/api/coordinator/saved).  Click a card →
+// POST /open then /coordinator/{ws_id}; coordinator_detail lazily
+// rehydrates from storage on the GET miss.
+// ---------------------------------------------------------------------------
+
+// In-flight de-dup for loadSavedCoordinators.  ws_closed events can
+// arrive in bursts on a busy cluster; without this guard each one
+// triggers a parallel fetch.  Single boolean is enough because the
+// renderer reads from the latest response — a coalesced re-fetch right
+// after the in-flight one resolves catches any state change.
+var _savedCoordsInFlight = false;
+var _savedCoordsRetry = false;
+
+function loadSavedCoordinators() {
+  if (!_hasCoordPermission()) return;
+  if (_savedCoordsInFlight) {
+    _savedCoordsRetry = true;
+    return;
+  }
+  _savedCoordsInFlight = true;
+  authFetch("/v1/api/coordinator/saved")
+    .then(function (r) {
+      return r.ok ? r.json() : { coordinators: [] };
+    })
+    .then(function (data) {
+      renderSavedCoordinators(data.coordinators || []);
+    })
+    .catch(function () {
+      /* silent — saved list is informational, not load-bearing */
+    })
+    .finally(function () {
+      _savedCoordsInFlight = false;
+      // If at least one call arrived while we were in flight, fire one
+      // catch-up fetch (not N) so the UI reflects the latest state
+      // without a per-event fan-out.
+      if (_savedCoordsRetry) {
+        _savedCoordsRetry = false;
+        loadSavedCoordinators();
+      }
+    });
+}
+
+function renderSavedCoordinators(items) {
+  var section = document.getElementById("saved-coordinators");
+  var cards = document.getElementById("saved-coord-cards");
+  var countEl = document.getElementById("saved-coord-count");
+  if (!section || !cards) return;
+  if (!items.length) {
+    section.style.display = "none";
+    cards.replaceChildren();
+    if (countEl) countEl.textContent = "";
+    return;
+  }
+  section.style.display = "";
+  if (countEl) countEl.textContent = "(" + items.length + ")";
+  cards.replaceChildren();
+  items.forEach(function (sess) {
+    var card = renderSessionCard(sess, {
+      ariaLabel: function (s) {
+        return (
+          "Resume coordinator: " + (s.alias || s.title || s.name || s.ws_id)
+        );
+      },
+      onActivate: function (s, cardEl) {
+        // POST /open BEFORE navigating so capacity issues surface as a
+        // toast instead of a broken-looking detail page.  The /open
+        // endpoint calls the same lazy-rehydrate path the GET would,
+        // but we get the status code synchronously so the user learns
+        // "all slots in use" instead of staring at a 404.
+        cardEl.classList.add("is-busy");
+        authFetch(
+          "/v1/api/coordinator/" + encodeURIComponent(s.ws_id) + "/open",
+          { method: "POST" },
+        )
+          .then(function (r) {
+            if (r.ok) {
+              window.location.href =
+                "/coordinator/" + encodeURIComponent(s.ws_id);
+              return;
+            }
+            cardEl.classList.remove("is-busy");
+            if (r.status === 429) {
+              showToast(
+                "All coordinator slots are active — close one first to restore this session",
+              );
+            } else if (r.status === 404) {
+              showToast("Coordinator no longer available");
+              loadSavedCoordinators();
+            } else if (r.status === 503) {
+              showToast("Coordinator subsystem not configured");
+            } else {
+              showToast("Failed to restore coordinator (" + r.status + ")");
+            }
+          })
+          .catch(function () {
+            cardEl.classList.remove("is-busy");
+            showToast("Failed to restore coordinator");
+          });
+      },
+    });
+    cards.appendChild(card);
+  });
+}
+
 // --- Init ---
 // SSE connects after auth is confirmed — either via onLoginSuccess after
 // login, or after the first successful data load (page refresh with valid cookie).
@@ -2217,10 +2346,28 @@ initLogin();
 // coordinator ws_created / ws_closed / cluster_state events.
 loadOverview();
 _ensureHomeComposerInit();
-// Refresh the coord button visibility after initial whoami lands in
-// sessionStorage (auth.js populates it asynchronously).  A short delay
-// is good enough — the shared pattern for permission-gated UI.
-setTimeout(_refreshHomeComposerVisibility, 500);
+// Refresh the coord button visibility once auth.js has populated
+// sessionStorage from the initial whoami.  window.permissionsReady
+// resolves after that completes (success or failure); fall back to a
+// short timeout if the promise isn't available (older auth.js).
+//
+// NOTE: permissionsReady is one-shot — it fires exactly once per page
+// load (see auth.js).  Subsequent re-logins are caught by the
+// onLoginSuccess hook above which calls loadSavedCoordinators() again.
+if (
+  window.permissionsReady &&
+  typeof window.permissionsReady.then === "function"
+) {
+  window.permissionsReady.then(function () {
+    _refreshHomeComposerVisibility();
+    loadSavedCoordinators();
+  });
+} else {
+  setTimeout(function () {
+    _refreshHomeComposerVisibility();
+    loadSavedCoordinators();
+  }, 500);
+}
 
 // --- Node Metadata Panel (read-only in node detail view) ---
 function _loadNodeMetadataPanel(nodeId) {

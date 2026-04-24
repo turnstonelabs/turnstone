@@ -1,248 +1,566 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en" data-design="v1">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>turnstone</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<!-- DS typography.css @imports Inter + JetBrains Mono from Google Fonts;
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>turnstone</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <!-- DS typography.css @imports Inter + JetBrains Mono from Google Fonts;
      no separate font link for legacy Outfit/IBM Plex Mono (those were
      removed to avoid loading two font stacks under data-design="v1"). -->
-<link rel="stylesheet" href="/shared/base.css">
-<link rel="stylesheet" href="/shared/ui-base.css">
-<link rel="stylesheet" href="/shared/chat.css">
-<link rel="stylesheet" href="/shared/katex-0.16.45/katex.min.css">
-<!-- Design system v1 — opt-in via data-design="v1" on <html>. Tokens
+    <link rel="stylesheet" href="/shared/base.css" />
+    <link rel="stylesheet" href="/shared/ui-base.css" />
+    <link rel="stylesheet" href="/shared/chat.css" />
+    <link rel="stylesheet" href="/shared/cards.css" />
+    <link rel="stylesheet" href="/shared/katex-0.16.45/katex.min.css" />
+    <!-- Design system v1 — opt-in via data-design="v1" on <html>. Tokens
      + primitives scope under the attribute selector so legacy styles
      below continue to own anything not yet migrated. -->
-<link rel="stylesheet" href="/shared/design/tokens.css">
-<link rel="stylesheet" href="/shared/design/typography.css">
-<link rel="stylesheet" href="/shared/design/chrome/appbar.css">
-<link rel="stylesheet" href="/shared/design/primitives/panel.css">
-<link rel="stylesheet" href="/shared/design/primitives/buttons.css">
-<link rel="stylesheet" href="/shared/design/primitives/pills.css">
-<link rel="stylesheet" href="/shared/design/primitives/message.css">
-<link rel="stylesheet" href="/shared/design/primitives/field.css">
-<link rel="stylesheet" href="/static/style.css">
-</head>
-<body>
-<div id="header" class="ts-header appbar">
-  <h1 class="appbar-title">turnstone</h1>
-  <span id="mcp-status" class="appbar-status" role="status" aria-live="polite"></span>
-  <span id="health-indicator" class="health-ok appbar-status" role="status" aria-live="polite" aria-atomic="true"></span>
-  <span class="header-spacer appbar-spacer"></span>
-  <span class="appbar-actions">
-    <button id="theme-toggle" class="header-btn btn" onclick="toggleTheme()" aria-label="Toggle light/dark theme" title="Switch to light theme">&#9790;</button>
-  </span>
-</div>
-
-<div id="tab-bar" role="toolbar" aria-label="Workstreams">
-  <div id="tab-list" role="tablist"></div>
-  <button id="new-tab-btn" onclick="newWorkstream()" title="New workstream (Ctrl+T)" aria-label="New workstream" aria-keyshortcuts="Control+t">+</button>
-  <button id="split-btn" onclick="splitFocusedPane()" title="Split pane (Ctrl+\)" aria-label="Split pane" aria-keyshortcuts="Control+Backslash">&#x29C9;</button>
-</div>
-
-<div id="dashboard" class="dashboard-overlay" role="dialog" aria-modal="true" aria-label="Dashboard">
-  <div class="dashboard-content">
-    <div class="dashboard-composer" id="dashboard-composer">
-      <textarea id="dashboard-input" class="dashboard-input" rows="3"
-                placeholder="What are you working on?"
-                aria-label="Start a new conversation"></textarea>
-      <div class="dashboard-composer-row">
-        <div class="dashboard-composer-actions">
-          <button id="dashboard-attach-btn" class="dashboard-icon-btn" type="button"
-                  title="Attach files" aria-label="Attach files">
-            <span aria-hidden="true">&#128206;</span>
-          </button>
-          <input id="dashboard-attach-input" type="file" multiple style="display:none"
-                 accept="image/png,image/jpeg,image/gif,image/webp,text/*,.md,.txt,.json,.yaml,.yml,.toml,.xml,.html,.css,.js,.jsx,.ts,.tsx,.py,.go,.rs,.java,.c,.cpp,.h,.hpp,.sh,.sql,.ini,.conf">
-          <button id="dashboard-options-btn" class="dashboard-icon-btn dashboard-options-btn" type="button"
-                  title="Options" aria-label="Toggle options" aria-expanded="false"
-                  aria-controls="dashboard-options">
-            Options <span aria-hidden="true" class="dashboard-options-caret">&#9662;</span>
-          </button>
-          <span id="dashboard-options-summary" class="dashboard-options-summary" aria-live="polite" hidden></span>
-        </div>
-        <button id="dashboard-submit-btn" class="dashboard-new-btn" type="button"
-                onclick="dashboardSubmit()" aria-label="Create workstream">Create</button>
-      </div>
-      <div id="dashboard-error" class="dashboard-error" role="status" aria-live="polite"></div>
-      <div id="dashboard-attach-chips" role="list" aria-label="Pending attachments" aria-live="polite"></div>
-      <div id="dashboard-options" class="dashboard-options"
-           role="region" aria-labelledby="dashboard-options-btn" hidden>
-        <label for="dashboard-model">Model</label>
-        <select id="dashboard-model"><option value="">Default model</option></select>
-        <label for="dashboard-judge-model">Judge Model</label>
-        <select id="dashboard-judge-model"><option value="">Default (agent model)</option></select>
-        <label for="dashboard-skill">Skill</label>
-        <select id="dashboard-skill"><option value="">Use defaults</option></select>
-      </div>
+    <link rel="stylesheet" href="/shared/design/tokens.css" />
+    <link rel="stylesheet" href="/shared/design/typography.css" />
+    <link rel="stylesheet" href="/shared/design/chrome/appbar.css" />
+    <link rel="stylesheet" href="/shared/design/primitives/panel.css" />
+    <link rel="stylesheet" href="/shared/design/primitives/buttons.css" />
+    <link rel="stylesheet" href="/shared/design/primitives/pills.css" />
+    <link rel="stylesheet" href="/shared/design/primitives/message.css" />
+    <link rel="stylesheet" href="/shared/design/primitives/field.css" />
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <div id="header" class="ts-header appbar">
+      <h1 class="appbar-title">turnstone</h1>
+      <span
+        id="mcp-status"
+        class="appbar-status"
+        role="status"
+        aria-live="polite"
+      ></span>
+      <span
+        id="health-indicator"
+        class="health-ok appbar-status"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      ></span>
+      <span class="header-spacer appbar-spacer"></span>
+      <span class="appbar-actions">
+        <button
+          id="theme-toggle"
+          class="header-btn btn"
+          onclick="toggleTheme()"
+          aria-label="Toggle light/dark theme"
+          title="Switch to light theme"
+        >
+          &#9790;
+        </button>
+      </span>
     </div>
-    <div class="dash-header">
-      <span class="dash-header-title">WORKSTREAMS</span>
-      <span class="dash-header-summary" id="dash-summary"></span>
-    </div>
-    <div class="dash-colheaders" aria-hidden="true">
-      <span class="dash-col dash-col-state">STATE</span>
-      <span class="dash-col dash-col-name">NAME</span>
-      <span class="dash-col dash-col-model">MODEL</span>
-      <span class="dash-col dash-col-node">NODE</span>
-      <span class="dash-col dash-col-task">TASK</span>
-      <span class="dash-col dash-col-tokens">TOKENS</span>
-      <span class="dash-col dash-col-ctx">CTX</span>
-    </div>
-    <div class="dash-table" id="dash-ws-table" role="group" aria-label="Workstreams"></div>
-    <div class="dash-footer" id="dash-footer">
-      <span class="dash-footer-nodes" id="dash-footer-nodes"></span>
-      <span class="dash-footer-stats" id="dash-footer-stats"></span>
-    </div>
-    <section class="dashboard-section" id="dashboard-saved-ws" aria-label="Saved workstreams">
-      <div class="dashboard-section-header">
-        <h2 class="dashboard-section-title">Saved Workstreams</h2>
-        <button id="ws-delete-btn" class="ws-delete-btn" onclick="startWsDeleteMode()" title="Delete workstreams"><span aria-hidden="true">&#x1f5d1;</span> Delete</button>
-      </div>
-      <div class="dashboard-cards" id="dashboard-saved-cards"></div>
-      <div id="ws-delete-bar" class="ws-delete-bar">
-        <span class="ws-delete-count-label" id="ws-delete-bar-count" role="status" aria-live="polite" aria-atomic="true">0 selected</span>
-        <button class="ws-delete-cancel-btn" onclick="cancelWsDeleteMode()">Cancel</button>
-        <button class="ws-delete-selectall-btn" id="ws-delete-bar-select-all" onclick="toggleSelectAll()">Select All</button>
-        <button class="ws-delete-bar-btn" id="ws-delete-bar-delete" onclick="confirmWsDeleteSelection()" disabled>Delete Selected</button>
-      </div>
-    </section>
-  </div>
-</div>
 
-<div id="split-root"></div>
-
-<!-- New workstream modal -->
-<div id="new-ws-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="new-ws-title">
-  <div id="new-ws-box">
-    <h3 id="new-ws-title">New Workstream</h3>
-    <div id="new-ws-error" role="alert" aria-live="assertive"></div>
-    <label for="new-ws-name">Name <span class="nws-hint">optional</span></label>
-    <input id="new-ws-name" type="text" placeholder="Auto-generated if empty" autocomplete="off">
-    <label for="new-ws-model">Model <span class="nws-hint">optional</span></label>
-    <select id="new-ws-model"><option value="">Default model</option></select>
-    <label for="new-ws-judge-model">Judge Model <span class="nws-hint">optional</span></label>
-    <select id="new-ws-judge-model"><option value="">Default (agent model)</option></select>
-    <label for="new-ws-skill">Skill <span class="nws-hint">optional</span></label>
-    <select id="new-ws-skill"><option value="">Use defaults</option></select>
-    <label for="new-ws-initial-message">First message <span class="nws-hint">optional</span></label>
-    <textarea id="new-ws-initial-message" rows="3" placeholder="Sent as the first turn after the workstream is created"></textarea>
-    <div id="new-ws-attach-row">
-      <button id="new-ws-attach-btn" type="button" title="Attach files to the first turn" aria-label="Attach files">
-        <span aria-hidden="true">&#128206;</span> Attach
+    <div id="tab-bar" role="toolbar" aria-label="Workstreams">
+      <div id="tab-list" role="tablist"></div>
+      <button
+        id="new-tab-btn"
+        onclick="newWorkstream()"
+        title="New workstream (Ctrl+T)"
+        aria-label="New workstream"
+        aria-keyshortcuts="Control+t"
+      >
+        +
       </button>
-      <input id="new-ws-attach-input" type="file" multiple style="display:none" accept="image/png,image/jpeg,image/gif,image/webp,text/*,.md,.txt,.json,.yaml,.yml,.toml,.xml,.html,.css,.js,.jsx,.ts,.tsx,.py,.go,.rs,.java,.c,.cpp,.h,.hpp,.sh,.sql,.ini,.conf">
-      <div id="new-ws-attach-chips" role="list" aria-label="Pending attachments"></div>
+      <button
+        id="split-btn"
+        onclick="splitFocusedPane()"
+        title="Split pane (Ctrl+\)"
+        aria-label="Split pane"
+        aria-keyshortcuts="Control+Backslash"
+      >
+        &#x29C9;
+      </button>
     </div>
-    <div id="new-ws-buttons">
-      <button id="new-ws-cancel" type="button">Cancel</button>
-      <button id="new-ws-submit" type="button">Create</button>
-    </div>
-  </div>
-</div>
 
-<!-- Edit title modal -->
-<div id="edit-title-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="edit-title-heading">
-  <div id="edit-title-box">
-    <h3 id="edit-title-heading">Edit Title</h3>
-    <input id="edit-title-input" type="text" maxlength="80" placeholder="Enter title..." onkeydown="if(event.key==='Enter')submitEditTitle();if(event.key==='Escape')cancelEditTitle();">
-    <div id="edit-title-buttons">
-      <button type="button" onclick="cancelEditTitle()">Cancel</button>
-      <button type="button" onclick="submitEditTitle()">Save</button>
+    <div
+      id="dashboard"
+      class="dashboard-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Dashboard"
+    >
+      <div class="dashboard-content">
+        <div class="dashboard-composer" id="dashboard-composer">
+          <textarea
+            id="dashboard-input"
+            class="dashboard-input"
+            rows="3"
+            placeholder="What are you working on?"
+            aria-label="Start a new conversation"
+          ></textarea>
+          <div class="dashboard-composer-row">
+            <div class="dashboard-composer-actions">
+              <button
+                id="dashboard-attach-btn"
+                class="dashboard-icon-btn"
+                type="button"
+                title="Attach files"
+                aria-label="Attach files"
+              >
+                <span aria-hidden="true">&#128206;</span>
+              </button>
+              <input
+                id="dashboard-attach-input"
+                type="file"
+                multiple
+                style="display: none"
+                accept="image/png,image/jpeg,image/gif,image/webp,text/*,.md,.txt,.json,.yaml,.yml,.toml,.xml,.html,.css,.js,.jsx,.ts,.tsx,.py,.go,.rs,.java,.c,.cpp,.h,.hpp,.sh,.sql,.ini,.conf"
+              />
+              <button
+                id="dashboard-options-btn"
+                class="dashboard-icon-btn dashboard-options-btn"
+                type="button"
+                title="Options"
+                aria-label="Toggle options"
+                aria-expanded="false"
+                aria-controls="dashboard-options"
+              >
+                Options
+                <span aria-hidden="true" class="dashboard-options-caret"
+                  >&#9662;</span
+                >
+              </button>
+              <span
+                id="dashboard-options-summary"
+                class="dashboard-options-summary"
+                aria-live="polite"
+                hidden
+              ></span>
+            </div>
+            <button
+              id="dashboard-submit-btn"
+              class="dashboard-new-btn"
+              type="button"
+              onclick="dashboardSubmit()"
+              aria-label="Create workstream"
+            >
+              Create
+            </button>
+          </div>
+          <div
+            id="dashboard-error"
+            class="dashboard-error"
+            role="status"
+            aria-live="polite"
+          ></div>
+          <div
+            id="dashboard-attach-chips"
+            role="list"
+            aria-label="Pending attachments"
+            aria-live="polite"
+          ></div>
+          <div
+            id="dashboard-options"
+            class="dashboard-options"
+            role="region"
+            aria-labelledby="dashboard-options-btn"
+            hidden
+          >
+            <label for="dashboard-model">Model</label>
+            <select id="dashboard-model">
+              <option value="">Default model</option>
+            </select>
+            <label for="dashboard-judge-model">Judge Model</label>
+            <select id="dashboard-judge-model">
+              <option value="">Default (agent model)</option>
+            </select>
+            <label for="dashboard-skill">Skill</label>
+            <select id="dashboard-skill">
+              <option value="">Use defaults</option>
+            </select>
+          </div>
+        </div>
+        <div class="dash-header">
+          <span class="dash-header-title">WORKSTREAMS</span>
+          <span class="dash-header-summary" id="dash-summary"></span>
+        </div>
+        <div class="dash-colheaders" aria-hidden="true">
+          <span class="dash-col dash-col-state">STATE</span>
+          <span class="dash-col dash-col-name">NAME</span>
+          <span class="dash-col dash-col-model">MODEL</span>
+          <span class="dash-col dash-col-node">NODE</span>
+          <span class="dash-col dash-col-task">TASK</span>
+          <span class="dash-col dash-col-tokens">TOKENS</span>
+          <span class="dash-col dash-col-ctx">CTX</span>
+        </div>
+        <div
+          class="dash-table"
+          id="dash-ws-table"
+          role="group"
+          aria-label="Workstreams"
+        ></div>
+        <div class="dash-footer" id="dash-footer">
+          <span class="dash-footer-nodes" id="dash-footer-nodes"></span>
+          <span class="dash-footer-stats" id="dash-footer-stats"></span>
+        </div>
+        <section
+          class="dashboard-section"
+          id="dashboard-saved-ws"
+          aria-label="Saved workstreams"
+        >
+          <div class="dashboard-section-header">
+            <h2 class="dashboard-section-title">Saved Workstreams</h2>
+            <button
+              id="ws-delete-btn"
+              class="ws-delete-btn"
+              onclick="startWsDeleteMode()"
+              title="Delete workstreams"
+            >
+              <span aria-hidden="true">&#x1f5d1;</span> Delete
+            </button>
+          </div>
+          <div class="dashboard-cards" id="dashboard-saved-cards"></div>
+          <div id="ws-delete-bar" class="ws-delete-bar">
+            <span
+              class="ws-delete-count-label"
+              id="ws-delete-bar-count"
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+              >0 selected</span
+            >
+            <button class="ws-delete-cancel-btn" onclick="cancelWsDeleteMode()">
+              Cancel
+            </button>
+            <button
+              class="ws-delete-selectall-btn"
+              id="ws-delete-bar-select-all"
+              onclick="toggleSelectAll()"
+            >
+              Select All
+            </button>
+            <button
+              class="ws-delete-bar-btn"
+              id="ws-delete-bar-delete"
+              onclick="confirmWsDeleteSelection()"
+              disabled
+            >
+              Delete Selected
+            </button>
+          </div>
+        </section>
+      </div>
     </div>
-  </div>
-</div>
 
-<!-- Delete workstream confirmation modal -->
-<div id="delete-ws-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="delete-ws-heading">
-  <div id="delete-ws-box">
-    <h3 id="delete-ws-heading">Delete Workstream</h3>
-    <p id="delete-ws-message"></p>
-    <div id="delete-ws-buttons">
-      <button type="button" onclick="cancelDeleteWs()">Cancel</button>
-      <button type="button" class="danger" onclick="executeDeleteWs()">Delete</button>
+    <div id="split-root"></div>
+
+    <!-- New workstream modal -->
+    <div
+      id="new-ws-overlay"
+      style="display: none"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="new-ws-title"
+    >
+      <div id="new-ws-box">
+        <h3 id="new-ws-title">New Workstream</h3>
+        <div id="new-ws-error" role="alert" aria-live="assertive"></div>
+        <label for="new-ws-name"
+          >Name <span class="nws-hint">optional</span></label
+        >
+        <input
+          id="new-ws-name"
+          type="text"
+          placeholder="Auto-generated if empty"
+          autocomplete="off"
+        />
+        <label for="new-ws-model"
+          >Model <span class="nws-hint">optional</span></label
+        >
+        <select id="new-ws-model">
+          <option value="">Default model</option>
+        </select>
+        <label for="new-ws-judge-model"
+          >Judge Model <span class="nws-hint">optional</span></label
+        >
+        <select id="new-ws-judge-model">
+          <option value="">Default (agent model)</option>
+        </select>
+        <label for="new-ws-skill"
+          >Skill <span class="nws-hint">optional</span></label
+        >
+        <select id="new-ws-skill">
+          <option value="">Use defaults</option>
+        </select>
+        <label for="new-ws-initial-message"
+          >First message <span class="nws-hint">optional</span></label
+        >
+        <textarea
+          id="new-ws-initial-message"
+          rows="3"
+          placeholder="Sent as the first turn after the workstream is created"
+        ></textarea>
+        <div id="new-ws-attach-row">
+          <button
+            id="new-ws-attach-btn"
+            type="button"
+            title="Attach files to the first turn"
+            aria-label="Attach files"
+          >
+            <span aria-hidden="true">&#128206;</span> Attach
+          </button>
+          <input
+            id="new-ws-attach-input"
+            type="file"
+            multiple
+            style="display: none"
+            accept="image/png,image/jpeg,image/gif,image/webp,text/*,.md,.txt,.json,.yaml,.yml,.toml,.xml,.html,.css,.js,.jsx,.ts,.tsx,.py,.go,.rs,.java,.c,.cpp,.h,.hpp,.sh,.sql,.ini,.conf"
+          />
+          <div
+            id="new-ws-attach-chips"
+            role="list"
+            aria-label="Pending attachments"
+          ></div>
+        </div>
+        <div id="new-ws-buttons">
+          <button id="new-ws-cancel" type="button">Cancel</button>
+          <button id="new-ws-submit" type="button">Create</button>
+        </div>
+      </div>
     </div>
-  </div>
-</div>
 
-<!-- Delete workstreams confirmation modal (batch) -->
-<div id="ws-delete-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="ws-delete-title">
-  <div id="ws-delete-box">
-    <h3 id="ws-delete-title">Delete Workstreams</h3>
-    <div id="ws-delete-error" role="alert" aria-live="assertive"></div>
-    <p id="ws-delete-count"></p>
-    <div id="ws-delete-list"></div>
-    <div id="ws-delete-buttons">
-      <button id="ws-delete-cancel-btn" type="button" onclick="cancelWsDelete()">Cancel</button>
-      <button id="ws-delete-confirm-btn" type="button" onclick="confirmWsDelete()">Delete</button>
+    <!-- Edit title modal -->
+    <div
+      id="edit-title-overlay"
+      style="display: none"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="edit-title-heading"
+    >
+      <div id="edit-title-box">
+        <h3 id="edit-title-heading">Edit Title</h3>
+        <input
+          id="edit-title-input"
+          type="text"
+          maxlength="80"
+          placeholder="Enter title..."
+          onkeydown="
+            if (event.key === 'Enter') submitEditTitle();
+            if (event.key === 'Escape') cancelEditTitle();
+          "
+        />
+        <div id="edit-title-buttons">
+          <button type="button" onclick="cancelEditTitle()">Cancel</button>
+          <button type="button" onclick="submitEditTitle()">Save</button>
+        </div>
+      </div>
     </div>
-  </div>
-</div>
 
-<!-- Plan review dialog -->
-<div id="plan-overlay">
-  <div id="plan-dialog" role="dialog" aria-modal="true" aria-labelledby="plan-dialog-title">
-    <h3 id="plan-dialog-title">Plan Review</h3>
-    <div id="plan-content"></div>
-    <input type="text" id="plan-feedback" placeholder="feedback (optional)" aria-label="Plan feedback">
-    <div id="plan-buttons">
-      <button id="btn-plan-reject"><span class="key">Esc</span> Reject</button>
-      <button id="btn-plan-approve" onclick="resolvePlan('')"><span class="key">&crarr;</span> Approve</button>
+    <!-- Delete workstream confirmation modal -->
+    <div
+      id="delete-ws-overlay"
+      style="display: none"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="delete-ws-heading"
+    >
+      <div id="delete-ws-box">
+        <h3 id="delete-ws-heading">Delete Workstream</h3>
+        <p id="delete-ws-message"></p>
+        <div id="delete-ws-buttons">
+          <button type="button" onclick="cancelDeleteWs()">Cancel</button>
+          <button type="button" class="danger" onclick="executeDeleteWs()">
+            Delete
+          </button>
+        </div>
+      </div>
     </div>
-  </div>
-</div>
 
-<div id="toast" role="status" aria-live="polite"></div>
-<script>
-window.TURNSTONE_AUTH_TITLE = "turnstone";
-window.TURNSTONE_KB_SHORTCUTS = [
-  { title: "Workstreams", keys: [
-    { desc: "Toggle dashboard", badge: '<span class="kb-key">Ctrl+D</span>' },
-    { desc: "New workstream", badge: '<span class="kb-key">Ctrl+T</span>' },
-    { desc: "Close workstream", badge: '<span class="kb-key">Ctrl+W</span>' },
-    { desc: "Switch to tab 1\u20139", badge: '<span class="kb-key">Ctrl+1</span>\u2026<span class="kb-key">9</span>' },
-    { desc: "Refresh title", badge: '<span class="kb-key">Ctrl+Shift+R</span>' },
-    { desc: "Edit title", badge: '<span class="kb-key">Ctrl+Shift+E</span>' },
-    { desc: "Fork workstream", badge: '<span class="kb-key">Ctrl+Shift+F</span>' },
-    { desc: "Delete workstream", badge: '<span class="kb-key">Ctrl+Shift+X</span>' }
-  ]},
-  { title: "Split panes", keys: [
-    { desc: "Split right", badge: '<span class="kb-key">Ctrl+\\</span>' },
-    { desc: "Split down", badge: '<span class="kb-key">Ctrl+Shift+\\</span>' },
-    { desc: "Close pane", badge: '<span class="kb-key">Ctrl+Shift+W</span>' },
-    { desc: "Cycle pane focus", badge: '<span class="kb-key">Ctrl+Alt+\u2190</span> <span class="kb-key">\u2192</span>' }
-  ]},
-  { title: "Tool approval", keys: [
-    { desc: "Approve", badge: '<span class="kb-key">y</span> / <span class="kb-key">Enter</span>' },
-    { desc: "Deny", badge: '<span class="kb-key">n</span> / <span class="kb-key">Esc</span>' },
-    { desc: "Always approve", badge: '<span class="kb-key">a</span>' }
-  ]},
-  { title: "Chat", keys: [
-    { desc: "Send message", badge: '<span class="kb-key">Enter</span>' },
-    { desc: "Stop generation", badge: '<span class="kb-key">Esc</span>' },
-    { desc: "New line", badge: '<span class="kb-key">Shift+Enter</span>' }
-  ]},
-  { title: "Navigation", keys: [
-    { desc: "Navigate table rows", badge: '<span class="kb-key">\u2191</span> <span class="kb-key">\u2193</span>' },
-    { desc: "Close dashboard", badge: '<span class="kb-key">Esc</span>' }
-  ]},
-  { title: "General", keys: [
-    { desc: "Show this help", badge: '<span class="kb-key">?</span>' }
-  ]}
-];
-</script>
-<script src="/shared/utils.js"></script>
-<script src="/shared/toast.js"></script>
-<script src="/shared/composer.js"></script>
-<script src="/shared/theme.js"></script>
-<script src="/shared/auth.js"></script>
-<script src="/shared/kb.js"></script>
-<script src="/shared/katex-0.16.45/katex.min.js"></script>
-<script src="/shared/hljs-11.11.1/highlight.min.js"></script>
-<script src="/shared/renderer.js"></script>
-<script src="/static/app.js"></script>
-</body>
+    <!-- Delete workstreams confirmation modal (batch) -->
+    <div
+      id="ws-delete-overlay"
+      style="display: none"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="ws-delete-title"
+    >
+      <div id="ws-delete-box">
+        <h3 id="ws-delete-title">Delete Workstreams</h3>
+        <div id="ws-delete-error" role="alert" aria-live="assertive"></div>
+        <p id="ws-delete-count"></p>
+        <div id="ws-delete-list"></div>
+        <div id="ws-delete-buttons">
+          <button
+            id="ws-delete-cancel-btn"
+            type="button"
+            onclick="cancelWsDelete()"
+          >
+            Cancel
+          </button>
+          <button
+            id="ws-delete-confirm-btn"
+            type="button"
+            onclick="confirmWsDelete()"
+          >
+            Delete
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Plan review dialog -->
+    <div id="plan-overlay">
+      <div
+        id="plan-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="plan-dialog-title"
+      >
+        <h3 id="plan-dialog-title">Plan Review</h3>
+        <div id="plan-content"></div>
+        <input
+          type="text"
+          id="plan-feedback"
+          placeholder="feedback (optional)"
+          aria-label="Plan feedback"
+        />
+        <div id="plan-buttons">
+          <button id="btn-plan-reject">
+            <span class="key">Esc</span> Reject
+          </button>
+          <button id="btn-plan-approve" onclick="resolvePlan('')">
+            <span class="key">&crarr;</span> Approve
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast" role="status" aria-live="polite"></div>
+    <script>
+      window.TURNSTONE_AUTH_TITLE = "turnstone";
+      window.TURNSTONE_KB_SHORTCUTS = [
+        {
+          title: "Workstreams",
+          keys: [
+            {
+              desc: "Toggle dashboard",
+              badge: '<span class="kb-key">Ctrl+D</span>',
+            },
+            {
+              desc: "New workstream",
+              badge: '<span class="kb-key">Ctrl+T</span>',
+            },
+            {
+              desc: "Close workstream",
+              badge: '<span class="kb-key">Ctrl+W</span>',
+            },
+            {
+              desc: "Switch to tab 1\u20139",
+              badge:
+                '<span class="kb-key">Ctrl+1</span>\u2026<span class="kb-key">9</span>',
+            },
+            {
+              desc: "Refresh title",
+              badge: '<span class="kb-key">Ctrl+Shift+R</span>',
+            },
+            {
+              desc: "Edit title",
+              badge: '<span class="kb-key">Ctrl+Shift+E</span>',
+            },
+            {
+              desc: "Fork workstream",
+              badge: '<span class="kb-key">Ctrl+Shift+F</span>',
+            },
+            {
+              desc: "Delete workstream",
+              badge: '<span class="kb-key">Ctrl+Shift+X</span>',
+            },
+          ],
+        },
+        {
+          title: "Split panes",
+          keys: [
+            {
+              desc: "Split right",
+              badge: '<span class="kb-key">Ctrl+\\</span>',
+            },
+            {
+              desc: "Split down",
+              badge: '<span class="kb-key">Ctrl+Shift+\\</span>',
+            },
+            {
+              desc: "Close pane",
+              badge: '<span class="kb-key">Ctrl+Shift+W</span>',
+            },
+            {
+              desc: "Cycle pane focus",
+              badge:
+                '<span class="kb-key">Ctrl+Alt+\u2190</span> <span class="kb-key">\u2192</span>',
+            },
+          ],
+        },
+        {
+          title: "Tool approval",
+          keys: [
+            {
+              desc: "Approve",
+              badge:
+                '<span class="kb-key">y</span> / <span class="kb-key">Enter</span>',
+            },
+            {
+              desc: "Deny",
+              badge:
+                '<span class="kb-key">n</span> / <span class="kb-key">Esc</span>',
+            },
+            { desc: "Always approve", badge: '<span class="kb-key">a</span>' },
+          ],
+        },
+        {
+          title: "Chat",
+          keys: [
+            {
+              desc: "Send message",
+              badge: '<span class="kb-key">Enter</span>',
+            },
+            {
+              desc: "Stop generation",
+              badge: '<span class="kb-key">Esc</span>',
+            },
+            {
+              desc: "New line",
+              badge: '<span class="kb-key">Shift+Enter</span>',
+            },
+          ],
+        },
+        {
+          title: "Navigation",
+          keys: [
+            {
+              desc: "Navigate table rows",
+              badge:
+                '<span class="kb-key">\u2191</span> <span class="kb-key">\u2193</span>',
+            },
+            {
+              desc: "Close dashboard",
+              badge: '<span class="kb-key">Esc</span>',
+            },
+          ],
+        },
+        {
+          title: "General",
+          keys: [
+            { desc: "Show this help", badge: '<span class="kb-key">?</span>' },
+          ],
+        },
+      ];
+    </script>
+    <script src="/shared/utils.js"></script>
+    <script src="/shared/cards.js"></script>
+    <script src="/shared/toast.js"></script>
+    <script src="/shared/composer.js"></script>
+    <script src="/shared/theme.js"></script>
+    <script src="/shared/auth.js"></script>
+    <script src="/shared/kb.js"></script>
+    <script src="/shared/katex-0.16.45/katex.min.js"></script>
+    <script src="/shared/hljs-11.11.1/highlight.min.js"></script>
+    <script src="/shared/renderer.js"></script>
+    <script src="/static/app.js"></script>
+  </body>
 </html>

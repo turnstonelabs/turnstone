@@ -38,6 +38,7 @@ from turnstone.console.server import (
     coordinator_history,
     coordinator_list,
     coordinator_open,
+    coordinator_saved,
     coordinator_send,
     coordinator_tasks,
 )
@@ -70,6 +71,13 @@ def _make_client(
                 methods=["POST"],
             ),
             Route("/v1/api/coordinator", coordinator_list, methods=["GET"]),
+            # Literal path before the /{ws_id} routes below so Starlette
+            # matches "saved" as the literal, not as a ws_id.
+            Route(
+                "/v1/api/coordinator/saved",
+                coordinator_saved,
+                methods=["GET"],
+            ),
             Route(
                 "/v1/api/coordinator/{ws_id}/send",
                 coordinator_send,
@@ -277,6 +285,143 @@ def test_list_admin_sees_all(storage):
     )
     assert resp.status_code == 200
     assert len(resp.json()["coordinators"]) == 2
+
+
+def _seed_closed_coord_with_history(
+    mgr,
+    storage,
+    *,
+    user_id: str,
+    name: str,
+) -> str:
+    """Create + close a coordinator and seed one conversation row.
+
+    list_workstreams_with_history's WHERE EXISTS guard skips coords with no
+    messages, so the saved-list endpoint won't surface a freshly-closed
+    coordinator unless we've stamped at least one conversation row.
+    """
+    ws = mgr.create(user_id=user_id, name=name)
+    storage.save_message(ws.id, role="user", content="seed")
+    assert mgr.close(ws.id)
+    return ws.id
+
+
+@pytest.fixture
+def saved_storage(tmp_path):
+    """Storage fixture for saved-coordinator tests.
+
+    coordinator_saved goes through ``list_workstreams_with_history``
+    which calls ``get_storage()`` (the singleton registry), not whatever
+    backend the manager holds.  This fixture initialises the registry to
+    a fresh SQLite db and yields the same backend so the test can also
+    seed conversation rows directly.
+    """
+    from turnstone.core.storage import init_storage, reset_storage
+
+    db_path = str(tmp_path / "saved.db")
+    reset_storage()
+    backend = init_storage("sqlite", path=db_path, run_migrations=False)
+    try:
+        yield backend
+    finally:
+        reset_storage()
+
+
+def test_saved_filters_by_caller(saved_storage):
+    storage = saved_storage
+    mgr = _build_mgr(storage)
+    mine_id = _seed_closed_coord_with_history(mgr, storage, user_id="user-1", name="mine")
+    _seed_closed_coord_with_history(mgr, storage, user_id="user-2", name="theirs")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get("/v1/api/coordinator/saved", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert {c["ws_id"] for c in body["coordinators"]} == {mine_id}
+
+
+def test_saved_admin_sees_all(saved_storage):
+    storage = saved_storage
+    mgr = _build_mgr(storage)
+    a = _seed_closed_coord_with_history(mgr, storage, user_id="user-1", name="a")
+    b = _seed_closed_coord_with_history(mgr, storage, user_id="user-2", name="b")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(
+        "/v1/api/coordinator/saved",
+        headers={
+            "X-Test-User": "admin-1",
+            "X-Test-Perms": "admin.coordinator,admin.users",
+        },
+    )
+    assert resp.status_code == 200
+    assert {c["ws_id"] for c in resp.json()["coordinators"]} == {a, b}
+
+
+def test_saved_blank_uid_returns_empty(saved_storage):
+    """Non-admin caller with no sub gets fail-closed empty list.
+
+    Mirrors list_saved_workstreams — empty user_id must not fall through
+    to a cluster-wide query (would leak orphan / migration rows).
+    """
+    storage = saved_storage
+    mgr = _build_mgr(storage)
+    _seed_closed_coord_with_history(mgr, storage, user_id="someone", name="x")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(
+        "/v1/api/coordinator/saved",
+        headers={"X-Test-User": "", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"coordinators": []}
+
+
+def test_saved_excludes_currently_loaded(saved_storage):
+    """A coordinator currently in coord_mgr must NOT appear in saved cards.
+
+    Even if its DB row says state='closed' (e.g. mid-restart race), the
+    in-memory presence wins so the same ws_id can't be in both the
+    active list and the saved-cards grid simultaneously.
+    """
+    storage = saved_storage
+    mgr = _build_mgr(storage)
+    closed_id = _seed_closed_coord_with_history(mgr, storage, user_id="user-1", name="closed")
+    # Create another coord, leave it loaded — should never appear in saved.
+    loaded_ws = mgr.create(user_id="user-1", name="loaded")
+    storage.save_message(loaded_ws.id, role="user", content="seed")
+    # Force it to state='closed' on disk without removing from memory, to
+    # exercise the defence-in-depth ``loaded`` filter.
+    storage.update_workstream_state(loaded_ws.id, "closed")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get("/v1/api/coordinator/saved", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    saved_ids = {c["ws_id"] for c in resp.json()["coordinators"]}
+    assert closed_id in saved_ids
+    assert loaded_ws.id not in saved_ids
+
+
+def test_saved_excludes_active_state_rows(saved_storage):
+    """Only state='closed' rows surface in the saved list.
+
+    A coordinator that's idle on disk but not currently loaded into
+    coord_mgr (e.g. orphaned across a console restart that hasn't
+    rehydrated yet) is NOT 'saved' — it's just not loaded yet, and the
+    saved grid is for explicit user-closed sessions.
+    """
+    storage = saved_storage
+    mgr = _build_mgr(storage)
+    closed_id = _seed_closed_coord_with_history(mgr, storage, user_id="user-1", name="closed")
+    # An idle row in storage with no in-memory presence — must not appear.
+    orphan = mgr.create(user_id="user-1", name="orphan")
+    storage.save_message(orphan.id, role="user", content="seed")
+    # Drop from memory without changing state (simulates manager restart).
+    mgr._workstreams.pop(orphan.id, None)
+    if orphan.id in mgr._order:
+        mgr._order.remove(orphan.id)
+    assert storage.get_workstream(orphan.id)["state"] == "idle"
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get("/v1/api/coordinator/saved", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    saved_ids = {c["ws_id"] for c in resp.json()["coordinators"]}
+    assert saved_ids == {closed_id}
 
 
 def test_send_to_someone_elses_coord_returns_404(storage):

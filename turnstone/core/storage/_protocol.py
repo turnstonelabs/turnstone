@@ -237,6 +237,7 @@ class StorageBackend(Protocol):
         *,
         kind: WorkstreamKind | str | None = None,
         user_id: str | None = None,
+        state: str | None = None,
     ) -> list[Any]:
         """List workstreams that have messages, ordered by updated DESC.
 
@@ -251,6 +252,12 @@ class StorageBackend(Protocol):
         uid from any tenant-visible endpoint; pass ``None`` for
         service-scoped callers that legitimately need cluster-wide
         visibility.  Mirrors the same contract on ``list_workstreams``.
+
+        ``state`` filters by lifecycle state — pass ``"closed"`` from the
+        coordinator "saved" surface so the list excludes deleted /
+        currently-active rows.  Default ``None`` preserves all-states
+        behaviour.  Accepts a string (rather than the WorkstreamState
+        enum) to match the on-disk column type.
         """
         ...
 

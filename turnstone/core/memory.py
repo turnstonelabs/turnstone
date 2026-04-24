@@ -321,6 +321,7 @@ def list_workstreams_with_history(
     *,
     kind: WorkstreamKind | str | None = None,
     user_id: str | None = None,
+    state: str | None = None,
 ) -> list[Any]:
     """List workstreams that have conversation messages.
 
@@ -334,12 +335,17 @@ def list_workstreams_with_history(
     authenticated caller's uid from any tenant-visible endpoint;
     leaving it as ``None`` means cluster-wide (service-scoped
     callers only).
+
+    ``state`` filters by lifecycle state — pass ``"closed"`` from the
+    coordinator-saved surface so deleted / currently-active rows don't
+    end up in the saved cards.  Default ``None`` preserves all-states.
     """
     try:
         return get_storage().list_workstreams_with_history(
             limit,
             kind=kind,
             user_id=user_id,
+            state=state,
         )
     except Exception:
         log.warning("Failed to list workstreams with history", exc_info=True)

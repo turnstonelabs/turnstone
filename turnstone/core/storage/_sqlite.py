@@ -387,6 +387,7 @@ class SQLiteBackend:
         *,
         kind: WorkstreamKind | str | None = None,
         user_id: str | None = None,
+        state: str | None = None,
     ) -> list[Any]:
         # ``kind`` filter applied at the SQL layer so coordinator rows
         # (which persist conversation history the same way interactive
@@ -397,15 +398,22 @@ class SQLiteBackend:
         # can't accidentally leak another tenant's workstreams.  None
         # = cluster-wide (service callers); empty string is a separate
         # filter value the caller chose deliberately.
+        # ``state`` filter — coordinator-saved surface passes "closed"
+        # so deleted / currently-active rows don't end up in the saved
+        # cards (which would 404 on click or duplicate the active list).
         params: dict[str, Any] = {"limit": limit}
         kind_clause = ""
         user_clause = ""
+        state_clause = ""
         if kind is not None:
             params["kind"] = WorkstreamKind(kind).value
             kind_clause = "AND w.kind = :kind "
         if user_id is not None:
             params["user_id"] = user_id
             user_clause = "AND w.user_id = :user_id "
+        if state is not None:
+            params["state"] = state
+            state_clause = "AND w.state = :state "
         with self._conn() as conn:
             return list(
                 conn.execute(
@@ -419,6 +427,7 @@ class SQLiteBackend:
                         "  (SELECT 1 FROM conversations c WHERE c.ws_id = w.ws_id) "
                         f"{kind_clause}"
                         f"{user_clause}"
+                        f"{state_clause}"
                         "ORDER BY w.updated DESC LIMIT :limit"
                     ),
                     params,

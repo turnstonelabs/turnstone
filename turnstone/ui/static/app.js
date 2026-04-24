@@ -3802,27 +3802,41 @@ var _wsSavedItems = [];
 function renderSavedWorkstreams(items) {
   _wsSavedItems = items;
   var c = document.getElementById("dashboard-saved-cards");
-  c.innerHTML = "";
+  c.replaceChildren();
   if (!items.length) {
-    c.innerHTML = '<div class="dashboard-empty">No saved workstreams</div>';
+    var empty = document.createElement("div");
+    empty.className = "dashboard-empty";
+    empty.textContent = "No saved workstreams";
+    c.appendChild(empty);
     return;
   }
   items.forEach(function (sess) {
-    var card = document.createElement("div");
-    card.className =
-      "dashboard-card" + (_wsDeleteMode ? " ws-delete-mode" : "");
-    card.dataset.wsId = sess.ws_id;
-    var label = sess.alias || sess.title || sess.ws_id;
-    card.setAttribute(
-      "aria-label",
-      _wsDeleteMode ? "Select: " + label : "Resume: " + label,
-    );
+    // Default card shape (title + meta + wsid + Resume click) comes from
+    // the shared /shared/cards.js helper so console (Saved Coordinators)
+    // and ui/static (Saved Workstreams) stay in lock-step.  Delete mode
+    // is interactive-only; we layer the checkbox + selection wiring on
+    // top of the shared card after construction.
+    var card = renderSessionCard(sess, {
+      ariaLabel: function (s) {
+        var label = s.alias || s.title || s.ws_id;
+        return _wsDeleteMode ? "Select: " + label : "Resume: " + label;
+      },
+      onActivate: function (s) {
+        // Suppressed in delete mode \u2014 the layered checkbox handler below
+        // owns clicks while delete-mode is active.
+        if (_wsDeleteMode) return;
+        dashboardResumeSession(s.ws_id);
+      },
+    });
 
     if (_wsDeleteMode) {
+      card.classList.add("ws-delete-mode");
+      card.removeAttribute("role"); // becomes a checkbox host, not a button
       var chk = document.createElement("input");
       chk.type = "checkbox";
       chk.className = "ws-card-check";
       chk.checked = !!_wsDeleteSelected[sess.ws_id];
+      var label = sess.alias || sess.title || sess.ws_id;
       chk.setAttribute("aria-label", "Select " + label + " for deletion");
       chk.onclick = function (e) {
         e.stopPropagation();
@@ -3831,8 +3845,9 @@ function renderSavedWorkstreams(items) {
         card.classList.toggle("ws-selected", chk.checked);
         updateWsDeleteBar();
       };
-      card.appendChild(chk);
-      card.setAttribute("tabindex", "0");
+      card.insertBefore(chk, card.firstChild);
+      // Override the shared helper's onclick/onkeydown \u2014 in delete mode
+      // a card click toggles the checkbox instead of activating Resume.
       card.onclick = function (e) {
         if (e.target === chk) return;
         chk.checked = !chk.checked;
@@ -3845,40 +3860,9 @@ function renderSavedWorkstreams(items) {
           chk.onclick(e);
         }
       };
-    } else {
-      card.setAttribute("role", "button");
-      card.setAttribute("tabindex", "0");
-      card.onclick = function () {
-        dashboardResumeSession(sess.ws_id);
-      };
-      card.onkeydown = function (e) {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          dashboardResumeSession(sess.ws_id);
-        }
-      };
+      if (_wsDeleteSelected[sess.ws_id]) card.classList.add("ws-selected");
     }
 
-    var title =
-      sess.alias || sess.title || sess.name || sess.ws_id.substring(0, 12);
-    var meta = sess.message_count + " msgs";
-    if (sess.updated) meta += " \u00b7 " + formatRelativeTime(sess.updated);
-    var inner = document.createElement("div");
-    inner.innerHTML =
-      '<div class="card-title">' +
-      escapeHtml(title) +
-      "</div>" +
-      '<div class="card-meta">' +
-      escapeHtml(meta) +
-      ' <span class="card-wsid">' +
-      escapeHtml(sess.ws_id.substring(0, 7)) +
-      "</span>" +
-      "</div>";
-    while (inner.firstChild) card.appendChild(inner.firstChild);
-
-    if (_wsDeleteMode && _wsDeleteSelected[sess.ws_id]) {
-      card.classList.add("ws-selected");
-    }
     c.appendChild(card);
   });
 }
@@ -4340,23 +4324,7 @@ function forkWorkstream(optWsId) {
   showNewWsModal(wsId);
 }
 
-function formatRelativeTime(iso) {
-  if (!iso) return "";
-  var s = iso.replace(" ", "T");
-  if (!s.endsWith("Z") && !s.includes("+")) s += "Z";
-  var d = new Date(s);
-  if (isNaN(d)) return "";
-  var now = new Date();
-  var ms = now - d;
-  var min = Math.floor(ms / 60000);
-  if (min < 1) return "just now";
-  if (min < 60) return min + "m ago";
-  var hr = Math.floor(min / 60);
-  if (hr < 24) return hr + "h ago";
-  var day = Math.floor(hr / 24);
-  if (day < 30) return day + "d ago";
-  return d.toLocaleDateString();
-}
+// formatRelativeTime moved to /shared/utils.js so both surfaces share it.
 
 function dashboardSwitchWorkstream(wsId) {
   if (workstreams[wsId]) {

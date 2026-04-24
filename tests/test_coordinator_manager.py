@@ -388,17 +388,37 @@ def test_open_admin_ignores_ownership(built_mgr):
     assert ws is not None
 
 
-def test_open_refuses_closed_coordinator(built_mgr):
-    """A coordinator that was closed (state=closed in storage) must not
-    silently resurrect on the next GET.  Otherwise the Close button is
-    reversible on URL revisit and burns max_active capacity."""
+def test_open_resurrects_closed_coordinator(built_mgr):
+    """A coordinator that was closed (state='closed' in storage) IS now
+    resurrectable via open().  Restore is an explicit user action via
+    the Saved Coordinators landing UI; ``_reserve_and_install_locked``
+    still enforces ``max_active`` (evicts an idle peer or 429s).  The
+    old "URL revisit silently undoes Close" safety lives in the slot
+    accounting now, not in a flat refusal at the open path."""
     mgr, _calls, storage = built_mgr
     ws = mgr.create(user_id="u1")
     mgr.close(ws.id)
-    # Direct GET via open() must NOT rehydrate the closed row.
+    assert storage.get_workstream(ws.id)["state"] == "closed"
+
     reopened = mgr.open(ws.id, "u1")
-    assert reopened is None
-    # Admin path must also refuse to resurrect — closed means closed.
+    assert reopened is not None
+    assert reopened.id == ws.id
+    # Re-loaded into memory.
+    assert mgr.get(ws.id) is reopened
+
+    # Admin path also resurrects.
+    mgr.close(ws.id)
+    assert mgr.open_admin(ws.id) is not None
+
+
+def test_open_refuses_deleted_coordinator(built_mgr):
+    """A coordinator marked state='deleted' is a tombstone — open() must
+    refuse to resurrect even though closed-state is now resurrectable."""
+    mgr, _calls, storage = built_mgr
+    ws = mgr.create(user_id="u1")
+    mgr.close(ws.id)
+    storage.update_workstream_state(ws.id, "deleted")
+    assert mgr.open(ws.id, "u1") is None
     assert mgr.open_admin(ws.id) is None
 
 

@@ -35,6 +35,26 @@ function formatCount(n) {
   return String(n);
 }
 
+// Naive ISO-8601 → "Nm ago" / "Nh ago" / "Nd ago" / locale date.
+// Tolerates space-as-separator (SQLite default) and missing TZ marker
+// (assumes UTC, matching the storage layer's stamp).
+function formatRelativeTime(iso) {
+  if (!iso) return "";
+  var s = String(iso).replace(" ", "T");
+  if (!s.endsWith("Z") && !s.includes("+")) s += "Z";
+  var d = new Date(s);
+  if (isNaN(d)) return "";
+  var ms = new Date() - d;
+  var min = Math.floor(ms / 60000);
+  if (min < 1) return "just now";
+  if (min < 60) return min + "m ago";
+  var hr = Math.floor(min / 60);
+  if (hr < 24) return hr + "h ago";
+  var day = Math.floor(hr / 24);
+  if (day < 30) return day + "d ago";
+  return d.toLocaleDateString();
+}
+
 // Safe CSS attribute-selector escape.  CSS.escape is universally
 // supported in modern browsers, but we keep a minimal polyfill so
 // selector-construction never throws on an older browser or a
