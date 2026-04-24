@@ -60,6 +60,7 @@ from turnstone.core.session_routes import (
     SessionEndpointConfig,
     SharedSessionVerbHandlers,
     make_approve_handler,
+    make_close_handler,
     make_legacy_body_keyed_adapter,
     register_session_routes,
 )
@@ -2630,93 +2631,6 @@ async def create_workstream(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=400)
 
 
-async def close_workstream(request: Request) -> JSONResponse:
-    """POST /v1/api/workstreams/close — close a workstream.
-
-    Optional ``reason`` from the request body is persisted on the
-    workstream's config row so post-mortem tooling (and the coordinator's
-    ``inspect_workstream``) can surface why the workstream was retired
-    without scraping the audit log.
-    """
-    from turnstone.core.audit import record_audit
-    from turnstone.core.output_guard import redact_credentials
-    from turnstone.core.web_helpers import read_json_or_400
-
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
-    ws_id = str(body.get("ws_id", ""))
-    raw_reason = body.get("reason", "")
-    # Cap reason length so a model that accidentally / maliciously dumps
-    # a multi-KB blob (or a captured secret) can't grow workstream_config
-    # rows without bound.  512 BYTES is enough for any human-readable
-    # close reason; anything longer is suspicious.  Slice on UTF-8 bytes
-    # (not code points) so a CJK / emoji-heavy payload can't sneak past
-    # the cap at 3-4x the documented budget.  ``errors="ignore"`` drops
-    # any partial code point left at the truncation boundary.  Then run
-    # the same credential-redaction the output guard applies to tool
-    # output — a model under prompt injection that dumps a captured
-    # secret in ``reason`` doesn't get to plant it in plaintext audit
-    # logs / workstream_config.
-    if isinstance(raw_reason, str):
-        capped = raw_reason.strip().encode("utf-8")[:512].decode("utf-8", errors="ignore")
-        reason = redact_credentials(capped)
-    else:
-        reason = ""
-    mgr = request.app.state.workstreams
-    # Cross-tenant close would abort another tenant's running generation.
-    # _require_ws_access returns 404 on non-owner — same shape as the
-    # "last workstream" (400) / "not found" (404) branches below.
-    _owner_uid, err = _require_ws_access(request, ws_id, mgr=mgr)
-    if err:
-        return err
-    ws_before = mgr.get(ws_id)
-    if not ws_before:
-        return JSONResponse({"error": "Workstream not found"}, status_code=404)
-    if mgr.close(ws_id):
-        storage = getattr(request.app.state, "auth_storage", None)
-        # Persist before the ws_closed event reaches consumers so any
-        # downstream reader sees the close_reason in the same
-        # observation window as the state change. The adapter-level
-        # emit_closed fires inside mgr.close() which already returned
-        # — strictly speaking the event beat us here, but the
-        # close_reason is advisory UI metadata, not a sync barrier.
-        if reason and storage is not None:
-            try:
-                storage.save_workstream_config(ws_id, {"close_reason": reason})
-            except Exception:
-                log.debug(
-                    "ws.close.reason_persist_failed ws=%s",
-                    ws_id[:8] if ws_id else "",
-                    exc_info=True,
-                )
-        if storage is not None:
-            _, ip = _audit_context(request)
-            audit_detail: dict[str, Any] = {
-                "kind": str(ws_before.kind),
-                "parent_ws_id": ws_before.parent_ws_id,
-            }
-            if reason:
-                audit_detail["reason"] = reason
-            record_audit(
-                storage,
-                _auth_user_id(request),
-                "workstream.closed",
-                "workstream",
-                ws_id,
-                audit_detail,
-                ip,
-            )
-        return JSONResponse({"status": "ok"})
-    # close() returned False — the ws was popped between the mgr.get()
-    # check above and our mgr.close() call (another close racing in).
-    # Return 404 so the API contract matches a "not found" caller
-    # experience; the old "Cannot close last workstream" 400 went away
-    # with the default-startup workstream and there's no scenario where
-    # this branch means anything other than "the ws isn't tracked here".
-    return JSONResponse({"error": "Workstream not found"}, status_code=404)
-
-
 async def delete_workstream_endpoint(request: Request) -> JSONResponse:
     """POST /v1/api/workstreams/{ws_id}/delete — permanently delete a saved workstream."""
     from turnstone.core.audit import record_audit
@@ -4408,6 +4322,37 @@ def create_app(
         audit_action_prefix="workstream",
     )
     approve_handler = make_approve_handler()
+
+    def _audit_close_workstream(
+        request: Request,
+        ws_id: str,
+        ws_before: Workstream,
+        reason: str,
+    ) -> None:
+        from turnstone.core.audit import record_audit
+
+        storage = request.app.state.auth_storage
+        _, ip = _audit_context(request)
+        detail: dict[str, Any] = {
+            "kind": str(ws_before.kind),
+            "parent_ws_id": ws_before.parent_ws_id,
+        }
+        if reason:
+            detail["reason"] = reason
+        record_audit(
+            storage,
+            _auth_user_id(request),
+            "workstream.closed",
+            "workstream",
+            ws_id,
+            detail,
+            ip,
+        )
+
+    close_handler = make_close_handler(
+        audit_emit=_audit_close_workstream,
+        supports_close_reason=True,
+    )
     v1_routes: list[Any] = [
         Route("/api/events", events_sse),
         Route("/api/events/global", global_events_sse),
@@ -4419,9 +4364,10 @@ def create_app(
             list_workstreams=list_workstreams,
             list_saved=list_saved_workstreams,
             create=create_workstream,
-            close_legacy=close_workstream,
+            close_legacy=make_legacy_body_keyed_adapter(close_handler),
             delete=delete_workstream_endpoint,
             open=open_workstream,
+            close=close_handler,  # lifted: shared body
             refresh_title=refresh_workstream_title,
             set_title=set_workstream_title,
             approve=approve_handler,  # lifted: shared body

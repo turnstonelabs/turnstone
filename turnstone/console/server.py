@@ -59,6 +59,7 @@ from turnstone.core.session_routes import (
     SessionEndpointConfig,
     SharedSessionVerbHandlers,
     make_approve_handler,
+    make_close_handler,
     register_coord_verbs,
     register_session_routes,
 )
@@ -67,7 +68,7 @@ from turnstone.core.web_helpers import (
     read_json_or_400,
     require_storage_or_503,
 )
-from turnstone.core.workstream import WorkstreamKind
+from turnstone.core.workstream import Workstream, WorkstreamKind
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
@@ -2558,40 +2559,6 @@ async def coordinator_cancel(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
-async def coordinator_close(request: Request) -> JSONResponse:
-    """POST /v1/api/workstreams/{ws_id}/close — unload the session."""
-    from turnstone.core.audit import record_audit
-
-    err = _require_admin_coordinator(request)
-    if err is not None:
-        return err
-    coord_mgr, err503 = _require_coord_mgr(request)
-    if err503 is not None:
-        return err503
-    ws_id = request.path_params.get("ws_id", "")
-    user_id = _auth_user_id(request)
-    ws = coord_mgr.get(ws_id)
-    if ws is None:
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    if not coord_mgr.close(ws_id):
-        return JSONResponse({"error": "close failed"}, status_code=500)
-    storage = getattr(request.app.state, "auth_storage", None)
-    if storage is not None:
-        try:
-            record_audit(
-                storage,
-                user_id,
-                "coordinator.close",
-                "workstream",
-                ws_id,
-                {"coord_ws_id": ws_id, "src": "coordinator"},
-                request.client.host if request.client else "",
-            )
-        except Exception:
-            log.debug("coordinator_close.audit_failed", exc_info=True)
-    return JSONResponse({"status": "ok"})
-
-
 async def coordinator_events(request: Request) -> Response:
     """GET /v1/api/workstreams/{ws_id}/events — SSE event stream."""
     err = _require_admin_coordinator(request)
@@ -3930,7 +3897,6 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                     build_console_session_factory,
                 )
                 from turnstone.core.session_manager import SessionManager
-                from turnstone.core.workstream import Workstream
 
                 jwt_secret: str = getattr(app.state, "jwt_secret", "")
                 console_bind_url: str = getattr(app.state, "console_url", "") or (
@@ -10127,6 +10093,24 @@ def create_app(
         not_found_label="coordinator not found",
         audit_action_prefix="coordinator",
     )
+
+    def _audit_close_coordinator(
+        request: Request,
+        ws_id: str,
+        ws_before: Workstream,
+        reason: str,  # noqa: ARG001 — coord doesn't expose close_reason yet
+    ) -> None:
+        storage = request.app.state.auth_storage
+        record_audit(
+            storage,
+            _auth_user_id(request),
+            "coordinator.close",
+            "workstream",
+            ws_id,
+            {"coord_ws_id": ws_id, "src": "coordinator"},
+            request.client.host if request.client else "",
+        )
+
     coord_workstream_routes: list[Any] = []
     register_session_routes(
         coord_workstream_routes,
@@ -10137,7 +10121,10 @@ def create_app(
             create=coordinator_create,
             detail=coordinator_detail,
             open=coordinator_open,
-            close=coordinator_close,
+            close=make_close_handler(  # lifted: shared body
+                audit_emit=_audit_close_coordinator,
+                supports_close_reason=False,
+            ),
             send=coordinator_send,
             approve=make_approve_handler(),  # lifted: shared body
             cancel=coordinator_cancel,

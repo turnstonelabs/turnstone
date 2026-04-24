@@ -414,3 +414,119 @@ def make_legacy_body_keyed_adapter(handler: Handler) -> Handler:
         return await handler(request)
 
     return adapter
+
+
+CloseAuditEmitter = Callable[
+    ["Request", str, "Workstream", str],
+    None,
+]
+
+
+def make_close_handler(
+    *,
+    audit_emit: CloseAuditEmitter | None = None,
+    supports_close_reason: bool = False,
+) -> Handler:
+    """Lifted body for ``POST {prefix}/{ws_id}/close``.
+
+    Closes the workstream's session (unloads from memory; storage row
+    survives so the session can be re-opened later). Both kinds share
+    the same auth → mgr → ws-lookup → ``mgr.close()`` → audit
+    sequence; per-kind divergence is in the audit detail shape and
+    whether a request body ``reason`` is read / capped / persisted on
+    the workstream's config row.
+
+    Args:
+        audit_emit: kind's audit emitter for the close event.
+            Receives ``(request, ws_id, ws_before, reason)``; ``reason``
+            is the empty string when ``supports_close_reason`` is
+            ``False`` or no reason was provided. ``None`` skips the
+            audit entirely (only valid when neither kind cares).
+        supports_close_reason: when ``True``, the handler reads a
+            ``reason`` field from the JSON body, caps it at 512 UTF-8
+            bytes, redacts credentials, persists it via
+            ``storage.save_workstream_config(ws_id, {"close_reason": ...})``,
+            and threads it through to ``audit_emit``. The cap protects
+            ``workstream_config`` from unbounded growth on a model-
+            generated dump; the redact protects audit logs from
+            captured-secret leakage under prompt injection.
+    """
+
+    async def close(request: Request) -> Response:
+        cfg: SessionEndpointConfig = request.app.state.session_endpoint_config
+        if cfg.permission_gate is not None:
+            err = cfg.permission_gate(request)
+            if err is not None:
+                return err
+        mgr, err503 = cfg.manager_lookup(request)
+        if err503 is not None:
+            return err503
+        assert mgr is not None
+        ws_id = request.path_params.get("ws_id", "")
+
+        reason = ""
+        if supports_close_reason:
+            from turnstone.core.output_guard import redact_credentials
+            from turnstone.core.web_helpers import read_json_or_400
+
+            body = await read_json_or_400(request)
+            if isinstance(body, JSONResponse):
+                return body
+            raw_reason = body.get("reason", "")
+            if isinstance(raw_reason, str):
+                # Cap on UTF-8 bytes (not code points) so a CJK / emoji
+                # payload can't sneak past at 3-4x the documented budget.
+                # ``errors="ignore"`` drops any partial code point left
+                # at the truncation boundary.
+                capped = raw_reason.strip().encode("utf-8")[:512].decode(
+                    "utf-8", errors="ignore"
+                )
+                reason = redact_credentials(capped)
+
+        if cfg.tenant_check is not None:
+            err_tenant = cfg.tenant_check(request, ws_id, mgr)
+            if err_tenant is not None:
+                return err_tenant
+
+        ws_before = mgr.get(ws_id)
+        if ws_before is None:
+            return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+        if not mgr.close(ws_id):
+            # Standardized to 404 (was 500 on the legacy coord path —
+            # overly pessimistic; close-failure here means the ws was
+            # popped between the .get() check and the .close() call,
+            # which is a "not found" semantic).
+            return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+
+        storage = getattr(request.app.state, "auth_storage", None)
+        if supports_close_reason and reason and storage is not None:
+            try:
+                storage.save_workstream_config(ws_id, {"close_reason": reason})
+            except Exception:
+                from turnstone.core.log import get_logger as _gl
+
+                _gl(__name__).debug(
+                    "ws.close.reason_persist_failed ws=%s",
+                    ws_id[:8] if ws_id else "",
+                    exc_info=True,
+                )
+
+        if audit_emit is not None and storage is not None:
+            try:
+                audit_emit(request, ws_id, ws_before, reason)
+            except Exception:
+                from turnstone.core.log import get_logger as _gl
+
+                _gl(__name__).debug(
+                    "ws.close.audit_failed ws=%s",
+                    ws_id[:8] if ws_id else "",
+                    exc_info=True,
+                )
+
+        return JSONResponse({"status": "ok"})
+
+    return close
+
+
+if TYPE_CHECKING:
+    from turnstone.core.workstream import Workstream  # noqa: F401 — used in type alias above

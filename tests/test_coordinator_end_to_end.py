@@ -15,7 +15,7 @@ MagicMock-backed stubs.  All four tests run in < 2 s total.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 import httpx
@@ -31,14 +31,43 @@ from turnstone.console.coordinator_adapter import CoordinatorAdapter
 from turnstone.console.coordinator_client import CoordinatorClient
 from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 from turnstone.console.server import (
-    coordinator_close,
+    _auth_user_id,
+    _require_admin_coordinator,
+    _require_coord_mgr,
     coordinator_create,
     coordinator_detail,
     coordinator_list,
 )
+from turnstone.core.audit import record_audit
 from turnstone.core.auth import AuthResult
 from turnstone.core.session_manager import SessionManager
+from turnstone.core.session_routes import (
+    SessionEndpointConfig,
+    make_close_handler,
+)
 from turnstone.core.storage._sqlite import SQLiteBackend
+
+if TYPE_CHECKING:
+    from turnstone.core.workstream import Workstream
+
+
+def _audit_close_coordinator_e2e(
+    request,
+    ws_id: str,
+    ws_before: Workstream,  # noqa: ARG001
+    reason: str,  # noqa: ARG001
+) -> None:
+    storage = request.app.state.auth_storage
+    record_audit(
+        storage,
+        _auth_user_id(request),
+        "coordinator.close",
+        "workstream",
+        ws_id,
+        {"coord_ws_id": ws_id, "src": "coordinator"},
+        request.client.host if request.client else "",
+    )
+
 
 # ---------------------------------------------------------------------------
 # Shared auth-injection middleware (mirrors test_coordinator_endpoints.py)
@@ -125,7 +154,10 @@ def _make_client(
             Route("/v1/api/workstreams", coordinator_list, methods=["GET"]),
             Route(
                 "/v1/api/workstreams/{ws_id}/close",
-                coordinator_close,
+                make_close_handler(
+                    audit_emit=_audit_close_coordinator_e2e,
+                    supports_close_reason=False,
+                ),
                 methods=["POST"],
             ),
             Route(
@@ -143,6 +175,13 @@ def _make_client(
     app.state.coord_registry_error = "" if coord_mgr else "registry missing"
     app.state.auth_storage = storage
     app.state.jwt_secret = "x" * 64
+    app.state.session_endpoint_config = SessionEndpointConfig(
+        permission_gate=_require_admin_coordinator,
+        manager_lookup=_require_coord_mgr,
+        tenant_check=None,
+        not_found_label="coordinator not found",
+        audit_action_prefix="coordinator",
+    )
     return TestClient(app)
 
 
