@@ -104,6 +104,13 @@
   background: var(--bg-highlight);
   padding: 1px 4px;
   border-radius: 2px;
+  /* Preserve internal whitespace + allow wrapping.  The body sets
+     ``white-space: normal`` to collapse phantom inter-block ``\n`` text
+     nodes; inline ``<code>`` would inherit that and silently collapse
+     multiple spaces inside backtick spans.  ``<pre>`` blocks rely on
+     the user-agent ``pre { white-space: pre }`` rule and don't need
+     this override. */
+  white-space: pre-wrap;
 }
 .ts-msg-body pre code {
   background: none;
