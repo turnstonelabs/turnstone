@@ -230,11 +230,11 @@ def test_bulk_live_admin_bypass_returns_live(storage):
     assert body["denied"] == []
 
 
-def test_bulk_live_tenant_filter_marks_foreign_rows_denied(storage):
-    """A non-admin caller whose user_id doesn't match the row's owner
-    gets the ws_id in ``denied`` rather than ``results`` — no
-    existence-oracle leak."""
-    # Seed a foreign-owned interactive workstream.
+def test_bulk_live_cluster_wide_visibility(storage):
+    """Trusted-team visibility: any ``admin.cluster.inspect`` caller
+    sees every row in ``results``.  ``denied`` is reserved for ids
+    that don't correspond to a persisted workstream (no existence
+    oracle for unknown ids)."""
     ws_id = "b" * 32
     _seed_workstream(storage, ws_id=ws_id, node_id="node-a", user_id="stranger")
     client = _make_client(storage, coord_mgr=_build_mgr(storage))
@@ -244,22 +244,18 @@ def test_bulk_live_tenant_filter_marks_foreign_rows_denied(storage):
     )
     assert resp.status_code == 200
     body = resp.json()
-    assert body["denied"] == [ws_id]
-    assert body["results"] == {}
+    assert ws_id in body["results"]
+    assert body["denied"] == []
 
 
-def test_bulk_live_empty_caller_uid_denies_empty_owner_rows(storage):
-    """Regression for #bug-3 / #sec-2: a caller with empty user_id
-    must NOT see rows with empty user_id (orphan / system-owned).
-    Either side empty → denied.  Admin bypass honoured (tested
-    elsewhere)."""
-    ws_id = "c" * 32
-    _seed_workstream(storage, ws_id=ws_id, node_id="node-a", user_id="")
+def test_bulk_live_unknown_ids_route_to_denied(storage):
+    """Unknown ids (not in storage) land in ``denied`` so the endpoint
+    can't be used as an existence oracle."""
+    ws_id = "c" * 32  # not seeded
     client = _make_client(storage, coord_mgr=_build_mgr(storage))
-    # caller_uid="" (empty X-Test-User) + non-admin perm.
     resp = client.get(
         f"/v1/api/cluster/ws/live?ids={ws_id}",
-        headers={"X-Test-User": "", "X-Test-Perms": "admin.cluster.inspect"},
+        headers={"X-Test-User": "user-1", "X-Test-Perms": "admin.cluster.inspect"},
     )
     assert resp.status_code == 200
     body = resp.json()
@@ -315,9 +311,9 @@ def test_metrics_invalid_ws_id_400(storage):
     assert resp.status_code == 400
 
 
-def test_metrics_ownership_404_mask(storage):
-    """A ws_id owned by another tenant returns 404, not 403 — no
-    existence-oracle leak (mirrors coordinator_detail)."""
+def test_metrics_any_admin_coordinator_caller_can_read(storage):
+    """Trusted-team visibility: metrics are readable by any caller
+    with ``admin.coordinator`` regardless of the coordinator owner."""
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="stranger")
     client = _make_client(storage, coord_mgr=mgr)
@@ -325,7 +321,8 @@ def test_metrics_ownership_404_mask(storage):
         f"/v1/api/coordinator/{ws.id}/metrics",
         headers=_METRICS_HEADERS,
     )
-    assert resp.status_code == 404
+    assert resp.status_code == 200
+    assert resp.json()["ws_id"] == ws.id
 
 
 def test_metrics_empty_coordinator_defaults(storage):
@@ -393,20 +390,13 @@ def test_metrics_spawns_and_state_counts(storage):
     assert body["child_state_counts"] == {"idle": 1, "running": 1, "closed": 1}
 
 
-def test_metrics_tenant_filter_excludes_forged_cross_tenant_child(storage):
-    """Defense-in-depth: a non-admin caller's aggregate counts must
-    exclude children whose parent_ws_id matches the coord but whose
-    user_id drifted to another tenant (forged / migration-era rows).
-    The primary defense is the 404-mask on coord ownership; this is
-    the secondary defense inside the aggregate queries (Copilot
-    review finding on PR #381).
-
-    Admin bypass sees the raw aggregate (no tenant filter) — same
-    pattern coordinator_children follows.
+def test_metrics_cluster_wide_aggregates(storage):
+    """Trusted-team model: aggregates are cluster-wide across every
+    caller with ``admin.coordinator``.  Every child under the
+    coordinator counts, regardless of the ``user_id`` on the row.
     """
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="alice")
-    # Legitimate child owned by alice.
     _seed_workstream(
         storage,
         ws_id="aa" * 16,
@@ -415,7 +405,6 @@ def test_metrics_tenant_filter_excludes_forged_cross_tenant_child(storage):
         parent_ws_id=ws.id,
         state="idle",
     )
-    # Forged / drifted child — same parent_ws_id but foreign owner.
     _seed_workstream(
         storage,
         ws_id="bb" * 16,
@@ -426,30 +415,16 @@ def test_metrics_tenant_filter_excludes_forged_cross_tenant_child(storage):
     )
     client = _make_client(storage, coord_mgr=mgr)
 
-    # Alice (non-admin) — counts must exclude bob's forged row.
-    resp = client.get(
-        f"/v1/api/coordinator/{ws.id}/metrics",
-        headers={"X-Test-User": "alice", "X-Test-Perms": "admin.coordinator"},
-    )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["spawns_total"] == 1
-    assert body["child_state_counts"] == {"idle": 1}
-    # "running" (bob's forged child) filtered out.
-    assert "running" not in body["child_state_counts"]
-
-    # Admin sees both.
-    resp_admin = client.get(
-        f"/v1/api/coordinator/{ws.id}/metrics",
-        headers={
-            "X-Test-User": "admin-1",
-            "X-Test-Perms": "admin.coordinator,admin.users",
-        },
-    )
-    assert resp_admin.status_code == 200
-    body_admin = resp_admin.json()
-    assert body_admin["spawns_total"] == 2
-    assert body_admin["child_state_counts"] == {"idle": 1, "running": 1}
+    # Every admin.coordinator caller sees both children.
+    for caller in ("alice", "bob", "admin-1"):
+        resp = client.get(
+            f"/v1/api/coordinator/{ws.id}/metrics",
+            headers={"X-Test-User": caller, "X-Test-Perms": "admin.coordinator"},
+        )
+        assert resp.status_code == 200, caller
+        body = resp.json()
+        assert body["spawns_total"] == 2, caller
+        assert body["child_state_counts"] == {"idle": 1, "running": 1}, caller
 
 
 def test_metrics_judge_fallback_rate_substring_match(storage):

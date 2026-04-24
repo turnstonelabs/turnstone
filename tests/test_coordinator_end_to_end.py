@@ -178,12 +178,13 @@ def test_create_list_detail_lifecycle(tmp_path):
     ids = {c["ws_id"] for c in coordinators}
     assert ws_id in ids
 
-    # Coordinator created by a different user is invisible to our caller.
+    # Trusted-team visibility: every ``admin.coordinator`` caller sees
+    # every active coordinator regardless of owner.
     mgr.create(user_id="other-user", name="not-mine")
     resp = client.get("/v1/api/coordinator", headers=_COORD_HEADERS)
     assert resp.status_code == 200
     names = {c["name"] for c in resp.json()["coordinators"]}
-    assert "not-mine" not in names
+    assert "not-mine" in names
 
     # --- Detail ---
     resp = client.get(f"/v1/api/coordinator/{ws_id}", headers=_COORD_HEADERS)
@@ -431,12 +432,14 @@ def test_lazy_rehydration_on_detail_get(tmp_path):
     # The endpoint triggers lazy rehydration — manager now tracks it.
     assert mgr.get("persisted-coord") is not None
 
-    # Non-owner cannot reach the same endpoint (returns 404 — no existence leak).
+    # Trusted-team visibility: any admin.coordinator caller can read
+    # the coordinator's detail, regardless of ``user_id``.
     resp_stranger = client.get(
         "/v1/api/coordinator/persisted-coord",
         headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
     )
-    assert resp_stranger.status_code == 404
+    assert resp_stranger.status_code == 200
+    assert resp_stranger.json()["user_id"] == "user-1"
 
     # A workstream with kind='interactive' is not reachable via the coordinator
     # endpoint even when it exists in storage.

@@ -277,9 +277,12 @@ def test_create_rolls_back_slot_on_session_failure() -> None:
     mgr, _, storage = _make_manager(adapter=adapter)
     with pytest.raises(RuntimeError, match="build_session forced failure"):
         mgr.create(user_id="u1")
-    # Slot freed, row deleted, no dangling capacity consumption.
+    # Slot freed — no dangling capacity consumption.  The storage row
+    # survives construction failure on purpose: the next ``open(ws_id)``
+    # retries build_session rather than forcing the user to create a
+    # brand-new workstream.
     assert mgr.count == 0
-    assert len(storage.rows) == 0
+    assert len(storage.rows) == 1
 
 
 def test_create_rolls_back_slot_on_persist_failure() -> None:
@@ -329,7 +332,7 @@ def test_concurrent_create_does_not_exceed_max_active() -> None:
 
 def test_open_returns_none_for_missing_row() -> None:
     mgr, _, _ = _make_manager()
-    assert mgr.open("missing", user_id="u1") is None
+    assert mgr.open("missing") is None
 
 
 def test_open_blocks_deleted_state() -> None:
@@ -338,7 +341,7 @@ def test_open_blocks_deleted_state() -> None:
     mgr.close(ws.id)
     # Flip the row to the tombstone state — open must refuse it.
     storage.rows[ws.id].state = "deleted"
-    assert mgr.open(ws.id, user_id="u1") is None
+    assert mgr.open(ws.id) is None
 
 
 def test_open_resurrects_closed_state() -> None:
@@ -348,7 +351,7 @@ def test_open_resurrects_closed_state() -> None:
     mgr.close(ws_id)
     assert mgr.get(ws_id) is None
 
-    reopened = mgr.open(ws_id, user_id="u1")
+    reopened = mgr.open(ws_id)
     assert reopened is not None
     assert reopened.id == ws_id
     assert reopened.session is not None
@@ -357,13 +360,18 @@ def test_open_resurrects_closed_state() -> None:
     assert ws_id in [e.ws_id for e in adapter.events_of("created")]
 
 
-def test_open_rejects_non_matching_user_when_not_admin() -> None:
+def test_open_ignores_owner_mismatch() -> None:
+    # Turnstone is a trusted-team tool; row-level ownership is
+    # metadata, not an access boundary.  ``open`` no longer cares
+    # who the caller is — any authenticated caller can rehydrate
+    # any persisted workstream.  Scope-level auth at the HTTP
+    # layer is the only gate.
     mgr, _, _ = _make_manager()
     ws = mgr.create(user_id="u1")
     mgr.close(ws.id)
-    assert mgr.open(ws.id, user_id="u2", admin=False) is None
-    # Admin bypass works.
-    assert mgr.open(ws.id, user_id="u2", admin=True) is not None
+    reopened = mgr.open(ws.id)
+    assert reopened is not None
+    assert reopened.user_id == "u1"  # metadata preserved
 
 
 def test_open_rejects_wrong_kind() -> None:
@@ -372,7 +380,7 @@ def test_open_rejects_wrong_kind() -> None:
     # Storage row claims a different kind than our adapter's.
     storage.rows[ws.id].kind = WorkstreamKind.COORDINATOR.value
     mgr.close(ws.id)
-    assert mgr.open(ws.id, user_id="u1") is None
+    assert mgr.open(ws.id) is None
 
 
 def test_concurrent_open_for_same_ws_id_returns_same_session() -> None:
@@ -387,7 +395,7 @@ def test_concurrent_open_for_same_ws_id_returns_same_session() -> None:
     lock = threading.Lock()
 
     def _open() -> None:
-        r = mgr.open(ws_id, user_id="u1")
+        r = mgr.open(ws_id)
         with lock:
             results.append(r)
 

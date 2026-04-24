@@ -272,7 +272,10 @@ def _register_ws(storage: Any, ws_id: str, owner: str) -> None:
 
 
 class TestCrossTenantDelete:
-    def test_non_owner_cannot_delete(self, app_client):
+    def test_any_caller_can_delete(self, app_client):
+        # Trusted-team model: scope auth gates the endpoint, not
+        # row-level ownership.  ``user_id`` stays on audit + storage
+        # metadata.
         from turnstone.core.storage import get_storage
 
         client, _mgr = app_client
@@ -283,9 +286,7 @@ class TestCrossTenantDelete:
             "/v1/api/workstreams/ws-victim/delete",
             headers=_auth("attacker-user"),
         )
-        assert resp.status_code == 404
-        # Victim's workstream still present in storage.
-        assert storage.get_workstream("ws-victim") is not None
+        assert resp.status_code == 200
 
     def test_owner_delete_records_audit(self, app_client):
         from turnstone.core.storage import get_storage
@@ -336,7 +337,11 @@ class TestCrossTenantClose:
 
 
 class TestCrossTenantTitle:
-    def test_non_owner_cannot_refresh_title(self, app_client):
+    def test_refresh_title_requires_live_session(self, app_client):
+        # Trusted-team model: scope-level auth is the gate; any caller
+        # can hit the endpoint.  A not-currently-active workstream
+        # still 404s because the refresh needs the live session, not
+        # because of tenant mismatch.
         from turnstone.core.storage import get_storage
 
         client, _mgr = app_client
@@ -348,8 +353,13 @@ class TestCrossTenantTitle:
             headers=_auth("attacker-user"),
         )
         assert resp.status_code == 404
+        assert "not active" in resp.json().get("error", "") or "not found" in resp.json().get(
+            "error", ""
+        )
 
-    def test_non_owner_cannot_set_title(self, app_client):
+    def test_any_caller_can_set_title(self, app_client):
+        # Trusted-team model: title is editable by any authenticated
+        # caller; ``user_id`` remains metadata.
         from turnstone.core.storage import get_storage
 
         client, _mgr = app_client
@@ -358,14 +368,16 @@ class TestCrossTenantTitle:
         _register_ws(storage, "ws-victim", "victim-user")
         resp = client.post(
             "/v1/api/workstreams/ws-victim/title",
-            json={"title": "phishing title"},
+            json={"title": "updated title"},
             headers=_auth("attacker-user"),
         )
-        assert resp.status_code == 404
+        assert resp.status_code == 200
 
 
 class TestCrossTenantOpen:
-    def test_non_owner_cannot_open_persisted(self, app_client):
+    def test_any_caller_can_open_persisted(self, app_client):
+        # Trusted-team model: open is gated on scope auth, not on row
+        # ownership.  The persisted ``user_id`` stays as metadata.
         from turnstone.core.storage import get_storage
 
         client, _mgr = app_client
@@ -376,7 +388,7 @@ class TestCrossTenantOpen:
             "/v1/api/workstreams/ws-victim/open",
             headers=_auth("attacker-user"),
         )
-        assert resp.status_code == 404
+        assert resp.status_code == 200
 
 
 class TestListWorkstreamsTrustedTeamVisibility:

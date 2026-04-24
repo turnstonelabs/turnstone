@@ -260,7 +260,10 @@ def test_create_returns_ws_id_and_records_audit(storage):
     assert "coordinator.create" in actions
 
 
-def test_list_filters_by_caller(storage):
+def test_list_returns_cluster_wide(storage):
+    # Trusted-team visibility: any caller with admin.coordinator sees
+    # every active coordinator regardless of owner.  ``user_id`` stays
+    # on the response as metadata.
     mgr = _build_mgr(storage)
     mgr.create(user_id="user-1", name="mine")
     mgr.create(user_id="user-2", name="theirs")
@@ -269,23 +272,7 @@ def test_list_filters_by_caller(storage):
     assert resp.status_code == 200
     body = resp.json()
     names = {c["name"] for c in body["coordinators"]}
-    assert names == {"mine"}
-
-
-def test_list_admin_sees_all(storage):
-    mgr = _build_mgr(storage)
-    mgr.create(user_id="user-1", name="mine")
-    mgr.create(user_id="user-2", name="theirs")
-    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.get(
-        "/v1/api/coordinator",
-        headers={
-            "X-Test-User": "admin-1",
-            "X-Test-Perms": "admin.coordinator,admin.users",
-        },
-    )
-    assert resp.status_code == 200
-    assert len(resp.json()["coordinators"]) == 2
+    assert names == {"mine", "theirs"}
 
 
 def _seed_closed_coord_with_history(
@@ -329,51 +316,17 @@ def saved_storage(tmp_path):
         reset_storage()
 
 
-def test_saved_filters_by_caller(saved_storage):
-    storage = saved_storage
-    mgr = _build_mgr(storage)
-    mine_id = _seed_closed_coord_with_history(mgr, storage, user_id="user-1", name="mine")
-    _seed_closed_coord_with_history(mgr, storage, user_id="user-2", name="theirs")
-    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.get("/v1/api/coordinator/saved", headers=_COORD_HEADERS)
-    assert resp.status_code == 200
-    body = resp.json()
-    assert {c["ws_id"] for c in body["coordinators"]} == {mine_id}
-
-
-def test_saved_admin_sees_all(saved_storage):
+def test_saved_returns_cluster_wide(saved_storage):
+    # Trusted-team visibility: every ``admin.coordinator`` caller sees
+    # every closed coordinator.
     storage = saved_storage
     mgr = _build_mgr(storage)
     a = _seed_closed_coord_with_history(mgr, storage, user_id="user-1", name="a")
     b = _seed_closed_coord_with_history(mgr, storage, user_id="user-2", name="b")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.get(
-        "/v1/api/coordinator/saved",
-        headers={
-            "X-Test-User": "admin-1",
-            "X-Test-Perms": "admin.coordinator,admin.users",
-        },
-    )
+    resp = client.get("/v1/api/coordinator/saved", headers=_COORD_HEADERS)
     assert resp.status_code == 200
     assert {c["ws_id"] for c in resp.json()["coordinators"]} == {a, b}
-
-
-def test_saved_blank_uid_returns_empty(saved_storage):
-    """Non-admin caller with no sub gets fail-closed empty list.
-
-    Mirrors list_saved_workstreams — empty user_id must not fall through
-    to a cluster-wide query (would leak orphan / migration rows).
-    """
-    storage = saved_storage
-    mgr = _build_mgr(storage)
-    _seed_closed_coord_with_history(mgr, storage, user_id="someone", name="x")
-    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.get(
-        "/v1/api/coordinator/saved",
-        headers={"X-Test-User": "", "X-Test-Perms": "admin.coordinator"},
-    )
-    assert resp.status_code == 200
-    assert resp.json() == {"coordinators": []}
 
 
 def test_saved_excludes_currently_loaded(saved_storage):
@@ -426,7 +379,10 @@ def test_saved_excludes_active_state_rows(saved_storage):
     assert saved_ids == {closed_id}
 
 
-def test_send_to_someone_elses_coord_returns_404(storage):
+def test_send_any_admin_coordinator_caller_can_send(storage):
+    # Trusted-team model: send is gated on admin.coordinator scope,
+    # not on per-row ownership.  Any caller with the scope can post
+    # to any coordinator.
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="owner", name="theirs")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
@@ -435,7 +391,7 @@ def test_send_to_someone_elses_coord_returns_404(storage):
         json={"message": "hi"},
         headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
     )
-    assert resp.status_code == 404  # not 403 — don't leak existence
+    assert resp.status_code == 200
 
 
 def test_send_requires_message(storage):
@@ -513,7 +469,10 @@ def test_detail_triggers_lazy_rehydration(storage):
     assert mgr.get("persisted-coord") is not None
 
 
-def test_detail_404_when_not_owned(storage):
+def test_detail_any_admin_coordinator_caller_can_open(storage):
+    # Trusted-team model: any ``admin.coordinator`` caller can rehydrate
+    # any persisted coordinator regardless of owner.  ``user_id`` stays
+    # on the response as metadata.
     mgr = _build_mgr(storage)
     storage.register_workstream("coord-x", kind="coordinator", user_id="owner")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
@@ -521,7 +480,8 @@ def test_detail_404_when_not_owned(storage):
         "/v1/api/coordinator/coord-x",
         headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
     )
-    assert resp.status_code == 404
+    assert resp.status_code == 200
+    assert resp.json()["user_id"] == "owner"
 
 
 def test_detail_404_when_kind_interactive(storage):
@@ -551,15 +511,19 @@ def test_history_returns_messages(storage):
     assert any(m.get("role") == "user" and m.get("content") == "hello" for m in body["messages"])
 
 
-def test_history_404_for_stranger(storage):
+def test_history_any_admin_coordinator_caller_can_read(storage):
+    # Trusted-team visibility: history is readable by any
+    # ``admin.coordinator`` caller.
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="owner")
+    storage.save_message(ws.id, "user", "hello")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.get(
         f"/v1/api/coordinator/{ws.id}/history",
         headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
     )
-    assert resp.status_code == 404
+    assert resp.status_code == 200
+    assert resp.json()["ws_id"] == ws.id
 
 
 # ---------------------------------------------------------------------------
@@ -595,7 +559,9 @@ def test_open_returns_already_loaded_when_in_memory(storage):
     assert body.get("already_loaded") is True
 
 
-def test_open_returns_404_on_ownership_mismatch_in_memory(storage):
+def test_open_any_admin_coordinator_caller_succeeds_in_memory(storage):
+    # Trusted-team model: open is gated by admin.coordinator scope
+    # only; any authenticated caller can open any in-memory coordinator.
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="owner", name="theirs")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
@@ -603,7 +569,8 @@ def test_open_returns_404_on_ownership_mismatch_in_memory(storage):
         f"/v1/api/coordinator/{ws.id}/open",
         headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
     )
-    assert resp.status_code == 404  # not 403 — don't leak existence
+    assert resp.status_code == 200
+    assert resp.json().get("already_loaded") is True
 
 
 def test_open_rehydrates_when_not_in_memory(storage, monkeypatch):
@@ -620,28 +587,9 @@ def test_open_rehydrates_when_not_in_memory(storage, monkeypatch):
     assert body["ws_id"] == "coord-rehy"
     assert body["name"] == "rehydrated"
     assert "already_loaded" not in body
-    mgr.open.assert_called_once_with("coord-rehy", user_id="user-1")
-
-
-def test_open_admin_uses_open_admin(storage, monkeypatch):
-    mgr = _build_mgr(storage)
-    rehydrated = MagicMock()
-    rehydrated.id = "coord-rehy"
-    rehydrated.name = "r"
-    rehydrated.user_id = "someone-else"
-    # SessionManager.open accepts (ws_id, *, user_id, admin) — admin
-    # callers pass admin=True instead of the old ``open_admin`` helper.
-    monkeypatch.setattr(mgr, "open", MagicMock(return_value=rehydrated))
-    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.post(
-        "/v1/api/coordinator/coord-rehy/open",
-        headers={
-            "X-Test-User": "admin-1",
-            "X-Test-Perms": "admin.coordinator,admin.users",
-        },
-    )
-    assert resp.status_code == 200
-    mgr.open.assert_called_once_with("coord-rehy", user_id="", admin=True)
+    # SessionManager.open takes a single positional arg now — no
+    # per-caller ownership / admin plumbing.
+    mgr.open.assert_called_once_with("coord-rehy")
 
 
 def test_open_returns_404_when_unknown_ws_id(storage, monkeypatch):
@@ -721,28 +669,16 @@ def test_children_returns_interactive_children(storage):
     assert kinds == {"interactive"}
 
 
-def test_children_ownership_404(storage):
-    mgr = _build_mgr(storage)
-    ws = mgr.create(user_id="owner")
-    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.get(
-        f"/v1/api/coordinator/{ws.id}/children",
-        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
-    )
-    assert resp.status_code == 404
-
-
-def test_children_admin_bypass(storage):
+def test_children_any_admin_coordinator_caller_sees_subtree(storage):
+    # Trusted-team visibility: the children subtree is readable by any
+    # ``admin.coordinator`` caller.
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="owner")
     _seed_child(storage, ws.id, "a" * 32)
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.get(
         f"/v1/api/coordinator/{ws.id}/children",
-        headers={
-            "X-Test-User": "admin-1",
-            "X-Test-Perms": "admin.coordinator,admin.users",
-        },
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
     )
     assert resp.status_code == 200
     assert len(resp.json()["items"]) == 1
@@ -804,7 +740,9 @@ def test_tasks_corrupt_envelope_returns_empty(storage):
     assert resp.json() == {"version": 1, "tasks": []}
 
 
-def test_tasks_ownership_404(storage):
+def test_tasks_any_admin_coordinator_caller_can_read(storage):
+    # Trusted-team visibility: any ``admin.coordinator`` caller can
+    # read the tasks envelope.
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="owner")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
@@ -812,7 +750,7 @@ def test_tasks_ownership_404(storage):
         f"/v1/api/coordinator/{ws.id}/tasks",
         headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
     )
-    assert resp.status_code == 404
+    assert resp.status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -844,7 +782,8 @@ def test_cluster_inspect_invalid_ws_id_400(storage):
     assert resp.status_code == 400
 
 
-def test_cluster_inspect_ownership_404(storage):
+def test_cluster_inspect_any_inspect_caller_sees_detail(storage):
+    # Trusted-team visibility: admin.cluster.inspect sees every row.
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="owner")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
@@ -852,7 +791,8 @@ def test_cluster_inspect_ownership_404(storage):
         f"/v1/api/cluster/ws/{ws.id}/detail",
         headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.cluster.inspect"},
     )
-    assert resp.status_code == 404
+    assert resp.status_code == 200
+    assert resp.json()["persisted"]["ws_id"] == ws.id
 
 
 def test_cluster_inspect_coordinator_self_path(storage):
@@ -1116,41 +1056,10 @@ def test_coordinator_rows_filters_by_caller_identity(storage):
         )
         return request
 
-    alice_rows = _coordinator_rows(
-        _request_for("alice", frozenset({"read"})),
-    )
-    names = {r["name"] for r in alice_rows}
-    assert names == {"alice-coord"}, "non-admin alice must NOT see bob's coordinator"
-
-    bob_rows = _coordinator_rows(_request_for("bob", frozenset({"read"})))
-    assert {r["name"] for r in bob_rows} == {"bob-coord"}
-
-    admin_rows = _coordinator_rows(
-        _request_for("admin-1", frozenset({"read", "admin.users"})),
-    )
-    assert {r["name"] for r in admin_rows} == {"alice-coord", "bob-coord"}
-
-
-def test_coordinator_rows_empty_user_id_returns_empty(storage):
-    """Defense-in-depth: a request with no user_id (shouldn't reach this
-    path through the auth middleware, but defensive) gets zero rows,
-    not a list_all leak."""
-    from unittest.mock import MagicMock
-
-    from turnstone.console.server import _coordinator_rows
-
-    mgr = _build_mgr(storage)
-    mgr.create(user_id="alice", name="alice-coord")
-
-    request = MagicMock()
-    request.app.state.coord_mgr = mgr
-    request.state.auth_result = AuthResult(
-        user_id="",
-        scopes=frozenset({"read"}),
-        token_source="test",
-        permissions=frozenset({"read"}),
-    )
-    assert _coordinator_rows(request) == []
+    # Trusted-team visibility: every caller sees every coordinator.
+    for caller in ("alice", "bob", "admin-1"):
+        rows = _coordinator_rows(_request_for(caller, frozenset({"read"})))
+        assert {r["name"] for r in rows} == {"alice-coord", "bob-coord"}
 
 
 def _persisted_rows_request(storage, mgr, user_id: str, perms: frozenset[str]):
@@ -1232,11 +1141,10 @@ def test_coordinator_rows_dedupes_by_ws_id_in_memory_wins(storage):
     assert rows[0]["state"] == "idle"
 
 
-def test_coordinator_rows_persisted_respects_tenant_filter(storage):
-    """Non-admin callers must not see OTHER tenants' persisted
-    (closed) coordinators either.  Regression lock — the user_id
-    kwarg on list_workstreams is pushed through; the defense-in-depth
-    client-side empty-string check catches the tail."""
+def test_coordinator_rows_persisted_cluster_wide(storage):
+    # Trusted-team visibility: every caller sees every persisted row,
+    # including rows from other identities and orphan (empty-user_id)
+    # rows.  ``user_id`` stays on the response as metadata.
     from turnstone.console.server import _coordinator_rows
     from turnstone.core.workstream import WorkstreamKind
 
@@ -1259,33 +1167,6 @@ def test_coordinator_rows_persisted_respects_tenant_filter(storage):
         kind=WorkstreamKind.COORDINATOR,
         parent_ws_id=None,
     )
-
-    alice_req = _persisted_rows_request(storage, mgr, "alice", frozenset({"read"}))
-    alice_rows = _coordinator_rows(alice_req)
-    assert {r["name"] for r in alice_rows} == {"alice-closed"}
-
-    bob_req = _persisted_rows_request(storage, mgr, "bob", frozenset({"read"}))
-    bob_rows = _coordinator_rows(bob_req)
-    assert {r["name"] for r in bob_rows} == {"bob-closed"}
-
-    admin_req = _persisted_rows_request(storage, mgr, "admin-1", frozenset({"read", "admin.users"}))
-    admin_rows = _coordinator_rows(admin_req)
-    assert {r["name"] for r in admin_rows} == {"alice-closed", "bob-closed"}
-
-
-def test_coordinator_rows_persisted_skips_orphan_rows_for_non_admin(storage):
-    """Defense-in-depth empty-string tenancy check — a persisted row
-    with empty user_id (migration-artifact / system-owned) must NOT
-    be visible to a non-admin caller with empty caller_uid either.
-    The SQL user_id filter above already enforces this, but duplicate
-    the check client-side so orphan rows never leak to any
-    hypothetical empty-sub JWT."""
-    from unittest.mock import MagicMock
-
-    from turnstone.console.server import _coordinator_rows
-    from turnstone.core.workstream import WorkstreamKind
-
-    mgr = _build_mgr(storage)
     storage.register_workstream(
         "c" * 32,
         node_id="console",
@@ -1296,14 +1177,11 @@ def test_coordinator_rows_persisted_skips_orphan_rows_for_non_admin(storage):
         parent_ws_id=None,
     )
 
-    # Non-admin with empty caller_uid must not see the orphan.
-    request = MagicMock()
-    request.app.state.coord_mgr = mgr
-    request.app.state.auth_storage = storage
-    request.state.auth_result = AuthResult(
-        user_id="",
-        scopes=frozenset({"read"}),
-        token_source="test",
-        permissions=frozenset({"read"}),
-    )
-    assert _coordinator_rows(request) == []
+    for caller, perms in (
+        ("alice", frozenset({"read"})),
+        ("bob", frozenset({"read"})),
+        ("admin-1", frozenset({"read", "admin.users"})),
+    ):
+        request = _persisted_rows_request(storage, mgr, caller, perms)
+        rows = _coordinator_rows(request)
+        assert {r["name"] for r in rows} == {"alice-closed", "bob-closed", "orphan-closed"}

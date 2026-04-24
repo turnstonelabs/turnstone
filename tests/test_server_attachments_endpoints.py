@@ -210,16 +210,17 @@ class TestUploadRejections:
         )
         assert resp.status_code == 404
 
-    def test_foreign_workstream_is_not_found(self, app_client):
+    def test_any_caller_can_attach_to_workstream(self, app_client):
+        # Trusted-team model: attaching to any workstream is gated on
+        # scope auth, not ownership.  The attachment is filed under
+        # the ws's persisted owner so existing storage shape holds.
         client, _ = app_client
-        # userA tries to attach to ws-B (owned by userB) — we mask this as
-        # 404 to avoid leaking workstream existence to non-owners.
         resp = client.post(
             "/v1/api/workstreams/ws-B/attachments",
             files={"file": ("x.md", b"x", "text/markdown")},
             headers=_auth("userA"),
         )
-        assert resp.status_code == 404
+        assert resp.status_code == 200
 
 
 class TestPendingCap:
@@ -298,13 +299,17 @@ class TestListAttachments:
         assert all("content" not in a for a in atts)
         assert {a["filename"] for a in atts} == {"a.md", "b.md"}
 
-    def test_list_isolated_per_user(self, app_client):
+    def test_list_visible_cluster_wide(self, app_client):
+        # Trusted-team visibility: any authenticated caller can list
+        # the attachments on any workstream.  Attachments are filed
+        # under the ws's owner uid so a cross-caller lister still sees
+        # the owner's pending uploads.
         client, _ = app_client
         _upload(client, "ws-A", "userA", "mine.md", b"mine", "text/markdown")
-        # userB can't even GET listing on ws-A (not their workstream);
-        # masked as 404 to avoid existence-leak.
         resp = client.get("/v1/api/workstreams/ws-A/attachments", headers=_auth("userB"))
-        assert resp.status_code == 404
+        assert resp.status_code == 200
+        atts = resp.json()["attachments"]
+        assert {a["filename"] for a in atts} == {"mine.md"}
 
 
 class TestGetContent:
@@ -343,15 +348,19 @@ class TestGetContent:
         assert resp.headers["content-type"].startswith("text/plain")
         assert resp.headers.get("x-content-type-options") == "nosniff"
 
-    def test_get_content_wrong_user_is_not_found(self, app_client):
+    def test_get_content_visible_cluster_wide(self, app_client):
+        # Trusted-team visibility: any authenticated caller can fetch
+        # the content of an attachment on any workstream.  Attachments
+        # are keyed by the ws's persisted owner uid so userB still
+        # resolves userA's blob via _require_ws_access's owner return.
         client, _ = app_client
         aid = _upload(client, "ws-A", "userA", "t.md", b"x", "text/markdown")
         resp = client.get(
             f"/v1/api/workstreams/ws-A/attachments/{aid}/content",
             headers=_auth("userB"),
         )
-        # 404 rather than 403 — caller can't distinguish from "ws doesn't exist".
-        assert resp.status_code == 404
+        assert resp.status_code == 200
+        assert resp.content == b"x"
 
     def test_get_content_cross_workstream_id_404(self, app_client):
         client, _ = app_client
@@ -400,12 +409,14 @@ class TestDelete:
         resp = client.delete(f"/v1/api/workstreams/ws-A/attachments/{aid}", headers=_auth("userA"))
         assert resp.status_code == 404
 
-    def test_delete_wrong_user_is_not_found(self, app_client):
+    def test_delete_cluster_wide(self, app_client):
+        # Trusted-team model: any authenticated caller can delete an
+        # attachment on any workstream.  The filed ``user_id`` stays
+        # for audit even after a cross-caller delete.
         client, _ = app_client
         aid = _upload(client, "ws-A", "userA", "t.md", b"x", "text/markdown")
         resp = client.delete(f"/v1/api/workstreams/ws-A/attachments/{aid}", headers=_auth("userB"))
-        # userB doesn't own ws-A — masked as 404 to avoid existence-leak.
-        assert resp.status_code == 404
+        assert resp.status_code == 200
 
 
 # ---------------------------------------------------------------------------

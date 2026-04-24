@@ -57,56 +57,11 @@ def _request_with_auth(
 
 
 # ---------------------------------------------------------------------------
-# _effective_user_filter — console edition (admin, service, uid, DENY)
+# _effective_user_filter — the console edition was deleted alongside the
+# row-level ownership gates (trusted-team unification).  Only the server
+# edition survives — it still differentiates service callers (cluster-
+# wide) from scoped users (tenant-pinned aggregates on node endpoints).
 # ---------------------------------------------------------------------------
-
-
-class TestConsoleEffectiveUserFilter:
-    def test_admin_returns_none(self):
-        from turnstone.console.server import _effective_user_filter
-
-        req = _request_with_auth(user_id="alice", permissions=frozenset({"admin.users"}))
-        assert _effective_user_filter(req) is None
-
-    def test_admin_roles_perm_also_bypasses(self):
-        from turnstone.console.server import _effective_user_filter
-
-        req = _request_with_auth(user_id="carol", permissions=frozenset({"admin.roles"}))
-        assert _effective_user_filter(req) is None
-
-    def test_service_scope_returns_none(self):
-        from turnstone.console.server import _effective_user_filter
-
-        req = _request_with_auth(user_id="svc-proxy", scopes=frozenset({"service"}))
-        assert _effective_user_filter(req) is None
-
-    def test_scoped_caller_returns_uid(self):
-        from turnstone.console.server import _effective_user_filter
-
-        req = _request_with_auth(user_id="alice", scopes=frozenset({"read"}))
-        assert _effective_user_filter(req) == "alice"
-
-    def test_blank_sub_non_service_returns_deny_sentinel(self):
-        from turnstone.console.server import DENY_EMPTY_SUB, _effective_user_filter
-
-        req = _request_with_auth(user_id="", scopes=frozenset({"read"}))
-        result = _effective_user_filter(req)
-        assert result is DENY_EMPTY_SUB, (
-            "blank-sub non-service callers must fail closed — "
-            "passing through to storage with user_id=None is a "
-            "service escape and user_id='' matches legacy orphans"
-        )
-
-    def test_deny_sentinel_is_singleton(self):
-        """Callers compare with ``is``; equality against a bare object()
-        must never match the sentinel, and two separate reads of the
-        attribute return the same instance (ruling out a property /
-        factory that would break ``is`` identity)."""
-        from turnstone.console.server import DENY_EMPTY_SUB as FIRST_READ
-        from turnstone.console.server import DENY_EMPTY_SUB as SECOND_READ
-
-        assert FIRST_READ is not object()
-        assert FIRST_READ is SECOND_READ
 
 
 # ---------------------------------------------------------------------------
@@ -513,15 +468,17 @@ class TestClusterEventsSseGate:
 
 
 class TestDenySentinelSharedIdentity:
-    def test_console_and_server_share_one_sentinel(self):
+    def test_core_and_server_share_one_sentinel(self):
         """The sentinel is compared with ``is``; a future refactor
         that re-introduced per-module duplicates would silently break
-        the identity check.  Lock the cross-module invariant."""
-        from turnstone.console.server import DENY_EMPTY_SUB as CONSOLE_DENY
+        the identity check.  Lock the cross-module invariant.
+
+        Only the server + core surfaces consume the sentinel after the
+        trusted-team unification — the console no longer gates on
+        row ownership, so its ``_effective_user_filter`` was removed."""
         from turnstone.core.auth import DENY_EMPTY_SUB as CORE_DENY
         from turnstone.server import DENY_EMPTY_SUB as SERVER_DENY
 
-        assert CORE_DENY is CONSOLE_DENY
         assert CORE_DENY is SERVER_DENY
 
 

@@ -340,7 +340,10 @@ def test_restrict_rejects_non_object_body(storage):
     assert resp.status_code == 400
 
 
-def test_trust_toggle_tenant_404_on_foreign_coord(storage):
+def test_trust_toggle_cluster_wide_access(storage):
+    # Trusted-team model: the trust toggle is gated on the scope
+    # permission, not on row-level ownership.  A caller holding
+    # ``coordinator.trust.send`` may toggle any coord's trust state.
     mgr = _build_mgr(storage)
     coord = mgr.create(user_id="user-owner", name="coord-a")
     coord.session, _ = _make_session_mock()
@@ -353,7 +356,7 @@ def test_trust_toggle_tenant_404_on_foreign_coord(storage):
             "X-Test-Perms": "admin.coordinator,coordinator.trust.send",
         },
     )
-    assert resp.status_code == 404
+    assert resp.status_code == 200
 
 
 def test_trust_toggle_404_when_session_not_loaded(storage):

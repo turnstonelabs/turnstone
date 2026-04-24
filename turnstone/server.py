@@ -2965,9 +2965,6 @@ async def refresh_workstream_title(request: Request, ws_id: str = "") -> JSONRes
     ws_id = request.path_params.get("ws_id", "")
     log.info("ws.title.refresh_requested", ws_id=ws_id[:8] if ws_id else "empty")
     mgr = request.app.state.workstreams
-    # Cross-tenant rename is a phishing / denial-of-use vector — a
-    # malicious caller could push the victim's title to a misleading
-    # string visible in list/dashboard responses.
     _owner, err = _require_ws_access(request, ws_id, mgr=mgr)
     if err:
         return err
@@ -3003,7 +3000,6 @@ async def set_workstream_title(request: Request, ws_id: str = "") -> JSONRespons
     if not ws_id:
         return JSONResponse({"error": "ws_id is required"}, status_code=400)
     mgr = request.app.state.workstreams
-    # Cross-tenant rename gate — same rationale as refresh-title above.
     _owner, err = _require_ws_access(request, ws_id, mgr=mgr)
     if err:
         return err
@@ -3213,11 +3209,14 @@ def _require_ws_access(
     *,
     mgr: SessionManager | None = None,
 ) -> tuple[str, JSONResponse | None]:
-    """Resolve ``ws_id`` to its owner after verifying the caller has access.
+    """Resolve ``ws_id`` to its owner, 404-ing when the row doesn't exist.
 
-    Service-scoped tokens (internal callers) bypass ownership checks.
-    Returns ``(owner_user_id, None)`` on success.  The owner id is what
-    attachments should be filed under.
+    Turnstone is a trusted-team tool: scope-level auth (e.g.
+    ``admin.workstreams``) is the only gate; row-level ownership is not
+    enforced here.  Returns ``(owner_user_id, None)`` on success — the
+    persisted owner id, which attachments should be filed under so
+    existing storage shape is preserved.  Falls back to the caller's
+    own uid when the row has no recorded owner.
 
     When ``mgr`` is provided and the workstream is live in the manager,
     trust its cached ``user_id`` instead of round-tripping storage —
@@ -3228,18 +3227,11 @@ def _require_ws_access(
     ``mgr`` and fall through to the storage path.
     """
     caller = _auth_user_id(request)
-    scopes = _auth_scopes(request)
-    is_service = "service" in scopes
 
     if mgr is not None:
         ws_mem = mgr.get(ws_id)
         if ws_mem is not None:
-            owner_mem = ws_mem.user_id
-            if is_service:
-                return owner_mem or caller, None
-            if owner_mem and owner_mem != caller:
-                return "", JSONResponse({"error": "Workstream not found"}, status_code=404)
-            return caller, None
+            return ws_mem.user_id or caller, None
         # Not in memory — fall through to storage so /delete etc.
         # still resolve persisted-but-not-loaded rows.
 
@@ -3248,17 +3240,7 @@ def _require_ws_access(
     owner = get_workstream_owner(ws_id)
     if owner is None:
         return "", JSONResponse({"error": "Workstream not found"}, status_code=404)
-    if is_service:
-        # Trust the service caller; file under its own user_id if no owner
-        # is set, otherwise under the existing owner.
-        return owner or caller, None
-    # Authenticated user must own the workstream.  If the workstream was
-    # created before user tracking (owner blank) or by the same user, allow.
-    if owner and owner != caller:
-        # Return 404 (not 403) so non-owners cannot enumerate workstream
-        # existence by response code.
-        return "", JSONResponse({"error": "Workstream not found"}, status_code=404)
-    return caller, None
+    return owner or caller, None
 
 
 async def upload_attachment(request: Request) -> JSONResponse:
@@ -3489,20 +3471,13 @@ async def open_workstream(request: Request) -> JSONResponse:
         )
 
     uid: str = _auth_user_id(request)
-    scopes = _auth_scopes(request)
 
-    # Ownership gate: the stored owner must match the caller (or the
-    # caller must hold service scope — used by the console routing proxy
-    # and cluster rehydration paths).  Ownerless persisted rows (the
-    # startup ``name="default"`` workstream, pre-migration legacy rows)
-    # are claimable by any authenticated caller — consistent with the
-    # trusted-team visibility model the listing endpoints assume, and
-    # symmetric with how _require_ws_access handles the same rows on
-    # the per-workstream interactive handlers.  404 (not 403) so
-    # existence isn't enumerable by non-owners.
+    # Trusted-team model: scope-level auth (already enforced by the
+    # middleware) is the only gate.  ``user_id`` is metadata for audit
+    # + display, not an access boundary, so any authenticated caller
+    # can rehydrate any persisted workstream.  Fall back to the
+    # caller's uid when the row has no recorded owner.
     stored_owner = (ws_row.get("user_id") or "").strip()
-    if stored_owner and "service" not in scopes and stored_owner != uid:
-        return JSONResponse({"error": "Workstream not found"}, status_code=404)
     owner_uid = stored_owner or uid
 
     try:

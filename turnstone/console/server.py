@@ -46,11 +46,9 @@ from turnstone.console.metrics import ConsoleMetrics
 from turnstone.console.router import ConsoleRouter
 from turnstone.core.audit import record_audit
 from turnstone.core.auth import (
-    DENY_EMPTY_SUB,
     JWT_AUD_CONSOLE,
     JWT_AUD_SERVER,
     AuthMiddleware,
-    _DenyFilter,
     create_jwt,
     jwt_version_slot,
     require_permission,
@@ -450,26 +448,15 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
     In-memory wins on ws_id conflict so live state stays authoritative
     for active sessions.
 
-    Ownership filter: non-admin callers must not see other tenants'
-    coordinator rows.  Admins (``admin.users`` / ``admin.roles``) get
-    the full set.  Unauthenticated callers shouldn't reach this path
-    — the endpoint sits behind global auth — but the filter defaults
-    to empty on a missing ``user_id`` rather than leaking.
+    Trusted-team visibility (post-#400): the cluster dashboard shows
+    every coordinator regardless of caller identity; ``user_id`` is
+    surfaced on each row as display metadata.
     """
     coord_mgr = getattr(request.app.state, "coord_mgr", None)
     if coord_mgr is None:
         return []
-    filt = _effective_user_filter(request)
-    if filt is DENY_EMPTY_SUB:
-        return []
-    # filt is now ``None`` (admin / service) or a non-empty caller uid.
-    # ``list_for_user`` lived on the old CoordinatorManager; SessionManager
-    # only exposes ``list_all`` — inline the owner filter at the call site.
     try:
-        all_wss = coord_mgr.list_all()
-        wss = (
-            all_wss if filt is None else [ws for ws in all_wss if ws.user_id and ws.user_id == filt]
-        )
+        wss = coord_mgr.list_all()
     except Exception:
         log.debug("cluster_workstreams.coord_list_failed", exc_info=True)
         return []
@@ -506,16 +493,15 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
 
     # Second lane — persisted coordinator rows, used to surface
     # closed / error / deleted coordinators the manager has already
-    # evicted from ``self._workstreams``.  ``filt`` carries the same
-    # tenant decision as the in-memory lane above (None = admin /
-    # service; str = scoped caller).
+    # evicted from ``self._workstreams``.  Cluster-wide (trusted-team
+    # visibility).
     storage = getattr(request.app.state, "auth_storage", None)
     if storage is None:
         return rows
     try:
         persisted = storage.list_workstreams(
             kind=WorkstreamKind.COORDINATOR,
-            user_id=filt,
+            user_id=None,
             limit=200,
         )
     except Exception:
@@ -534,12 +520,6 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
         if not row_id or row_id in seen:
             continue
         row_owner = m.get("user_id") or ""
-        # Defense-in-depth empty-string tenancy check.  The SQL user_id
-        # filter above already enforces the match when ``filt`` is set;
-        # drop any rows whose owner still lands empty (migration
-        # artifacts) for non-admin callers.
-        if filt is not None and (not row_owner or row_owner != filt):
-            continue
         rows.append(
             {
                 "id": row_id,
@@ -894,15 +874,6 @@ async def cluster_ws_detail(request: Request) -> JSONResponse:
     if row is None:
         return JSONResponse({"error": "workstream not found"}, status_code=404)
 
-    user_id = _auth_user_id(request)
-    err404 = _check_row_owner_or_404(
-        request,
-        row.get("user_id") or "",
-        user_id,
-    )
-    if err404 is not None:
-        return err404
-
     try:
         live = await _fetch_live_block(request, row, ws_id)
     except Exception:
@@ -991,14 +962,6 @@ async def cluster_ws_live_bulk(request: Request) -> JSONResponse:
     if not cleaned:
         return JSONResponse({"results": {}, "denied": [], "truncated": False})
 
-    filt = _effective_user_filter(request)
-    if filt is DENY_EMPTY_SUB:
-        # Non-admin, non-service caller with a blank sub — every row
-        # is denied by the empty-string rule.  Skip the batch fetch
-        # entirely and route all ids to ``denied`` (no existence
-        # oracle).
-        return JSONResponse({"results": {}, "denied": cleaned, "truncated": truncated})
-
     try:
         rows = await asyncio.to_thread(storage.get_workstreams_batch, cleaned)
     except Exception:
@@ -1020,14 +983,9 @@ async def cluster_ws_live_bulk(request: Request) -> JSONResponse:
     for wid in cleaned:
         row = rows.get(wid)
         if row is None:
-            denied.append(wid)
-            continue
-        # Tenant check — admin / service (``filt is None``) sees all
-        # rows; scoped callers (``filt`` is a uid) see only matching
-        # rows.  An orphan / migration-artifact row with ``user_id=""``
-        # is denied for scoped callers by the ``not row_owner`` guard.
-        row_owner = row.get("user_id") or ""
-        if filt is not None and (not row_owner or row_owner != filt):
+            # Missing rows route to ``denied`` rather than ``results``
+            # so the endpoint can't be used as an existence oracle for
+            # ids outside the caller's knowledge.
             denied.append(wid)
             continue
         owned_rows.append((wid, row))
@@ -2368,28 +2326,6 @@ def _require_admin_coordinator(
     )
 
 
-def _check_row_owner_or_404(
-    request: Request,
-    row_owner: str,
-    user_id: str,
-    *,
-    error_msg: str = "workstream not found",
-) -> JSONResponse | None:
-    """Ownership gate with the empty-string defense.
-
-    Non-admin callers need BOTH ``user_id`` and ``row_owner`` to be
-    non-empty AND equal.  Either side being empty is a 404 — otherwise
-    an orphan / migration-artifact / system-owned row with
-    ``user_id=""`` would leak to a (hypothetical) caller whose JWT
-    carries an empty ``sub`` claim.  Admin bypass honoured.
-    """
-    if _is_admin(request):
-        return None
-    if not user_id or not row_owner or row_owner != user_id:
-        return JSONResponse({"error": error_msg}, status_code=404)
-    return None
-
-
 def _resolve_coordinator_or_404(
     request: Request,
     coord_mgr: Any,
@@ -2397,21 +2333,22 @@ def _resolve_coordinator_or_404(
     ws_id: str,
     user_id: str,
 ) -> tuple[Any, JSONResponse | None]:
-    """Resolve a coordinator workstream and check ownership.
+    """Resolve a coordinator workstream by id.
 
     Returns ``(ws, None)`` on success — ``ws`` is the in-memory
     ``Workstream`` when present, ``None`` when the coordinator is
     persisted but not loaded (callers may then fall through to
     ``storage`` directly or trigger lazy rehydration).  Returns
-    ``(None, 404)`` on missing row / wrong kind / storage unavailable
-    / ownership mismatch.
+    ``(None, 404)`` on missing row / wrong kind / storage unavailable.
 
     Centralises the manager-first, storage-fallback, 404-mask ladder
     previously duplicated across ``coordinator_children`` /
-    ``coordinator_tasks`` / ``coordinator_history``.  Ownership uses
-    :func:`_check_row_owner_or_404` so the empty-string defense
-    applies uniformly.
+    ``coordinator_tasks`` / ``coordinator_history``.  Turnstone is a
+    trusted-team tool — ``user_id`` is metadata, not an access
+    boundary, so this helper no longer gates on row ownership; scope
+    auth (``admin.coordinator``) upstream is the gate.
     """
+    del user_id  # retained in signature for caller-site clarity; not consulted here
     miss = JSONResponse({"error": "coordinator not found"}, status_code=404)
     ws = coord_mgr.get(ws_id) if coord_mgr is not None else None
     if ws is None:
@@ -2424,23 +2361,7 @@ def _resolve_coordinator_or_404(
             return None, miss
         if row is None or row.get("kind") != WorkstreamKind.COORDINATOR:
             return None, miss
-        err = _check_row_owner_or_404(
-            request,
-            row.get("user_id") or "",
-            user_id,
-            error_msg="coordinator not found",
-        )
-        if err is not None:
-            return None, err
         return None, None
-    err = _check_row_owner_or_404(
-        request,
-        ws.user_id or "",
-        user_id,
-        error_msg="coordinator not found",
-    )
-    if err is not None:
-        return None, err
     return ws, None
 
 
@@ -2452,53 +2373,6 @@ def _auth_user_id(request: Request) -> str:
 def _auth_scopes(request: Request) -> set[str]:
     auth = getattr(getattr(request, "state", None), "auth_result", None)
     return set(getattr(auth, "scopes", []) or [])
-
-
-def _is_admin(request: Request) -> bool:
-    auth = getattr(getattr(request, "state", None), "auth_result", None)
-    perms: frozenset[str] = getattr(auth, "permissions", frozenset())
-    return "admin.users" in perms or "admin.roles" in perms
-
-
-def _effective_user_filter(request: Request) -> str | None | _DenyFilter:
-    """Resolve the effective ``user_id`` filter for a tenant-scoped aggregate.
-
-    Returns one of:
-
-    - ``None`` — admin (``admin.users`` / ``admin.roles``) or
-      service-scoped caller; no tenant filter — storage helpers see
-      cluster-wide rows.
-    - ``str`` — non-admin, non-service caller with a resolved uid;
-      storage helpers MUST receive ``user_id=<uid>`` and push the
-      filter into SQL.
-    - :data:`DENY_EMPTY_SUB` — non-admin, non-service caller whose
-      ``sub`` claim is blank.  Callers MUST short-circuit with their
-      endpoint's empty-shape response; passing ``None`` through to
-      storage would be a service-escape and passing ``""`` would
-      accidentally match legacy orphan rows with empty ``user_id``.
-
-    .. note::
-       The service-scope bypass is end-to-end only on endpoints that
-       do NOT first gate on :func:`_check_row_owner_or_404` (which
-       currently bypasses for ``admin.*`` permissions but not for
-       service scope).  A service-scoped non-admin caller to
-       ``coordinator_children`` / ``coordinator_metrics`` is 404'd
-       before the filter runs; the bypass there is reachable only by
-       admin callers.  ``_coordinator_rows`` and
-       ``cluster_ws_live_bulk`` honour the full three-way return.
-
-    See the class-level tenancy contract on
-    :class:`~turnstone.core.storage._protocol.StorageBackend` for the
-    storage-side requirement.
-    """
-    if _is_admin(request):
-        return None
-    if "service" in _auth_scopes(request):
-        return None
-    uid = _auth_user_id(request)
-    if not uid:
-        return DENY_EMPTY_SUB
-    return uid
 
 
 async def coordinator_create(request: Request) -> JSONResponse:
@@ -2603,15 +2477,8 @@ async def coordinator_send(request: Request) -> JSONResponse:
     message = (body.get("message") or "").strip()
     if not message:
         return JSONResponse({"error": "message is required"}, status_code=400)
-    user_id = _auth_user_id(request)
     ws = coord_mgr.get(ws_id)
     if ws is None:
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    if ws.user_id != user_id and not _is_admin(request):
-        # Strict equality (not short-circuit on empty ws.user_id) —
-        # empty-owner rows would otherwise leak ws_id/state/history
-        # across tenants to anyone with admin.coordinator.  404 (not
-        # 403) to avoid leaking existence.
         return JSONResponse({"error": "coordinator not found"}, status_code=404)
     coord_adapter = getattr(request.app.state, "coord_adapter", None)
     if coord_adapter is None or not coord_adapter.send(ws_id, message):
@@ -2642,12 +2509,8 @@ async def coordinator_approve(request: Request) -> JSONResponse:
     approved = bool(body.get("approved", False))
     feedback = body.get("feedback")
     always = bool(body.get("always", False))
-    user_id = _auth_user_id(request)
     ws = coord_mgr.get(ws_id)
     if ws is None:
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    if ws.user_id != user_id and not _is_admin(request):
-        # Strict equality — empty-owner rows must not leak across tenants.
         return JSONResponse({"error": "coordinator not found"}, status_code=404)
     ui = ws.ui
     if ui is None or not hasattr(ui, "resolve_approval"):
@@ -2682,9 +2545,6 @@ async def coordinator_cancel(request: Request) -> JSONResponse:
     ws = coord_mgr.get(ws_id)
     if ws is None:
         return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    if ws.user_id != user_id and not _is_admin(request):
-        # Strict equality — empty-owner rows must not leak across tenants.
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
     coord_mgr.cancel(ws_id)
     storage = getattr(request.app.state, "auth_storage", None)
     if storage is not None:
@@ -2718,9 +2578,6 @@ async def coordinator_close(request: Request) -> JSONResponse:
     ws = coord_mgr.get(ws_id)
     if ws is None:
         return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    if ws.user_id != user_id and not _is_admin(request):
-        # Strict equality — empty-owner rows must not leak across tenants.
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
     if not coord_mgr.close(ws_id):
         return JSONResponse({"error": "close failed"}, status_code=500)
     storage = getattr(request.app.state, "auth_storage", None)
@@ -2749,12 +2606,8 @@ async def coordinator_events(request: Request) -> Response:
     if err503 is not None:
         return err503
     ws_id = request.path_params.get("ws_id", "")
-    user_id = _auth_user_id(request)
     ws = coord_mgr.get(ws_id)
     if ws is None:
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    if ws.user_id != user_id and not _is_admin(request):
-        # Strict equality — empty-owner rows must not leak across tenants.
         return JSONResponse({"error": "coordinator not found"}, status_code=404)
     ui = ws.ui
     if ui is None or not hasattr(ui, "_register_listener"):
@@ -2831,13 +2684,10 @@ async def coordinator_list(request: Request) -> JSONResponse:
     coord_mgr, err503 = _require_coord_mgr(request)
     if err503 is not None:
         return err503
-    user_id = _auth_user_id(request)
-    all_rows = coord_mgr.list_all()
-    rows = (
-        all_rows
-        if _is_admin(request)
-        else [ws for ws in all_rows if ws.user_id and ws.user_id == user_id]
-    )
+    # Trusted-team visibility: any admin.coordinator-scoped caller
+    # sees cluster-wide active coordinators.  ``user_id`` stays on the
+    # response row as metadata for the UI.
+    rows = coord_mgr.list_all()
     return JSONResponse(
         {
             "coordinators": [
@@ -2879,17 +2729,10 @@ async def coordinator_saved(request: Request) -> JSONResponse:
     if err is not None:
         return err
 
-    if _is_admin(request):
-        user_filter: str | None = None
-    else:
-        caller_uid = _auth_user_id(request)
-        if not caller_uid:
-            # Blank sub on a non-service / non-admin token — fail closed
-            # rather than match every orphan / migration row with empty
-            # user_id.  Mirrors list_saved_workstreams.
-            return JSONResponse({"coordinators": []})
-        user_filter = caller_uid
-
+    # Trusted-team visibility (post-#400): any caller with the
+    # ``admin.coordinator`` scope sees cluster-wide saved coordinators;
+    # ``user_id`` stays as metadata on the persisted row but isn't a
+    # filter here.
     # Offload the blocking storage call + the lock-acquiring list_all
     # off the event loop, matching coordinator_create's pattern (#perf-2
     # from the saved-coordinators review).  list_workstreams_with_history
@@ -2900,7 +2743,7 @@ async def coordinator_saved(request: Request) -> JSONResponse:
         list_workstreams_with_history,
         limit=50,
         kind=WorkstreamKind.COORDINATOR,
-        user_id=user_filter,
+        user_id=None,
         state="closed",
     )
 
@@ -2974,7 +2817,6 @@ async def coordinator_detail(request: Request) -> JSONResponse:
     if err503 is not None:
         return err503
     ws_id = request.path_params.get("ws_id", "")
-    user_id = _auth_user_id(request)
     ws = coord_mgr.get(ws_id)
     if ws is None:
         # Lazy rehydration goes through the session factory, which can
@@ -2982,11 +2824,7 @@ async def coordinator_detail(request: Request) -> JSONResponse:
         # the correlation-id mask so stack traces don't leak through
         # the detail endpoint either.
         try:
-            ws = (
-                coord_mgr.open(ws_id, user_id="", admin=True)
-                if _is_admin(request)
-                else coord_mgr.open(ws_id, user_id=user_id)
-            )
+            ws = coord_mgr.open(ws_id)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=503)
         except Exception:
@@ -3008,9 +2846,6 @@ async def coordinator_detail(request: Request) -> JSONResponse:
             )
         if ws is None:
             return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    if ws.user_id != user_id and not _is_admin(request):
-        # Strict equality — empty-owner rows must not leak across tenants.
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
     return JSONResponse(
         {
             "ws_id": ws.id,
@@ -3040,18 +2875,11 @@ async def coordinator_open(request: Request) -> JSONResponse:
     ws_id = request.path_params.get("ws_id", "")
     if not ws_id:
         return JSONResponse({"error": "ws_id is required"}, status_code=400)
-    user_id = _auth_user_id(request)
     ws = coord_mgr.get(ws_id)
     if ws is not None:
-        if ws.user_id != user_id and not _is_admin(request):
-            return JSONResponse({"error": "coordinator not found"}, status_code=404)
         return JSONResponse({"ws_id": ws.id, "name": ws.name, "already_loaded": True})
     try:
-        ws = (
-            coord_mgr.open(ws_id, user_id="", admin=True)
-            if _is_admin(request)
-            else coord_mgr.open(ws_id, user_id=user_id)
-        )
+        ws = coord_mgr.open(ws_id)
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=503)
     except Exception:
@@ -3071,8 +2899,6 @@ async def coordinator_open(request: Request) -> JSONResponse:
             status_code=500,
         )
     if ws is None:
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    if ws.user_id != user_id and not _is_admin(request):
         return JSONResponse({"error": "coordinator not found"}, status_code=404)
     return JSONResponse({"ws_id": ws.id, "name": ws.name})
 
@@ -3147,21 +2973,15 @@ async def coordinator_children(request: Request) -> JSONResponse:
     if err404 is not None:
         return err404
 
-    # Tenant filter: push the caller's user_id into SQL so forged /
-    # migration-era rows with the same parent_ws_id but a different
-    # owner can't leak through.  Admins / service scope bypass the
-    # filter (they're expected to see the full subtree).  The prior
-    # _resolve_coordinator_or_404 already rejected non-admin callers
-    # with a blank sub, so DENY here is defense-in-depth.
-    filter_user_id = _effective_user_filter(request)
-    if filter_user_id is DENY_EMPTY_SUB:
-        return JSONResponse({"items": [], "truncated": False})
+    # Trusted-team visibility: any caller with admin.coordinator sees
+    # the full child subtree.  ``user_id`` stays on each row as
+    # metadata, not a filter.
     try:
         raw = storage.list_workstreams(
             limit=_CHILDREN_PAGE_LIMIT + 1,
             parent_ws_id=ws_id,
             kind=None,
-            user_id=filter_user_id,
+            user_id=None,
         )
     except Exception:
         correlation_id = secrets.token_hex(4)
@@ -3281,27 +3101,17 @@ async def coordinator_metrics(request: Request) -> JSONResponse:
     # (#perf-1).  Two cheap queries instead of a ``list_workstreams``
     # scan up to 10k rows.
     #
-    # Tenant filter on the aggregates — push user_id into SQL so a
-    # non-admin caller can't observe cross-tenant counts via forged /
-    # migration-era rows sharing parent_ws_id.  The 404-mask above
-    # already rejected foreign coord_ws_id, so the filter here is
-    # defense-in-depth against child rows with drifted user_id.
+    # Trusted-team visibility: aggregates run cluster-wide per the
+    # unified ownership model; ``user_id`` is not a filter here.
     from datetime import UTC, datetime
 
-    filter_user_id = _effective_user_filter(request)
-    if filter_user_id is DENY_EMPTY_SUB:
-        # Prior _resolve_coordinator_or_404 already rejected this
-        # shape, but belt-and-braces: never fall through to storage
-        # with ``user_id=""`` (matches legacy orphans) or ``None``
-        # (service escape).
-        return JSONResponse(_coordinator_metrics_payload(ws_id=ws_id))
     now_epoch = time.time()
     hour_ago_iso = datetime.fromtimestamp(now_epoch - 3600, tz=UTC).strftime("%Y-%m-%dT%H:%M:%S")
     try:
         state_counts = await asyncio.to_thread(
             storage.count_workstreams_by_state,
             parent_ws_id=ws_id,
-            user_id=filter_user_id,
+            user_id=None,
         )
     except Exception:
         log.debug("coordinator_metrics.state_counts_failed ws=%s", ws_id[:8], exc_info=True)
@@ -3312,7 +3122,7 @@ async def coordinator_metrics(request: Request) -> JSONResponse:
             storage.count_workstreams_since,
             hour_ago_iso,
             parent_ws_id=ws_id,
-            user_id=filter_user_id,
+            user_id=None,
         )
     except Exception:
         log.debug(

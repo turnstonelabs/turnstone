@@ -206,9 +206,11 @@ class SessionManager:
         """Construct a new workstream, persist, and register.
 
         Slot reservation + placeholder install happen under the lock
-        (single-phase, ported from CoordinatorManager). Session
-        construction runs outside the lock; on failure the slot + row
-        are rolled back so capacity isn't leaked.
+        (single-phase). Session construction runs outside the lock; on
+        failure the in-memory slot is freed so capacity isn't leaked.
+        The storage row survives construction failure — the next
+        ``open(ws_id)`` retries session construction rather than
+        forcing the user to create a brand-new workstream.
 
         Raises ``RuntimeError`` when the manager is at capacity with
         no idle workstream to evict — callers (HTTP handlers) translate
@@ -230,7 +232,7 @@ class SessionManager:
         # Persist before session construction. Fail-closed: if the row
         # can't be written, the in-memory session would be invisible to
         # any lazy-rehydrate path and show up as "missing" after
-        # restart — better to surface the storage failure now.
+        # restart — surface the storage failure now.
         try:
             self._storage.register_workstream(
                 ws_id,
@@ -256,12 +258,13 @@ class SessionManager:
                 **extra_session_kwargs,
             )
         except Exception:
+            # Release the slot so capacity isn't leaked, and call
+            # cleanup_ui on the placeholder so any listener/lock state
+            # the UI factory allocated is released. Storage row stays:
+            # the next open() on this ws_id retries construction.
+            self._adapter.cleanup_ui(ws)
             with self._lock:
                 self._remove_locked(ws_id)
-            try:
-                self._storage.delete_workstream(ws_id)
-            except Exception:
-                log.warning("session_mgr.rollback_delete_failed ws=%s", ws_id[:8], exc_info=True)
             raise
 
         self._adapter.emit_created(ws)
@@ -297,18 +300,14 @@ class SessionManager:
     # open — lazy rehydrate for a persisted workstream
     # ------------------------------------------------------------------
 
-    def open(
-        self,
-        ws_id: str,
-        *,
-        user_id: str,
-        admin: bool = False,
-    ) -> Workstream | None:
+    def open(self, ws_id: str) -> Workstream | None:
         """Rehydrate a persisted workstream on demand.
 
         Returns ``None`` when the row doesn't exist, doesn't match our
-        kind, is tombstoned (``state='deleted'``), or doesn't belong to
-        ``user_id`` (non-admin callers only).
+        kind, or is tombstoned (``state='deleted'``). Turnstone is a
+        trusted-team tool — ownership is metadata for audit/display,
+        not an access boundary; HTTP handlers gate callers at the
+        scope level, not the row level.
 
         Serializes concurrent opens of the same ws_id through a
         per-ws refcounted lock so two GETs don't each construct a
@@ -326,14 +325,11 @@ class SessionManager:
                 if row is None or row.get("kind") != self.kind:
                     return None
                 # ``deleted`` is a tombstone — never resurrect.
-                # ``closed`` IS resurrectable: Saved Workstreams landing
-                # makes restore an explicit user action, and
+                # ``closed`` IS resurrectable; the Saved Workstreams
+                # landing makes restore an explicit user action, and
                 # ``_reserve_and_install_locked`` still enforces
                 # max_active (evicting an idle peer or raising).
                 if row.get("state") == "deleted":
-                    return None
-                row_owner = row.get("user_id") or ""
-                if not admin and row_owner != user_id:
                     return None
 
                 with self._lock:
@@ -344,7 +340,7 @@ class SessionManager:
                         return existing
                     ws, evicted = self._reserve_and_install_locked(
                         ws_id,
-                        user_id=row_owner,
+                        user_id=row.get("user_id") or "",
                         name=row.get("name") or f"ws-{ws_id[:4]}",
                         parent_ws_id=row.get("parent_ws_id"),
                     )
@@ -356,6 +352,9 @@ class SessionManager:
                 try:
                     ws.session = self._adapter.build_session(ws)
                 except Exception:
+                    # Clean up the UI the adapter built before re-raising
+                    # so any listener/lock resources are released.
+                    self._adapter.cleanup_ui(ws)
                     with self._lock:
                         self._remove_locked(ws_id)
                     raise
@@ -571,7 +570,17 @@ class SessionManager:
         ws.kind = self.kind
         ws.user_id = user_id
         ws.parent_ws_id = parent_ws_id if parent_ws_id else None
-        ws.ui = self._adapter.build_ui(ws)
+        try:
+            ws.ui = self._adapter.build_ui(ws)
+        except Exception:
+            # An IDLE peer may already have been popped above; if we
+            # propagate without unwinding, that peer leaks its session
+            # + worker + UI listeners and no ws_closed reaches
+            # subscribers.
+            if evicted is not None:
+                self._adapter.cleanup_ui(evicted)
+                self._adapter.emit_closed(evicted.id, reason="evicted")
+            raise
         self._workstreams[ws_id] = ws
         self._order.append(ws_id)
         if self._active_id is None:
