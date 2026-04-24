@@ -13,80 +13,28 @@ upstream node fetches.
 
 from __future__ import annotations
 
-from typing import Any
-from unittest.mock import MagicMock
-
 import pytest
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from turnstone.console.collector import ClusterCollector
-from turnstone.console.coordinator_adapter import CoordinatorAdapter
-from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
+from tests._coord_test_helpers import (
+    _AuthMiddleware,
+    _build_mgr,
+    _fake_registry,
+    _FakeConfigStore,
+)
 from turnstone.console.server import (
     cluster_ws_live_bulk,
     coordinator_metrics,
 )
-from turnstone.core.auth import AuthResult
-from turnstone.core.session_manager import SessionManager
 from turnstone.core.storage._sqlite import SQLiteBackend
-
-
-class _AuthMiddleware(BaseHTTPMiddleware):
-    """Inject a configurable AuthResult from header-based contract."""
-
-    async def dispatch(self, request, call_next):
-        perms = request.headers.get("X-Test-Perms", "")
-        user_id = request.headers.get("X-Test-User", "")
-        if perms or user_id:
-            request.state.auth_result = AuthResult(
-                user_id=user_id,
-                scopes=frozenset({"approve"}),
-                token_source="test",
-                permissions=frozenset(p for p in perms.split(",") if p),
-            )
-        return await call_next(request)
-
-
-class _FakeConfigStore:
-    def __init__(self, values: dict[str, Any]) -> None:
-        self._values = values
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return self._values.get(key, default)
 
 
 @pytest.fixture
 def storage(tmp_path):
     return SQLiteBackend(str(tmp_path / "phase6.db"))
-
-
-def _build_mgr(storage) -> SessionManager:
-    def _sf(ui, model_alias=None, ws_id=None, **kw):
-        return MagicMock()
-
-    adapter = CoordinatorAdapter(
-        collector=MagicMock(),
-        ui_factory=lambda ws: ConsoleCoordinatorUI(ws_id=ws.id, user_id=ws.user_id or ""),
-        session_factory=_sf,
-    )
-    mgr = SessionManager(
-        adapter,
-        storage=storage,
-        max_active=3,
-        node_id=ClusterCollector.CONSOLE_PSEUDO_NODE_ID,
-    )
-    adapter.attach(mgr)
-    return mgr
-
-
-def _fake_registry() -> MagicMock:
-    reg = MagicMock()
-    reg.resolve.return_value = (MagicMock(), "gpt-4", MagicMock())
-    return reg
 
 
 def _make_client(storage, *, coord_mgr=None) -> TestClient:

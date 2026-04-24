@@ -28,8 +28,9 @@ from tests._coord_test_helpers import (
 )
 from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 from turnstone.console.server import (
+    _require_admin_coordinator,
+    _require_coord_mgr,
     cluster_ws_detail,
-    coordinator_approve,
     coordinator_cancel,
     coordinator_children,
     coordinator_close,
@@ -43,6 +44,7 @@ from turnstone.console.server import (
     coordinator_tasks,
 )
 from turnstone.core.auth import AuthResult
+from turnstone.core.session_routes import SessionEndpointConfig, make_approve_handler
 from turnstone.core.storage._sqlite import SQLiteBackend
 
 # ---------------------------------------------------------------------------
@@ -85,7 +87,7 @@ def _make_client(
             ),
             Route(
                 "/v1/api/workstreams/{ws_id}/approve",
-                coordinator_approve,
+                make_approve_handler(),
                 methods=["POST"],
             ),
             Route(
@@ -138,6 +140,14 @@ def _make_client(
     app.state.coord_registry_error = "" if coord_mgr else "registry missing"
     app.state.auth_storage = storage
     app.state.jwt_secret = "x" * 64
+    # Wire the per-kind endpoint config the lifted handlers consult.
+    app.state.session_endpoint_config = SessionEndpointConfig(
+        permission_gate=_require_admin_coordinator,
+        manager_lookup=_require_coord_mgr,
+        tenant_check=None,
+        not_found_label="coordinator not found",
+        audit_action_prefix="coordinator",
+    )
     return TestClient(app)
 
 

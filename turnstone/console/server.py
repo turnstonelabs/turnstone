@@ -56,7 +56,9 @@ from turnstone.core.auth import (
 from turnstone.core.rendezvous import NoAvailableNodeError
 from turnstone.core.session_routes import (
     CoordOnlyVerbHandlers,
+    SessionEndpointConfig,
     SharedSessionVerbHandlers,
+    make_approve_handler,
     register_coord_verbs,
     register_session_routes,
 )
@@ -2520,44 +2522,6 @@ async def coordinator_send(request: Request) -> JSONResponse:
         if ws_now is not None and ws_now.session is not None:
             return JSONResponse({"error": "worker queue full; retry shortly"}, status_code=429)
         return JSONResponse({"error": "send failed"}, status_code=500)
-    return JSONResponse({"status": "ok"})
-
-
-async def coordinator_approve(request: Request) -> JSONResponse:
-    """POST /v1/api/workstreams/{ws_id}/approve — unblock pending approval."""
-    from turnstone.core.web_helpers import read_json_or_400
-
-    err = _require_admin_coordinator(request)
-    if err is not None:
-        return err
-    coord_mgr, err503 = _require_coord_mgr(request)
-    if err503 is not None:
-        return err503
-    ws_id = request.path_params.get("ws_id", "")
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
-    approved = bool(body.get("approved", False))
-    feedback = body.get("feedback")
-    always = bool(body.get("always", False))
-    ws = coord_mgr.get(ws_id)
-    if ws is None:
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    ui = ws.ui
-    if ui is None or not hasattr(ui, "resolve_approval"):
-        return JSONResponse(
-            {"error": "coordinator UI does not support approval"},
-            status_code=409,
-        )
-    if always and approved and getattr(ui, "_pending_approval", None):
-        tool_names = {
-            it.get("approval_label", "") or it.get("func_name", "")
-            for it in ui._pending_approval.get("items", [])
-            if it.get("needs_approval") and it.get("func_name") and not it.get("error")
-        }
-        tool_names.discard("")
-        ui.auto_approve_tools.update(tool_names)
-    ui.resolve_approval(approved, feedback)
     return JSONResponse({"status": "ok"})
 
 
@@ -10149,9 +10113,20 @@ def create_app(
     _docs_handler = make_docs_handler()
 
     # Coord workstream HTTP tree mounts under the unified
-    # ``/api/workstreams/`` shape. Handlers look the coord manager up
-    # via ``request.app.state.coord_mgr`` because the manager is built
-    # in the lifespan, after app construction.
+    # ``/api/workstreams/`` shape. Lifted handlers (e.g. ``approve``)
+    # consult ``app.state.session_endpoint_config`` for the kind's
+    # auth + manager-lookup policies. Per-kind handlers
+    # (``coordinator_*``) still look the coord manager up via
+    # ``request.app.state.coord_mgr`` because the manager is built in
+    # the lifespan, after this app construction; future verb lifts
+    # carry that lookup into the config callable.
+    coord_endpoint_config = SessionEndpointConfig(
+        permission_gate=_require_admin_coordinator,
+        manager_lookup=_require_coord_mgr,
+        tenant_check=None,  # cluster-wide admin.coordinator gate covers it
+        not_found_label="coordinator not found",
+        audit_action_prefix="coordinator",
+    )
     coord_workstream_routes: list[Any] = []
     register_session_routes(
         coord_workstream_routes,
@@ -10164,7 +10139,7 @@ def create_app(
             open=coordinator_open,
             close=coordinator_close,
             send=coordinator_send,
-            approve=coordinator_approve,
+            approve=make_approve_handler(),  # lifted: shared body
             cancel=coordinator_cancel,
             events=coordinator_events,
             history=coordinator_history,
@@ -10621,6 +10596,7 @@ def create_app(
         lifespan=_lifespan,
     )
     app.state.collector = collector
+    app.state.session_endpoint_config = coord_endpoint_config
     app.state.jwt_secret = jwt_secret
     app.state.auth_storage = auth_storage
     app.state.proxy_token_mgr = proxy_token_mgr

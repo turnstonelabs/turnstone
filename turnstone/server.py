@@ -57,7 +57,10 @@ from turnstone.core.session import ChatSession, GenerationCancelled, SessionUI  
 from turnstone.core.session_manager import SessionManager
 from turnstone.core.session_routes import (
     AttachmentHandlers,
+    SessionEndpointConfig,
     SharedSessionVerbHandlers,
+    make_approve_handler,
+    make_legacy_body_keyed_adapter,
     register_session_routes,
 )
 from turnstone.core.session_ui_base import SessionUIBase
@@ -1670,43 +1673,6 @@ async def send_message(request: Request) -> JSONResponse:
             "dropped_attachment_ids": dropped,
         }
     )
-
-
-async def approve(request: Request) -> JSONResponse:
-    """POST /v1/api/approve — approve or deny a tool call."""
-    from turnstone.core.web_helpers import read_json_or_400
-
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
-    approved = body.get("approved", False)
-    feedback = body.get("feedback")
-    always = body.get("always", False)
-    ws_id = body.get("ws_id")
-    mgr = request.app.state.workstreams
-    # Cross-tenant guard: resolving a pending tool approval on another
-    # tenant's workstream is RCE-adjacent (the victim queued a command
-    # expecting to decide themselves).  Gate before touching the UI.
-    # Pass mgr= so the check uses the in-memory ws.user_id and survives
-    # transient storage outages.
-    _owner, err = _require_ws_access(request, str(ws_id or ""), mgr=mgr)
-    if err:
-        return err
-    ws, ui = _get_ws(mgr, ws_id)
-    if not ws or not ui:
-        return JSONResponse({"error": "Unknown workstream"}, status_code=404)
-    if always and approved and ui._pending_approval:
-        tool_names = {
-            it.get("approval_label", "") or it.get("func_name", "")
-            for it in ui._pending_approval.get("items", [])
-            if it.get("needs_approval") and it.get("func_name") and not it.get("error")
-        }
-        tool_names.discard("")
-        tool_names.discard("__budget_override__")
-        if tool_names:
-            ui.auto_approve_tools.update(tool_names)
-    ui.resolve_approval(approved, feedback)
-    return JSONResponse({"status": "ok"})
 
 
 async def plan_feedback(request: Request) -> JSONResponse:
@@ -4423,7 +4389,25 @@ def create_app(
 
     # Workstream HTTP tree — owned by the shared registrar in
     # ``turnstone.core.session_routes`` so the console mounts the same
-    # shape against its coord manager.
+    # shape against its coord manager. ``session_endpoint_config``
+    # carries the kind-specific policy (auth, manager lookup, audit
+    # prefix) the lifted handler bodies consult at request time.
+    def _interactive_tenant_check(
+        request: Request, ws_id: str, mgr: SessionManager
+    ) -> JSONResponse | None:
+        # ``_require_ws_access`` returns ``(owner_uid, err)``; only the
+        # err matters for the gate.
+        _owner, err = _require_ws_access(request, ws_id, mgr=mgr)
+        return err
+
+    interactive_endpoint_config = SessionEndpointConfig(
+        permission_gate=None,  # interactive auth is enforced at the middleware layer
+        manager_lookup=lambda r: (r.app.state.workstreams, None),
+        tenant_check=_interactive_tenant_check,
+        not_found_label="Workstream not found",
+        audit_action_prefix="workstream",
+    )
+    approve_handler = make_approve_handler()
     v1_routes: list[Any] = [
         Route("/api/events", events_sse),
         Route("/api/events/global", global_events_sse),
@@ -4440,6 +4424,7 @@ def create_app(
             open=open_workstream,
             refresh_title=refresh_workstream_title,
             set_title=set_workstream_title,
+            approve=approve_handler,  # lifted: shared body
             attachments=AttachmentHandlers(
                 upload=upload_attachment,
                 list=list_attachments,
@@ -4460,7 +4445,11 @@ def create_app(
                     Route("/api/skills", list_skills_summary),
                     Route("/api/models", list_available_models),
                     Route("/api/send", send_message, methods=["POST", "DELETE"]),
-                    Route("/api/approve", approve, methods=["POST"]),
+                    Route(
+                        "/api/approve",
+                        make_legacy_body_keyed_adapter(approve_handler),
+                        methods=["POST"],
+                    ),
                     Route("/api/plan", plan_feedback, methods=["POST"]),
                     Route("/api/command", command, methods=["POST"]),
                     Route("/api/cancel", cancel_generation, methods=["POST"]),
@@ -4506,6 +4495,7 @@ def create_app(
         lifespan=_lifespan,
     )
     app.state.workstreams = workstreams
+    app.state.session_endpoint_config = interactive_endpoint_config
     app.state.global_queue = global_queue
     app.state.global_listeners = global_listeners
     app.state.global_listeners_lock = global_listeners_lock

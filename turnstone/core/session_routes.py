@@ -4,9 +4,10 @@ Both node and console processes mount the workstream HTTP tree at
 ``/v1/api/workstreams/`` via this registrar against their own
 :class:`~turnstone.core.session_manager.SessionManager` (interactive
 on the node, coordinator on the console). One URL shape, two
-processes, kind-specific handler bodies wired in by the caller.
+processes, kind-specific policy in :class:`SessionEndpointConfig`
+that handlers consult at request time via ``app.state``.
 
-Two registrar functions:
+Three registrar functions:
 
 - :func:`register_session_routes` — verbs both kinds expose
   (``new``, ``close``, ``open``, ``delete``, ``send``, ``approve``,
@@ -17,14 +18,21 @@ Two registrar functions:
   ``restrict``, ``stop_cascade``, ``close_all_children``,
   ``children``, ``tasks``, ``metrics``) that read or mutate state
   that doesn't exist on interactive workstreams.
+
+Some verbs in :class:`SharedSessionVerbHandlers` ship as factory-
+returned closures (e.g. :func:`make_approve_handler`) that bake the
+:class:`SessionEndpointConfig` in at app-construction time. Both
+node and console call the factory during startup and pass the
+result as ``handlers.approve``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 if TYPE_CHECKING:
@@ -32,8 +40,56 @@ if TYPE_CHECKING:
     from starlette.responses import Response
     from starlette.routing import BaseRoute
 
+    from turnstone.core.session_manager import SessionManager
+
 
 Handler = Callable[["Request"], Awaitable["Response"]]
+PermissionGate = Callable[["Request"], "JSONResponse | None"]
+ManagerLookup = Callable[["Request"], tuple["SessionManager | None", "JSONResponse | None"]]
+TenantCheck = Callable[
+    ["Request", str, "SessionManager"],
+    "JSONResponse | None",
+]
+
+
+@dataclass(frozen=True)
+class SessionEndpointConfig:
+    """Per-kind policy the lifted handler bodies consult at request time.
+
+    Instantiated once per process during app construction and stored
+    on ``app.state.session_endpoint_config``. The unified handler
+    bodies pull this config + the kind manager from ``app.state``
+    rather than taking either as a per-request parameter — keeps the
+    handler signatures uniform (``Handler = Request -> Response``)
+    so the registrar mounts them like any other route.
+
+    - ``permission_gate``: kind's pre-handler permission check
+      (e.g. ``admin.coordinator`` for coord, ``None`` for interactive
+      which has no per-handler scope check beyond auth middleware).
+      Returns the rejection response when the gate fails, ``None``
+      when the request passes.
+    - ``manager_lookup``: returns ``(SessionManager, None)`` when the
+      kind's manager is loaded, or ``(None, JSONResponse)`` with a
+      503 when the subsystem isn't available (coord on a console
+      without configured models). For interactive the lookup just
+      returns ``(app.state.workstreams, None)``.
+    - ``tenant_check``: per-``ws_id`` cross-tenant guard. Interactive
+      uses ``_require_ws_access`` (404 on owner mismatch); coord
+      relies on the cluster-wide ``admin.coordinator`` scope from
+      ``permission_gate`` and sets this to ``None``.
+    - ``not_found_label``: the message body for the 404 returned when
+      the manager has no such ws_id ("Workstream not found" for
+      interactive; "coordinator not found" for coord).
+    - ``audit_action_prefix``: the dot-namespaced prefix the kind
+      uses for its audit actions ("workstream" → ``workstream.cancel``;
+      "coordinator" → ``coordinator.cancel``).
+    """
+
+    permission_gate: PermissionGate | None
+    manager_lookup: ManagerLookup
+    tenant_check: TenantCheck | None
+    not_found_label: str
+    audit_action_prefix: str
 
 
 @dataclass(frozen=True)
@@ -236,3 +292,125 @@ def register_coord_verbs(
             methods=["POST"],
         )
     )
+
+
+# ---------------------------------------------------------------------------
+# Lifted handler bodies — Stage 2 Priority 0 body-convergence
+#
+# Each verb here was previously implemented twice (once in
+# ``turnstone/server.py`` for interactive, once in
+# ``turnstone/console/server.py`` for coord). The lifted body uses
+# the kind-specific :class:`SessionEndpointConfig` from
+# ``app.state.session_endpoint_config`` to branch on the few places
+# the kinds legitimately differ.
+#
+# Verbs not lifted yet (intentional — bodies have substantive
+# behavior divergence that needs SessionManager-side refactoring,
+# not just kind branching): send (worker dispatch — Priority 1
+# territory), cancel (interactive does inline forensics + force-cancel
+# ws._lock manipulation), close (interactive caps + redacts +
+# persists close_reason), open (interactive resume vs coord rehydrate),
+# events (different SSE replay shapes), create (interactive
+# attachments vs coord initial_message), list / saved (different
+# response keys: ``workstreams`` vs ``coordinators``).
+# ---------------------------------------------------------------------------
+
+
+def make_approve_handler() -> Handler:
+    """Lifted body for ``POST {prefix}/{ws_id}/approve``.
+
+    Resolves a pending tool approval on the workstream's UI. Both
+    kinds expose the same approve / feedback / always body shape and
+    the same ``ui.resolve_approval(approved, feedback)`` mechanic;
+    differences are auth scope, manager lookup, and the
+    ``__budget_override__`` filter (interactive-only — coord workstreams
+    don't have the budget-override pseudo-tool).
+    """
+    from turnstone.core.web_helpers import read_json_or_400
+
+    async def approve(request: Request) -> Response:
+        cfg: SessionEndpointConfig = request.app.state.session_endpoint_config
+        if cfg.permission_gate is not None:
+            err = cfg.permission_gate(request)
+            if err is not None:
+                return err
+        mgr, err503 = cfg.manager_lookup(request)
+        if err503 is not None:
+            return err503
+        assert mgr is not None  # narrowed by the err503 None-check
+        body = await read_json_or_400(request)
+        if isinstance(body, JSONResponse):
+            return body
+        ws_id = request.path_params.get("ws_id", "")
+        approved = bool(body.get("approved", False))
+        feedback = body.get("feedback")
+        always = bool(body.get("always", False))
+        if cfg.tenant_check is not None:
+            err_tenant = cfg.tenant_check(request, ws_id, mgr)
+            if err_tenant is not None:
+                return err_tenant
+        ws = mgr.get(ws_id)
+        if ws is None:
+            return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+        ui = ws.ui
+        if ui is None or not hasattr(ui, "resolve_approval"):
+            return JSONResponse(
+                {"error": "session UI does not support approval"},
+                status_code=409,
+            )
+        # ``_pending_approval`` and ``auto_approve_tools`` aren't on the
+        # ``SessionUI`` Protocol — both interactive ``WebUI`` and
+        # ``ConsoleCoordinatorUI`` add them, but a kind-agnostic body
+        # has to look them up dynamically. The CLI ``CliUI`` wouldn't
+        # have either, so accessing through ``getattr`` is also safer.
+        pending = getattr(ui, "_pending_approval", None)
+        auto_approve_tools = getattr(ui, "auto_approve_tools", None)
+        if always and approved and pending and auto_approve_tools is not None:
+            tool_names: set[str] = {
+                it.get("approval_label", "") or it.get("func_name", "")
+                for it in pending.get("items", [])
+                if it.get("needs_approval") and it.get("func_name") and not it.get("error")
+            }
+            tool_names.discard("")
+            # Budget-override is an interactive-only pseudo-tool that
+            # must never be added to the auto-approve set — discarding
+            # unconditionally is safe (no-op for coord).
+            tool_names.discard("__budget_override__")
+            if tool_names:
+                auto_approve_tools.update(tool_names)
+        ui.resolve_approval(approved, feedback)
+        return JSONResponse({"status": "ok"})
+
+    return approve
+
+
+def make_legacy_body_keyed_adapter(handler: Handler) -> Handler:
+    """Wrap a path-keyed handler so it can be mounted at a body-keyed URL.
+
+    Pre-1.5 interactive handlers (``/api/approve``, ``/api/cancel``,
+    ``/api/plan``, etc.) take ``ws_id`` from the JSON body. The
+    lifted bodies in this module read ``ws_id`` from the path. This
+    adapter peeks the body for ``ws_id``, copies it into
+    ``request.path_params``, and forwards. Starlette caches the
+    request body so the lifted handler's own body read is a hash-map
+    lookup, not a second network read.
+    """
+
+    async def adapter(request: Request) -> Response:
+        from turnstone.core.web_helpers import read_json_or_400
+
+        body = await read_json_or_400(request)
+        if isinstance(body, JSONResponse):
+            return body
+        ws_id = str(body.get("ws_id") or "")
+        # ``request.path_params`` is normally populated by Starlette
+        # at Route match time; since this adapter is mounted on a
+        # body-keyed URL with no ``{ws_id}`` slot, we splice it into
+        # the scope so the lifted handler's ``request.path_params.get(...)``
+        # finds it.
+        path_params: dict[str, Any] = dict(request.path_params)
+        path_params["ws_id"] = ws_id
+        request.scope["path_params"] = path_params
+        return await handler(request)
+
+    return adapter
