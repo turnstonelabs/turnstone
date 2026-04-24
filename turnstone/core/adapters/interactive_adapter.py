@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from turnstone.core.session import ChatSession, SessionUI
+    from turnstone.core.session_manager import SessionManager
 
 log = get_logger(__name__)
 
@@ -41,6 +42,31 @@ class InteractiveAdapter:
         self._global_queue = global_queue
         self._ui_factory = ui_factory
         self._session_factory = session_factory
+        # Late-bound via ``attach`` after the SessionManager is built.
+        # Mirrors the coord-side pattern: the manager's ctor takes the
+        # adapter, so we can't pass the manager to the adapter's
+        # ``__init__`` — break the cycle with a setter called from the
+        # CLI entry point.
+        self._manager: SessionManager | None = None
+
+    def attach(self, manager: SessionManager) -> None:
+        """Late-bind the owning :class:`SessionManager`.
+
+        Called once from the CLI entry right after the manager is
+        constructed. Enables ``ui_factory`` closures to resolve the
+        manager via :attr:`manager` without the ``list``-ref hack.
+        """
+        self._manager = manager
+
+    @property
+    def manager(self) -> SessionManager:
+        """The attached manager. Raises if :meth:`attach` hasn't run."""
+        mgr = self._manager
+        if mgr is None:
+            raise RuntimeError(
+                "InteractiveAdapter: manager not attached — call attach(mgr) after construction"
+            )
+        return mgr
 
     # ------------------------------------------------------------------
     # Lifecycle events — push onto the process-wide SSE queue

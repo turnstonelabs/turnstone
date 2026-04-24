@@ -1166,17 +1166,16 @@ def main() -> None:
         )
 
     # Create session manager and initial workstream. The InteractiveAdapter
-    # ui_factory builds a terminal UI bound to the manager it was created
-    # with — use a list-ref to break the circular reference (manager's ctor
-    # takes the adapter; the adapter's ui_factory references the manager).
+    # ui_factory needs the manager to build its terminal UI, but the
+    # manager's ctor takes the adapter — break the cycle via
+    # ``InteractiveAdapter.attach`` (mirrors the coord-side pattern).
     import queue as _queue_mod
 
-    _mgr_ref: list[SessionManager] = []
     cli_adapter = InteractiveAdapter(
         # CLI doesn't consume SSE events; drain into a tiny queue and let
         # emit_* drop silently on Full (the adapter already suppresses).
         global_queue=_queue_mod.Queue(maxsize=1),
-        ui_factory=lambda ws: WorkstreamTerminalUI(ws.id, _mgr_ref[0]),
+        ui_factory=lambda ws: WorkstreamTerminalUI(ws.id, cli_adapter.manager),
         session_factory=session_factory,
     )
     manager = SessionManager(
@@ -1184,7 +1183,7 @@ def main() -> None:
         storage=_get_storage(),
         max_active=50,
     )
-    _mgr_ref.append(manager)
+    cli_adapter.attach(manager)
     ws = manager.create(user_id="")
     if args.skip_permissions and isinstance(ws.ui, TerminalUI):
         ws.ui.auto_approve = True

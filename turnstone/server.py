@@ -5130,6 +5130,7 @@ def main() -> None:
         max_active=config_store.get("server.max_workstreams"),
         node_id=_node_id,
     )
+    interactive_adapter.attach(manager)
     WebUI._workstream_mgr = manager
 
     def _watch_restore_fn(ws_id: str) -> Any:

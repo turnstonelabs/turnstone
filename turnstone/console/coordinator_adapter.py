@@ -209,7 +209,9 @@ class CoordinatorAdapter:
         """
         mgr = self._manager
         if mgr is None:
-            return False
+            raise RuntimeError(
+                "CoordinatorAdapter: manager not attached — call attach(mgr) after construction"
+            )
         ws = mgr.get(ws_id)
         if ws is None or ws.session is None:
             return False
@@ -344,7 +346,9 @@ class CoordinatorAdapter:
         """
         mgr = self._manager
         if mgr is None:
-            return
+            raise RuntimeError(
+                "CoordinatorAdapter: manager not attached — call attach(mgr) after construction"
+            )
         storage = getattr(mgr, "_storage", None)
         if storage is None:
             return
@@ -514,7 +518,9 @@ class CoordinatorAdapter:
             return
         mgr = self._manager
         if mgr is None:
-            return
+            raise RuntimeError(
+                "CoordinatorAdapter: manager not attached — call attach(mgr) after construction"
+            )
         by_parent: dict[str, list[str]] = {}
         known = {ws.id for ws in mgr.list_all()}
         for node in nodes:
