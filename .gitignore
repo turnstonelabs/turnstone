@@ -21,3 +21,5 @@ PROGRESS.md
 .coverage
 tools/skill_audit_analysis/data/
 tools/skill_audit_analysis/output/
+design_ideas/
+.claude/
