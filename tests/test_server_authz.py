@@ -369,10 +369,16 @@ class TestCrossTenantOpen:
         assert resp.status_code == 404
 
 
-class TestListWorkstreamsFiltered:
-    def test_list_excludes_other_tenants(self, app_client):
-        client, mgr = app_client
-        # Seed two workstreams in the in-memory manager — one per tenant.
+class TestListWorkstreamsTrustedTeamVisibility:
+    """Listing endpoints (/workstreams, /dashboard, /workstreams/saved)
+    return the cluster-wide set to any authenticated caller — turnstone
+    is deployed as a self-hosted, trusted-team tool and the previous
+    per-user filter created friction without preventing the relevant
+    threats (mutations are gated independently on the per-workstream
+    handlers; see TestCrossTenant{Delete,Approve,Close,Title,Open})."""
+
+    def test_list_returns_all_owners(self, app_client):
+        client, _mgr = app_client
         resp_a = client.post(
             "/v1/api/workstreams/new",
             json={"name": "a"},
@@ -386,16 +392,15 @@ class TestListWorkstreamsFiltered:
         assert resp_a.status_code == 200 and resp_b.status_code == 200
         ws_a, ws_b = resp_a.json()["ws_id"], resp_b.json()["ws_id"]
 
-        # user-a sees only ws_a.
+        # user-a now sees both.
         resp = client.get("/v1/api/workstreams", headers=_auth("user-a"))
         assert resp.status_code == 200
         ids = {w["id"] for w in resp.json()["workstreams"]}
-        assert ws_a in ids
-        assert ws_b not in ids
+        assert {ws_a, ws_b}.issubset(ids), ids
 
 
-class TestDashboardFiltered:
-    def test_dashboard_aggregate_scoped_to_caller(self, app_client):
+class TestDashboardTrustedTeamVisibility:
+    def test_dashboard_aggregate_includes_all_owners(self, app_client):
         client, _mgr = app_client
         client.post("/v1/api/workstreams/new", json={"name": "a"}, headers=_auth("user-a"))
         client.post("/v1/api/workstreams/new", json={"name": "b"}, headers=_auth("user-b"))
@@ -404,19 +409,18 @@ class TestDashboardFiltered:
         resp = client.get("/v1/api/dashboard", headers=_auth("user-b"))
         assert resp.status_code == 200
         data = resp.json()
-        # user-b owns 2; aggregate total_count reflects filtered set.
-        assert data["aggregate"]["total_count"] == 2
+        # All three workstreams visible regardless of caller identity.
+        assert data["aggregate"]["total_count"] == 3
         owners = {w["user_id"] for w in data["workstreams"]}
-        assert owners == {"user-b"}
+        assert {"user-a", "user-b"}.issubset(owners)
 
 
-class TestSavedWorkstreamsTenantScoping:
-    """Regression for Copilot review on #380: /v1/api/workstreams/saved
-    used to call list_workstreams_with_history with no tenant filter,
-    so every authenticated user could see every other user's saved
-    workstream aliases / titles / names.  Fix tightens to
-    ``list_workstreams_with_history(user_id=caller)`` with the
-    service-scope bypass matching _visible_workstreams."""
+class TestSavedWorkstreamsTrustedTeamVisibility:
+    """Listing returns the cluster-wide set across all owners (no
+    per-user filter).  Resuming a saved workstream still goes through
+    the per-workstream ownership gate on /open, so this endpoint only
+    leaks metadata (name, message_count, updated) — see TestCrossTenantOpen
+    for the resume-side guard."""
 
     def _seed(self, client):
         """Create two workstreams per user, each with a message so they
@@ -432,19 +436,16 @@ class TestSavedWorkstreamsTenantScoping:
         storage.save_message("bob-saved", "user", "bob's plan")
         return storage
 
-    def test_non_service_caller_sees_only_own_rows(self, app_client):
+    def test_any_caller_sees_all_rows(self, app_client):
         client, _mgr = app_client
         self._seed(client)
         resp = client.get("/v1/api/workstreams/saved", headers=_auth("alice"))
         assert resp.status_code == 200
-        rows = resp.json()["workstreams"]
-        ids = {r["ws_id"] for r in rows}
-        assert ids == {"alice-saved"}, f"alice must not see bob's saved rows: {ids}"
+        ids = {r["ws_id"] for r in resp.json()["workstreams"]}
+        assert {"alice-saved", "bob-saved"}.issubset(ids), ids
 
     def test_service_scope_sees_all_rows(self, app_client):
-        """Cluster-wide visibility is preserved for service callers
-        (console collector, cluster tooling) so they can still hydrate
-        cross-tenant state when needed."""
+        """Service-scope still works — same set, different auth path."""
         client, _mgr = app_client
         self._seed(client)
         resp = client.get(
@@ -452,26 +453,25 @@ class TestSavedWorkstreamsTenantScoping:
             headers=_auth("cluster-collector", scopes=frozenset({"read", "service"})),
         )
         assert resp.status_code == 200
-        rows = resp.json()["workstreams"]
-        ids = {r["ws_id"] for r in rows}
+        ids = {r["ws_id"] for r in resp.json()["workstreams"]}
         assert {"alice-saved", "bob-saved"}.issubset(ids)
 
-    def test_blank_sub_non_service_returns_empty(self, app_client):
-        """Defense-in-depth — a non-service token with an empty ``sub``
-        claim (orphan / migration-artifact auth path) must not match
-        every workstream with empty ``user_id``.  Fail closed."""
+    def test_orphan_rows_visible(self, app_client):
+        """Orphan rows (empty user_id from migrations / pre-002) are no
+        longer fail-closed since the whole-listing now exposes
+        cluster-wide metadata.  Resume of an orphan still requires
+        admin path on /open."""
         client, _mgr = app_client
         storage = self._seed(client)
-        # Also seed an orphan row so the test would fail loudly if the
-        # handler leaked it.
         _register_ws(storage, "orphan-saved", "")
         storage.save_message("orphan-saved", "user", "orphan content")
         resp = client.get(
             "/v1/api/workstreams/saved",
-            headers=_auth("", scopes=frozenset({"read"})),
+            headers=_auth("alice", scopes=frozenset({"read"})),
         )
         assert resp.status_code == 200
-        assert resp.json()["workstreams"] == []
+        ids = {r["ws_id"] for r in resp.json()["workstreams"]}
+        assert "orphan-saved" in ids
 
     def test_coordinator_rows_excluded_even_for_service(self, app_client):
         """kind filter is orthogonal to the user_id filter — even a

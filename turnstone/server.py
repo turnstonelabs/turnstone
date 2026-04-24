@@ -1207,29 +1207,35 @@ async def global_events_sse(request: Request) -> Response:
     return EventSourceResponse(event_generator(), ping=5)
 
 
-def _visible_workstreams(request: Request, wss: list[Workstream]) -> list[Workstream]:
-    """Filter an in-memory workstream list to the caller's tenant view.
-
-    Service-scoped tokens see everything (internal cluster callers,
-    console routing proxy).  End-user tokens see only workstreams they
-    own — a blank ``ws.user_id`` (legacy / pre-migration rows) is
-    hidden from non-service callers to prevent orphan leakage.
-    """
-    if "service" in _auth_scopes(request):
-        return wss
-    caller = _auth_user_id(request)
-    if not caller:
-        return []
-    return [ws for ws in wss if ws.user_id and ws.user_id == caller]
-
-
 async def list_workstreams(request: Request) -> JSONResponse:
-    """GET /v1/api/workstreams — list workstreams visible to the caller."""
+    """GET /v1/api/workstreams — list workstreams visible to any
+    authenticated caller.
+
+    Listing intentionally returns the full set across all owners (no
+    per-user filter).  turnstone is deployed as a self-hosted, trusted-
+    team tool: console operators already see cluster-wide state via
+    service scope, and the previous ``_visible_workstreams`` filter (PR
+    #375) created more friction than security in that shape — it also
+    hid the auto-created ``name="default"`` startup workstream from
+    every web user, leaving fresh installs staring at a blank dashboard.
+
+    Per-workstream MUTATIONS (/send, /close, /open, /title, /delete,
+    /refresh-title) keep their independent ownership checks — see those
+    handlers for the cross-tenant guards that PR #375 also added and
+    which DO remain in force.  What you can read here is metadata
+    (name, state, kind); message history requires the per-workstream
+    ownership gate on /history.
+
+    If turnstone is ever deployed as a multi-tenant SaaS, the right
+    boundary is a real ``tenant_id`` column with row-level filtering at
+    the storage layer, not the empty-user_id heuristic this used to
+    apply.
+    """
     from turnstone.core.memory import get_workstream_display_name
 
     mgr: WorkstreamManager = request.app.state.workstreams
     result = []
-    for ws in _visible_workstreams(request, mgr.list_all()):
+    for ws in mgr.list_all():
         title = get_workstream_display_name(ws.id) or ws.name
         # kind + parent_ws_id mirror the shape /dashboard returns below so
         # client consumers (SDK, frontend, integrators) see one consistent
@@ -1252,7 +1258,9 @@ async def dashboard(request: Request) -> JSONResponse:
     from turnstone.core.memory import get_workstream_display_name
 
     mgr: WorkstreamManager = request.app.state.workstreams
-    wss = _visible_workstreams(request, mgr.list_all())
+    # No per-user filter — see list_workstreams above for the rationale
+    # (trusted-team deployment shape; mutations stay owner-gated).
+    wss = mgr.list_all()
     total_tokens = 0
     total_tool_calls = 0
     active_count = 0
@@ -1308,13 +1316,15 @@ async def dashboard(request: Request) -> JSONResponse:
 
 
 async def list_saved_workstreams(request: Request) -> JSONResponse:
-    """GET /v1/api/workstreams/saved — list saved workstreams with conversation history.
+    """GET /v1/api/workstreams/saved — list saved interactive workstreams
+    with conversation history, visible to any authenticated caller.
 
-    Tenant-scoped — service-scoped callers (console collector, cluster
-    tooling) see cluster-wide rows; end-user callers see only their
-    own workstreams (matching ``_visible_workstreams``).  A non-service
-    call with a blank ``user_id`` returns an empty list rather than
-    leaking orphan rows.
+    Listing returns the cluster-wide set across all owners (no per-user
+    filter) — see ``list_workstreams`` above for the rationale.
+    Resuming a saved workstream still goes through the per-workstream
+    ownership gate on ``/v1/api/workstreams/{ws_id}/open``, so this
+    endpoint only exposes metadata (name, message_count, updated), not
+    history.
 
     Restricted to ``kind="interactive"`` — the interactive UI's "saved
     workstreams" sidebar is not a coordinator surface, and coordinator
@@ -1324,23 +1334,10 @@ async def list_saved_workstreams(request: Request) -> JSONResponse:
     from turnstone.core.memory import list_workstreams_with_history
     from turnstone.core.workstream import WorkstreamKind
 
-    scopes = _auth_scopes(request)
-    if "service" in scopes:
-        # Cluster-wide visibility for service-scoped callers.
-        user_filter: str | None = None
-    else:
-        caller_uid = _auth_user_id(request)
-        if not caller_uid:
-            # Blank sub on a non-service token — fail closed instead of
-            # matching every orphan / migration-artifact row with empty
-            # user_id.  Mirrors _visible_workstreams.
-            return JSONResponse({"workstreams": []})
-        user_filter = caller_uid
-
     rows = list_workstreams_with_history(
         limit=50,
         kind=WorkstreamKind.INTERACTIVE,
-        user_id=user_filter,
+        user_id=None,
     )
     result = [
         {
