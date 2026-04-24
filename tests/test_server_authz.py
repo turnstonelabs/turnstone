@@ -371,11 +371,9 @@ class TestCrossTenantOpen:
 
 class TestListWorkstreamsTrustedTeamVisibility:
     """Listing endpoints (/workstreams, /dashboard, /workstreams/saved)
-    return the cluster-wide set to any authenticated caller — turnstone
-    is deployed as a self-hosted, trusted-team tool and the previous
-    per-user filter created friction without preventing the relevant
-    threats (mutations are gated independently on the per-workstream
-    handlers; see TestCrossTenant{Delete,Approve,Close,Title,Open})."""
+    return the cluster-wide set to any authenticated caller.  Mutations
+    are gated independently on the per-workstream handlers — see
+    TestCrossTenant{Delete,Approve,Close,Title,Open} for those gates."""
 
     def test_list_returns_all_owners(self, app_client):
         client, _mgr = app_client
@@ -416,11 +414,11 @@ class TestDashboardTrustedTeamVisibility:
 
 
 class TestSavedWorkstreamsTrustedTeamVisibility:
-    """Listing returns the cluster-wide set across all owners (no
-    per-user filter).  Resuming a saved workstream still goes through
-    the per-workstream ownership gate on /open, so this endpoint only
-    leaks metadata (name, message_count, updated) — see TestCrossTenantOpen
-    for the resume-side guard."""
+    """Listing returns the cluster-wide set across all owners.  Resuming
+    an owned saved workstream goes through the per-workstream ownership
+    gate on /open (see TestCrossTenantOpen); ownerless persisted rows
+    are claimable by any authenticated caller via /open, consistent
+    with the same trusted-team model."""
 
     def _seed(self, client):
         """Create two workstreams per user, each with a message so they
@@ -457,10 +455,11 @@ class TestSavedWorkstreamsTrustedTeamVisibility:
         assert {"alice-saved", "bob-saved"}.issubset(ids)
 
     def test_orphan_rows_visible(self, app_client):
-        """Orphan rows (empty user_id from migrations / pre-002) are no
-        longer fail-closed since the whole-listing now exposes
-        cluster-wide metadata.  Resume of an orphan still requires
-        admin path on /open."""
+        """Ownerless rows (empty user_id from migrations / startup
+        ``name="default"``) appear in the cluster-wide listing alongside
+        owned rows.  /open lets any authenticated caller claim them —
+        intentional under the trusted-team model — so the listing isn't
+        leaking anything the resume path wouldn't already grant."""
         client, _mgr = app_client
         storage = self._seed(client)
         _register_ws(storage, "orphan-saved", "")

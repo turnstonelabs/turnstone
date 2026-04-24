@@ -635,6 +635,12 @@ class TestServerAuth:
         mock_ws.name = "test"
         mock_ws.state = WorkstreamState.IDLE
         mock_ws.session = mock_session
+        # Set kind / parent_ws_id / user_id explicitly so list_workstreams
+        # JSON-serializes them — a bare MagicMock attribute returns another
+        # MagicMock that fails json.dumps and surfaces as 500.
+        mock_ws.kind = "interactive"
+        mock_ws.parent_ws_id = None
+        mock_ws.user_id = "u1"
         mock_mgr = MagicMock()
         mock_mgr.list_all.return_value = [mock_ws]
         mock_mgr.max_workstreams = 10
@@ -851,6 +857,12 @@ class TestServerLogin:
         mock_ws.name = "test"
         mock_ws.state = WorkstreamState.IDLE
         mock_ws.session = mock_session
+        # Set kind / parent_ws_id / user_id explicitly so list_workstreams
+        # JSON-serializes them — a bare MagicMock attribute returns another
+        # MagicMock that fails json.dumps and surfaces as 500.
+        mock_ws.kind = "interactive"
+        mock_ws.parent_ws_id = None
+        mock_ws.user_id = "u1"
         mock_mgr = MagicMock()
         mock_mgr.list_all.return_value = [mock_ws]
         mock_mgr.max_workstreams = 10

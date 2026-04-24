@@ -11099,12 +11099,7 @@ def main() -> None:
 
     # ``service`` scope is REQUIRED — ``/v1/api/events/global`` on every
     # upstream node hard-gates on it (server.py global_events_sse).
-    # The dashboard / workstreams listing endpoints no longer tenant-
-    # filter (the per-user filter was retired in favour of the trusted-
-    # team visibility model — see the rationale on list_workstreams),
-    # so service scope here is now load-bearing only for the SSE event
-    # stream.  Kept for that reason plus belt-and-braces.  ``read`` is
-    # kept for legacy read-path compatibility.
+    # ``read`` is kept for legacy read-path compatibility.
     collector_token_mgr = ServiceTokenManager(
         user_id="console-collector",
         scopes=frozenset({"read", "service"}),

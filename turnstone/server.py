@@ -1211,25 +1211,23 @@ async def list_workstreams(request: Request) -> JSONResponse:
     """GET /v1/api/workstreams — list workstreams visible to any
     authenticated caller.
 
-    Listing intentionally returns the full set across all owners (no
-    per-user filter).  turnstone is deployed as a self-hosted, trusted-
-    team tool: console operators already see cluster-wide state via
-    service scope, and the previous ``_visible_workstreams`` filter (PR
-    #375) created more friction than security in that shape — it also
-    hid the auto-created ``name="default"`` startup workstream from
-    every web user, leaving fresh installs staring at a blank dashboard.
+    Trusted-team visibility: listing returns the full cluster set
+    across all owners (no per-user filter).  Self-hosted deployments
+    are the assumed shape; console operators already see cluster-wide
+    state via service scope, and a per-user filter would also hide
+    ownerless rows like the auto-created ``name="default"`` startup
+    workstream from every authenticated caller.
 
-    Per-workstream MUTATIONS (/send, /close, /open, /title, /delete,
-    /refresh-title) keep their independent ownership checks — see those
-    handlers for the cross-tenant guards that PR #375 also added and
-    which DO remain in force.  What you can read here is metadata
-    (name, state, kind); message history requires the per-workstream
-    ownership gate on /history.
+    Per-workstream mutations (``/send``, ``/close``, ``/open``,
+    ``/title``, ``/delete``, ``/refresh-title``) keep their independent
+    ownership checks — see those handlers for the cross-tenant guards
+    that stay in force.  This endpoint exposes metadata only (name,
+    state, kind, parent_ws_id); message history requires the per-
+    workstream ownership gate on ``/history``.
 
-    If turnstone is ever deployed as a multi-tenant SaaS, the right
-    boundary is a real ``tenant_id`` column with row-level filtering at
-    the storage layer, not the empty-user_id heuristic this used to
-    apply.
+    For a multi-tenant SaaS deployment, the right boundary is a real
+    ``tenant_id`` column with row-level filtering at the storage
+    layer, not an empty-user_id heuristic.
     """
     from turnstone.core.memory import get_workstream_display_name
 
@@ -1316,15 +1314,20 @@ async def dashboard(request: Request) -> JSONResponse:
 
 
 async def list_saved_workstreams(request: Request) -> JSONResponse:
-    """GET /v1/api/workstreams/saved — list saved interactive workstreams
-    with conversation history, visible to any authenticated caller.
+    """GET /v1/api/workstreams/saved — list saved interactive workstream
+    metadata, visible to any authenticated caller.
 
-    Listing returns the cluster-wide set across all owners (no per-user
-    filter) — see ``list_workstreams`` above for the rationale.
-    Resuming a saved workstream still goes through the per-workstream
-    ownership gate on ``/v1/api/workstreams/{ws_id}/open``, so this
-    endpoint only exposes metadata (name, message_count, updated), not
-    history.
+    Trusted-team visibility: returns the cluster-wide set across all
+    owners (no per-user filter) — see ``list_workstreams`` for the
+    rationale.  This endpoint exposes summary fields only (ws_id,
+    alias, title, name, created, updated, message_count); message
+    history requires the per-workstream ownership gate on
+    ``/v1/api/workstreams/{ws_id}/history``.
+
+    Resuming an owned saved workstream goes through ``/open``'s
+    ownership check; ownerless persisted rows (legacy / migration /
+    startup ``name="default"``) are claimable by any authenticated
+    caller via ``/open``, consistent with the same trusted-team model.
 
     Restricted to ``kind="interactive"`` — the interactive UI's "saved
     workstreams" sidebar is not a coordinator surface, and coordinator
@@ -3506,11 +3509,14 @@ async def open_workstream(request: Request) -> JSONResponse:
     scopes = _auth_scopes(request)
 
     # Ownership gate: the stored owner must match the caller (or the
-    # caller must hold the service scope, which covers the console
-    # routing proxy and cluster rehydration paths).  A legacy row with
-    # a blank owner is claimable by the authenticated caller — same
-    # semantics as _require_ws_access for the interactive handlers.
-    # 404 (not 403) so existence isn't enumerable by non-owners.
+    # caller must hold service scope — used by the console routing proxy
+    # and cluster rehydration paths).  Ownerless persisted rows (the
+    # startup ``name="default"`` workstream, pre-migration legacy rows)
+    # are claimable by any authenticated caller — consistent with the
+    # trusted-team visibility model the listing endpoints assume, and
+    # symmetric with how _require_ws_access handles the same rows on
+    # the per-workstream interactive handlers.  404 (not 403) so
+    # existence isn't enumerable by non-owners.
     stored_owner = (ws_row.get("user_id") or "").strip()
     if stored_owner and "service" not in scopes and stored_owner != uid:
         return JSONResponse({"error": "Workstream not found"}, status_code=404)
