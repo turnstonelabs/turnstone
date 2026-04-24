@@ -128,29 +128,12 @@ class WebUI(SessionUIBase):
         # holds in every ws_state/ws_activity event payload — mirrors
         # the storage-layer normalization at register_workstream.
         self._parent_ws_id = parent_ws_id if parent_ws_id else None
-        # Per-workstream metrics accumulators (written by worker thread, read by metrics handler)
-        self._ws_lock = threading.Lock()
-        self._ws_prompt_tokens: int = 0
-        self._ws_completion_tokens: int = 0
-        self._ws_messages: int = 0
-        self._ws_tool_calls: dict[str, int] = {}
-        self._ws_tool_calls_reported: int = 0  # last cumulative total sent to usage
-        self._ws_context_ratio: float = 0.0
-        self._ws_turn_tool_calls: int = 0
-        # Activity tracking for dashboard (current tool / thinking / approval)
-        self._ws_current_activity: str = ""
-        self._ws_activity_state: str = ""  # "tool" | "approval" | "thinking" | ""
-        # Verdicts awaiting user_decision update on approval resolution
-        self._pending_verdicts: list[dict[str, Any]] = []
-        # Last user decision for late-arriving verdicts (set in resolve_approval)
-        self._last_verdict_decision: str = ""
-        # Content accumulator — tokens appended in on_content_token(), joined
-        # and piggybacked onto the ws_state:idle global SSE event, then reset.
+        # Content accumulator — tokens appended in on_content_token(),
+        # joined and piggybacked onto the ws_state:idle global SSE
+        # event, then reset. WebUI-specific optimization; coord sessions
+        # don't broadcast rich ws_state payloads.
         self._ws_turn_content: list[str] = []
         self._ws_turn_content_size: int = 0
-        # Cached LLM verdicts keyed by call_id — replayed on SSE reconnect
-        # so tab-switching doesn't lose the final judge result.
-        self._llm_verdicts: dict[str, dict[str, Any]] = {}
 
     # ``_enqueue`` / ``_register_listener`` / ``_unregister_listener``
     # inherited from :class:`SessionUIBase`.
@@ -545,124 +528,22 @@ class WebUI(SessionUIBase):
                 )
 
     def on_intent_verdict(self, verdict: dict[str, Any]) -> None:
-        """Deliver LLM judge verdict to frontend via SSE."""
-        # Cache for replay on SSE reconnect (tab switching)
-        call_id = verdict.get("call_id", "")
-        if call_id:
-            with self._ws_lock:
-                # Evict oldest entry if cache is full (defensive cap of 50)
-                if len(self._llm_verdicts) >= 50 and call_id not in self._llm_verdicts:
-                    oldest_key = next(iter(self._llm_verdicts))
-                    del self._llm_verdicts[oldest_key]
-                self._llm_verdicts[call_id] = verdict
-        self._enqueue({"type": "intent_verdict", **verdict})
-        # Persist the LLM verdict (fire-and-forget)
-        try:
-            from turnstone.core.storage._registry import get_storage
-
-            storage = get_storage()
-            if storage is not None:
-                storage.create_intent_verdict(
-                    verdict_id=verdict.get("verdict_id", ""),
-                    ws_id=self.ws_id,
-                    call_id=verdict.get("call_id", ""),
-                    func_name=verdict.get("func_name", ""),
-                    func_args=verdict.get("func_args", ""),
-                    intent_summary=verdict.get("intent_summary", ""),
-                    risk_level=verdict.get("risk_level", "medium"),
-                    confidence=verdict.get("confidence", 0.5),
-                    recommendation=verdict.get("recommendation", "review"),
-                    reasoning=verdict.get("reasoning", ""),
-                    evidence=json.dumps(verdict.get("evidence", [])),
-                    tier=verdict.get("tier", "llm"),
-                    judge_model=verdict.get("judge_model", ""),
-                    latency_ms=verdict.get("latency_ms", 0),
-                )
-        except Exception:
-            log.debug("Failed to persist LLM verdict", exc_info=True)
+        """Extend :meth:`SessionUIBase.on_intent_verdict` with a
+        node-level prometheus metric update.
+        """
+        super().on_intent_verdict(verdict)
         _metrics.record_judge_verdict(
             verdict.get("tier", "llm"),
             verdict.get("risk_level", "medium"),
             verdict.get("latency_ms", 0),
         )
-        # If approval already resolved, update user_decision immediately.
-        # Read decision under lock to avoid racing with resolve_approval().
-        with self._ws_lock:
-            decision = self._last_verdict_decision
-        if decision:
-            try:
-                from turnstone.core.storage._registry import get_storage
 
-                storage = get_storage()
-                if storage is not None:
-                    storage.update_intent_verdict(
-                        verdict.get("verdict_id", ""), user_decision=decision
-                    )
-            except Exception:
-                log.debug("Failed to update late verdict user_decision", exc_info=True)
-        else:
-            with self._ws_lock:
-                self._pending_verdicts.append(verdict)
+    # ``on_output_warning`` inherited from :class:`SessionUIBase`.
 
-    def on_output_warning(self, call_id: str, assessment: dict[str, Any]) -> None:
-        """Deliver output guard warning to frontend via SSE + persist."""
-        self._enqueue({"type": "output_warning", "call_id": call_id, **assessment})
-        # Fire-and-forget persistence
-        try:
-            from turnstone.core.storage._registry import get_storage
-
-            storage = get_storage()
-            if storage is not None:
-                storage.record_output_assessment(
-                    assessment_id=uuid.uuid4().hex,
-                    ws_id=self.ws_id,
-                    call_id=call_id,
-                    func_name=assessment.get("func_name", ""),
-                    flags=json.dumps(assessment.get("flags", [])),
-                    risk_level=assessment.get("risk_level", "none"),
-                    annotations=json.dumps(assessment.get("annotations", [])),
-                    output_length=assessment.get("output_length", 0),
-                    redacted=assessment.get("redacted", False),
-                )
-        except Exception:
-            log.debug("Failed to persist output assessment", exc_info=True)
-
-    def resolve_approval(self, approved: bool, feedback: str | None = None) -> None:
-        """Resolve a pending approval, whether triggered by the HTTP
-        handler (user approves/denies in the browser) or by
-        server-initiated flows like cancellations / timeouts.
-
-        Extends :meth:`SessionUIBase.resolve_approval` with intent-
-        verdict bookkeeping: after the worker unblocks, every judge
-        verdict that fired during this approval round gets its
-        ``user_decision`` updated so the audit trail reflects what
-        the user chose.
-        """
-        # Update user_decision on all tracked verdicts BEFORE the
-        # worker wakes up so the audit row is consistent by the time
-        # the next pending_verdict fires. Swap-and-clear + set
-        # decision under lock to avoid racing with the daemon judge
-        # thread's on_intent_verdict() appends.
-        decision_str = "approved" if approved else "denied"
-        with self._ws_lock:
-            pending = self._pending_verdicts
-            self._pending_verdicts = []
-            self._last_verdict_decision = decision_str
-        if pending:
-            try:
-                from turnstone.core.storage._registry import get_storage
-
-                storage = get_storage()
-                if storage is not None:
-                    for v in pending:
-                        vid = v.get("verdict_id", "")
-                        if vid:
-                            storage.update_intent_verdict(vid, user_decision=decision_str)
-            except Exception:
-                log.debug("Failed to update verdict user_decision", exc_info=True)
-        super().resolve_approval(approved, feedback)
-
-    # ``resolve_plan`` inherited from :class:`SessionUIBase`.
+    # ``resolve_approval`` / ``resolve_plan`` inherited from
+    # :class:`SessionUIBase`. Intent-verdict decision propagation lives
+    # in the base now — both interactive and coord share the same
+    # bookkeeping.
 
 
 # ---------------------------------------------------------------------------

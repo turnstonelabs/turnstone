@@ -246,13 +246,7 @@ class ConsoleCoordinatorUI(SessionUIBase):
                     exc_info=True,
                 )
 
-    def on_intent_verdict(self, verdict: dict[str, Any]) -> None:
-        # Coordinator sessions use the intent judge like any other session.
-        # Surface verdicts to the UI for visibility, but skip the
-        # persistence + late-decision plumbing that WebUI does — those
-        # are acceptable to defer for v1 and add alongside the broader
-        # audit-on-proxy work in a follow-up.
-        self._enqueue({"type": "intent_verdict", **verdict})
-
-    def on_output_warning(self, call_id: str, assessment: dict[str, Any]) -> None:
-        self._enqueue({"type": "output_warning", "call_id": call_id, **assessment})
+    # ``on_intent_verdict`` and ``on_output_warning`` inherited from
+    # :class:`SessionUIBase`. Coordinator sessions now persist verdicts
+    # and output assessments to storage alongside the interactive path
+    # (the "skip the persistence" deferral note has been retired).
