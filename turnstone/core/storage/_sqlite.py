@@ -649,7 +649,7 @@ class SQLiteBackend:
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         # Kind validation at the storage edge — third of three layers
-        # (HTTP handler in server.py returns 400, WorkstreamManager.create
+        # (HTTP handler in server.py returns 400, SessionManager.create
         # raises for in-process callers, here we reject direct storage
         # callers: SDK inserts, restore paths, test doubles).  Each layer
         # targets a different audience; trimming any one of them opens a

@@ -253,7 +253,7 @@ class _FakeUI:
 
 @pytest.fixture
 def app_client(tmp_path, monkeypatch):
-    """End-to-end app with a fake session factory + WorkstreamManager."""
+    """End-to-end app with a fake session factory + SessionManager."""
     from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
     from turnstone.core.metrics import MetricsCollector
     from turnstone.core.session_manager import SessionManager

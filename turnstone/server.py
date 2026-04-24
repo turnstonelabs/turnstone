@@ -2538,7 +2538,8 @@ async def create_workstream(request: Request) -> JSONResponse:
     # Kind + parent relationship: coordinator-spawned children forward
     # these from the console's CoordinatorClient.  Default kind is
     # ``INTERACTIVE``; coordinators themselves are created by the console's
-    # own CoordinatorManager and never land in this handler.  Only
+    # own SessionManager (coordinator kind) and never land in this handler.
+    # Only
     # ``INTERACTIVE`` is accepted here — requests that try to create a
     # coordinator via the generic workstream endpoint are rejected, and
     # unknown kinds (typos, future-only values) are 400 rather than being

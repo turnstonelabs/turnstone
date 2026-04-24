@@ -660,7 +660,7 @@ def _build_registry() -> dict[str, SettingDef]:
             max_value=100,
             help="Cap on how many coordinator workstreams can run at once on this "
             "console. When the limit is reached, POST /v1/api/coordinator/new either "
-            "evicts the oldest idle coordinator (matching WorkstreamManager.close_idle "
+            "evicts the oldest idle coordinator (matching SessionManager.close_idle "
             "semantics) or returns 429 if every slot is non-idle.",
         ),
         SettingDef(

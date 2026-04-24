@@ -1722,8 +1722,8 @@ class TestSkillConfigAppliedToWorkstream:
     @pytest.fixture()
     def _ws_app(self, tmp_path):
         """Build a minimal Starlette app with the real ``create_workstream``
-        handler, a real ``WorkstreamManager``, and a temp SQLite storage
-        backend.  Returns ``(TestClient, WorkstreamManager, storage)``.
+        handler, a real ``SessionManager``, and a temp SQLite storage
+        backend.  Returns ``(TestClient, SessionManager, storage)``.
         """
         import queue
         import threading

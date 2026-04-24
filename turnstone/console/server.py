@@ -437,9 +437,9 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
 
     Sources two lanes and merges by ws_id:
 
-    - **In-memory** via :meth:`CoordinatorManager.list_for_user` /
-      ``list_all`` — carries live session state (model / model_alias /
-      current workstream state) for currently-loaded coordinators.
+    - **In-memory** via :meth:`SessionManager.list_all` — carries live
+      session state (model / model_alias / current workstream state)
+      for currently-loaded coordinators.
     - **Persisted** via ``storage.list_workstreams(kind=COORDINATOR)``
       — includes closed / error / soft-deleted rows the manager has
       evicted from memory.  Without this, closed coordinators
@@ -716,9 +716,10 @@ async def _fetch_live_block(
     """Fetch the per-workstream ``live`` block for cluster-inspect.
 
     For coordinator-hosted workstreams, read live state from the
-    in-process :class:`CoordinatorManager`.  For node-backed
-    workstreams, issue a short-timeout HTTP GET against the owning
-    node's ``/v1/api/dashboard`` and project the matching entry.
+    in-process :class:`SessionManager` (coordinator kind).  For
+    node-backed workstreams, issue a short-timeout HTTP GET against
+    the owning node's ``/v1/api/dashboard`` and project the matching
+    entry.
 
     Always returns ``None`` on coordinator-not-loaded, node unreachable,
     wrong status, un-parseable payload, or no matching entry — the
@@ -731,9 +732,9 @@ async def _fetch_live_block(
 
     # Kind is the authoritative discriminator; the `"console"` node_id
     # sentinel is paired with coordinator rows only (see
-    # ``CoordinatorManager.NODE_ID``).  Branching purely on kind avoids
-    # a subtle collision if a real node ever registers with
-    # ``node_id="console"``.
+    # ``ClusterCollector.CONSOLE_PSEUDO_NODE_ID``).  Branching purely
+    # on kind avoids a subtle collision if a real node ever registers
+    # with ``node_id="console"``.
     if row_kind == WorkstreamKind.COORDINATOR:
         coord_mgr = getattr(request.app.state, "coord_mgr", None)
         if coord_mgr is None:
@@ -803,7 +804,7 @@ async def cluster_ws_detail(request: Request) -> JSONResponse:
 
     Gated on ``admin.cluster.inspect``.  Aggregates the workstream's stored
     row with its live state from the owning node's ``/v1/api/dashboard``
-    (for node-backed workstreams) or the in-process :class:`CoordinatorManager`
+    (for node-backed workstreams) or the in-process :class:`SessionManager`
     (for ``kind="coordinator"`` rows).
 
     Behavior:
@@ -3026,9 +3027,9 @@ async def coordinator_children(request: Request) -> JSONResponse:
     for row in raw:
         serialized = _coord_children_row(row)
         # Drop nested coordinators defensively — current schema can't
-        # produce them (WorkstreamManager rejects kind!=interactive), but
-        # the filter keeps the tree UI contract stable across schema
-        # changes.
+        # produce them (the interactive-side SessionManager rejects
+        # kind!=interactive), but the filter keeps the tree UI contract
+        # stable across schema changes.
         if serialized.get("kind") == WorkstreamKind.COORDINATOR:
             continue
         items.append(serialized)

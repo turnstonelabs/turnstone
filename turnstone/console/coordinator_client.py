@@ -1222,7 +1222,7 @@ class CoordinatorClient:
         links blanked (0 if nothing needed doing, envelope was corrupt,
         or the lookup failed).
 
-        Called by :meth:`CoordinatorManager.close` after the state
+        Called by :meth:`SessionManager.close` after the state
         transition — the task envelope is a per-coordinator planning
         structure, so cross-coord scope guards don't apply the same way
         they do for add/update/remove.  Held under the same per-ws

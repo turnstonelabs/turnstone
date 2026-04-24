@@ -400,7 +400,7 @@ def test_lazy_rehydration_on_detail_get(tmp_path):
 
     Sequence:
     1. Pre-seed storage with a coordinator row (simulating a previous process).
-    2. Build a CoordinatorManager that doesn't know about it yet.
+    2. Build a SessionManager (coordinator kind) that doesn't know about it yet.
     3. Hit GET /v1/api/coordinator/{ws_id} — expect 200.
     4. Manager now tracks the rehydrated session.
     5. The response body carries the correct kind / user_id metadata.

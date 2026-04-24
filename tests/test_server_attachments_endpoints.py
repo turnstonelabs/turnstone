@@ -1,7 +1,7 @@
 """HTTP endpoint tests for workstream attachments.
 
 Uses Starlette's TestClient against an in-process app with a mocked
-WorkstreamManager.  Exercises: upload happy path, size/mime rejection,
+SessionManager.  Exercises: upload happy path, size/mime rejection,
 pending-list, GET /content, DELETE, auth isolation, and the extended
 /api/send handler with both explicit and auto-consumed attachment ids.
 """
@@ -39,7 +39,7 @@ def _make_jwt(user_id: str) -> str:
 
 @pytest.fixture
 def app_client(tmp_path):
-    """Spin up an in-process Starlette app with a mocked WorkstreamManager
+    """Spin up an in-process Starlette app with a mocked SessionManager
     and a fresh SQLite storage."""
     import sqlalchemy as sa
 
@@ -67,7 +67,7 @@ def app_client(tmp_path):
         conn.execute(sa.update(ws_tbl).where(ws_tbl.c.ws_id == "ws-B").values(user_id="userB"))
         conn.commit()
 
-    # WorkstreamManager mock returns None for get(); send endpoint handles that,
+    # SessionManager mock returns None for get(); send endpoint handles that,
     # but we bypass send to focus on attachments.  get() returning a mock is
     # only needed for /api/send; upload/list/content/delete don't use mgr.
     mock_mgr = MagicMock()
