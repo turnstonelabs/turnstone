@@ -2395,18 +2395,39 @@ async def coordinator_create(request: Request) -> JSONResponse:
     name = (body.get("name") or "").strip()
     skill = (body.get("skill") or "").strip() or None
     initial_message = (body.get("initial_message") or "").strip()
+    # Pre-resolve skill → (template_id, applied_version) so the
+    # persisted row records what was applied. SessionManager.create
+    # is kind-agnostic and no longer does this lookup itself.
+    skill_id_resolved = ""
+    skill_version_resolved = 0
+    if skill:
+        from turnstone.core.memory import get_skill_by_name
+        from turnstone.core.storage._registry import get_storage as _get_storage
+
+        _st = _get_storage()
+        skill_data = await asyncio.to_thread(get_skill_by_name, skill)
+        if skill_data and skill_data.get("template_id") and _st is not None:
+            skill_id_resolved = str(skill_data["template_id"])
+            try:
+                skill_version_resolved = (
+                    await asyncio.to_thread(_st.count_skill_versions, skill_id_resolved) + 1
+                )
+            except Exception:
+                log.debug("coord_create.skill_version_failed skill=%s", skill, exc_info=True)
+                skill_version_resolved = 1
     try:
         # Offload to a worker thread — SessionManager.create runs
-        # blocking storage calls (register_workstream, get_skill_by_name,
-        # count_skill_versions) and the session-factory invocation.
-        # Running inline on the async event loop stalled the SSE
-        # manager + every other async handler for the duration of the
-        # create (#perf-4).
+        # blocking storage calls (register_workstream) and the
+        # session-factory invocation. Running inline on the async
+        # event loop stalled the SSE manager + every other async
+        # handler for the duration of the create (#perf-4).
         ws = await asyncio.to_thread(
             coord_mgr.create,
             user_id=user_id,
             name=name,
             skill=skill,
+            skill_id=skill_id_resolved,
+            skill_version=skill_version_resolved,
         )
     except RuntimeError as exc:
         return JSONResponse({"error": str(exc)}, status_code=429)

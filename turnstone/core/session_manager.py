@@ -197,6 +197,8 @@ class SessionManager:
         user_id: str,
         name: str = "",
         skill: str | None = None,
+        skill_id: str = "",
+        skill_version: int = 0,
         ws_id: str = "",
         model: str | None = None,
         client_type: str = "",
@@ -218,7 +220,6 @@ class SessionManager:
         """
         ws_id = ws_id or uuid.uuid4().hex
         effective_name = name or f"ws-{ws_id[:4]}"
-        skill_id_resolved, skill_version_resolved = self._resolve_skill(skill)
 
         with self._lock:
             ws, evicted = self._reserve_and_install_locked(
@@ -241,8 +242,8 @@ class SessionManager:
                 name=ws.name,
                 kind=self.kind,
                 parent_ws_id=parent_ws_id,
-                skill_id=skill_id_resolved,
-                skill_version=skill_version_resolved,
+                skill_id=skill_id,
+                skill_version=skill_version,
             )
         except Exception:
             with self._lock:
@@ -269,32 +270,6 @@ class SessionManager:
 
         self._adapter.emit_created(ws)
         return ws
-
-    def _resolve_skill(self, skill: str | None) -> tuple[str, int]:
-        """Resolve a skill name to (template_id, applied_version).
-
-        Empty / missing / unknown skills return ``("", 0)``. Mirrors
-        the CoordinatorManager lookup so the persisted row records
-        what was actually applied, not just what was requested.
-        """
-        if not skill:
-            return "", 0
-        try:
-            from turnstone.core.memory import get_skill_by_name
-
-            skill_data = get_skill_by_name(skill)
-        except Exception:
-            log.debug("session_mgr.skill_lookup_failed skill=%s", skill, exc_info=True)
-            return "", 0
-        if not skill_data or not skill_data.get("template_id"):
-            return "", 0
-        template_id = str(skill_data["template_id"])
-        try:
-            version = self._storage.count_skill_versions(template_id) + 1
-        except Exception:
-            log.debug("session_mgr.skill_version_failed skill=%s", skill, exc_info=True)
-            version = 1
-        return template_id, version
 
     # ------------------------------------------------------------------
     # open — lazy rehydrate for a persisted workstream

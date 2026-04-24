@@ -2591,6 +2591,8 @@ async def create_workstream(request: Request) -> JSONResponse:
             name=body.get("name", ""),
             model=resolved_model,
             skill=resolved_skill,
+            skill_id=skill_data["template_id"] if skill_data else "",
+            skill_version=applied_skill_version,
             ws_id=requested_ws_id,
             client_type=body.get("client_type", "") or "",
             judge_model=body.get("judge_model", "") or None,
