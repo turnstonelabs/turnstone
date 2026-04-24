@@ -1132,7 +1132,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
     # enforced per-row (callers without ``admin.system`` see only their
     # own coordinators); cross-tenant misses 404-mask.
     EndpointSpec(
-        "/v1/api/coordinator/new",
+        "/v1/api/workstreams/new",
         "POST",
         "Create a new coordinator workstream",
         description=(
@@ -1147,7 +1147,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator",
+        "/v1/api/workstreams",
         "GET",
         "List coordinator workstreams visible to the caller",
         description=(
@@ -1159,7 +1159,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}",
+        "/v1/api/workstreams/{ws_id}",
         "GET",
         "Get coordinator detail (rehydrates lazily on miss)",
         description=(
@@ -1173,7 +1173,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/open",
+        "/v1/api/workstreams/{ws_id}/open",
         "POST",
         "Open (rehydrate) a coordinator workstream by ws_id",
         description=(
@@ -1187,7 +1187,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/send",
+        "/v1/api/workstreams/{ws_id}/send",
         "POST",
         "Queue a user message onto the coordinator session",
         description=(
@@ -1200,7 +1200,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/approve",
+        "/v1/api/workstreams/{ws_id}/approve",
         "POST",
         "Resolve a pending tool approval on the coordinator session",
         description=(
@@ -1215,7 +1215,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/cancel",
+        "/v1/api/workstreams/{ws_id}/cancel",
         "POST",
         "Cancel in-flight generation on the coordinator session",
         description=(
@@ -1228,7 +1228,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/close",
+        "/v1/api/workstreams/{ws_id}/close",
         "POST",
         "Soft-close the coordinator (unload from memory; storage preserved)",
         description=(
@@ -1242,7 +1242,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/events",
+        "/v1/api/workstreams/{ws_id}/events",
         "GET",
         "Subscribe to the coordinator's SSE event stream",
         description=(
@@ -1257,7 +1257,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/history",
+        "/v1/api/workstreams/{ws_id}/history",
         "GET",
         "Read the coordinator's reconstructed message history",
         description=(
@@ -1278,7 +1278,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/children",
+        "/v1/api/workstreams/{ws_id}/children",
         "GET",
         "List the coordinator's spawned child workstreams",
         description=(
@@ -1291,7 +1291,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/tasks",
+        "/v1/api/workstreams/{ws_id}/tasks",
         "GET",
         "Read the coordinator's task list envelope",
         description=(
@@ -1304,7 +1304,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/trust",
+        "/v1/api/workstreams/{ws_id}/trust",
         "POST",
         "Toggle trusted-session mode for send_to_workstream",
         description=(
@@ -1325,7 +1325,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/restrict",
+        "/v1/api/workstreams/{ws_id}/restrict",
         "POST",
         "Revoke tool access on a live coordinator session",
         description=(
@@ -1344,7 +1344,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/stop_cascade",
+        "/v1/api/workstreams/{ws_id}/stop_cascade",
         "POST",
         "Cancel the coordinator and every direct child",
         description=(
@@ -1362,7 +1362,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/close_all_children",
+        "/v1/api/workstreams/{ws_id}/close_all_children",
         "POST",
         "Soft-close every direct child of the coordinator",
         description=(

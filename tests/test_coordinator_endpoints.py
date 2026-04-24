@@ -66,60 +66,60 @@ def _make_client(
     app = Starlette(
         routes=[
             Route(
-                "/v1/api/coordinator/new",
+                "/v1/api/workstreams/new",
                 coordinator_create,
                 methods=["POST"],
             ),
-            Route("/v1/api/coordinator", coordinator_list, methods=["GET"]),
+            Route("/v1/api/workstreams", coordinator_list, methods=["GET"]),
             # Literal path before the /{ws_id} routes below so Starlette
             # matches "saved" as the literal, not as a ws_id.
             Route(
-                "/v1/api/coordinator/saved",
+                "/v1/api/workstreams/saved",
                 coordinator_saved,
                 methods=["GET"],
             ),
             Route(
-                "/v1/api/coordinator/{ws_id}/send",
+                "/v1/api/workstreams/{ws_id}/send",
                 coordinator_send,
                 methods=["POST"],
             ),
             Route(
-                "/v1/api/coordinator/{ws_id}/approve",
+                "/v1/api/workstreams/{ws_id}/approve",
                 coordinator_approve,
                 methods=["POST"],
             ),
             Route(
-                "/v1/api/coordinator/{ws_id}/cancel",
+                "/v1/api/workstreams/{ws_id}/cancel",
                 coordinator_cancel,
                 methods=["POST"],
             ),
             Route(
-                "/v1/api/coordinator/{ws_id}/close",
+                "/v1/api/workstreams/{ws_id}/close",
                 coordinator_close,
                 methods=["POST"],
             ),
             Route(
-                "/v1/api/coordinator/{ws_id}/history",
+                "/v1/api/workstreams/{ws_id}/history",
                 coordinator_history,
                 methods=["GET"],
             ),
             Route(
-                "/v1/api/coordinator/{ws_id}/open",
+                "/v1/api/workstreams/{ws_id}/open",
                 coordinator_open,
                 methods=["POST"],
             ),
             Route(
-                "/v1/api/coordinator/{ws_id}/children",
+                "/v1/api/workstreams/{ws_id}/children",
                 coordinator_children,
                 methods=["GET"],
             ),
             Route(
-                "/v1/api/coordinator/{ws_id}/tasks",
+                "/v1/api/workstreams/{ws_id}/tasks",
                 coordinator_tasks,
                 methods=["GET"],
             ),
             Route(
-                "/v1/api/coordinator/{ws_id}",
+                "/v1/api/workstreams/{ws_id}",
                 coordinator_detail,
                 methods=["GET"],
             ),
@@ -150,7 +150,7 @@ def test_missing_permission_returns_403(storage):
     mgr = _build_mgr(storage)
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        "/v1/api/coordinator/new",
+        "/v1/api/workstreams/new",
         json={"name": "c1"},
         headers={"X-Test-User": "user-1", "X-Test-Perms": "read"},
     )
@@ -161,7 +161,7 @@ def test_no_auth_returns_401(storage):
     """No AuthResult in request.state → 401 (require_permission semantics)."""
     mgr = _build_mgr(storage)
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.post("/v1/api/coordinator/new", json={"name": "c1"})
+    resp = client.post("/v1/api/workstreams/new", json={"name": "c1"})
     assert resp.status_code == 401
 
 
@@ -173,7 +173,7 @@ def test_no_auth_returns_401(storage):
 def test_missing_coord_mgr_returns_503(storage):
     client = _make_client(storage, coord_mgr=None)
     resp = client.post(
-        "/v1/api/coordinator/new",
+        "/v1/api/workstreams/new",
         json={"name": "c1"},
         headers={"X-Test-User": "user-1", "X-Test-Perms": "admin.coordinator"},
     )
@@ -189,7 +189,7 @@ def test_missing_model_alias_falls_back_to_registry_default(storage):
     mgr = _build_mgr(storage)
     client = _make_client(storage, coord_mgr=mgr, alias="", registry=_fake_registry())
     resp = client.post(
-        "/v1/api/coordinator/new",
+        "/v1/api/workstreams/new",
         json={},
         headers={"X-Test-User": "user-1", "X-Test-Perms": "admin.coordinator"},
     )
@@ -209,7 +209,7 @@ def test_missing_alias_and_no_default_returns_503(storage):
     broken_registry.resolve.side_effect = KeyError("no-default")
     client = _make_client(storage, coord_mgr=mgr, alias="", registry=broken_registry)
     resp = client.post(
-        "/v1/api/coordinator/new",
+        "/v1/api/workstreams/new",
         json={},
         headers={"X-Test-User": "user-1", "X-Test-Perms": "admin.coordinator"},
     )
@@ -223,7 +223,7 @@ def test_unresolvable_alias_returns_503(storage):
     broken_registry.resolve.side_effect = KeyError("no-such-alias")
     client = _make_client(storage, coord_mgr=mgr, alias="my-alias", registry=broken_registry)
     resp = client.post(
-        "/v1/api/coordinator/new",
+        "/v1/api/workstreams/new",
         json={},
         headers={"X-Test-User": "user-1", "X-Test-Perms": "admin.coordinator"},
     )
@@ -243,7 +243,7 @@ def test_create_returns_ws_id_and_records_audit(storage):
     mgr = _build_mgr(storage)
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        "/v1/api/coordinator/new",
+        "/v1/api/workstreams/new",
         json={"name": "my-coord"},
         headers=_COORD_HEADERS,
     )
@@ -268,7 +268,7 @@ def test_list_returns_cluster_wide(storage):
     mgr.create(user_id="user-1", name="mine")
     mgr.create(user_id="user-2", name="theirs")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.get("/v1/api/coordinator", headers=_COORD_HEADERS)
+    resp = client.get("/v1/api/workstreams", headers=_COORD_HEADERS)
     assert resp.status_code == 200
     body = resp.json()
     names = {c["name"] for c in body["coordinators"]}
@@ -324,7 +324,7 @@ def test_saved_returns_cluster_wide(saved_storage):
     a = _seed_closed_coord_with_history(mgr, storage, user_id="user-1", name="a")
     b = _seed_closed_coord_with_history(mgr, storage, user_id="user-2", name="b")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.get("/v1/api/coordinator/saved", headers=_COORD_HEADERS)
+    resp = client.get("/v1/api/workstreams/saved", headers=_COORD_HEADERS)
     assert resp.status_code == 200
     assert {c["ws_id"] for c in resp.json()["coordinators"]} == {a, b}
 
@@ -346,7 +346,7 @@ def test_saved_excludes_currently_loaded(saved_storage):
     # exercise the defence-in-depth ``loaded`` filter.
     storage.update_workstream_state(loaded_ws.id, "closed")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.get("/v1/api/coordinator/saved", headers=_COORD_HEADERS)
+    resp = client.get("/v1/api/workstreams/saved", headers=_COORD_HEADERS)
     assert resp.status_code == 200
     saved_ids = {c["ws_id"] for c in resp.json()["coordinators"]}
     assert closed_id in saved_ids
@@ -373,7 +373,7 @@ def test_saved_excludes_active_state_rows(saved_storage):
         mgr._order.remove(orphan.id)
     assert storage.get_workstream(orphan.id)["state"] == "idle"
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.get("/v1/api/coordinator/saved", headers=_COORD_HEADERS)
+    resp = client.get("/v1/api/workstreams/saved", headers=_COORD_HEADERS)
     assert resp.status_code == 200
     saved_ids = {c["ws_id"] for c in resp.json()["coordinators"]}
     assert saved_ids == {closed_id}
@@ -387,7 +387,7 @@ def test_send_any_admin_coordinator_caller_can_send(storage):
     ws = mgr.create(user_id="owner", name="theirs")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{ws.id}/send",
+        f"/v1/api/workstreams/{ws.id}/send",
         json={"message": "hi"},
         headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
     )
@@ -399,7 +399,7 @@ def test_send_requires_message(storage):
     ws = mgr.create(user_id="user-1")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{ws.id}/send",
+        f"/v1/api/workstreams/{ws.id}/send",
         json={},
         headers=_COORD_HEADERS,
     )
@@ -410,7 +410,7 @@ def test_close_records_audit_and_removes_from_mgr(storage):
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="user-1")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.post(f"/v1/api/coordinator/{ws.id}/close", headers=_COORD_HEADERS)
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/close", headers=_COORD_HEADERS)
     assert resp.status_code == 200
     assert mgr.get(ws.id) is None
     events = storage.list_audit_events(user_id="user-1", limit=10)
@@ -436,7 +436,7 @@ def test_approve_resolves_ui_event(storage):
     ws.ui._approval_event.clear()
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{ws.id}/approve",
+        f"/v1/api/workstreams/{ws.id}/approve",
         json={"approved": True, "always": True, "call_id": "c-1"},
         headers=_COORD_HEADERS,
     )
@@ -452,7 +452,7 @@ def test_approve_resolves_ui_event(storage):
 
 
 def test_detail_triggers_lazy_rehydration(storage):
-    """GET /v1/api/coordinator/{ws_id} finds the row and rehydrates it."""
+    """GET /v1/api/workstreams/{ws_id} finds the row and rehydrates it."""
     mgr = _build_mgr(storage)
     # Simulate a coordinator persisted by a previous console process.
     storage.register_workstream(
@@ -463,7 +463,7 @@ def test_detail_triggers_lazy_rehydration(storage):
     )
     assert mgr.get("persisted-coord") is None
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.get("/v1/api/coordinator/persisted-coord", headers=_COORD_HEADERS)
+    resp = client.get("/v1/api/workstreams/persisted-coord", headers=_COORD_HEADERS)
     assert resp.status_code == 200
     # Now tracked in the manager.
     assert mgr.get("persisted-coord") is not None
@@ -477,7 +477,7 @@ def test_detail_any_admin_coordinator_caller_can_open(storage):
     storage.register_workstream("coord-x", kind="coordinator", user_id="owner")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.get(
-        "/v1/api/coordinator/coord-x",
+        "/v1/api/workstreams/coord-x",
         headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
     )
     assert resp.status_code == 200
@@ -489,7 +489,7 @@ def test_detail_404_when_kind_interactive(storage):
     mgr = _build_mgr(storage)
     storage.register_workstream("ws-int", kind="interactive", user_id="user-1")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.get("/v1/api/coordinator/ws-int", headers=_COORD_HEADERS)
+    resp = client.get("/v1/api/workstreams/ws-int", headers=_COORD_HEADERS)
     assert resp.status_code == 404
 
 
@@ -504,7 +504,7 @@ def test_history_returns_messages(storage):
     # Seed a message in storage.
     storage.save_message(ws.id, "user", "hello")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.get(f"/v1/api/coordinator/{ws.id}/history", headers=_COORD_HEADERS)
+    resp = client.get(f"/v1/api/workstreams/{ws.id}/history", headers=_COORD_HEADERS)
     assert resp.status_code == 200
     body = resp.json()
     assert body["ws_id"] == ws.id
@@ -519,7 +519,7 @@ def test_history_any_admin_coordinator_caller_can_read(storage):
     storage.save_message(ws.id, "user", "hello")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.get(
-        f"/v1/api/coordinator/{ws.id}/history",
+        f"/v1/api/workstreams/{ws.id}/history",
         headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
     )
     assert resp.status_code == 200
@@ -538,7 +538,7 @@ def test_cancel_resolves_pending_approval(storage):
     ws.ui._pending_approval = {"type": "approve_request", "items": []}
     ws.ui._approval_event.clear()
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.post(f"/v1/api/coordinator/{ws.id}/cancel", headers=_COORD_HEADERS)
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/cancel", headers=_COORD_HEADERS)
     assert resp.status_code == 200
     assert ws.ui._approval_event.is_set()
 
@@ -552,7 +552,7 @@ def test_open_returns_already_loaded_when_in_memory(storage):
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="user-1", name="live")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.post(f"/v1/api/coordinator/{ws.id}/open", headers=_COORD_HEADERS)
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/open", headers=_COORD_HEADERS)
     assert resp.status_code == 200
     body = resp.json()
     assert body["ws_id"] == ws.id
@@ -566,7 +566,7 @@ def test_open_any_admin_coordinator_caller_succeeds_in_memory(storage):
     ws = mgr.create(user_id="owner", name="theirs")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{ws.id}/open",
+        f"/v1/api/workstreams/{ws.id}/open",
         headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
     )
     assert resp.status_code == 200
@@ -581,7 +581,7 @@ def test_open_rehydrates_when_not_in_memory(storage, monkeypatch):
     rehydrated.user_id = "user-1"
     monkeypatch.setattr(mgr, "open", MagicMock(return_value=rehydrated))
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.post("/v1/api/coordinator/coord-rehy/open", headers=_COORD_HEADERS)
+    resp = client.post("/v1/api/workstreams/coord-rehy/open", headers=_COORD_HEADERS)
     assert resp.status_code == 200
     body = resp.json()
     assert body["ws_id"] == "coord-rehy"
@@ -596,13 +596,13 @@ def test_open_returns_404_when_unknown_ws_id(storage, monkeypatch):
     mgr = _build_mgr(storage)
     monkeypatch.setattr(mgr, "open", MagicMock(return_value=None))
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.post("/v1/api/coordinator/nonexistent/open", headers=_COORD_HEADERS)
+    resp = client.post("/v1/api/workstreams/nonexistent/open", headers=_COORD_HEADERS)
     assert resp.status_code == 404
 
 
 def test_open_503_on_coord_mgr_unavailable(storage):
     client = _make_client(storage, coord_mgr=None)
-    resp = client.post("/v1/api/coordinator/any-ws/open", headers=_COORD_HEADERS)
+    resp = client.post("/v1/api/workstreams/any-ws/open", headers=_COORD_HEADERS)
     assert resp.status_code == 503
 
 
@@ -610,7 +610,7 @@ def test_open_correlation_id_on_factory_failure(storage, monkeypatch):
     mgr = _build_mgr(storage)
     monkeypatch.setattr(mgr, "open", MagicMock(side_effect=RuntimeError("boom")))
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.post("/v1/api/coordinator/bad-ws/open", headers=_COORD_HEADERS)
+    resp = client.post("/v1/api/workstreams/bad-ws/open", headers=_COORD_HEADERS)
     assert resp.status_code == 500
     assert "correlation_id=" in resp.json()["error"]
 
@@ -620,13 +620,13 @@ def test_open_503_when_open_raises_value_error(storage, monkeypatch):
     mgr = _build_mgr(storage)
     monkeypatch.setattr(mgr, "open", MagicMock(side_effect=ValueError("coord registry missing")))
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.post("/v1/api/coordinator/bad-ws/open", headers=_COORD_HEADERS)
+    resp = client.post("/v1/api/workstreams/bad-ws/open", headers=_COORD_HEADERS)
     assert resp.status_code == 503
     assert "registry missing" in resp.json()["error"]
 
 
 # ---------------------------------------------------------------------------
-# GET /v1/api/coordinator/{ws_id}/children — phase 3 tree view backend
+# GET /v1/api/workstreams/{ws_id}/children — phase 3 tree view backend
 # ---------------------------------------------------------------------------
 
 
@@ -647,7 +647,7 @@ def test_children_empty_for_new_coordinator(storage):
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="user-1")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.get(f"/v1/api/coordinator/{ws.id}/children", headers=_COORD_HEADERS)
+    resp = client.get(f"/v1/api/workstreams/{ws.id}/children", headers=_COORD_HEADERS)
     assert resp.status_code == 200
     body = resp.json()
     assert body == {"items": [], "truncated": False}
@@ -659,7 +659,7 @@ def test_children_returns_interactive_children(storage):
     _seed_child(storage, ws.id, "c" * 32)
     _seed_child(storage, ws.id, "d" * 32, state="running")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.get(f"/v1/api/coordinator/{ws.id}/children", headers=_COORD_HEADERS)
+    resp = client.get(f"/v1/api/workstreams/{ws.id}/children", headers=_COORD_HEADERS)
     assert resp.status_code == 200
     body = resp.json()
     assert len(body["items"]) == 2
@@ -677,7 +677,7 @@ def test_children_any_admin_coordinator_caller_sees_subtree(storage):
     _seed_child(storage, ws.id, "a" * 32)
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.get(
-        f"/v1/api/coordinator/{ws.id}/children",
+        f"/v1/api/workstreams/{ws.id}/children",
         headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
     )
     assert resp.status_code == 200
@@ -687,12 +687,12 @@ def test_children_any_admin_coordinator_caller_sees_subtree(storage):
 def test_children_invalid_ws_id_400(storage):
     mgr = _build_mgr(storage)
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.get("/v1/api/coordinator/INVALID-WS-SHOUT/children", headers=_COORD_HEADERS)
+    resp = client.get("/v1/api/workstreams/INVALID-WS-SHOUT/children", headers=_COORD_HEADERS)
     assert resp.status_code == 400
 
 
 # ---------------------------------------------------------------------------
-# GET /v1/api/coordinator/{ws_id}/tasks — phase 3 task pane backend
+# GET /v1/api/workstreams/{ws_id}/tasks — phase 3 task pane backend
 # ---------------------------------------------------------------------------
 
 
@@ -700,7 +700,7 @@ def test_tasks_empty_envelope_for_new_coordinator(storage):
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="user-1")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.get(f"/v1/api/coordinator/{ws.id}/tasks", headers=_COORD_HEADERS)
+    resp = client.get(f"/v1/api/workstreams/{ws.id}/tasks", headers=_COORD_HEADERS)
     assert resp.status_code == 200
     assert resp.json() == {"version": 1, "tasks": []}
 
@@ -725,7 +725,7 @@ def test_tasks_round_trips_stored_envelope(storage):
     }
     storage.save_workstream_config(ws.id, {"tasks": json.dumps(envelope)})
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.get(f"/v1/api/coordinator/{ws.id}/tasks", headers=_COORD_HEADERS)
+    resp = client.get(f"/v1/api/workstreams/{ws.id}/tasks", headers=_COORD_HEADERS)
     assert resp.status_code == 200
     assert resp.json() == envelope
 
@@ -735,7 +735,7 @@ def test_tasks_corrupt_envelope_returns_empty(storage):
     ws = mgr.create(user_id="user-1")
     storage.save_workstream_config(ws.id, {"tasks": "NOT-JSON"})
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.get(f"/v1/api/coordinator/{ws.id}/tasks", headers=_COORD_HEADERS)
+    resp = client.get(f"/v1/api/workstreams/{ws.id}/tasks", headers=_COORD_HEADERS)
     assert resp.status_code == 200
     assert resp.json() == {"version": 1, "tasks": []}
 
@@ -747,7 +747,7 @@ def test_tasks_any_admin_coordinator_caller_can_read(storage):
     ws = mgr.create(user_id="owner")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.get(
-        f"/v1/api/coordinator/{ws.id}/tasks",
+        f"/v1/api/workstreams/{ws.id}/tasks",
         headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
     )
     assert resp.status_code == 200

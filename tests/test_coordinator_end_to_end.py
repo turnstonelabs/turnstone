@@ -6,7 +6,7 @@ real in-process components:
 1. Create + list + detail round-trip via the Starlette TestClient.
 2. CoordinatorClient against a MockTransport "server node" stub.
 3. list_children storage read flow (kind filtering, parent scoping).
-4. Lazy rehydration via GET /v1/api/coordinator/{ws_id}.
+4. Lazy rehydration via GET /v1/api/workstreams/{ws_id}.
 
 Intentionally no real LLM infrastructure — session factories return
 MagicMock-backed stubs.  All four tests run in < 2 s total.
@@ -118,18 +118,18 @@ def _make_client(
     app = Starlette(
         routes=[
             Route(
-                "/v1/api/coordinator/new",
+                "/v1/api/workstreams/new",
                 coordinator_create,
                 methods=["POST"],
             ),
-            Route("/v1/api/coordinator", coordinator_list, methods=["GET"]),
+            Route("/v1/api/workstreams", coordinator_list, methods=["GET"]),
             Route(
-                "/v1/api/coordinator/{ws_id}/close",
+                "/v1/api/workstreams/{ws_id}/close",
                 coordinator_close,
                 methods=["POST"],
             ),
             Route(
-                "/v1/api/coordinator/{ws_id}",
+                "/v1/api/workstreams/{ws_id}",
                 coordinator_detail,
                 methods=["GET"],
             ),
@@ -161,7 +161,7 @@ def test_create_list_detail_lifecycle(tmp_path):
 
     # --- Create ---
     resp = client.post(
-        "/v1/api/coordinator/new",
+        "/v1/api/workstreams/new",
         json={"name": "e2e-coord"},
         headers=_COORD_HEADERS,
     )
@@ -172,7 +172,7 @@ def test_create_list_detail_lifecycle(tmp_path):
     assert "e2e-coord" in body["name"]
 
     # --- List: caller sees their own coordinator ---
-    resp = client.get("/v1/api/coordinator", headers=_COORD_HEADERS)
+    resp = client.get("/v1/api/workstreams", headers=_COORD_HEADERS)
     assert resp.status_code == 200, resp.text
     coordinators = resp.json()["coordinators"]
     ids = {c["ws_id"] for c in coordinators}
@@ -181,13 +181,13 @@ def test_create_list_detail_lifecycle(tmp_path):
     # Trusted-team visibility: every ``admin.coordinator`` caller sees
     # every active coordinator regardless of owner.
     mgr.create(user_id="other-user", name="not-mine")
-    resp = client.get("/v1/api/coordinator", headers=_COORD_HEADERS)
+    resp = client.get("/v1/api/workstreams", headers=_COORD_HEADERS)
     assert resp.status_code == 200
     names = {c["name"] for c in resp.json()["coordinators"]}
     assert "not-mine" in names
 
     # --- Detail ---
-    resp = client.get(f"/v1/api/coordinator/{ws_id}", headers=_COORD_HEADERS)
+    resp = client.get(f"/v1/api/workstreams/{ws_id}", headers=_COORD_HEADERS)
     assert resp.status_code == 200, resp.text
     detail = resp.json()
     assert detail["ws_id"] == ws_id
@@ -195,7 +195,7 @@ def test_create_list_detail_lifecycle(tmp_path):
     assert detail["user_id"] == "user-1"
 
     # --- Close ---
-    resp = client.post(f"/v1/api/coordinator/{ws_id}/close", headers=_COORD_HEADERS)
+    resp = client.post(f"/v1/api/workstreams/{ws_id}/close", headers=_COORD_HEADERS)
     assert resp.status_code == 200
 
     # Manager no longer tracks it after close.
@@ -391,7 +391,7 @@ def test_list_children_skill_filter(seeded_storage):
 
 
 # ---------------------------------------------------------------------------
-# Test 4 — Lazy rehydration via GET /v1/api/coordinator/{ws_id}
+# Test 4 — Lazy rehydration via GET /v1/api/workstreams/{ws_id}
 # ---------------------------------------------------------------------------
 
 
@@ -401,7 +401,7 @@ def test_lazy_rehydration_on_detail_get(tmp_path):
     Sequence:
     1. Pre-seed storage with a coordinator row (simulating a previous process).
     2. Build a SessionManager (coordinator kind) that doesn't know about it yet.
-    3. Hit GET /v1/api/coordinator/{ws_id} — expect 200.
+    3. Hit GET /v1/api/workstreams/{ws_id} — expect 200.
     4. Manager now tracks the rehydrated session.
     5. The response body carries the correct kind / user_id metadata.
     """
@@ -421,7 +421,7 @@ def test_lazy_rehydration_on_detail_get(tmp_path):
     assert mgr.get("persisted-coord") is None
 
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.get("/v1/api/coordinator/persisted-coord", headers=_COORD_HEADERS)
+    resp = client.get("/v1/api/workstreams/persisted-coord", headers=_COORD_HEADERS)
     assert resp.status_code == 200, resp.text
 
     body = resp.json()
@@ -435,7 +435,7 @@ def test_lazy_rehydration_on_detail_get(tmp_path):
     # Trusted-team visibility: any admin.coordinator caller can read
     # the coordinator's detail, regardless of ``user_id``.
     resp_stranger = client.get(
-        "/v1/api/coordinator/persisted-coord",
+        "/v1/api/workstreams/persisted-coord",
         headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
     )
     assert resp_stranger.status_code == 200
@@ -444,5 +444,5 @@ def test_lazy_rehydration_on_detail_get(tmp_path):
     # A workstream with kind='interactive' is not reachable via the coordinator
     # endpoint even when it exists in storage.
     storage.register_workstream("interactive-ws", kind="interactive", user_id="user-1")
-    resp_int = client.get("/v1/api/coordinator/interactive-ws", headers=_COORD_HEADERS)
+    resp_int = client.get("/v1/api/workstreams/interactive-ws", headers=_COORD_HEADERS)
     assert resp_int.status_code == 404

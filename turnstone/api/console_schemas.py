@@ -985,7 +985,7 @@ class BulkSetNodeMetadataRequest(BaseModel):
 
 
 class CoordinatorOpenResponse(BaseModel):
-    """Response body for POST /v1/api/coordinator/{ws_id}/open."""
+    """Response body for POST /v1/api/workstreams/{ws_id}/open."""
 
     ws_id: str
     name: str
@@ -996,7 +996,7 @@ class CoordinatorOpenResponse(BaseModel):
 
 
 class CoordinatorCreateRequest(BaseModel):
-    """Body for POST /v1/api/coordinator/new."""
+    """Body for POST /v1/api/workstreams/new."""
 
     name: str = Field(default="", description="Optional display name; auto-generated when empty.")
     skill: str | None = Field(
@@ -1010,7 +1010,7 @@ class CoordinatorCreateRequest(BaseModel):
 
 
 class CoordinatorCreateResponse(BaseModel):
-    """Response body for POST /v1/api/coordinator/new (201)."""
+    """Response body for POST /v1/api/workstreams/new (201)."""
 
     ws_id: str
     name: str
@@ -1026,13 +1026,13 @@ class CoordinatorInfo(BaseModel):
 
 
 class CoordinatorListResponse(BaseModel):
-    """Response body for GET /v1/api/coordinator."""
+    """Response body for GET /v1/api/workstreams."""
 
     coordinators: list[CoordinatorInfo] = Field(default_factory=list)
 
 
 class CoordinatorDetailResponse(BaseModel):
-    """Response body for GET /v1/api/coordinator/{ws_id}."""
+    """Response body for GET /v1/api/workstreams/{ws_id}."""
 
     ws_id: str
     name: str
@@ -1042,13 +1042,13 @@ class CoordinatorDetailResponse(BaseModel):
 
 
 class CoordinatorSendRequest(BaseModel):
-    """Body for POST /v1/api/coordinator/{ws_id}/send."""
+    """Body for POST /v1/api/workstreams/{ws_id}/send."""
 
     message: str = Field(description="User message to queue onto the coordinator's worker.")
 
 
 class CoordinatorApproveRequest(BaseModel):
-    """Body for POST /v1/api/coordinator/{ws_id}/approve."""
+    """Body for POST /v1/api/workstreams/{ws_id}/approve."""
 
     approved: bool = Field(description="True approves the pending tool call(s); False denies.")
     feedback: str | None = Field(
@@ -1065,7 +1065,7 @@ class CoordinatorApproveRequest(BaseModel):
 
 
 class CoordinatorHistoryResponse(BaseModel):
-    """Response body for GET /v1/api/coordinator/{ws_id}/history."""
+    """Response body for GET /v1/api/workstreams/{ws_id}/history."""
 
     ws_id: str
     messages: list[dict[str, Any]] = Field(
@@ -1094,7 +1094,7 @@ class CoordinatorChildInfo(BaseModel):
 
 
 class CoordinatorChildrenResponse(BaseModel):
-    """Response body for GET /v1/api/coordinator/{ws_id}/children."""
+    """Response body for GET /v1/api/workstreams/{ws_id}/children."""
 
     items: list[CoordinatorChildInfo] = Field(default_factory=list)
     truncated: bool = Field(
@@ -1115,7 +1115,7 @@ class CoordinatorTaskInfo(BaseModel):
 
 
 class CoordinatorTasksResponse(BaseModel):
-    """Response body for GET /v1/api/coordinator/{ws_id}/tasks.
+    """Response body for GET /v1/api/workstreams/{ws_id}/tasks.
 
     Mirrors the envelope the ``task_list(action='list')`` model tool returns.
     """
@@ -1125,7 +1125,7 @@ class CoordinatorTasksResponse(BaseModel):
 
 
 class CoordinatorTrustRequest(BaseModel):
-    """Body for POST /v1/api/coordinator/{ws_id}/trust."""
+    """Body for POST /v1/api/workstreams/{ws_id}/trust."""
 
     send: bool = Field(
         description=(
@@ -1138,14 +1138,14 @@ class CoordinatorTrustRequest(BaseModel):
 
 
 class CoordinatorTrustResponse(BaseModel):
-    """Response body for POST /v1/api/coordinator/{ws_id}/trust."""
+    """Response body for POST /v1/api/workstreams/{ws_id}/trust."""
 
     status: str = Field(default="ok")
     trust_send: bool = Field(description="Post-toggle value of the flag.")
 
 
 class CoordinatorRestrictRequest(BaseModel):
-    """Body for POST /v1/api/coordinator/{ws_id}/restrict."""
+    """Body for POST /v1/api/workstreams/{ws_id}/restrict."""
 
     revoke: list[str] = Field(
         description=(
@@ -1157,14 +1157,14 @@ class CoordinatorRestrictRequest(BaseModel):
 
 
 class CoordinatorRestrictResponse(BaseModel):
-    """Response body for POST /v1/api/coordinator/{ws_id}/restrict."""
+    """Response body for POST /v1/api/workstreams/{ws_id}/restrict."""
 
     status: str = Field(default="ok")
     revoked_tools: list[str] = Field(description="Full post-revocation set of revoked tool names.")
 
 
 class CoordinatorStopCascadeResponse(BaseModel):
-    """Response body for POST /v1/api/coordinator/{ws_id}/stop_cascade."""
+    """Response body for POST /v1/api/workstreams/{ws_id}/stop_cascade."""
 
     status: str = Field(default="ok")
     cancelled: list[str] = Field(
@@ -1191,7 +1191,7 @@ class CoordinatorStopCascadeResponse(BaseModel):
 
 
 class CoordinatorCloseAllChildrenRequest(BaseModel):
-    """Body for POST /v1/api/coordinator/{ws_id}/close_all_children."""
+    """Body for POST /v1/api/workstreams/{ws_id}/close_all_children."""
 
     reason: str = Field(
         default="",
@@ -1205,7 +1205,7 @@ class CoordinatorCloseAllChildrenRequest(BaseModel):
 
 
 class CoordinatorCloseAllChildrenResponse(BaseModel):
-    """Response body for POST /v1/api/coordinator/{ws_id}/close_all_children."""
+    """Response body for POST /v1/api/workstreams/{ws_id}/close_all_children."""
 
     status: str = Field(default="ok")
     closed: list[str] = Field(

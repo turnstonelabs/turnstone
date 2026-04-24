@@ -123,18 +123,18 @@ class TestConsoleSpec:
         spec = build_console_spec()
         paths = set(spec["paths"].keys())
         expected = {
-            "/v1/api/coordinator/new",
-            "/v1/api/coordinator",
-            "/v1/api/coordinator/{ws_id}",
-            "/v1/api/coordinator/{ws_id}/open",
-            "/v1/api/coordinator/{ws_id}/send",
-            "/v1/api/coordinator/{ws_id}/approve",
-            "/v1/api/coordinator/{ws_id}/cancel",
-            "/v1/api/coordinator/{ws_id}/close",
-            "/v1/api/coordinator/{ws_id}/events",
-            "/v1/api/coordinator/{ws_id}/history",
-            "/v1/api/coordinator/{ws_id}/children",
-            "/v1/api/coordinator/{ws_id}/tasks",
+            "/v1/api/workstreams/new",
+            "/v1/api/workstreams",
+            "/v1/api/workstreams/{ws_id}",
+            "/v1/api/workstreams/{ws_id}/open",
+            "/v1/api/workstreams/{ws_id}/send",
+            "/v1/api/workstreams/{ws_id}/approve",
+            "/v1/api/workstreams/{ws_id}/cancel",
+            "/v1/api/workstreams/{ws_id}/close",
+            "/v1/api/workstreams/{ws_id}/events",
+            "/v1/api/workstreams/{ws_id}/history",
+            "/v1/api/workstreams/{ws_id}/children",
+            "/v1/api/workstreams/{ws_id}/tasks",
             "/v1/api/cluster/ws/{ws_id}/detail",
         }
         assert expected.issubset(paths), f"Missing: {expected - paths}"
@@ -144,7 +144,7 @@ class TestConsoleSpec:
         from turnstone.api.console_spec import build_console_spec
 
         spec = build_console_spec()
-        op = spec["paths"]["/v1/api/coordinator/new"]["post"]
+        op = spec["paths"]["/v1/api/workstreams/new"]["post"]
         assert "requestBody" in op
         assert "application/json" in op["requestBody"]["content"]
         # Pin the 201 success code.
@@ -154,7 +154,7 @@ class TestConsoleSpec:
         from turnstone.api.console_spec import build_console_spec
 
         spec = build_console_spec()
-        op = spec["paths"]["/v1/api/coordinator/{ws_id}/history"]["get"]
+        op = spec["paths"]["/v1/api/workstreams/{ws_id}/history"]["get"]
         param_names = [p["name"] for p in op.get("parameters", [])]
         assert "ws_id" in param_names  # auto-added from path
         assert "limit" in param_names

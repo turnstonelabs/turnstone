@@ -1,12 +1,12 @@
 /* coordinator.js — one-pane UI for console-hosted coordinator sessions.
  *
  * Connects to:
- *   GET  /v1/api/coordinator/{ws_id}/events  (SSE)
- *   GET  /v1/api/coordinator/{ws_id}/history (initial history)
- *   POST /v1/api/coordinator/{ws_id}/send
- *   POST /v1/api/coordinator/{ws_id}/approve
- *   POST /v1/api/coordinator/{ws_id}/cancel
- *   POST /v1/api/coordinator/{ws_id}/close
+ *   GET  /v1/api/workstreams/{ws_id}/events  (SSE)
+ *   GET  /v1/api/workstreams/{ws_id}/history (initial history)
+ *   POST /v1/api/workstreams/{ws_id}/send
+ *   POST /v1/api/workstreams/{ws_id}/approve
+ *   POST /v1/api/workstreams/{ws_id}/cancel
+ *   POST /v1/api/workstreams/{ws_id}/close
  *
  * Depends on shared/auth.js (authFetch, fetchWithCreds), shared/theme.js
  * (toggleTheme), shared/toast.js (toast.info / toast.error),
@@ -516,7 +516,7 @@
     setApprovalButtonsDisabled(true);
     try {
       const resp = await postJSON(
-        "/v1/api/coordinator/" + encodeURIComponent(wsId) + "/approve",
+        "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/approve",
         body,
       );
       if (!resp.ok) throw new Error("approve failed: HTTP " + resp.status);
@@ -538,7 +538,7 @@
     if (!msg) return false;
     composer.clear();
     composer.setBusy(true);
-    postJSON("/v1/api/coordinator/" + encodeURIComponent(wsId) + "/send", {
+    postJSON("/v1/api/workstreams/" + encodeURIComponent(wsId) + "/send", {
       message: msg,
     })
       .then((resp) => {
@@ -561,7 +561,7 @@
 
   window.coordCancel = function () {
     postJSON(
-      "/v1/api/coordinator/" + encodeURIComponent(wsId) + "/cancel",
+      "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/cancel",
       {},
     ).catch((e) => console.error(e));
   };
@@ -575,7 +575,7 @@
       return;
     try {
       const resp = await postJSON(
-        "/v1/api/coordinator/" + encodeURIComponent(wsId) + "/close",
+        "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/close",
         {},
       );
       if (!resp.ok) throw new Error("close failed: HTTP " + resp.status);
@@ -649,7 +649,7 @@
     // we were disconnected aren't replayed by coordinator_events, so
     // the client has to pull authoritative state after any gap.
     const wasReconnecting = reconnectAttempts > 0;
-    const url = "/v1/api/coordinator/" + encodeURIComponent(wsId) + "/events";
+    const url = "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/events";
     evtSource = new EventSource(url, { withCredentials: true });
     evtSource.onopen = function () {
       reconnectAttempts = 0;
@@ -686,7 +686,7 @@
       // On any other outcome, fall through to the normal reconnect
       // schedule.
       var probe = typeof authFetch === "function" ? authFetch : fetch;
-      probe("/v1/api/coordinator/" + encodeURIComponent(wsId))
+      probe("/v1/api/workstreams/" + encodeURIComponent(wsId))
         .then(function (r) {
           if (r.status === 401 && typeof showLogin === "function") {
             showLogin("Session expired. Please sign in to reconnect.");
@@ -1242,7 +1242,7 @@
     childrenTreeEl.setAttribute("aria-busy", "true");
     try {
       const body = await getJSON(
-        "/v1/api/coordinator/" + encodeURIComponent(wsId) + "/children",
+        "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/children",
       );
       // Default (initial page load): merge rather than clear.  SSE
       // events may have arrived during the in-flight fetch and
@@ -1274,7 +1274,7 @@
   async function loadTasks() {
     try {
       const body = await getJSON(
-        "/v1/api/coordinator/" + encodeURIComponent(wsId) + "/tasks",
+        "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/tasks",
       );
       tasksState = body || { version: 1, tasks: [] };
     } catch (e) {
@@ -1559,7 +1559,7 @@
   async function init() {
     try {
       const data = await getJSON(
-        "/v1/api/coordinator/" + encodeURIComponent(wsId),
+        "/v1/api/workstreams/" + encodeURIComponent(wsId),
       );
       nameEl.textContent = data.name || "";
       statusEl.textContent = data.state || "";
@@ -1569,7 +1569,7 @@
     }
     try {
       const hist = await getJSON(
-        "/v1/api/coordinator/" + encodeURIComponent(wsId) + "/history",
+        "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/history",
       );
       (hist.messages || []).forEach((m) => {
         const role = m.role || "tool";

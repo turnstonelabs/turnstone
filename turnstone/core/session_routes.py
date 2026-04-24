@@ -2,32 +2,29 @@
 
 Stage 2 Priority 0 of the SessionManager unification — collapses the
 parallel ``/v1/api/workstreams/*`` (interactive) and
-``/v1/api/coordinator/*`` (coordinator) handler trees into one.
+``/v1/api/coordinator/*`` (coordinator, never shipped stable) handler
+trees into one. The legacy coord URL prefix has been removed; both
+node and console processes mount the same shape against their own
+manager via this registrar.
 
 Step 0.1: scaffolded the registrar; interactive ``server.py`` mounts
 through it.
 
-Step 0.2 (this commit): grow the registrar to cover the coord-side
-verbs (``send`` / ``approve`` / ``plan`` / ``cancel`` / ``close`` /
-``events`` / ``history`` / ``detail``) and have ``console/server.py``
-mount coord at ``/v1/api/workstreams/`` alongside its existing
-``/v1/api/coordinator/`` paths. Both URL shapes point at the same
-handler functions during the transition; Step 0.4 deletes the
-``/coordinator/`` shape outright once the frontend (Step 0.6) and
-tests (Step 0.7) move off it.
-
-Handler bodies still live in their server modules and are passed in
-via :class:`SessionRouteHandlers` — body convergence is the next
-Step 0.2 follow-on (kind branching behind config flags). Splitting
-"URL surface unified" from "handler bodies converged" keeps the
-soak-able diffs small.
+Step 0.2: grew the registrar to cover the coord-side verbs (``send``
+/ ``approve`` / ``plan`` / ``cancel`` / ``close`` / ``events`` /
+``history`` / ``detail``); console mounted coord through it
+alongside the legacy ``/v1/api/coordinator/`` paths.
 
 Step 0.3: coord-only verbs (``/trust``, ``/restrict``,
 ``/stop_cascade``, ``/close_all_children``, ``/children``,
-``/metrics``, ``/tasks``) migrate via :func:`register_coord_verbs`,
-404-ing on non-coord ws_ids via the manager's kind check.
+``/metrics``, ``/tasks``) migrated via :func:`register_coord_verbs`.
 
-Step 0.4: ``/v1/api/coordinator/*`` deletes outright.
+Step 0.4: legacy ``/v1/api/coordinator/*`` Route entries deleted from
+``console/server.py`` — alongside the URL sweep across the OpenAPI
+spec, frontend JS, server-side coord client, and test suite (Steps
+0.5–0.7). The handler functions stay named ``coordinator_*`` until
+the body-convergence follow-on lifts them into this module with
+kind branching behind :class:`SessionRouteConfig` flags.
 
 See ``1.5.0-session-manager-stage-2.md`` for the full sequencing.
 """

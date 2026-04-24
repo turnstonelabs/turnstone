@@ -147,7 +147,7 @@ class CreateWorkstreamRequest(BaseModel):
         description=(
             "Workstream kind — 'interactive' (default) or 'coordinator'. "
             "Coordinator workstreams are created by the console's own "
-            "/v1/api/coordinator/new endpoint; clients hitting "
+            "/v1/api/workstreams/new endpoint; clients hitting "
             "/v1/api/workstreams/new should leave this at the default."
         ),
     )

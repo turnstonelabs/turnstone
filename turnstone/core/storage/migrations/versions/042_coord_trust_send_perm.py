@@ -1,6 +1,6 @@
 """Add ``coordinator.trust.send`` permission to the builtin-admin role.
 
-Gates the trusted-session mode on ``POST /v1/api/coordinator/{ws_id}/trust``:
+Gates the trusted-session mode on ``POST /v1/api/workstreams/{ws_id}/trust``:
 when set on a coordinator session, sends to the coordinator's own
 children skip the approval prompt.  Foreign ws_ids still go through
 approval regardless — the permission only unlocks the toggle, it does

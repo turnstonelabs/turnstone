@@ -248,7 +248,7 @@ _ROUTE_PATHS: dict[str, str] = {
     # routing-proxy prefix.  ``_post`` still formats against
     # ``_base_url``; formatting of the ``{ws_id}`` slot happens at call
     # time in ``close_all_children``.
-    "close_all_children": "/v1/api/coordinator/{ws_id}/close_all_children",
+    "close_all_children": "/v1/api/workstreams/{ws_id}/close_all_children",
 }
 
 

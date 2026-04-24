@@ -3,7 +3,7 @@
 Covers:
 
 - GET /v1/api/cluster/ws/live — bulk live-block fetch (admin.cluster.inspect).
-- GET /v1/api/coordinator/{ws_id}/metrics — per-coordinator health snapshot.
+- GET /v1/api/workstreams/{ws_id}/metrics — per-coordinator health snapshot.
 
 Both endpoints ride on the same test harness as
 ``test_coordinator_endpoints.py`` — a minimal Starlette app with an
@@ -94,7 +94,7 @@ def _make_client(storage, *, coord_mgr=None) -> TestClient:
         routes=[
             Route("/v1/api/cluster/ws/live", cluster_ws_live_bulk, methods=["GET"]),
             Route(
-                "/v1/api/coordinator/{ws_id}/metrics",
+                "/v1/api/workstreams/{ws_id}/metrics",
                 coordinator_metrics,
                 methods=["GET"],
             ),
@@ -283,7 +283,7 @@ def test_bulk_live_coordinator_row_uses_manager_snapshot(storage):
 
 
 # ---------------------------------------------------------------------------
-# GET /v1/api/coordinator/{ws_id}/metrics — per-coordinator health snapshot
+# GET /v1/api/workstreams/{ws_id}/metrics — per-coordinator health snapshot
 # ---------------------------------------------------------------------------
 
 
@@ -295,7 +295,7 @@ def test_metrics_requires_permission(storage):
     ws = mgr.create(user_id="user-1")
     client = _make_client(storage, coord_mgr=mgr)
     resp = client.get(
-        f"/v1/api/coordinator/{ws.id}/metrics",
+        f"/v1/api/workstreams/{ws.id}/metrics",
         headers={"X-Test-User": "user-1", "X-Test-Perms": "read"},
     )
     assert resp.status_code == 403
@@ -305,7 +305,7 @@ def test_metrics_invalid_ws_id_400(storage):
     mgr = _build_mgr(storage)
     client = _make_client(storage, coord_mgr=mgr)
     resp = client.get(
-        "/v1/api/coordinator/NOT-HEX/metrics",
+        "/v1/api/workstreams/NOT-HEX/metrics",
         headers=_METRICS_HEADERS,
     )
     assert resp.status_code == 400
@@ -318,7 +318,7 @@ def test_metrics_any_admin_coordinator_caller_can_read(storage):
     ws = mgr.create(user_id="stranger")
     client = _make_client(storage, coord_mgr=mgr)
     resp = client.get(
-        f"/v1/api/coordinator/{ws.id}/metrics",
+        f"/v1/api/workstreams/{ws.id}/metrics",
         headers=_METRICS_HEADERS,
     )
     assert resp.status_code == 200
@@ -332,7 +332,7 @@ def test_metrics_empty_coordinator_defaults(storage):
     ws = mgr.create(user_id="user-1")
     client = _make_client(storage, coord_mgr=mgr)
     resp = client.get(
-        f"/v1/api/coordinator/{ws.id}/metrics",
+        f"/v1/api/workstreams/{ws.id}/metrics",
         headers=_METRICS_HEADERS,
     )
     assert resp.status_code == 200
@@ -381,7 +381,7 @@ def test_metrics_spawns_and_state_counts(storage):
     )
     client = _make_client(storage, coord_mgr=mgr)
     resp = client.get(
-        f"/v1/api/coordinator/{ws.id}/metrics",
+        f"/v1/api/workstreams/{ws.id}/metrics",
         headers=_METRICS_HEADERS,
     )
     assert resp.status_code == 200
@@ -418,7 +418,7 @@ def test_metrics_cluster_wide_aggregates(storage):
     # Every admin.coordinator caller sees both children.
     for caller in ("alice", "bob", "admin-1"):
         resp = client.get(
-            f"/v1/api/coordinator/{ws.id}/metrics",
+            f"/v1/api/workstreams/{ws.id}/metrics",
             headers={"X-Test-User": caller, "X-Test-Perms": "admin.coordinator"},
         )
         assert resp.status_code == 200, caller
@@ -456,7 +456,7 @@ def test_metrics_judge_fallback_rate_substring_match(storage):
         )
     client = _make_client(storage, coord_mgr=mgr)
     resp = client.get(
-        f"/v1/api/coordinator/{ws.id}/metrics",
+        f"/v1/api/workstreams/{ws.id}/metrics",
         headers=_METRICS_HEADERS,
     )
     assert resp.status_code == 200
@@ -499,7 +499,7 @@ def test_metrics_spawns_last_hour_boundary(storage):
     )
     client = _make_client(storage, coord_mgr=mgr)
     resp = client.get(
-        f"/v1/api/coordinator/{ws.id}/metrics",
+        f"/v1/api/workstreams/{ws.id}/metrics",
         headers=_METRICS_HEADERS,
     )
     assert resp.status_code == 200

@@ -178,7 +178,7 @@ def test_route_map_matches_console_routes():
     assert _ROUTE_PATHS["delete"] == "/v1/api/route/workstreams/delete"
     # Cascade endpoint lives on the console itself (not a node), so the
     # path slots in the coord ws_id rather than routing through a proxy.
-    assert _ROUTE_PATHS["close_all_children"] == "/v1/api/coordinator/{ws_id}/close_all_children"
+    assert _ROUTE_PATHS["close_all_children"] == "/v1/api/workstreams/{ws_id}/close_all_children"
 
 
 def test_spawn_posts_to_routing_proxy_with_bearer_token():
@@ -256,7 +256,7 @@ def test_close_all_children_posts_to_console_endpoint():
     )
     result = client.close_all_children(reason="batch done")
     assert result["closed"] == ["c-1", "c-2"]
-    assert captured[0].url.path == "/v1/api/coordinator/coord-1/close_all_children"
+    assert captured[0].url.path == "/v1/api/workstreams/coord-1/close_all_children"
     assert captured[0].headers["Authorization"] == "Bearer test-token"
     body = json.loads(captured[0].content)
     assert body == {"reason": "batch done"}

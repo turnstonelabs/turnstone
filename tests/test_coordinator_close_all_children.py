@@ -39,7 +39,7 @@ def _make_client(storage, *, coord_mgr, alias="my-model", registry=None) -> Test
     app = Starlette(
         routes=[
             Route(
-                "/v1/api/coordinator/{ws_id}/close_all_children",
+                "/v1/api/workstreams/{ws_id}/close_all_children",
                 coordinator_close_all_children,
                 methods=["POST"],
             ),
@@ -73,7 +73,7 @@ def test_close_all_children_closes_each_child_and_audits(storage):
 
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/close_all_children",
+        f"/v1/api/workstreams/{coord.id}/close_all_children",
         json={"reason": "tests done"},
         headers=_COORD_HEADERS,
     )
@@ -122,7 +122,7 @@ def test_close_all_children_routes_404_to_skipped_bucket(storage):
 
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/close_all_children",
+        f"/v1/api/workstreams/{coord.id}/close_all_children",
         json={},
         headers=_COORD_HEADERS,
     )
@@ -141,7 +141,7 @@ def test_close_all_children_empty_children_still_audits(storage):
 
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/close_all_children",
+        f"/v1/api/workstreams/{coord.id}/close_all_children",
         json={},
         headers=_COORD_HEADERS,
     )
@@ -162,7 +162,7 @@ def test_close_all_children_without_coord_client_marks_all_failed(storage):
 
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/close_all_children",
+        f"/v1/api/workstreams/{coord.id}/close_all_children",
         json={},
         headers=_COORD_HEADERS,
     )
@@ -181,7 +181,7 @@ def test_close_all_children_rejects_non_string_reason(storage):
 
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/close_all_children",
+        f"/v1/api/workstreams/{coord.id}/close_all_children",
         json={"reason": 123},
         headers=_COORD_HEADERS,
     )
@@ -196,7 +196,7 @@ def test_close_all_children_rejects_overlong_reason(storage):
 
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/close_all_children",
+        f"/v1/api/workstreams/{coord.id}/close_all_children",
         json={"reason": "x" * 600},
         headers=_COORD_HEADERS,
     )
@@ -209,7 +209,7 @@ def test_close_all_children_404_when_session_not_loaded(storage):
     coord.session = None
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/close_all_children",
+        f"/v1/api/workstreams/{coord.id}/close_all_children",
         json={},
         headers=_COORD_HEADERS,
     )
@@ -229,7 +229,7 @@ def test_close_all_children_service_token_cannot_bypass_admin_coordinator(storag
     headers = {"X-Test-User": "user-1", "X-Test-Perms": ""}
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/close_all_children",
+        f"/v1/api/workstreams/{coord.id}/close_all_children",
         json={},
         headers=headers,
     )

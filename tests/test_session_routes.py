@@ -234,11 +234,9 @@ def test_register_coord_verbs_mounts_expected_paths() -> None:
 
 
 def test_console_create_app_exposes_unified_workstream_paths() -> None:
-    """The console's ``create_app`` mounts coord verbs at both the
-    legacy ``/api/coordinator/`` shape and the unified
-    ``/api/workstreams/`` shape so SDK consumers can migrate
-    incrementally before the legacy paths delete in Step 0.4.
-    """
+    """The console's ``create_app`` mounts coord verbs at the unified
+    ``/api/workstreams/`` shape and no longer mounts the legacy
+    ``/api/coordinator/`` shape (deleted in Step 0.4)."""
     from tests.test_console import MockStorage
     from turnstone.console.collector import ClusterCollector
     from turnstone.console.server import create_app
@@ -257,71 +255,19 @@ def test_console_create_app_exposes_unified_workstream_paths() -> None:
                 _walk(sub)
 
     _walk(app.routes)
-    # Legacy shape still present (Step 0.2 transition; Step 0.4 deletes).
-    assert any("/api/coordinator/" in p or p.endswith("/api/coordinator") for p in paths)
-    # Unified shape is now also present.
-    assert "/v1/api/workstreams" in paths or "/api/workstreams" in paths
+    # Legacy shape is gone — no path under ``/api/coordinator/`` should
+    # remain (the bare ``/api/coordinator`` literal is also gone).
+    assert not any("/api/coordinator" in p for p in paths), (
+        f"legacy /api/coordinator paths still mounted: "
+        f"{sorted(p for p in paths if '/api/coordinator' in p)}"
+    )
+    # Unified shape carries the workstream verb tree.
+    assert any(p.endswith("/api/workstreams") for p in paths)
     assert any(p.endswith("/api/workstreams/{ws_id}/send") for p in paths)
     assert any(p.endswith("/api/workstreams/{ws_id}/approve") for p in paths)
     assert any(p.endswith("/api/workstreams/{ws_id}/events") for p in paths)
     assert any(p.endswith("/api/workstreams/{ws_id}") for p in paths)
-
-
-def test_console_unified_paths_route_to_legacy_handlers() -> None:
-    """Each unified ``/api/workstreams/{verb}`` route on the console
-    points at the SAME handler function as the legacy
-    ``/api/coordinator/{verb}`` route — the transition is a pure
-    URL alias, not a fork.
-    """
-    from tests.test_console import MockStorage
-    from turnstone.console.collector import ClusterCollector
-    from turnstone.console.server import create_app
-
-    collector = ClusterCollector(storage=MockStorage(), discovery_interval=999)
-    app = create_app(collector=collector)
-
-    endpoint_by_path: dict[str, Any] = {}
-
-    def _walk(routes: Any) -> None:
-        for r in routes:
-            if isinstance(r, Route):
-                endpoint_by_path[r.path] = r.endpoint
-            sub = getattr(r, "routes", None)
-            if sub:
-                _walk(sub)
-
-    _walk(app.routes)
-
-    # Spot-check the verb pairs whose handlers must remain identical.
-    aliases = {
-        "/api/coordinator": "/api/workstreams",
-        "/api/coordinator/saved": "/api/workstreams/saved",
-        "/api/coordinator/new": "/api/workstreams/new",
-        "/api/coordinator/{ws_id}/send": "/api/workstreams/{ws_id}/send",
-        "/api/coordinator/{ws_id}/approve": "/api/workstreams/{ws_id}/approve",
-        "/api/coordinator/{ws_id}/cancel": "/api/workstreams/{ws_id}/cancel",
-        "/api/coordinator/{ws_id}/close": "/api/workstreams/{ws_id}/close",
-        "/api/coordinator/{ws_id}/open": "/api/workstreams/{ws_id}/open",
-        "/api/coordinator/{ws_id}/events": "/api/workstreams/{ws_id}/events",
-        "/api/coordinator/{ws_id}/history": "/api/workstreams/{ws_id}/history",
-        "/api/coordinator/{ws_id}": "/api/workstreams/{ws_id}",
-        # Step 0.3: coord-only verbs.
-        "/api/coordinator/{ws_id}/children": "/api/workstreams/{ws_id}/children",
-        "/api/coordinator/{ws_id}/tasks": "/api/workstreams/{ws_id}/tasks",
-        "/api/coordinator/{ws_id}/metrics": "/api/workstreams/{ws_id}/metrics",
-        "/api/coordinator/{ws_id}/trust": "/api/workstreams/{ws_id}/trust",
-        "/api/coordinator/{ws_id}/restrict": "/api/workstreams/{ws_id}/restrict",
-        "/api/coordinator/{ws_id}/stop_cascade": "/api/workstreams/{ws_id}/stop_cascade",
-        "/api/coordinator/{ws_id}/close_all_children": (
-            "/api/workstreams/{ws_id}/close_all_children"
-        ),
-    }
-    # Walked Route paths are relative to their parent Mount; the
-    # ``/v1`` prefix is applied at request time, not stored on the
-    # nested Route object.
-    for legacy, unified in aliases.items():
-        assert legacy in endpoint_by_path, f"missing legacy path {legacy}"
-        assert unified in endpoint_by_path, f"missing unified path {unified}"
-        assert endpoint_by_path[legacy] is endpoint_by_path[unified], (
-            f"{unified} routes to a different handler than {legacy}"
-        )
+    # Coord-only verbs from Step 0.3 are also present at the unified prefix.
+    assert any(p.endswith("/api/workstreams/{ws_id}/trust") for p in paths)
+    assert any(p.endswith("/api/workstreams/{ws_id}/children") for p in paths)
+    assert any(p.endswith("/api/workstreams/{ws_id}/close_all_children") for p in paths)

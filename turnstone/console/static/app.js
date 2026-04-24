@@ -8,7 +8,7 @@ window.onLoginSuccess = function () {
   // Re-populate the home-composer skill dropdown and re-probe the
   // coordinator subsystem now that auth has landed.  The initial
   // page-load pass runs before login completes, so /v1/api/skills
-  // and /v1/api/coordinator both 401; without this re-run the
+  // and /v1/api/workstreams both 401; without this re-run the
   // dropdown stays empty and the 503 banner never flips correctly.
   if (typeof _populateHomeSkillDropdown === "function") {
     _populateHomeSkillDropdown();
@@ -150,7 +150,7 @@ function patchClusterState(data) {
     // real-node interactive closes don't carry kind on the wire, but
     // they're already typed in clusterState from the matching ws_created
     // event.  Skipping interactive closes avoids per-close fan-out into
-    // /v1/api/coordinator/saved on busy clusters.
+    // /v1/api/workstreams/saved on busy clusters.
     var wasCoordinator = false;
     Object.keys(clusterState.nodes).forEach(function (nid) {
       (clusterState.nodes[nid].workstreams || []).forEach(function (ws) {
@@ -1826,7 +1826,7 @@ function _hasCoordPermission() {
   return perms.split(",").indexOf("admin.coordinator") !== -1;
 }
 
-// POST /v1/api/coordinator/new.  Accepts the three request fields
+// POST /v1/api/workstreams/new.  Accepts the three request fields
 // directly + an errEl / setBusy callback so the caller owns the
 // loading-state UX (button label swap, composer disabled flag, etc.).
 // On success redirects to /coordinator/{ws_id}; on 503 invokes on503
@@ -1849,7 +1849,7 @@ function _createCoordinator(opts) {
   if (skill) body.skill = skill;
   if (task) body.initial_message = task;
 
-  authFetch("/v1/api/coordinator/new", {
+  authFetch("/v1/api/workstreams/new", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -1983,7 +1983,7 @@ function _populateHomeSkillDropdown() {
     });
 }
 
-// Probe GET /v1/api/coordinator — 200 = subsystem ready; 503 = no model
+// Probe GET /v1/api/workstreams — 200 = subsystem ready; 503 = no model
 // alias resolvable, show remediation banner.  4xx (auth / permission) is
 // treated as "unknown, don't flip the banner" because the probe cannot
 // actually tell us anything about subsystem readiness in that case —
@@ -1998,7 +1998,7 @@ function _populateHomeSkillDropdown() {
 // round-trip on every login.
 function _probeCoordSubsystem() {
   if (!_hasCoordPermission()) return;
-  authFetch("/v1/api/coordinator")
+  authFetch("/v1/api/workstreams")
     .then(function (r) {
       if (r.status === 503) {
         _homeCoordReady = false;
@@ -2224,7 +2224,7 @@ function _renderHomeView() {
 // Saved coordinators — closed sessions persisted on disk.  Mirrors the
 // interactive UI's "Saved Workstreams" card grid (same /shared/cards.css
 // primitives, same /shared/cards.js renderSessionCard helper, same
-// response item shape from /v1/api/coordinator/saved).  Click a card →
+// response item shape from /v1/api/workstreams/saved).  Click a card →
 // POST /open then /coordinator/{ws_id}; coordinator_detail lazily
 // rehydrates from storage on the GET miss.
 // ---------------------------------------------------------------------------
@@ -2244,7 +2244,7 @@ function loadSavedCoordinators() {
     return;
   }
   _savedCoordsInFlight = true;
-  authFetch("/v1/api/coordinator/saved")
+  authFetch("/v1/api/workstreams/saved")
     .then(function (r) {
       return r.ok ? r.json() : { coordinators: [] };
     })
@@ -2295,7 +2295,7 @@ function renderSavedCoordinators(items) {
         // "all slots in use" instead of staring at a 404.
         cardEl.classList.add("is-busy");
         authFetch(
-          "/v1/api/coordinator/" + encodeURIComponent(s.ws_id) + "/open",
+          "/v1/api/workstreams/" + encodeURIComponent(s.ws_id) + "/open",
           { method: "POST" },
         )
           .then(function (r) {

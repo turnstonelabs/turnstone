@@ -2392,7 +2392,12 @@ async def create_workstream(request: Request) -> JSONResponse:
         )
     if body_kind != WorkstreamKind.INTERACTIVE:
         return JSONResponse(
-            {"error": "coordinator workstreams must be created via /v1/api/coordinator/new"},
+            {
+                "error": (
+                    "coordinator workstreams must be created on the console via "
+                    "POST /v1/api/workstreams/new (with admin.coordinator scope)"
+                )
+            },
             status_code=400,
         )
     body_parent = body.get("parent_ws_id") or None

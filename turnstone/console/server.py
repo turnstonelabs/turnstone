@@ -2265,7 +2265,10 @@ async def _proxy_sse(
 
 
 # ---------------------------------------------------------------------------
-# Coordinator workstream endpoints — POST /v1/api/coordinator/*
+# Coordinator workstream endpoints — mounted under /v1/api/workstreams/*
+# via register_session_routes + register_coord_verbs. Handler bodies stay
+# named ``coordinator_*`` for now; the body-convergence follow-on lifts
+# them into turnstone.core.session_routes with kind branching.
 # ---------------------------------------------------------------------------
 
 
@@ -2384,7 +2387,7 @@ def _auth_scopes(request: Request) -> set[str]:
 
 
 async def coordinator_create(request: Request) -> JSONResponse:
-    """POST /v1/api/coordinator/new — create a new coordinator session."""
+    """POST /v1/api/workstreams/new — create a new coordinator session."""
     from turnstone.core.audit import record_audit
     from turnstone.core.web_helpers import read_json_or_400
 
@@ -2490,7 +2493,7 @@ async def coordinator_create(request: Request) -> JSONResponse:
 
 
 async def coordinator_send(request: Request) -> JSONResponse:
-    """POST /v1/api/coordinator/{ws_id}/send — queue a user message."""
+    """POST /v1/api/workstreams/{ws_id}/send — queue a user message."""
     from turnstone.core.web_helpers import read_json_or_400
 
     err = _require_admin_coordinator(request)
@@ -2522,7 +2525,7 @@ async def coordinator_send(request: Request) -> JSONResponse:
 
 
 async def coordinator_approve(request: Request) -> JSONResponse:
-    """POST /v1/api/coordinator/{ws_id}/approve — unblock pending approval."""
+    """POST /v1/api/workstreams/{ws_id}/approve — unblock pending approval."""
     from turnstone.core.web_helpers import read_json_or_400
 
     err = _require_admin_coordinator(request)
@@ -2560,7 +2563,7 @@ async def coordinator_approve(request: Request) -> JSONResponse:
 
 
 async def coordinator_cancel(request: Request) -> JSONResponse:
-    """POST /v1/api/coordinator/{ws_id}/cancel — cancel in-flight generation."""
+    """POST /v1/api/workstreams/{ws_id}/cancel — cancel in-flight generation."""
     from turnstone.core.audit import record_audit
 
     err = _require_admin_coordinator(request)
@@ -2593,7 +2596,7 @@ async def coordinator_cancel(request: Request) -> JSONResponse:
 
 
 async def coordinator_close(request: Request) -> JSONResponse:
-    """POST /v1/api/coordinator/{ws_id}/close — unload the session."""
+    """POST /v1/api/workstreams/{ws_id}/close — unload the session."""
     from turnstone.core.audit import record_audit
 
     err = _require_admin_coordinator(request)
@@ -2627,7 +2630,7 @@ async def coordinator_close(request: Request) -> JSONResponse:
 
 
 async def coordinator_events(request: Request) -> Response:
-    """GET /v1/api/coordinator/{ws_id}/events — SSE event stream."""
+    """GET /v1/api/workstreams/{ws_id}/events — SSE event stream."""
     err = _require_admin_coordinator(request)
     if err is not None:
         return err
@@ -2670,7 +2673,7 @@ async def coordinator_events(request: Request) -> Response:
 
 
 async def coordinator_history(request: Request) -> JSONResponse:
-    """GET /v1/api/coordinator/{ws_id}/history — message history for page load.
+    """GET /v1/api/workstreams/{ws_id}/history — message history for page load.
 
     Supports a ``?limit=`` query param (default 100, max 500) bounding
     how many conversation rows are fetched from storage.  Long-lived
@@ -2706,7 +2709,7 @@ async def coordinator_history(request: Request) -> JSONResponse:
 
 
 async def coordinator_list(request: Request) -> JSONResponse:
-    """GET /v1/api/coordinator — list active coordinator sessions for the caller."""
+    """GET /v1/api/workstreams — list active coordinator sessions for the caller."""
     err = _require_admin_coordinator(request)
     if err is not None:
         return err
@@ -2733,7 +2736,7 @@ async def coordinator_list(request: Request) -> JSONResponse:
 
 
 async def coordinator_saved(request: Request) -> JSONResponse:
-    """GET /v1/api/coordinator/saved — list saved (closed-but-persisted) coordinator
+    """GET /v1/api/workstreams/saved — list saved (closed-but-persisted) coordinator
     sessions for the caller.
 
     Mirrors :func:`turnstone.server.list_saved_workstreams` for the
@@ -2838,7 +2841,7 @@ async def coordinator_page(request: Request) -> Response:
 
 
 async def coordinator_detail(request: Request) -> JSONResponse:
-    """GET /v1/api/coordinator/{ws_id} — detail + lazy rehydrate on miss."""
+    """GET /v1/api/workstreams/{ws_id} — detail + lazy rehydrate on miss."""
     err = _require_admin_coordinator(request)
     if err is not None:
         return err
@@ -2887,7 +2890,7 @@ async def coordinator_detail(request: Request) -> JSONResponse:
 
 
 async def coordinator_open(request: Request) -> JSONResponse:
-    """POST /v1/api/coordinator/{ws_id}/open — explicit rehydration.
+    """POST /v1/api/workstreams/{ws_id}/open — explicit rehydration.
 
     Parity with the server's ``POST /v1/api/workstreams/{ws_id}/open``.
     ``coordinator_detail`` already rehydrates lazily on a GET miss; this
@@ -2972,7 +2975,7 @@ def _coord_children_row(row: Any) -> dict[str, Any]:
 
 
 async def coordinator_children(request: Request) -> JSONResponse:
-    """GET /v1/api/coordinator/{ws_id}/children — list direct children.
+    """GET /v1/api/workstreams/{ws_id}/children — list direct children.
 
     Returns ``{items, truncated}`` with one row per interactive workstream
     whose ``parent_ws_id`` is the coordinator.  Matches the shape of the
@@ -3076,7 +3079,7 @@ def _coordinator_metrics_payload(
 
 
 async def coordinator_metrics(request: Request) -> JSONResponse:
-    """GET /v1/api/coordinator/{ws_id}/metrics — per-coordinator health snapshot.
+    """GET /v1/api/workstreams/{ws_id}/metrics — per-coordinator health snapshot.
 
     Aggregates cheap, already-persisted signals into a one-shot "is
     this coordinator healthy?" answer for operators (#16).  No new
@@ -3371,7 +3374,7 @@ def _set_audit_executor(executor: ThreadPoolExecutor | None) -> None:
 
 
 async def coordinator_trust(request: Request) -> JSONResponse:
-    """POST /v1/api/coordinator/{ws_id}/trust — toggle trusted-session mode."""
+    """POST /v1/api/workstreams/{ws_id}/trust — toggle trusted-session mode."""
     trust_err = require_permission(request, "coordinator.trust.send", allow_service_bypass=False)
     if trust_err is not None:
         return trust_err
@@ -3401,7 +3404,7 @@ async def coordinator_trust(request: Request) -> JSONResponse:
 
 
 async def coordinator_restrict(request: Request) -> JSONResponse:
-    """POST /v1/api/coordinator/{ws_id}/restrict — revoke tool access mid-session."""
+    """POST /v1/api/workstreams/{ws_id}/restrict — revoke tool access mid-session."""
     resolved = await _resolve_coord_session(request, allow_service_bypass=False)
     if isinstance(resolved, JSONResponse):
         return resolved
@@ -3445,7 +3448,7 @@ async def coordinator_restrict(request: Request) -> JSONResponse:
 
 
 async def coordinator_stop_cascade(request: Request) -> JSONResponse:
-    """POST /v1/api/coordinator/{ws_id}/stop_cascade — cancel the subtree."""
+    """POST /v1/api/workstreams/{ws_id}/stop_cascade — cancel the subtree."""
     resolved = await _resolve_coord_session(request, allow_service_bypass=False)
     if isinstance(resolved, JSONResponse):
         return resolved
@@ -3496,7 +3499,7 @@ _CLOSE_ALL_CHILDREN_MAX_REASON_LEN = 512
 
 
 async def coordinator_close_all_children(request: Request) -> JSONResponse:
-    """POST /v1/api/coordinator/{ws_id}/close_all_children — soft-close the direct children.
+    """POST /v1/api/workstreams/{ws_id}/close_all_children — soft-close the direct children.
 
     Near-twin of ``coordinator_stop_cascade`` — both fan out over
     ``children_snapshot`` via ``_fanout_on_children``.  Returns
@@ -3567,7 +3570,7 @@ async def coordinator_close_all_children(request: Request) -> JSONResponse:
 
 
 async def coordinator_tasks(request: Request) -> JSONResponse:
-    """GET /v1/api/coordinator/{ws_id}/tasks — read task list envelope.
+    """GET /v1/api/workstreams/{ws_id}/tasks — read task list envelope.
 
     Returns ``{"version": 1, "tasks": [...]}`` — the same shape the
     ``task_list(action="list")`` tool returns (less the list-tool's
@@ -10237,96 +10240,12 @@ def create_app(
                         methods=["GET"],
                     ),
                     Route("/api/route", route_lookup, methods=["GET"]),
-                    # Coordinator workstream API — console-hosted sessions.
-                    # All require admin.coordinator permission.
-                    Route(
-                        "/api/coordinator/new",
-                        coordinator_create,
-                        methods=["POST"],
-                    ),
-                    Route("/api/coordinator", coordinator_list, methods=["GET"]),
-                    # Literal path BEFORE the /{ws_id} routes below so
-                    # Starlette doesn't match "saved" as a ws_id.
-                    Route(
-                        "/api/coordinator/saved",
-                        coordinator_saved,
-                        methods=["GET"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/send",
-                        coordinator_send,
-                        methods=["POST"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/approve",
-                        coordinator_approve,
-                        methods=["POST"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/cancel",
-                        coordinator_cancel,
-                        methods=["POST"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/close",
-                        coordinator_close,
-                        methods=["POST"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/open",
-                        coordinator_open,
-                        methods=["POST"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/events",
-                        coordinator_events,
-                        methods=["GET"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/history",
-                        coordinator_history,
-                        methods=["GET"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/children",
-                        coordinator_children,
-                        methods=["GET"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/tasks",
-                        coordinator_tasks,
-                        methods=["GET"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/metrics",
-                        coordinator_metrics,
-                        methods=["GET"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/trust",
-                        coordinator_trust,
-                        methods=["POST"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/restrict",
-                        coordinator_restrict,
-                        methods=["POST"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/stop_cascade",
-                        coordinator_stop_cascade,
-                        methods=["POST"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/close_all_children",
-                        coordinator_close_all_children,
-                        methods=["POST"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}",
-                        coordinator_detail,
-                        methods=["GET"],
-                    ),
+                    # Coordinator workstream API mounts above via
+                    # ``register_session_routes`` + ``register_coord_verbs``
+                    # at the unified ``/api/workstreams/`` prefix. The
+                    # legacy ``/api/coordinator/`` shape was deleted in
+                    # Stage 2 Priority 0 Step 0.4 — it never shipped in
+                    # a stable release, so no compat carry-forward.
                     Route("/api/models", list_available_models),
                     Route("/api/skills", list_skills_summary),
                     Route("/api/auth/login", auth_login, methods=["POST"]),
