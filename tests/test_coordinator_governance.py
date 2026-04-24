@@ -63,6 +63,7 @@ def _make_client(storage, *, coord_mgr, alias="my-model", registry=None) -> Test
         middleware=[Middleware(_AuthMiddleware)],
     )
     app.state.coord_mgr = coord_mgr
+    app.state.coord_adapter = coord_mgr._adapter if coord_mgr is not None else None
     app.state.config_store = _FakeConfigStore({"coordinator.model_alias": alias})
     app.state.coord_registry = registry
     app.state.coord_registry_error = "" if coord_mgr else "registry missing"
@@ -183,6 +184,7 @@ def _service_token_client(
         ],
     )
     app.state.coord_mgr = coord_mgr
+    app.state.coord_adapter = coord_mgr._adapter if coord_mgr is not None else None
     app.state.config_store = _FakeConfigStore({"coordinator.model_alias": "my-model"})
     app.state.coord_registry = _fake_registry()
     app.state.coord_registry_error = ""
@@ -634,7 +636,7 @@ def test_prepare_tool_allows_non_revoked_tool():
 def test_stop_cascade_cancels_coord_and_each_child(storage):
     mgr = _build_mgr(storage)
     coord = mgr.create(user_id="user-1", name="coord-a")
-    mgr.register_children(coord.id, ["child-1", "child-2", "child-3"])
+    mgr._adapter.register_children(coord.id, ["child-1", "child-2", "child-3"])
 
     def _cancel(wid: str) -> dict:
         if wid == "child-2":
@@ -683,7 +685,7 @@ def test_stop_cascade_routes_404_to_skipped_bucket(storage):
     them apart."""
     mgr = _build_mgr(storage)
     coord = mgr.create(user_id="user-1", name="coord-a")
-    mgr.register_children(coord.id, ["stale-child"])
+    mgr._adapter.register_children(coord.id, ["stale-child"])
 
     coord_client = MagicMock()
     coord_client.cancel.return_value = {
@@ -730,7 +732,7 @@ def test_stop_cascade_without_coord_client_marks_all_failed(storage):
     the operator can investigate."""
     mgr = _build_mgr(storage)
     coord = mgr.create(user_id="user-1", name="coord-a")
-    mgr.register_children(coord.id, ["child-a", "child-b"])
+    mgr._adapter.register_children(coord.id, ["child-a", "child-b"])
     coord.session = MagicMock()
     coord.session._coord_client = None
 
@@ -763,10 +765,10 @@ def test_stop_cascade_404_when_session_not_loaded(storage):
 def test_children_snapshot_returns_copy_not_live_set(storage):
     mgr = _build_mgr(storage)
     coord = mgr.create(user_id="user-1", name="coord-a")
-    mgr.register_children(coord.id, ["a", "b", "c"])
-    snap = mgr.children_snapshot(coord.id)
+    mgr._adapter.register_children(coord.id, ["a", "b", "c"])
+    snap = mgr._adapter.children_snapshot(coord.id)
     assert set(snap) == {"a", "b", "c"}
-    mgr.register_children(coord.id, ["d"])
+    mgr._adapter.register_children(coord.id, ["d"])
     assert set(snap) == {"a", "b", "c"}
 
 

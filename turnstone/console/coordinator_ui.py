@@ -22,9 +22,12 @@ import threading
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core.log import get_logger
+from turnstone.core.workstream import WorkstreamState
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from turnstone.core.session_manager import SessionManager
 
 log = get_logger(__name__)
 
@@ -47,6 +50,13 @@ class ConsoleCoordinatorUI:
     event loop.  All shared state is guarded by ``_listeners_lock`` or
     threading primitives.
     """
+
+    # Shared reference to the unified :class:`SessionManager` for
+    # coordinator workstreams. Set once at console startup so
+    # ``on_state_change`` can flow state transitions through
+    # ``mgr.set_state`` (which owns the storage write + adapter
+    # emit_state fan-out).  Mirrors ``WebUI._workstream_mgr``.
+    _coord_mgr: SessionManager | None = None
 
     def __init__(self, ws_id: str = "", user_id: str = "") -> None:
         self.ws_id = ws_id
@@ -272,6 +282,23 @@ class ConsoleCoordinatorUI:
         self._enqueue({"type": "error", "message": message})
 
     def on_state_change(self, state: str) -> None:
+        # Flow state transitions through the unified SessionManager so
+        # the storage write + adapter emit_state fan-out stay in lockstep
+        # with set_state() callers elsewhere. Mirrors WebUI's pattern.
+        if ConsoleCoordinatorUI._coord_mgr is not None:
+            try:
+                ws_state = WorkstreamState(state)
+            except ValueError:
+                log.debug("coord_ui.unknown_state state=%r ws=%s", state, self.ws_id)
+            else:
+                try:
+                    ConsoleCoordinatorUI._coord_mgr.set_state(self.ws_id, ws_state)
+                except Exception:
+                    log.debug(
+                        "coord_ui.set_state_failed ws=%s",
+                        self.ws_id,
+                        exc_info=True,
+                    )
         self._enqueue({"type": "state_change", "state": state})
         observer = self._on_state_observer
         if observer is not None:

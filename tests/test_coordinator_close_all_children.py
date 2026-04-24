@@ -46,6 +46,7 @@ def _make_client(storage, *, coord_mgr, alias="my-model", registry=None) -> Test
         middleware=[Middleware(_AuthMiddleware)],
     )
     app.state.coord_mgr = coord_mgr
+    app.state.coord_adapter = coord_mgr._adapter if coord_mgr is not None else None
     app.state.config_store = _FakeConfigStore({"coordinator.model_alias": alias})
     app.state.coord_registry = registry
     app.state.coord_registry_error = "" if coord_mgr else "registry missing"
@@ -57,7 +58,7 @@ def _make_client(storage, *, coord_mgr, alias="my-model", registry=None) -> Test
 def test_close_all_children_closes_each_child_and_audits(storage):
     mgr = _build_mgr(storage)
     coord = mgr.create(user_id="user-1", name="coord-a")
-    mgr.register_children(coord.id, ["child-1", "child-2", "child-3"])
+    mgr._adapter.register_children(coord.id, ["child-1", "child-2", "child-3"])
 
     def _close(wid, reason):
         if wid == "child-2":
@@ -108,7 +109,7 @@ def test_close_all_children_routes_404_to_skipped_bucket(storage):
     is 'already gone', not a dispatch failure.  Route to skipped."""
     mgr = _build_mgr(storage)
     coord = mgr.create(user_id="user-1", name="coord-a")
-    mgr.register_children(coord.id, ["stale-child"])
+    mgr._adapter.register_children(coord.id, ["stale-child"])
 
     coord_client = MagicMock()
     coord_client.close_workstream.return_value = {
@@ -154,7 +155,7 @@ def test_close_all_children_empty_children_still_audits(storage):
 def test_close_all_children_without_coord_client_marks_all_failed(storage):
     mgr = _build_mgr(storage)
     coord = mgr.create(user_id="user-1", name="coord-a")
-    mgr.register_children(coord.id, ["child-a", "child-b"])
+    mgr._adapter.register_children(coord.id, ["child-a", "child-b"])
     coord.session = MagicMock()
     coord.session._coord_client = None
 

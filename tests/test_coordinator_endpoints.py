@@ -132,6 +132,7 @@ def _make_client(
         middleware=[Middleware(_AuthMiddleware)],
     )
     app.state.coord_mgr = coord_mgr
+    app.state.coord_adapter = coord_mgr._adapter if coord_mgr is not None else None
     app.state.config_store = _FakeConfigStore({"coordinator.model_alias": alias})
     app.state.coord_registry = registry
     app.state.coord_registry_error = "" if coord_mgr else "registry missing"
@@ -619,7 +620,7 @@ def test_open_rehydrates_when_not_in_memory(storage, monkeypatch):
     assert body["ws_id"] == "coord-rehy"
     assert body["name"] == "rehydrated"
     assert "already_loaded" not in body
-    mgr.open.assert_called_once_with("coord-rehy", "user-1")
+    mgr.open.assert_called_once_with("coord-rehy", user_id="user-1")
 
 
 def test_open_admin_uses_open_admin(storage, monkeypatch):
@@ -628,7 +629,9 @@ def test_open_admin_uses_open_admin(storage, monkeypatch):
     rehydrated.id = "coord-rehy"
     rehydrated.name = "r"
     rehydrated.user_id = "someone-else"
-    monkeypatch.setattr(mgr, "open_admin", MagicMock(return_value=rehydrated))
+    # SessionManager.open accepts (ws_id, *, user_id, admin) — admin
+    # callers pass admin=True instead of the old ``open_admin`` helper.
+    monkeypatch.setattr(mgr, "open", MagicMock(return_value=rehydrated))
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
         "/v1/api/coordinator/coord-rehy/open",
@@ -638,7 +641,7 @@ def test_open_admin_uses_open_admin(storage, monkeypatch):
         },
     )
     assert resp.status_code == 200
-    mgr.open_admin.assert_called_once_with("coord-rehy")
+    mgr.open.assert_called_once_with("coord-rehy", user_id="", admin=True)
 
 
 def test_open_returns_404_when_unknown_ws_id(storage, monkeypatch):

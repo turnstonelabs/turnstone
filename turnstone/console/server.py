@@ -463,8 +463,13 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
     if filt is DENY_EMPTY_SUB:
         return []
     # filt is now ``None`` (admin / service) or a non-empty caller uid.
+    # ``list_for_user`` lived on the old CoordinatorManager; SessionManager
+    # only exposes ``list_all`` — inline the owner filter at the call site.
     try:
-        wss = coord_mgr.list_all() if filt is None else coord_mgr.list_for_user(filt)
+        all_wss = coord_mgr.list_all()
+        wss = (
+            all_wss if filt is None else [ws for ws in all_wss if ws.user_id and ws.user_id == filt]
+        )
     except Exception:
         log.debug("cluster_workstreams.coord_list_failed", exc_info=True)
         return []
@@ -2517,8 +2522,8 @@ async def coordinator_create(request: Request) -> JSONResponse:
     skill = (body.get("skill") or "").strip() or None
     initial_message = (body.get("initial_message") or "").strip()
     try:
-        # Offload to a worker thread — coord_mgr.create runs blocking
-        # storage calls (register_workstream, get_skill_by_name,
+        # Offload to a worker thread — SessionManager.create runs
+        # blocking storage calls (register_workstream, get_skill_by_name,
         # count_skill_versions) and the session-factory invocation.
         # Running inline on the async event loop stalled the SSE
         # manager + every other async handler for the duration of the
@@ -2528,7 +2533,6 @@ async def coordinator_create(request: Request) -> JSONResponse:
             user_id=user_id,
             name=name,
             skill=skill,
-            initial_message=initial_message,
         )
     except RuntimeError as exc:
         return JSONResponse({"error": str(exc)}, status_code=429)
@@ -2556,6 +2560,15 @@ async def coordinator_create(request: Request) -> JSONResponse:
             },
             status_code=500,
         )
+    # Initial message spawns the first worker after the session has
+    # been installed on the adapter. Previously this rode inside
+    # ``coord_mgr.create`` via the old ``initial_message`` kwarg; the
+    # unified SessionManager.create is kind-agnostic so the worker spawn
+    # moved to the caller.
+    if initial_message:
+        coord_adapter = getattr(request.app.state, "coord_adapter", None)
+        if coord_adapter is not None:
+            coord_adapter.send(ws.id, initial_message)
     storage = getattr(request.app.state, "auth_storage", None)
     if storage is not None:
         try:
@@ -2600,7 +2613,8 @@ async def coordinator_send(request: Request) -> JSONResponse:
         # across tenants to anyone with admin.coordinator.  404 (not
         # 403) to avoid leaking existence.
         return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    if not coord_mgr.send(ws_id, message):
+    coord_adapter = getattr(request.app.state, "coord_adapter", None)
+    if coord_adapter is None or not coord_adapter.send(ws_id, message):
         # Distinguish "worker busy + queue full" from "ws not loaded".
         # If ws is loaded and session exists, the worker queue is full —
         # tell the client to back off rather than retry blindly.
@@ -2818,7 +2832,12 @@ async def coordinator_list(request: Request) -> JSONResponse:
     if err503 is not None:
         return err503
     user_id = _auth_user_id(request)
-    rows = coord_mgr.list_all() if _is_admin(request) else coord_mgr.list_for_user(user_id)
+    all_rows = coord_mgr.list_all()
+    rows = (
+        all_rows
+        if _is_admin(request)
+        else [ws for ws in all_rows if ws.user_id and ws.user_id == user_id]
+    )
     return JSONResponse(
         {
             "coordinators": [
@@ -2964,9 +2983,9 @@ async def coordinator_detail(request: Request) -> JSONResponse:
         # the detail endpoint either.
         try:
             ws = (
-                coord_mgr.open_admin(ws_id)
+                coord_mgr.open(ws_id, user_id="", admin=True)
                 if _is_admin(request)
-                else coord_mgr.open(ws_id, user_id)
+                else coord_mgr.open(ws_id, user_id=user_id)
             )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=503)
@@ -3028,7 +3047,11 @@ async def coordinator_open(request: Request) -> JSONResponse:
             return JSONResponse({"error": "coordinator not found"}, status_code=404)
         return JSONResponse({"ws_id": ws.id, "name": ws.name, "already_loaded": True})
     try:
-        ws = coord_mgr.open_admin(ws_id) if _is_admin(request) else coord_mgr.open(ws_id, user_id)
+        ws = (
+            coord_mgr.open(ws_id, user_id="", admin=True)
+            if _is_admin(request)
+            else coord_mgr.open(ws_id, user_id=user_id)
+        )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=503)
     except Exception:
@@ -3592,8 +3615,9 @@ async def coordinator_stop_cascade(request: Request) -> JSONResponse:
     coord_mgr, err503 = _require_coord_mgr(request)
     if err503 is not None:
         return err503  # pragma: no cover — _resolve_coord_session already gated this
+    coord_adapter = getattr(request.app.state, "coord_adapter", None)
 
-    child_ids = list(coord_mgr.children_snapshot(ws_id))
+    child_ids = list(coord_adapter.children_snapshot(ws_id)) if coord_adapter is not None else []
     coord_mgr.cancel(ws_id)
 
     coord_client: Any = getattr(session, "_coord_client", None)
@@ -3650,6 +3674,8 @@ async def coordinator_close_all_children(request: Request) -> JSONResponse:
     coord_mgr, err503 = _require_coord_mgr(request)
     if err503 is not None:
         return err503  # pragma: no cover — _resolve_coord_session already gated this
+    del coord_mgr  # children_snapshot moved to the adapter
+    coord_adapter = getattr(request.app.state, "coord_adapter", None)
 
     body = await _require_json_object(request)
     if isinstance(body, JSONResponse):
@@ -3667,7 +3693,7 @@ async def coordinator_close_all_children(request: Request) -> JSONResponse:
             status_code=400,
         )
 
-    child_ids = list(coord_mgr.children_snapshot(ws_id))
+    child_ids = list(coord_adapter.children_snapshot(ws_id)) if coord_adapter is not None else []
 
     coord_client: Any = getattr(session, "_coord_client", None)
     closed, failed, skipped = await _fanout_on_children(
@@ -4071,6 +4097,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     # the coordinator endpoints return 503 with a remediation message
     # when coord_mgr is None, so the rest of the console still works.
     app.state.coord_mgr = None
+    app.state.coord_adapter = None
     app.state.coord_registry = None
     app.state.coord_registry_error = ""
     if storage and config_store:
@@ -4087,7 +4114,8 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                 coord_registry = None
 
             if coord_registry is not None:
-                from turnstone.console.coordinator import CoordinatorManager
+                from turnstone.console.collector import ClusterCollector
+                from turnstone.console.coordinator_adapter import CoordinatorAdapter
                 from turnstone.console.coordinator_client import (
                     CoordinatorClient,
                     CoordinatorTokenManager,
@@ -4096,14 +4124,16 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                 from turnstone.console.session_factory import (
                     build_console_session_factory,
                 )
+                from turnstone.core.session_manager import SessionManager
+                from turnstone.core.workstream import Workstream
 
                 jwt_secret: str = getattr(app.state, "jwt_secret", "")
                 console_bind_url: str = getattr(app.state, "console_url", "") or (
                     "http://127.0.0.1:8001"
                 )
 
-                def _ui_factory(ws_id: str, user_id: str) -> ConsoleCoordinatorUI:
-                    return ConsoleCoordinatorUI(ws_id=ws_id, user_id=user_id)
+                def _ui_factory(ws: Workstream) -> ConsoleCoordinatorUI:
+                    return ConsoleCoordinatorUI(ws_id=ws.id, user_id=ws.user_id or "")
 
                 def _coord_client_factory(ws_id: str, user_id: str) -> CoordinatorClient:
                     ttl = int(config_store.get("coordinator.session_jwt_ttl_seconds"))
@@ -4133,18 +4163,32 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                     node_id="console",
                     coord_client_factory=_coord_client_factory,
                 )
-                app.state.coord_mgr = CoordinatorManager(
-                    session_factory=coord_factory,
+                coord_adapter = CoordinatorAdapter(
+                    collector=app.state.collector,
                     ui_factory=_ui_factory,
+                    session_factory=coord_factory,
+                )
+                coord_mgr = SessionManager(
+                    coord_adapter,
                     storage=storage,
                     max_active=int(config_store.get("coordinator.max_active")),
+                    node_id=ClusterCollector.CONSOLE_PSEUDO_NODE_ID,
                 )
+                # Late-bind the manager onto the adapter so
+                # ``_rebuild_children_registry`` / ``send`` /
+                # fan-out dispatch can call ``mgr.get(ws_id)``.
+                coord_adapter.attach(coord_mgr)
+                # Shared ref so ConsoleCoordinatorUI.on_state_change flows
+                # state transitions through the unified manager.
+                ConsoleCoordinatorUI._coord_mgr = coord_mgr
+                app.state.coord_mgr = coord_mgr
+                app.state.coord_adapter = coord_adapter
                 # Wire the cluster-event subscription so the coordinator's
                 # SSE stream fans out filtered child_ws_* events.  Safe to
                 # call even when the collector has no nodes yet — the
                 # subscription just sits idle until the first node event.
                 try:
-                    app.state.coord_mgr.start_child_event_fanout(app.state.collector)
+                    coord_adapter.start_child_event_fanout(app.state.collector)
                 except Exception:
                     log.warning("console.coordinator_child_fanout_init_failed", exc_info=True)
                 log.info(
@@ -4169,12 +4213,21 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         await tls_mgr.stop_renewal()
     if scheduler is not None:
         scheduler.stop()
-    coord_mgr_shutdown = getattr(app.state, "coord_mgr", None)
-    if coord_mgr_shutdown is not None:
+    coord_adapter_shutdown = getattr(app.state, "coord_adapter", None)
+    if coord_adapter_shutdown is not None:
         try:
-            coord_mgr_shutdown.shutdown()
+            coord_adapter_shutdown.shutdown()
         except Exception:
-            log.debug("console.coord_mgr_shutdown_failed", exc_info=True)
+            log.debug("console.coord_adapter_shutdown_failed", exc_info=True)
+    # Drop the shared ConsoleCoordinatorUI._coord_mgr ref on teardown so
+    # tests that spin up multiple lifespan instances don't carry stale
+    # manager references across them.
+    try:
+        from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
+
+        ConsoleCoordinatorUI._coord_mgr = None
+    except Exception:
+        log.debug("console.coord_ui_mgr_reset_failed", exc_info=True)
     await app.state.proxy_sse_client.aclose()
     await app.state.proxy_client.aclose()
     app.state.collector.stop()

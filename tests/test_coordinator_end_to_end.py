@@ -26,7 +26,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from turnstone.console.coordinator import CoordinatorManager
+from turnstone.console.collector import ClusterCollector
+from turnstone.console.coordinator_adapter import CoordinatorAdapter
 from turnstone.console.coordinator_client import CoordinatorClient
 from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 from turnstone.console.server import (
@@ -36,6 +37,7 @@ from turnstone.console.server import (
     coordinator_list,
 )
 from turnstone.core.auth import AuthResult
+from turnstone.core.session_manager import SessionManager
 from turnstone.core.storage._sqlite import SQLiteBackend
 
 # ---------------------------------------------------------------------------
@@ -81,8 +83,8 @@ def _fake_registry() -> MagicMock:
     return reg
 
 
-def _build_mgr(storage: SQLiteBackend) -> CoordinatorManager:
-    """Build a CoordinatorManager backed by stub factories."""
+def _build_mgr(storage: SQLiteBackend) -> SessionManager:
+    """Build a SessionManager(CoordinatorAdapter) backed by stub factories."""
 
     def _sf(ui, model_alias=None, ws_id=None, **kw):
         s = MagicMock()
@@ -90,18 +92,25 @@ def _build_mgr(storage: SQLiteBackend) -> CoordinatorManager:
         s.send.return_value = None
         return s
 
-    return CoordinatorManager(
+    adapter = CoordinatorAdapter(
+        collector=MagicMock(),
+        ui_factory=lambda ws: ConsoleCoordinatorUI(ws_id=ws.id, user_id=ws.user_id or ""),
         session_factory=_sf,
-        ui_factory=lambda w, u: ConsoleCoordinatorUI(ws_id=w, user_id=u),
+    )
+    mgr = SessionManager(
+        adapter,
         storage=storage,
         max_active=5,
+        node_id=ClusterCollector.CONSOLE_PSEUDO_NODE_ID,
     )
+    adapter.attach(mgr)
+    return mgr
 
 
 def _make_client(
     storage: SQLiteBackend,
     *,
-    coord_mgr: CoordinatorManager | None = None,
+    coord_mgr: SessionManager | None = None,
     alias: str = "my-model",
     registry: Any = None,
 ) -> TestClient:
@@ -128,6 +137,7 @@ def _make_client(
         middleware=[Middleware(_AuthMiddleware)],
     )
     app.state.coord_mgr = coord_mgr
+    app.state.coord_adapter = coord_mgr._adapter if coord_mgr is not None else None
     app.state.config_store = _FakeConfigStore({"coordinator.model_alias": alias})
     app.state.coord_registry = registry
     app.state.coord_registry_error = "" if coord_mgr else "registry missing"

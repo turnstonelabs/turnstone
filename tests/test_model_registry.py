@@ -1209,10 +1209,10 @@ def _make_manager(session_factory: Any) -> Any:
     """Construct a SessionManager with an interactive adapter that
     forwards to the supplied session_factory. Storage is mocked — the
     only thing the model-alias tests exercise is the factory passthrough."""
+    import queue
+
     from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
     from turnstone.core.session_manager import SessionManager
-
-    import queue
 
     adapter = InteractiveAdapter(
         global_queue=queue.Queue(maxsize=100),

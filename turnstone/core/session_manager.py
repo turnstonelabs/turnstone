@@ -9,6 +9,7 @@ persistence, per-ws lock refcount for concurrent lazy rehydrate.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 import uuid
@@ -440,6 +441,30 @@ class SessionManager:
             except Exception:
                 log.debug("session_mgr.state_update_failed ws=%s", ws_id[:8], exc_info=True)
         self._adapter.emit_state(ws, state)
+
+    def cancel(self, ws_id: str) -> bool:
+        """Cancel in-flight generation and unblock any pending approval / plan.
+
+        Does NOT unload the workstream — use ``close`` for that. The
+        session stays live and can receive further messages. Returns
+        ``False`` if the workstream isn't tracked.
+        """
+        ws = self.get(ws_id)
+        if ws is None:
+            return False
+        if ws.session is not None and hasattr(ws.session, "cancel"):
+            try:
+                ws.session.cancel()
+            except Exception:
+                log.debug("session_mgr.cancel_failed ws=%s", ws_id[:8], exc_info=True)
+        if ws.ui is not None:
+            if hasattr(ws.ui, "resolve_approval"):
+                with contextlib.suppress(Exception):
+                    ws.ui.resolve_approval(False, "cancelled")
+            if hasattr(ws.ui, "resolve_plan"):
+                with contextlib.suppress(Exception):
+                    ws.ui.resolve_plan("reject")
+        return True
 
     def close_idle(self, max_age_seconds: float) -> list[str]:
         """Close IDLE workstreams inactive for more than ``max_age_seconds``.

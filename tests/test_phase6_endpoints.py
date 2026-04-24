@@ -23,13 +23,15 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from turnstone.console.coordinator import CoordinatorManager
+from turnstone.console.collector import ClusterCollector
+from turnstone.console.coordinator_adapter import CoordinatorAdapter
 from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 from turnstone.console.server import (
     cluster_ws_live_bulk,
     coordinator_metrics,
 )
 from turnstone.core.auth import AuthResult
+from turnstone.core.session_manager import SessionManager
 from turnstone.core.storage._sqlite import SQLiteBackend
 
 
@@ -62,16 +64,23 @@ def storage(tmp_path):
     return SQLiteBackend(str(tmp_path / "phase6.db"))
 
 
-def _build_mgr(storage) -> CoordinatorManager:
+def _build_mgr(storage) -> SessionManager:
     def _sf(ui, model_alias=None, ws_id=None, **kw):
         return MagicMock()
 
-    return CoordinatorManager(
+    adapter = CoordinatorAdapter(
+        collector=MagicMock(),
+        ui_factory=lambda ws: ConsoleCoordinatorUI(ws_id=ws.id, user_id=ws.user_id or ""),
         session_factory=_sf,
-        ui_factory=lambda w, u: ConsoleCoordinatorUI(ws_id=w, user_id=u),
+    )
+    mgr = SessionManager(
+        adapter,
         storage=storage,
         max_active=3,
+        node_id=ClusterCollector.CONSOLE_PSEUDO_NODE_ID,
     )
+    adapter.attach(mgr)
+    return mgr
 
 
 def _fake_registry() -> MagicMock:
@@ -93,6 +102,7 @@ def _make_client(storage, *, coord_mgr=None) -> TestClient:
         middleware=[Middleware(_AuthMiddleware)],
     )
     app.state.coord_mgr = coord_mgr
+    app.state.coord_adapter = coord_mgr._adapter if coord_mgr is not None else None
     app.state.config_store = _FakeConfigStore({"coordinator.model_alias": "gpt-4"})
     app.state.coord_registry = _fake_registry() if coord_mgr is not None else None
     app.state.coord_registry_error = "" if coord_mgr else "registry missing"
