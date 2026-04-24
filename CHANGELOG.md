@@ -38,6 +38,24 @@ Three release tracks are maintained:
   `/v1/api/coordinator/`, so this change is a no-op for anyone
   upgrading from a stable line.
 
+  Two handler bodies (`approve`, `close`) lifted into the shared
+  registrar with kind branching behind `SessionEndpointConfig` —
+  both kinds share one implementation per verb. The `close`
+  failure-status code standardized to 404 across both kinds (was
+  500 on coord; "popped between .get() and .close()" is a not-
+  found semantic, not a server error). Other shared verbs (`send`,
+  `cancel`, `open`, `events`, `create`, `list`, `saved`, `history`,
+  `detail`) keep their per-kind handlers — body convergence for
+  those requires SessionManager-side refactors (e.g. Priority 1's
+  worker-dispatch unification for `send`) or coordinated frontend
+  changes (response-shape unification for `list` / `saved`) that
+  fall outside Priority 0 scope.
+
+- **TypeScript SDK bumped to 0.4.0** to flag the URL change for any
+  1.5.0aN-era consumer of the experimental coord client. The
+  `openapi-{server,console}.json` reference specs ship with the
+  unified path tree.
+
 ## [1.4.0]
 
 User-visible additions: a full attachment system (images + text documents,
