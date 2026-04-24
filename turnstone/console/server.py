@@ -10106,13 +10106,13 @@ def create_app(
     _docs_handler = make_docs_handler()
 
     # Coord workstream HTTP tree mounts under the unified
-    # ``/api/workstreams/`` shape. Lifted handlers (e.g. ``approve``)
-    # consult ``app.state.session_endpoint_config`` for the kind's
-    # auth + manager-lookup policies. Per-kind handlers
-    # (``coordinator_*``) still look the coord manager up via
-    # ``request.app.state.coord_mgr`` because the manager is built in
-    # the lifespan, after this app construction; future verb lifts
-    # carry that lookup into the config callable.
+    # ``/api/workstreams/`` shape. Lifted handlers (e.g. ``approve``,
+    # ``close``) capture the kind-specific ``SessionEndpointConfig``
+    # via the factory closure. Per-kind handlers (``coordinator_*``)
+    # still look the coord manager up via ``request.app.state.coord_mgr``
+    # at request time because the manager is built in the lifespan,
+    # after this app construction; future verb lifts carry that lookup
+    # into the config callable.
     coord_endpoint_config = SessionEndpointConfig(
         permission_gate=_require_admin_coordinator,
         manager_lookup=_require_coord_mgr,
@@ -10593,7 +10593,6 @@ def create_app(
         lifespan=_lifespan,
     )
     app.state.collector = collector
-    app.state.session_endpoint_config = coord_endpoint_config
     app.state.jwt_secret = jwt_secret
     app.state.auth_storage = auth_storage
     app.state.proxy_token_mgr = proxy_token_mgr

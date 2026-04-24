@@ -815,8 +815,8 @@ def _interactive_manager_lookup(
 
     Interactive always has the manager loaded (it's constructed
     synchronously at server startup), so the 503 branch is unused
-    on this side. Match the :data:`SessionRouteHandlers` signature
-    so the lifted handler bodies can call it uniformly.
+    on this side. Matches the :attr:`SessionEndpointConfig.manager_lookup`
+    callable shape so the lifted handler bodies can call it uniformly.
     """
     return request.app.state.workstreams, None
 
@@ -4369,9 +4369,9 @@ def create_app(
 
     # Workstream HTTP tree — owned by the shared registrar in
     # ``turnstone.core.session_routes`` so the console mounts the same
-    # shape against its coord manager. ``session_endpoint_config``
-    # carries the kind-specific policy (auth, manager lookup, audit
-    # prefix) the lifted handler bodies consult.
+    # shape against its coord manager. The lifted handler factories
+    # (``make_approve_handler``, ``make_close_handler``) capture the
+    # kind-specific ``SessionEndpointConfig`` via closure.
     interactive_endpoint_config = SessionEndpointConfig(
         permission_gate=None,  # interactive auth is enforced at the middleware layer
         manager_lookup=_interactive_manager_lookup,
@@ -4473,7 +4473,6 @@ def create_app(
         lifespan=_lifespan,
     )
     app.state.workstreams = workstreams
-    app.state.session_endpoint_config = interactive_endpoint_config
     app.state.global_queue = global_queue
     app.state.global_listeners = global_listeners
     app.state.global_listeners_lock = global_listeners_lock

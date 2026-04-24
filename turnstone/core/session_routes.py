@@ -5,7 +5,8 @@ Both node and console processes mount the workstream HTTP tree at
 :class:`~turnstone.core.session_manager.SessionManager` (interactive
 on the node, coordinator on the console). One URL shape, two
 processes, kind-specific policy in :class:`SessionEndpointConfig`
-that handlers consult at request time via ``app.state``.
+captured by closure when the handler factory is called at app
+construction.
 
 Three registrar functions:
 
@@ -20,10 +21,12 @@ Three registrar functions:
   that doesn't exist on interactive workstreams.
 
 Some verbs in :class:`SharedSessionVerbHandlers` ship as factory-
-returned closures (e.g. :func:`make_approve_handler`) that bake the
-:class:`SessionEndpointConfig` in at app-construction time. Both
-node and console call the factory during startup and pass the
-result as ``handlers.approve``.
+returned closures (e.g. :func:`make_approve_handler`,
+:func:`make_close_handler`) that bake their
+:class:`SessionEndpointConfig` (and any verb-specific args like
+``audit_emit``) in at app-construction time. Both node and console
+call the factory during startup and pass the result as
+``handlers.approve`` / ``handlers.close``.
 """
 
 from __future__ import annotations
@@ -61,12 +64,11 @@ TenantCheck = Callable[
 class SessionEndpointConfig:
     """Per-kind policy the lifted handler bodies consult at request time.
 
-    Instantiated once per process during app construction and stored
-    on ``app.state.session_endpoint_config``. The unified handler
-    bodies pull this config + the kind manager from ``app.state``
-    rather than taking either as a per-request parameter — keeps the
-    handler signatures uniform (``Handler = Request -> Response``)
-    so the registrar mounts them like any other route.
+    Instantiated once per process during app construction and passed
+    to the verb factory (e.g. :func:`make_approve_handler`,
+    :func:`make_close_handler`), which captures it via closure. The
+    request-time handler reads ``cfg`` from the closure rather than
+    ``app.state`` so the dependency is visible at the wire-up site.
 
     - ``permission_gate``: kind's pre-handler permission check
       (e.g. ``admin.coordinator`` for coord, ``None`` for interactive
@@ -304,20 +306,18 @@ def register_coord_verbs(
 #
 # Each verb here was previously implemented twice (once in
 # ``turnstone/server.py`` for interactive, once in
-# ``turnstone/console/server.py`` for coord). The lifted body uses
-# the kind-specific :class:`SessionEndpointConfig` from
-# ``app.state.session_endpoint_config`` to branch on the few places
-# the kinds legitimately differ.
+# ``turnstone/console/server.py`` for coord). The lifted body
+# branches on the kind-specific :class:`SessionEndpointConfig` the
+# factory captured at app-construction time.
 #
 # Verbs not lifted yet (intentional — bodies have substantive
 # behavior divergence that needs SessionManager-side refactoring,
 # not just kind branching): send (worker dispatch — Priority 1
-# territory), cancel (interactive does inline forensics + force-cancel
-# ws._lock manipulation), close (interactive caps + redacts +
-# persists close_reason), open (interactive resume vs coord rehydrate),
-# events (different SSE replay shapes), create (interactive
-# attachments vs coord initial_message), list / saved (different
-# response keys: ``workstreams`` vs ``coordinators``).
+# territory), cancel (interactive does inline forensics + force-
+# cancel ws._lock manipulation), open (interactive resume vs coord
+# rehydrate), events (different SSE replay shapes), create
+# (interactive attachments vs coord initial_message), list / saved
+# (different response keys: ``workstreams`` vs ``coordinators``).
 # ---------------------------------------------------------------------------
 
 

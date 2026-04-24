@@ -114,7 +114,5 @@ class MockStorage:
     def __init__(self) -> None:
         self.services: list[dict[str, str]] = []
 
-    def list_services(
-        self, service_type: str, max_age_seconds: int = 120
-    ) -> list[dict[str, str]]:
+    def list_services(self, service_type: str, max_age_seconds: int = 120) -> list[dict[str, str]]:
         return list(self.services)
