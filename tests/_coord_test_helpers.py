@@ -100,3 +100,21 @@ def _build_mgr(storage: Any) -> SessionManager:
     )
     adapter.attach(mgr)
     return mgr
+
+
+class MockStorage:
+    """Minimal storage mock that implements ``list_services``.
+
+    Used by the collector tests + the console route-walk tests. The
+    collector calls ``list_services("turnstone-server", ...)`` to
+    discover nodes; tests that don't care about discovery push an
+    empty list (the default).
+    """
+
+    def __init__(self) -> None:
+        self.services: list[dict[str, str]] = []
+
+    def list_services(
+        self, service_type: str, max_age_seconds: int = 120
+    ) -> list[dict[str, str]]:
+        return list(self.services)

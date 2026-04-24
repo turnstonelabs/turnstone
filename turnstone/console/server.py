@@ -55,9 +55,8 @@ from turnstone.core.auth import (
 )
 from turnstone.core.rendezvous import NoAvailableNodeError
 from turnstone.core.session_routes import (
-    CoordVerbHandlers,
-    SessionRouteConfig,
-    SessionRouteHandlers,
+    CoordOnlyVerbHandlers,
+    SharedSessionVerbHandlers,
     register_coord_verbs,
     register_session_routes,
 )
@@ -10149,20 +10148,15 @@ def create_app(
     _openapi_handler = make_openapi_handler(_spec)
     _docs_handler = make_docs_handler()
 
-    # Coord verbs mounted under the unified ``/api/workstreams/`` shape
-    # via the shared registrar. The legacy ``/api/coordinator/...`` routes
-    # below stay live during the Step 0.2 transition; Step 0.4 deletes
-    # them once the frontend (Step 0.6) and tests (Step 0.7) move off.
-    # ``mgr`` / ``adapter`` are built in the lifespan (after this app
-    # construction), so handlers continue to look them up via
-    # ``request.app.state.coord_mgr`` for now — they only become
-    # registrar-arguments in the body-convergence follow-on.
+    # Coord workstream HTTP tree mounts under the unified
+    # ``/api/workstreams/`` shape. Handlers look the coord manager up
+    # via ``request.app.state.coord_mgr`` because the manager is built
+    # in the lifespan, after app construction.
     coord_workstream_routes: list[Any] = []
     register_session_routes(
         coord_workstream_routes,
         prefix="/api/workstreams",
-        config=SessionRouteConfig(),
-        handlers=SessionRouteHandlers(
+        handlers=SharedSessionVerbHandlers(
             list_workstreams=coordinator_list,
             list_saved=coordinator_saved,
             create=coordinator_create,
@@ -10176,13 +10170,10 @@ def create_app(
             history=coordinator_history,
         ),
     )
-    # Step 0.3: coord-only verbs (children registry, quotas, trust /
-    # restrict policy, cascade controls) mount alongside under the
-    # same unified prefix.
     register_coord_verbs(
         coord_workstream_routes,
         prefix="/api/workstreams",
-        handlers=CoordVerbHandlers(
+        handlers=CoordOnlyVerbHandlers(
             children=coordinator_children,
             tasks=coordinator_tasks,
             metrics=coordinator_metrics,
@@ -10240,12 +10231,6 @@ def create_app(
                         methods=["GET"],
                     ),
                     Route("/api/route", route_lookup, methods=["GET"]),
-                    # Coordinator workstream API mounts above via
-                    # ``register_session_routes`` + ``register_coord_verbs``
-                    # at the unified ``/api/workstreams/`` prefix. The
-                    # legacy ``/api/coordinator/`` shape was deleted in
-                    # Stage 2 Priority 0 Step 0.4 — it never shipped in
-                    # a stable release, so no compat carry-forward.
                     Route("/api/models", list_available_models),
                     Route("/api/skills", list_skills_summary),
                     Route("/api/auth/login", auth_login, methods=["POST"]),

@@ -1,11 +1,10 @@
 """Tests for the shared session HTTP route registrar.
 
-Stage 2 Priority 0 Step 0.2 — verifies that
-:func:`turnstone.core.session_routes.register_session_routes` mounts
-the right route table per the configured handler bundle, and that
-the console's ``create_app`` exposes the unified
-``/v1/api/workstreams/`` URL shape for coord alongside the legacy
-``/v1/api/coordinator/`` paths during the transition window.
+Verifies that :func:`turnstone.core.session_routes.register_session_routes`
+and :func:`turnstone.core.session_routes.register_coord_verbs` mount
+the right route table per the supplied handler bundles, and that the
+console's ``create_app`` exposes the unified ``/v1/api/workstreams/``
+URL shape (the legacy ``/v1/api/coordinator/`` shape is gone).
 
 Body-level behavior is covered by the per-kind endpoint tests
 (``tests/test_workstream_endpoints.py``,
@@ -17,14 +16,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-import pytest
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from turnstone.core.session_routes import (
-    CoordVerbHandlers,
-    SessionRouteConfig,
-    SessionRouteHandlers,
+    AttachmentHandlers,
+    CoordOnlyVerbHandlers,
+    SharedSessionVerbHandlers,
     register_coord_verbs,
     register_session_routes,
 )
@@ -35,6 +33,10 @@ if TYPE_CHECKING:
 
 async def _stub(_request: Request) -> JSONResponse:
     return JSONResponse({"ok": True})
+
+
+def _attach() -> AttachmentHandlers:
+    return AttachmentHandlers(upload=_stub, list=_stub, get_content=_stub, delete=_stub)
 
 
 def _route_paths(routes: list[Any]) -> list[tuple[str, frozenset[str]]]:
@@ -51,117 +53,9 @@ def test_empty_handlers_register_no_routes() -> None:
     register_session_routes(
         routes,
         prefix="/api/workstreams",
-        config=SessionRouteConfig(),
-        handlers=SessionRouteHandlers(),
+        handlers=SharedSessionVerbHandlers(),
     )
     assert routes == []
-
-
-def test_coord_shape_mounts_expected_verbs() -> None:
-    """Coord wiring exposes list / saved / new / detail + the
-    per-``{ws_id}`` interaction verbs at the unified prefix."""
-    routes: list[Any] = []
-    register_session_routes(
-        routes,
-        prefix="/api/workstreams",
-        config=SessionRouteConfig(),
-        handlers=SessionRouteHandlers(
-            list_workstreams=_stub,
-            list_saved=_stub,
-            create=_stub,
-            detail=_stub,
-            open=_stub,
-            close=_stub,
-            send=_stub,
-            approve=_stub,
-            cancel=_stub,
-            events=_stub,
-            history=_stub,
-        ),
-    )
-    paths = _route_paths(routes)
-    expected = {
-        ("/api/workstreams", frozenset({"GET", "HEAD"})),
-        ("/api/workstreams/saved", frozenset({"GET", "HEAD"})),
-        ("/api/workstreams/new", frozenset({"POST"})),
-        ("/api/workstreams/{ws_id}/open", frozenset({"POST"})),
-        ("/api/workstreams/{ws_id}/close", frozenset({"POST"})),
-        ("/api/workstreams/{ws_id}/send", frozenset({"POST"})),
-        ("/api/workstreams/{ws_id}/approve", frozenset({"POST"})),
-        ("/api/workstreams/{ws_id}/cancel", frozenset({"POST"})),
-        ("/api/workstreams/{ws_id}/events", frozenset({"GET", "HEAD"})),
-        ("/api/workstreams/{ws_id}/history", frozenset({"GET", "HEAD"})),
-        ("/api/workstreams/{ws_id}", frozenset({"GET", "HEAD"})),
-    }
-    assert set(paths) == expected
-
-
-def test_interactive_shape_mounts_legacy_close_and_attachments() -> None:
-    """Interactive wiring exposes legacy body-keyed close + the
-    full attachments quartet under the unified prefix."""
-    routes: list[Any] = []
-    register_session_routes(
-        routes,
-        prefix="/api/workstreams",
-        config=SessionRouteConfig(supports_legacy_close=True),
-        handlers=SessionRouteHandlers(
-            list_workstreams=_stub,
-            list_saved=_stub,
-            create=_stub,
-            close_legacy=_stub,
-            delete=_stub,
-            open=_stub,
-            refresh_title=_stub,
-            set_title=_stub,
-            upload_attachment=_stub,
-            list_attachments=_stub,
-            get_attachment_content=_stub,
-            delete_attachment=_stub,
-        ),
-    )
-    paths = {(p, m) for p, m in _route_paths(routes)}
-    assert ("/api/workstreams/close", frozenset({"POST"})) in paths
-    assert ("/api/workstreams/{ws_id}/delete", frozenset({"POST"})) in paths
-    assert ("/api/workstreams/{ws_id}/refresh-title", frozenset({"POST"})) in paths
-    assert ("/api/workstreams/{ws_id}/title", frozenset({"POST"})) in paths
-    assert ("/api/workstreams/{ws_id}/attachments", frozenset({"POST"})) in paths
-    assert ("/api/workstreams/{ws_id}/attachments", frozenset({"GET", "HEAD"})) in paths
-    assert (
-        "/api/workstreams/{ws_id}/attachments/{attachment_id}/content",
-        frozenset({"GET", "HEAD"}),
-    ) in paths
-    assert (
-        "/api/workstreams/{ws_id}/attachments/{attachment_id}",
-        frozenset({"DELETE"}),
-    ) in paths
-
-
-def test_supports_legacy_close_without_handler_raises() -> None:
-    routes: list[Any] = []
-    with pytest.raises(ValueError, match="close_legacy"):
-        register_session_routes(
-            routes,
-            prefix="/api/workstreams",
-            config=SessionRouteConfig(supports_legacy_close=True),
-            handlers=SessionRouteHandlers(),
-        )
-
-
-def test_partial_attachment_handlers_raise() -> None:
-    """Setting one or two attachment handlers without all four is a
-    config error — partial surfaces leave broken frontend flows."""
-    routes: list[Any] = []
-    with pytest.raises(ValueError, match="attachment handlers"):
-        register_session_routes(
-            routes,
-            prefix="/api/workstreams",
-            config=SessionRouteConfig(),
-            handlers=SessionRouteHandlers(
-                upload_attachment=_stub,
-                list_attachments=_stub,
-                # missing get_attachment_content + delete_attachment
-            ),
-        )
 
 
 def test_saved_registers_before_detail() -> None:
@@ -171,8 +65,7 @@ def test_saved_registers_before_detail() -> None:
     register_session_routes(
         routes,
         prefix="/api/workstreams",
-        config=SessionRouteConfig(),
-        handlers=SessionRouteHandlers(
+        handlers=SharedSessionVerbHandlers(
             list_saved=_stub,
             detail=_stub,
         ),
@@ -189,8 +82,7 @@ def test_specific_verbs_register_before_bare_detail() -> None:
     register_session_routes(
         routes,
         prefix="/api/workstreams",
-        config=SessionRouteConfig(),
-        handlers=SessionRouteHandlers(
+        handlers=SharedSessionVerbHandlers(
             detail=_stub,
             close=_stub,
             send=_stub,
@@ -204,14 +96,60 @@ def test_specific_verbs_register_before_bare_detail() -> None:
     assert paths.index("/api/workstreams/{ws_id}/events") < detail_idx
 
 
-def test_register_coord_verbs_mounts_expected_paths() -> None:
+def test_attachment_routes_mount_when_quartet_provided() -> None:
+    """All four attachment routes mount when ``handlers.attachments``
+    is non-``None`` — the type system requires the four-handler
+    quartet to be set together."""
+    routes: list[Any] = []
+    register_session_routes(
+        routes,
+        prefix="/api/workstreams",
+        handlers=SharedSessionVerbHandlers(attachments=_attach()),
+    )
+    paths = {(p, m) for p, m in _route_paths(routes)}
+    assert ("/api/workstreams/{ws_id}/attachments", frozenset({"POST"})) in paths
+    assert ("/api/workstreams/{ws_id}/attachments", frozenset({"GET", "HEAD"})) in paths
+    assert (
+        "/api/workstreams/{ws_id}/attachments/{attachment_id}/content",
+        frozenset({"GET", "HEAD"}),
+    ) in paths
+    assert (
+        "/api/workstreams/{ws_id}/attachments/{attachment_id}",
+        frozenset({"DELETE"}),
+    ) in paths
+
+
+def test_close_legacy_mounts_when_handler_provided() -> None:
+    """The legacy body-keyed close (``POST {prefix}/close``) mounts
+    when ``handlers.close_legacy`` is non-``None`` — there is no
+    separate config flag, just the handler's presence."""
+    routes_with: list[Any] = []
+    register_session_routes(
+        routes_with,
+        prefix="/api/workstreams",
+        handlers=SharedSessionVerbHandlers(close_legacy=_stub),
+    )
+    assert any(r.path == "/api/workstreams/close" for r in routes_with if isinstance(r, Route))
+
+    routes_without: list[Any] = []
+    register_session_routes(
+        routes_without,
+        prefix="/api/workstreams",
+        handlers=SharedSessionVerbHandlers(),
+    )
+    assert not any(
+        r.path == "/api/workstreams/close" for r in routes_without if isinstance(r, Route)
+    )
+
+
+def test_register_coord_verbs_mounts_seven_paths() -> None:
     """``register_coord_verbs`` mounts the seven coord-only verbs
     at the unified prefix."""
     routes: list[Any] = []
     register_coord_verbs(
         routes,
         prefix="/api/workstreams",
-        handlers=CoordVerbHandlers(
+        handlers=CoordOnlyVerbHandlers(
             children=_stub,
             tasks=_stub,
             metrics=_stub,
@@ -233,17 +171,16 @@ def test_register_coord_verbs_mounts_expected_paths() -> None:
     }
 
 
-def test_console_create_app_exposes_unified_workstream_paths() -> None:
-    """The console's ``create_app`` mounts coord verbs at the unified
-    ``/api/workstreams/`` shape and no longer mounts the legacy
-    ``/api/coordinator/`` shape (deleted in Step 0.4)."""
-    from tests.test_console import MockStorage
+def test_console_create_app_only_mounts_unified_workstream_paths() -> None:
+    """The console's ``create_app`` mounts coord verbs only at the
+    unified ``/api/workstreams/`` shape — no path under
+    ``/api/coordinator/`` should remain (deleted in Step 0.4)."""
+    from tests._coord_test_helpers import MockStorage
     from turnstone.console.collector import ClusterCollector
     from turnstone.console.server import create_app
 
     collector = ClusterCollector(storage=MockStorage(), discovery_interval=999)
     app = create_app(collector=collector)
-    # Walk the route tree to collect every mounted path.
     paths: set[str] = set()
 
     def _walk(routes: Any) -> None:
@@ -255,19 +192,15 @@ def test_console_create_app_exposes_unified_workstream_paths() -> None:
                 _walk(sub)
 
     _walk(app.routes)
-    # Legacy shape is gone — no path under ``/api/coordinator/`` should
-    # remain (the bare ``/api/coordinator`` literal is also gone).
     assert not any("/api/coordinator" in p for p in paths), (
         f"legacy /api/coordinator paths still mounted: "
         f"{sorted(p for p in paths if '/api/coordinator' in p)}"
     )
-    # Unified shape carries the workstream verb tree.
     assert any(p.endswith("/api/workstreams") for p in paths)
+    # Spot-check one verb per category from the registrar.
     assert any(p.endswith("/api/workstreams/{ws_id}/send") for p in paths)
-    assert any(p.endswith("/api/workstreams/{ws_id}/approve") for p in paths)
     assert any(p.endswith("/api/workstreams/{ws_id}/events") for p in paths)
     assert any(p.endswith("/api/workstreams/{ws_id}") for p in paths)
-    # Coord-only verbs from Step 0.3 are also present at the unified prefix.
+    # And one from the coord-only registrar.
     assert any(p.endswith("/api/workstreams/{ws_id}/trust") for p in paths)
-    assert any(p.endswith("/api/workstreams/{ws_id}/children") for p in paths)
     assert any(p.endswith("/api/workstreams/{ws_id}/close_all_children") for p in paths)

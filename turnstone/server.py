@@ -54,10 +54,10 @@ from turnstone.core.log import get_logger
 from turnstone.core.metrics import metrics as _metrics
 from turnstone.core.ratelimit import resolve_client_ip
 from turnstone.core.session import ChatSession, GenerationCancelled, SessionUI  # noqa: F401
-from turnstone.core.session_manager import SessionKindAdapter, SessionManager
+from turnstone.core.session_manager import SessionManager
 from turnstone.core.session_routes import (
-    SessionRouteConfig,
-    SessionRouteHandlers,
+    AttachmentHandlers,
+    SharedSessionVerbHandlers,
     register_session_routes,
 )
 from turnstone.core.session_ui_base import SessionUIBase
@@ -4397,7 +4397,6 @@ def _build_middleware(cors_origins: list[str] | None = None) -> list[Middleware]
 def create_app(
     *,
     workstreams: SessionManager,
-    adapter: SessionKindAdapter | None = None,
     global_queue: queue.Queue[dict[str, Any]],
     global_listeners: list[queue.Queue[dict[str, Any]]],
     global_listeners_lock: threading.Lock,
@@ -4423,13 +4422,8 @@ def create_app(
     _docs_handler = make_docs_handler()
 
     # Workstream HTTP tree — owned by the shared registrar in
-    # turnstone.core.session_routes so the coord side can mount the
-    # same shape against its own manager in Stage 2 Step 0.2. The
-    # ``adapter`` param defaults off the manager so existing test
-    # call sites that build a manager + app directly don't have to
-    # thread the adapter through.
-    if adapter is None:
-        adapter = workstreams.adapter
+    # ``turnstone.core.session_routes`` so the console mounts the same
+    # shape against its coord manager.
     v1_routes: list[Any] = [
         Route("/api/events", events_sse),
         Route("/api/events/global", global_events_sse),
@@ -4437,10 +4431,7 @@ def create_app(
     register_session_routes(
         v1_routes,
         prefix="/api/workstreams",
-        mgr=workstreams,
-        adapter=adapter,
-        config=SessionRouteConfig(supports_legacy_close=True),
-        handlers=SessionRouteHandlers(
+        handlers=SharedSessionVerbHandlers(
             list_workstreams=list_workstreams,
             list_saved=list_saved_workstreams,
             create=create_workstream,
@@ -4449,14 +4440,14 @@ def create_app(
             open=open_workstream,
             refresh_title=refresh_workstream_title,
             set_title=set_workstream_title,
-            upload_attachment=upload_attachment,
-            list_attachments=list_attachments,
-            get_attachment_content=get_attachment_content,
-            delete_attachment=delete_attachment,
+            attachments=AttachmentHandlers(
+                upload=upload_attachment,
+                list=list_attachments,
+                get_content=get_attachment_content,
+                delete=delete_attachment,
+            ),
         ),
     )
-    # Dashboard sits outside the /workstreams prefix today; Step 0.2
-    # decides whether to fold it in alongside the unified verbs.
     v1_routes.append(Route("/api/dashboard", dashboard))
 
     app = Starlette(
@@ -5066,7 +5057,6 @@ def main() -> None:
     _skip_perms = config_store.get("tools.skip_permissions")
     app = create_app(
         workstreams=manager,
-        adapter=interactive_adapter,
         global_queue=global_queue,
         global_listeners=global_listeners,
         global_listeners_lock=global_listeners_lock,

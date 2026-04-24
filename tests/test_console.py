@@ -31,16 +31,7 @@ _TEST_AUTH_HEADERS = {"Authorization": f"Bearer {_test_jwt()}"}
 # Mock storage for collector tests
 # ---------------------------------------------------------------------------
 
-
-class MockStorage:
-    """Minimal storage mock that implements list_services for collector tests."""
-
-    def __init__(self):
-        self.services: list[dict[str, str]] = []
-
-    def list_services(self, service_type: str, max_age_seconds: int = 120) -> list[dict[str, str]]:
-        return list(self.services)
-
+from tests._coord_test_helpers import MockStorage  # noqa: E402, F401
 
 # ---------------------------------------------------------------------------
 # Helpers

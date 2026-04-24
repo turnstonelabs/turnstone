@@ -1,32 +1,22 @@
 """Shared HTTP route registrar for workstream-shaped sessions.
 
-Stage 2 Priority 0 of the SessionManager unification — collapses the
-parallel ``/v1/api/workstreams/*`` (interactive) and
-``/v1/api/coordinator/*`` (coordinator, never shipped stable) handler
-trees into one. The legacy coord URL prefix has been removed; both
-node and console processes mount the same shape against their own
-manager via this registrar.
+Both node and console processes mount the workstream HTTP tree at
+``/v1/api/workstreams/`` via this registrar against their own
+:class:`~turnstone.core.session_manager.SessionManager` (interactive
+on the node, coordinator on the console). One URL shape, two
+processes, kind-specific handler bodies wired in by the caller.
 
-Step 0.1: scaffolded the registrar; interactive ``server.py`` mounts
-through it.
+Two registrar functions:
 
-Step 0.2: grew the registrar to cover the coord-side verbs (``send``
-/ ``approve`` / ``plan`` / ``cancel`` / ``close`` / ``events`` /
-``history`` / ``detail``); console mounted coord through it
-alongside the legacy ``/v1/api/coordinator/`` paths.
-
-Step 0.3: coord-only verbs (``/trust``, ``/restrict``,
-``/stop_cascade``, ``/close_all_children``, ``/children``,
-``/metrics``, ``/tasks``) migrated via :func:`register_coord_verbs`.
-
-Step 0.4: legacy ``/v1/api/coordinator/*`` Route entries deleted from
-``console/server.py`` — alongside the URL sweep across the OpenAPI
-spec, frontend JS, server-side coord client, and test suite (Steps
-0.5–0.7). The handler functions stay named ``coordinator_*`` until
-the body-convergence follow-on lifts them into this module with
-kind branching behind :class:`SessionRouteConfig` flags.
-
-See ``1.5.0-session-manager-stage-2.md`` for the full sequencing.
+- :func:`register_session_routes` — verbs both kinds expose
+  (``new``, ``close``, ``open``, ``delete``, ``send``, ``approve``,
+  ``cancel``, ``events``, ``history``, ``detail``, ...).
+  All handlers in :class:`SharedSessionVerbHandlers` are optional;
+  ``None`` skips the route, so one bundle describes either kind.
+- :func:`register_coord_verbs` — coord-only verbs (``trust``,
+  ``restrict``, ``stop_cascade``, ``close_all_children``,
+  ``children``, ``tasks``, ``metrics``) that read or mutate state
+  that doesn't exist on interactive workstreams.
 """
 
 from __future__ import annotations
@@ -42,27 +32,37 @@ if TYPE_CHECKING:
     from starlette.responses import Response
     from starlette.routing import BaseRoute
 
-    from turnstone.core.session_manager import SessionKindAdapter, SessionManager
-
 
 Handler = Callable[["Request"], Awaitable["Response"]]
 
 
 @dataclass(frozen=True)
-class SessionRouteHandlers:
-    """Bundle of HTTP handler callables the registrar mounts.
+class AttachmentHandlers:
+    """The four-handler quartet for the per-workstream attachment surface.
 
-    All handlers are optional; ``None`` skips that route. Lets one
-    bundle describe both the interactive shape (no per-``{ws_id}``
-    ``send`` / ``approve`` etc. yet — those use legacy body-keyed
-    paths) and the coord shape (no attachments, no
-    ``refresh-title``).
+    Grouped so the type system enforces that you can't mount
+    upload-without-delete or list-without-content (a half-mounted
+    surface leaves broken frontend flows). Set
+    :attr:`SharedSessionVerbHandlers.attachments` to ``None`` for
+    kinds that don't expose attachments yet.
+    """
 
-    Step 0.2 placeholder: handlers live in their server modules and
-    are passed in here. The next Step 0.2 follow-on lifts the
-    bodies into ``session_routes`` and switches kind branching to
-    live behind :class:`SessionRouteConfig` flags, at which point
-    this struct deletes.
+    upload: Handler  # POST   {prefix}/{ws_id}/attachments
+    list: Handler  # GET    {prefix}/{ws_id}/attachments
+    get_content: Handler  # GET    {prefix}/{ws_id}/attachments/{attachment_id}/content
+    delete: Handler  # DELETE {prefix}/{ws_id}/attachments/{attachment_id}
+
+
+@dataclass(frozen=True)
+class SharedSessionVerbHandlers:
+    """Bundle of HTTP handler callables for verbs both kinds expose.
+
+    All handlers are optional; ``None`` skips that route. One bundle
+    describes either kind — interactive omits the per-``{ws_id}``
+    interaction verbs (``send`` / ``approve`` / ``plan`` / ``cancel``
+    / ``events`` / ``history`` / ``detail``) until Priority 1's
+    worker dispatch unification; coord omits ``delete`` /
+    ``refresh_title`` / ``set_title`` / attachments.
     """
 
     # Listing
@@ -80,8 +80,9 @@ class SessionRouteHandlers:
     refresh_title: Handler | None = None  # POST {prefix}/{ws_id}/refresh-title
     set_title: Handler | None = None  # POST {prefix}/{ws_id}/title
 
-    # Legacy interactive close (``ws_id`` in body, not path)
-    close_legacy: Handler | None = None  # POST {prefix}/close
+    # Legacy interactive close (``ws_id`` in body, not path) — the only
+    # surviving body-keyed verb. Set non-``None`` to mount POST {prefix}/close.
+    close_legacy: Handler | None = None
 
     # Per-``{ws_id}`` interaction (coord shape today; interactive
     # adopts these in Priority 1's worker dispatch unification)
@@ -92,37 +93,39 @@ class SessionRouteHandlers:
     events: Handler | None = None  # GET  {prefix}/{ws_id}/events (SSE)
     history: Handler | None = None  # GET  {prefix}/{ws_id}/history
 
-    # Attachments (interactive only today; coord parity is post-1.5)
-    upload_attachment: Handler | None = None
-    list_attachments: Handler | None = None
-    get_attachment_content: Handler | None = None
-    delete_attachment: Handler | None = None
+    # Attachments — the four handlers come together or not at all.
+    attachments: AttachmentHandlers | None = None
 
 
 @dataclass(frozen=True)
-class SessionRouteConfig:
-    """Per-kind feature flags for the session HTTP route registrar.
+class CoordOnlyVerbHandlers:
+    """Bundle of coord-only HTTP handler callables.
 
-    Step 0.2 carries one flag — whether the legacy body-keyed
-    ``close`` verb is mounted. Step 0.2's body-convergence follow-on
-    grows this with the per-kind branching flags handler bodies
-    consult (e.g. ``permission_scope``, ``audit_action_prefix``,
-    ``not_found_label``).
+    These verbs read or mutate state that doesn't exist on interactive
+    workstreams — children registry, parent quota, trust / restrict
+    policy, cascade controls — so they live on a Protocol distinct
+    from :class:`SharedSessionVerbHandlers`. Mounted at the same
+    ``/api/workstreams/{ws_id}/`` prefix so the URL surface stays
+    unified, but registered through a separate call so the kind
+    separation is explicit at the wiring site.
     """
 
-    supports_legacy_close: bool = False  # POST {prefix}/close — ws_id in body
+    children: Handler  # GET  {prefix}/{ws_id}/children
+    tasks: Handler  # GET  {prefix}/{ws_id}/tasks
+    metrics: Handler  # GET  {prefix}/{ws_id}/metrics
+    trust: Handler  # POST {prefix}/{ws_id}/trust
+    restrict: Handler  # POST {prefix}/{ws_id}/restrict
+    stop_cascade: Handler  # POST {prefix}/{ws_id}/stop_cascade
+    close_all_children: Handler  # POST {prefix}/{ws_id}/close_all_children
 
 
 def register_session_routes(
     routes: list[BaseRoute],
     *,
     prefix: str,
-    mgr: SessionManager | None = None,
-    adapter: SessionKindAdapter | None = None,
-    config: SessionRouteConfig,
-    handlers: SessionRouteHandlers,
+    handlers: SharedSessionVerbHandlers,
 ) -> None:
-    """Append the workstream HTTP route table to ``routes`` at ``prefix``.
+    """Append the shared workstream HTTP route table to ``routes`` at ``prefix``.
 
     Mounts every verb whose handler is non-``None``. Routes register
     in an order that respects Starlette's first-match semantics:
@@ -130,29 +133,9 @@ def register_session_routes(
     per-``{ws_id}`` patterns; per-``{ws_id}/{verb}`` patterns before
     the bare ``{ws_id}`` detail GET.
 
-    Args:
-        routes: list to extend; typically the inner ``Mount`` route
-            list a Starlette app uses.
-        prefix: URL prefix relative to the mount, e.g.
-            ``"/api/workstreams"``.
-        mgr: the session manager owning the workstream kind, when
-            available at app-construction time. Optional today
-            because the console builds its coord manager in the
-            lifespan (after routes), and current handler bodies
-            look the manager up via ``request.app.state``. Becomes
-            required in the body-convergence follow-on once handlers
-            move into this module and read ``mgr`` directly.
-        adapter: the kind's adapter. Same forward-wiring rationale.
-        config: per-kind feature flags.
-        handlers: bundle of handler callables for the routes the
-            registrar mounts. The body-convergence follow-on
-            deletes this argument.
+    ``prefix`` is the URL prefix relative to the mount, e.g.
+    ``"/api/workstreams"``.
     """
-    # ``mgr`` and ``adapter`` are unused this commit; declared in the
-    # signature so handler bodies can pick them up directly in the
-    # body-convergence follow-on without a callsite churn.
-    _ = (mgr, adapter)
-
     p = prefix.rstrip("/")
 
     # --- Listing endpoints ----------------------------------------------
@@ -166,9 +149,7 @@ def register_session_routes(
     # --- Lifecycle: create + legacy close (ws_id in body) ---------------
     if handlers.create is not None:
         routes.append(Route(f"{p}/new", handlers.create, methods=["POST"]))
-    if config.supports_legacy_close:
-        if handlers.close_legacy is None:
-            raise ValueError("supports_legacy_close=True requires handlers.close_legacy")
+    if handlers.close_legacy is not None:
         routes.append(Route(f"{p}/close", handlers.close_legacy, methods=["POST"]))
 
     # --- Per-``{ws_id}`` verbs (specific verbs first) -------------------
@@ -201,49 +182,22 @@ def register_session_routes(
     if handlers.history is not None:
         routes.append(Route(f"{p}/{{ws_id}}/history", handlers.history, methods=["GET"]))
 
-    # --- Attachments ----------------------------------------------------
-    has_any_attachment_handler = (
-        handlers.upload_attachment is not None
-        or handlers.list_attachments is not None
-        or handlers.get_attachment_content is not None
-        or handlers.delete_attachment is not None
-    )
-    if has_any_attachment_handler:
-        # Either all four come together or it's a config error — partial
-        # attachment surfaces (e.g. upload without delete) leave broken
-        # frontend flows.
-        if (
-            handlers.upload_attachment is None
-            or handlers.list_attachments is None
-            or handlers.get_attachment_content is None
-            or handlers.delete_attachment is None
-        ):
-            raise ValueError("attachment handlers must be set as a complete set of four")
-        routes.append(
-            Route(
-                f"{p}/{{ws_id}}/attachments",
-                handlers.upload_attachment,
-                methods=["POST"],
-            )
-        )
-        routes.append(
-            Route(
-                f"{p}/{{ws_id}}/attachments",
-                handlers.list_attachments,
-                methods=["GET"],
-            )
-        )
+    # --- Attachments (the quartet comes together or not at all) ---------
+    if handlers.attachments is not None:
+        a = handlers.attachments
+        routes.append(Route(f"{p}/{{ws_id}}/attachments", a.upload, methods=["POST"]))
+        routes.append(Route(f"{p}/{{ws_id}}/attachments", a.list, methods=["GET"]))
         routes.append(
             Route(
                 f"{p}/{{ws_id}}/attachments/{{attachment_id}}/content",
-                handlers.get_attachment_content,
+                a.get_content,
                 methods=["GET"],
             )
         )
         routes.append(
             Route(
                 f"{p}/{{ws_id}}/attachments/{{attachment_id}}",
-                handlers.delete_attachment,
+                a.delete,
                 methods=["DELETE"],
             )
         )
@@ -254,40 +208,11 @@ def register_session_routes(
         routes.append(Route(f"{p}/{{ws_id}}", handlers.detail, methods=["GET"]))
 
 
-@dataclass(frozen=True)
-class CoordVerbHandlers:
-    """Bundle of coord-only HTTP handler callables.
-
-    These verbs are legitimately kind-specific (they read or mutate
-    coord-only state — children registry, parent quota, trust /
-    restrict policy, cascade controls) so they live on a separate
-    Protocol from :class:`SessionRouteHandlers`. Mounted alongside
-    the shared session verbs at the same ``/api/workstreams/{ws_id}/``
-    prefix so the URL surface stays unified, but registered through
-    a distinct call so the kind separation is explicit at the wiring
-    site.
-
-    Step 0.3 placeholder: handlers live in
-    ``turnstone/console/server.py`` and are passed in here; the
-    body-convergence follow-on lifts them into a coord-specific
-    module.
-    """
-
-    children: Handler  # GET  {prefix}/{ws_id}/children
-    tasks: Handler  # GET  {prefix}/{ws_id}/tasks
-    metrics: Handler  # GET  {prefix}/{ws_id}/metrics
-    trust: Handler  # POST {prefix}/{ws_id}/trust
-    restrict: Handler  # POST {prefix}/{ws_id}/restrict
-    stop_cascade: Handler  # POST {prefix}/{ws_id}/stop_cascade
-    close_all_children: Handler  # POST {prefix}/{ws_id}/close_all_children
-
-
 def register_coord_verbs(
     routes: list[BaseRoute],
     *,
     prefix: str,
-    mgr: SessionManager | None = None,
-    handlers: CoordVerbHandlers,
+    handlers: CoordOnlyVerbHandlers,
 ) -> None:
     """Mount coord-only verbs at the unified ``{prefix}/{ws_id}/...`` shape.
 
@@ -295,26 +220,8 @@ def register_coord_verbs(
     in practice — Starlette's default ``str`` path converter is
     single-segment, so ``{ws_id}/{verb}`` patterns can never collide
     with the bare ``{ws_id}`` detail GET registered by
-    ``register_session_routes``. The body-convergence follow-on will
-    additionally have these handlers 404 on non-coord ws_ids via the
-    manager's kind check; today the legacy ``admin.coordinator``
-    permission gate and ``_require_coord_mgr`` 503 are the
-    enforcement.
-
-    Args:
-        routes: list to extend; typically the inner ``Mount`` route
-            list a Starlette app uses.
-        prefix: URL prefix relative to the mount, e.g.
-            ``"/api/workstreams"``.
-        mgr: the coord session manager when available at
-            app-construction time. Optional today because the console
-            builds its coord manager in the lifespan; becomes required
-            in the body-convergence follow-on.
-        handlers: bundle of handler callables for the coord-only
-            verbs.
+    ``register_session_routes``.
     """
-    _ = mgr  # forward-wired; see :func:`register_session_routes`
-
     p = prefix.rstrip("/")
     routes.append(Route(f"{p}/{{ws_id}}/children", handlers.children, methods=["GET"]))
     routes.append(Route(f"{p}/{{ws_id}}/tasks", handlers.tasks, methods=["GET"]))
