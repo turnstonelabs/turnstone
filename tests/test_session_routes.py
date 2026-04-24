@@ -22,8 +22,10 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from turnstone.core.session_routes import (
+    CoordVerbHandlers,
     SessionRouteConfig,
     SessionRouteHandlers,
+    register_coord_verbs,
     register_session_routes,
 )
 
@@ -202,6 +204,35 @@ def test_specific_verbs_register_before_bare_detail() -> None:
     assert paths.index("/api/workstreams/{ws_id}/events") < detail_idx
 
 
+def test_register_coord_verbs_mounts_expected_paths() -> None:
+    """``register_coord_verbs`` mounts the seven coord-only verbs
+    at the unified prefix."""
+    routes: list[Any] = []
+    register_coord_verbs(
+        routes,
+        prefix="/api/workstreams",
+        handlers=CoordVerbHandlers(
+            children=_stub,
+            tasks=_stub,
+            metrics=_stub,
+            trust=_stub,
+            restrict=_stub,
+            stop_cascade=_stub,
+            close_all_children=_stub,
+        ),
+    )
+    paths = {(p, m) for p, m in _route_paths(routes)}
+    assert paths == {
+        ("/api/workstreams/{ws_id}/children", frozenset({"GET", "HEAD"})),
+        ("/api/workstreams/{ws_id}/tasks", frozenset({"GET", "HEAD"})),
+        ("/api/workstreams/{ws_id}/metrics", frozenset({"GET", "HEAD"})),
+        ("/api/workstreams/{ws_id}/trust", frozenset({"POST"})),
+        ("/api/workstreams/{ws_id}/restrict", frozenset({"POST"})),
+        ("/api/workstreams/{ws_id}/stop_cascade", frozenset({"POST"})),
+        ("/api/workstreams/{ws_id}/close_all_children", frozenset({"POST"})),
+    }
+
+
 def test_console_create_app_exposes_unified_workstream_paths() -> None:
     """The console's ``create_app`` mounts coord verbs at both the
     legacy ``/api/coordinator/`` shape and the unified
@@ -274,6 +305,16 @@ def test_console_unified_paths_route_to_legacy_handlers() -> None:
         "/api/coordinator/{ws_id}/events": "/api/workstreams/{ws_id}/events",
         "/api/coordinator/{ws_id}/history": "/api/workstreams/{ws_id}/history",
         "/api/coordinator/{ws_id}": "/api/workstreams/{ws_id}",
+        # Step 0.3: coord-only verbs.
+        "/api/coordinator/{ws_id}/children": "/api/workstreams/{ws_id}/children",
+        "/api/coordinator/{ws_id}/tasks": "/api/workstreams/{ws_id}/tasks",
+        "/api/coordinator/{ws_id}/metrics": "/api/workstreams/{ws_id}/metrics",
+        "/api/coordinator/{ws_id}/trust": "/api/workstreams/{ws_id}/trust",
+        "/api/coordinator/{ws_id}/restrict": "/api/workstreams/{ws_id}/restrict",
+        "/api/coordinator/{ws_id}/stop_cascade": "/api/workstreams/{ws_id}/stop_cascade",
+        "/api/coordinator/{ws_id}/close_all_children": (
+            "/api/workstreams/{ws_id}/close_all_children"
+        ),
     }
     # Walked Route paths are relative to their parent Mount; the
     # ``/v1`` prefix is applied at request time, not stored on the

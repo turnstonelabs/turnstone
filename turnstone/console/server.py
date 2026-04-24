@@ -55,8 +55,10 @@ from turnstone.core.auth import (
 )
 from turnstone.core.rendezvous import NoAvailableNodeError
 from turnstone.core.session_routes import (
+    CoordVerbHandlers,
     SessionRouteConfig,
     SessionRouteHandlers,
+    register_coord_verbs,
     register_session_routes,
 )
 from turnstone.core.skill_kind import SkillKind
@@ -10169,6 +10171,22 @@ def create_app(
             cancel=coordinator_cancel,
             events=coordinator_events,
             history=coordinator_history,
+        ),
+    )
+    # Step 0.3: coord-only verbs (children registry, quotas, trust /
+    # restrict policy, cascade controls) mount alongside under the
+    # same unified prefix.
+    register_coord_verbs(
+        coord_workstream_routes,
+        prefix="/api/workstreams",
+        handlers=CoordVerbHandlers(
+            children=coordinator_children,
+            tasks=coordinator_tasks,
+            metrics=coordinator_metrics,
+            trust=coordinator_trust,
+            restrict=coordinator_restrict,
+            stop_cascade=coordinator_stop_cascade,
+            close_all_children=coordinator_close_all_children,
         ),
     )
 

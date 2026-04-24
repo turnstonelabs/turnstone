@@ -255,3 +255,80 @@ def register_session_routes(
     #     suffixed patterns above win for ``{ws_id}/...`` paths.
     if handlers.detail is not None:
         routes.append(Route(f"{p}/{{ws_id}}", handlers.detail, methods=["GET"]))
+
+
+@dataclass(frozen=True)
+class CoordVerbHandlers:
+    """Bundle of coord-only HTTP handler callables.
+
+    These verbs are legitimately kind-specific (they read or mutate
+    coord-only state — children registry, parent quota, trust /
+    restrict policy, cascade controls) so they live on a separate
+    Protocol from :class:`SessionRouteHandlers`. Mounted alongside
+    the shared session verbs at the same ``/api/workstreams/{ws_id}/``
+    prefix so the URL surface stays unified, but registered through
+    a distinct call so the kind separation is explicit at the wiring
+    site.
+
+    Step 0.3 placeholder: handlers live in
+    ``turnstone/console/server.py`` and are passed in here; the
+    body-convergence follow-on lifts them into a coord-specific
+    module.
+    """
+
+    children: Handler  # GET  {prefix}/{ws_id}/children
+    tasks: Handler  # GET  {prefix}/{ws_id}/tasks
+    metrics: Handler  # GET  {prefix}/{ws_id}/metrics
+    trust: Handler  # POST {prefix}/{ws_id}/trust
+    restrict: Handler  # POST {prefix}/{ws_id}/restrict
+    stop_cascade: Handler  # POST {prefix}/{ws_id}/stop_cascade
+    close_all_children: Handler  # POST {prefix}/{ws_id}/close_all_children
+
+
+def register_coord_verbs(
+    routes: list[BaseRoute],
+    *,
+    prefix: str,
+    mgr: SessionManager | None = None,
+    handlers: CoordVerbHandlers,
+) -> None:
+    """Mount coord-only verbs at the unified ``{prefix}/{ws_id}/...`` shape.
+
+    Call ordering vs :func:`register_session_routes` doesn't matter
+    in practice — Starlette's default ``str`` path converter is
+    single-segment, so ``{ws_id}/{verb}`` patterns can never collide
+    with the bare ``{ws_id}`` detail GET registered by
+    ``register_session_routes``. The body-convergence follow-on will
+    additionally have these handlers 404 on non-coord ws_ids via the
+    manager's kind check; today the legacy ``admin.coordinator``
+    permission gate and ``_require_coord_mgr`` 503 are the
+    enforcement.
+
+    Args:
+        routes: list to extend; typically the inner ``Mount`` route
+            list a Starlette app uses.
+        prefix: URL prefix relative to the mount, e.g.
+            ``"/api/workstreams"``.
+        mgr: the coord session manager when available at
+            app-construction time. Optional today because the console
+            builds its coord manager in the lifespan; becomes required
+            in the body-convergence follow-on.
+        handlers: bundle of handler callables for the coord-only
+            verbs.
+    """
+    _ = mgr  # forward-wired; see :func:`register_session_routes`
+
+    p = prefix.rstrip("/")
+    routes.append(Route(f"{p}/{{ws_id}}/children", handlers.children, methods=["GET"]))
+    routes.append(Route(f"{p}/{{ws_id}}/tasks", handlers.tasks, methods=["GET"]))
+    routes.append(Route(f"{p}/{{ws_id}}/metrics", handlers.metrics, methods=["GET"]))
+    routes.append(Route(f"{p}/{{ws_id}}/trust", handlers.trust, methods=["POST"]))
+    routes.append(Route(f"{p}/{{ws_id}}/restrict", handlers.restrict, methods=["POST"]))
+    routes.append(Route(f"{p}/{{ws_id}}/stop_cascade", handlers.stop_cascade, methods=["POST"]))
+    routes.append(
+        Route(
+            f"{p}/{{ws_id}}/close_all_children",
+            handlers.close_all_children,
+            methods=["POST"],
+        )
+    )
