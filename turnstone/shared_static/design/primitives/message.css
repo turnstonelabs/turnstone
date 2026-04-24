@@ -42,8 +42,12 @@
 }
 
 /* Variant left-borders */
-[data-design="v1"] .msg.user       { border-left-color: var(--accent); }
-[data-design="v1"] .msg.assistant  { border-left-color: var(--hair-2); }
+[data-design="v1"] .msg.user {
+  border-left-color: var(--accent);
+}
+[data-design="v1"] .msg.assistant {
+  border-left-color: var(--hair-2);
+}
 [data-design="v1"] .msg.reasoning {
   border-left-style: dashed;
   border-left-color: var(--ink-4);
@@ -102,7 +106,9 @@
 }
 
 @keyframes ts-caret {
-  to { opacity: 0; }
+  to {
+    opacity: 0;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -111,8 +117,12 @@
   }
 }
 
-[data-design="v1"] .msg-body > *:first-child { margin-top: 0; }
-[data-design="v1"] .msg-body > *:last-child  { margin-bottom: 0; }
+[data-design="v1"] .msg-body > *:first-child {
+  margin-top: 0;
+}
+[data-design="v1"] .msg-body > *:last-child {
+  margin-bottom: 0;
+}
 
 [data-design="v1"] .msg-body pre {
   margin: 6px 0;
@@ -166,22 +176,44 @@
   color: var(--ink);
 }
 
-[data-design="v1"] .msg-body h1 { font-size: 16px; }
-[data-design="v1"] .msg-body h2 { font-size: 14px; }
-[data-design="v1"] .msg-body h3 { font-size: 13px; }
+[data-design="v1"] .msg-body h1 {
+  font-size: 16px;
+}
+[data-design="v1"] .msg-body h2 {
+  font-size: 14px;
+}
+[data-design="v1"] .msg-body h3 {
+  font-size: 13px;
+}
 [data-design="v1"] .msg-body h4,
 [data-design="v1"] .msg-body h5,
-[data-design="v1"] .msg-body h6 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink-3); }
+[data-design="v1"] .msg-body h6 {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-3);
+}
+
+[data-design="v1"] .msg-body p {
+  margin: 6px 0;
+}
 
 [data-design="v1"] .msg-body ul,
 [data-design="v1"] .msg-body ol {
   margin: 4px 0 4px 20px;
   padding: 0;
 }
-[data-design="v1"] .msg-body li { margin: 2px 0; }
+[data-design="v1"] .msg-body li {
+  margin: 2px 0;
+}
 
-[data-design="v1"] .msg-body strong { color: var(--ink); font-weight: 600; }
-[data-design="v1"] .msg-body em     { font-style: italic; }
+[data-design="v1"] .msg-body strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+[data-design="v1"] .msg-body em {
+  font-style: italic;
+}
 
 [data-design="v1"] .msg-body blockquote {
   margin: 6px 0;
@@ -242,6 +274,12 @@
    shared_static/chat.css:146. Keyboard users are handled by
    :focus-within on .msg above. */
 @media (hover: none) and (pointer: coarse) {
-  [data-design="v1"] .msg-actions { opacity: 1; pointer-events: auto; }
-  [data-design="v1"] .msg-action-btn { padding: 4px 8px; font-size: 12px; }
+  [data-design="v1"] .msg-actions {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  [data-design="v1"] .msg-action-btn {
+    padding: 4px 8px;
+    font-size: 12px;
+  }
 }
