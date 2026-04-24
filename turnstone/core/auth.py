@@ -1320,7 +1320,7 @@ async def handle_auth_refresh(request: Request, audience: str) -> Response:
     )
 
     role = "full" if "write" in scopes else "read"
-    resp_body: dict[str, str] = {
+    resp_body: dict[str, Any] = {
         "status": "ok",
         "role": role,
         "scopes": ",".join(sorted(scopes)),
@@ -1329,6 +1329,22 @@ async def handle_auth_refresh(request: Request, audience: str) -> Response:
     }
     if perms:
         resp_body["permissions"] = ",".join(sorted(perms))
+    # Surface the new cookie's exp (epoch seconds) so the frontend can
+    # populate sessionStorage permissions AND schedule the next refresh
+    # off the refresh response itself, without a follow-up /whoami round
+    # trip.  Decoded without re-validating — we just minted it.  Mirrors
+    # the same pattern handle_auth_whoami uses for the cookie's exp.
+    try:
+        import jwt as _jwt
+
+        unverified = _jwt.decode(new_token, options={"verify_signature": False})
+        exp_value = unverified.get("exp")
+        if isinstance(exp_value, int | float):
+            resp_body["exp"] = int(exp_value)
+    except Exception:
+        # Best-effort surfacing; absence falls the client back to its
+        # whoami-based reschedule path.
+        pass
 
     response = JSONResponse(resp_body)
     secure = is_secure_request(dict(request.headers), request.url.scheme)

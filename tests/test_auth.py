@@ -994,6 +994,34 @@ class TestServerLogin:
         resp = self.test_client.get("/v1/api/workstreams")
         assert resp.status_code == 200
 
+    def test_refresh_response_includes_exp_and_permissions(self):
+        """Refresh response shape must match whoami so the frontend can
+        populate sessionStorage + reschedule the next refresh off the
+        single round-trip without a follow-up /whoami call."""
+        import time
+
+        self.test_client.app.state.auth_storage.get_user_permissions.return_value = {
+            "read",
+            "write",
+            "approve",
+        }
+        login = self.test_client.post(
+            "/v1/api/auth/login",
+            json={"username": "testuser", "password": "testpass"},
+        )
+        assert login.status_code == 200
+
+        refresh = self.test_client.post("/v1/api/auth/refresh")
+        assert refresh.status_code == 200
+        body = refresh.json()
+        # exp present + within the expected default JWT TTL window
+        assert "exp" in body, body
+        now = int(time.time())
+        assert now < body["exp"] < now + 25 * 3600, body
+        # permissions present + non-empty (matches the seeded role set)
+        assert body.get("permissions"), body
+        assert "write" in body["permissions"].split(",")
+
     def test_refresh_unauthenticated_401(self):
         """Refresh requires a currently-valid cookie — no cookie → 401."""
         # Clear cookies on the test client

@@ -93,13 +93,36 @@ var _REFRESH_MIN_DELAY_MS = 30 * 1000;
 var _REFRESH_MAX_DELAY_MS = 24 * 60 * 60 * 1000;
 var _refreshTimer = null;
 var _refreshInFlight = null;
-// Logout race guard: a refresh in flight when the user clicks Logout
-// can land AFTER /logout and re-set the cookie, silently undoing the
-// logout.  _loggedOut is set synchronously in logout() and the
-// refresh path bails on its post-fetch effects when it sees the flag.
-// _refreshAbort is the AbortController for any in-flight /refresh.
+// Logout race guard: a refresh (or whoami) in flight when the user
+// clicks Logout can land AFTER /logout and re-populate state, silently
+// undoing the logout.  _loggedOut is set synchronously in logout() and
+// every fetch's .then bails on its post-fetch effects when it sees the
+// flag.  _refreshAbort / _whoamiAbort are the AbortControllers for any
+// in-flight /refresh and /whoami respectively.
 var _loggedOut = false;
 var _refreshAbort = null;
+var _whoamiAbort = null;
+
+// Permissions-ready: one-shot promise resolved after the initial whoami
+// completes (success OR failure).  Lets permission-gated UI await the
+// "have we tried to populate sessionStorage yet?" signal instead of
+// guessing a setTimeout duration.  Subsequent logins/logouts refresh
+// permissions through the existing onLoginSuccess / onLogout hooks, so
+// one-shot is sufficient for the page-load gate problem.
+var _permissionsReadyResolve = null;
+var _permissionsReady = new Promise(function (resolve) {
+  _permissionsReadyResolve = resolve;
+});
+function _markPermissionsReady() {
+  if (_permissionsReadyResolve) {
+    var r = _permissionsReadyResolve;
+    _permissionsReadyResolve = null;
+    r();
+  }
+}
+if (typeof window !== "undefined") {
+  window.permissionsReady = _permissionsReady;
+}
 
 async function _tryRefresh() {
   // Don't start a refresh if logout already won the race.
@@ -128,7 +151,7 @@ async function _tryRefresh() {
       try {
         data = await r.json();
       } catch (_e) {
-        /* empty body — still successful refresh */
+        /* refresh succeeded but body unreadable — fall back to whoami */
       }
       // If logout fired while the refresh was in flight, drop all
       // post-fetch effects: don't store perms (already cleared), don't
@@ -136,8 +159,26 @@ async function _tryRefresh() {
       // The new cookie is harmless — logout's clear-cookie response
       // already overwrote it on the way back from this fetch.
       if (_loggedOut) return false;
-      if (data) _storePermissions(data);
-      _scheduleRefreshFromWhoami(); // reschedule based on the new exp
+      // Consume the refresh response inline.  /refresh returns the same
+      // permissions + exp shape as /whoami (auth.py:handle_auth_refresh),
+      // so we can populate sessionStorage and reschedule the next refresh
+      // off this single round-trip — no follow-up whoami needed.  The
+      // caller (authFetch retry loop, refresh timer) sees fresh
+      // sessionStorage immediately on resume, so a permission re-resolve
+      // server-side is reflected in the UI on the very next
+      // permission-gated check.
+      if (data) {
+        _storePermissions(data);
+        if (typeof data.exp === "number") {
+          _scheduleRefreshAt(data.exp);
+        } else {
+          // Server didn't surface exp (older deployment) — fall back to
+          // the whoami round-trip so we still reschedule.
+          _scheduleRefreshFromWhoami();
+        }
+      } else {
+        _scheduleRefreshFromWhoami();
+      }
       if (_authChannel) _authChannel.postMessage("refresh");
       return true;
     } catch (_e) {
@@ -173,17 +214,52 @@ function _scheduleRefreshFromWhoami() {
   // Best-effort — failure here just means no proactive refresh; the
   // reactive on-401 path still works.  Uses fetch (not authFetch) to
   // avoid recursion through the on-401 trap.
-  fetch("/v1/api/auth/whoami", { credentials: "same-origin" })
+  //
+  // Also rehydrates sessionStorage permissions when the cookie outlives
+  // the tab session: an existing valid cookie means the user is still
+  // authenticated, but sessionStorage was cleared on tab close, so
+  // permission-gated UI (e.g. the coordinator composer) hides until the
+  // user manually logs out + back in.  Populating from whoami here keeps
+  // the gate consistent with the actual auth state.
+  //
+  // Logout race: if logout() fires while this fetch is in flight, the
+  // .then must NOT call _storePermissions (would re-populate after
+  // logout cleared) or _scheduleRefreshAt (would re-arm the timer).
+  // _loggedOut guards the post-fetch effects; _whoamiAbort lets logout
+  // cancel the in-flight request directly so the network roundtrip
+  // doesn't even complete.
+  var ctrl =
+    typeof AbortController !== "undefined" ? new AbortController() : null;
+  _whoamiAbort = ctrl;
+  fetch("/v1/api/auth/whoami", {
+    credentials: "same-origin",
+    signal: ctrl ? ctrl.signal : undefined,
+  })
     .then(function (r) {
       return r.ok ? r.json() : null;
     })
     .then(function (data) {
+      if (_loggedOut) return;
+      // Treat a non-OK whoami (data === null) as an explicit clear.
+      // _storePermissions(null) removes the key so stale UI gating
+      // disappears when the server-side identity is gone (user
+      // deleted, role stripped, token revoked between tab close and
+      // restore).  Per the documented threat model these permissions
+      // are cosmetic — but a stale "you're an admin" badge after
+      // server-side revocation is exactly the kind of thing that
+      // surprises an operator at the wrong moment.
+      _storePermissions(data);
       if (data && typeof data.exp === "number") {
         _scheduleRefreshAt(data.exp);
       }
     })
     .catch(function () {
-      /* silent — proactive refresh is optional */
+      /* silent — proactive refresh is optional, abort is expected */
+    })
+    .finally(function () {
+      // Only clear if still ours — a newer call may have replaced it.
+      if (_whoamiAbort === ctrl) _whoamiAbort = null;
+      _markPermissionsReady();
     });
 }
 
@@ -649,19 +725,21 @@ function _onSuccess() {
 }
 
 function logout() {
-  // Set flag + abort in-flight refresh BEFORE the network call so any
-  // concurrent _tryRefresh() bails its post-fetch effects (see
-  // _loggedOut handling above).  Without this, a refresh already in
-  // flight can land after /logout and re-set the cookie.
+  // Set flag + abort in-flight fetches BEFORE the network call so any
+  // concurrent _tryRefresh() / _scheduleRefreshFromWhoami() bails its
+  // post-fetch effects (see _loggedOut handling above).  Without this,
+  // a refresh or whoami already in flight can land after /logout and
+  // re-set the cookie or re-populate sessionStorage permissions.
   _loggedOut = true;
   _cancelRefreshTimer();
-  if (_refreshAbort) {
+  [_refreshAbort, _whoamiAbort].forEach(function (ctrl) {
+    if (!ctrl) return;
     try {
-      _refreshAbort.abort();
+      ctrl.abort();
     } catch (_e) {
       /* AbortController not available; the _loggedOut flag handles it */
     }
-  }
+  });
   fetch("/v1/api/auth/logout", { method: "POST" }).then(function () {
     sessionStorage.removeItem("turnstone_permissions");
     if (_authChannel) _authChannel.postMessage("logout");
