@@ -643,7 +643,7 @@ class TestServerAuth:
         mock_ws.user_id = "u1"
         mock_mgr = MagicMock()
         mock_mgr.list_all.return_value = [mock_ws]
-        mock_mgr.max_workstreams = 10
+        mock_mgr.max_active = 10
 
         from turnstone.core.auth import JWT_AUD_SERVER
 
@@ -865,7 +865,7 @@ class TestServerLogin:
         mock_ws.user_id = "u1"
         mock_mgr = MagicMock()
         mock_mgr.list_all.return_value = [mock_ws]
-        mock_mgr.max_workstreams = 10
+        mock_mgr.max_active = 10
 
         # Mock storage with a test user for password login
         from turnstone.core.auth import hash_password
@@ -1671,7 +1671,7 @@ class TestCorsConfigurable:
 
         mgr = MagicMock()
         mgr.list_all.return_value = []
-        mgr.max_workstreams = 10
+        mgr.max_active = 10
         app = srv_mod.create_app(
             workstreams=mgr,
             global_queue=queue.Queue(),
@@ -1692,7 +1692,7 @@ class TestCorsConfigurable:
 
         mgr = MagicMock()
         mgr.list_all.return_value = []
-        mgr.max_workstreams = 10
+        mgr.max_active = 10
         app = srv_mod.create_app(
             workstreams=mgr,
             global_queue=queue.Queue(),

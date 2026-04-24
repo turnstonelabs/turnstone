@@ -542,6 +542,87 @@ def test_manual_close_uses_closed_reason() -> None:
 
 
 # ---------------------------------------------------------------------------
+# CLI focus state
+# ---------------------------------------------------------------------------
+
+
+def test_active_id_seeded_on_first_create() -> None:
+    mgr, _, _ = _make_manager()
+    assert mgr.active_id is None
+    ws = mgr.create(user_id="u1")
+    assert mgr.active_id == ws.id
+    assert mgr.get_active() is ws
+
+
+def test_active_id_unchanged_on_subsequent_creates() -> None:
+    mgr, _, _ = _make_manager()
+    first = mgr.create(user_id="u1")
+    mgr.create(user_id="u1")
+    # Creating a second workstream doesn't change focus.
+    assert mgr.active_id == first.id
+
+
+def test_switch_moves_active_id() -> None:
+    mgr, _, _ = _make_manager()
+    a = mgr.create(user_id="u1")
+    b = mgr.create(user_id="u1")
+    assert mgr.active_id == a.id
+    result = mgr.switch(b.id)
+    assert result is b
+    assert mgr.active_id == b.id
+    # Unknown id → no change.
+    assert mgr.switch("ghost") is None
+    assert mgr.active_id == b.id
+
+
+def test_switch_by_index_uses_1_based_ordering() -> None:
+    mgr, _, _ = _make_manager()
+    a = mgr.create(user_id="u1")
+    b = mgr.create(user_id="u1")
+    c = mgr.create(user_id="u1")
+    assert mgr.switch_by_index(2) is b
+    assert mgr.active_id == b.id
+    assert mgr.switch_by_index(3) is c
+    assert mgr.switch_by_index(0) is None
+    assert mgr.switch_by_index(99) is None
+    # Still on c after the invalid switches.
+    assert mgr.active_id == c.id
+    assert mgr.index_of(a.id) == 1
+    assert mgr.index_of("ghost") == 0
+
+
+def test_active_id_moves_on_eviction() -> None:
+    mgr, _, _ = _make_manager(max_active=2)
+    a = mgr.create(user_id="u1")
+    a.last_active = time.monotonic() - 100
+    mgr.create(user_id="u1")
+    # First create seeded active to a; eviction of a must re-home active.
+    assert mgr.active_id == a.id
+    c = mgr.create(user_id="u1")  # evicts a
+    assert mgr.active_id != a.id
+    assert mgr.active_id in (mgr._order[0], c.id)  # type: ignore[attr-defined]
+
+
+def test_active_id_moves_on_close() -> None:
+    mgr, _, _ = _make_manager()
+    a = mgr.create(user_id="u1")
+    b = mgr.create(user_id="u1")
+    mgr.switch(a.id)
+    mgr.close(a.id)
+    assert mgr.active_id == b.id
+
+
+def test_eviction_count_tracks_evictions() -> None:
+    mgr, _, _ = _make_manager(max_active=2)
+    assert mgr.eviction_count == 0
+    a = mgr.create(user_id="u1")
+    a.last_active = time.monotonic() - 100
+    mgr.create(user_id="u1")
+    mgr.create(user_id="u1")  # evicts a
+    assert mgr.eviction_count == 1
+
+
+# ---------------------------------------------------------------------------
 # Storage access patterns with mocks (defensive coverage)
 # ---------------------------------------------------------------------------
 

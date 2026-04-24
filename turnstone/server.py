@@ -42,6 +42,7 @@ from starlette.staticfiles import StaticFiles
 from turnstone import __version__
 from turnstone.api.docs import make_docs_handler, make_openapi_handler
 from turnstone.api.server_spec import build_server_spec
+from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
 from turnstone.core.auth import (
     DENY_EMPTY_SUB,
     JWT_AUD_SERVER,
@@ -53,12 +54,12 @@ from turnstone.core.log import get_logger
 from turnstone.core.metrics import metrics as _metrics
 from turnstone.core.ratelimit import resolve_client_ip
 from turnstone.core.session import ChatSession, GenerationCancelled, SessionUI  # noqa: F401
+from turnstone.core.session_manager import SessionManager
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
 from turnstone.core.web_helpers import version_html as _version_html
 from turnstone.core.workstream import (
     Workstream,
     WorkstreamKind,
-    WorkstreamManager,
     WorkstreamState,
 )
 from turnstone.prompts import ClientType
@@ -106,7 +107,7 @@ class WebUI:
     # Shared global event queue for state-change broadcasts across all
     # workstreams.  Set by main() before any WebUI instances are created.
     _global_queue: queue.Queue[dict[str, Any]] | None = None  # bounded in main()
-    _workstream_mgr: WorkstreamManager | None = None
+    _workstream_mgr: SessionManager | None = None
 
     def __init__(
         self,
@@ -933,9 +934,7 @@ class LogContextMiddleware:
 # ---------------------------------------------------------------------------
 
 
-def _get_ws(
-    mgr: WorkstreamManager, ws_id: str | None
-) -> tuple[Workstream, WebUI] | tuple[None, None]:
+def _get_ws(mgr: SessionManager, ws_id: str | None) -> tuple[Workstream, WebUI] | tuple[None, None]:
     """Look up workstream by id.  Returns (Workstream, WebUI) or (None, None)."""
     if not ws_id:
         return None, None
@@ -1079,7 +1078,7 @@ def _build_node_snapshot(app_state: Any) -> dict[str, Any]:
     """
     from turnstone.core.memory import get_workstream_display_name
 
-    mgr: WorkstreamManager = app_state.workstreams
+    mgr: SessionManager = app_state.workstreams
     wss = mgr.list_all()
     total_tokens = 0
     total_tool_calls = 0
@@ -1231,7 +1230,7 @@ async def list_workstreams(request: Request) -> JSONResponse:
     """
     from turnstone.core.memory import get_workstream_display_name
 
-    mgr: WorkstreamManager = request.app.state.workstreams
+    mgr: SessionManager = request.app.state.workstreams
     result = []
     for ws in mgr.list_all():
         title = get_workstream_display_name(ws.id) or ws.name
@@ -1255,7 +1254,7 @@ async def dashboard(request: Request) -> JSONResponse:
     """GET /v1/api/dashboard — enriched workstream data + aggregate stats."""
     from turnstone.core.memory import get_workstream_display_name
 
-    mgr: WorkstreamManager = request.app.state.workstreams
+    mgr: SessionManager = request.app.state.workstreams
     # No per-user filter — see list_workstreams above for the rationale
     # (trusted-team deployment shape; mutations stay owner-gated).
     wss = mgr.list_all()
@@ -1443,7 +1442,7 @@ def _build_health_dict(app_state: Any) -> dict[str, Any]:
 
     Shared by the ``/health`` endpoint and the global SSE snapshot.
     """
-    mgr: WorkstreamManager = app_state.workstreams
+    mgr: SessionManager = app_state.workstreams
     wss = mgr.list_all()
     states = _count_ws_states(wss)
     health_reg = getattr(app_state, "health_registry", None)
@@ -1466,7 +1465,7 @@ def _build_health_dict(app_state: Any) -> dict[str, Any]:
         "node_id": getattr(app_state, "node_id", ""),
         "uptime_seconds": round(time.monotonic() - _metrics.start_time, 2),
         "model": _metrics.model,
-        "max_ws": mgr.max_workstreams,
+        "max_ws": mgr.max_active,
         "workstreams": {"total": len(wss), **states},
         "backend": {
             "status": "up" if backend_ok else "down",
@@ -1489,7 +1488,7 @@ async def health(request: Request) -> JSONResponse:
 
 async def metrics_endpoint(request: Request) -> Response:
     """GET /metrics — Prometheus text exposition format."""
-    mgr: WorkstreamManager = request.app.state.workstreams
+    mgr: SessionManager = request.app.state.workstreams
     wss = mgr.list_all()
     states = _count_ws_states(wss)
     ws_data = []
@@ -2481,7 +2480,7 @@ async def create_workstream(request: Request) -> JSONResponse:
         if isinstance(json_body, JSONResponse):
             return json_body
         body = json_body
-    mgr: WorkstreamManager = request.app.state.workstreams
+    mgr: SessionManager = request.app.state.workstreams
     skip: bool = request.app.state.skip_permissions
     auth = getattr(getattr(request, "state", None), "auth_result", None)
     uid: str = getattr(auth, "user_id", "") or ""
@@ -2588,17 +2587,13 @@ async def create_workstream(request: Request) -> JSONResponse:
             )
     try:
         ws = mgr.create(
+            user_id=uid,
             name=body.get("name", ""),
-            ui_factory=lambda wid, **kw: WebUI(ws_id=wid, user_id=uid, **kw),
             model=resolved_model,
             skill=resolved_skill,
-            skill_id=skill_data["template_id"] if skill_data else "",
-            skill_version=applied_skill_version,
             ws_id=requested_ws_id,
             client_type=body.get("client_type", "") or "",
             judge_model=body.get("judge_model", "") or None,
-            user_id=uid,
-            kind=body_kind,
             parent_ws_id=body_parent,
         )
         if not isinstance(ws.ui, WebUI):
@@ -2666,18 +2661,6 @@ async def create_workstream(request: Request) -> JSONResponse:
                 {"kind": str(ws.kind), "parent_ws_id": ws.parent_ws_id},
                 _audit_ip,
             )
-        # Emit eviction event if a workstream was evicted to make room
-        evicted = mgr.last_evicted
-        if evicted is not None:
-            with contextlib.suppress(queue.Full):
-                gq.put_nowait(
-                    {
-                        "type": "ws_closed",
-                        "ws_id": evicted.id,
-                        "name": evicted.name,
-                        "reason": "evicted",
-                    }
-                )
         # Atomic workstream resume during creation.
         resumed = False
         message_count = 0
@@ -3228,7 +3211,7 @@ def _require_ws_access(
     request: Request,
     ws_id: str,
     *,
-    mgr: WorkstreamManager | None = None,
+    mgr: SessionManager | None = None,
 ) -> tuple[str, JSONResponse | None]:
     """Resolve ``ws_id`` to its owner after verifying the caller has access.
 
@@ -3480,7 +3463,7 @@ async def open_workstream(request: Request) -> JSONResponse:
     if not resolved_id:
         return JSONResponse({"error": "Workstream not found"}, status_code=404)
 
-    mgr: WorkstreamManager = request.app.state.workstreams
+    mgr: SessionManager = request.app.state.workstreams
 
     if mgr.get(resolved_id):
         return JSONResponse(
@@ -3524,11 +3507,9 @@ async def open_workstream(request: Request) -> JSONResponse:
 
     try:
         ws = mgr.create(
-            name=ws_row.get("name", ""),
-            ui_factory=lambda wid, **kw: WebUI(ws_id=wid, user_id=owner_uid, **kw),
-            ws_id=resolved_id,
             user_id=owner_uid,
-            kind=WorkstreamKind.from_raw(ws_row.get("kind")),
+            name=ws_row.get("name", ""),
+            ws_id=resolved_id,
             parent_ws_id=ws_row.get("parent_ws_id"),
         )
     except Exception as e:
@@ -4291,7 +4272,7 @@ def _update_backend_metric(app_state: Any) -> None:
 
 
 def _aggregate_emitter_thread(
-    mgr: WorkstreamManager,
+    mgr: SessionManager,
     global_queue: queue.Queue[dict[str, Any]],
     interval: float = 10.0,
 ) -> None:
@@ -4334,7 +4315,7 @@ def _aggregate_emitter_thread(
 
 
 def _idle_cleanup_thread(
-    mgr: WorkstreamManager,
+    mgr: SessionManager,
     timeout_sec: float,
     global_queue: queue.Queue[dict[str, Any]],
     rate_limiter: Any = None,
@@ -4590,7 +4571,7 @@ def _build_middleware(cors_origins: list[str] | None = None) -> list[Middleware]
 
 def create_app(
     *,
-    workstreams: WorkstreamManager,
+    workstreams: SessionManager,
     global_queue: queue.Queue[dict[str, Any]],
     global_listeners: list[queue.Queue[dict[str, Any]]],
     global_listeners_lock: threading.Lock,
@@ -5155,10 +5136,21 @@ def main() -> None:
     from turnstone.core.storage import get_storage as _get_storage
     from turnstone.core.watch import WatchRunner
 
-    # Create workstream manager first (watch restore_fn captures it)
-    manager = WorkstreamManager(
-        session_factory,
-        max_workstreams=config_store.get("server.max_workstreams"),
+    # Create session manager first (watch restore_fn captures it).
+    interactive_adapter = InteractiveAdapter(
+        global_queue=global_queue,
+        ui_factory=lambda ws: WebUI(
+            ws_id=ws.id,
+            user_id=ws.user_id,
+            kind=ws.kind,
+            parent_ws_id=ws.parent_ws_id,
+        ),
+        session_factory=session_factory,
+    )
+    manager = SessionManager(
+        interactive_adapter,
+        storage=_get_storage(),
+        max_active=config_store.get("server.max_workstreams"),
         node_id=_node_id,
     )
     WebUI._workstream_mgr = manager
@@ -5172,9 +5164,7 @@ def main() -> None:
         must start a worker thread directly — same pattern as send_message().
         """
         try:
-            ws = manager.create(
-                ui_factory=lambda wid, **kw: WebUI(ws_id=wid, **kw),
-            )
+            ws = manager.create(user_id="", name="watch-restore")
             # Restored workstreams run unattended — auto-approve tool calls
             # to avoid blocking forever on approval with no connected user.
             if isinstance(ws.ui, WebUI):
@@ -5194,20 +5184,11 @@ def main() -> None:
         tool_timeout=config_store.get("tools.timeout"),
         restore_fn=_watch_restore_fn,
     )
-    ws = manager.create(
-        name="default",
-        ui_factory=lambda wid, **kw: WebUI(ws_id=wid, **kw),
-    )
-    if not isinstance(ws.ui, WebUI):
-        raise TypeError(f"Expected WebUI, got {type(ws.ui).__name__}")
-    if config_store.get("tools.skip_permissions"):
-        ws.ui.auto_approve = True
 
-    # Handle --resume
-    assert ws.session is not None
-    ws.session.set_watch_runner(
-        _watch_runner, dispatch_fn=_make_watch_dispatch(ws, ws.session, ws.ui)
-    )
+    # ``--resume`` lazily creates a workstream scoped to the resumed
+    # content. Without ``--resume`` no default workstream is spawned;
+    # the web UI handles the 0-ws state and users create workstreams
+    # on demand via POST /v1/api/workstreams.
     if args.resume:
         from turnstone.core.memory import resolve_workstream
 
@@ -5215,6 +5196,15 @@ def main() -> None:
         if not target_id:
             log.error("Workstream not found: %s", args.resume)
             sys.exit(1)
+        ws = manager.create(user_id="", name="resumed")
+        if not isinstance(ws.ui, WebUI):
+            raise TypeError(f"Expected WebUI, got {type(ws.ui).__name__}")
+        if config_store.get("tools.skip_permissions"):
+            ws.ui.auto_approve = True
+        assert ws.session is not None
+        ws.session.set_watch_runner(
+            _watch_runner, dispatch_fn=_make_watch_dispatch(ws, ws.session, ws.ui)
+        )
         if not ws.session.resume(target_id):
             log.error("Workstream '%s' has no messages.", args.resume)
             sys.exit(1)

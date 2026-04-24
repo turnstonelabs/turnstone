@@ -644,7 +644,7 @@ class TestServerHealthMetrics:
 
         mock_mgr = MagicMock()
         mock_mgr.list_all.return_value = [mock_ws]
-        mock_mgr.max_workstreams = 10
+        mock_mgr.max_active = 10
 
         app = srv_mod.create_app(
             workstreams=mock_mgr,
@@ -820,7 +820,7 @@ class TestServerRateLimiting:
 
         mock_mgr = MagicMock()
         mock_mgr.list_all.return_value = [mock_ws]
-        mock_mgr.max_workstreams = 10
+        mock_mgr.max_active = 10
 
         app = srv_mod.create_app(
             workstreams=mock_mgr,

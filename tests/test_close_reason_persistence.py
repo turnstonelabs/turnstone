@@ -50,7 +50,7 @@ def _make_app(storage: Any) -> TestClient:
     mock_mgr.get.return_value = mock_ws
     mock_mgr.close.return_value = True
     mock_mgr.list_all.return_value = [mock_ws]
-    mock_mgr.max_workstreams = 10
+    mock_mgr.max_active = 10
 
     app = srv_mod.create_app(
         workstreams=mock_mgr,

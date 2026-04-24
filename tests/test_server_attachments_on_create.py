@@ -254,10 +254,11 @@ class _FakeUI:
 @pytest.fixture
 def app_client(tmp_path, monkeypatch):
     """End-to-end app with a fake session factory + WorkstreamManager."""
+    from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
     from turnstone.core.metrics import MetricsCollector
-    from turnstone.core.storage import init_storage, reset_storage
-    from turnstone.core.workstream import WorkstreamManager
-    from turnstone.server import create_app
+    from turnstone.core.session_manager import SessionManager
+    from turnstone.core.storage import get_storage, init_storage, reset_storage
+    from turnstone.server import WebUI, create_app
 
     reset_storage()
     init_storage("sqlite", path=str(tmp_path / "t.db"), run_migrations=False)
@@ -278,9 +279,18 @@ def app_client(tmp_path, monkeypatch):
         fake_sessions.append(s)
         return s
 
-    mgr = WorkstreamManager(_factory, max_workstreams=10, node_id="node-test")
+    gq: queue.Queue[dict] = queue.Queue(maxsize=1000)
+    WebUI._global_queue = gq
+    adapter = InteractiveAdapter(
+        global_queue=gq,
+        ui_factory=lambda ws: _FakeUI(
+            ws_id=ws.id,
+            user_id=ws.user_id,
+        ),
+        session_factory=_factory,
+    )
+    mgr = SessionManager(adapter, storage=get_storage(), max_active=10, node_id="node-test")
 
-    gq: queue.Queue[dict] = queue.Queue()
     app = create_app(
         workstreams=mgr,
         global_queue=gq,

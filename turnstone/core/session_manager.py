@@ -108,6 +108,11 @@ class SessionManager:
         # third arrival could allocate a fresh lock for the same ws_id
         # and defeat serialization on the failure path.
         self._open_locks: dict[str, tuple[threading.Lock, int]] = {}
+        # CLI REPL focus state. The web UI tracks active tab itself;
+        # the CLI uses these for ``/switch`` / ``/next``. Coordinator
+        # manager never reads them.
+        self._active_id: str | None = None
+        self._eviction_count: int = 0
 
     # ------------------------------------------------------------------
     # Properties
@@ -125,6 +130,52 @@ class SessionManager:
     def count(self) -> int:
         with self._lock:
             return len(self._workstreams)
+
+    @property
+    def eviction_count(self) -> int:
+        """Total number of workstreams auto-evicted by ``create`` / ``open``."""
+        return self._eviction_count
+
+    # ------------------------------------------------------------------
+    # CLI focus state
+    #
+    # Used by the CLI REPL only — the web UI tracks active tab in
+    # browser state and coordinator navigation is URL-based.
+    # ------------------------------------------------------------------
+
+    @property
+    def active_id(self) -> str | None:
+        return self._active_id
+
+    def get_active(self) -> Workstream | None:
+        with self._lock:
+            if self._active_id is None:
+                return None
+            return self._workstreams.get(self._active_id)
+
+    def switch(self, ws_id: str) -> Workstream | None:
+        with self._lock:
+            if ws_id in self._workstreams:
+                self._active_id = ws_id
+                return self._workstreams[ws_id]
+        return None
+
+    def switch_by_index(self, index: int) -> Workstream | None:
+        """1-based index into the creation-order list."""
+        with self._lock:
+            if 1 <= index <= len(self._order):
+                ws_id = self._order[index - 1]
+                self._active_id = ws_id
+                return self._workstreams.get(ws_id)
+        return None
+
+    def index_of(self, ws_id: str) -> int:
+        """1-based creation-order index of a workstream, or 0 if absent."""
+        with self._lock:
+            try:
+                return self._order.index(ws_id) + 1
+            except ValueError:
+                return 0
 
     # ------------------------------------------------------------------
     # create — new session
@@ -353,6 +404,8 @@ class SessionManager:
                 return False
             if ws_id in self._order:
                 self._order.remove(ws_id)
+            if self._active_id == ws_id:
+                self._active_id = self._order[0] if self._order else None
 
         self._adapter.cleanup_ui(ws)
         try:
@@ -472,6 +525,9 @@ class SessionManager:
             self._workstreams.pop(oldest.id, None)
             if oldest.id in self._order:
                 self._order.remove(oldest.id)
+            if self._active_id == oldest.id:
+                self._active_id = self._order[0] if self._order else None
+            self._eviction_count += 1
             evicted = oldest
 
         ws = Workstream(id=ws_id, name=name)
@@ -481,6 +537,8 @@ class SessionManager:
         ws.ui = self._adapter.build_ui(ws)
         self._workstreams[ws_id] = ws
         self._order.append(ws_id)
+        if self._active_id is None:
+            self._active_id = ws_id
         return ws, evicted
 
     def _remove_locked(self, ws_id: str) -> None:
@@ -493,3 +551,5 @@ class SessionManager:
         self._workstreams.pop(ws_id, None)
         if ws_id in self._order:
             self._order.remove(ws_id)
+        if self._active_id == ws_id:
+            self._active_id = self._order[0] if self._order else None

@@ -1205,11 +1205,26 @@ class TestSessionAgentModel:
 # ---------------------------------------------------------------------------
 
 
+def _make_manager(session_factory: Any) -> Any:
+    """Construct a SessionManager with an interactive adapter that
+    forwards to the supplied session_factory. Storage is mocked — the
+    only thing the model-alias tests exercise is the factory passthrough."""
+    from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
+    from turnstone.core.session_manager import SessionManager
+
+    import queue
+
+    adapter = InteractiveAdapter(
+        global_queue=queue.Queue(maxsize=100),
+        ui_factory=lambda ws: MagicMock(),
+        session_factory=session_factory,
+    )
+    return SessionManager(adapter, storage=MagicMock(), max_active=10)
+
+
 class TestWorkstreamModelParam:
     def test_create_with_model(self) -> None:
-        """WorkstreamManager.create passes model_alias to session_factory."""
-        from turnstone.core.workstream import WorkstreamManager
-
+        """SessionManager.create passes model_alias to session_factory."""
         captured_alias = None
 
         def factory(
@@ -1221,8 +1236,8 @@ class TestWorkstreamModelParam:
             mock_session.ws_id = "test123"
             return mock_session
 
-        mgr = WorkstreamManager(factory)
-        mgr.create(name="test", model="openai")
+        mgr = _make_manager(factory)
+        mgr.create(user_id="", name="test", model="openai")
         assert captured_alias == "openai"
 
     def test_create_without_model(self) -> None:
@@ -1237,10 +1252,8 @@ class TestWorkstreamModelParam:
             mock_session.ws_id = "test123"
             return mock_session
 
-        from turnstone.core.workstream import WorkstreamManager
-
-        mgr = WorkstreamManager(factory)
-        mgr.create(name="test")
+        mgr = _make_manager(factory)
+        mgr.create(user_id="", name="test")
         assert captured_alias is None
 
 

@@ -73,7 +73,7 @@ def app_client(tmp_path):
     mock_mgr = MagicMock()
     mock_mgr.get.return_value = None
     mock_mgr.list_all.return_value = []
-    mock_mgr.max_workstreams = 10
+    mock_mgr.max_active = 10
 
     app = srv_mod.create_app(
         workstreams=mock_mgr,

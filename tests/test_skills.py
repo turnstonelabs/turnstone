@@ -1729,8 +1729,9 @@ class TestSkillConfigAppliedToWorkstream:
         import threading
 
         import turnstone.core.storage._registry as _reg
-        from turnstone.core.workstream import WorkstreamManager
-        from turnstone.server import create_workstream
+        from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
+        from turnstone.core.session_manager import SessionManager
+        from turnstone.server import WebUI, create_workstream
 
         storage = SQLiteBackend(str(tmp_path / "ws_test.db"))
 
@@ -1754,7 +1755,19 @@ class TestSkillConfigAppliedToWorkstream:
                 skill=kwargs.get("skill"),
             )
 
-        mgr = WorkstreamManager(_session_factory)
+        gq: queue.Queue[dict[str, Any]] = queue.Queue()
+        WebUI._global_queue = gq
+        adapter = InteractiveAdapter(
+            global_queue=gq,
+            ui_factory=lambda ws: WebUI(
+                ws_id=ws.id,
+                user_id=ws.user_id,
+                kind=ws.kind,
+                parent_ws_id=ws.parent_ws_id,
+            ),
+            session_factory=_session_factory,
+        )
+        mgr = SessionManager(adapter, storage=storage, max_active=10)
 
         routes = [
             Mount(
@@ -1774,7 +1787,7 @@ class TestSkillConfigAppliedToWorkstream:
         )
         app.state.workstreams = mgr
         app.state.skip_permissions = True
-        app.state.global_queue = queue.Queue()
+        app.state.global_queue = gq
         app.state.global_listeners = []
         app.state.global_listeners_lock = threading.Lock()
 

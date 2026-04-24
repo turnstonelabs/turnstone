@@ -440,9 +440,12 @@ class TestResumeDeletedTemplate:
 
 class TestSkillFactoryPassthrough:
     def test_skill_passed_through_workstream_create(self, tmp_db):
-        """WorkstreamManager.create(skill=...) propagates to session factory."""
+        """SessionManager.create(skill=...) propagates to session factory."""
+        import queue
+
+        from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
+        from turnstone.core.session_manager import SessionManager
         from turnstone.core.storage import get_storage
-        from turnstone.core.workstream import WorkstreamManager
 
         db = get_storage()
         _create_template(db, "t1", "factory-tpl", "FACTORY_CONTENT", is_default=False)
@@ -454,15 +457,26 @@ class TestSkillFactoryPassthrough:
             captured_skill = skill
             return _make_session(skill=captured_skill)
 
-        mgr = WorkstreamManager(factory)
-        ws = mgr.create(name="test", skill="factory-tpl")
+        gq: queue.Queue[dict] = queue.Queue(maxsize=1000)
+        adapter = InteractiveAdapter(
+            global_queue=gq,
+            ui_factory=lambda ws: NullUI(),
+            session_factory=factory,
+        )
+        mgr = SessionManager(adapter, storage=MagicMock(), max_active=10)
+        ws = mgr.create(user_id="", name="test", skill="factory-tpl")
         assert captured_skill == "factory-tpl"
         assert ws.session is not None
         assert ws.session._skill_name == "factory-tpl"
         assert "FACTORY_CONTENT" in _sys_content(ws.session)
 
     def test_skill_none_uses_defaults(self, tmp_db):
-        """WorkstreamManager.create() without skill passes None."""
+        """SessionManager.create() without skill passes None."""
+        import queue
+
+        from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
+        from turnstone.core.session_manager import SessionManager
+
         captured_skill = "sentinel"
 
         def factory(ui, model_alias=None, ws_id=None, *, skill=None, **_kwargs):
@@ -470,10 +484,14 @@ class TestSkillFactoryPassthrough:
             captured_skill = skill
             return _make_session(skill=skill)
 
-        from turnstone.core.workstream import WorkstreamManager
-
-        mgr = WorkstreamManager(factory)
-        mgr.create(name="test")
+        gq: queue.Queue[dict] = queue.Queue(maxsize=1000)
+        adapter = InteractiveAdapter(
+            global_queue=gq,
+            ui_factory=lambda ws: NullUI(),
+            session_factory=factory,
+        )
+        mgr = SessionManager(adapter, storage=MagicMock(), max_active=10)
+        mgr.create(user_id="", name="test")
         assert captured_skill is None
 
 
