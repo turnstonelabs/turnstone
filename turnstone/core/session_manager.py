@@ -422,8 +422,9 @@ class SessionManager:
         # that acquires ws._lock after us sees _closed=True and skips
         # its storage write. ``state_writer.discard`` (when present)
         # drops any pending buffered transient AND waits for any
-        # in-flight flush so our sync ``closed`` write isn't
-        # overtaken by a late buffered write (bug-3 invariant).
+        # in-flight flush, so a late-flushing 'running' can't land in
+        # storage AFTER our sync 'closed' write and resurrect the
+        # closed row.
         with ws._lock:
             ws._closed = True
             if self._state_writer is not None:
@@ -544,7 +545,8 @@ class SessionManager:
             # before the storage write so any concurrent set_state sees
             # the tombstone and skips its own write. ``state_writer.discard``
             # drops any pending buffered transient + waits for any
-            # in-flight flush (bug-3 invariant).
+            # in-flight flush so the sync 'closed' write is the final
+            # one for this ws_id.
             with ws._lock:
                 ws._closed = True
                 if self._state_writer is not None:
