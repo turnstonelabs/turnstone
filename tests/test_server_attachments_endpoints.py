@@ -452,6 +452,7 @@ class TestSendMessageAttachments:
         ws.ui = ui
         ws.session = session
         ws.worker_thread = None
+        ws._worker_running = False
         ws._lock = threading.RLock()
         mgr.get.return_value = ws
         return captured, session
@@ -628,7 +629,7 @@ class TestQueuedSendWithAttachments:
         ui._ws_messages = 0
         ui._ws_turn_tool_calls = 0
 
-        # worker_thread needs .is_alive() → True to hit the queue branch
+        # _worker_running=True forces session_worker.send onto the queue path
         worker = MagicMock()
         worker.is_alive = MagicMock(return_value=True)
 
@@ -638,6 +639,7 @@ class TestQueuedSendWithAttachments:
         ws.ui = ui
         ws.session = session
         ws.worker_thread = worker
+        ws._worker_running = True
         ws._lock = threading.RLock()
         mgr.get.return_value = ws
         return captured
@@ -760,6 +762,7 @@ class TestQueuedAttachmentReservation:
         session.send = fake_send  # type: ignore[method-assign]
         ws = mgr.get.return_value
         ws.worker_thread = None  # idle → non-queue path
+        ws._worker_running = False
 
         # Auto-consume on a follow-up send: reserved attachment must not
         # be picked up (another turn isn't entitled to it).
@@ -791,6 +794,7 @@ class TestQueuedAttachmentReservation:
         session.send = fake_send  # type: ignore[method-assign]
         ws = mgr.get.return_value
         ws.worker_thread = None
+        ws._worker_running = False
 
         # A second send explicitly naming the reserved id: scope check
         # rejects it, so the attachment list is empty.
@@ -885,6 +889,7 @@ class TestReserveThenDispatchRace:
         ws.ui = ui
         ws.session = session
         ws.worker_thread = None
+        ws._worker_running = False
         ws._lock = threading.RLock()
         mgr.get.return_value = ws
 

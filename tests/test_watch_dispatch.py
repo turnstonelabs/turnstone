@@ -128,20 +128,15 @@ def test_busy_workstream_enqueues_message():
     ws = Workstream()
     ui = _RecordingUI()
 
-    # Simulate a live worker thread.
-    blocker = threading.Event()
-    ws.worker_thread = threading.Thread(target=blocker.wait, args=(5,), daemon=True)
-    ws.worker_thread.start()
+    # Simulate a live worker — session_worker.send gates on
+    # ``_worker_running``, not ``Thread.is_alive``.
+    ws._worker_running = True
 
-    try:
-        dispatch = _make_watch_dispatch(ws, session, ui)
-        dispatch("queued msg")
+    dispatch = _make_watch_dispatch(ws, session, ui)
+    dispatch("queued msg")
 
-        item = session._watch_pending.get_nowait()
-        assert item == {"message": "queued msg"}
-    finally:
-        blocker.set()
-        ws.worker_thread.join(2)
+    item = session._watch_pending.get_nowait()
+    assert item == {"message": "queued msg"}
 
 
 def test_busy_workstream_drops_on_full_queue():
@@ -154,19 +149,13 @@ def test_busy_workstream_drops_on_full_queue():
     ws = Workstream()
     ui = _RecordingUI()
 
-    blocker = threading.Event()
-    ws.worker_thread = threading.Thread(target=blocker.wait, args=(5,), daemon=True)
-    ws.worker_thread.start()
+    ws._worker_running = True  # simulate a live worker
 
-    try:
-        dispatch = _make_watch_dispatch(ws, session, ui)
-        # Should not block or raise — just log a warning and drop.
-        dispatch("overflow msg")
+    dispatch = _make_watch_dispatch(ws, session, ui)
+    # Should not block or raise — just log a warning and drop.
+    dispatch("overflow msg")
 
-        assert session._watch_pending.full()
-    finally:
-        blocker.set()
-        ws.worker_thread.join(2)
+    assert session._watch_pending.full()
 
 
 # ── Lock guard ───────────────────────────────────────────────────────────────

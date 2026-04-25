@@ -42,6 +42,7 @@ from starlette.staticfiles import StaticFiles
 from turnstone import __version__
 from turnstone.api.docs import make_docs_handler, make_openapi_handler
 from turnstone.api.server_spec import build_server_spec
+from turnstone.core import session_worker
 from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
 from turnstone.core.auth import (
     DENY_EMPTY_SUB,
@@ -1435,43 +1436,48 @@ async def metrics_endpoint(request: Request) -> Response:
 def _make_watch_dispatch(ws: Workstream, session: ChatSession, ui: Any) -> Any:
     """Create a dispatch function for watch results on a workstream.
 
-    Handles both idle (start worker thread) and busy (enqueue for IDLE drain)
-    cases.  Mirrors the ``send_message`` worker-thread pattern.
+    Handles both busy (enqueue into ``session._watch_pending`` for drain at IDLE)
+    and idle (spawn a worker thread) cases via the shared
+    :func:`turnstone.core.session_worker.send` dispatcher. The shared
+    dispatcher's ``_worker_running`` gate keeps watches and ``/v1/api/send``
+    from racing into parallel workers on the same ChatSession.
     """
     pending = session._watch_pending
 
     def dispatch(msg: str) -> None:
-        with ws._lock:
-            if ws.worker_thread and ws.worker_thread.is_alive():
-                # Workstream is busy — queue for drain at IDLE (Path A)
-                try:
-                    pending.put_nowait({"message": msg})
-                except queue.Full:
-                    log.warning(
-                        "Watch pending queue full, dropping result for ws %s",
-                        ws.id,
-                    )
-                return
+        def _enq() -> None:
+            # Watches don't pump through ChatSession.queue_message; instead
+            # they drop into the IDLE-drain pending queue. Swallow Full
+            # locally — drop-on-full is the long-standing watch behavior
+            # (no 429 surface).
+            try:
+                pending.put_nowait({"message": msg})
+            except queue.Full:
+                log.warning(
+                    "Watch pending queue full, dropping result for ws %s",
+                    ws.id,
+                )
 
-            # Workstream is idle — start a worker thread (Path B)
-            # Mirrors the send_message() run() pattern for proper cleanup.
-            def run() -> None:
-                me = threading.current_thread()
-                try:
-                    session.send(msg)
-                except GenerationCancelled:
-                    if ws.worker_thread is me and ui:
-                        ui.on_stream_end()
-                        ui.on_state_change("idle")
-                except Exception as exc:
-                    if ws.worker_thread is me and ui:
-                        ui.on_error(f"Watch error: {exc}")
-                        ui.on_stream_end()
-                        ui.on_state_change("error")
+        def _run() -> None:
+            me = threading.current_thread()
+            try:
+                session.send(msg)
+            except GenerationCancelled:
+                if ws.worker_thread is me and ui:
+                    ui.on_stream_end()
+                    ui.on_state_change("idle")
+            except Exception as exc:
+                if ws.worker_thread is me and ui:
+                    ui.on_error(f"Watch error: {exc}")
+                    ui.on_stream_end()
+                    ui.on_state_change("error")
 
-            t = threading.Thread(target=run, daemon=True)
-            ws.worker_thread = t
-            t.start()
+        session_worker.send(
+            ws,
+            enqueue=_enq,
+            run=_run,
+            thread_name=f"watch-worker-{ws.id[:8]}",
+        )
 
     return dispatch
 
@@ -1634,105 +1640,108 @@ async def send_message(request: Request) -> JSONResponse:
 
             _unreserve(send_id, ws_id, attach_user_id)
 
-    # Atomically check-and-start to prevent two concurrent workers on the
-    # same session (ChatSession.send() is not thread-safe).
     # If cancel was requested, poll briefly for the worker to exit before
-    # rejecting.  Snapshot the thread ref since force-cancel can set it to
-    # None concurrently.  Uses async sleep to avoid blocking the event loop.
-    worker = ws.worker_thread
-    if worker and worker.is_alive() and ws.session and ws.session._cancel_event.is_set():
+    # dispatching.  ``_worker_running`` flips to False atomically under
+    # ws._lock when the worker thread reaches its finally block — gates
+    # the dispatch on the same flag the shared dispatcher uses.  Uses
+    # async sleep to avoid blocking the event loop.
+    if ws._worker_running and ws.session and ws.session._cancel_event.is_set():
         for _ in range(30):  # up to 3s in 100ms steps
             await asyncio.sleep(0.1)
-            if not worker.is_alive():
+            if not ws._worker_running:
                 break
-    with ws._lock:
-        if ws.worker_thread and ws.worker_thread.is_alive():
-            # Queue the message for injection at the next tool-result seam
-            # instead of rejecting outright.  Attachments were already
-            # reserved above using ``send_id`` as the token — we pass
-            # the same id in as ``queue_msg_id`` so the queue entry, the
-            # reservation, and the eventual consume all share one token.
-            if ws.session is not None:
-                try:
-                    cleaned, priority, msg_id = ws.session.queue_message(
-                        message,
-                        attachment_ids=list(ordered_reserved),
-                        queue_msg_id=send_id,
-                    )
-                except queue.Full:
-                    _release_reservation_on_fail()
-                    return JSONResponse({"status": "queue_full"})
-                ui._enqueue(
-                    {
-                        "type": "message_queued",
-                        "message": cleaned,
-                        "priority": priority,
-                        "msg_id": msg_id,
-                    }
-                )
-                # Report the reservation outcome so the UI can clear
-                # only the chips that actually got attached, leaving
-                # un-reserved ones visible for retry.
-                dropped = [aid for aid in requested_ids if aid not in reserved_set]
-                return JSONResponse(
-                    {
-                        "status": "queued",
-                        "priority": priority,
-                        "msg_id": msg_id,
-                        "attached_ids": list(ordered_reserved),
-                        "dropped_attachment_ids": dropped,
-                    }
-                )
-            _release_reservation_on_fail()
-            ui._enqueue(
-                {
-                    "type": "busy_error",
-                    "message": "Already processing a request. Please wait.",
-                }
+    if ws.session is None:
+        _release_reservation_on_fail()
+        return JSONResponse({"error": "No session"}, status_code=500)
+
+    session = ws.session
+
+    # Pre-allocate the queue-path outcome dict; populated by ``_enqueue``
+    # only when the shared dispatcher routes us onto a live worker.
+    queue_outcome: dict[str, Any] = {}
+
+    def _enqueue() -> None:
+        # Reuse path: append to the live worker's pending queue. The
+        # ``send_id`` token threads through ``queue_msg_id`` so the
+        # queue entry, the attachment reservation, and the eventual
+        # consume all share one token.
+        cleaned, priority, msg_id = session.queue_message(
+            message,
+            attachment_ids=list(ordered_reserved),
+            queue_msg_id=send_id,
+        )
+        queue_outcome["cleaned"] = cleaned
+        queue_outcome["priority"] = priority
+        queue_outcome["msg_id"] = msg_id
+
+    def _run() -> None:
+        assert ui is not None
+        me = threading.current_thread()
+        try:
+            session.send(
+                message,
+                attachments=resolved_atts or None,
+                send_id=send_id,
             )
-            return JSONResponse({"status": "busy"})
-        session = ws.session
-        if session is None:
+        except GenerationCancelled:
+            # Safety net — send() normally handles this internally.
+            # If this thread was force-abandoned, ws.worker_thread will
+            # have been set to None — don't emit spurious events.
             _release_reservation_on_fail()
-            return JSONResponse({"error": "No session"}, status_code=500)
+            if ws.worker_thread is me:
+                ui.on_stream_end()
+                ui.on_state_change("idle")
+        except Exception as e:
+            # Release the reservation so the attachments don't stay
+            # soft-locked forever when the worker crashes before
+            # reaching the consume step.  Safe-by-idempotency: once
+            # mark_attachments_consumed has cleared the token, a
+            # follow-up unreserve is a no-op.
+            _release_reservation_on_fail()
+            if ws.worker_thread is me:
+                ui.on_error(f"Error: {e}")
+                ui.on_stream_end()
+                ui.on_state_change("error")
 
-        def run() -> None:
-            assert ui is not None
-            me = threading.current_thread()
-            try:
-                session.send(
-                    message,
-                    attachments=resolved_atts or None,
-                    send_id=send_id,
-                )
-            except GenerationCancelled:
-                # Safety net — send() normally handles this internally.
-                # If this thread was force-abandoned, ws.worker_thread will
-                # have been set to None — don't emit spurious events.
-                _release_reservation_on_fail()
-                if ws.worker_thread is me:
-                    ui.on_stream_end()
-                    ui.on_state_change("idle")
-            except Exception as e:
-                # Release the reservation so the attachments don't stay
-                # soft-locked forever when the worker crashes before
-                # reaching the consume step.  Safe-by-idempotency: once
-                # mark_attachments_consumed has cleared the token, a
-                # follow-up unreserve is a no-op.
-                _release_reservation_on_fail()
-                if ws.worker_thread is me:
-                    ui.on_error(f"Error: {e}")
-                    ui.on_stream_end()
-                    ui.on_state_change("error")
+    ok = session_worker.send(
+        ws,
+        enqueue=_enqueue,
+        run=_run,
+        thread_name=f"send-worker-{ws.id[:8]}",
+    )
+    if not ok:
+        # Returns False on queue.Full (live worker, queue at capacity)
+        # or session-disappeared race. Either way the message couldn't
+        # land — surface as queue_full so the client can retry.
+        _release_reservation_on_fail()
+        return JSONResponse({"status": "queue_full"})
 
-        t = threading.Thread(target=run, daemon=True)
-        ws.worker_thread = t
-        t.start()
+    dropped = [aid for aid in requested_ids if aid not in reserved_set]
+    if queue_outcome:
+        # Reused a live worker; queue_message succeeded.
+        ui._enqueue(
+            {
+                "type": "message_queued",
+                "message": queue_outcome["cleaned"],
+                "priority": queue_outcome["priority"],
+                "msg_id": queue_outcome["msg_id"],
+            }
+        )
+        return JSONResponse(
+            {
+                "status": "queued",
+                "priority": queue_outcome["priority"],
+                "msg_id": queue_outcome["msg_id"],
+                "attached_ids": list(ordered_reserved),
+                "dropped_attachment_ids": dropped,
+            }
+        )
+
+    # Spawned a fresh worker — count this as a new turn.
     _metrics.record_message_sent()
     with ui._ws_lock:
         ui._ws_messages += 1
         ui._ws_turn_tool_calls = 0
-    dropped = [aid for aid in requested_ids if aid not in reserved_set]
     return JSONResponse(
         {
             "status": "ok",
@@ -1790,7 +1799,7 @@ async def cancel_generation(request: Request) -> JSONResponse:
     if session is None:
         return JSONResponse({"error": "No session"}, status_code=400)
     force = body.get("force", False) is True
-    was_running = bool(ws.worker_thread and ws.worker_thread.is_alive())
+    was_running = ws._worker_running
     dropped = _capture_cancel_forensics(session, ui, was_running=was_running)
     # Only act if generation is actually in progress
     if was_running:
@@ -1964,11 +1973,18 @@ async def command(request: Request) -> JSONResponse:
                             ui.on_error(f"Error: {exc}")
                             ui.on_stream_end()
                             ui.on_state_change("error")
+                    finally:
+                        with ws._lock:
+                            ws._worker_running = False
 
+                # Gate on ``_worker_running`` for parity with the shared
+                # session_worker dispatcher — avoids racing a /v1/api/send
+                # spawn with the retry spawn into two parallel workers.
                 with ws._lock:
-                    if ws.worker_thread and ws.worker_thread.is_alive():
+                    if ws._worker_running:
                         ui.on_error("Cannot retry: workstream is busy")
                     else:
+                        ws._worker_running = True
                         t = threading.Thread(target=run_retry, daemon=True)
                         ws.worker_thread = t
                         t.start()
@@ -2679,10 +2695,18 @@ async def create_workstream(request: Request) -> JSONResponse:
                         _fire_notify_targets(ws, last_content)
                     except Exception:
                         log.warning("notify_completion.hook_error", ws_id=ws.id, exc_info=True)
+                    with ws._lock:
+                        ws._worker_running = False
 
-            t = threading.Thread(target=_run_initial, daemon=True, name=f"ws-init-{ws.id[:8]}")
-            ws.worker_thread = t
-            t.start()
+            # Mark the worker live under ws._lock so a /v1/api/send
+            # arriving immediately after creation observes the running
+            # state via the shared session_worker gate instead of
+            # racing into a parallel worker.
+            with ws._lock:
+                ws._worker_running = True
+                t = threading.Thread(target=_run_initial, daemon=True, name=f"ws-init-{ws.id[:8]}")
+                ws.worker_thread = t
+                t.start()
 
         return JSONResponse(
             {
@@ -4166,6 +4190,10 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     # Start watch runner (periodic command polling)
     if app.state.watch_runner:
         app.state.watch_runner.start()
+    # Start the buffered state-writer flusher
+    state_writer = getattr(app.state, "state_writer", None)
+    if state_writer is not None:
+        state_writer.start()
 
     # Sweep stale attachment reservations left over from process crashes
     # between reserve_attachments and consume/unreserve.  Run once at
@@ -4304,6 +4332,10 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         await tls_client.stop_renewal()
     if app.state.watch_runner:
         app.state.watch_runner.stop()
+    # Drain + stop the buffered state-writer
+    state_writer = getattr(app.state, "state_writer", None)
+    if state_writer is not None:
+        state_writer.shutdown()
     # Stop the orphan-reservation sweep loop
     _orphan_sweep_stop.set()
     with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -4361,6 +4393,7 @@ def create_app(
     judge_config: Any = None,
     config_store: Any = None,
     advertise_url: str = "",
+    state_writer: Any = None,
 ) -> Starlette:
     """Create and configure the Starlette ASGI application."""
     _spec = build_server_spec()
@@ -4473,6 +4506,7 @@ def create_app(
         lifespan=_lifespan,
     )
     app.state.workstreams = workstreams
+    app.state.state_writer = state_writer
     app.state.global_queue = global_queue
     app.state.global_listeners = global_listeners
     app.state.global_listeners_lock = global_listeners_lock
@@ -4930,11 +4964,15 @@ def main() -> None:
         ),
         session_factory=session_factory,
     )
+    from turnstone.core.state_writer import StateWriter
+
+    state_writer = StateWriter(_get_storage())
     manager = SessionManager(
         interactive_adapter,
         storage=_get_storage(),
         max_active=config_store.get("server.max_workstreams"),
         node_id=_node_id,
+        state_writer=state_writer,
     )
     interactive_adapter.attach(manager)
     WebUI._workstream_mgr = manager
@@ -5042,6 +5080,7 @@ def main() -> None:
         judge_config=judge_config,
         config_store=config_store,
         advertise_url=_advertise_url,
+        state_writer=state_writer,
     )
 
     # Wire app ref so health callbacks can access app.state for metrics
