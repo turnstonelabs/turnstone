@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from turnstone.core.session import ChatSession, SessionUI
+    from turnstone.core.state_writer import StateWriter
     from turnstone.core.storage._protocol import StorageBackend
 
 log = get_logger(__name__)
@@ -112,12 +113,18 @@ class SessionManager:
         storage: StorageBackend,
         max_active: int,
         node_id: str | None = None,
+        state_writer: StateWriter | None = None,
     ) -> None:
         if max_active < 1:
             raise ValueError(f"max_active must be >= 1, got {max_active}")
         self._adapter = adapter
         self._storage = storage
         self._max_active = max_active
+        # Optional buffered state-writer. Pass one in for production
+        # paths so non-terminal ``set_state`` writes don't hold
+        # ``ws._lock`` across a sync DB UPDATE. Tests can leave it
+        # None and get the legacy direct-write behaviour.
+        self._state_writer = state_writer
         self._node_id = node_id
         self._workstreams: dict[str, Workstream] = {}
         self._order: list[str] = []
@@ -413,9 +420,14 @@ class SessionManager:
         # via ws._lock. Setting ``_closed`` inside the lock makes the
         # close visible to set_state before we release — any set_state
         # that acquires ws._lock after us sees _closed=True and skips
-        # its storage write.
+        # its storage write. ``state_writer.discard`` (when present)
+        # drops any pending buffered transient AND waits for any
+        # in-flight flush so our sync ``closed`` write isn't
+        # overtaken by a late buffered write (bug-3 invariant).
         with ws._lock:
             ws._closed = True
+            if self._state_writer is not None:
+                self._state_writer.discard(ws_id)
             try:
                 self._storage.update_workstream_state(ws_id, "closed")
             except Exception:
@@ -452,10 +464,22 @@ class SessionManager:
             ws.state = state
             ws.last_active = time.monotonic()
             ws.error_message = error_msg
-            try:
-                self._storage.update_workstream_state(ws_id, state.value)
-            except Exception:
-                log.debug("session_mgr.state_update_failed ws=%s", ws_id[:8], exc_info=True)
+            # Terminal ERROR transitions flush sync — error-surfacing
+            # paths (dashboard, audit) must observe the row durably
+            # before any caller sees the state-change event. Non-
+            # terminal transitions buffer through state_writer so we
+            # don't hold ws._lock across a Postgres round-trip.
+            if self._state_writer is not None:
+                self._state_writer.record(
+                    ws_id,
+                    state.value,
+                    flush_now=(state is WorkstreamState.ERROR),
+                )
+            else:
+                try:
+                    self._storage.update_workstream_state(ws_id, state.value)
+                except Exception:
+                    log.debug("session_mgr.state_update_failed ws=%s", ws_id[:8], exc_info=True)
         self._adapter.emit_state(ws, state)
         if self._on_state_change is not None:
             with contextlib.suppress(Exception):
@@ -518,9 +542,13 @@ class SessionManager:
             self._adapter.cleanup_ui(ws)
             # Mirrors ``close``: set ``ws._closed`` inside ws._lock
             # before the storage write so any concurrent set_state sees
-            # the tombstone and skips its own write.
+            # the tombstone and skips its own write. ``state_writer.discard``
+            # drops any pending buffered transient + waits for any
+            # in-flight flush (bug-3 invariant).
             with ws._lock:
                 ws._closed = True
+                if self._state_writer is not None:
+                    self._state_writer.discard(ws.id)
                 try:
                     self._storage.update_workstream_state(ws.id, "closed")
                 except Exception:
