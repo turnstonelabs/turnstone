@@ -662,3 +662,120 @@ def test_create_uses_configured_node_id() -> None:
     mgr = SessionManager(FakeAdapter(), storage=storage, max_active=3, node_id="node-xyz")
     mgr.create(user_id="u1")
     assert storage.register_workstream.call_args.kwargs["node_id"] == "node-xyz"
+
+
+# ---------------------------------------------------------------------------
+# StateWriter integration — bug-3 invariant under write-behind
+# ---------------------------------------------------------------------------
+
+
+class TestSessionManagerWithStateWriter:
+    """When a buffered StateWriter is wired in, ``set_state`` no longer
+    blocks ``ws._lock`` on a sync DB write — but ``close`` must still
+    leave 'closed' as the durable final state for the row, never
+    a buffered transient that flushes after close."""
+
+    def _make_with_writer(
+        self, *, flush_interval: float = 0.05
+    ) -> tuple[SessionManager, FakeStorage, Any]:
+        from turnstone.core.state_writer import StateWriter
+
+        storage = FakeStorage()
+        writer = StateWriter(storage, flush_interval=flush_interval)
+        mgr = SessionManager(
+            FakeAdapter(),
+            storage=storage,
+            max_active=3,
+            state_writer=writer,
+        )
+        return mgr, storage, writer
+
+    def test_set_state_buffers_through_writer(self) -> None:
+        mgr, storage, writer = self._make_with_writer(flush_interval=60.0)
+        ws = mgr.create(user_id="u1")
+        # Initial register write may have landed; clear and inspect afterwards.
+        storage.state_updates.clear()
+
+        mgr.set_state(ws.id, WorkstreamState.RUNNING)
+        # Long flush_interval → buffered, no sync write yet.
+        assert storage.state_updates == []
+        # Drain the buffer manually (test stand-in for the periodic flush).
+        writer._flush_once()
+        assert (ws.id, "running") in storage.state_updates
+
+    def test_set_state_error_flushes_sync(self) -> None:
+        """Terminal ERROR transitions must be durable on return — error
+        surfacing paths (audit, dashboard) need the row to reflect
+        the failure before any observer sees it."""
+        mgr, storage, _writer = self._make_with_writer(flush_interval=60.0)
+        ws = mgr.create(user_id="u1")
+        storage.state_updates.clear()
+
+        mgr.set_state(ws.id, WorkstreamState.ERROR, error_msg="boom")
+        # No buffer-drain needed — error path bypasses.
+        assert (ws.id, "error") in storage.state_updates
+
+    def test_close_after_buffered_set_state_writes_closed_not_transient(self) -> None:
+        """The bug-3 invariant under write-behind. close() must call
+        state_writer.discard BEFORE its sync 'closed' write, so any
+        buffered 'running' state can't be flushed AFTER 'closed'.
+        """
+        mgr, storage, writer = self._make_with_writer(flush_interval=60.0)
+        ws = mgr.create(user_id="u1")
+        storage.state_updates.clear()
+
+        # Buffer a transient transition.
+        mgr.set_state(ws.id, WorkstreamState.RUNNING)
+        # Now close — must drain/discard the buffer + write 'closed' sync.
+        ok = mgr.close(ws.id)
+        assert ok is True
+        # Force a flush; the buffered 'running' must already be gone.
+        writer._flush_once()
+
+        # The final write for ws.id must be 'closed', and 'running' must
+        # NOT have landed in storage at all.
+        ws_writes = [s for w, s in storage.state_updates if w == ws.id]
+        assert "running" not in ws_writes, f"buffered running flushed after close: {ws_writes}"
+        assert ws_writes[-1] == "closed"
+
+    def test_close_idle_after_buffered_set_state_writes_closed(self) -> None:
+        """Same invariant via close_idle (the idle-cleanup batch path)."""
+        mgr, storage, writer = self._make_with_writer(flush_interval=60.0)
+        ws = mgr.create(user_id="u1")
+        storage.state_updates.clear()
+
+        mgr.set_state(ws.id, WorkstreamState.RUNNING)
+        # Force the workstream into IDLE state before close_idle considers
+        # it (close_idle gates on ws.state, not the buffered state).
+        with mgr._lock:
+            mgr._workstreams[ws.id].state = WorkstreamState.IDLE
+            mgr._workstreams[ws.id].last_active = 0.0  # ancient → stale
+
+        closed = mgr.close_idle(max_age_seconds=0)
+        assert ws.id in closed
+        writer._flush_once()
+        ws_writes = [s for w, s in storage.state_updates if w == ws.id]
+        assert "running" not in ws_writes, f"buffered running flushed after close_idle: {ws_writes}"
+        assert ws_writes[-1] == "closed"
+
+    def test_set_state_after_close_short_circuits(self) -> None:
+        """The existing tombstone (ws._closed) check must still fire
+        before reaching state_writer.record — set_state after close
+        must NOT enqueue 'running' to the buffer (which would then
+        get flushed and resurrect the closed row)."""
+        mgr, storage, writer = self._make_with_writer(flush_interval=60.0)
+        ws = mgr.create(user_id="u1")
+        ws_id = ws.id
+
+        # Close first — sets ws._closed=True synchronously.
+        mgr.close(ws_id)
+        storage.state_updates.clear()
+
+        # A late set_state call (e.g. from a worker still cleaning up).
+        # Should NOT buffer 'running' for this ws.
+        mgr.set_state(ws_id, WorkstreamState.RUNNING)
+        writer._flush_once()
+        ws_writes = [s for w, s in storage.state_updates if w == ws_id]
+        assert "running" not in ws_writes, (
+            f"set_state after close enqueued through buffer: {ws_writes}"
+        )
