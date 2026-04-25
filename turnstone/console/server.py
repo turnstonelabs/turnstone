@@ -3966,16 +3966,22 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                     ui_factory=_ui_factory,
                     session_factory=coord_factory,
                 )
+                from turnstone.core.state_writer import StateWriter
+
+                coord_state_writer = StateWriter(storage)
+                coord_state_writer.start()
                 coord_mgr = SessionManager(
                     coord_adapter,
                     storage=storage,
                     max_active=int(config_store.get("coordinator.max_active")),
                     node_id=ClusterCollector.CONSOLE_PSEUDO_NODE_ID,
+                    state_writer=coord_state_writer,
                 )
                 # Late-bind the manager onto the adapter so
                 # ``_rebuild_children_registry`` / ``send`` /
                 # fan-out dispatch can call ``mgr.get(ws_id)``.
                 coord_adapter.attach(coord_mgr)
+                app.state.coord_state_writer = coord_state_writer
                 # Shared refs so ConsoleCoordinatorUI.on_state_change
                 # flows state transitions through the unified manager
                 # and on_rename fans out to the cluster dashboard.
@@ -4019,6 +4025,12 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
             coord_adapter_shutdown.shutdown()
         except Exception:
             log.debug("console.coord_adapter_shutdown_failed", exc_info=True)
+    coord_state_writer_shutdown = getattr(app.state, "coord_state_writer", None)
+    if coord_state_writer_shutdown is not None:
+        try:
+            coord_state_writer_shutdown.shutdown()
+        except Exception:
+            log.debug("console.coord_state_writer_shutdown_failed", exc_info=True)
     # Drop the shared ConsoleCoordinatorUI refs on teardown so tests
     # that spin up multiple lifespan instances don't carry stale
     # manager/collector references across them.
