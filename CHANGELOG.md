@@ -66,6 +66,37 @@ Three release tracks are maintained:
   `openapi-{server,console}.json` reference specs ship with the
   unified path tree.
 
+- **Worker dispatch unified across interactive + coordinator**
+  ([Stage 2 Priority 1]). The atomic check-and-(spawn-or-queue)
+  decision for ``ChatSession.send`` now lives in
+  ``turnstone.core.session_worker.send`` and is shared by both
+  paths. Interactive ``/v1/api/send``, the coordinator adapter, the
+  watch-result dispatch, the rewind/retry path, and the
+  initial-message-on-create path all gate on
+  ``Workstream._worker_running`` (set/cleared atomically under
+  ``ws._lock``) instead of ``Thread.is_alive()`` — closes a race
+  where two senders could spawn parallel workers on the same
+  ChatSession. The HTTP response shapes for ``/send`` stay
+  per-kind (interactive carries attachments / queue priorities /
+  msg_ids, coord doesn't); body convergence at the HTTP layer is
+  out of scope until coord grows attachments parity.
+
+- **Workstream state writes are now buffered through ``StateWriter``.**
+  ``SessionManager.set_state`` no longer holds ``ws._lock`` across a
+  synchronous Postgres ``UPDATE`` for non-terminal transitions;
+  instead a ``StateWriter`` (constructed at app startup, started /
+  shutdown by the lifespan) coalesces transient transitions per
+  ws_id and flushes every ~1s. **Observable behavior change**:
+  transient state (``thinking`` / ``running`` / ``idle`` /
+  ``attention``) shows up in storage up to ~1s late; SSE consumers
+  see it immediately via the adapter's ``emit_state``. Terminal
+  ``ERROR`` transitions and ``close()`` write synchronously and
+  remain durable on return. The bug-3 invariant — a closed row
+  can't be resurrected by a buffered transient — is preserved by
+  ``close()`` calling ``state_writer.discard(ws_id)`` (drops
+  pending + waits for any in-flight flush) before its sync
+  ``state='closed'`` write.
+
 ## [1.4.0]
 
 User-visible additions: a full attachment system (images + text documents,
