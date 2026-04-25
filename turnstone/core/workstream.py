@@ -105,11 +105,13 @@ class Workstream:
     # racing ``set_state`` can detect the close before it overwrites
     # the persisted ``state='closed'`` row. Guarded by ``_lock``.
     _closed: bool = field(default=False, repr=False)
-    # True while a coordinator worker thread is actively running
-    # ``ChatSession.send``. Toggled under ``_lock`` by the adapter's
-    # ``_spawn_worker`` so concurrent ``send()`` calls can safely
-    # decide queue-vs-spawn without racing ``Thread.is_alive()``.
-    # Interactive workstreams ignore this field.
+    # True while a worker thread is actively running ``ChatSession.send``.
+    # Toggled under ``_lock`` by ``turnstone.core.session_worker.send``
+    # (and the few sites that spawn workers directly — see
+    # ``server.py``'s init-message + retry-after-rewind paths) so
+    # concurrent dispatches can safely decide queue-vs-spawn without
+    # racing ``Thread.is_alive()``. Used by both interactive and
+    # coordinator paths since Stage 2 P1.
     _worker_running: bool = field(default=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 

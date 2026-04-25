@@ -19,6 +19,7 @@ import queue
 import threading
 from typing import TYPE_CHECKING, Any
 
+from turnstone.core import session_worker
 from turnstone.core.adapters._ui_cleanup import cleanup_session_ui
 from turnstone.core.log import get_logger
 from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamState
@@ -218,7 +219,7 @@ class CoordinatorAdapter:
         )
 
     # ------------------------------------------------------------------
-    # Worker dispatch — send + _spawn_worker
+    # Worker dispatch — delegates to turnstone.core.session_worker
     # ------------------------------------------------------------------
 
     def send(self, ws_id: str, message: str) -> bool:
@@ -228,6 +229,12 @@ class CoordinatorAdapter:
         if the worker's pending-message queue is full (caller should
         surface 429 / backpressure). Priority is parsed from the message
         prefix (``/high``, ``/urgent``, etc.) by :meth:`ChatSession.queue_message`.
+
+        Worker spawn / reuse mechanics live in
+        :func:`turnstone.core.session_worker.send`; the closures below
+        carry coord-specific error surfacing (UI ``on_error`` +
+        ``on_state_change=error``) so the dashboard reflects the
+        failure instead of a bare ``error`` badge.
         """
         mgr = self._manager
         if mgr is None:
@@ -237,74 +244,28 @@ class CoordinatorAdapter:
         ws = mgr.get(ws_id)
         if ws is None or ws.session is None:
             return False
-        return self._spawn_worker(ws, message)
 
-    def _spawn_worker(self, ws: Workstream, message: str) -> bool:
-        """Start (or reuse) a worker thread that drives session.send.
-
-        Returns True on successful enqueue (existing worker) or thread
-        spawn (no live worker). Returns False when an existing worker's
-        queue is full — must NOT spawn a second concurrent worker on the
-        same ChatSession (mutates messages, queued_messages, streaming
-        state, LLM client cursors, approvals).
-
-        Queue-vs-spawn decided under ``ws._lock`` using the
-        ``_worker_running`` flag (set by ``_run`` before calling send,
-        cleared in the finally block). Using ``Thread.is_alive()`` as
-        the gate was racy: the worker could exit between the
-        ``is_alive()`` check and a ``queue_message`` call, stranding
-        the message with no consumer. The flag transitions atomically
-        inside the same lock ``_spawn_worker`` uses.
-        """
+        ws_ref = ws
         session = ws.session
-        if session is None:
-            return False
-        with ws._lock:
-            if ws._worker_running and hasattr(session, "queue_message"):
-                try:
-                    session.queue_message(message)
-                    return True
-                except queue.Full:
-                    # Queue is at capacity AND a worker is still
-                    # running. Spawning a second thread on the same
-                    # ChatSession would corrupt history / cursors /
-                    # approvals — return False so the caller surfaces
-                    # backpressure (HTTP 429).
-                    log.warning(
-                        "coord_adapter.queue_full ws=%s — message dropped (worker still busy)",
-                        ws.id[:8],
-                    )
-                    return False
-                except Exception:
-                    log.warning(
-                        "coord_adapter.queue_message_failed ws=%s",
-                        ws.id[:8],
-                        exc_info=True,
-                    )
-                    return False
-            # Mark before release so any concurrent _spawn_worker
-            # acquiring ws._lock next observes the running state and
-            # enqueues instead of spawning a second worker.
-            ws._worker_running = True
 
         def _run() -> None:
             try:
                 session.send(message)
             except Exception as exc:
-                log.exception("coord_adapter.worker_failed ws=%s", ws.id[:8])
+                log.exception("coord_adapter.worker_failed ws=%s", ws_ref.id[:8])
                 # Surface the failure to the coordinator's SSE stream
                 # so the operator sees what broke instead of a bare
                 # "error" badge — most common cause is a model-alias
                 # misconfig (wrong provider for the model) which the
                 # raw traceback narrows down quickly.
-                ui = ws.ui
+                ui = ws_ref.ui
                 if ui is not None and hasattr(ui, "on_error"):
                     try:
                         ui.on_error(f"{type(exc).__name__}: {exc}")
                     except Exception:
                         log.debug(
                             "coord_adapter.on_error_dispatch_failed ws=%s",
-                            ws.id[:8],
+                            ws_ref.id[:8],
                             exc_info=True,
                         )
                 # Also mark the workstream state=error so the cluster
@@ -315,21 +276,19 @@ class CoordinatorAdapter:
                     except Exception:
                         log.debug(
                             "coord_adapter.error_state_update_failed ws=%s",
-                            ws.id[:8],
+                            ws_ref.id[:8],
                             exc_info=True,
                         )
-            finally:
-                with ws._lock:
-                    ws._worker_running = False
 
-        t = threading.Thread(
-            target=_run,
-            name=f"coord-worker-{ws.id[:8]}",
-            daemon=True,
+        def _enqueue() -> None:
+            session.queue_message(message)
+
+        return session_worker.send(
+            ws,
+            enqueue=_enqueue,
+            run=_run,
+            thread_name=f"coord-worker-{ws.id[:8]}",
         )
-        ws.worker_thread = t
-        t.start()
-        return True
 
     # ------------------------------------------------------------------
     # Children registry
