@@ -67,6 +67,26 @@ def send(
         (logged). Falling through to spawn a second worker on a full
         queue would corrupt ChatSession state.
     """
+    name = thread_name or f"session-worker-{ws.id[:8]}"
+
+    def _runner() -> None:
+        try:
+            run()
+        except BaseException:
+            # Per-kind callers wrap their own try/except inside ``run``
+            # for typed surfacing (UI on_error, GenerationCancelled,
+            # reservation cleanup). This catch is defense-in-depth —
+            # ensures ``_worker_running`` is always cleared even if a
+            # caller forgets to handle a new exception class.
+            log.exception("session_worker.uncaught ws=%s", ws.id[:8])
+        finally:
+            with ws._lock:
+                ws._worker_running = False
+
+    # Construct the Thread before acquiring the lock — Thread() is
+    # cheap and pure-Python, and we want the lock window narrow.
+    t = threading.Thread(target=_runner, name=name, daemon=True)
+
     with ws._lock:
         if ws._worker_running:
             try:
@@ -89,28 +109,17 @@ def send(
                     exc_info=True,
                 )
                 return False
-        # Mark before releasing the lock so a concurrent caller observes
-        # the running state and takes the enqueue path instead of
-        # spawning a parallel worker.
+        # Set ``_worker_running`` AND assign ``ws.worker_thread`` under
+        # the same lock acquisition — readers gating on either flag see
+        # a coherent (worker_thread, _worker_running) pair. Without
+        # this, a reader could observe ``_worker_running=True`` while
+        # ``ws.worker_thread`` still points at the previous (already-
+        # exited) thread, breaking every ``ws.worker_thread is me``
+        # identity check downstream.
         ws._worker_running = True
-
-    name = thread_name or f"session-worker-{ws.id[:8]}"
-
-    def _runner() -> None:
-        try:
-            run()
-        except BaseException:
-            # Per-kind callers wrap their own try/except inside ``run``
-            # for typed surfacing (UI on_error, GenerationCancelled,
-            # reservation cleanup). This catch is defense-in-depth —
-            # ensures ``_worker_running`` is always cleared even if a
-            # caller forgets to handle a new exception class.
-            log.exception("session_worker.uncaught ws=%s", ws.id[:8])
-        finally:
-            with ws._lock:
-                ws._worker_running = False
-
-    t = threading.Thread(target=_runner, name=name, daemon=True)
-    ws.worker_thread = t
+        ws.worker_thread = t
+    # ``t.start()`` may run user code (worker body) before returning;
+    # keep it outside the lock to avoid pinning ``ws._lock`` for the
+    # full thread-creation cost.
     t.start()
     return True

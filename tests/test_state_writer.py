@@ -47,7 +47,7 @@ class _FakeStorage:
 
 def _drain(writer: StateWriter) -> None:
     """Trigger a single flush synchronously."""
-    writer._flush_once()
+    writer.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +92,77 @@ def test_flush_now_swallows_storage_error() -> None:
     # Should not raise — set_state path can't recover from a storage
     # write failure mid-transition.
     writer.record("ws-1", "error", flush_now=True)
+
+
+def test_flush_now_drops_pending_buffered_state_for_same_ws_id() -> None:
+    """Terminal-bypass invariant: a buffered transient for the same
+    ws_id must NOT flush AFTER the sync ``flush_now`` write and
+    clobber the terminal state. (This was a real correctness gap
+    flagged by /review.)"""
+    storage = _FakeStorage()
+    writer = StateWriter(storage)
+
+    # Buffer a transient transition first.
+    writer.record("ws-A", "running")
+
+    # Sync ERROR write must drop the buffered 'running' AND wait on
+    # the flush_lock so any in-flight flush can't sneak through after.
+    writer.record("ws-A", "error", flush_now=True)
+
+    # Run the flusher; nothing pending for ws-A any more.
+    writer.flush()
+
+    ws_writes = [s for w, s in storage.calls if w == "ws-A"]
+    # The sync 'error' must be in storage, and 'running' must NOT have
+    # been flushed AFTER it.
+    assert "error" in ws_writes, ws_writes
+    assert ws_writes[-1] == "error", f"buffered 'running' clobbered terminal 'error': {ws_writes}"
+    # Stronger: the 'running' should never have landed at all.
+    assert "running" not in ws_writes, ws_writes
+
+
+def test_flush_now_waits_for_in_flight_flush_to_complete() -> None:
+    """Same shape as the discard wait: if a flusher is mid-write on
+    the same ws_id, ``flush_now`` must NOT issue its sync write
+    until the flusher finishes — otherwise the order on the wire is
+    flush_now → flusher's late write → final state is the transient,
+    not the terminal."""
+    storage = _FakeStorage()
+    storage.write_gate = threading.Event()
+    writer = StateWriter(storage)
+
+    writer.record("ws-A", "running")
+
+    flush_done = threading.Event()
+
+    def _flush_in_bg() -> None:
+        writer.flush()
+        flush_done.set()
+
+    flusher = threading.Thread(target=_flush_in_bg, daemon=True)
+    flusher.start()
+    assert storage.write_started.wait(timeout=1.0)
+
+    flush_now_done = threading.Event()
+
+    def _flush_now_in_bg() -> None:
+        writer.record("ws-A", "error", flush_now=True)
+        flush_now_done.set()
+
+    fn_thread = threading.Thread(target=_flush_now_in_bg, daemon=True)
+    fn_thread.start()
+    time.sleep(0.05)
+    assert flush_now_done.is_set() is False, (
+        "flush_now returned before in-flight flush released flush_lock"
+    )
+
+    storage.write_gate.set()
+    flusher.join(timeout=2.0)
+    fn_thread.join(timeout=2.0)
+    assert flush_done.is_set() and flush_now_done.is_set()
+    # The flusher's 'running' lands first, then flush_now's 'error'.
+    ws_writes = [s for w, s in storage.calls if w == "ws-A"]
+    assert ws_writes == ["running", "error"], ws_writes
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +333,32 @@ def test_start_is_idempotent() -> None:
     writer.start()
     assert writer._thread is first_thread
     writer.shutdown(timeout=2.0)
+
+
+def test_discard_times_out_when_flush_hangs() -> None:
+    """If the flusher is wedged on a stuck Postgres connection, discard
+    must NOT block forever — callers hold ws._lock across this call,
+    so an unbounded wait would deadlock all close paths system-wide."""
+    storage = _FakeStorage()
+    storage.write_gate = threading.Event()  # never released
+    writer = StateWriter(storage)
+
+    writer.record("ws-A", "running")
+
+    # Pin the flusher inside update_workstream_state.
+    flusher = threading.Thread(target=writer.flush, daemon=True)
+    flusher.start()
+    assert storage.write_started.wait(timeout=1.0)
+
+    # discard must return within ~timeout, NOT hang forever.
+    start = time.monotonic()
+    writer.discard("ws-A", flush_lock_timeout=0.1)
+    elapsed = time.monotonic() - start
+    assert elapsed < 1.0, f"discard hung: {elapsed:.2f}s"
+
+    # Cleanup.
+    storage.write_gate.set()
+    flusher.join(timeout=2.0)
 
 
 def test_shutdown_is_idempotent() -> None:

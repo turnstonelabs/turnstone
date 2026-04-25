@@ -18,9 +18,9 @@ module replaces that with a write-behind buffer:
   pending state is evicted on insertion of a new ws_id. All entries
   are non-terminal (terminals bypass), so eviction is safe.
 
-The bug-3 invariant the close path must keep holding (a closed ws
-row can't be resurrected by a buffered transient state writing
-"running" after close's sync "closed" write):
+**Close-vs-buffered-transient invariant**. A closed ws row must never
+be resurrected by a late-flushing buffered transient writing 'running'
+AFTER ``close()``'s sync 'closed' write. The flow that preserves it:
 
 1. ``close()`` acquires ``ws._lock`` and sets ``ws._closed = True``.
 2. ``close()`` calls :meth:`StateWriter.discard` to drop any pending
@@ -31,6 +31,12 @@ row can't be resurrected by a buffered transient state writing
 4. Any later ``set_state`` for this ws_id sees ``ws._closed=True``
    under ``ws._lock`` and short-circuits — never reaches
    :meth:`StateWriter.record`.
+
+**Terminal-bypass invariant**. The same hazard exists for the
+``flush_now=True`` path: an earlier buffered 'running' for the same
+ws_id could flush AFTER the sync 'error' write and clobber it. Same
+fix — ``record(flush_now=True)`` discards any pending entry and waits
+on the flush_lock before the sync write.
 """
 
 from __future__ import annotations
@@ -91,10 +97,21 @@ class StateWriter:
         before any observer sees the state. Errors are logged and
         swallowed to match the prior ``set_state`` behaviour (which
         wrapped its DB call in a try/except for the same reason).
+
+        The terminal-bypass invariant requires the same
+        drop-pending + wait-for-in-flight-flush dance that
+        :meth:`discard` performs: an earlier buffered 'running' for
+        the same ws_id must not flush AFTER the sync write and
+        clobber the terminal state. We pop under ``self._lock`` and
+        wait on ``self._flush_lock`` before the sync UPDATE so the
+        terminal state is the final write for this ws_id.
         """
         if flush_now:
+            with self._lock:
+                self._buffer.pop(ws_id, None)
             try:
-                self._storage.update_workstream_state(ws_id, state)
+                with self._flush_lock:
+                    self._storage.update_workstream_state(ws_id, state)
             except Exception as exc:
                 log.debug(
                     "state_writer.flush_now_failed ws=%s",
@@ -121,7 +138,7 @@ class StateWriter:
         # snapshots the buffer atomically.
         self._wake.set()
 
-    def discard(self, ws_id: str) -> None:
+    def discard(self, ws_id: str, *, flush_lock_timeout: float = 5.0) -> None:
         """Drop any pending buffered state for ``ws_id`` and wait for any
         in-progress flush to complete.
 
@@ -130,6 +147,16 @@ class StateWriter:
         ``state='closed'`` write. After this returns, no buffered or
         in-flight write for ``ws_id`` can land in storage AFTER the
         caller's sync ``closed`` write.
+
+        ``flush_lock_timeout`` bounds the wait on the in-flight flush.
+        Without a timeout a stuck Postgres connection (network
+        partition, table-lock contention) would block the discard
+        forever — and because callers hold ``ws._lock`` across this
+        call, that means a system-wide hang on every close path.
+        Defaults to 5s. On timeout we proceed and log; the worst
+        outcome is "buffered transient flushes shortly after the
+        sync 'closed' write" — eventual consistency degrades but the
+        process keeps moving.
         """
         with self._lock:
             self._buffer.pop(ws_id, None)
@@ -137,8 +164,16 @@ class StateWriter:
         # The flusher snapshots the buffer under self._lock then writes
         # under self._flush_lock, so any write of ``ws_id`` already
         # in-flight will complete before this returns.
-        with self._flush_lock:
+        if not self._flush_lock.acquire(timeout=flush_lock_timeout):
+            log.warning(
+                "state_writer.discard_flush_lock_timeout ws=%s — proceeding without wait",
+                ws_id[:8],
+            )
+            return
+        try:
             pass
+        finally:
+            self._flush_lock.release()
 
     def start(self) -> None:
         """Start the background flusher thread. Idempotent."""
@@ -166,6 +201,16 @@ class StateWriter:
             self._thread = None
         # Final synchronous drain. The flusher may have exited mid-loop
         # without picking up the last record(s); make sure they land.
+        self.flush()
+
+    def flush(self) -> None:
+        """Synchronously drain one batch of buffered state writes.
+
+        Public wrapper over the internal flush step so callers and
+        tests don't reach into ``_flush_once``. The flusher loop and
+        :meth:`shutdown` use it; tests use it as a deterministic
+        drain instead of waiting on ``flush_interval``.
+        """
         self._flush_once()
 
     # ------------------------------------------------------------------

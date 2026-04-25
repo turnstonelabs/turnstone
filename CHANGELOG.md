@@ -76,10 +76,14 @@ Three release tracks are maintained:
   ``Workstream._worker_running`` (set/cleared atomically under
   ``ws._lock``) instead of ``Thread.is_alive()`` — closes a race
   where two senders could spawn parallel workers on the same
-  ChatSession. The HTTP response shapes for ``/send`` stay
-  per-kind (interactive carries attachments / queue priorities /
-  msg_ids, coord doesn't); body convergence at the HTTP layer is
-  out of scope until coord grows attachments parity.
+  ChatSession.
+
+  The ``/send`` HTTP body itself stays per-kind in this PR.
+  Verb-shape convergence (one shared factory body with capability
+  flags for attachments / queue priorities / metric increments) is
+  tracked as P1.5 and MUST land before 1.5.0 stable — letting the
+  fork ship into the stable line bakes the duplication in for the
+  lifetime of the 1.5 track.
 
 - **Workstream state writes are now buffered through ``StateWriter``.**
   ``SessionManager.set_state`` no longer holds ``ws._lock`` across a

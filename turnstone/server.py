@@ -1911,9 +1911,14 @@ async def command(request: Request) -> JSONResponse:
             if err:
                 ui.on_error("Permission denied: conversation.modify required")
                 return err
-            # Prevent rewind/retry while a generation is in progress
+            # Prevent rewind/retry while a generation is in progress.
+            # Gate on ``_worker_running`` (not ``worker_thread.is_alive()``)
+            # for parity with session_worker.send: spawn paths set the
+            # flag before assigning ws.worker_thread, so a reader using
+            # the old gate could see a stale dead thread while a new
+            # worker is in the middle of starting.
             with ws._lock:
-                if ws.worker_thread and ws.worker_thread.is_alive():
+                if ws._worker_running:
                     ui._enqueue(
                         {
                             "type": "busy_error",
@@ -1977,9 +1982,12 @@ async def command(request: Request) -> JSONResponse:
                         with ws._lock:
                             ws._worker_running = False
 
-                # Gate on ``_worker_running`` for parity with the shared
-                # session_worker dispatcher — avoids racing a /v1/api/send
-                # spawn with the retry spawn into two parallel workers.
+                # Inlined rather than via ``session_worker.send`` because
+                # retry-when-busy is a hard reject (UI error, no fallback
+                # queue) — the shared dispatcher's enqueue/spawn shape
+                # doesn't fit. We gate on ``_worker_running`` for parity
+                # with that dispatcher so the two paths can't race into
+                # parallel workers on the same ChatSession.
                 with ws._lock:
                     if ws._worker_running:
                         ui.on_error("Cannot retry: workstream is busy")
@@ -2698,10 +2706,14 @@ async def create_workstream(request: Request) -> JSONResponse:
                     with ws._lock:
                         ws._worker_running = False
 
-            # Mark the worker live under ws._lock so a /v1/api/send
-            # arriving immediately after creation observes the running
-            # state via the shared session_worker gate instead of
-            # racing into a parallel worker.
+            # Inlined rather than via ``session_worker.send`` because
+            # at workstream creation no live worker can exist by
+            # construction — the enqueue branch of the shared dispatch
+            # is dead code here. We still set ``_worker_running`` and
+            # ``ws.worker_thread`` together under ``ws._lock`` so a
+            # /v1/api/send arriving immediately after creation observes
+            # the running state via the shared session_worker gate
+            # instead of racing into a parallel worker.
             with ws._lock:
                 ws._worker_running = True
                 t = threading.Thread(target=_run_initial, daemon=True, name=f"ws-init-{ws.id[:8]}")
