@@ -700,7 +700,7 @@ class TestSessionManagerWithStateWriter:
         # Long flush_interval → buffered, no sync write yet.
         assert storage.state_updates == []
         # Drain the buffer manually (test stand-in for the periodic flush).
-        writer._flush_once()
+        writer.flush()
         assert (ws.id, "running") in storage.state_updates
 
     def test_set_state_error_flushes_sync(self) -> None:
@@ -730,7 +730,7 @@ class TestSessionManagerWithStateWriter:
         ok = mgr.close(ws.id)
         assert ok is True
         # Force a flush; the buffered 'running' must already be gone.
-        writer._flush_once()
+        writer.flush()
 
         # The final write for ws.id must be 'closed', and 'running' must
         # NOT have landed in storage at all.
@@ -753,7 +753,7 @@ class TestSessionManagerWithStateWriter:
 
         closed = mgr.close_idle(max_age_seconds=0)
         assert ws.id in closed
-        writer._flush_once()
+        writer.flush()
         ws_writes = [s for w, s in storage.state_updates if w == ws.id]
         assert "running" not in ws_writes, f"buffered running flushed after close_idle: {ws_writes}"
         assert ws_writes[-1] == "closed"
@@ -774,7 +774,7 @@ class TestSessionManagerWithStateWriter:
         # A late set_state call (e.g. from a worker still cleaning up).
         # Should NOT buffer 'running' for this ws.
         mgr.set_state(ws_id, WorkstreamState.RUNNING)
-        writer._flush_once()
+        writer.flush()
         ws_writes = [s for w, s in storage.state_updates if w == ws_id]
         assert "running" not in ws_writes, (
             f"set_state after close enqueued through buffer: {ws_writes}"

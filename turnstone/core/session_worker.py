@@ -72,20 +72,20 @@ def send(
     def _runner() -> None:
         try:
             run()
-        except BaseException:
+        except Exception:
             # Per-kind callers wrap their own try/except inside ``run``
             # for typed surfacing (UI on_error, GenerationCancelled,
             # reservation cleanup). This catch is defense-in-depth —
             # ensures ``_worker_running`` is always cleared even if a
-            # caller forgets to handle a new exception class.
+            # caller forgets to handle a new exception class. Daemon
+            # threads don't receive SystemExit/KeyboardInterrupt, so
+            # ``Exception`` is sufficient — no need to widen to
+            # ``BaseException`` (and accidentally catch generator-
+            # close style signals if the runtime ever delivers them).
             log.exception("session_worker.uncaught ws=%s", ws.id[:8])
         finally:
             with ws._lock:
                 ws._worker_running = False
-
-    # Construct the Thread before acquiring the lock — Thread() is
-    # cheap and pure-Python, and we want the lock window narrow.
-    t = threading.Thread(target=_runner, name=name, daemon=True)
 
     with ws._lock:
         if ws._worker_running:
@@ -116,7 +116,14 @@ def send(
         # ``ws.worker_thread`` still points at the previous (already-
         # exited) thread, breaking every ``ws.worker_thread is me``
         # identity check downstream.
+        #
+        # Thread() construction stays inside the lock so we don't
+        # allocate one on the enqueue path (a hot path for busy
+        # workstreams). The constructor is microsecond-cheap, so the
+        # lock-window cost is dominated by the spawn branch's identity
+        # write either way.
         ws._worker_running = True
+        t = threading.Thread(target=_runner, name=name, daemon=True)
         ws.worker_thread = t
     # ``t.start()`` may run user code (worker body) before returning;
     # keep it outside the lock to avoid pinning ``ws._lock`` for the

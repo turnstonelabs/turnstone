@@ -258,7 +258,7 @@ def test_discard_waits_for_in_flight_flush_to_complete() -> None:
     flush_done = threading.Event()
 
     def _flush_in_bg() -> None:
-        writer._flush_once()
+        writer.flush()
         flush_done.set()
 
     flusher = threading.Thread(target=_flush_in_bg, daemon=True)

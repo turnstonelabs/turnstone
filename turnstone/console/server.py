@@ -4028,7 +4028,9 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     coord_state_writer_shutdown = getattr(app.state, "coord_state_writer", None)
     if coord_state_writer_shutdown is not None:
         try:
-            coord_state_writer_shutdown.shutdown()
+            # shutdown() joins a daemon thread + runs sync DB writes;
+            # offload to keep the console lifespan event loop moving.
+            await asyncio.to_thread(coord_state_writer_shutdown.shutdown)
         except Exception:
             log.debug("console.coord_state_writer_shutdown_failed", exc_info=True)
     # Drop the shared ConsoleCoordinatorUI refs on teardown so tests

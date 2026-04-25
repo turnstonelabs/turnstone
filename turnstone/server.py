@@ -4344,10 +4344,13 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         await tls_client.stop_renewal()
     if app.state.watch_runner:
         app.state.watch_runner.stop()
-    # Drain + stop the buffered state-writer
+    # Drain + stop the buffered state-writer. shutdown() joins a
+    # daemon thread and runs synchronous DB writes; offload to a
+    # worker thread so we don't block the lifespan event loop and
+    # delay other teardown tasks.
     state_writer = getattr(app.state, "state_writer", None)
     if state_writer is not None:
-        state_writer.shutdown()
+        await asyncio.to_thread(state_writer.shutdown)
     # Stop the orphan-reservation sweep loop
     _orphan_sweep_stop.set()
     with contextlib.suppress(asyncio.CancelledError, Exception):
