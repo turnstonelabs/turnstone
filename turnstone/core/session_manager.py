@@ -284,6 +284,7 @@ class SessionManager:
         model: str | None = None,
         client_type: str = "",
         parent_ws_id: str | None = None,
+        defer_emit_created: bool = False,
         **extra_session_kwargs: Any,
     ) -> Workstream:
         """Construct a new workstream, persist, and register.
@@ -298,6 +299,26 @@ class SessionManager:
         Raises ``RuntimeError`` when the manager is at capacity with
         no idle workstream to evict — callers (HTTP handlers) translate
         this to 429.
+
+        ``defer_emit_created``: when ``True``, the ``emit_created`` call
+        on the configured event emitter is skipped. The caller takes
+        ownership of advertising the new workstream — typically by
+        calling :meth:`commit_create` after running additional
+        post-create work that might roll the create back (e.g. the
+        Stage 2 ``create`` HTTP handler runs uploaded-attachment
+        validation post-create and rolls the workstream back via
+        :meth:`discard` on validation failure; deferring the emit
+        means a rolled-back create produces no phantom create→close
+        pair on the cluster events stream).
+
+        Default ``False`` preserves the legacy "advertise immediately"
+        contract for direct callers (test fixtures, the CLI REPL,
+        anything that doesn't have a post-create gate).
+
+        Caller-bug if ``defer_emit_created=True`` is set but neither
+        :meth:`commit_create` nor :meth:`discard` is ever called: the
+        slot is held forever (capacity leak). The HTTP handler bracket
+        runs both terminations within a single request lifecycle.
         """
         ws_id = ws_id or uuid.uuid4().hex
         effective_name = name or f"ws-{ws_id[:4]}"
@@ -350,9 +371,110 @@ class SessionManager:
                 self._remove_locked(ws_id)
             raise
 
+        if not defer_emit_created:
+            # Mark fired BEFORE the actual emit so a concurrent
+            # ``discard`` can't observe ``False`` after the event
+            # already fanned out. The flag is observational (powers
+            # the discard warning); strict ordering relative to the
+            # event isn't load-bearing for fan-out correctness.
+            ws._emit_created_fired = True
+            if self._event_emitter is not None:
+                self._event_emitter.emit_created(ws)
+        return ws
+
+    def commit_create(self, ws: Workstream) -> None:
+        """Fire the deferred ``emit_created`` event for ``ws``.
+
+        Pairs with :meth:`create` called with
+        ``defer_emit_created=True``. The caller is responsible for
+        invoking ``commit_create`` exactly once per deferred ``create``,
+        before any state-change events flow (so subscribers see the
+        ``ws_created`` event before the first ``ws_state``). On the
+        rollback branch the caller invokes :meth:`discard` instead.
+
+        Idempotent against a missing emitter — when ``event_emitter`` is
+        ``None`` (test fixtures, future kinds without an emitter wired)
+        the lifecycle event is skipped but ``ws._emit_created_fired``
+        is still set so a subsequent :meth:`discard` correctly
+        identifies the workstream as committed (the warning path
+        treats "committed" as a contract assertion, not as "actually
+        broadcast somewhere").
+        """
+        # See the matching comment in ``create`` re: ordering. Flag
+        # set before the emit so a racing discard sees True even if
+        # it observes us mid-fanout.
+        ws._emit_created_fired = True
         if self._event_emitter is not None:
             self._event_emitter.emit_created(ws)
-        return ws
+
+    def discard(self, ws_id: str) -> bool:
+        """Release a workstream's in-memory slot WITHOUT firing ``emit_closed``.
+
+        Use after :meth:`create` was called with
+        ``defer_emit_created=True`` and a post-create check determined
+        the workstream should not be advertised at all. Callers that
+        also want to remove the persisted storage row should call
+        ``turnstone.core.memory.delete_workstream(ws_id)`` separately
+        — :meth:`discard` only owns the in-memory side, mirroring the
+        split between ``mgr.create``'s slot reservation and
+        ``self._storage.register_workstream``'s row write.
+
+        Distinct from :meth:`close`:
+
+        - ``close`` advertises the transition (``emit_closed``) and
+          writes ``state='closed'`` to storage so the workstream is
+          re-openable later.
+        - ``discard`` does neither — the workstream's existence was
+          never advertised (caller deferred ``emit_created``) so there
+          is no transition to advertise, and the row should be
+          deleted (not soft-closed) since the create is being
+          unwound.
+
+        Returns ``True`` when a workstream was removed, ``False`` if
+        the id wasn't tracked. The method is safe to call from the
+        HTTP handler's rollback path under
+        ``contextlib.suppress(Exception)`` even if ``cleanup_ui``
+        raises — the in-memory slot release runs first under the
+        lock, so capacity is freed before any UI-cleanup error
+        surfaces.
+
+        Logs a ``warning`` when the workstream's
+        ``_emit_created_fired`` flag is set — that means the
+        workstream was already advertised to lifecycle subscribers
+        (either created without ``defer_emit_created`` or committed
+        via :meth:`commit_create`), and discarding now leaves a stale
+        ``ws_created`` on the wire with no matching ``ws_closed``.
+        Discard still completes (returns ``True``) so the slot is
+        freed, but the warning surfaces the caller-bug for triage.
+        Use :meth:`close` instead when the workstream's lifecycle
+        was advertised and now needs to be retracted.
+        """
+        with self._lock:
+            ws = self._workstreams.pop(ws_id, None)
+            if ws is None:
+                return False
+            if ws_id in self._order:
+                self._order.remove(ws_id)
+            if self._active_id == ws_id:
+                self._active_id = self._order[0] if self._order else None
+        if ws._emit_created_fired:
+            # Caller-bug path: the workstream was already advertised
+            # via ``emit_created`` — a clean rollback would need
+            # ``close`` (which fires ``emit_closed``) to retract the
+            # advertisement, not ``discard``. Surface the misuse so
+            # operators / future contributors can find the call site
+            # via the log line; we still complete the in-memory
+            # release so the slot is freed.
+            log.warning(
+                "session_mgr.discard.after_emit_created ws=%s",
+                ws_id[:8] if ws_id else "",
+            )
+        # cleanup_ui runs OUTSIDE the manager lock to match
+        # ``close``'s ordering — UI cleanup may join worker threads
+        # or do other potentially-blocking work that must not hold
+        # the slot-accounting mutex.
+        self._adapter.cleanup_ui(ws)
+        return True
 
     # ------------------------------------------------------------------
     # open — lazy rehydrate for a persisted workstream

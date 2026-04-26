@@ -17,6 +17,47 @@ Three release tracks are maintained:
 
 ### Changed
 
+- **`SessionManager.create` gains a deferred-emit option; lifted
+  ``create`` HTTP handler eliminates the phantom create→close
+  pair on coord rollback.** ``SessionManager.create`` now accepts
+  ``defer_emit_created: bool = False`` (default preserves the
+  legacy "advertise immediately" contract for direct callers); two
+  new methods complete the deferred-create bracket:
+  - ``SessionManager.commit_create(ws)`` fires the deferred
+    ``emit_created`` event after the caller's post-create work
+    confirms the workstream should be advertised.
+  - ``SessionManager.discard(ws_id)`` releases the in-memory slot
+    + cleans up the UI WITHOUT firing ``emit_closed`` — the
+    workstream's existence was never advertised, so there's
+    nothing to advertise on rollback. Storage-row deletion stays
+    a separate concern (caller invokes ``delete_workstream`` for
+    a complete rollback), mirroring ``mgr.create``'s split between
+    slot reservation and ``register_workstream``. Logs a
+    ``warning`` (``session_mgr.discard.after_emit_created``) when
+    invoked on a workstream that's already been advertised
+    (non-deferred create or post-``commit_create``); the slot is
+    still released so capacity isn't stranded, but the warning
+    surfaces the caller-bug case where ``close`` would have been
+    the right call.
+
+  The lifted ``make_create_handler`` now uses this bracket: pass
+  ``defer_emit_created=True``, validate uploaded attachments, then
+  ``mgr.commit_create(ws)`` on success / ``mgr.discard(ws.id)`` on
+  failure. Pre-fix, coord's ``mgr.create`` fired ``emit_created``
+  synchronously — a rollback then called ``mgr.close`` which
+  fired ``emit_closed``, surfacing a quick create→close pair on
+  the cluster events stream that the collector's diff-reconcile
+  had to handle. Post-fix, a rejected upload produces zero
+  events. Interactive's ``emit_created`` is a documented no-op
+  stub so the deferral is observably a no-op there; the
+  ``ws_created`` broadcast on the global SSE queue continues to
+  fire from the kind's post_install callback after attachment
+  validation passes (unchanged).
+
+  Direct callers of ``mgr.create`` (test fixtures, the CLI REPL,
+  channel adapters) keep the default ``defer_emit_created=False``
+  and see no behaviour change.
+
 - **Coordinator HTTP surface unified under `/v1/api/workstreams/`**
   ([Stage 2 Priority 0]). The experimental `/v1/api/coordinator/*`
   URL tree from 1.5.0aN is removed; coord verbs now mount at the

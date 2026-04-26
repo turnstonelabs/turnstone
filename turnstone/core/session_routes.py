@@ -1421,10 +1421,12 @@ def make_create_handler(
 ) -> Handler:
     """Lifted body for ``POST {prefix}/new`` — workstream creation.
 
-    Both kinds share the create sequence (parse body → resolve uid →
-    resolve skill → kind-specific validate → ``mgr.create`` → save
-    attachments → audit → kind-specific post-install → respond).
-    Per-kind divergence captured by the cfg + ``audit_emit``:
+    Both kinds share the create sequence (parse body → resolve uid
+    → kind-specific validate → resolve skill → ``mgr.create`` (with
+    ``defer_emit_created=True``) → save attachments → ``mgr.discard``
+    on validation failure / ``mgr.commit_create`` on success → audit
+    → kind-specific post-install → respond). Per-kind divergence
+    captured by the cfg + ``audit_emit``:
 
     - ``cfg.create_supports_attachments`` — when ``True``, the body
       may arrive as ``multipart/form-data`` with a ``meta`` JSON
@@ -1447,6 +1449,22 @@ def make_create_handler(
     - ``audit_emit`` — ``workstream.created`` on interactive,
       ``coordinator.create`` on coord.
 
+    Ordering invariants (load-bearing — easy to break in a refactor):
+
+    1. ``mgr.create(defer_emit_created=True)`` runs FIRST so the
+       slot + storage row + session exist before any post-create
+       work touches them.
+    2. Attachment validation runs BEFORE ``commit_create`` so a
+       rejected upload produces zero lifecycle events. Failure path
+       is ``mgr.discard`` + ``delete_workstream``; success path
+       falls through.
+    3. ``mgr.commit_create(ws)`` runs BEFORE ``audit_emit`` and
+       ``post_install`` so any state-change events ``post_install``
+       triggers (e.g. a worker dispatched on ``initial_message``)
+       reach the cluster collector for an already-known ws_id.
+       Reordering this commit after the worker dispatch puts
+       ``emit_state`` on the wire ahead of ``emit_created``.
+
     Behavior changes vs the pre-lift handlers (documented in
     CHANGELOG, mostly coord-up-to-interactive parity gains):
 
@@ -1454,12 +1472,25 @@ def make_create_handler(
       ``coordinator_create`` accepted JSON only and ignored uploads;
       the lifted body parses multipart bodies on coord and saves
       attachments through the kind-agnostic storage layer (§ Post-P3
-      reckoning item #1). Coord's initial_message dispatch does NOT
-      yet reserve those attachments onto the first turn (coord
-      adapter's ``send`` doesn't take attachments) — the rows save
-      as pending and the first ``/send`` picks them up via the
-      standard send-with-attachments path. Initial-message + create-
-      time attachments coordination is a follow-up.
+      reckoning item #1). When the same request supplies an
+      ``initial_message``, the uploads are reserved onto the
+      dispatched first turn via ``CoordinatorAdapter.send`` (which
+      gained ``attachments`` + ``send_id`` kwargs in the same
+      release).
+    - **No phantom create→close pair on coord rollback.** The lifted
+      body now passes ``defer_emit_created=True`` to ``mgr.create``
+      and explicitly fires ``mgr.commit_create(ws)`` only after
+      attachment validation passes. On failure ``mgr.discard(ws.id)``
+      releases the slot WITHOUT firing ``emit_closed`` (because the
+      create was never advertised). Pre-fix, coord's ``mgr.create``
+      fired ``emit_created`` synchronously and a rollback then
+      called ``mgr.close``, surfacing a quick create→close pair on
+      the cluster events stream that consumers had to reconcile via
+      the collector's diff path. Post-fix, a rejected upload
+      produces zero events. Interactive's ``emit_created`` is a
+      documented no-op stub so the deferral is observably a no-op
+      there; the ``ws_created`` broadcast on the global SSE queue
+      continues to fire from the kind's post_install callback.
     - **Coord gains the disabled-skill rejection.** Pre-lift
       ``coordinator_create`` silently allowed disabled skills to
       flow through to ``mgr.create``; the lifted body returns 400
@@ -1691,7 +1722,9 @@ def make_create_handler(
             kwargs = cfg.create_build_kwargs(
                 request, body, uid, skill_data, skill_id_resolved, applied_skill_version
             )
-            ws = await asyncio.to_thread(mgr.create, **kwargs)
+            # Deferred emit — committed below post-attachment-
+            # validation. See handler docstring's Ordering invariants.
+            ws = await asyncio.to_thread(mgr.create, defer_emit_created=True, **kwargs)
         except RuntimeError as exc:
             # ``SessionManager.create`` documents RuntimeError as
             # "manager at capacity" — translate to 429 (rate-limit /
@@ -1727,18 +1760,10 @@ def make_create_handler(
             )
 
         # --- Attachment validation + save + rollback --------------------
-        # Interactive's pre-lift pattern: validate post-create so
-        # ``ws_id`` is bound (the storage layer scopes attachments by
-        # ws_id). On any failure, mgr.close + delete_workstream the
-        # workstream so the caller doesn't see a half-built phantom.
-        # On coord this is a brand-new path — pre-lift coord_create
-        # had no attachments support. Note: coord's mgr.create already
-        # fired ``emit_created`` (cluster collector fan-out) by this
-        # point, so a rollback here produces a phantom create→close
-        # pair on the cluster events stream. Cluster consumers handle
-        # this gracefully (same shape as any quick-create-close), and
-        # the alternative (decoupling emit_created from mgr.create)
-        # is a bigger refactor that doesn't belong in the verb lift.
+        # Validate post-create so ``ws_id`` is bound. Rollback uses
+        # ``mgr.discard`` (no ``emit_closed`` because the create was
+        # deferred) + ``delete_workstream`` for the storage row. See
+        # handler docstring's Ordering invariants for the rationale.
         attachment_ids: list[str] = []
         if uploaded_files:
             saved_ids, save_err = await asyncio.to_thread(
@@ -1748,11 +1773,16 @@ def make_create_handler(
                 from turnstone.core.memory import delete_workstream as _delete_ws
 
                 with contextlib.suppress(Exception):
-                    await asyncio.to_thread(mgr.close, ws.id)
+                    await asyncio.to_thread(mgr.discard, ws.id)
                 with contextlib.suppress(Exception):
                     await asyncio.to_thread(_delete_ws, ws.id)
                 return save_err
             attachment_ids = saved_ids
+
+        # --- Commit the deferred emit_created ----------------------------
+        # Synchronous: in-memory non-blocking work on every kind
+        # (interactive: no-op stub; coord: dict + ``queue.put_nowait``).
+        mgr.commit_create(ws)
 
         # --- Audit emit --------------------------------------------------
         if audit_emit is not None:
