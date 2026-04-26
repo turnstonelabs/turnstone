@@ -39,14 +39,28 @@ class SessionKindAdapter(Protocol):
       events when a workstream closes.
 
     Lifecycle event fan-out (``ws_created`` / ``ws_state`` /
-    ``ws_closed``) is a *separate* Protocol — :class:`SessionEventEmitter`
-    — and is opt-in. Interactive emits its lifecycle events out-of-band
-    (``WebUI._broadcast_state`` for state, the create handler for
-    create), so the interactive adapter doesn't implement
-    ``SessionEventEmitter`` and the manager skips the emit calls when no
-    emitter is wired. Coordinator implements both: the construction
-    Protocol here AND the emitter Protocol so the cluster collector's
-    pseudo-node sees lifecycle transitions.
+    ``ws_closed``) lives on a *separate* Protocol —
+    :class:`SessionEventEmitter` — wired through the manager's
+    optional ``event_emitter`` kwarg. Both production adapters
+    implement *both* Protocols. The asymmetry is in *which* emit
+    methods carry real bodies:
+
+    - Coordinator: all four ``emit_*`` are real — every transition
+      fans out via the cluster collector's pseudo-node.
+    - Interactive: only ``emit_closed`` is load-bearing (it's the
+      sole transport path for ``ws_closed`` onto the global SSE
+      queue); ``emit_created`` / ``emit_state`` / ``emit_rehydrated``
+      are documented no-op stubs because those events fire from
+      out-of-band paths (the create HTTP handler enqueues
+      ``ws_created`` after attachment validation;
+      ``WebUI._broadcast_state`` enqueues a richer ``ws_state``
+      payload than this Protocol carries).
+
+    The manager's ``if self._event_emitter is not None`` guard
+    handles the case where no emitter is wired at all — used by
+    tests that don't care about the event side effects, and reserved
+    for future kinds whose lifecycle transitions don't fan out
+    anywhere.
 
     Intentionally NOT on the Protocol (see design brief's "Decisions
     settled during the pruning pass"): per-kind permission scope
@@ -85,13 +99,19 @@ class SessionEventEmitter(Protocol):
     """Optional transport fan-out for lifecycle events.
 
     Wired into :class:`SessionManager` via the ``event_emitter`` kwarg.
-    Kinds whose lifecycle events flow through out-of-band channels
-    (interactive's ``WebUI._broadcast_state`` for state and its
-    HTTP create handler's ``ws_created`` enqueue for create / rehydrate)
-    don't implement this Protocol and the manager simply skips the
-    emit calls. Coordinator implements both this Protocol and
-    :class:`SessionKindAdapter` so the cluster collector's pseudo-node
-    sees every transition.
+    Both production adapters implement this Protocol; the manager's
+    ``if self._event_emitter is not None`` guard exists for kinds /
+    tests that omit an emitter entirely.
+
+    Implementing the Protocol does not commit a kind to wiring every
+    method — interactive's ``emit_created`` / ``emit_state`` /
+    ``emit_rehydrated`` are documented no-op stubs because those
+    events fire from out-of-band channels (``WebUI._broadcast_state``
+    for state, the create HTTP handler for ``ws_created`` after
+    attachment validation). Only ``emit_closed`` carries a real body
+    on interactive. Coordinator's four methods are all real (cluster
+    collector's pseudo-node sees every transition). See
+    :class:`SessionKindAdapter` docstring for the asymmetry rationale.
     """
 
     def emit_created(self, ws: Workstream) -> None:
