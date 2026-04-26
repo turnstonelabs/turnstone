@@ -399,11 +399,47 @@ class SessionManager:
         identifies the workstream as committed (the warning path
         treats "committed" as a contract assertion, not as "actually
         broadcast somewhere").
+
+        Caller-bug guard: under the manager lock, check that ``ws`` is
+        still tracked by this manager and that ``_emit_created_fired``
+        is not already set. Either failure logs a warning and returns
+        without firing the event — duplicate calls and calls after
+        :meth:`discard` become safe no-ops. Symmetric to
+        :meth:`discard`'s warning when invoked on an already-
+        advertised workstream; together the two methods make the
+        deferred-create bracket robust against the obvious caller-
+        bug shapes.
         """
-        # See the matching comment in ``create`` re: ordering. Flag
-        # set before the emit so a racing discard sees True even if
-        # it observes us mid-fanout.
-        ws._emit_created_fired = True
+        with self._lock:
+            if ws._emit_created_fired:
+                # Duplicate commit_create call. Could surface as a
+                # double ``ws_created`` on the wire if we proceeded;
+                # warn instead and bail.
+                log.warning(
+                    "session_mgr.commit_create.already_fired ws=%s",
+                    ws.id[:8] if ws.id else "",
+                )
+                return
+            tracked = self._workstreams.get(ws.id)
+            if tracked is not ws:
+                # Workstream was discarded (or never tracked, or
+                # replaced by a same-id reuse — which would be a
+                # different ws object). Firing emit_created for an
+                # untracked ws_id leaks a phantom ``ws_created`` to
+                # subscribers with no matching close. Warn + bail.
+                log.warning(
+                    "session_mgr.commit_create.untracked ws=%s",
+                    ws.id[:8] if ws.id else "",
+                )
+                return
+            # Both checks passed — flip the flag under the lock so a
+            # racing discard sees True before our emit completes
+            # outside the lock. (Manager lock is not held during the
+            # emit itself: emit_created on coord acquires its own
+            # locks for collector + children-registry updates and
+            # holding the manager lock during fan-out would couple
+            # the two unnecessarily.)
+            ws._emit_created_fired = True
         if self._event_emitter is not None:
             self._event_emitter.emit_created(ws)
 

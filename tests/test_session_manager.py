@@ -347,7 +347,8 @@ def test_discard_releases_slot_without_emit_closed() -> None:
     ws = mgr.create(user_id="u1", name="will-be-discarded", defer_emit_created=True)
     ws_id = ws.id
 
-    assert mgr.discard(ws_id) is True
+    discarded = mgr.discard(ws_id)
+    assert discarded is True
 
     # In-memory slot released — capacity restored.
     assert mgr.get(ws_id) is None
@@ -369,36 +370,61 @@ def test_discard_returns_false_for_unknown_ws_id() -> None:
     safely call discard inside ``contextlib.suppress`` without
     spurious failures swallowing real errors."""
     mgr, _, _ = _make_manager()
-    assert mgr.discard("nonexistent-ws-id") is False
+    result = mgr.discard("nonexistent-ws-id")
+    assert result is False
 
 
-def test_commit_create_after_discard_is_caller_bug_no_op(caplog) -> None:
-    """Caller-bug case: ``commit_create`` after ``discard`` must
-    not crash and must not re-emit the created event for a
-    workstream that's no longer tracked by the manager. The
-    workstream object still exists in the caller's scope (the
-    discard only removed it from the manager's slot map), so
-    forwarding it to ``commit_create`` would fire a phantom
+def test_commit_create_after_discard_is_no_op(caplog) -> None:
+    """Caller-bug case: ``commit_create`` after ``discard`` must not
+    fire ``emit_created`` for a workstream that's no longer tracked
+    by the manager. The workstream object still exists in the
+    caller's scope (discard only removed it from the manager's slot
+    map), so forwarding it to ``commit_create`` would fire a phantom
     ``ws_created`` for an id the cluster collector / children
-    registry will then never see ``ws_closed`` for.
+    registry will then never see ``ws_closed`` for. The guard logs
+    ``session_mgr.commit_create.untracked`` and returns without
+    emitting."""
+    import logging
 
-    Pinning current behaviour: ``commit_create`` does NOT verify
-    the workstream is still tracked — it forwards to
-    ``event_emitter.emit_created(ws)`` unconditionally. This is
-    surprising but matches the docstring's "trust the caller"
-    contract; the regression test exists so a future refactor
-    that adds the guard makes a deliberate choice instead of an
-    accident."""
     mgr, adapter, _ = _make_manager()
     ws = mgr.create(user_id="u1", defer_emit_created=True)
-    assert mgr.discard(ws.id) is True
+    discarded = mgr.discard(ws.id)
+    assert discarded is True
     assert adapter.events_of("created") == []
 
-    # Caller-bug: commit_create after discard. Re-fires the event
-    # because no guard exists. Pinning the behaviour.
-    mgr.commit_create(ws)
+    with caplog.at_level(logging.WARNING, logger="turnstone.core.session_manager"):
+        mgr.commit_create(ws)
 
+    # No event emitted — the tracked-ws check failed.
+    assert adapter.events_of("created") == []
+    # Warning surfaced for operator triage.
+    assert any("commit_create.untracked" in record.message for record in caplog.records), [
+        r.message for r in caplog.records
+    ]
+
+
+def test_commit_create_is_idempotent_on_duplicate_call(caplog) -> None:
+    """Caller-bug case: calling ``commit_create`` twice on the same
+    workstream must fire ``emit_created`` exactly once. The second
+    call hits the ``_emit_created_fired`` guard, logs
+    ``session_mgr.commit_create.already_fired``, and returns without
+    re-emitting."""
+    import logging
+
+    mgr, adapter, _ = _make_manager()
+    ws = mgr.create(user_id="u1", defer_emit_created=True)
+    mgr.commit_create(ws)
     assert [e.ws_id for e in adapter.events_of("created")] == [ws.id]
+
+    with caplog.at_level(logging.WARNING, logger="turnstone.core.session_manager"):
+        mgr.commit_create(ws)
+
+    # Still exactly one created event — the guard short-circuited
+    # the second call.
+    assert [e.ws_id for e in adapter.events_of("created")] == [ws.id]
+    assert any("commit_create.already_fired" in record.message for record in caplog.records), [
+        r.message for r in caplog.records
+    ]
 
 
 def test_discard_after_emit_created_warns_but_releases_slot(caplog) -> None:
