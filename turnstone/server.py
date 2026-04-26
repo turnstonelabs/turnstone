@@ -71,7 +71,9 @@ from turnstone.core.session_routes import (
     make_events_handler,
     make_legacy_body_keyed_adapter,
     make_legacy_query_keyed_adapter,
+    make_list_handler,
     make_open_handler,
+    make_saved_handler,
     make_send_handler,
     register_session_routes,
 )
@@ -1211,52 +1213,15 @@ async def global_events_sse(request: Request) -> Response:
     return EventSourceResponse(event_generator(), ping=5)
 
 
-async def list_workstreams(request: Request) -> JSONResponse:
-    """GET /v1/api/workstreams — list workstreams visible to any
-    authenticated caller.
-
-    Trusted-team visibility: listing returns the full cluster set
-    across all owners (no per-user filter).  Self-hosted deployments
-    are the assumed shape; console operators already see cluster-wide
-    state via service scope, and a per-user filter would also hide
-    ownerless rows like the auto-created ``name="default"`` startup
-    workstream from every authenticated caller.
-
-    Per-workstream mutations (``/send``, ``/close``, ``/open``,
-    ``/title``, ``/delete``, ``/refresh-title``) keep their independent
-    ownership checks — see those handlers for the cross-tenant guards
-    that stay in force.  This endpoint exposes metadata only (name,
-    state, kind, parent_ws_id); message history requires the per-
-    workstream ownership gate on ``/history``.
-
-    For a multi-tenant SaaS deployment, the right boundary is a real
-    ``tenant_id`` column with row-level filtering at the storage
-    layer, not an empty-user_id heuristic.
-    """
-    from turnstone.core.memory import get_workstream_display_name
-
-    mgr: SessionManager = request.app.state.workstreams
-    result = []
-    for ws in mgr.list_all():
-        title = get_workstream_display_name(ws.id) or ws.name
-        # kind + parent_ws_id mirror the shape /dashboard returns below so
-        # client consumers (SDK, frontend, integrators) see one consistent
-        # row schema across adjacent endpoints instead of a subset here
-        # and a superset there.
-        result.append(
-            {
-                "id": ws.id,
-                "name": title,
-                "state": ws.state.value,
-                "kind": ws.kind,
-                "parent_ws_id": ws.parent_ws_id,
-            }
-        )
-    return JSONResponse({"workstreams": result})
-
-
 async def dashboard(request: Request) -> JSONResponse:
-    """GET /v1/api/dashboard — enriched workstream data + aggregate stats."""
+    """GET /v1/api/dashboard — enriched workstream data + aggregate stats.
+
+    NOTE: row shape still uses ``"id"`` (not ``"ws_id"``) — Stage 2's
+    list-verb lift converged ``/v1/api/workstreams`` and
+    ``/saved`` on ``ws_id`` but left dashboard alone to keep that
+    PR's diff focused. The same rename should land here as a separate
+    cleanup so the v1 row shape is consistent across the family.
+    """
     from turnstone.core.memory import get_workstream_display_name
 
     mgr: SessionManager = request.app.state.workstreams
@@ -1315,50 +1280,6 @@ async def dashboard(request: Request) -> JSONResponse:
             },
         }
     )
-
-
-async def list_saved_workstreams(request: Request) -> JSONResponse:
-    """GET /v1/api/workstreams/saved — list saved interactive workstream
-    metadata, visible to any authenticated caller.
-
-    Trusted-team visibility: returns the cluster-wide set across all
-    owners (no per-user filter) — see ``list_workstreams`` for the
-    rationale.  This endpoint exposes summary fields only (ws_id,
-    alias, title, name, created, updated, message_count); message
-    history requires the per-workstream ownership gate on
-    ``/v1/api/workstreams/{ws_id}/history``.
-
-    Resuming an owned saved workstream goes through ``/open``'s
-    ownership check; ownerless persisted rows (legacy / migration /
-    startup ``name="default"``) are claimable by any authenticated
-    caller via ``/open``, consistent with the same trusted-team model.
-
-    Restricted to ``kind="interactive"`` — the interactive UI's "saved
-    workstreams" sidebar is not a coordinator surface, and coordinator
-    rows (which persist conversation history too) would otherwise leak
-    into it.
-    """
-    from turnstone.core.memory import list_workstreams_with_history
-    from turnstone.core.workstream import WorkstreamKind
-
-    rows = list_workstreams_with_history(
-        limit=50,
-        kind=WorkstreamKind.INTERACTIVE,
-        user_id=None,
-    )
-    result = [
-        {
-            "ws_id": wid,
-            "alias": alias,
-            "title": title,
-            "name": name,
-            "created": created,
-            "updated": updated,
-            "message_count": count,
-        }
-        for wid, alias, title, name, created, updated, count, *_extra in rows
-    ]
-    return JSONResponse({"workstreams": result})
 
 
 async def list_skills_summary(request: Request) -> JSONResponse:
@@ -3624,6 +3545,9 @@ def create_app(
         classify_text_attachment=_classify_text_attachment,
         upload_lock=_attachment_upload_lock,
     )
+    from turnstone.core.memory import (
+        get_workstream_display_names as _get_ws_display_names,
+    )
     from turnstone.core.memory import resolve_workstream as _resolve_workstream_alias
 
     interactive_endpoint_config = SessionEndpointConfig(
@@ -3653,6 +3577,22 @@ def create_app(
         create_validate_request=_interactive_create_validate_request,
         create_build_kwargs=_interactive_create_build_kwargs,
         create_post_install=_interactive_create_post_install,
+        # Bulk display-name resolution for the active list — one
+        # ``SELECT ... WHERE ws_id IN (...)`` for the whole snapshot
+        # instead of N per-row queries. Returns a {ws_id: title-or-None}
+        # dict; the lifted body falls back to ``ws.name`` per-row.
+        list_resolve_titles=_get_ws_display_names,
+        # Explicit kind classifier for the lifted list/saved factory's
+        # storage filter — required to avoid silently filtering for
+        # the wrong kind when a future kind is added.
+        list_kind=WorkstreamKind.INTERACTIVE,
+        # No state filter: the interactive saved sidebar shows every
+        # persisted workstream the storage layer doesn't already
+        # tombstone (deleted rows are excluded at the SQL level).
+        saved_state_filter=None,
+        # No in-memory exclusion: an interactive workstream that's
+        # both saved AND loaded is a normal display state.
+        saved_loaded_lookup=None,
     )
     approve_handler = make_approve_handler(interactive_endpoint_config)
     close_handler = make_close_handler(
@@ -3673,6 +3613,8 @@ def create_app(
         interactive_endpoint_config,
         audit_emit=_audit_workstream_created,
     )
+    list_handler = make_list_handler(interactive_endpoint_config)
+    saved_handler = make_saved_handler(interactive_endpoint_config)
     v1_routes: list[Any] = [
         Route("/api/events", make_legacy_query_keyed_adapter(events_handler)),
         Route("/api/events/global", global_events_sse),
@@ -3681,8 +3623,8 @@ def create_app(
         v1_routes,
         prefix="/api/workstreams",
         handlers=SharedSessionVerbHandlers(
-            list_workstreams=list_workstreams,
-            list_saved=list_saved_workstreams,
+            list_workstreams=list_handler,  # lifted: shared body
+            list_saved=saved_handler,  # lifted: shared body
             create=create_handler,  # lifted: shared body
             close_legacy=make_legacy_body_keyed_adapter(close_handler),
             delete=delete_workstream_endpoint,

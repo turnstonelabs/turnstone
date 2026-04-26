@@ -46,7 +46,7 @@ if TYPE_CHECKING:
     from starlette.routing import BaseRoute
 
     from turnstone.core.session_manager import SessionManager
-    from turnstone.core.workstream import Workstream
+    from turnstone.core.workstream import Workstream, WorkstreamKind
 
 log = get_logger(__name__)
 
@@ -205,6 +205,29 @@ CreateAuditEmitter = Callable[
     ["Request", "Workstream", dict[str, Any], str],
     None,
 ]
+
+
+# (ws_ids) -> {ws_id: title-or-None} bulk lookup. Interactive wires
+# :func:`turnstone.core.memory.get_workstream_display_names` so the
+# active-list endpoint resolves every alias in one storage round-trip
+# instead of the pre-lift N+1 (one SELECT per row). Coord wires
+# ``None`` (coord doesn't have an alias surface today) and the lifted
+# body uses ``ws.name`` directly. Returns a dict keyed on every
+# requested ws_id; missing rows map to ``None``, and the caller
+# falls back to ``ws.name`` per-row.
+ListResolveTitles = Callable[[list[str]], dict[str, str | None]]
+# (request) -> set of ws_ids currently held in memory by the kind's
+# manager. Coord wires a callable that returns
+# ``{ws.id for ws in coord_mgr.list_all()}`` so the saved-card list
+# can defence-in-depth filter out coordinators currently in the warm
+# pool (a coord can be ``state='closed'`` on disk briefly while the
+# close-emit sequence races the in-memory pop). Interactive wires
+# ``None``: an interactive workstream that's both saved and loaded
+# is a normal display state, not a race the saved card needs to
+# hide. Async because the coord-side implementation runs through
+# ``asyncio.to_thread`` (the manager lock is acquired in
+# ``coord_mgr.list_all``).
+SavedLoadedLookup = Callable[["Request"], Awaitable[set[str]]]
 
 
 @dataclass(frozen=True)
@@ -378,6 +401,34 @@ class SessionEndpointConfig:
     # ``None`` skips the post-install entirely (response is just
     # ``{ws_id, name, ...}`` with empty parity fields).
     create_post_install: CreatePostInstall | None = None
+    # (ws_ids) -> {ws_id: title-or-None} — bulk title lookup for the
+    # active-list endpoint. Interactive wires
+    # ``get_workstream_display_names`` so every row's alias resolves
+    # in one storage round-trip; coord wires ``None`` (no alias
+    # surface today). See :data:`ListResolveTitles`.
+    list_resolve_titles: ListResolveTitles | None = None
+    # Kind classifier for the lifted ``list``/``saved`` factories'
+    # storage filter. Required when a kind mounts either handler —
+    # the factories pass it straight through to
+    # ``list_workstreams_with_history(kind=...)``. Distinct from
+    # ``audit_action_prefix`` (audit-action namespacing) so adding a
+    # third kind doesn't have to overload the audit prefix as a
+    # filter. ``None`` is allowed for kinds that don't mount a
+    # list/saved handler.
+    list_kind: WorkstreamKind | None = None
+    # Storage-side state filter for the saved-list endpoint. Interactive
+    # wires ``None`` — saved sidebar shows every persisted interactive
+    # workstream regardless of state (the storage layer already
+    # excludes ``state='deleted'`` tombstones). Coord wires
+    # ``"closed"`` so only explicitly-closed coordinators surface in
+    # the saved-card grid; active / in-flight rows live in the active
+    # list.
+    saved_state_filter: str | None = None
+    # (request) -> set of ws_ids in the kind's in-memory pool. Coord
+    # wires a coroutine that returns ``{ws.id for ws in
+    # coord_mgr.list_all()}`` (defence-in-depth filter — see
+    # :data:`SavedLoadedLookup`). Interactive wires ``None``.
+    saved_loaded_lookup: SavedLoadedLookup | None = None
 
 
 @dataclass(frozen=True)
@@ -1822,6 +1873,212 @@ def make_create_handler(
         )
 
     return create
+
+
+def make_list_handler(cfg: SessionEndpointConfig) -> Handler:
+    """Lifted body for ``GET {prefix}`` — list workstreams in memory.
+
+    Both kinds share the listing sequence (auth → manager lookup →
+    ``mgr.list_all()`` → row serialisation → respond). Per-kind
+    divergence captured by:
+
+    - ``cfg.permission_gate`` — coord's ``admin.coordinator`` check;
+      interactive ``None`` (auth middleware covers it).
+    - ``cfg.manager_lookup`` — already used by every other lifted
+      verb.
+    - ``cfg.list_resolve_title`` — interactive's user-alias override;
+      coord ``None``.
+
+    Always-include row shape: ``{ws_id, name, state, kind,
+    parent_ws_id, user_id}``. SDK consumers don't branch on kind.
+
+    Behaviour changes vs the pre-lift handlers (documented in
+    CHANGELOG):
+
+    - **Top-level response key converges on ``"workstreams"``.**
+      Pre-lift coord returned ``{"coordinators": [...]}``; the lifted
+      body returns ``{"workstreams": [...]}`` for response-shape
+      parity with interactive. Coord SDK / frontend consumers
+      branching on ``data.coordinators`` swap to ``data.workstreams``.
+    - **Interactive row key renames ``"id"`` → ``"ws_id"``.** Pre-
+      lift interactive used the bare ``id`` field while every other
+      shared verb on this surface (cancel, open, events, create,
+      saved-list) uses ``ws_id``. Convergence eliminates the
+      internal inconsistency. Frontend consumers reading
+      ``ws.id`` from the active-list response swap to ``ws.ws_id``.
+    - **Always-include row fields.** ``user_id`` was coord-only;
+      ``kind`` + ``parent_ws_id`` were interactive-only. Both
+      kinds now populate all three. ``parent_ws_id`` defaults to
+      ``None`` for coord (coordinators have no parent).
+    - **Storage / manager-lock work moved off the event loop.**
+      ``mgr.list_all()`` acquires the manager mutex; the title
+      resolution may dip into storage for the alias lookup. Both
+      now run via ``asyncio.to_thread`` (matching coord's pre-
+      existing perf-2 pattern from the saved-coordinators review).
+
+    Args:
+        cfg: per-kind policy bundle.
+    """
+
+    async def list_workstreams_handler(request: Request) -> Response:
+        import asyncio
+
+        if cfg.permission_gate is not None:
+            err = cfg.permission_gate(request)
+            if err is not None:
+                return err
+        mgr_opt, err503 = cfg.manager_lookup(request)
+        if err503 is not None:
+            return err503
+        # See ``make_approve_handler`` for the cast rationale.
+        mgr = cast("SessionManager", mgr_opt)
+
+        # Manager-lock + bulk title resolution off the event loop.
+        # ``list_all`` snapshots under the manager lock; the bulk
+        # alias lookup hits storage for every row in a single
+        # ``SELECT ... WHERE ws_id IN (...)`` (replaces the pre-lift
+        # per-row N+1). Running inline would stall every other async
+        # handler for the duration of the listing.
+        resolve_titles = cfg.list_resolve_titles
+
+        def _build_rows() -> list[dict[str, Any]]:
+            wss = mgr.list_all()
+            titles: dict[str, str | None] = {}
+            if resolve_titles is not None and wss:
+                titles = resolve_titles([ws.id for ws in wss])
+            rows: list[dict[str, Any]] = []
+            for ws in wss:
+                title = titles.get(ws.id) or ws.name
+                rows.append(
+                    {
+                        "ws_id": ws.id,
+                        "name": title,
+                        "state": ws.state.value,
+                        "kind": ws.kind,
+                        "parent_ws_id": ws.parent_ws_id,
+                        "user_id": ws.user_id,
+                    }
+                )
+            return rows
+
+        rows = await asyncio.to_thread(_build_rows)
+        return JSONResponse({"workstreams": rows})
+
+    return list_workstreams_handler
+
+
+def make_saved_handler(cfg: SessionEndpointConfig) -> Handler:
+    """Lifted body for ``GET {prefix}/saved`` — list persisted workstreams.
+
+    Both kinds share the storage-backed listing sequence (auth →
+    ``list_workstreams_with_history`` filtered by kind → optional
+    in-memory exclusion filter → row serialisation → respond).
+    Per-kind divergence:
+
+    - ``cfg.permission_gate`` — coord's ``admin.coordinator`` check.
+    - ``cfg.audit_action_prefix`` — used to derive the kind filter
+      ("workstream" → INTERACTIVE; "coordinator" → COORDINATOR).
+      Already wired on every endpoint cfg; reuse here keeps the
+      cfg surface tight.
+    - ``cfg.saved_state_filter`` — coord wires ``"closed"`` so only
+      explicitly-closed coordinators surface; interactive wires
+      ``None`` (any state except the tombstoned ``deleted`` rows the
+      storage layer already filters).
+    - ``cfg.saved_loaded_lookup`` — coord-only defence-in-depth
+      filter that excludes ws_ids currently in the in-memory pool
+      (a row can be ``state='closed'`` briefly while the close-emit
+      sequence races the in-memory pop). Interactive ``None``.
+
+    Always-include row shape: ``{ws_id, alias, title, name,
+    created, updated, message_count}``. Identical between kinds
+    pre-lift; the lift just moves the row construction into one
+    place.
+
+    Behaviour changes vs the pre-lift handlers:
+
+    - **Top-level response key converges on ``"workstreams"``.**
+      Pre-lift coord returned ``{"coordinators": [...]}``; the
+      lifted body returns ``{"workstreams": [...]}``. Mirrors the
+      active-list convergence.
+    - **Interactive's storage call moves to ``asyncio.to_thread``.**
+      Pre-lift interactive ran ``list_workstreams_with_history``
+      inline — under heavy load the SQL (which includes a
+      correlated COUNT subquery) stalled every other async
+      handler. Coord already used ``to_thread`` (perf-2 from the
+      saved-coordinators review); convergence lifts interactive up.
+
+    Args:
+        cfg: per-kind policy bundle.
+    """
+
+    async def saved_workstreams_handler(request: Request) -> Response:
+        import asyncio
+
+        from turnstone.core.memory import list_workstreams_with_history
+
+        if cfg.permission_gate is not None:
+            err = cfg.permission_gate(request)
+            if err is not None:
+                return err
+
+        if cfg.list_kind is None:
+            # Misconfig: a kind mounted the saved handler without
+            # wiring ``cfg.list_kind``. Fail loud instead of silently
+            # filtering for the wrong kind — pre-fix the lifted body
+            # defaulted to INTERACTIVE on any non-"coordinator"
+            # ``audit_action_prefix``, which would have leaked
+            # interactive rows on any future kind that forgot the
+            # cfg field.
+            log.error("ws.saved.misconfigured_no_list_kind")
+            return JSONResponse(
+                {"error": "saved handler misconfigured"},
+                status_code=500,
+            )
+
+        rows = await asyncio.to_thread(
+            list_workstreams_with_history,
+            limit=50,
+            kind=cfg.list_kind,
+            user_id=None,
+            state=cfg.saved_state_filter,
+        )
+
+        # Coord-only: exclude ws_ids currently in the warm pool.
+        loaded: set[str] = set()
+        if cfg.saved_loaded_lookup is not None:
+            try:
+                loaded = await cfg.saved_loaded_lookup(request)
+            except Exception:
+                # Defence-in-depth filter — never let a lookup error
+                # block the saved list. Log + continue with empty
+                # set (worst case: a duplicate row in the saved list
+                # for a few seconds during a close-emit race).
+                log.debug(
+                    "ws.saved.loaded_lookup_failed",
+                    exc_info=True,
+                )
+
+        # Column order from list_workstreams_with_history is
+        # (ws_id, alias, title, name, created, updated, count, node_id) —
+        # ``*_extra`` swallows the trailing node_id (and any future
+        # columns the SELECT may grow). Keep this comment in sync if
+        # the SELECT changes the prefix order.
+        result = [
+            {
+                "ws_id": wid,
+                "alias": alias,
+                "title": title,
+                "name": name,
+                "created": created,
+                "updated": updated,
+                "message_count": count,
+            }
+            for wid, alias, title, name, created, updated, count, *_extra in rows
+            if wid not in loaded
+        ]
+        return JSONResponse({"workstreams": result})
+
+    return saved_workstreams_handler
 
 
 def make_send_handler(cfg: SessionEndpointConfig) -> Handler:

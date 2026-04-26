@@ -17,6 +17,80 @@ Three release tracks are maintained:
 
 ### Changed
 
+- **`list` / `saved` verb bodies lifted across both kinds** ([Stage 2
+  Verb Lift — `list` / `saved`]). The interactive
+  ``GET /v1/api/workstreams`` + ``GET /v1/api/workstreams/saved``
+  and coord ``GET /v1/api/workstreams`` + ``GET /v1/api/workstreams/saved``
+  handlers now share two factory bodies via
+  ``make_list_handler(cfg)`` and ``make_saved_handler(cfg)``. Three
+  new ``SessionEndpointConfig`` fields capture the per-kind
+  divergence:
+
+  - ``list_resolve_title: ListResolveTitle | None`` — interactive
+    wires :func:`turnstone.core.memory.get_workstream_display_name`
+    so user-set aliases override the auto-generated ws-XXXX name in
+    the active list. Coord wires ``None`` (no alias surface).
+  - ``saved_state_filter: str | None`` — coord wires ``"closed"``
+    so only explicitly-closed coordinators surface in the
+    saved-card grid. Interactive wires ``None`` (the storage
+    layer already excludes ``state='deleted'`` tombstones).
+  - ``saved_loaded_lookup: SavedLoadedLookup | None`` — coord-only
+    defence-in-depth filter that excludes ws_ids currently in the
+    in-memory pool (a row can be ``state='closed'`` for a few
+    seconds while the close-emit sequence races the in-memory pop).
+    Interactive wires ``None``.
+
+  Five observable behaviour changes (all documented per kind):
+
+  - **Active-list top-level key converges on ``"workstreams"``.**
+    Pre-lift coord returned ``{"coordinators": [...]}``; the lifted
+    body returns ``{"workstreams": [...]}`` for response-shape
+    parity with interactive. Coord is a 1.5.0aN-only surface — never
+    shipped stable — so SDK / frontend consumers swap once and
+    there's no compat shim or fallback (the convergence MUST land
+    before v1.5.0 stable per
+    ``project_unification_before_stable.md``).
+  - **Saved-list top-level key converges on ``"workstreams"``.**
+    Same shape change as the active list, applied to
+    ``GET /v1/api/workstreams/saved`` on coord. Coord-only surface;
+    no compat shim.
+  - **Active-list row key renames ``"id"`` → ``"ws_id"``** on
+    interactive. Pre-lift interactive used the bare ``id`` field
+    while every other shared verb on this surface (cancel, open,
+    events, create, saved-list) uses ``ws_id``. Convergence
+    eliminates the internal inconsistency. Frontend consumers
+    reading ``ws.id`` from the active-list response swap to
+    ``ws.ws_id``. Interactive HAS shipped stable across 1.0 / 1.3 /
+    1.4, but the active-list endpoint is consumed by the bundled
+    JS only — there's no external SDK on those stable lines reading
+    the field. Browser-cache staleness is bounded by normal
+    static-asset reload on next page load.
+  - **Active-list row gains always-include fields.** ``user_id``
+    was coord-only; ``kind`` + ``parent_ws_id`` were
+    interactive-only. Both kinds now populate all three.
+    ``parent_ws_id`` defaults to ``None`` for coord (coordinators
+    have no parent).
+  - **Storage / manager-lock work moved off the event loop on
+    interactive.** The lifted ``saved`` body always uses
+    ``asyncio.to_thread`` for ``list_workstreams_with_history``;
+    pre-lift interactive ran it inline (correlated COUNT subquery
+    can stall every other async handler on a cluster with thousands
+    of saved rows). Coord already used ``to_thread`` (perf-2 from
+    the saved-coordinators review); convergence lifts interactive
+    up. The active-list body also moves ``mgr.list_all`` +
+    per-row title resolution off the event loop on both kinds.
+
+  Pydantic schemas: ``WorkstreamInfo.id`` renamed → ``ws_id``,
+  ``WorkstreamInfo.user_id`` field added. ``CoordinatorInfo`` and
+  ``CoordinatorListResponse`` removed (folded into the unified
+  ``WorkstreamInfo`` / ``ListWorkstreamsResponse``); ``console_spec``
+  active-list endpoint now points at ``ListWorkstreamsResponse``.
+  OpenAPI spec snapshots regenerated.
+
+  ``GET /v1/api/dashboard`` is **not** in the lift's scope and
+  still returns rows keyed on ``id``. A separate cleanup PR will
+  converge the dashboard row shape with the rest of the v1 surface.
+
 - **`SessionManager.create` gains a deferred-emit option; lifted
   ``create`` HTTP handler eliminates the phantom create→close
   pair on coord rollback.** ``SessionManager.create`` now accepts

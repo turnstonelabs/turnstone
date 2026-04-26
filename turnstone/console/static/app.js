@@ -2246,10 +2246,10 @@ function loadSavedCoordinators() {
   _savedCoordsInFlight = true;
   authFetch("/v1/api/workstreams/saved")
     .then(function (r) {
-      return r.ok ? r.json() : { coordinators: [] };
+      return r.ok ? r.json() : { workstreams: [] };
     })
     .then(function (data) {
-      renderSavedCoordinators(data.coordinators || []);
+      renderSavedCoordinators(data.workstreams || []);
     })
     .catch(function () {
       /* silent — saved list is informational, not load-bearing */

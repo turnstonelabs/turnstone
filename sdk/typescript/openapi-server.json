@@ -2014,6 +2014,7 @@
         "type": "object"
       },
       "ListWorkstreamsResponse": {
+        "description": "Response body for ``GET /v1/api/workstreams`` on either kind.\n\nTop-level key is ``workstreams`` regardless of the kind serving\nthe request \u2014 pre-lift coord returned ``{\"coordinators\": [...]}``;\nconvergence lifted both kinds onto the same shape. Coord SDK /\nfrontend consumers branching on ``data.coordinators`` swap to\n``data.workstreams``.",
         "properties": {
           "workstreams": {
             "items": {
@@ -2030,9 +2031,10 @@
         "type": "object"
       },
       "WorkstreamInfo": {
+        "description": "Active-list row shape, shared across both kinds.\n\nRenamed ``id`` \u2192 ``ws_id`` and added ``user_id`` in the Stage 2\n``list``/``saved`` verb lift so the active-list response shape\nmatches the rest of the v1 surface (every other shared verb's\npayload uses ``ws_id``). ``user_id`` was previously coord-only;\ninteractive now populates it too. SDK consumers reading\n``row.id`` should swap to ``row.ws_id``.",
         "properties": {
-          "id": {
-            "title": "Id",
+          "ws_id": {
+            "title": "Ws Id",
             "type": "string"
           },
           "name": {
@@ -2058,10 +2060,15 @@
             ],
             "default": null,
             "title": "Parent Ws Id"
+          },
+          "user_id": {
+            "default": "",
+            "title": "User Id",
+            "type": "string"
           }
         },
         "required": [
-          "id",
+          "ws_id",
           "name",
           "state"
         ],

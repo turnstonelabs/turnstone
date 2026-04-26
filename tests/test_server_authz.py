@@ -430,8 +430,49 @@ class TestListWorkstreamsTrustedTeamVisibility:
         # user-a now sees both.
         resp = client.get("/v1/api/workstreams", headers=_auth("user-a"))
         assert resp.status_code == 200
-        ids = {w["id"] for w in resp.json()["workstreams"]}
+        # Row key renamed id → ws_id in the Stage 2 list-verb lift.
+        ids = {w["ws_id"] for w in resp.json()["workstreams"]}
         assert {ws_a, ws_b}.issubset(ids), ids
+
+    def test_active_list_row_shape_includes_unified_fields(self, app_client):
+        """Stage 2 list-verb-lift parity regression — interactive
+        active-list row carries the always-include fields (ws_id,
+        name, state, kind, parent_ws_id, user_id) that the lifted
+        ``make_list_handler`` produces on every kind. Mirrors the
+        coord-side ``test_active_list_row_shape_includes_unified_fields``
+        in ``test_coordinator_endpoints.py`` so a future regression
+        that drops a field on either branch is caught."""
+        client, _mgr = app_client
+        create_resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "shape-check"},
+            headers=_auth("user-shape"),
+        )
+        assert create_resp.status_code == 200
+        ws_id = create_resp.json()["ws_id"]
+
+        resp = client.get("/v1/api/workstreams", headers=_auth("user-shape"))
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "workstreams" in body
+        rows = [w for w in body["workstreams"] if w["ws_id"] == ws_id]
+        assert len(rows) == 1
+        row = rows[0]
+        # Always-include row shape — interactive populates kind=
+        # INTERACTIVE; user_id is post-lift parity (was coord-only).
+        assert set(row.keys()) == {
+            "ws_id",
+            "name",
+            "state",
+            "kind",
+            "parent_ws_id",
+            "user_id",
+        }
+        assert row["kind"] == "interactive"
+        assert row["user_id"] == "user-shape"
+        # parent_ws_id is None for top-level interactive workstreams
+        # (only coord-spawned children carry it).
+        assert row["parent_ws_id"] is None
 
 
 class TestDashboardTrustedTeamVisibility:

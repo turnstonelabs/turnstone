@@ -469,6 +469,24 @@ class PostgreSQLBackend:
                 return str(value) if value is not None else None
             return None
 
+    def get_workstream_display_names(self, ws_ids: list[str]) -> dict[str, str | None]:
+        if not ws_ids:
+            return {}
+        with self._conn() as conn:
+            rows = conn.execute(
+                sa.select(
+                    workstreams.c.ws_id,
+                    workstreams.c.alias,
+                    workstreams.c.title,
+                    workstreams.c.name,
+                ).where(workstreams.c.ws_id.in_(ws_ids))
+            ).fetchall()
+        result: dict[str, str | None] = dict.fromkeys(ws_ids)
+        for r in rows:
+            value = r[1] or r[2] or r[3]
+            result[r[0]] = str(value) if value is not None else None
+        return result
+
     def get_workstream_owner(self, ws_id: str) -> str | None:
         with self._conn() as conn:
             row = conn.execute(

@@ -4603,7 +4603,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CoordinatorListResponse"
+                  "$ref": "#/components/schemas/ListWorkstreamsResponse"
                 }
               }
             }
@@ -7548,49 +7548,6 @@
           "ws_id"
         ],
         "title": "CoordinatorHistoryResponse",
-        "type": "object"
-      },
-      "CoordinatorInfo": {
-        "description": "Per-coordinator row in the list response.",
-        "properties": {
-          "ws_id": {
-            "title": "Ws Id",
-            "type": "string"
-          },
-          "name": {
-            "title": "Name",
-            "type": "string"
-          },
-          "state": {
-            "title": "State",
-            "type": "string"
-          },
-          "user_id": {
-            "title": "User Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "ws_id",
-          "name",
-          "state",
-          "user_id"
-        ],
-        "title": "CoordinatorInfo",
-        "type": "object"
-      },
-      "CoordinatorListResponse": {
-        "description": "Response body for GET /v1/api/workstreams.",
-        "properties": {
-          "coordinators": {
-            "items": {
-              "$ref": "#/components/schemas/CoordinatorInfo"
-            },
-            "title": "Coordinators",
-            "type": "array"
-          }
-        },
-        "title": "CoordinatorListResponse",
         "type": "object"
       },
       "CoordinatorOpenResponse": {

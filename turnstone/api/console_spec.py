@@ -31,8 +31,6 @@ from turnstone.api.console_schemas import (
     CoordinatorCreateResponse,
     CoordinatorDetailResponse,
     CoordinatorHistoryResponse,
-    CoordinatorInfo,
-    CoordinatorListResponse,
     CoordinatorOpenResponse,
     CoordinatorRestrictRequest,
     CoordinatorRestrictResponse,
@@ -134,6 +132,7 @@ from turnstone.api.schemas import (
 from turnstone.api.server_schemas import (
     ListAttachmentsResponse,
     ListSkillSummaryResponse,
+    ListWorkstreamsResponse,
     SkillSummary,
     UploadAttachmentResponse,
 )
@@ -1159,7 +1158,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
             "Returns coordinators owned by the caller.  Callers with "
             "``admin.system`` see every coordinator across tenants."
         ),
-        response_model=CoordinatorListResponse,
+        response_model=ListWorkstreamsResponse,
         error_codes=[403, 503],
         tags=["Coordinator"],
     ),
@@ -1510,8 +1509,6 @@ _ALL_MODELS: list[type[BaseModel]] = [
     CoordinatorCreateResponse,
     CoordinatorDetailResponse,
     CoordinatorHistoryResponse,
-    CoordinatorInfo,
-    CoordinatorListResponse,
     CoordinatorOpenResponse,
     CoordinatorRestrictRequest,
     CoordinatorRestrictResponse,

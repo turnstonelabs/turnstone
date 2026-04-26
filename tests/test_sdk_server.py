@@ -40,7 +40,7 @@ async def test_list_workstreams():
     transport = _mock_transport(
         {
             "GET /v1/api/workstreams": _json_response(
-                {"workstreams": [{"id": "ws1", "name": "test", "state": "idle"}]}
+                {"workstreams": [{"ws_id": "ws1", "name": "test", "state": "idle"}]}
             )
         }
     )
@@ -48,7 +48,8 @@ async def test_list_workstreams():
         client = AsyncTurnstoneServer(httpx_client=hc)
         resp = await client.list_workstreams()
         assert len(resp.workstreams) == 1
-        assert resp.workstreams[0].id == "ws1"
+        # Row key renamed id → ws_id in the Stage 2 list-verb lift.
+        assert resp.workstreams[0].ws_id == "ws1"
 
 
 @pytest.mark.anyio

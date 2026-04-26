@@ -472,6 +472,25 @@ def get_workstream_display_name(ws_id: str) -> str | None:
         return None
 
 
+def get_workstream_display_names(ws_ids: list[str]) -> dict[str, str | None]:
+    """Bulk variant of :func:`get_workstream_display_name`.
+
+    One ``SELECT ... WHERE ws_id IN (...)`` instead of N. Used by the
+    lifted ``list`` verb to resolve aliases for every active row in a
+    single round-trip. Returns a dict with every requested ws_id —
+    missing rows map to ``None``; the caller falls back to ``ws.name``
+    per-row. Errors return an empty dict so the caller falls back to
+    ``ws.name`` on every row.
+    """
+    if not ws_ids:
+        return {}
+    try:
+        return get_storage().get_workstream_display_names(ws_ids)
+    except Exception:
+        log.warning("Failed to get display names count=%d", len(ws_ids), exc_info=True)
+        return {}
+
+
 def get_workstream_metadata(ws_id: str) -> dict[str, Any] | None:
     """Return workstream metadata dict or None if not found."""
     try:
