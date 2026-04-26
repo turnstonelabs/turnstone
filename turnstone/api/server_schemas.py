@@ -188,14 +188,34 @@ class CloseWorkstreamRequest(BaseModel):
 
 
 class WorkstreamInfo(BaseModel):
-    id: str
+    """Active-list row shape, shared across both kinds.
+
+    Renamed ``id`` → ``ws_id`` and added ``user_id`` in the Stage 2
+    ``list``/``saved`` verb lift so the active-list response shape
+    matches the rest of the v1 surface (every other shared verb's
+    payload uses ``ws_id``). ``user_id`` was previously coord-only;
+    interactive now populates it too. SDK consumers reading
+    ``row.id`` should swap to ``row.ws_id``.
+    """
+
+    ws_id: str
     name: str
     state: str
     kind: WorkstreamKind = WorkstreamKind.INTERACTIVE
     parent_ws_id: str | None = None
+    user_id: str = ""
 
 
 class ListWorkstreamsResponse(BaseModel):
+    """Response body for ``GET /v1/api/workstreams`` on either kind.
+
+    Top-level key is ``workstreams`` regardless of the kind serving
+    the request — pre-lift coord returned ``{"coordinators": [...]}``;
+    convergence lifted both kinds onto the same shape. Coord SDK /
+    frontend consumers branching on ``data.coordinators`` swap to
+    ``data.workstreams``.
+    """
+
     workstreams: list[WorkstreamInfo]
 
 

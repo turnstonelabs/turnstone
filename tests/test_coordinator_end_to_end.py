@@ -39,7 +39,6 @@ from turnstone.console.server import (
     _require_admin_coordinator,
     _require_coord_mgr,
     coordinator_detail,
-    coordinator_list,
 )
 from turnstone.core.auth import AuthResult
 from turnstone.core.session_manager import SessionManager
@@ -47,6 +46,7 @@ from turnstone.core.session_routes import (
     SessionEndpointConfig,
     make_close_handler,
     make_create_handler,
+    make_list_handler,
 )
 from turnstone.core.storage._sqlite import SQLiteBackend
 
@@ -148,7 +148,11 @@ def _make_client(
                 make_create_handler(_coord_endpoint_config, audit_emit=_audit_coordinator_create),
                 methods=["POST"],
             ),
-            Route("/v1/api/workstreams", coordinator_list, methods=["GET"]),
+            Route(
+                "/v1/api/workstreams",
+                make_list_handler(_coord_endpoint_config),
+                methods=["GET"],
+            ),
             Route(
                 "/v1/api/workstreams/{ws_id}/close",
                 make_close_handler(
@@ -204,7 +208,7 @@ def test_create_list_detail_lifecycle(tmp_path):
     # --- List: caller sees their own coordinator ---
     resp = client.get("/v1/api/workstreams", headers=_COORD_HEADERS)
     assert resp.status_code == 200, resp.text
-    coordinators = resp.json()["coordinators"]
+    coordinators = resp.json()["workstreams"]
     ids = {c["ws_id"] for c in coordinators}
     assert ws_id in ids
 
@@ -213,7 +217,7 @@ def test_create_list_detail_lifecycle(tmp_path):
     mgr.create(user_id="other-user", name="not-mine")
     resp = client.get("/v1/api/workstreams", headers=_COORD_HEADERS)
     assert resp.status_code == 200
-    names = {c["name"] for c in resp.json()["coordinators"]}
+    names = {c["name"] for c in resp.json()["workstreams"]}
     assert "not-mine" in names
 
     # --- Detail ---

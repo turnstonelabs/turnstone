@@ -289,6 +289,16 @@ class StorageBackend(Protocol):
         """Return the alias (or title) for a workstream, or None if unset."""
         ...
 
+    def get_workstream_display_names(self, ws_ids: list[str]) -> dict[str, str | None]:
+        """Bulk variant of :meth:`get_workstream_display_name`.
+
+        Returns a dict keyed on every requested ws_id. Missing rows
+        map to ``None``; the caller falls back to ``ws.name`` per-row.
+        Used by the lifted ``list`` verb to avoid the per-row
+        N+1 storage round-trip pre-lift had.
+        """
+        ...
+
     def get_workstream_metadata(self, ws_id: str) -> dict[str, Any] | None:
         """Return workstream metadata dict or None if not found."""
         ...

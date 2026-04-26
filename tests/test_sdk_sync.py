@@ -73,7 +73,7 @@ def test_sync_server_list_workstreams():
     """Sync server client delegates to async and returns correct model."""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return _json_response({"workstreams": [{"id": "ws1", "name": "test", "state": "idle"}]})
+        return _json_response({"workstreams": [{"ws_id": "ws1", "name": "test", "state": "idle"}]})
 
     # We need to create the async client with a mock transport,
     # then wrap it in the sync client
@@ -88,7 +88,8 @@ def test_sync_server_list_workstreams():
     try:
         resp = server.list_workstreams()
         assert len(resp.workstreams) == 1
-        assert resp.workstreams[0].id == "ws1"
+        # Row key renamed id → ws_id in the Stage 2 list-verb lift.
+        assert resp.workstreams[0].ws_id == "ws1"
     finally:
         server.close()
 

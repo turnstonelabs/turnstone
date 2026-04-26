@@ -166,9 +166,15 @@ export interface CloseWorkstreamRequest {
 }
 
 export interface WorkstreamInfo {
-  id: string;
+  // Renamed `id` → `ws_id` and added kind/parent_ws_id/user_id in
+  // the Stage 2 list-verb lift. Pre-1.5 readers branching on
+  // `row.id` should swap to `row.ws_id`.
+  ws_id: string;
   name: string;
   state: string;
+  kind: string;
+  parent_ws_id: string | null;
+  user_id: string;
 }
 
 export interface ListWorkstreamsResponse {

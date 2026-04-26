@@ -516,7 +516,7 @@ Pane.prototype.connectSSE = function (wsId) {
           return r.json().then(function (data) {
             workstreams = {};
             (data.workstreams || []).forEach(function (ws) {
-              workstreams[ws.id] = { name: ws.name, state: ws.state };
+              workstreams[ws.ws_id] = { name: ws.name, state: ws.state };
             });
             renderTabBar();
             // Reconnect all disconnected panes, reassigning stale ws_ids.
@@ -5816,7 +5816,7 @@ function initWorkstreams() {
     })
     .then(function (data) {
       data.workstreams.forEach(function (ws) {
-        workstreams[ws.id] = { name: ws.name, state: ws.state };
+        workstreams[ws.ws_id] = { name: ws.name, state: ws.state };
       });
       connectGlobalSSE();
       var wsIds = Object.keys(workstreams);

@@ -65,7 +65,9 @@ from turnstone.core.session_routes import (
     make_close_handler,
     make_create_handler,
     make_events_handler,
+    make_list_handler,
     make_open_handler,
+    make_saved_handler,
     make_send_handler,
     register_coord_verbs,
     register_session_routes,
@@ -2620,6 +2622,36 @@ def _audit_coordinator_create(
     )
 
 
+async def _coord_saved_loaded_lookup(request: Request) -> set[str]:
+    """Return ws_ids currently held in ``coord_mgr``'s warm pool.
+
+    Wired onto :attr:`SessionEndpointConfig.saved_loaded_lookup`.
+    Defence-in-depth filter for the saved-coordinators list — a row
+    can be ``state='closed'`` on disk for a few seconds while the
+    close-emit sequence races the in-memory pop, and we don't want
+    the saved card grid showing a coord that's still loaded.
+
+    Empty set when ``coord_mgr`` isn't attached (subsystem unavailable)
+    or empty (zero-element snapshot — skip the executor hop too).
+    Errors are swallowed by the lifted body's outer ``try/except``;
+    returning ``set()`` here on a missing manager keeps the caller
+    happy without trampling the lifted body's error log.
+    """
+    coord_mgr = getattr(request.app.state, "coord_mgr", None)
+    if coord_mgr is None:
+        return set()
+    # Cheap probe: an empty pool can answer without paying the
+    # ``asyncio.to_thread`` round-trip. ``count`` reads under the
+    # manager lock but doesn't block; if the manager isn't empty we
+    # still need ``list_all`` under to_thread because the snapshot
+    # itself acquires the same lock.
+    if coord_mgr.count == 0:
+        return set()
+    return await asyncio.to_thread(
+        lambda: {ws.id for ws in coord_mgr.list_all()},
+    )
+
+
 async def coordinator_history(request: Request) -> JSONResponse:
     """GET /v1/api/workstreams/{ws_id}/history — message history for page load.
 
@@ -2654,113 +2686,6 @@ async def coordinator_history(request: Request) -> JSONResponse:
         except Exception:
             log.debug("coordinator_history.load_failed ws=%s", ws_id[:8], exc_info=True)
     return JSONResponse({"ws_id": ws_id, "messages": messages})
-
-
-async def coordinator_list(request: Request) -> JSONResponse:
-    """GET /v1/api/workstreams — list active coordinator sessions for the caller."""
-    err = _require_admin_coordinator(request)
-    if err is not None:
-        return err
-    coord_mgr, err503 = _require_coord_mgr(request)
-    if err503 is not None:
-        return err503
-    # Trusted-team visibility: any admin.coordinator-scoped caller
-    # sees cluster-wide active coordinators.  ``user_id`` stays on the
-    # response row as metadata for the UI.
-    rows = coord_mgr.list_all()
-    return JSONResponse(
-        {
-            "coordinators": [
-                {
-                    "ws_id": r.id,
-                    "name": r.name,
-                    "state": r.state.value,
-                    "user_id": r.user_id,
-                }
-                for r in rows
-            ]
-        }
-    )
-
-
-async def coordinator_saved(request: Request) -> JSONResponse:
-    """GET /v1/api/workstreams/saved — list saved (closed-but-persisted) coordinator
-    sessions for the caller.
-
-    Mirrors :func:`turnstone.server.list_saved_workstreams` for the
-    coordinator surface so the frontend can render a "saved coordinators"
-    card grid identically to the interactive "saved workstreams" sidebar.
-    Same response item shape, same tenant/admin scoping.
-
-    Returns ONLY rows with ``state='closed'`` — explicitly closed
-    coordinators that the user can re-open via the saved card.  Active /
-    in-flight rows live in the active list above; deleted rows are
-    tombstones that ``_open_impl`` refuses to resurrect.
-
-    Also filters out coordinators currently loaded into ``coord_mgr``
-    (defence-in-depth: a coordinator could be 'closed' on disk but
-    still in the warm pool right after a restart of the close-emit
-    sequence races the in-memory pop).
-    """
-    from turnstone.core.memory import list_workstreams_with_history
-    from turnstone.core.workstream import WorkstreamKind
-
-    err = _require_admin_coordinator(request)
-    if err is not None:
-        return err
-
-    # Trusted-team visibility (post-#400): any caller with the
-    # ``admin.coordinator`` scope sees cluster-wide saved coordinators;
-    # ``user_id`` stays as metadata on the persisted row but isn't a
-    # filter here.
-    # Offload the blocking storage call + the lock-acquiring list_all
-    # off the event loop, matching coordinator_create's pattern (#perf-2
-    # from the saved-coordinators review).  list_workstreams_with_history
-    # runs a correlated COUNT subquery; coord_mgr.list_all() takes the
-    # manager lock.  Either can stall every other async handler if run
-    # inline.
-    rows = await asyncio.to_thread(
-        list_workstreams_with_history,
-        limit=50,
-        kind=WorkstreamKind.COORDINATOR,
-        user_id=None,
-        state="closed",
-    )
-
-    coord_mgr = getattr(request.app.state, "coord_mgr", None)
-    loaded: set[str] = set()
-    if coord_mgr is not None:
-        try:
-            loaded = await asyncio.to_thread(
-                lambda: {ws.id for ws in coord_mgr.list_all()},
-            )
-        except Exception:
-            log.debug("coordinator_saved.list_all_failed", exc_info=True)
-
-    # Column order from list_workstreams_with_history is
-    # (ws_id, alias, title, name, created, updated, count, node_id) — see
-    # the SELECT in turnstone/core/storage/_sqlite.py:list_workstreams_with_history.
-    # ``*_extra`` swallows the trailing node_id (and any future columns
-    # appended at the tail); keep this comment in sync if the SELECT
-    # changes the prefix order.
-    result = [
-        {
-            "ws_id": wid,
-            "alias": alias,
-            "title": title,
-            "name": name,
-            "created": created,
-            "updated": updated,
-            "message_count": count,
-        }
-        for wid, alias, title, name, created, updated, count, *_extra in rows
-        if wid not in loaded
-    ]
-    # Key is ``coordinators`` (not ``workstreams``) for consistency with
-    # the sibling coordinator_list endpoint.  Item shape matches the
-    # interactive saved-workstreams response so the frontend card renderer
-    # stays a 1:1 mirror.
-    return JSONResponse({"coordinators": result})
 
 
 async def coordinator_page(request: Request) -> Response:
@@ -10143,14 +10068,27 @@ def create_app(
         create_validate_request=_coord_create_validate_request,
         create_build_kwargs=_coord_create_build_kwargs,
         create_post_install=_coord_create_post_install,
+        # No alias surface on coord today — the lifted body falls
+        # back to ``ws.name`` when ``list_resolve_titles`` is None.
+        list_resolve_titles=None,
+        # Explicit kind classifier for the lifted list/saved factory's
+        # storage filter (drops the pre-fix ``audit_action_prefix``
+        # string compare that would have silently leaked interactive
+        # rows for any future kind).
+        list_kind=WorkstreamKind.COORDINATOR,
+        # Coord saved cards show only explicitly-closed coordinators —
+        # active / in-flight rows live in the active list and
+        # tombstones are non-resurrectable.
+        saved_state_filter="closed",
+        saved_loaded_lookup=_coord_saved_loaded_lookup,
     )
     coord_workstream_routes: list[Any] = []
     register_session_routes(
         coord_workstream_routes,
         prefix="/api/workstreams",
         handlers=SharedSessionVerbHandlers(
-            list_workstreams=coordinator_list,
-            list_saved=coordinator_saved,
+            list_workstreams=make_list_handler(coord_endpoint_config),  # lifted: shared body
+            list_saved=make_saved_handler(coord_endpoint_config),  # lifted: shared body
             create=make_create_handler(  # lifted: shared body
                 coord_endpoint_config,
                 audit_emit=_audit_coordinator_create,

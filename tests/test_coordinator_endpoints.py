@@ -37,14 +37,13 @@ from turnstone.console.server import (
     _coord_create_build_kwargs,
     _coord_create_post_install,
     _coord_create_validate_request,
+    _coord_saved_loaded_lookup,
     _require_admin_coordinator,
     _require_coord_mgr,
     cluster_ws_detail,
     coordinator_children,
     coordinator_detail,
     coordinator_history,
-    coordinator_list,
-    coordinator_saved,
     coordinator_tasks,
 )
 from turnstone.core.attachments import (
@@ -65,10 +64,13 @@ from turnstone.core.session_routes import (
     make_cancel_handler,
     make_close_handler,
     make_create_handler,
+    make_list_handler,
     make_open_handler,
+    make_saved_handler,
     make_send_handler,
 )
 from turnstone.core.storage._sqlite import SQLiteBackend
+from turnstone.core.workstream import WorkstreamKind
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -115,6 +117,10 @@ _coord_endpoint_config = SessionEndpointConfig(
     create_validate_request=_coord_create_validate_request,
     create_build_kwargs=_coord_create_build_kwargs,
     create_post_install=_coord_create_post_install,
+    list_resolve_titles=None,
+    list_kind=WorkstreamKind.COORDINATOR,
+    saved_state_filter="closed",
+    saved_loaded_lookup=_coord_saved_loaded_lookup,
 )
 
 
@@ -142,12 +148,16 @@ def _make_client(
                 coord_create_handler,
                 methods=["POST"],
             ),
-            Route("/v1/api/workstreams", coordinator_list, methods=["GET"]),
+            Route(
+                "/v1/api/workstreams",
+                make_list_handler(_coord_endpoint_config),
+                methods=["GET"],
+            ),
             # Literal path before the /{ws_id} routes below so Starlette
             # matches "saved" as the literal, not as a ws_id.
             Route(
                 "/v1/api/workstreams/saved",
-                coordinator_saved,
+                make_saved_handler(_coord_endpoint_config),
                 methods=["GET"],
             ),
             Route(
@@ -336,6 +346,42 @@ def test_unresolvable_alias_returns_503(storage):
 
 
 _COORD_HEADERS = {"X-Test-User": "user-1", "X-Test-Perms": "admin.coordinator"}
+
+
+def test_active_list_row_shape_includes_unified_fields(storage):
+    """Stage 2 list-verb-lift parity regression — coord active-list row
+    carries the always-include fields (ws_id, name, state, kind,
+    parent_ws_id, user_id) that the lifted ``make_list_handler``
+    produces on every kind. SDK consumers don't have to branch on
+    kind to read any of these. Pre-lift coord returned a smaller
+    row ({ws_id, name, state, user_id}) under a different top-level
+    key (``coordinators`` vs ``workstreams``)."""
+    mgr = _build_mgr(storage)
+    mgr.create(user_id="u1", name="lifted-coord")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get("/v1/api/workstreams", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    # Top-level key converged on `workstreams`.
+    assert "workstreams" in body
+    assert "coordinators" not in body
+    rows = body["workstreams"]
+    assert len(rows) == 1
+    row = rows[0]
+    # Always-include row shape — coord populates kind=COORDINATOR
+    # and parent_ws_id=None (coordinators have no parent today).
+    assert set(row.keys()) == {
+        "ws_id",
+        "name",
+        "state",
+        "kind",
+        "parent_ws_id",
+        "user_id",
+    }
+    assert row["name"] == "lifted-coord"
+    assert row["kind"] == "coordinator"
+    assert row["parent_ws_id"] is None
+    assert row["user_id"] == "u1"
 
 
 def test_create_returns_ws_id_and_records_audit(storage):
@@ -561,7 +607,7 @@ def test_list_returns_cluster_wide(storage):
     resp = client.get("/v1/api/workstreams", headers=_COORD_HEADERS)
     assert resp.status_code == 200
     body = resp.json()
-    names = {c["name"] for c in body["coordinators"]}
+    names = {c["name"] for c in body["workstreams"]}
     assert names == {"mine", "theirs"}
 
 
@@ -616,7 +662,7 @@ def test_saved_returns_cluster_wide(saved_storage):
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.get("/v1/api/workstreams/saved", headers=_COORD_HEADERS)
     assert resp.status_code == 200
-    assert {c["ws_id"] for c in resp.json()["coordinators"]} == {a, b}
+    assert {c["ws_id"] for c in resp.json()["workstreams"]} == {a, b}
 
 
 def test_saved_excludes_currently_loaded(saved_storage):
@@ -638,7 +684,7 @@ def test_saved_excludes_currently_loaded(saved_storage):
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.get("/v1/api/workstreams/saved", headers=_COORD_HEADERS)
     assert resp.status_code == 200
-    saved_ids = {c["ws_id"] for c in resp.json()["coordinators"]}
+    saved_ids = {c["ws_id"] for c in resp.json()["workstreams"]}
     assert closed_id in saved_ids
     assert loaded_ws.id not in saved_ids
 
@@ -665,7 +711,7 @@ def test_saved_excludes_active_state_rows(saved_storage):
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.get("/v1/api/workstreams/saved", headers=_COORD_HEADERS)
     assert resp.status_code == 200
-    saved_ids = {c["ws_id"] for c in resp.json()["coordinators"]}
+    saved_ids = {c["ws_id"] for c in resp.json()["workstreams"]}
     assert saved_ids == {closed_id}
 
 

@@ -26,7 +26,16 @@ function mockFetchError(
 describe("TurnstoneServer", () => {
   it("listWorkstreams returns parsed response", async () => {
     const fetchFn = mockFetch({
-      workstreams: [{ id: "ws1", name: "test", state: "idle" }],
+      workstreams: [
+        {
+          ws_id: "ws1",
+          name: "test",
+          state: "idle",
+          kind: "interactive",
+          parent_ws_id: null,
+          user_id: "u1",
+        },
+      ],
     });
     const client = new TurnstoneServer({
       baseUrl: "http://test",
@@ -34,7 +43,9 @@ describe("TurnstoneServer", () => {
     });
     const resp = await client.listWorkstreams();
     expect(resp.workstreams).toHaveLength(1);
-    expect(resp.workstreams[0].id).toBe("ws1");
+    // Row key renamed id → ws_id in the Stage 2 list-verb lift.
+    expect(resp.workstreams[0].ws_id).toBe("ws1");
+    expect(resp.workstreams[0].kind).toBe("interactive");
     expect(fetchFn).toHaveBeenCalledWith(
       "http://test/v1/api/workstreams",
       expect.objectContaining({ method: "GET" }),

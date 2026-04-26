@@ -1024,21 +1024,6 @@ class CoordinatorCreateResponse(BaseModel):
     attachment_ids: list[str] = Field(default_factory=list)
 
 
-class CoordinatorInfo(BaseModel):
-    """Per-coordinator row in the list response."""
-
-    ws_id: str
-    name: str
-    state: str
-    user_id: str
-
-
-class CoordinatorListResponse(BaseModel):
-    """Response body for GET /v1/api/workstreams."""
-
-    coordinators: list[CoordinatorInfo] = Field(default_factory=list)
-
-
 class CoordinatorDetailResponse(BaseModel):
     """Response body for GET /v1/api/workstreams/{ws_id}."""
 
