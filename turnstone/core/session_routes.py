@@ -71,15 +71,22 @@ AttachmentOwnerResolver = Callable[
 SpawnMetricsHook = Callable[["Request", Any], None]
 
 
-# (session, ui, *, was_running) — pure read; returns the ``dropped``
-# dict surfaced in the cancel response (pending-approval tool names,
-# queued-message count + preview, etc.). Kinds that don't need a
-# forensic snapshot wire ``None`` and the lifted body returns an
-# empty ``dropped`` dict in the response. Protocol-typed because
-# ``Callable`` can't express the keyword-only ``was_running`` arg
-# the lifted body passes.
 class CancelForensics(Protocol):
-    def __call__(self, session: Any, ui: Any, *, was_running: bool) -> dict[str, Any]: ...
+    """Pure-read snapshot the lifted ``cancel`` body surfaces as ``dropped``.
+
+    Returns a dict with whatever in-flight session / UI state the
+    kind wants to expose to the caller (pending-approval tool names,
+    queued-message count + preview, etc.). Kinds that don't need a
+    forensic snapshot wire ``None`` on the cfg and the lifted body
+    returns an empty ``dropped`` dict in the response.
+
+    Protocol-typed (rather than ``Callable``) because the keyword-only
+    ``was_running`` argument the lifted body passes can't be expressed
+    by a plain ``Callable`` type alias.
+    """
+
+    def __call__(self, session: Any, ui: Any, *, was_running: bool) -> dict[str, Any]:
+        """Return the ``dropped`` snapshot for the cancel response."""
 
 
 @dataclass(frozen=True)
