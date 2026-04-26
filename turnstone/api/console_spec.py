@@ -37,6 +37,7 @@ from turnstone.api.console_schemas import (
     CoordinatorRestrictRequest,
     CoordinatorRestrictResponse,
     CoordinatorSendRequest,
+    CoordinatorSendResponse,
     CoordinatorStopCascadeResponse,
     CoordinatorTaskInfo,
     CoordinatorTasksResponse,
@@ -131,8 +132,10 @@ from turnstone.api.schemas import (
     UserInfo,
 )
 from turnstone.api.server_schemas import (
+    ListAttachmentsResponse,
     ListSkillSummaryResponse,
     SkillSummary,
+    UploadAttachmentResponse,
 )
 
 CONSOLE_ENDPOINTS: list[EndpointSpec] = [
@@ -1191,12 +1194,63 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "POST",
         "Queue a user message onto the coordinator session",
         description=(
-            "Worker thread picks up the message via the session's queue.  "
-            "``429`` when the worker queue is full — caller should back off."
+            "Worker thread picks up the message via the session's queue. "
+            "Optional ``attachment_ids`` reserve attachments under the "
+            "message's send_id token (parity with the interactive surface). "
+            "Response carries ``attached_ids`` / ``dropped_attachment_ids`` "
+            "so callers can detect partial reservations and ``priority`` / "
+            "``msg_id`` on the queued path. "
+            "``status: queue_full`` when the worker queue is full — caller "
+            "should back off."
         ),
         request_model=CoordinatorSendRequest,
+        response_model=CoordinatorSendResponse,
+        error_codes=[400, 403, 404, 500, 503],
+        tags=["Coordinator"],
+    ),
+    # --- Coordinator attachments (P1.5: parity with interactive) ---
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/attachments",
+        "POST",
+        "Upload a file attachment to a coordinator workstream",
+        description=(
+            "Multipart upload (field ``file``). Same validation rules as "
+            "the interactive surface: magic-byte image sniff, UTF-8 text "
+            "decode, per-kind size cap, per-(ws,user) pending cap. "
+            "Attachments stay pending until a subsequent ``/send`` "
+            "reserves them under its ``send_id`` token."
+        ),
+        response_model=UploadAttachmentResponse,
+        error_codes=[400, 403, 404, 409, 413, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/attachments",
+        "GET",
+        "List the caller's pending coordinator attachments",
+        response_model=ListAttachmentsResponse,
+        error_codes=[403, 404, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/attachments/{attachment_id}/content",
+        "GET",
+        "Return raw bytes of a coordinator attachment",
+        description=(
+            "Same byte-stream + headers as the interactive surface. Text "
+            "kinds are forced to ``text/plain`` so an HTML-shaped text "
+            "upload can't render same-origin."
+        ),
+        error_codes=[403, 404, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/attachments/{attachment_id}",
+        "DELETE",
+        "Remove a pending coordinator attachment",
+        description="Consumed attachments return 404.",
         response_model=StatusResponse,
-        error_codes=[400, 403, 404, 429, 500, 503],
+        error_codes=[403, 404, 503],
         tags=["Coordinator"],
     ),
     EndpointSpec(
@@ -1460,6 +1514,7 @@ _ALL_MODELS: list[type[BaseModel]] = [
     CoordinatorRestrictRequest,
     CoordinatorRestrictResponse,
     CoordinatorSendRequest,
+    CoordinatorSendResponse,
     CoordinatorStopCascadeResponse,
     CoordinatorTaskInfo,
     CoordinatorTasksResponse,

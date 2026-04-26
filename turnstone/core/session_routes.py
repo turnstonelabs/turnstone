@@ -58,6 +58,39 @@ TenantCheck = Callable[
     ["Request", str, "SessionManager"],
     "JSONResponse | None",
 ]
+# (request, ws_id, mgr) -> (owner_user_id, error_response). Owner is
+# the user_id attachments are filed under; error is a 404 when the ws
+# doesn't exist anywhere (memory or storage).
+AttachmentOwnerResolver = Callable[
+    ["Request", str, "SessionManager"],
+    tuple[str, "JSONResponse | None"],
+]
+# (request, ui) — kind's spawn-time bookkeeping. Interactive bumps
+# ``_metrics.record_message_sent`` + per-UI message counters; coord
+# has no analog and wires ``None``.
+SpawnMetricsHook = Callable[["Request", Any], None]
+
+
+@dataclass(frozen=True)
+class AttachmentUploadHelpers:
+    """Process-local hooks the lifted attachment factories call into.
+
+    The classification + per-(ws,user) lock are stateful concerns that
+    don't belong on the (frozen) :class:`SessionEndpointConfig`
+    directly: ``sniff_image_mime`` and ``classify_text_attachment``
+    are pure but defined in the kind's owning module;
+    ``upload_lock`` returns a process-local cached lock. Bundling
+    them on a separate dataclass keeps the cfg declarative and lets
+    callers share one helper instance across kinds if the policies
+    converge later.
+    """
+
+    sniff_image_mime: Callable[[bytes], str | None]
+    classify_text_attachment: Callable[
+        [str, str, bytes],
+        tuple[str | None, str | None],
+    ]
+    upload_lock: Callable[[str, str], Any]
 
 
 @dataclass(frozen=True)
@@ -66,9 +99,10 @@ class SessionEndpointConfig:
 
     Instantiated once per process during app construction and passed
     to the verb factory (e.g. :func:`make_approve_handler`,
-    :func:`make_close_handler`), which captures it via closure. The
-    request-time handler reads ``cfg`` from the closure rather than
-    ``app.state`` so the dependency is visible at the wire-up site.
+    :func:`make_close_handler`, :func:`make_send_handler`), which
+    captures it via closure. The request-time handler reads ``cfg``
+    from the closure rather than ``app.state`` so the dependency is
+    visible at the wire-up site.
 
     - ``permission_gate``: kind's pre-handler permission check
       (e.g. ``admin.coordinator`` for coord, ``None`` for interactive
@@ -90,6 +124,28 @@ class SessionEndpointConfig:
     - ``audit_action_prefix``: the dot-namespaced prefix the kind
       uses for its audit actions ("workstream" → ``workstream.cancel``;
       "coordinator" → ``coordinator.cancel``).
+
+    Capability flags (added with the P1.5 ``send`` body lift):
+
+    - ``supports_attachments``: when ``True``, the lifted ``send``
+      handler resolves attachment_ids, reserves under a send_id token,
+      and threads them through ``ChatSession.send`` /
+      ``ChatSession.queue_message``. Both kinds wire ``True`` post-P1.5
+      (the storage layer was always kind-agnostic; the gate stays
+      around so a kind that hasn't lit up its UI surface yet can
+      defer the verb body changes).
+    - ``attachment_owner_resolver``: resolves the ``user_id`` to scope
+      attachments under for a given request + ws_id. Required when
+      ``supports_attachments`` is ``True``.
+    - ``spawn_metrics``: optional bookkeeping hook fired once per
+      ``send`` that spawns a fresh worker (queue-reuse path skips it).
+      Interactive wires its WebUI per-conversation counters; coord
+      wires ``None``.
+    - ``emit_message_queued``: when ``True`` and the dispatcher takes
+      the live-worker enqueue path, the lifted body emits a
+      ``message_queued`` event onto the workstream's listener queue
+      via ``ui._enqueue``. Both kinds wire ``True`` since both UIs
+      have a listener queue.
     """
 
     permission_gate: PermissionGate | None
@@ -97,6 +153,11 @@ class SessionEndpointConfig:
     tenant_check: TenantCheck | None
     not_found_label: str
     audit_action_prefix: str
+    supports_attachments: bool = False
+    attachment_owner_resolver: AttachmentOwnerResolver | None = None
+    attachment_helpers: AttachmentUploadHelpers | None = None
+    spawn_metrics: SpawnMetricsHook | None = None
+    emit_message_queued: bool = True
 
 
 @dataclass(frozen=True)
@@ -544,3 +605,556 @@ def make_close_handler(
         return JSONResponse({"status": "ok"})
 
     return close
+
+
+def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
+    """Lifted body for ``POST {prefix}/{ws_id}/send`` — message dispatch.
+
+    Reserves any attachment ids the request carries, captures a
+    ``send_id`` token for end-to-end tracking, then dispatches via
+    :func:`turnstone.core.session_worker.send` (atomic
+    spawn-or-enqueue under ``ws._lock``). Both queue-reuse and
+    spawn paths reserve so the eventual ``mark_attachments_consumed``
+    can match on ``reserved_for_msg_id``.
+
+    Capability flags on ``cfg`` toggle the kind-specific behaviour:
+
+    - ``supports_attachments``: when ``False``, attachment-resolution
+      logic short-circuits and the handler accepts only
+      ``{"message": ...}``.
+    - ``spawn_metrics``: when set, fires once on the spawn path with
+      ``(request, ui)``. Interactive wires its WebUI per-conversation
+      counters here; coord wires ``None``.
+    - ``emit_message_queued``: when ``True``, the queue-reuse path
+      pushes a ``message_queued`` event onto the listener queue.
+
+    Response shape (both kinds, P1.5 onwards):
+
+    - 200 ``{"status": "ok", "attached_ids", "dropped_attachment_ids"}``
+      — fresh worker spawned. ``attached_ids`` is the subset of
+      requested attachments that landed (may be a strict subset on
+      reservation race losses).
+    - 200 ``{"status": "queued", "priority", "msg_id", "attached_ids",
+      "dropped_attachment_ids"}`` — reused live worker; queued for
+      injection at the next tool-result seam.
+    - 200 ``{"status": "queue_full"}`` — live worker's queue at
+      capacity. Caller should retry.
+    - 4xx / 500 — auth / not-found / no-session per the usual
+      :class:`SessionEndpointConfig` semantics.
+    """
+    import asyncio
+    import threading
+    import uuid
+
+    from turnstone.core import session_worker
+    from turnstone.core.session import GenerationCancelled
+    from turnstone.core.web_helpers import read_json_or_400
+
+    async def send(request: Request) -> Response:
+        if cfg.permission_gate is not None:
+            err = cfg.permission_gate(request)
+            if err is not None:
+                return err
+        mgr_opt, err503 = cfg.manager_lookup(request)
+        if err503 is not None:
+            return err503
+        mgr = cast("SessionManager", mgr_opt)
+
+        body = await read_json_or_400(request)
+        if isinstance(body, JSONResponse):
+            return body
+
+        ws_id = request.path_params.get("ws_id", "")
+        message = (body.get("message") or "").strip()
+        if not message:
+            return JSONResponse({"error": "message is required"}, status_code=400)
+
+        if cfg.tenant_check is not None:
+            err_tenant = cfg.tenant_check(request, ws_id, mgr)
+            if err_tenant is not None:
+                return err_tenant
+
+        ws = mgr.get(ws_id)
+        if ws is None:
+            return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+        ui = ws.ui
+        if ui is None:
+            return JSONResponse({"error": "session UI not available"}, status_code=409)
+
+        # ----- Attachment reservation (atomic reserve-then-dispatch) -----
+        send_id = ""
+        requested_ids: list[str] = []
+        ordered_reserved: list[str] = []
+        reserved_set: set[str] = set()
+        reserved_ids: list[str] = []
+        resolved_atts: list[Any] = []
+        attach_user_id = ""
+
+        if cfg.supports_attachments:
+            from turnstone.core.attachments import (
+                MAX_PENDING_ATTACHMENTS_PER_USER_WS,
+                Attachment,
+            )
+            from turnstone.core.memory import (
+                get_attachments as _get_attachments,
+            )
+            from turnstone.core.memory import (
+                get_pending_attachments_with_content as _get_pending_with_content,
+            )
+            from turnstone.core.memory import (
+                reserve_attachments as _reserve,
+            )
+
+            if cfg.attachment_owner_resolver is None:
+                # Mis-wired config — the resolver is mandatory when
+                # attachments are enabled. Fail loudly rather than
+                # silently filing under the wrong owner.
+                return JSONResponse({"error": "attachment_owner_resolver missing"}, status_code=500)
+            attach_user_id, owner_err = cfg.attachment_owner_resolver(request, ws_id, mgr)
+            if owner_err is not None:
+                return owner_err
+
+            send_id = uuid.uuid4().hex
+            raw_ids = body.get("attachment_ids")
+            auto_consume_rows: list[dict[str, Any]] = []
+            if raw_ids is None:
+                # Auto-consume: pull the caller's pending (unreserved)
+                # rows in creation order — bytes included so we skip
+                # a second fetch below.
+                auto_consume_rows = _get_pending_with_content(ws_id, attach_user_id)
+                requested_ids = [str(r["attachment_id"]) for r in auto_consume_rows]
+            elif isinstance(raw_ids, list) and raw_ids:
+                if len(raw_ids) > MAX_PENDING_ATTACHMENTS_PER_USER_WS:
+                    return JSONResponse(
+                        {
+                            "error": (
+                                f"Too many attachment_ids "
+                                f"(max {MAX_PENDING_ATTACHMENTS_PER_USER_WS})"
+                            ),
+                            "code": "too_many",
+                        },
+                        status_code=400,
+                    )
+                requested_ids = [str(x) for x in raw_ids if x]
+
+            reserved_ids = (
+                _reserve(requested_ids, send_id, ws_id, attach_user_id) if requested_ids else []
+            )
+            reserved_set = set(reserved_ids)
+            ordered_reserved = [aid for aid in requested_ids if aid in reserved_set]
+
+            if ordered_reserved:
+                if auto_consume_rows and all(
+                    str(r["attachment_id"]) in reserved_set for r in auto_consume_rows
+                ):
+                    rows_by_id = {str(r["attachment_id"]): r for r in auto_consume_rows}
+                    # reserved_for_msg_id was None at pre-fetch; patch
+                    # in the token so the scope check below admits the
+                    # rows we just reserved.
+                    for r in rows_by_id.values():
+                        r["reserved_for_msg_id"] = send_id
+                else:
+                    rows = _get_attachments(ordered_reserved)
+                    rows_by_id = {str(r["attachment_id"]): r for r in rows}
+                for aid in ordered_reserved:
+                    row = rows_by_id.get(aid)
+                    if not row:
+                        continue
+                    # Belt-and-braces scope check on top of the reservation.
+                    if (
+                        row.get("ws_id") != ws_id
+                        or row.get("user_id") != attach_user_id
+                        or row.get("message_id") is not None
+                        or row.get("reserved_for_msg_id") != send_id
+                    ):
+                        continue
+                    content = row.get("content")
+                    if not isinstance(content, bytes):
+                        continue
+                    resolved_atts.append(
+                        Attachment(
+                            attachment_id=str(row["attachment_id"]),
+                            filename=str(row.get("filename") or ""),
+                            mime_type=str(row.get("mime_type") or "application/octet-stream"),
+                            kind=str(row.get("kind") or ""),
+                            content=content,
+                        )
+                    )
+
+        def _release_reservation_on_fail() -> None:
+            """Unreserve if we bail before the dispatcher takes ownership."""
+            if reserved_ids:
+                from turnstone.core.memory import (
+                    unreserve_attachments as _unreserve,
+                )
+
+                _unreserve(send_id, ws_id, attach_user_id)
+
+        # If a cancel was just issued, briefly poll for the worker to
+        # exit before dispatching — avoids spawning into a stale
+        # worker. ``_worker_running`` flips False under ws._lock when
+        # the thread reaches its finally block (same gate the
+        # dispatcher uses). Async sleep keeps the event loop free.
+        if ws._worker_running and ws.session and ws.session._cancel_event.is_set():
+            for _ in range(30):  # up to 3s in 100ms steps
+                await asyncio.sleep(0.1)
+                if not ws._worker_running:
+                    break
+        if ws.session is None:
+            _release_reservation_on_fail()
+            return JSONResponse({"error": "No session"}, status_code=500)
+
+        session = ws.session
+        # Captured by ``_enqueue`` only when the dispatcher takes the
+        # live-worker reuse path. Empty after a fresh-spawn dispatch.
+        queue_outcome: dict[str, Any] = {}
+
+        def _enqueue() -> None:
+            cleaned, priority, msg_id = session.queue_message(
+                message,
+                attachment_ids=list(ordered_reserved),
+                queue_msg_id=send_id or None,
+            )
+            queue_outcome["cleaned"] = cleaned
+            queue_outcome["priority"] = priority
+            queue_outcome["msg_id"] = msg_id
+
+        def _run() -> None:
+            me = threading.current_thread()
+            try:
+                kwargs: dict[str, Any] = {}
+                if resolved_atts:
+                    kwargs["attachments"] = resolved_atts
+                if send_id:
+                    kwargs["send_id"] = send_id
+                session.send(message, **kwargs)
+            except GenerationCancelled:
+                # Safety net — send() normally handles this internally.
+                # If this thread was force-abandoned, ws.worker_thread
+                # was set to None — don't emit spurious events.
+                _release_reservation_on_fail()
+                if ws.worker_thread is me and ui is not None:
+                    ui.on_stream_end()
+                    ui.on_state_change("idle")
+            except Exception as e:
+                # Release the reservation so attachments don't stay
+                # soft-locked forever on a worker crash before the
+                # consume step. Idempotent: once consume cleared the
+                # token, a follow-up unreserve is a no-op.
+                _release_reservation_on_fail()
+                if ws.worker_thread is me and ui is not None:
+                    ui.on_error(f"Error: {e}")
+                    ui.on_stream_end()
+                    ui.on_state_change("error")
+
+        ok = session_worker.send(
+            ws,
+            enqueue=_enqueue,
+            run=_run,
+            thread_name=f"send-worker-{ws.id[:8]}",
+        )
+        if not ok:
+            # queue.Full or session-disappeared race — surface as
+            # queue_full so clients retry rather than 500.
+            _release_reservation_on_fail()
+            return JSONResponse({"status": "queue_full"})
+
+        dropped = [aid for aid in requested_ids if aid not in reserved_set]
+        if queue_outcome:
+            # Reused a live worker; ``queue_message`` succeeded.
+            if cfg.emit_message_queued and hasattr(ui, "_enqueue"):
+                ui._enqueue(
+                    {
+                        "type": "message_queued",
+                        "message": queue_outcome["cleaned"],
+                        "priority": queue_outcome["priority"],
+                        "msg_id": queue_outcome["msg_id"],
+                    }
+                )
+            return JSONResponse(
+                {
+                    "status": "queued",
+                    "priority": queue_outcome["priority"],
+                    "msg_id": queue_outcome["msg_id"],
+                    "attached_ids": list(ordered_reserved),
+                    "dropped_attachment_ids": dropped,
+                }
+            )
+
+        # Spawned a fresh worker — kind's metrics fire once per turn.
+        if cfg.spawn_metrics is not None:
+            try:
+                cfg.spawn_metrics(request, ui)
+            except Exception:
+                log.debug(
+                    "ws.send.spawn_metrics_failed ws=%s",
+                    ws_id[:8] if ws_id else "",
+                    exc_info=True,
+                )
+        return JSONResponse(
+            {
+                "status": "ok",
+                "attached_ids": list(ordered_reserved),
+                "dropped_attachment_ids": dropped,
+            }
+        )
+
+    return send
+
+
+def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
+    """Lifted bodies for the four per-workstream attachment endpoints.
+
+    Both kinds share the storage layer
+    (:mod:`turnstone.core.memory` calls are kind-agnostic) and the
+    same per-(``ws_id``, ``user_id``) scope semantics. Differences
+    factor into ``cfg.permission_gate`` (auth) and
+    ``cfg.attachment_owner_resolver`` (scope + 404 mask).
+
+    ``cfg.supports_attachments`` is checked at registration time —
+    callers should only invoke this factory when it's ``True``. The
+    factory still returns four working handlers if you call it
+    otherwise; they'll just no-op-with-500 when
+    ``attachment_owner_resolver`` is unset.
+    """
+    import uuid
+
+    async def _gate(request: Request) -> JSONResponse | None:
+        if cfg.permission_gate is not None:
+            err = cfg.permission_gate(request)
+            if err is not None:
+                return err
+        return None
+
+    async def _resolve_owner(request: Request, ws_id: str) -> tuple[str, JSONResponse | None]:
+        mgr_opt, err503 = cfg.manager_lookup(request)
+        if err503 is not None:
+            return "", err503
+        mgr = cast("SessionManager", mgr_opt)
+        if cfg.attachment_owner_resolver is None:
+            return "", JSONResponse({"error": "attachment_owner_resolver missing"}, status_code=500)
+        return cfg.attachment_owner_resolver(request, ws_id, mgr)
+
+    async def upload(request: Request) -> Response:
+        from turnstone.core.attachments import (
+            IMAGE_SIZE_CAP,
+            MAX_PENDING_ATTACHMENTS_PER_USER_WS,
+            TEXT_DOC_SIZE_CAP,
+        )
+        from turnstone.core.memory import list_pending_attachments, save_attachment
+        from turnstone.core.web_helpers import read_multipart_file_or_400
+
+        # Sniffing helpers stay kind-specific because they're tied to
+        # the file-classification policy table; defer to the cfg's
+        # owning module via the upload-helper hook.
+        if cfg.attachment_helpers is None:
+            return JSONResponse({"error": "attachment_helpers missing"}, status_code=500)
+        sniff_image = cfg.attachment_helpers.sniff_image_mime
+        classify_text = cfg.attachment_helpers.classify_text_attachment
+        upload_lock = cfg.attachment_helpers.upload_lock
+
+        err_gate = await _gate(request)
+        if err_gate is not None:
+            return err_gate
+
+        ws_id = request.path_params.get("ws_id", "")
+        if not ws_id:
+            return JSONResponse({"error": "ws_id is required"}, status_code=400)
+
+        user_id, err = await _resolve_owner(request, ws_id)
+        if err:
+            return err
+
+        got = await read_multipart_file_or_400(request, field="file", max_bytes=IMAGE_SIZE_CAP)
+        if isinstance(got, JSONResponse):
+            return got
+        filename, claimed_mime, data = got
+        if not data:
+            return JSONResponse({"error": "Empty file"}, status_code=400)
+
+        sniffed_image = sniff_image(data)
+        if sniffed_image is not None:
+            if len(data) > IMAGE_SIZE_CAP:
+                return JSONResponse(
+                    {
+                        "error": (
+                            f"Image too large ({len(data):,} bytes); "
+                            f"cap is {IMAGE_SIZE_CAP:,} bytes."
+                        ),
+                        "code": "too_large",
+                    },
+                    status_code=413,
+                )
+            kind = "image"
+            mime = sniffed_image
+        else:
+            if len(data) > TEXT_DOC_SIZE_CAP:
+                return JSONResponse(
+                    {
+                        "error": (
+                            f"Text document too large ({len(data):,} bytes); "
+                            f"cap is {TEXT_DOC_SIZE_CAP:,} bytes."
+                        ),
+                        "code": "too_large",
+                    },
+                    status_code=413,
+                )
+            mime_or_err = classify_text(filename, claimed_mime, data)
+            if mime_or_err[0] is None:
+                return JSONResponse(
+                    {"error": mime_or_err[1], "code": "unsupported"}, status_code=400
+                )
+            kind = "text"
+            mime = mime_or_err[0]
+
+        # Serialize count-check + save per (ws, user) so concurrent
+        # uploads can't both pass a check that sees count == cap-1.
+        lock = upload_lock(ws_id, user_id)
+        with lock:
+            if len(list_pending_attachments(ws_id, user_id)) >= MAX_PENDING_ATTACHMENTS_PER_USER_WS:
+                return JSONResponse(
+                    {
+                        "error": (
+                            f"Too many pending attachments "
+                            f"(max {MAX_PENDING_ATTACHMENTS_PER_USER_WS} pending per workstream)"
+                        ),
+                        "code": "too_many",
+                    },
+                    status_code=409,
+                )
+            attachment_id = uuid.uuid4().hex
+            save_attachment(attachment_id, ws_id, user_id, filename, mime, len(data), kind, data)
+        return JSONResponse(
+            {
+                "attachment_id": attachment_id,
+                "filename": filename,
+                "mime_type": mime,
+                "size_bytes": len(data),
+                "kind": kind,
+            }
+        )
+
+    async def list_pending(request: Request) -> Response:
+        from turnstone.core.memory import list_pending_attachments
+
+        err_gate = await _gate(request)
+        if err_gate is not None:
+            return err_gate
+        ws_id = request.path_params.get("ws_id", "")
+        if not ws_id:
+            return JSONResponse({"error": "ws_id is required"}, status_code=400)
+        user_id, err = await _resolve_owner(request, ws_id)
+        if err:
+            return err
+        rows = list_pending_attachments(ws_id, user_id)
+        return JSONResponse({"attachments": rows})
+
+    async def get_content(request: Request) -> Response:
+        from starlette.responses import Response as _Response
+
+        from turnstone.core.memory import get_attachment
+
+        err_gate = await _gate(request)
+        if err_gate is not None:
+            return err_gate
+        ws_id = request.path_params.get("ws_id", "")
+        attachment_id = request.path_params.get("attachment_id", "")
+        if not ws_id or not attachment_id:
+            return JSONResponse({"error": "ws_id and attachment_id are required"}, status_code=400)
+        user_id, err = await _resolve_owner(request, ws_id)
+        if err:
+            return err
+        row = get_attachment(attachment_id)
+        # Scope on user_id too — id-guessing across users in an
+        # unowned workstream would otherwise leak blobs. Mask
+        # cross-user / cross-ws as 404 to avoid leaking existence.
+        if not row or row.get("ws_id") != ws_id or row.get("user_id") != user_id:
+            return JSONResponse({"error": "Not found"}, status_code=404)
+        body = row.get("content") or b""
+        kind = row.get("kind") or ""
+        stored_mime = row.get("mime_type") or "application/octet-stream"
+        filename = str(row.get("filename") or "attachment")
+        # Force text/plain for text kinds — avoids same-origin HTML/SVG
+        # rendering if a user uploaded an HTML-ish text file. Images
+        # keep their sniffed MIME (allowlist is strict: png/jpeg/gif/webp).
+        response_mime = "text/plain; charset=utf-8" if kind == "text" else stored_mime
+        safe_name = filename.replace('"', "").replace("\r", "").replace("\n", "")
+        headers = {
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+            "Content-Disposition": f'inline; filename="{safe_name}"',
+            "Cache-Control": "private, no-store",
+        }
+        return _Response(body, media_type=response_mime, headers=headers)
+
+    async def delete_(request: Request) -> Response:
+        from turnstone.core.memory import delete_attachment as _delete
+
+        err_gate = await _gate(request)
+        if err_gate is not None:
+            return err_gate
+        ws_id = request.path_params.get("ws_id", "")
+        attachment_id = request.path_params.get("attachment_id", "")
+        if not ws_id or not attachment_id:
+            return JSONResponse({"error": "ws_id and attachment_id are required"}, status_code=400)
+        user_id, err = await _resolve_owner(request, ws_id)
+        if err:
+            return err
+        deleted = _delete(attachment_id, ws_id, user_id)
+        if not deleted:
+            return JSONResponse({"error": "Not found"}, status_code=404)
+        return JSONResponse({"status": "deleted"})
+
+    return AttachmentHandlers(
+        upload=upload,
+        list=list_pending,
+        get_content=get_content,
+        delete=delete_,
+    )
+
+
+def make_dequeue_handler(cfg: SessionEndpointConfig) -> Handler:
+    """Lifted body for ``DELETE {prefix}/{ws_id}/send`` — cancel a queued message.
+
+    Removes a previously-queued message identified by ``msg_id`` from
+    the workstream's pending queue. Returns ``status: removed`` when
+    the queue had the entry and ``status: not_found`` otherwise.
+    Reservations attached to the dequeued message are released by
+    ``ChatSession.dequeue_message`` so attachments can be reused.
+    """
+    from turnstone.core.web_helpers import read_json_or_400
+
+    async def dequeue(request: Request) -> Response:
+        if cfg.permission_gate is not None:
+            err = cfg.permission_gate(request)
+            if err is not None:
+                return err
+        mgr_opt, err503 = cfg.manager_lookup(request)
+        if err503 is not None:
+            return err503
+        mgr = cast("SessionManager", mgr_opt)
+
+        body = await read_json_or_400(request)
+        if isinstance(body, JSONResponse):
+            return body
+        msg_id = body.get("msg_id")
+        if not msg_id:
+            return JSONResponse({"error": "msg_id required"}, status_code=400)
+
+        # ws_id may come from path (new path-keyed shape) or body
+        # (legacy /v1/api/send DELETE under the body-keyed adapter).
+        ws_id = request.path_params.get("ws_id", "") or str(body.get("ws_id") or "")
+        if cfg.tenant_check is not None:
+            err_tenant = cfg.tenant_check(request, ws_id, mgr)
+            if err_tenant is not None:
+                return err_tenant
+
+        ws = mgr.get(ws_id)
+        if ws is None:
+            return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+        if ws.session is None:
+            return JSONResponse({"error": "No session"}, status_code=400)
+        removed = ws.session.dequeue_message(msg_id)
+        return JSONResponse({"status": "removed" if removed else "not_found"})
+
+    return dequeue

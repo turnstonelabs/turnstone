@@ -246,6 +246,63 @@ def require_storage_or_503(
     return storage, None
 
 
+def auth_user_id(request: Request) -> str:
+    """Return the authenticated user's id (empty string when absent).
+
+    Reads ``request.state.auth_result.user_id`` set by
+    :class:`AuthMiddleware`. Both node and console processes carry the
+    same ``AuthResult`` shape, so this helper is kind-agnostic — useful
+    for handlers lifted into :mod:`turnstone.core.session_routes`.
+    """
+    auth = getattr(getattr(request, "state", None), "auth_result", None)
+    return str(getattr(auth, "user_id", "") or "")
+
+
+def resolve_workstream_owner(
+    request: Request,
+    ws_id: str,
+    *,
+    mgr: Any | None = None,
+    not_found_label: str = "Workstream not found",
+) -> tuple[str, JSONResponse | None]:
+    """Resolve ``ws_id`` to its owner; 404 when the row doesn't exist.
+
+    Turnstone is a trusted-team tool: scope-level auth (e.g.
+    ``admin.workstreams`` / ``admin.coordinator``) is the only gate;
+    row-level ownership is not enforced here. Returns
+    ``(owner_user_id, None)`` on success — the persisted owner id,
+    which attachments should be filed under so existing storage shape
+    is preserved. Falls back to the caller's own uid when the row has
+    no recorded owner.
+
+    When ``mgr`` is provided and the workstream is live in memory,
+    trust its cached ``user_id`` instead of round-tripping storage —
+    keeps in-memory-only handlers functional during transient DB
+    outages and trims the hot-path by one query.
+
+    ``not_found_label`` is the message body the 404 carries — the
+    interactive surface uses "Workstream not found"; coord uses
+    "coordinator not found" so error strings stay readable per kind.
+    """
+    from starlette.responses import JSONResponse as _JSONResponse
+
+    caller = auth_user_id(request)
+
+    if mgr is not None:
+        ws_mem = mgr.get(ws_id)
+        if ws_mem is not None:
+            return ws_mem.user_id or caller, None
+        # Not in memory — fall through to storage so persisted-but-not-
+        # loaded rows still resolve.
+
+    from turnstone.core.memory import get_workstream_owner
+
+    owner = get_workstream_owner(ws_id)
+    if owner is None:
+        return "", _JSONResponse({"error": not_found_label}, status_code=404)
+    return owner or caller, None
+
+
 def parse_cors_origins() -> list[str] | None:
     """Parse ``TURNSTONE_CORS_ORIGINS`` env var into a list of origin strings.
 
