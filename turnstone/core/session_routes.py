@@ -1016,10 +1016,19 @@ def make_open_handler(
                 ws_id[:8] if ws_id else "",
                 exc_info=True,
             )
+            # Per-kind noun in the user-facing error so coord callers
+            # see "failed to open coordinator" and interactive callers
+            # see "failed to open workstream" (matching the pre-lift
+            # ``coordinator_open`` / ``open_workstream`` wording on
+            # both sides). ``audit_action_prefix`` is the existing
+            # per-kind label both lifespans already construct
+            # ("workstream" / "coordinator"); reusing it here gives
+            # the cfg field its first runtime reader.
+            kind_noun = cfg.audit_action_prefix or "workstream"
             return JSONResponse(
                 {
                     "error": (
-                        f"failed to open workstream (internal error). "
+                        f"failed to open {kind_noun} (internal error). "
                         f"correlation_id={correlation_id}"
                     )
                 },

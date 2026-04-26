@@ -490,6 +490,63 @@ class TestOpenWorkstream:
         assert captured == [("ws-fresh", "fresh-name")]
 
     @patch("turnstone.core.memory.resolve_workstream")
+    def test_open_500_message_uses_kind_noun_from_cfg(self, mock_resolve, _inject_storage):
+        """``cfg.audit_action_prefix`` ("workstream" interactive,
+        "coordinator" coord) is woven into the 500 error string so
+        coord callers see ``"failed to open coordinator"`` and
+        interactive callers see ``"failed to open workstream"``,
+        matching the pre-lift wording on both sides. Pre-fix
+        (Copilot review on PR #414) the message was hardcoded
+        ``"failed to open workstream"`` for both kinds — coord
+        callers got misleading text."""
+        from starlette.applications import Starlette
+        from starlette.middleware import Middleware
+        from starlette.routing import Mount, Route
+        from starlette.testclient import TestClient
+
+        def _lazy_alias(ws_id: str) -> str | None:
+            from turnstone.core.memory import resolve_workstream
+
+            return resolve_workstream(ws_id)
+
+        mock_mgr = MagicMock()
+        cfg = SessionEndpointConfig(
+            permission_gate=None,
+            manager_lookup=lambda _r: (mock_mgr, None),
+            tenant_check=None,
+            not_found_label="coordinator not found",
+            audit_action_prefix="coordinator",  # coord-shaped cfg
+            open_resolve_alias=_lazy_alias,
+        )
+        handler = make_open_handler(cfg)
+        app = Starlette(
+            routes=[
+                Mount(
+                    "/v1",
+                    routes=[
+                        Route("/api/workstreams/{ws_id}/open", handler, methods=["POST"]),
+                    ],
+                ),
+            ],
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        client = TestClient(app)
+
+        mock_resolve.return_value = "ws-fresh"
+        mock_mgr.get.return_value = None
+        mock_mgr.open.side_effect = RuntimeError("session factory blew up")
+
+        r = client.post("/v1/api/workstreams/ws-fresh/open")
+        assert r.status_code == 500
+        body = r.json()
+        # Per-kind noun in the message.
+        assert "failed to open coordinator" in body["error"]
+        # Correlation id present so support can match a log entry.
+        assert "correlation_id=" in body["error"]
+        # Exception text is NOT echoed (no internal-detail leak).
+        assert "session factory blew up" not in body["error"]
+
+    @patch("turnstone.core.memory.resolve_workstream")
     def test_open_swallows_post_load_exception(self, mock_resolve, _inject_storage):
         """A bug in ``open_post_load`` must NOT block the open from
         returning 200 — the workstream is already loaded by mgr.open
