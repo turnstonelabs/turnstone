@@ -1886,8 +1886,10 @@ def make_list_handler(cfg: SessionEndpointConfig) -> Handler:
       interactive ``None`` (auth middleware covers it).
     - ``cfg.manager_lookup`` — already used by every other lifted
       verb.
-    - ``cfg.list_resolve_title`` — interactive's user-alias override;
-      coord ``None``.
+    - ``cfg.list_resolve_titles`` — interactive's bulk user-alias
+      lookup; coord ``None``. Single ``SELECT ... WHERE ws_id IN
+      (...)`` resolves every active row's title in one storage
+      round-trip (replaces the pre-lift per-row N+1).
 
     Always-include row shape: ``{ws_id, name, state, kind,
     parent_ws_id, user_id}``. SDK consumers don't branch on kind.
@@ -1976,10 +1978,14 @@ def make_saved_handler(cfg: SessionEndpointConfig) -> Handler:
     Per-kind divergence:
 
     - ``cfg.permission_gate`` — coord's ``admin.coordinator`` check.
-    - ``cfg.audit_action_prefix`` — used to derive the kind filter
-      ("workstream" → INTERACTIVE; "coordinator" → COORDINATOR).
-      Already wired on every endpoint cfg; reuse here keeps the
-      cfg surface tight.
+    - ``cfg.list_kind`` — required ``WorkstreamKind`` passed straight
+      through to ``list_workstreams_with_history(kind=...)``. The
+      handler treats a missing value as a configuration error and
+      surfaces 500 with a clear log line — fails loud rather than
+      silently filtering for the wrong kind. Distinct from
+      ``audit_action_prefix`` (audit-action namespacing) so adding a
+      third kind doesn't have to overload the audit prefix as a
+      kind classifier.
     - ``cfg.saved_state_filter`` — coord wires ``"closed"`` so only
       explicitly-closed coordinators surface; interactive wires
       ``None`` (any state except the tombstoned ``deleted`` rows the

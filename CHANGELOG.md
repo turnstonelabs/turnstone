@@ -22,14 +22,24 @@ Three release tracks are maintained:
   ``GET /v1/api/workstreams`` + ``GET /v1/api/workstreams/saved``
   and coord ``GET /v1/api/workstreams`` + ``GET /v1/api/workstreams/saved``
   handlers now share two factory bodies via
-  ``make_list_handler(cfg)`` and ``make_saved_handler(cfg)``. Three
+  ``make_list_handler(cfg)`` and ``make_saved_handler(cfg)``. Four
   new ``SessionEndpointConfig`` fields capture the per-kind
   divergence:
 
-  - ``list_resolve_title: ListResolveTitle | None`` — interactive
-    wires :func:`turnstone.core.memory.get_workstream_display_name`
-    so user-set aliases override the auto-generated ws-XXXX name in
-    the active list. Coord wires ``None`` (no alias surface).
+  - ``list_resolve_titles: ListResolveTitles | None`` — interactive
+    wires :func:`turnstone.core.memory.get_workstream_display_names`
+    (new bulk helper added on the storage layer + ``memory.py``)
+    so the active-list endpoint resolves every user-set alias in
+    ONE ``SELECT ... WHERE ws_id IN (...)`` instead of the pre-lift
+    per-row N+1. Coord wires ``None`` (no alias surface today).
+  - ``list_kind: WorkstreamKind | None`` — required storage-side
+    kind classifier passed to ``list_workstreams_with_history``.
+    Interactive wires ``WorkstreamKind.INTERACTIVE``; coord wires
+    ``WorkstreamKind.COORDINATOR``. Distinct from
+    ``audit_action_prefix`` (audit-action namespacing) so adding a
+    third kind doesn't have to overload the audit prefix as a
+    classifier; missing value surfaces as 500 with a clear log
+    line rather than silently filtering for the wrong kind.
   - ``saved_state_filter: str | None`` — coord wires ``"closed"``
     so only explicitly-closed coordinators surface in the
     saved-card grid. Interactive wires ``None`` (the storage
