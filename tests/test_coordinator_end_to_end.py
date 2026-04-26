@@ -32,9 +32,12 @@ from turnstone.console.coordinator_client import CoordinatorClient
 from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 from turnstone.console.server import (
     _audit_close_coordinator,
+    _audit_coordinator_create,
+    _coord_create_build_kwargs,
+    _coord_create_post_install,
+    _coord_create_validate_request,
     _require_admin_coordinator,
     _require_coord_mgr,
-    coordinator_create,
     coordinator_detail,
     coordinator_list,
 )
@@ -43,6 +46,7 @@ from turnstone.core.session_manager import SessionManager
 from turnstone.core.session_routes import (
     SessionEndpointConfig,
     make_close_handler,
+    make_create_handler,
 )
 from turnstone.core.storage._sqlite import SQLiteBackend
 
@@ -53,6 +57,11 @@ _coord_endpoint_config = SessionEndpointConfig(
     tenant_check=None,
     not_found_label="coordinator not found",
     audit_action_prefix="coordinator",
+    create_supports_attachments=True,
+    create_supports_user_id_override=False,
+    create_validate_request=_coord_create_validate_request,
+    create_build_kwargs=_coord_create_build_kwargs,
+    create_post_install=_coord_create_post_install,
 )
 
 
@@ -136,7 +145,7 @@ def _make_client(
         routes=[
             Route(
                 "/v1/api/workstreams/new",
-                coordinator_create,
+                make_create_handler(_coord_endpoint_config, audit_emit=_audit_coordinator_create),
                 methods=["POST"],
             ),
             Route("/v1/api/workstreams", coordinator_list, methods=["GET"]),
@@ -186,7 +195,7 @@ def test_create_list_detail_lifecycle(tmp_path):
         json={"name": "e2e-coord"},
         headers=_COORD_HEADERS,
     )
-    assert resp.status_code == 201, resp.text
+    assert resp.status_code == 200, resp.text
     body = resp.json()
     ws_id = body["ws_id"]
     assert ws_id

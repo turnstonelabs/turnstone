@@ -139,16 +139,20 @@ class TestConsoleSpec:
         }
         assert expected.issubset(paths), f"Missing: {expected - paths}"
 
-    def test_coordinator_create_has_request_body_and_201(self):
-        """Coordinator create returns 201 (not 200) and accepts a body."""
+    def test_coordinator_create_has_request_body_and_200(self):
+        """Coordinator create returns 200 and accepts a body.
+
+        Pre-1.5.0 this returned 201 (REST-strict for create); the lifted
+        ``make_create_handler`` factory converges on 200 across both
+        kinds for response-shape parity with every other shared verb.
+        """
         from turnstone.api.console_spec import build_console_spec
 
         spec = build_console_spec()
         op = spec["paths"]["/v1/api/workstreams/new"]["post"]
         assert "requestBody" in op
         assert "application/json" in op["requestBody"]["content"]
-        # Pin the 201 success code.
-        assert "201" in op["responses"]
+        assert "200" in op["responses"]
 
     def test_coordinator_history_has_limit_query_param(self):
         from turnstone.api.console_spec import build_console_spec

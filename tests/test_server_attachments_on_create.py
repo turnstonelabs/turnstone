@@ -50,9 +50,11 @@ def _auth(user: str) -> dict[str, str]:
 
 class TestValidateAndSaveUploadedFiles:
     def test_saves_image_and_text(self, tmp_path):
+        from turnstone.core.attachments import (
+            validate_and_save_uploaded_files as _validate_and_save_uploaded_files,
+        )
         from turnstone.core.memory import list_pending_attachments
         from turnstone.core.storage import init_storage, reset_storage
-        from turnstone.server import _validate_and_save_uploaded_files
 
         reset_storage()
         init_storage("sqlite", path=str(tmp_path / "t.db"), run_migrations=False)
@@ -73,8 +75,10 @@ class TestValidateAndSaveUploadedFiles:
 
     def test_rejects_oversized_image(self, tmp_path):
         from turnstone.core.attachments import IMAGE_SIZE_CAP
+        from turnstone.core.attachments import (
+            validate_and_save_uploaded_files as _validate_and_save_uploaded_files,
+        )
         from turnstone.core.storage import init_storage, reset_storage
-        from turnstone.server import _validate_and_save_uploaded_files
 
         reset_storage()
         init_storage("sqlite", path=str(tmp_path / "t.db"), run_migrations=False)
@@ -90,8 +94,10 @@ class TestValidateAndSaveUploadedFiles:
             reset_storage()
 
     def test_rejects_unsupported_text(self, tmp_path):
+        from turnstone.core.attachments import (
+            validate_and_save_uploaded_files as _validate_and_save_uploaded_files,
+        )
         from turnstone.core.storage import init_storage, reset_storage
-        from turnstone.server import _validate_and_save_uploaded_files
 
         reset_storage()
         init_storage("sqlite", path=str(tmp_path / "t.db"), run_migrations=False)
@@ -107,9 +113,11 @@ class TestValidateAndSaveUploadedFiles:
 
     def test_pending_cap_returns_409(self, tmp_path):
         from turnstone.core.attachments import MAX_PENDING_ATTACHMENTS_PER_USER_WS
+        from turnstone.core.attachments import (
+            validate_and_save_uploaded_files as _validate_and_save_uploaded_files,
+        )
         from turnstone.core.memory import save_attachment
         from turnstone.core.storage import init_storage, reset_storage
-        from turnstone.server import _validate_and_save_uploaded_files
 
         reset_storage()
         init_storage("sqlite", path=str(tmp_path / "t.db"), run_migrations=False)

@@ -14,8 +14,12 @@ from __future__ import annotations
 import collections
 import os
 import threading
+import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from starlette.responses import JSONResponse
 
 # Byte caps — enforced by the server layer at upload time.  The
 # constants live here so the session / tests share the same definitions.
@@ -186,6 +190,104 @@ def classify_text_attachment(
     if mime_ok and claimed_mime:
         return claimed_mime, None
     return "text/plain", None
+
+
+def validate_and_save_uploaded_files(
+    files: list[tuple[str, str, bytes]],
+    ws_id: str,
+    user_id: str,
+) -> tuple[list[str], JSONResponse | None]:
+    """Classify + save a list of ``(filename, claimed_mime, data)`` tuples.
+
+    Applies the same validation rules as ``upload_attachment`` (magic-byte
+    image sniffing, UTF-8 text decode, per-kind size cap, per-(ws,user)
+    pending cap) under the shared :func:`upload_lock`.
+
+    Kind-agnostic: both interactive and coordinator create-with-attachments
+    paths call into this helper from the lifted ``make_create_handler``
+    factory (Stage 2 ``create`` verb lift). The helper does not consult
+    any kind-specific config — the storage layer is kind-agnostic by
+    design (P1.5).
+
+    Returns ``(attachment_ids, None)`` on success or ``(ids_saved_so_far,
+    JSONResponse)`` on the first failure so the caller can roll back any
+    partial state.
+    """
+    from starlette.responses import JSONResponse as _JSONResponse
+
+    from turnstone.core.memory import list_pending_attachments, save_attachment
+
+    saved_ids: list[str] = []
+    if not files:
+        return saved_ids, None
+
+    lock = upload_lock(ws_id, user_id)
+    with lock:
+        pending_count = len(list_pending_attachments(ws_id, user_id))
+        for filename, claimed_mime, data in files:
+            if not data:
+                return saved_ids, _JSONResponse({"error": "Empty file"}, status_code=400)
+            sniffed_image = sniff_image_mime(data)
+            if sniffed_image is not None:
+                if len(data) > IMAGE_SIZE_CAP:
+                    return saved_ids, _JSONResponse(
+                        {
+                            "error": (
+                                f"Image too large ({len(data):,} bytes); "
+                                f"cap is {IMAGE_SIZE_CAP:,} bytes."
+                            ),
+                            "code": "too_large",
+                        },
+                        status_code=413,
+                    )
+                kind = "image"
+                mime = sniffed_image
+            else:
+                if len(data) > TEXT_DOC_SIZE_CAP:
+                    return saved_ids, _JSONResponse(
+                        {
+                            "error": (
+                                f"Text document too large ({len(data):,} bytes); "
+                                f"cap is {TEXT_DOC_SIZE_CAP:,} bytes."
+                            ),
+                            "code": "too_large",
+                        },
+                        status_code=413,
+                    )
+                mime_or_err = classify_text_attachment(filename, claimed_mime, data)
+                if mime_or_err[0] is None:
+                    return saved_ids, _JSONResponse(
+                        {"error": mime_or_err[1], "code": "unsupported"},
+                        status_code=400,
+                    )
+                kind = "text"
+                mime = mime_or_err[0]
+
+            if pending_count + 1 > MAX_PENDING_ATTACHMENTS_PER_USER_WS:
+                return saved_ids, _JSONResponse(
+                    {
+                        "error": (
+                            f"Too many pending attachments "
+                            f"(max {MAX_PENDING_ATTACHMENTS_PER_USER_WS} pending per workstream)"
+                        ),
+                        "code": "too_many",
+                    },
+                    status_code=409,
+                )
+            attachment_id = uuid.uuid4().hex
+            save_attachment(
+                attachment_id,
+                ws_id,
+                user_id,
+                filename,
+                mime,
+                len(data),
+                kind,
+                data,
+            )
+            saved_ids.append(attachment_id)
+            pending_count += 1
+    return saved_ids, None
 
 
 def unreadable_placeholder(filename: str) -> dict[str, Any]:

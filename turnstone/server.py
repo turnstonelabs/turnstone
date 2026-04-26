@@ -66,6 +66,7 @@ from turnstone.core.session_routes import (
     make_attachment_handlers,
     make_cancel_handler,
     make_close_handler,
+    make_create_handler,
     make_dequeue_handler,
     make_events_handler,
     make_legacy_body_keyed_adapter,
@@ -2013,209 +2014,55 @@ def _reserve_and_resolve_attachments(
     return resolved, ordered_reserved, dropped
 
 
-def _validate_and_save_uploaded_files(
-    files: list[tuple[str, str, bytes]],
-    ws_id: str,
-    user_id: str,
-) -> tuple[list[str], JSONResponse | None]:
-    """Classify + save a list of ``(filename, claimed_mime, data)`` tuples.
+async def _interactive_create_validate_request(
+    request: Request,
+    body: dict[str, Any],
+    uid: str,
+    uploaded_files: list[tuple[str, str, bytes]],
+) -> JSONResponse | None:
+    """Per-kind pre-create gates for interactive workstreams.
 
-    Applies the same validation rules as ``upload_attachment`` (magic-byte
-    image sniffing, UTF-8 text decode, per-kind size cap, per-(ws,user)
-    pending cap) under the shared ``_attachment_upload_lock``.
+    Wired onto :attr:`SessionEndpointConfig.create_validate_request`
+    and called by :func:`make_create_handler` after body parsing
+    but before skill resolution / ``mgr.create``. Returns the
+    rejection response or ``None`` to continue.
 
-    Returns ``(attachment_ids, None)`` on success or ``(ids_saved_so_far,
-    JSONResponse)`` on the first failure so the caller can roll back any
-    partial state.
+    Gates:
+    - ws_id format must match :data:`_VALID_WS_ID` (32 hex chars)
+      when supplied.
+    - attachments + resume_ws combo is disallowed (resume forks an
+      existing ws; attachments belong on the *fresh* turn — caller
+      should resume first, then upload via the standard endpoint).
+    - body kind must be ``INTERACTIVE``: coordinator workstreams
+      land on the console handler with ``admin.coordinator`` scope,
+      not this one. Unknown / future kind values 400 rather than
+      silently coerce.
+    - parent_ws_id (when supplied) must reference a coordinator
+      owned by ``uid``. Without this gate an attacker could point a
+      new interactive workstream at someone else's coordinator and
+      receive that coordinator's child_ws_* SSE events
+      (name/state/tokens leak).
+    - notify_targets (when supplied) must validate.
+      :func:`_validate_notify_targets` is pure-read and doesn't need
+      ``ws`` to be built — gating here preserves pre-lift's 400
+      semantic for caller-supplied input. Without this pre-create
+      gate a malformed ``notify_targets`` would land in
+      ``post_install`` (after ``mgr.create``, audit emit, and the
+      ``ws_created`` broadcast) and the only available signal is to
+      raise — which the factory turns into 500. 400 at the gate is
+      correct shape for client-input validation.
     """
-    from turnstone.core.attachments import (
-        IMAGE_SIZE_CAP,
-        MAX_PENDING_ATTACHMENTS_PER_USER_WS,
-        TEXT_DOC_SIZE_CAP,
-        classify_text_attachment,
-        sniff_image_mime,
-        upload_lock,
-    )
-    from turnstone.core.memory import list_pending_attachments, save_attachment
-
-    saved_ids: list[str] = []
-    if not files:
-        return saved_ids, None
-
-    lock = upload_lock(ws_id, user_id)
-    with lock:
-        pending_count = len(list_pending_attachments(ws_id, user_id))
-        for filename, claimed_mime, data in files:
-            if not data:
-                return saved_ids, JSONResponse({"error": "Empty file"}, status_code=400)
-            sniffed_image = sniff_image_mime(data)
-            if sniffed_image is not None:
-                if len(data) > IMAGE_SIZE_CAP:
-                    return saved_ids, JSONResponse(
-                        {
-                            "error": (
-                                f"Image too large ({len(data):,} bytes); "
-                                f"cap is {IMAGE_SIZE_CAP:,} bytes."
-                            ),
-                            "code": "too_large",
-                        },
-                        status_code=413,
-                    )
-                kind = "image"
-                mime = sniffed_image
-            else:
-                if len(data) > TEXT_DOC_SIZE_CAP:
-                    return saved_ids, JSONResponse(
-                        {
-                            "error": (
-                                f"Text document too large ({len(data):,} bytes); "
-                                f"cap is {TEXT_DOC_SIZE_CAP:,} bytes."
-                            ),
-                            "code": "too_large",
-                        },
-                        status_code=413,
-                    )
-                mime_or_err = classify_text_attachment(filename, claimed_mime, data)
-                if mime_or_err[0] is None:
-                    return saved_ids, JSONResponse(
-                        {"error": mime_or_err[1], "code": "unsupported"},
-                        status_code=400,
-                    )
-                kind = "text"
-                mime = mime_or_err[0]
-
-            if pending_count + 1 > MAX_PENDING_ATTACHMENTS_PER_USER_WS:
-                return saved_ids, JSONResponse(
-                    {
-                        "error": (
-                            f"Too many pending attachments "
-                            f"(max {MAX_PENDING_ATTACHMENTS_PER_USER_WS} pending per workstream)"
-                        ),
-                        "code": "too_many",
-                    },
-                    status_code=409,
-                )
-            attachment_id = uuid.uuid4().hex
-            save_attachment(
-                attachment_id,
-                ws_id,
-                user_id,
-                filename,
-                mime,
-                len(data),
-                kind,
-                data,
-            )
-            saved_ids.append(attachment_id)
-            pending_count += 1
-    return saved_ids, None
-
-
-async def create_workstream(request: Request) -> JSONResponse:
-    """POST /v1/api/workstreams/new — create a new workstream.
-
-    Accepts two content types:
-
-    - ``application/json`` (default): body is a :class:`CreateWorkstreamRequest`.
-    - ``multipart/form-data``: one ``meta`` field (JSON object, same shape
-      as the JSON body) plus zero-or-more ``file`` parts. Files are saved
-      as attachments under the new workstream and reserved onto the first
-      ``initial_message`` turn (if provided) before the worker dispatches.
-    """
-    from turnstone.core.attachments import IMAGE_SIZE_CAP
-    from turnstone.core.audit import record_audit
-    from turnstone.core.memory import get_workstream_display_name
-    from turnstone.core.web_helpers import (
-        read_json_or_400,
-        read_multipart_create_or_400,
-    )
-
-    content_type = (request.headers.get("content-type") or "").lower()
-    uploaded_files: list[tuple[str, str, bytes]] = []
-    body: dict[str, Any]
-    if content_type.startswith("multipart/form-data"):
-        # Multipart cap: up to MAX_PENDING × image cap, plus slack for
-        # JSON meta + multipart framing.  Per-file size is enforced in
-        # _validate_and_save_uploaded_files against the kind-specific cap.
-        parsed = await read_multipart_create_or_400(
-            request,
-            max_files=10,
-            max_per_file_bytes=IMAGE_SIZE_CAP,
-            max_total_bytes=10 * IMAGE_SIZE_CAP,
-        )
-        if isinstance(parsed, JSONResponse):
-            return parsed
-        body, uploaded_files = parsed
-    else:
-        json_body = await read_json_or_400(request)
-        if isinstance(json_body, JSONResponse):
-            return json_body
-        body = json_body
-    mgr: SessionManager = request.app.state.workstreams
-    skip: bool = request.app.state.skip_permissions
-    auth = getattr(getattr(request, "state", None), "auth_result", None)
-    uid: str = getattr(auth, "user_id", "") or ""
-    # Trusted services (console) may forward the real user_id in the request
-    # body when creating workstreams on behalf of a user.  Only service
-    # identities are trusted — end-user tokens (including console-proxy tokens
-    # that carry the real user's identity) must not override user_id.
-    trusted_sources = {"console"}
-    if (
-        body.get("user_id")
-        and isinstance(body["user_id"], str)
-        and auth is not None
-        and auth.token_source in trusted_sources
-    ):
-        uid = body["user_id"]
-    body_skill = body.get("skill", "")
-    resume_ws_id = body.get("resume_ws", "")
-    # Resolve skill — applies content + session config (model, temperature, etc.)
-    # Skip when resuming: the resumed session restores its own skill from config.
-    skill_data: dict[str, Any] | None = None
-    if body_skill and not resume_ws_id:
-        from turnstone.core.memory import get_skill_by_name
-
-        skill_data = get_skill_by_name(body_skill)
-        if not skill_data or not skill_data.get("enabled", False):
-            return JSONResponse(
-                {"error": f"Skill not found or disabled: {body_skill}"},
-                status_code=400,
-            )
-    resolved_model = body.get("model") or None
-    if skill_data and skill_data.get("model"):
-        resolved_model = skill_data["model"]
-    resolved_skill: str | None = body_skill if skill_data else None
-    applied_skill_version = 0
-    if skill_data:
-        from turnstone.core.storage import get_storage as _get_storage
-
-        _st = _get_storage()
-        applied_skill_version = len(_st.list_skill_versions(skill_data["template_id"])) + 1
     requested_ws_id = body.get("ws_id", "") or ""
     if not isinstance(requested_ws_id, str):
         requested_ws_id = ""
     if requested_ws_id and not _VALID_WS_ID.match(requested_ws_id):
         return JSONResponse({"error": "invalid ws_id format"}, status_code=400)
-    # Disallow attachments + resume_ws in the same request — semantics
-    # are unclear (resume forks an existing ws, but attachments are for
-    # the *fresh* turn).  Caller should resume first, then upload via
-    # the standard endpoint.  Checked before mgr.create() so we don't
-    # waste work on a request we'll reject.
+    resume_ws_id = body.get("resume_ws", "") or ""
     if uploaded_files and resume_ws_id:
         return JSONResponse(
             {"error": "attachments cannot be combined with resume_ws"},
             status_code=400,
         )
-    # Kind + parent relationship: coordinator-spawned children forward
-    # these from the console's CoordinatorClient.  Default kind is
-    # ``INTERACTIVE``; coordinators themselves are created by the console's
-    # own SessionManager (coordinator kind) and never land in this handler.
-    # Only
-    # ``INTERACTIVE`` is accepted here — requests that try to create a
-    # coordinator via the generic workstream endpoint are rejected, and
-    # unknown kinds (typos, future-only values) are 400 rather than being
-    # silently coerced.  User-facing edge: the storage_edge and manager
-    # layers below re-validate, see comments at those sites for why.
     try:
         body_kind = WorkstreamKind.from_raw(body.get("kind"))
     except ValueError:
@@ -2235,16 +2082,6 @@ async def create_workstream(request: Request) -> JSONResponse:
         )
     body_parent = body.get("parent_ws_id") or None
     if body_parent is not None:
-        # Ownership gate: parent_ws_id is client-supplied in the request
-        # body, so a malicious caller could previously point a new
-        # interactive workstream at another tenant's coordinator — the
-        # coordinator's SSE fan-out would then route child_ws_* events
-        # (carrying the attacker's name/state/tokens) to that victim.
-        # Validate against storage: the parent must exist, be a
-        # coordinator, and belong to the same user.  Coordinator-spawned
-        # children satisfy this by construction (the coordinator's JWT
-        # `sub` claim is the owning user and parent_ws_id is the coord's
-        # own ws_id); external clients that fabricate the field get 403.
         from turnstone.core.storage._registry import get_storage as _get_storage_for_parent
 
         _pstorage = _get_storage_for_parent()
@@ -2262,251 +2099,295 @@ async def create_workstream(request: Request) -> JSONResponse:
                 {"error": "parent_ws_id must reference a coordinator you own"},
                 status_code=403,
             )
-    try:
-        ws = mgr.create(
-            user_id=uid,
-            name=body.get("name", ""),
-            model=resolved_model,
-            skill=resolved_skill,
-            skill_id=skill_data["template_id"] if skill_data else "",
-            skill_version=applied_skill_version,
-            ws_id=requested_ws_id,
-            client_type=body.get("client_type", "") or "",
-            judge_model=body.get("judge_model", "") or None,
-            parent_ws_id=body_parent,
-        )
-        if not isinstance(ws.ui, WebUI):
-            raise TypeError(f"Expected WebUI, got {type(ws.ui).__name__}")
-        if skip or body.get("auto_approve", False):
-            ws.ui.auto_approve = True
-        # Register watch runner for this workstream
-        runner = getattr(request.app.state, "watch_runner", None)
-        if runner and ws.session:
-            ws.session.set_watch_runner(
-                runner, dispatch_fn=_make_watch_dispatch(ws, ws.session, ws.ui)
-            )
-        gq: queue.Queue[dict[str, Any]] = request.app.state.global_queue
+    notify_targets_raw = body.get("notify_targets", "[]")
+    if isinstance(notify_targets_raw, list):
+        notify_targets_raw = json.dumps(notify_targets_raw)
+    _, nt_err = _validate_notify_targets(notify_targets_raw)
+    if nt_err:
+        return JSONResponse({"error": nt_err}, status_code=400)
+    return None
 
-        # Save attachments BEFORE the ws_created broadcast so failed
-        # validation doesn't make SSE consumers flash a workstream that
-        # never really existed.  Validate + save happens early; rollback
-        # is silent (no ws_created → no ws_closed needed).
-        attachment_ids: list[str] = []
-        if uploaded_files:
-            saved_ids, save_err = _validate_and_save_uploaded_files(uploaded_files, ws.id, uid)
-            if save_err is not None:
-                from turnstone.core.memory import delete_workstream as _delete_ws
 
-                with contextlib.suppress(Exception):
-                    mgr.close(ws.id)
-                with contextlib.suppress(Exception):
-                    _delete_ws(ws.id)
-                return save_err
-            attachment_ids = saved_ids
+def _interactive_create_build_kwargs(
+    request: Request,
+    body: dict[str, Any],
+    uid: str,
+    skill_data: dict[str, Any] | None,
+    skill_id: str,
+    applied_skill_version: int,
+) -> dict[str, Any]:
+    """Build kwargs for ``mgr.create`` from a parsed interactive create body.
 
-        # Emit creation event on global queue for SSE consumers (console).
-        # Deferred until past attachment validation so a rejected create
-        # doesn't surface a phantom create→close pair.
-        display_name = get_workstream_display_name(ws.id) or ws.name
-        with contextlib.suppress(queue.Full):
-            gq.put_nowait(
-                {
-                    "type": "ws_created",
-                    "ws_id": ws.id,
-                    "name": display_name,
-                    "model": ws.session.model if ws.session else "",
-                    "model_alias": ws.session.model_alias if ws.session else "",
-                    "kind": ws.kind,
-                    "parent_ws_id": ws.parent_ws_id,
-                    # Owner id is propagated through the cluster event
-                    # stream so console-side fan-out can enforce tenant
-                    # isolation — a coordinator must never receive
-                    # child_ws_* events for workstreams it doesn't own.
-                    "user_id": ws.user_id,
-                }
-            )
-        # Tamper-evident audit trail.  Lives alongside the broadcast
-        # event (not replacing it — the broadcast is ephemeral UI
-        # signalling, the audit row survives for forensic review).
-        _audit_storage = getattr(request.app.state, "auth_storage", None)
-        if _audit_storage is not None:
-            _, _audit_ip = _audit_context(request)
-            record_audit(
-                _audit_storage,
-                uid,
-                "workstream.created",
-                "workstream",
-                ws.id,
-                {"kind": str(ws.kind), "parent_ws_id": ws.parent_ws_id},
-                _audit_ip,
-            )
-        # Atomic workstream resume during creation.
-        resumed = False
-        message_count = 0
-        if resume_ws_id and ws.session is not None:
-            from turnstone.core.memory import resolve_workstream
+    Wired onto :attr:`SessionEndpointConfig.create_build_kwargs`. The
+    factory threads the resolved skill_data + skill_id + version
+    through; this builder picks the right model (skill override
+    beats body) and assembles the full kwargs dict that
+    ``SessionManager.create`` accepts (including the kind-specific
+    ``judge_model`` / ``client_type`` / ``parent_ws_id`` extras).
+    """
+    resolved_model = body.get("model") or None
+    if skill_data and skill_data.get("model"):
+        resolved_model = skill_data["model"]
+    requested_ws_id = body.get("ws_id", "") or ""
+    if not isinstance(requested_ws_id, str):
+        requested_ws_id = ""
+    return {
+        "user_id": uid,
+        "name": body.get("name", ""),
+        "model": resolved_model,
+        "skill": body.get("skill", "") if skill_data else None,
+        "skill_id": skill_id,
+        "skill_version": applied_skill_version,
+        "ws_id": requested_ws_id,
+        "client_type": body.get("client_type", "") or "",
+        "judge_model": body.get("judge_model", "") or None,
+        "parent_ws_id": body.get("parent_ws_id") or None,
+    }
 
-            target_id = resolve_workstream(resume_ws_id)
-            if target_id and ws.session.resume(target_id, fork=True):
-                resumed = True
-                message_count = len(ws.session.messages)
-                # If the user provided a custom name, set it as the fork's alias
-                # so it takes priority in display.  Otherwise keep the
-                # auto-generated name so auto-title can run fresh.
-                user_name = body.get("name", "").strip()
-                if user_name:
-                    from turnstone.core.memory import set_workstream_alias
 
-                    set_workstream_alias(ws.id, user_name)
-                    ws.name = user_name
-                ui = ws.ui
-                if isinstance(ui, WebUI):
-                    ui._enqueue({"type": "clear_ui"})
-                    history = _build_history(ws.session)
-                    if history:
-                        ui._enqueue({"type": "history", "messages": history})
-                # Broadcast a rename so the tab picks up the correct fork name
-                # (the ws_created event fired before fork with the pre-fork name).
-                with contextlib.suppress(queue.Full):
-                    gq.put_nowait({"type": "ws_rename", "ws_id": ws.id, "name": ws.name})
+async def _interactive_create_post_install(
+    request: Request,
+    ws: Workstream,
+    body: dict[str, Any],
+    uid: str,
+    skill_data: dict[str, Any] | None,
+    applied_skill_version: int,
+    attachment_ids: list[str],
+) -> dict[str, Any]:
+    """Tail end of interactive create: per-WebUI bookkeeping + dispatch.
 
-        # Apply skill session config (only for new workstreams with a skill)
-        if skill_data and not resumed and ws.session:
-            sess = ws.session
-            # Session settings from skill
-            if skill_data.get("temperature") is not None:
-                sess.temperature = skill_data["temperature"]
-            if skill_data.get("reasoning_effort"):
-                sess.reasoning_effort = skill_data["reasoning_effort"]
-            if skill_data.get("max_tokens") is not None:
-                sess.max_tokens = skill_data["max_tokens"]
-            if skill_data.get("token_budget", 0) > 0:
-                sess._token_budget = skill_data["token_budget"]
-            if skill_data.get("agent_max_turns") is not None:
-                sess.agent_max_turns = skill_data["agent_max_turns"]
-            # Approval policy
-            if skill_data.get("auto_approve"):
-                ws.ui.auto_approve = True
-            allowed = skill_data.get("allowed_tools", "")
-            if allowed and allowed != "[]":
-                # Parse as JSON array or comma-separated
-                import json as _json
+    Wired onto :attr:`SessionEndpointConfig.create_post_install`.
+    Runs after the workstream is fully built, attachments saved,
+    and audit emitted. Sequence:
 
-                try:
-                    tools_list = _json.loads(allowed)
-                except (ValueError, TypeError):
-                    tools_list = [t.strip() for t in allowed.split(",") if t.strip()]
-                if tools_list:
-                    ws.ui.auto_approve_tools = set(tools_list)
-            # Metadata
-            sess._notify_on_complete = skill_data.get("notify_on_complete", "{}")
-            sess._applied_skill_id = skill_data["template_id"]
-            sess._applied_skill_version = applied_skill_version
-            if skill_data.get("content"):
-                sess._applied_skill_content = skill_data["content"]
-            sess._save_config()
+    1. Cast ``ws.ui`` to :class:`WebUI` (defence in depth — the
+       interactive adapter's session factory is the only path that
+       reaches this handler).
+    2. Apply ``auto_approve`` from server-wide ``skip_permissions``
+       or per-request body.
+    3. Register the watch runner for the workstream's session.
+    4. Broadcast ``ws_created`` on the global SSE queue. Held until
+       this point so a rejected attachment validation produces no
+       phantom create→close pair on the SSE stream.
+    5. Atomic resume: if ``body["resume_ws"]`` is set, fork the
+       referenced session into the new ws_id, push history into the
+       UI listener queue, and rebroadcast ``ws_rename`` so the tab
+       picks up the fork's display name.
+    6. Apply the skill's session config (temperature / reasoning /
+       max_tokens / approval policy / metadata).
+    7. Resolve notify_targets (schedule targets win over skill
+       fallback).
+    8. Pin the workstream's routing to this node when no caller-
+       supplied ``ws_id`` was provided (direct creates).
+    9. Spawn the initial-message worker thread when ``initial_message``
+       is set, reserving any uploaded attachments for that first
+       turn.
 
-        # Resolve notify_targets: schedule targets override skill targets
-        notify_targets_raw = body.get("notify_targets", "[]")
-        if isinstance(notify_targets_raw, list):
-            notify_targets_raw = json.dumps(notify_targets_raw)
-        nt_str, nt_err = _validate_notify_targets(notify_targets_raw)
-        if nt_err:
-            return JSONResponse({"error": nt_err}, status_code=400)
-        # Skill fallback (only if schedule didn't specify targets)
-        if nt_str == "[]" and skill_data:
-            skill_notify = skill_data.get("notify_on_complete", "[]")
-            if skill_notify and skill_notify != "{}" and skill_notify != "[]":
-                fallback_str, fallback_err = _validate_notify_targets(skill_notify)
-                if not fallback_err:
-                    nt_str = fallback_str
-        ws.notify_targets = nt_str
+    Returns ``{resumed, message_count}`` for the response. On the
+    no-resume path both default to ``False`` / ``0``.
+    """
+    from turnstone.core.memory import get_workstream_display_name
 
-        # Pin locally-created workstreams so the console routes to this node.
-        # Console-routed creates pass ws_id in the request body — those are
-        # already bucket-aligned and don't need an override. Direct creates
-        # (web UI, watch, TurnstoneInit) generate their own ws_id, which may
-        # hash to a bucket assigned to a different node.
-        if not requested_ws_id:
-            node_id = getattr(request.app.state, "node_id", "")
-            if node_id:
-                try:
-                    from turnstone.core.storage import get_storage as _gs
-
-                    _gs().set_workstream_override(ws.id, node_id, reason="local")
-                except Exception:
-                    log.debug("Failed to set routing override for %s", ws.id, exc_info=True)
-
-        # If an initial_message was provided, send it as the first user message.
-        # This replaces the old bridge behavior where CreateWorkstreamMessage
-        # carried initial_message and the bridge sent it as a follow-up.
-        initial_message = body.get("initial_message", "").strip()
-        if initial_message and ws.session is not None:
-            session = ws.session
-            # Reserve any attachments uploaded in this request before the
-            # worker dispatches.  Mirrors the /send endpoint pattern: the
-            # send_id token scopes both the reservation and the eventual
-            # consume.  Unreserve on worker failure so the rows don't stay
-            # soft-locked forever.
-            send_id = uuid.uuid4().hex
-            resolved_atts: list[Any] = []
-            if attachment_ids:
-                resolved_atts, _ord, _drop = _reserve_and_resolve_attachments(
-                    attachment_ids, send_id, ws.id, uid
-                )
-
-            def _run_initial() -> None:
-                try:
-                    session.send(
-                        initial_message,
-                        attachments=resolved_atts or None,
-                        send_id=send_id if resolved_atts else None,
-                    )
-                except (Exception, GenerationCancelled):
-                    if attachment_ids:
-                        from turnstone.core.memory import (
-                            unreserve_attachments as _unreserve,
-                        )
-
-                        with contextlib.suppress(Exception):
-                            _unreserve(send_id, ws.id, uid)
-                    if isinstance(ws.ui, WebUI):
-                        ws.ui.on_stream_end()
-                        ws.ui.on_state_change("idle")
-                finally:
-                    try:
-                        last_content = _extract_last_assistant_content(session)
-                        _fire_notify_targets(ws, last_content)
-                    except Exception:
-                        log.warning("notify_completion.hook_error", ws_id=ws.id, exc_info=True)
-                    with ws._lock:
-                        ws._worker_running = False
-
-            # Inlined rather than via ``session_worker.send`` because
-            # at workstream creation no live worker can exist by
-            # construction — the enqueue branch of the shared dispatch
-            # is dead code here. We still set ``_worker_running`` and
-            # ``ws.worker_thread`` together under ``ws._lock`` so a
-            # /v1/api/send arriving immediately after creation observes
-            # the running state via the shared session_worker gate
-            # instead of racing into a parallel worker.
-            with ws._lock:
-                ws._worker_running = True
-                t = threading.Thread(target=_run_initial, daemon=True, name=f"ws-init-{ws.id[:8]}")
-                ws.worker_thread = t
-                t.start()
-
-        return JSONResponse(
+    if not isinstance(ws.ui, WebUI):
+        raise TypeError(f"Expected WebUI, got {type(ws.ui).__name__}")
+    skip: bool = request.app.state.skip_permissions
+    if skip or body.get("auto_approve", False):
+        ws.ui.auto_approve = True
+    runner = getattr(request.app.state, "watch_runner", None)
+    if runner and ws.session:
+        ws.session.set_watch_runner(runner, dispatch_fn=_make_watch_dispatch(ws, ws.session, ws.ui))
+    gq: queue.Queue[dict[str, Any]] = request.app.state.global_queue
+    # Emit ``ws_created`` on the global queue for SSE consumers
+    # (console). Held until past attachment validation in the
+    # factory so a rejected upload doesn't flash a workstream that
+    # never really existed.
+    display_name = get_workstream_display_name(ws.id) or ws.name
+    with contextlib.suppress(queue.Full):
+        gq.put_nowait(
             {
+                "type": "ws_created",
                 "ws_id": ws.id,
-                "name": ws.name,
-                "resumed": resumed,
-                "message_count": message_count,
-                "attachment_ids": attachment_ids,
+                "name": display_name,
+                "model": ws.session.model if ws.session else "",
+                "model_alias": ws.session.model_alias if ws.session else "",
+                "kind": ws.kind,
+                "parent_ws_id": ws.parent_ws_id,
+                # Owner id propagates through the cluster event
+                # stream so console-side fan-out can enforce tenant
+                # isolation — a coordinator must never receive
+                # child_ws_* events for workstreams it doesn't own.
+                "user_id": ws.user_id,
             }
         )
-    except RuntimeError as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+
+    # Atomic workstream resume during creation.
+    resumed = False
+    message_count = 0
+    resume_ws_id = body.get("resume_ws", "") or ""
+    if resume_ws_id and ws.session is not None:
+        from turnstone.core.memory import resolve_workstream
+
+        target_id = resolve_workstream(resume_ws_id)
+        if target_id and ws.session.resume(target_id, fork=True):
+            resumed = True
+            message_count = len(ws.session.messages)
+            user_name = body.get("name", "").strip()
+            if user_name:
+                from turnstone.core.memory import set_workstream_alias
+
+                set_workstream_alias(ws.id, user_name)
+                ws.name = user_name
+            ui = ws.ui
+            if isinstance(ui, WebUI):
+                ui._enqueue({"type": "clear_ui"})
+                history = _build_history(ws.session)
+                if history:
+                    ui._enqueue({"type": "history", "messages": history})
+            with contextlib.suppress(queue.Full):
+                gq.put_nowait({"type": "ws_rename", "ws_id": ws.id, "name": ws.name})
+
+    # Apply skill session config (only for new workstreams with a skill).
+    if skill_data and not resumed and ws.session:
+        sess = ws.session
+        if skill_data.get("temperature") is not None:
+            sess.temperature = skill_data["temperature"]
+        if skill_data.get("reasoning_effort"):
+            sess.reasoning_effort = skill_data["reasoning_effort"]
+        if skill_data.get("max_tokens") is not None:
+            sess.max_tokens = skill_data["max_tokens"]
+        if skill_data.get("token_budget", 0) > 0:
+            sess._token_budget = skill_data["token_budget"]
+        if skill_data.get("agent_max_turns") is not None:
+            sess.agent_max_turns = skill_data["agent_max_turns"]
+        if skill_data.get("auto_approve"):
+            ws.ui.auto_approve = True
+        allowed = skill_data.get("allowed_tools", "")
+        if allowed and allowed != "[]":
+            import json as _json
+
+            try:
+                tools_list = _json.loads(allowed)
+            except (ValueError, TypeError):
+                tools_list = [t.strip() for t in allowed.split(",") if t.strip()]
+            if tools_list:
+                ws.ui.auto_approve_tools = set(tools_list)
+        sess._notify_on_complete = skill_data.get("notify_on_complete", "{}")
+        sess._applied_skill_id = skill_data["template_id"]
+        sess._applied_skill_version = applied_skill_version
+        if skill_data.get("content"):
+            sess._applied_skill_content = skill_data["content"]
+        sess._save_config()
+
+    # notify_targets: schedule targets override skill targets. The
+    # validator already gated malformed input as 400; here we just
+    # canonicalise (list → JSON-encoded string) and apply the skill
+    # fallback if the caller didn't supply targets.
+    notify_targets_raw = body.get("notify_targets", "[]")
+    if isinstance(notify_targets_raw, list):
+        notify_targets_raw = json.dumps(notify_targets_raw)
+    nt_str, _ = _validate_notify_targets(notify_targets_raw)
+    if nt_str == "[]" and skill_data:
+        skill_notify = skill_data.get("notify_on_complete", "[]")
+        if skill_notify and skill_notify != "{}" and skill_notify != "[]":
+            fallback_str, fallback_err = _validate_notify_targets(skill_notify)
+            if not fallback_err:
+                nt_str = fallback_str
+    ws.notify_targets = nt_str
+
+    # Pin locally-created workstreams so the console routes to this node.
+    requested_ws_id = body.get("ws_id", "") or ""
+    if not requested_ws_id:
+        node_id = getattr(request.app.state, "node_id", "")
+        if node_id:
+            try:
+                from turnstone.core.storage import get_storage as _gs
+
+                _gs().set_workstream_override(ws.id, node_id, reason="local")
+            except Exception:
+                log.debug("Failed to set routing override for %s", ws.id, exc_info=True)
+
+    # Initial-message worker thread.
+    initial_message = body.get("initial_message", "").strip()
+    if initial_message and ws.session is not None:
+        session = ws.session
+        send_id = uuid.uuid4().hex
+        resolved_atts: list[Any] = []
+        if attachment_ids:
+            resolved_atts, _ord, _drop = _reserve_and_resolve_attachments(
+                attachment_ids, send_id, ws.id, uid
+            )
+
+        def _run_initial() -> None:
+            try:
+                session.send(
+                    initial_message,
+                    attachments=resolved_atts or None,
+                    send_id=send_id if resolved_atts else None,
+                )
+            except (Exception, GenerationCancelled):
+                if attachment_ids:
+                    from turnstone.core.memory import (
+                        unreserve_attachments as _unreserve,
+                    )
+
+                    with contextlib.suppress(Exception):
+                        _unreserve(send_id, ws.id, uid)
+                if isinstance(ws.ui, WebUI):
+                    ws.ui.on_stream_end()
+                    ws.ui.on_state_change("idle")
+            finally:
+                try:
+                    last_content = _extract_last_assistant_content(session)
+                    _fire_notify_targets(ws, last_content)
+                except Exception:
+                    log.warning("notify_completion.hook_error", ws_id=ws.id, exc_info=True)
+                with ws._lock:
+                    ws._worker_running = False
+
+        # Inlined rather than via ``session_worker.send`` because at
+        # workstream creation no live worker can exist by
+        # construction — the enqueue branch of the shared dispatch
+        # is dead code here. ``_worker_running`` + ``ws.worker_thread``
+        # are set together under ``ws._lock`` so a /v1/api/send
+        # arriving immediately after creation observes the running
+        # state via the shared session_worker gate instead of racing
+        # into a parallel worker.
+        with ws._lock:
+            ws._worker_running = True
+            t = threading.Thread(target=_run_initial, daemon=True, name=f"ws-init-{ws.id[:8]}")
+            ws.worker_thread = t
+            t.start()
+
+    return {"resumed": resumed, "message_count": message_count}
+
+
+def _audit_workstream_created(
+    request: Request,
+    ws: Workstream,
+    body: dict[str, Any],
+    uid: str,
+) -> None:
+    """Audit emitter for the interactive ``workstream.created`` event.
+
+    Wired onto :func:`make_create_handler` as ``audit_emit``. Runs
+    after the workstream is built and attachments saved; failures
+    are caught + logged by the factory (HTTP response stays 201).
+    """
+    from turnstone.core.audit import record_audit
+
+    _audit_storage = getattr(request.app.state, "auth_storage", None)
+    if _audit_storage is None:
+        return
+    _, _audit_ip = _audit_context(request)
+    record_audit(
+        _audit_storage,
+        uid,
+        "workstream.created",
+        "workstream",
+        ws.id,
+        {"kind": str(ws.kind), "parent_ws_id": ws.parent_ws_id},
+        _audit_ip,
+    )
 
 
 async def delete_workstream_endpoint(request: Request) -> JSONResponse:
@@ -3814,6 +3695,11 @@ def create_app(
         # the lifted contract — coord wires ``None`` and falls
         # back to the default executor.
         sse_executor_lookup=lambda request: request.app.state.sse_executor,
+        create_supports_attachments=True,
+        create_supports_user_id_override=True,
+        create_validate_request=_interactive_create_validate_request,
+        create_build_kwargs=_interactive_create_build_kwargs,
+        create_post_install=_interactive_create_post_install,
     )
     approve_handler = make_approve_handler(interactive_endpoint_config)
     close_handler = make_close_handler(
@@ -3830,6 +3716,10 @@ def create_app(
     send_handler = make_send_handler(interactive_endpoint_config)
     dequeue_handler = make_dequeue_handler(interactive_endpoint_config)
     attachment_handlers = make_attachment_handlers(interactive_endpoint_config)
+    create_handler = make_create_handler(
+        interactive_endpoint_config,
+        audit_emit=_audit_workstream_created,
+    )
     v1_routes: list[Any] = [
         Route("/api/events", make_legacy_query_keyed_adapter(events_handler)),
         Route("/api/events/global", global_events_sse),
@@ -3840,7 +3730,7 @@ def create_app(
         handlers=SharedSessionVerbHandlers(
             list_workstreams=list_workstreams,
             list_saved=list_saved_workstreams,
-            create=create_workstream,
+            create=create_handler,  # lifted: shared body
             close_legacy=make_legacy_body_keyed_adapter(close_handler),
             delete=delete_workstream_endpoint,
             open=open_handler,  # lifted: shared body
