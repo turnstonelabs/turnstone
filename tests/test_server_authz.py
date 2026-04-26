@@ -608,3 +608,87 @@ class TestAuditEventsOnMutations:
         assert matching, "audit row absent for newly created workstream"
         detail = json.loads(matching[0]["detail"])
         assert detail["kind"] == "interactive"
+
+
+class TestInteractiveCancelLifted:
+    """HTTP-level coverage for the post-lift interactive ``/api/cancel``
+    handler. The lifted ``make_cancel_handler`` body is shared with
+    coord but interactive routes through ``make_legacy_body_keyed_adapter``
+    (ws_id in body, not path). Pre-lift ``cancel_generation`` was
+    untested at the HTTP layer; coord exercised the lifted body via
+    ``test_coordinator_endpoints.py``. This class adds the missing
+    interactive-side parity."""
+
+    def _create_ws(self, client) -> str:
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "cancel-target"},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 200
+        return resp.json()["ws_id"]
+
+    def test_cancel_returns_dropped_shape(self, app_client):
+        """Always-include shape: response carries ``dropped`` (the
+        forensic snapshot) regardless of whether anything was running."""
+        client, _mgr = app_client
+        ws_id = self._create_ws(client)
+        resp = client.post(
+            "/v1/api/cancel",
+            json={"ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "ok"
+        assert "dropped" in body
+        assert body["dropped"]["was_running"] is False
+
+    def test_cancel_force_clears_worker_thread_and_running_flag(self, app_client):
+        """Force-cancel parity with coord: clears ``worker_thread`` AND
+        ``_worker_running`` so a follow-up send doesn't route through
+        ``enqueue()`` to the abandoned worker's queue (bug-2 from the
+        cancel-lift /review). Mirrors
+        ``test_cancel_force_flag_abandons_worker_thread_and_emits_stream_end``
+        on the coord side."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        # Simulate an in-flight worker the lifted cancel needs to
+        # abandon. The fake session's cancel() is a no-op, so the
+        # cancel flag side-effect doesn't matter — what matters is
+        # the (worker_thread, _worker_running) pair after force-cancel.
+        ws._worker_running = True
+        ws.worker_thread = threading.Thread(target=lambda: None, daemon=True)
+
+        resp = client.post(
+            "/v1/api/cancel",
+            json={"ws_id": ws_id, "force": True},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 200
+        # Both fields cleared together — invariant from session_worker
+        # ("readers gating on either flag see a coherent
+        # (worker_thread, _worker_running) pair").
+        assert ws.worker_thread is None
+        assert ws._worker_running is False
+
+    def test_cancel_returns_400_when_session_missing(self, app_client):
+        """Parity with coord: a placeholder workstream (session=None)
+        gets a 400 ``"No session"`` rather than a silent no-op 200.
+        Pre-lift interactive already returned 400 here; the lift
+        preserves the behaviour and propagates it to coord."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        ws.session = None  # force the build-failed shape
+
+        resp = client.post(
+            "/v1/api/cancel",
+            json={"ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "No session"

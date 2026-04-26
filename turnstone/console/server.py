@@ -61,6 +61,7 @@ from turnstone.core.session_routes import (
     SharedSessionVerbHandlers,
     make_approve_handler,
     make_attachment_handlers,
+    make_cancel_handler,
     make_close_handler,
     make_send_handler,
     register_coord_verbs,
@@ -2425,6 +2426,33 @@ def _audit_close_coordinator(
     )
 
 
+def _audit_cancel_coordinator(
+    request: Request,
+    ws_id: str,
+    ws_before: Workstream,  # noqa: ARG001 — coord audit detail doesn't use it yet
+    force: bool,
+) -> None:
+    """Record the ``coordinator.cancel`` audit event.
+
+    Passed to :func:`make_cancel_handler` as the ``audit_emit``
+    callable. Mirrors :func:`_audit_close_coordinator`. The ``force``
+    flag rides into the audit detail so an operator-driven recovery
+    is distinguishable from a routine cancel.
+    """
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return
+    record_audit(
+        storage,
+        _auth_user_id(request),
+        "coordinator.cancel",
+        "workstream",
+        ws_id,
+        {"coord_ws_id": ws_id, "src": "coordinator", "force": force},
+        request.client.host if request.client else "",
+    )
+
+
 async def coordinator_create(request: Request) -> JSONResponse:
     """POST /v1/api/workstreams/new — create a new coordinator session."""
     from turnstone.core.audit import record_audit
@@ -2529,39 +2557,6 @@ async def coordinator_create(request: Request) -> JSONResponse:
         except Exception:
             log.debug("coordinator_create.audit_failed", exc_info=True)
     return JSONResponse({"ws_id": ws.id, "name": ws.name}, status_code=201)
-
-
-async def coordinator_cancel(request: Request) -> JSONResponse:
-    """POST /v1/api/workstreams/{ws_id}/cancel — cancel in-flight generation."""
-    from turnstone.core.audit import record_audit
-
-    err = _require_admin_coordinator(request)
-    if err is not None:
-        return err
-    coord_mgr, err503 = _require_coord_mgr(request)
-    if err503 is not None:
-        return err503
-    ws_id = request.path_params.get("ws_id", "")
-    user_id = _auth_user_id(request)
-    ws = coord_mgr.get(ws_id)
-    if ws is None:
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    coord_mgr.cancel(ws_id)
-    storage = getattr(request.app.state, "auth_storage", None)
-    if storage is not None:
-        try:
-            record_audit(
-                storage,
-                user_id,
-                "coordinator.cancel",
-                "workstream",
-                ws_id,
-                {"coord_ws_id": ws_id, "src": "coordinator"},
-                request.client.host if request.client else "",
-            )
-        except Exception:
-            log.debug("coordinator_cancel.audit_failed", exc_info=True)
-    return JSONResponse({"status": "ok"})
 
 
 async def coordinator_events(request: Request) -> Response:
@@ -3184,6 +3179,16 @@ async def _fanout_on_children(
                 # 404 both mean "already gone".  Route to skipped so
                 # operators can distinguish from dispatch failures.
                 if result.get("status") == 404:
+                    return cid, "skipped"
+                # Lifted ``cancel`` returns 400 with "No session" for
+                # placeholder / build-failed workstreams (the in-memory
+                # row exists but its ChatSession was never constructed,
+                # so there's nothing to cancel). Treat the same as
+                # 404 — the child has no work to stop, not a dispatch
+                # failure that should fire alerts. Pre-lift coord
+                # silently no-op'd on placeholders; this keeps cascade
+                # behaviour parity with the pre-lift outcome.
+                if result.get("status") == 400 and result.get("error") == "No session":
                     return cid, "skipped"
                 return cid, "failed"
             except Exception:
@@ -10180,7 +10185,10 @@ def create_app(
             ),
             send=make_send_handler(coord_endpoint_config),  # lifted: shared body (P1.5)
             approve=make_approve_handler(coord_endpoint_config),  # lifted: shared body
-            cancel=coordinator_cancel,
+            cancel=make_cancel_handler(  # lifted: shared body
+                coord_endpoint_config,
+                audit_emit=_audit_cancel_coordinator,
+            ),
             events=coordinator_events,
             history=coordinator_history,
             attachments=make_attachment_handlers(

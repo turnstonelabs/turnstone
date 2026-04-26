@@ -31,11 +31,11 @@ from tests._coord_test_helpers import (
 )
 from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 from turnstone.console.server import (
+    _audit_cancel_coordinator,
     _audit_close_coordinator,
     _require_admin_coordinator,
     _require_coord_mgr,
     cluster_ws_detail,
-    coordinator_cancel,
     coordinator_children,
     coordinator_create,
     coordinator_detail,
@@ -60,6 +60,7 @@ from turnstone.core.session_routes import (
     SessionEndpointConfig,
     make_approve_handler,
     make_attachment_handlers,
+    make_cancel_handler,
     make_close_handler,
     make_send_handler,
 )
@@ -149,7 +150,10 @@ def _make_client(
             ),
             Route(
                 "/v1/api/workstreams/{ws_id}/cancel",
-                coordinator_cancel,
+                make_cancel_handler(
+                    _coord_endpoint_config,
+                    audit_emit=_audit_cancel_coordinator,
+                ),
                 methods=["POST"],
             ),
             Route(
@@ -624,6 +628,166 @@ def test_cancel_resolves_pending_approval(storage):
     resp = client.post(f"/v1/api/workstreams/{ws.id}/cancel", headers=_COORD_HEADERS)
     assert resp.status_code == 200
     assert ws.ui._approval_event.is_set()
+
+
+def test_cancel_response_always_includes_dropped_key(storage):
+    """Always-include shape parity: post-P3 verb lift, coord cancel
+    returns ``{"status": "ok", "dropped": {}}`` regardless of whether
+    a forensics callable is wired (coord wires ``None``). SDK
+    consumers don't have to branch on kind to read ``dropped``."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/cancel", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["dropped"] == {}
+
+
+def test_cancel_force_flag_abandons_worker_thread_and_emits_stream_end(storage):
+    """Parity gain from the verb lift: coord now honours the ``force``
+    flag the same way interactive does (pre-lift coord ignored it).
+    Stuck-worker recovery: the abandoned thread is cleared, an
+    ``idle`` state-change is dispatched via the UI, and a
+    ``stream_end`` event lands on the listener queue so the dashboard
+    recovers without waiting for the daemon thread to exit."""
+    import threading
+
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    assert isinstance(ws.ui, ConsoleCoordinatorUI)
+    # Simulate an in-flight worker the UI is still waiting on.
+    ws._worker_running = True
+    ws.worker_thread = threading.Thread(target=lambda: None, daemon=True)
+    listener = ws.ui._register_listener()
+
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/cancel",
+        headers=_COORD_HEADERS,
+        json={"force": True},
+    )
+    assert resp.status_code == 200
+    # Worker thread reference cleared so a follow-up send doesn't
+    # think a generation is still in flight.
+    assert ws.worker_thread is None
+    # ``stream_end`` lands on the listener so SDK consumers bail out
+    # of the SSE loop instead of hanging on the daemon thread.
+    seen = []
+    while not listener.empty():
+        seen.append(listener.get_nowait().get("type"))
+    assert "stream_end" in seen
+
+
+def test_cancel_returns_400_when_session_missing(storage):
+    """Pre-lift coord called ``coord_mgr.cancel`` which silently
+    no-op'd on a placeholder workstream (session=None). The lifted
+    body 400s for parity with interactive's existing
+    ``"No session"`` branch — surfaces the build-failure state to
+    the operator instead of swallowing it."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    # Force the placeholder/build-failed shape.
+    ws.session = None
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/cancel", headers=_COORD_HEADERS)
+    assert resp.status_code == 400
+
+
+def test_cancel_swallows_forensics_exception(storage):
+    """``cancel_forensics`` is observational — a bug in the snapshot
+    callable must NOT block the actual cancel. The lifted body wraps
+    the call in try/except + log.debug and falls through with an
+    empty ``dropped`` dict so the response shape stays consistent."""
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from turnstone.core.session_routes import (
+        SessionEndpointConfig,
+        make_cancel_handler,
+    )
+
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+
+    def _raises_forensics(session, ui, *, was_running):  # noqa: ARG001
+        raise RuntimeError("forensics blew up")
+
+    cfg = SessionEndpointConfig(
+        permission_gate=_require_admin_coordinator,
+        manager_lookup=lambda r: (mgr, None),
+        tenant_check=None,
+        not_found_label="coordinator not found",
+        audit_action_prefix="coordinator",
+        cancel_forensics=_raises_forensics,
+    )
+    handler = make_cancel_handler(cfg)
+    app = Starlette(routes=[Route("/v1/api/workstreams/{ws_id}/cancel", handler, methods=["POST"])])
+    app.add_middleware(_AuthMiddleware)
+    client = TestClient(app)
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/cancel", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert resp.json()["dropped"] == {}
+
+
+def test_cancel_swallows_audit_emit_exception(storage):
+    """``audit_emit`` failures are demoted to ``log.warning`` and the
+    cancel returns 200. Mirrors the same pattern in ``make_close_handler``
+    — telemetry bugs must not block recovery verbs."""
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from turnstone.core.session_routes import (
+        SessionEndpointConfig,
+        make_cancel_handler,
+    )
+
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+
+    def _raises_audit(request, ws_id, ws_obj, force):  # noqa: ARG001
+        raise RuntimeError("audit blew up")
+
+    cfg = SessionEndpointConfig(
+        permission_gate=_require_admin_coordinator,
+        manager_lookup=lambda r: (mgr, None),
+        tenant_check=None,
+        not_found_label="coordinator not found",
+        audit_action_prefix="coordinator",
+    )
+    handler = make_cancel_handler(cfg, audit_emit=_raises_audit)
+    app = Starlette(routes=[Route("/v1/api/workstreams/{ws_id}/cancel", handler, methods=["POST"])])
+    app.add_middleware(_AuthMiddleware)
+    client = TestClient(app)
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/cancel", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+
+
+def test_cancel_idle_workstream_does_not_broadcast_approval_resolved(storage):
+    """Bug-1 from /review: the unconditional resolve_approval lift
+    leaked a stale ``approval_resolved`` SSE event on every idle
+    cancel. The fix gates the call on ``_pending_approval is not None``
+    so listeners don't see a phantom resolution. Asserts the
+    ``approval_resolved`` event does NOT land on the listener queue
+    when no approval is pending."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    assert isinstance(ws.ui, ConsoleCoordinatorUI)
+    assert ws.ui._pending_approval is None  # idle baseline
+    listener = ws.ui._register_listener()
+
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/cancel", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+
+    seen_types = []
+    while not listener.empty():
+        seen_types.append(listener.get_nowait().get("type"))
+    assert "approval_resolved" not in seen_types
 
 
 # ---------------------------------------------------------------------------

@@ -61,6 +61,7 @@ from turnstone.core.session_routes import (
     SharedSessionVerbHandlers,
     make_approve_handler,
     make_attachment_handlers,
+    make_cancel_handler,
     make_close_handler,
     make_dequeue_handler,
     make_legacy_body_keyed_adapter,
@@ -1523,59 +1524,6 @@ async def plan_feedback(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Unknown workstream"}, status_code=404)
     ui.resolve_plan(feedback)
     return JSONResponse({"status": "ok"})
-
-
-async def cancel_generation(request: Request) -> JSONResponse:
-    """POST /v1/api/cancel — cancel the active generation in a workstream.
-
-    Returns ``{status, dropped}`` where ``dropped`` captures a forensic
-    snapshot of what was in flight at cancel time: any pending approval's
-    tool names, queued-message count and a short preview, and whether a
-    worker thread was actively generating.  The model-invoked
-    ``cancel_workstream`` tool passes this through so a coordinator can
-    tell operators what it just killed instead of a bare ``{cancelled:
-    true}``.  Absent keys mean "nothing observable in that lane".
-    """
-    from turnstone.core.web_helpers import read_json_or_400
-
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
-    ws_id = body.get("ws_id")
-    mgr = request.app.state.workstreams
-    _owner, err = _require_ws_access(request, str(ws_id or ""), mgr=mgr)
-    if err:
-        return err
-    ws, ui = _get_ws(mgr, ws_id)
-    if not ws or not ui:
-        return JSONResponse({"error": "Unknown workstream"}, status_code=404)
-    session = ws.session
-    if session is None:
-        return JSONResponse({"error": "No session"}, status_code=400)
-    force = body.get("force", False) is True
-    was_running = ws._worker_running
-    dropped = _capture_cancel_forensics(session, ui, was_running=was_running)
-    # Only act if generation is actually in progress
-    if was_running:
-        # Set the cooperative cancel flag (worker thread checks at checkpoints)
-        session.cancel()
-        # Unblock any pending approval/plan review waits
-        ui.resolve_approval(False, "Cancelled by user")
-        ui.resolve_plan("reject")
-        if force:
-            # Force cancel: abandon the stuck worker thread (daemon, will
-            # die on process exit or stream timeout) and emit stream_end
-            # so the UI and session recover immediately.  The per-generation
-            # cancel event stays set so the abandoned thread still kills
-            # subprocesses at its next checkpoint.
-            with ws._lock:
-                ws.worker_thread = None
-            ui._enqueue({"type": "stream_end"})
-            ui.on_state_change("idle")
-        else:
-            # Emit cancelled SSE event so SDK consumers get a typed signal
-            ui._enqueue({"type": "cancelled"})
-    return JSONResponse({"status": "ok", "dropped": dropped})
 
 
 def _capture_cancel_forensics(session: Any, ui: Any, *, was_running: bool) -> dict[str, Any]:
@@ -3896,6 +3844,7 @@ def create_app(
         attachment_helpers=interactive_attachment_helpers,
         spawn_metrics=_interactive_spawn_metrics,
         emit_message_queued=True,
+        cancel_forensics=_capture_cancel_forensics,
     )
     approve_handler = make_approve_handler(interactive_endpoint_config)
     close_handler = make_close_handler(
@@ -3903,6 +3852,7 @@ def create_app(
         audit_emit=_audit_close_workstream,
         supports_close_reason=True,
     )
+    cancel_handler = make_cancel_handler(interactive_endpoint_config)
     send_handler = make_send_handler(interactive_endpoint_config)
     dequeue_handler = make_dequeue_handler(interactive_endpoint_config)
     attachment_handlers = make_attachment_handlers(interactive_endpoint_config)
@@ -3925,6 +3875,7 @@ def create_app(
             set_title=set_workstream_title,
             send=send_handler,  # lifted: shared body (P1.5)
             approve=approve_handler,  # lifted: shared body
+            cancel=cancel_handler,  # lifted: shared body
             attachments=attachment_handlers,  # lifted: shared body (P1.5)
         ),
     )
@@ -3958,7 +3909,11 @@ def create_app(
                     ),
                     Route("/api/plan", plan_feedback, methods=["POST"]),
                     Route("/api/command", command, methods=["POST"]),
-                    Route("/api/cancel", cancel_generation, methods=["POST"]),
+                    Route(
+                        "/api/cancel",
+                        make_legacy_body_keyed_adapter(cancel_handler),
+                        methods=["POST"],
+                    ),
                     Route("/api/watches", list_watches),
                     Route("/api/watches/{watch_id}/cancel", cancel_watch, methods=["POST"]),
                     Route("/api/memories", list_memories),

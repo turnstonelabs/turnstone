@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -69,6 +69,17 @@ AttachmentOwnerResolver = Callable[
 # ``_metrics.record_message_sent`` + per-UI message counters; coord
 # has no analog and wires ``None``.
 SpawnMetricsHook = Callable[["Request", Any], None]
+
+
+# (session, ui, *, was_running) — pure read; returns the ``dropped``
+# dict surfaced in the cancel response (pending-approval tool names,
+# queued-message count + preview, etc.). Kinds that don't need a
+# forensic snapshot wire ``None`` and the lifted body returns an
+# empty ``dropped`` dict in the response. Protocol-typed because
+# ``Callable`` can't express the keyword-only ``was_running`` arg
+# the lifted body passes.
+class CancelForensics(Protocol):
+    def __call__(self, session: Any, ui: Any, *, was_running: bool) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -161,6 +172,15 @@ class SessionEndpointConfig:
     attachment_helpers: AttachmentUploadHelpers | None = None
     spawn_metrics: SpawnMetricsHook | None = None
     emit_message_queued: bool = True
+    # (session, ui, *, was_running) -> dict. When set, the lifted
+    # ``cancel`` body calls this and surfaces the result as the
+    # ``dropped`` key on the response. Interactive wires
+    # ``_capture_cancel_forensics`` so the model-invoked
+    # ``cancel_workstream`` tool can tell operators what got killed
+    # (pending-approval tool names, queued-message count + preview).
+    # Coord wires ``None`` — no forensic surface today; the lifted
+    # body still returns ``dropped: {}`` for response-shape parity.
+    cancel_forensics: CancelForensics | None = None
 
 
 @dataclass(frozen=True)
@@ -608,6 +628,229 @@ def make_close_handler(
         return JSONResponse({"status": "ok"})
 
     return close
+
+
+CancelAuditEmitter = Callable[
+    ["Request", str, "Workstream", bool],
+    None,
+]
+
+
+def make_cancel_handler(
+    cfg: SessionEndpointConfig,
+    *,
+    audit_emit: CancelAuditEmitter | None = None,
+) -> Handler:
+    """Lifted body for ``POST {prefix}/{ws_id}/cancel``.
+
+    Cancels in-flight generation on a workstream. Sets the cooperative
+    cancel flag on the session, unblocks any pending approval / plan
+    waits, and (when the request body asks for it) force-abandons a
+    stuck worker thread so the UI recovers immediately.
+
+    Both kinds share the cancel sequence (``session.cancel`` →
+    ``ui.resolve_approval(False)`` → ``ui.resolve_plan("reject")``).
+    Per-kind divergence captured via the cfg + ``audit_emit``:
+
+    - ``cancel_forensics`` (cfg) — when set, the lifted body calls
+      it with ``(session, ui, was_running=...)`` and surfaces the
+      result as the response's ``dropped`` key. Interactive wires
+      ``_capture_cancel_forensics`` so the model-invoked
+      ``cancel_workstream`` tool can tell operators what got killed
+      (pending-approval tool names, queued-message preview); coord
+      wires ``None`` and the response's ``dropped`` is ``{}``.
+    - ``audit_emit`` — receives ``(request, ws_id, ws, force)``.
+      Coord wires its ``coordinator.cancel`` audit hook; interactive
+      wires ``None`` (cancel isn't audited on interactive today —
+      preserved for behavioural parity with the pre-lift handler).
+
+    Args:
+        cfg: per-kind policy bundle (auth, manager lookup, tenant
+            check, error labels, ``cancel_forensics``).
+        audit_emit: kind's audit emitter for the cancel event.
+            ``None`` skips the audit entirely.
+
+    Behavior changes vs the pre-lift handlers:
+
+    - **Coord gains the ``force`` flag.** Pre-lift coord ignored
+      ``force``; the lifted body honours it on both kinds (parity
+      gain — coord workers can hang the same way interactive's can,
+      and operators benefit from the same recovery path).
+    - **Coord response shape now includes ``dropped: {}``.**
+      Pre-lift coord returned bare ``{"status": "ok"}``; the unified
+      shape always carries ``dropped`` so SDK consumers don't have
+      to branch on kind. Coord's ``dropped`` is ``{}`` until coord
+      grows its own forensic capture.
+    - **Coord cancel returns 400 when ``ws.session is None``** (the
+      placeholder/build-failed path). Pre-lift coord called
+      ``coord_mgr.cancel`` which silently no-op'd on a placeholder;
+      the lifted body 400s for parity with interactive's existing
+      "No session" branch.
+    - **Interactive resolve_approval / resolve_plan now run
+      unconditionally** (was gated on ``was_running``). Lifts coord's
+      always-resolve behaviour onto interactive — a stuck
+      approval-pending state from a crashed worker thread can now
+      be cleared via ``cancel`` on interactive, matching coord's
+      pre-lift recovery path. The calls are idempotent and no-op
+      when nothing is blocked, so the new path is strictly safer.
+    """
+
+    async def cancel(request: Request) -> Response:
+        from turnstone.core.web_helpers import read_json_or_400
+
+        if cfg.permission_gate is not None:
+            err = cfg.permission_gate(request)
+            if err is not None:
+                return err
+        mgr_opt, err503 = cfg.manager_lookup(request)
+        if err503 is not None:
+            return err503
+        # See ``make_approve_handler`` for the cast rationale.
+        mgr = cast("SessionManager", mgr_opt)
+        ws_id = request.path_params.get("ws_id", "")
+
+        # Body is optional — only ``force`` is read. An empty body is
+        # a valid cancel request (the original coord URL took no body
+        # at all; preserve that ergonomic). Malformed JSON is treated
+        # as no body rather than 400'd: cancel is a recovery verb and
+        # should work even when the caller's JSON is junk.
+        force = False
+        try:
+            body = await read_json_or_400(request)
+        except Exception:
+            body = None
+        if isinstance(body, dict):
+            force = body.get("force", False) is True
+
+        if cfg.tenant_check is not None:
+            err_tenant = cfg.tenant_check(request, ws_id, mgr)
+            if err_tenant is not None:
+                return err_tenant
+
+        ws = mgr.get(ws_id)
+        if ws is None:
+            return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+        session = ws.session
+        ui = ws.ui
+        if session is None or ui is None:
+            return JSONResponse({"error": "No session"}, status_code=400)
+
+        was_running = bool(getattr(ws, "_worker_running", False))
+        dropped: dict[str, Any] = {}
+        if cfg.cancel_forensics is not None:
+            try:
+                dropped = cfg.cancel_forensics(session, ui, was_running=was_running)
+            except Exception:
+                # Forensics is observational — never let a snapshot
+                # bug block the actual cancel. Log and proceed with
+                # an empty dropped dict.
+                log.debug("ws.cancel.forensics_failed ws=%s", ws_id[:8], exc_info=True)
+                dropped = {}
+
+        # Always set the cooperative cancel flag — cheap, no harm if
+        # nothing's running. resolve_approval / resolve_plan are
+        # gated by their respective ``_pending_*`` slots: pre-lift
+        # coord called them unconditionally via ``mgr.cancel`` (which
+        # is recovery-friendly: a stuck approval-pending state from a
+        # crashed worker can still be cleared), but ``resolve_approval``
+        # is NOT idempotent — calling it with no pending approval
+        # broadcasts a stale ``approval_resolved`` SSE event and
+        # overwrites ``_approval_result``. Gating on the pending slot
+        # preserves the recovery semantics for the actual stuck case
+        # while skipping the broadcast on idle cancels. ``resolve_plan``
+        # has its own internal no-pending guard, so the call is
+        # already safe to make unconditionally.
+        try:
+            session.cancel()
+        except Exception:
+            log.debug("ws.cancel.session_failed ws=%s", ws_id[:8], exc_info=True)
+        if hasattr(ui, "resolve_approval") and getattr(ui, "_pending_approval", None) is not None:
+            try:
+                ui.resolve_approval(False, "Cancelled by user")
+            except Exception:
+                log.debug(
+                    "ws.cancel.resolve_approval_failed ws=%s",
+                    ws_id[:8],
+                    exc_info=True,
+                )
+        if hasattr(ui, "resolve_plan"):
+            try:
+                ui.resolve_plan("reject")
+            except Exception:
+                log.debug(
+                    "ws.cancel.resolve_plan_failed ws=%s",
+                    ws_id[:8],
+                    exc_info=True,
+                )
+
+        # The remaining steps only matter when a worker is actually
+        # running: force-recovery has nothing to recover otherwise,
+        # and the SSE ``cancelled`` event would mislead consumers that
+        # have no in-flight generation to cancel.
+        if was_running:
+            if force:
+                # Force cancel: abandon the stuck worker thread (daemon,
+                # will die on process exit or stream timeout) and emit
+                # stream_end so the UI and session recover immediately.
+                # The per-generation cancel flag stays set so the
+                # abandoned thread still kills subprocesses at its next
+                # checkpoint. Clear ``_worker_running`` alongside
+                # ``worker_thread`` so a follow-up send doesn't see the
+                # ``(_worker_running=True, worker_thread=None)``
+                # half-state and route through ``enqueue()`` to the
+                # abandoned worker's queue (which won't drain — the
+                # cancel flag short-circuits the abandoned thread
+                # before it reaches the queue-drain seam, leaving the
+                # queued message orphaned until the next spawn).
+                # ``session_worker.send`` documents this invariant:
+                # "readers gating on either flag see a coherent
+                # (worker_thread, _worker_running) pair."
+                with ws._lock:
+                    ws.worker_thread = None
+                    ws._worker_running = False
+                if hasattr(ui, "_enqueue"):
+                    try:
+                        ui._enqueue({"type": "stream_end"})
+                    except Exception:
+                        log.debug(
+                            "ws.cancel.stream_end_failed ws=%s",
+                            ws_id[:8],
+                            exc_info=True,
+                        )
+                if hasattr(ui, "on_state_change"):
+                    try:
+                        ui.on_state_change("idle")
+                    except Exception:
+                        log.debug(
+                            "ws.cancel.idle_state_failed ws=%s",
+                            ws_id[:8],
+                            exc_info=True,
+                        )
+            elif hasattr(ui, "_enqueue"):
+                try:
+                    ui._enqueue({"type": "cancelled"})
+                except Exception:
+                    log.debug(
+                        "ws.cancel.cancelled_event_failed ws=%s",
+                        ws_id[:8],
+                        exc_info=True,
+                    )
+
+        if audit_emit is not None:
+            try:
+                audit_emit(request, ws_id, ws, force)
+            except Exception:
+                # Mirrors make_close_handler — audit-write failures
+                # shouldn't surface as HTTP 500. Log + continue.
+                log.warning(
+                    "ws.cancel.audit_failed ws=%s",
+                    ws_id[:8] if ws_id else "",
+                    exc_info=True,
+                )
+
+        return JSONResponse({"status": "ok", "dropped": dropped})
+
+    return cancel
 
 
 def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
