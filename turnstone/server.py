@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import collections
 import contextlib
 import functools
 import hashlib
@@ -57,12 +56,15 @@ from turnstone.core.ratelimit import resolve_client_ip
 from turnstone.core.session import ChatSession, GenerationCancelled, SessionUI  # noqa: F401
 from turnstone.core.session_manager import SessionManager
 from turnstone.core.session_routes import (
-    AttachmentHandlers,
+    AttachmentUploadHelpers,
     SessionEndpointConfig,
     SharedSessionVerbHandlers,
     make_approve_handler,
+    make_attachment_handlers,
     make_close_handler,
+    make_dequeue_handler,
     make_legacy_body_keyed_adapter,
+    make_send_handler,
     register_session_routes,
 )
 from turnstone.core.session_ui_base import SessionUIBase
@@ -834,6 +836,27 @@ def _interactive_tenant_check(
     return err
 
 
+def _make_method_dispatch(
+    handlers: dict[str, Any],
+) -> Any:
+    """Mount one URL with different bodies per HTTP method.
+
+    Starlette's ``Route`` accepts a single handler; the legacy
+    ``/v1/api/send`` URL serves both POST (send) and DELETE (dequeue)
+    via the same path. The shared registrar mounts these as two
+    separate path-keyed verbs (``send`` / ``DELETE``); this helper
+    bridges so the legacy body-keyed URL can keep its single Route.
+    """
+
+    async def dispatch(request: Request) -> Any:
+        handler = handlers.get(request.method)
+        if handler is None:
+            return JSONResponse({"error": f"method {request.method} not allowed"}, status_code=405)
+        return await handler(request)
+
+    return dispatch
+
+
 def _audit_close_workstream(
     request: Request,
     ws_id: str,
@@ -1482,275 +1505,6 @@ def _make_watch_dispatch(ws: Workstream, session: ChatSession, ui: Any) -> Any:
     return dispatch
 
 
-async def send_message(request: Request) -> JSONResponse:
-    """POST /v1/api/send — send or queue a user message.
-
-    DELETE /v1/api/send — remove a queued message by ``msg_id``.
-    """
-    from turnstone.core.web_helpers import read_json_or_400
-
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
-
-    # DELETE — remove a queued message
-    if request.method == "DELETE":
-        ws_id = body.get("ws_id")
-        msg_id = body.get("msg_id")
-        if not msg_id:
-            return JSONResponse({"error": "msg_id required"}, status_code=400)
-        mgr = request.app.state.workstreams
-        ws, ui = _get_ws(mgr, ws_id)
-        if not ws or not ui:
-            return JSONResponse({"error": "Unknown workstream"}, status_code=404)
-        session = ws.session
-        if session is None:
-            return JSONResponse({"error": "No session"}, status_code=400)
-        removed = session.dequeue_message(msg_id)
-        return JSONResponse({"status": "removed" if removed else "not_found"})
-
-    # POST — send or queue
-    message = body.get("message", "").strip()
-    ws_id = body.get("ws_id")
-    if not message:
-        return JSONResponse({"error": "Empty message"}, status_code=400)
-    mgr = request.app.state.workstreams
-    ws, ui = _get_ws(mgr, ws_id)
-    if not ws or not ui:
-        return JSONResponse({"error": "Unknown workstream"}, status_code=404)
-
-    # --- Atomic reserve-then-dispatch for attachments ---------------------
-    # Generate a send token up front and reserve attachments BEFORE we
-    # commit to queueing or starting a worker.  The reserved set is the
-    # source of truth — overlapping requests can't select the same row.
-    # Idle path and busy path both reserve, so session.send / dequeue can
-    # consume with defense-in-depth (matching reserved_for_msg_id).
-    from turnstone.core.attachments import Attachment
-    from turnstone.core.memory import (
-        get_attachments as _get_attachments,
-    )
-    from turnstone.core.memory import (
-        get_pending_attachments_with_content as _get_pending_with_content,
-    )
-    from turnstone.core.memory import (
-        reserve_attachments as _reserve,
-    )
-
-    # Actor resolution: service-scoped callers file attachments under the
-    # workstream owner (matches upload/list/delete semantics).  Returns
-    # 404 on missing/foreign workstreams.
-    attach_user_id, err = _require_ws_access(request, ws_id or "")
-    if err:
-        return err
-    # _require_ws_access already 404'd on missing ws_id; the explicit
-    # check keeps the type-checker happy without a bare assert.
-    if not isinstance(ws_id, str):
-        return JSONResponse({"error": "ws_id required"}, status_code=400)
-
-    # Full UUID hex — this token scopes both the attachment reservation
-    # and the eventual consume, so keep the full 128 bits.
-    send_id = uuid.uuid4().hex
-    raw_ids = body.get("attachment_ids")
-    auto_consume_rows: list[dict[str, Any]] = []
-    if raw_ids is None:
-        # Auto-consume: pull the current user's pending (unreserved)
-        # rows in creation order IN ONE QUERY (bytes included) — we'll
-        # reserve them below and skip the second fetch.  The reserve
-        # call is scoped to message_id IS NULL AND reserved_for_msg_id
-        # IS NULL so a concurrent reservation can't double-book.
-        auto_consume_rows = _get_pending_with_content(ws_id, attach_user_id)
-        requested_ids = [str(r["attachment_id"]) for r in auto_consume_rows]
-    elif isinstance(raw_ids, list) and raw_ids:
-        # Cap inbound id-list length so a hostile client can't blow up
-        # the storage IN (...) clause with millions of bogus ids.
-        from turnstone.core.attachments import MAX_PENDING_ATTACHMENTS_PER_USER_WS
-
-        if len(raw_ids) > MAX_PENDING_ATTACHMENTS_PER_USER_WS:
-            return JSONResponse(
-                {
-                    "error": (
-                        f"Too many attachment_ids (max {MAX_PENDING_ATTACHMENTS_PER_USER_WS})"
-                    ),
-                    "code": "too_many",
-                },
-                status_code=400,
-            )
-        requested_ids = [str(x) for x in raw_ids if x]
-    else:
-        requested_ids = []
-
-    reserved_ids: list[str] = (
-        _reserve(requested_ids, send_id, ws_id, attach_user_id) if requested_ids else []
-    )
-    # Preserve request order; reserve returned a set that may be a
-    # strict subset (lost a race, already consumed, etc.).  Silently
-    # drop losers — the user can re-upload if needed and sees the
-    # partial outcome via the UI's chip-clearing on success.
-    reserved_set = set(reserved_ids)
-    ordered_reserved: list[str] = [aid for aid in requested_ids if aid in reserved_set]
-
-    resolved_atts: list[Attachment] = []
-    if ordered_reserved:
-        # Prefer the bytes we already fetched on the auto-consume path.
-        # Bytes were pre-reserve-call though, so reserved_for_msg_id
-        # needs refresh from the authoritative row.  Re-fetch if the
-        # auto-fetch is stale or empty.
-        if auto_consume_rows and all(
-            str(r["attachment_id"]) in set(ordered_reserved) for r in auto_consume_rows
-        ):
-            rows_by_id = {str(r["attachment_id"]): r for r in auto_consume_rows}
-            # reserved_for_msg_id was None at pre-fetch; patch in the token
-            # so the belt-and-braces scope check below doesn't reject the
-            # rows we just reserved.
-            for r in rows_by_id.values():
-                r["reserved_for_msg_id"] = send_id
-        else:
-            rows = _get_attachments(ordered_reserved)
-            rows_by_id = {str(r["attachment_id"]): r for r in rows}
-        for aid in ordered_reserved:
-            row = rows_by_id.get(aid)
-            if not row:
-                continue
-            r = row
-            # Scope check — belt and braces on top of the reservation.
-            if (
-                r.get("ws_id") != ws_id
-                or r.get("user_id") != attach_user_id
-                or r.get("message_id") is not None
-                or r.get("reserved_for_msg_id") != send_id
-            ):
-                continue
-            content = r.get("content")
-            if not isinstance(content, bytes):
-                continue
-            resolved_atts.append(
-                Attachment(
-                    attachment_id=str(r["attachment_id"]),
-                    filename=str(r.get("filename") or ""),
-                    mime_type=str(r.get("mime_type") or "application/octet-stream"),
-                    kind=str(r.get("kind") or ""),
-                    content=content,
-                )
-            )
-
-    def _release_reservation_on_fail() -> None:
-        """Unreserve if we bail out before dispatching."""
-        if reserved_ids:
-            from turnstone.core.memory import unreserve_attachments as _unreserve
-
-            _unreserve(send_id, ws_id, attach_user_id)
-
-    # If cancel was requested, poll briefly for the worker to exit before
-    # dispatching.  ``_worker_running`` flips to False atomically under
-    # ws._lock when the worker thread reaches its finally block — gates
-    # the dispatch on the same flag the shared dispatcher uses.  Uses
-    # async sleep to avoid blocking the event loop.
-    if ws._worker_running and ws.session and ws.session._cancel_event.is_set():
-        for _ in range(30):  # up to 3s in 100ms steps
-            await asyncio.sleep(0.1)
-            if not ws._worker_running:
-                break
-    if ws.session is None:
-        _release_reservation_on_fail()
-        return JSONResponse({"error": "No session"}, status_code=500)
-
-    session = ws.session
-
-    # Pre-allocate the queue-path outcome dict; populated by ``_enqueue``
-    # only when the shared dispatcher routes us onto a live worker.
-    queue_outcome: dict[str, Any] = {}
-
-    def _enqueue() -> None:
-        # Reuse path: append to the live worker's pending queue. The
-        # ``send_id`` token threads through ``queue_msg_id`` so the
-        # queue entry, the attachment reservation, and the eventual
-        # consume all share one token.
-        cleaned, priority, msg_id = session.queue_message(
-            message,
-            attachment_ids=list(ordered_reserved),
-            queue_msg_id=send_id,
-        )
-        queue_outcome["cleaned"] = cleaned
-        queue_outcome["priority"] = priority
-        queue_outcome["msg_id"] = msg_id
-
-    def _run() -> None:
-        assert ui is not None
-        me = threading.current_thread()
-        try:
-            session.send(
-                message,
-                attachments=resolved_atts or None,
-                send_id=send_id,
-            )
-        except GenerationCancelled:
-            # Safety net — send() normally handles this internally.
-            # If this thread was force-abandoned, ws.worker_thread will
-            # have been set to None — don't emit spurious events.
-            _release_reservation_on_fail()
-            if ws.worker_thread is me:
-                ui.on_stream_end()
-                ui.on_state_change("idle")
-        except Exception as e:
-            # Release the reservation so the attachments don't stay
-            # soft-locked forever when the worker crashes before
-            # reaching the consume step.  Safe-by-idempotency: once
-            # mark_attachments_consumed has cleared the token, a
-            # follow-up unreserve is a no-op.
-            _release_reservation_on_fail()
-            if ws.worker_thread is me:
-                ui.on_error(f"Error: {e}")
-                ui.on_stream_end()
-                ui.on_state_change("error")
-
-    ok = session_worker.send(
-        ws,
-        enqueue=_enqueue,
-        run=_run,
-        thread_name=f"send-worker-{ws.id[:8]}",
-    )
-    if not ok:
-        # Returns False on queue.Full (live worker, queue at capacity)
-        # or session-disappeared race. Either way the message couldn't
-        # land — surface as queue_full so the client can retry.
-        _release_reservation_on_fail()
-        return JSONResponse({"status": "queue_full"})
-
-    dropped = [aid for aid in requested_ids if aid not in reserved_set]
-    if queue_outcome:
-        # Reused a live worker; queue_message succeeded.
-        ui._enqueue(
-            {
-                "type": "message_queued",
-                "message": queue_outcome["cleaned"],
-                "priority": queue_outcome["priority"],
-                "msg_id": queue_outcome["msg_id"],
-            }
-        )
-        return JSONResponse(
-            {
-                "status": "queued",
-                "priority": queue_outcome["priority"],
-                "msg_id": queue_outcome["msg_id"],
-                "attached_ids": list(ordered_reserved),
-                "dropped_attachment_ids": dropped,
-            }
-        )
-
-    # Spawned a fresh worker — count this as a new turn.
-    _metrics.record_message_sent()
-    with ui._ws_lock:
-        ui._ws_messages += 1
-        ui._ws_turn_tool_calls = 0
-    return JSONResponse(
-        {
-            "status": "ok",
-            "attached_ids": list(ordered_reserved),
-            "dropped_attachment_ids": dropped,
-        }
-    )
-
-
 async def plan_feedback(request: Request) -> JSONResponse:
     """POST /v1/api/plan — respond to a plan review."""
     from turnstone.core.web_helpers import read_json_or_400
@@ -2259,6 +2013,9 @@ def _validate_and_save_uploaded_files(
         IMAGE_SIZE_CAP,
         MAX_PENDING_ATTACHMENTS_PER_USER_WS,
         TEXT_DOC_SIZE_CAP,
+        classify_text_attachment,
+        sniff_image_mime,
+        upload_lock,
     )
     from turnstone.core.memory import list_pending_attachments, save_attachment
 
@@ -2266,13 +2023,13 @@ def _validate_and_save_uploaded_files(
     if not files:
         return saved_ids, None
 
-    lock = _attachment_upload_lock(ws_id, user_id)
+    lock = upload_lock(ws_id, user_id)
     with lock:
         pending_count = len(list_pending_attachments(ws_id, user_id))
         for filename, claimed_mime, data in files:
             if not data:
                 return saved_ids, JSONResponse({"error": "Empty file"}, status_code=400)
-            sniffed_image = _sniff_image_mime(data)
+            sniffed_image = sniff_image_mime(data)
             if sniffed_image is not None:
                 if len(data) > IMAGE_SIZE_CAP:
                     return saved_ids, JSONResponse(
@@ -2299,7 +2056,7 @@ def _validate_and_save_uploaded_files(
                         },
                         status_code=413,
                     )
-                mime_or_err = _classify_text_attachment(filename, claimed_mime, data)
+                mime_or_err = classify_text_attachment(filename, claimed_mime, data)
                 if mime_or_err[0] is None:
                     return saved_ids, JSONResponse(
                         {"error": mime_or_err[1], "code": "unsupported"},
@@ -2851,145 +2608,6 @@ async def set_workstream_title(request: Request, ws_id: str = "") -> JSONRespons
     return JSONResponse({"status": "ok", "title": title})
 
 
-# ---------------------------------------------------------------------------
-# Workstream attachments
-# ---------------------------------------------------------------------------
-
-
-# Per-(ws_id, user_id) lock serializing the count-check → insert on
-# upload.  Guards the pending-cap against a concurrent-upload TOCTOU race
-# within a single process.  Multi-process deployments would need an
-# additional DB-side check, but turnstone-server runs one process per node.
-#
-# Uses ``threading.Lock`` (not ``asyncio.Lock``) on purpose: Starlette's
-# TestClient — and any framework that runs each request on a fresh
-# anyio task — can leave a cached ``asyncio.Lock`` bound to a stale,
-# closed event loop, and the next acquire deadlocks silently.  A
-# threading.Lock is loop-agnostic, and the critical section here is
-# short (one COUNT, one INSERT) so blocking the event loop briefly is
-# acceptable.
-#
-# Bounded LRU eviction prevents unbounded growth on long-running nodes:
-# when the map exceeds the soft cap we drop the oldest *unlocked* entries
-# (a held lock means an upload is in flight — never evict those).
-_ATTACHMENT_UPLOAD_LOCKS_MAX = 1024
-_attachment_upload_locks: collections.OrderedDict[tuple[str, str], threading.Lock] = (
-    collections.OrderedDict()
-)
-_attachment_upload_locks_mx = threading.Lock()
-
-
-def _attachment_upload_lock(ws_id: str, user_id: str) -> threading.Lock:
-    key = (ws_id, user_id)
-    with _attachment_upload_locks_mx:
-        lock = _attachment_upload_locks.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _attachment_upload_locks[key] = lock
-        else:
-            # Touch for LRU
-            _attachment_upload_locks.move_to_end(key)
-        # Opportunistic eviction once we exceed the soft cap.  Skip
-        # held locks (an upload is in flight under that key).
-        if len(_attachment_upload_locks) > _ATTACHMENT_UPLOAD_LOCKS_MAX:
-            for stale_key in list(_attachment_upload_locks):
-                if len(_attachment_upload_locks) <= _ATTACHMENT_UPLOAD_LOCKS_MAX:
-                    break
-                if stale_key == key:
-                    continue  # never evict the lock we're handing out
-                stale = _attachment_upload_locks[stale_key]
-                # threading.Lock has no public locked() — use the
-                # non-blocking acquire-and-release probe instead.
-                if stale.acquire(blocking=False):
-                    stale.release()
-                    del _attachment_upload_locks[stale_key]
-        return lock
-
-
-_TEXT_ATTACHMENT_EXTENSIONS: frozenset[str] = frozenset(
-    {
-        ".c",
-        ".conf",
-        ".cpp",
-        ".css",
-        ".go",
-        ".h",
-        ".hpp",
-        ".html",
-        ".ini",
-        ".java",
-        ".js",
-        ".json",
-        ".jsx",
-        ".md",
-        ".py",
-        ".rs",
-        ".sh",
-        ".sql",
-        ".toml",
-        ".ts",
-        ".tsx",
-        ".txt",
-        ".xml",
-        ".yaml",
-        ".yml",
-    }
-)
-
-
-def _sniff_image_mime(data: bytes) -> str | None:
-    """Return a canonical image MIME type by inspecting magic bytes.
-
-    Returns ``None`` if the bytes don't match any supported image
-    format.  Do not trust the client-provided ``Content-Type`` alone.
-    """
-    if len(data) < 12:
-        return None
-    if data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if data.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    if data[:6] in (b"GIF87a", b"GIF89a"):
-        return "image/gif"
-    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "image/webp"
-    return None
-
-
-def _classify_text_attachment(
-    filename: str, claimed_mime: str, data: bytes
-) -> tuple[str | None, str | None]:
-    """Return ``(canonical_mime, error)`` for a candidate text upload.
-
-    Accepts MIMEs starting with ``text/`` or in an application allowlist,
-    OR a filename with a known text-file extension.  The payload must
-    decode as UTF-8.  Returns ``(None, error_message)`` on rejection.
-    """
-    import os
-
-    allowed_app_mimes = {
-        "application/json",
-        "application/xml",
-        "application/x-yaml",
-        "application/yaml",
-        "application/toml",
-    }
-    mime_ok = claimed_mime.startswith("text/") or claimed_mime in allowed_app_mimes
-    ext_ok = os.path.splitext(filename)[1].lower() in _TEXT_ATTACHMENT_EXTENSIONS
-    if not (mime_ok or ext_ok):
-        return None, (
-            f"Unsupported file type: {claimed_mime or 'unknown'} (filename: {filename!r})"
-        )
-    try:
-        data.decode("utf-8")
-    except UnicodeDecodeError:
-        return None, "Text attachment is not valid UTF-8"
-    # Normalize MIME — prefer the claimed one if sensible, else text/plain.
-    if mime_ok and claimed_mime:
-        return claimed_mime, None
-    return "text/plain", None
-
-
 def _auth_user_id(request: Request) -> str:
     """Return the authenticated user's id (empty string when absent)."""
     auth = getattr(getattr(request, "state", None), "auth_result", None)
@@ -3068,189 +2686,6 @@ def _require_ws_access(
     if owner is None:
         return "", JSONResponse({"error": "Workstream not found"}, status_code=404)
     return owner or caller, None
-
-
-async def upload_attachment(request: Request) -> JSONResponse:
-    """POST /v1/api/workstreams/{ws_id}/attachments — upload one file.
-
-    Multipart body with a single ``file`` field.  Validates size + MIME
-    + magic bytes, enforces per-(ws,user) pending cap, then stores.
-    """
-    from turnstone.core.attachments import (
-        IMAGE_SIZE_CAP,
-        MAX_PENDING_ATTACHMENTS_PER_USER_WS,
-        TEXT_DOC_SIZE_CAP,
-    )
-    from turnstone.core.memory import list_pending_attachments, save_attachment
-    from turnstone.core.web_helpers import read_multipart_file_or_400
-
-    ws_id = request.path_params.get("ws_id", "")
-    if not ws_id:
-        return JSONResponse({"error": "ws_id is required"}, status_code=400)
-
-    user_id, err = _require_ws_access(request, ws_id)
-    if err:
-        return err
-
-    # Cap at image size (largest permitted type) — per-kind cap enforced below.
-    got = await read_multipart_file_or_400(request, field="file", max_bytes=IMAGE_SIZE_CAP)
-    if isinstance(got, JSONResponse):
-        return got
-    filename, claimed_mime, data = got
-
-    if not data:
-        return JSONResponse({"error": "Empty file"}, status_code=400)
-
-    # Classify: image (magic-byte sniff) vs text (mime/ext + UTF-8 decode)
-    sniffed_image = _sniff_image_mime(data)
-    if sniffed_image is not None:
-        if len(data) > IMAGE_SIZE_CAP:
-            return JSONResponse(
-                {
-                    "error": (
-                        f"Image too large ({len(data):,} bytes); cap is {IMAGE_SIZE_CAP:,} bytes."
-                    ),
-                    "code": "too_large",
-                },
-                status_code=413,
-            )
-        kind = "image"
-        mime = sniffed_image
-    else:
-        if len(data) > TEXT_DOC_SIZE_CAP:
-            return JSONResponse(
-                {
-                    "error": (
-                        f"Text document too large ({len(data):,} bytes); "
-                        f"cap is {TEXT_DOC_SIZE_CAP:,} bytes."
-                    ),
-                    "code": "too_large",
-                },
-                status_code=413,
-            )
-        mime_or_err = _classify_text_attachment(filename, claimed_mime, data)
-        if mime_or_err[0] is None:
-            return JSONResponse({"error": mime_or_err[1], "code": "unsupported"}, status_code=400)
-        kind = "text"
-        mime = mime_or_err[0]
-
-    # Serialize count-check + save per (ws, user) so concurrent uploads
-    # can't both pass a check that sees count == cap-1.  Plain
-    # threading.Lock (not asyncio.Lock) — see _attachment_upload_lock
-    # for why.  The critical section is short, so blocking the event
-    # loop briefly is acceptable.
-    lock = _attachment_upload_lock(ws_id, user_id)
-    with lock:
-        if len(list_pending_attachments(ws_id, user_id)) >= MAX_PENDING_ATTACHMENTS_PER_USER_WS:
-            return JSONResponse(
-                {
-                    "error": (
-                        f"Too many pending attachments "
-                        f"(max {MAX_PENDING_ATTACHMENTS_PER_USER_WS} pending per workstream)"
-                    ),
-                    "code": "too_many",
-                },
-                status_code=409,
-            )
-        attachment_id = uuid.uuid4().hex
-        save_attachment(
-            attachment_id,
-            ws_id,
-            user_id,
-            filename,
-            mime,
-            len(data),
-            kind,
-            data,
-        )
-    return JSONResponse(
-        {
-            "attachment_id": attachment_id,
-            "filename": filename,
-            "mime_type": mime,
-            "size_bytes": len(data),
-            "kind": kind,
-        }
-    )
-
-
-async def list_attachments(request: Request) -> JSONResponse:
-    """GET /v1/api/workstreams/{ws_id}/attachments — list current user's
-    pending (unconsumed) attachments for this workstream.
-    """
-    from turnstone.core.memory import list_pending_attachments
-
-    ws_id = request.path_params.get("ws_id", "")
-    if not ws_id:
-        return JSONResponse({"error": "ws_id is required"}, status_code=400)
-    user_id, err = _require_ws_access(request, ws_id)
-    if err:
-        return err
-    rows = list_pending_attachments(ws_id, user_id)
-    return JSONResponse({"attachments": rows})
-
-
-async def get_attachment_content(request: Request) -> Response:
-    """GET /v1/api/workstreams/{ws_id}/attachments/{attachment_id}/content —
-    raw bytes of the attachment with its stored ``Content-Type``.
-
-    The caller must own the workstream (or hold service scope).
-    Unknown / cross-workstream ids return 404 to avoid leaking existence.
-    """
-    from turnstone.core.memory import get_attachment
-
-    ws_id = request.path_params.get("ws_id", "")
-    attachment_id = request.path_params.get("attachment_id", "")
-    if not ws_id or not attachment_id:
-        return JSONResponse({"error": "ws_id and attachment_id are required"}, status_code=400)
-    user_id, err = _require_ws_access(request, ws_id)
-    if err:
-        return err
-    row = get_attachment(attachment_id)
-    # Scope on user_id too — in an unowned workstream different users
-    # could otherwise fetch each other's blobs via id-guessing.  Mask
-    # cross-user / cross-ws as 404 to avoid leaking existence.
-    if not row or row.get("ws_id") != ws_id or row.get("user_id") != user_id:
-        return JSONResponse({"error": "Not found"}, status_code=404)
-    body = row.get("content") or b""
-    kind = row.get("kind") or ""
-    stored_mime = row.get("mime_type") or "application/octet-stream"
-    filename = str(row.get("filename") or "attachment")
-    # Force text/plain for text kinds — avoids same-origin HTML/SVG
-    # rendering if a user uploaded an HTML-ish text file.  Images keep
-    # their sniffed MIME (the allowlist is strict: png/jpeg/gif/webp).
-    response_mime = "text/plain; charset=utf-8" if kind == "text" else stored_mime
-    # Sanitize filename for Content-Disposition (quotes / CRLF only —
-    # browsers tolerate most other characters).  RFC 6266 filename*=
-    # would be more complete but isn't needed for the inline-attachment
-    # use case here.
-    safe_name = filename.replace('"', "").replace("\r", "").replace("\n", "")
-    headers = {
-        "X-Content-Type-Options": "nosniff",
-        "Content-Security-Policy": "default-src 'none'; sandbox",
-        "Content-Disposition": f'inline; filename="{safe_name}"',
-        "Cache-Control": "private, no-store",
-    }
-    return Response(body, media_type=response_mime, headers=headers)
-
-
-async def delete_attachment(request: Request) -> JSONResponse:
-    """DELETE /v1/api/workstreams/{ws_id}/attachments/{attachment_id} —
-    remove a pending attachment.  Consumed attachments return 404.
-    """
-    from turnstone.core.memory import delete_attachment as _delete
-
-    ws_id = request.path_params.get("ws_id", "")
-    attachment_id = request.path_params.get("attachment_id", "")
-    if not ws_id or not attachment_id:
-        return JSONResponse({"error": "ws_id and attachment_id are required"}, status_code=400)
-    user_id, err = _require_ws_access(request, ws_id)
-    if err:
-        return err
-    deleted = _delete(attachment_id, ws_id, user_id)
-    if not deleted:
-        return JSONResponse({"error": "Not found"}, status_code=404)
-    return JSONResponse({"status": "deleted"})
 
 
 async def open_workstream(request: Request) -> JSONResponse:
@@ -4420,12 +3855,51 @@ def create_app(
     # shape against its coord manager. The lifted handler factories
     # (``make_approve_handler``, ``make_close_handler``) capture the
     # kind-specific ``SessionEndpointConfig`` via closure.
+    def _interactive_attachment_owner(
+        request: Request, ws_id: str, _mgr: SessionManager
+    ) -> tuple[str, JSONResponse | None]:
+        """Resolve attachment owner for interactive workstreams via
+        :func:`_require_ws_access`. Mirrors the pre-P1.5 inline logic
+        in ``send_message`` — uses the storage path (``mgr`` not
+        passed) so tests with MagicMock managers don't trip on a
+        magic-mocked ``ws.user_id``."""
+        return _require_ws_access(request, ws_id)
+
+    def _interactive_spawn_metrics(_request: Request, ui: Any) -> None:
+        """Per-conversation metrics fired once per send that spawns a
+        fresh worker. Coord wires ``None`` for this hook."""
+        _metrics.record_message_sent()
+        if hasattr(ui, "_ws_lock") and hasattr(ui, "_ws_messages"):
+            with ui._ws_lock:
+                ui._ws_messages += 1
+                ui._ws_turn_tool_calls = 0
+
+    from turnstone.core.attachments import (
+        classify_text_attachment as _classify_text_attachment,
+    )
+    from turnstone.core.attachments import (
+        sniff_image_mime as _sniff_image_mime,
+    )
+    from turnstone.core.attachments import (
+        upload_lock as _attachment_upload_lock,
+    )
+
+    interactive_attachment_helpers = AttachmentUploadHelpers(
+        sniff_image_mime=_sniff_image_mime,
+        classify_text_attachment=_classify_text_attachment,
+        upload_lock=_attachment_upload_lock,
+    )
     interactive_endpoint_config = SessionEndpointConfig(
         permission_gate=None,  # interactive auth is enforced at the middleware layer
         manager_lookup=_interactive_manager_lookup,
         tenant_check=_interactive_tenant_check,
         not_found_label="Workstream not found",
         audit_action_prefix="workstream",
+        supports_attachments=True,
+        attachment_owner_resolver=_interactive_attachment_owner,
+        attachment_helpers=interactive_attachment_helpers,
+        spawn_metrics=_interactive_spawn_metrics,
+        emit_message_queued=True,
     )
     approve_handler = make_approve_handler(interactive_endpoint_config)
     close_handler = make_close_handler(
@@ -4433,6 +3907,9 @@ def create_app(
         audit_emit=_audit_close_workstream,
         supports_close_reason=True,
     )
+    send_handler = make_send_handler(interactive_endpoint_config)
+    dequeue_handler = make_dequeue_handler(interactive_endpoint_config)
+    attachment_handlers = make_attachment_handlers(interactive_endpoint_config)
     v1_routes: list[Any] = [
         Route("/api/events", events_sse),
         Route("/api/events/global", global_events_sse),
@@ -4450,13 +3927,9 @@ def create_app(
             close=close_handler,  # lifted: shared body
             refresh_title=refresh_workstream_title,
             set_title=set_workstream_title,
+            send=send_handler,  # lifted: shared body (P1.5)
             approve=approve_handler,  # lifted: shared body
-            attachments=AttachmentHandlers(
-                upload=upload_attachment,
-                list=list_attachments,
-                get_content=get_attachment_content,
-                delete=delete_attachment,
-            ),
+            attachments=attachment_handlers,  # lifted: shared body (P1.5)
         ),
     )
     v1_routes.append(Route("/api/dashboard", dashboard))
@@ -4470,7 +3943,18 @@ def create_app(
                     *v1_routes,
                     Route("/api/skills", list_skills_summary),
                     Route("/api/models", list_available_models),
-                    Route("/api/send", send_message, methods=["POST", "DELETE"]),
+                    Route(
+                        "/api/send",
+                        make_legacy_body_keyed_adapter(
+                            _make_method_dispatch(
+                                {
+                                    "POST": send_handler,
+                                    "DELETE": dequeue_handler,
+                                }
+                            )
+                        ),
+                        methods=["POST", "DELETE"],
+                    ),
                     Route(
                         "/api/approve",
                         make_legacy_body_keyed_adapter(approve_handler),

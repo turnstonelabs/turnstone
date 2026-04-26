@@ -55,11 +55,14 @@ from turnstone.core.auth import (
 )
 from turnstone.core.rendezvous import NoAvailableNodeError
 from turnstone.core.session_routes import (
+    AttachmentUploadHelpers,
     CoordOnlyVerbHandlers,
     SessionEndpointConfig,
     SharedSessionVerbHandlers,
     make_approve_handler,
+    make_attachment_handlers,
     make_close_handler,
+    make_send_handler,
     register_coord_verbs,
     register_session_routes,
 )
@@ -2519,38 +2522,6 @@ async def coordinator_create(request: Request) -> JSONResponse:
         except Exception:
             log.debug("coordinator_create.audit_failed", exc_info=True)
     return JSONResponse({"ws_id": ws.id, "name": ws.name}, status_code=201)
-
-
-async def coordinator_send(request: Request) -> JSONResponse:
-    """POST /v1/api/workstreams/{ws_id}/send — queue a user message."""
-    from turnstone.core.web_helpers import read_json_or_400
-
-    err = _require_admin_coordinator(request)
-    if err is not None:
-        return err
-    coord_mgr, err503 = _require_coord_mgr(request)
-    if err503 is not None:
-        return err503
-    ws_id = request.path_params.get("ws_id", "")
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
-    message = (body.get("message") or "").strip()
-    if not message:
-        return JSONResponse({"error": "message is required"}, status_code=400)
-    ws = coord_mgr.get(ws_id)
-    if ws is None:
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    coord_adapter = getattr(request.app.state, "coord_adapter", None)
-    if coord_adapter is None or not coord_adapter.send(ws_id, message):
-        # Distinguish "worker busy + queue full" from "ws not loaded".
-        # If ws is loaded and session exists, the worker queue is full —
-        # tell the client to back off rather than retry blindly.
-        ws_now = coord_mgr.get(ws_id)
-        if ws_now is not None and ws_now.session is not None:
-            return JSONResponse({"error": "worker queue full; retry shortly"}, status_code=429)
-        return JSONResponse({"error": "send failed"}, status_code=500)
-    return JSONResponse({"status": "ok"})
 
 
 async def coordinator_cancel(request: Request) -> JSONResponse:
@@ -10127,12 +10098,50 @@ def create_app(
     # at request time because the manager is built in the lifespan,
     # after this app construction; future verb lifts carry that lookup
     # into the config callable.
+    def _coord_attachment_owner(
+        request: Request, ws_id: str, mgr: Any
+    ) -> tuple[str, JSONResponse | None]:
+        """Resolve the attachment owner for a coord ws_id.
+
+        Mirrors interactive's resolver: prefers the in-memory ws's
+        ``user_id`` (the operator who created the coord), falls back
+        to the persisted row owner, returns 404 when neither is found.
+        """
+        from turnstone.core.web_helpers import resolve_workstream_owner
+
+        return resolve_workstream_owner(
+            request, ws_id, mgr=mgr, not_found_label="coordinator not found"
+        )
+
+    from turnstone.core.attachments import (
+        classify_text_attachment as _coord_classify_text,
+    )
+    from turnstone.core.attachments import (
+        sniff_image_mime as _coord_sniff_image,
+    )
+    from turnstone.core.attachments import (
+        upload_lock as _coord_upload_lock,
+    )
+
+    coord_attachment_helpers = AttachmentUploadHelpers(
+        sniff_image_mime=_coord_sniff_image,
+        classify_text_attachment=_coord_classify_text,
+        upload_lock=_coord_upload_lock,
+    )
     coord_endpoint_config = SessionEndpointConfig(
         permission_gate=_require_admin_coordinator,
         manager_lookup=_require_coord_mgr,
         tenant_check=None,  # cluster-wide admin.coordinator gate covers it
         not_found_label="coordinator not found",
         audit_action_prefix="coordinator",
+        supports_attachments=True,
+        attachment_owner_resolver=_coord_attachment_owner,
+        attachment_helpers=coord_attachment_helpers,
+        # No per-conversation metrics on coord — the per-UI counters
+        # interactive maintains don't have an analog on the coord
+        # dashboard. Cluster-level metrics fan out via the collector.
+        spawn_metrics=None,
+        emit_message_queued=True,
     )
     coord_workstream_routes: list[Any] = []
     register_session_routes(
@@ -10149,11 +10158,14 @@ def create_app(
                 audit_emit=_audit_close_coordinator,
                 supports_close_reason=False,
             ),
-            send=coordinator_send,
+            send=make_send_handler(coord_endpoint_config),  # lifted: shared body (P1.5)
             approve=make_approve_handler(coord_endpoint_config),  # lifted: shared body
             cancel=coordinator_cancel,
             events=coordinator_events,
             history=coordinator_history,
+            attachments=make_attachment_handlers(
+                coord_endpoint_config
+            ),  # lifted: shared body (P1.5)
         ),
     )
     register_coord_verbs(

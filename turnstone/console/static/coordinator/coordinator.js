@@ -1573,10 +1573,48 @@
       );
       (hist.messages || []).forEach((m) => {
         const role = m.role || "tool";
-        const content =
-          typeof m.content === "string"
-            ? m.content
-            : JSON.stringify(m.content || "");
+        // User messages with attachments arrive as multipart list
+        // content (text + image_url/document parts) and may carry an
+        // ``_attachments_meta`` side-channel with display metadata.
+        // Extract the text portion + attachment count for a readable
+        // history replay; chip-rendering parity with the interactive
+        // pane is deferred (the coord dashboard is diagnostic-leaning
+        // — primary use is monitoring, not authoring).
+        let content;
+        let attachmentCount = 0;
+        if (typeof m.content === "string") {
+          content = m.content;
+        } else if (Array.isArray(m.content)) {
+          const textParts = [];
+          for (const part of m.content) {
+            if (!part || typeof part !== "object") continue;
+            if (part.type === "text") {
+              textParts.push(String(part.text || ""));
+            } else if (part.type === "image_url" || part.type === "document") {
+              attachmentCount += 1;
+            }
+          }
+          content = textParts.join("\n");
+        } else {
+          content = JSON.stringify(m.content || "");
+        }
+        const meta = Array.isArray(m._attachments_meta)
+          ? m._attachments_meta
+          : null;
+        if (meta && meta.length > attachmentCount) {
+          // Prefer the side-channel count when present — it covers
+          // attachments whose multipart parts couldn't be reconstructed.
+          attachmentCount = meta.length;
+        }
+        if (attachmentCount > 0) {
+          const noun = attachmentCount === 1 ? "attachment" : "attachments";
+          content =
+            (content ? content + "\n\n" : "") +
+            "📎 " +
+            attachmentCount +
+            " " +
+            noun;
+        }
         if (!content) return;
         if (role === "tool") {
           appendToolResult(
