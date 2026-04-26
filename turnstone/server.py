@@ -3854,9 +3854,18 @@ def create_app(
 
     def _interactive_spawn_metrics(_request: Request, ui: Any) -> None:
         """Per-conversation metrics fired once per send that spawns a
-        fresh worker. Coord wires ``None`` for this hook."""
+        fresh worker. Coord wires ``None`` for this hook.
+
+        The per-UI counters live on ``WebUI`` only — guard all three
+        attributes so a future ``SessionUI`` subclass without the
+        full counter set doesn't trip on the assignment.
+        """
         _metrics.record_message_sent()
-        if hasattr(ui, "_ws_lock") and hasattr(ui, "_ws_messages"):
+        if (
+            hasattr(ui, "_ws_lock")
+            and hasattr(ui, "_ws_messages")
+            and hasattr(ui, "_ws_turn_tool_calls")
+        ):
             with ui._ws_lock:
                 ui._ws_messages += 1
                 ui._ws_turn_tool_calls = 0

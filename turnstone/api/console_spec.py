@@ -1205,7 +1205,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         ),
         request_model=CoordinatorSendRequest,
         response_model=CoordinatorSendResponse,
-        error_codes=[400, 403, 404, 500, 503],
+        error_codes=[400, 403, 404, 409, 500, 503],
         tags=["Coordinator"],
     ),
     # --- Coordinator attachments (P1.5: parity with interactive) ---

@@ -114,10 +114,13 @@ class SessionEndpointConfig:
       503 when the subsystem isn't available (coord on a console
       without configured models). For interactive the lookup just
       returns ``(app.state.workstreams, None)``.
-    - ``tenant_check``: per-``ws_id`` cross-tenant guard. Interactive
-      uses ``_require_ws_access`` (404 on owner mismatch); coord
-      relies on the cluster-wide ``admin.coordinator`` scope from
-      ``permission_gate`` and sets this to ``None``.
+    - ``tenant_check``: per-``ws_id`` existence + access gate.
+      Interactive wires :func:`_require_ws_access` (which 404s when
+      the workstream doesn't exist; row-level ownership is NOT
+      enforced — turnstone is a trusted-team tool, ``admin.workstreams``
+      scope is the cluster-wide gate). Coord sets this to ``None``
+      and relies on ``admin.coordinator`` from ``permission_gate``
+      plus an in-memory ``coord_mgr`` lookup at handler time.
     - ``not_found_label``: the message body for the 404 returned when
       the manager has no such ws_id ("Workstream not found" for
       interactive; "coordinator not found" for coord).
@@ -619,16 +622,23 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
 
     Capability flags on ``cfg`` toggle the kind-specific behaviour:
 
-    - ``supports_attachments``: when ``False``, attachment-resolution
-      logic short-circuits and the handler accepts only
-      ``{"message": ...}``.
+    - ``supports_attachments``: when ``False``, the entire
+      attachment-resolution block (reservation, fetch, scope-check)
+      short-circuits and any ``attachment_ids`` in the body are
+      silently ignored — no reservation, no error. Both kinds wire
+      ``True`` post-P1.5; the flag exists so a kind that hasn't
+      lit up its UI surface yet can defer.
     - ``spawn_metrics``: when set, fires once on the spawn path with
       ``(request, ui)``. Interactive wires its WebUI per-conversation
       counters here; coord wires ``None``.
     - ``emit_message_queued``: when ``True``, the queue-reuse path
       pushes a ``message_queued`` event onto the listener queue.
 
-    Response shape (both kinds, P1.5 onwards):
+    Response shape (both kinds, P1.5 onwards). Every successful
+    response carries ``attached_ids`` and ``dropped_attachment_ids``
+    (empty lists when no attachments are involved), so SDK
+    consumers don't have to branch on whether the request had
+    attachments:
 
     - 200 ``{"status": "ok", "attached_ids", "dropped_attachment_ids"}``
       — fresh worker spawned. ``attached_ids`` is the subset of
@@ -637,8 +647,11 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
     - 200 ``{"status": "queued", "priority", "msg_id", "attached_ids",
       "dropped_attachment_ids"}`` — reused live worker; queued for
       injection at the next tool-result seam.
-    - 200 ``{"status": "queue_full"}`` — live worker's queue at
-      capacity. Caller should retry.
+    - 200 ``{"status": "queue_full", "attached_ids",
+      "dropped_attachment_ids"}`` — live worker's queue at
+      capacity; reservations released. Caller should retry. The
+      ``attached_ids`` list is always empty here (the dispatch
+      didn't take ownership of any reservations).
     - 4xx / 500 — auth / not-found / no-session per the usual
       :class:`SessionEndpointConfig` semantics.
     """
@@ -882,9 +895,19 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
         )
         if not ok:
             # queue.Full or session-disappeared race — surface as
-            # queue_full so clients retry rather than 500.
+            # queue_full so clients retry rather than 500. Reservations
+            # released above; ``attached_ids`` is always empty on this
+            # path (the dispatch never took ownership). The empty
+            # arrays preserve the response-shape guarantee so SDK
+            # consumers don't branch on status.
             _release_reservation_on_fail()
-            return JSONResponse({"status": "queue_full"})
+            return JSONResponse(
+                {
+                    "status": "queue_full",
+                    "attached_ids": [],
+                    "dropped_attachment_ids": list(requested_ids),
+                }
+            )
 
         dropped = [aid for aid in requested_ids if aid not in reserved_set]
         if queue_outcome:
