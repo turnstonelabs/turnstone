@@ -1731,7 +1731,18 @@ class TestSkillConfigAppliedToWorkstream:
         import turnstone.core.storage._registry as _reg
         from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
         from turnstone.core.session_manager import SessionManager
-        from turnstone.server import WebUI, create_workstream
+        from turnstone.core.session_routes import (
+            SessionEndpointConfig,
+            make_create_handler,
+        )
+        from turnstone.server import (
+            WebUI,
+            _interactive_create_build_kwargs,
+            _interactive_create_post_install,
+            _interactive_create_validate_request,
+            _interactive_manager_lookup,
+            _interactive_tenant_check,
+        )
 
         storage = SQLiteBackend(str(tmp_path / "ws_test.db"))
 
@@ -1769,13 +1780,29 @@ class TestSkillConfigAppliedToWorkstream:
         )
         mgr = SessionManager(adapter, storage=storage, max_active=10, event_emitter=adapter)
 
+        # Build the same lifted create handler the production app
+        # mounts so this fixture exercises the make_create_handler
+        # factory rather than a parallel pre-lift body.
+        _test_cfg = SessionEndpointConfig(
+            permission_gate=None,
+            manager_lookup=_interactive_manager_lookup,
+            tenant_check=_interactive_tenant_check,
+            not_found_label="Workstream not found",
+            audit_action_prefix="workstream",
+            create_supports_attachments=True,
+            create_supports_user_id_override=True,
+            create_validate_request=_interactive_create_validate_request,
+            create_build_kwargs=_interactive_create_build_kwargs,
+            create_post_install=_interactive_create_post_install,
+        )
+        _test_create_handler = make_create_handler(_test_cfg)
         routes = [
             Mount(
                 "/v1",
                 routes=[
                     Route(
                         "/api/workstreams/new",
-                        create_workstream,
+                        _test_create_handler,
                         methods=["POST"],
                     ),
                 ],
@@ -1797,6 +1824,23 @@ class TestSkillConfigAppliedToWorkstream:
 
         # Restore original storage singleton.
         _reg._storage = old_storage
+
+    def test_create_lift_400s_on_malformed_notify_targets(self, _ws_app):
+        """Regression for the lifted create handler — malformed
+        ``notify_targets`` returns 400 from the validator (pre-create
+        gate), not 500 from a post_install raise."""
+        client, mgr, storage = _ws_app
+
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "x", "notify_targets": "{not json"},
+        )
+        assert resp.status_code == 400, resp.text
+        body = resp.json()
+        assert "error" in body
+        # The workstream must NOT have been created — the validator
+        # gates BEFORE mgr.create, so storage stays clean.
+        assert len(list(storage.list_workstreams())) == 0
 
     def test_session_receives_temperature(self, _ws_app):
         """Skill temperature overrides the session default."""

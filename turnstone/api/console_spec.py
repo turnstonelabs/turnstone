@@ -1140,12 +1140,14 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "Create a new coordinator workstream",
         description=(
             'Allocates a console-hosted ``kind="coordinator"`` ChatSession.  '
-            "201 on create; 429 when the ``coordinator.max_active`` cap is "
-            "reached and no idle coordinator can be evicted."
+            "200 on create; 429 when the ``coordinator.max_active`` cap is "
+            "reached and no idle coordinator can be evicted.  "
+            "Pre-1.5.0 this returned 201; the lifted ``create`` factory "
+            "(Stage 2 verb lift) converges on 200 across both kinds."
         ),
         request_model=CoordinatorCreateRequest,
         response_model=CoordinatorCreateResponse,
-        response_code=201,
+        response_code=200,
         error_codes=[400, 401, 403, 429, 500, 503],
         tags=["Coordinator"],
     ),

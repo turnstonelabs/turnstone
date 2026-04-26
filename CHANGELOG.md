@@ -400,6 +400,151 @@ Three release tracks are maintained:
     semantics are preserved by wrapping the iteration in the same
     try/except.
 
+- **`create` verb body lifted across both kinds** ([Stage 2 Verb
+  Lift — `create`]). The interactive
+  ``POST /v1/api/workstreams/new`` and coord
+  ``POST /v1/api/workstreams/new`` handlers now share one body via
+  ``make_create_handler(cfg, *, audit_emit=None)``. Per-kind
+  divergence captured by five new ``SessionEndpointConfig`` fields:
+
+  - ``create_supports_attachments: bool`` — multipart body parsing
+    + attachment validation+save+rollback. Both kinds wire ``True``.
+  - ``create_supports_user_id_override: bool`` — trusted-source
+    body ``user_id`` override (interactive ``True`` for console-
+    proxied creates; coord ``False``).
+  - ``create_validate_request: CreateRequestValidator | None`` —
+    per-kind pre-create gates (interactive: ws_id format, kind,
+    parent ownership, attachments+resume_ws combo; coord: 401-on-
+    empty-uid).
+  - ``create_build_kwargs: CreateKwargsBuilder | None`` — per-kind
+    kwargs dict for ``mgr.create``.
+  - ``create_post_install: CreatePostInstall | None`` — per-kind
+    tail end (interactive: WebUI auto_approve + watch_runner +
+    ``ws_created`` global broadcast + atomic resume + skill session
+    config + notify_targets + routing override + initial-message
+    worker thread; coord: ``coord_adapter.send`` for the optional
+    initial_message).
+
+  The pure helper ``_validate_and_save_uploaded_files`` lifted from
+  ``turnstone.server`` to ``turnstone.core.attachments`` as
+  ``validate_and_save_uploaded_files`` so both processes can call
+  the same kind-agnostic implementation.
+
+  **§ Post-P3 reckoning item #1 done — coord gains create-time
+  attachments.** Pre-lift ``coordinator_create`` accepted JSON only
+  and ignored uploads; the lifted body parses ``multipart/form-data``
+  on coord and saves attachments through the kind-agnostic storage
+  layer. Coord's adapter ``send`` does NOT yet take attachments,
+  so when a create request carries both ``initial_message`` and
+  uploads, the rows save as pending and the next ``/send`` picks
+  them up via the standard send-with-attachments path. Initial-
+  message + create-time attachments coordination on coord is a
+  follow-up — out of scope for the verb-shape lift.
+
+  Note on broadcast timing: coord's ``mgr.create`` fires
+  ``emit_created`` (cluster collector fan-out) BEFORE the lifted
+  body runs attachment validation. If validation fails on coord and
+  the rollback (``mgr.close`` → ``emit_closed``) fires, the cluster
+  events stream sees a phantom create→close pair. Cluster consumers
+  handle this gracefully (same shape as any quick-create-close);
+  decoupling ``emit_created`` from ``mgr.create`` would be a bigger
+  refactor that doesn't belong in the verb lift. Interactive's
+  broadcast (``gq.put_nowait("ws_created")``) is held until after
+  attachment validation by the post-install callback, so interactive
+  never sees the phantom pair.
+
+  Five observable behaviour changes on the create response:
+
+  - **Both kinds converge on 200 OK.** Pre-lift interactive
+    returned 200 (default JSONResponse status); pre-lift coord
+    returned 201. Picked 200 over 201 for response-shape parity
+    with every other shared verb at the cost of REST-strict
+    correctness — a one-time release note rather than ongoing
+    client churn (the rest of the v1 SDK already uses
+    ``response.ok`` per ``feedback_test_frontend_locally.md``).
+    SDK consumers that branched on ``status == 201`` for coord
+    must switch to ``response.ok``.
+  - **Always-include response shape.** Pre-lift interactive
+    returned ``{ws_id, name, resumed, message_count, attachment_ids}``
+    (5 fields); pre-lift coord returned ``{ws_id, name}`` (2). The
+    lifted body always returns the full shape, with ``resumed=False``
+    / ``message_count=0`` / ``attachment_ids=[]`` on kinds whose
+    post-install doesn't populate them. Coord callers will see the
+    parity fields appear with default values.
+  - **Both kinds converge on the manager-at-capacity 429
+    semantic.** Pre-lift interactive translated ``mgr.create``'s
+    ``RuntimeError`` to 400; coord already translated to 429. The
+    documented contract on ``SessionManager.create`` is "raises
+    RuntimeError when the manager is at capacity" — 429 (rate-
+    limit / try-later) is the correct shape.
+  - **Both kinds converge on the factory-misconfig 503 semantic.**
+    Pre-lift interactive let ``ValueError`` propagate as 500 with
+    a stack trace; coord already translated to 503 with the
+    factory's remediation text. Operators get the actionable
+    message instead of the trace.
+  - **Both kinds get a correlation_id'd 500 on unexpected
+    ``mgr.create`` failure.** Pre-lift interactive let unexpected
+    exceptions propagate as 500 with a stack trace (potential
+    information leak via frame names / file paths); coord already
+    returned a correlation_id'd 500 with the message redacted. The
+    lifted body adopts coord's safer pattern on both kinds.
+
+  Two coord-specific parity gains:
+
+  - **Coord rejects disabled skills.** Pre-lift
+    ``coordinator_create`` silently allowed disabled skills to
+    flow through to ``mgr.create`` — the row would create with a
+    skill the operator had marked inert, surprising both the
+    operator and the next user. The lifted body returns 400
+    "Skill not found or disabled" matching interactive's
+    behaviour.
+  - **Coord audit-emit failures no longer 500.** Pre-lift
+    ``coordinator_create`` already swallowed; pre-lift interactive
+    let the failure propagate as 500. The lifted body wraps
+    ``audit_emit`` in try/except + ``warning`` log, returning the
+    successful 200 to the caller. Mirrors the close / cancel /
+    open / events lift contracts.
+
+  No legacy adapter is needed for create — both kinds already
+  mounted ``POST {prefix}/new`` pre-lift; the lifted handler slots
+  in at the same path on each kind.
+
+  Three /review fixes folded into the same commit:
+
+  - **Pre-lift's 400 on malformed ``notify_targets`` preserved.** The
+    initial draft surfaced ``notify_targets`` validation errors from
+    inside the interactive ``post_install`` callback, which the
+    factory had no return-the-400 channel for — the only signal was
+    to ``raise``, which the factory's generic exception handler
+    turned into a redacted 500. Worse, by the time ``post_install``
+    ran the workstream was fully built (audit row written,
+    ``ws_created`` broadcast emitted), so a malformed-input request
+    surfaced as "create failed" with the workstream actually live.
+    Fixed by moving the ``notify_targets`` validation into
+    :func:`_interactive_create_validate_request` (the pre-create
+    gate), which returns the 400 before ``mgr.create`` runs and
+    keeps storage clean. New regression test:
+    ``test_create_lift_400s_on_malformed_notify_targets``.
+  - **Skill-lookup storage failure now correlation_id'd.** The
+    initial draft swallowed ``get_skill_by_name`` exceptions into
+    ``skill_data = None`` and returned a 400 "Skill not found or
+    disabled" — masking storage outages as user-input misses and
+    making operator triage of skill-related reports impossible. The
+    lifted body now lets the storage exception propagate to the
+    same correlation_id'd 500 path that ``mgr.create`` failures
+    use; the skill-lookup + version count + ``mgr.create`` all live
+    inside one ``try / except`` so storage outages anywhere in the
+    create-prelude get the redacted-message-with-correlation-id
+    treatment instead of a stack-traced 500 leak.
+  - **Whitespace-only ``skill`` field treated as empty.** The
+    initial draft took ``body.get("skill") or ""`` literally — a
+    payload with ``"skill": "  "`` would have hit
+    ``get_skill_by_name(" ")`` and 400'd as "Skill not found".
+    Pre-lift coord stripped via ``(body.get("skill") or "").strip()
+    or None``; the lifted body now strips for both kinds (interactive
+    never received whitespace-only skills from the web UI but the
+    convergence is the safer default).
+
 ### Security
 
 - **Coord attachment endpoints are now kind-strict**

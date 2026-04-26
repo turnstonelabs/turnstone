@@ -148,6 +148,65 @@ class EventsReplay(Protocol):
 SseExecutorLookup = Callable[["Request"], Any]
 
 
+# (request, body, uid, uploaded_files) -> JSONResponse | None.
+# Optional kind-specific gate the lifted ``create`` body fires after
+# body parsing + uid resolution but before skill resolution and
+# ``mgr.create``. Returns ``None`` to continue, or a 4xx response
+# to short-circuit. Interactive wires gates for ws_id format,
+# kind=INTERACTIVE, parent_ws_id ownership, attachments+resume_ws
+# combo. Coord wires a 401-on-empty-uid (admin tokens always carry a
+# uid in practice; the gate is defensive). Mostly read-only — the
+# parent_ws_id ownership gate does a single storage lookup but
+# doesn't mutate anything.
+CreateRequestValidator = Callable[
+    ["Request", dict[str, Any], str, list[tuple[str, str, bytes]]],
+    "Awaitable[JSONResponse | None]",
+]
+# (request, body, uid, skill_data, skill_id, applied_skill_version) -> kwargs.
+# Builds the kwargs dict for ``mgr.create``. Both kinds call
+# ``mgr.create`` with the same callable shape, but the kwargs they
+# pass differ (interactive threads model + judge_model + client_type +
+# parent_ws_id + ws_id; coord threads only the smaller subset).
+# Captured in a per-kind callable rather than a flag-soup so the
+# kwargs dict construction stays readable at the wire-up site.
+CreateKwargsBuilder = Callable[
+    ["Request", dict[str, Any], str, dict[str, Any] | None, str, int],
+    dict[str, Any],
+]
+# (request, ws, body, uid, skill_data, applied_skill_version, attachment_ids) ->
+# extra response fields. Kind-specific tail end the lifted ``create``
+# body fires after the workstream is built, attachments are saved,
+# and audit is emitted. Returns extra fields to merge into the
+# response (e.g. interactive returns ``{resumed, message_count}``;
+# coord returns ``{}``). May spawn worker threads / register watch
+# runners / persist skill session config / dispatch initial messages
+# / pin routing. The factory does NOT wrap the call in try/except:
+# post-install failures should surface to the caller as 5xx so the
+# operator sees the misconfig instead of a half-built workstream.
+CreatePostInstall = Callable[
+    [
+        "Request",
+        "Workstream",
+        dict[str, Any],
+        str,
+        dict[str, Any] | None,
+        int,
+        list[str],
+    ],
+    "Awaitable[dict[str, Any]]",
+]
+# (request, ws, body, uid) -> None. Audit emitter for the create
+# event. Interactive emits ``workstream.created`` with
+# ``{kind, parent_ws_id}`` detail; coord emits ``coordinator.create``
+# with ``{coord_ws_id, src, name}`` detail. Wrapped in try/except by
+# the factory — audit-write failures shouldn't surface as HTTP 500
+# (mirrors the close / cancel / open lift contracts).
+CreateAuditEmitter = Callable[
+    ["Request", "Workstream", dict[str, Any], str],
+    None,
+]
+
+
 @dataclass(frozen=True)
 class AttachmentUploadHelpers:
     """Process-local hooks the lifted attachment factories call into.
@@ -282,6 +341,43 @@ class SessionEndpointConfig:
     # body falls through to the default executor. See
     # :data:`SseExecutorLookup` docstring above.
     sse_executor_lookup: SseExecutorLookup | None = None
+    # When ``True``, the lifted ``create`` body parses
+    # ``multipart/form-data`` (with one ``meta`` JSON field + zero or
+    # more ``file`` parts) in addition to plain ``application/json``.
+    # Both kinds wire ``True`` post-create-lift — coord gains
+    # create-time attachments here (§ Post-P3 reckoning item #1).
+    # The actual attachment validation+save+rollback always uses the
+    # storage layer (kind-agnostic since P1.5); this flag only
+    # toggles whether the multipart parse is attempted at all.
+    create_supports_attachments: bool = False
+    # When ``True``, the lifted ``create`` body honours a ``user_id``
+    # field in the request body if the caller's auth token comes from
+    # a trusted service (currently just ``"console"``). Interactive
+    # wires ``True`` so console-proxied creates can carry the real
+    # end user's identity through to the workstream owner. Coord
+    # wires ``False`` — coord create runs only on the console process
+    # and the operator's auth result is the source of truth.
+    create_supports_user_id_override: bool = False
+    # (request, body, uid, uploaded_files) -> JSONResponse | None.
+    # Per-kind pre-create gate (ws_id format, parent ownership, kind
+    # validation, etc. on interactive; 401-on-empty-uid on coord).
+    # ``None`` skips the gate entirely.
+    create_validate_request: CreateRequestValidator | None = None
+    # (request, body, uid, skill_data, skill_id, applied_skill_version)
+    # -> kwargs for ``mgr.create``. Required when the kind mounts a
+    # ``create`` handler — the lifted body has no opinion on the
+    # kind-specific kwarg shape and threads whatever this returns
+    # straight through to ``await asyncio.to_thread(mgr.create, **kwargs)``.
+    create_build_kwargs: CreateKwargsBuilder | None = None
+    # (request, ws, body, uid, skill_data, applied_skill_version,
+    # attachment_ids) -> extra response fields. Kind-specific tail
+    # end fired after attachments save + audit. Interactive returns
+    # ``{resumed, message_count}`` and spawns the initial-message
+    # worker thread; coord returns ``{}`` and dispatches via
+    # ``coord_adapter.send`` when an initial_message is provided.
+    # ``None`` skips the post-install entirely (response is just
+    # ``{ws_id, name, ...}`` with empty parity fields).
+    create_post_install: CreatePostInstall | None = None
 
 
 @dataclass(frozen=True)
@@ -1316,6 +1412,376 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
         return EventSourceResponse(event_generator(), ping=5)
 
     return events
+
+
+def make_create_handler(
+    cfg: SessionEndpointConfig,
+    *,
+    audit_emit: CreateAuditEmitter | None = None,
+) -> Handler:
+    """Lifted body for ``POST {prefix}/new`` — workstream creation.
+
+    Both kinds share the create sequence (parse body → resolve uid →
+    resolve skill → kind-specific validate → ``mgr.create`` → save
+    attachments → audit → kind-specific post-install → respond).
+    Per-kind divergence captured by the cfg + ``audit_emit``:
+
+    - ``cfg.create_supports_attachments`` — when ``True``, the body
+      may arrive as ``multipart/form-data`` with a ``meta`` JSON
+      field + ``file`` parts; uploads are validated post-create and
+      the workstream is rolled back if any file fails (interactive's
+      pre-lift pattern, lifted to coord here for parity).
+    - ``cfg.create_supports_user_id_override`` — when ``True``, a
+      ``user_id`` body field overrides the auth-derived uid if the
+      auth token is from a trusted service. Interactive ``True`` so
+      console-proxied creates carry the real end-user identity;
+      coord ``False``.
+    - ``cfg.create_validate_request`` — kind-specific pre-create
+      gates (interactive: ws_id format, kind, parent_ws_id ownership,
+      attachments+resume_ws combo; coord: 401-on-empty-uid).
+    - ``cfg.create_build_kwargs`` — kind-specific kwargs for
+      ``mgr.create``. Required when the kind mounts a create handler.
+    - ``cfg.create_post_install`` — kind-specific tail end (e.g.
+      interactive's resume + skill_config + initial-message worker
+      thread; coord's initial_message via coord_adapter.send).
+    - ``audit_emit`` — ``workstream.created`` on interactive,
+      ``coordinator.create`` on coord.
+
+    Behavior changes vs the pre-lift handlers (documented in
+    CHANGELOG, mostly coord-up-to-interactive parity gains):
+
+    - **Coord gains create-time attachments.** Pre-lift
+      ``coordinator_create`` accepted JSON only and ignored uploads;
+      the lifted body parses multipart bodies on coord and saves
+      attachments through the kind-agnostic storage layer (§ Post-P3
+      reckoning item #1). Coord's initial_message dispatch does NOT
+      yet reserve those attachments onto the first turn (coord
+      adapter's ``send`` doesn't take attachments) — the rows save
+      as pending and the first ``/send`` picks them up via the
+      standard send-with-attachments path. Initial-message + create-
+      time attachments coordination is a follow-up.
+    - **Coord gains the disabled-skill rejection.** Pre-lift
+      ``coordinator_create`` silently allowed disabled skills to
+      flow through to ``mgr.create``; the lifted body returns 400
+      ("Skill not found or disabled") matching interactive's
+      behaviour. Disabled skills are inert by definition; the gate
+      makes that explicit.
+    - **Both kinds converge on 200 OK.** Pre-lift interactive
+      returned 200 (default); coord returned 201. SDK consumers
+      that were branching on ``response.status == 201`` on coord
+      should switch to ``response.ok``. 200 was picked over 201 for
+      response-shape parity with the rest of the v1 surface (every
+      other shared verb returns 200), at the cost of leaving REST-
+      strictly-correct semantics on the table — a one-time release
+      note rather than ongoing client churn.
+    - **Both kinds converge on the manager-at-capacity 429
+      semantic.** Pre-lift interactive translated mgr.create's
+      ``RuntimeError`` to 400 ("invalid create request"); coord
+      already translated to 429. RuntimeError on ``SessionManager.create``
+      is documented as "manager at capacity" — 429 (rate-limit /
+      try-later) is the correct shape for both.
+    - **Both kinds converge on the factory-misconfig 503
+      semantic.** Pre-lift interactive let ``ValueError`` (raised by
+      the session factory on a misconfigured model alias) propagate
+      as 500; coord already translated to 503. The lifted body uses
+      503 with the factory's remediation text on both kinds —
+      operators get the actionable message instead of a generic
+      stack-traced 500.
+    - **Both kinds get a correlation_id'd 500 on unexpected
+      ``mgr.create`` failure.** Pre-lift interactive let unexpected
+      exceptions propagate as 500 with a stack-traced response
+      (potential information leak); coord already returned a
+      correlation_id'd 500 with the message redacted. The lifted
+      body adopts coord's safer pattern on both kinds.
+    - **Audit-emit failures no longer 500.** Pre-lift interactive
+      audit failures surfaced as HTTP 500 (no try/except); coord
+      swallowed via try/except + log.debug. The lifted body wraps
+      ``audit_emit`` in try/except + ``warning`` log, returning the
+      successful 201 to the caller. Mirrors the close / cancel /
+      open lift contracts.
+    - **Always-include response shape.** The lifted body always
+      returns ``{ws_id, name, resumed, message_count, attachment_ids}``,
+      with the parity fields defaulting to ``False`` / ``0`` / ``[]``
+      on kinds whose post-install doesn't populate them. SDK
+      consumers don't branch on kind.
+
+    Args:
+        cfg: per-kind policy bundle.
+        audit_emit: kind's audit emitter for the create event.
+            ``None`` skips the audit entirely.
+    """
+    # Lazy-imported at factory call time (mirrors the events lift) so
+    # ``session_routes.py``'s top-level import graph stays tight.
+
+    async def create(request: Request) -> Response:
+        import asyncio
+        import contextlib
+        import secrets
+
+        from turnstone.core.attachments import (
+            IMAGE_SIZE_CAP,
+            validate_and_save_uploaded_files,
+        )
+        from turnstone.core.web_helpers import (
+            read_json_or_400,
+            read_multipart_create_or_400,
+        )
+
+        if cfg.permission_gate is not None:
+            err = cfg.permission_gate(request)
+            if err is not None:
+                return err
+        mgr_opt, err503 = cfg.manager_lookup(request)
+        if err503 is not None:
+            return err503
+        # See ``make_approve_handler`` for the cast rationale.
+        mgr = cast("SessionManager", mgr_opt)
+
+        # --- Body parsing -------------------------------------------------
+        # Multipart only when the cfg lights up attachments AND the
+        # caller actually sent a multipart body. Plain JSON stays the
+        # default content type for both kinds.
+        content_type = (request.headers.get("content-type") or "").lower()
+        uploaded_files: list[tuple[str, str, bytes]] = []
+        body: dict[str, Any]
+        if cfg.create_supports_attachments and content_type.startswith("multipart/form-data"):
+            # Multipart cap: up to MAX_PENDING × image cap, plus slack
+            # for JSON meta + multipart framing. Per-file size is
+            # enforced inside :func:`validate_and_save_uploaded_files`
+            # against the kind-specific cap.
+            parsed = await read_multipart_create_or_400(
+                request,
+                max_files=10,
+                max_per_file_bytes=IMAGE_SIZE_CAP,
+                max_total_bytes=10 * IMAGE_SIZE_CAP,
+            )
+            if isinstance(parsed, JSONResponse):
+                return parsed
+            body, uploaded_files = parsed
+        else:
+            json_body = await read_json_or_400(request)
+            if isinstance(json_body, JSONResponse):
+                return json_body
+            body = json_body
+
+        # --- User id resolution ------------------------------------------
+        # Auth middleware populates ``request.state.auth_result`` for
+        # every authed request; we just read the user_id off it.
+        auth = getattr(getattr(request, "state", None), "auth_result", None)
+        uid: str = getattr(auth, "user_id", "") or ""
+        if cfg.create_supports_user_id_override:
+            # Trusted services (currently just ``console``) may forward
+            # the real end-user's id in the body so console-proxied
+            # creates carry the right owner. Token sources on end-user
+            # tokens (including console-proxy tokens that carry the
+            # real user's identity at the auth layer) are NOT trusted;
+            # only service identities. The deny-by-default keeps a
+            # malicious caller from impersonating other users.
+            body_uid = body.get("user_id")
+            if (
+                isinstance(body_uid, str)
+                and body_uid
+                and auth is not None
+                and getattr(auth, "token_source", "") in {"console"}
+            ):
+                uid = body_uid
+
+        # --- Per-kind pre-create validation ------------------------------
+        # Interactive validates ws_id format, kind, parent ownership,
+        # attachments+resume_ws combo. Coord 401s on empty uid.
+        if cfg.create_validate_request is not None:
+            err_validate = await cfg.create_validate_request(request, body, uid, uploaded_files)
+            if err_validate is not None:
+                return err_validate
+
+        # --- Skill resolution --------------------------------------------
+        # Both kinds resolve a body ``skill`` field through
+        # ``get_skill_by_name`` to the skill_data dict + the next
+        # applied_skill_version. Interactive previously skipped this
+        # entirely on resume_ws (the resumed session restores its own
+        # skill from config); the resume gate is captured by the
+        # interactive validator above (it returns 400 on the
+        # attachments+resume combo, but standalone resume_ws + skill
+        # is still allowed). To preserve that exact pre-lift skip on
+        # interactive, the validator may stash a sentinel — but
+        # simplest: re-read resume_ws_id here and skip skill lookup
+        # when both kinds see a non-empty resume_ws_id (coord doesn't
+        # support resume_ws today; the field is silently ignored).
+        # Strip whitespace on the skill name so a caller passing
+        # ``"skill": "  "`` is treated identically to ``"skill": ""``
+        # (skip skill resolution). Pre-lift coord explicitly stripped
+        # via ``(body.get("skill") or "").strip() or None``; pre-lift
+        # interactive didn't strip but never received whitespace-only
+        # skill names from the web UI. Convergence on the safer
+        # behaviour avoids a misleading 400 for an inert payload.
+        body_skill_raw = body.get("skill") or ""
+        body_skill = body_skill_raw.strip() if isinstance(body_skill_raw, str) else ""
+        resume_ws_id_raw = body.get("resume_ws") or ""
+        skill_data: dict[str, Any] | None = None
+        applied_skill_version = 0
+
+        # --- mgr.create (with skill resolution) -------------------------
+        # Skill lookup + version count + ``mgr.create`` all live inside
+        # one try/except so any storage failure during skill resolution
+        # gets the same correlation_id'd 500 as a ``mgr.create``
+        # exception. Pre-lift interactive let storage exceptions
+        # propagate to a stack-traced 500; the lifted body keeps the
+        # 500 status but redacts the message (operator gets the
+        # correlation id; logs carry the full ``exc_info``). The
+        # ``RuntimeError`` (capacity) and ``ValueError`` (factory
+        # misconfig) branches stay specific to ``mgr.create``: the
+        # skill-lookup path doesn't raise either of those.
+        if cfg.create_build_kwargs is None:
+            # The cfg required a build_kwargs callback for any kind
+            # mounting a create handler. Surface the misconfig as 500
+            # with a clear log line so the operator sees it instead of
+            # a confusing AttributeError.
+            log.error("ws.create.misconfigured_no_build_kwargs")
+            return JSONResponse(
+                {"error": "create handler misconfigured"},
+                status_code=500,
+            )
+        try:
+            if body_skill and not (isinstance(resume_ws_id_raw, str) and resume_ws_id_raw):
+                from turnstone.core.memory import get_skill_by_name
+                from turnstone.core.storage._registry import get_storage as _get_storage
+
+                skill_data = await asyncio.to_thread(get_skill_by_name, body_skill)
+                if not skill_data or not skill_data.get("enabled", False):
+                    return JSONResponse(
+                        {"error": f"Skill not found or disabled: {body_skill}"},
+                        status_code=400,
+                    )
+                tid = skill_data.get("template_id")
+                if tid:
+                    _st = _get_storage()
+                    if _st is not None:
+                        # ``count_skill_versions`` is best-effort: if the
+                        # version count call fails (transient storage
+                        # blip), default to 1 rather than aborting the
+                        # whole create. Persisted skill_version=1 is
+                        # the right semantic for the first applied
+                        # instance even if the count was unobtainable.
+                        try:
+                            applied_skill_version = (
+                                await asyncio.to_thread(_st.count_skill_versions, str(tid)) + 1
+                            )
+                        except Exception:
+                            log.debug(
+                                "ws.create.skill_version_failed skill=%s",
+                                body_skill,
+                                exc_info=True,
+                            )
+                            applied_skill_version = 1
+            skill_id_resolved = (
+                str(skill_data["template_id"])
+                if skill_data and skill_data.get("template_id")
+                else ""
+            )
+            kwargs = cfg.create_build_kwargs(
+                request, body, uid, skill_data, skill_id_resolved, applied_skill_version
+            )
+            ws = await asyncio.to_thread(mgr.create, **kwargs)
+        except RuntimeError as exc:
+            # ``SessionManager.create`` documents RuntimeError as
+            # "manager at capacity" — translate to 429 (rate-limit /
+            # try-later) on both kinds.
+            return JSONResponse({"error": str(exc)}, status_code=429)
+        except ValueError as exc:
+            # Session factory raises ValueError on misconfigured alias
+            # (model alias points at a model that no longer exists,
+            # etc.). Surface the factory's remediation text as 503 so
+            # operators get the actionable message instead of a
+            # stack-traced 500.
+            return JSONResponse({"error": str(exc)}, status_code=503)
+        except Exception:
+            # Don't echo the exception text — it can leak internal
+            # paths / frame names. Log with a correlation id and
+            # return that to the client so support can match a report
+            # to the log line.
+            correlation_id = secrets.token_hex(4)
+            log.warning(
+                "ws.create.failed correlation_id=%s",
+                correlation_id,
+                exc_info=True,
+            )
+            kind_noun = cfg.audit_action_prefix or "workstream"
+            return JSONResponse(
+                {
+                    "error": (
+                        f"failed to create {kind_noun} (internal error). "
+                        f"correlation_id={correlation_id}"
+                    )
+                },
+                status_code=500,
+            )
+
+        # --- Attachment validation + save + rollback --------------------
+        # Interactive's pre-lift pattern: validate post-create so
+        # ``ws_id`` is bound (the storage layer scopes attachments by
+        # ws_id). On any failure, mgr.close + delete_workstream the
+        # workstream so the caller doesn't see a half-built phantom.
+        # On coord this is a brand-new path — pre-lift coord_create
+        # had no attachments support. Note: coord's mgr.create already
+        # fired ``emit_created`` (cluster collector fan-out) by this
+        # point, so a rollback here produces a phantom create→close
+        # pair on the cluster events stream. Cluster consumers handle
+        # this gracefully (same shape as any quick-create-close), and
+        # the alternative (decoupling emit_created from mgr.create)
+        # is a bigger refactor that doesn't belong in the verb lift.
+        attachment_ids: list[str] = []
+        if uploaded_files:
+            saved_ids, save_err = await asyncio.to_thread(
+                validate_and_save_uploaded_files, uploaded_files, ws.id, uid
+            )
+            if save_err is not None:
+                from turnstone.core.memory import delete_workstream as _delete_ws
+
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(mgr.close, ws.id)
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(_delete_ws, ws.id)
+                return save_err
+            attachment_ids = saved_ids
+
+        # --- Audit emit --------------------------------------------------
+        if audit_emit is not None:
+            try:
+                audit_emit(request, ws, body, uid)
+            except Exception:
+                # Mirrors make_close_handler / make_cancel_handler /
+                # make_open_handler — audit-write failures shouldn't
+                # surface as HTTP 500. Log + continue.
+                log.warning(
+                    "ws.create.audit_failed ws=%s",
+                    ws.id[:8] if ws.id else "",
+                    exc_info=True,
+                )
+
+        # --- Per-kind post-install ---------------------------------------
+        extra_response: dict[str, Any] = {}
+        if cfg.create_post_install is not None:
+            extra_response = await cfg.create_post_install(
+                request,
+                ws,
+                body,
+                uid,
+                skill_data,
+                applied_skill_version,
+                attachment_ids,
+            )
+
+        return JSONResponse(
+            {
+                "ws_id": ws.id,
+                "name": ws.name,
+                "resumed": bool(extra_response.get("resumed", False)),
+                "message_count": int(extra_response.get("message_count", 0)),
+                "attachment_ids": attachment_ids,
+            }
+        )
+
+    return create
 
 
 def make_send_handler(cfg: SessionEndpointConfig) -> Handler:

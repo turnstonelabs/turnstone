@@ -33,11 +33,14 @@ from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 from turnstone.console.server import (
     _audit_cancel_coordinator,
     _audit_close_coordinator,
+    _audit_coordinator_create,
+    _coord_create_build_kwargs,
+    _coord_create_post_install,
+    _coord_create_validate_request,
     _require_admin_coordinator,
     _require_coord_mgr,
     cluster_ws_detail,
     coordinator_children,
-    coordinator_create,
     coordinator_detail,
     coordinator_history,
     coordinator_list,
@@ -61,6 +64,7 @@ from turnstone.core.session_routes import (
     make_attachment_handlers,
     make_cancel_handler,
     make_close_handler,
+    make_create_handler,
     make_open_handler,
     make_send_handler,
 )
@@ -106,6 +110,11 @@ _coord_endpoint_config = SessionEndpointConfig(
     ),
     spawn_metrics=None,
     emit_message_queued=True,
+    create_supports_attachments=True,
+    create_supports_user_id_override=False,
+    create_validate_request=_coord_create_validate_request,
+    create_build_kwargs=_coord_create_build_kwargs,
+    create_post_install=_coord_create_post_install,
 )
 
 
@@ -123,11 +132,14 @@ def _make_client(
 ) -> TestClient:
     """Build a TestClient exposing just the coordinator routes."""
     coord_attachments = make_attachment_handlers(_coord_endpoint_config)
+    coord_create_handler = make_create_handler(
+        _coord_endpoint_config, audit_emit=_audit_coordinator_create
+    )
     app = Starlette(
         routes=[
             Route(
                 "/v1/api/workstreams/new",
-                coordinator_create,
+                coord_create_handler,
                 methods=["POST"],
             ),
             Route("/v1/api/workstreams", coordinator_list, methods=["GET"]),
@@ -334,17 +346,123 @@ def test_create_returns_ws_id_and_records_audit(storage):
         json={"name": "my-coord"},
         headers=_COORD_HEADERS,
     )
-    assert resp.status_code == 201
+    assert resp.status_code == 200
     body = resp.json()
     assert body["ws_id"]
     assert "my-coord" in body["name"]
+    # Always-include parity fields land on coord post-`create` lift —
+    # SDK consumers don't have to branch on kind to read them.
+    assert body["resumed"] is False
+    assert body["message_count"] == 0
+    assert body["attachment_ids"] == []
     # Audit row recorded on storage.
-    from turnstone.core.audit import record_audit  # noqa: F401 (verify import works)
-
-    # Query audit_events via storage.
     events = storage.list_audit_events(user_id="user-1", limit=10)
     actions = [e["action"] for e in events]
     assert "coordinator.create" in actions
+
+
+def test_create_with_multipart_attachments_saves_pending_rows(storage):
+    """§ Post-P3 reckoning item #1 regression — coord gains create-time
+    attachments. Multipart create with a magic-byte-valid PNG saves
+    a pending attachment row scoped to the new coord ws_id."""
+    from turnstone.core.memory import list_pending_attachments
+
+    # Magic-byte-valid 1x1 PNG (matches test_server_attachments_endpoints.py).
+    png_1x1 = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\xfc\xcf"
+        b"\xc0\xc0\xc0\x00\x00\x00\x05\x00\x01\xa5\xf6E@\x00\x00\x00\x00IEND"
+        b"\xaeB`\x82"
+    )
+    mgr = _build_mgr(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    # Inject the test storage backend as the global singleton so
+    # ``save_attachment`` / ``list_pending_attachments`` (which both
+    # go through ``turnstone.core.memory`` → ``get_storage()``)
+    # resolve onto our SQLiteBackend instead of the real one.
+    import turnstone.core.storage._registry as _reg
+
+    _old_storage = _reg._storage
+    _reg._storage = storage
+    try:
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            data={"meta": '{"name": "with-image"}'},
+            files={"file": ("img.png", png_1x1, "image/png")},
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        ws_id = body["ws_id"]
+        assert ws_id
+        assert len(body["attachment_ids"]) == 1
+        # Attachment row is pending (saved but not consumed) — coord's
+        # adapter ``send`` doesn't reserve attachments at create time
+        # yet, so the next ``/send`` picks it up via the standard
+        # send-with-attachments path.
+        pending = list_pending_attachments(ws_id, "user-1")
+        assert len(pending) == 1
+        assert pending[0]["kind"] == "image"
+    finally:
+        _reg._storage = _old_storage
+
+
+def test_create_rejects_disabled_skill(storage):
+    """Coord parity gain — disabled skills now rejected at the lift,
+    matching interactive's pre-lift behaviour. Pre-lift coord silently
+    let disabled skills through."""
+    import turnstone.core.storage._registry as _reg
+
+    _old_storage = _reg._storage
+    _reg._storage = storage
+    try:
+        # Save a disabled skill row so ``get_skill_by_name`` resolves
+        # but the lifted body's enabled check rejects it. Mirrors the
+        # ``_create_template`` helper in ``tests/test_skills.py``;
+        # inlined here so this regression test stays self-contained.
+        storage.create_prompt_template(
+            template_id="sk-disabled",
+            name="dormant-skill",
+            category="general",
+            content="dormant",
+            variables="[]",
+            is_default=False,
+            org_id="",
+            created_by="test",
+            origin="manual",
+            mcp_server="",
+            readonly=False,
+            description="",
+            tags="[]",
+            source_url="",
+            version="1.0.0",
+            author="",
+            activation="named",
+            token_estimate=0,
+            model="",
+            auto_approve=False,
+            temperature=None,
+            reasoning_effort="",
+            max_tokens=None,
+            token_budget=0,
+            agent_max_turns=None,
+            notify_on_complete="{}",
+            enabled=False,  # the gate under test
+            allowed_tools="[]",
+            priority=0,
+        )
+        mgr = _build_mgr(storage)
+        client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "x", "skill": "dormant-skill"},
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 400
+        assert "dormant-skill" in resp.json()["error"]
+    finally:
+        _reg._storage = _old_storage
 
 
 def test_list_returns_cluster_wide(storage):

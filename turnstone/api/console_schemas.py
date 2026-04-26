@@ -1010,10 +1010,18 @@ class CoordinatorCreateRequest(BaseModel):
 
 
 class CoordinatorCreateResponse(BaseModel):
-    """Response body for POST /v1/api/workstreams/new (201)."""
+    """Response body for POST /v1/api/workstreams/new (200)."""
 
     ws_id: str
     name: str
+    # Always-include parity fields from the Stage 2 ``create`` verb
+    # lift. Coord doesn't populate ``resumed`` or ``message_count``
+    # today (no resume-on-create surface yet), so they default to
+    # ``False`` / ``0``. ``attachment_ids`` carries the saved-but-
+    # pending attachment ids when the request was multipart.
+    resumed: bool = False
+    message_count: int = 0
+    attachment_ids: list[str] = Field(default_factory=list)
 
 
 class CoordinatorInfo(BaseModel):

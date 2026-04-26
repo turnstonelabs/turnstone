@@ -63,6 +63,7 @@ from turnstone.core.session_routes import (
     make_attachment_handlers,
     make_cancel_handler,
     make_close_handler,
+    make_create_handler,
     make_events_handler,
     make_open_handler,
     make_send_handler,
@@ -2481,110 +2482,111 @@ def _coord_events_replay(
         yield pending_plan
 
 
-async def coordinator_create(request: Request) -> JSONResponse:
-    """POST /v1/api/workstreams/new — create a new coordinator session."""
-    from turnstone.core.audit import record_audit
-    from turnstone.core.web_helpers import read_json_or_400
+async def _coord_create_validate_request(
+    request: Request,
+    body: dict[str, Any],
+    uid: str,
+    uploaded_files: list[tuple[str, str, bytes]],
+) -> JSONResponse | None:
+    """Per-kind pre-create gate for coord.
 
-    err = _require_admin_coordinator(request)
-    if err is not None:
-        return err
-    coord_mgr, err503 = _require_coord_mgr(request)
-    if err503 is not None:
-        return err503
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
-    user_id = _auth_user_id(request)
-    if not user_id:
+    Wired onto :attr:`SessionEndpointConfig.create_validate_request`
+    and called by :func:`make_create_handler` after body parsing
+    but before skill resolution / ``mgr.create``. The single gate is
+    a 401 when the auth result resolved to an empty user id —
+    coord's ``admin.coordinator`` scope check at the
+    ``permission_gate`` is the primary access boundary, but a token
+    that passes the scope check with ``sub=""`` would still land
+    here, and ``mgr.create`` requires a non-empty ``user_id``.
+    """
+    if not uid:
         return JSONResponse({"error": "authentication required"}, status_code=401)
-    name = (body.get("name") or "").strip()
-    skill = (body.get("skill") or "").strip() or None
-    initial_message = (body.get("initial_message") or "").strip()
-    # Pre-resolve skill → (template_id, applied_version) so the
-    # persisted row records what was applied. SessionManager.create
-    # is kind-agnostic and no longer does this lookup itself.
-    skill_id_resolved = ""
-    skill_version_resolved = 0
-    if skill:
-        from turnstone.core.memory import get_skill_by_name
-        from turnstone.core.storage._registry import get_storage as _get_storage
+    return None
 
-        _st = _get_storage()
-        skill_data = await asyncio.to_thread(get_skill_by_name, skill)
-        if skill_data and skill_data.get("template_id") and _st is not None:
-            skill_id_resolved = str(skill_data["template_id"])
-            try:
-                skill_version_resolved = (
-                    await asyncio.to_thread(_st.count_skill_versions, skill_id_resolved) + 1
-                )
-            except Exception:
-                log.debug("coord_create.skill_version_failed skill=%s", skill, exc_info=True)
-                skill_version_resolved = 1
-    try:
-        # Offload to a worker thread — SessionManager.create runs
-        # blocking storage calls (register_workstream) and the
-        # session-factory invocation. Running inline on the async
-        # event loop stalled the SSE manager + every other async
-        # handler for the duration of the create (#perf-4).
-        ws = await asyncio.to_thread(
-            coord_mgr.create,
-            user_id=user_id,
-            name=name,
-            skill=skill,
-            skill_id=skill_id_resolved,
-            skill_version=skill_version_resolved,
-        )
-    except RuntimeError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=429)
-    except ValueError as exc:
-        # Session factory raises ValueError on misconfigured alias —
-        # surface as 503 with the factory's remediation text.
-        return JSONResponse({"error": str(exc)}, status_code=503)
-    except Exception:
-        # Don't echo the exception text to the caller — it can leak
-        # internals (stack frame names, file paths, etc.).  Log with a
-        # short correlation id and return that to the client so support
-        # can match a user report to the log line.
-        correlation_id = secrets.token_hex(4)
-        log.warning(
-            "coordinator_create.failed correlation_id=%s",
-            correlation_id,
-            exc_info=True,
-        )
-        return JSONResponse(
-            {
-                "error": (
-                    "failed to create coordinator (internal error). "
-                    f"correlation_id={correlation_id}"
-                )
-            },
-            status_code=500,
-        )
-    # Initial message spawns the first worker after the session has
-    # been installed on the adapter. Previously this rode inside
-    # ``coord_mgr.create`` via the old ``initial_message`` kwarg; the
-    # unified SessionManager.create is kind-agnostic so the worker spawn
-    # moved to the caller.
+
+def _coord_create_build_kwargs(
+    request: Request,
+    body: dict[str, Any],
+    uid: str,
+    skill_data: dict[str, Any] | None,
+    skill_id: str,
+    applied_skill_version: int,
+) -> dict[str, Any]:
+    """Build kwargs for ``coord_mgr.create`` from a parsed coord create body.
+
+    Coord's create takes a smaller set than interactive's (no
+    ``model`` / ``judge_model`` / ``client_type`` / ``parent_ws_id`` /
+    ``ws_id``) — those concepts either don't apply to coordinators
+    (no parent on coord; coord ws_id is always server-generated)
+    or live on a separate ConfigStore knob (the dashboard-managed
+    plan/task model + reasoning_effort settings).
+    """
+    body_skill = (body.get("skill") or "").strip() or None
+    name = (body.get("name") or "").strip()
+    return {
+        "user_id": uid,
+        "name": name,
+        "skill": body_skill,
+        "skill_id": skill_id,
+        "skill_version": applied_skill_version,
+    }
+
+
+async def _coord_create_post_install(
+    request: Request,
+    ws: Workstream,
+    body: dict[str, Any],
+    uid: str,
+    skill_data: dict[str, Any] | None,
+    applied_skill_version: int,
+    attachment_ids: list[str],
+) -> dict[str, Any]:
+    """Tail end of coord create: dispatch the initial message.
+
+    Wired onto :attr:`SessionEndpointConfig.create_post_install`. The
+    factory has already saved any uploaded attachments through the
+    kind-agnostic storage layer; coord's adapter ``send`` does not
+    yet take attachments, so the rows save as pending and the next
+    ``/send`` picks them up via the standard send-with-attachments
+    path. Initial-message + create-time attachments coordination is
+    a follow-up.
+
+    Returns ``{}`` — coord's response carries only the always-include
+    parity fields populated by the factory.
+    """
+    initial_message = (body.get("initial_message") or "").strip()
     if initial_message:
         coord_adapter = getattr(request.app.state, "coord_adapter", None)
         if coord_adapter is not None:
             coord_adapter.send(ws.id, initial_message)
+    return {}
+
+
+def _audit_coordinator_create(
+    request: Request,
+    ws: Workstream,
+    body: dict[str, Any],
+    uid: str,
+) -> None:
+    """Audit emitter for the coord ``coordinator.create`` event.
+
+    Wired onto :func:`make_create_handler` as ``audit_emit``. Failures
+    are caught + logged at ``warning`` by the factory.
+    """
+    from turnstone.core.audit import record_audit
+
     storage = getattr(request.app.state, "auth_storage", None)
-    if storage is not None:
-        try:
-            record_audit(
-                storage,
-                user_id,
-                "coordinator.create",
-                "workstream",
-                ws.id,
-                {"coord_ws_id": ws.id, "src": "coordinator", "name": ws.name},
-                request.client.host if request.client else "",
-            )
-        except Exception:
-            log.debug("coordinator_create.audit_failed", exc_info=True)
-    return JSONResponse({"ws_id": ws.id, "name": ws.name}, status_code=201)
+    if storage is None:
+        return
+    record_audit(
+        storage,
+        uid,
+        "coordinator.create",
+        "workstream",
+        ws.id,
+        {"coord_ws_id": ws.id, "src": "coordinator", "name": ws.name},
+        request.client.host if request.client else "",
+    )
 
 
 async def coordinator_history(request: Request) -> JSONResponse:
@@ -10105,6 +10107,11 @@ def create_app(
         spawn_metrics=None,
         emit_message_queued=True,
         events_replay=_coord_events_replay,
+        create_supports_attachments=True,
+        create_supports_user_id_override=False,
+        create_validate_request=_coord_create_validate_request,
+        create_build_kwargs=_coord_create_build_kwargs,
+        create_post_install=_coord_create_post_install,
     )
     coord_workstream_routes: list[Any] = []
     register_session_routes(
@@ -10113,7 +10120,10 @@ def create_app(
         handlers=SharedSessionVerbHandlers(
             list_workstreams=coordinator_list,
             list_saved=coordinator_saved,
-            create=coordinator_create,
+            create=make_create_handler(  # lifted: shared body
+                coord_endpoint_config,
+                audit_emit=_audit_coordinator_create,
+            ),
             detail=coordinator_detail,
             open=make_open_handler(coord_endpoint_config),  # lifted: shared body
             close=make_close_handler(  # lifted: shared body
