@@ -111,8 +111,6 @@ _VALID_WS_ID = re.compile(r"^[0-9a-f]{32}$")
 # WebUI — implements SessionUI for browser-based interaction
 # ---------------------------------------------------------------------------
 
-_MAX_TURN_CONTENT_CHARS = 256 * 1024  # cap piggybacked content on idle events
-
 # Orphan-attachment-reservation sweep cadence.  Threshold is measured
 # against the storage layer's `reserved_at` column (time the row last
 # transitioned into reserved state, NOT upload time), so a 1-hour cap
@@ -152,15 +150,11 @@ class WebUI(SessionUIBase):
         # holds in every ws_state/ws_activity event payload — mirrors
         # the storage-layer normalization at register_workstream.
         self._parent_ws_id = parent_ws_id if parent_ws_id else None
-        # Content accumulator — tokens appended in on_content_token(),
-        # joined and piggybacked onto the ws_state:idle global SSE
-        # event, then reset. WebUI-specific optimization; coord sessions
-        # don't broadcast rich ws_state payloads.
-        self._ws_turn_content: list[str] = []
-        self._ws_turn_content_size: int = 0
 
     # ``_enqueue`` / ``_register_listener`` / ``_unregister_listener``
-    # inherited from :class:`SessionUIBase`.
+    # inherited from :class:`SessionUIBase`. ``_ws_turn_content`` /
+    # ``_ws_turn_content_size`` accumulator fields lifted to
+    # :class:`SessionUIBase` so coord can populate them too.
 
     def _ws_kind_and_parent(self) -> tuple[WorkstreamKind, str | None]:
         """Return cached (kind, parent_ws_id) for broadcast event payloads.
@@ -173,32 +167,30 @@ class WebUI(SessionUIBase):
         return self._kind, self._parent_ws_id
 
     def _broadcast_state(self, state: str) -> None:
-        """Send a state-change event to the global SSE channel."""
+        """Send a state-change event to the global SSE channel.
+
+        Reads the rich-payload snapshot via the lifted
+        :meth:`SessionUIBase.snapshot_and_consume_state_payload`
+        helper, then puts the assembled ``ws_state`` event on the
+        global queue. The snapshot helper handles the IDLE/ERROR
+        ``_ws_turn_content`` consume + clear under ``_ws_lock``.
+        """
         if WebUI._global_queue is not None:
-            with self._ws_lock:
-                tokens = self._ws_prompt_tokens + self._ws_completion_tokens
-                ctx = self._ws_context_ratio
-                activity = self._ws_current_activity
-                activity_state = self._ws_activity_state
+            payload = self.snapshot_and_consume_state_payload(state)
             kind, parent_ws_id = self._ws_kind_and_parent()
             event: dict[str, Any] = {
                 "type": "ws_state",
                 "ws_id": self.ws_id,
                 "state": state,
-                "tokens": tokens,
-                "context_ratio": ctx,
-                "activity": activity,
-                "activity_state": activity_state,
+                "tokens": payload["tokens"],
+                "context_ratio": payload["context_ratio"],
+                "activity": payload["activity"],
+                "activity_state": payload["activity_state"],
                 "kind": kind,
                 "parent_ws_id": parent_ws_id,
             }
             if state == "idle":
-                event["content"] = "".join(self._ws_turn_content)
-                self._ws_turn_content = []
-                self._ws_turn_content_size = 0
-            elif state == "error":
-                self._ws_turn_content = []
-                self._ws_turn_content_size = 0
+                event["content"] = payload["content"]
             try:
                 WebUI._global_queue.put_nowait(event)
             except queue.Full:
@@ -224,32 +216,13 @@ class WebUI(SessionUIBase):
                 )
 
     # --- SessionUI protocol ---
-
-    def on_thinking_start(self) -> None:
-        with self._ws_lock:
-            self._ws_current_activity = "Thinking\u2026"
-            self._ws_activity_state = "thinking"
-        self._broadcast_activity()
-        self._enqueue({"type": "thinking_start"})
-
-    def on_thinking_stop(self) -> None:
-        self._enqueue({"type": "thinking_stop"})
-
-    def on_reasoning_token(self, text: str) -> None:
-        self._enqueue({"type": "reasoning", "text": text})
-
-    def on_content_token(self, text: str) -> None:
-        if self._ws_turn_content_size < _MAX_TURN_CONTENT_CHARS:
-            self._ws_turn_content.append(text)
-            self._ws_turn_content_size += len(text)
-        self._enqueue({"type": "content", "text": text})
-
-    def on_stream_end(self) -> None:
-        with self._ws_lock:
-            self._ws_current_activity = ""
-            self._ws_activity_state = ""
-        self._broadcast_activity()
-        self._enqueue({"type": "stream_end"})
+    #
+    # ``on_thinking_start`` / ``on_thinking_stop`` / ``on_reasoning_token``
+    # / ``on_content_token`` / ``on_stream_end`` / ``on_tool_output_chunk``
+    # / ``on_info`` / ``on_error`` are inherited from
+    # :class:`SessionUIBase`. ``on_status`` and ``on_tool_result`` are
+    # overridden below to layer Prometheus ``_metrics.record_*`` calls
+    # (node-only) on top of the shared per-ws metric writes.
 
     def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]:
         self._reset_approval_cycle()
@@ -435,80 +408,28 @@ class WebUI(SessionUIBase):
         *,
         is_error: bool = False,
     ) -> None:
+        """Layer node-only Prometheus metrics on top of the shared body."""
         _metrics.record_tool_call(name)
-        with self._ws_lock:
-            self._ws_tool_calls[name] = self._ws_tool_calls.get(name, 0) + 1
-            self._ws_turn_tool_calls += 1
-            self._ws_current_activity = ""
-            self._ws_activity_state = ""
-        self._broadcast_activity()
-        event: dict[str, Any] = {
-            "type": "tool_result",
-            "call_id": call_id,
-            "name": name,
-            "output": output,
-        }
-        if is_error:
-            event["is_error"] = True
-        self._enqueue(event)
-
-    def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:
-        self._enqueue({"type": "tool_output_chunk", "call_id": call_id, "chunk": chunk})
+        super().on_tool_result(call_id, name, output, is_error=is_error)
 
     def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None:
-        total_tok = usage["prompt_tokens"] + usage["completion_tokens"]
-        pct = total_tok / context_window * 100 if context_window > 0 else 0
+        """Layer node-only Prometheus metrics on top of the shared body.
+
+        ``_metrics.record_*`` calls feed the node's prometheus
+        endpoint; the per-ws counter writes, the ``status`` event
+        enqueue, and the ``usage_event`` storage row are inherited
+        from :meth:`SessionUIBase.on_status`. ``usage`` field access
+        is defensive for parity with the lifted body.
+        """
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+        total_tok = prompt_tokens + completion_tokens
         cache_creation = usage.get("cache_creation_tokens", 0)
         cache_read = usage.get("cache_read_tokens", 0)
-        _metrics.record_tokens(usage["prompt_tokens"], usage["completion_tokens"])
+        _metrics.record_tokens(prompt_tokens, completion_tokens)
         _metrics.record_cache_tokens(cache_creation, cache_read)
         _metrics.record_context_ratio(total_tok / context_window if context_window > 0 else 0.0)
-        with self._ws_lock:
-            self._ws_prompt_tokens += usage["prompt_tokens"]
-            self._ws_completion_tokens += usage["completion_tokens"]
-            self._ws_context_ratio = total_tok / context_window if context_window > 0 else 0.0
-            tool_total = sum(self._ws_tool_calls.values())
-            tool_count = tool_total - self._ws_tool_calls_reported
-            self._ws_tool_calls_reported = tool_total
-            turn_tool_calls = self._ws_turn_tool_calls
-            turn_count = self._ws_messages
-        self._enqueue(
-            {
-                "type": "status",
-                "prompt_tokens": usage["prompt_tokens"],
-                "completion_tokens": usage["completion_tokens"],
-                "total_tokens": total_tok,
-                "context_window": context_window,
-                "pct": round(pct, 1),
-                "effort": effort,
-                "cache_creation_tokens": cache_creation,
-                "cache_read_tokens": cache_read,
-                "tool_calls_this_turn": turn_tool_calls,
-                "turn_count": turn_count,
-            }
-        )
-        # Record usage event for governance dashboard
-        try:
-            from turnstone.core.storage._registry import get_storage
-
-            storage = get_storage()
-            if storage is not None:
-                import uuid
-
-                storage.record_usage_event(
-                    event_id=uuid.uuid4().hex,
-                    user_id=self._user_id,
-                    ws_id=self.ws_id,
-                    node_id="",
-                    model=usage.get("model", ""),
-                    prompt_tokens=usage["prompt_tokens"],
-                    completion_tokens=usage["completion_tokens"],
-                    tool_calls_count=tool_count,
-                    cache_creation_tokens=cache_creation,
-                    cache_read_tokens=cache_read,
-                )
-        except Exception:
-            log.warning("Failed to record usage event", exc_info=True)
+        super().on_status(usage, context_window, effort)
 
     def on_plan_review(self, content: str) -> str:
         self._plan_event.clear()
@@ -520,12 +441,10 @@ class WebUI(SessionUIBase):
         self._pending_plan_review = None
         return self._plan_result
 
-    def on_info(self, message: str) -> None:
-        self._enqueue({"type": "info", "message": message})
-
     def on_error(self, message: str) -> None:
+        """Layer node-only Prometheus error counter on top of the shared body."""
         _metrics.record_error()
-        self._enqueue({"type": "error", "message": message})
+        super().on_error(message)
 
     def on_state_change(self, state: str) -> None:
         # Update the Workstream object so dashboard/polling sees the new state
@@ -3516,11 +3435,17 @@ def create_app(
 
     def _interactive_spawn_metrics(_request: Request, ui: Any) -> None:
         """Per-conversation metrics fired once per send that spawns a
-        fresh worker. Coord wires ``None`` for this hook.
+        fresh worker. Coord wires its own
+        :func:`turnstone.console.server._coord_spawn_metrics` (the
+        Prometheus-free analog) post the rich ``ws_state`` payload
+        lift — both kinds need the per-UI counter writes so the
+        cluster broadcast renders the same per-turn shape.
 
-        The per-UI counters live on ``WebUI`` only — guard all three
-        attributes so a future ``SessionUI`` subclass without the
-        full counter set doesn't trip on the assignment.
+        The per-UI counters live on :class:`SessionUIBase`
+        (inherited by both :class:`WebUI` and
+        :class:`turnstone.console.coordinator_ui.ConsoleCoordinatorUI`),
+        so the ``hasattr`` guards survive only as defence against a
+        future ``SessionUI`` subclass that doesn't extend the base.
         """
         _metrics.record_message_sent()
         if (

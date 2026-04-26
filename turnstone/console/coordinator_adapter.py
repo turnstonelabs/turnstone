@@ -146,8 +146,41 @@ class CoordinatorAdapter:
             log.debug("coord_adapter.created_fanout_failed ws=%s", ws.id[:8], exc_info=True)
 
     def emit_state(self, ws: Workstream, state: WorkstreamState) -> None:
+        """Fan a state-change with the rich payload snapshot to the collector.
+
+        Reads tokens / context_ratio / activity / content from
+        ``ws.ui`` via the lifted :meth:`SessionUIBase.snapshot_and_consume_state_payload`
+        helper (which handles the IDLE/ERROR ``_ws_turn_content``
+        consume + clear under ``_ws_lock``). Pre-rich-payload this
+        broadcast was state-only; the dashboard's coord row now
+        renders the same tokens / activity / content fields
+        interactive rows do.
+
+        Defensive: ``ws.ui`` can be ``None`` mid-eviction; in that
+        case we still broadcast the state-change with empty rich
+        fields so the dashboard's coord row still flips state.
+        """
+        ui = ws.ui
+        if ui is not None and hasattr(ui, "snapshot_and_consume_state_payload"):
+            payload = ui.snapshot_and_consume_state_payload(state.value)
+        else:
+            payload = {
+                "tokens": 0,
+                "context_ratio": 0.0,
+                "activity": "",
+                "activity_state": "",
+                "content": "",
+            }
         try:
-            self._collector.emit_console_ws_state(ws.id, state.value)
+            self._collector.emit_console_ws_state(
+                ws.id,
+                state.value,
+                tokens=payload["tokens"],
+                context_ratio=payload["context_ratio"],
+                activity=payload["activity"],
+                activity_state=payload["activity_state"],
+                content=payload["content"],
+            )
         except Exception:
             log.debug("coord_adapter.state_fanout_failed ws=%s", ws.id[:8], exc_info=True)
 

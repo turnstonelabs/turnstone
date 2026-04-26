@@ -1094,14 +1094,35 @@ class ClusterCollector:
             node.workstreams.pop(ws_id, None)
         self._fanout({"type": "ws_closed", "ws_id": ws_id})
 
-    def emit_console_ws_state(self, ws_id: str, state: str) -> None:
+    def emit_console_ws_state(
+        self,
+        ws_id: str,
+        state: str,
+        *,
+        tokens: int = 0,
+        context_ratio: float = 0.0,
+        activity: str = "",
+        activity_state: str = "",
+        content: str = "",
+    ) -> None:
         """Update the coordinator row's state on the console pseudo-node + fan out.
 
-        Coordinators don't surface live-token counts the way real-node
-        workstreams do (the collector reads aggregate tokens from the
-        node's ``/v1/api/dashboard`` feed, which the console doesn't
-        expose).  Emit state transitions only — downstream rendering
-        gracefully handles the absent ``tokens`` field.
+        The keyword args carry the rich-payload snapshot the cluster
+        dashboard renders for both kinds (matches the interactive
+        ``ws_state`` event shape the SSE relay produces in
+        :meth:`_apply_delta`). Pre-rich-payload coord broadcast was
+        state-only with ``tokens=0`` / ``content=""`` hardcoded —
+        the dashboard's coord row showed the state column updating
+        but no token count, no activity, no per-turn content. With
+        the lift, all four populate (per the per-ws metric writes
+        :class:`ConsoleCoordinatorUI` inherits from
+        :class:`SessionUIBase`), so coord rows match interactive in
+        the cluster overview.
+
+        Defaults are kept so :class:`turnstone.console.coordinator_adapter.CoordinatorAdapter`
+        is the only production caller wiring the rich kwargs; tests
+        and any future call site can stay state-only without
+        breaking.
         """
         with self._lock:
             node = self._nodes.get(self.CONSOLE_PSEUDO_NODE_ID)
@@ -1111,18 +1132,60 @@ class ClusterCollector:
             if entry is None:
                 return
             entry["state"] = state
+            entry["tokens"] = tokens
+            entry["context_ratio"] = context_ratio
+            entry["activity"] = activity
+            entry["activity_state"] = activity_state
         self._fanout(
             {
                 "type": "cluster_state",
                 "ws_id": ws_id,
                 "state": state,
                 "node_id": self.CONSOLE_PSEUDO_NODE_ID,
-                "tokens": 0,
-                "content": "",
+                "tokens": tokens,
+                "content": content,
                 "kind": WorkstreamKind.COORDINATOR.value,
                 "parent_ws_id": None,
             }
         )
+
+    def update_console_ws_activity(
+        self,
+        ws_id: str,
+        *,
+        activity: str,
+        activity_state: str,
+    ) -> None:
+        """Update a coord row's live activity transition (no fan-out).
+
+        Mirrors :meth:`_apply_delta`'s ``ws_activity`` handler for
+        real-node workstreams: writes the in-memory pseudo-node
+        entry but does NOT fan out a separate event over the cluster
+        SSE stream (interactive doesn't either — activity is
+        snapshot data piggybacked on subsequent state-change
+        broadcasts). The dashboard's per-ws polling reads the
+        in-memory row, so live activity ticks land on the next
+        snapshot fetch even without a dedicated SSE event.
+
+        Named ``update_*`` rather than ``emit_*`` to flag the
+        no-fan-out asymmetry vs. the rest of the
+        ``emit_console_ws_*`` family (``_created`` / ``_closed`` /
+        ``_state`` / ``_rename`` all call ``self._fanout`` — this
+        one doesn't).
+
+        Best-effort: drop silently if the pseudo-node or the row
+        isn't present (e.g. activity tick arrives between row pop
+        and listener re-registration during evict).
+        """
+        with self._lock:
+            node = self._nodes.get(self.CONSOLE_PSEUDO_NODE_ID)
+            if node is None:
+                return
+            entry = node.workstreams.get(ws_id)
+            if entry is None:
+                return
+            entry["activity"] = activity
+            entry["activity_state"] = activity_state
 
     def emit_console_ws_rename(self, ws_id: str, name: str) -> None:
         """Rename the coordinator row + fan out ``ws_rename``."""

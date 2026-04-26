@@ -8,16 +8,17 @@ thread on two pending-input gates (tool approval, plan review) that
 HTTP handlers resolve.
 
 That skeleton — plus per-workstream metrics tracking, intent-verdict
-bookkeeping, and output-warning persistence — lives here. Subclasses
-add only kind-specific broadcast (``_broadcast_state`` /
-``_broadcast_activity`` override hooks) and any node-level metrics
-adapters (``_metrics.record_*`` calls stay on ``WebUI`` since they
-feed the node's prometheus endpoint).
+bookkeeping, output-warning persistence, and the canonical
+``on_status`` / ``on_content_token`` / activity-tracking bodies —
+lives here. Subclasses add only kind-specific broadcast
+(``_broadcast_state`` / ``_broadcast_activity`` override hooks) and
+any node-level metrics adapters (``_metrics.record_*`` calls stay on
+``WebUI`` since they feed the node's prometheus endpoint).
 
 This module intentionally does not satisfy
-:class:`turnstone.core.session.SessionUI` by itself — some ``on_*``
-method bodies (``on_thinking_start``, ``on_state_change``, ``on_rename``)
-still require subclass implementation.
+:class:`turnstone.core.session.SessionUI` by itself — ``on_state_change``
+and ``on_rename`` still require subclass implementation, since their
+storage/transport routing is kind-specific.
 """
 
 from __future__ import annotations
@@ -37,6 +38,15 @@ log = get_logger(__name__)
 # UI's ``_LISTENER_QUEUE_MAX``. Per-queue cap keeps a slow SSE consumer
 # from bloating memory.
 _DEFAULT_LISTENER_QUEUE_MAX = 500
+
+# Cap on the per-turn assistant content accumulator. The accumulator
+# is piggybacked onto the ``ws_state:idle`` broadcast payload so the
+# cluster collector / dashboard can render the freshly-emitted assistant
+# turn without round-tripping storage; capping it keeps a runaway turn
+# from ballooning the broadcast event past the listener queues' size
+# budget. Lifted from WebUI in the rich ``ws_state`` payload work so
+# coord broadcasts hit the same ceiling.
+_MAX_TURN_CONTENT_CHARS = 256 * 1024
 
 
 class SessionUIBase:
@@ -95,6 +105,21 @@ class SessionUIBase:
         # Activity tracking for dashboard ("thinking" / "tool" / "").
         self._ws_current_activity: str = ""
         self._ws_activity_state: str = ""
+        # Turn-content accumulator: assistant tokens piggybacked onto
+        # the ``ws_state:idle`` broadcast so the dashboard renders the
+        # turn without an extra storage round-trip. Cleared on IDLE /
+        # ERROR transitions by :meth:`snapshot_and_consume_state_payload`.
+        self._ws_turn_content: list[str] = []
+        self._ws_turn_content_size: int = 0
+        # Last broadcast (activity, activity_state) tuple — used by
+        # :meth:`_broadcast_activity` overrides to dedup back-to-back
+        # identical activity ticks. Tool-heavy turns can fire many
+        # ``on_tool_result`` calls in succession that all clear the
+        # activity to ``("", "")``; without the dedup, each fan-out
+        # acquires the cluster collector's lock for a no-op write.
+        # ``None`` until the first broadcast so the first emit always
+        # fires.
+        self._last_broadcast_activity: tuple[str, str] | None = None
         # Verdicts from the LLM intent judge — tracked so
         # ``resolve_approval`` can stamp a ``user_decision`` onto every
         # verdict that fired during this approval round.
@@ -316,3 +341,244 @@ class SessionUIBase:
             )
         except Exception:
             log.debug("Failed to persist output assessment", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Streaming + status — lifted from WebUI in the rich ``ws_state``
+    # payload work so coord populates the same per-ws metric fields the
+    # cluster broadcast reads. Subclasses override ``_broadcast_state``
+    # and ``_broadcast_activity`` for kind-specific transport
+    # (interactive: per-node global SSE queue; coord: cluster collector).
+    # ``WebUI`` additionally overrides ``on_status`` / ``on_tool_result``
+    # to layer Prometheus ``_metrics.record_*`` calls (node-only) on top
+    # of the shared writes.
+    # ------------------------------------------------------------------
+
+    def on_thinking_start(self) -> None:
+        """Track that the model is thinking; broadcast activity + enqueue."""
+        with self._ws_lock:
+            self._ws_current_activity = "Thinking…"
+            self._ws_activity_state = "thinking"
+        self._broadcast_activity()
+        self._enqueue({"type": "thinking_start"})
+
+    def on_thinking_stop(self) -> None:
+        self._enqueue({"type": "thinking_stop"})
+
+    def on_reasoning_token(self, text: str) -> None:
+        self._enqueue({"type": "reasoning", "text": text})
+
+    def on_content_token(self, text: str) -> None:
+        """Append to the turn-content accumulator (capped) + enqueue.
+
+        The cap-check + append + size-update run under ``_ws_lock``
+        so a concurrent :meth:`snapshot_and_consume_state_payload`
+        IDLE/ERROR drain can't see a torn list mid-append. In
+        production this is single-writer-per-ws (the worker thread)
+        but the snapshot reader runs from coord's adapter via
+        ``mgr.set_state``; without the lock the writer's append
+        could land in an orphaned list reference the snapshot just
+        swapped out. Lock hold is microseconds.
+        """
+        with self._ws_lock:
+            if self._ws_turn_content_size < _MAX_TURN_CONTENT_CHARS:
+                self._ws_turn_content.append(text)
+                self._ws_turn_content_size += len(text)
+        self._enqueue({"type": "content", "text": text})
+
+    def on_stream_end(self) -> None:
+        with self._ws_lock:
+            self._ws_current_activity = ""
+            self._ws_activity_state = ""
+        self._broadcast_activity()
+        self._enqueue({"type": "stream_end"})
+
+    def on_tool_result(
+        self,
+        call_id: str,
+        name: str,
+        output: str,
+        *,
+        is_error: bool = False,
+    ) -> None:
+        """Track per-ws tool-call counts + clear activity + enqueue.
+
+        Subclasses can override to add kind-specific bookkeeping (e.g.
+        ``WebUI`` calls :func:`_metrics.record_tool_call` on top of the
+        shared writes); call ``super().on_tool_result(...)`` to keep
+        the per-ws counters consistent.
+        """
+        with self._ws_lock:
+            self._ws_tool_calls[name] = self._ws_tool_calls.get(name, 0) + 1
+            self._ws_turn_tool_calls += 1
+            self._ws_current_activity = ""
+            self._ws_activity_state = ""
+        self._broadcast_activity()
+        event: dict[str, Any] = {
+            "type": "tool_result",
+            "call_id": call_id,
+            "name": name,
+            "output": output,
+        }
+        if is_error:
+            event["is_error"] = True
+        self._enqueue(event)
+
+    def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:
+        self._enqueue({"type": "tool_output_chunk", "call_id": call_id, "chunk": chunk})
+
+    def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None:
+        """Record per-ws token / context counters + enqueue + persist usage.
+
+        Shared body: writes ``_ws_prompt_tokens`` / ``_ws_completion_tokens``
+        / ``_ws_context_ratio`` under ``_ws_lock``, fans the ``status``
+        event to listener queues, and persists a ``usage_event`` row to
+        storage for governance dashboards. Subclasses (currently
+        :class:`WebUI`) can override to layer node-only Prometheus
+        ``_metrics.record_*`` calls before / after; call
+        ``super().on_status(...)`` to keep the per-ws counters and
+        usage-event row consistent.
+
+        Behaviour change for coord: pre-lift coord's ``on_status`` was a
+        thin enqueue-only stub; the lift turns it into the same writes
+        WebUI does, so the cluster collector's rich ``ws_state``
+        broadcast reads non-zero ``tokens`` / ``context_ratio`` for
+        coord rows, AND coord ``usage_event`` rows now persist to
+        storage (governance gains visibility into coordinator token
+        consumption).
+
+        ``usage`` field access is defensive (``.get(..., 0)``) — pre-
+        lift coord's stub used the same defensive pattern, and a
+        provider-translation bug that produces a partial ``usage``
+        dict shouldn't be surfaced as a worker-thread KeyError.
+        """
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+        total_tok = prompt_tokens + completion_tokens
+        pct = total_tok / context_window * 100 if context_window > 0 else 0
+        cache_creation = usage.get("cache_creation_tokens", 0)
+        cache_read = usage.get("cache_read_tokens", 0)
+        with self._ws_lock:
+            self._ws_prompt_tokens += prompt_tokens
+            self._ws_completion_tokens += completion_tokens
+            self._ws_context_ratio = total_tok / context_window if context_window > 0 else 0.0
+            tool_total = sum(self._ws_tool_calls.values())
+            tool_count = tool_total - self._ws_tool_calls_reported
+            self._ws_tool_calls_reported = tool_total
+            turn_tool_calls = self._ws_turn_tool_calls
+            turn_count = self._ws_messages
+        self._enqueue(
+            {
+                "type": "status",
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tok,
+                "context_window": context_window,
+                "pct": round(pct, 1),
+                "effort": effort,
+                "cache_creation_tokens": cache_creation,
+                "cache_read_tokens": cache_read,
+                "tool_calls_this_turn": turn_tool_calls,
+                "turn_count": turn_count,
+            }
+        )
+        try:
+            from turnstone.core.storage._registry import get_storage
+
+            storage = get_storage()
+            if storage is not None:
+                storage.record_usage_event(
+                    event_id=uuid.uuid4().hex,
+                    user_id=self._user_id,
+                    ws_id=self.ws_id,
+                    node_id="",
+                    model=usage.get("model", ""),
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    tool_calls_count=tool_count,
+                    cache_creation_tokens=cache_creation,
+                    cache_read_tokens=cache_read,
+                )
+        except Exception:
+            log.warning("Failed to record usage event", exc_info=True)
+
+    def on_info(self, message: str) -> None:
+        self._enqueue({"type": "info", "message": message})
+
+    def on_error(self, message: str) -> None:
+        self._enqueue({"type": "error", "message": message})
+
+    # ------------------------------------------------------------------
+    # Broadcast hooks — kind-specific transport.
+    #
+    # Default implementations are no-ops: subclasses override to fan
+    # the snapshot out to their kind's transport (interactive: per-node
+    # global SSE queue; coord: cluster collector). The shared on_* methods
+    # above call these unconditionally so adding broadcast on a future
+    # kind only requires the override.
+    # ------------------------------------------------------------------
+
+    def _broadcast_state(self, state: str) -> None:  # noqa: ARG002 — hook stub
+        """Fan a state-change snapshot out to the kind's transport.
+
+        Default: no-op. Subclasses override.
+        """
+
+    def _broadcast_activity(self) -> None:
+        """Fan a current-activity snapshot out to the kind's transport.
+
+        Default: no-op. Subclasses override.
+        """
+
+    # ------------------------------------------------------------------
+    # State-broadcast snapshot helper
+    # ------------------------------------------------------------------
+
+    def snapshot_and_consume_state_payload(self, state: str) -> dict[str, Any]:
+        """Return the rich-payload snapshot a state-change broadcast carries.
+
+        Reads under ``_ws_lock`` so the snapshot is internally consistent
+        with concurrent ``on_status`` / ``on_tool_result`` /
+        ``on_content_token`` writes (all of which take the same lock).
+        For terminal states (``"idle"`` / ``"error"``) the turn-content
+        accumulator is also swapped out — IDLE piggybacks the joined
+        content onto the broadcast so the dashboard renders the
+        assistant turn without an extra storage round-trip; ERROR
+        clears without emitting (the broadcast is just for the state
+        transition).
+
+        The IDLE branch swaps the accumulator OUT under the lock and
+        joins the captured list OUTSIDE the lock — keeps the lock
+        hold to microseconds even on a 256 KiB turn, and decouples
+        the join walk from any concurrent ``on_content_token`` racing
+        the swap.
+
+        Returns a dict with keys ``tokens`` / ``context_ratio`` /
+        ``activity`` / ``activity_state`` / ``content``. Callers fan
+        the dict out via their kind's transport
+        (:meth:`_broadcast_state` or, for coord,
+        :meth:`turnstone.console.coordinator_adapter.CoordinatorAdapter.emit_state`).
+        """
+        captured_content: list[str] = []
+        with self._ws_lock:
+            tokens = self._ws_prompt_tokens + self._ws_completion_tokens
+            ctx = self._ws_context_ratio
+            activity = self._ws_current_activity
+            activity_state = self._ws_activity_state
+            if state == "idle":
+                captured_content = self._ws_turn_content
+                self._ws_turn_content = []
+                self._ws_turn_content_size = 0
+            elif state == "error":
+                self._ws_turn_content = []
+                self._ws_turn_content_size = 0
+        # Join outside the lock — bounded at _MAX_TURN_CONTENT_CHARS but
+        # still O(n) over the captured fragments, so worth not blocking
+        # concurrent on_content_token writers for the duration.
+        content = "".join(captured_content) if captured_content else ""
+        return {
+            "tokens": tokens,
+            "context_ratio": ctx,
+            "activity": activity,
+            "activity_state": activity_state,
+            "content": content,
+        }
