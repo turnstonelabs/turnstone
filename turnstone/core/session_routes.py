@@ -686,13 +686,20 @@ def make_cancel_handler(
       ``coord_mgr.cancel`` which silently no-op'd on a placeholder;
       the lifted body 400s for parity with interactive's existing
       "No session" branch.
-    - **Interactive resolve_approval / resolve_plan now run
-      unconditionally** (was gated on ``was_running``). Lifts coord's
-      always-resolve behaviour onto interactive — a stuck
-      approval-pending state from a crashed worker thread can now
-      be cleared via ``cancel`` on interactive, matching coord's
-      pre-lift recovery path. The calls are idempotent and no-op
-      when nothing is blocked, so the new path is strictly safer.
+    - **Interactive ``resolve_plan`` now runs on every cancel** (was
+      gated on ``was_running``). Lifts coord's always-resolve
+      behaviour onto interactive — a stuck plan-pending state from
+      a crashed worker thread can now be cleared via ``cancel``,
+      matching coord's pre-lift recovery path. ``resolve_plan`` has
+      its own internal ``_pending_plan_review is None`` guard, so
+      the call is genuinely no-op when nothing is blocked.
+      ``resolve_approval`` is **gated on ``ui._pending_approval is not None``**
+      because :meth:`SessionUIBase.resolve_approval` is *not*
+      idempotent — it always broadcasts ``approval_resolved`` and
+      overwrites ``_approval_result``. Without the gate, every idle
+      cancel would leak a stale resolution event to SSE listeners.
+      The gate preserves the recovery semantics for the genuine
+      stuck case while skipping the broadcast on idle cancels.
     """
 
     async def cancel(request: Request) -> Response:

@@ -188,13 +188,23 @@ Three release tracks are maintained:
     lifted body 400s with ``{"error": "No session"}`` for parity
     with interactive's pre-existing branch.
 
-  One observable change for interactive: ``resolve_approval`` /
-  ``resolve_plan`` now run on every cancel (previously gated on
-  ``was_running``). Lifts coord's pre-lift behaviour onto interactive
-  — a stuck approval-pending state from a crashed worker can now
-  be cleared via ``cancel`` instead of requiring a workstream
-  close + rehydrate. The calls are idempotent and no-op when
-  nothing is blocked.
+  Two observable changes for interactive (asymmetric — coord
+  pre-lift already had this behaviour):
+
+  - ``resolve_plan`` now runs on every cancel (previously gated
+    on ``was_running``). ``resolve_plan`` has an internal
+    ``_pending_plan_review is None`` guard, so the call is no-op
+    when no plan review is pending. Lift gives interactive coord's
+    pre-lift recovery path: a stuck plan-pending state from a
+    crashed worker can be cleared via ``cancel`` instead of
+    requiring a workstream close + rehydrate.
+  - ``resolve_approval`` runs on every cancel **only when
+    ``ui._pending_approval is not None``** (the lifted body gates
+    the call). ``resolve_approval`` is not idempotent — it always
+    broadcasts ``approval_resolved`` and overwrites
+    ``_approval_result`` — so the gate prevents a stale resolution
+    event from leaking on idle cancels while preserving the recovery
+    path when an approval really is pending.
 
   Coord ``coordinator.cancel`` audit detail now includes ``force``
   so operator-driven recovery is distinguishable from a routine
