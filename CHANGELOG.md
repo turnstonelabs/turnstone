@@ -385,6 +385,20 @@ Three release tracks are maintained:
     pool starvation; the ``request.is_disconnected()`` probe
     between polls already covers cancel-detection latency the
     timeout would otherwise gate.
+  - **Replay phase streams events directly from the generator
+    instead of pre-building into a list.** The initial draft
+    materialised the entire kind-specific replay payload
+    (``connected`` + ``status`` + ``history`` + pending prompts)
+    into a list before constructing the ``EventSourceResponse``,
+    delaying time-to-first-byte until the heaviest replay event
+    (``_build_history`` for long-running interactive workstreams)
+    finished serialising AND letting the per-UI listener queue
+    accumulate over its 500-slot cap on a chatty mid-generation
+    workstream. The lifted body now iterates ``cfg.events_replay``
+    inside the async generator so each event ships as soon as the
+    callback yields it; the existing observational-failure swallow
+    semantics are preserved by wrapping the iteration in the same
+    try/except.
 
 ### Security
 

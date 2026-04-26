@@ -1244,26 +1244,6 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
 
         client_queue = register()
 
-        # Pre-build the replay payload while we still hold the
-        # request context. The kind-specific callback can read
-        # ``ws.session._last_usage`` / ``ui._pending_approval`` etc.
-        # synchronously; we don't need to keep the request alive
-        # for the iteration.
-        replay_events: list[dict[str, Any]] = []
-        if cfg.events_replay is not None:
-            try:
-                for ev in cfg.events_replay(ws, ui, request):
-                    replay_events.append(ev)
-            except Exception:
-                # Replay is observational — never let a snapshot bug
-                # block the live stream. Log and start the loop with
-                # whatever partial replay we managed to build.
-                log.debug(
-                    "ws.events.replay_failed ws=%s",
-                    ws_id[:8],
-                    exc_info=True,
-                )
-
         # Per-kind executor for the blocking ``client_queue.get``
         # wait. Interactive returns its dedicated 200-thread
         # ``sse_executor`` so SSE polling stays isolated from every
@@ -1275,6 +1255,9 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
         live_executor = (
             cfg.sse_executor_lookup(request) if cfg.sse_executor_lookup is not None else None
         )
+        # Capture the replay callback in a local so the inner
+        # generator's closure doesn't have to re-read the cfg field.
+        replay_cb = cfg.events_replay
 
         async def event_generator() -> Any:
             import functools
@@ -1282,10 +1265,30 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
             _metrics.record_sse_connect()
             loop = asyncio.get_running_loop()
             try:
-                # Replay phase — yield the kind-specific initial
-                # payload before the live loop starts.
-                for ev in replay_events:
-                    yield {"data": json.dumps(ev)}
+                # Replay phase — stream the kind-specific initial
+                # payload one event at a time so the client sees the
+                # first byte immediately (interactive's ``connected``
+                # event is the very first yield, before the heavier
+                # ``status`` / ``history`` work runs). Pre-building
+                # the replay into a list would block time-to-first-
+                # byte until the entire replay materialized AND let
+                # the listener queue accumulate (potentially over its
+                # 500-slot cap on a chatty mid-generation workstream)
+                # while replay was being built.
+                if replay_cb is not None:
+                    try:
+                        for ev in replay_cb(ws, ui, request):
+                            yield {"data": json.dumps(ev)}
+                    except Exception:
+                        # Replay is observational — never let a
+                        # snapshot bug block the live stream. Log
+                        # and continue with whatever partial replay
+                        # was already yielded.
+                        log.debug(
+                            "ws.events.replay_failed ws=%s",
+                            ws_id[:8],
+                            exc_info=True,
+                        )
                 # Live phase — drain the per-UI listener queue
                 # until either the workstream closes or the client
                 # disconnects. 5s poll matches pre-lift interactive
