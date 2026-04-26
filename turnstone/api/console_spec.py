@@ -1329,7 +1329,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
                 default=100,
             ),
         ],
-        error_codes=[403, 404, 503],
+        error_codes=[400, 403, 404, 500, 503],
         tags=["Coordinator"],
     ),
     EndpointSpec(
