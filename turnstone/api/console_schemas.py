@@ -1045,6 +1045,48 @@ class CoordinatorSendRequest(BaseModel):
     """Body for POST /v1/api/workstreams/{ws_id}/send."""
 
     message: str = Field(description="User message to queue onto the coordinator's worker.")
+    attachment_ids: list[str] | None = Field(
+        default=None,
+        description=(
+            "Explicit list of attachment ids to inject into this turn. "
+            "When omitted, any pending attachments for the caller on "
+            "this coordinator are auto-consumed. An empty list disables "
+            "auto-consumption for this send."
+        ),
+    )
+
+
+class CoordinatorSendResponse(BaseModel):
+    """Response shape for POST /v1/api/workstreams/{ws_id}/send (coord)."""
+
+    status: str = Field(
+        description="'ok' (fresh worker spawned), 'queued' (live worker reuse), or 'queue_full'.",
+        examples=["ok", "queued", "queue_full"],
+    )
+    attached_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Attachment ids actually reserved onto this turn. Subset of "
+            "the request's `attachment_ids` (or the auto-consumed pending "
+            "set). Empty when the send carries no attachments."
+        ),
+    )
+    dropped_attachment_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Attachment ids the caller requested that the server could "
+            "not reserve (lost a race, already consumed, or cross-scope). "
+            "The request still proceeds with whatever was reserved."
+        ),
+    )
+    priority: str | None = Field(
+        default=None,
+        description="Set on `queued` responses: relative priority of the queued message.",
+    )
+    msg_id: str | None = Field(
+        default=None,
+        description="Set on `queued` responses: id used to dequeue the message.",
+    )
 
 
 class CoordinatorApproveRequest(BaseModel):
