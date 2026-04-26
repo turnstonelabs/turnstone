@@ -646,8 +646,8 @@
     setSseStatus("connecting…", "");
     // Snapshot whether this is a reconnect BEFORE resetting
     // reconnectAttempts in onopen — child_ws_* events dispatched while
-    // we were disconnected aren't replayed by coordinator_events, so
-    // the client has to pull authoritative state after any gap.
+    // we were disconnected aren't replayed by the events SSE handler,
+    // so the client has to pull authoritative state after any gap.
     const wasReconnecting = reconnectAttempts > 0;
     const url = "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/events";
     evtSource = new EventSource(url, { withCredentials: true });
@@ -750,9 +750,9 @@
       case "approve_request":
         showApproval(ev.items);
         // Surface each tool for context.  Dedupe by call_id: the console
-        // replays _pending_approval into every new SSE subscriber (see
-        // coordinator_events handler), so without this check an SSE
-        // reconnect would render each tool row a second time.
+        // replays _pending_approval into every new SSE subscriber (the
+        // events SSE handler's coord-side replay), so without this check
+        // an SSE reconnect would render each tool row a second time.
         (ev.items || []).forEach((it) => {
           if (!it.needs_approval) return;
           if (

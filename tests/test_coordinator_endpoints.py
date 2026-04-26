@@ -791,6 +791,58 @@ def test_cancel_idle_workstream_does_not_broadcast_approval_resolved(storage):
 
 
 # ---------------------------------------------------------------------------
+# Events (SSE replay shape)
+# ---------------------------------------------------------------------------
+
+
+def test_coord_events_replay_yields_pending_approval_then_pending_plan():
+    """The lifted coord ``events_replay`` callback yields two things
+    on a fresh SSE connect: pending approval (if any) + pending plan
+    review (if any). Pre-lift coord pushed both onto the listener
+    queue via ``put_nowait``; the lift restructures as a generator
+    the lifted body iterates and yields as ``data:`` lines, but the
+    payload identity is preserved. Pure-read — never mutates ``ui``."""
+    from turnstone.console.server import _coord_events_replay
+
+    ui = MagicMock()
+    ui._pending_approval = {"type": "approve_request", "items": []}
+    ui._pending_plan_review = {"type": "plan_review", "content": "..."}
+    ws = MagicMock()
+    request = MagicMock()
+
+    out = list(_coord_events_replay(ws, ui, request))
+    # Order matters — the pre-lift body re-injected approval first.
+    assert out[0]["type"] == "approve_request"
+    assert out[1]["type"] == "plan_review"
+
+
+def test_coord_events_replay_yields_nothing_when_no_pending():
+    """A workstream with no pending approval / plan review yields
+    an empty replay. The lifted body falls through to the live loop
+    immediately."""
+    from turnstone.console.server import _coord_events_replay
+
+    ui = MagicMock()
+    ui._pending_approval = None
+    ui._pending_plan_review = None
+    ws = MagicMock()
+    request = MagicMock()
+
+    out = list(_coord_events_replay(ws, ui, request))
+    assert out == []
+
+
+def test_coord_events_returns_404_on_missing_ws(storage):
+    """Cross-kind / missing ws_id surfaces as 404 with
+    ``cfg.not_found_label`` ("coordinator not found") via the lifted
+    body's ``mgr.get`` None-return contract."""
+    mgr = _build_mgr(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get("/v1/api/workstreams/nonexistent-id/events", headers=_COORD_HEADERS)
+    assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
 # Open (explicit rehydration)
 # ---------------------------------------------------------------------------
 

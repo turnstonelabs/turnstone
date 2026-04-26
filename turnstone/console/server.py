@@ -63,6 +63,7 @@ from turnstone.core.session_routes import (
     make_attachment_handlers,
     make_cancel_handler,
     make_close_handler,
+    make_events_handler,
     make_open_handler,
     make_send_handler,
     register_coord_verbs,
@@ -76,7 +77,7 @@ from turnstone.core.web_helpers import (
 from turnstone.core.workstream import Workstream, WorkstreamKind
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable
+    from collections.abc import AsyncGenerator, Callable, Iterable
 
     from starlette.requests import Request
 
@@ -2454,6 +2455,32 @@ def _audit_cancel_coordinator(
     )
 
 
+def _coord_events_replay(
+    ws: Workstream,  # noqa: ARG001 — coord replay reads ui only
+    ui: Any,
+    request: Request,  # noqa: ARG001 — coord replay doesn't need request context
+) -> Iterable[dict[str, Any]]:
+    """Initial SSE replay payload for coord ``events`` connections.
+
+    Pre-lift ``coordinator_events`` re-injected just two things on
+    connect: the pending approval prompt (if any) and the pending
+    plan-review (if any). The lifted ``make_events_handler`` body
+    delegates to this callback so the kind-specific shape stays in
+    this module. Coord doesn't replay ``connected``/``status``/
+    ``history`` because its dashboard fetches conversation history
+    via a separate ``/history`` endpoint and doesn't render the
+    per-tab status bar (those are interactive-UX-specific).
+
+    Pure read — never mutates ``ui``.
+    """
+    pending_approval = getattr(ui, "_pending_approval", None)
+    if pending_approval is not None:
+        yield pending_approval
+    pending_plan = getattr(ui, "_pending_plan_review", None)
+    if pending_plan is not None:
+        yield pending_plan
+
+
 async def coordinator_create(request: Request) -> JSONResponse:
     """POST /v1/api/workstreams/new — create a new coordinator session."""
     from turnstone.core.audit import record_audit
@@ -2558,49 +2585,6 @@ async def coordinator_create(request: Request) -> JSONResponse:
         except Exception:
             log.debug("coordinator_create.audit_failed", exc_info=True)
     return JSONResponse({"ws_id": ws.id, "name": ws.name}, status_code=201)
-
-
-async def coordinator_events(request: Request) -> Response:
-    """GET /v1/api/workstreams/{ws_id}/events — SSE event stream."""
-    err = _require_admin_coordinator(request)
-    if err is not None:
-        return err
-    coord_mgr, err503 = _require_coord_mgr(request)
-    if err503 is not None:
-        return err503
-    ws_id = request.path_params.get("ws_id", "")
-    ws = coord_mgr.get(ws_id)
-    if ws is None:
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    ui = ws.ui
-    if ui is None or not hasattr(ui, "_register_listener"):
-        return JSONResponse({"error": "coordinator has no UI"}, status_code=409)
-
-    client_queue = ui._register_listener()
-    # Replay any pending approval so a reconnecting tab sees the prompt.
-    pending = getattr(ui, "_pending_approval", None)
-    if pending is not None:
-        with contextlib.suppress(queue.Full):
-            client_queue.put_nowait(pending)
-    pending_plan = getattr(ui, "_pending_plan_review", None)
-    if pending_plan is not None:
-        with contextlib.suppress(queue.Full):
-            client_queue.put_nowait(pending_plan)
-
-    async def event_generator() -> AsyncGenerator[dict[str, Any], None]:
-        try:
-            while True:
-                if await request.is_disconnected():
-                    break
-                try:
-                    event = await asyncio.to_thread(client_queue.get, True, 1.0)
-                    yield {"data": json.dumps(event)}
-                except queue.Empty:
-                    pass  # ping keeps the connection alive
-        finally:
-            ui._unregister_listener(client_queue)
-
-    return EventSourceResponse(event_generator(), ping=5)
 
 
 async def coordinator_history(request: Request) -> JSONResponse:
@@ -5594,7 +5578,6 @@ def _parse_skill_session_config(body: dict[str, Any]) -> tuple[dict[str, Any], J
 
 def _skill_to_response(r: dict[str, Any], resource_count: int = 0) -> dict[str, Any]:
     """Convert a storage skill dict to a JSON-safe response dict."""
-    import contextlib
     import json as _json
 
     tags: list[str] = []
@@ -5994,7 +5977,6 @@ async def admin_list_skill_versions(request: Request) -> JSONResponse:
 
 async def list_skills_summary(request: Request) -> JSONResponse:
     """GET /v1/api/skills — list available skills (summary)."""
-    import contextlib
     import json as _json
 
     from turnstone.core.web_helpers import require_storage_or_503
@@ -10122,6 +10104,7 @@ def create_app(
         # dashboard. Cluster-level metrics fan out via the collector.
         spawn_metrics=None,
         emit_message_queued=True,
+        events_replay=_coord_events_replay,
     )
     coord_workstream_routes: list[Any] = []
     register_session_routes(
@@ -10144,7 +10127,7 @@ def create_app(
                 coord_endpoint_config,
                 audit_emit=_audit_cancel_coordinator,
             ),
-            events=coordinator_events,
+            events=make_events_handler(coord_endpoint_config),  # lifted: shared body
             history=coordinator_history,
             attachments=make_attachment_handlers(
                 coord_endpoint_config

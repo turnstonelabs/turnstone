@@ -308,6 +308,84 @@ Three release tracks are maintained:
     handler body keeps a future contributor from narrowing it
     incorrectly.
 
+- **`events` verb body lifted across both kinds** ([Stage 2 Verb
+  Lift — `events`]). The interactive
+  ``GET /v1/api/events?ws_id=...`` and coord
+  ``GET /v1/api/workstreams/{ws_id}/events`` SSE handlers now
+  share one body via ``make_events_handler(cfg)``. Per-kind
+  divergence captured by a new
+  ``events_replay: EventsReplay | None`` cfg field — a Protocol-
+  typed callback yielding the kind-specific initial replay
+  payload that the lifted body iterates and sends as ``data:``
+  lines before starting the live event loop. Interactive's
+  ``_interactive_events_replay`` yields the pre-lift sequence
+  (``connected`` + ``status`` + ``history`` + ``pending_approval``
+  + cached intent verdicts + ``pending_plan_review``); coord's
+  ``_coord_events_replay`` yields just ``pending_approval`` +
+  ``pending_plan_review`` (matches pre-lift coord behaviour).
+
+  The legacy interactive query-keyed URL is preserved via a new
+  ``make_legacy_query_keyed_adapter`` helper (sister to
+  ``make_legacy_body_keyed_adapter`` from earlier lifts) — it
+  reads ``ws_id`` from the query string and splices into
+  ``request.path_params`` before delegating to the lifted body.
+  ``GET /v1/api/events?ws_id=...`` continues to work for any 1.x
+  SDK consumer.
+
+  Two convergence wins:
+
+  - **Coord gains SSE connect/disconnect metrics.** Pre-lift
+    coord didn't record per-stream metrics; the lifted body
+    always calls ``metrics.record_sse_connect()`` /
+    ``...disconnect()``, giving the cluster dashboard the same
+    per-stream observability interactive's had since 1.0.
+  - **Both kinds now check ``request.is_disconnected()`` AND
+    the ``ws_closed`` event** to terminate. Pre-lift interactive
+    relied solely on ``ws_closed`` (which never fires if the
+    client just goes away without closing the workstream);
+    pre-lift coord relied solely on ``is_disconnected``. The
+    lifted body uses both — whichever fires first wins.
+
+  One observable shape change for coord callers: the lifted body
+  returns 409 ``"session has no UI"`` when ``ws.ui`` is missing
+  (placeholder / build-failed UI), matching pre-lift coord.
+  Pre-lift interactive returned 404 in this case; the lift
+  converges on 409 across kinds because the workstream EXISTS
+  (404 would imply it doesn't).
+
+  **Item #2 from § Post-P3 reckoning split out** of this lift
+  during scoping (rich ``ws_state`` payload parity for coord —
+  lifting coord's ``ConsoleCoordinatorUI`` to broadcast
+  ``tokens + context_ratio + activity + content`` like
+  ``WebUI._broadcast_state`` does). The body lift touches
+  ``session_routes.py`` + ``server.py`` + ``console/server.py``;
+  the rich-payload work touches ``coordinator_ui.py`` +
+  ``collector.py`` + ``session_ui_base.py`` (different files,
+  different reviewer concern). Tracked as standalone follow-up
+  ``feat/coord-rich-ws-state-payload``.
+
+  Two /review fixes folded into the same commit:
+
+  - **Restored interactive's dedicated SSE thread pool.** The
+    initial draft of ``make_events_handler`` used
+    ``asyncio.to_thread`` (default executor, capped at
+    ``min(32, cpu_count + 4)``) for the per-connection
+    ``client_queue.get`` blocking wait. Pre-lift interactive used
+    a dedicated 200-thread ``sse_executor`` (created in the
+    lifespan with ``thread_name_prefix="sse"``) precisely to
+    avoid this — under high concurrent SSE counts the default
+    pool starves and SSE polling contends with every other
+    ``asyncio.to_thread`` caller in the process (storage, router,
+    audit). Restored isolation via a new
+    ``sse_executor_lookup: SseExecutorLookup | None`` cfg field;
+    interactive returns ``request.app.state.sse_executor``, coord
+    wires ``None`` and falls through to the default executor.
+  - **Restored 5s queue.get poll** (was shortened to 1s in the
+    initial draft). The 5x wakeup-rate bump compounded the thread-
+    pool starvation; the ``request.is_disconnected()`` probe
+    between polls already covers cancel-detection latency the
+    timeout would otherwise gate.
+
 ### Security
 
 - **Coord attachment endpoints are now kind-strict**

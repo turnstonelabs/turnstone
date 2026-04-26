@@ -31,7 +31,7 @@ call the factory during startup and pass the result as
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
@@ -110,6 +110,42 @@ OpenPostLoad = Callable[["Request", "Workstream"], None]
 # event. Same shape as ``CloseAuditEmitter``'s leading args. Coord
 # wires ``None`` (coord doesn't audit open today).
 OpenAuditEmitter = Callable[["Request", "Workstream"], None]
+
+
+class EventsReplay(Protocol):
+    """Pure-read generator of the per-kind initial SSE replay payload.
+
+    The lifted ``events`` body calls this once per SSE connection
+    *after* the per-UI listener queue is registered, but *before* the
+    live event loop starts. Each yielded dict gets JSON-serialised
+    and sent as a single ``data:`` line to the client.
+
+    Interactive yields five things on connect: ``connected`` (model +
+    skip_permissions), ``status`` (token usage + context %, only when
+    ``session._last_usage`` exists), ``history`` (replayed conversation),
+    ``pending_approval`` + cached intent verdicts, and
+    ``pending_plan_review``. Coord yields just two: ``pending_approval``
+    and ``pending_plan_review`` (the rest aren't needed because coord's
+    dashboard fetches history via a separate ``/history`` endpoint
+    and doesn't render the per-tab status bar). Kinds that don't
+    need any pre-replay wire ``None`` and the live loop starts
+    immediately.
+    """
+
+    def __call__(self, ws: Workstream, ui: Any, request: Request) -> Iterable[dict[str, Any]]:
+        """Return the iterable of initial replay events."""
+
+
+# (request) -> Executor for the SSE live-loop's blocking `queue.get`
+# wait. Interactive returns the dedicated ``sse_executor``
+# (200-thread pool created at lifespan setup) so the SSE poll path
+# stays isolated from every other ``asyncio.to_thread`` caller in
+# the process (storage, router, audit). Coord returns ``None`` and
+# the lifted body falls through to ``asyncio.to_thread`` (default
+# executor, capped at ``min(32, os.cpu_count() + 4)`` workers) —
+# coord's per-process SSE concurrency stays well under that ceiling
+# and adding a dedicated pool would over-engineer for the LOC win.
+SseExecutorLookup = Callable[["Request"], Any]
 
 
 @dataclass(frozen=True)
@@ -228,6 +264,24 @@ class SessionEndpointConfig:
     # wires ``None`` and lets the cluster collector handle the
     # transition via ``CoordinatorAdapter.emit_rehydrated``.
     open_post_load: OpenPostLoad | None = None
+    # (ws, ui, request) -> Iterable[dict]. Kind-specific initial
+    # SSE replay payload the lifted ``events`` body yields after
+    # registering the per-UI listener queue but before the live
+    # event loop. Interactive replays connected + status + history
+    # + pending_approval (with cached intent verdicts) +
+    # pending_plan_review. Coord replays just pending_approval +
+    # pending_plan_review (its dashboard fetches history via a
+    # separate ``/history`` endpoint and doesn't render the per-tab
+    # status bar). Kinds that don't need pre-replay wire ``None``.
+    events_replay: EventsReplay | None = None
+    # (request) -> Executor for the SSE live-loop's blocking
+    # ``queue.get`` wait. Interactive returns the dedicated
+    # ``request.app.state.sse_executor`` (200-thread pool) so SSE
+    # polling stays isolated from every other ``asyncio.to_thread``
+    # caller in the process; coord wires ``None`` and the lifted
+    # body falls through to the default executor. See
+    # :data:`SseExecutorLookup` docstring above.
+    sse_executor_lookup: SseExecutorLookup | None = None
 
 
 @dataclass(frozen=True)
@@ -547,6 +601,29 @@ def make_legacy_body_keyed_adapter(handler: Handler) -> Handler:
         # body-keyed URL with no ``{ws_id}`` slot, we splice it into
         # the scope so the lifted handler's ``request.path_params.get(...)``
         # finds it.
+        path_params: dict[str, Any] = dict(request.path_params)
+        path_params["ws_id"] = ws_id
+        request.scope["path_params"] = path_params
+        return await handler(request)
+
+    return adapter
+
+
+def make_legacy_query_keyed_adapter(handler: Handler) -> Handler:
+    """Wrap a path-keyed handler so it can be mounted at a query-keyed URL.
+
+    Pre-1.5 interactive ``GET /api/events?ws_id=...`` takes ``ws_id``
+    from the query string. The lifted ``events`` body reads it from
+    the path. This adapter mirrors :func:`make_legacy_body_keyed_adapter`
+    for the query-param case: read ``ws_id`` from the query, splice
+    into path_params, forward.
+
+    SSE-friendly: no body read involved (events is GET); the handler
+    stays streaming.
+    """
+
+    async def adapter(request: Request) -> Response:
+        ws_id = request.query_params.get("ws_id", "")
         path_params: dict[str, Any] = dict(request.path_params)
         path_params["ws_id"] = ws_id
         request.scope["path_params"] = path_params
@@ -1075,6 +1152,167 @@ def make_open_handler(
         return JSONResponse({"ws_id": ws.id, "name": ws.name})
 
     return open_ws
+
+
+def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
+    """Lifted body for ``GET {prefix}/{ws_id}/events`` — per-workstream SSE.
+
+    Both kinds share the SSE plumbing: register the per-UI listener
+    queue, run the kind-specific initial replay (``cfg.events_replay``,
+    typically ``connected`` + ``status`` + ``history`` + pending
+    approval / plan on interactive; just pending approval / plan on
+    coord), then drain the queue forever until either the workstream
+    closes (``ws_closed`` event) or the client disconnects.
+
+    The kind-specific divergence is captured entirely by
+    ``cfg.events_replay``. The live-loop body, the listener
+    registration, the ``ws_closed`` exit, the disconnect detection,
+    and the SSE-connect/disconnect metric recording are uniform.
+
+    Pre-lift behaviour preserved on both kinds with two small
+    convergence wins:
+
+    - **Coord gains SSE connect/disconnect metrics.** Pre-lift coord
+      did no metric recording on its events stream; the lifted body
+      always calls ``metrics.record_sse_connect()`` / ``...disconnect()``,
+      which gives the cluster dashboard the same per-stream
+      observability interactive's had since 1.0.
+    - **Both kinds now check ``request.is_disconnected()`` between
+      polls AND the ``ws_closed`` event.** Pre-lift interactive
+      relied solely on ``ws_closed`` to terminate (which never fires
+      if the client just goes away without a proper close); pre-lift
+      coord relied solely on ``is_disconnected``. The lifted body
+      uses both — whichever fires first wins.
+
+    Args:
+        cfg: per-kind policy bundle. ``events_replay`` is the only
+             field the events body reads beyond the standard
+             permission_gate / manager_lookup / tenant_check prelude.
+    """
+    # Lazy-imported at factory call time so the metrics module isn't
+    # dragged into ``session_routes.py``'s top-level import graph
+    # (which is consumed by the ``client_type="chat"`` channel
+    # gateway, where the metrics collector is irrelevant).
+    from turnstone.core.metrics import metrics as _metrics
+
+    async def events(request: Request) -> Response:
+        import asyncio
+        import json
+        import queue
+
+        from sse_starlette import EventSourceResponse
+
+        if cfg.permission_gate is not None:
+            err = cfg.permission_gate(request)
+            if err is not None:
+                return err
+        mgr_opt, err503 = cfg.manager_lookup(request)
+        if err503 is not None:
+            return err503
+        # See ``make_approve_handler`` for the cast rationale.
+        mgr = cast("SessionManager", mgr_opt)
+
+        ws_id = request.path_params.get("ws_id", "")
+        if not ws_id:
+            return JSONResponse({"error": "ws_id is required"}, status_code=400)
+
+        if cfg.tenant_check is not None:
+            err_tenant = cfg.tenant_check(request, ws_id, mgr)
+            if err_tenant is not None:
+                return err_tenant
+
+        ws = mgr.get(ws_id)
+        if ws is None:
+            return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+        ui = ws.ui
+        # The listener-queue methods aren't on the ``SessionUI``
+        # Protocol surface (they live on ``SessionUIBase``), so
+        # extract via ``getattr`` after presence checks. Both kinds'
+        # production UIs subclass ``SessionUIBase``; the placeholder /
+        # build-failed UI path may have neither.
+        register = getattr(ui, "_register_listener", None) if ui is not None else None
+        unregister = getattr(ui, "_unregister_listener", None) if ui is not None else None
+        if ui is None or register is None or unregister is None:
+            # Placeholder / build-failed UI — there's no listener
+            # queue to attach to. 409 (not 404) because the
+            # workstream EXISTS in the manager but its UI is half-built.
+            # Pre-lift coord returned 409 for this case; pre-lift
+            # interactive 404'd. Lifted converges on 409 across
+            # kinds — more accurate for the workstream-exists-but-
+            # half-built shape.
+            return JSONResponse({"error": "session has no UI"}, status_code=409)
+
+        client_queue = register()
+
+        # Pre-build the replay payload while we still hold the
+        # request context. The kind-specific callback can read
+        # ``ws.session._last_usage`` / ``ui._pending_approval`` etc.
+        # synchronously; we don't need to keep the request alive
+        # for the iteration.
+        replay_events: list[dict[str, Any]] = []
+        if cfg.events_replay is not None:
+            try:
+                for ev in cfg.events_replay(ws, ui, request):
+                    replay_events.append(ev)
+            except Exception:
+                # Replay is observational — never let a snapshot bug
+                # block the live stream. Log and start the loop with
+                # whatever partial replay we managed to build.
+                log.debug(
+                    "ws.events.replay_failed ws=%s",
+                    ws_id[:8],
+                    exc_info=True,
+                )
+
+        # Per-kind executor for the blocking ``client_queue.get``
+        # wait. Interactive returns its dedicated 200-thread
+        # ``sse_executor`` so SSE polling stays isolated from every
+        # other ``asyncio.to_thread`` caller in the process; coord
+        # returns ``None`` and the lifted body falls back to the
+        # default executor (capped at ``min(32, cpu+4)``). Pre-lift
+        # interactive used the dedicated pool too — the lookup
+        # restores that isolation under the lifted contract.
+        live_executor = (
+            cfg.sse_executor_lookup(request) if cfg.sse_executor_lookup is not None else None
+        )
+
+        async def event_generator() -> Any:
+            import functools
+
+            _metrics.record_sse_connect()
+            loop = asyncio.get_running_loop()
+            try:
+                # Replay phase — yield the kind-specific initial
+                # payload before the live loop starts.
+                for ev in replay_events:
+                    yield {"data": json.dumps(ev)}
+                # Live phase — drain the per-UI listener queue
+                # until either the workstream closes or the client
+                # disconnects. 5s poll matches pre-lift interactive
+                # (the ``is_disconnected`` probe between polls covers
+                # cancel-detection latency the timeout would otherwise
+                # gate; shortening to 1s 5x'd the wakeup rate without
+                # any client-observable benefit).
+                while True:
+                    if await request.is_disconnected():
+                        return
+                    try:
+                        event = await loop.run_in_executor(
+                            live_executor,
+                            functools.partial(client_queue.get, timeout=5),
+                        )
+                    except queue.Empty:
+                        continue  # ping keeps the connection alive
+                    if event.get("type") == "ws_closed":
+                        return
+                    yield {"data": json.dumps(event)}
+            finally:
+                _metrics.record_sse_disconnect()
+                unregister(client_queue)
+
+        return EventSourceResponse(event_generator(), ping=5)
+
+    return events
 
 
 def make_send_handler(cfg: SessionEndpointConfig) -> Handler:

@@ -30,6 +30,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
 from sse_starlette import EventSourceResponse
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -64,7 +67,9 @@ from turnstone.core.session_routes import (
     make_cancel_handler,
     make_close_handler,
     make_dequeue_handler,
+    make_events_handler,
     make_legacy_body_keyed_adapter,
+    make_legacy_query_keyed_adapter,
     make_open_handler,
     make_send_handler,
     register_session_routes,
@@ -895,6 +900,88 @@ def _audit_close_workstream(
     )
 
 
+def _interactive_events_replay(
+    ws: Workstream, ui: Any, request: Request
+) -> Iterable[dict[str, Any]]:
+    """Initial SSE replay payload for interactive ``events`` connections.
+
+    Pre-lift ``events_sse`` yielded five things on connect: a
+    ``connected`` event with model + skip_permissions; a ``status``
+    event with the workstream's last token usage + context %; the
+    full conversation ``history`` (with pending-approval flagging on
+    the last assistant entry's tool calls); the pending approval
+    prompt + cached intent verdicts (if a prompt is pending); the
+    pending plan-review (if a review is pending). The lifted
+    ``make_events_handler`` body delegates that yield sequence to
+    this callback so the kind-specific shape stays in this module.
+
+    Pure read — never mutates ``ws`` / ``ui`` / ``session``.
+    """
+    del request  # not needed; replay reads ws/ui/session state
+    session = ws.session
+    if session is None:
+        # Defensive — the lifted body's UI presence check guarantees
+        # the workstream made it past placeholder state, but the
+        # session can still be detached on the close-then-reopen path.
+        return
+
+    # Connected event — model + skip-permissions ride here so the
+    # client can populate the per-tab status bar before any history
+    # arrives.
+    yield {
+        "type": "connected",
+        "model": session.model,
+        "model_alias": session.model_alias or "",
+        "skip_permissions": getattr(ui, "auto_approve", False),
+    }
+
+    # Status replay — only when last_usage exists so the client can
+    # populate the token / context-window bar on resume.
+    last_usage = session._last_usage
+    if last_usage is not None:
+        total_tok = last_usage["prompt_tokens"] + last_usage["completion_tokens"]
+        cw = session.context_window
+        pct = total_tok / cw * 100 if cw > 0 else 0
+        with ui._ws_lock:
+            turn_tool_calls = ui._ws_turn_tool_calls
+            turn_count = ui._ws_messages
+        yield {
+            "type": "status",
+            "prompt_tokens": last_usage["prompt_tokens"],
+            "completion_tokens": last_usage["completion_tokens"],
+            "total_tokens": total_tok,
+            "context_window": cw,
+            "pct": round(pct, 1),
+            "effort": session.reasoning_effort,
+            "cache_creation_tokens": last_usage.get("cache_creation_tokens", 0),
+            "cache_read_tokens": last_usage.get("cache_read_tokens", 0),
+            "tool_calls_this_turn": turn_tool_calls,
+            "turn_count": turn_count,
+        }
+
+    # History replay — pending-approval flag rides on the last
+    # assistant entry's tool_calls so the client renders them as
+    # awaiting approval rather than already approved.
+    pending_approval = getattr(ui, "_pending_approval", None)
+    history = _build_history(session, has_pending_approval=pending_approval is not None)
+    if history:
+        yield {"type": "history", "messages": history}
+
+    # Pending approval re-injection (so a reconnecting tab sees the
+    # prompt) + cached LLM verdicts received since the prompt fired.
+    if pending_approval is not None:
+        yield pending_approval
+        with ui._ws_lock:
+            cached_verdicts = list(ui._llm_verdicts.values())
+        for v in cached_verdicts:
+            yield {"type": "intent_verdict", **v}
+
+    # Pending plan-review re-injection.
+    pending_plan = getattr(ui, "_pending_plan_review", None)
+    if pending_plan is not None:
+        yield pending_plan
+
+
 def _interactive_open_post_load(request: Request, ws: Workstream) -> None:
     """Post-load hook for the lifted interactive ``open`` body.
 
@@ -985,100 +1072,6 @@ async def index(request: Request) -> Response:
     resp.headers["Cache-Control"] = "no-cache"
     resp.headers["ETag"] = _HTML_ETAG
     return resp
-
-
-async def events_sse(request: Request) -> Response:
-    """GET /v1/api/events — per-workstream SSE event stream."""
-    mgr = request.app.state.workstreams
-    ws_id = request.query_params.get("ws_id")
-    # Subscribing to another tenant's stream would leak their messages,
-    # tool calls, and pending approvals in real time.  Gate before
-    # _register_listener so non-owners get a flat 404 (no enumeration).
-    # In-memory fast path via mgr= keeps SSE resilient to DB blips.
-    _owner, err = _require_ws_access(request, ws_id or "", mgr=mgr)
-    if err:
-        return err
-    ws, ui = _get_ws(mgr, ws_id)
-    if not ws or not ui:
-        return JSONResponse({"error": "Unknown workstream"}, status_code=404)
-
-    # Each client gets its own queue — no drain needed.
-    client_queue = ui._register_listener()
-
-    async def event_generator() -> AsyncGenerator[dict[str, str], None]:
-        assert ws.session is not None
-        session: ChatSession = ws.session
-        # Connected event
-        yield {
-            "data": json.dumps(
-                {
-                    "type": "connected",
-                    "model": session.model,
-                    "model_alias": session.model_alias or "",
-                    "skip_permissions": ui.auto_approve,
-                }
-            )
-        }
-        # Replay last status so the per-pane status bar populates on resume
-        if session._last_usage is not None:
-            u = session._last_usage
-            total_tok = u["prompt_tokens"] + u["completion_tokens"]
-            cw = session.context_window
-            pct = total_tok / cw * 100 if cw > 0 else 0
-            with ui._ws_lock:
-                turn_tool_calls = ui._ws_turn_tool_calls
-                turn_count = ui._ws_messages
-            yield {
-                "data": json.dumps(
-                    {
-                        "type": "status",
-                        "prompt_tokens": u["prompt_tokens"],
-                        "completion_tokens": u["completion_tokens"],
-                        "total_tokens": total_tok,
-                        "context_window": cw,
-                        "pct": round(pct, 1),
-                        "effort": session.reasoning_effort,
-                        "cache_creation_tokens": u.get("cache_creation_tokens", 0),
-                        "cache_read_tokens": u.get("cache_read_tokens", 0),
-                        "tool_calls_this_turn": turn_tool_calls,
-                        "turn_count": turn_count,
-                    }
-                )
-            }
-        # History replay
-        history = _build_history(session, has_pending_approval=ui._pending_approval is not None)
-        if history:
-            yield {"data": json.dumps({"type": "history", "messages": history})}
-        # Re-inject pending approval or plan review
-        if ui._pending_approval is not None:
-            yield {"data": json.dumps(ui._pending_approval)}
-            # Replay any LLM verdicts received since the approval was sent
-            with ui._ws_lock:
-                cached_verdicts = list(ui._llm_verdicts.values())
-            for v in cached_verdicts:
-                yield {"data": json.dumps({"type": "intent_verdict", **v})}
-        if ui._pending_plan_review is not None:
-            yield {"data": json.dumps(ui._pending_plan_review)}
-
-        _metrics.record_sse_connect()
-        try:
-            loop = asyncio.get_running_loop()
-            executor = request.app.state.sse_executor
-            while True:
-                try:
-                    event = await loop.run_in_executor(
-                        executor, functools.partial(client_queue.get, timeout=5)
-                    )
-                    if event.get("type") == "ws_closed":
-                        return
-                    yield {"data": json.dumps(event)}
-                except queue.Empty:
-                    pass  # poll timeout, retry
-        finally:
-            _metrics.record_sse_disconnect()
-            ui._unregister_listener(client_queue)
-
-    return EventSourceResponse(event_generator(), ping=5)
 
 
 def _build_node_snapshot(app_state: Any) -> dict[str, Any]:
@@ -3813,6 +3806,14 @@ def create_app(
         cancel_forensics=_capture_cancel_forensics,
         open_resolve_alias=_resolve_workstream_alias,
         open_post_load=_interactive_open_post_load,
+        events_replay=_interactive_events_replay,
+        # Pre-lift ``events_sse`` used the dedicated 200-thread
+        # ``sse_executor`` so SSE polling stayed isolated from
+        # every other ``asyncio.to_thread`` caller in the process
+        # (storage, router, audit). Restore that isolation under
+        # the lifted contract — coord wires ``None`` and falls
+        # back to the default executor.
+        sse_executor_lookup=lambda request: request.app.state.sse_executor,
     )
     approve_handler = make_approve_handler(interactive_endpoint_config)
     close_handler = make_close_handler(
@@ -3825,11 +3826,12 @@ def create_app(
         interactive_endpoint_config,
         audit_emit=_audit_workstream_opened,
     )
+    events_handler = make_events_handler(interactive_endpoint_config)
     send_handler = make_send_handler(interactive_endpoint_config)
     dequeue_handler = make_dequeue_handler(interactive_endpoint_config)
     attachment_handlers = make_attachment_handlers(interactive_endpoint_config)
     v1_routes: list[Any] = [
-        Route("/api/events", events_sse),
+        Route("/api/events", make_legacy_query_keyed_adapter(events_handler)),
         Route("/api/events/global", global_events_sse),
     ]
     register_session_routes(
@@ -3848,6 +3850,7 @@ def create_app(
             send=send_handler,  # lifted: shared body (P1.5)
             approve=approve_handler,  # lifted: shared body
             cancel=cancel_handler,  # lifted: shared body
+            events=events_handler,  # lifted: shared body
             attachments=attachment_handlers,  # lifted: shared body (P1.5)
         ),
     )
