@@ -4802,7 +4802,7 @@
         "tags": [
           "Coordinator"
         ],
-        "description": "Worker thread picks up the message via the session's queue.  ``429`` when the worker queue is full \u2014 caller should back off.",
+        "description": "Worker thread picks up the message via the session's queue. Optional ``attachment_ids`` reserve attachments under the message's send_id token (parity with the interactive surface). Response carries ``attached_ids`` / ``dropped_attachment_ids`` so callers can detect partial reservations and ``priority`` / ``msg_id`` on the queued path. ``status: queue_full`` when the worker queue is full \u2014 caller should back off.",
         "parameters": [
           {
             "name": "ws_id",
@@ -4829,7 +4829,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/StatusResponse"
+                  "$ref": "#/components/schemas/CoordinatorSendResponse"
                 }
               }
             }
@@ -4864,8 +4864,8 @@
               }
             }
           },
-          "429": {
-            "description": "Error 429",
+          "500": {
+            "description": "Error 500",
             "content": {
               "application/json": {
                 "schema": {
@@ -4874,8 +4874,282 @@
               }
             }
           },
-          "500": {
-            "description": "Error 500",
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/{ws_id}/attachments": {
+      "post": {
+        "summary": "Upload a file attachment to a coordinator workstream",
+        "operationId": "v1_api_workstreams_{ws_id}_attachments_post",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Multipart upload (field ``file``). Same validation rules as the interactive surface: magic-byte image sniff, UTF-8 text decode, per-kind size cap, per-(ws,user) pending cap. Attachments stay pending until a subsequent ``/send`` reserves them under its ``send_id`` token.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadAttachmentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Error 413",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "List the caller's pending coordinator attachments",
+        "operationId": "v1_api_workstreams_{ws_id}_attachments_get",
+        "tags": [
+          "Coordinator"
+        ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListAttachmentsResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/{ws_id}/attachments/{attachment_id}/content": {
+      "get": {
+        "summary": "Return raw bytes of a coordinator attachment",
+        "operationId": "v1_api_workstreams_{ws_id}_attachments_{attachment_id}_content_get",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Same byte-stream + headers as the interactive surface. Text kinds are forced to ``text/plain`` so an HTML-shaped text upload can't render same-origin.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "attachment_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/{ws_id}/attachments/{attachment_id}": {
+      "delete": {
+        "summary": "Remove a pending coordinator attachment",
+        "operationId": "v1_api_workstreams_{ws_id}_attachments_{attachment_id}_delete",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Consumed attachments return 404.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "attachment_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
             "content": {
               "application/json": {
                 "schema": {
@@ -7372,12 +7646,90 @@
             "description": "User message to queue onto the coordinator's worker.",
             "title": "Message",
             "type": "string"
+          },
+          "attachment_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Explicit list of attachment ids to inject into this turn. When omitted, any pending attachments for the caller on this coordinator are auto-consumed. An empty list disables auto-consumption for this send.",
+            "title": "Attachment Ids"
           }
         },
         "required": [
           "message"
         ],
         "title": "CoordinatorSendRequest",
+        "type": "object"
+      },
+      "CoordinatorSendResponse": {
+        "description": "Response shape for POST /v1/api/workstreams/{ws_id}/send (coord).",
+        "properties": {
+          "status": {
+            "description": "'ok' (fresh worker spawned), 'queued' (live worker reuse), or 'queue_full'.",
+            "examples": [
+              "ok",
+              "queued",
+              "queue_full"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "attached_ids": {
+            "description": "Attachment ids actually reserved onto this turn. Subset of the request's `attachment_ids` (or the auto-consumed pending set). Empty when the send carries no attachments.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Attached Ids",
+            "type": "array"
+          },
+          "dropped_attachment_ids": {
+            "description": "Attachment ids the caller requested that the server could not reserve (lost a race, already consumed, or cross-scope). The request still proceeds with whatever was reserved.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Dropped Attachment Ids",
+            "type": "array"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Set on `queued` responses: relative priority of the queued message.",
+            "title": "Priority"
+          },
+          "msg_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Set on `queued` responses: id used to dequeue the message.",
+            "title": "Msg Id"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "CoordinatorSendResponse",
         "type": "object"
       },
       "CoordinatorStopCascadeResponse": {
