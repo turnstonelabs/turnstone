@@ -139,9 +139,11 @@ class TestValidateAndSaveUploadedFiles:
 class TestReserveAndResolveAttachments:
     def test_reserves_and_returns_attachments(self, tmp_path):
         from turnstone.core.attachments import Attachment
+        from turnstone.core.attachments import (
+            reserve_and_resolve_attachments as _reserve_and_resolve_attachments,
+        )
         from turnstone.core.memory import save_attachment
         from turnstone.core.storage import init_storage, reset_storage
-        from turnstone.server import _reserve_and_resolve_attachments
 
         reset_storage()
         init_storage("sqlite", path=str(tmp_path / "t.db"), run_migrations=False)
@@ -161,9 +163,11 @@ class TestReserveAndResolveAttachments:
             reset_storage()
 
     def test_double_reserve_drops_second(self, tmp_path):
+        from turnstone.core.attachments import (
+            reserve_and_resolve_attachments as _reserve_and_resolve_attachments,
+        )
         from turnstone.core.memory import save_attachment
         from turnstone.core.storage import init_storage, reset_storage
-        from turnstone.server import _reserve_and_resolve_attachments
 
         reset_storage()
         init_storage("sqlite", path=str(tmp_path / "t.db"), run_migrations=False)

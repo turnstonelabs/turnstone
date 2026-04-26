@@ -1958,62 +1958,6 @@ def _deliver_notification(
             time.sleep(1.0 if attempt == 0 else 3.0)
 
 
-def _reserve_and_resolve_attachments(
-    requested_ids: list[str],
-    send_id: str,
-    ws_id: str,
-    user_id: str,
-) -> tuple[list[Any], list[str], list[str]]:
-    """Reserve attachment ids for ``send_id`` and resolve to Attachment objects.
-
-    Returns ``(resolved, ordered_reserved, dropped)``. ``dropped`` is the
-    subset of *requested_ids* that could not be reserved (already consumed,
-    lost a race, or cross-scope).  Used by the create-with-attachments
-    path; ``send_message`` has its own inlined variant with an
-    auto-consume fast path that reuses bytes fetched during selection.
-    """
-    from turnstone.core.attachments import Attachment
-    from turnstone.core.memory import get_attachments as _get_attachments
-    from turnstone.core.memory import reserve_attachments as _reserve
-
-    if not requested_ids:
-        return [], [], []
-
-    reserved_ids: list[str] = _reserve(requested_ids, send_id, ws_id, user_id)
-    reserved_set = set(reserved_ids)
-    ordered_reserved: list[str] = [aid for aid in requested_ids if aid in reserved_set]
-    dropped: list[str] = [aid for aid in requested_ids if aid not in reserved_set]
-
-    resolved: list[Any] = []
-    if ordered_reserved:
-        rows = _get_attachments(ordered_reserved)
-        rows_by_id = {str(r["attachment_id"]): r for r in rows}
-        for aid in ordered_reserved:
-            r = rows_by_id.get(aid)
-            if not r:
-                continue
-            if (
-                r.get("ws_id") != ws_id
-                or r.get("user_id") != user_id
-                or r.get("message_id") is not None
-                or r.get("reserved_for_msg_id") != send_id
-            ):
-                continue
-            content = r.get("content")
-            if not isinstance(content, bytes):
-                continue
-            resolved.append(
-                Attachment(
-                    attachment_id=str(r["attachment_id"]),
-                    filename=str(r.get("filename") or ""),
-                    mime_type=str(r.get("mime_type") or "application/octet-stream"),
-                    kind=str(r.get("kind") or ""),
-                    content=content,
-                )
-            )
-    return resolved, ordered_reserved, dropped
-
-
 async def _interactive_create_validate_request(
     request: Request,
     body: dict[str, Any],
@@ -2131,11 +2075,17 @@ def _interactive_create_build_kwargs(
     requested_ws_id = body.get("ws_id", "") or ""
     if not isinstance(requested_ws_id, str):
         requested_ws_id = ""
+    # Use the canonical skill name from the resolved row rather than
+    # ``body["skill"]`` so a whitespace-padded request body
+    # (``"skill": "  my-skill "``) doesn't persist a name that fails
+    # later session-side lookups. The factory strips the lookup key
+    # but the raw value used to flow through unchanged.
+    canonical_skill = str(skill_data["name"]) if skill_data and skill_data.get("name") else None
     return {
         "user_id": uid,
         "name": body.get("name", ""),
         "model": resolved_model,
-        "skill": body.get("skill", "") if skill_data else None,
+        "skill": canonical_skill,
         "skill_id": skill_id,
         "skill_version": applied_skill_version,
         "ws_id": requested_ws_id,
@@ -2309,13 +2259,15 @@ async def _interactive_create_post_install(
     # Initial-message worker thread.
     initial_message = body.get("initial_message", "").strip()
     if initial_message and ws.session is not None:
+        from turnstone.core.attachments import (
+            reserve_and_resolve_attachments as _reserve_and_resolve,
+        )
+
         session = ws.session
         send_id = uuid.uuid4().hex
         resolved_atts: list[Any] = []
         if attachment_ids:
-            resolved_atts, _ord, _drop = _reserve_and_resolve_attachments(
-                attachment_ids, send_id, ws.id, uid
-            )
+            resolved_atts, _ord, _drop = _reserve_and_resolve(attachment_ids, send_id, ws.id, uid)
 
         def _run_initial() -> None:
             try:
@@ -2371,7 +2323,8 @@ def _audit_workstream_created(
 
     Wired onto :func:`make_create_handler` as ``audit_emit``. Runs
     after the workstream is built and attachments saved; failures
-    are caught + logged by the factory (HTTP response stays 201).
+    are caught + logged at ``warning`` by the factory without
+    changing the create handler's successful 200 response.
     """
     from turnstone.core.audit import record_audit
 

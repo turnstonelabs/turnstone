@@ -361,19 +361,24 @@ def test_create_returns_ws_id_and_records_audit(storage):
     assert "coordinator.create" in actions
 
 
+_PNG_1X1 = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\xfc\xcf"
+    b"\xc0\xc0\xc0\x00\x00\x00\x05\x00\x01\xa5\xf6E@\x00\x00\x00\x00IEND"
+    b"\xaeB`\x82"
+)
+
+
 def test_create_with_multipart_attachments_saves_pending_rows(storage):
     """§ Post-P3 reckoning item #1 regression — coord gains create-time
     attachments. Multipart create with a magic-byte-valid PNG saves
-    a pending attachment row scoped to the new coord ws_id."""
+    a pending attachment row scoped to the new coord ws_id.
+
+    No ``initial_message`` here, so attachments stay pending and a
+    subsequent ``/send`` picks them up via the standard
+    send-with-attachments path."""
     from turnstone.core.memory import list_pending_attachments
 
-    # Magic-byte-valid 1x1 PNG (matches test_server_attachments_endpoints.py).
-    png_1x1 = (
-        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-        b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\xfc\xcf"
-        b"\xc0\xc0\xc0\x00\x00\x00\x05\x00\x01\xa5\xf6E@\x00\x00\x00\x00IEND"
-        b"\xaeB`\x82"
-    )
     mgr = _build_mgr(storage)
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
 
@@ -389,7 +394,7 @@ def test_create_with_multipart_attachments_saves_pending_rows(storage):
         resp = client.post(
             "/v1/api/workstreams/new",
             data={"meta": '{"name": "with-image"}'},
-            files={"file": ("img.png", png_1x1, "image/png")},
+            files={"file": ("img.png", _PNG_1X1, "image/png")},
             headers=_COORD_HEADERS,
         )
         assert resp.status_code == 200, resp.text
@@ -397,13 +402,51 @@ def test_create_with_multipart_attachments_saves_pending_rows(storage):
         ws_id = body["ws_id"]
         assert ws_id
         assert len(body["attachment_ids"]) == 1
-        # Attachment row is pending (saved but not consumed) — coord's
-        # adapter ``send`` doesn't reserve attachments at create time
-        # yet, so the next ``/send`` picks it up via the standard
-        # send-with-attachments path.
         pending = list_pending_attachments(ws_id, "user-1")
         assert len(pending) == 1
         assert pending[0]["kind"] == "image"
+    finally:
+        _reg._storage = _old_storage
+
+
+def test_create_with_multipart_attachments_and_initial_message_reserves(storage):
+    """Coord initial-message + create-time-attachments coordination —
+    when ``initial_message`` is provided alongside multipart uploads,
+    the attachments are reserved onto the dispatched first turn (via
+    :meth:`CoordinatorAdapter.send` with ``send_id``), so they're
+    not still pending after the create returns. Closes the parity
+    gap with interactive's create-with-attachments+initial_message
+    worker thread."""
+    from turnstone.core.memory import get_attachments, list_pending_attachments
+
+    mgr = _build_mgr(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    import turnstone.core.storage._registry as _reg
+
+    _old_storage = _reg._storage
+    _reg._storage = storage
+    try:
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            data={"meta": '{"name": "with-init", "initial_message": "look at this image"}'},
+            files={"file": ("img.png", _PNG_1X1, "image/png")},
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        ws_id = body["ws_id"]
+        attachment_ids = body["attachment_ids"]
+        assert len(attachment_ids) == 1
+        # Reserved (not pending): the row's ``reserved_for_msg_id``
+        # carries the send_id token that ``CoordinatorAdapter.send``
+        # generated; the worker's first ``ChatSession.send(...,
+        # send_id=...)`` call will consume it on dequeue.
+        pending = list_pending_attachments(ws_id, "user-1")
+        assert pending == [], "attachments should be reserved, not pending"
+        rows = get_attachments(attachment_ids)
+        assert len(rows) == 1
+        assert rows[0]["reserved_for_msg_id"], "attachment must carry a send_id reservation token"
     finally:
         _reg._storage = _old_storage
 

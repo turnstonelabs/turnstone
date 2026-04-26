@@ -434,12 +434,19 @@ Three release tracks are maintained:
   attachments.** Pre-lift ``coordinator_create`` accepted JSON only
   and ignored uploads; the lifted body parses ``multipart/form-data``
   on coord and saves attachments through the kind-agnostic storage
-  layer. Coord's adapter ``send`` does NOT yet take attachments,
-  so when a create request carries both ``initial_message`` and
-  uploads, the rows save as pending and the next ``/send`` picks
-  them up via the standard send-with-attachments path. Initial-
-  message + create-time attachments coordination on coord is a
-  follow-up — out of scope for the verb-shape lift.
+  layer. ``CoordinatorAdapter.send`` gained optional
+  ``attachments`` + ``send_id`` kwargs so when a create request
+  carries both ``initial_message`` and uploads, the attachments
+  are reserved onto the dispatched first turn — the worker's
+  ``ChatSession.send(..., send_id=...)`` consumes them on dequeue
+  exactly the way interactive's create-with-attachments worker
+  thread does. The ``send_id`` reservation token soft-locks the
+  rows, and the adapter's failure path unreserves so a worker
+  crash returns them to pending. The pure helper
+  ``_reserve_and_resolve_attachments`` lifted from ``server.py``
+  to ``turnstone.core.attachments`` as
+  ``reserve_and_resolve_attachments`` so both kinds call one
+  kind-agnostic implementation.
 
   Note on broadcast timing: coord's ``mgr.create`` fires
   ``emit_created`` (cluster collector fan-out) BEFORE the lifted
@@ -544,6 +551,16 @@ Three release tracks are maintained:
     or None``; the lifted body now strips for both kinds (interactive
     never received whitespace-only skills from the web UI but the
     convergence is the safer default).
+  - **Canonical skill name persisted to ``mgr.create``.** The initial
+    draft's ``_interactive_create_build_kwargs`` /
+    ``_coord_create_build_kwargs`` passed the raw ``body["skill"]``
+    through, so a whitespace-padded request would have persisted
+    ``"  my-skill "`` even though the lookup was done on the
+    stripped name. The build_kwargs callbacks now thread
+    ``skill_data["name"]`` (the resolved row's canonical name) so
+    the persisted ``Workstream.skill`` matches the row that was
+    actually applied — keeps later session-side ``skill`` lookups
+    working regardless of how dirty the inbound payload was.
 
 ### Security
 

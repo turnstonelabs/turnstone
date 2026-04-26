@@ -239,13 +239,23 @@ class _SendSession:
         self.cancelled = False
         self.closed = False
 
-    def send(self, message: str) -> None:
+    def send(
+        self,
+        message: str,
+        attachments: Any = None,
+        send_id: str | None = None,
+    ) -> None:
         if self._send_gate is not None:
             self._send_gate.wait(timeout=2.0)
         with self._send_lock:
             self.send_calls.append(message)
 
-    def queue_message(self, message: str) -> None:
+    def queue_message(
+        self,
+        message: str,
+        attachment_ids: Any = None,
+        queue_msg_id: str | None = None,
+    ) -> None:
         if self._queue_full:
             raise queue.Full
         self.queue_calls.append(message)

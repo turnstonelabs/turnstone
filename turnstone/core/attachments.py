@@ -290,6 +290,68 @@ def validate_and_save_uploaded_files(
     return saved_ids, None
 
 
+def reserve_and_resolve_attachments(
+    requested_ids: list[str],
+    send_id: str,
+    ws_id: str,
+    user_id: str,
+) -> tuple[list[Attachment], list[str], list[str]]:
+    """Reserve attachment ids for ``send_id`` and resolve to Attachment objects.
+
+    Returns ``(resolved, ordered_reserved, dropped)``. ``dropped`` is the
+    subset of *requested_ids* that could not be reserved (already consumed,
+    lost a race, or cross-scope).
+
+    Kind-agnostic: both interactive and coordinator create-with-attachments
+    paths call into this helper from their respective ``post_install``
+    callbacks (Stage 2 ``create`` verb lift). The reservation token
+    (``send_id``) scopes both the soft-lock and the eventual consume —
+    the worker calling ``ChatSession.send(..., send_id=...)`` matches
+    the lock and converts pending → consumed; failure paths
+    ``unreserve_attachments(send_id, ws_id, user_id)`` to release the
+    rows back to pending.
+    """
+    from turnstone.core.memory import get_attachments as _get_attachments
+    from turnstone.core.memory import reserve_attachments as _reserve
+
+    if not requested_ids:
+        return [], [], []
+
+    reserved_ids: list[str] = _reserve(requested_ids, send_id, ws_id, user_id)
+    reserved_set = set(reserved_ids)
+    ordered_reserved: list[str] = [aid for aid in requested_ids if aid in reserved_set]
+    dropped: list[str] = [aid for aid in requested_ids if aid not in reserved_set]
+
+    resolved: list[Attachment] = []
+    if ordered_reserved:
+        rows = _get_attachments(ordered_reserved)
+        rows_by_id = {str(r["attachment_id"]): r for r in rows}
+        for aid in ordered_reserved:
+            r = rows_by_id.get(aid)
+            if not r:
+                continue
+            if (
+                r.get("ws_id") != ws_id
+                or r.get("user_id") != user_id
+                or r.get("message_id") is not None
+                or r.get("reserved_for_msg_id") != send_id
+            ):
+                continue
+            content = r.get("content")
+            if not isinstance(content, bytes):
+                continue
+            resolved.append(
+                Attachment(
+                    attachment_id=str(r["attachment_id"]),
+                    filename=str(r.get("filename") or ""),
+                    mime_type=str(r.get("mime_type") or "application/octet-stream"),
+                    kind=str(r.get("kind") or ""),
+                    content=content,
+                )
+            )
+    return resolved, ordered_reserved, dropped
+
+
 def unreadable_placeholder(filename: str) -> dict[str, Any]:
     """Return a content-part placeholder used when an attachment can't be
     decoded for a given turn.

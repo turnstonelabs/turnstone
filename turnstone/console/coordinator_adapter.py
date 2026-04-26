@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 
     from turnstone.console.collector import ClusterCollector
     from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
+    from turnstone.core.attachments import Attachment
     from turnstone.core.session import ChatSession, SessionUI
     from turnstone.core.session_manager import SessionManager
 
@@ -222,7 +223,14 @@ class CoordinatorAdapter:
     # Worker dispatch — delegates to turnstone.core.session_worker
     # ------------------------------------------------------------------
 
-    def send(self, ws_id: str, message: str) -> bool:
+    def send(
+        self,
+        ws_id: str,
+        message: str,
+        *,
+        attachments: list[Attachment] | None = None,
+        send_id: str | None = None,
+    ) -> bool:
         """Queue a message onto a coordinator session's ChatSession.
 
         Returns False if the coordinator isn't loaded in the manager or
@@ -235,6 +243,17 @@ class CoordinatorAdapter:
         carry coord-specific error surfacing (UI ``on_error`` +
         ``on_state_change=error``) so the dashboard reflects the
         failure instead of a bare ``error`` badge.
+
+        Optional ``attachments`` + ``send_id`` carry create-time
+        attachments onto the first turn dispatched by the lifted
+        ``create`` handler's ``_coord_create_post_install``. The
+        send_id token must match the reservation already taken
+        against the attachment rows (see
+        :func:`turnstone.core.attachments.reserve_and_resolve_attachments`);
+        the worker's failure path unreserves so a worker crash
+        doesn't leave the rows soft-locked. Both kwargs default to
+        ``None`` so the steady-state ``coord_adapter.send`` call
+        sites (no attachments) keep working unchanged.
         """
         mgr = self._manager
         if mgr is None:
@@ -247,11 +266,33 @@ class CoordinatorAdapter:
 
         ws_ref = ws
         session = ws.session
+        # Capture into locals so the worker closure doesn't pull
+        # mutable kwargs through the call-site frame after return.
+        _attachments = attachments or None
+        _send_id = send_id if _attachments else None
+        _user_id = ws.user_id
 
         def _run() -> None:
             try:
-                session.send(message)
+                session.send(message, attachments=_attachments, send_id=_send_id)
             except Exception as exc:
+                # Unreserve any attachments we soft-locked for this
+                # send_id so the rows return to pending and don't stay
+                # locked forever after a worker crash. Mirrors the
+                # interactive create-with-attachments worker pattern.
+                if _attachments and _send_id:
+                    from turnstone.core.memory import (
+                        unreserve_attachments as _unreserve,
+                    )
+
+                    try:
+                        _unreserve(_send_id, ws_ref.id, _user_id)
+                    except Exception:
+                        log.debug(
+                            "coord_adapter.attachment_unreserve_failed ws=%s",
+                            ws_ref.id[:8],
+                            exc_info=True,
+                        )
                 log.exception("coord_adapter.worker_failed ws=%s", ws_ref.id[:8])
                 # Surface the failure to the coordinator's SSE stream
                 # so the operator sees what broke instead of a bare
@@ -281,7 +322,13 @@ class CoordinatorAdapter:
                         )
 
         def _enqueue() -> None:
-            session.queue_message(message)
+            # ``queue_message`` takes attachment *ids* + ``queue_msg_id``
+            # (which doubles as the cross-table reservation token); the
+            # send_id we hold IS that token. Convert Attachment objects
+            # to id list at enqueue time so the queued turn picks the
+            # files up at dequeue.
+            att_ids = [a.attachment_id for a in _attachments] if _attachments else None
+            session.queue_message(message, attachment_ids=att_ids, queue_msg_id=_send_id)
 
         return session_worker.send(
             ws,

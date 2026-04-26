@@ -2521,12 +2521,20 @@ def _coord_create_build_kwargs(
     or live on a separate ConfigStore knob (the dashboard-managed
     plan/task model + reasoning_effort settings).
     """
-    body_skill = (body.get("skill") or "").strip() or None
+    # Use the canonical skill name from the resolved row when one was
+    # found; falls back to the stripped body value (which is what the
+    # validator already normalised) so the persisted skill name stays
+    # whitespace-clean regardless of how the request shape changes.
+    canonical_skill: str | None
+    if skill_data and skill_data.get("name"):
+        canonical_skill = str(skill_data["name"])
+    else:
+        canonical_skill = (body.get("skill") or "").strip() or None
     name = (body.get("name") or "").strip()
     return {
         "user_id": uid,
         "name": name,
-        "skill": body_skill,
+        "skill": canonical_skill,
         "skill_id": skill_id,
         "skill_version": applied_skill_version,
     }
@@ -2543,22 +2551,45 @@ async def _coord_create_post_install(
 ) -> dict[str, Any]:
     """Tail end of coord create: dispatch the initial message.
 
-    Wired onto :attr:`SessionEndpointConfig.create_post_install`. The
-    factory has already saved any uploaded attachments through the
-    kind-agnostic storage layer; coord's adapter ``send`` does not
-    yet take attachments, so the rows save as pending and the next
-    ``/send`` picks them up via the standard send-with-attachments
-    path. Initial-message + create-time attachments coordination is
-    a follow-up.
+    Wired onto :attr:`SessionEndpointConfig.create_post_install`. When
+    an ``initial_message`` is provided, dispatches via
+    :meth:`CoordinatorAdapter.send`; any uploaded ``attachment_ids``
+    are reserved onto the same ``send_id`` token so the worker's
+    first turn picks them up exactly the way interactive's
+    ``post_install`` worker thread does.
 
     Returns ``{}`` — coord's response carries only the always-include
     parity fields populated by the factory.
     """
+    import uuid as _uuid
+
+    from turnstone.core.attachments import reserve_and_resolve_attachments
+
     initial_message = (body.get("initial_message") or "").strip()
-    if initial_message:
-        coord_adapter = getattr(request.app.state, "coord_adapter", None)
-        if coord_adapter is not None:
-            coord_adapter.send(ws.id, initial_message)
+    if not initial_message:
+        return {}
+    coord_adapter = getattr(request.app.state, "coord_adapter", None)
+    if coord_adapter is None:
+        return {}
+
+    # Mirror interactive's reservation pattern: same send_id token
+    # scopes the soft-lock and the eventual consume. Coord's
+    # ``CoordinatorAdapter.send`` worker passes both through to
+    # ``ChatSession.send(..., send_id=...)``; on worker failure the
+    # adapter's exception path unreserves so the rows return to
+    # pending.
+    send_id = _uuid.uuid4().hex
+    resolved_atts: list[Any] = []
+    if attachment_ids:
+        resolved_atts, _ord, _drop = reserve_and_resolve_attachments(
+            attachment_ids, send_id, ws.id, uid
+        )
+    coord_adapter.send(
+        ws.id,
+        initial_message,
+        attachments=resolved_atts or None,
+        send_id=send_id if resolved_atts else None,
+    )
     return {}
 
 

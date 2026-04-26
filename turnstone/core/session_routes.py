@@ -1497,7 +1497,7 @@ def make_create_handler(
       audit failures surfaced as HTTP 500 (no try/except); coord
       swallowed via try/except + log.debug. The lifted body wraps
       ``audit_emit`` in try/except + ``warning`` log, returning the
-      successful 201 to the caller. Mirrors the close / cancel /
+      successful 200 to the caller. Mirrors the close / cancel /
       open lift contracts.
     - **Always-include response shape.** The lifted body always
       returns ``{ws_id, name, resumed, message_count, attachment_ids}``,
@@ -1643,10 +1643,22 @@ def make_create_handler(
             )
         try:
             if body_skill and not (isinstance(resume_ws_id_raw, str) and resume_ws_id_raw):
-                from turnstone.core.memory import get_skill_by_name
                 from turnstone.core.storage._registry import get_storage as _get_storage
 
-                skill_data = await asyncio.to_thread(get_skill_by_name, body_skill)
+                # Call ``storage.get_prompt_template_by_name`` directly
+                # rather than going through
+                # ``turnstone.core.memory.get_skill_by_name`` — that
+                # helper swallows all storage exceptions into ``None``,
+                # which would mask a real outage as the 400 "Skill not
+                # found or disabled" branch below. Calling storage
+                # directly lets exceptions propagate to the lifted
+                # body's correlation_id'd 500 path so operators chasing
+                # a "Skill not found" report can distinguish real
+                # misses from registry outages.
+                _st = _get_storage()
+                if _st is None:
+                    return JSONResponse({"error": "storage unavailable"}, status_code=503)
+                skill_data = await asyncio.to_thread(_st.get_prompt_template_by_name, body_skill)
                 if not skill_data or not skill_data.get("enabled", False):
                     return JSONResponse(
                         {"error": f"Skill not found or disabled: {body_skill}"},
@@ -1654,25 +1666,23 @@ def make_create_handler(
                     )
                 tid = skill_data.get("template_id")
                 if tid:
-                    _st = _get_storage()
-                    if _st is not None:
-                        # ``count_skill_versions`` is best-effort: if the
-                        # version count call fails (transient storage
-                        # blip), default to 1 rather than aborting the
-                        # whole create. Persisted skill_version=1 is
-                        # the right semantic for the first applied
-                        # instance even if the count was unobtainable.
-                        try:
-                            applied_skill_version = (
-                                await asyncio.to_thread(_st.count_skill_versions, str(tid)) + 1
-                            )
-                        except Exception:
-                            log.debug(
-                                "ws.create.skill_version_failed skill=%s",
-                                body_skill,
-                                exc_info=True,
-                            )
-                            applied_skill_version = 1
+                    # ``count_skill_versions`` is best-effort: if the
+                    # version count call fails (transient storage
+                    # blip), default to 1 rather than aborting the
+                    # whole create. Persisted skill_version=1 is the
+                    # right semantic for the first applied instance
+                    # even if the count was unobtainable.
+                    try:
+                        applied_skill_version = (
+                            await asyncio.to_thread(_st.count_skill_versions, str(tid)) + 1
+                        )
+                    except Exception:
+                        log.debug(
+                            "ws.create.skill_version_failed skill=%s",
+                            body_skill,
+                            exc_info=True,
+                        )
+                        applied_skill_version = 1
             skill_id_resolved = (
                 str(skill_data["template_id"])
                 if skill_data and skill_data.get("template_id")
