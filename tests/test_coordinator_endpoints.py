@@ -451,6 +451,48 @@ def test_create_with_multipart_attachments_and_initial_message_reserves(storage)
         _reg._storage = _old_storage
 
 
+def test_create_attachment_failure_no_phantom_create_close_pair(storage):
+    """Regression for the ``defer_emit_created`` follow-up — when a
+    multipart create rolls back on attachment validation failure,
+    the cluster collector sees zero events: no phantom
+    ``ws_created``, no orphan ``ws_closed``. Pre-fix, coord's
+    ``mgr.create`` fired ``emit_created`` synchronously and the
+    rollback path called ``mgr.close`` which fired ``emit_closed``,
+    surfacing a quick create→close pair on the cluster events
+    stream."""
+    mgr = _build_mgr(storage)
+    # Pull the collector MagicMock out of the adapter so we can
+    # introspect call counts after the failed create.
+    coord_collector = mgr._adapter._collector  # type: ignore[attr-defined]
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    import turnstone.core.storage._registry as _reg
+
+    _old_storage = _reg._storage
+    _reg._storage = storage
+    try:
+        # Empty file body → ``validate_and_save_uploaded_files``
+        # returns the 400 "Empty file" path which the lifted body
+        # surfaces directly. The rollback path runs after.
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            data={"meta": '{"name": "rollback-target"}'},
+            files={"file": ("blank.bin", b"", "application/octet-stream")},
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 400, resp.text
+        # Manager is empty — slot was discarded.
+        assert mgr.count == 0
+        # The collector saw NEITHER create nor close events for any
+        # ws_id. ``MagicMock`` records every method call, so an empty
+        # list of calls to these specific methods is the regression
+        # check.
+        assert coord_collector.emit_console_ws_created.call_count == 0
+        assert coord_collector.emit_console_ws_closed.call_count == 0
+    finally:
+        _reg._storage = _old_storage
+
+
 def test_create_rejects_disabled_skill(storage):
     """Coord parity gain — disabled skills now rejected at the lift,
     matching interactive's pre-lift behaviour. Pre-lift coord silently

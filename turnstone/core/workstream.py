@@ -113,6 +113,20 @@ class Workstream:
     # racing ``Thread.is_alive()``. Used by both interactive and
     # coordinator paths since Stage 2 P1.
     _worker_running: bool = field(default=False, repr=False)
+    # True once ``SessionManager.commit_create`` (or the non-deferred
+    # path through ``SessionManager.create``) has fired the lifecycle
+    # ``emit_created`` event for this workstream. Used by
+    # :meth:`SessionManager.discard` (warns when set — abandoning an
+    # already-advertised ws leaves a stale ``ws_created`` on the wire
+    # with no matching ``ws_closed``) and by
+    # :meth:`SessionManager.commit_create` itself (no-ops when set,
+    # to make the idempotent-second-call and the
+    # commit-after-discard caller-bug paths safe). The non-deferred
+    # ``create`` sets this immediately before calling
+    # ``emit_created``; ``commit_create`` sets it under the manager
+    # lock alongside the tracked-ws check so a racing ``discard`` can
+    # never see it without also seeing the slot already popped.
+    _emit_created_fired: bool = field(default=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def __post_init__(self) -> None:
