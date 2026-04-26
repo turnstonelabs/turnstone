@@ -43,20 +43,39 @@ from turnstone.console.server import (
     coordinator_list,
     coordinator_open,
     coordinator_saved,
-    coordinator_send,
     coordinator_tasks,
+)
+from turnstone.core.attachments import (
+    classify_text_attachment as _coord_test_classify_text,
+)
+from turnstone.core.attachments import (
+    sniff_image_mime as _coord_test_sniff_image,
+)
+from turnstone.core.attachments import (
+    upload_lock as _coord_test_upload_lock,
 )
 from turnstone.core.auth import AuthResult
 from turnstone.core.session_routes import (
+    AttachmentUploadHelpers,
     SessionEndpointConfig,
     make_approve_handler,
+    make_attachment_handlers,
     make_close_handler,
+    make_send_handler,
 )
 from turnstone.core.storage._sqlite import SQLiteBackend
+from turnstone.core.web_helpers import resolve_workstream_owner
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+def _coord_attach_owner(request, ws_id, mgr):
+    """Coord attachment owner resolver mirroring production wiring."""
+    return resolve_workstream_owner(
+        request, ws_id, mgr=mgr, not_found_label="coordinator not found"
+    )
 
 
 # Per-kind config the lifted handler factories capture by closure.
@@ -68,6 +87,15 @@ _coord_endpoint_config = SessionEndpointConfig(
     tenant_check=None,
     not_found_label="coordinator not found",
     audit_action_prefix="coordinator",
+    supports_attachments=True,
+    attachment_owner_resolver=_coord_attach_owner,
+    attachment_helpers=AttachmentUploadHelpers(
+        sniff_image_mime=_coord_test_sniff_image,
+        classify_text_attachment=_coord_test_classify_text,
+        upload_lock=_coord_test_upload_lock,
+    ),
+    spawn_metrics=None,
+    emit_message_queued=True,
 )
 
 
@@ -84,6 +112,7 @@ def _make_client(
     registry=None,
 ) -> TestClient:
     """Build a TestClient exposing just the coordinator routes."""
+    coord_attachments = make_attachment_handlers(_coord_endpoint_config)
     app = Starlette(
         routes=[
             Route(
@@ -101,7 +130,7 @@ def _make_client(
             ),
             Route(
                 "/v1/api/workstreams/{ws_id}/send",
-                coordinator_send,
+                make_send_handler(_coord_endpoint_config),
                 methods=["POST"],
             ),
             Route(
@@ -142,6 +171,26 @@ def _make_client(
                 "/v1/api/workstreams/{ws_id}/tasks",
                 coordinator_tasks,
                 methods=["GET"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/attachments",
+                coord_attachments.upload,
+                methods=["POST"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/attachments",
+                coord_attachments.list,
+                methods=["GET"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/attachments/{attachment_id}/content",
+                coord_attachments.get_content,
+                methods=["GET"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/attachments/{attachment_id}",
+                coord_attachments.delete,
+                methods=["DELETE"],
             ),
             Route(
                 "/v1/api/workstreams/{ws_id}",
@@ -1210,3 +1259,115 @@ def test_coordinator_rows_persisted_cluster_wide(storage):
         request = _persisted_rows_request(storage, mgr, caller, perms)
         rows = _coordinator_rows(request)
         assert {r["name"] for r in rows} == {"alice-closed", "bob-closed", "orphan-closed"}
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 P1.5 — coord attachment surface parity with interactive
+# ---------------------------------------------------------------------------
+
+
+class TestCoordinatorAttachments:
+    """The lifted ``make_attachment_handlers`` factory exposes
+    upload / list / get_content / delete on coord workstreams using
+    the same kind-agnostic storage layer interactive uses. These
+    tests exercise the surface end-to-end via TestClient."""
+
+    def _upload(self, client, ws_id, *, name="hello.md", body=b"hi", mime="text/markdown"):
+        files = {"file": (name, body, mime)}
+        resp = client.post(
+            f"/v1/api/workstreams/{ws_id}/attachments",
+            files=files,
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    def test_upload_round_trip_lists_pending(self, storage):
+        mgr = _build_mgr(storage)
+        ws = mgr.create(user_id="user-1", name="c1")
+        client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+        info = self._upload(client, ws.id, name="note.md", body=b"hello world")
+        assert info["filename"] == "note.md"
+        assert info["kind"] == "text"
+        assert info["size_bytes"] == len(b"hello world")
+
+        listing = client.get(f"/v1/api/workstreams/{ws.id}/attachments", headers=_COORD_HEADERS)
+        assert listing.status_code == 200
+        ids = [a["attachment_id"] for a in listing.json()["attachments"]]
+        assert info["attachment_id"] in ids
+
+    def test_get_content_returns_raw_bytes(self, storage):
+        mgr = _build_mgr(storage)
+        ws = mgr.create(user_id="user-1", name="c1")
+        client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+        info = self._upload(
+            client, ws.id, name="data.json", body=b'{"k":1}', mime="application/json"
+        )
+        resp = client.get(
+            f"/v1/api/workstreams/{ws.id}/attachments/{info['attachment_id']}/content",
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 200
+        # Text kinds force text/plain to avoid same-origin HTML/SVG rendering.
+        assert resp.headers["content-type"].startswith("text/plain")
+        assert resp.content == b'{"k":1}'
+
+    def test_delete_removes_pending(self, storage):
+        mgr = _build_mgr(storage)
+        ws = mgr.create(user_id="user-1", name="c1")
+        client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+        info = self._upload(client, ws.id)
+        resp = client.delete(
+            f"/v1/api/workstreams/{ws.id}/attachments/{info['attachment_id']}",
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "deleted"}
+
+        listing = client.get(f"/v1/api/workstreams/{ws.id}/attachments", headers=_COORD_HEADERS)
+        ids = [a["attachment_id"] for a in listing.json()["attachments"]]
+        assert info["attachment_id"] not in ids
+
+    def test_send_with_attachment_ids_consumes_pending(self, storage):
+        """End-to-end: upload an attachment, then ``coord_send`` it. The
+        reservation flips ``reserved_for_msg_id`` to the send_id, so the
+        attachment is no longer in the pending listing."""
+        mgr = _build_mgr(storage)
+        ws = mgr.create(user_id="user-1", name="c1")
+        client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+        info = self._upload(client, ws.id)
+        resp = client.post(
+            f"/v1/api/workstreams/{ws.id}/send",
+            json={"message": "hi", "attachment_ids": [info["attachment_id"]]},
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "ok"
+        # Surfacing parity with interactive: response carries the
+        # attached / dropped lists even when no drops occurred.
+        assert body["attached_ids"] == [info["attachment_id"]]
+        assert body["dropped_attachment_ids"] == []
+
+    def test_send_response_includes_attached_ids_field_when_no_attachments(self, storage):
+        """The unified response shape always carries ``attached_ids`` /
+        ``dropped_attachment_ids`` so SDK consumers don't have to
+        branch on whether attachments were involved."""
+        mgr = _build_mgr(storage)
+        ws = mgr.create(user_id="user-1", name="c1")
+        client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+        resp = client.post(
+            f"/v1/api/workstreams/{ws.id}/send",
+            json={"message": "no attachments here"},
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "ok"
+        assert body["attached_ids"] == []
+        assert body["dropped_attachment_ids"] == []

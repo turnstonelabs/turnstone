@@ -85,6 +85,56 @@ Three release tracks are maintained:
   fork ship into the stable line bakes the duplication in for the
   lifetime of the 1.5 track.
 
+- **`/send` body lift + coordinator attachments + queue surface
+  parity** ([Stage 2 Priority 1.5]). The ``/send`` HTTP handler is
+  now ONE factory body (``make_send_handler(cfg)``) wired with
+  capability flags on both kinds; the four attachment endpoints
+  (``upload`` / ``list`` / ``get_content`` / ``delete``) are also
+  unified via ``make_attachment_handlers(cfg)``. Coord workstreams
+  light up:
+
+  - ``POST/GET /v1/api/workstreams/{ws_id}/attachments``,
+    ``GET .../attachments/{aid}/content``,
+    ``DELETE .../attachments/{aid}`` — same shape, same caps, same
+    reservation flow as interactive.
+  - ``POST /v1/api/workstreams/{ws_id}/send`` accepts
+    ``attachment_ids`` (or auto-consumes pending) and returns
+    ``attached_ids`` / ``dropped_attachment_ids`` for surfacing
+    partial reservations. Live-worker reuse path also returns
+    ``priority`` / ``msg_id`` (parity with the interactive
+    ``status: queued`` shape).
+
+  Backend parity is end-to-end: storage layer was already
+  kind-agnostic; the route registrar's ``AttachmentHandlers`` slot
+  has been there since Stage 2 P0; the multi-node attachment
+  routing-proxy on the console (``route_attachment_proxy``) was
+  already shipping. P1.5 is the wiring + verb-shape lift that lets
+  these primitives surface on the coord side.
+
+  Coord dashboard rendering surfaces an attachment-count badge on
+  past messages with attachments; full chip rendering with
+  click-to-view is deferred (the coord dashboard is
+  diagnostic-leaning and chip parity isn't on the critical path
+  for the unification thesis). Python SDK adds
+  ``coordinator_send`` / ``coordinator_upload_attachment`` /
+  ``coordinator_list_attachments`` /
+  ``coordinator_get_attachment_content`` /
+  ``coordinator_delete_attachment`` on
+  ``AsyncTurnstoneConsole`` + ``TurnstoneConsole``. TS SDK
+  regenerated; bumped to 0.5.0.
+
+  Three lifted helpers (``sniff_image_mime``,
+  ``classify_text_attachment``, ``upload_lock``) moved from
+  ``turnstone/server.py`` to ``turnstone/core/attachments.py`` so
+  both processes use the canonical implementation. The interactive
+  surface keeps the same behaviour; the helpers are simply
+  imported from their new home.
+
+  ``coordinator_send`` no longer returns ``429`` on a full worker
+  queue — the unified body returns ``200 {"status": "queue_full"}``
+  for parity with interactive. Existing callers checking for ``429``
+  should switch to the status-code shape.
+
 - **Workstream state writes are now buffered through ``StateWriter``.**
   ``SessionManager.set_state`` no longer holds ``ws._lock`` across a
   synchronous Postgres ``UPDATE`` for non-terminal transitions;
