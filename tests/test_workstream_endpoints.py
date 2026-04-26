@@ -18,11 +18,14 @@ if TYPE_CHECKING:
     from starlette.responses import Response
 
 from turnstone.core.auth import AuthResult
+from turnstone.core.session_routes import (
+    SessionEndpointConfig,
+    make_open_handler,
+)
 from turnstone.core.storage._sqlite import SQLiteBackend
 from turnstone.server import (
     delete_workstream_endpoint,
     list_interface_settings,
-    open_workstream,
     refresh_workstream_title,
     set_workstream_title,
     update_interface_setting,
@@ -114,6 +117,31 @@ def title_client(_inject_storage):
 
 @pytest.fixture
 def open_client(_inject_storage):
+    """Build a TestClient with the lifted ``open`` handler wired the
+    same way ``server.py`` does — alias resolver, no post-load
+    callback (the tests assert HTTP-shape only, not the SSE replay).
+
+    The alias resolver is wrapped in a lazy lookup so each test's
+    ``@patch("turnstone.core.memory.resolve_workstream")`` is
+    visible at request time. A direct function reference would
+    bind to the unpatched original at fixture-construction time.
+    """
+
+    def _lazy_alias_resolver(ws_id: str) -> str | None:
+        from turnstone.core.memory import resolve_workstream
+
+        return resolve_workstream(ws_id)
+
+    mock_mgr = MagicMock()
+    cfg = SessionEndpointConfig(
+        permission_gate=None,
+        manager_lookup=lambda _r: (mock_mgr, None),
+        tenant_check=None,
+        not_found_label="Workstream not found",
+        audit_action_prefix="workstream",
+        open_resolve_alias=_lazy_alias_resolver,
+    )
+    open_handler = make_open_handler(cfg)
     app = Starlette(
         routes=[
             Mount(
@@ -121,7 +149,7 @@ def open_client(_inject_storage):
                 routes=[
                     Route(
                         "/api/workstreams/{ws_id}/open",
-                        open_workstream,
+                        open_handler,
                         methods=["POST"],
                     ),
                 ],
@@ -129,7 +157,6 @@ def open_client(_inject_storage):
         ],
         middleware=[Middleware(_InjectAuthMiddleware)],
     )
-    mock_mgr = MagicMock()
     app.state.workstreams = mock_mgr
     gq: queue.Queue[dict[str, Any]] = queue.Queue()
     app.state.global_queue = gq
@@ -300,16 +327,25 @@ class TestRefreshWorkstreamTitle:
 class TestOpenWorkstream:
     @patch("turnstone.core.memory.resolve_workstream")
     def test_open_already_loaded(self, mock_resolve, open_client):
+        """The lifted body returns ``ws.name`` directly on the
+        already-loaded shortcut path (not a display-alias re-lookup).
+        Pre-lift interactive routed through ``get_workstream_display_name``
+        here; the lift consolidates on the in-memory ``ws.name`` field
+        for parity with coord's pre-lift behaviour. Frontend already
+        re-fetches names from the dashboard endpoint so a freshly-
+        renamed workstream still surfaces its alias on subsequent
+        listings — no observable user-facing regression."""
         client, mock_mgr, gq = open_client
         mock_resolve.return_value = "ws-abc"
         mock_ws = MagicMock()
         mock_ws.id = "ws-abc"
+        mock_ws.name = "My WS"
         mock_mgr.get.return_value = mock_ws
-        with patch("turnstone.core.memory.get_workstream_display_name", return_value="My WS"):
-            r = client.post("/v1/api/workstreams/ws-abc/open")
+        r = client.post("/v1/api/workstreams/ws-abc/open")
         assert r.status_code == 200
         assert r.json()["already_loaded"] is True
         assert r.json()["ws_id"] == "ws-abc"
+        assert r.json()["name"] == "My WS"
 
     @patch("turnstone.core.memory.resolve_workstream")
     def test_open_not_found(self, mock_resolve, open_client):
@@ -320,13 +356,193 @@ class TestOpenWorkstream:
 
     @patch("turnstone.core.memory.resolve_workstream")
     def test_open_no_storage_row(self, mock_resolve, open_client, _inject_storage):
+        """``mgr.open`` returns ``None`` for missing storage rows, kind
+        mismatches, and tombstoned rows — all surface as 404 with
+        ``cfg.not_found_label``. Pre-lift returned a more specific
+        ``"Workstream not found in storage"`` from a separate
+        pre-mgr.create storage probe; the lift consolidates the
+        404 path through ``mgr.open``'s single None-return contract
+        (the kind-specific failure mode is internal detail not worth
+        a distinct error string)."""
         client, mock_mgr, gq = open_client
         mock_resolve.return_value = "ws-abc"
         mock_mgr.get.return_value = None  # not loaded
-        # Storage has no row for ws-abc
+        mock_mgr.open.return_value = (
+            None  # mgr.open's contract: None for missing/wrong-kind/tombstone
+        )
         r = client.post("/v1/api/workstreams/ws-abc/open")
         assert r.status_code == 404
-        assert "storage" in r.json()["error"].lower()
+        assert "not found" in r.json()["error"].lower()
+
+    @patch("turnstone.core.memory.resolve_workstream")
+    def test_open_calls_mgr_open_not_mgr_create(self, mock_resolve, open_client):
+        """Post-P3 reckoning item #3: interactive ``open`` must route
+        through ``mgr.open()`` (which fires ``emit_rehydrated``), not
+        ``mgr.create(ws_id=...)`` (the pre-lift workaround that
+        bypassed ``emit_rehydrated`` entirely, leaving it dead-by-
+        routing on interactive). Asserting ``mgr.open`` was called
+        + ``mgr.create`` was NOT called pins the load-bearing
+        behaviour change."""
+        client, mock_mgr, gq = open_client
+        mock_resolve.return_value = "ws-resolved"
+        mock_mgr.get.return_value = None  # not loaded
+        loaded_ws = MagicMock()
+        loaded_ws.id = "ws-resolved"
+        loaded_ws.name = "resolved"
+        mock_mgr.open.return_value = loaded_ws
+
+        r = client.post("/v1/api/workstreams/some-alias/open")
+        assert r.status_code == 200
+        mock_mgr.open.assert_called_once_with("ws-resolved")
+        mock_mgr.create.assert_not_called()
+
+    @patch("turnstone.core.memory.resolve_workstream")
+    def test_open_resolves_alias_before_lookup(self, mock_resolve, open_client):
+        """``cfg.open_resolve_alias`` runs first — the path-param can
+        be a user-friendly alias that resolves to a hex id, and the
+        already-loaded shortcut + mgr.open both see the resolved id.
+        Pre-lift behaviour preserved verbatim (interactive's friendly-
+        alias UX survives the lift)."""
+        client, mock_mgr, gq = open_client
+        mock_resolve.return_value = "ws-canonical-id"
+        mock_mgr.get.return_value = None
+        loaded_ws = MagicMock()
+        loaded_ws.id = "ws-canonical-id"
+        loaded_ws.name = "x"
+        mock_mgr.open.return_value = loaded_ws
+
+        r = client.post("/v1/api/workstreams/my-friendly-alias/open")
+        assert r.status_code == 200
+        mock_resolve.assert_called_once_with("my-friendly-alias")
+        mock_mgr.get.assert_called_once_with("ws-canonical-id")
+        mock_mgr.open.assert_called_once_with("ws-canonical-id")
+
+    @patch("turnstone.core.memory.resolve_workstream")
+    def test_open_post_load_callback_fires_with_request_and_ws(self, mock_resolve, _inject_storage):
+        """``cfg.open_post_load`` is the kind-specific hook for
+        post-mgr.open work (interactive uses it for UI replay +
+        handler-side ws_created enqueue; coord wires None). Verify
+        the callback receives ``(request, ws)`` exactly once on a
+        successful open and is NOT fired on the already-loaded
+        shortcut (the pre-lift handler also returned early in the
+        already-loaded branch before any post-load work)."""
+        from starlette.applications import Starlette
+        from starlette.middleware import Middleware
+        from starlette.routing import Mount, Route
+        from starlette.testclient import TestClient
+
+        captured: list[tuple[str, Any]] = []
+
+        def _post_load(request: Any, ws_obj: Any) -> None:
+            captured.append((ws_obj.id, ws_obj.name))
+
+        def _lazy_alias(ws_id: str) -> str | None:
+            from turnstone.core.memory import resolve_workstream
+
+            return resolve_workstream(ws_id)
+
+        mock_mgr = MagicMock()
+        cfg = SessionEndpointConfig(
+            permission_gate=None,
+            manager_lookup=lambda _r: (mock_mgr, None),
+            tenant_check=None,
+            not_found_label="Workstream not found",
+            audit_action_prefix="workstream",
+            open_resolve_alias=_lazy_alias,
+            open_post_load=_post_load,
+        )
+        handler = make_open_handler(cfg)
+        app = Starlette(
+            routes=[
+                Mount(
+                    "/v1",
+                    routes=[
+                        Route("/api/workstreams/{ws_id}/open", handler, methods=["POST"]),
+                    ],
+                ),
+            ],
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        client = TestClient(app)
+
+        # Already-loaded path: post_load must NOT fire (pre-lift
+        # parity — the original handler returned early without any
+        # post-load work in the already-loaded branch).
+        mock_resolve.return_value = "ws-loaded"
+        loaded_ws = MagicMock()
+        loaded_ws.id = "ws-loaded"
+        loaded_ws.name = "loaded-name"
+        mock_mgr.get.return_value = loaded_ws
+        r = client.post("/v1/api/workstreams/ws-loaded/open")
+        assert r.status_code == 200
+        assert r.json()["already_loaded"] is True
+        assert captured == [], "post_load fired on the already-loaded shortcut"
+
+        # Load-from-storage path: post_load fires with (request, ws).
+        mock_resolve.return_value = "ws-fresh"
+        mock_mgr.get.return_value = None
+        opened_ws = MagicMock()
+        opened_ws.id = "ws-fresh"
+        opened_ws.name = "fresh-name"
+        mock_mgr.open.return_value = opened_ws
+        r = client.post("/v1/api/workstreams/ws-fresh/open")
+        assert r.status_code == 200
+        assert captured == [("ws-fresh", "fresh-name")]
+
+    @patch("turnstone.core.memory.resolve_workstream")
+    def test_open_swallows_post_load_exception(self, mock_resolve, _inject_storage):
+        """A bug in ``open_post_load`` must NOT block the open from
+        returning 200 — the workstream is already loaded by mgr.open
+        and the post-load is observational. Mirrors the same swallow
+        pattern in ``make_cancel_handler``'s ``cancel_forensics``
+        wrapper."""
+        from starlette.applications import Starlette
+        from starlette.middleware import Middleware
+        from starlette.routing import Mount, Route
+        from starlette.testclient import TestClient
+
+        def _raises_post_load(_request: Any, _ws: Any) -> None:
+            raise RuntimeError("post-load blew up")
+
+        def _lazy_alias(ws_id: str) -> str | None:
+            from turnstone.core.memory import resolve_workstream
+
+            return resolve_workstream(ws_id)
+
+        mock_mgr = MagicMock()
+        cfg = SessionEndpointConfig(
+            permission_gate=None,
+            manager_lookup=lambda _r: (mock_mgr, None),
+            tenant_check=None,
+            not_found_label="Workstream not found",
+            audit_action_prefix="workstream",
+            open_resolve_alias=_lazy_alias,
+            open_post_load=_raises_post_load,
+        )
+        handler = make_open_handler(cfg)
+        app = Starlette(
+            routes=[
+                Mount(
+                    "/v1",
+                    routes=[
+                        Route("/api/workstreams/{ws_id}/open", handler, methods=["POST"]),
+                    ],
+                ),
+            ],
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        client = TestClient(app)
+
+        mock_resolve.return_value = "ws-fresh"
+        mock_mgr.get.return_value = None
+        opened_ws = MagicMock()
+        opened_ws.id = "ws-fresh"
+        opened_ws.name = "fresh-name"
+        mock_mgr.open.return_value = opened_ws
+
+        r = client.post("/v1/api/workstreams/ws-fresh/open")
+        assert r.status_code == 200
+        assert r.json()["ws_id"] == "ws-fresh"
 
 
 # ===========================================================================

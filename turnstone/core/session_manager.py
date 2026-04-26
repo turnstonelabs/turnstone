@@ -424,7 +424,22 @@ class SessionManager:
                     try:
                         ws.session.resume(ws_id)
                     except Exception:
-                        log.debug("session_mgr.resume_failed ws=%s", ws_id[:8], exc_info=True)
+                        # Resume can leave the session in a partial state
+                        # (``ChatSession.resume`` assigns ``self.messages``
+                        # before the config-restore block, so a failure
+                        # mid-restore loads the conversation but with
+                        # default ``temperature`` / ``max_tokens`` /
+                        # tool config). Treating this as success would
+                        # silently 200 with broken state; the user's next
+                        # send would run with default config instead of
+                        # the persisted config. Roll the slot back so the
+                        # caller surfaces a 5xx and the storage row stays
+                        # available for a retry. Mirrors the
+                        # build_session-failure unwind above.
+                        self._adapter.cleanup_ui(ws)
+                        with self._lock:
+                            self._remove_locked(ws_id)
+                        raise
 
                 # No DB state-flip on resurrect. The in-memory session
                 # is IDLE; the DB row may still say 'closed' from the

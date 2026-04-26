@@ -41,7 +41,6 @@ from turnstone.console.server import (
     coordinator_detail,
     coordinator_history,
     coordinator_list,
-    coordinator_open,
     coordinator_saved,
     coordinator_tasks,
 )
@@ -62,6 +61,7 @@ from turnstone.core.session_routes import (
     make_attachment_handlers,
     make_cancel_handler,
     make_close_handler,
+    make_open_handler,
     make_send_handler,
 )
 from turnstone.core.storage._sqlite import SQLiteBackend
@@ -172,7 +172,7 @@ def _make_client(
             ),
             Route(
                 "/v1/api/workstreams/{ws_id}/open",
-                coordinator_open,
+                make_open_handler(_coord_endpoint_config),
                 methods=["POST"],
             ),
             Route(

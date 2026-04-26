@@ -234,6 +234,80 @@ Three release tracks are maintained:
     those children were silently no-op'd, so the cascade response's
     ``failed`` bucket no longer fires spurious operator alerts.
 
+- **`open` verb body lifted across both kinds** ([Stage 2 Verb
+  Lift — `open`]). The interactive
+  ``POST /v1/api/workstreams/{ws_id}/open`` and coord
+  ``POST /v1/api/workstreams/{ws_id}/open`` handlers now share one
+  body via ``make_open_handler(cfg, *, audit_emit=None)``. Per-kind
+  divergence captured by two new ``SessionEndpointConfig`` fields:
+
+  - ``open_resolve_alias: AliasResolver | None`` — interactive
+    wires :func:`turnstone.core.memory.resolve_workstream` so
+    callers can pass user-friendly aliases ("my-debug-ws") in the
+    path param. Coord wires ``None`` (hex ids only).
+  - ``open_post_load: OpenPostLoad | None`` — interactive wires the
+    UI-replay (``clear_ui`` + history) + handler-side ``ws_created``
+    enqueue onto the global SSE queue. Coord wires ``None`` and
+    relies on the cluster collector fan-out from
+    ``CoordinatorAdapter.emit_rehydrated``.
+
+  **Load-bearing fix** (§ Post-P3 reckoning item #3): interactive
+  ``open_workstream`` previously called
+  ``mgr.create(ws_id=resolved_id)`` + ``ws.session.resume(...)`` to
+  rehydrate, bypassing ``mgr.open()`` entirely. After the lift both
+  kinds route through ``mgr.open()`` — which makes
+  ``InteractiveAdapter.emit_rehydrated`` reachable on interactive
+  (it had been dead-by-routing) and gives the manager a single
+  rehydrate code path to maintain. ``emit_rehydrated`` stays a
+  documented no-op stub on the interactive adapter (the
+  handler-side ``ws_created`` enqueue from ``open_post_load`` is
+  the load-bearing emission).
+
+  Two observable behaviour changes for interactive callers:
+
+  - **Cross-kind open returns 404** (was 400). Pre-lift had a
+    pre-mgr storage probe that returned ``400`` with
+    ``"Workstream is not an interactive kind"`` for coord rows;
+    the lift consolidates on ``mgr.open()``'s single ``None``-
+    return contract for missing / wrong-kind / tombstoned rows.
+    Security boundary unchanged.
+  - **Already-loaded response uses ``ws.name`` directly** (was
+    ``get_workstream_display_name(resolved_id) or resolved_id``).
+    A workstream renamed via ``set_workstream_alias`` after being
+    loaded into memory will surface the storage-row name in the
+    open response's ``name`` field instead of the latest alias.
+    The dashboard listing endpoint still resolves aliases on its
+    own pass, so the user-visible workstream name in the tab strip
+    isn't affected.
+
+  Coord behaviour unchanged.
+
+  Two /review fixes folded into the same commit:
+
+  - **Resume failures now return 5xx instead of broken-200.**
+    ``SessionManager.open()`` previously caught and ``log.debug``-
+    swallowed exceptions from ``ChatSession.resume`` (which assigns
+    ``self.messages`` *before* the config-restore block, so a
+    partial-failure resume — corrupted ``workstream_config`` row,
+    model-registry mismatch on a saved alias, malformed
+    ``temperature`` / ``max_tokens`` — would leave the session with
+    history but with default config). Pre-lift, the interactive
+    open handler called ``ws.session.resume(...)`` directly and let
+    exceptions propagate as 500. The lift accidentally inherited
+    the swallow because it routed through ``mgr.open()``. Restored
+    pre-lift behaviour: ``mgr.open()`` now re-raises resume
+    exceptions after rolling back the slot (``cleanup_ui`` +
+    ``_remove_locked``), so the lifted handler returns 500 with
+    a correlation id and the storage row stays available for a
+    retry instead of silently 200'ing with broken state.
+  - **``except Exception`` in the lifted body documents intent.**
+    The bare exception catch around ``mgr.open(ws_id)`` is
+    intentional — the kind's session factory has no documented
+    exception spec, and resume can propagate from
+    ``ChatSession.resume``. A one-line rationale comment in the
+    handler body keeps a future contributor from narrowing it
+    incorrectly.
+
 ### Security
 
 - **Coord attachment endpoints are now kind-strict**

@@ -65,6 +65,7 @@ from turnstone.core.session_routes import (
     make_close_handler,
     make_dequeue_handler,
     make_legacy_body_keyed_adapter,
+    make_open_handler,
     make_send_handler,
     register_session_routes,
 )
@@ -890,6 +891,83 @@ def _audit_close_workstream(
         "workstream",
         ws_id,
         detail,
+        ip,
+    )
+
+
+def _interactive_open_post_load(request: Request, ws: Workstream) -> None:
+    """Post-load hook for the lifted interactive ``open`` body.
+
+    Runs after ``mgr.open(ws_id)`` returns the workstream (which
+    internally already attempted ``ws.session.resume(ws_id)`` and
+    fired ``InteractiveAdapter.emit_rehydrated`` — the latter being
+    a no-op stub on interactive per the documented asymmetry). This
+    callback handles the interactive-only out-of-band emissions:
+
+    1. Sync the workstream's name to the persisted display alias
+       (a user-renamed workstream stores its alias separately from
+       the manager's in-memory name).
+    2. Replay clear_ui + history onto the per-workstream UI listener
+       queue so a freshly-connected browser tab sees the conversation
+       state. Only fires when ``ws.session.messages`` is non-empty
+       (resume succeeded and there's history to show).
+    3. Enqueue ``ws_created`` onto the global SSE queue so dashboards
+       and other multi-workstream consumers see the rehydrate. The
+       handler-side emission is the load-bearing path on interactive;
+       ``InteractiveAdapter.emit_rehydrated`` is a no-op stub
+       precisely because this enqueue lives here.
+    """
+    from turnstone.core.memory import get_workstream_display_name
+
+    ws.name = get_workstream_display_name(ws.id) or ws.name
+    ui = ws.ui
+    session = ws.session
+    if isinstance(ui, WebUI) and session is not None and session.messages:
+        ui._enqueue({"type": "clear_ui"})
+        history = _build_history(session)
+        if history:
+            ui._enqueue({"type": "history", "messages": history})
+
+    gq: queue.Queue[dict[str, Any]] | None = getattr(request.app.state, "global_queue", None)
+    if gq is not None:
+        with contextlib.suppress(queue.Full):
+            gq.put_nowait(
+                {
+                    "type": "ws_created",
+                    "ws_id": ws.id,
+                    "name": ws.name,
+                    "model": session.model if session else "",
+                    "model_alias": session.model_alias if session else "",
+                    "kind": ws.kind,
+                    "parent_ws_id": ws.parent_ws_id,
+                    "user_id": ws.user_id,
+                }
+            )
+
+
+def _audit_workstream_opened(request: Request, ws: Workstream) -> None:
+    """Record the ``workstream.opened`` audit event.
+
+    Passed to :func:`make_open_handler` as the ``audit_emit``
+    callable. Mirrors :func:`_audit_close_workstream`'s shape.
+    Distinguishing rehydrate from fresh-create in the audit trail
+    (same ``ws_created`` SSE shape on the wire; the audit action
+    name is the disambiguator) is the original justification for
+    this row.
+    """
+    from turnstone.core.audit import record_audit
+
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return
+    _, ip = _audit_context(request)
+    record_audit(
+        storage,
+        _auth_user_id(request),
+        "workstream.opened",
+        "workstream",
+        ws.id,
+        {"kind": str(ws.kind), "parent_ws_id": ws.parent_ws_id},
         ip,
     )
 
@@ -2623,120 +2701,6 @@ def _require_ws_access(
     return resolve_workstream_owner(request, ws_id, mgr=mgr, not_found_label="Workstream not found")
 
 
-async def open_workstream(request: Request) -> JSONResponse:
-    """POST /v1/api/workstreams/{ws_id}/open — load a saved workstream into memory.
-
-    Unlike resume (which creates a NEW workstream and forks), this endpoint
-    loads the existing workstream into memory with its original ws_id preserved.
-    """
-    from turnstone.core.log import get_logger
-    from turnstone.core.memory import get_workstream_display_name, resolve_workstream
-    from turnstone.core.storage import get_storage as _get_storage
-
-    log = get_logger(__name__)
-    ws_id = request.path_params.get("ws_id", "")
-    if not ws_id:
-        return JSONResponse({"error": "ws_id is required"}, status_code=400)
-
-    resolved_id = resolve_workstream(ws_id)
-    if not resolved_id:
-        return JSONResponse({"error": "Workstream not found"}, status_code=404)
-
-    mgr: SessionManager = request.app.state.workstreams
-
-    if mgr.get(resolved_id):
-        return JSONResponse(
-            {
-                "ws_id": resolved_id,
-                "name": get_workstream_display_name(resolved_id) or resolved_id,
-                "already_loaded": True,
-            }
-        )
-
-    _st = _get_storage()
-    ws_row = _st.get_workstream(resolved_id)
-    if not ws_row:
-        return JSONResponse({"error": "Workstream not found in storage"}, status_code=404)
-
-    # Coordinator workstreams live on the console process, not on server
-    # nodes.  Refuse to rehydrate one here so we don't silently build a
-    # coordinator-kind ChatSession with coord_client=None (A/S1 guard).
-    if ws_row.get("kind") != WorkstreamKind.INTERACTIVE:
-        return JSONResponse(
-            {"error": "Workstream is not an interactive kind"},
-            status_code=400,
-        )
-
-    uid: str = _auth_user_id(request)
-
-    # Trusted-team model: scope-level auth (already enforced by the
-    # middleware) is the only gate.  ``user_id`` is metadata for audit
-    # + display, not an access boundary, so any authenticated caller
-    # can rehydrate any persisted workstream.  Fall back to the
-    # caller's uid when the row has no recorded owner.
-    stored_owner = (ws_row.get("user_id") or "").strip()
-    owner_uid = stored_owner or uid
-
-    try:
-        ws = mgr.create(
-            user_id=owner_uid,
-            name=ws_row.get("name", ""),
-            ws_id=resolved_id,
-            parent_ws_id=ws_row.get("parent_ws_id"),
-        )
-    except Exception as e:
-        log.warning("ws.open.create_failed", ws_id=resolved_id[:8], error=str(e))
-        return JSONResponse({"error": f"Failed to load workstream: {e}"}, status_code=500)
-
-    if not isinstance(ws.ui, WebUI):
-        msg = f"Expected WebUI, got {type(ws.ui).__name__}"
-        raise TypeError(msg)
-
-    if ws.session is not None and ws.session.resume(resolved_id):
-        ws.name = get_workstream_display_name(resolved_id) or ws.name
-        ui = ws.ui
-        ui._enqueue({"type": "clear_ui"})
-        history = _build_history(ws.session)
-        if history:
-            ui._enqueue({"type": "history", "messages": history})
-
-    gq: queue.Queue[dict[str, Any]] = request.app.state.global_queue
-    with contextlib.suppress(queue.Full):
-        gq.put_nowait(
-            {
-                "type": "ws_created",
-                "ws_id": ws.id,
-                "name": ws.name,
-                "model": ws.session.model if ws.session else "",
-                "model_alias": ws.session.model_alias if ws.session else "",
-                "kind": ws.kind,
-                "parent_ws_id": ws.parent_ws_id,
-                "user_id": ws.user_id,
-            }
-        )
-
-    # Audit the rehydration so console-side forensic review can distinguish
-    # rehydrated workstreams from fresh creates (same broadcast shape; the
-    # audit action name is the disambiguator).
-    _audit_storage = getattr(request.app.state, "auth_storage", None)
-    if _audit_storage is not None:
-        from turnstone.core.audit import record_audit as _record_audit
-
-        _, _audit_ip = _audit_context(request)
-        _record_audit(
-            _audit_storage,
-            _auth_user_id(request),
-            "workstream.opened",
-            "workstream",
-            ws.id,
-            {"kind": str(ws.kind), "parent_ws_id": ws.parent_ws_id},
-            _audit_ip,
-        )
-
-    log.info("ws.opened", ws_id=resolved_id[:8])
-    return JSONResponse({"ws_id": ws.id, "name": ws.name})
-
-
 async def list_watches(request: Request) -> JSONResponse:
     """GET /v1/api/watches — list active watches, optionally filtered by ws_id."""
     from turnstone.core.storage._registry import get_storage
@@ -3833,6 +3797,8 @@ def create_app(
         classify_text_attachment=_classify_text_attachment,
         upload_lock=_attachment_upload_lock,
     )
+    from turnstone.core.memory import resolve_workstream as _resolve_workstream_alias
+
     interactive_endpoint_config = SessionEndpointConfig(
         permission_gate=None,  # interactive auth is enforced at the middleware layer
         manager_lookup=_interactive_manager_lookup,
@@ -3845,6 +3811,8 @@ def create_app(
         spawn_metrics=_interactive_spawn_metrics,
         emit_message_queued=True,
         cancel_forensics=_capture_cancel_forensics,
+        open_resolve_alias=_resolve_workstream_alias,
+        open_post_load=_interactive_open_post_load,
     )
     approve_handler = make_approve_handler(interactive_endpoint_config)
     close_handler = make_close_handler(
@@ -3853,6 +3821,10 @@ def create_app(
         supports_close_reason=True,
     )
     cancel_handler = make_cancel_handler(interactive_endpoint_config)
+    open_handler = make_open_handler(
+        interactive_endpoint_config,
+        audit_emit=_audit_workstream_opened,
+    )
     send_handler = make_send_handler(interactive_endpoint_config)
     dequeue_handler = make_dequeue_handler(interactive_endpoint_config)
     attachment_handlers = make_attachment_handlers(interactive_endpoint_config)
@@ -3869,7 +3841,7 @@ def create_app(
             create=create_workstream,
             close_legacy=make_legacy_body_keyed_adapter(close_handler),
             delete=delete_workstream_endpoint,
-            open=open_workstream,
+            open=open_handler,  # lifted: shared body
             close=close_handler,  # lifted: shared body
             refresh_title=refresh_workstream_title,
             set_title=set_workstream_title,

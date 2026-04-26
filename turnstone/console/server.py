@@ -63,6 +63,7 @@ from turnstone.core.session_routes import (
     make_attachment_handlers,
     make_cancel_handler,
     make_close_handler,
+    make_open_handler,
     make_send_handler,
     register_coord_verbs,
     register_session_routes,
@@ -2817,52 +2818,6 @@ async def coordinator_detail(request: Request) -> JSONResponse:
             "kind": ws.kind,
         }
     )
-
-
-async def coordinator_open(request: Request) -> JSONResponse:
-    """POST /v1/api/workstreams/{ws_id}/open — explicit rehydration.
-
-    Parity with the server's ``POST /v1/api/workstreams/{ws_id}/open``.
-    ``coordinator_detail`` already rehydrates lazily on a GET miss; this
-    endpoint gives SDK callers and operators a way to warm a coordinator
-    without browsing to it.  Same ownership / 404-on-mismatch /
-    correlation-id-masked error semantics as ``coordinator_detail``.
-    """
-    err = _require_admin_coordinator(request)
-    if err is not None:
-        return err
-    coord_mgr, err503 = _require_coord_mgr(request)
-    if err503 is not None:
-        return err503
-    ws_id = request.path_params.get("ws_id", "")
-    if not ws_id:
-        return JSONResponse({"error": "ws_id is required"}, status_code=400)
-    ws = coord_mgr.get(ws_id)
-    if ws is not None:
-        return JSONResponse({"ws_id": ws.id, "name": ws.name, "already_loaded": True})
-    try:
-        ws = coord_mgr.open(ws_id)
-    except ValueError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=503)
-    except Exception:
-        correlation_id = secrets.token_hex(4)
-        log.warning(
-            "coordinator_open.rehydrate_failed correlation_id=%s ws_id=%s",
-            correlation_id,
-            ws_id[:8],
-            exc_info=True,
-        )
-        return JSONResponse(
-            {
-                "error": (
-                    f"failed to open coordinator (internal error). correlation_id={correlation_id}"
-                )
-            },
-            status_code=500,
-        )
-    if ws is None:
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    return JSONResponse({"ws_id": ws.id, "name": ws.name})
 
 
 _CHILDREN_PAGE_LIMIT = 200
@@ -10177,7 +10132,7 @@ def create_app(
             list_saved=coordinator_saved,
             create=coordinator_create,
             detail=coordinator_detail,
-            open=coordinator_open,
+            open=make_open_handler(coord_endpoint_config),  # lifted: shared body
             close=make_close_handler(  # lifted: shared body
                 coord_endpoint_config,
                 audit_emit=_audit_close_coordinator,

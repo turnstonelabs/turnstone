@@ -89,6 +89,29 @@ class CancelForensics(Protocol):
         """Return the ``dropped`` snapshot for the cancel response."""
 
 
+# (alias_or_id) -> canonical_id_or_None. Interactive's lifted
+# ``open`` body (:func:`make_open_handler`) pre-resolves user-friendly
+# aliases to the canonical hex ws_id via
+# :func:`turnstone.core.memory.resolve_workstream` so callers can
+# pass either shape. Coord wires ``None`` (coord workstreams are
+# addressed by hex id only).
+AliasResolver = Callable[[str], str | None]
+# (request, ws) -> None. Optional kind-specific post-load callback
+# the lifted ``open`` body fires after the workstream is loaded into
+# the manager. Interactive uses it to push a ``clear_ui`` + history
+# replay onto the UI listener queue and to enqueue a handler-side
+# ``ws_created`` event onto the global SSE queue (the global-queue
+# emission stays out of band on interactive — see
+# :class:`SessionKindAdapter` docstring for the asymmetry rationale).
+# Coord wires ``None`` and relies on the cluster collector fan-out
+# triggered by ``CoordinatorAdapter.emit_rehydrated``.
+OpenPostLoad = Callable[["Request", "Workstream"], None]
+# (request, ws) -> None. Optional audit emitter for the ``open``
+# event. Same shape as ``CloseAuditEmitter``'s leading args. Coord
+# wires ``None`` (coord doesn't audit open today).
+OpenAuditEmitter = Callable[["Request", "Workstream"], None]
+
+
 @dataclass(frozen=True)
 class AttachmentUploadHelpers:
     """Process-local hooks the lifted attachment factories call into.
@@ -188,6 +211,23 @@ class SessionEndpointConfig:
     # Coord wires ``None`` — no forensic surface today; the lifted
     # body still returns ``dropped: {}`` for response-shape parity.
     cancel_forensics: CancelForensics | None = None
+    # (alias_or_id) -> canonical_id_or_None. When set, the lifted
+    # ``open`` body resolves the path-param ws_id through this
+    # callable before any storage lookup. Interactive wires
+    # :func:`turnstone.core.memory.resolve_workstream` so user-friendly
+    # aliases ("my-debug-ws") map to canonical hex ids. Coord wires
+    # ``None`` — coord uses hex ids only.
+    open_resolve_alias: AliasResolver | None = None
+    # (request, ws) -> None. Kind-specific post-load callback fired
+    # by the lifted ``open`` body after ``mgr.open(ws_id)`` returns
+    # the workstream. Interactive uses it to send the UI-replay
+    # events (``clear_ui`` + history) and to enqueue a handler-side
+    # ``ws_created`` onto the global SSE queue (out-of-band path —
+    # see :class:`SessionKindAdapter` docstring for why interactive's
+    # creation events stay outside the manager's emit_*). Coord
+    # wires ``None`` and lets the cluster collector handle the
+    # transition via ``CoordinatorAdapter.emit_rehydrated``.
+    open_post_load: OpenPostLoad | None = None
 
 
 @dataclass(frozen=True)
@@ -865,6 +905,167 @@ def make_cancel_handler(
         return JSONResponse({"status": "ok", "dropped": dropped})
 
     return cancel
+
+
+def make_open_handler(
+    cfg: SessionEndpointConfig,
+    *,
+    audit_emit: OpenAuditEmitter | None = None,
+) -> Handler:
+    """Lifted body for ``POST {prefix}/{ws_id}/open``.
+
+    Loads a persisted workstream into memory under its original
+    ws_id (vs ``resume`` which forks into a fresh ws_id). Both kinds
+    share the auth → mgr → already-loaded shortcut → ``mgr.open()``
+    → 404-on-miss sequence; per-kind divergence captured by the
+    cfg + ``audit_emit``:
+
+    - ``cfg.open_resolve_alias`` — interactive wires
+      :func:`turnstone.core.memory.resolve_workstream` so callers
+      can pass user-friendly aliases ("my-debug-ws") in the path
+      param. Coord wires ``None`` (hex ids only).
+    - ``cfg.open_post_load`` — interactive uses it for UI-replay
+      events (``clear_ui`` + history) plus a handler-side
+      ``ws_created`` enqueue onto the global SSE queue. Coord wires
+      ``None`` and relies on the cluster collector fan-out triggered
+      by ``CoordinatorAdapter.emit_rehydrated``.
+    - ``audit_emit`` — kind's audit hook for the ``open`` event.
+      Interactive wires ``workstream.opened``; coord wires ``None``
+      (coord doesn't audit open today).
+
+    Pre-lift behaviour preserved on both kinds with one important
+    fix: **interactive previously called ``mgr.create(ws_id=...)``
+    + ``ws.session.resume(...)`` to rehydrate, bypassing
+    ``mgr.open()`` entirely**. After this lift both kinds route
+    through ``mgr.open()`` — which makes ``emit_rehydrated``
+    reachable on interactive (it had been dead-by-routing pre-lift)
+    and gives the manager a single rehydrate code path to maintain.
+    See § Post-P3 reckoning item #3 in
+    ``1.5.0-session-manager-stage-2.md`` for the design history.
+
+    Args:
+        cfg: per-kind policy bundle.
+        audit_emit: kind's audit hook. ``None`` skips the audit.
+    """
+
+    async def open_ws(request: Request) -> Response:
+        if cfg.permission_gate is not None:
+            err = cfg.permission_gate(request)
+            if err is not None:
+                return err
+        mgr_opt, err503 = cfg.manager_lookup(request)
+        if err503 is not None:
+            return err503
+        # See ``make_approve_handler`` for the cast rationale.
+        mgr = cast("SessionManager", mgr_opt)
+
+        ws_id = request.path_params.get("ws_id", "")
+        if not ws_id:
+            return JSONResponse({"error": "ws_id is required"}, status_code=400)
+
+        # Optional alias resolution. Interactive lets callers pass
+        # user-friendly aliases; coord skips this entirely.
+        if cfg.open_resolve_alias is not None:
+            resolved = cfg.open_resolve_alias(ws_id)
+            if not resolved:
+                return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+            ws_id = resolved
+
+        # Already-loaded shortcut — both kinds return the same
+        # ``{ws_id, name, already_loaded: true}`` shape.
+        existing = mgr.get(ws_id)
+        if existing is not None:
+            return JSONResponse(
+                {
+                    "ws_id": existing.id,
+                    "name": existing.name,
+                    "already_loaded": True,
+                }
+            )
+
+        try:
+            ws = mgr.open(ws_id)
+        except ValueError as exc:
+            # Session factory misconfig (e.g., a model alias that
+            # no longer exists). Surface the factory's remediation
+            # text as a 503 so the operator can fix it without
+            # digging through stack traces. Same shape coord used
+            # pre-lift; standardised across both kinds here.
+            return JSONResponse({"error": str(exc)}, status_code=503)
+        except Exception:
+            # Bare ``Exception`` is intentional: ``mgr.open`` can
+            # raise from ``adapter.build_session`` (no documented
+            # exception spec — depends on the kind's session factory)
+            # or from ``ChatSession.resume`` propagating a partial-
+            # restore failure (corrupted workstream_config row,
+            # model-registry mismatch on saved alias, etc.). Either
+            # way the workstream isn't loadable; the operator needs
+            # the correlation-id'd log entry to diagnose.
+            #
+            # Don't echo the exception text — it can leak internal
+            # paths / frame names. Log with a correlation id and
+            # return that to the client so support can match a
+            # report to the log line. Mirrors coord's pre-lift
+            # ``coordinator_open`` 500 path.
+            import secrets
+
+            correlation_id = secrets.token_hex(4)
+            log.warning(
+                "ws.open.rehydrate_failed correlation_id=%s ws_id=%s",
+                correlation_id,
+                ws_id[:8] if ws_id else "",
+                exc_info=True,
+            )
+            return JSONResponse(
+                {
+                    "error": (
+                        f"failed to open workstream (internal error). "
+                        f"correlation_id={correlation_id}"
+                    )
+                },
+                status_code=500,
+            )
+
+        # Both except branches above ``return``; ``ws`` is bound here.
+        if ws is None:
+            # ``mgr.open`` returns None for missing rows, kind
+            # mismatch, and tombstoned rows — all surface as 404
+            # for the caller (the kind-specific failure mode is
+            # internal detail).
+            return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+
+        # Kind-specific post-load action (interactive: UI replay +
+        # handler-side ws_created enqueue; coord: None and the
+        # cluster collector handles the fan-out via the adapter's
+        # emit_rehydrated path).
+        if cfg.open_post_load is not None:
+            try:
+                cfg.open_post_load(request, ws)
+            except Exception:
+                # Post-load is observational — never let a hook bug
+                # block the open. Log + continue.
+                log.debug(
+                    "ws.open.post_load_failed ws=%s",
+                    ws.id[:8],
+                    exc_info=True,
+                )
+
+        if audit_emit is not None:
+            try:
+                audit_emit(request, ws)
+            except Exception:
+                # Mirrors make_close_handler / make_cancel_handler
+                # — audit-write failures shouldn't surface as HTTP
+                # 500. Log + continue.
+                log.warning(
+                    "ws.open.audit_failed ws=%s",
+                    ws.id[:8],
+                    exc_info=True,
+                )
+
+        return JSONResponse({"ws_id": ws.id, "name": ws.name})
+
+    return open_ws
 
 
 def make_send_handler(cfg: SessionEndpointConfig) -> Handler:

@@ -241,7 +241,19 @@ class TestKindValidationOnCreate:
 
 
 class TestOpenKindGate:
-    """POST /v1/api/workstreams/{ws_id}/open refuses coordinator rows."""
+    """POST /v1/api/workstreams/{ws_id}/open refuses coordinator rows.
+
+    Post-lift behavior change: the lifted ``open`` body delegates the
+    kind check to ``SessionManager.open()`` (which returns ``None``
+    for kind mismatch / missing row / tombstone — all the
+    "manager has no such ws_id" cases). The pre-lift handler had a
+    separate pre-mgr storage probe that returned a kind-specific
+    400 ("Workstream is not an interactive kind"); the lift
+    consolidates on a single 404 ("Workstream not found"). Security
+    boundary unchanged — caller still can't open a coord row from
+    the interactive node — but the error code + message converge
+    with the rest of the not-found paths.
+    """
 
     def test_refuses_to_open_coordinator(self, app_client):
         from turnstone.core.storage import get_storage
@@ -260,8 +272,8 @@ class TestOpenKindGate:
             "/v1/api/workstreams/coord-1/open",
             headers=_auth("user-1"),
         )
-        assert resp.status_code == 400
-        assert "interactive" in resp.json()["error"].lower()
+        assert resp.status_code == 404
+        assert "not found" in resp.json()["error"].lower()
 
 
 # ---------------------------------------------------------------------------
