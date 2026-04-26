@@ -38,7 +38,6 @@ from turnstone.console.server import (
     _coord_create_validate_request,
     _require_admin_coordinator,
     _require_coord_mgr,
-    coordinator_detail,
 )
 from turnstone.core.auth import AuthResult
 from turnstone.core.session_manager import SessionManager
@@ -46,6 +45,7 @@ from turnstone.core.session_routes import (
     SessionEndpointConfig,
     make_close_handler,
     make_create_handler,
+    make_detail_handler,
     make_list_handler,
 )
 from turnstone.core.storage._sqlite import SQLiteBackend
@@ -164,7 +164,7 @@ def _make_client(
             ),
             Route(
                 "/v1/api/workstreams/{ws_id}",
-                coordinator_detail,
+                make_detail_handler(_coord_endpoint_config),
                 methods=["GET"],
             ),
         ],

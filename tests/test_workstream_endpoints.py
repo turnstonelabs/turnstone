@@ -20,9 +20,12 @@ if TYPE_CHECKING:
 from turnstone.core.auth import AuthResult
 from turnstone.core.session_routes import (
     SessionEndpointConfig,
+    make_detail_handler,
+    make_history_handler,
     make_open_handler,
 )
 from turnstone.core.storage._sqlite import SQLiteBackend
+from turnstone.core.workstream import WorkstreamKind
 from turnstone.server import (
     delete_workstream_endpoint,
     list_interface_settings,
@@ -678,3 +681,262 @@ class TestUpdateInterfaceSetting:
             json={"value": "neon-pink"},
         )
         assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# History / detail — interactive parity with the lifted factories
+# ---------------------------------------------------------------------------
+#
+# Stage 2 ``history`` / ``detail`` verb lift adds these endpoints to the
+# interactive surface as a feature gain (pre-lift only coord exposed
+# them). The lifted factories live in :mod:`turnstone.core.session_routes`;
+# coord parity coverage lives in :mod:`tests.test_coordinator_endpoints`.
+# These tests pin the interactive wiring against the same factory.
+
+
+def _interactive_endpoint_cfg(mock_mgr: Any) -> SessionEndpointConfig:
+    """Interactive-shaped cfg wired the same way ``server.py`` does.
+
+    Shared by both :func:`_build_history_app` and :func:`_build_detail_app`
+    — every field both factories actually read is present (the detail
+    factory ignores ``list_kind`` since it relies on ``mgr.open()`` for
+    cross-kind isolation, but the field is harmless to set).
+    """
+    return SessionEndpointConfig(
+        permission_gate=None,  # auth middleware covers it
+        manager_lookup=lambda _r: (mock_mgr, None),
+        tenant_check=None,
+        not_found_label="Workstream not found",
+        audit_action_prefix="workstream",
+        list_kind=WorkstreamKind.INTERACTIVE,
+    )
+
+
+def _build_history_app(mock_mgr: Any, storage: Any) -> TestClient:
+    cfg = _interactive_endpoint_cfg(mock_mgr)
+    handler = make_history_handler(cfg)
+    app = Starlette(
+        routes=[
+            Mount(
+                "/v1",
+                routes=[
+                    Route("/api/workstreams/{ws_id}/history", handler, methods=["GET"]),
+                ],
+            ),
+        ],
+        middleware=[Middleware(_InjectAuthMiddleware)],
+    )
+    app.state.workstreams = mock_mgr
+    app.state.auth_storage = storage
+    return TestClient(app)
+
+
+def _build_detail_app(mock_mgr: Any) -> TestClient:
+    cfg = _interactive_endpoint_cfg(mock_mgr)
+    handler = make_detail_handler(cfg)
+    app = Starlette(
+        routes=[
+            Mount(
+                "/v1",
+                routes=[Route("/api/workstreams/{ws_id}", handler, methods=["GET"])],
+            ),
+        ],
+        middleware=[Middleware(_InjectAuthMiddleware)],
+    )
+    app.state.workstreams = mock_mgr
+    return TestClient(app)
+
+
+class TestHistoryInteractive:
+    """Interactive parity for the lifted ``GET /v1/api/workstreams/{ws_id}/history``."""
+
+    def test_returns_messages_for_in_memory_workstream(self, _inject_storage):
+        ws_id = "ws-int-1"
+        _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
+        _inject_storage.save_message(ws_id, "user", "hello interactive")
+        mock_ws = MagicMock()
+        mock_ws.id = ws_id
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = mock_ws
+        client = _build_history_app(mock_mgr, _inject_storage)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}/history")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ws_id"] == ws_id
+        assert any(
+            m.get("role") == "user" and m.get("content") == "hello interactive"
+            for m in body["messages"]
+        )
+
+    def test_serves_storage_only_workstream(self, _inject_storage):
+        """Persisted-but-not-loaded interactives serve history without
+        rehydrating — same shape as coord. Pre-lift interactive had no
+        history endpoint at all, so this is a feature gain."""
+        ws_id = "ws-cold"
+        _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
+        _inject_storage.save_message(ws_id, "assistant", "from cold storage")
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = None  # not loaded
+        client = _build_history_app(mock_mgr, _inject_storage)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}/history")
+        assert r.status_code == 200
+        assert any(m.get("content") == "from cold storage" for m in r.json()["messages"])
+
+    def test_404_on_missing_ws_id(self, _inject_storage):
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = None
+        client = _build_history_app(mock_mgr, _inject_storage)
+
+        r = client.get("/v1/api/workstreams/no-such-ws/history")
+        assert r.status_code == 404
+        assert r.json()["error"] == "Workstream not found"
+
+    def test_404_on_cross_kind_coord_ws_id(self, _inject_storage):
+        """Cross-kind isolation on the storage fallback: a coord ws_id
+        in shared storage 404s on the interactive history endpoint.
+        Mirrors :func:`test_history_404_when_kind_interactive` in
+        ``tests.test_coordinator_endpoints``."""
+        ws_id = "ws-coord-1"
+        _inject_storage.register_workstream(ws_id, kind="coordinator", user_id="test-user")
+        _inject_storage.save_message(ws_id, "user", "coord-only content")
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = None
+        client = _build_history_app(mock_mgr, _inject_storage)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}/history")
+        assert r.status_code == 404
+        assert "coord-only content" not in r.text
+
+    def test_clamps_limit_query_param(self, _inject_storage):
+        """Same [1, 500] clamp as coord — pre-lift interactive had no
+        history endpoint to enforce a clamp, so this is the
+        first-time bound. Out-of-range / unparseable values fall
+        back to defaults instead of erroring."""
+        ws_id = "ws-clamp"
+        _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
+        for i in range(4):
+            _inject_storage.save_message(ws_id, "user", f"msg-{i}")
+        mock_ws = MagicMock()
+        mock_ws.id = ws_id
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = mock_ws
+        client = _build_history_app(mock_mgr, _inject_storage)
+
+        base = f"/v1/api/workstreams/{ws_id}/history"
+        # No limit → default 100 returns all 4.
+        assert len(client.get(base).json()["messages"]) == 4
+        # limit=2 → only 2.
+        assert len(client.get(base, params={"limit": 2}).json()["messages"]) == 2
+        # 0 → clamps to 1.
+        assert len(client.get(base, params={"limit": 0}).json()["messages"]) == 1
+        # Garbage → falls back to 100.
+        assert client.get(base, params={"limit": "garbage"}).status_code == 200
+        # Above-cap → clamps to 500 (response is still 200; we have 4 rows).
+        assert client.get(base, params={"limit": 999}).status_code == 200
+
+
+class TestDetailInteractive:
+    """Interactive parity for the lifted ``GET /v1/api/workstreams/{ws_id}``.
+
+    The lifted ``make_detail_handler`` factory never reads storage —
+    cross-kind isolation is enforced inside ``mgr.open()`` and the
+    response is built from in-memory ``Workstream`` fields. The
+    ``mgr.open`` calls are mocked via ``MagicMock`` here, so the
+    storage-registry side effect that ``_inject_storage`` would
+    otherwise provide is irrelevant; the fixture is intentionally
+    omitted from these methods (unlike :class:`TestHistoryInteractive`
+    where the storage backend serves the message rows).
+    """
+
+    def test_returns_workstream_fields(self):
+        ws_id = "ws-detail-1"
+        ws_state = MagicMock()
+        ws_state.value = "idle"
+        loaded_ws = MagicMock()
+        loaded_ws.id = ws_id
+        loaded_ws.name = "my-interactive"
+        loaded_ws.state = ws_state
+        loaded_ws.user_id = "test-user"
+        loaded_ws.kind = "interactive"
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = loaded_ws
+        client = _build_detail_app(mock_mgr)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}")
+        assert r.status_code == 200
+        body = r.json()
+        assert body == {
+            "ws_id": ws_id,
+            "name": "my-interactive",
+            "state": "idle",
+            "user_id": "test-user",
+            "kind": "interactive",
+        }
+
+    def test_lazy_rehydrates_on_miss(self):
+        """``mgr.get`` miss → ``mgr.open`` rehydrate. Same flow as coord;
+        pre-lift interactive had no detail endpoint so this is the
+        first time the rehydrate path is exercised on this surface."""
+        ws_id = "ws-cold-detail"
+        ws_state = MagicMock()
+        ws_state.value = "closed"
+        rehydrated = MagicMock()
+        rehydrated.id = ws_id
+        rehydrated.name = "rehydrated"
+        rehydrated.state = ws_state
+        rehydrated.user_id = "owner"
+        rehydrated.kind = "interactive"
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = None
+        mock_mgr.open.return_value = rehydrated
+        client = _build_detail_app(mock_mgr)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}")
+        assert r.status_code == 200
+        assert r.json()["name"] == "rehydrated"
+        mock_mgr.open.assert_called_once_with(ws_id)
+
+    def test_404_on_missing_ws_id(self):
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = None
+        # ``mgr.open`` returns None for missing rows / kind mismatch /
+        # tombstoned rows — all 404 with the per-kind label.
+        mock_mgr.open.return_value = None
+        client = _build_detail_app(mock_mgr)
+
+        r = client.get("/v1/api/workstreams/no-such-ws")
+        assert r.status_code == 404
+        assert r.json()["error"] == "Workstream not found"
+
+    def test_503_on_session_factory_misconfig(self):
+        """``ValueError`` from ``mgr.open`` (e.g. a model alias that no
+        longer resolves) surfaces as 503 with the factory's
+        remediation text — not a correlation-id'd 500. Mirrors
+        :func:`make_open_handler`."""
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = None
+        mock_mgr.open.side_effect = ValueError("alias 'gone' no longer resolves")
+        client = _build_detail_app(mock_mgr)
+
+        r = client.get("/v1/api/workstreams/ws-misconfig")
+        assert r.status_code == 503
+        assert "alias 'gone' no longer resolves" in r.json()["error"]
+
+    def test_correlation_id_on_unexpected_rehydrate_failure(self):
+        """Bare ``Exception`` from ``mgr.open`` → 500 + correlation_id +
+        per-kind noun in user-facing message. Exception text is NOT
+        echoed (no internal-detail leak)."""
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = None
+        mock_mgr.open.side_effect = RuntimeError("internal stack frame leak")
+        client = _build_detail_app(mock_mgr)
+
+        r = client.get("/v1/api/workstreams/ws-broken")
+        assert r.status_code == 500
+        body = r.json()
+        assert "internal stack frame leak" not in body["error"]
+        assert "correlation_id=" in body["error"]
+        # Per-kind noun via cfg.audit_action_prefix.
+        assert "workstream" in body["error"]

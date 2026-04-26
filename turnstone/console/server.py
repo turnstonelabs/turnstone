@@ -64,7 +64,9 @@ from turnstone.core.session_routes import (
     make_cancel_handler,
     make_close_handler,
     make_create_handler,
+    make_detail_handler,
     make_events_handler,
+    make_history_handler,
     make_list_handler,
     make_open_handler,
     make_saved_handler,
@@ -835,7 +837,7 @@ async def cluster_ws_detail(request: Request) -> JSONResponse:
       ``live=null`` rather than an error status.
     - ``messages`` — tail-N conversation messages, default 20, capped at 200.
 
-    404 masks ownership failures (match ``coordinator_detail``).
+    404 masks ownership failures (match :func:`make_detail_handler`).
     Correlation-id masks unexpected exceptions in the merge path.
     """
     from turnstone.core.auth import require_permission
@@ -853,7 +855,7 @@ async def cluster_ws_detail(request: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid ws_id"}, status_code=400)
 
     # Accept either ``?limit=`` (the canonical name used by
-    # coordinator_history and the list_workstreams tool) or the
+    # the lifted history factory and the list_workstreams tool) or the
     # transitional ``?message_limit=`` from earlier phase-3 drafts.
     # ``?limit`` wins when both are set so callers migrating from the
     # older name can overlap without surprise.
@@ -2364,8 +2366,10 @@ def _resolve_coordinator_or_404(
     ``(None, 404)`` on missing row / wrong kind / storage unavailable.
 
     Centralises the manager-first, storage-fallback, 404-mask ladder
-    previously duplicated across ``coordinator_children`` /
-    ``coordinator_tasks`` / ``coordinator_history``.  Turnstone is a
+    used by the coord-only verbs (``coordinator_children`` /
+    ``coordinator_tasks``).  The shared verbs (history, detail, ...)
+    inline the same ladder via :func:`make_history_handler` /
+    :func:`make_detail_handler`.  Turnstone is a
     trusted-team tool — ``user_id`` is metadata, not an access
     boundary, so this helper no longer gates on row ownership; scope
     auth (``admin.coordinator``) upstream is the gate.
@@ -2652,42 +2656,6 @@ async def _coord_saved_loaded_lookup(request: Request) -> set[str]:
     )
 
 
-async def coordinator_history(request: Request) -> JSONResponse:
-    """GET /v1/api/workstreams/{ws_id}/history — message history for page load.
-
-    Supports a ``?limit=`` query param (default 100, max 500) bounding
-    how many conversation rows are fetched from storage.  Long-lived
-    coordinators can accumulate thousands of messages — the page load
-    only needs the tail.
-    """
-    err = _require_admin_coordinator(request)
-    if err is not None:
-        return err
-    coord_mgr, err503 = _require_coord_mgr(request)
-    if err503 is not None:
-        return err503
-    ws_id = request.path_params.get("ws_id", "")
-    user_id = _auth_user_id(request)
-    storage = getattr(request.app.state, "auth_storage", None)
-    _ws, err404 = _resolve_coordinator_or_404(request, coord_mgr, storage, ws_id, user_id)
-    if err404 is not None:
-        return err404
-
-    try:
-        limit = int(request.query_params.get("limit", "100"))
-    except (TypeError, ValueError):
-        limit = 100
-    limit = max(1, min(limit, 500))
-
-    messages: list[dict[str, Any]] = []
-    if storage is not None:
-        try:
-            messages = storage.load_messages(ws_id, limit=limit)
-        except Exception:
-            log.debug("coordinator_history.load_failed ws=%s", ws_id[:8], exc_info=True)
-    return JSONResponse({"ws_id": ws_id, "messages": messages})
-
-
 async def coordinator_page(request: Request) -> Response:
     """GET /coordinator/{ws_id} — serve the one-pane coordinator HTML.
 
@@ -2711,55 +2679,6 @@ async def coordinator_page(request: Request) -> Response:
     # to HTML-escape; leave the replacement simple.
     body = body.replace("{{WS_ID}}", ws_id)
     return Response(body, media_type="text/html; charset=utf-8")
-
-
-async def coordinator_detail(request: Request) -> JSONResponse:
-    """GET /v1/api/workstreams/{ws_id} — detail + lazy rehydrate on miss."""
-    err = _require_admin_coordinator(request)
-    if err is not None:
-        return err
-    coord_mgr, err503 = _require_coord_mgr(request)
-    if err503 is not None:
-        return err503
-    ws_id = request.path_params.get("ws_id", "")
-    ws = coord_mgr.get(ws_id)
-    if ws is None:
-        # Lazy rehydration goes through the session factory, which can
-        # raise the same exceptions coordinator_create handles — match
-        # the correlation-id mask so stack traces don't leak through
-        # the detail endpoint either.
-        try:
-            ws = coord_mgr.open(ws_id)
-        except ValueError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=503)
-        except Exception:
-            correlation_id = secrets.token_hex(4)
-            log.warning(
-                "coordinator_detail.rehydrate_failed correlation_id=%s ws_id=%s",
-                correlation_id,
-                ws_id[:8],
-                exc_info=True,
-            )
-            return JSONResponse(
-                {
-                    "error": (
-                        "failed to rehydrate coordinator (internal error). "
-                        f"correlation_id={correlation_id}"
-                    )
-                },
-                status_code=500,
-            )
-        if ws is None:
-            return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    return JSONResponse(
-        {
-            "ws_id": ws.id,
-            "name": ws.name,
-            "state": ws.state.value,
-            "user_id": ws.user_id,
-            "kind": ws.kind,
-        }
-    )
 
 
 _CHILDREN_PAGE_LIMIT = 200
@@ -2810,7 +2729,7 @@ async def coordinator_children(request: Request) -> JSONResponse:
     the same rows.
 
     Same ownership / 404-on-mismatch / admin-bypass semantics as
-    ``coordinator_detail``.  Reads don't audit.
+    :func:`make_detail_handler`.  Reads don't audit.
     """
     from turnstone.core.web_helpers import require_storage_or_503
 
@@ -2932,8 +2851,8 @@ async def coordinator_metrics(request: Request) -> JSONResponse:
       wait-tool instrumentation (future work — the SSE events from
       #14 carry the data live but aren't persisted yet).
 
-    Ownership / authz: same gate as ``coordinator_detail`` — 404-mask
-    rows the caller doesn't own (no existence-oracle leak).
+    Ownership / authz: same gate as :func:`make_detail_handler` —
+    404-mask rows the caller doesn't own (no existence-oracle leak).
     """
     from turnstone.core.web_helpers import require_storage_or_503
 
@@ -10093,7 +10012,7 @@ def create_app(
                 coord_endpoint_config,
                 audit_emit=_audit_coordinator_create,
             ),
-            detail=coordinator_detail,
+            detail=make_detail_handler(coord_endpoint_config),  # lifted: shared body
             open=make_open_handler(coord_endpoint_config),  # lifted: shared body
             close=make_close_handler(  # lifted: shared body
                 coord_endpoint_config,
@@ -10107,7 +10026,7 @@ def create_app(
                 audit_emit=_audit_cancel_coordinator,
             ),
             events=make_events_handler(coord_endpoint_config),  # lifted: shared body
-            history=coordinator_history,
+            history=make_history_handler(coord_endpoint_config),  # lifted: shared body
             attachments=make_attachment_handlers(
                 coord_endpoint_config
             ),  # lifted: shared body (P1.5)

@@ -68,7 +68,9 @@ from turnstone.core.session_routes import (
     make_close_handler,
     make_create_handler,
     make_dequeue_handler,
+    make_detail_handler,
     make_events_handler,
+    make_history_handler,
     make_legacy_body_keyed_adapter,
     make_legacy_query_keyed_adapter,
     make_list_handler,
@@ -3615,6 +3617,8 @@ def create_app(
     )
     list_handler = make_list_handler(interactive_endpoint_config)
     saved_handler = make_saved_handler(interactive_endpoint_config)
+    history_handler = make_history_handler(interactive_endpoint_config)
+    detail_handler = make_detail_handler(interactive_endpoint_config)
     v1_routes: list[Any] = [
         Route("/api/events", make_legacy_query_keyed_adapter(events_handler)),
         Route("/api/events/global", global_events_sse),
@@ -3628,6 +3632,7 @@ def create_app(
             create=create_handler,  # lifted: shared body
             close_legacy=make_legacy_body_keyed_adapter(close_handler),
             delete=delete_workstream_endpoint,
+            detail=detail_handler,  # lifted: shared body (interactive feature gain)
             open=open_handler,  # lifted: shared body
             close=close_handler,  # lifted: shared body
             refresh_title=refresh_workstream_title,
@@ -3636,6 +3641,7 @@ def create_app(
             approve=approve_handler,  # lifted: shared body
             cancel=cancel_handler,  # lifted: shared body
             events=events_handler,  # lifted: shared body
+            history=history_handler,  # lifted: shared body (interactive feature gain)
             attachments=attachment_handlers,  # lifted: shared body (P1.5)
         ),
     )

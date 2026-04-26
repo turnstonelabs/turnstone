@@ -2087,6 +2087,215 @@ def make_saved_handler(cfg: SessionEndpointConfig) -> Handler:
     return saved_workstreams_handler
 
 
+def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
+    """Lifted body for ``GET {prefix}/{ws_id}/history`` — message history.
+
+    Returns the tail of the workstream's reconstructed conversation as
+    OpenAI-like message dicts. Used by coord's page-load handshake (the
+    dashboard fetches history once, then SSE handles updates). The lift
+    also adds the endpoint to interactive as a feature gain — pre-lift
+    interactive only exposed history through the SSE replay on
+    ``/events``, so SDK consumers had to subscribe to a stream just to
+    read message rows.
+
+    Per-kind divergence captured by:
+
+    - ``cfg.permission_gate`` — coord's ``admin.coordinator`` check;
+      interactive ``None``.
+    - ``cfg.manager_lookup`` — already used by every other lifted verb.
+    - ``cfg.list_kind`` — required for the storage-fallback kind check
+      so an interactive ws_id can't read history through the coord
+      process and vice versa. Pre-lift coord went through
+      :func:`_resolve_coordinator_or_404` for the same isolation; the
+      lifted body uses ``cfg.list_kind`` (already wired by both
+      production lifespans for the list/saved factories) instead of
+      adding a new cfg field. **Required when this handler is mounted**
+      — a missing value fails loud (500 + ``log.error``) rather than
+      silently leaking cross-kind history through the storage
+      fallback. Mirrors :func:`make_saved_handler`'s same gate.
+    - ``cfg.not_found_label`` — per-kind 404 wording.
+
+    Pre-lift coord behaviour preserved with one performance lift:
+    both the storage-row kind check and the ``load_messages`` call now
+    run through ``asyncio.to_thread`` (matched to the rest of the
+    lifted verbs' storage offload pattern; pre-lift coord ran them
+    inline on the event loop).
+
+    Args:
+        cfg: per-kind policy bundle.
+    """
+
+    async def history(request: Request) -> Response:
+        import asyncio
+
+        if cfg.permission_gate is not None:
+            err = cfg.permission_gate(request)
+            if err is not None:
+                return err
+
+        # Fail-closed misconfig gate. Without ``cfg.list_kind`` the
+        # storage-fallback path below has no way to enforce cross-kind
+        # isolation — an interactive ws_id requested through a coord
+        # process would silently serve coord history from storage (and
+        # vice versa). Mirrors :func:`make_saved_handler`'s same gate
+        # for the same reason; a future kind / hand-rolled test cfg
+        # that drops the field fails loud instead of leaking rows.
+        if cfg.list_kind is None:
+            log.error("ws.history.misconfigured_no_list_kind")
+            return JSONResponse(
+                {"error": "history handler misconfigured"},
+                status_code=500,
+            )
+
+        mgr_opt, err503 = cfg.manager_lookup(request)
+        if err503 is not None:
+            return err503
+        mgr = cast("SessionManager", mgr_opt)
+
+        ws_id = request.path_params.get("ws_id", "")
+        if not ws_id:
+            return JSONResponse({"error": "ws_id is required"}, status_code=400)
+
+        # Existence + kind check. The workstream may live only in
+        # storage (closed coordinators are still readable via /history
+        # without rehydrating; persisted-but-not-loaded interactives
+        # are likewise readable). Mirrors the pre-lift coord
+        # ``_resolve_coordinator_or_404`` ladder: in-memory mgr.get →
+        # storage row + kind check → 404. Falling back to storage
+        # without the kind check would leak interactive rows through
+        # the coord endpoint (and vice versa) on a process that
+        # shares storage with the other kind. ``cfg.list_kind`` is
+        # guaranteed non-None by the misconfig gate above.
+        storage = getattr(request.app.state, "auth_storage", None)
+        if mgr.get(ws_id) is None:
+            if storage is None:
+                return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+            try:
+                row = await asyncio.to_thread(storage.get_workstream, ws_id)
+            except Exception:
+                log.debug("ws.history.lookup_failed ws=%s", ws_id[:8], exc_info=True)
+                return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+            if row is None or row.get("kind") != cfg.list_kind:
+                return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+
+        # Bound the row count. Pre-lift coord clamped to [1, 500].
+        try:
+            limit = int(request.query_params.get("limit", "100"))
+        except (TypeError, ValueError):
+            limit = 100
+        limit = max(1, min(limit, 500))
+
+        messages: list[dict[str, Any]] = []
+        if storage is not None:
+            try:
+                messages = await asyncio.to_thread(storage.load_messages, ws_id, limit=limit)
+            except Exception:
+                log.debug("ws.history.load_failed ws=%s", ws_id[:8], exc_info=True)
+        return JSONResponse({"ws_id": ws_id, "messages": messages})
+
+    return history
+
+
+def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
+    """Lifted body for ``GET {prefix}/{ws_id}`` — workstream display fields.
+
+    Returns ``{ws_id, name, state, user_id, kind}`` for the workstream.
+    Lazy-rehydrates on miss via ``mgr.open(ws_id)`` so a closed/evicted
+    workstream comes back into memory before the response. Mirrors the
+    error-handling pattern from :func:`make_open_handler`: ``ValueError``
+    from the session factory surfaces as 503 with the factory's
+    remediation text; any other rehydrate failure surfaces as a
+    correlation-id'd 500 with the per-kind noun in the user-facing
+    message.
+
+    Cross-kind isolation is enforced inside ``mgr.open()`` itself —
+    it returns ``None`` for missing rows, kind mismatches, and
+    tombstoned rows; all surface as 404 with ``cfg.not_found_label``.
+    No inline storage check needed (unlike :func:`make_history_handler`)
+    because rehydrate is the existence proof.
+
+    Per-kind divergence:
+
+    - ``cfg.permission_gate`` — coord's ``admin.coordinator`` check;
+      interactive ``None``.
+    - ``cfg.manager_lookup`` — already used by every other lifted verb.
+    - ``cfg.not_found_label`` — per-kind 404 wording.
+    - ``cfg.audit_action_prefix`` — per-kind noun in the 500 error.
+
+    Pre-lift coord behaviour preserved verbatim. The lift adds the
+    endpoint to interactive as a feature gain — pre-lift interactive
+    had no HTTP detail endpoint (SDK consumers had to subscribe to
+    SSE just to read display fields).
+
+    Args:
+        cfg: per-kind policy bundle.
+    """
+
+    async def detail(request: Request) -> Response:
+        if cfg.permission_gate is not None:
+            err = cfg.permission_gate(request)
+            if err is not None:
+                return err
+        mgr_opt, err503 = cfg.manager_lookup(request)
+        if err503 is not None:
+            return err503
+        mgr = cast("SessionManager", mgr_opt)
+
+        ws_id = request.path_params.get("ws_id", "")
+        if not ws_id:
+            return JSONResponse({"error": "ws_id is required"}, status_code=400)
+
+        ws = mgr.get(ws_id)
+        if ws is None:
+            try:
+                ws = mgr.open(ws_id)
+            except ValueError as exc:
+                # Session factory misconfig (e.g. a model alias that no
+                # longer resolves). Surface remediation text as 503
+                # mirroring :func:`make_open_handler`.
+                return JSONResponse({"error": str(exc)}, status_code=503)
+            except Exception:
+                # Bare ``Exception`` is intentional — see
+                # :func:`make_open_handler` for the rationale
+                # (``adapter.build_session`` / ``ChatSession.resume``
+                # have no documented exception spec).
+                import secrets
+
+                correlation_id = secrets.token_hex(4)
+                log.warning(
+                    "ws.detail.rehydrate_failed correlation_id=%s ws_id=%s",
+                    correlation_id,
+                    ws_id[:8] if ws_id else "",
+                    exc_info=True,
+                )
+                kind_noun = cfg.audit_action_prefix or "workstream"
+                return JSONResponse(
+                    {
+                        "error": (
+                            f"failed to rehydrate {kind_noun} (internal error). "
+                            f"correlation_id={correlation_id}"
+                        )
+                    },
+                    status_code=500,
+                )
+            if ws is None:
+                # ``mgr.open`` returns None for missing rows, kind
+                # mismatch, and tombstoned rows — all surface as 404.
+                return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+
+        return JSONResponse(
+            {
+                "ws_id": ws.id,
+                "name": ws.name,
+                "state": ws.state.value,
+                "user_id": ws.user_id,
+                "kind": ws.kind,
+            }
+        )
+
+    return detail
+
+
 def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
     """Lifted body for ``POST {prefix}/{ws_id}/send`` — message dispatch.
 

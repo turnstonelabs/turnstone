@@ -623,6 +623,130 @@
         }
       }
     },
+    "/v1/api/workstreams/{ws_id}": {
+      "get": {
+        "summary": "Get workstream detail (rehydrates lazily on miss)",
+        "operationId": "v1_api_workstreams_{ws_id}_get",
+        "tags": [
+          "Workstreams"
+        ],
+        "description": "Returns the persisted workstream's display fields. If the session isn't currently in memory the manager rehydrates it before responding; ``500`` on rehydrate failure carries a correlation id matching the server log line. Lifted from the coord-only surface in the Stage 2 history/detail verb lift \u2014 interactive previously had no detail endpoint.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkstreamDetailResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/{ws_id}/history": {
+      "get": {
+        "summary": "Read the workstream's reconstructed message history",
+        "operationId": "v1_api_workstreams_{ws_id}_history_get",
+        "tags": [
+          "Workstreams"
+        ],
+        "description": "Returns the tail of the conversation in OpenAI-like message format. Persisted-but-not-loaded workstreams (closed / evicted) serve history without rehydrating. Lifted from the coord-only surface in the Stage 2 history/detail verb lift \u2014 interactive previously only exposed history through the SSE replay on ``/events``.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 100
+            },
+            "description": "Max conversation rows to fetch from storage (default 100, max 500)."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkstreamHistoryResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/api/workstreams/{ws_id}/attachments": {
       "post": {
         "summary": "Upload a file (multipart/form-data, field 'file') and attach it to the caller's next user turn on this workstream.  Validates size, MIME, and UTF-8 for text; magic-byte sniff for images.  Ownership failures are masked as 404 so non-owners cannot enumerate workstream existence; a 403 indicates a scope/auth failure from the middleware layer.",
@@ -2073,6 +2197,62 @@
           "state"
         ],
         "title": "WorkstreamInfo",
+        "type": "object"
+      },
+      "WorkstreamDetailResponse": {
+        "description": "Response body for ``GET /v1/api/workstreams/{ws_id}``.\n\nRenamed and relocated from ``CoordinatorDetailResponse`` in the\nStage 2 history/detail verb lift. Both kinds populate every field;\nSDK consumers don't branch on kind to read them. The lift adds the\nendpoint to interactive as a feature gain (pre-lift only coord\nexposed it).",
+        "properties": {
+          "ws_id": {
+            "title": "Ws Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/WorkstreamKind",
+            "default": "interactive"
+          }
+        },
+        "required": [
+          "ws_id",
+          "name",
+          "state",
+          "user_id"
+        ],
+        "title": "WorkstreamDetailResponse",
+        "type": "object"
+      },
+      "WorkstreamHistoryResponse": {
+        "description": "Response body for ``GET /v1/api/workstreams/{ws_id}/history``.\n\nRenamed and relocated from ``CoordinatorHistoryResponse`` in the\nStage 2 history/detail verb lift. Same OpenAI-like message-row\nshape on both kinds; the lift adds the endpoint to interactive as\na feature gain (pre-lift interactive only exposed history through\nthe SSE replay on ``/events``).",
+        "properties": {
+          "ws_id": {
+            "title": "Ws Id",
+            "type": "string"
+          },
+          "messages": {
+            "description": "Tail of the workstream's reconstructed message history (provider-fidelity OpenAI-like shape). Bounded by the ``limit`` query parameter (default 100, max 500).",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Messages",
+            "type": "array"
+          }
+        },
+        "required": [
+          "ws_id"
+        ],
+        "title": "WorkstreamHistoryResponse",
         "type": "object"
       },
       "DashboardResponse": {

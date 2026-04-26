@@ -29,8 +29,6 @@ from turnstone.api.console_schemas import (
     CoordinatorCloseAllChildrenResponse,
     CoordinatorCreateRequest,
     CoordinatorCreateResponse,
-    CoordinatorDetailResponse,
-    CoordinatorHistoryResponse,
     CoordinatorOpenResponse,
     CoordinatorRestrictRequest,
     CoordinatorRestrictResponse,
@@ -135,6 +133,8 @@ from turnstone.api.server_schemas import (
     ListWorkstreamsResponse,
     SkillSummary,
     UploadAttachmentResponse,
+    WorkstreamDetailResponse,
+    WorkstreamHistoryResponse,
 )
 
 CONSOLE_ENDPOINTS: list[EndpointSpec] = [
@@ -1172,7 +1172,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
             "before responding; ``500`` on rehydrate failure carries a "
             "correlation id matching the server log line."
         ),
-        response_model=CoordinatorDetailResponse,
+        response_model=WorkstreamDetailResponse,
         error_codes=[400, 403, 404, 500, 503],
         tags=["Coordinator"],
     ),
@@ -1320,7 +1320,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
             "format.  Used by the page-load handshake; SSE handles updates "
             "after that.  Bounded by the ``limit`` query parameter."
         ),
-        response_model=CoordinatorHistoryResponse,
+        response_model=WorkstreamHistoryResponse,
         query_params=[
             QueryParam(
                 "limit",
@@ -1507,8 +1507,6 @@ _ALL_MODELS: list[type[BaseModel]] = [
     CoordinatorCloseAllChildrenResponse,
     CoordinatorCreateRequest,
     CoordinatorCreateResponse,
-    CoordinatorDetailResponse,
-    CoordinatorHistoryResponse,
     CoordinatorOpenResponse,
     CoordinatorRestrictRequest,
     CoordinatorRestrictResponse,
@@ -1589,6 +1587,8 @@ _ALL_MODELS: list[type[BaseModel]] = [
     RouteCreateResponse,
     SkillSummary,
     ListSkillSummaryResponse,
+    WorkstreamDetailResponse,
+    WorkstreamHistoryResponse,
 ]
 
 

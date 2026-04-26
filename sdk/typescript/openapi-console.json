@@ -4655,7 +4655,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CoordinatorDetailResponse"
+                  "$ref": "#/components/schemas/WorkstreamDetailResponse"
                 }
               }
             }
@@ -5506,7 +5506,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CoordinatorHistoryResponse"
+                  "$ref": "#/components/schemas/WorkstreamHistoryResponse"
                 }
               }
             }
@@ -7491,63 +7491,6 @@
           "name"
         ],
         "title": "CoordinatorCreateResponse",
-        "type": "object"
-      },
-      "CoordinatorDetailResponse": {
-        "description": "Response body for GET /v1/api/workstreams/{ws_id}.",
-        "properties": {
-          "ws_id": {
-            "title": "Ws Id",
-            "type": "string"
-          },
-          "name": {
-            "title": "Name",
-            "type": "string"
-          },
-          "state": {
-            "title": "State",
-            "type": "string"
-          },
-          "user_id": {
-            "title": "User Id",
-            "type": "string"
-          },
-          "kind": {
-            "default": "coordinator",
-            "title": "Kind",
-            "type": "string"
-          }
-        },
-        "required": [
-          "ws_id",
-          "name",
-          "state",
-          "user_id"
-        ],
-        "title": "CoordinatorDetailResponse",
-        "type": "object"
-      },
-      "CoordinatorHistoryResponse": {
-        "description": "Response body for GET /v1/api/workstreams/{ws_id}/history.",
-        "properties": {
-          "ws_id": {
-            "title": "Ws Id",
-            "type": "string"
-          },
-          "messages": {
-            "description": "Tail of the coordinator's reconstructed message history (provider-fidelity OpenAI-like shape).  Bounded by the ``limit`` query parameter (default 100, max 500).",
-            "items": {
-              "additionalProperties": true,
-              "type": "object"
-            },
-            "title": "Messages",
-            "type": "array"
-          }
-        },
-        "required": [
-          "ws_id"
-        ],
-        "title": "CoordinatorHistoryResponse",
         "type": "object"
       },
       "CoordinatorOpenResponse": {
@@ -11692,6 +11635,71 @@
           "skills"
         ],
         "title": "ListSkillSummaryResponse",
+        "type": "object"
+      },
+      "WorkstreamDetailResponse": {
+        "description": "Response body for ``GET /v1/api/workstreams/{ws_id}``.\n\nRenamed and relocated from ``CoordinatorDetailResponse`` in the\nStage 2 history/detail verb lift. Both kinds populate every field;\nSDK consumers don't branch on kind to read them. The lift adds the\nendpoint to interactive as a feature gain (pre-lift only coord\nexposed it).",
+        "properties": {
+          "ws_id": {
+            "title": "Ws Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/WorkstreamKind",
+            "default": "interactive"
+          }
+        },
+        "required": [
+          "ws_id",
+          "name",
+          "state",
+          "user_id"
+        ],
+        "title": "WorkstreamDetailResponse",
+        "type": "object"
+      },
+      "WorkstreamKind": {
+        "description": "Classifier for which manager hosts a workstream.\n\nStrEnum so members are drop-in ``str`` replacements for the DB column,\nJSON payloads, and existing ``==`` comparisons against raw strings.\nNarrow internal annotations to this type; wide boundaries (HTTP body,\nDB row) stay ``str`` and parse via ``WorkstreamKind(raw)`` / ``from_raw``\nat the edge.",
+        "enum": [
+          "interactive",
+          "coordinator"
+        ],
+        "title": "WorkstreamKind",
+        "type": "string"
+      },
+      "WorkstreamHistoryResponse": {
+        "description": "Response body for ``GET /v1/api/workstreams/{ws_id}/history``.\n\nRenamed and relocated from ``CoordinatorHistoryResponse`` in the\nStage 2 history/detail verb lift. Same OpenAI-like message-row\nshape on both kinds; the lift adds the endpoint to interactive as\na feature gain (pre-lift interactive only exposed history through\nthe SSE replay on ``/events``).",
+        "properties": {
+          "ws_id": {
+            "title": "Ws Id",
+            "type": "string"
+          },
+          "messages": {
+            "description": "Tail of the workstream's reconstructed message history (provider-fidelity OpenAI-like shape). Bounded by the ``limit`` query parameter (default 100, max 500).",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Messages",
+            "type": "array"
+          }
+        },
+        "required": [
+          "ws_id"
+        ],
+        "title": "WorkstreamHistoryResponse",
         "type": "object"
       }
     }

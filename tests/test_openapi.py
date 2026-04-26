@@ -26,6 +26,8 @@ class TestServerSpec:
         paths = set(spec["paths"].keys())
         expected = {
             "/v1/api/workstreams",
+            "/v1/api/workstreams/{ws_id}",
+            "/v1/api/workstreams/{ws_id}/history",
             "/v1/api/dashboard",
             "/v1/api/workstreams/saved",
             "/v1/api/send",
@@ -41,6 +43,17 @@ class TestServerSpec:
             "/health",
         }
         assert expected.issubset(paths), f"Missing: {expected - paths}"
+
+    def test_workstream_history_has_limit_query_param(self):
+        """Mirror of the coord-side history limit param test — server now
+        exposes the same endpoint via the lifted factory."""
+        from turnstone.api.server_spec import build_server_spec
+
+        spec = build_server_spec()
+        op = spec["paths"]["/v1/api/workstreams/{ws_id}/history"]["get"]
+        param_names = [p["name"] for p in op.get("parameters", [])]
+        assert "ws_id" in param_names
+        assert "limit" in param_names
 
     def test_schemas_not_empty(self):
         from turnstone.api.server_spec import build_server_spec

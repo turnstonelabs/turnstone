@@ -17,6 +17,62 @@ Three release tracks are maintained:
 
 ### Changed
 
+- **`history` / `detail` verb bodies lifted across both kinds**
+  ([Stage 2 Verb Lift — `history` / `detail`]). The coord
+  ``GET /v1/api/workstreams/{ws_id}/history`` and
+  ``GET /v1/api/workstreams/{ws_id}`` handlers now share two factory
+  bodies via ``make_history_handler(cfg)`` and
+  ``make_detail_handler(cfg)``. The lift adds both endpoints to the
+  interactive surface as a feature gain (pre-lift only coord exposed
+  them; interactive consumers had to subscribe to ``/events`` SSE
+  just to read history rows or display fields). No new
+  ``SessionEndpointConfig`` fields — the factories reuse
+  ``permission_gate``, ``manager_lookup``, ``not_found_label``,
+  ``audit_action_prefix``, and (for history's storage-fallback kind
+  check) ``list_kind`` — all already wired by both production
+  lifespans.
+
+  Three observable behaviour changes (all documented per kind):
+
+  - **Interactive gains ``GET /v1/api/workstreams/{ws_id}``.** Pre-lift
+    interactive had no detail endpoint — SDK consumers had to read
+    display fields from the SSE replay on ``/events`` or scrape the
+    active list. The lifted body lazy-rehydrates a closed/evicted
+    workstream via ``mgr.open()`` so the response shape is stable
+    across loaded / persisted-only states. Same
+    ``{ws_id, name, state, user_id, kind}`` shape coord exposed
+    pre-lift, now available on both surfaces.
+  - **Interactive gains ``GET /v1/api/workstreams/{ws_id}/history``.**
+    Same ``?limit=`` query param contract as coord (default 100, max
+    500, malformed values fall back to 100, out-of-range clamps to
+    [1, 500]). Persisted-but-not-loaded interactives serve history
+    without rehydrating — the lifted body falls back to a storage-row
+    + kind check (via ``cfg.list_kind``) when ``mgr.get`` returns
+    ``None``, mirroring coord's pre-lift
+    ``_resolve_coordinator_or_404`` ladder.
+  - **Storage / manager-lock work moved off the event loop on coord.**
+    The lifted ``history`` body always runs ``storage.get_workstream``
+    (storage-fallback path) and ``storage.load_messages`` through
+    ``asyncio.to_thread``; pre-lift coord ran them inline on the
+    event loop. Long-tail message reads on a saturated console no
+    longer stall every other async handler for the duration of the
+    SQL.
+
+  Pydantic schemas: ``CoordinatorDetailResponse`` and
+  ``CoordinatorHistoryResponse`` removed; both folded into
+  ``WorkstreamDetailResponse`` / ``WorkstreamHistoryResponse`` on
+  the shared ``server_schemas.py`` (mirrors the list lift's pattern
+  for ``WorkstreamInfo``). Both server and console OpenAPI specs
+  reference the unified schemas; ``server_spec.py`` gains
+  ``EndpointSpec`` entries for the new interactive endpoints. TS
+  SDK gains ``WorkstreamDetailResponse`` / ``WorkstreamHistoryResponse``
+  interfaces in ``sdk/typescript/src/types.ts``;
+  ``openapi-{server,console}.json`` regenerated.
+  ``GET /v1/api/workstreams/{ws_id}/history`` is the only verb
+  whose lifted body keeps a kind-aware storage fallback (via
+  ``cfg.list_kind``); ``detail`` defers cross-kind isolation to
+  ``mgr.open()`` itself.
+
 - **`list` / `saved` verb bodies lifted across both kinds** ([Stage 2
   Verb Lift — `list` / `saved`]). The interactive
   ``GET /v1/api/workstreams`` + ``GET /v1/api/workstreams/saved``

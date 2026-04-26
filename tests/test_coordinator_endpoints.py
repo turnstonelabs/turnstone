@@ -42,8 +42,6 @@ from turnstone.console.server import (
     _require_coord_mgr,
     cluster_ws_detail,
     coordinator_children,
-    coordinator_detail,
-    coordinator_history,
     coordinator_tasks,
 )
 from turnstone.core.attachments import (
@@ -64,6 +62,8 @@ from turnstone.core.session_routes import (
     make_cancel_handler,
     make_close_handler,
     make_create_handler,
+    make_detail_handler,
+    make_history_handler,
     make_list_handler,
     make_open_handler,
     make_saved_handler,
@@ -189,7 +189,7 @@ def _make_client(
             ),
             Route(
                 "/v1/api/workstreams/{ws_id}/history",
-                coordinator_history,
+                make_history_handler(_coord_endpoint_config),
                 methods=["GET"],
             ),
             Route(
@@ -229,7 +229,7 @@ def _make_client(
             ),
             Route(
                 "/v1/api/workstreams/{ws_id}",
-                coordinator_detail,
+                make_detail_handler(_coord_endpoint_config),
                 methods=["GET"],
             ),
             Route(
@@ -829,6 +829,42 @@ def test_detail_404_when_kind_interactive(storage):
     assert resp.status_code == 404
 
 
+def test_detail_503_on_session_factory_misconfig(storage):
+    """``ValueError`` from ``mgr.open`` (e.g. a model alias that no longer
+    resolves) surfaces as 503 with the factory's remediation text — not
+    a correlation-id'd 500. Mirrors the open verb lift's contract so
+    operators can fix the misconfig without grepping logs."""
+    from unittest.mock import patch
+
+    mgr = _build_mgr(storage)
+    storage.register_workstream("misconfig-coord", kind="coordinator", user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    with patch.object(mgr, "open", side_effect=ValueError("no such model alias")):
+        resp = client.get("/v1/api/workstreams/misconfig-coord", headers=_COORD_HEADERS)
+    assert resp.status_code == 503
+    assert "no such model alias" in resp.json()["error"]
+
+
+def test_detail_correlation_id_on_unexpected_rehydrate_failure(storage):
+    """Bare ``Exception`` from ``mgr.open`` (build_session / resume failure
+    with no documented spec) surfaces as a correlation-id'd 500 with the
+    per-kind noun in the user-facing message — not the raw exception
+    text. Mirrors :func:`make_open_handler`'s leak-prevention contract."""
+    from unittest.mock import patch
+
+    mgr = _build_mgr(storage)
+    storage.register_workstream("broken-coord", kind="coordinator", user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    with patch.object(mgr, "open", side_effect=RuntimeError("internal stack frame leak")):
+        resp = client.get("/v1/api/workstreams/broken-coord", headers=_COORD_HEADERS)
+    assert resp.status_code == 500
+    body = resp.json()
+    assert "internal stack frame leak" not in body["error"]
+    assert "correlation_id=" in body["error"]
+    # Per-kind noun via cfg.audit_action_prefix — coord wires "coordinator".
+    assert "coordinator" in body["error"]
+
+
 # ---------------------------------------------------------------------------
 # History
 # ---------------------------------------------------------------------------
@@ -860,6 +896,107 @@ def test_history_any_admin_coordinator_caller_can_read(storage):
     )
     assert resp.status_code == 200
     assert resp.json()["ws_id"] == ws.id
+
+
+def test_history_serves_storage_only_workstream(storage):
+    """Persisted-but-not-loaded coordinators (closed / evicted) are still
+    readable via /history without rehydrating. Mirrors the pre-lift
+    ``_resolve_coordinator_or_404`` ladder: storage-row + kind check
+    is sufficient when ``mgr.get`` returns None."""
+    mgr = _build_mgr(storage)
+    storage.register_workstream("storage-only-coord", kind="coordinator", user_id="user-1")
+    storage.save_message("storage-only-coord", "user", "from cold storage")
+    # Confirm precondition: row is in storage, NOT in the manager's pool.
+    assert mgr.get("storage-only-coord") is None
+
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(
+        "/v1/api/workstreams/storage-only-coord/history",
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert any(m.get("content") == "from cold storage" for m in resp.json()["messages"])
+    # History does NOT rehydrate (unlike detail) — pool stays cold.
+    assert mgr.get("storage-only-coord") is None
+
+
+def test_history_404_when_kind_interactive(storage):
+    """Cross-kind isolation on the storage fallback path: an interactive
+    ws_id that exists in storage 404s on the coord history endpoint
+    (mirrors :func:`test_detail_404_when_kind_interactive`). The lifted
+    factory uses ``cfg.list_kind`` for the kind check; pre-lift coord
+    used :func:`_resolve_coordinator_or_404`'s explicit kind compare."""
+    mgr = _build_mgr(storage)
+    storage.register_workstream("ws-int", kind="interactive", user_id="user-1")
+    storage.save_message("ws-int", "user", "interactive content")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get("/v1/api/workstreams/ws-int/history", headers=_COORD_HEADERS)
+    assert resp.status_code == 404
+    assert "interactive content" not in resp.text
+
+
+def test_history_swallows_load_messages_exception_returns_empty(storage):
+    """``storage.load_messages`` raising mid-call (transient DB outage,
+    corrupted row, etc.) must not 5xx the page-load handshake — coord
+    pre-lift logged at debug and returned 200 with ``messages == []``.
+    The lifted body preserves that contract on both kinds; pin it
+    explicitly so a future reader doesn't remove the bare-except as
+    dead code."""
+    from unittest.mock import patch
+
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    with patch.object(storage, "load_messages", side_effect=RuntimeError("db gone")):
+        resp = client.get(f"/v1/api/workstreams/{ws.id}/history", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ws_id"] == ws.id
+    assert body["messages"] == []
+
+
+def test_history_clamps_limit_query_param(storage):
+    """Pre-lift coord clamped ``?limit=`` to [1, 500]. The lifted factory
+    preserves the same bounds. Out-of-range / unparseable values
+    fall back to defaults instead of erroring — coord's page-load
+    handshake should never 4xx on a malformed limit param."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    # Seed enough messages to exercise the upper bound. SQLite's INSERT
+    # is fast enough that 6 inserts in a tight loop is fine.
+    for i in range(6):
+        storage.save_message(ws.id, "user", f"msg-{i}")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    base = f"/v1/api/workstreams/{ws.id}/history"
+
+    # No limit → default 100 (returns all 6).
+    resp = client.get(base, headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert len(resp.json()["messages"]) == 6
+
+    # limit=2 → only 2 messages returned (storage owns the row
+    # ordering contract; the factory just threads ``limit`` through).
+    resp = client.get(base, params={"limit": 2}, headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert len(resp.json()["messages"]) == 2
+
+    # Negative / zero → clamp to 1 (factory: ``max(1, min(limit, 500))``).
+    resp = client.get(base, params={"limit": 0}, headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert len(resp.json()["messages"]) == 1
+
+    # Garbage → falls back to default 100 (still 200, returns all 6).
+    resp = client.get(base, params={"limit": "garbage"}, headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert len(resp.json()["messages"]) == 6
+
+    # Above-cap → clamps to 500 (page-load handshake never 4xx's).
+    resp = client.get(base, params={"limit": 999}, headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    # We only have 6 messages but the response is still 200 — the cap
+    # is enforced on the SQL LIMIT, not on the row count.
+    assert len(resp.json()["messages"]) == 6
 
 
 # ---------------------------------------------------------------------------

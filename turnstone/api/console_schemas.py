@@ -1024,16 +1024,6 @@ class CoordinatorCreateResponse(BaseModel):
     attachment_ids: list[str] = Field(default_factory=list)
 
 
-class CoordinatorDetailResponse(BaseModel):
-    """Response body for GET /v1/api/workstreams/{ws_id}."""
-
-    ws_id: str
-    name: str
-    state: str
-    user_id: str
-    kind: str = Field(default="coordinator")
-
-
 class CoordinatorSendRequest(BaseModel):
     """Body for POST /v1/api/workstreams/{ws_id}/send."""
 
@@ -1095,20 +1085,6 @@ class CoordinatorApproveRequest(BaseModel):
         description=(
             "When approved=True, also adds the pending tool name(s) to the session's "
             "auto-approve set so subsequent calls of the same tool skip the prompt."
-        ),
-    )
-
-
-class CoordinatorHistoryResponse(BaseModel):
-    """Response body for GET /v1/api/workstreams/{ws_id}/history."""
-
-    ws_id: str
-    messages: list[dict[str, Any]] = Field(
-        default_factory=list,
-        description=(
-            "Tail of the coordinator's reconstructed message history "
-            "(provider-fidelity OpenAI-like shape).  Bounded by the ``limit`` "
-            "query parameter (default 100, max 500)."
         ),
     )
 

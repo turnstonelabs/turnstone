@@ -42,6 +42,8 @@ from turnstone.api.server_schemas import (
     SendResponse,
     SkillSummary,
     UploadAttachmentResponse,
+    WorkstreamDetailResponse,
+    WorkstreamHistoryResponse,
 )
 
 SERVER_ENDPOINTS: list[EndpointSpec] = [
@@ -181,6 +183,46 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "/v1/api/workstreams/{ws_id}/refresh-title",
         "POST",
         "Regenerate workstream title via LLM",
+        error_codes=[404],
+        tags=["Workstreams"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}",
+        "GET",
+        "Get workstream detail (rehydrates lazily on miss)",
+        description=(
+            "Returns the persisted workstream's display fields. If the "
+            "session isn't currently in memory the manager rehydrates it "
+            "before responding; ``500`` on rehydrate failure carries a "
+            "correlation id matching the server log line. Lifted from "
+            "the coord-only surface in the Stage 2 history/detail verb "
+            "lift — interactive previously had no detail endpoint."
+        ),
+        response_model=WorkstreamDetailResponse,
+        error_codes=[400, 404, 500, 503],
+        tags=["Workstreams"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/history",
+        "GET",
+        "Read the workstream's reconstructed message history",
+        description=(
+            "Returns the tail of the conversation in OpenAI-like message "
+            "format. Persisted-but-not-loaded workstreams (closed / "
+            "evicted) serve history without rehydrating. Lifted from "
+            "the coord-only surface in the Stage 2 history/detail verb "
+            "lift — interactive previously only exposed history through "
+            "the SSE replay on ``/events``."
+        ),
+        response_model=WorkstreamHistoryResponse,
+        query_params=[
+            QueryParam(
+                "limit",
+                "Max conversation rows to fetch from storage (default 100, max 500).",
+                schema_type="integer",
+                default=100,
+            ),
+        ],
         error_codes=[404],
         tags=["Workstreams"],
     ),
@@ -397,6 +439,8 @@ _ALL_MODELS: list[type[BaseModel]] = [
     CreateWorkstreamResponse,
     CloseWorkstreamRequest,
     ListWorkstreamsResponse,
+    WorkstreamDetailResponse,
+    WorkstreamHistoryResponse,
     DashboardResponse,
     ListSavedWorkstreamsResponse,
     UploadAttachmentResponse,

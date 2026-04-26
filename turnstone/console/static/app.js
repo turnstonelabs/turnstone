@@ -2225,8 +2225,8 @@ function _renderHomeView() {
 // interactive UI's "Saved Workstreams" card grid (same /shared/cards.css
 // primitives, same /shared/cards.js renderSessionCard helper, same
 // response item shape from /v1/api/workstreams/saved).  Click a card →
-// POST /open then /coordinator/{ws_id}; coordinator_detail lazily
-// rehydrates from storage on the GET miss.
+// POST /open then /coordinator/{ws_id}; the lifted detail factory
+// lazily rehydrates from storage on the GET miss.
 // ---------------------------------------------------------------------------
 
 // In-flight de-dup for loadSavedCoordinators.  ws_closed events can

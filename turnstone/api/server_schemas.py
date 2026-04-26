@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -267,6 +267,49 @@ class SavedWorkstreamInfo(BaseModel):
 
 class ListSavedWorkstreamsResponse(BaseModel):
     workstreams: list[SavedWorkstreamInfo]
+
+
+# ---------------------------------------------------------------------------
+# Detail / history (Stage 2 verb lift — both kinds expose these)
+# ---------------------------------------------------------------------------
+
+
+class WorkstreamDetailResponse(BaseModel):
+    """Response body for ``GET /v1/api/workstreams/{ws_id}``.
+
+    Renamed and relocated from ``CoordinatorDetailResponse`` in the
+    Stage 2 history/detail verb lift. Both kinds populate every field;
+    SDK consumers don't branch on kind to read them. The lift adds the
+    endpoint to interactive as a feature gain (pre-lift only coord
+    exposed it).
+    """
+
+    ws_id: str
+    name: str
+    state: str
+    user_id: str
+    kind: WorkstreamKind = WorkstreamKind.INTERACTIVE
+
+
+class WorkstreamHistoryResponse(BaseModel):
+    """Response body for ``GET /v1/api/workstreams/{ws_id}/history``.
+
+    Renamed and relocated from ``CoordinatorHistoryResponse`` in the
+    Stage 2 history/detail verb lift. Same OpenAI-like message-row
+    shape on both kinds; the lift adds the endpoint to interactive as
+    a feature gain (pre-lift interactive only exposed history through
+    the SSE replay on ``/events``).
+    """
+
+    ws_id: str
+    messages: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "Tail of the workstream's reconstructed message history "
+            "(provider-fidelity OpenAI-like shape). Bounded by the "
+            "``limit`` query parameter (default 100, max 500)."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
