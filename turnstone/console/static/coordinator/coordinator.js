@@ -838,6 +838,17 @@
       case "rename":
         nameEl.textContent = ev.name || "";
         break;
+      case "message_queued":
+        // Live-worker reuse path: send appended to the running
+        // worker's pending queue rather than spawning a new one.
+        // Surface as an info row so operators see queueing happen
+        // instead of dropping the event silently.
+        appendText(
+          "info",
+          "Queued (priority: " + (ev.priority || "normal") + ")",
+          { label: "queued" },
+        );
+        break;
       case "tools_auto_approved":
         (ev.items || []).forEach((it) => appendToolCall(it));
         break;

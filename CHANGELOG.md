@@ -135,6 +135,29 @@ Three release tracks are maintained:
   for parity with interactive. Existing callers checking for ``429``
   should switch to the status-code shape.
 
+  Coord ``GenerationCancelled`` now emits ``state=idle`` +
+  ``stream_end`` (parity with interactive); pre-P1.5 a cancel-killed
+  coord worker would have terminated silently with no state event.
+  Cluster fanout / alerting keyed on ``state=error`` for cancelled
+  coord workers should switch to monitoring ``stream_end`` /
+  ``state=idle`` together.
+
+### Security
+
+- **Coord attachment endpoints are now kind-strict**
+  ([Stage 2 P1.5]). The coord ``attachment_owner_resolver``
+  resolves through the in-memory ``coord_mgr`` only — it does NOT
+  fall back to storage. Without this, an
+  ``admin.coordinator``-scoped caller could pass an *interactive*
+  workstream ws_id to the new coord attachment endpoints; the
+  generic ``get_workstream_owner`` storage call (kind-agnostic)
+  would resolve cleanly and grant cross-kind read / write access
+  to interactive attachments. The kind-strict resolver returns
+  404 for any ws_id not currently held by the coord manager,
+  closing the cross-kind path. Persisted-but-not-loaded
+  coordinators must be ``open``ed before their attachment endpoints
+  respond. Caught by /review pre-merge; no exploit observed.
+
 - **Workstream state writes are now buffered through ``StateWriter``.**
   ``SessionManager.set_state`` no longer holds ``ws._lock`` across a
   synchronous Postgres ``UPDATE`` for non-terminal transitions;

@@ -64,7 +64,6 @@ from turnstone.core.session_routes import (
     make_send_handler,
 )
 from turnstone.core.storage._sqlite import SQLiteBackend
-from turnstone.core.web_helpers import resolve_workstream_owner
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -72,10 +71,20 @@ from turnstone.core.web_helpers import resolve_workstream_owner
 
 
 def _coord_attach_owner(request, ws_id, mgr):
-    """Coord attachment owner resolver mirroring production wiring."""
-    return resolve_workstream_owner(
-        request, ws_id, mgr=mgr, not_found_label="coordinator not found"
-    )
+    """Coord attachment owner resolver mirroring production wiring.
+
+    Kind-strict — coord attachments can only be accessed for
+    workstreams currently held by ``coord_mgr``; no storage fallback
+    so cross-kind ws_ids 404 instead of leaking through storage.
+    """
+    from starlette.responses import JSONResponse
+
+    from turnstone.core.web_helpers import auth_user_id
+
+    ws = mgr.get(ws_id)
+    if ws is None:
+        return "", JSONResponse({"error": "coordinator not found"}, status_code=404)
+    return ws.user_id or auth_user_id(request), None
 
 
 # Per-kind config the lifted handler factories capture by closure.
@@ -1371,3 +1380,51 @@ class TestCoordinatorAttachments:
         assert body["status"] == "ok"
         assert body["attached_ids"] == []
         assert body["dropped_attachment_ids"] == []
+
+    def test_coord_attachment_endpoints_404_on_interactive_ws_id(self, storage):
+        """Security regression: an ``admin.coordinator``-scoped caller
+        must NOT be able to read or mutate attachments on
+        **interactive** workstreams via the coord attachment surface.
+        The kind-strict resolver returns 404 (no storage fallback) so
+        a cross-kind ws_id never resolves to its owner."""
+        from turnstone.core.workstream import WorkstreamKind
+
+        # Persist an interactive workstream row directly — never loaded
+        # into the coord_mgr.
+        interactive_ws_id = "i" * 32
+        storage.register_workstream(
+            interactive_ws_id,
+            node_id="some-node",
+            user_id="alice",
+            name="alice-interactive",
+            kind=WorkstreamKind.INTERACTIVE,
+            parent_ws_id=None,
+        )
+        mgr = _build_mgr(storage)
+        client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+        # Upload attempt — must 404, not 200.
+        files = {"file": ("note.md", b"sneaky", "text/markdown")}
+        resp = client.post(
+            f"/v1/api/workstreams/{interactive_ws_id}/attachments",
+            files=files,
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 404, resp.text
+
+        # List, get-content, delete — same kind-strict 404 behaviour.
+        resp = client.get(
+            f"/v1/api/workstreams/{interactive_ws_id}/attachments",
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 404
+        resp = client.get(
+            f"/v1/api/workstreams/{interactive_ws_id}/attachments/anything/content",
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 404
+        resp = client.delete(
+            f"/v1/api/workstreams/{interactive_ws_id}/attachments/anything",
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 404

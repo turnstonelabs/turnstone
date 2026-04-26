@@ -2609,9 +2609,16 @@ async def set_workstream_title(request: Request, ws_id: str = "") -> JSONRespons
 
 
 def _auth_user_id(request: Request) -> str:
-    """Return the authenticated user's id (empty string when absent)."""
-    auth = getattr(getattr(request, "state", None), "auth_result", None)
-    return str(getattr(auth, "user_id", "") or "")
+    """Return the authenticated user's id (empty string when absent).
+
+    Thin shim over :func:`turnstone.core.web_helpers.auth_user_id` —
+    kept as a module-level alias so existing call sites don't need a
+    sweeping rename. The lifted helper is the canonical version
+    (shared by both kinds since P1.5).
+    """
+    from turnstone.core.web_helpers import auth_user_id
+
+    return auth_user_id(request)
 
 
 def _auth_scopes(request: Request) -> set[str]:
@@ -2656,36 +2663,16 @@ def _require_ws_access(
 ) -> tuple[str, JSONResponse | None]:
     """Resolve ``ws_id`` to its owner, 404-ing when the row doesn't exist.
 
-    Turnstone is a trusted-team tool: scope-level auth (e.g.
-    ``admin.workstreams``) is the only gate; row-level ownership is not
-    enforced here.  Returns ``(owner_user_id, None)`` on success — the
-    persisted owner id, which attachments should be filed under so
-    existing storage shape is preserved.  Falls back to the caller's
-    own uid when the row has no recorded owner.
-
-    When ``mgr`` is provided and the workstream is live in the manager,
-    trust its cached ``user_id`` instead of round-tripping storage —
-    keeps in-memory-only handlers (approve / plan / cancel / command /
-    close / SSE / title) functional during transient DB outages and
-    trims the hot-path by one query.  Handlers that act on
-    persisted-but-not-loaded workstreams (``/delete``, ``/open``) omit
-    ``mgr`` and fall through to the storage path.
+    Thin shim over :func:`turnstone.core.web_helpers.resolve_workstream_owner` —
+    kept as a module-level alias for the many existing callers.
+    Both helpers preserve the same trusted-team semantics: any
+    authenticated caller resolves to the row's recorded owner (with
+    fallback to caller uid on unowned rows). The lifted version is
+    the canonical implementation post-P1.5.
     """
-    caller = _auth_user_id(request)
+    from turnstone.core.web_helpers import resolve_workstream_owner
 
-    if mgr is not None:
-        ws_mem = mgr.get(ws_id)
-        if ws_mem is not None:
-            return ws_mem.user_id or caller, None
-        # Not in memory — fall through to storage so /delete etc.
-        # still resolve persisted-but-not-loaded rows.
-
-    from turnstone.core.memory import get_workstream_owner
-
-    owner = get_workstream_owner(ws_id)
-    if owner is None:
-        return "", JSONResponse({"error": "Workstream not found"}, status_code=404)
-    return owner or caller, None
+    return resolve_workstream_owner(request, ws_id, mgr=mgr, not_found_label="Workstream not found")
 
 
 async def open_workstream(request: Request) -> JSONResponse:

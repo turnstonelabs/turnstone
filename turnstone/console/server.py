@@ -2382,8 +2382,15 @@ def _resolve_coordinator_or_404(
 
 
 def _auth_user_id(request: Request) -> str:
-    auth = getattr(getattr(request, "state", None), "auth_result", None)
-    return getattr(auth, "user_id", "") or ""
+    """Thin shim over :func:`turnstone.core.web_helpers.auth_user_id`.
+
+    Kept as a module-level alias so existing call sites don't need a
+    sweeping rename; the lifted helper is the canonical version
+    (shared with the node side since P1.5).
+    """
+    from turnstone.core.web_helpers import auth_user_id
+
+    return auth_user_id(request)
 
 
 def _auth_scopes(request: Request) -> set[str]:
@@ -10103,15 +10110,23 @@ def create_app(
     ) -> tuple[str, JSONResponse | None]:
         """Resolve the attachment owner for a coord ws_id.
 
-        Mirrors interactive's resolver: prefers the in-memory ws's
-        ``user_id`` (the operator who created the coord), falls back
-        to the persisted row owner, returns 404 when neither is found.
+        Kind-strict — only resolves through ``coord_mgr.get(ws_id)``
+        and DOES NOT fall back to storage. This keeps an
+        ``admin.coordinator``-scoped caller from reading or mutating
+        attachments on **interactive** workstreams via the coord
+        attachment endpoints: the storage row for an interactive ws
+        would otherwise resolve cleanly through the generic
+        ``get_workstream_owner`` storage call (which doesn't filter
+        by kind), granting cross-kind access. Persisted-but-not-loaded
+        coordinators must be ``open``ed before they can accept
+        attachment operations.
         """
-        from turnstone.core.web_helpers import resolve_workstream_owner
+        from turnstone.core.web_helpers import auth_user_id
 
-        return resolve_workstream_owner(
-            request, ws_id, mgr=mgr, not_found_label="coordinator not found"
-        )
+        ws = mgr.get(ws_id)
+        if ws is None:
+            return "", JSONResponse({"error": "coordinator not found"}, status_code=404)
+        return ws.user_id or auth_user_id(request), None
 
     from turnstone.core.attachments import (
         classify_text_attachment as _coord_classify_text,

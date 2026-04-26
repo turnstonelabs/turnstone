@@ -819,6 +819,29 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
             queue_outcome["priority"] = priority
             queue_outcome["msg_id"] = msg_id
 
+        def _emit_ui(hook_name: str, *args: Any) -> None:
+            """Best-effort UI hook dispatch.
+
+            Each call is wrapped in try/except so a failure in one
+            hook (e.g. listener-queue full → on_error raises) doesn't
+            suppress the others. Mirrors the pre-P1.5
+            coord_adapter.send per-hook defense.
+            """
+            if ui is None:
+                return
+            method = getattr(ui, hook_name, None)
+            if method is None:
+                return
+            try:
+                method(*args)
+            except Exception:
+                log.debug(
+                    "ws.send.ui_hook_failed ws=%s hook=%s",
+                    ws.id[:8] if ws.id else "",
+                    hook_name,
+                    exc_info=True,
+                )
+
         def _run() -> None:
             me = threading.current_thread()
             try:
@@ -833,19 +856,23 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
                 # If this thread was force-abandoned, ws.worker_thread
                 # was set to None — don't emit spurious events.
                 _release_reservation_on_fail()
-                if ws.worker_thread is me and ui is not None:
-                    ui.on_stream_end()
-                    ui.on_state_change("idle")
-            except Exception as e:
+                if ws.worker_thread is me:
+                    _emit_ui("on_stream_end")
+                    _emit_ui("on_state_change", "idle")
+            except Exception as exc:
                 # Release the reservation so attachments don't stay
                 # soft-locked forever on a worker crash before the
                 # consume step. Idempotent: once consume cleared the
                 # token, a follow-up unreserve is a no-op.
                 _release_reservation_on_fail()
-                if ws.worker_thread is me and ui is not None:
-                    ui.on_error(f"Error: {e}")
-                    ui.on_stream_end()
-                    ui.on_state_change("error")
+                if ws.worker_thread is me:
+                    # ``type(exc).__name__: msg`` carries the exception
+                    # class — coord operators triaging worker failures
+                    # rely on the class name to disambiguate (model-
+                    # alias misconfig vs. tool-policy reject vs. etc.).
+                    _emit_ui("on_error", f"{type(exc).__name__}: {exc}")
+                    _emit_ui("on_stream_end")
+                    _emit_ui("on_state_change", "error")
 
         ok = session_worker.send(
             ws,
@@ -1150,7 +1177,11 @@ def make_dequeue_handler(cfg: SessionEndpointConfig) -> Handler:
                 return err_tenant
 
         ws = mgr.get(ws_id)
-        if ws is None:
+        if ws is None or ws.ui is None:
+            # ``ws.ui is None`` mirrors the pre-P1.5 ``_get_ws`` check —
+            # a workstream observed during a partial-construction or
+            # close window can have no UI; dequeue would otherwise
+            # answer for a session whose listener queues are gone.
             return JSONResponse({"error": cfg.not_found_label}, status_code=404)
         if ws.session is None:
             return JSONResponse({"error": "No session"}, status_code=400)
