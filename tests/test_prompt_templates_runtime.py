@@ -463,7 +463,7 @@ class TestSkillFactoryPassthrough:
             ui_factory=lambda ws: NullUI(),
             session_factory=factory,
         )
-        mgr = SessionManager(adapter, storage=MagicMock(), max_active=10)
+        mgr = SessionManager(adapter, storage=MagicMock(), max_active=10, event_emitter=adapter)
         ws = mgr.create(user_id="", name="test", skill="factory-tpl")
         assert captured_skill == "factory-tpl"
         assert ws.session is not None
@@ -490,7 +490,7 @@ class TestSkillFactoryPassthrough:
             ui_factory=lambda ws: NullUI(),
             session_factory=factory,
         )
-        mgr = SessionManager(adapter, storage=MagicMock(), max_active=10)
+        mgr = SessionManager(adapter, storage=MagicMock(), max_active=10, event_emitter=adapter)
         mgr.create(user_id="", name="test")
         assert captured_skill is None
 

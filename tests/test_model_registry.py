@@ -1219,7 +1219,7 @@ def _make_manager(session_factory: Any) -> Any:
         ui_factory=lambda ws: MagicMock(),
         session_factory=session_factory,
     )
-    return SessionManager(adapter, storage=MagicMock(), max_active=10)
+    return SessionManager(adapter, storage=MagicMock(), max_active=10, event_emitter=adapter)
 
 
 class TestWorkstreamModelParam:

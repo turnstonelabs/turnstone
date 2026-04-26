@@ -3954,6 +3954,11 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                     max_active=int(config_store.get("coordinator.max_active")),
                     node_id=ClusterCollector.CONSOLE_PSEUDO_NODE_ID,
                     state_writer=coord_state_writer,
+                    # CoordinatorAdapter implements SessionEventEmitter
+                    # in full — every lifecycle transition fans out to
+                    # the cluster collector's pseudo-node so the
+                    # dashboard tree mirrors child state.
+                    event_emitter=coord_adapter,
                 )
                 # Late-bind the manager onto the adapter so
                 # ``_rebuild_children_registry`` / ``send`` /

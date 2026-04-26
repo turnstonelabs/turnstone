@@ -4468,6 +4468,11 @@ def main() -> None:
         max_active=config_store.get("server.max_workstreams"),
         node_id=_node_id,
         state_writer=state_writer,
+        # InteractiveAdapter satisfies SessionEventEmitter for the
+        # ``ws_closed`` transport path; emit_created / emit_state /
+        # emit_rehydrated are no-ops because those events fire from
+        # out-of-band paths (create handler + WebUI._broadcast_state).
+        event_emitter=interactive_adapter,
     )
     interactive_adapter.attach(manager)
     WebUI._workstream_mgr = manager

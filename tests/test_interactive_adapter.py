@@ -1,10 +1,18 @@
 """Tests for InteractiveAdapter.
 
-Focus: the transport contract (what gets pushed onto the global
-queue) and cleanup_ui behavior (unblock pending events, broadcast
-ws_closed to per-UI listeners, cancel + close session). The
-SessionManager-level tests in ``test_session_manager.py`` cover the
-adapter-agnostic lifecycle.
+Focus: the ``emit_closed`` transport contract (sole path for
+``ws_closed`` onto the process-wide queue) and ``cleanup_ui``
+behavior (unblock pending events, broadcast ``ws_closed`` to per-UI
+listeners, cancel + close session). The SessionManager-level tests
+in ``test_session_manager.py`` cover the adapter-agnostic lifecycle.
+
+The other three :class:`SessionEventEmitter` methods
+(``emit_created`` / ``emit_state`` / ``emit_rehydrated``) are
+documented no-op stubs — ``ws_created`` is fired by the create HTTP
+handler after attachment validation, and ``ws_state`` is fired by
+``WebUI._broadcast_state`` with the full payload. No-op assertions
+on those methods would be tautological given the class docstring,
+so they're not retested here.
 """
 
 from __future__ import annotations
@@ -15,7 +23,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
-from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamState
+from turnstone.core.workstream import Workstream, WorkstreamKind
 
 
 class _StubUI:
@@ -71,36 +79,9 @@ def _make_ws(**overrides: Any) -> Workstream:
 
 
 # ---------------------------------------------------------------------------
-# Transport — emit_created / emit_state / emit_closed
+# Transport — emit_closed (the only emit_* with real behavior on interactive;
+# emit_created / emit_state / emit_rehydrated are documented no-op stubs)
 # ---------------------------------------------------------------------------
-
-
-def test_emit_created_is_noop_on_interactive() -> None:
-    """The create_workstream HTTP handler fires ws_created after
-    attachment validation; the adapter intentionally no-ops so the
-    event isn't duplicated (and so failed-attachment creates don't
-    surface a phantom create→close pair)."""
-    adapter, gq = _make_adapter()
-    ws = _make_ws()
-    adapter.emit_created(ws)
-    assert gq.empty()
-
-
-def test_emit_rehydrated_is_noop_on_interactive() -> None:
-    adapter, gq = _make_adapter()
-    ws = _make_ws()
-    adapter.emit_rehydrated(ws)
-    assert gq.empty()
-
-
-def test_emit_state_is_noop_on_interactive() -> None:
-    """WebUI._broadcast_state emits the full ws_state payload (tokens,
-    context_ratio, activity). The adapter no-ops to avoid duplicating
-    that with a thinner payload."""
-    adapter, gq = _make_adapter()
-    ws = _make_ws()
-    adapter.emit_state(ws, WorkstreamState.RUNNING)
-    assert gq.empty()
 
 
 def test_emit_closed_defaults_to_closed_reason() -> None:

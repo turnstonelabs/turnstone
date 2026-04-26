@@ -118,6 +118,7 @@ def _build_mgr(storage: SQLiteBackend) -> SessionManager:
         storage=storage,
         max_active=5,
         node_id=ClusterCollector.CONSOLE_PSEUDO_NODE_ID,
+        event_emitter=adapter,
     )
     adapter.attach(mgr)
     return mgr

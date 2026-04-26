@@ -1767,7 +1767,7 @@ class TestSkillConfigAppliedToWorkstream:
             ),
             session_factory=_session_factory,
         )
-        mgr = SessionManager(adapter, storage=storage, max_active=10)
+        mgr = SessionManager(adapter, storage=storage, max_active=10, event_emitter=adapter)
 
         routes = [
             Mount(

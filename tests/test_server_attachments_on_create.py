@@ -289,7 +289,9 @@ def app_client(tmp_path, monkeypatch):
         ),
         session_factory=_factory,
     )
-    mgr = SessionManager(adapter, storage=get_storage(), max_active=10, node_id="node-test")
+    mgr = SessionManager(
+        adapter, storage=get_storage(), max_active=10, node_id="node-test", event_emitter=adapter
+    )
 
     app = create_app(
         workstreams=mgr,

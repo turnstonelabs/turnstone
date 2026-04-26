@@ -97,6 +97,7 @@ def _build_mgr(storage: Any) -> SessionManager:
         storage=storage,
         max_active=3,
         node_id=ClusterCollector.CONSOLE_PSEUDO_NODE_ID,
+        event_emitter=adapter,
     )
     adapter.attach(mgr)
     return mgr

@@ -1,9 +1,12 @@
 """InteractiveAdapter — SessionManager bridge for interactive workstreams.
 
-Emits lifecycle events onto the process-wide ``global_queue`` the SSE
-fan-out thread copies to every connected browser tab. Uses
-``WebUI``'s per-UI listener set for ``cleanup_ui`` — the same hooks
-(``_approval_event`` / ``_plan_event`` / ``_fg_event`` + the
+Implements both :class:`SessionKindAdapter` (construction + cleanup)
+and :class:`SessionEventEmitter` (lifecycle emission). The emission
+surface is asymmetric on the interactive side and the asymmetry is
+load-bearing — see ``InteractiveAdapter`` docstring.
+
+Uses ``WebUI``'s per-UI listener set for ``cleanup_ui`` — the same
+hooks (``_approval_event`` / ``_plan_event`` / ``_fg_event`` + the
 ``ws_closed`` broadcast) the old ``WorkstreamManager._cleanup_ui``
 touched.
 """
@@ -28,7 +31,29 @@ log = get_logger(__name__)
 
 
 class InteractiveAdapter:
-    """Bridges SessionManager to the interactive node's transport."""
+    """Bridges SessionManager to the interactive node's transport.
+
+    Lifecycle emission asymmetry:
+
+    - :meth:`emit_closed` is the **sole** transport path for
+      ``ws_closed`` onto the process-wide ``global_queue`` the SSE
+      fan-out thread copies to every connected browser tab. Stage 1
+      consolidated the old inline emission from the create handler
+      (``reason="evicted"``) here so there's exactly one emission point;
+      ``name`` powers the frontend's eviction toast.
+
+    - :meth:`emit_created` / :meth:`emit_state` / :meth:`emit_rehydrated`
+      are no-ops. The corresponding events fire from out-of-band paths:
+      the create HTTP handler enqueues ``ws_created`` directly onto
+      ``global_queue`` *after* attachment validation (so a rejected
+      upload doesn't surface a phantom create→close pair), and
+      ``WebUI._broadcast_state`` emits the full ``ws_state`` payload
+      (tokens + context_ratio + activity) via the
+      ``SessionUI.on_state_change`` callback chain. The stubs exist
+      solely to satisfy :class:`SessionEventEmitter` Protocol so the
+      adapter can be wired as the manager's ``event_emitter`` for the
+      ``emit_closed`` path.
+    """
 
     kind: WorkstreamKind = WorkstreamKind.INTERACTIVE
 
@@ -69,27 +94,17 @@ class InteractiveAdapter:
         return mgr
 
     # ------------------------------------------------------------------
-    # Lifecycle events — push onto the process-wide SSE queue
+    # SessionEventEmitter — see class docstring for the asymmetry
     # ------------------------------------------------------------------
 
     def emit_created(self, ws: Workstream) -> None:
-        # No-op on interactive. The create_workstream HTTP handler
-        # (turnstone/server.py) fires ws_created to the global queue
-        # AFTER attachment validation so a rejected upload doesn't
-        # surface a phantom create→close pair. Firing here would
-        # duplicate the event and reintroduce the phantom.
-        pass
+        del ws  # no-op — ws_created fires from the create HTTP handler
 
     def emit_state(self, ws: Workstream, state: WorkstreamState) -> None:
-        # No-op on interactive. WebUI._broadcast_state emits the full
-        # ws_state payload (tokens + context_ratio + activity) via the
-        # SessionUI.on_state_change callback chain; firing here would
-        # duplicate the event with a thinner payload.
-        pass
+        del ws, state  # no-op — ws_state fires from WebUI._broadcast_state
 
     def emit_rehydrated(self, ws: Workstream) -> None:
-        # No-op on interactive (mirrors emit_created).
-        pass
+        del ws  # no-op — mirrors emit_created (handler-side ws_created)
 
     def emit_closed(
         self,
@@ -98,23 +113,15 @@ class InteractiveAdapter:
         reason: str = "closed",
         name: str = "",
     ) -> None:
-        # Sole transport path for ws_closed on interactive. The old
-        # create_workstream HTTP handler used to fire this inline (with
-        # name + reason="evicted" on the eviction path) — Stage 1
-        # consolidated that here so there's exactly one emission point.
-        # ``name`` powers the frontend eviction toast.
-        self._enqueue(
-            {
-                "type": "ws_closed",
-                "ws_id": ws_id,
-                "reason": reason,
-                "name": name,
-            }
-        )
-
-    def _enqueue(self, event: dict[str, Any]) -> None:
         with contextlib.suppress(queue.Full):
-            self._global_queue.put_nowait(event)
+            self._global_queue.put_nowait(
+                {
+                    "type": "ws_closed",
+                    "ws_id": ws_id,
+                    "reason": reason,
+                    "name": name,
+                }
+            )
 
     # ------------------------------------------------------------------
     # UI cleanup — unblock pending events + broadcast ws_closed to listeners

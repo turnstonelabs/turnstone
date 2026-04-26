@@ -142,6 +142,26 @@ Three release tracks are maintained:
   coord workers should switch to monitoring ``stream_end`` /
   ``state=idle`` together.
 
+- **`SessionKindAdapter` Protocol split into construction +
+  emission** ([Stage 2 Priority 3]). The adapter Protocol now covers
+  only what every kind must implement (``kind`` / ``build_ui`` /
+  ``build_session`` / ``cleanup_ui``); the four lifecycle emit
+  methods (``emit_created`` / ``emit_state`` / ``emit_rehydrated`` /
+  ``emit_closed``) move to a separate ``SessionEventEmitter``
+  Protocol wired through a new optional
+  ``event_emitter: SessionEventEmitter | None`` kwarg on
+  ``SessionManager``. Both production adapters (interactive on
+  ``server.py``, coordinator on ``console/server.py``) implement
+  both Protocols and are passed as both ``adapter`` and
+  ``event_emitter`` at lifespan-construction time, so production
+  behavior is unchanged. The interactive adapter's three
+  ``emit_created`` / ``emit_state`` / ``emit_rehydrated`` methods
+  remain documented no-op stubs (those events fire from out-of-band
+  paths — the create handler enqueues ``ws_created`` after
+  attachment validation, ``WebUI._broadcast_state`` emits
+  ``ws_state``); ``emit_closed`` stays load-bearing as the sole
+  transport path for ``ws_closed`` onto the global SSE queue.
+
 ### Security
 
 - **Coord attachment endpoints are now kind-strict**

@@ -6,7 +6,11 @@ reservation, eviction, per-ws lock serialization on lazy rehydrate,
 state flips, close-unblocks-UI. All exercised through a
 ``FakeAdapter`` that records ``emit_*`` / ``cleanup_ui`` calls so
 tests can assert the transport contract without spinning up real
-WebUI / ClusterCollector pipelines.
+WebUI / ClusterCollector pipelines. The adapter is wired as both the
+manager's ``adapter`` (for ``cleanup_ui`` / ``build_*``) and its
+``event_emitter`` (for the ``emit_*`` lifecycle calls); production
+adapters do the same — interactive on ``server.py``, coordinator on
+``console/server.py``.
 """
 
 from __future__ import annotations
@@ -29,7 +33,7 @@ from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamStat
 
 @dataclass
 class _Event:
-    kind: str  # "created" | "state" | "closed"
+    kind: str  # "created" | "rehydrated" | "state" | "closed"
     ws_id: str
     state: WorkstreamState | None = None
     reason: str | None = None
@@ -96,13 +100,14 @@ class FakeAdapter:
             self.events.append(_Event("created", ws.id))
 
     def emit_rehydrated(self, ws: Workstream) -> None:
-        # Record as a plain "created" event — the test suite treats
-        # create + rehydrate as indistinguishable on the interactive
-        # transport. The coord-side adapter uses emit_rehydrated for
-        # its storage-seeded subtree rebuild; the fake doesn't need a
-        # separate event type.
+        # Distinct from "created" so a regression where the manager
+        # fires emit_created on the rehydrate path (or emit_rehydrated
+        # on the create path) actually fails a test. The
+        # SessionEventEmitter Protocol carves these out as semantically
+        # different — coord uses emit_rehydrated for the storage-seeded
+        # subtree rebuild that emit_created skips.
         with self._events_lock:
-            self.events.append(_Event("created", ws.id))
+            self.events.append(_Event("rehydrated", ws.id))
 
     def emit_state(self, ws: Workstream, state: WorkstreamState) -> None:
         with self._events_lock:
@@ -222,7 +227,15 @@ def _make_manager(
 ) -> tuple[SessionManager, FakeAdapter, FakeStorage]:
     adapter = adapter or FakeAdapter()
     storage = storage or FakeStorage()
-    mgr = SessionManager(adapter, storage=storage, max_active=max_active)
+    # FakeAdapter implements both Protocols (the production adapters
+    # do too — wire as both so the emit_* assertions in this file
+    # still see the events the manager fires).
+    mgr = SessionManager(
+        adapter,
+        storage=storage,
+        max_active=max_active,
+        event_emitter=adapter,
+    )
     return mgr, adapter, storage
 
 
@@ -374,8 +387,10 @@ def test_open_resurrects_closed_state() -> None:
     assert reopened.id == ws_id
     assert reopened.session is not None
     assert reopened.session.resumed is True  # type: ignore[attr-defined]
-    # Open fires a fresh emit_created so observers see the rehydrate.
-    assert ws_id in [e.ws_id for e in adapter.events_of("created")]
+    # Open fires emit_rehydrated (NOT emit_created) so observers can
+    # gate any extra resurrect-only setup on it (e.g. coord's
+    # storage-seeded children rebuild).
+    assert ws_id in [e.ws_id for e in adapter.events_of("rehydrated")]
 
 
 def test_open_ignores_owner_mismatch() -> None:
@@ -659,7 +674,10 @@ def test_eviction_count_tracks_evictions() -> None:
 
 def test_create_uses_configured_node_id() -> None:
     storage = MagicMock()
-    mgr = SessionManager(FakeAdapter(), storage=storage, max_active=3, node_id="node-xyz")
+    adapter = FakeAdapter()
+    mgr = SessionManager(
+        adapter, storage=storage, max_active=3, node_id="node-xyz", event_emitter=adapter
+    )
     mgr.create(user_id="u1")
     assert storage.register_workstream.call_args.kwargs["node_id"] == "node-xyz"
 
@@ -682,11 +700,13 @@ class TestSessionManagerWithStateWriter:
 
         storage = FakeStorage()
         writer = StateWriter(storage, flush_interval=flush_interval)
+        adapter = FakeAdapter()
         mgr = SessionManager(
-            FakeAdapter(),
+            adapter,
             storage=storage,
             max_active=3,
             state_writer=writer,
+            event_emitter=adapter,
         )
         return mgr, storage, writer
 
