@@ -2994,7 +2994,21 @@ function updateTabIndicator(wsId, state, extra) {
 function switchTab(wsId) {
   closeTabDropdown();
   var pane = getFocusedPane();
-  if (!pane) return;
+  if (!pane) {
+    // Bootstrap the first pane on a fresh-loaded page that had no
+    // workstreams to render at init time. Without this, creating
+    // or opening a workstream from the dashboard left switchTab
+    // with nowhere to attach: it early-returned, no SSE connected,
+    // the chat UI showed nothing, and only a refresh fixed it
+    // (initWorkstreams creates the pane on a now-populated
+    // workstreams list). Mirrors the bootstrap block in
+    // initWorkstreams; renderLayout fires once so the pane DOM is
+    // attached before the rest of switchTab connects SSE.
+    pane = createPane(wsId);
+    splitRoot = { type: "leaf", pane: pane };
+    setFocusedPane(pane.id);
+    renderLayout();
+  }
   if (wsId === pane.wsId && !dashboardVisible) return;
 
   // Track last active for close_tab_action
