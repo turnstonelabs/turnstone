@@ -317,9 +317,11 @@ def test_coordinator_client_spawn_close_delete(tmp_path):
     assert close_result.get("status") in (200, "ok"), close_result
 
     close_req = captured[0]
-    assert close_req.url.path == "/v1/api/route/workstreams/close"
+    # Path-keyed shape post-#422: ws_id rides in the URL.
+    assert close_req.url.path == "/v1/api/route/workstreams/child-99/close"
     close_body = json.loads(close_req.content)
-    assert close_body["ws_id"] == "child-99"
+    # Body no longer carries ws_id — the path is authoritative.
+    assert "ws_id" not in close_body
 
     # delete --------------------------------------------------------------
     captured.clear()
