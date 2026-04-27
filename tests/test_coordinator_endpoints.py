@@ -1312,6 +1312,64 @@ def test_coord_events_replay_yields_pending_approval_then_pending_plan():
     assert out[1]["type"] == "plan_review"
 
 
+def test_coord_events_replay_yields_cached_verdicts_after_pending_approval():
+    """When the SSE stream reconnects mid-approval, the verdict-cache
+    replay must follow the pending_approval re-injection. Without this,
+    a refreshing tab sees the approve_request prompt but no judge chip
+    until the operator re-invokes the action — intent_verdict is a
+    one-shot SSE event with no late-subscriber push. Mirrors the
+    interactive replay path."""
+    import threading
+
+    from turnstone.console.server import _coord_events_replay
+
+    ui = MagicMock()
+    ui._pending_approval = {
+        "type": "approve_request",
+        "items": [{"call_id": "c-1"}],
+    }
+    ui._pending_plan_review = None
+    ui._llm_verdicts = {
+        "c-1": {
+            "verdict_id": "v-1",
+            "call_id": "c-1",
+            "recommendation": "deny",
+            "risk_level": "high",
+        }
+    }
+    ui._ws_lock = threading.Lock()
+    ws = MagicMock()
+    request = MagicMock()
+
+    out = list(_coord_events_replay(ws, ui, request))
+    # approve_request first, then any cached verdicts.
+    assert out[0]["type"] == "approve_request"
+    assert out[1]["type"] == "intent_verdict"
+    assert out[1]["verdict_id"] == "v-1"
+    assert out[1]["recommendation"] == "deny"
+
+
+def test_coord_events_replay_skips_verdict_replay_without_pending_approval():
+    """Verdict replay rides on top of pending_approval — no prompt,
+    no chip. Stale verdicts from a previously-resolved round must
+    not surface on a fresh connect."""
+    import threading
+
+    from turnstone.console.server import _coord_events_replay
+
+    ui = MagicMock()
+    ui._pending_approval = None
+    ui._pending_plan_review = None
+    # Stale entries — should NOT be replayed.
+    ui._llm_verdicts = {"old": {"verdict_id": "stale"}}
+    ui._ws_lock = threading.Lock()
+    ws = MagicMock()
+    request = MagicMock()
+
+    out = list(_coord_events_replay(ws, ui, request))
+    assert out == []
+
+
 def test_coord_events_replay_yields_nothing_when_no_pending():
     """A workstream with no pending approval / plan review yields
     an empty replay. The lifted body falls through to the live loop
