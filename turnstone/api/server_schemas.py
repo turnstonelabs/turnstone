@@ -244,6 +244,54 @@ class ListWorkstreamsResponse(BaseModel):
     workstreams: list[WorkstreamInfo]
 
 
+class PendingApprovalItem(BaseModel):
+    """One pending tool-call inside a ``PendingApprovalDetail`` envelope.
+
+    Mirrors the dict ``SessionUIBase.serialize_pending_approval_detail``
+    emits per item. ``heuristic_verdict`` / ``judge_verdict`` are kept
+    loosely-typed because the underlying verdict shape varies by tier;
+    consumers that want the full structure can decode against
+    :class:`turnstone.sdk.events.IntentVerdictEvent`.
+    """
+
+    call_id: str = ""
+    header: str = ""
+    preview: str = ""
+    func_name: str = ""
+    approval_label: str = ""
+    needs_approval: bool = False
+    error: str | None = None
+    heuristic_verdict: dict[str, Any] | None = None
+    judge_verdict: dict[str, Any] | None = None
+
+
+class PendingApprovalDetail(BaseModel):
+    """Inline approval payload merged into ``DashboardWorkstream``.
+
+    Set when a workstream's ``approve_tools`` is parked on
+    ``_approval_event``; ``None`` (omitted) otherwise. Cross-tenant
+    exposure here follows the same trusted-team posture as
+    ``activity`` / ``tokens`` — see ``server.py``'s ``dashboard``
+    handler comment.
+    """
+
+    call_id: str = Field(
+        default="",
+        description=(
+            "Primary call_id — first non-empty call_id in items list "
+            "order. Matches the 409 ``current_call_id`` response from "
+            "``POST /v1/api/workstreams/{ws_id}/approve`` so the UI "
+            "can render the same identifier the server reports as "
+            "current."
+        ),
+    )
+    judge_pending: bool = Field(
+        default=False,
+        description="LLM judge tier still running; heuristic verdicts may already be present on items.",
+    )
+    items: list[PendingApprovalItem] = Field(default_factory=list)
+
+
 class DashboardWorkstream(BaseModel):
     """Dashboard row shape for ``GET /v1/api/dashboard``.
 
@@ -268,6 +316,18 @@ class DashboardWorkstream(BaseModel):
     kind: WorkstreamKind = WorkstreamKind.INTERACTIVE
     parent_ws_id: str | None = None
     user_id: str = ""
+    pending_approval_detail: PendingApprovalDetail | None = Field(
+        default=None,
+        description=(
+            "Inline approval payload for the coordinator children-tree "
+            "UI. Carries the merged ``_pending_approval`` items list + "
+            "per-call_id LLM verdict cache so a coord can render "
+            "approve/deny buttons + judge pill without a separate "
+            "per-child round-trip. ``None`` when no approval is pending. "
+            "Also surfaced (verbatim) on ``GET /v1/api/cluster/ws/live`` "
+            "via the ``_CLUSTER_WS_LIVE_KEYS`` projection."
+        ),
+    )
 
 
 class DashboardAggregate(BaseModel):

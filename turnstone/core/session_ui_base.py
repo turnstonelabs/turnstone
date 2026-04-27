@@ -353,18 +353,24 @@ class SessionUIBase:
         if not items:
             return None
         call_ids = [item.get("call_id", "") for item in items]
-        # Snapshot the verdict cache under lock — writers are
-        # ``on_intent_verdict`` (daemon judge thread) and
-        # ``_reset_approval_cycle`` (worker thread). ``deepcopy``
-        # under lock keeps the snapshot fully decoupled from cache
-        # state (verdict dicts carry list-typed ``evidence`` that
-        # callers might mutate). Lock hold is microseconds.
+        # Snapshot verdict references under lock, deepcopy after
+        # release. Writers (``on_intent_verdict`` daemon judge
+        # thread + ``_reset_approval_cycle`` worker thread) only
+        # ASSIGN entries, never mutate them in place — so a snapped
+        # reference is stable after the lock drops, and the
+        # subsequent deepcopy can run lock-free even though
+        # verdict dicts carry list-typed ``evidence`` that
+        # downstream callers might mutate. This keeps the lock
+        # window O(N items) without paying the deepcopy cost
+        # (O(verdict size)) under contention with the per-token
+        # write path that also holds ``_ws_lock``.
         with self._ws_lock:
-            verdicts = {
-                cid: copy.deepcopy(self._llm_verdicts[cid])
+            verdict_refs = {
+                cid: self._llm_verdicts[cid]
                 for cid in call_ids
                 if cid and cid in self._llm_verdicts
             }
+        verdicts = {cid: copy.deepcopy(v) for cid, v in verdict_refs.items()}
         serialized: list[dict[str, Any]] = []
         for item in items:
             cid = item.get("call_id", "")

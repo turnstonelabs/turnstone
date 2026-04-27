@@ -83,12 +83,17 @@ class _FakeUI:
         if not items:
             return None
         call_ids = [item.get("call_id", "") for item in items]
+        # Match the real impl's pattern (session_ui_base.py): snapshot
+        # references under the lock, copy after release. Writers only
+        # assign — never mutate — so the reference snapshot is stable
+        # outside the lock window.
         with self._ws_lock:
-            verdicts = {
-                cid: dict(self._llm_verdicts[cid])
+            verdict_refs = {
+                cid: self._llm_verdicts[cid]
                 for cid in call_ids
                 if cid and cid in self._llm_verdicts
             }
+        verdicts = {cid: dict(v) for cid, v in verdict_refs.items()}
         serialized: list[dict[str, Any]] = []
         for item in items:
             cid = item.get("call_id", "")
