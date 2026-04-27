@@ -79,7 +79,7 @@ class "Scope Hierarchy" as SH <<scope>> {
     --
     GET → read
     POST write paths → write
-    POST /api/approve → approve
+    POST /api/workstreams/{ws_id}/approve → approve
     /api/admin/* → approve
 }
 

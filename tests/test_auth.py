@@ -53,8 +53,8 @@ class TestIsPublicPath:
     def test_api_workstreams_not_public(self):
         assert is_public_path("/api/workstreams") is False
 
-    def test_api_send_not_public(self):
-        assert is_public_path("/api/send") is False
+    def test_api_workstreams_send_not_public(self):
+        assert is_public_path("/api/workstreams/abc/send") is False
 
     def test_api_cluster_overview_not_public(self):
         assert is_public_path("/api/cluster/overview") is False
@@ -419,7 +419,7 @@ class TestCheckRequest:
 
     def test_write_full_token_ok(self, full_jwt):
         allowed, status, msg, _result = check_request(
-            "POST", "/api/send", full_jwt, jwt_secret=self._SECRET
+            "POST", "/api/workstreams/abc/send", full_jwt, jwt_secret=self._SECRET
         )
         assert allowed is True
         assert status == 200
@@ -520,7 +520,7 @@ class TestCheckRequest:
 
     def test_approve_full_token_ok(self, full_jwt):
         allowed, status, msg, _result = check_request(
-            "POST", "/api/approve", full_jwt, jwt_secret=self._SECRET
+            "POST", "/api/workstreams/abc/approve", full_jwt, jwt_secret=self._SECRET
         )
         assert allowed is True
 
@@ -562,7 +562,7 @@ class TestCheckRequestWithCookie:
     def test_bearer_takes_precedence_over_cookie(self, read_jwt, full_jwt):
         allowed, status, _, _r = check_request(
             "POST",
-            "/api/send",
+            "/api/workstreams/abc/send",
             f"Bearer {full_jwt}",
             cookie_header=f"turnstone_auth={read_jwt}",
             jwt_secret=self._SECRET,
@@ -594,7 +594,7 @@ class TestCheckRequestWithCookie:
     def test_cookie_full_on_write_ok(self, full_jwt):
         allowed, status, _, _r = check_request(
             "POST",
-            "/api/send",
+            "/api/workstreams/abc/send",
             None,
             cookie_header=f"turnstone_auth={full_jwt}",
             jwt_secret=self._SECRET,

@@ -43,7 +43,7 @@ eval --> sqlite : SQLite
 
 console --> server : HTTP proxy\n(hash-ring bucket lookup,\nproxy /node/{id}/* traffic)
 
-channel --> server : HTTP + SSE\n(POST /v1/api/send,\nGET /v1/api/events)
+channel --> server : HTTP + SSE\n(POST /v1/api/workstreams/{ws_id}/send,\nGET /v1/api/workstreams/{ws_id}/events)
 
 ' Notes
 note right of console

@@ -61,15 +61,15 @@ class TestRateLimiter:
     def test_disabled_allows_everything(self):
         limiter = RateLimiter(enabled=False, rate=1.0, burst=1)
         for _ in range(100):
-            allowed, retry = limiter.check("1.2.3.4", "/api/send")
+            allowed, retry = limiter.check("1.2.3.4", "/api/workstreams/abc/send")
             assert allowed is True
             assert retry == 0.0
 
     def test_exempt_paths_bypass(self):
         limiter = RateLimiter(enabled=True, rate=1.0, burst=1)
         # Exhaust the bucket on a normal path
-        limiter.check("1.2.3.4", "/api/send")
-        limiter.check("1.2.3.4", "/api/send")
+        limiter.check("1.2.3.4", "/api/workstreams/abc/send")
+        limiter.check("1.2.3.4", "/api/workstreams/abc/send")
 
         # Exempt paths should still pass
         allowed, retry = limiter.check("1.2.3.4", "/health")
@@ -84,18 +84,18 @@ class TestRateLimiter:
         limiter = RateLimiter(enabled=True, rate=1.0, burst=1)
 
         # Exhaust IP A
-        allowed_a, _ = limiter.check("10.0.0.1", "/api/send")
+        allowed_a, _ = limiter.check("10.0.0.1", "/api/workstreams/abc/send")
         assert allowed_a is True
-        allowed_a, _ = limiter.check("10.0.0.1", "/api/send")
+        allowed_a, _ = limiter.check("10.0.0.1", "/api/workstreams/abc/send")
         assert allowed_a is False
 
         # IP B should still have its own bucket
-        allowed_b, _ = limiter.check("10.0.0.2", "/api/send")
+        allowed_b, _ = limiter.check("10.0.0.2", "/api/workstreams/abc/send")
         assert allowed_b is True
 
     def test_burst_then_reject(self):
         limiter = RateLimiter(enabled=True, rate=10.0, burst=3)
-        results = [limiter.check("1.2.3.4", "/api/send")[0] for _ in range(5)]
+        results = [limiter.check("1.2.3.4", "/api/workstreams/abc/send")[0] for _ in range(5)]
         assert results == [True, True, True, False, False]
 
     def test_cleanup_removes_stale(self):
@@ -104,8 +104,8 @@ class TestRateLimiter:
             limiter = RateLimiter(enabled=True, rate=10.0, burst=5)
 
             # Create buckets for two IPs
-            limiter.check("10.0.0.1", "/api/send")
-            limiter.check("10.0.0.2", "/api/send")
+            limiter.check("10.0.0.1", "/api/workstreams/abc/send")
+            limiter.check("10.0.0.2", "/api/workstreams/abc/send")
 
             # Advance time past max_age for both
             mock_time.return_value = 5000.0
@@ -120,11 +120,11 @@ class TestRateLimiter:
             mock_time.return_value = 1000.0
             limiter = RateLimiter(enabled=True, rate=10.0, burst=5)
 
-            limiter.check("10.0.0.1", "/api/send")
+            limiter.check("10.0.0.1", "/api/workstreams/abc/send")
 
             # Only 60s later — well within max_age
             mock_time.return_value = 1060.0
-            limiter.check("10.0.0.2", "/api/send")
+            limiter.check("10.0.0.2", "/api/workstreams/abc/send")
 
             mock_time.return_value = 1060.0
             removed = limiter.cleanup(max_age=3600.0)

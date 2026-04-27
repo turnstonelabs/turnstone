@@ -1,7 +1,7 @@
 """Unit tests for ``turnstone.core.session_worker``.
 
 The shared worker dispatch is load-bearing for both the interactive
-``/v1/api/send`` HTTP handler and the coordinator
+``/v1/api/workstreams/{ws_id}/send`` HTTP handler and the coordinator
 ``CoordinatorAdapter.send`` path. Tests cover the four invariants the
 module must hold:
 

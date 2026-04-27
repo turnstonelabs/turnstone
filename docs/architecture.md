@@ -1100,8 +1100,8 @@ Three hierarchical scopes control endpoint access:
 | Scope | Grants | Endpoints |
 |-------|--------|-----------|
 | `read` | SSE streams, workstream listing, history | GET endpoints |
-| `write` | `read` + send, command, workstream create/close | POST to `/api/send`, `/api/command`, etc. |
-| `approve` | `write` + tool approval, admin operations | POST to `/api/approve`, `/api/admin/*` |
+| `write` | `read` + send, command, workstream create/close | POST to `/api/workstreams/{ws_id}/send`, `/api/command`, etc. |
+| `approve` | `write` + tool approval, admin operations | POST to `/api/workstreams/{ws_id}/approve`, `/api/admin/*` |
 
 ### Middleware Flow
 
