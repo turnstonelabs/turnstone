@@ -544,6 +544,290 @@ def test_serialize_pending_approval_detail_returned_dict_is_decoupled() -> None:
     assert ui._llm_verdicts["c-1"]["recommendation"] == "approve"
 
 
+# ---------------------------------------------------------------------------
+# Auto-approve visibility — _serialize_approval_items + _record_auto_approves
+# + serialize_recent_auto_approvals
+# ---------------------------------------------------------------------------
+
+
+def test_serialize_approval_items_forwards_auto_approve_fields() -> None:
+    """When the upstream pipeline tags an item with ``auto_approved`` +
+    ``auto_approve_reason``, the serialized payload must carry both
+    so the dashboard pill / per-ws SSE consumer can show *which*
+    path bypassed the operator gate."""
+    ui = _make_ui()
+    items = [
+        {
+            "call_id": "c1",
+            "func_name": "bash",
+            "approval_label": "bash",
+            "needs_approval": False,
+            "auto_approved": True,
+            "auto_approve_reason": "skill",
+        },
+        {
+            "call_id": "c2",
+            "func_name": "read_file",
+            "needs_approval": False,
+            # No auto_approved tag — read-only tool that never needed approval.
+        },
+    ]
+    out = ui._serialize_approval_items(items)
+    assert out[0]["auto_approved"] is True
+    assert out[0]["auto_approve_reason"] == "skill"
+    # Items not flagged as auto-approved must NOT carry the fields —
+    # otherwise the dashboard would show pills for read-only tools too.
+    assert "auto_approved" not in out[1]
+    assert "auto_approve_reason" not in out[1]
+
+
+def test_serialize_approval_items_forwards_denial_msg_as_error() -> None:
+    """Denied items surface their ``denial_msg`` as ``error`` so the
+    /dashboard / SSE consumer renders the policy-block reason
+    without exposing the raw item shape."""
+    ui = _make_ui()
+    items = [
+        {
+            "call_id": "c1",
+            "func_name": "bash",
+            "denied": True,
+            "denial_msg": "Blocked by tool policy (pattern match for 'bash')",
+        }
+    ]
+    out = ui._serialize_approval_items(items)
+    assert out[0]["error"] == "Blocked by tool policy (pattern match for 'bash')"
+
+
+def test_record_auto_approves_appends_only_tagged_items() -> None:
+    """Items without ``auto_approved=True`` are skipped — the ring
+    buffer is meant to surface bypassed-the-gate calls, not a
+    record of every tool invocation."""
+    storage = MagicMock()
+    ui = _make_ui()
+    items = [
+        {
+            "call_id": "c1",
+            "func_name": "bash",
+            "approval_label": "bash",
+            "auto_approved": True,
+            "auto_approve_reason": "skill",
+        },
+        {
+            "call_id": "c2",
+            "func_name": "read_file",
+            # No auto_approved tag — read-only tool, gets skipped.
+        },
+    ]
+    with _patch_get_storage(storage):
+        ui._record_auto_approves(items)
+    snapshot = ui.serialize_recent_auto_approvals()
+    assert len(snapshot) == 1
+    assert snapshot[0]["func_name"] == "bash"
+    assert snapshot[0]["auto_approve_reason"] == "skill"
+    # Audit row recorded — one row per call (not per item) so
+    # tool-heavy turns don't blow up the audit table.
+    storage.record_audit_event.assert_called_once()
+    call_kwargs = storage.record_audit_event.call_args.kwargs
+    assert call_kwargs["action"] == "tool.auto_approved"
+
+
+def test_record_auto_approves_caps_buffer_at_max() -> None:
+    """Bounded ring buffer — a long-running skill workstream can't
+    fill the /dashboard payload with stale rows.  The cap is the
+    class-level constant, exercised here to lock the contract."""
+    ui = _make_ui()
+    cap = ui._RECENT_AUTO_APPROVALS_MAX
+    # Push (cap + 5) items; only the most recent ``cap`` survive.
+    for i in range(cap + 5):
+        with _patch_get_storage(MagicMock()):
+            ui._record_auto_approves(
+                [
+                    {
+                        "call_id": f"c{i}",
+                        "func_name": f"tool_{i}",
+                        "auto_approved": True,
+                        "auto_approve_reason": "blanket",
+                    }
+                ]
+            )
+    snapshot = ui.serialize_recent_auto_approvals()
+    assert len(snapshot) == cap
+    # Tail preserved — oldest entries roll off the head.
+    assert snapshot[-1]["func_name"] == f"tool_{cap + 5 - 1}"
+    assert snapshot[0]["func_name"] == f"tool_{5}"
+
+
+def test_record_auto_approves_noop_when_no_tagged_items() -> None:
+    """No tagged items → no buffer write, no audit — matters for
+    the every-tool-call-was-read-only case where ``items`` is
+    non-empty but nothing was an auto-approve."""
+    storage = MagicMock()
+    ui = _make_ui()
+    with _patch_get_storage(storage):
+        ui._record_auto_approves(
+            [{"call_id": "c1", "func_name": "read_file"}]  # no auto_approved tag
+        )
+    assert ui.serialize_recent_auto_approvals() == []
+    storage.record_audit_event.assert_not_called()
+
+
+def test_record_auto_approves_swallows_audit_failure() -> None:
+    """An audit-write exception must not break the tool-execution
+    path — visibility is best-effort, the SSE event + ring buffer
+    already shipped to operators by the time this fires."""
+    storage = MagicMock()
+    storage.record_audit_event.side_effect = RuntimeError("audit table down")
+    ui = _make_ui()
+    items = [
+        {
+            "call_id": "c1",
+            "func_name": "bash",
+            "auto_approved": True,
+            "auto_approve_reason": "policy",
+        }
+    ]
+    # Must not raise — the docstring explicitly promises best-effort.
+    with _patch_get_storage(storage):
+        ui._record_auto_approves(items)
+    # Buffer write still happened (it's first, before the audit).
+    assert len(ui.serialize_recent_auto_approvals()) == 1
+
+
+def test_replay_recent_auto_approvals_from_audit_seeds_buffer() -> None:
+    """Audit-replay seeds the ring buffer on UI construction so the
+    dashboard pill survives UI rebuilds (saved-workstream rehydrate /
+    coord→node click-through / process restart all create a fresh UI
+    whose buffer would otherwise be empty even though the audit row
+    is still on disk)."""
+    storage = MagicMock()
+    storage.list_audit_events.return_value = [
+        # DESC order — newest first.
+        {
+            "timestamp": "2026-04-27T18:00:00",
+            "detail": (
+                '{"tools": [{"call_id": "c2", "func_name": "edit_file",'
+                ' "approval_label": "edit_file", "reason": "policy"}],'
+                ' "count": 1}'
+            ),
+        },
+        {
+            "timestamp": "2026-04-27T17:00:00",
+            "detail": (
+                '{"tools": [{"call_id": "c1", "func_name": "bash",'
+                ' "approval_label": "bash", "reason": "skill"}],'
+                ' "count": 1}'
+            ),
+        },
+    ]
+    with _patch_get_storage(storage):
+        ui = _make_ui(ws_id="ws-replay")
+    # Buffer holds the replayed entries in chronological order
+    # (oldest first), matching what live appends produce.
+    snapshot = ui.serialize_recent_auto_approvals()
+    assert len(snapshot) == 2
+    assert snapshot[0]["func_name"] == "bash"
+    assert snapshot[0]["auto_approve_reason"] == "skill"
+    assert snapshot[1]["func_name"] == "edit_file"
+    assert snapshot[1]["auto_approve_reason"] == "policy"
+    # And the audit query was scoped to this ws + tool.auto_approved.
+    storage.list_audit_events.assert_called_once()
+    call_kwargs = storage.list_audit_events.call_args.kwargs
+    assert call_kwargs["action"] == "tool.auto_approved"
+    assert call_kwargs["resource_id"] == "ws-replay"
+
+
+def test_replay_swallows_audit_storage_failure() -> None:
+    """A storage outage at construction time must not break UI
+    instantiation — the buffer simply stays empty until the next
+    live auto-approve populates it."""
+    storage = MagicMock()
+    storage.list_audit_events.side_effect = RuntimeError("audit table down")
+    with _patch_get_storage(storage):
+        ui = _make_ui(ws_id="ws-replay")
+    assert ui.serialize_recent_auto_approvals() == []
+
+
+def test_replay_skips_when_ws_id_missing() -> None:
+    """No ws_id → no audit query.  Test fixtures sometimes
+    construct a UI with the default empty ws_id; the replay must
+    not fire a wildcard query that returns rows from other ws's."""
+    storage = MagicMock()
+    with _patch_get_storage(storage):
+        ui = _make_ui(ws_id="")
+    storage.list_audit_events.assert_not_called()
+    assert ui.serialize_recent_auto_approvals() == []
+
+
+def test_replay_tolerates_malformed_audit_detail() -> None:
+    """Unparseable / wrong-shape audit detail rows are skipped, not
+    propagated.  A historic audit row with a different schema (e.g.
+    pre-fix migration leftover) must not crash UI construction."""
+    storage = MagicMock()
+    storage.list_audit_events.return_value = [
+        {"timestamp": "2026-04-27T18:00:00", "detail": "not-json"},
+        {"timestamp": "2026-04-27T17:30:00", "detail": '{"tools": "wrong-shape"}'},
+        {
+            "timestamp": "2026-04-27T17:00:00",
+            "detail": '{"tools": [{"func_name": "bash", "reason": "skill"}], "count": 1}',
+        },
+    ]
+    with _patch_get_storage(storage):
+        ui = _make_ui(ws_id="ws-replay")
+    # Only the well-shaped row contributes.
+    snapshot = ui.serialize_recent_auto_approvals()
+    assert len(snapshot) == 1
+    assert snapshot[0]["func_name"] == "bash"
+
+
+def test_replay_caps_at_buffer_max() -> None:
+    """Replay output is bounded by the same cap as live appends.
+    A long-lived workstream with hundreds of audit rows must not
+    blow past the 10-entry limit during replay."""
+    storage = MagicMock()
+    # Generate many fake rows.
+    storage.list_audit_events.return_value = [
+        {
+            "timestamp": f"2026-04-27T{i:02d}:00:00",
+            "detail": (
+                f'{{"tools": [{{"func_name": "tool_{i}", "reason": "skill"}}], "count": 1}}'
+            ),
+        }
+        for i in range(20)
+    ]
+    with _patch_get_storage(storage):
+        ui = _make_ui(ws_id="ws-replay")
+    snapshot = ui.serialize_recent_auto_approvals()
+    # Cap holds even when audit-replay fans in past it.
+    assert len(snapshot) == ui._RECENT_AUTO_APPROVALS_MAX
+
+
+def test_serialize_recent_auto_approvals_returns_a_copy() -> None:
+    """Mutating the returned list must not corrupt the buffer —
+    HTTP handler should not be able to drain or reorder it."""
+    ui = _make_ui()
+    with _patch_get_storage(MagicMock()):
+        ui._record_auto_approves(
+            [
+                {
+                    "call_id": "c1",
+                    "func_name": "bash",
+                    "auto_approved": True,
+                    "auto_approve_reason": "skill",
+                }
+            ]
+        )
+    snapshot = ui.serialize_recent_auto_approvals()
+    snapshot.clear()
+    snapshot.append({"poisoned": True})
+    # Buffer state survives the caller's mutation.
+    fresh = ui.serialize_recent_auto_approvals()
+    assert len(fresh) == 1
+    assert fresh[0]["func_name"] == "bash"
+
+
+# ---------------------------------------------------------------------------
+
+
 def test_concurrent_enqueue_and_listener_registration() -> None:
     """Fan-out under concurrent enqueue + register/unregister shouldn't
     drop events or crash on the lock. Sanity-level stress."""

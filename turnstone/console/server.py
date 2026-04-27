@@ -613,6 +613,13 @@ _CLUSTER_WS_LIVE_KEYS = (
     # Cross-tenant exposure follows the trusted-team posture documented
     # on ``SessionUIBase.serialize_pending_approval_detail``.
     "pending_approval_detail",
+    # Ring buffer of the child's recent auto-approves (last 10) for
+    # the coord-tree's "auto-approved by skill X" pill.  Without this
+    # the operator has no surface to see WHICH tool calls bypassed
+    # the gate or WHY (skill allowlist / blanket / admin policy /
+    # explicit "Always" click) — the SSE ``tool_info`` event fires
+    # only on the per-ws stream the coord doesn't subscribe to.
+    "recent_auto_approvals",
 )
 
 
@@ -733,6 +740,7 @@ def _coordinator_live_snapshot(ws: Any) -> dict[str, Any]:
     # transient states (newly-created ws before activation); every
     # active coord UI is a ``SessionUIBase`` and supports the method.
     pending_approval_detail = ui.serialize_pending_approval_detail() if ui is not None else None
+    recent_auto_approvals = ui.serialize_recent_auto_approvals() if ui is not None else []
 
     return {
         "state": ws.state.value if hasattr(ws.state, "value") else str(ws.state),
@@ -747,6 +755,7 @@ def _coordinator_live_snapshot(ws: Any) -> dict[str, Any]:
         "name": getattr(ws, "name", "") or "",
         "pending_approval": pending_approval,
         "pending_approval_detail": pending_approval_detail,
+        "recent_auto_approvals": recent_auto_approvals,
     }
 
 

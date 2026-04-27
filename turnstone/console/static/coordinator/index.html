@@ -195,6 +195,27 @@
     font-size: 11px;
     line-height: 1.4;
   }
+  /* Auto-approved pill — same 22px indent as .approval-block / .meta
+     so a child row showing both stacks cleanly.  Lower visual weight
+     than the live approve/deny block (this is informational, not
+     actionable) but still distinct enough that the operator notices
+     when a tool call bypassed the gate. */
+  [data-design="v1"] .ch-row .ch-auto-approved-pill {
+    margin-top: 2px;
+    padding: 2px 8px 2px 22px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    line-height: 1.4;
+    color: var(--ink-3);
+    cursor: help;
+  }
+  [data-design="v1"] .ch-row .ch-auto-approved-label {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    border: 1px solid var(--hair);
+    background: var(--surface-1, transparent);
+  }
   [data-design="v1"] .ch-row .approval-header {
     display: flex;
     flex-wrap: wrap;

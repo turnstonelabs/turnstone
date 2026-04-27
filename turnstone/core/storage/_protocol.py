@@ -1209,8 +1209,16 @@ class StorageBackend(Protocol):
         until: str = "",
         limit: int = 100,
         offset: int = 0,
+        resource_id: str = "",
     ) -> list[dict[str, Any]]:
-        """List audit events with optional filters, ordered by timestamp DESC."""
+        """List audit events with optional filters, ordered by timestamp DESC.
+
+        ``resource_id`` filters to events scoped to a single
+        workstream (or other resource id) — added so per-ws
+        consumers like ``SessionUIBase._replay_recent_auto_approvals``
+        can pull a workstream's bypass history without scanning
+        the full table.
+        """
         ...
 
     def count_audit_events(
