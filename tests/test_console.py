@@ -1192,6 +1192,68 @@ class TestConsoleProxy:
         )
         assert resp.status_code == 404
 
+    def test_proxy_api_per_ws_events_routes_to_sse_handler(self, client, mock_collector):
+        """``/node/{node_id}/v1/api/workstreams/{ws_id}/events`` is the
+        per-workstream SSE stream the interactive WebUI subscribes to.
+        Without explicit detection, the path falls through to the
+        regular GET branch and the EventSource API can't consume the
+        one-shot response — Firefox surfaces it as "can't establish a
+        connection". Regression guard for the legacy URL surface
+        removal (#422) that moved per-ws SSE under
+        ``/workstreams/{ws_id}/events`` without updating the proxy."""
+        from unittest.mock import AsyncMock, patch
+
+        from starlette.responses import Response
+
+        mock_collector.get_node_detail.return_value = {
+            "node_id": "node-a",
+            "server_url": "http://a:8080",
+            "reachable": True,
+        }
+        ws_id = "a" * 32
+        with (
+            patch(
+                "turnstone.console.server._proxy_sse",
+                new_callable=AsyncMock,
+                return_value=Response("ok", status_code=200),
+            ) as sse_mock,
+            patch(
+                "turnstone.console.server._proxy_get",
+                new_callable=AsyncMock,
+                return_value=Response("ok", status_code=200),
+            ) as get_mock,
+        ):
+            client.get(f"/node/node-a/v1/api/workstreams/{ws_id}/events")
+            assert sse_mock.await_count == 1, (
+                "per-ws events path must route to _proxy_sse, not _proxy_get"
+            )
+            assert get_mock.await_count == 0
+            # Path passed to _proxy_sse must be the workstreams-prefixed
+            # form so the upstream URL is reconstructed correctly.
+            sse_args = sse_mock.await_args
+            assert sse_args.args[2] == f"workstreams/{ws_id}/events"
+
+    def test_proxy_api_global_events_still_routes_to_sse(self, client, mock_collector):
+        """The bare ``events/global`` path was the only SSE path the
+        proxy recognized before the per-ws fix. Verify it still routes
+        correctly so the new branch didn't regress the existing case."""
+        from unittest.mock import AsyncMock, patch
+
+        from starlette.responses import Response
+
+        mock_collector.get_node_detail.return_value = {
+            "node_id": "node-a",
+            "server_url": "http://a:8080",
+            "reachable": True,
+        }
+        with patch(
+            "turnstone.console.server._proxy_sse",
+            new_callable=AsyncMock,
+            return_value=Response("ok", status_code=200),
+        ) as sse_mock:
+            client.get("/node/node-a/v1/api/events/global")
+            assert sse_mock.await_count == 1
+
 
 # ---------------------------------------------------------------------------
 # Proxy URL rewriting unit tests (no HTTP needed)
