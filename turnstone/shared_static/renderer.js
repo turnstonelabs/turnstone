@@ -357,9 +357,18 @@ function renderMarkdown(text) {
     },
   );
 
-  // Protect display math ($$...$$) — must come before inline code/math
+  // Protect display math — must come before inline code/math.
+  // Two delimiter styles: TeX ($$...$$) and LaTeX (\[...\]). Most
+  // models emit one or the other depending on system-prompt style;
+  // GPT-5 / o-series and Claude with reasoning effort tend to emit
+  // the LaTeX form. Without both, math nested in a markdown
+  // paragraph silently passes through as raw \[...\] text.
   var mathBlocks = [];
   text = text.replace(/\$\$([\s\S]+?)\$\$/g, function (m, tex) {
+    mathBlocks.push(renderLatex(tex.trim(), true));
+    return "\x00MB" + (mathBlocks.length - 1) + "\x00";
+  });
+  text = text.replace(/\\\[([\s\S]+?)\\\]/g, function (m, tex) {
     mathBlocks.push(renderLatex(tex.trim(), true));
     return "\x00MB" + (mathBlocks.length - 1) + "\x00";
   });
@@ -371,10 +380,15 @@ function renderMarkdown(text) {
     return "\x00IC" + (inlineCodes.length - 1) + "\x00";
   });
 
-  // Protect inline math ($...$) — after inline code so `$x$` in code is safe
+  // Protect inline math — both delimiter styles ($...$ and \(...\)).
+  // After inline code so `$x$` / `\(x\)` inside code stays literal.
   var inlineMaths = [];
   text = text.replace(/\$([^\$\n]+?)\$/g, function (m, tex) {
     inlineMaths.push(renderLatex(tex, false));
+    return "\x00IM" + (inlineMaths.length - 1) + "\x00";
+  });
+  text = text.replace(/\\\(([\s\S]+?)\\\)/g, function (m, tex) {
+    inlineMaths.push(renderLatex(tex.trim(), false));
     return "\x00IM" + (inlineMaths.length - 1) + "\x00";
   });
 
