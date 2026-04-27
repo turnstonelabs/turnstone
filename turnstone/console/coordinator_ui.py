@@ -110,7 +110,20 @@ class ConsoleCoordinatorUI(SessionUIBase):
         # independently of the blanket ``auto_approve`` flag — matches
         # the WebUI two-tier contract (turnstone/server.py).
         if self.auto_approve_tools:
-            pending_names = {it.get("func_name", "") for it in pending if it.get("func_name")}
+            # Match WebUI's set-membership key: ``approval_label or
+            # func_name``.  ``auto_approve_tools`` is populated by
+            # both the skill template (bare func_name) and the
+            # "Approve + Always" handler (which tags via approval_label
+            # at session_routes.py).  Pre-fix the coord UI used only
+            # func_name, so an Always-added tool whose approval_label
+            # differs from func_name (e.g. ``skill__name``,
+            # ``mcp_resource__uri``) wouldn't match here and the
+            # operator would get prompted again on the coord page.
+            pending_names = {
+                it.get("approval_label", "") or it.get("func_name", "")
+                for it in pending
+                if it.get("func_name")
+            }
             if pending_names and pending_names.issubset(self.auto_approve_tools):
                 # Tag for /dashboard visibility — matches WebUI shape so
                 # the coord-tree pill renders the same source string

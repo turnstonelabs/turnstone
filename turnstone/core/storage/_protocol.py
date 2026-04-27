@@ -1215,7 +1215,8 @@ class StorageBackend(Protocol):
 
         ``resource_id`` filters to events scoped to a single
         workstream (or other resource id) — added so per-ws
-        consumers like ``SessionUIBase._replay_recent_auto_approvals``
+        consumers like
+        ``SessionUIBase.replay_recent_auto_approvals_from_audit``
         can pull a workstream's bypass history without scanning
         the full table.
         """

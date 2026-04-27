@@ -779,6 +779,22 @@ def test_replay_tolerates_malformed_audit_detail() -> None:
     assert snapshot[0]["func_name"] == "bash"
 
 
+def test_parse_audit_timestamp_treats_naive_strings_as_utc() -> None:
+    """Audit rows are stored as naive UTC strings (e.g.
+    ``2026-04-27T18:00:00`` with no timezone marker); a server in
+    a non-UTC timezone would mis-stamp pill entries by hours
+    without explicit UTC.replace at parse time."""
+    from datetime import UTC, datetime
+
+    from turnstone.core.session_ui_base import SessionUIBase
+
+    expected = datetime(2026, 4, 27, 18, 0, 0, tzinfo=UTC).timestamp()
+    assert SessionUIBase._parse_audit_timestamp("2026-04-27T18:00:00") == expected
+    # Explicit-offset strings parse correctly too — the UTC stamp
+    # only applies when tzinfo is None.
+    assert SessionUIBase._parse_audit_timestamp("2026-04-27T18:00:00+00:00") == expected
+
+
 def test_replay_caps_at_buffer_max() -> None:
     """Replay output is bounded by the same cap as live appends.
     A long-lived workstream with hundreds of audit rows must not

@@ -313,9 +313,10 @@ class WebUI(SessionUIBase):
             if blanket_active and pending:
                 # Blanket flag drained the rest of pending \u2014 tag so the
                 # dashboard can distinguish from
-                # ``auto_approve_tools`` / ``policy``.
+                # ``auto_approve_tools`` / ``policy``.  No need to
+                # clear ``pending`` here: the function returns inside
+                # this block without reading it again.
                 self._tag_auto_approved(pending, AutoApproveReason.BLANKET)
-                pending = []
             # Track auto-approved tool activity
             first = items[0] if items else {}
             label = first.get("func_name", "")

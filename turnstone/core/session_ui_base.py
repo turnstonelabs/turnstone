@@ -708,6 +708,15 @@ class SessionUIBase:
     def _parse_audit_timestamp(ts_str: str) -> float:
         """Parse the audit row's ISO-8601 timestamp into epoch seconds.
 
+        Audit rows are written as ``datetime.now(UTC).strftime(...)``
+        without a timezone marker (see ``storage/_sqlite.py:record_audit_event``),
+        so ``datetime.fromisoformat`` returns a *naive* datetime.
+        Calling ``.timestamp()`` on a naive datetime interprets it
+        in the server's local timezone — wrong here, since the
+        source clock is UTC.  Stamp UTC explicitly before
+        converting so a non-UTC server doesn't render pill
+        timestamps off by hours.
+
         Falls back to ``0.0`` on a missing / malformed timestamp so
         the buffer entry still surfaces (just with a "no time"
         indicator the JS pill renderer treats as missing).
@@ -715,9 +724,11 @@ class SessionUIBase:
         if not ts_str:
             return 0.0
         try:
-            from datetime import datetime
+            from datetime import UTC, datetime
 
             dt = datetime.fromisoformat(ts_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
             return dt.timestamp()
         except (TypeError, ValueError):
             return 0.0
