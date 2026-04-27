@@ -71,8 +71,6 @@ from turnstone.core.session_routes import (
     make_detail_handler,
     make_events_handler,
     make_history_handler,
-    make_legacy_body_keyed_adapter,
-    make_legacy_query_keyed_adapter,
     make_list_handler,
     make_open_handler,
     make_saved_handler,
@@ -765,27 +763,6 @@ def _interactive_tenant_check(
     """
     _owner, err = _require_ws_access(request, ws_id, mgr=mgr)
     return err
-
-
-def _make_method_dispatch(
-    handlers: dict[str, Any],
-) -> Any:
-    """Mount one URL with different bodies per HTTP method.
-
-    Starlette's ``Route`` accepts a single handler; the legacy
-    ``/v1/api/send`` URL serves both POST (send) and DELETE (dequeue)
-    via the same path. The shared registrar mounts these as two
-    separate path-keyed verbs (``send`` / ``DELETE``); this helper
-    bridges so the legacy body-keyed URL can keep its single Route.
-    """
-
-    async def dispatch(request: Request) -> Any:
-        handler = handlers.get(request.method)
-        if handler is None:
-            return JSONResponse({"error": f"method {request.method} not allowed"}, status_code=405)
-        return await handler(request)
-
-    return dispatch
 
 
 def _audit_close_workstream(
@@ -3538,7 +3515,6 @@ def create_app(
     history_handler = make_history_handler(interactive_endpoint_config)
     detail_handler = make_detail_handler(interactive_endpoint_config)
     v1_routes: list[Any] = [
-        Route("/api/events", make_legacy_query_keyed_adapter(events_handler)),
         Route("/api/events/global", global_events_sse),
     ]
     register_session_routes(
@@ -3548,7 +3524,6 @@ def create_app(
             list_workstreams=list_handler,  # lifted: shared body
             list_saved=saved_handler,  # lifted: shared body
             create=create_handler,  # lifted: shared body
-            close_legacy=make_legacy_body_keyed_adapter(close_handler),
             delete=delete_workstream_endpoint,
             detail=detail_handler,  # lifted: shared body (interactive feature gain)
             open=open_handler,  # lifted: shared body
@@ -3575,30 +3550,8 @@ def create_app(
                     *v1_routes,
                     Route("/api/skills", list_skills_summary),
                     Route("/api/models", list_available_models),
-                    Route(
-                        "/api/send",
-                        make_legacy_body_keyed_adapter(
-                            _make_method_dispatch(
-                                {
-                                    "POST": send_handler,
-                                    "DELETE": dequeue_handler,
-                                }
-                            )
-                        ),
-                        methods=["POST", "DELETE"],
-                    ),
-                    Route(
-                        "/api/approve",
-                        make_legacy_body_keyed_adapter(approve_handler),
-                        methods=["POST"],
-                    ),
                     Route("/api/plan", plan_feedback, methods=["POST"]),
                     Route("/api/command", command, methods=["POST"]),
-                    Route(
-                        "/api/cancel",
-                        make_legacy_body_keyed_adapter(cancel_handler),
-                        methods=["POST"],
-                    ),
                     Route("/api/watches", list_watches),
                     Route("/api/watches/{watch_id}/cancel", cancel_watch, methods=["POST"]),
                     Route("/api/memories", list_memories),

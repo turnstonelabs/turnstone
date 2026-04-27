@@ -453,11 +453,9 @@ class SharedSessionVerbHandlers:
     """Bundle of HTTP handler callables for verbs both kinds expose.
 
     All handlers are optional; ``None`` skips that route. One bundle
-    describes either kind — interactive omits the per-``{ws_id}``
-    interaction verbs (``send`` / ``approve`` / ``plan`` / ``cancel``
-    / ``events`` / ``history`` / ``detail``) until Priority 1's
-    worker dispatch unification; coord omits ``delete`` /
-    ``refresh_title`` / ``set_title`` / attachments.
+    describes either kind — coord omits ``delete`` / ``refresh_title``
+    / ``set_title`` / attachments; interactive populates every
+    interaction verb post-Stage-2.
     """
 
     # Listing
@@ -475,12 +473,7 @@ class SharedSessionVerbHandlers:
     refresh_title: Handler | None = None  # POST {prefix}/{ws_id}/refresh-title
     set_title: Handler | None = None  # POST {prefix}/{ws_id}/title
 
-    # Legacy interactive close (``ws_id`` in body, not path) — the only
-    # surviving body-keyed verb. Set non-``None`` to mount POST {prefix}/close.
-    close_legacy: Handler | None = None
-
-    # Per-``{ws_id}`` interaction (coord shape today; interactive
-    # adopts these in Priority 1's worker dispatch unification)
+    # Per-``{ws_id}`` interaction
     send: Handler | None = None  # POST {prefix}/{ws_id}/send
     dequeue: Handler | None = None  # DELETE {prefix}/{ws_id}/send
     approve: Handler | None = None  # POST {prefix}/{ws_id}/approve
@@ -525,9 +518,9 @@ def register_session_routes(
 
     Mounts every verb whose handler is non-``None``. Routes register
     in an order that respects Starlette's first-match semantics:
-    literal subpaths (``saved``, ``new``, ``close``) before the
-    per-``{ws_id}`` patterns; per-``{ws_id}/{verb}`` patterns before
-    the bare ``{ws_id}`` detail GET.
+    literal subpaths (``saved``, ``new``) before the per-``{ws_id}``
+    patterns; per-``{ws_id}/{verb}`` patterns before the bare
+    ``{ws_id}`` detail GET.
 
     ``prefix`` is the URL prefix relative to the mount, e.g.
     ``"/api/workstreams"``.
@@ -542,11 +535,9 @@ def register_session_routes(
     if handlers.list_saved is not None:
         routes.append(Route(f"{p}/saved", handlers.list_saved))
 
-    # --- Lifecycle: create + legacy close (ws_id in body) ---------------
+    # --- Lifecycle: create -----------------------------------------------
     if handlers.create is not None:
         routes.append(Route(f"{p}/new", handlers.create, methods=["POST"]))
-    if handlers.close_legacy is not None:
-        routes.append(Route(f"{p}/close", handlers.close_legacy, methods=["POST"]))
 
     # --- Per-``{ws_id}`` verbs (specific verbs first) -------------------
     if handlers.delete is not None:
@@ -725,61 +716,6 @@ def make_approve_handler(cfg: SessionEndpointConfig) -> Handler:
         return JSONResponse({"status": "ok"})
 
     return approve
-
-
-def make_legacy_body_keyed_adapter(handler: Handler) -> Handler:
-    """Wrap a path-keyed handler so it can be mounted at a body-keyed URL.
-
-    Pre-1.5 interactive handlers (``/api/approve``, ``/api/cancel``,
-    ``/api/plan``, etc.) take ``ws_id`` from the JSON body. The
-    lifted bodies in this module read ``ws_id`` from the path. This
-    adapter peeks the body for ``ws_id``, copies it into
-    ``request.path_params``, and forwards. Starlette caches the
-    request body so the lifted handler's own body read is a hash-map
-    lookup, not a second network read.
-    """
-
-    async def adapter(request: Request) -> Response:
-        from turnstone.core.web_helpers import read_json_or_400
-
-        body = await read_json_or_400(request)
-        if isinstance(body, JSONResponse):
-            return body
-        ws_id = str(body.get("ws_id") or "")
-        # ``request.path_params`` is normally populated by Starlette
-        # at Route match time; since this adapter is mounted on a
-        # body-keyed URL with no ``{ws_id}`` slot, we splice it into
-        # the scope so the lifted handler's ``request.path_params.get(...)``
-        # finds it.
-        path_params: dict[str, Any] = dict(request.path_params)
-        path_params["ws_id"] = ws_id
-        request.scope["path_params"] = path_params
-        return await handler(request)
-
-    return adapter
-
-
-def make_legacy_query_keyed_adapter(handler: Handler) -> Handler:
-    """Wrap a path-keyed handler so it can be mounted at a query-keyed URL.
-
-    Pre-1.5 interactive ``GET /api/events?ws_id=...`` takes ``ws_id``
-    from the query string. The lifted ``events`` body reads it from
-    the path. This adapter mirrors :func:`make_legacy_body_keyed_adapter`
-    for the query-param case: read ``ws_id`` from the query, splice
-    into path_params, forward.
-
-    SSE-friendly: no body read involved (events is GET); the handler
-    stays streaming.
-    """
-
-    async def adapter(request: Request) -> Response:
-        ws_id = request.query_params.get("ws_id", "")
-        path_params: dict[str, Any] = dict(request.path_params)
-        path_params["ws_id"] = ws_id
-        request.scope["path_params"] = path_params
-        return await handler(request)
-
-    return adapter
 
 
 CloseAuditEmitter = Callable[
@@ -2880,9 +2816,7 @@ def make_dequeue_handler(cfg: SessionEndpointConfig) -> Handler:
         if not msg_id:
             return JSONResponse({"error": "msg_id required"}, status_code=400)
 
-        # ws_id may come from path (new path-keyed shape) or body
-        # (legacy /v1/api/send DELETE under the body-keyed adapter).
-        ws_id = request.path_params.get("ws_id", "") or str(body.get("ws_id") or "")
+        ws_id = request.path_params.get("ws_id", "")
         if cfg.tenant_check is not None:
             err_tenant = cfg.tenant_check(request, ws_id, mgr)
             if err_tenant is not None:
