@@ -228,6 +228,52 @@ def test_bulk_live_coordinator_row_uses_manager_snapshot(storage):
     live = body["results"][ws.id]
     assert live is not None
     assert "pending_approval" in live
+    # New field always present on the wire — None when no approval
+    # is pending so the JS can `key in row` without surprise.
+    assert "pending_approval_detail" in live
+    assert live["pending_approval_detail"] is None
+
+
+def test_bulk_live_coordinator_row_includes_pending_approval_detail(storage):
+    """When _pending_approval is set on a coord UI, the live block
+    surfaces the merged items + judge_verdict payload through the
+    coord-pseudo-node path. End-to-end equivalent of the dashboard
+    test in test_server_authz, but for the console live-bulk
+    endpoint that the coord tree UI actually consumes."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    ws.ui._pending_approval = {
+        "type": "approve_request",
+        "items": [
+            {
+                "call_id": "c-99",
+                "header": "spawn_workstream",
+                "preview": "{...}",
+                "func_name": "spawn_workstream",
+                "approval_label": "spawn_workstream",
+                "needs_approval": True,
+            }
+        ],
+        "judge_pending": False,
+    }
+    ws.ui._llm_verdicts["c-99"] = {
+        "recommendation": "approve",
+        "risk_level": "low",
+        "tier": "llm",
+    }
+    client = _make_client(storage, coord_mgr=mgr)
+    resp = client.get(
+        f"/v1/api/cluster/ws/live?ids={ws.id}",
+        headers=_OWNER_HEADERS,
+    )
+    assert resp.status_code == 200
+    live = resp.json()["results"][ws.id]
+    assert live["pending_approval"] is True  # boolean derived flag
+    detail = live["pending_approval_detail"]
+    assert detail is not None
+    assert detail["call_id"] == "c-99"
+    assert detail["items"][0]["func_name"] == "spawn_workstream"
+    assert detail["items"][0]["judge_verdict"]["recommendation"] == "approve"
 
 
 # ---------------------------------------------------------------------------
