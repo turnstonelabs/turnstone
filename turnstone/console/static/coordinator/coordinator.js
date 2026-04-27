@@ -678,6 +678,15 @@
         // they're always reachable by the time onopen fires.
         activeWaits.clear();
         _renderWaitIndicator();
+        // Drop the live-badge cache too — entries within the 5s TTL
+        // can carry stale pending_approval_detail (the child may
+        // have resolved its approval during the SSE gap).  Without
+        // this clear, inline approve/deny buttons could render on
+        // a row whose approval was resolved elsewhere; the next
+        // scheduleLiveFetch from loadChildren's finally branch
+        // (which fires for every visible row) repopulates with
+        // authoritative state.
+        liveBadgeCache.clear();
       }
     };
     evtSource.onerror = function () {

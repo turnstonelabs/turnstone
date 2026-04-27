@@ -81,3 +81,8 @@ def test_coordinator_js_exposes_inline_approval_helpers():
     assert "{ urgent: true }" in body or "urgent: true" in body
     # Server-side payload field — drift here means the JS reads stale keys
     assert "pending_approval_detail" in body
+    # Reconnect parity (chunk 4): the SSE re-open handler must clear
+    # the live-badge cache so a stale pending_approval_detail (left
+    # from before the disconnect) can't render zombie approve/deny
+    # buttons on a row whose approval was resolved during the gap.
+    assert "liveBadgeCache.clear()" in body
