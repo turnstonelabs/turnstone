@@ -229,12 +229,12 @@ below.
 
 ---
 
-### `GET /v1/api/events?ws_id=<id>`
+### `GET /v1/api/workstreams/{ws_id}/events`
 
 Opens a Server-Sent Events stream scoped to a single workstream. The connection
 remains open indefinitely; the server pushes events as they occur.
 
-**Query parameters:**
+**Path parameters:**
 
 | Parameter | Type   | Required | Description                |
 |-----------|--------|----------|----------------------------|
@@ -346,7 +346,7 @@ action required).
 ```
 
 **`approve_request`** -- one or more tool calls that require user approval. The
-client must respond via `POST /v1/api/approve`.
+client must respond via `POST /v1/api/workstreams/{ws_id}/approve`.
 
 ```json
 {
@@ -450,7 +450,7 @@ after `/clear` or `/new` commands).
 ```
 
 **`cancelled`** -- a cancel request was acknowledged (via the Stop button or
-`POST /v1/api/cancel`). This signals that cancellation is in progress, not
+`POST /v1/api/workstreams/{ws_id}/cancel`). This signals that cancellation is in progress, not
 that it is complete. The worker thread may still be finishing — wait for
 `stream_end` before transitioning to a ready state. The client should clear
 any in-progress assistant rendering but not re-enable the send button until
@@ -558,7 +558,7 @@ Possible `state` values:
 and copies each event to every client queue. If a client queue is full, the
 event is silently dropped for that client.
 
-**Keepalive:** Same as `/v1/api/events` -- an SSE comment every 5 seconds.
+**Keepalive:** Same as `/v1/api/workstreams/{ws_id}/events` -- an SSE comment every 5 seconds.
 
 ---
 
@@ -654,21 +654,26 @@ Each skill summary:
 
 ---
 
-### `POST /v1/api/send`
+### `POST /v1/api/workstreams/{ws_id}/send`
 
 Sends a user message to a workstream. Spawns a daemon worker thread that calls
 `session.send()` and streams results back via the SSE channel.
 
+**Path parameters:**
+
+| Parameter | Type   | Required | Description          |
+|-----------|--------|----------|----------------------|
+| `ws_id`   | string | yes      | Target workstream ID |
+
 **Request body:**
 
 ```json
-{"message": "Explain how the server works", "ws_id": "abc123"}
+{"message": "Explain how the server works"}
 ```
 
 | Field     | Type   | Required | Description             |
 |-----------|--------|----------|-------------------------|
 | `message` | string | yes      | The user's message text |
-| `ws_id`   | string | yes      | Target workstream ID    |
 
 **Response (success):**
 
@@ -692,15 +697,21 @@ from a previous request. Also pushes a `busy_error` event to the SSE stream.
 
 ---
 
-### `POST /v1/api/approve`
+### `POST /v1/api/workstreams/{ws_id}/approve`
 
 Responds to a tool approval request. The SSE stream must have previously sent
 an `approve_request` event for the given workstream.
 
+**Path parameters:**
+
+| Parameter | Type   | Required | Description          |
+|-----------|--------|----------|----------------------|
+| `ws_id`   | string | yes      | Target workstream ID |
+
 **Request body:**
 
 ```json
-{"approved": true, "feedback": null, "always": false, "ws_id": "abc123"}
+{"approved": true, "feedback": null, "always": false}
 ```
 
 | Field      | Type        | Required | Description                                      |
@@ -708,7 +719,6 @@ an `approve_request` event for the given workstream.
 | `approved` | bool        | yes      | `true` to approve, `false` to deny               |
 | `feedback` | string/null | no       | Optional feedback text (sent as denial reason)    |
 | `always`   | bool        | no       | If `true` and `approved`, enables auto-approve    |
-| `ws_id`    | string      | yes      | Target workstream ID                              |
 
 When `always` is `true` and `approved` is `true`, the workstream's WebUI
 instance sets `auto_approve = True`, causing all subsequent tool calls to be
@@ -789,7 +799,7 @@ containing the resumed session's messages.
 
 ---
 
-### `POST /v1/api/cancel`
+### `POST /v1/api/workstreams/{ws_id}/cancel`
 
 Cancels the active generation in a workstream. Sets a cooperative cancellation
 flag that is checked at multiple points in the generation loop (per streaming
@@ -812,15 +822,20 @@ for the orphaned thread. Use force cancel when cooperative cancel has not
 resolved within a few seconds — the web UI offers this as a "Force Stop"
 button automatically.
 
+**Path parameters:**
+
+| Parameter | Type   | Required | Description          |
+|-----------|--------|----------|----------------------|
+| `ws_id`   | string | yes      | Target workstream ID |
+
 **Request body:**
 
 ```json
-{"ws_id": "abc123", "force": false}
+{"force": false}
 ```
 
 | Field  | Type   | Required | Description          |
 |--------|--------|----------|----------------------|
-| `ws_id`| string | yes      | Target workstream ID |
 | `force`| bool   | no       | Abandon stuck worker immediately (default: `false`) |
 
 **Response:**
@@ -893,20 +908,18 @@ Status code: `400`
 
 ---
 
-### `POST /v1/api/workstreams/close`
+### `POST /v1/api/workstreams/{ws_id}/close`
 
 Closes and removes a workstream. The last remaining workstream cannot be
 closed.
 
-**Request body:**
+**Path parameters:**
 
-```json
-{"ws_id": "abc123"}
-```
+| Parameter | Type   | Required | Description            |
+|-----------|--------|----------|------------------------|
+| `ws_id`   | string | yes      | Workstream ID to close |
 
-| Field   | Type   | Required | Description               |
-|---------|--------|----------|---------------------------|
-| `ws_id` | string | yes      | Workstream ID to close    |
+The body is empty (or `{}`).
 
 **Response (success):**
 
@@ -937,7 +950,7 @@ turn on this workstream.
 
 The attachment moves through three states: `pending → reserved →
 consumed`.  Reservation tokens are threaded through
-`POST /v1/api/send` so a queued multimodal turn cannot lose its file to
+`POST /v1/api/workstreams/{ws_id}/send` so a queued multimodal turn cannot lose its file to
 an overlapping send.
 
 Ownership failures are masked as `404` so non-owners cannot enumerate
@@ -1952,7 +1965,7 @@ Status code: `200` with an empty body.
 | Malformed or unparseable JSON body | Treated as an empty dict `{}`; missing fields use defaults |
 | Unknown `ws_id`                    | `404` with `{"error": "Unknown workstream"}`               |
 | Unknown path (GET or POST)         | `404` with plain-text body `Not found`                     |
-| Empty `message` on `/v1/api/send`     | `400` with `{"error": "Empty message"}`                    |
+| Empty `message` on `/v1/api/workstreams/{ws_id}/send` | `400` with `{"error": "Empty message"}`            |
 | Empty `command` on `/v1/api/command`  | `400` with `{"error": "Empty command"}`                    |
 | Rate limit exceeded                | `429` with `Retry-After` header (see below)                |
 
@@ -1995,7 +2008,7 @@ reconnection:
 On reconnect, the server replays the full conversation history via the
 `history` event, so the client can rebuild its UI state without data loss. The
 same reconnection strategy applies to both the per-workstream SSE stream
-(`/v1/api/events`) and the global state stream (`/v1/api/events/global`).
+(`/v1/api/workstreams/{ws_id}/events`) and the global state stream (`/v1/api/events/global`).
 
 ---
 
@@ -2105,7 +2118,7 @@ turnstone_workstreams_active_total 1
 # TYPE turnstone_http_requests_total counter
 turnstone_http_requests_total{method="GET",endpoint="/health",status_code="200"} 42
 turnstone_http_requests_total{method="GET",endpoint="/metrics",status_code="200"} 7
-turnstone_http_requests_total{method="POST",endpoint="/v1/api/send",status_code="200"} 18
+turnstone_http_requests_total{method="POST",endpoint="/v1/api/workstreams/{ws_id}/send",status_code="200"} 18
 # HELP turnstone_tokens_total Total tokens consumed
 # TYPE turnstone_tokens_total counter
 turnstone_tokens_total{type="prompt"} 84320

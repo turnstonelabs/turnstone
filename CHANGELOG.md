@@ -15,6 +15,52 @@ Three release tracks are maintained:
 
 ## [Unreleased]
 
+### Removed (BREAKING — 1.5.0)
+
+- **Legacy body-keyed and query-keyed URL family for the workstream
+  interaction verbs.** Pre-1.5 interactive shipped both a path-keyed
+  and a body-keyed surface for the same five verbs; this release drops
+  the body-keyed and query-keyed mounts (and the
+  ``make_legacy_body_keyed_adapter`` /
+  ``make_legacy_query_keyed_adapter`` shims that backed them). External
+  SDK consumers on stable 1.0/1.3/1.4 must move to the path-keyed
+  shape:
+
+  | Removed (1.0/1.3/1.4)                          | Use instead                                            |
+  | ---------------------------------------------- | ------------------------------------------------------ |
+  | ``GET  /v1/api/events?ws_id=X``                | ``GET  /v1/api/workstreams/{ws_id}/events``            |
+  | ``POST /v1/api/send``     (body ``ws_id``)     | ``POST /v1/api/workstreams/{ws_id}/send``              |
+  | ``DELETE /v1/api/send``   (body ``ws_id``)     | ``DELETE /v1/api/workstreams/{ws_id}/send``            |
+  | ``POST /v1/api/approve``  (body ``ws_id``)     | ``POST /v1/api/workstreams/{ws_id}/approve``           |
+  | ``POST /v1/api/cancel``   (body ``ws_id``)     | ``POST /v1/api/workstreams/{ws_id}/cancel``            |
+  | ``POST /v1/api/workstreams/close`` (body)      | ``POST /v1/api/workstreams/{ws_id}/close``             |
+
+  Calls to the old URLs return **404** on 1.5.0+. Bodies on the new
+  URLs no longer carry ``ws_id`` (the path provides it); the
+  ``SendRequest`` / ``ApproveRequest`` / ``CancelRequest`` Pydantic
+  schemas drop the field, and ``CloseWorkstreamRequest`` is removed
+  outright (its only field was ``ws_id``).
+
+  ``/v1/api/plan`` and ``/v1/api/command`` are unaffected and remain
+  body-keyed in this release. The bundled web UI, channel adapters,
+  Python SDK, TypeScript SDK, and console routing-proxy SDK ship the
+  new URLs automatically; pinning to ≥ 1.5.0 is enough.
+
+  The console routing proxy's ``/v1/api/route/...`` family is updated
+  alongside: ``/v1/api/route/workstreams/{ws_id}/<verb>`` replaces the
+  pre-1.5 ``/v1/api/route/{send,approve,cancel,workstreams/close}``
+  mounts. ``DELETE`` is now passed through (``client.request(method,
+  ...)`` instead of ``client.post(...)``) so the new dequeue route
+  works through the proxy. Audit attribution for ``DELETE`` on
+  ``/send`` is logged as ``route.workstream.dequeue`` rather than
+  ``route.workstream.send``.
+
+  Auth scope wiring (``WRITE_PATHS`` / ``APPROVE_PATHS`` literals plus
+  the path-keyed verb match in ``required_scope``) updated to grant
+  ``write`` for path-keyed ``send/cancel/close``, ``approve`` for
+  path-keyed ``approve``, and ``write`` for ``DELETE`` on
+  path-keyed ``/send``. The ``/node/*`` proxy branch mirrors all four.
+
 ### Changed
 
 - **Dashboard row shape: ``id`` → ``ws_id``.** The

@@ -665,13 +665,12 @@ class TestAuditEventsOnMutations:
 
 
 class TestInteractiveCancelLifted:
-    """HTTP-level coverage for the post-lift interactive ``/api/cancel``
-    handler. The lifted ``make_cancel_handler`` body is shared with
-    coord but interactive routes through ``make_legacy_body_keyed_adapter``
-    (ws_id in body, not path). Pre-lift ``cancel_generation`` was
-    untested at the HTTP layer; coord exercised the lifted body via
-    ``test_coordinator_endpoints.py``. This class adds the missing
-    interactive-side parity."""
+    """HTTP-level coverage for the post-lift interactive ``cancel``
+    handler at ``POST /v1/api/workstreams/{ws_id}/cancel``. The lifted
+    ``make_cancel_handler`` body is shared with coord. Pre-lift
+    ``cancel_generation`` was untested at the HTTP layer; coord
+    exercised the lifted body via ``test_coordinator_endpoints.py``.
+    This class adds the missing interactive-side parity."""
 
     def _create_ws(self, client) -> str:
         resp = client.post(

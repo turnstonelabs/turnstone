@@ -34,7 +34,7 @@ async def test_stream_sse_yields_json():
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = _BaseClient(httpx_client=hc)
         events = []
-        async for data in client._stream_sse("/v1/api/events", params={"ws_id": "ws1"}):
+        async for data in client._stream_sse("/v1/api/workstreams/ws1/events"):
             events.append(data)
         assert len(events) == 2
         assert events[0]["type"] == "content"

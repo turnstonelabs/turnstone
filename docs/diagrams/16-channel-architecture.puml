@@ -95,10 +95,10 @@ class "ChannelRouter" as Router <<service>> {
 
 ' -- Server --
 class "turnstone-server" as Server <<server>> {
-    POST /v1/api/send
-    POST /v1/api/approve
+    POST /v1/api/workstreams/{ws_id}/send
+    POST /v1/api/workstreams/{ws_id}/approve
     POST /v1/api/workstreams/new
-    GET  /v1/api/events?ws_id=
+    GET  /v1/api/workstreams/{ws_id}/events
     --
     LLM execution + tool use
     SSE event stream
@@ -148,15 +148,15 @@ Bot --> Router : on_message\non_interaction
 Router --> CU : resolve identity
 Router --> CR : resolve / register route
 
-Router --> Server : POST /v1/api/send\nPOST /v1/api/approve\nPOST /v1/api/workstreams/new
-Bot --> Server : GET /v1/api/events?ws_id=\n(SSE via httpx-sse)
+Router --> Server : POST /v1/api/workstreams/{ws_id}/send\nPOST /v1/api/workstreams/{ws_id}/approve\nPOST /v1/api/workstreams/new
+Bot --> Server : GET /v1/api/workstreams/{ws_id}/events\n(SSE via httpx-sse)
 Server --> Bot : SSE event stream
 
 Bot --> Discord : reply / embed\nbutton callback
 
 Slack --> SlackBot : socket-mode\nevents
 SlackBot --> Router : on_message / on_action
-SlackBot --> Server : POST /v1/api/send\nGET /v1/api/events?ws_id=
+SlackBot --> Server : POST /v1/api/workstreams/{ws_id}/send\nGET /v1/api/workstreams/{ws_id}/events
 SlackBot --> Slack : post / update\nBlock Kit button callbacks
 
 Teams .[hidden]. Slack
@@ -179,7 +179,7 @@ note right of Bot
      (or creates new workstream)
   4. ChannelRouter resolves platform user -> user_id
      via channel_users table
-  5. Router sends POST /v1/api/send to server
+  5. Router sends POST /v1/api/workstreams/{ws_id}/send to server
 
   **Workstream Resume (evicted workstreams)**
   1. Stale route detected (no active SSE listener)
@@ -193,7 +193,7 @@ end note
 note right of Server
   **Outbound Flow**
   1. Server emits SSE events on
-     GET /v1/api/events?ws_id=
+     GET /v1/api/workstreams/{ws_id}/events
   2. Bot subscribes via httpx-sse
   3. Bot formats and sends to Discord thread
 end note
@@ -204,7 +204,7 @@ note bottom of CR
   2. Bot renders Discord buttons (Approve / Deny)
   3. User clicks button -> on_interaction()
   4. Router builds ApproveMessage
-  5. Router sends POST /v1/api/approve to server
+  5. Router sends POST /v1/api/workstreams/{ws_id}/approve to server
 end note
 
 note bottom of CU

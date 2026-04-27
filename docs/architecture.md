@@ -384,11 +384,11 @@ non-idle background workstreams above the input prompt.
   (`Ctrl+\`, `Ctrl+Shift+\`). Max 6 panes; no duplicate workstreams across panes.
   Layout persisted to `localStorage`.
 - **Per-pane SSE**: `Pane.connectSSE(wsId)` opens
-  `/v1/api/events?ws_id=<id>` for each pane's event stream independently.
+  `/v1/api/workstreams/{ws_id}/events` for each pane's event stream independently.
 - **Global SSE**: `connectGlobalSSE()` opens `/v1/api/events/global` which
   receives `ws_state` broadcasts from all workstreams, used to update tab
   indicators and pane headers without switching.
-- **New tab / close**: POST `/v1/api/workstreams/new`, POST `/v1/api/workstreams/close`.
+- **New tab / close**: POST `/v1/api/workstreams/new`, POST `/v1/api/workstreams/{ws_id}/close`.
 
 ### Thread Safety
 
@@ -1198,12 +1198,12 @@ stderr so it does not interfere with readline. Tool execution may use a
 Starlette ASGI app (served by uvicorn)
   |
   +-- Async request handlers (all under /v1/ prefix)
-  |     POST /v1/api/send      -> starts worker thread per workstream
-  |     POST /v1/api/approve   -> unblocks WebUI._approval_event
-  |     POST /v1/api/plan      -> unblocks WebUI._plan_event
-  |     POST /v1/api/workstreams/new -> creates workstream + worker
-  |     GET  /v1/api/events    -> SSE via EventSourceResponse (per workstream)
-  |     GET  /v1/api/events/global -> SSE via EventSourceResponse (fan-out)
+  |     POST /v1/api/workstreams/{ws_id}/send    -> starts worker thread per workstream
+  |     POST /v1/api/workstreams/{ws_id}/approve -> unblocks WebUI._approval_event
+  |     POST /v1/api/plan                        -> unblocks WebUI._plan_event
+  |     POST /v1/api/workstreams/new             -> creates workstream + worker
+  |     GET  /v1/api/workstreams/{ws_id}/events  -> SSE via EventSourceResponse (per workstream)
+  |     GET  /v1/api/events/global               -> SSE via EventSourceResponse (fan-out)
   |
   +-- ASGI middleware stack
   |     MetricsMiddleware -> CORSMiddleware -> AuthMiddleware -> RateLimitMiddleware
@@ -1277,10 +1277,10 @@ Monitoring (2 daemon threads)        Control + Proxy (async Starlette)
 | SSE manager      |                 | GET /node/{node_id}/       |
 | asyncio loop     |                 |   → httpx.AsyncClient      |
 | 1 task per node  |                 |     proxy to server_url    |
-| /events/global   |                 | GET /node/{id}/v1/api/events |
-| snapshot+deltas  |                 |   → SSE stream proxy       |
-+------------------+                 | POST /node/{id}/v1/api/send  |
-                                     |   → forwarded to server    |
+| /events/global   |                 | GET /node/{id}/v1/api/workstreams/{ws_id}/events |
+| snapshot+deltas  |                 |   → SSE stream proxy                              |
++------------------+                 | POST /node/{id}/v1/api/workstreams/{ws_id}/send   |
+                                     |   → forwarded to server                           |
                                      +----------------------------+
 ```
 

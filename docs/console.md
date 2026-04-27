@@ -334,7 +334,7 @@ The console reverse-proxies each node's server UI at `/node/{node_id}/`. This al
 
 ### URL Rewriting
 
-The server UI uses root-relative URLs (`/v1/api/send`, `/static/app.js`, `/shared/base.css`, etc.). Since `<base>` tags cannot rewrite root-relative URLs, the console uses a JS shim approach:
+The server UI uses root-relative URLs (`/v1/api/workstreams/{ws_id}/send`, `/static/app.js`, `/shared/base.css`, etc.). Since `<base>` tags cannot rewrite root-relative URLs, the console uses a JS shim approach:
 
 1. **HTML rewriting** — when serving `index.html`, replaces `href=` and `src=` references to both `/static/` and `/shared/` with the proxy prefix (`/node/{node_id}/static/` and `/node/{node_id}/shared/` respectively).
 
@@ -344,7 +344,7 @@ The server UI uses root-relative URLs (`/v1/api/send`, `/static/app.js`, `/share
 
 ### SSE Proxy
 
-SSE streams (`/v1/api/events`, `/v1/api/events/global`) are proxied as raw byte passthrough — the console opens an `httpx.AsyncClient.stream()` to the upstream server (with `read=None` and `pool=None` timeouts since SSE connections are long-lived) and relays every byte via `StreamingResponse`. This preserves server-side ping comments, event framing, and keepalives verbatim without parsing or re-encoding.
+SSE streams (`/v1/api/workstreams/{ws_id}/events`, `/v1/api/events/global`) are proxied as raw byte passthrough — the console opens an `httpx.AsyncClient.stream()` to the upstream server (with `read=None` and `pool=None` timeouts since SSE connections are long-lived) and relays every byte via `StreamingResponse`. This preserves server-side ping comments, event framing, and keepalives verbatim without parsing or re-encoding.
 
 ### Authentication
 

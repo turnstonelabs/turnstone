@@ -55,7 +55,7 @@
         "tags": [
           "Workstreams"
         ],
-        "description": "Accepts two content types. Default is `application/json` with a `CreateWorkstreamRequest` body. Alternatively, `multipart/form-data` with one `meta` field (JSON-encoded `CreateWorkstreamRequest` shape) plus zero-or-more `file` parts saves each file as an attachment under the new workstream. When `initial_message` is also set, attachments are reserved onto that turn before the worker thread dispatches; otherwise they remain pending for a follow-up `POST /v1/api/send`.",
+        "description": "Accepts two content types. Default is `application/json` with a `CreateWorkstreamRequest` body. Alternatively, `multipart/form-data` with one `meta` field (JSON-encoded `CreateWorkstreamRequest` shape) plus zero-or-more `file` parts saves each file as an attachment under the new workstream. When `initial_message` is also set, attachments are reserved onto that turn before the worker thread dispatches; otherwise they remain pending for a follow-up `POST /v1/api/workstreams/{ws_id}/send`.",
         "requestBody": {
           "required": true,
           "content": {
@@ -110,23 +110,23 @@
         }
       }
     },
-    "/v1/api/workstreams/close": {
+    "/v1/api/workstreams/{ws_id}/close": {
       "post": {
         "summary": "Close a workstream",
-        "operationId": "v1_api_workstreams_close_post",
+        "operationId": "v1_api_workstreams_{ws_id}_close_post",
         "tags": [
           "Workstreams"
         ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CloseWorkstreamRequest"
-              }
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
             }
           }
-        },
+        ],
         "responses": {
           "200": {
             "description": "Success",
@@ -147,16 +147,36 @@
                 }
               }
             }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }
     },
-    "/v1/api/send": {
+    "/v1/api/workstreams/{ws_id}/send": {
       "post": {
         "summary": "Send a user message",
-        "operationId": "v1_api_send_post",
+        "operationId": "v1_api_workstreams_{ws_id}_send_post",
         "tags": [
           "Chat"
+        ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
         ],
         "requestBody": {
           "required": true,
@@ -200,14 +220,67 @@
             }
           }
         }
-      }
-    },
-    "/v1/api/approve": {
-      "post": {
-        "summary": "Approve or deny a tool call",
-        "operationId": "v1_api_approve_post",
+      },
+      "delete": {
+        "summary": "Cancel a queued message",
+        "operationId": "v1_api_workstreams_{ws_id}_send_delete",
         "tags": [
           "Chat"
+        ],
+        "description": "Removes a previously-queued message from the workstream's pending queue. Body: ``{\"msg_id\": \"...\"}``. Returns ``status: removed`` when the queue had the entry, ``status: not_found`` otherwise.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/{ws_id}/approve": {
+      "post": {
+        "summary": "Approve or deny a tool call",
+        "operationId": "v1_api_workstreams_{ws_id}_approve_post",
+        "tags": [
+          "Chat"
+        ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
         ],
         "requestBody": {
           "required": true,
@@ -335,12 +408,22 @@
         }
       }
     },
-    "/v1/api/cancel": {
+    "/v1/api/workstreams/{ws_id}/cancel": {
       "post": {
         "summary": "Cancel the active generation in a workstream",
-        "operationId": "v1_api_cancel_post",
+        "operationId": "v1_api_workstreams_{ws_id}_cancel_post",
         "tags": [
           "Chat"
+        ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
         ],
         "requestBody": {
           "required": true,
@@ -386,10 +469,10 @@
         }
       }
     },
-    "/v1/api/events": {
+    "/v1/api/workstreams/{ws_id}/events": {
       "get": {
         "summary": "Per-workstream SSE event stream",
-        "operationId": "v1_api_events_get",
+        "operationId": "v1_api_workstreams_{ws_id}_events_get",
         "tags": [
           "Streaming"
         ],
@@ -397,12 +480,11 @@
         "parameters": [
           {
             "name": "ws_id",
-            "in": "query",
+            "in": "path",
             "required": true,
             "schema": {
               "type": "string"
-            },
-            "description": "Workstream identifier"
+            }
           }
         ],
         "responses": {
@@ -1823,11 +1905,6 @@
             "title": "Message",
             "type": "string"
           },
-          "ws_id": {
-            "description": "Target workstream ID",
-            "title": "Ws Id",
-            "type": "string"
-          },
           "attachment_ids": {
             "anyOf": [
               {
@@ -1846,8 +1923,7 @@
           }
         },
         "required": [
-          "message",
-          "ws_id"
+          "message"
         ],
         "title": "SendRequest",
         "type": "object"
@@ -1939,16 +2015,10 @@
             "description": "Auto-approve the tools in this batch going forward",
             "title": "Always",
             "type": "boolean"
-          },
-          "ws_id": {
-            "description": "Target workstream ID",
-            "title": "Ws Id",
-            "type": "string"
           }
         },
         "required": [
-          "approved",
-          "ws_id"
+          "approved"
         ],
         "title": "ApproveRequest",
         "type": "object"
@@ -1995,11 +2065,6 @@
       },
       "CancelRequest": {
         "properties": {
-          "ws_id": {
-            "description": "Target workstream ID",
-            "title": "Ws Id",
-            "type": "string"
-          },
           "force": {
             "default": false,
             "description": "Force cancel: abandon the stuck worker thread immediately. Use when cooperative cancel has not resolved within a few seconds.",
@@ -2007,9 +2072,6 @@
             "type": "boolean"
           }
         },
-        "required": [
-          "ws_id"
-        ],
         "title": "CancelRequest",
         "type": "object"
       },
@@ -2138,7 +2200,7 @@
             "type": "integer"
           },
           "attachment_ids": {
-            "description": "Ids of attachments saved by this request (multipart variant only). Already reserved onto the initial_message turn when one was provided; otherwise left pending for a follow-up POST /v1/api/send.",
+            "description": "Ids of attachments saved by this request (multipart variant only). Already reserved onto the initial_message turn when one was provided; otherwise left pending for a follow-up POST /v1/api/workstreams/{ws_id}/send.",
             "items": {
               "type": "string"
             },
@@ -2151,20 +2213,6 @@
           "name"
         ],
         "title": "CreateWorkstreamResponse",
-        "type": "object"
-      },
-      "CloseWorkstreamRequest": {
-        "properties": {
-          "ws_id": {
-            "description": "Workstream ID to close",
-            "title": "Ws Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "ws_id"
-        ],
-        "title": "CloseWorkstreamRequest",
         "type": "object"
       },
       "ListWorkstreamsResponse": {

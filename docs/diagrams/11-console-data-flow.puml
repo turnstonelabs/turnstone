@@ -170,15 +170,15 @@ Server --> Browser : Shimmed app.js
 deactivate Server
 
 note right of Browser
-  All fetch("/v1/api/send") calls in the
-  server UI now become fetch("/node/nodeA/v1/api/send"),
+  All fetch("/v1/api/workstreams/{ws_id}/send") calls in the
+  server UI now become fetch("/node/nodeA/v1/api/workstreams/{ws_id}/send"),
   routed through the console proxy.
 end note
 
-Browser -> Server : GET /node/nodeA/v1/api/events?ws_id=ws789
+Browser -> Server : GET /node/nodeA/v1/api/workstreams/ws789/events
 activate Server #FFF9C4
 
-Server -> NodeA : GET http://10.0.1.1:8080/v1/api/events?ws_id=ws789\n(SSE stream via httpx.AsyncClient timeout=None)
+Server -> NodeA : GET http://10.0.1.1:8080/v1/api/workstreams/ws789/events\n(SSE stream via httpx.AsyncClient timeout=None)
 activate NodeA
 
 loop SSE streaming
@@ -189,10 +189,10 @@ end
 deactivate NodeA
 deactivate Server
 
-Browser -> Server : POST /node/nodeA/v1/api/send\n{message:"hello", ws_id:"ws789"}
+Browser -> Server : POST /node/nodeA/v1/api/workstreams/ws789/send\n{message:"hello"}
 activate Server #FFF9C4
 
-Server -> NodeA : POST http://10.0.1.1:8080/v1/api/send\n(body forwarded)
+Server -> NodeA : POST http://10.0.1.1:8080/v1/api/workstreams/ws789/send\n(body forwarded)
 activate NodeA
 NodeA --> Server : {status:"ok"}
 deactivate NodeA
