@@ -1145,53 +1145,85 @@
       const detail = cached.live.pending_approval_detail;
       const block = renderApprovalBlock(child, detail);
       if (block) row.appendChild(block);
-      // Late-arriving LLM judge: if judge_pending is set and not
-      // every item has a judge_verdict yet, poll the live block on
-      // a short cadence until the verdict lands. Without this, the
-      // operator stares at a "heuristic"-tier pill forever — the
-      // judge runs async on the child node and never pushes a
-      // signal that reaches the coord directly. Self-terminates
-      // when the verdict arrives, the row closes, or attempts hit
-      // the cap (failed/timed-out judge).
-      _maybePollForJudgeVerdict(child.ws_id);
+      // Late-arriving LLM judge: see comment above
+      // _maybeStartJudgePoll for the why. Hooks into a single
+      // global poller (not per-row) so off-screen rows still
+      // refresh and one bulk request covers every pending row.
+      _maybeStartJudgePoll();
     }
     return row;
   }
 
-  // Late-judge polling — see callsite in renderChildRow. Single
-  // active timer per ws_id. Re-entrant-safe: a fresh render of the
-  // same row while a timer is already in flight is a no-op.
-  const judgePollTimers = new Map(); // ws_id → timer handle
-  const MAX_JUDGE_POLL_ATTEMPTS = 6; // ≈12s at JUDGE_POLL_INTERVAL_MS
+  // Late-judge polling — single global timer driving a bulk
+  // re-fetch of every row whose `pending_approval_detail.judge_pending`
+  // is true and not every item has a `judge_verdict` yet.  Necessary
+  // because the LLM judge runs async on the child node and never
+  // pushes a signal that reaches the coord; without polling the
+  // operator would stare at a "heuristic"-tier pill forever.
+  //
+  // Why a global poller instead of per-row:
+  //  1. Per-row would invalidate the cache and call scheduleLiveFetch
+  //     for off-screen rows, but scheduleLiveFetch returns early on
+  //     non-visible ids — leaving the cache empty AND no fetch in
+  //     flight.  Result: off-screen rows stuck on stale heuristic.
+  //  2. A single bulk request covers every pending row in one
+  //     round-trip; the per-row design would issue N microtask-
+  //     batched fetches that share the bulk path anyway.
   const JUDGE_POLL_INTERVAL_MS = 2000;
+  // Cap by total wall-clock time, not attempts. Real LLM judges
+  // (esp. with reasoning effort) can exceed 30s — a 6-attempt /
+  // 12s cap was prematurely giving up.
+  const JUDGE_POLL_MAX_DURATION_MS = 90_000;
+  let judgePollTimer = null;
+  let judgePollStartedAt = 0;
 
-  function _maybePollForJudgeVerdict(childWsId) {
-    if (!childWsId) return;
-    if (judgePollTimers.has(childWsId)) return; // already polling
-    const tick = (attempts) => {
-      judgePollTimers.delete(childWsId);
-      if (attempts >= MAX_JUDGE_POLL_ATTEMPTS) return;
-      const entry = childrenState.get(childWsId);
-      if (!entry || TERMINAL_CHILD_STATES.has(entry.state)) return;
-      const c = liveBadgeCache.get(childWsId);
-      const detail = c && c.live && c.live.pending_approval_detail;
-      if (!detail) return; // approval no longer pending
+  function _maybeStartJudgePoll() {
+    if (judgePollTimer !== null) return; // already polling
+    judgePollStartedAt = Date.now();
+    judgePollTimer = setTimeout(_judgePollTick, JUDGE_POLL_INTERVAL_MS);
+  }
+
+  function _judgePollTick() {
+    judgePollTimer = null;
+    if (Date.now() - judgePollStartedAt > JUDGE_POLL_MAX_DURATION_MS) {
+      // Failed / timed-out judge — give up so we don't poll forever.
+      // Operator can hit the Refresh button to force a fresh fetch.
+      return;
+    }
+    // Walk the full childrenState — not just visible — so off-screen
+    // rows still get refreshed.  scheduleLiveFetch's visibility gate
+    // exists to keep idle rows from burning round-trips; here we
+    // explicitly want every pending-judge row in the next bulk
+    // regardless of viewport.
+    let stillPending = false;
+    for (const [wsId, entry] of childrenState) {
+      if (TERMINAL_CHILD_STATES.has(entry.state)) continue;
+      const cached = liveBadgeCache.get(wsId);
+      if (!cached || !cached.live) continue;
+      const detail = cached.live.pending_approval_detail;
+      if (!detail || !detail.judge_pending) continue;
       const items = Array.isArray(detail.items) ? detail.items : [];
       const allHaveJudge =
         items.length > 0 && items.every((it) => it.judge_verdict);
-      if (!detail.judge_pending || allHaveJudge) return; // verdict landed
-      invalidateLiveBadge(childWsId);
-      scheduleLiveFetch(childWsId, { urgent: true });
-      const timer = setTimeout(
-        () => tick(attempts + 1),
-        JUDGE_POLL_INTERVAL_MS,
-      );
-      judgePollTimers.set(childWsId, timer);
-    };
-    // First tick fires after the initial delay so we don't fetch
-    // again immediately after the just-rendered live-bulk response.
-    const timer = setTimeout(() => tick(0), JUDGE_POLL_INTERVAL_MS);
-    judgePollTimers.set(childWsId, timer);
+      if (allHaveJudge) continue;
+      // Bypass scheduleLiveFetch entirely (skips visibility + TTL
+      // gates) by adding to pendingLiveIds directly. flushLiveFetches
+      // will batch every pending row into one request.
+      if (WS_ID_RE.test(wsId)) {
+        pendingLiveIds.add(wsId);
+        stillPending = true;
+      }
+    }
+    if (!stillPending) return; // every verdict landed — done
+    // Cancel any debounce that's still pending so our flush runs
+    // now instead of waiting for it. Then flush directly so the
+    // bulk request fires before the next tick re-arms.
+    if (liveBadgeFlushTimer !== null) {
+      clearTimeout(liveBadgeFlushTimer);
+      liveBadgeFlushTimer = null;
+    }
+    flushLiveFetches();
+    judgePollTimer = setTimeout(_judgePollTick, JUDGE_POLL_INTERVAL_MS);
   }
 
   // Build the inline approval block: severity pill, intent summary +

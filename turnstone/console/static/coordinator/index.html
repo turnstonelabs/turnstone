@@ -357,8 +357,12 @@
     border-color: var(--err);
   }
   /* Mobile (<700px) — hit targets must stay ≥44px tall on touch.
-     Buttons stretch to full row width and increase padding so the
-     accordion-collapsed sidebar remains thumb-usable. */
+     Buttons share the row 50/50 (flex: 1 on each) so Deny + Approve
+     each get half the available width with a comfortable touch
+     target. Stacking would push the action row off-screen below the
+     preview/disclosure on tall envelopes; side-by-side keeps both
+     verbs reachable without a scroll. Larger font + min-height
+     bring the targets into WCAG 2.5.5. */
   @media (max-width: 700px) {
     [data-design="v1"] .ch-row .approval-actions {
       flex-direction: row;
