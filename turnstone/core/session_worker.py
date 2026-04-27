@@ -1,7 +1,8 @@
 """Shared worker-thread dispatch for SessionManager workstreams.
 
-Both the interactive ``/v1/api/send`` HTTP handler and the coordinator
-``CoordinatorAdapter.send`` need the same atomic check-and-(spawn-or-queue)
+Both the interactive ``/v1/api/workstreams/{ws_id}/send`` HTTP handler
+and the coordinator ``CoordinatorAdapter.send`` need the same atomic
+check-and-(spawn-or-queue)
 on a workstream: if a worker thread is already driving
 :meth:`ChatSession.send`, append the new message to its pending queue;
 otherwise spawn a fresh daemon thread. The decision is taken under

@@ -140,8 +140,9 @@ def _parse_int(
 # ---------------------------------------------------------------------------
 
 # JS shim injected into proxied HTML when served through the console.
-# Overrides fetch() and EventSource() so root-relative URLs (/v1/api/send etc.)
-# route through the console proxy at /node/{node_id}/v1/api/... instead.
+# Overrides fetch() and EventSource() so root-relative URLs
+# (e.g. /v1/api/workstreams/{ws_id}/send) route through the console
+# proxy at /node/{node_id}/v1/api/... instead.
 _JS_PROXY_SHIM = """\
 (function(){
   var _pfx="PREFIX_PLACEHOLDER";
@@ -308,6 +309,7 @@ def _proxy_auth_headers(request: Request) -> dict[str, str]:
 # module docstring for the canonical action-namespace registry.
 _ROUTE_PROXY_AUDIT_ACTIONS: dict[str, str] = {
     "send": "route.workstream.send",
+    "dequeue": "route.workstream.dequeue",
     "approve": "route.approve",
     "cancel": "route.cancel",
     "command": "route.command",
@@ -1756,12 +1758,19 @@ async def route_attachment_proxy(request: Request) -> Response:
 
 
 async def route_proxy(request: Request) -> Response:
-    """Generic routing proxy for send/approve/cancel/command/close."""
+    """Generic routing proxy for send/approve/cancel/command/close.
+
+    Path-keyed shape: ``POST/DELETE /v1/api/route/workstreams/{ws_id}/<verb>``
+    (or ``POST /v1/api/route/<verb>`` for the body-keyed plan/command
+    legacies still in scope). ``verb`` drives the audit action lookup;
+    DELETE on ``/send`` is treated as dequeue for audit attribution.
+    """
     t0 = time.monotonic()
-    # Extract method name from path: /v1/api/route/send -> "send"
-    method = request.url.path.rsplit("/", 1)[-1]
-    if method == "close":
-        method = "close"  # /route/workstreams/close
+    # Extract verb name from URL tail: /v1/api/route/.../send -> "send".
+    # DELETE on /send is the dequeue path — audit attribution diverges.
+    verb = request.url.path.rsplit("/", 1)[-1]
+    if verb == "send" and request.method == "DELETE":
+        verb = "dequeue"
     router: ConsoleRouter | None = request.app.state.router
     ring_ready = router is not None and router.is_ready()
     if not ring_ready:
@@ -1771,7 +1780,7 @@ async def route_proxy(request: Request) -> Response:
         if not ring_ready:
             return _record_route(
                 request,
-                method,
+                verb,
                 503,
                 t0,
                 JSONResponse(
@@ -1786,7 +1795,7 @@ async def route_proxy(request: Request) -> Response:
     except Exception:
         return _record_route(
             request,
-            method,
+            verb,
             400,
             t0,
             JSONResponse(
@@ -1795,11 +1804,14 @@ async def route_proxy(request: Request) -> Response:
             ),
         )
 
-    ws_id = body.get("ws_id", "")
+    # Path-keyed shape (post-1.5) carries ws_id in the URL; the
+    # legacy plan/command routes still mount at body-keyed URLs and
+    # supply ws_id via the JSON body. Try path first, fall back to body.
+    ws_id = request.path_params.get("ws_id", "") or str(body.get("ws_id") or "")
     if not ws_id:
         return _record_route(
             request,
-            method,
+            verb,
             400,
             t0,
             JSONResponse(
@@ -1812,7 +1824,7 @@ async def route_proxy(request: Request) -> Response:
     except (NoAvailableNodeError, ValueError):
         return _record_route(
             request,
-            method,
+            verb,
             503,
             t0,
             JSONResponse(
@@ -1827,12 +1839,15 @@ async def route_proxy(request: Request) -> Response:
 
     client: httpx.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
+    http_method = request.method
     try:
-        resp = await client.post(f"{ref.url}{upstream_path}", json=body, headers=headers)
+        resp = await client.request(
+            http_method, f"{ref.url}{upstream_path}", json=body, headers=headers
+        )
     except httpx.HTTPError:
         return _record_route(
             request,
-            method,
+            verb,
             502,
             t0,
             JSONResponse(
@@ -1859,13 +1874,16 @@ async def route_proxy(request: Request) -> Response:
             new_ref = ref
         if new_ref.node_id != ref.node_id:
             try:
-                resp = await client.post(
-                    f"{new_ref.url}{upstream_path}", json=body, headers=headers
+                resp = await client.request(
+                    http_method,
+                    f"{new_ref.url}{upstream_path}",
+                    json=body,
+                    headers=headers,
                 )
             except httpx.HTTPError:
                 return _record_route(
                     request,
-                    method,
+                    verb,
                     502,
                     t0,
                     JSONResponse(
@@ -1876,12 +1894,12 @@ async def route_proxy(request: Request) -> Response:
             ref = new_ref  # retried node — used for audit attribution (only emits on 2xx via the next block).
 
     if 200 <= resp.status_code < 300:
-        action = _ROUTE_PROXY_AUDIT_ACTIONS.get(method)
+        action = _ROUTE_PROXY_AUDIT_ACTIONS.get(verb)
         if action:
             _emit_route_audit(request, action, ws_id, ref.node_id)
     return _record_route(
         request,
-        method,
+        verb,
         resp.status_code,
         t0,
         Response(
@@ -10089,12 +10107,28 @@ def create_app(
                     Route("/api/cluster/events", cluster_events_sse),
                     # Workstream routing (rendezvous proxy to server nodes)
                     Route("/api/route/workstreams/new", route_create, methods=["POST"]),
-                    Route("/api/route/send", route_proxy, methods=["POST"]),
-                    Route("/api/route/approve", route_proxy, methods=["POST"]),
-                    Route("/api/route/cancel", route_proxy, methods=["POST"]),
+                    Route(
+                        "/api/route/workstreams/{ws_id}/send",
+                        route_proxy,
+                        methods=["POST", "DELETE"],
+                    ),
+                    Route(
+                        "/api/route/workstreams/{ws_id}/approve",
+                        route_proxy,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/route/workstreams/{ws_id}/cancel",
+                        route_proxy,
+                        methods=["POST"],
+                    ),
                     Route("/api/route/command", route_proxy, methods=["POST"]),
                     Route("/api/route/plan", route_proxy, methods=["POST"]),
-                    Route("/api/route/workstreams/close", route_proxy, methods=["POST"]),
+                    Route(
+                        "/api/route/workstreams/{ws_id}/close",
+                        route_proxy,
+                        methods=["POST"],
+                    ),
                     # Coordinator-only hard delete — forwards to the server's
                     # path-parameter form at /v1/api/workstreams/{ws_id}/delete.
                     Route(

@@ -402,7 +402,9 @@ class AsyncTurnstoneConsole(_BaseClient):
     async def route_send(self, message: str, ws_id: str) -> dict[str, Any]:
         """Send a message via the routing proxy."""
         return await self._request(
-            "POST", "/v1/api/route/send", json_body={"message": message, "ws_id": ws_id}
+            "POST",
+            f"/v1/api/route/workstreams/{ws_id}/send",
+            json_body={"message": message},
         )
 
     async def route_approve(
@@ -414,12 +416,14 @@ class AsyncTurnstoneConsole(_BaseClient):
         always: bool = False,
     ) -> dict[str, Any]:
         """Approve or reject a pending tool call via the routing proxy."""
-        body: dict[str, Any] = {"ws_id": ws_id, "approved": approved}
+        body: dict[str, Any] = {"approved": approved}
         if feedback:
             body["feedback"] = feedback
         if always:
             body["always"] = True
-        return await self._request("POST", "/v1/api/route/approve", json_body=body)
+        return await self._request(
+            "POST", f"/v1/api/route/workstreams/{ws_id}/approve", json_body=body
+        )
 
     async def route_plan_feedback(self, *, ws_id: str, feedback: str) -> dict[str, Any]:
         """Send plan feedback via the routing proxy."""
@@ -429,16 +433,16 @@ class AsyncTurnstoneConsole(_BaseClient):
 
     async def route_close(self, ws_id: str) -> dict[str, Any]:
         """Close a workstream via the routing proxy."""
-        return await self._request(
-            "POST", "/v1/api/route/workstreams/close", json_body={"ws_id": ws_id}
-        )
+        return await self._request("POST", f"/v1/api/route/workstreams/{ws_id}/close", json_body={})
 
     async def route_cancel(self, ws_id: str, *, force: bool = False) -> dict[str, Any]:
         """Cancel the current turn via the routing proxy."""
-        body: dict[str, Any] = {"ws_id": ws_id}
+        body: dict[str, Any] = {}
         if force:
             body["force"] = True
-        return await self._request("POST", "/v1/api/route/cancel", json_body=body)
+        return await self._request(
+            "POST", f"/v1/api/route/workstreams/{ws_id}/cancel", json_body=body
+        )
 
     async def route_command(self, *, ws_id: str, command: str) -> dict[str, Any]:
         """Send a slash command via the routing proxy."""

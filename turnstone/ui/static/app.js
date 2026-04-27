@@ -483,7 +483,7 @@ Pane.prototype.connectSSE = function (wsId) {
   }
 
   this.evtSource = new EventSource(
-    "/v1/api/events?ws_id=" + encodeURIComponent(wsId),
+    "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/events",
   );
 
   this.evtSource.onopen = function () {
@@ -823,11 +823,14 @@ Pane.prototype.handleEvent = function (evt) {
         this._pendingEditSend = null;
         this.setBusy(true);
         this.addUserMessage(editText);
-        authFetch("/v1/api/send", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: editText, ws_id: self.wsId }),
-        }).catch(function (err) {
+        authFetch(
+          "/v1/api/workstreams/" + encodeURIComponent(self.wsId) + "/send",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message: editText }),
+          },
+        ).catch(function (err) {
           self.addErrorMessage("Connection error: " + err.message);
           self.setBusy(false);
         });
@@ -931,10 +934,10 @@ Pane.prototype._dequeueMessage = function (el) {
     el.remove();
     return;
   }
-  authFetch("/v1/api/send", {
+  authFetch("/v1/api/workstreams/" + encodeURIComponent(this.wsId) + "/send", {
     method: "DELETE",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ws_id: this.wsId, msg_id: msgId }),
+    body: JSON.stringify({ msg_id: msgId }),
   })
     .then(function (r) {
       return r.json();
@@ -1460,19 +1463,21 @@ Pane.prototype.resolveApproval = function (
   this.sendBtn.disabled = this.busy;
   this.inputEl.focus();
 
-  // POST to server with ws_id (skip when server already resolved, e.g. timeout)
+  // POST to server (skip when server already resolved, e.g. timeout)
   if (!skipPost) {
     var self = this;
-    authFetch("/v1/api/approve", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        approved: approved,
-        feedback: feedback || null,
-        always: !!always,
-        ws_id: this.wsId,
-      }),
-    }).catch(function (err) {
+    authFetch(
+      "/v1/api/workstreams/" + encodeURIComponent(this.wsId) + "/approve",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          approved: approved,
+          feedback: feedback || null,
+          always: !!always,
+        }),
+      },
+    ).catch(function (err) {
       self.addErrorMessage("Connection error: " + err.message);
     });
   }
@@ -1840,12 +1845,11 @@ Pane.prototype.sendMessage = function () {
   }
   this.composer.clear();
 
-  authFetch("/v1/api/send", {
+  authFetch("/v1/api/workstreams/" + encodeURIComponent(this.wsId) + "/send", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       message: text,
-      ws_id: this.wsId,
       attachment_ids: attachmentIds,
     }),
   })
@@ -1886,11 +1890,14 @@ Pane.prototype.sendMessage = function () {
       if (data.status === "queued" && data.msg_id && queuedEl) {
         if (queuedEl.dataset.pendingDismiss) {
           // User dismissed before ID arrived — send deferred DELETE
-          authFetch("/v1/api/send", {
-            method: "DELETE",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ ws_id: self.wsId, msg_id: data.msg_id }),
-          });
+          authFetch(
+            "/v1/api/workstreams/" + encodeURIComponent(self.wsId) + "/send",
+            {
+              method: "DELETE",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ msg_id: data.msg_id }),
+            },
+          );
         } else {
           queuedEl.dataset.msgId = data.msg_id;
         }
@@ -1918,11 +1925,14 @@ Pane.prototype.cancelGeneration = function () {
   var self = this;
   var isForce = this.stopBtn.dataset.forceCancel === "true";
   this.stopBtn.disabled = true;
-  authFetch("/v1/api/cancel", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ws_id: this.wsId, force: isForce }),
-  })
+  authFetch(
+    "/v1/api/workstreams/" + encodeURIComponent(this.wsId) + "/cancel",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ force: isForce }),
+    },
+  )
     .then(function () {
       if (isForce) {
         // Force cancel abandons the worker — transition immediately.
@@ -3562,10 +3572,10 @@ function closeWorkstream(wsId) {
     return tab.dataset.wsId;
   });
 
-  authFetch("/v1/api/workstreams/close", {
+  authFetch("/v1/api/workstreams/" + encodeURIComponent(wsId) + "/close", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ws_id: wsId }),
+    body: "{}",
   })
     .then(function (r) {
       return r.json();

@@ -94,9 +94,11 @@ export class TurnstoneServer extends BaseClient {
   }
 
   async closeWorkstream(wsId: string): Promise<StatusResponse> {
-    return this.request("POST", "/v1/api/workstreams/close", {
-      json: { ws_id: wsId },
-    });
+    return this.request(
+      "POST",
+      `/v1/api/workstreams/${encodeURIComponent(wsId)}/close`,
+      { json: {} },
+    );
   }
 
   // -- Chat interaction -----------------------------------------------------
@@ -106,11 +108,15 @@ export class TurnstoneServer extends BaseClient {
     wsId: string,
     opts?: { attachmentIds?: string[] },
   ): Promise<SendResponse> {
-    const body: Record<string, unknown> = { message, ws_id: wsId };
+    const body: Record<string, unknown> = { message };
     if (opts?.attachmentIds !== undefined) {
       body.attachment_ids = opts.attachmentIds;
     }
-    return this.request("POST", "/v1/api/send", { json: body });
+    return this.request(
+      "POST",
+      `/v1/api/workstreams/${encodeURIComponent(wsId)}/send`,
+      { json: body },
+    );
   }
 
   // -- Attachments ----------------------------------------------------------
@@ -156,14 +162,17 @@ export class TurnstoneServer extends BaseClient {
     feedback?: string | null;
     always?: boolean;
   }): Promise<StatusResponse> {
-    return this.request("POST", "/v1/api/approve", {
-      json: {
-        ws_id: opts.wsId,
-        approved: opts.approved ?? true,
-        feedback: opts.feedback,
-        always: opts.always,
+    return this.request(
+      "POST",
+      `/v1/api/workstreams/${encodeURIComponent(opts.wsId)}/approve`,
+      {
+        json: {
+          approved: opts.approved ?? true,
+          feedback: opts.feedback,
+          always: opts.always,
+        },
       },
-    });
+    );
   }
 
   async planFeedback(opts: {
@@ -188,15 +197,21 @@ export class TurnstoneServer extends BaseClient {
     wsId: string,
     opts?: { force?: boolean },
   ): Promise<StatusResponse> {
-    const body: Record<string, unknown> = { ws_id: wsId };
+    const body: Record<string, unknown> = {};
     if (opts?.force) body.force = true;
-    return this.request("POST", "/v1/api/cancel", { json: body });
+    return this.request(
+      "POST",
+      `/v1/api/workstreams/${encodeURIComponent(wsId)}/cancel`,
+      { json: body },
+    );
   }
 
   // -- Streaming ------------------------------------------------------------
 
   async *streamEvents(wsId: string): AsyncIterableIterator<ServerEvent> {
-    yield* this.streamSSE<ServerEvent>("/v1/api/events", { ws_id: wsId });
+    yield* this.streamSSE<ServerEvent>(
+      `/v1/api/workstreams/${encodeURIComponent(wsId)}/events`,
+    );
   }
 
   async *streamGlobalEvents(): AsyncIterableIterator<ServerEvent> {
@@ -236,8 +251,8 @@ export class TurnstoneServer extends BaseClient {
     try {
       // Start consuming the per-workstream SSE stream first
       const events = this.streamSSE<ServerEvent>(
-        "/v1/api/events",
-        { ws_id: wsId },
+        `/v1/api/workstreams/${encodeURIComponent(wsId)}/events`,
+        undefined,
         controller.signal,
       );
 

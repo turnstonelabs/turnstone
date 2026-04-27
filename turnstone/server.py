@@ -1347,8 +1347,8 @@ def _make_watch_dispatch(ws: Workstream, session: ChatSession, ui: Any) -> Any:
     Handles both busy (enqueue into ``session._watch_pending`` for drain at IDLE)
     and idle (spawn a worker thread) cases via the shared
     :func:`turnstone.core.session_worker.send` dispatcher. The shared
-    dispatcher's ``_worker_running`` gate keeps watches and ``/v1/api/send``
-    from racing into parallel workers on the same ChatSession.
+    dispatcher's ``_worker_running`` gate keeps watches and the path-keyed
+    send endpoint from racing into parallel workers on the same ChatSession.
     """
     pending = session._watch_pending
 
@@ -2112,7 +2112,7 @@ async def _interactive_create_post_install(
         # workstream creation no live worker can exist by
         # construction — the enqueue branch of the shared dispatch
         # is dead code here. ``_worker_running`` + ``ws.worker_thread``
-        # are set together under ``ws._lock`` so a /v1/api/send
+        # are set together under ``ws._lock`` so a path-keyed send
         # arriving immediately after creation observes the running
         # state via the shared session_worker gate instead of racing
         # into a parallel worker.

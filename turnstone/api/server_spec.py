@@ -73,7 +73,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
             "under the new workstream. When `initial_message` is also set, "
             "attachments are reserved onto that turn before the worker thread "
             "dispatches; otherwise they remain pending for a follow-up "
-            "`POST /v1/api/send`."
+            "`POST /v1/api/workstreams/{ws_id}/send`."
         ),
         request_model=CreateWorkstreamRequest,
         response_model=CreateWorkstreamResponse,

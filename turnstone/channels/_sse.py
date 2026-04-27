@@ -65,7 +65,7 @@ async def run_sse_stream(
     while True:
         try:
             node_base = await node_url_fn(ws_id)
-            url = f"{node_base}/v1/api/events"
+            url = f"{node_base}/v1/api/workstreams/{ws_id}/events"
 
             sse_headers: dict[str, str] | None = None
             if token_factory is not None:
@@ -75,7 +75,6 @@ async def run_sse_stream(
                 http_client,
                 "GET",
                 url,
-                params={"ws_id": ws_id},
                 headers=sse_headers,
             ) as event_source:
                 status = event_source.response.status_code

@@ -19,7 +19,7 @@ def _fields_of(cls: type[Any]) -> frozenset[str]:
 
 
 # ---------------------------------------------------------------------------
-# Server per-workstream events  (/v1/api/events?ws_id=X)
+# Server per-workstream events  (/v1/api/workstreams/{ws_id}/events)
 # ---------------------------------------------------------------------------
 
 

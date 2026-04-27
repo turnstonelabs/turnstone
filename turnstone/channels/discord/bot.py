@@ -5,8 +5,9 @@ lifecycle of SSE event subscriptions, streaming message edits, and interactive
 approval / plan-review views.
 
 Events are consumed from the server's per-workstream SSE endpoint
-(``GET /v1/api/events?ws_id=X``) using httpx-sse.  Inbound messages are
-sent directly to server nodes via HTTP (``POST /v1/api/send``).
+(``GET /v1/api/workstreams/{ws_id}/events``) using httpx-sse.  Inbound
+messages are sent directly to server nodes via HTTP
+(``POST /v1/api/workstreams/{ws_id}/send``).
 """
 
 from __future__ import annotations

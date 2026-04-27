@@ -183,8 +183,7 @@ class AsyncTurnstoneServer(_BaseClient):
     async def close_workstream(self, ws_id: str) -> StatusResponse:
         return await self._request(
             "POST",
-            "/v1/api/workstreams/close",
-            json_body={"ws_id": ws_id},
+            f"/v1/api/workstreams/{ws_id}/close",
             response_model=StatusResponse,
         )
 
@@ -197,12 +196,12 @@ class AsyncTurnstoneServer(_BaseClient):
         *,
         attachment_ids: list[str] | None = None,
     ) -> SendResponse:
-        body: dict[str, Any] = {"message": message, "ws_id": ws_id}
+        body: dict[str, Any] = {"message": message}
         if attachment_ids is not None:
             body["attachment_ids"] = list(attachment_ids)
         return await self._request(
             "POST",
-            "/v1/api/send",
+            f"/v1/api/workstreams/{ws_id}/send",
             json_body=body,
             response_model=SendResponse,
         )
@@ -268,13 +267,16 @@ class AsyncTurnstoneServer(_BaseClient):
         feedback: str | None = None,
         always: bool = False,
     ) -> StatusResponse:
-        body: dict[str, Any] = {"ws_id": ws_id, "approved": approved}
+        body: dict[str, Any] = {"approved": approved}
         if feedback is not None:
             body["feedback"] = feedback
         if always:
             body["always"] = True
         return await self._request(
-            "POST", "/v1/api/approve", json_body=body, response_model=StatusResponse
+            "POST",
+            f"/v1/api/workstreams/{ws_id}/approve",
+            json_body=body,
+            response_model=StatusResponse,
         )
 
     async def plan_feedback(self, *, ws_id: str, feedback: str = "") -> StatusResponse:
@@ -294,12 +296,12 @@ class AsyncTurnstoneServer(_BaseClient):
         )
 
     async def cancel(self, ws_id: str, *, force: bool = False) -> StatusResponse:
-        body: dict[str, object] = {"ws_id": ws_id}
+        body: dict[str, object] = {}
         if force:
             body["force"] = True
         return await self._request(
             "POST",
-            "/v1/api/cancel",
+            f"/v1/api/workstreams/{ws_id}/cancel",
             json_body=body,
             response_model=StatusResponse,
         )
@@ -308,7 +310,7 @@ class AsyncTurnstoneServer(_BaseClient):
 
     async def stream_events(self, ws_id: str) -> AsyncIterator[ServerEvent]:
         """Iterate over per-workstream SSE events."""
-        async for data in self._stream_sse("/v1/api/events", params={"ws_id": ws_id}):
+        async for data in self._stream_sse(f"/v1/api/workstreams/{ws_id}/events"):
             yield ServerEvent.from_dict(data)
 
     async def stream_global_events(self) -> AsyncIterator[ServerEvent]:
@@ -352,7 +354,7 @@ class AsyncTurnstoneServer(_BaseClient):
         result = TurnResult(ws_id=ws_id)
 
         async def _consume() -> None:
-            async for data in self._stream_sse("/v1/api/events", params={"ws_id": ws_id}):
+            async for data in self._stream_sse(f"/v1/api/workstreams/{ws_id}/events"):
                 event = ServerEvent.from_dict(data)
                 if on_event:
                     on_event(event)
