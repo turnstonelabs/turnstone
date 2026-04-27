@@ -178,12 +178,9 @@ PUBLIC_PREFIXES: tuple[str, ...] = ("/static/", "/shared/", "/acme/")
 
 WRITE_PATHS: frozenset[str] = frozenset(
     {
-        "/api/send",
         "/api/plan",
         "/api/command",
-        "/api/cancel",
         "/api/workstreams/new",
-        "/api/workstreams/close",
         "/api/cluster/workstreams/new",
         "/api/memories",
     }
@@ -191,7 +188,6 @@ WRITE_PATHS: frozenset[str] = frozenset(
 
 APPROVE_PATHS: frozenset[str] = frozenset(
     {
-        "/api/approve",
         "/api/_internal/config-reload",
         "/api/_internal/mcp-reload",
         "/api/_internal/model-reload",
@@ -538,12 +534,37 @@ def required_scope(method: str, path: str) -> str:
     # Workstream sub-resource mutations: /api/workstreams/{ws_id}/{action}.
     # The entries here denote write actions OR write-requiring collection
     # endpoints (e.g. `attachments` is a collection with a POST that
-    # uploads a file — not a verb, but semantically a write).
+    # uploads a file — not a verb, but semantically a write). `events`
+    # falls through to the GET-default `read` and is intentionally not
+    # listed here.
     if (
         method == "POST"
         and normalized.startswith("/api/workstreams/")
         and normalized.rsplit("/", 1)[-1]
-        in {"delete", "open", "refresh-title", "title", "attachments"}
+        in {
+            "delete",
+            "open",
+            "refresh-title",
+            "title",
+            "attachments",
+            "send",
+            "cancel",
+            "close",
+        }
+    ):
+        return "write"
+    # Path-keyed approve verb: POST /api/workstreams/{ws_id}/approve.
+    if (
+        method == "POST"
+        and normalized.startswith("/api/workstreams/")
+        and normalized.rsplit("/", 1)[-1] == "approve"
+    ):
+        return "approve"
+    # Path-keyed dequeue: DELETE /api/workstreams/{ws_id}/send.
+    if (
+        method == "DELETE"
+        and normalized.startswith("/api/workstreams/")
+        and normalized.rsplit("/", 1)[-1] == "send"
     ):
         return "write"
     # Attachment deletion: DELETE /api/workstreams/{ws_id}/attachments/{attachment_id}.
@@ -570,13 +591,25 @@ def required_scope(method: str, path: str) -> str:
                 "refresh-title",
                 "title",
                 "attachments",
+                "send",
+                "cancel",
+                "close",
             }:
                 return "write"
+            if proxied.startswith("/api/workstreams/") and proxied.rsplit("/", 1)[-1] == "approve":
+                return "approve"
 
     # Proxied attachment deletion: /node/.../api/workstreams/{ws}/attachments/{id}
     if method == "DELETE" and normalized.startswith("/node/"):
         proxied = _extract_proxied_path(normalized)
         if proxied and _ATTACHMENT_DELETE_RE.match(proxied):
+            return "write"
+        # Proxied path-keyed dequeue: DELETE /node/.../api/workstreams/{ws}/send.
+        if (
+            proxied
+            and proxied.startswith("/api/workstreams/")
+            and proxied.rsplit("/", 1)[-1] == "send"
+        ):
             return "write"
 
     return "read"

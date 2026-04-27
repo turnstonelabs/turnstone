@@ -15,7 +15,6 @@ from turnstone.core.workstream import WorkstreamKind
 
 class SendRequest(BaseModel):
     message: str = Field(description="User message text")
-    ws_id: str = Field(description="Target workstream ID")
     attachment_ids: list[str] | None = Field(
         default=None,
         description=(
@@ -83,7 +82,6 @@ class ApproveRequest(BaseModel):
     always: bool = Field(
         default=False, description="Auto-approve the tools in this batch going forward"
     )
-    ws_id: str = Field(description="Target workstream ID")
 
 
 class PlanFeedbackRequest(BaseModel):
@@ -97,7 +95,6 @@ class CommandRequest(BaseModel):
 
 
 class CancelRequest(BaseModel):
-    ws_id: str = Field(description="Target workstream ID")
     force: bool = Field(
         default=False,
         description="Force cancel: abandon the stuck worker thread immediately. "
@@ -173,13 +170,10 @@ class CreateWorkstreamResponse(BaseModel):
         description=(
             "Ids of attachments saved by this request (multipart variant only). "
             "Already reserved onto the initial_message turn when one was provided; "
-            "otherwise left pending for a follow-up POST /v1/api/send."
+            "otherwise left pending for a follow-up POST "
+            "/v1/api/workstreams/{ws_id}/send."
         ),
     )
-
-
-class CloseWorkstreamRequest(BaseModel):
-    ws_id: str = Field(description="Workstream ID to close")
 
 
 # ---------------------------------------------------------------------------

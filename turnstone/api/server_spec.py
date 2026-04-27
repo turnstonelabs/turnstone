@@ -22,7 +22,6 @@ from turnstone.api.server_schemas import (
     ApproveRequest,
     AvailableModelInfo,
     CancelRequest,
-    CloseWorkstreamRequest,
     CommandRequest,
     CreateWorkstreamRequest,
     CreateWorkstreamResponse,
@@ -82,17 +81,16 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         tags=["Workstreams"],
     ),
     EndpointSpec(
-        "/v1/api/workstreams/close",
+        "/v1/api/workstreams/{ws_id}/close",
         "POST",
         "Close a workstream",
-        request_model=CloseWorkstreamRequest,
         response_model=StatusResponse,
-        error_codes=[400],
+        error_codes=[400, 404],
         tags=["Workstreams"],
     ),
     # --- Chat ---
     EndpointSpec(
-        "/v1/api/send",
+        "/v1/api/workstreams/{ws_id}/send",
         "POST",
         "Send a user message",
         request_model=SendRequest,
@@ -101,7 +99,20 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         tags=["Chat"],
     ),
     EndpointSpec(
-        "/v1/api/approve",
+        "/v1/api/workstreams/{ws_id}/send",
+        "DELETE",
+        "Cancel a queued message",
+        description=(
+            "Removes a previously-queued message from the workstream's "
+            'pending queue. Body: ``{"msg_id": "..."}``. Returns '
+            "``status: removed`` when the queue had the entry, "
+            "``status: not_found`` otherwise."
+        ),
+        error_codes=[400, 404],
+        tags=["Chat"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/approve",
         "POST",
         "Approve or deny a tool call",
         request_model=ApproveRequest,
@@ -128,7 +139,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         tags=["Chat"],
     ),
     EndpointSpec(
-        "/v1/api/cancel",
+        "/v1/api/workstreams/{ws_id}/cancel",
         "POST",
         "Cancel the active generation in a workstream",
         request_model=CancelRequest,
@@ -138,12 +149,11 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
     ),
     # --- Streaming ---
     EndpointSpec(
-        "/v1/api/events",
+        "/v1/api/workstreams/{ws_id}/events",
         "GET",
         "Per-workstream SSE event stream",
         description="Opens a Server-Sent Events stream scoped to a single workstream. "
         "Returns text/event-stream. See API reference for event types.",
-        query_params=[QueryParam("ws_id", "Workstream identifier", required=True)],
         error_codes=[404],
         tags=["Streaming"],
     ),
@@ -437,7 +447,6 @@ _ALL_MODELS: list[type[BaseModel]] = [
     CancelRequest,
     CreateWorkstreamRequest,
     CreateWorkstreamResponse,
-    CloseWorkstreamRequest,
     ListWorkstreamsResponse,
     WorkstreamDetailResponse,
     WorkstreamHistoryResponse,
