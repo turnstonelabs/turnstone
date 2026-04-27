@@ -73,6 +73,15 @@ def _inject_storage(storage):
 
 @pytest.fixture
 def delete_client(_inject_storage):
+    """Yield ``(TestClient, Starlette app)`` for the delete endpoint.
+
+    ``app.state.auth_storage`` is pre-attached so the endpoint's
+    pre-delete snapshot block runs (without it the snapshot is
+    skipped and the lifecycle event lands with ``name=""``).  Tests
+    that need a wired manager attach ``app.state.workstreams = mgr``
+    after the yield; tests that don't care just ignore the second
+    tuple member.
+    """
     app = Starlette(
         routes=[
             Mount(
@@ -88,7 +97,8 @@ def delete_client(_inject_storage):
         ],
         middleware=[Middleware(_InjectAuthMiddleware)],
     )
-    return TestClient(app)
+    app.state.auth_storage = _inject_storage
+    return TestClient(app), app
 
 
 @pytest.fixture
@@ -196,27 +206,63 @@ def settings_client(_inject_storage):
 
 class TestDeleteWorkstream:
     def test_delete_success(self, delete_client, storage):
+        client, _ = delete_client
         storage.register_workstream("ws-abc", "node-1", name="test")
-        r = delete_client.post("/v1/api/workstreams/ws-abc/delete")
+        r = client.post("/v1/api/workstreams/ws-abc/delete")
         assert r.status_code == 200
         assert r.json()["deleted"] == "ws-abc"
 
     def test_delete_not_found(self, delete_client):
-        r = delete_client.post("/v1/api/workstreams/nonexistent/delete")
+        client, _ = delete_client
+        r = client.post("/v1/api/workstreams/nonexistent/delete")
         assert r.status_code == 404
         assert "not found" in r.json()["error"].lower()
 
     def test_delete_error_redacted(self, delete_client, storage):
         """500 response should not leak exception internals."""
+        client, _ = delete_client
         storage.register_workstream("ws-abc", "node-1", name="test", user_id="test-user")
         with patch(
             "turnstone.core.memory.delete_workstream",
             side_effect=RuntimeError("secret internal detail"),
         ):
-            r = delete_client.post("/v1/api/workstreams/ws-abc/delete")
+            r = client.post("/v1/api/workstreams/ws-abc/delete")
         assert r.status_code == 500
         assert "Delete failed" in r.json()["error"]
         assert "secret" not in r.json()["error"]
+
+    def test_delete_fires_lifecycle_event_with_snapshotted_name(self, delete_client, storage):
+        """The endpoint must call ``mgr.delete(ws_id, name=...)`` after a
+        successful storage delete so the cluster collector → coord
+        adapter chain can re-emit ``child_ws_closed`` and the operator's
+        child-tree drops the row.  Without this the deleted child stays
+        visible (with its last-known state) until a full reload — a
+        coordinator that spawns→completes→deletes children leaves an
+        ever-growing tree on the dashboard."""
+        client, app = delete_client
+        storage.register_workstream("ws-event", "node-1", name="needs-event", user_id="test-user")
+        mgr = MagicMock()
+        app.state.workstreams = mgr
+        r = client.post("/v1/api/workstreams/ws-event/delete")
+        assert r.status_code == 200
+        # The event-emission call must use the name we snapshotted
+        # before the storage row was wiped.
+        mgr.delete.assert_called_once_with("ws-event", name="needs-event")
+
+    def test_delete_event_emit_failure_does_not_500(self, delete_client, storage):
+        """A best-effort event emit: if the manager's emitter chokes
+        (queue full, adapter mid-shutdown, etc.) the storage row is
+        already gone and the response must still be 200 — rolling
+        back the delete to satisfy a fan-out failure would corrupt
+        the operator's view of an already-vanished workstream."""
+        client, app = delete_client
+        storage.register_workstream("ws-flaky", "node-1", name="flaky", user_id="test-user")
+        mgr = MagicMock()
+        mgr.delete.side_effect = RuntimeError("queue full or whatever")
+        app.state.workstreams = mgr
+        r = client.post("/v1/api/workstreams/ws-flaky/delete")
+        assert r.status_code == 200
+        assert r.json()["deleted"] == "ws-flaky"
 
 
 # ===========================================================================

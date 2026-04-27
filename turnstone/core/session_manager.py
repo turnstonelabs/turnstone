@@ -633,6 +633,59 @@ class SessionManager:
                 self._open_locks[ws_id] = (lk, refs - 1)
 
     # ------------------------------------------------------------------
+    # delete — hard-delete event broadcast (storage row is caller's job)
+    # ------------------------------------------------------------------
+
+    def delete(self, ws_id: str, *, name: str = "") -> bool:
+        """Drop the in-memory slot if present + emit ``ws_closed`` with
+        ``reason="deleted"`` so subscribers (cluster collector → coord
+        adapter → child-tree UI) can drop the row.
+
+        Storage row removal is the **caller's** responsibility — the
+        delete HTTP endpoint already calls
+        :func:`turnstone.core.memory.delete_workstream` before invoking
+        this; the manager only handles the in-memory + event side so
+        the lifecycle event lands on the same global queue every other
+        terminal transition uses.
+
+        Distinct from :meth:`close` (which writes ``state='closed'`` so
+        the row is re-openable later) and :meth:`discard` (which fires
+        no event because it's the rollback partner of an unwound
+        ``defer_emit_created`` create).  Hard-delete advertises a
+        terminal transition with ``reason="deleted"`` regardless of
+        whether the workstream was loaded — a row that was closed
+        (and therefore unloaded from memory) before being deleted
+        still needs the broadcast so a long-lived dashboard tab
+        drops the entry from its tree.
+
+        Returns ``True`` when an in-memory slot was released, ``False``
+        when the id wasn't tracked.  The event fires either way; the
+        return value is informational for callers that care about
+        capacity accounting.
+        """
+        with self._lock:
+            ws = self._workstreams.pop(ws_id, None)
+            if ws is not None:
+                if ws_id in self._order:
+                    self._order.remove(ws_id)
+                if self._active_id == ws_id:
+                    self._active_id = self._order[0] if self._order else None
+        if ws is not None:
+            # cleanup_ui outside the manager lock — mirrors the close()
+            # ordering so any blocking UI teardown can't pin the
+            # slot-accounting mutex.
+            self._adapter.cleanup_ui(ws)
+        if self._event_emitter is not None:
+            # Fall back to the workstream's name when the caller didn't
+            # snapshot one (the event payload's ``name`` field surfaces
+            # in operator toasts on real-node closures; coord-side
+            # ``child_ws_closed`` ignores it but the global queue
+            # consumers don't all do so).
+            event_name = name or (ws.name if ws is not None else "")
+            self._event_emitter.emit_closed(ws_id, reason="deleted", name=event_name)
+        return ws is not None
+
+    # ------------------------------------------------------------------
     # close / set_state / close_idle
     # ------------------------------------------------------------------
 

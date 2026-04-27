@@ -680,6 +680,104 @@ def test_close_unknown_returns_false() -> None:
 
 
 # ---------------------------------------------------------------------------
+# delete — hard-delete event broadcast (storage delete is the caller's job)
+# ---------------------------------------------------------------------------
+
+
+def test_delete_emits_closed_with_reason_deleted() -> None:
+    """Hard-delete a still-loaded workstream: the in-memory slot
+    drops AND a ``ws_closed`` event fires with ``reason='deleted'``
+    so the cluster collector → coord adapter chain can re-emit as
+    ``child_ws_closed`` and the operator's child-tree drops the row.
+    Pre-fix the storage row vanished but no event fired, so a
+    long-lived dashboard tab would leave the deleted child visible
+    (with its last-known state) until a full reload."""
+    mgr, adapter, _ = _make_manager()
+    ws = mgr.create(user_id="u1", name="will-be-deleted")
+    ws_id = ws.id
+
+    assert mgr.delete(ws_id) is True
+    # In-memory slot released — capacity restored just like close.
+    assert mgr.get(ws_id) is None
+    # Closed event fired with the deletion reason.
+    closed_events = adapter.events_of("closed")
+    assert len(closed_events) == 1
+    ev = closed_events[0]
+    assert ev.ws_id == ws_id
+    assert ev.reason == "deleted"
+    assert ev.name == "will-be-deleted"
+    # UI cleanup ran (mirrors close ordering).
+    assert ws_id in adapter.cleaned_up
+
+
+def test_delete_unloaded_ws_still_fires_event() -> None:
+    """A row that was closed (and therefore unloaded from memory)
+    before delete still needs the broadcast — otherwise a closed
+    row that's then deleted leaves the closed-state child stuck on
+    the dashboard tree forever.  The in-memory return is False
+    (nothing to release) but the event MUST fire."""
+    mgr, adapter, _ = _make_manager()
+    ws = mgr.create(user_id="u1", name="closed-then-deleted")
+    ws_id = ws.id
+    mgr.close(ws_id)
+    # Drain the close event so we can assert the delete event in isolation.
+    pre_delete_closed = list(adapter.events_of("closed"))
+    assert len(pre_delete_closed) == 1
+    assert pre_delete_closed[0].reason == "closed"
+
+    # Deleting an already-unloaded ws — no in-memory slot to release.
+    result = mgr.delete(ws_id, name="closed-then-deleted")
+    assert result is False
+    # But the event MUST fire — the dashboard hasn't seen the row drop yet.
+    closed_events = adapter.events_of("closed")
+    assert len(closed_events) == 2
+    delete_event = closed_events[1]
+    assert delete_event.ws_id == ws_id
+    assert delete_event.reason == "deleted"
+    assert delete_event.name == "closed-then-deleted"
+
+
+def test_delete_falls_back_to_workstream_name_when_caller_omits() -> None:
+    """When the caller doesn't snapshot a name, the event payload
+    falls back to the live workstream's name so operator toasts on
+    the global queue still carry useful context."""
+    mgr, adapter, _ = _make_manager()
+    ws = mgr.create(user_id="u1", name="auto-name-from-ws")
+
+    mgr.delete(ws.id)  # no name kwarg
+    closed_events = adapter.events_of("closed")
+    assert closed_events[-1].name == "auto-name-from-ws"
+
+
+def test_delete_returns_false_for_unknown_ws_id() -> None:
+    """Idempotent on an absent + never-loaded ws_id — still fires
+    the event so a dashboard with a stale row can drop it, and
+    returns False so the caller knows nothing was tracked."""
+    mgr, adapter, _ = _make_manager()
+    result = mgr.delete("never-existed")
+    assert result is False
+    # Event still fires — a stale dashboard entry is exactly the
+    # case where this matters.
+    closed_events = adapter.events_of("closed")
+    assert len(closed_events) == 1
+    assert closed_events[0].ws_id == "never-existed"
+    assert closed_events[0].reason == "deleted"
+
+
+def test_delete_without_event_emitter_is_quiet() -> None:
+    """When the manager is constructed without an event emitter
+    (e.g. the no-op kind in tests), ``delete`` releases the slot
+    silently — the no-emitter branch must not raise."""
+    mgr, adapter, _ = _make_manager(event_emitter=None)
+    ws = mgr.create(user_id="u1")
+    result = mgr.delete(ws.id)
+    assert result is True
+    # Adapter still gets cleanup_ui — that's the kind-side surface,
+    # distinct from the lifecycle-event side channel.
+    assert ws.id in adapter.cleaned_up
+
+
+# ---------------------------------------------------------------------------
 # set_state
 # ---------------------------------------------------------------------------
 

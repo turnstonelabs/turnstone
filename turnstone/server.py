@@ -2176,18 +2176,40 @@ async def delete_workstream_endpoint(request: Request) -> JSONResponse:
     storage = getattr(request.app.state, "auth_storage", None)
     kind: str = ""
     parent_ws_id: str | None = None
+    name: str = ""
     _, ip = _audit_context(request)
     try:
-        # Snapshot kind/parent for the audit record before the delete
-        # wipes the row.  Inside the try so a transient storage error
-        # surfaces through the endpoint's redacted 500 handler below
-        # rather than as an unhandled exception.
+        # Snapshot kind/parent/name for the audit record + lifecycle
+        # event before the delete wipes the row.  Inside the try so a
+        # transient storage error surfaces through the endpoint's
+        # redacted 500 handler below rather than as an unhandled
+        # exception.  ``name`` is forwarded to ``mgr.delete`` so the
+        # ``ws_closed`` event payload carries the same field other
+        # terminal transitions emit (interactive operators see the
+        # name in close toasts; coord-side ``child_ws_closed`` ignores
+        # it but the global queue contract is uniform).
         if storage is not None:
             row = storage.get_workstream(ws_id) or {}
             kind = row.get("kind", "")
             parent_ws_id = row.get("parent_ws_id")
+            name = row.get("name", "") or ""
         if delete_workstream(ws_id):
             log.info("ws.deleted", ws_id=ws_id[:8])
+            # Fire ``ws_closed`` with ``reason='deleted'`` so the
+            # cluster collector → coord adapter chain re-emits as
+            # ``child_ws_closed`` and the operator's child-tree drops
+            # the row.  Without this the row stays visible (with its
+            # last-known state) until a full reload — a model that
+            # spawns→completes→deletes children leaves an
+            # ever-growing tree on the dashboard.  Best-effort: an
+            # emit failure must not roll back the storage delete or
+            # 500 the response.
+            mgr = getattr(request.app.state, "workstreams", None)
+            if mgr is not None:
+                try:
+                    mgr.delete(ws_id, name=name)
+                except Exception:
+                    log.warning("ws.delete.event_emit_failed", ws_id=ws_id[:8], exc_info=True)
             if storage is not None:
                 record_audit(
                     storage,
