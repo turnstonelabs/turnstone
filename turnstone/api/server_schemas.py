@@ -220,7 +220,15 @@ class ListWorkstreamsResponse(BaseModel):
 
 
 class DashboardWorkstream(BaseModel):
-    id: str
+    """Dashboard row shape for ``GET /v1/api/dashboard``.
+
+    Renamed ``id`` → ``ws_id`` for v1 row-shape consistency with
+    the rest of the workstream surface (active list, saved list,
+    history, detail, etc.). Frontend consumers reading
+    ``dashboard.workstreams[].id`` swap to ``.ws_id``.
+    """
+
+    ws_id: str
     name: str
     state: str
     title: str = ""

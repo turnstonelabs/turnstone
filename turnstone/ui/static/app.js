@@ -3644,7 +3644,7 @@ function loadDashboard() {
       renderDashboardTable(wsList, agg);
       var activeWsIds = {};
       wsList.forEach(function (ws) {
-        activeWsIds[ws.id] = true;
+        activeWsIds[ws.ws_id] = true;
       });
       var savedList = (res[1].workstreams || []).filter(function (s) {
         return !activeWsIds[s.ws_id];
@@ -3674,14 +3674,18 @@ function renderDashboardTable(wsList, agg) {
   }
   wsList.forEach(function (ws) {
     var liveState =
-      (workstreams[ws.id] && workstreams[ws.id].state) || ws.state || "idle";
+      (workstreams[ws.ws_id] && workstreams[ws.ws_id].state) ||
+      ws.state ||
+      "idle";
     var liveName =
-      (workstreams[ws.id] && workstreams[ws.id].name) || ws.name || ws.id;
+      (workstreams[ws.ws_id] && workstreams[ws.ws_id].name) ||
+      ws.name ||
+      ws.ws_id;
     var sd = STATE_DISPLAY[liveState] || STATE_DISPLAY.idle;
 
     var row = document.createElement("div");
     row.className = "dash-row";
-    row.dataset.wsId = ws.id;
+    row.dataset.wsId = ws.ws_id;
     row.dataset.state = liveState;
     row.setAttribute("role", "button");
     row.setAttribute("tabindex", "0");
@@ -3754,12 +3758,12 @@ function renderDashboardTable(wsList, agg) {
     row.appendChild(sub);
 
     row.onclick = function () {
-      dashboardSwitchWorkstream(ws.id);
+      dashboardSwitchWorkstream(ws.ws_id);
     };
     row.onkeydown = function (e) {
       if (e.key === "Enter" || e.key === " ") {
         e.preventDefault();
-        dashboardSwitchWorkstream(ws.id);
+        dashboardSwitchWorkstream(ws.ws_id);
       }
     };
 

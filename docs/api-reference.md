@@ -571,8 +571,8 @@ Returns a list of all active workstreams.
 ```json
 {
   "workstreams": [
-    {"id": "abc123", "name": "default", "state": "idle"},
-    {"id": "def456", "name": "hacker-news", "state": "thinking"}
+    {"ws_id": "abc123", "name": "default", "state": "idle"},
+    {"ws_id": "def456", "name": "hacker-news", "state": "thinking"}
   ]
 }
 ```
@@ -581,7 +581,7 @@ Each workstream object:
 
 | Field        | Type        | Description                                            |
 |--------------|-------------|--------------------------------------------------------|
-| `id`         | string      | Unique workstream routing identifier                   |
+| `ws_id`      | string      | Unique workstream routing identifier                   |
 | `name`       | string      | Display name (alias if set, otherwise `ws-xxxx`)       |
 | `state`      | string      | Current state (see state values above)                 |
 

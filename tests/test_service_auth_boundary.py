@@ -318,13 +318,13 @@ class TestDashboardCache4xxLogLevel:
             calls["n"] += 1
             if calls["n"] == 1:
                 return httpx.Response(403, text="forbidden")
-            return httpx.Response(200, json={"workstreams": [{"id": "ws-1"}]})
+            return httpx.Response(200, json={"workstreams": [{"ws_id": "ws-1"}]})
 
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         first = await cache.get("node-1", "http://node-1:8001", client, {})
         second = await cache.get("node-1", "http://node-1:8001", client, {})
         assert first is None
-        assert second == {"workstreams": [{"id": "ws-1"}]}
+        assert second == {"workstreams": [{"ws_id": "ws-1"}]}
         assert calls["n"] == 2, "4xx must bypass the cache so the retry reaches upstream"
 
 

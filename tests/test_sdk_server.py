@@ -60,7 +60,7 @@ async def test_dashboard():
                 {
                     "workstreams": [
                         {
-                            "id": "ws1",
+                            "ws_id": "ws1",
                             "name": "demo",
                             "state": "idle",
                             "tokens": 100,

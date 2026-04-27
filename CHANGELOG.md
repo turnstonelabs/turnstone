@@ -17,6 +17,23 @@ Three release tracks are maintained:
 
 ### Changed
 
+- **Dashboard row shape: ``id`` → ``ws_id``.** The
+  ``GET /v1/api/dashboard`` row dict now keys the workstream
+  identifier as ``ws_id`` (matching the rest of the v1 workstream
+  surface — active list, saved list, history, detail). The Stage 2
+  list-verb lift converged ``/v1/api/workstreams`` and
+  ``/v1/api/workstreams/saved`` on ``ws_id`` but left dashboard
+  alone to keep that PR's diff focused; this lands the same rename
+  on the remaining endpoint so the v1 row shape is consistent
+  across the family. Pydantic ``DashboardWorkstream`` and the
+  TypeScript SDK ``DashboardWorkstream`` interface both rename the
+  field accordingly. The bundled web UI is the only consumer that
+  reads ``dashboard.workstreams[].id`` and is updated atomically;
+  no external SDK on a stable line reads the field, so the swap is
+  bounded by normal static-asset reload. Console
+  ``_fetch_live_block`` (cluster-inspect's projection over a
+  remote node's dashboard payload) is updated to match.
+
 - **Coordinator gains rich `ws_state` payload + live activity broadcast**
   ([§ Post-P3 reckoning item #2 follow-up]). Pre-lift coord's
   cluster broadcast was state-only — the dashboard's coord rows

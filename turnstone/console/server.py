@@ -809,7 +809,7 @@ async def _fetch_live_block(
     if payload is None:
         return None
     for entry in payload.get("workstreams", []) or []:
-        if isinstance(entry, dict) and entry.get("id") == ws_id:
+        if isinstance(entry, dict) and entry.get("ws_id") == ws_id:
             live = {k: entry.get(k) for k in _CLUSTER_WS_LIVE_KEYS if k in entry}
             # Derived field — kept in lockstep with
             # _coordinator_live_snapshot so both origins produce the

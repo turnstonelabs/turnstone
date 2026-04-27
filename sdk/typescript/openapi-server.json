@@ -2342,9 +2342,10 @@
         "type": "object"
       },
       "DashboardWorkstream": {
+        "description": "Dashboard row shape for ``GET /v1/api/dashboard``.\n\nRenamed ``id`` \u2192 ``ws_id`` for v1 row-shape consistency with\nthe rest of the workstream surface (active list, saved list,\nhistory, detail, etc.). Frontend consumers reading\n``dashboard.workstreams[].id`` swap to ``.ws_id``.",
         "properties": {
-          "id": {
-            "title": "Id",
+          "ws_id": {
+            "title": "Ws Id",
             "type": "string"
           },
           "name": {
@@ -2423,7 +2424,7 @@
           }
         },
         "required": [
-          "id",
+          "ws_id",
           "name",
           "state"
         ],

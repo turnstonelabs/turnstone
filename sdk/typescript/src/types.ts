@@ -201,7 +201,7 @@ export interface WorkstreamHistoryResponse {
 }
 
 export interface DashboardWorkstream {
-  id: string;
+  ws_id: string;
   name: string;
   state: string;
   title?: string;

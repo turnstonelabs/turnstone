@@ -1565,7 +1565,7 @@ def test_cluster_inspect_node_backed_success(storage):
     payload = {
         "workstreams": [
             {
-                "id": ws_id,
+                "ws_id": ws_id,
                 "state": "running",
                 "tokens": 512,
                 "context_ratio": 0.25,
@@ -1608,7 +1608,7 @@ def test_cluster_inspect_node_backed_pending_approval_synthesized(storage):
     payload = {
         "workstreams": [
             {
-                "id": ws_id,
+                "ws_id": ws_id,
                 "state": "attention",
                 "activity_state": "approval",
                 "activity": "awaiting approval",
@@ -1661,7 +1661,7 @@ def test_cluster_inspect_node_missing_entry_live_null(storage):
     _seed_node_workstream(storage, ws_id=ws_id, node_id="node-a")
     payload = {
         "workstreams": [
-            {"id": "different-" + "x" * 24, "state": "idle"},
+            {"ws_id": "different-" + "x" * 24, "state": "idle"},
         ]
     }
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())

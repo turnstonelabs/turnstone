@@ -1135,14 +1135,7 @@ async def global_events_sse(request: Request) -> Response:
 
 
 async def dashboard(request: Request) -> JSONResponse:
-    """GET /v1/api/dashboard — enriched workstream data + aggregate stats.
-
-    NOTE: row shape still uses ``"id"`` (not ``"ws_id"``) — Stage 2's
-    list-verb lift converged ``/v1/api/workstreams`` and
-    ``/saved`` on ``ws_id`` but left dashboard alone to keep that
-    PR's diff focused. The same rename should land here as a separate
-    cleanup so the v1 row shape is consistent across the family.
-    """
+    """GET /v1/api/dashboard — enriched workstream data + aggregate stats."""
     from turnstone.core.memory import get_workstream_display_name
 
     mgr: SessionManager = request.app.state.workstreams
@@ -1170,7 +1163,7 @@ async def dashboard(request: Request) -> JSONResponse:
             title = get_workstream_display_name(ws.session.ws_id) or ""
         ws_list.append(
             {
-                "id": ws.id,
+                "ws_id": ws.id,
                 "name": title or ws.name,
                 "state": ws.state.value,
                 "title": title,
