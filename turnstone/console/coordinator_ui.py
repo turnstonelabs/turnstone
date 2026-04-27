@@ -193,7 +193,12 @@ class ConsoleCoordinatorUI(SessionUIBase):
         without this dedup each one acquires the cluster collector's
         main lock for a no-op write. (Pre-lift coord didn't broadcast
         activity at all, so this is genuinely new contention worth
-        gating.)
+        gating.) The dedup state is updated **only after a successful
+        collector call** — if the collector raises mid-broadcast,
+        the next identical tick must retry instead of being silently
+        suppressed (otherwise a transient collector failure would
+        strand the dashboard's coord row at the pre-failure activity
+        until the activity actually changes).
         """
         collector = ConsoleCoordinatorUI._collector
         if collector is None:
@@ -204,7 +209,6 @@ class ConsoleCoordinatorUI(SessionUIBase):
             current = (activity, activity_state)
             if current == self._last_broadcast_activity:
                 return
-            self._last_broadcast_activity = current
         try:
             collector.update_console_ws_activity(
                 self.ws_id,
@@ -217,6 +221,18 @@ class ConsoleCoordinatorUI(SessionUIBase):
                 self.ws_id,
                 exc_info=True,
             )
+            return
+        # Update dedup state only on successful broadcast so a
+        # transient collector failure doesn't suppress the next
+        # identical tick's retry. Re-acquire the lock briefly —
+        # the worker thread is the only writer to
+        # ``_last_broadcast_activity``, so the only race is with
+        # another concurrent ``_broadcast_activity`` that just
+        # took the same snapshot; whichever lands the assignment
+        # last wins, and both correspond to the same broadcast
+        # tuple anyway.
+        with self._ws_lock:
+            self._last_broadcast_activity = current
 
     def on_state_change(self, state: str) -> None:
         # Flow state transitions through the unified SessionManager so

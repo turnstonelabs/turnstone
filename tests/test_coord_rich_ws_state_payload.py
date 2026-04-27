@@ -359,6 +359,63 @@ def test_coord_ui_broadcast_activity_no_op_when_collector_unset() -> None:
     ui.on_thinking_start()  # must not raise
 
 
+def test_coord_ui_broadcast_activity_failure_does_not_strand_dedup() -> None:
+    """Regression for the Copilot finding on PR #420: post-fix the
+    dedup state ``_last_broadcast_activity`` is updated **only after**
+    a successful collector call. If the collector raises mid-broadcast
+    on tick #1, tick #2 with the same activity tuple must still
+    attempt the broadcast (otherwise a transient collector failure
+    would strand the dashboard's coord row at the pre-failure
+    activity until the activity actually changes). Pre-fix the
+    dedup state was assigned inside the lock before the collector
+    call, so the failed broadcast still updated it and tick #2
+    silently no-op'd."""
+    recorder = MagicMock()
+    # First call fails (transient collector outage); second call succeeds.
+    recorder.update_console_ws_activity.side_effect = [
+        RuntimeError("collector dead"),
+        None,
+    ]
+    ui = ConsoleCoordinatorUI(ws_id="coord-ws", user_id="u1")
+    ConsoleCoordinatorUI._collector = recorder
+    try:
+        # Tick #1 — collector raises; dedup state must NOT update.
+        ui.on_thinking_start()
+        assert ui._last_broadcast_activity is None, (
+            "dedup state was updated despite a failed collector call — "
+            "next identical tick would be silently suppressed"
+        )
+        # Tick #2 — same activity tuple. Pre-fix this would no-op
+        # (because dedup state was already (Thinking…, thinking)).
+        # Post-fix it retries; collector succeeds; dedup state lands.
+        ui.on_thinking_start()
+        assert recorder.update_console_ws_activity.call_count == 2, (
+            "second tick was deduped despite the first call failing"
+        )
+        assert ui._last_broadcast_activity == ("Thinking…", "thinking")
+    finally:
+        ConsoleCoordinatorUI._collector = None
+
+
+def test_coord_ui_broadcast_activity_dedup_skips_identical_after_success() -> None:
+    """Happy-path dedup: after a successful broadcast, the next identical
+    tick is deduped — the cluster collector lock is not re-acquired
+    for a no-op write. This is the perf optimization the dedup is
+    there for; the regression test above checks the failure-recovery
+    invariant doesn't break it."""
+    recorder = MagicMock()
+    ui = ConsoleCoordinatorUI(ws_id="coord-ws", user_id="u1")
+    ConsoleCoordinatorUI._collector = recorder
+    try:
+        ui.on_thinking_start()  # tick 1 — fires
+        ui.on_thinking_start()  # tick 2 — same tuple, deduped
+        ui.on_thinking_start()  # tick 3 — same tuple, deduped
+        assert recorder.update_console_ws_activity.call_count == 1
+        assert ui._last_broadcast_activity == ("Thinking…", "thinking")
+    finally:
+        ConsoleCoordinatorUI._collector = None
+
+
 # ---------------------------------------------------------------------------
 # Spawn metrics — coord wires its own hook
 # ---------------------------------------------------------------------------
@@ -440,8 +497,8 @@ def test_snapshot_under_concurrent_writes_does_not_crash() -> None:
     on join so a silent worker crash can't slip through as a bare
     deadlock-check pass."""
     ui = ConsoleCoordinatorUI(ws_id="coord-ws", user_id="u1")
-    writer_exc: list[BaseException] = []
-    reader_exc: list[BaseException] = []
+    writer_exc: list[Exception] = []
+    reader_exc: list[Exception] = []
 
     def _writer() -> None:
         try:
@@ -454,7 +511,7 @@ def test_snapshot_under_concurrent_writes_does_not_crash() -> None:
                     )
                     ui.on_content_token(f"chunk-{i}")
                     ui.on_thinking_start()
-        except BaseException as exc:  # noqa: BLE001 — surface to main thread
+        except Exception as exc:  # noqa: BLE001 — surface to main thread
             writer_exc.append(exc)
 
     def _reader() -> None:
@@ -462,7 +519,7 @@ def test_snapshot_under_concurrent_writes_does_not_crash() -> None:
             states = ("running", "idle", "error")
             for i in range(50):
                 ui.snapshot_and_consume_state_payload(states[i % len(states)])
-        except BaseException as exc:  # noqa: BLE001 — surface to main thread
+        except Exception as exc:  # noqa: BLE001 — surface to main thread
             reader_exc.append(exc)
 
     writer = threading.Thread(target=_writer)

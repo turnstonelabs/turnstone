@@ -45,12 +45,16 @@ Three release tracks are maintained:
     ``usage_event`` by ``ws_id`` will see coord rows for the first
     time.
   - **Coord broadcasts live activity transitions.** New
-    ``collector.emit_console_ws_activity(ws_id, *, activity,
-    activity_state)`` method. The cluster dashboard's per-ws
-    polling reads the in-memory pseudo-node row, so activity ticks
-    land on the next snapshot fetch (matches WebUI's behaviour
-    where activity events are observational; not fanned out
-    through the cluster SSE stream).
+    ``ClusterCollector.update_console_ws_activity(ws_id, *,
+    activity, activity_state)`` method (named ``update_*`` rather
+    than ``emit_*`` to flag the no-fan-out asymmetry vs. the rest
+    of the ``emit_console_ws_*`` family — it updates the in-memory
+    pseudo-node row but intentionally does NOT fan out a separate
+    SSE event). The cluster dashboard's per-ws polling reads the
+    in-memory pseudo-node row, so activity ticks land on the next
+    snapshot fetch (matches WebUI's behaviour where activity
+    events are observational; not fanned out through the cluster
+    SSE stream).
   - **Cluster ``cluster_state`` events for coord rows now carry
     non-zero ``tokens`` / ``content`` fields.** Frontend rendering
     that conditionally hid these on coord rows can drop the
