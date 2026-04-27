@@ -24,6 +24,7 @@ storage/transport routing is kind-specific.
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
 import queue
 import threading
@@ -318,6 +319,77 @@ class SessionUIBase:
             )
         except Exception:
             log.debug("Failed to persist LLM verdict", exc_info=True)
+
+    def serialize_pending_approval_detail(self) -> dict[str, Any] | None:
+        """Build the inline approval payload for dashboard projection.
+
+        Merges :attr:`_pending_approval` items with the per-call_id
+        LLM verdict cache so a coordinator's children-tree row can
+        render inline approve/deny buttons + judge-verdict pill
+        without making a separate per-child round-trip. Returns
+        ``None`` when no approval is pending.
+
+        The shape mirrors the inline tool-call info already broadcast
+        via the ``approve_request`` SSE event but adds a
+        ``judge_verdict`` sibling per item (looked up from
+        :attr:`_llm_verdicts`, the cache seeded by
+        :meth:`on_intent_verdict`). Heuristic verdicts already carried
+        on items are forwarded as ``heuristic_verdict``.
+
+        Cross-tenant exposure note: this method is read by
+        ``GET /v1/api/dashboard`` (read scope, cross-tenant under the
+        trusted-team posture documented at ``server.py:1119-1120``).
+        Judge ``reasoning`` / ``evidence`` / ``func_args`` therefore
+        cross the same boundary as ``activity`` and ``tokens`` already
+        do — intentional for inline coord approval, not a leak. If
+        the deployment posture ever drops the trusted-team
+        assumption, project the verdict to a safe subset before
+        embedding (or move the field behind ``admin.cluster.inspect``).
+        """
+        pending = self._pending_approval
+        if pending is None:
+            return None
+        items = pending.get("items") or []
+        if not items:
+            return None
+        call_ids = [item.get("call_id", "") for item in items]
+        # Snapshot the verdict cache under lock — writers are
+        # ``on_intent_verdict`` (daemon judge thread) and
+        # ``_reset_approval_cycle`` (worker thread). ``deepcopy``
+        # under lock keeps the snapshot fully decoupled from cache
+        # state (verdict dicts carry list-typed ``evidence`` that
+        # callers might mutate). Lock hold is microseconds.
+        with self._ws_lock:
+            verdicts = {
+                cid: copy.deepcopy(self._llm_verdicts[cid])
+                for cid in call_ids
+                if cid and cid in self._llm_verdicts
+            }
+        serialized: list[dict[str, Any]] = []
+        for item in items:
+            cid = item.get("call_id", "")
+            serialized.append(
+                {
+                    "call_id": cid,
+                    "header": item.get("header", ""),
+                    "preview": item.get("preview", ""),
+                    "func_name": item.get("func_name", ""),
+                    "approval_label": item.get("approval_label", ""),
+                    "needs_approval": item.get("needs_approval", False),
+                    "error": item.get("error"),
+                    "heuristic_verdict": item.get("verdict"),
+                    "judge_verdict": verdicts.get(cid),
+                }
+            )
+        # Primary call_id = first non-empty in list order (matches the
+        # 409 response shape from ``make_approve_handler`` so the UI
+        # can render the same identifier the server thinks is current).
+        primary = next((cid for cid in call_ids if cid), "")
+        return {
+            "call_id": primary,
+            "judge_pending": bool(pending.get("judge_pending", False)),
+            "items": serialized,
+        }
 
     def on_output_warning(self, call_id: str, assessment: dict[str, Any]) -> None:
         """Deliver an output-guard warning + persist its assessment row."""

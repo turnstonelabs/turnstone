@@ -699,6 +699,38 @@ def make_approve_handler(cfg: SessionEndpointConfig) -> Handler:
         # have either, so accessing through ``getattr`` is also safer.
         pending = getattr(ui, "_pending_approval", None)
         auto_approve_tools = getattr(ui, "auto_approve_tools", None)
+        # call_id guard — when the body sends a call_id, it must
+        # match one of the currently-pending items. Stops a stale
+        # row in the coordinator's children tree (where the operator
+        # clicked approve on call A) from silently resolving an
+        # unrelated call B that took A's place after the row was
+        # rendered. Empty/missing call_id preserves backward-compat
+        # for clients (CLI, channel adapters) that don't track it.
+        body_call_id_raw = body.get("call_id", "")
+        body_call_id = body_call_id_raw.strip() if isinstance(body_call_id_raw, str) else ""
+        if body_call_id:
+            if pending is None:
+                return JSONResponse(
+                    {"error": "no pending approval", "current_call_id": None},
+                    status_code=409,
+                )
+            pending_items = pending.get("items") or []
+            pending_call_ids = {
+                item.get("call_id", "") for item in pending_items if item.get("call_id")
+            }
+            if body_call_id not in pending_call_ids:
+                # Primary = first non-empty call_id in list order, matching
+                # ``serialize_pending_approval_detail``. The two definitions
+                # must agree so the UI can re-render against the same
+                # identifier the server reports as current.
+                primary = next(
+                    (item.get("call_id", "") for item in pending_items if item.get("call_id")),
+                    None,
+                )
+                return JSONResponse(
+                    {"error": "stale call_id", "current_call_id": primary},
+                    status_code=409,
+                )
         if always and approved and pending and auto_approve_tools is not None:
             tool_names: set[str] = {
                 it.get("approval_label", "") or it.get("func_name", "")

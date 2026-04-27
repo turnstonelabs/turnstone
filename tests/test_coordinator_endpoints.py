@@ -782,6 +782,116 @@ def test_approve_resolves_ui_event(storage):
     assert "spawn_workstream" in ws.ui.auto_approve_tools
 
 
+def _seed_pending(ws, *call_ids: str) -> None:
+    ws.ui._pending_approval = {
+        "type": "approve_request",
+        "items": [
+            {
+                "call_id": cid,
+                "func_name": "spawn_workstream",
+                "approval_label": "spawn_workstream",
+                "needs_approval": True,
+            }
+            for cid in call_ids
+        ],
+    }
+    ws.ui._approval_event.clear()
+
+
+def test_approve_409_on_stale_call_id(storage):
+    """Body call_id doesn't match any pending item → 409 with the
+    current primary call_id so the UI can re-render against the
+    new round."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    _seed_pending(ws, "c-current")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": True, "call_id": "c-stale"},
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 409
+    body = resp.json()
+    assert body["error"] == "stale call_id"
+    assert body["current_call_id"] == "c-current"
+    # Approval event must NOT be set — no resolve_approval ran.
+    assert not ws.ui._approval_event.is_set()
+
+
+def test_approve_409_when_no_pending_and_call_id_sent(storage):
+    """Body sends a call_id but the UI has no pending approval —
+    409 with current_call_id=None so the UI knows to clear the row."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    # No _pending_approval seeded → ui._pending_approval is None.
+    ws.ui._approval_event.clear()
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": True, "call_id": "c-anything"},
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 409
+    body = resp.json()
+    assert body["error"] == "no pending approval"
+    assert body["current_call_id"] is None
+    assert not ws.ui._approval_event.is_set()
+
+
+def test_approve_no_call_id_preserves_backward_compat(storage):
+    """Existing clients (CLI, channel adapters) that omit call_id
+    must still resolve approvals — the guard only kicks in when
+    call_id is present in the body."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    _seed_pending(ws, "c-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": True},  # no call_id
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert ws.ui._approval_event.is_set()
+
+
+def test_approve_no_call_id_no_pending_falls_through(storage):
+    """Legacy clients (no call_id) calling approve when pending is
+    None hit the existing resolve_approval no-op path — the new
+    guard must not change that behavior. Regression guard for the
+    legacy code path that the call_id check intentionally bypasses."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    ws.ui._approval_event.clear()
+    # No _pending_approval seeded.
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": True},  # no call_id
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert ws.ui._approval_event.is_set()
+
+
+def test_approve_call_id_matches_any_item_in_multi_envelope(storage):
+    """N>1 envelope: any one of the items' call_ids in the body
+    is sufficient — server resolves the whole envelope per the
+    one-boolean semantics of resolve_approval."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    _seed_pending(ws, "c-1", "c-2", "c-3")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": True, "call_id": "c-2"},  # middle item
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert ws.ui._approval_event.is_set()
+
+
 # ---------------------------------------------------------------------------
 # Lazy rehydration
 # ---------------------------------------------------------------------------

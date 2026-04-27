@@ -68,6 +68,48 @@ class _FakeUI:
         self._ws_activity_state = ""
         self._ws_messages = 0
         self._ws_turn_tool_calls = 0
+        self._llm_verdicts: dict[str, dict[str, Any]] = {}
+
+    def serialize_pending_approval_detail(self) -> dict[str, Any] | None:
+        # Mirrors SessionUIBase.serialize_pending_approval_detail —
+        # the fake is monkeypatched in for ``WebUI`` and the dashboard
+        # handler reads this method during projection. Real subclasses
+        # inherit from ``SessionUIBase``; the fake replicates the
+        # shape directly to stay decoupled.
+        pending = self._pending_approval
+        if pending is None:
+            return None
+        items = pending.get("items") or []
+        if not items:
+            return None
+        call_ids = [item.get("call_id", "") for item in items]
+        with self._ws_lock:
+            verdicts = {
+                cid: dict(self._llm_verdicts[cid])
+                for cid in call_ids
+                if cid and cid in self._llm_verdicts
+            }
+        serialized: list[dict[str, Any]] = []
+        for item in items:
+            cid = item.get("call_id", "")
+            serialized.append(
+                {
+                    "call_id": cid,
+                    "header": item.get("header", ""),
+                    "preview": item.get("preview", ""),
+                    "func_name": item.get("func_name", ""),
+                    "approval_label": item.get("approval_label", ""),
+                    "needs_approval": item.get("needs_approval", False),
+                    "error": item.get("error"),
+                    "heuristic_verdict": item.get("verdict"),
+                    "judge_verdict": verdicts.get(cid),
+                }
+            )
+        return {
+            "call_id": call_ids[0] if call_ids else "",
+            "judge_pending": bool(pending.get("judge_pending", False)),
+            "items": serialized,
+        }
 
     def _register_listener(self) -> queue.Queue[dict[str, Any]]:
         q: queue.Queue[dict[str, Any]] = queue.Queue()
@@ -489,6 +531,58 @@ class TestDashboardTrustedTeamVisibility:
         assert data["aggregate"]["total_count"] == 3
         owners = {w["user_id"] for w in data["workstreams"]}
         assert {"user-a", "user-b"}.issubset(owners)
+
+    def test_dashboard_pending_approval_detail_default_none(self, app_client):
+        """No pending approval → field is explicitly null on the wire so
+        consumers can distinguish "not present" from "absent key"."""
+        client, _mgr = app_client
+        client.post("/v1/api/workstreams/new", json={"name": "a"}, headers=_auth("user-a"))
+        resp = client.get("/v1/api/dashboard", headers=_auth("user-a"))
+        assert resp.status_code == 200
+        rows = resp.json()["workstreams"]
+        assert len(rows) == 1
+        assert "pending_approval_detail" in rows[0]
+        assert rows[0]["pending_approval_detail"] is None
+
+    def test_dashboard_pending_approval_detail_merges_judge_verdict(self, app_client):
+        """When _pending_approval is set on a ws's UI, /dashboard
+        embeds the merged items + judge_verdict so coord live-bulk
+        callers can render inline approve/deny buttons."""
+        client, mgr = app_client
+        client.post("/v1/api/workstreams/new", json={"name": "a"}, headers=_auth("user-a"))
+        ws_id = next(iter(mgr.list_all())).id
+        ui = mgr.get(ws_id).ui
+        ui._pending_approval = {
+            "type": "approve_request",
+            "items": [
+                {
+                    "call_id": "c-1",
+                    "header": "bash",
+                    "preview": "$ ls",
+                    "func_name": "bash",
+                    "approval_label": "bash",
+                    "needs_approval": True,
+                }
+            ],
+            "judge_pending": False,
+        }
+        ui._llm_verdicts["c-1"] = {
+            "recommendation": "deny",
+            "risk_level": "crit",
+            "confidence": 0.93,
+            "tier": "llm",
+        }
+        resp = client.get("/v1/api/dashboard", headers=_auth("user-a"))
+        assert resp.status_code == 200
+        row = next(w for w in resp.json()["workstreams"] if w["ws_id"] == ws_id)
+        detail = row["pending_approval_detail"]
+        assert detail is not None
+        assert detail["call_id"] == "c-1"
+        assert detail["judge_pending"] is False
+        item = detail["items"][0]
+        assert item["func_name"] == "bash"
+        assert item["judge_verdict"]["recommendation"] == "deny"
+        assert item["judge_verdict"]["risk_level"] == "crit"
 
 
 class TestSavedWorkstreamsTrustedTeamVisibility:

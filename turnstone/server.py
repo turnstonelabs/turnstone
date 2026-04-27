@@ -1155,6 +1155,7 @@ async def dashboard(request: Request) -> JSONResponse:
                 "kind": ws.kind,
                 "parent_ws_id": ws.parent_ws_id,
                 "user_id": ws.user_id,
+                "pending_approval_detail": ui.serialize_pending_approval_detail(),
             }
         )
     uptime_sec = round(time.monotonic() - _metrics.start_time)
