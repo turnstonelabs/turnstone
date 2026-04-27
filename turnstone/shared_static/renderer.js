@@ -762,6 +762,11 @@ var _mermaidQueue = []; // callbacks queued while loading
 var _mermaidIdCounter = 0;
 
 function _initMermaid() {
+  // Clear caches on (re-)init so a theme change via reRenderAllMermaid
+  // doesn't serve stale SVG keyed by source-only — the rendered output
+  // depends on themeVariables which we just changed.
+  if (typeof _mermaidSvgCache !== "undefined") _mermaidSvgCache.clear();
+  if (typeof _mermaidErrorCache !== "undefined") _mermaidErrorCache.clear();
   mermaid.initialize({
     startOnLoad: false,
     securityLevel: "strict",
@@ -841,7 +846,10 @@ var _mermaidErrorCache = new Map();
 var _MERMAID_CACHE_MAX = 64;
 
 function _cacheMermaidEntry(cache, source, value) {
-  if (cache.size >= _MERMAID_CACHE_MAX) {
+  // Only evict the oldest when inserting a new key — overwriting an
+  // existing source is an in-place update and should not pay the
+  // eviction cost (which would drop an unrelated cached entry).
+  if (!cache.has(source) && cache.size >= _MERMAID_CACHE_MAX) {
     var firstKey = cache.keys().next().value;
     cache.delete(firstKey);
   }
@@ -867,44 +875,84 @@ function _applyMermaidError(container, source, message) {
     "</code></pre>";
 }
 
-// Render a single mermaid block, then call callback (serialized to avoid
-// concurrent mermaid.render() calls which corrupt shared internal state)
+// Global render queue + per-source pending-container map.
+//
+// mermaid.render() uses module-level state internally — concurrent
+// calls clobber that state. With postRenderMermaid now firing on
+// every streaming rAF tick (not just on stream_end), two ticks
+// could each find a fresh container (the prior tick's container
+// is detached after innerHTML replace) for the SAME unfinished
+// source, or for DIFFERENT sources, and both would queue
+// mermaid.render() concurrently. Two layers of serialization fix
+// this:
+//
+//   1. _mermaidPending: per-source. While a render is in flight
+//      for source X, additional containers asking for source X
+//      are queued; the single render result fans out to all
+//      pending containers when it lands.
+//   2. _mermaidRenderChain: across-source. Promises chain so
+//      mermaid.render() runs at most one at a time globally.
+//
+// Detached containers (no longer in the DOM by the time the
+// render completes) are skipped — innerHTML replace during
+// streaming detaches them and a later rAF tick's render is
+// already taking care of the live container.
+var _mermaidPending = new Map();
+var _mermaidRenderChain = Promise.resolve();
+
 function _renderMermaidBlock(container, callback) {
   var source = container.getAttribute("data-mermaid-source");
   if (!source) {
     if (callback) callback();
     return;
   }
-  var id = "mermaid-" + ++_mermaidIdCounter;
-  function _onError(err) {
-    // Clean up orphaned temp SVG element mermaid may have left
-    var orphan = document.getElementById(id);
-    if (orphan) orphan.remove();
-    var msg = err && err.message ? err.message : "Diagram error";
-    _cacheMermaidEntry(_mermaidErrorCache, source, msg);
-    _applyMermaidError(container, source, msg);
+  // Same source already in flight — append to pending list.
+  // Caller's callback fires as if the render started; the actual
+  // SVG application happens when the in-flight render lands.
+  if (_mermaidPending.has(source)) {
+    _mermaidPending.get(source).push(container);
     if (callback) callback();
+    return;
   }
-  try {
-    mermaid
-      .render(id, source)
-      .then(function (result) {
-        _cacheMermaidEntry(_mermaidSvgCache, source, result.svg);
-        _applyMermaidSvg(container, result.svg, result.bindFunctions);
-        if (callback) callback();
-      })
-      .catch(_onError);
-  } catch (err) {
-    _onError(err);
-  }
+  _mermaidPending.set(source, [container]);
+  _mermaidRenderChain = _mermaidRenderChain.then(function () {
+    var pending = _mermaidPending.get(source) || [];
+    _mermaidPending.delete(source);
+    var id = "mermaid-" + ++_mermaidIdCounter;
+    return mermaid.render(id, source).then(
+      function (result) {
+        _cacheMermaidEntry(_mermaidSvgCache, source, {
+          svg: result.svg,
+          bindFunctions: result.bindFunctions,
+        });
+        for (var i = 0; i < pending.length; i++) {
+          var c = pending[i];
+          if (c.isConnected) {
+            _applyMermaidSvg(c, result.svg, result.bindFunctions);
+          }
+        }
+      },
+      function (err) {
+        var orphan = document.getElementById(id);
+        if (orphan) orphan.remove();
+        var msg = err && err.message ? err.message : "Diagram error";
+        _cacheMermaidEntry(_mermaidErrorCache, source, msg);
+        for (var i = 0; i < pending.length; i++) {
+          var c = pending[i];
+          if (c.isConnected) _applyMermaidError(c, source, msg);
+        }
+      },
+    );
+  });
+  if (callback) callback();
 }
 
-// Render mermaid blocks sequentially (mermaid uses shared state internally)
+// Render mermaid blocks via the global chain. Calls return
+// immediately; serialization happens inside _renderMermaidBlock.
 function _renderMermaidSequence(containers, idx) {
-  if (idx >= containers.length) return;
-  _renderMermaidBlock(containers[idx], function () {
-    _renderMermaidSequence(containers, idx + 1);
-  });
+  for (var i = 0; i < containers.length; i++) {
+    _renderMermaidBlock(containers[i]);
+  }
 }
 
 function postRenderMermaid(containerEl) {
@@ -917,22 +965,25 @@ function postRenderMermaid(containerEl) {
     var source = codeEls[i].textContent;
     var div = document.createElement("div");
     div.setAttribute("data-mermaid-source", source);
-    var cachedSvg = _mermaidSvgCache.get(source);
-    var cachedError = _mermaidErrorCache.get(source);
-    if (cachedSvg) {
+    // Use cache.has (not truthiness) so a future cached value of
+    // empty string / falsy SVG doesn't masquerade as a miss.
+    if (_mermaidSvgCache.has(source)) {
       // Cache hit — sync swap, no loading flash, no async work.
       // Identical source produces identical SVG (mermaid is
       // deterministic for a given init), so reusing the rendered
-      // SVG verbatim is safe across streamingRender's wholesale
-      // innerHTML replaces.
+      // result is safe across streamingRender's wholesale
+      // innerHTML replaces. Re-apply via the same helper used
+      // by fresh renders so mermaid's bindFunctions (link/click
+      // bindings) attach to each new container instance.
+      var cached = _mermaidSvgCache.get(source);
       div.className = "mermaid-container mermaid-rendered";
-      div.innerHTML = cachedSvg;
+      _applyMermaidSvg(div, cached.svg, cached.bindFunctions);
       pre.replaceWith(div);
-    } else if (cachedError) {
+    } else if (_mermaidErrorCache.has(source)) {
       // Errored source — keep showing the error without thrashing
       // mermaid.render on every streaming tick.
       div.className = "mermaid-container mermaid-error";
-      _applyMermaidError(div, source, cachedError);
+      _applyMermaidError(div, source, _mermaidErrorCache.get(source));
       pre.replaceWith(div);
     } else {
       // Cache miss — show loading state, queue async render.

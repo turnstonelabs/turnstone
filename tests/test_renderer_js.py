@@ -272,6 +272,15 @@ function makeEl(tag) {
     set textContent(v) { this._textContent = v; this.children = []; },
     get innerHTML() { return this._innerHTML; },
     set innerHTML(v) { this._innerHTML = v; this.children = []; },
+    get isConnected() {
+      // In real DOM this checks attachment to the document; for the
+      // test harness we approximate via the parent chain. After
+      // replaceWith, the displaced element's parent is nulled so
+      // its isConnected goes false — which is exactly the
+      // detached-during-streaming case the production guard
+      // protects against.
+      return !!this.parent;
+    },
     appendChild(c) {
       c.parent = this;
       this.children.push(c);
@@ -394,6 +403,22 @@ const container = buildContainer(sources);
 """
 
 
+# Drain microtasks + global mermaid render chain. Wraps the async
+# work in a setTimeout(0) hop so all queued microtasks (including
+# the per-source pending list draining via _mermaidRenderChain)
+# flush before the assertion script reads cache state.
+_MERMAID_DRAIN_JS = """
+function drainAndReport(report) {
+  // Two setTimeout hops give the global chain time to resolve
+  // mermaid.render's promise + the .then handlers that populate
+  // the cache and call _applyMermaidSvg.
+  setTimeout(() => setTimeout(() => {
+    process.stdout.write(JSON.stringify(report()));
+  }, 0), 0);
+}
+"""
+
+
 def test_mermaid_cache_hit_skips_render_call() -> None:
     """Identical source on a second postRenderMermaid call must serve
     from the cache — mermaid.render runs exactly once across both
@@ -401,24 +426,23 @@ def test_mermaid_cache_hit_skips_render_call() -> None:
     fire postRenderMermaid on every rAF tick without thrashing."""
     scenario = (
         _build_mermaid_container_js(["graph TD\n  A --> B"])
+        + _MERMAID_DRAIN_JS
         + """
 postRenderMermaid(container);
-// Drain microtasks so the async mermaid.render Promise resolves
-// before we measure call count.
-Promise.resolve().then(() => Promise.resolve()).then(() => {
+setTimeout(() => setTimeout(() => {
   // Second invocation — fresh container, same source. Should NOT
   // call mermaid.render again because the cache holds the SVG.
   const container2 = buildContainer(sources);
   postRenderMermaid(container2);
-  Promise.resolve().then(() => {
+  setTimeout(() => {
     process.stdout.write(JSON.stringify({
       renderCalls: renderCallCount,
       cacheSize: _mermaidSvgCache.size,
       firstClass: container.children[0].className,
       secondClass: container2.children[0].className,
     }));
-  });
-});
+  }, 0);
+}, 0), 0);
 """
     )
     out = _run_mermaid_scenario(scenario)
@@ -437,12 +461,14 @@ def test_mermaid_distinct_sources_render_independently() -> None:
         _build_mermaid_container_js(["graph TD\n  A --> B", "sequenceDiagram\n  A->>B: hi"])
         + """
 postRenderMermaid(container);
-Promise.resolve().then(() => Promise.resolve()).then(() => {
+// Drain twice — across-source serialization means the second
+// render starts only after the first lands.
+setTimeout(() => setTimeout(() => setTimeout(() => {
   process.stdout.write(JSON.stringify({
     renderCalls: renderCallCount,
     cacheSize: _mermaidSvgCache.size,
   }));
-});
+}, 0), 0), 0);
 """
     )
     out = _run_mermaid_scenario(scenario)
@@ -459,19 +485,19 @@ def test_mermaid_error_cached_to_avoid_thrash() -> None:
         + """
 renderShouldFail = true;
 postRenderMermaid(container);
-Promise.resolve().then(() => Promise.resolve()).then(() => {
+setTimeout(() => setTimeout(() => {
   // Re-run with same source — should hit error cache.
   const container2 = buildContainer(sources);
   postRenderMermaid(container2);
-  Promise.resolve().then(() => {
+  setTimeout(() => {
     process.stdout.write(JSON.stringify({
       renderCalls: renderCallCount,
       errorCacheSize: _mermaidErrorCache.size,
       svgCacheSize: _mermaidSvgCache.size,
       secondClass: container2.children[0].className,
     }));
-  });
-});
+  }, 0);
+}, 0), 0);
 """
     )
     out = _run_mermaid_scenario(scenario)
@@ -488,7 +514,7 @@ def test_mermaid_cache_evicts_oldest_at_cap() -> None:
     scenario = """
 const cap = _MERMAID_CACHE_MAX;
 for (let i = 0; i < cap + 5; i++) {
-  _cacheMermaidEntry(_mermaidSvgCache, 'src-' + i, 'svg-' + i);
+  _cacheMermaidEntry(_mermaidSvgCache, 'src-' + i, {svg: 'svg-' + i, bindFunctions: null});
 }
 process.stdout.write(JSON.stringify({
   size: _mermaidSvgCache.size,
@@ -502,16 +528,99 @@ process.stdout.write(JSON.stringify({
     assert out["hasNewest"] is True
 
 
+def test_mermaid_overwrite_does_not_evict() -> None:
+    """Overwriting an existing key is an in-place update, not a new
+    insertion — should not evict the oldest entry. Pre-fix, an
+    update at cap would unnecessarily drop an unrelated cached SVG."""
+    scenario = """
+const cap = _MERMAID_CACHE_MAX;
+// Fill exactly to cap.
+for (let i = 0; i < cap; i++) {
+  _cacheMermaidEntry(_mermaidSvgCache, 'src-' + i, {svg: 'svg-' + i, bindFunctions: null});
+}
+// Overwrite an existing entry — must not evict src-0.
+_cacheMermaidEntry(_mermaidSvgCache, 'src-5', {svg: 'svg-updated', bindFunctions: null});
+process.stdout.write(JSON.stringify({
+  size: _mermaidSvgCache.size,
+  hasOldest: _mermaidSvgCache.has('src-0'),
+  updated: _mermaidSvgCache.get('src-5').svg,
+}));
+"""
+    out = _run_mermaid_scenario(scenario)
+    assert out["size"] == 64
+    assert out["hasOldest"] is True, "overwrite evicted oldest unnecessarily"
+    assert out["updated"] == "svg-updated"
+
+
+def test_mermaid_cache_cleared_on_init() -> None:
+    """_initMermaid must clear both caches so a theme change via
+    reRenderAllMermaid doesn't serve stale SVG keyed by source-only
+    — the rendered output depends on themeVariables which change
+    on init."""
+    scenario = """
+_cacheMermaidEntry(_mermaidSvgCache, 'src-1', {svg: 'old', bindFunctions: null});
+_cacheMermaidEntry(_mermaidErrorCache, 'src-bad', 'old error');
+_initMermaid();
+process.stdout.write(JSON.stringify({
+  svgSize: _mermaidSvgCache.size,
+  errorSize: _mermaidErrorCache.size,
+}));
+"""
+    out = _run_mermaid_scenario(scenario)
+    assert out["svgSize"] == 0
+    assert out["errorSize"] == 0
+
+
+def test_mermaid_cache_hit_reapplies_bind_functions() -> None:
+    """bindFunctions returned by mermaid.render attach link/click
+    handlers to the rendered SVG. Cache hits must re-invoke this
+    on the new container instance — pre-fix, only the first render
+    got bindings; subsequent cache hits via innerHTML left the SVG
+    inert."""
+    scenario = (
+        _build_mermaid_container_js(["graph TD\n  A --> B"])
+        + """
+let bindCallCount = 0;
+const origRender = mermaid.render;
+mermaid.render = (id, source) => {
+  return Promise.resolve({
+    svg: '<svg>render</svg>',
+    bindFunctions: () => { bindCallCount++; },
+  });
+};
+postRenderMermaid(container);
+setTimeout(() => setTimeout(() => {
+  // Second invocation — cache hit, should still call
+  // bindFunctions on the new container.
+  const container2 = buildContainer(sources);
+  postRenderMermaid(container2);
+  setTimeout(() => {
+    process.stdout.write(JSON.stringify({
+      bindCallCount: bindCallCount,
+    }));
+  }, 0);
+}, 0), 0);
+"""
+    )
+    out = _run_mermaid_scenario(scenario)
+    # First render binds; cache hit on second container also binds.
+    assert out["bindCallCount"] == 2, (
+        "bindFunctions was not re-applied on cache hit — interactive "
+        "diagram features (links, callbacks) would silently break"
+    )
+
+
 def test_streaming_render_invokes_mermaid_post_render() -> None:
     """_streamingRenderApply must call postRenderMermaid so closed
     mermaid fences appear progressively during streaming, not only
     at stream_end via streamingRenderFinalize."""
     body = _RENDERER_JS.read_text(encoding="utf-8")
-    # Find the function body of _streamingRenderApply.
+    # Bound the search to a window after the function declaration —
+    # avoids the brittleness of stopping at the first inner-block
+    # closing brace.
     start = body.index("function _streamingRenderApply")
-    end = body.index("\n}\n", start) + 2
-    fn_body = body[start:end]
-    assert "postRenderMermaid(el)" in fn_body, (
+    mermaid_call = body.find("postRenderMermaid(el)", start, start + 4000)
+    assert mermaid_call != -1, (
         "_streamingRenderApply must call postRenderMermaid for "
         "progressive diagram rendering during streaming"
     )
