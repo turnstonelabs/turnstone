@@ -2189,8 +2189,17 @@ async def proxy_api(request: Request) -> Response:
     if request.url.path.startswith(f"/node/{safe_node}/v1/api/"):
         api_prefix = "v1/api"
 
-    # SSE detection: GET requests to events endpoints
-    if request.method == "GET" and path in ("events", "events/global"):
+    # SSE detection: GET requests to events endpoints. The bare
+    # ``events`` / ``events/global`` paths are the legacy / global
+    # streams; ``workstreams/{ws_id}/events`` is the per-workstream
+    # stream the interactive WebUI subscribes to. Without matching
+    # the per-ws shape, the EventSource API can't consume the
+    # response (gets a one-shot GET instead of text/event-stream)
+    # and Firefox surfaces it as "can't establish a connection".
+    is_sse = path in ("events", "events/global") or (
+        path.startswith("workstreams/") and path.endswith("/events")
+    )
+    if request.method == "GET" and is_sse:
         return await _proxy_sse(request, server_url, path, api_prefix=api_prefix)
 
     if request.method in ("POST", "PUT", "DELETE"):
