@@ -582,8 +582,11 @@ class CoordinatorClient:
 
         ``message`` carries the child's last assistant message text for
         ``idle`` / ``error`` states, or a short status sentinel for
-        ``closed`` / ``deleted`` / ``denied``; non-terminal entries
-        (e.g. ``running`` after a timeout) carry ``None``.  Capped at
+        ``closed`` / ``denied``.  Non-terminal entries (e.g. ``running``
+        after a timeout) and ``deleted`` rows carry ``None`` — hard
+        deletes cascade rows out of storage so a real ``deleted`` state
+        is never observed; the legacy/synthetic-row path falls into the
+        same null-message shape as a still-running ws.  Capped at
         ``WAIT_MESSAGE_MAX_BYTES`` UTF-8 bytes per ws — when the cap
         triggers, ``truncated`` is ``True`` so the model can opt into a
         follow-up ``inspect_workstream`` for the rest.  Bundled inline
