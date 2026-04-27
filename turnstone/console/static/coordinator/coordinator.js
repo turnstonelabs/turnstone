@@ -509,12 +509,24 @@
   // Generic approve POST — usable for both the coord-self dock and
   // the per-child inline buttons in the children-tree. Returns the
   // response so callers can inspect 409 (stale call_id) bodies and
-  // refresh their local state. Throws on transport errors.
+  // refresh their local state.
+  //
+  // The path differs by target: the coord workstream is hosted on
+  // the console process itself (lifted verbs at /v1/api/workstreams/
+  // {coord_ws_id}/approve), but child workstreams live on cluster
+  // nodes and need to round-trip through the routing proxy at
+  // /v1/api/route/workstreams/{child_ws_id}/approve which resolves
+  // the ws_id to its owning node and forwards the body verbatim.
+  // Without the /route/ prefix children always 404 because the
+  // console doesn't host them.
   async function approveWorkstream(targetWsId, body) {
-    return postJSON(
-      "/v1/api/workstreams/" + encodeURIComponent(targetWsId) + "/approve",
-      body,
-    );
+    const isSelf = targetWsId === wsId;
+    const path = isSelf
+      ? "/v1/api/workstreams/" + encodeURIComponent(targetWsId) + "/approve"
+      : "/v1/api/route/workstreams/" +
+        encodeURIComponent(targetWsId) +
+        "/approve";
+    return postJSON(path, body);
   }
 
   window.coordApprove = async function (approved, always) {
@@ -1130,13 +1142,56 @@
     // arrived yet (urgent live-bulk fetch is in flight); the row gets
     // re-rendered when it lands.
     if (cached && cached.live && cached.live.pending_approval_detail) {
-      const block = renderApprovalBlock(
-        child,
-        cached.live.pending_approval_detail,
-      );
+      const detail = cached.live.pending_approval_detail;
+      const block = renderApprovalBlock(child, detail);
       if (block) row.appendChild(block);
+      // Late-arriving LLM judge: if judge_pending is set and not
+      // every item has a judge_verdict yet, poll the live block on
+      // a short cadence until the verdict lands. Without this, the
+      // operator stares at a "heuristic"-tier pill forever — the
+      // judge runs async on the child node and never pushes a
+      // signal that reaches the coord directly. Self-terminates
+      // when the verdict arrives, the row closes, or attempts hit
+      // the cap (failed/timed-out judge).
+      _maybePollForJudgeVerdict(child.ws_id);
     }
     return row;
+  }
+
+  // Late-judge polling — see callsite in renderChildRow. Single
+  // active timer per ws_id. Re-entrant-safe: a fresh render of the
+  // same row while a timer is already in flight is a no-op.
+  const judgePollTimers = new Map(); // ws_id → timer handle
+  const MAX_JUDGE_POLL_ATTEMPTS = 6; // ≈12s at JUDGE_POLL_INTERVAL_MS
+  const JUDGE_POLL_INTERVAL_MS = 2000;
+
+  function _maybePollForJudgeVerdict(childWsId) {
+    if (!childWsId) return;
+    if (judgePollTimers.has(childWsId)) return; // already polling
+    const tick = (attempts) => {
+      judgePollTimers.delete(childWsId);
+      if (attempts >= MAX_JUDGE_POLL_ATTEMPTS) return;
+      const entry = childrenState.get(childWsId);
+      if (!entry || TERMINAL_CHILD_STATES.has(entry.state)) return;
+      const c = liveBadgeCache.get(childWsId);
+      const detail = c && c.live && c.live.pending_approval_detail;
+      if (!detail) return; // approval no longer pending
+      const items = Array.isArray(detail.items) ? detail.items : [];
+      const allHaveJudge =
+        items.length > 0 && items.every((it) => it.judge_verdict);
+      if (!detail.judge_pending || allHaveJudge) return; // verdict landed
+      invalidateLiveBadge(childWsId);
+      scheduleLiveFetch(childWsId, { urgent: true });
+      const timer = setTimeout(
+        () => tick(attempts + 1),
+        JUDGE_POLL_INTERVAL_MS,
+      );
+      judgePollTimers.set(childWsId, timer);
+    };
+    // First tick fires after the initial delay so we don't fetch
+    // again immediately after the just-rendered live-bulk response.
+    const timer = setTimeout(() => tick(0), JUDGE_POLL_INTERVAL_MS);
+    judgePollTimers.set(childWsId, timer);
   }
 
   // Build the inline approval block: severity pill, intent summary +
