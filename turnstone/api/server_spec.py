@@ -27,6 +27,7 @@ from turnstone.api.server_schemas import (
     CreateWorkstreamRequest,
     CreateWorkstreamResponse,
     DashboardResponse,
+    DequeueRequest,
     HealthResponse,
     ListAttachmentsResponse,
     ListAvailableModelsResponse,
@@ -106,10 +107,11 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "Cancel a queued message",
         description=(
             "Removes a previously-queued message from the workstream's "
-            'pending queue. Body: ``{"msg_id": "..."}``. Returns '
-            "``status: removed`` when the queue had the entry, "
-            "``status: not_found`` otherwise."
+            "pending queue. Returns ``status: removed`` when the queue "
+            "had the entry, ``status: not_found`` otherwise."
         ),
+        request_model=DequeueRequest,
+        response_model=StatusResponse,
         error_codes=[400, 404],
         tags=["Chat"],
     ),
@@ -443,6 +445,7 @@ _ALL_MODELS: list[type[BaseModel]] = [
     AuthStatusResponse,
     SendRequest,
     SendResponse,
+    DequeueRequest,
     ApproveRequest,
     PlanFeedbackRequest,
     CommandRequest,

@@ -237,7 +237,7 @@
         "tags": [
           "Chat"
         ],
-        "description": "Removes a previously-queued message from the workstream's pending queue. Body: ``{\"msg_id\": \"...\"}``. Returns ``status: removed`` when the queue had the entry, ``status: not_found`` otherwise.",
+        "description": "Removes a previously-queued message from the workstream's pending queue. Returns ``status: removed`` when the queue had the entry, ``status: not_found`` otherwise.",
         "parameters": [
           {
             "name": "ws_id",
@@ -248,9 +248,26 @@
             }
           }
         ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DequeueRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
-            "description": "Success"
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
           },
           "400": {
             "description": "Error 400",
@@ -1998,6 +2015,21 @@
           "status"
         ],
         "title": "SendResponse",
+        "type": "object"
+      },
+      "DequeueRequest": {
+        "description": "Body for ``DELETE /v1/api/workstreams/{ws_id}/send``.\n\nRemoves a previously-queued message from the workstream's pending\nqueue. ``msg_id`` is the id returned in a prior ``send`` response\nwhen the workstream was busy and the message was queued.",
+        "properties": {
+          "msg_id": {
+            "description": "Id of the queued message to remove",
+            "title": "Msg Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "msg_id"
+        ],
+        "title": "DequeueRequest",
         "type": "object"
       },
       "ApproveRequest": {

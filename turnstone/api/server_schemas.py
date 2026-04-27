@@ -26,6 +26,17 @@ class SendRequest(BaseModel):
     )
 
 
+class DequeueRequest(BaseModel):
+    """Body for ``DELETE /v1/api/workstreams/{ws_id}/send``.
+
+    Removes a previously-queued message from the workstream's pending
+    queue. ``msg_id`` is the id returned in a prior ``send`` response
+    when the workstream was busy and the message was queued.
+    """
+
+    msg_id: str = Field(description="Id of the queued message to remove")
+
+
 class SendResponse(BaseModel):
     status: str = Field(
         description="'ok', 'busy', 'queued', or 'queue_full'",
