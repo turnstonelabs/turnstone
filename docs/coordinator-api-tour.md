@@ -258,7 +258,7 @@ burst can't starve audit writes.
 
 ### `POST /trust` — auto-approve own-subtree sends
 
-```json
+```http
 POST /v1/api/workstreams/{ws_id}/trust
 {"send": true}
 ```
@@ -272,7 +272,7 @@ second grants a service token the opt-in it otherwise wouldn't get).
 
 ### `POST /restrict` — revoke tool access mid-session
 
-```json
+```http
 POST /v1/api/workstreams/{ws_id}/restrict
 {"revoke": ["spawn_workstream", "delete_workstream"]}
 ```
@@ -284,7 +284,7 @@ opt in per session.  Cap 256 tool names per request, 128 chars each.
 
 ### `POST /stop_cascade` — cancel the subtree
 
-```json
+```http
 POST /v1/api/workstreams/{ws_id}/stop_cascade
 {}
 ```
@@ -306,7 +306,7 @@ propagate via the child's SSE stream.
 
 ### `POST /close_all_children` — soft-close the direct fan-out
 
-```json
+```http
 POST /v1/api/workstreams/{ws_id}/close_all_children
 {"reason": "audit round complete"}
 ```
@@ -337,7 +337,7 @@ The `approve` endpoint is what resolves an `approve_request` SSE
 event.  The coordinator's worker thread is blocked inside
 `ui.approve_tools` waiting for this POST.
 
-```json
+```http
 POST /v1/api/workstreams/{ws_id}/approve
 {"approved": true, "feedback": null, "always": false}
 {"approved": false, "feedback": "spawn count looks too high — try 3 not 10"}
@@ -347,7 +347,7 @@ POST /v1/api/workstreams/{ws_id}/approve
 `cancel` drops the in-flight generation but leaves the coordinator
 idle and open for a fresh `send`:
 
-```json
+```http
 POST /v1/api/workstreams/{ws_id}/cancel
 {}
 ```
@@ -356,7 +356,7 @@ POST /v1/api/workstreams/{ws_id}/cancel
 
 ## 9. Close
 
-```json
+```http
 POST /v1/api/workstreams/{ws_id}/close
 {}
 ```
