@@ -93,6 +93,15 @@ def _wire_proxy(app: Any, mock_post: MagicMock | None = None) -> None:
         mock_post = _make_proxy_post()
     mock_proxy = MagicMock(spec=httpx.AsyncClient)
     mock_proxy.post = mock_post
+
+    # route_proxy uses ``client.request(method, url, ...)`` for path-keyed
+    # routes (so DELETE on /send proxies through correctly). Wire a
+    # request-shim that drops the leading method positional and forwards
+    # to the same mock_post for compatibility.
+    async def _request_shim(method: str, *args: Any, **kwargs: Any) -> httpx.Response:
+        return await mock_post(*args, **kwargs)
+
+    mock_proxy.request = MagicMock(side_effect=_request_shim)
     app.state.proxy_client = mock_proxy
 
 
@@ -283,7 +292,8 @@ class TestRouteCreate503Retry:
 
 
 class TestRouteProxy:
-    """POST /v1/api/route/send (and other routed endpoints)."""
+    """POST /v1/api/route/workstreams/{ws_id}/<verb> (and the surviving
+    body-keyed plan/command routes)."""
 
     @pytest.fixture()
     def client(self):
@@ -296,29 +306,33 @@ class TestRouteProxy:
 
     def test_route_proxy_send(self, client):
         resp = client.post(
-            "/v1/api/route/send",
-            json={"ws_id": "abc123", "message": "hello"},
+            "/v1/api/route/workstreams/abc123/send",
+            json={"message": "hello"},
             headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 200
-        # Verify upstream URL was /v1/api/send (not /v1/api/route/send)
-        mock_post = client.app.state.proxy_client.post
-        call_args = mock_post.call_args
-        assert "/v1/api/send" in call_args[0][0]
-        assert "/route/" not in call_args[0][0]
+        # Verify upstream URL was /v1/api/workstreams/abc123/send
+        # (not /v1/api/route/workstreams/abc123/send).
+        mock_request = client.app.state.proxy_client.request
+        call_args = mock_request.call_args
+        # request is called as ``request(method, url, ...)`` — url is the
+        # second positional arg.
+        upstream_url = call_args[0][1]
+        assert "/v1/api/workstreams/abc123/send" in upstream_url
+        assert "/route/" not in upstream_url
 
     def test_route_proxy_approve(self, client):
         resp = client.post(
-            "/v1/api/route/approve",
-            json={"ws_id": "abc123", "approved": True},
+            "/v1/api/route/workstreams/abc123/approve",
+            json={"approved": True},
             headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 200
 
     def test_route_proxy_cancel(self, client):
         resp = client.post(
-            "/v1/api/route/cancel",
-            json={"ws_id": "abc123"},
+            "/v1/api/route/workstreams/abc123/cancel",
+            json={},
             headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 200
@@ -333,8 +347,8 @@ class TestRouteProxy:
 
     def test_route_proxy_close(self, client):
         resp = client.post(
-            "/v1/api/route/workstreams/close",
-            json={"ws_id": "abc123"},
+            "/v1/api/route/workstreams/abc123/close",
+            json={},
             headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 200
@@ -413,8 +427,8 @@ class TestRouteNotReady:
 
     def test_route_proxy_no_router_503(self, client_no_router):
         resp = client_no_router.post(
-            "/v1/api/route/send",
-            json={"ws_id": "abc", "message": "hello"},
+            "/v1/api/route/workstreams/abc/send",
+            json={"message": "hello"},
             headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 503
@@ -425,8 +439,8 @@ class TestRouteNotReady:
 
     def test_route_proxy_empty_cache_503(self, client_empty_cache):
         resp = client_empty_cache.post(
-            "/v1/api/route/send",
-            json={"ws_id": "abc", "message": "hello"},
+            "/v1/api/route/workstreams/abc/send",
+            json={"message": "hello"},
             headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 503
@@ -465,8 +479,8 @@ class TestRouteNoNode:
 
     def test_route_proxy_no_node_503(self, client):
         resp = client.post(
-            "/v1/api/route/send",
-            json={"ws_id": "abc", "message": "hello"},
+            "/v1/api/route/workstreams/abc/send",
+            json={"message": "hello"},
             headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 503

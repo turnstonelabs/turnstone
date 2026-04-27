@@ -76,7 +76,7 @@ class TestServerVersioning:
         assert resp.status_code == 200
         spec = resp.json()
         assert spec["openapi"] == "3.1.0"
-        assert "/v1/api/send" in spec["paths"]
+        assert "/v1/api/workstreams/{ws_id}/send" in spec["paths"]
 
     def test_docs_page(self, client):
         resp = client.get("/docs")

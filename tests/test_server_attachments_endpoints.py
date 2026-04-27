@@ -463,8 +463,8 @@ class TestSendMessageAttachments:
         aid = _upload(client, "ws-A", "userA", "n.md", b"hi", "text/markdown")
 
         resp = client.post(
-            "/v1/api/send",
-            json={"message": "review", "ws_id": "ws-A", "attachment_ids": [aid]},
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "review", "attachment_ids": [aid]},
             headers=_auth("userA"),
         )
         assert resp.status_code == 200
@@ -489,8 +489,8 @@ class TestSendMessageAttachments:
         _upload(client, "ws-A", "userA", "b.md", b"B", "text/markdown")
 
         resp = client.post(
-            "/v1/api/send",
-            json={"message": "do", "ws_id": "ws-A"},
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "do"},
             headers=_auth("userA"),
         )
         assert resp.status_code == 200
@@ -510,8 +510,8 @@ class TestSendMessageAttachments:
         _upload(client, "ws-A", "userA", "a.md", b"A", "text/markdown")
 
         resp = client.post(
-            "/v1/api/send",
-            json={"message": "plain", "ws_id": "ws-A", "attachment_ids": []},
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "plain", "attachment_ids": []},
             headers=_auth("userA"),
         )
         assert resp.status_code == 200
@@ -533,10 +533,9 @@ class TestSendMessageAttachments:
 
         # Request order: c, a, b — must be preserved through resolution
         resp = client.post(
-            "/v1/api/send",
+            "/v1/api/workstreams/ws-A/send",
             json={
                 "message": "ordered",
-                "ws_id": "ws-A",
                 "attachment_ids": [c, a, b],
             },
             headers=_auth("userA"),
@@ -561,8 +560,8 @@ class TestSendMessageAttachments:
 
         too_many = [f"id-{i}" for i in range(MAX_PENDING_ATTACHMENTS_PER_USER_WS + 1)]
         resp = client.post(
-            "/v1/api/send",
-            json={"message": "x", "ws_id": "ws-A", "attachment_ids": too_many},
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "x", "attachment_ids": too_many},
             headers=_auth("userA"),
         )
         assert resp.status_code == 400
@@ -580,10 +579,9 @@ class TestSendMessageAttachments:
 
         captured, _ = self._wire_ws(mgr, "ws-A", "userA")
         resp = client.post(
-            "/v1/api/send",
+            "/v1/api/workstreams/ws-A/send",
             json={
                 "message": "sneaky",
-                "ws_id": "ws-A",
                 "attachment_ids": [stolen_id],
             },
             headers=_auth("userA"),
@@ -651,10 +649,9 @@ class TestQueuedSendWithAttachments:
         b = _upload(client, "ws-A", "userA", "b.md", b"B", "text/markdown")
 
         resp = client.post(
-            "/v1/api/send",
+            "/v1/api/workstreams/ws-A/send",
             json={
                 "message": "ping",
-                "ws_id": "ws-A",
                 "attachment_ids": [b, a],  # intentionally reversed
             },
             headers=_auth("userA"),
@@ -714,8 +711,8 @@ class TestQueuedAttachmentReservation:
         aid = _upload(client, ws_id, "userA", filename, b"Q", "text/markdown")
         ws, session = self._wire_busy_ws(mgr, ws_id)
         resp = client.post(
-            "/v1/api/send",
-            json={"message": "queued", "ws_id": ws_id, "attachment_ids": [aid]},
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "queued", "attachment_ids": [aid]},
             headers=_auth("userA"),
         )
         assert resp.status_code == 200
@@ -767,8 +764,8 @@ class TestQueuedAttachmentReservation:
         # Auto-consume on a follow-up send: reserved attachment must not
         # be picked up (another turn isn't entitled to it).
         resp = client.post(
-            "/v1/api/send",
-            json={"message": "follow up", "ws_id": "ws-A"},
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "follow up"},
             headers=_auth("userA"),
         )
         assert resp.status_code == 200
@@ -799,8 +796,8 @@ class TestQueuedAttachmentReservation:
         # A second send explicitly naming the reserved id: scope check
         # rejects it, so the attachment list is empty.
         resp = client.post(
-            "/v1/api/send",
-            json={"message": "take mine", "ws_id": "ws-A", "attachment_ids": [aid]},
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "take mine", "attachment_ids": [aid]},
             headers=_auth("userA"),
         )
         assert resp.status_code == 200
@@ -823,8 +820,8 @@ class TestQueuedAttachmentReservation:
         # Cancel the queued message — DELETE /api/send with msg_id
         resp = client.request(
             "DELETE",
-            "/v1/api/send",
-            json={"ws_id": "ws-A", "msg_id": mid},
+            "/v1/api/workstreams/ws-A/send",
+            json={"msg_id": mid},
             headers=_auth("userA"),
         )
         assert resp.status_code == 200
@@ -895,8 +892,8 @@ class TestReserveThenDispatchRace:
 
         # First send — reserves A under its send_id, worker blocks
         resp1 = client.post(
-            "/v1/api/send",
-            json={"message": "one", "ws_id": "ws-A", "attachment_ids": [aid]},
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "one", "attachment_ids": [aid]},
             headers=_auth("userA"),
         )
         assert resp1.status_code == 200
@@ -924,8 +921,8 @@ class TestReserveThenDispatchRace:
         session.send = second_send  # type: ignore[method-assign]
 
         resp2 = client.post(
-            "/v1/api/send",
-            json={"message": "two", "ws_id": "ws-A", "attachment_ids": [aid]},
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "two", "attachment_ids": [aid]},
             headers=_auth("userA"),
         )
         assert resp2.status_code == 200
@@ -961,8 +958,8 @@ class TestReserveThenDispatchRace:
         session.send = exploding_send  # type: ignore[method-assign]
 
         resp = client.post(
-            "/v1/api/send",
-            json={"message": "boom", "ws_id": "ws-A", "attachment_ids": [aid]},
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "boom", "attachment_ids": [aid]},
             headers=_auth("userA"),
         )
         assert resp.status_code == 200
@@ -1005,8 +1002,8 @@ class TestReserveThenDispatchRace:
         ws_tuple[1].send = fake_send  # type: ignore[method-assign]
 
         resp = client.post(
-            "/v1/api/send",
-            json={"message": "both", "ws_id": "ws-A", "attachment_ids": [a, b]},
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "both", "attachment_ids": [a, b]},
             headers=_auth("userA"),
         )
         assert resp.status_code == 200
@@ -1068,8 +1065,8 @@ class TestServiceScopedActorFlow:
             "userA",
         )
         resp = client.post(
-            "/v1/api/send",
-            json={"message": "svc send", "ws_id": "ws-A", "attachment_ids": [aid]},
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "svc send", "attachment_ids": [aid]},
             headers=svc_headers,
         )
         assert resp.status_code == 200

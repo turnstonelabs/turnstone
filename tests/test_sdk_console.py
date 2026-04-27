@@ -517,43 +517,46 @@ async def test_route_send():
         client = AsyncTurnstoneConsole(httpx_client=hc)
         resp = await client.route_send("Hello", "ws1")
         assert resp["status"] == "ok"
-        assert captured["path"] == "/v1/api/route/send"
-        assert captured["body"] == {"message": "Hello", "ws_id": "ws1"}
+        assert captured["path"] == "/v1/api/route/workstreams/ws1/send"
+        assert captured["body"] == {"message": "Hello"}
 
 
 @pytest.mark.anyio
 async def test_route_approve():
-    captured_body: dict = {}
+    captured: dict = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        captured_body.update(json.loads(request.content))
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
         return _json_response({"status": "ok"})
 
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneConsole(httpx_client=hc)
         await client.route_approve(ws_id="ws1", approved=False, feedback="no", always=True)
-        assert captured_body["ws_id"] == "ws1"
-        assert captured_body["approved"] is False
-        assert captured_body["feedback"] == "no"
-        assert captured_body["always"] is True
+        assert captured["path"] == "/v1/api/route/workstreams/ws1/approve"
+        assert captured["body"] == {
+            "approved": False,
+            "feedback": "no",
+            "always": True,
+        }
 
 
 @pytest.mark.anyio
 async def test_route_approve_omits_defaults():
-    captured_body: dict = {}
+    captured: dict = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        captured_body.update(json.loads(request.content))
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
         return _json_response({"status": "ok"})
 
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneConsole(httpx_client=hc)
         await client.route_approve(ws_id="ws1", approved=True)
-        assert captured_body == {"ws_id": "ws1", "approved": True}
-        assert "feedback" not in captured_body
-        assert "always" not in captured_body
+        assert captured["path"] == "/v1/api/route/workstreams/ws1/approve"
+        assert captured["body"] == {"approved": True}
 
 
 @pytest.mark.anyio
@@ -587,39 +590,42 @@ async def test_route_close():
         client = AsyncTurnstoneConsole(httpx_client=hc)
         resp = await client.route_close("ws1")
         assert resp["status"] == "ok"
-        assert captured["path"] == "/v1/api/route/workstreams/close"
-        assert captured["body"] == {"ws_id": "ws1"}
+        assert captured["path"] == "/v1/api/route/workstreams/ws1/close"
+        assert captured["body"] == {}
 
 
 @pytest.mark.anyio
 async def test_route_cancel():
-    captured_body: dict = {}
+    captured: dict = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        captured_body.update(json.loads(request.content))
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
         return _json_response({"status": "ok"})
 
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneConsole(httpx_client=hc)
         await client.route_cancel("ws1", force=True)
-        assert captured_body == {"ws_id": "ws1", "force": True}
+        assert captured["path"] == "/v1/api/route/workstreams/ws1/cancel"
+        assert captured["body"] == {"force": True}
 
 
 @pytest.mark.anyio
 async def test_route_cancel_omits_force_when_false():
-    captured_body: dict = {}
+    captured: dict = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        captured_body.update(json.loads(request.content))
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
         return _json_response({"status": "ok"})
 
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneConsole(httpx_client=hc)
         await client.route_cancel("ws1")
-        assert captured_body == {"ws_id": "ws1"}
-        assert "force" not in captured_body
+        assert captured["path"] == "/v1/api/route/workstreams/ws1/cancel"
+        assert captured["body"] == {}
 
 
 @pytest.mark.anyio

@@ -73,8 +73,8 @@ def storage(tmp_path):
 def test_close_with_reason_persists_to_workstream_config(storage):
     client = _make_app(storage)
     resp = client.post(
-        "/v1/api/workstreams/close",
-        json={"ws_id": "ws-target", "reason": "task complete"},
+        "/v1/api/workstreams/ws-target/close",
+        json={"reason": "task complete"},
         headers=_full_hdr(),
     )
     assert resp.status_code == 200
@@ -85,8 +85,8 @@ def test_close_with_reason_persists_to_workstream_config(storage):
 def test_close_without_reason_does_not_touch_config(storage):
     client = _make_app(storage)
     resp = client.post(
-        "/v1/api/workstreams/close",
-        json={"ws_id": "ws-target"},
+        "/v1/api/workstreams/ws-target/close",
+        json={},
         headers=_full_hdr(),
     )
     assert resp.status_code == 200
@@ -102,8 +102,8 @@ def test_close_reason_capped_at_512_bytes(storage):
     huge = "x" * 5000
     client = _make_app(storage)
     resp = client.post(
-        "/v1/api/workstreams/close",
-        json={"ws_id": "ws-target", "reason": huge},
+        "/v1/api/workstreams/ws-target/close",
+        json={"reason": huge},
         headers=_full_hdr(),
     )
     assert resp.status_code == 200
@@ -120,8 +120,8 @@ def test_close_reason_byte_cap_holds_for_multibyte_utf8(storage):
     huge = "\u6f22" * 600  # 3 bytes/char in UTF-8
     client = _make_app(storage)
     resp = client.post(
-        "/v1/api/workstreams/close",
-        json={"ws_id": "ws-target", "reason": huge},
+        "/v1/api/workstreams/ws-target/close",
+        json={"reason": huge},
         headers=_full_hdr(),
     )
     assert resp.status_code == 200
@@ -137,8 +137,8 @@ def test_close_with_non_string_reason_drops_silently(storage):
     proceeds without writing to workstream_config."""
     client = _make_app(storage)
     resp = client.post(
-        "/v1/api/workstreams/close",
-        json={"ws_id": "ws-target", "reason": {"unexpected": "shape"}},
+        "/v1/api/workstreams/ws-target/close",
+        json={"reason": {"unexpected": "shape"}},
         headers=_full_hdr(),
     )
     assert resp.status_code == 200
@@ -154,8 +154,8 @@ def test_close_reason_redacts_credentials(storage):
     client = _make_app(storage)
     secret = "AKIAIOSFODNN7EXAMPLE"  # AWS access key — output guard catches.
     resp = client.post(
-        "/v1/api/workstreams/close",
-        json={"ws_id": "ws-target", "reason": f"task done; key={secret}"},
+        "/v1/api/workstreams/ws-target/close",
+        json={"reason": f"task done; key={secret}"},
         headers=_full_hdr(),
     )
     assert resp.status_code == 200
@@ -177,8 +177,8 @@ def test_close_reason_persistence_failure_does_not_block_close(storage):
 
     storage.save_workstream_config = _boom  # type: ignore[method-assign]
     resp = client.post(
-        "/v1/api/workstreams/close",
-        json={"ws_id": "ws-target", "reason": "task complete"},
+        "/v1/api/workstreams/ws-target/close",
+        json={"reason": "task complete"},
         headers=_full_hdr(),
     )
     assert resp.status_code == 200

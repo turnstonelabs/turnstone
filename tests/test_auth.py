@@ -71,8 +71,8 @@ class TestIsPublicPath:
     def test_v1_api_workstreams_not_public(self):
         assert is_public_path("/v1/api/workstreams") is False
 
-    def test_v1_api_send_not_public(self):
-        assert is_public_path("/v1/api/send") is False
+    def test_v1_api_workstreams_send_not_public(self):
+        assert is_public_path("/v1/api/workstreams/abc/send") is False
 
     def test_openapi_json_public(self):
         assert is_public_path("/openapi.json") is True
@@ -97,10 +97,22 @@ class TestRequiredScope:
         assert required_scope("GET", "/api/events") == "read"
 
     def test_post_send_needs_write(self):
-        assert required_scope("POST", "/api/send") == "write"
+        assert required_scope("POST", "/api/workstreams/abc/send") == "write"
+
+    def test_delete_send_needs_write(self):
+        assert required_scope("DELETE", "/api/workstreams/abc/send") == "write"
 
     def test_post_approve_needs_approve(self):
-        assert required_scope("POST", "/api/approve") == "approve"
+        assert required_scope("POST", "/api/workstreams/abc/approve") == "approve"
+
+    def test_post_cancel_needs_write(self):
+        assert required_scope("POST", "/api/workstreams/abc/cancel") == "write"
+
+    def test_post_close_needs_write(self):
+        assert required_scope("POST", "/api/workstreams/abc/close") == "write"
+
+    def test_get_events_per_ws_needs_read(self):
+        assert required_scope("GET", "/api/workstreams/abc/events") == "read"
 
     def test_post_plan_needs_write(self):
         assert required_scope("POST", "/api/plan") == "write"
@@ -111,9 +123,6 @@ class TestRequiredScope:
     def test_post_workstreams_new_needs_write(self):
         assert required_scope("POST", "/api/workstreams/new") == "write"
 
-    def test_post_workstreams_close_needs_write(self):
-        assert required_scope("POST", "/api/workstreams/close") == "write"
-
     def test_all_write_paths_need_write(self):
         for path in WRITE_PATHS:
             scope = required_scope("POST", path)
@@ -123,10 +132,10 @@ class TestRequiredScope:
         assert required_scope("POST", "/api/unknown") == "read"
 
     def test_v1_post_send_needs_write(self):
-        assert required_scope("POST", "/v1/api/send") == "write"
+        assert required_scope("POST", "/v1/api/workstreams/abc/send") == "write"
 
     def test_v1_post_approve_needs_approve(self):
-        assert required_scope("POST", "/v1/api/approve") == "approve"
+        assert required_scope("POST", "/v1/api/workstreams/abc/approve") == "approve"
 
     def test_v1_get_workstreams_needs_read(self):
         assert required_scope("GET", "/v1/api/workstreams") == "read"
@@ -135,10 +144,10 @@ class TestRequiredScope:
         assert required_scope("POST", "/v1/api/cluster/workstreams/new") == "write"
 
     def test_proxy_v1_send_needs_write(self):
-        assert required_scope("POST", "/node/node-a/v1/api/send") == "write"
+        assert required_scope("POST", "/node/node-a/v1/api/workstreams/abc/send") == "write"
 
     def test_proxy_v1_approve_needs_approve(self):
-        assert required_scope("POST", "/node/node-a/v1/api/approve") == "approve"
+        assert required_scope("POST", "/node/node-a/v1/api/workstreams/abc/approve") == "approve"
 
     def test_proxy_v1_read_endpoint_needs_read(self):
         assert required_scope("GET", "/node/node-a/v1/api/workstreams") == "read"
@@ -402,7 +411,7 @@ class TestCheckRequest:
 
     def test_write_read_token_403(self, read_jwt):
         allowed, status, msg, _result = check_request(
-            "POST", "/api/send", read_jwt, jwt_secret=self._SECRET
+            "POST", "/api/workstreams/abc/send", read_jwt, jwt_secret=self._SECRET
         )
         assert allowed is False
         assert status == 403
@@ -417,7 +426,7 @@ class TestCheckRequest:
 
     def test_approve_read_token_403(self, read_jwt):
         allowed, status, msg, _result = check_request(
-            "POST", "/api/approve", read_jwt, jwt_secret=self._SECRET
+            "POST", "/api/workstreams/abc/approve", read_jwt, jwt_secret=self._SECRET
         )
         assert allowed is False
         assert status == 403
@@ -425,7 +434,10 @@ class TestCheckRequest:
     def test_proxy_write_read_token_403(self, read_jwt):
         """Read tokens cannot escalate to write ops via proxy routes."""
         allowed, status, msg, _result = check_request(
-            "POST", "/node/node-a/api/send", read_jwt, jwt_secret=self._SECRET
+            "POST",
+            "/node/node-a/api/workstreams/abc/send",
+            read_jwt,
+            jwt_secret=self._SECRET,
         )
         assert allowed is False
         assert status == 403
@@ -433,7 +445,10 @@ class TestCheckRequest:
     def test_proxy_write_trailing_slash_read_token_403(self, read_jwt):
         """Trailing slash must not bypass write-role check on proxy routes."""
         allowed, status, msg, _result = check_request(
-            "POST", "/node/node-a/api/send/", read_jwt, jwt_secret=self._SECRET
+            "POST",
+            "/node/node-a/api/workstreams/abc/send/",
+            read_jwt,
+            jwt_secret=self._SECRET,
         )
         assert allowed is False
         assert status == 403
@@ -441,7 +456,7 @@ class TestCheckRequest:
     def test_direct_write_trailing_slash_read_token_403(self, read_jwt):
         """Trailing slash must not bypass write-role check on direct routes."""
         allowed, status, msg, _result = check_request(
-            "POST", "/api/send/", read_jwt, jwt_secret=self._SECRET
+            "POST", "/api/workstreams/abc/send/", read_jwt, jwt_secret=self._SECRET
         )
         assert allowed is False
         assert status == 403
@@ -449,14 +464,20 @@ class TestCheckRequest:
     def test_proxy_write_full_token_ok(self, full_jwt):
         """Full tokens pass through proxy write routes."""
         allowed, status, msg, _result = check_request(
-            "POST", "/node/node-a/api/send", full_jwt, jwt_secret=self._SECRET
+            "POST",
+            "/node/node-a/api/workstreams/abc/send",
+            full_jwt,
+            jwt_secret=self._SECRET,
         )
         assert allowed is True
 
     def test_proxy_v1_write_read_token_403(self, read_jwt):
         """Read tokens cannot escalate to write ops via v1 proxy routes."""
         allowed, status, msg, _result = check_request(
-            "POST", "/node/node-a/v1/api/send", read_jwt, jwt_secret=self._SECRET
+            "POST",
+            "/node/node-a/v1/api/workstreams/abc/send",
+            read_jwt,
+            jwt_secret=self._SECRET,
         )
         assert allowed is False
         assert status == 403
@@ -464,7 +485,10 @@ class TestCheckRequest:
     def test_proxy_v1_write_full_token_ok(self, full_jwt):
         """Full tokens pass through v1 proxy write routes."""
         allowed, status, msg, _result = check_request(
-            "POST", "/node/node-a/v1/api/send", full_jwt, jwt_secret=self._SECRET
+            "POST",
+            "/node/node-a/v1/api/workstreams/abc/send",
+            full_jwt,
+            jwt_secret=self._SECRET,
         )
         assert allowed is True
 
@@ -559,7 +583,7 @@ class TestCheckRequestWithCookie:
     def test_cookie_read_on_write_403(self, read_jwt):
         allowed, status, _, _r = check_request(
             "POST",
-            "/api/send",
+            "/api/workstreams/abc/send",
             None,
             cookie_header=f"turnstone_auth={read_jwt}",
             jwt_secret=self._SECRET,
@@ -700,25 +724,25 @@ class TestServerAuth:
 
     def test_api_send_read_token_403(self):
         resp = self.client.post(
-            "/v1/api/send",
+            "/v1/api/workstreams/x/send",
             headers=self._read_hdr,
-            json={"message": "hello", "ws_id": "x"},
+            json={"message": "hello"},
         )
         assert resp.status_code == 403
         assert "Forbidden" in resp.json().get("error", "")
 
     def test_api_send_full_token_passes_auth(self):
         resp = self.client.post(
-            "/v1/api/send",
+            "/v1/api/workstreams/nonexistent/send",
             headers=self._full_hdr,
-            json={"message": "hello", "ws_id": "nonexistent"},
+            json={"message": "hello"},
         )
         assert resp.status_code not in (401, 403)
 
     def test_api_send_no_token_401(self):
         resp = self.client.post(
-            "/v1/api/send",
-            json={"message": "hello", "ws_id": "x"},
+            "/v1/api/workstreams/x/send",
+            json={"message": "hello"},
         )
         assert resp.status_code == 401
 
@@ -731,7 +755,7 @@ class TestServerAuth:
 
     def test_options_no_auth_required(self):
         resp = self.client.options(
-            "/v1/api/send",
+            "/v1/api/workstreams/x/send",
             headers={
                 "Origin": "http://example.com",
                 "Access-Control-Request-Method": "POST",

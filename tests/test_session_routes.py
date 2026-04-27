@@ -147,29 +147,6 @@ def test_send_mounts_post_and_delete_when_dequeue_provided() -> None:
     assert ("/api/workstreams/{ws_id}/send", frozenset({"POST"})) not in paths_dequeue_only
 
 
-def test_close_legacy_mounts_when_handler_provided() -> None:
-    """The legacy body-keyed close (``POST {prefix}/close``) mounts
-    when ``handlers.close_legacy`` is non-``None`` — there is no
-    separate config flag, just the handler's presence."""
-    routes_with: list[Any] = []
-    register_session_routes(
-        routes_with,
-        prefix="/api/workstreams",
-        handlers=SharedSessionVerbHandlers(close_legacy=_stub),
-    )
-    assert any(r.path == "/api/workstreams/close" for r in routes_with if isinstance(r, Route))
-
-    routes_without: list[Any] = []
-    register_session_routes(
-        routes_without,
-        prefix="/api/workstreams",
-        handlers=SharedSessionVerbHandlers(),
-    )
-    assert not any(
-        r.path == "/api/workstreams/close" for r in routes_without if isinstance(r, Route)
-    )
-
-
 def test_register_coord_verbs_mounts_seven_paths() -> None:
     """``register_coord_verbs`` mounts the seven coord-only verbs
     at the unified prefix."""

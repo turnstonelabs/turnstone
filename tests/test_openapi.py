@@ -28,16 +28,17 @@ class TestServerSpec:
             "/v1/api/workstreams",
             "/v1/api/workstreams/{ws_id}",
             "/v1/api/workstreams/{ws_id}/history",
+            "/v1/api/workstreams/{ws_id}/send",
+            "/v1/api/workstreams/{ws_id}/approve",
+            "/v1/api/workstreams/{ws_id}/cancel",
+            "/v1/api/workstreams/{ws_id}/close",
+            "/v1/api/workstreams/{ws_id}/events",
             "/v1/api/dashboard",
             "/v1/api/workstreams/saved",
-            "/v1/api/send",
-            "/v1/api/approve",
             "/v1/api/plan",
             "/v1/api/command",
-            "/v1/api/events",
             "/v1/api/events/global",
             "/v1/api/workstreams/new",
-            "/v1/api/workstreams/close",
             "/v1/api/auth/login",
             "/v1/api/auth/logout",
             "/health",
@@ -72,7 +73,7 @@ class TestServerSpec:
         from turnstone.api.server_spec import build_server_spec
 
         spec = build_server_spec()
-        send = spec["paths"]["/v1/api/send"]["post"]
+        send = spec["paths"]["/v1/api/workstreams/{ws_id}/send"]["post"]
         assert "requestBody" in send
         assert "application/json" in send["requestBody"]["content"]
 

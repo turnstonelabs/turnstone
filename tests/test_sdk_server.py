@@ -99,7 +99,7 @@ async def test_create_workstream():
 @pytest.mark.anyio
 async def test_close_workstream():
     transport = _mock_transport(
-        {"POST /v1/api/workstreams/close": _json_response({"status": "ok"})}
+        {"POST /v1/api/workstreams/ws1/close": _json_response({"status": "ok"})}
     )
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
@@ -114,7 +114,9 @@ async def test_close_workstream():
 
 @pytest.mark.anyio
 async def test_send():
-    transport = _mock_transport({"POST /v1/api/send": _json_response({"status": "ok"})})
+    transport = _mock_transport(
+        {"POST /v1/api/workstreams/ws1/send": _json_response({"status": "ok"})}
+    )
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         resp = await client.send("Hello", "ws1")
@@ -123,7 +125,9 @@ async def test_send():
 
 @pytest.mark.anyio
 async def test_approve():
-    transport = _mock_transport({"POST /v1/api/approve": _json_response({"status": "ok"})})
+    transport = _mock_transport(
+        {"POST /v1/api/workstreams/ws1/approve": _json_response({"status": "ok"})}
+    )
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         resp = await client.approve(ws_id="ws1", approved=True, feedback="looks good")
@@ -238,7 +242,11 @@ async def test_health():
 @pytest.mark.anyio
 async def test_api_error_raised():
     transport = _mock_transport(
-        {"POST /v1/api/send": httpx.Response(404, json={"error": "Unknown workstream"})}
+        {
+            "POST /v1/api/workstreams/bad_ws/send": httpx.Response(
+                404, json={"error": "Unknown workstream"}
+            )
+        }
     )
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
@@ -279,7 +287,7 @@ async def test_request_body_correct():
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         await client.send("Hello world", "ws_123")
-        assert captured_body == {"message": "Hello world", "ws_id": "ws_123"}
+        assert captured_body == {"message": "Hello world"}
 
 
 # ---------------------------------------------------------------------------

@@ -328,8 +328,8 @@ class TestCrossTenantApprove:
         assert storage is not None
         _register_ws(storage, "ws-victim", "victim-user")
         resp = client.post(
-            "/v1/api/approve",
-            json={"ws_id": "ws-victim", "approved": True},
+            "/v1/api/workstreams/ws-victim/approve",
+            json={"approved": True},
             headers=_auth("attacker-user"),
         )
         assert resp.status_code == 404
@@ -344,8 +344,8 @@ class TestCrossTenantClose:
         assert storage is not None
         _register_ws(storage, "ws-victim", "victim-user")
         resp = client.post(
-            "/v1/api/workstreams/close",
-            json={"ws_id": "ws-victim"},
+            "/v1/api/workstreams/ws-victim/close",
+            json={},
             headers=_auth("attacker-user"),
         )
         assert resp.status_code == 404
@@ -632,7 +632,7 @@ class TestPerWsSseGate:
         assert storage is not None
         _register_ws(storage, "ws-victim", "victim-user")
         resp = client.get(
-            "/v1/api/events?ws_id=ws-victim",
+            "/v1/api/workstreams/ws-victim/events",
             headers=_auth("attacker-user"),
         )
         assert resp.status_code == 404
@@ -688,8 +688,8 @@ class TestInteractiveCancelLifted:
         client, _mgr = app_client
         ws_id = self._create_ws(client)
         resp = client.post(
-            "/v1/api/cancel",
-            json={"ws_id": ws_id},
+            f"/v1/api/workstreams/{ws_id}/cancel",
+            json={},
             headers=_auth("user-1"),
         )
         assert resp.status_code == 200
@@ -717,8 +717,8 @@ class TestInteractiveCancelLifted:
         ws.worker_thread = threading.Thread(target=lambda: None, daemon=True)
 
         resp = client.post(
-            "/v1/api/cancel",
-            json={"ws_id": ws_id, "force": True},
+            f"/v1/api/workstreams/{ws_id}/cancel",
+            json={"force": True},
             headers=_auth("user-1"),
         )
         assert resp.status_code == 200
@@ -740,8 +740,8 @@ class TestInteractiveCancelLifted:
         ws.session = None  # force the build-failed shape
 
         resp = client.post(
-            "/v1/api/cancel",
-            json={"ws_id": ws_id},
+            f"/v1/api/workstreams/{ws_id}/cancel",
+            json={},
             headers=_auth("user-1"),
         )
         assert resp.status_code == 400
@@ -874,22 +874,15 @@ class TestInteractiveEventsLifted:
         out = list(_interactive_events_replay(ws, ui, request))
         assert out == []
 
-    def test_events_legacy_query_keyed_url_still_resolves_to_404_for_unknown_ws(self, app_client):
-        """The legacy ``GET /api/events?ws_id=...`` URL (interactive
-        stable surface since 1.0) routes through the
-        ``make_legacy_query_keyed_adapter`` shim into the lifted
-        body. Pinning a 404 response confirms the shim wires
-        ``ws_id`` from query into ``path_params`` correctly — if the
-        shim were broken, the lifted body's
-        ``request.path_params.get('ws_id', '')`` would return empty
-        and we'd see a 400 (``ws_id is required``) instead."""
+    def test_events_path_keyed_url_resolves_to_404_for_unknown_ws(self, app_client):
+        """``GET /v1/api/workstreams/{ws_id}/events`` returns 404 for an
+        unknown ws_id. Pre-1.5 the same intent was tested against
+        ``GET /api/events?ws_id=...`` via the legacy query-keyed
+        adapter; that URL family was removed in 1.5 along with the
+        adapter."""
         client, _mgr = app_client
         resp = client.get(
-            "/v1/api/events?ws_id=does-not-exist",
+            "/v1/api/workstreams/does-not-exist/events",
             headers=_auth("user-1"),
         )
-        # 404 because the workstream isn't loaded; NOT 400 (which
-        # would indicate the shim failed to splice ws_id into
-        # path_params).
         assert resp.status_code == 404
-        assert "ws_id" not in resp.json().get("error", "").lower()

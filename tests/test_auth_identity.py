@@ -175,10 +175,10 @@ class TestRequiredScope:
         assert required_scope("GET", "/api/workstreams") == "read"
 
     def test_post_write(self):
-        assert required_scope("POST", "/api/send") == "write"
+        assert required_scope("POST", "/api/workstreams/abc/send") == "write"
 
     def test_post_approve(self):
-        assert required_scope("POST", "/api/approve") == "approve"
+        assert required_scope("POST", "/api/workstreams/abc/approve") == "approve"
 
     def test_admin_prefix(self):
         assert required_scope("GET", "/api/admin/users") == "approve"
@@ -186,14 +186,14 @@ class TestRequiredScope:
         assert required_scope("DELETE", "/api/admin/users/abc") == "approve"
 
     def test_versioned_path(self):
-        assert required_scope("POST", "/v1/api/send") == "write"
-        assert required_scope("POST", "/v1/api/approve") == "approve"
+        assert required_scope("POST", "/v1/api/workstreams/abc/send") == "write"
+        assert required_scope("POST", "/v1/api/workstreams/abc/approve") == "approve"
 
     def test_proxy_write(self):
-        assert required_scope("POST", "/node/n1/api/send") == "write"
+        assert required_scope("POST", "/node/n1/api/workstreams/abc/send") == "write"
 
     def test_proxy_approve(self):
-        assert required_scope("POST", "/node/n1/api/approve") == "approve"
+        assert required_scope("POST", "/node/n1/api/workstreams/abc/approve") == "approve"
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +270,7 @@ class TestCheckRequestScopes:
         jwt_tok = create_jwt("u1", frozenset({"read"}), "test", self._SECRET)
         allowed, status, msg, _ = check_request(
             "POST",
-            "/api/send",
+            "/api/workstreams/abc/send",
             f"Bearer {jwt_tok}",
             jwt_secret=self._SECRET,
         )
@@ -282,7 +282,7 @@ class TestCheckRequestScopes:
         jwt_tok = create_jwt("u1", frozenset({"read"}), "test", self._SECRET)
         allowed, status, msg, _ = check_request(
             "POST",
-            "/api/approve",
+            "/api/workstreams/abc/approve",
             f"Bearer {jwt_tok}",
             jwt_secret=self._SECRET,
         )
@@ -294,7 +294,7 @@ class TestCheckRequestScopes:
         jwt_tok = create_jwt("u1", frozenset({"read", "write", "approve"}), "test", self._SECRET)
         allowed, status, msg, result = check_request(
             "POST",
-            "/api/approve",
+            "/api/workstreams/abc/approve",
             f"Bearer {jwt_tok}",
             jwt_secret=self._SECRET,
         )
@@ -306,7 +306,7 @@ class TestCheckRequestScopes:
         jwt_tok = create_jwt("u1", frozenset({"read", "write"}), "db", self._SECRET)
         allowed, status, msg, result = check_request(
             "POST",
-            "/api/send",
+            "/api/workstreams/abc/send",
             f"Bearer {jwt_tok}",
             jwt_secret=self._SECRET,
         )
@@ -318,7 +318,7 @@ class TestCheckRequestScopes:
         jwt_tok = create_jwt("u1", frozenset({"read"}), "db", self._SECRET)
         allowed, status, msg, _ = check_request(
             "POST",
-            "/api/send",
+            "/api/workstreams/abc/send",
             f"Bearer {jwt_tok}",
             jwt_secret=self._SECRET,
         )

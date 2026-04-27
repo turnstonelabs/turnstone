@@ -97,8 +97,12 @@ def _make_proxy(status_code: int = 200, body: dict[str, Any] | None = None) -> M
             request=httpx.Request("POST", args[0] if args else "http://test"),
         )
 
+    async def _request(method: str, *args: Any, **kwargs: Any) -> httpx.Response:
+        return await _post(*args, **kwargs)
+
     proxy = MagicMock(spec=httpx.AsyncClient)
     proxy.post = MagicMock(side_effect=_post)
+    proxy.request = MagicMock(side_effect=_request)
     return proxy
 
 
@@ -261,12 +265,12 @@ class TestRouteProxyAudit:
     @pytest.mark.parametrize(
         "path,expected_action",
         [
-            ("/v1/api/route/send", "route.workstream.send"),
-            ("/v1/api/route/approve", "route.approve"),
-            ("/v1/api/route/cancel", "route.cancel"),
+            ("/v1/api/route/workstreams/abc123/send", "route.workstream.send"),
+            ("/v1/api/route/workstreams/abc123/approve", "route.approve"),
+            ("/v1/api/route/workstreams/abc123/cancel", "route.cancel"),
             ("/v1/api/route/command", "route.command"),
             ("/v1/api/route/plan", "route.plan"),
-            ("/v1/api/route/workstreams/close", "route.workstream.close"),
+            ("/v1/api/route/workstreams/abc123/close", "route.workstream.close"),
         ],
     )
     def test_method_to_action_mapping(self, path: str, expected_action: str):
@@ -276,6 +280,9 @@ class TestRouteProxyAudit:
         _wire(app, _make_proxy(200, {"status": "ok"}), storage)
         client = TestClient(app, raise_server_exceptions=False)
 
+        # ws_id in body is still required by the surviving body-keyed
+        # mounts (/route/plan, /route/command); for the path-keyed
+        # workstreams routes the proxy reads ws_id from path_params.
         resp = client.post(
             path,
             json={"ws_id": "abc123", "message": "hi"},
@@ -305,8 +312,8 @@ class TestRouteProxyAudit:
         client = TestClient(app, raise_server_exceptions=False)
 
         resp = client.post(
-            "/v1/api/route/send",
-            json={"ws_id": "abc", "message": "hi"},
+            "/v1/api/route/workstreams/abc/send",
+            json={"message": "hi"},
             headers=_COORD_HEADERS,
         )
         assert resp.status_code == 403
@@ -322,8 +329,8 @@ class TestRouteProxyAudit:
         client = TestClient(app, raise_server_exceptions=False)
 
         resp = client.post(
-            "/v1/api/route/send",
-            json={"ws_id": "abc", "message": "hi"},
+            "/v1/api/route/workstreams/abc/send",
+            json={"message": "hi"},
             headers=_PLAIN_HEADERS,
         )
         assert resp.status_code == 200
@@ -402,8 +409,8 @@ class TestAuditResilience:
         client = TestClient(app, raise_server_exceptions=False)
 
         resp = client.post(
-            "/v1/api/route/send",
-            json={"ws_id": "abc", "message": "hi"},
+            "/v1/api/route/workstreams/abc/send",
+            json={"message": "hi"},
             headers=_COORD_HEADERS,
         )
         # Audit failure is swallowed — proxied response still 200.
