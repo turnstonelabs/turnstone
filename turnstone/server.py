@@ -77,7 +77,7 @@ from turnstone.core.session_routes import (
     make_send_handler,
     register_session_routes,
 )
-from turnstone.core.session_ui_base import SessionUIBase
+from turnstone.core.session_ui_base import AutoApproveReason, SessionUIBase
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
 from turnstone.core.web_helpers import version_html as _version_html
 from turnstone.core.workstream import (
@@ -226,22 +226,6 @@ class WebUI(SessionUIBase):
         self._reset_approval_cycle()
         pending = [it for it in items if it.get("needs_approval") and not it.get("error")]
 
-        # Always send tool info to the browser
-        serialized = []
-        for item in items:
-            entry: dict[str, Any] = {
-                "call_id": item.get("call_id", ""),
-                "header": item.get("header", ""),
-                "preview": item.get("preview", ""),
-                "func_name": item.get("func_name", ""),
-                "approval_label": item.get("approval_label", item.get("func_name", "")),
-                "needs_approval": item.get("needs_approval", False),
-                "error": item.get("error"),
-            }
-            if "_heuristic_verdict" in item:
-                entry["verdict"] = item["_heuristic_verdict"]
-            serialized.append(entry)
-
         # -- Tool policy evaluation -----------------------------------------------
         # Check admin-defined tool policies before the auto_approve check.
         if pending:
@@ -268,29 +252,31 @@ class WebUI(SessionUIBase):
                                     f"Blocked by tool policy (pattern match for '{policy_name}')"
                                 )
                             elif verdict == "allow":
+                                # Admin-defined ``allow`` rule fires the
+                                # auto-approve gate without any UI prompt.
+                                # Tag for /dashboard visibility so the
+                                # operator can see which calls bypassed
+                                # the prompt and why.
                                 it["needs_approval"] = False
+                                self._tag_auto_approved([it], AutoApproveReason.POLICY)
                             else:
                                 still_pending.append(it)
-                        # Rebuild serialized to reflect policy verdicts
-                        serialized = []
-                        for it in items:
-                            rebuilt: dict[str, Any] = {
-                                "call_id": it.get("call_id", ""),
-                                "header": it.get("header", ""),
-                                "preview": it.get("preview", ""),
-                                "func_name": it.get("func_name", ""),
-                                "approval_label": it.get("approval_label", it.get("func_name", "")),
-                                "needs_approval": it.get("needs_approval", False),
-                                "error": it.get("denial_msg") if it.get("denied") else None,
-                            }
-                            if "_heuristic_verdict" in it:
-                                rebuilt["verdict"] = it["_heuristic_verdict"]
-                            serialized.append(rebuilt)
                         # If all were resolved by policy, check if any were denied
                         if not still_pending:
                             any_denied = any(it.get("denied") for it in items)
                             if any_denied:
-                                self._enqueue({"type": "tool_info", "items": serialized})
+                                # Record the policy-allowed siblings before
+                                # the early return — the line-325 fall-
+                                # through branch never runs on this path,
+                                # so without this the policy bypass is
+                                # invisible to /dashboard + audit.
+                                self._record_auto_approves(items)
+                                self._enqueue(
+                                    {
+                                        "type": "tool_info",
+                                        "items": self._serialize_approval_items(items),
+                                    }
+                                )
                                 return False, "Blocked by tool policy"
                         pending = still_pending
             except Exception:
@@ -305,12 +291,32 @@ class WebUI(SessionUIBase):
                 if it.get("func_name")
             }
             if pending_names and pending_names.issubset(self.auto_approve_tools):
+                # Tag each formerly-pending item with the per-tool source
+                # recorded when ``auto_approve_tools`` was populated:
+                # ``skill`` (skill template's ``allowed_tools``) /
+                # ``always`` (user "Approve + Always" click) / fallback
+                # ``auto_approve_tools`` for legacy or unknown writers.
+                # Visibility for the skill-vs-explicit conflation
+                # flagged on the coord tree dashboard.
+                self._tag_auto_approved(
+                    pending,
+                    AutoApproveReason.AUTO_APPROVE_TOOLS,
+                    source_map=self._auto_approve_tools_source,
+                )
                 pending = []
 
         # Budget override requires explicit approval — never auto-approved by
         # blanket auto_approve (tool policies can still allow it explicitly).
         has_budget_override = any(it.get("func_name") == "__budget_override__" for it in pending)
-        if not pending or (self.auto_approve and not has_budget_override):
+        blanket_active = self.auto_approve and not has_budget_override
+        if not pending or blanket_active:
+            if blanket_active and pending:
+                # Blanket flag drained the rest of pending \u2014 tag so the
+                # dashboard can distinguish from
+                # ``auto_approve_tools`` / ``policy``.  No need to
+                # clear ``pending`` here: the function returns inside
+                # this block without reading it again.
+                self._tag_auto_approved(pending, AutoApproveReason.BLANKET)
             # Track auto-approved tool activity
             first = items[0] if items else {}
             label = first.get("func_name", "")
@@ -319,7 +325,8 @@ class WebUI(SessionUIBase):
                 self._ws_current_activity = f"\u2699 {label}: {preview}" if label else ""
                 self._ws_activity_state = "tool" if label else ""
             self._broadcast_activity()
-            self._enqueue({"type": "tool_info", "items": serialized})
+            self._record_auto_approves(items)
+            self._enqueue({"type": "tool_info", "items": self._serialize_approval_items(items)})
             return True, None
 
         # Track pending approval activity
@@ -371,12 +378,20 @@ class WebUI(SessionUIBase):
         with self._ws_lock:
             self._pending_verdicts = heuristic_verdicts
 
+        # Record any items the policy block already auto-approved
+        # before falling through to the prompt — without this the
+        # mixed-policy-then-prompt path leaves the policy bypass
+        # invisible to /dashboard (the line-325 fall-through never
+        # runs since pending is non-empty + blanket inactive).
+        # No-op when no items are auto-approve-tagged.
+        self._record_auto_approves(items)
+
         # Send approval request and block
         judge_pending = bool(any(it.get("_heuristic_verdict") for it in items))
         self._approval_event.clear()
         self._pending_approval = {
             "type": "approve_request",
-            "items": serialized,
+            "items": self._serialize_approval_items(items),
             "judge_pending": judge_pending,
         }
         self._enqueue(self._pending_approval)
@@ -1156,6 +1171,12 @@ async def dashboard(request: Request) -> JSONResponse:
                 "parent_ws_id": ws.parent_ws_id,
                 "user_id": ws.user_id,
                 "pending_approval_detail": ui.serialize_pending_approval_detail(),
+                # Per-ws ring buffer of recent auto-approves (last 10).
+                # Lets the coord-tree render a "recently auto-approved
+                # by skill X" pill without a per-child round-trip — the
+                # tools-bypassed-the-prompt set is otherwise invisible
+                # to anyone watching the dashboard tree.
+                "recent_auto_approvals": ui.serialize_recent_auto_approvals(),
             }
         )
     uptime_sec = round(time.monotonic() - _metrics.start_time)
@@ -2034,6 +2055,12 @@ async def _interactive_create_post_install(
                 tools_list = [t.strip() for t in allowed.split(",") if t.strip()]
             if tools_list:
                 ws.ui.auto_approve_tools = set(tools_list)
+                # Tag each as skill-sourced so the dashboard can show
+                # "auto-approved by skill X" instead of a generic
+                # auto-approval pill — distinguishes the (often
+                # surprising) skill-template path from a deliberate
+                # operator "Approve + Always" click.
+                ws.ui._auto_approve_tools_source = {t: AutoApproveReason.SKILL for t in tools_list}
         sess._notify_on_complete = skill_data.get("notify_on_complete", "{}")
         sess._applied_skill_id = skill_data["template_id"]
         sess._applied_skill_version = applied_skill_version

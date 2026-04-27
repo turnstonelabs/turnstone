@@ -121,6 +121,14 @@ class _FakeUI:
             "items": serialized,
         }
 
+    def serialize_recent_auto_approvals(self) -> list[dict[str, Any]]:
+        # Empty buffer for tests that don't exercise the auto-approve
+        # visibility path.  /dashboard handler reads this method
+        # unconditionally now (paired with serialize_pending_approval_detail);
+        # returning [] keeps the row payload compatible without
+        # modeling the full ring buffer in the fake.
+        return []
+
     def _register_listener(self) -> queue.Queue[dict[str, Any]]:
         q: queue.Queue[dict[str, Any]] = queue.Queue()
         with self._listeners_lock:

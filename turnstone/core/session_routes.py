@@ -39,6 +39,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from turnstone.core.log import get_logger
+from turnstone.core.session_ui_base import AutoApproveReason
 
 if TYPE_CHECKING:
     from starlette.requests import Request
@@ -744,6 +745,16 @@ def make_approve_handler(cfg: SessionEndpointConfig) -> Handler:
             tool_names.discard("__budget_override__")
             if tool_names:
                 auto_approve_tools.update(tool_names)
+                # Tag the source so /dashboard pills can distinguish
+                # an explicit "Approve + Always" click from the
+                # skill-template path (which the user may have set
+                # up months ago).  Defensive ``getattr`` because the
+                # source map landed alongside this fix; pre-fix
+                # workstreams would lack it during a hot-deploy.
+                source_map = getattr(ui, "_auto_approve_tools_source", None)
+                if source_map is not None:
+                    for t in tool_names:
+                        source_map[t] = AutoApproveReason.ALWAYS
         ui.resolve_approval(approved, feedback)
         return JSONResponse({"status": "ok"})
 

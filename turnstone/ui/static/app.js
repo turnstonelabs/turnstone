@@ -1316,13 +1316,17 @@ Pane.prototype.showInlineToolBlock = function (
 
   items.forEach(function (item) {
     block.appendChild(buildToolDiv(item));
-    // Render verdict badge if present
-    if (item.verdict) {
+    // Render verdict badge if present.  Server emits the heuristic
+    // verdict under ``heuristic_verdict`` (matches the api/server_schemas
+    // PendingApprovalItem shape).  Falls back to the legacy ``verdict``
+    // key in case a stale SSE payload arrives mid-deploy.
+    var heuristic = item.heuristic_verdict || item.verdict;
+    if (heuristic) {
       block.insertAdjacentHTML(
         "beforeend",
-        renderVerdictBadge(item.verdict, judgePending),
+        renderVerdictBadge(heuristic, judgePending),
       );
-      var rec = item.verdict.recommendation || "review";
+      var rec = heuristic.recommendation || "review";
       if (
         !glowRec ||
         rec === "deny" ||
@@ -4818,6 +4822,20 @@ function buildToolDiv(item) {
   var name = document.createElement("div");
   name.className = "tool-name" + (item.error ? " tool-name--error" : "");
   name.textContent = item.func_name || "";
+  // Inline auto-approve indicator — surfaces tools that bypassed the
+  // operator approval gate (skill allowlist / blanket / admin policy /
+  // explicit "Approve + Always") right next to the tool name.  The
+  // coord-tree pill is bounded to the coord page; this small badge
+  // gives the operator the same signal on the per-ws page they
+  // navigated into.
+  if (item.auto_approved) {
+    var badge = document.createElement("span");
+    badge.className = "tool-auto-approved";
+    var reason = item.auto_approve_reason || "auto_approve_tools";
+    badge.textContent = " auto: " + reason;
+    badge.title = "Tool auto-approved (no operator prompt) — reason: " + reason;
+    name.appendChild(badge);
+  }
   div.appendChild(name);
 
   var cmd = document.createElement("div");

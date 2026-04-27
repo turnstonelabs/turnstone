@@ -31,7 +31,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core.log import get_logger
-from turnstone.core.session_ui_base import SessionUIBase
+from turnstone.core.session_ui_base import AutoApproveReason, SessionUIBase
 from turnstone.core.workstream import WorkstreamState
 
 if TYPE_CHECKING:
@@ -93,24 +93,16 @@ class ConsoleCoordinatorUI(SessionUIBase):
         self._reset_approval_cycle()
         pending = [it for it in items if it.get("needs_approval") and not it.get("error")]
 
-        serialized = []
-        for item in items:
-            entry: dict[str, Any] = {
-                "call_id": item.get("call_id", ""),
-                "header": item.get("header", ""),
-                "preview": item.get("preview", ""),
-                "func_name": item.get("func_name", ""),
-                "approval_label": item.get("approval_label", item.get("func_name", "")),
-                "needs_approval": item.get("needs_approval", False),
-                "error": item.get("error"),
-            }
-            serialized.append(entry)
-
         if not pending:
             # Nothing to approve; broadcast tool info anyway so the UI
             # can render the tool preview.
-            if serialized:
-                self._enqueue({"type": "tools_auto_approved", "items": serialized})
+            if items:
+                self._enqueue(
+                    {
+                        "type": "tools_auto_approved",
+                        "items": self._serialize_approval_items(items),
+                    }
+                )
             return True, None
 
         # Per-tool auto-approve: 'Always approve this tool' adds the
@@ -118,21 +110,55 @@ class ConsoleCoordinatorUI(SessionUIBase):
         # independently of the blanket ``auto_approve`` flag — matches
         # the WebUI two-tier contract (turnstone/server.py).
         if self.auto_approve_tools:
-            pending_names = {it.get("func_name", "") for it in pending if it.get("func_name")}
+            # Match WebUI's set-membership key: ``approval_label or
+            # func_name``.  ``auto_approve_tools`` is populated by
+            # both the skill template (bare func_name) and the
+            # "Approve + Always" handler (which tags via approval_label
+            # at session_routes.py).  Pre-fix the coord UI used only
+            # func_name, so an Always-added tool whose approval_label
+            # differs from func_name (e.g. ``skill__name``,
+            # ``mcp_resource__uri``) wouldn't match here and the
+            # operator would get prompted again on the coord page.
+            pending_names = {
+                it.get("approval_label", "") or it.get("func_name", "")
+                for it in pending
+                if it.get("func_name")
+            }
             if pending_names and pending_names.issubset(self.auto_approve_tools):
-                self._enqueue({"type": "tools_auto_approved", "items": serialized})
+                # Tag for /dashboard visibility — matches WebUI shape so
+                # the coord-tree pill renders the same source string
+                # (``skill`` / ``always`` / generic) for both kinds.
+                self._tag_auto_approved(
+                    pending,
+                    AutoApproveReason.AUTO_APPROVE_TOOLS,
+                    source_map=self._auto_approve_tools_source,
+                )
+                self._record_auto_approves(items)
+                self._enqueue(
+                    {
+                        "type": "tools_auto_approved",
+                        "items": self._serialize_approval_items(items),
+                    }
+                )
                 return True, None
 
         # Blanket auto-approve (set e.g. during scripted
         # restart-rehydration) — also matches WebUI semantics.
         if self.auto_approve:
-            self._enqueue({"type": "tools_auto_approved", "items": serialized})
+            self._tag_auto_approved(pending, AutoApproveReason.BLANKET)
+            self._record_auto_approves(items)
+            self._enqueue(
+                {
+                    "type": "tools_auto_approved",
+                    "items": self._serialize_approval_items(items),
+                }
+            )
             return True, None
 
         self._approval_event.clear()
         self._pending_approval = {
             "type": "approve_request",
-            "items": serialized,
+            "items": self._serialize_approval_items(items),
             "judge_pending": False,
         }
         self._enqueue(self._pending_approval)

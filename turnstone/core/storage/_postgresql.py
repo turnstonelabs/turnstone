@@ -2855,6 +2855,7 @@ class PostgreSQLBackend:
         until: str = "",
         limit: int = 100,
         offset: int = 0,
+        resource_id: str = "",
     ) -> list[dict[str, Any]]:
         with self._conn() as conn:
             q = sa.select(
@@ -2876,6 +2877,8 @@ class PostgreSQLBackend:
                 q = q.where(audit_events.c.timestamp >= since)
             if until:
                 q = q.where(audit_events.c.timestamp <= until)
+            if resource_id:
+                q = q.where(audit_events.c.resource_id == resource_id)
             q = q.limit(limit).offset(offset)
             rows = conn.execute(q).fetchall()
             return [

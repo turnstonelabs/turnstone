@@ -28,6 +28,7 @@ import copy
 import json
 import queue
 import threading
+import time
 import uuid
 from typing import Any
 
@@ -48,6 +49,48 @@ _DEFAULT_LISTENER_QUEUE_MAX = 500
 # budget. Lifted from WebUI in the rich ``ws_state`` payload work so
 # coord broadcasts hit the same ceiling.
 _MAX_TURN_CONTENT_CHARS = 256 * 1024
+
+
+class AutoApproveReason:
+    """Source vocabulary for ``auto_approve_reason`` annotations.
+
+    Pinned as constants so writers can't typo a reason silently and
+    desync the wire from the JS pill renderer.  Kept on a class
+    rather than an Enum so the wire-format string IS the value (no
+    ``.value`` dance at every emit site, and no surprise behaviour
+    if a consumer compares against the literal).
+
+    The five reasons reflect the disjoint set of paths that bypass
+    the operator approval gate:
+
+    - :attr:`SKILL` — workstream's skill template populated
+      ``auto_approve_tools`` from its ``allowed_tools`` JSON list at
+      create time.  The dashboard pill flags this so an operator
+      can see when a child is silently auto-approving because of a
+      previously-installed skill they may have forgotten about.
+    - :attr:`ALWAYS` — operator clicked "Approve + Always" on a
+      tool earlier in this session, adding its name to
+      ``auto_approve_tools``.
+    - :attr:`POLICY` — admin-defined ``tool_policies`` row with
+      ``action='allow'`` matched the tool name (or pattern).
+    - :attr:`BLANKET` — workstream-level ``auto_approve=True`` flag
+      (server config / skill ``auto_approve``).  Drains every
+      remaining pending tool unconditionally except for
+      ``__budget_override__`` which always prompts.
+    - :attr:`AUTO_APPROVE_TOOLS` — fallback when ``auto_approve_tools``
+      contains a name but the per-tool source map was never
+      populated (legacy / pre-source-tracking instances).  Visible
+      as a generic pill rather than a misleading ``skill`` /
+      ``always`` claim.
+    """
+
+    SKILL = "skill"
+    ALWAYS = "always"
+    POLICY = "policy"
+    BLANKET = "blanket"
+    AUTO_APPROVE_TOOLS = "auto_approve_tools"
+
+    ALL: frozenset[str] = frozenset({SKILL, ALWAYS, POLICY, BLANKET, AUTO_APPROVE_TOOLS})
 
 
 class SessionUIBase:
@@ -80,6 +123,32 @@ class SessionUIBase:
         self._pending_plan_review: dict[str, Any] | None = None
         self.auto_approve = False
         self.auto_approve_tools: set[str] = set()
+        # Per-tool source for ``auto_approve_tools`` membership.  Two
+        # writers populate the set with semantically different intent:
+        #
+        # - **Skill template** at create time (the ``allowed_tools``
+        #   JSON list landing on ``auto_approve_tools`` from
+        #   ``server.py``'s skill block) — operator may not have
+        #   explicitly opted in tool-by-tool.
+        # - **User "Approve + Always"** click at runtime — explicit
+        #   per-tool consent from the live operator.
+        #
+        # Without per-tool source tracking the dashboard can't tell
+        # the operator WHICH path silently approved a tool call.
+        # Maps ``approval_label_or_func_name → source_string``;
+        # callers populate at the same point they update the set
+        # itself.  Default empty when neither writer ran (e.g. CLI
+        # ``/always`` doesn't set this — pre-existing).
+        self._auto_approve_tools_source: dict[str, str] = {}
+        # Ring buffer of recent auto-approve events for /dashboard
+        # visibility — a child workstream whose tool calls bypass the
+        # approval gate (skill allowlist / blanket / admin policy)
+        # would otherwise leave no operator-facing trace at all.  Fed
+        # by :meth:`_record_auto_approves`; surfaced through
+        # :meth:`serialize_recent_auto_approvals` and the per-ws
+        # ``/dashboard`` payload.  Capped so a long-running skill
+        # workstream can't fill the live block with stale rows.
+        self._recent_auto_approvals: list[dict[str, Any]] = []
         # Foreground gate — used by the CLI's WorkstreamTerminalUI to
         # block output when the workstream is in the background.
         # Starts set so non-CLI UIs can skip any explicit management.
@@ -129,6 +198,16 @@ class SessionUIBase:
         # Verdict cache for SSE reconnect replay (tab switching
         # shouldn't lose the judge's final call on a just-run tool).
         self._llm_verdicts: dict[str, dict[str, Any]] = {}
+        # Re-populate the recent-auto-approve ring buffer from the
+        # audit log so the dashboard pill survives UI rebuilds —
+        # saved-workstream rehydrate / coord→node click-through /
+        # process restart all build a fresh UI whose buffer would
+        # otherwise start empty even though the audit row is still
+        # there.  Best-effort: storage outage / not-yet-wired silently
+        # leaves the buffer empty (the next live auto-approve will
+        # populate it).  Runs last in __init__ so all the lock + state
+        # fields the replay touches are already initialised.
+        self.replay_recent_auto_approvals_from_audit()
 
     # ------------------------------------------------------------------
     # Listener plumbing (SSE)
@@ -396,6 +475,275 @@ class SessionUIBase:
             "judge_pending": bool(pending.get("judge_pending", False)),
             "items": serialized,
         }
+
+    # ---------------------------------------------------------------
+    # Auto-approve visibility — shared by interactive + coord UIs
+    # ---------------------------------------------------------------
+    #
+    # When a tool call gets approved without an explicit operator
+    # click (admin tool policy, skill ``allowed_tools`` allowlist,
+    # blanket ``auto_approve``, or "Approve + Always" memory) the
+    # coord-tree dashboard would otherwise have no surface to show
+    # WHICH tools bypassed the gate or WHY.  These helpers feed two
+    # sinks: per-item annotations on the ``tool_info`` SSE event
+    # (live operator visibility) and a short ring buffer surfaced
+    # via ``/dashboard`` (post-hoc visibility for the coord tree).
+
+    # Cap on the per-ws ring buffer.  Sized for "the operator opens
+    # the row in the next minute" — older entries roll off so the
+    # /dashboard payload stays bounded on long-running skill
+    # workstreams that auto-approve dozens of tool calls per turn.
+    _RECENT_AUTO_APPROVALS_MAX = 10
+
+    @staticmethod
+    def _serialize_approval_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Project each item to the wire shape the SSE event payload uses.
+
+        Single source of truth for both ``approve_request`` and
+        ``tool_info`` payloads — pre-fix the WebUI rebuilt this
+        twice (once eagerly, once after policy evaluation), and
+        adding new fields meant editing both copies in lockstep.
+        Forwards ``auto_approved`` / ``auto_approve_reason`` when
+        the upstream pipeline tagged the item, so the operator can
+        see which path silently approved each call.
+
+        Heuristic verdict surfaces under ``heuristic_verdict`` for
+        consistency with :meth:`serialize_pending_approval_detail`
+        and :class:`api.server_schemas.PendingApprovalItem` — pre-
+        fix this method emitted ``verdict`` while the dashboard
+        payload used ``heuristic_verdict``, leaving JS consumers
+        with two code paths for the same field.
+        """
+        out: list[dict[str, Any]] = []
+        for it in items:
+            denied = it.get("denied")
+            entry: dict[str, Any] = {
+                "call_id": it.get("call_id", ""),
+                "header": it.get("header", ""),
+                "preview": it.get("preview", ""),
+                "func_name": it.get("func_name", ""),
+                "approval_label": it.get("approval_label", it.get("func_name", "")),
+                "needs_approval": it.get("needs_approval", False),
+                "error": it.get("denial_msg") if denied else it.get("error"),
+            }
+            if "_heuristic_verdict" in it:
+                entry["heuristic_verdict"] = it["_heuristic_verdict"]
+            if it.get("auto_approved"):
+                entry["auto_approved"] = True
+                entry["auto_approve_reason"] = it.get("auto_approve_reason", "")
+            out.append(entry)
+        return out
+
+    def _tag_auto_approved(
+        self,
+        pending: list[dict[str, Any]],
+        reason: str,
+        *,
+        source_map: dict[str, str] | None = None,
+    ) -> None:
+        """Mark each pending item as auto-approved with the given reason.
+
+        Used at the three branch points in ``approve_tools`` (policy
+        ``allow`` / ``auto_approve_tools.issubset`` / blanket
+        ``auto_approve``) so both :class:`turnstone.server.WebUI` and
+        :class:`turnstone.console.coordinator_ui.ConsoleCoordinatorUI`
+        share the loop body — pre-fix the per-branch tag loops were
+        copy-pasted line-for-line across the two subclasses.
+
+        ``source_map`` is the per-tool source dict
+        (``_auto_approve_tools_source``) populated by the skill
+        template / "Approve + Always" writers.  When provided, each
+        item's reason is looked up by ``approval_label_or_func_name``
+        and falls back to ``reason`` when the entry is missing
+        (legacy / unknown writer).  Pass ``None`` for the policy /
+        blanket branches that don't carry per-tool source.
+        """
+        for it in pending:
+            it["auto_approved"] = True
+            if source_map is not None:
+                name = it.get("approval_label", "") or it.get("func_name", "")
+                it["auto_approve_reason"] = source_map.get(name, reason)
+            else:
+                it["auto_approve_reason"] = reason
+
+    def _record_auto_approves(self, items: list[dict[str, Any]]) -> None:
+        """Append auto-approved items to the per-ws ring buffer + audit log.
+
+        Called from ``approve_tools`` immediately before the
+        ``tool_info`` emit so the /dashboard payload reflects the
+        same set of tools the SSE consumer just saw.  No-op when
+        ``items`` is empty (every item was a "no approval needed"
+        read-only tool, not an auto-approve).
+
+        Also writes one ``tool.auto_approved`` audit row per call so
+        operators have a durable forensic record beyond the SSE
+        stream + ring buffer (both ephemeral).  Audit failure is
+        logged but never raised — visibility is best-effort and
+        must not break the tool-execution path.
+        """
+        if not items:
+            return
+        ts = time.time()
+        appended = [
+            {
+                "call_id": it.get("call_id", ""),
+                "func_name": it.get("func_name", ""),
+                "approval_label": it.get("approval_label", "") or it.get("func_name", ""),
+                "auto_approve_reason": it.get("auto_approve_reason", ""),
+                "ts": ts,
+            }
+            for it in items
+            if it.get("auto_approved")
+        ]
+        if not appended:
+            return
+        with self._ws_lock:
+            self._recent_auto_approvals.extend(appended)
+            overflow = len(self._recent_auto_approvals) - self._RECENT_AUTO_APPROVALS_MAX
+            if overflow > 0:
+                self._recent_auto_approvals = self._recent_auto_approvals[overflow:]
+        # Audit emission — one row per ``approve_tools`` call (not one
+        # per item) keeps the audit table from blowing up on
+        # tool-heavy turns while still capturing every tool name +
+        # reason in the detail payload.
+        try:
+            from turnstone.core.audit import record_audit
+            from turnstone.core.storage._registry import get_storage
+
+            storage = get_storage()
+            if storage is None:
+                return
+            tools = [
+                {
+                    "func_name": entry["func_name"],
+                    "approval_label": entry["approval_label"],
+                    "reason": entry["auto_approve_reason"],
+                    "call_id": entry["call_id"],
+                }
+                for entry in appended
+            ]
+            record_audit(
+                storage,
+                self._user_id,
+                "tool.auto_approved",
+                "workstream",
+                self.ws_id,
+                {"tools": tools, "count": len(tools)},
+            )
+        except Exception:
+            log.debug("auto_approve.audit_failed ws=%s", self.ws_id, exc_info=True)
+
+    def replay_recent_auto_approvals_from_audit(self) -> None:
+        """Seed :attr:`_recent_auto_approvals` from the audit log.
+
+        Without this the dashboard pill vanishes on every UI rebuild
+        — a saved-workstream rehydrate / coord→node click-through /
+        process restart all build a fresh ``WebUI`` whose ring
+        buffer starts empty even though the audit table still holds
+        the bypass history.  Replaying recent ``tool.auto_approved``
+        rows on construction makes the pill survive these
+        transitions; the audit row is the canonical durable
+        record, the ring buffer is just its in-memory mirror.
+
+        Best-effort: any storage / parse error silently leaves the
+        buffer empty — the next live auto-approve will populate it
+        as before.  No-op when ``ws_id`` is unset (test fixture).
+        """
+        if not self.ws_id:
+            return
+        try:
+            from turnstone.core.storage._registry import get_storage
+
+            storage = get_storage()
+            if storage is None:
+                return
+            rows = storage.list_audit_events(
+                action="tool.auto_approved",
+                resource_id=self.ws_id,
+                limit=self._RECENT_AUTO_APPROVALS_MAX,
+            )
+        except Exception:
+            log.debug(
+                "auto_approve.replay_from_audit_failed ws=%s",
+                self.ws_id,
+                exc_info=True,
+            )
+            return
+        appended: list[dict[str, Any]] = []
+        # ``list_audit_events`` returns DESC; reverse so the oldest
+        # row lands first in the buffer (chronological order matches
+        # what live appends produce).
+        for row in reversed(rows or []):
+            try:
+                detail = json.loads(row.get("detail") or "{}")
+            except (TypeError, ValueError):
+                continue
+            tools = detail.get("tools") or []
+            ts = self._parse_audit_timestamp(row.get("timestamp", ""))
+            for t in tools:
+                if not isinstance(t, dict):
+                    continue
+                appended.append(
+                    {
+                        "call_id": t.get("call_id", "") or "",
+                        "func_name": t.get("func_name", "") or "",
+                        "approval_label": (t.get("approval_label") or t.get("func_name", "") or ""),
+                        "auto_approve_reason": t.get("reason", "") or "",
+                        "ts": ts,
+                    }
+                )
+        if not appended:
+            return
+        with self._ws_lock:
+            # Replay merges with whatever the live path may have
+            # appended in the interleaving window between
+            # construction and replay completion: replay rows go
+            # first, then any live entries, and the buffer is
+            # capped from the head.
+            live = list(self._recent_auto_approvals)
+            merged = appended + live
+            self._recent_auto_approvals = merged[-self._RECENT_AUTO_APPROVALS_MAX :]
+
+    @staticmethod
+    def _parse_audit_timestamp(ts_str: str) -> float:
+        """Parse the audit row's ISO-8601 timestamp into epoch seconds.
+
+        Audit rows are written as ``datetime.now(UTC).strftime(...)``
+        without a timezone marker (see ``storage/_sqlite.py:record_audit_event``),
+        so ``datetime.fromisoformat`` returns a *naive* datetime.
+        Calling ``.timestamp()`` on a naive datetime interprets it
+        in the server's local timezone — wrong here, since the
+        source clock is UTC.  Stamp UTC explicitly before
+        converting so a non-UTC server doesn't render pill
+        timestamps off by hours.
+
+        Falls back to ``0.0`` on a missing / malformed timestamp so
+        the buffer entry still surfaces (just with a "no time"
+        indicator the JS pill renderer treats as missing).
+        """
+        if not ts_str:
+            return 0.0
+        try:
+            from datetime import UTC, datetime
+
+            dt = datetime.fromisoformat(ts_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            return dt.timestamp()
+        except (TypeError, ValueError):
+            return 0.0
+
+    def serialize_recent_auto_approvals(self) -> list[dict[str, Any]]:
+        """Return a snapshot of the recent-auto-approves ring buffer.
+
+        Read by the per-ws ``/dashboard`` payload (and the
+        cross-cluster live-bulk projection on the console) so the
+        coord-tree row can render an "auto-approved by …" pill.
+        Returns a shallow copy under ``_ws_lock`` so the caller
+        can't mutate the buffer mid-iteration.
+        """
+        with self._ws_lock:
+            return [dict(entry) for entry in self._recent_auto_approvals]
 
     def on_output_warning(self, call_id: str, assessment: dict[str, Any]) -> None:
         """Deliver an output-guard warning + persist its assessment row."""

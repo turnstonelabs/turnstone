@@ -105,6 +105,31 @@
   const WS_ID_RE = /^[a-f0-9]{8,64}$/i;
   const NODE_ID_RE = /^[A-Za-z0-9._-]{1,256}$/;
 
+  // Auto-approve reason vocabulary — kept in lockstep with the
+  // ``AutoApproveReason`` constants in turnstone/core/session_ui_base.py.
+  // The pill renderer validates incoming reason strings against this
+  // set so a server-side typo (or a future reason this build doesn't
+  // know about) renders as "unknown" with a console.warn instead of
+  // silently surfacing the typo verbatim in the operator-facing label.
+  const KNOWN_AUTO_APPROVE_REASONS = new Set([
+    "skill",
+    "always",
+    "policy",
+    "blanket",
+    "auto_approve_tools",
+  ]);
+  const UNKNOWN_AUTO_APPROVE_REASON = "unknown";
+
+  function _normaliseAutoApproveReason(raw) {
+    const r = raw || "auto_approve_tools";
+    if (KNOWN_AUTO_APPROVE_REASONS.has(r)) return r;
+    console.warn(
+      "coord_ui: unknown auto_approve_reason from server:",
+      JSON.stringify(raw),
+    );
+    return UNKNOWN_AUTO_APPROVE_REASON;
+  }
+
   function renderToolOutput(rawText) {
     // Try parse JSON first — coordinator tool output is JSON-shaped.
     let parsed = null;
@@ -1151,7 +1176,76 @@
       // refresh and one bulk request covers every pending row.
       _maybeStartJudgePoll();
     }
+    // Recent auto-approves — tools that bypassed the operator gate
+    // (skill ``allowed_tools`` allowlist / blanket / admin policy /
+    // explicit "Always" click).  Without this pill the operator sees
+    // the child run tools they never approved with no explanation.
+    // The buffer is bounded server-side at 10 entries so this stays
+    // O(1) per render.
+    if (
+      cached &&
+      cached.live &&
+      Array.isArray(cached.live.recent_auto_approvals) &&
+      cached.live.recent_auto_approvals.length > 0
+    ) {
+      const pill = renderAutoApprovedPill(cached.live.recent_auto_approvals);
+      if (pill) row.appendChild(pill);
+    }
     return row;
+  }
+
+  // Build a compact pill summarising the row's recent auto-approves.
+  // Format: "auto-approved (skill): bash, edit_file +2".  Tooltip
+  // expands the full list with reasons.  Returns null when the
+  // server hasn't surfaced any entries — defensive against a missing
+  // field on older node payloads.
+  function renderAutoApprovedPill(entries) {
+    if (!Array.isArray(entries) || entries.length === 0) return null;
+    const pill = document.createElement("div");
+    pill.className = "ch-auto-approved-pill";
+    // Group by reason for the lead label; show the most-common reason
+    // when the buffer mixes (e.g. skill + always after the operator
+    // hit "Approve + Always" on a tool the skill template missed).
+    const reasonCounts = new Map();
+    for (const e of entries) {
+      const r = _normaliseAutoApproveReason(e && e.auto_approve_reason);
+      reasonCounts.set(r, (reasonCounts.get(r) || 0) + 1);
+    }
+    let topReason = "auto_approve_tools";
+    let topCount = 0;
+    for (const [r, n] of reasonCounts) {
+      if (n > topCount) {
+        topReason = r;
+        topCount = n;
+      }
+    }
+    const names = entries
+      .map((e) => (e && (e.approval_label || e.func_name)) || "")
+      .filter(Boolean);
+    const visible = names.slice(0, 3).join(", ");
+    const more = names.length > 3 ? " +" + (names.length - 3) : "";
+    const label = document.createElement("span");
+    label.className = "ch-auto-approved-label";
+    label.textContent =
+      "✓ auto-approved (" + topReason + "): " + visible + more;
+    pill.appendChild(label);
+    // Full breakdown in the tooltip — operator can hover to see
+    // every tool name + its specific reason without expanding any
+    // additional UI.  Includes timestamps so a recent ad-hoc
+    // approval can be told apart from the skill-template baseline.
+    const tooltip = entries
+      .map((e) => {
+        const name = (e && (e.approval_label || e.func_name)) || "(unknown)";
+        const reason = _normaliseAutoApproveReason(e && e.auto_approve_reason);
+        const ts =
+          e && typeof e.ts === "number"
+            ? new Date(e.ts * 1000).toLocaleTimeString()
+            : "";
+        return ts ? `${ts}  ${name}  (${reason})` : `${name}  (${reason})`;
+      })
+      .join("\n");
+    pill.title = tooltip;
+    return pill;
   }
 
   // Late-judge polling — single global timer driving a bulk

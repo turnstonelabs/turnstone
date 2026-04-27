@@ -265,6 +265,35 @@ class PendingApprovalItem(BaseModel):
     judge_verdict: dict[str, Any] | None = None
 
 
+class RecentAutoApproval(BaseModel):
+    """One ring-buffer entry for ``DashboardWorkstream.recent_auto_approvals``.
+
+    Records a tool call that bypassed the operator approval gate
+    (admin tool policy / skill ``allowed_tools`` allowlist / blanket
+    ``auto_approve`` / "Approve + Always" memory).  The coord-tree
+    pill reads this list to surface "auto-approved by skill X" so
+    the operator can see WHICH calls bypassed and WHY.
+    """
+
+    call_id: str = ""
+    func_name: str = ""
+    approval_label: str = ""
+    auto_approve_reason: str = Field(
+        default="",
+        description=(
+            "Source that fired the bypass.  ``skill`` (skill template's "
+            "``allowed_tools``), ``always`` (user 'Approve + Always' "
+            "click), ``policy`` (admin tool-policy ``allow`` rule), "
+            "``blanket`` (workstream-level ``auto_approve=True``), or "
+            "``auto_approve_tools`` (legacy / unknown writer)."
+        ),
+    )
+    ts: float = Field(
+        default=0.0,
+        description="Unix epoch seconds when the auto-approve fired.",
+    )
+
+
 class PendingApprovalDetail(BaseModel):
     """Inline approval payload merged into ``DashboardWorkstream``.
 
@@ -326,6 +355,19 @@ class DashboardWorkstream(BaseModel):
             "per-child round-trip. ``None`` when no approval is pending. "
             "Also surfaced (verbatim) on ``GET /v1/api/cluster/ws/live`` "
             "via the ``_CLUSTER_WS_LIVE_KEYS`` projection."
+        ),
+    )
+    recent_auto_approvals: list[RecentAutoApproval] = Field(
+        default_factory=list,
+        description=(
+            "Per-ws ring buffer (cap 10) of recent tool calls that "
+            "bypassed the operator approval gate. Surfaces "
+            "``WebUI._recent_auto_approvals`` so the coord-tree row "
+            "can render an 'auto-approved by ...' pill when the "
+            "child's skill / blanket / admin-policy rules silently "
+            "let a tool through. Also projected onto "
+            "``GET /v1/api/cluster/ws/live`` via "
+            "``_CLUSTER_WS_LIVE_KEYS``."
         ),
     )
 
