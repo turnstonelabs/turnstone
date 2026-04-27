@@ -12,8 +12,8 @@ Existing bulk endpoints at time of writing:
 |---------------------------------------------------------|--------------------------|------------------------------------------|
 | `GET  /v1/api/cluster/ws/live?ids=a,b,c`                | bulk read                | `{results, denied, truncated}`           |
 | model tool `spawn_batch`                                 | bulk create (per-item)   | `{results, denied}`                      |
-| `POST /v1/api/coordinator/{ws_id}/stop_cascade`          | cascade mutation         | `{cancelled, failed, skipped}`           |
-| `POST /v1/api/coordinator/{ws_id}/close_all_children`    | cascade mutation         | `{closed, failed, skipped}`              |
+| `POST /v1/api/workstreams/{ws_id}/stop_cascade`          | cascade mutation         | `{cancelled, failed, skipped}`           |
+| `POST /v1/api/workstreams/{ws_id}/close_all_children`    | cascade mutation         | `{closed, failed, skipped}`              |
 
 ---
 

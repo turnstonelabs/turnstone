@@ -26,28 +26,43 @@ schema changes.
 
 ## The 9 steps
 
-| # | Action                       | Operation                                                   | Operation id                                                |
-|---|------------------------------|-------------------------------------------------------------|-------------------------------------------------------------|
-| 1 | Create                       | `POST /v1/api/coordinator/new`                              | `v1_api_coordinator_new_post`                               |
-| 2 | Subscribe to events          | `GET /v1/api/coordinator/{ws_id}/events` (SSE)              | `v1_api_coordinator_{ws_id}_events_get`                     |
-| 3 | Send a user message          | `POST /v1/api/coordinator/{ws_id}/send`                     | `v1_api_coordinator_{ws_id}_send_post`                      |
-| 4 | Inspect children             | `GET /v1/api/coordinator/{ws_id}/children`                  | `v1_api_coordinator_{ws_id}_children_get`                   |
-| 5 | Inspect one workstream       | `GET /v1/api/cluster/ws/{ws_id}/detail`                     | `v1_api_cluster_ws_{ws_id}_detail_get`                      |
-| 6 | Wait for fan-out             | model-side tool `wait_for_workstream`                       | — (tool call, not HTTP)                                     |
-| 7 | Govern                       | `POST /v1/api/coordinator/{ws_id}/trust`                    | `v1_api_coordinator_{ws_id}_trust_post`                     |
-|   |                              | `POST /v1/api/coordinator/{ws_id}/restrict`                 | `v1_api_coordinator_{ws_id}_restrict_post`                  |
-|   |                              | `POST /v1/api/coordinator/{ws_id}/stop_cascade`             | `v1_api_coordinator_{ws_id}_stop_cascade_post`              |
-|   |                              | `POST /v1/api/coordinator/{ws_id}/close_all_children`       | `v1_api_coordinator_{ws_id}_close_all_children_post`        |
-| 8 | Approve / cancel             | `POST /v1/api/coordinator/{ws_id}/approve`                  | `v1_api_coordinator_{ws_id}_approve_post`                   |
-|   |                              | `POST /v1/api/coordinator/{ws_id}/cancel`                   | `v1_api_coordinator_{ws_id}_cancel_post`                    |
-| 9 | Close                        | `POST /v1/api/coordinator/{ws_id}/close`                    | `v1_api_coordinator_{ws_id}_close_post`                     |
+> **URL convergence (1.5.0).** Pre-1.5 coord-only endpoints lived
+> under `/v1/api/coordinator/...`. The Stage 2 verb-shape lift
+> consolidated coord and interactive onto the unified
+> `/v1/api/workstreams/{ws_id}/<verb>` tree; coord still distinguishes
+> itself via the `kind=coordinator` row classifier rather than a
+> separate URL space. The endpoints below reflect the post-lift
+> surface served by `turnstone-console`.
+
+| # | Action                       | Operation                                                   |
+|---|------------------------------|-------------------------------------------------------------|
+| 1 | Create                       | `POST /v1/api/workstreams/new`                              |
+| 2 | Subscribe to events          | `GET /v1/api/workstreams/{ws_id}/events` (SSE)              |
+| 3 | Send a user message          | `POST /v1/api/workstreams/{ws_id}/send`                     |
+| 4 | Inspect children             | `GET /v1/api/workstreams/{ws_id}/children`                  |
+| 5 | Inspect one workstream       | `GET /v1/api/cluster/ws/{ws_id}/detail`                     |
+| 6 | Wait for fan-out             | model-side tool `wait_for_workstream`                       |
+| 7 | Govern                       | `POST /v1/api/workstreams/{ws_id}/trust`                    |
+|   |                              | `POST /v1/api/workstreams/{ws_id}/restrict`                 |
+|   |                              | `POST /v1/api/workstreams/{ws_id}/stop_cascade`             |
+|   |                              | `POST /v1/api/workstreams/{ws_id}/close_all_children`       |
+| 8 | Approve / cancel             | `POST /v1/api/workstreams/{ws_id}/approve`                  |
+|   |                              | `POST /v1/api/workstreams/{ws_id}/cancel`                   |
+| 9 | Close                        | `POST /v1/api/workstreams/{ws_id}/close`                    |
+
+Refer to `/openapi.json` (Swagger UI at `/docs`) on any
+`turnstone-console` process for the authoritative operation ids and
+schemas. Coordinator-only verbs (`/children`, `/trust`, `/restrict`,
+`/stop_cascade`, `/close_all_children`) 404 against `kind=interactive`
+rows; the shared verbs (`/send`, `/approve`, `/cancel`, `/events`,
+`/history`, `/open`, `/close`, etc.) work on both kinds.
 
 ---
 
 ## 1. Create a coordinator
 
 ```http
-POST /v1/api/coordinator/new
+POST /v1/api/workstreams/new
 Content-Type: application/json
 Authorization: Bearer <token>
 
@@ -80,7 +95,7 @@ subscribers (step 2) see the session warm up as token traffic starts.
 ## 2. Subscribe to the per-coordinator event stream
 
 ```http
-GET /v1/api/coordinator/{ws_id}/events HTTP/1.1
+GET /v1/api/workstreams/{ws_id}/events HTTP/1.1
 Accept: text/event-stream
 Authorization: Bearer <token>
 ```
@@ -124,7 +139,7 @@ operator.
 ## 3. Send the first user message
 
 ```http
-POST /v1/api/coordinator/{ws_id}/send
+POST /v1/api/workstreams/{ws_id}/send
 Content-Type: application/json
 
 {"message": "audit /auth for CSRF handling across all active routes"}
@@ -147,7 +162,7 @@ events, finishing with `state_change → idle` or an
 ## 4. Inspect direct children
 
 ```http
-GET /v1/api/coordinator/{ws_id}/children HTTP/1.1
+GET /v1/api/workstreams/{ws_id}/children HTTP/1.1
 ```
 
 ```json
@@ -244,7 +259,7 @@ burst can't starve audit writes.
 ### `POST /trust` — auto-approve own-subtree sends
 
 ```json
-POST /v1/api/coordinator/{ws_id}/trust
+POST /v1/api/workstreams/{ws_id}/trust
 {"send": true}
 ```
 
@@ -258,7 +273,7 @@ second grants a service token the opt-in it otherwise wouldn't get).
 ### `POST /restrict` — revoke tool access mid-session
 
 ```json
-POST /v1/api/coordinator/{ws_id}/restrict
+POST /v1/api/workstreams/{ws_id}/restrict
 {"revoke": ["spawn_workstream", "delete_workstream"]}
 ```
 
@@ -270,7 +285,7 @@ opt in per session.  Cap 256 tool names per request, 128 chars each.
 ### `POST /stop_cascade` — cancel the subtree
 
 ```json
-POST /v1/api/coordinator/{ws_id}/stop_cascade
+POST /v1/api/workstreams/{ws_id}/stop_cascade
 {}
 ```
 
@@ -292,7 +307,7 @@ propagate via the child's SSE stream.
 ### `POST /close_all_children` — soft-close the direct fan-out
 
 ```json
-POST /v1/api/coordinator/{ws_id}/close_all_children
+POST /v1/api/workstreams/{ws_id}/close_all_children
 {"reason": "audit round complete"}
 ```
 
@@ -323,7 +338,7 @@ event.  The coordinator's worker thread is blocked inside
 `ui.approve_tools` waiting for this POST.
 
 ```json
-POST /v1/api/coordinator/{ws_id}/approve
+POST /v1/api/workstreams/{ws_id}/approve
 {"approved": true, "feedback": null, "always": false}
 {"approved": false, "feedback": "spawn count looks too high — try 3 not 10"}
 {"approved": true, "feedback": null, "always": true}    // always-approve this tool name
@@ -333,7 +348,7 @@ POST /v1/api/coordinator/{ws_id}/approve
 idle and open for a fresh `send`:
 
 ```json
-POST /v1/api/coordinator/{ws_id}/cancel
+POST /v1/api/workstreams/{ws_id}/cancel
 {}
 ```
 
@@ -342,7 +357,7 @@ POST /v1/api/coordinator/{ws_id}/cancel
 ## 9. Close
 
 ```json
-POST /v1/api/coordinator/{ws_id}/close
+POST /v1/api/workstreams/{ws_id}/close
 {}
 ```
 
@@ -350,7 +365,7 @@ Soft-closes the session — state persists, children keep running (use
 `close_all_children` or `stop_cascade` first to wind them down), the
 worker thread exits, SSE streams send a final `stream_end` and
 disconnect.  The row is reopenable via
-`POST /v1/api/coordinator/{ws_id}/open` so long as it hasn't been
+`POST /v1/api/workstreams/{ws_id}/open` so long as it hasn't been
 deleted.
 
 ---
