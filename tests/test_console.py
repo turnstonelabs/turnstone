@@ -1253,6 +1253,36 @@ class TestConsoleProxy:
         ) as sse_mock:
             client.get("/node/node-a/v1/api/events/global")
             assert sse_mock.await_count == 1
+            # events/global must use the console's service token —
+            # the upstream gates this path on `service` scope and
+            # end-user JWTs don't carry it. Without this, the
+            # browser's interactive UI 403-loops on every retry.
+            assert sse_mock.await_args.kwargs.get("use_service_auth") is True
+
+    def test_proxy_api_per_ws_events_uses_user_auth_not_service(self, client, mock_collector):
+        """Per-ws events route uses the user's re-minted JWT, not the
+        service token — the upstream per-ws SSE handler scopes by
+        user identity for tenant filtering, and a service-scoped
+        call would bypass that gate. Only ``events/global``
+        (cross-tenant inventory by design) opts into service auth."""
+        from unittest.mock import AsyncMock, patch
+
+        from starlette.responses import Response
+
+        mock_collector.get_node_detail.return_value = {
+            "node_id": "node-a",
+            "server_url": "http://a:8080",
+            "reachable": True,
+        }
+        ws_id = "b" * 32
+        with patch(
+            "turnstone.console.server._proxy_sse",
+            new_callable=AsyncMock,
+            return_value=Response("ok", status_code=200),
+        ) as sse_mock:
+            client.get(f"/node/node-a/v1/api/workstreams/{ws_id}/events")
+            assert sse_mock.await_count == 1
+            assert sse_mock.await_args.kwargs.get("use_service_auth") is False
 
 
 # ---------------------------------------------------------------------------
