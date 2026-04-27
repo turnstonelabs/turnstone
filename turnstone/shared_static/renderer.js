@@ -357,24 +357,53 @@ function renderMarkdown(text) {
     },
   );
 
-  // Protect display math ($$...$$) — must come before inline code/math
-  var mathBlocks = [];
-  text = text.replace(/\$\$([\s\S]+?)\$\$/g, function (m, tex) {
-    mathBlocks.push(renderLatex(tex.trim(), true));
-    return "\x00MB" + (mathBlocks.length - 1) + "\x00";
-  });
-
-  // Protect inline code
+  // Protect inline code FIRST so backtick spans containing math
+  // delimiters (e.g. `` `$$x$$` `` or `` `\[x\]` ``) stay literal.
+  // Display math used to run first, but that lets the math regex
+  // consume delimiters inside backticks and replace them with
+  // \x00MB…\x00 sentinels — sentinels then captured by the inline
+  // code grab end up restored INSIDE the <code>, leaking the
+  // null-byte placeholder into rendered output. Code first means
+  // backticks seal their content before any math regex sees it.
+  // The reverse edge case (math containing backticks, e.g.
+  // ``$$ \verb|`x`| $$``) is much rarer and KaTeX would reject
+  // the verbatim syntax anyway.
   var inlineCodes = [];
   text = text.replace(/`([^`\n]+)`/g, function (m, code) {
     inlineCodes.push("<code>" + escapeHtml(code) + "</code>");
     return "\x00IC" + (inlineCodes.length - 1) + "\x00";
   });
 
-  // Protect inline math ($...$) — after inline code so `$x$` in code is safe
+  // Protect display math — both TeX ($$...$$) and LaTeX (\[...\])
+  // delimiter styles. Most models emit one or the other depending
+  // on system-prompt style; GPT-5 / o-series and Claude with
+  // reasoning effort tend to emit the LaTeX form. Without both,
+  // math nested in a markdown paragraph silently passes through
+  // as raw \[...\] text.
+  var mathBlocks = [];
+  text = text.replace(/\$\$([\s\S]+?)\$\$/g, function (m, tex) {
+    mathBlocks.push(renderLatex(tex.trim(), true));
+    return "\x00MB" + (mathBlocks.length - 1) + "\x00";
+  });
+  text = text.replace(/\\\[([\s\S]+?)\\\]/g, function (m, tex) {
+    mathBlocks.push(renderLatex(tex.trim(), true));
+    return "\x00MB" + (mathBlocks.length - 1) + "\x00";
+  });
+
+  // Protect inline math — both delimiter styles ($...$ and \(...\)).
+  // Both regexes explicitly forbid newlines inside the captured
+  // group: an unterminated \(...\) (or $...$) on one line would
+  // otherwise eat the next paragraph until it found a closing
+  // delimiter, which is jarring on streaming markdown where the
+  // closer hasn't arrived yet. Display math (\[...\] / $$...$$)
+  // is the multi-line form by design.
   var inlineMaths = [];
   text = text.replace(/\$([^\$\n]+?)\$/g, function (m, tex) {
     inlineMaths.push(renderLatex(tex, false));
+    return "\x00IM" + (inlineMaths.length - 1) + "\x00";
+  });
+  text = text.replace(/\\\(([^\n]+?)\\\)/g, function (m, tex) {
+    inlineMaths.push(renderLatex(tex.trim(), false));
     return "\x00IM" + (inlineMaths.length - 1) + "\x00";
   });
 
