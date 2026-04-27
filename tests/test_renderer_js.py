@@ -177,3 +177,54 @@ def test_markdown_link_unaffected_by_math_protection() -> None:
     out = _render("See [docs](https://example.com).")
     assert '<a href="https://example.com"' in out
     assert ">docs</a>" in out
+
+
+# ---------------------------------------------------------------------------
+# Edge cases — Copilot review on PR #425
+# ---------------------------------------------------------------------------
+
+
+def test_display_math_inside_inline_code_stays_literal() -> None:
+    r"""``$$...$$`` inside backticks must NOT trigger display-math
+    extraction — otherwise the math sentinel ends up wrapped inside
+    the <code> placeholder and leaks into rendered HTML as a raw
+    null-byte sentinel string.
+
+    Pre-#425 ordering ran display-math before inline code, which
+    caused this leak. The reordering makes inline code seal first.
+    """
+    out = _render(r"Use `$$x$$` for display math.")
+    assert "<code>$$x$$</code>" in out
+    assert '<span class="katex">' not in out
+    assert "\x00" not in out  # no leaked sentinel
+
+
+def test_latex_display_math_inside_inline_code_stays_literal() -> None:
+    r"""Same as above, but for the LaTeX-style \[...\] delimiter."""
+    out = _render(r"Use `\[x\]` for display math.")
+    assert r"<code>\[x\]</code>" in out
+    assert '<span class="katex">' not in out
+    assert "\x00" not in out
+
+
+def test_inline_latex_math_does_not_span_paragraphs() -> None:
+    r"""An unterminated \(...\) on one line must not eat the
+    following paragraph until it finds a closing \) — that would
+    consume large chunks of text under streaming markdown where
+    the closer hasn't arrived yet. Mirrors the $...$ behavior."""
+    src = "Open \\(unterminated\n\nNext paragraph with \\(x\\) here."
+    out = _render(src)
+    # The bare \( on line 1 should NOT match; the well-formed \(x\)
+    # on the second paragraph should render normally.
+    assert out.count('<span class="katex">') == 1
+    assert "[KATEX:x:inline]" in out
+    # The "unterminated" stays as raw text.
+    assert "unterminated" in out
+
+
+def test_inline_tex_math_does_not_span_newlines() -> None:
+    """Existing $...$ behavior — regression guard."""
+    src = "Open $unterminated\n\nNext paragraph $x$ here."
+    out = _render(src)
+    assert out.count('<span class="katex">') == 1
+    assert "[KATEX:x:inline]" in out
