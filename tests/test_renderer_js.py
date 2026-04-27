@@ -19,6 +19,7 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -228,3 +229,289 @@ def test_inline_tex_math_does_not_span_newlines() -> None:
     out = _render(src)
     assert out.count('<span class="katex">') == 1
     assert "[KATEX:x:inline]" in out
+
+
+# ---------------------------------------------------------------------------
+# Mermaid progressive rendering — source-keyed SVG cache
+# ---------------------------------------------------------------------------
+
+
+_MERMAID_HARNESS_TEMPLATE = """
+const vm = require('vm');
+const fs = require('fs');
+
+// Minimal DOM fake — enough surface for postRenderMermaid + the
+// mermaid render path. Each created element tracks its attributes,
+// classList, children, and parent so replaceWith works.
+function makeEl(tag) {
+  const el = {
+    tagName: tag.toUpperCase(),
+    _attrs: {},
+    _classes: new Set(),
+    children: [],
+    parent: null,
+    _innerHTML: '',
+    _textContent: '',
+    setAttribute(k, v) { this._attrs[k] = v; },
+    getAttribute(k) { return this._attrs[k] !== undefined ? this._attrs[k] : null; },
+    get classList() {
+      const self = this;
+      return {
+        add(...c) { c.forEach(x => self._classes.add(x)); },
+        remove(...c) { c.forEach(x => self._classes.delete(x)); },
+        contains(c) { return self._classes.has(c); },
+      };
+    },
+    get className() { return Array.from(this._classes).join(' '); },
+    set className(v) {
+      this._classes = new Set(String(v).split(/\\s+/).filter(Boolean));
+    },
+    get textContent() {
+      return this._textContent || this.children.map(c => c.textContent || '').join('');
+    },
+    set textContent(v) { this._textContent = v; this.children = []; },
+    get innerHTML() { return this._innerHTML; },
+    set innerHTML(v) { this._innerHTML = v; this.children = []; },
+    appendChild(c) {
+      c.parent = this;
+      this.children.push(c);
+      return c;
+    },
+    closest(selector) {
+      const t = selector.toUpperCase();
+      let cur = this;
+      while (cur) {
+        if (cur.tagName === t) return cur;
+        cur = cur.parent;
+      }
+      return null;
+    },
+    replaceWith(other) {
+      if (!this.parent) return;
+      const idx = this.parent.children.indexOf(this);
+      if (idx === -1) return;
+      this.parent.children[idx] = other;
+      other.parent = this.parent;
+      this.parent = null;
+    },
+    querySelectorAll(selector) {
+      // Only supports the literal "pre code.language-mermaid"
+      // selector that postRenderMermaid uses.
+      const out = [];
+      function walk(node) {
+        for (const c of (node.children || [])) {
+          if (
+            c.tagName === 'CODE' &&
+            c.parent && c.parent.tagName === 'PRE' &&
+            c._classes.has('language-mermaid')
+          ) {
+            out.push(c);
+          }
+          walk(c);
+        }
+      }
+      walk(this);
+      return out;
+    },
+  };
+  return el;
+}
+
+global.document = {
+  createElement: makeEl,
+  addEventListener: () => {},
+  getElementById: () => null,
+  head: { appendChild: () => {} },
+  documentElement: {},
+};
+global.window = global;
+global.getComputedStyle = () => ({ getPropertyValue: () => '' });
+
+let renderCallCount = 0;
+let renderShouldFail = false;
+global.mermaid = {
+  initialize: () => {},
+  render: (id, source) => {
+    renderCallCount++;
+    if (renderShouldFail) {
+      return Promise.reject(new Error('bad diagram: ' + source));
+    }
+    return Promise.resolve({
+      svg: '<svg data-source="' + source + '">rendered</svg>',
+      bindFunctions: null,
+    });
+  },
+};
+
+vm.runInThisContext(fs.readFileSync(%(utils)s, 'utf8'));
+vm.runInThisContext(fs.readFileSync(%(renderer)s, 'utf8'));
+
+// Mermaid is normally lazy-loaded via _loadMermaid which fetches a
+// script tag. Force-mark it ready so postRenderMermaid invokes the
+// render path synchronously without trying to inject a script.
+_mermaidState = 'ready';
+
+%(scenario)s
+"""
+
+
+def _run_mermaid_scenario(scenario_js: str) -> dict[str, Any]:
+    """Run a JS snippet against the mermaid-aware harness, return JSON output."""
+    harness = _MERMAID_HARNESS_TEMPLATE % {
+        "utils": json.dumps(str(_UTILS_JS)),
+        "renderer": json.dumps(str(_RENDERER_JS)),
+        "scenario": scenario_js,
+    }
+    result = subprocess.run(
+        ["node", "-e", harness],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+    parsed: dict[str, Any] = json.loads(result.stdout)
+    return parsed
+
+
+def _build_mermaid_container_js(sources: list[str]) -> str:
+    """JS expression that builds a container with ``<pre><code language-mermaid>`` blocks."""
+    src_array = "[" + ", ".join(json.dumps(s) for s in sources) + "]"
+    return f"""
+function buildContainer(sources) {{
+  const container = document.createElement('div');
+  for (const src of sources) {{
+    const pre = document.createElement('pre');
+    const code = document.createElement('code');
+    code.classList.add('language-mermaid');
+    code.textContent = src;
+    pre.appendChild(code);
+    container.appendChild(pre);
+  }}
+  return container;
+}}
+const sources = {src_array};
+const container = buildContainer(sources);
+"""
+
+
+def test_mermaid_cache_hit_skips_render_call() -> None:
+    """Identical source on a second postRenderMermaid call must serve
+    from the cache — mermaid.render runs exactly once across both
+    invocations. This is the core invariant that lets streamingRender
+    fire postRenderMermaid on every rAF tick without thrashing."""
+    scenario = (
+        _build_mermaid_container_js(["graph TD\n  A --> B"])
+        + """
+postRenderMermaid(container);
+// Drain microtasks so the async mermaid.render Promise resolves
+// before we measure call count.
+Promise.resolve().then(() => Promise.resolve()).then(() => {
+  // Second invocation — fresh container, same source. Should NOT
+  // call mermaid.render again because the cache holds the SVG.
+  const container2 = buildContainer(sources);
+  postRenderMermaid(container2);
+  Promise.resolve().then(() => {
+    process.stdout.write(JSON.stringify({
+      renderCalls: renderCallCount,
+      cacheSize: _mermaidSvgCache.size,
+      firstClass: container.children[0].className,
+      secondClass: container2.children[0].className,
+    }));
+  });
+});
+"""
+    )
+    out = _run_mermaid_scenario(scenario)
+    assert out["renderCalls"] == 1, "second postRenderMermaid call invoked render — cache miss"
+    assert out["cacheSize"] == 1
+    # Both containers end up with the rendered class — second from cache.
+    assert "mermaid-rendered" in out["firstClass"]
+    assert "mermaid-rendered" in out["secondClass"]
+
+
+def test_mermaid_distinct_sources_render_independently() -> None:
+    """Two distinct sources each trigger mermaid.render once and are
+    cached separately. Verifies the cache key is the source string,
+    not e.g. a positional index."""
+    scenario = (
+        _build_mermaid_container_js(["graph TD\n  A --> B", "sequenceDiagram\n  A->>B: hi"])
+        + """
+postRenderMermaid(container);
+Promise.resolve().then(() => Promise.resolve()).then(() => {
+  process.stdout.write(JSON.stringify({
+    renderCalls: renderCallCount,
+    cacheSize: _mermaidSvgCache.size,
+  }));
+});
+"""
+    )
+    out = _run_mermaid_scenario(scenario)
+    assert out["renderCalls"] == 2
+    assert out["cacheSize"] == 2
+
+
+def test_mermaid_error_cached_to_avoid_thrash() -> None:
+    """A mermaid render failure caches the error message keyed by
+    source, so subsequent postRenderMermaid calls on the same source
+    don't re-invoke mermaid.render only to re-fail."""
+    scenario = (
+        _build_mermaid_container_js(["bogus diagram"])
+        + """
+renderShouldFail = true;
+postRenderMermaid(container);
+Promise.resolve().then(() => Promise.resolve()).then(() => {
+  // Re-run with same source — should hit error cache.
+  const container2 = buildContainer(sources);
+  postRenderMermaid(container2);
+  Promise.resolve().then(() => {
+    process.stdout.write(JSON.stringify({
+      renderCalls: renderCallCount,
+      errorCacheSize: _mermaidErrorCache.size,
+      svgCacheSize: _mermaidSvgCache.size,
+      secondClass: container2.children[0].className,
+    }));
+  });
+});
+"""
+    )
+    out = _run_mermaid_scenario(scenario)
+    assert out["renderCalls"] == 1, "errored source re-invoked mermaid.render — error cache miss"
+    assert out["errorCacheSize"] == 1
+    assert out["svgCacheSize"] == 0
+    # Second container shows the error class without re-rendering.
+    assert "mermaid-error" in out["secondClass"]
+
+
+def test_mermaid_cache_evicts_oldest_at_cap() -> None:
+    """FIFO eviction at _MERMAID_CACHE_MAX prevents unbounded growth
+    on long sessions emitting many distinct diagrams."""
+    scenario = """
+const cap = _MERMAID_CACHE_MAX;
+for (let i = 0; i < cap + 5; i++) {
+  _cacheMermaidEntry(_mermaidSvgCache, 'src-' + i, 'svg-' + i);
+}
+process.stdout.write(JSON.stringify({
+  size: _mermaidSvgCache.size,
+  hasOldest: _mermaidSvgCache.has('src-0'),
+  hasNewest: _mermaidSvgCache.has('src-' + (cap + 4)),
+}));
+"""
+    out = _run_mermaid_scenario(scenario)
+    assert out["size"] == 64
+    assert out["hasOldest"] is False
+    assert out["hasNewest"] is True
+
+
+def test_streaming_render_invokes_mermaid_post_render() -> None:
+    """_streamingRenderApply must call postRenderMermaid so closed
+    mermaid fences appear progressively during streaming, not only
+    at stream_end via streamingRenderFinalize."""
+    body = _RENDERER_JS.read_text(encoding="utf-8")
+    # Find the function body of _streamingRenderApply.
+    start = body.index("function _streamingRenderApply")
+    end = body.index("\n}\n", start) + 2
+    fn_body = body[start:end]
+    assert "postRenderMermaid(el)" in fn_body, (
+        "_streamingRenderApply must call postRenderMermaid for "
+        "progressive diagram rendering during streaming"
+    )

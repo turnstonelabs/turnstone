@@ -821,6 +821,52 @@ function _getMermaidTheme() {
   };
 }
 
+// Source-keyed SVG cache. Identical mermaid source produces identical
+// SVG, so we can swap in cached output synchronously without re-running
+// mermaid.render. Crucial for streaming markdown: streamingRender does
+// `el.innerHTML = html` wholesale on every rAF tick, which destroys
+// rendered SVG nodes — without the cache, a closed mermaid block would
+// re-trigger an async render on every subsequent token. With the cache,
+// each unique source pays mermaid.render exactly once per session.
+//
+// Errored sources are cached too (as the message string) so a
+// syntactically-broken diagram doesn't re-thrash mermaid on every
+// render. The user can fix the diagram and the new source string
+// misses the cache, triggering a fresh render.
+//
+// FIFO bounded so a long session that emits many distinct diagrams
+// can't grow unbounded.
+var _mermaidSvgCache = new Map();
+var _mermaidErrorCache = new Map();
+var _MERMAID_CACHE_MAX = 64;
+
+function _cacheMermaidEntry(cache, source, value) {
+  if (cache.size >= _MERMAID_CACHE_MAX) {
+    var firstKey = cache.keys().next().value;
+    cache.delete(firstKey);
+  }
+  cache.set(source, value);
+}
+
+function _applyMermaidSvg(container, svg, bindFunctions) {
+  container.innerHTML = svg;
+  container.classList.remove("mermaid-loading", "mermaid-error");
+  container.classList.add("mermaid-rendered");
+  if (bindFunctions) bindFunctions(container);
+}
+
+function _applyMermaidError(container, source, message) {
+  container.classList.remove("mermaid-loading");
+  container.classList.add("mermaid-error");
+  container.innerHTML =
+    '<div class="mermaid-error-msg">' +
+    escapeHtml(message || "Diagram error") +
+    "</div>" +
+    "<pre><code>" +
+    escapeHtml(source) +
+    "</code></pre>";
+}
+
 // Render a single mermaid block, then call callback (serialized to avoid
 // concurrent mermaid.render() calls which corrupt shared internal state)
 function _renderMermaidBlock(container, callback) {
@@ -834,25 +880,17 @@ function _renderMermaidBlock(container, callback) {
     // Clean up orphaned temp SVG element mermaid may have left
     var orphan = document.getElementById(id);
     if (orphan) orphan.remove();
-    container.classList.remove("mermaid-loading");
-    container.classList.add("mermaid-error");
-    container.innerHTML =
-      '<div class="mermaid-error-msg">' +
-      escapeHtml(err.message || "Diagram error") +
-      "</div>" +
-      "<pre><code>" +
-      escapeHtml(source) +
-      "</code></pre>";
+    var msg = err && err.message ? err.message : "Diagram error";
+    _cacheMermaidEntry(_mermaidErrorCache, source, msg);
+    _applyMermaidError(container, source, msg);
     if (callback) callback();
   }
   try {
     mermaid
       .render(id, source)
       .then(function (result) {
-        container.innerHTML = result.svg;
-        container.classList.remove("mermaid-loading", "mermaid-error");
-        container.classList.add("mermaid-rendered");
-        if (result.bindFunctions) result.bindFunctions(container);
+        _cacheMermaidEntry(_mermaidSvgCache, source, result.svg);
+        _applyMermaidSvg(container, result.svg, result.bindFunctions);
         if (callback) callback();
       })
       .catch(_onError);
@@ -872,21 +910,41 @@ function _renderMermaidSequence(containers, idx) {
 function postRenderMermaid(containerEl) {
   var codeEls = containerEl.querySelectorAll("pre code.language-mermaid");
   if (codeEls.length === 0) return;
-  var containers = [];
+  var pendingContainers = [];
   for (var i = 0; i < codeEls.length; i++) {
     var pre = codeEls[i].closest("pre");
     if (!pre) continue;
     var source = codeEls[i].textContent;
     var div = document.createElement("div");
-    div.className = "mermaid-container mermaid-loading";
     div.setAttribute("data-mermaid-source", source);
-    div.textContent = "Loading diagram\u2026";
-    pre.replaceWith(div);
-    containers.push(div);
+    var cachedSvg = _mermaidSvgCache.get(source);
+    var cachedError = _mermaidErrorCache.get(source);
+    if (cachedSvg) {
+      // Cache hit — sync swap, no loading flash, no async work.
+      // Identical source produces identical SVG (mermaid is
+      // deterministic for a given init), so reusing the rendered
+      // SVG verbatim is safe across streamingRender's wholesale
+      // innerHTML replaces.
+      div.className = "mermaid-container mermaid-rendered";
+      div.innerHTML = cachedSvg;
+      pre.replaceWith(div);
+    } else if (cachedError) {
+      // Errored source — keep showing the error without thrashing
+      // mermaid.render on every streaming tick.
+      div.className = "mermaid-container mermaid-error";
+      _applyMermaidError(div, source, cachedError);
+      pre.replaceWith(div);
+    } else {
+      // Cache miss — show loading state, queue async render.
+      div.className = "mermaid-container mermaid-loading";
+      div.textContent = "Loading diagram\u2026";
+      pre.replaceWith(div);
+      pendingContainers.push(div);
+    }
   }
-  if (containers.length === 0) return;
+  if (pendingContainers.length === 0) return;
   _loadMermaid(function () {
-    _renderMermaidSequence(containers, 0);
+    _renderMermaidSequence(pendingContainers, 0);
   });
 }
 
@@ -913,17 +971,28 @@ function reRenderAllMermaid() {
 //  cycle.  renderMarkdown tolerates mid-stream partial fences / lists
 //  (they render as literal text and resolve once the closing tokens
 //  arrive), and the per-element buffer cache skips identical redundant
-//  renders (SSE retries / resumes).  postRenderMarkdown stays deferred
-//  to streamingRenderFinalize so syntax highlighting + mermaid + KaTeX
-//  don't thrash mid-stream.  renderMarkdown escapes HTML internally
-//  (see escapeHtml in utils.js); it is the trust boundary for the
-//  markup written to el below.
+//  renders (SSE retries / resumes).  hljs syntax highlighting stays
+//  deferred to streamingRenderFinalize, but mermaid runs inline on
+//  every render so closed diagram fences appear progressively as they
+//  complete (the source-keyed SVG cache makes re-renders cheap; only
+//  the first encounter with a given source pays mermaid.render).
+//  renderMarkdown escapes HTML internally (see escapeHtml in
+//  utils.js); it is the trust boundary for the markup written to el
+//  below.
 // ---------------------------------------------------------------------------
 function _streamingRenderApply(el, buffer) {
   if (el._lastRenderedBuffer === buffer) return;
   el._lastRenderedBuffer = buffer;
   var html = renderMarkdown(buffer);
   el.innerHTML = html;
+  // Progressive mermaid render — see comment above. postRenderMermaid
+  // is no-op when the element has no language-mermaid code blocks,
+  // and the source-keyed cache avoids re-invoking mermaid.render
+  // for blocks we've already rendered. Subsequent rAF ticks that
+  // re-extract the same closed fence hit the cache synchronously.
+  if (typeof postRenderMermaid === "function") {
+    postRenderMermaid(el);
+  }
 }
 
 function streamingRender(el, buffer) {
