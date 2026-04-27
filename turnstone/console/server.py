@@ -2626,6 +2626,27 @@ def _audit_coordinator_create(
     )
 
 
+def _coord_spawn_metrics(_request: Request, ui: Any) -> None:
+    """Per-spawn counter writes for coord — mirrors interactive's pattern.
+
+    Wired onto :attr:`SessionEndpointConfig.spawn_metrics`. Increments
+    ``_ws_messages`` and resets ``_ws_turn_tool_calls`` so the rich
+    ``ws_state`` cluster broadcast renders the same per-turn shape
+    coord rows on the dashboard need. Coord doesn't have a Prometheus
+    endpoint to feed (the console isn't a node), so the
+    ``_metrics.record_message_sent()`` call interactive's analog
+    fires is omitted.
+    """
+    if (
+        hasattr(ui, "_ws_lock")
+        and hasattr(ui, "_ws_messages")
+        and hasattr(ui, "_ws_turn_tool_calls")
+    ):
+        with ui._ws_lock:
+            ui._ws_messages += 1
+            ui._ws_turn_tool_calls = 0
+
+
 async def _coord_saved_loaded_lookup(request: Request) -> set[str]:
     """Return ws_ids currently held in ``coord_mgr``'s warm pool.
 
@@ -9976,10 +9997,14 @@ def create_app(
         supports_attachments=True,
         attachment_owner_resolver=_coord_attachment_owner,
         attachment_helpers=coord_attachment_helpers,
-        # No per-conversation metrics on coord — the per-UI counters
-        # interactive maintains don't have an analog on the coord
-        # dashboard. Cluster-level metrics fan out via the collector.
-        spawn_metrics=None,
+        # Per-spawn counter writes — the rich ``ws_state`` payload
+        # cluster broadcast (PR #420) reads ``_ws_messages`` and
+        # resets ``_ws_turn_tool_calls`` per turn so coord rows render
+        # the same activity / per-turn counts interactive rows do.
+        # Coord doesn't fire Prometheus metrics (the console isn't a
+        # node and has no /metrics endpoint), but the per-UI counter
+        # writes match interactive's pattern.
+        spawn_metrics=_coord_spawn_metrics,
         emit_message_queued=True,
         events_replay=_coord_events_replay,
         create_supports_attachments=True,

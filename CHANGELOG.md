@@ -17,6 +17,111 @@ Three release tracks are maintained:
 
 ### Changed
 
+- **Coordinator gains rich `ws_state` payload + live activity broadcast**
+  ([§ Post-P3 reckoning item #2 follow-up]). Pre-lift coord's
+  cluster broadcast was state-only — the dashboard's coord rows
+  showed the state column flipping but the ``tokens``,
+  ``context_ratio``, ``activity``, and per-turn ``content`` fields
+  were all hardcoded to zero / empty. The lift turns
+  ``on_status`` / ``on_content_token`` / ``on_thinking_start`` /
+  ``on_thinking_stop`` / ``on_stream_end`` / ``on_tool_result``
+  into shared bodies on :class:`SessionUIBase` so coord populates
+  the same per-ws metric fields interactive does (the fields were
+  already declared on the base; only the writes were
+  WebUI-specific). ``coord_adapter.emit_state`` now reads the UI's
+  snapshot under ``_ws_lock`` via the new
+  :meth:`SessionUIBase.snapshot_and_consume_state_payload` helper
+  and passes the rich kwargs through to
+  ``collector.emit_console_ws_state``; the cluster dashboard's
+  coord rows now render with the same tokens / activity / content /
+  context_ratio fields interactive rows do.
+
+  Three observable behaviour changes (all CHANGELOG-callout-worthy):
+
+  - **Coord persists ``usage_event`` storage rows.** Pre-lift only
+    WebUI did. The lifted ``on_status`` body unifies usage tracking
+    so governance dashboards / token-spend queries see coordinator
+    consumption alongside interactive. Operators querying
+    ``usage_event`` by ``ws_id`` will see coord rows for the first
+    time.
+  - **Coord broadcasts live activity transitions.** New
+    ``ClusterCollector.update_console_ws_activity(ws_id, *,
+    activity, activity_state)`` method (named ``update_*`` rather
+    than ``emit_*`` to flag the no-fan-out asymmetry vs. the rest
+    of the ``emit_console_ws_*`` family — it updates the in-memory
+    pseudo-node row but intentionally does NOT fan out a separate
+    SSE event). The cluster dashboard's per-ws polling reads the
+    in-memory pseudo-node row, so activity ticks land on the next
+    snapshot fetch (matches WebUI's behaviour where activity
+    events are observational; not fanned out through the cluster
+    SSE stream).
+  - **Cluster ``cluster_state`` events for coord rows now carry
+    non-zero ``tokens`` / ``content`` fields.** Frontend rendering
+    that conditionally hid these on coord rows can drop the
+    branch.
+
+  Architecture changes:
+
+  - ``_MAX_TURN_CONTENT_CHARS`` moved from ``turnstone.server`` to
+    ``turnstone.core.session_ui_base`` so coord enforces the same
+    per-turn content cap interactive does.
+  - WebUI keeps ``on_status`` / ``on_tool_result`` / ``on_error``
+    overrides that layer Prometheus ``_metrics.record_*`` calls
+    (node-only) on top of the shared body via ``super()`` — the
+    Prometheus surface stays node-scoped (the console isn't a
+    node and has no /metrics endpoint).
+  - ``ConsoleCoordinatorUI`` adds a ``_broadcast_activity``
+    override that fans out via the cluster collector instead of
+    the global SSE queue (which is node-only on interactive).
+  - ``coord_endpoint_config`` wires a new ``_coord_spawn_metrics``
+    hook (mirrors interactive's) so the per-spawn ``_ws_messages``
+    increment + ``_ws_turn_tool_calls`` reset happen on coord too.
+
+  Test additions: 23 new tests in ``tests/test_coord_rich_ws_state_payload.py``
+  pin the per-ws metric writes (status, content accumulation,
+  activity tracking, tool-result counters, stream-end activity
+  clear), the snapshot helper's IDLE/ERROR drain semantics +
+  single-lock-acquisition guarantee, the adapter's rich-payload
+  pass-through + defensive None-UI handling, the activity
+  broadcast (collector wire + failure swallow + no-op-when-
+  collector-unset + dedup against last-emitted state), the
+  spawn_metrics hook, and a concurrent-writes-during-snapshot
+  stress case (cycles through running / idle / error so the
+  drain branches actually run against a concurrent writer).
+  Plus WebUI-override regression tests confirming
+  ``_metrics.record_*`` still fires on top of the lifted bodies.
+  Existing ``tests/test_webui_content.py`` updated to import
+  ``_MAX_TURN_CONTENT_CHARS`` from its new home in
+  ``turnstone.core.session_ui_base``;
+  ``tests/test_coordinator_adapter.py`` updated to expect the
+  rich-payload kwargs (``tokens=0`` defaults) on
+  ``emit_console_ws_state``.
+
+  Two deferred follow-ups (out-of-scope for this lift,
+  flagged for tracking):
+
+  - **Synchronous ``record_usage_event`` INSERT on coord worker
+    thread.** The lifted ``on_status`` body persists usage rows on
+    every provider response — same shape WebUI uses, but coord
+    workers can fire multi-step plan/task agent loops where each
+    response blocks the worker for a write transaction. Parity
+    with WebUI is the explicit goal here; if coord throughput
+    becomes a concern, batch usage_event writes onto a background
+    flusher thread (one batch INSERT per N events / per K ms) on
+    both kinds.
+  - **Coord assistant turn content now flows on the cluster SSE
+    stream (``/v1/api/cluster/events``).** Pre-lift the broadcast
+    was ``content=""``; post-lift it carries the joined assistant
+    output. The cluster SSE stream has no per-user filter today —
+    extends an existing cross-tenant exposure (interactive
+    ``cluster_state`` events already carry content) to a
+    previously-empty channel (coord rows). Proper fix needs the
+    SSE endpoint gated on ``admin.cluster.inspect`` (matching
+    ``/v1/api/cluster/ws/{ws_id}/detail``) or per-listener
+    user_id filtering. Tracked as a separate security-tightening
+    project; not gating this lift since it inherits an existing
+    exposure rather than introducing a new mechanism.
+
 - **`history` / `detail` verb bodies lifted across both kinds**
   ([Stage 2 Verb Lift — `history` / `detail`]). The coord
   ``GET /v1/api/workstreams/{ws_id}/history`` and

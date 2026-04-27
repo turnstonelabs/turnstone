@@ -2,14 +2,26 @@
 
 Mirrors ``turnstone.server.WebUI`` but scoped to the console's needs:
 
-- Per-session SSE listener fan-out (same ``threading.Lock`` + queue list
-  pattern as WebUI).
+- Per-session SSE listener fan-out (inherited from
+  :class:`SessionUIBase` — same ``threading.Lock`` + queue list
+  pattern WebUI uses).
 - ``threading.Event`` + ``_approval_result`` / ``_plan_result`` for
   blocking the worker thread until a console endpoint delivers the
-  decision.
-- No global broadcast channel and no per-node metrics — the console is
-  not a node.  Dashboard aggregation for coordinator sessions lands in
-  Phase D; here we only emit events the one-pane UI consumes.
+  decision (inherited).
+- Per-ws metric tracking + turn-content accumulator + activity
+  bookkeeping (inherited from :class:`SessionUIBase` post the rich
+  ``ws_state`` payload lift). Coord populates the same
+  ``_ws_prompt_tokens`` / ``_ws_context_ratio`` /
+  ``_ws_current_activity`` fields interactive does, and
+  ``coord_adapter.emit_state`` reads them under lock to broadcast
+  the rich payload to the cluster collector.
+- No global SSE broadcast channel — the console isn't a node and
+  has no ``/v1/api/events/global`` analog. State + activity
+  broadcasts route through the cluster collector instead
+  (``coord_adapter.emit_state`` for state changes;
+  :meth:`_broadcast_activity` override for live activity ticks).
+- No per-node Prometheus metrics — the console has no /metrics
+  endpoint. WebUI's ``_metrics.record_*`` calls don't apply here.
 
 Contract: this class must conform to :class:`turnstone.core.session.SessionUI`.
 """
@@ -59,22 +71,19 @@ class ConsoleCoordinatorUI(SessionUIBase):
 
     # ------------------------------------------------------------------
     # SessionUI protocol — streaming
+    #
+    # ``on_thinking_start`` / ``on_thinking_stop`` / ``on_reasoning_token``
+    # / ``on_content_token`` / ``on_stream_end`` / ``on_tool_output_chunk``
+    # / ``on_tool_result`` / ``on_status`` / ``on_info`` / ``on_error``
+    # are inherited from :class:`SessionUIBase`. The lifted bodies do
+    # the per-ws metric writes the rich ``ws_state`` cluster broadcast
+    # reads (``_ws_prompt_tokens`` / ``_ws_context_ratio`` /
+    # ``_ws_current_activity`` / ``_ws_turn_content``); the cluster
+    # collector then renders coord rows on the dashboard with the same
+    # tokens / activity / content fields interactive rows have. Pre-lift
+    # coord populated none of these — the dashboard's coord row showed
+    # state-only.
     # ------------------------------------------------------------------
-
-    def on_thinking_start(self) -> None:
-        self._enqueue({"type": "thinking_start"})
-
-    def on_thinking_stop(self) -> None:
-        self._enqueue({"type": "thinking_stop"})
-
-    def on_reasoning_token(self, text: str) -> None:
-        self._enqueue({"type": "reasoning", "text": text})
-
-    def on_content_token(self, text: str) -> None:
-        self._enqueue({"type": "content", "text": text})
-
-    def on_stream_end(self) -> None:
-        self._enqueue({"type": "stream_end"})
 
     # ------------------------------------------------------------------
     # SessionUI protocol — approvals
@@ -161,52 +170,69 @@ class ConsoleCoordinatorUI(SessionUIBase):
     # ``resolve_plan`` inherited from :class:`SessionUIBase`.
 
     # ------------------------------------------------------------------
-    # SessionUI protocol — tool results + status + misc
+    # SessionUI protocol — broadcast hook + state change + rename
     # ------------------------------------------------------------------
 
-    def on_tool_result(
-        self,
-        call_id: str,
-        name: str,
-        output: str,
-        *,
-        is_error: bool = False,
-    ) -> None:
-        event: dict[str, Any] = {
-            "type": "tool_result",
-            "call_id": call_id,
-            "name": name,
-            "output": output,
-        }
-        if is_error:
-            event["is_error"] = True
-        self._enqueue(event)
+    def _broadcast_activity(self) -> None:
+        """Fan a current-activity snapshot out to the cluster collector.
 
-    def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:
-        self._enqueue({"type": "tool_output_chunk", "call_id": call_id, "chunk": chunk})
+        Overrides the no-op base hook on :class:`SessionUIBase`. The
+        lifted streaming bodies (``on_thinking_start`` /
+        ``on_tool_result`` / ``on_stream_end``) call this whenever
+        ``_ws_current_activity`` flips, so the cluster dashboard's
+        coord rows show live activity transitions between state
+        changes the same way interactive rows do. Reads under
+        ``_ws_lock`` for snapshot consistency with the worker
+        thread's writes; collector failure is logged at debug —
+        activity broadcast is observational, never block the worker.
 
-    def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None:
-        total = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
-        pct = round(total / context_window * 100, 1) if context_window > 0 else 0
-        self._enqueue(
-            {
-                "type": "status",
-                "prompt_tokens": usage.get("prompt_tokens", 0),
-                "completion_tokens": usage.get("completion_tokens", 0),
-                "total_tokens": total,
-                "context_window": context_window,
-                "pct": pct,
-                "effort": effort,
-                "cache_creation_tokens": usage.get("cache_creation_tokens", 0),
-                "cache_read_tokens": usage.get("cache_read_tokens", 0),
-            }
-        )
-
-    def on_info(self, message: str) -> None:
-        self._enqueue({"type": "info", "message": message})
-
-    def on_error(self, message: str) -> None:
-        self._enqueue({"type": "error", "message": message})
+        Dedups back-to-back identical activity ticks against the
+        last-emitted ``(activity, activity_state)`` tuple. A
+        tool-heavy turn fires many ``on_tool_result`` calls in
+        succession that all clear the activity to ``("", "")``;
+        without this dedup each one acquires the cluster collector's
+        main lock for a no-op write. (Pre-lift coord didn't broadcast
+        activity at all, so this is genuinely new contention worth
+        gating.) The dedup state is updated **only after a successful
+        collector call** — if the collector raises mid-broadcast,
+        the next identical tick must retry instead of being silently
+        suppressed (otherwise a transient collector failure would
+        strand the dashboard's coord row at the pre-failure activity
+        until the activity actually changes).
+        """
+        collector = ConsoleCoordinatorUI._collector
+        if collector is None:
+            return
+        with self._ws_lock:
+            activity = self._ws_current_activity
+            activity_state = self._ws_activity_state
+            current = (activity, activity_state)
+            if current == self._last_broadcast_activity:
+                return
+        try:
+            collector.update_console_ws_activity(
+                self.ws_id,
+                activity=activity,
+                activity_state=activity_state,
+            )
+        except Exception:
+            log.debug(
+                "coord_ui.activity_fanout_failed ws=%s",
+                self.ws_id,
+                exc_info=True,
+            )
+            return
+        # Update dedup state only on successful broadcast so a
+        # transient collector failure doesn't suppress the next
+        # identical tick's retry. Re-acquire the lock briefly —
+        # the worker thread is the only writer to
+        # ``_last_broadcast_activity``, so the only race is with
+        # another concurrent ``_broadcast_activity`` that just
+        # took the same snapshot; whichever lands the assignment
+        # last wins, and both correspond to the same broadcast
+        # tuple anyway.
+        with self._ws_lock:
+            self._last_broadcast_activity = current
 
     def on_state_change(self, state: str) -> None:
         # Flow state transitions through the unified SessionManager so

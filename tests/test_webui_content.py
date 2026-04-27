@@ -137,7 +137,9 @@ class TestContentAccumulation:
 
     def test_content_cap_prevents_unbounded_growth(self):
         """Content exceeding the cap should stop accumulating."""
-        from turnstone.server import _MAX_TURN_CONTENT_CHARS
+        # Constant lifted from turnstone.server to turnstone.core.session_ui_base
+        # in the rich ws_state payload work so coord enforces the same ceiling.
+        from turnstone.core.session_ui_base import _MAX_TURN_CONTENT_CHARS
 
         ui = _make_ui()
         # Fill to capacity

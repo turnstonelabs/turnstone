@@ -88,11 +88,21 @@ def test_emit_created_calls_collector_with_coord_fields() -> None:
 
 
 def test_emit_state_calls_collector_state() -> None:
+    """Post-rich-payload, emit_state passes tokens / context_ratio /
+    activity / activity_state / content kwargs read from ws.ui's
+    snapshot. Default values (zeros / empty strings) when the UI
+    hasn't recorded any per-ws metrics yet."""
     adapter, collector = _make_adapter()
     ws = _make_ws()
     adapter.emit_state(ws, WorkstreamState.RUNNING)
     collector.emit_console_ws_state.assert_called_once_with(
-        "coord-1", WorkstreamState.RUNNING.value
+        "coord-1",
+        WorkstreamState.RUNNING.value,
+        tokens=0,
+        context_ratio=0.0,
+        activity="",
+        activity_state="",
+        content="",
     )
 
 
