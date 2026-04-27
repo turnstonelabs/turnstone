@@ -2519,6 +2519,20 @@ def _coord_events_replay(
     pending_approval = getattr(ui, "_pending_approval", None)
     if pending_approval is not None:
         yield pending_approval
+        # Cached LLM verdicts that fired since the approval prompt
+        # — without this replay, a reconnecting / refreshing tab
+        # sees the approve_request prompt but no judge chip, and
+        # since intent_verdict only fires once per call_id (no
+        # push to a late subscriber), the chip would never appear
+        # until the operator re-invokes the action. Mirrors the
+        # interactive path at ``turnstone/server.py:875-878``.
+        llm_verdicts = getattr(ui, "_llm_verdicts", None)
+        ws_lock = getattr(ui, "_ws_lock", None)
+        if llm_verdicts and ws_lock is not None:
+            with ws_lock:
+                cached_verdicts = list(llm_verdicts.values())
+            for v in cached_verdicts:
+                yield {"type": "intent_verdict", **v}
     pending_plan = getattr(ui, "_pending_plan_review", None)
     if pending_plan is not None:
         yield pending_plan
