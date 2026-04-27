@@ -482,6 +482,7 @@ class SharedSessionVerbHandlers:
     # Per-``{ws_id}`` interaction (coord shape today; interactive
     # adopts these in Priority 1's worker dispatch unification)
     send: Handler | None = None  # POST {prefix}/{ws_id}/send
+    dequeue: Handler | None = None  # DELETE {prefix}/{ws_id}/send
     approve: Handler | None = None  # POST {prefix}/{ws_id}/approve
     plan: Handler | None = None  # POST {prefix}/{ws_id}/plan
     cancel: Handler | None = None  # POST {prefix}/{ws_id}/cancel
@@ -566,6 +567,8 @@ def register_session_routes(
         routes.append(Route(f"{p}/{{ws_id}}/title", handlers.set_title, methods=["POST"]))
     if handlers.send is not None:
         routes.append(Route(f"{p}/{{ws_id}}/send", handlers.send, methods=["POST"]))
+    if handlers.dequeue is not None:
+        routes.append(Route(f"{p}/{{ws_id}}/send", handlers.dequeue, methods=["DELETE"]))
     if handlers.approve is not None:
         routes.append(Route(f"{p}/{{ws_id}}/approve", handlers.approve, methods=["POST"]))
     if handlers.plan is not None:

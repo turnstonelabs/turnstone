@@ -119,6 +119,34 @@ def test_attachment_routes_mount_when_quartet_provided() -> None:
     ) in paths
 
 
+def test_send_mounts_post_and_delete_when_dequeue_provided() -> None:
+    """``handlers.send`` mounts POST {prefix}/{ws_id}/send and
+    ``handlers.dequeue`` mounts DELETE on the same path. The two
+    routes register as separate ``Route`` entries with disjoint
+    method sets — Starlette dispatches by (path, method)."""
+    routes: list[Any] = []
+    register_session_routes(
+        routes,
+        prefix="/api/workstreams",
+        handlers=SharedSessionVerbHandlers(send=_stub, dequeue=_stub),
+    )
+    paths = {(p, m) for p, m in _route_paths(routes)}
+    assert ("/api/workstreams/{ws_id}/send", frozenset({"POST"})) in paths
+    assert ("/api/workstreams/{ws_id}/send", frozenset({"DELETE"})) in paths
+
+    # ``dequeue`` is independent of ``send`` — providing it alone
+    # mounts only the DELETE half (no POST regression).
+    routes_dequeue_only: list[Any] = []
+    register_session_routes(
+        routes_dequeue_only,
+        prefix="/api/workstreams",
+        handlers=SharedSessionVerbHandlers(dequeue=_stub),
+    )
+    paths_dequeue_only = {(p, m) for p, m in _route_paths(routes_dequeue_only)}
+    assert ("/api/workstreams/{ws_id}/send", frozenset({"DELETE"})) in paths_dequeue_only
+    assert ("/api/workstreams/{ws_id}/send", frozenset({"POST"})) not in paths_dequeue_only
+
+
 def test_close_legacy_mounts_when_handler_provided() -> None:
     """The legacy body-keyed close (``POST {prefix}/close``) mounts
     when ``handlers.close_legacy`` is non-``None`` — there is no

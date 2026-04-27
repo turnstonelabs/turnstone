@@ -3556,6 +3556,7 @@ def create_app(
             refresh_title=refresh_workstream_title,
             set_title=set_workstream_title,
             send=send_handler,  # lifted: shared body (P1.5)
+            dequeue=dequeue_handler,  # lifted (P1.5) — DELETE /send
             approve=approve_handler,  # lifted: shared body
             cancel=cancel_handler,  # lifted: shared body
             events=events_handler,  # lifted: shared body
