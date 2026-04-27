@@ -696,7 +696,8 @@ def test_delete_emits_closed_with_reason_deleted() -> None:
     ws = mgr.create(user_id="u1", name="will-be-deleted")
     ws_id = ws.id
 
-    assert mgr.delete(ws_id) is True
+    deleted = mgr.delete(ws_id)
+    assert deleted is True
     # In-memory slot released — capacity restored just like close.
     assert mgr.get(ws_id) is None
     # Closed event fired with the deletion reason.

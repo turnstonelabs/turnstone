@@ -73,14 +73,14 @@ def _inject_storage(storage):
 
 @pytest.fixture
 def delete_client(_inject_storage):
-    """Yield ``(TestClient, Starlette app)`` for the delete endpoint.
+    """Return ``(TestClient, Starlette app)`` for the delete endpoint.
 
     ``app.state.auth_storage`` is pre-attached so the endpoint's
     pre-delete snapshot block runs (without it the snapshot is
     skipped and the lifecycle event lands with ``name=""``).  Tests
     that need a wired manager attach ``app.state.workstreams = mgr``
-    after the yield; tests that don't care just ignore the second
-    tuple member.
+    on the returned app; tests that don't care just ignore the
+    second tuple member.
     """
     app = Starlette(
         routes=[

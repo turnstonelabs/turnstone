@@ -2179,15 +2179,18 @@ async def delete_workstream_endpoint(request: Request) -> JSONResponse:
     name: str = ""
     _, ip = _audit_context(request)
     try:
-        # Snapshot kind/parent/name for the audit record + lifecycle
-        # event before the delete wipes the row.  Inside the try so a
-        # transient storage error surfaces through the endpoint's
-        # redacted 500 handler below rather than as an unhandled
-        # exception.  ``name`` is forwarded to ``mgr.delete`` so the
-        # ``ws_closed`` event payload carries the same field other
-        # terminal transitions emit (interactive operators see the
-        # name in close toasts; coord-side ``child_ws_closed`` ignores
-        # it but the global queue contract is uniform).
+        # Snapshot row fields before the delete wipes the row.  Inside
+        # the try so a transient storage error surfaces through the
+        # endpoint's redacted 500 handler below rather than as an
+        # unhandled exception.  ``kind`` / ``parent_ws_id`` go into the
+        # audit record; ``name`` is forwarded ONLY to ``mgr.delete`` so
+        # the ``ws_closed`` event payload carries the same field other
+        # terminal transitions emit (interactive operators see the name
+        # in close toasts; coord-side ``child_ws_closed`` ignores it
+        # but the global queue contract is uniform).  ``name`` is
+        # deliberately NOT in the audit detail — display names can be
+        # long / operator-noisy and aren't needed for forensic recall
+        # (ws_id + kind + parent are enough).
         if storage is not None:
             row = storage.get_workstream(ws_id) or {}
             kind = row.get("kind", "")
