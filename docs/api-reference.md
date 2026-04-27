@@ -919,7 +919,21 @@ closed.
 |-----------|--------|----------|------------------------|
 | `ws_id`   | string | yes      | Workstream ID to close |
 
-The body is empty (or `{}`).
+**Request body:**
+
+The body must be valid JSON. If you are not supplying any optional
+fields, send `{}` — an empty / non-JSON body is rejected with a
+`400`.
+
+| Field    | Type   | Required | Description                                              |
+|----------|--------|----------|----------------------------------------------------------|
+| `reason` | string | no       | Optional close reason persisted to `workstream_config`.  |
+
+The `reason` is capped at **512 UTF-8 bytes** (multibyte-safe — the
+cap holds for CJK and emoji payloads), and the output guard's
+credential-redaction pass strips secrets before the value is
+persisted. A non-string `reason` is silently coerced to empty and
+the close proceeds without writing the field.
 
 **Response (success):**
 

@@ -127,6 +127,16 @@
             }
           }
         ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloseWorkstreamRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Success",
@@ -2213,6 +2223,26 @@
           "name"
         ],
         "title": "CreateWorkstreamResponse",
+        "type": "object"
+      },
+      "CloseWorkstreamRequest": {
+        "description": "Body for ``POST /v1/api/workstreams/{ws_id}/close``.\n\nThe body must be valid JSON; send ``{}`` when omitting all\nfields. Pre-1.5 the model also carried a body-keyed ``ws_id``;\n1.5 moved that to the path so the body shrinks to the optional\n``reason``. Coord ignores the body entirely (its close handler\nis wired ``supports_close_reason=False``).",
+        "properties": {
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional close reason persisted to ``workstream_config`` for postmortem. Capped at 512 UTF-8 bytes server-side; credential-redaction is applied via the output guard.",
+            "title": "Reason"
+          }
+        },
+        "title": "CloseWorkstreamRequest",
         "type": "object"
       },
       "ListWorkstreamsResponse": {

@@ -107,6 +107,32 @@ async def test_close_workstream():
         assert resp.status == "ok"
 
 
+@pytest.mark.anyio
+async def test_close_workstream_sends_valid_json_body():
+    """The interactive close handler reads the body via
+    ``read_json_or_400`` (``supports_close_reason=True``), so a missing
+    or non-JSON body 400s.  Regression-lock that the SDK never sends
+    an empty body.  ``request.json()`` raises ``ValueError`` on empty
+    bytes; this handler asserts the SDK actually transmitted a JSON
+    object."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["content"] = bytes(request.content)
+        captured["body"] = json.loads(request.content) if request.content else None
+        return httpx.Response(200, json={"status": "ok"})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneServer(httpx_client=hc)
+        # Default call (no reason) — body must still be valid JSON.
+        await client.close_workstream("ws1")
+        assert captured["body"] == {}
+        # With reason — field round-trips.
+        await client.close_workstream("ws1", reason="task complete")
+        assert captured["body"] == {"reason": "task complete"}
+
+
 # ---------------------------------------------------------------------------
 # Chat interaction
 # ---------------------------------------------------------------------------

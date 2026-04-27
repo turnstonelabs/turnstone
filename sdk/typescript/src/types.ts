@@ -161,6 +161,15 @@ export interface CreateWorkstreamResponse {
   attachment_ids?: string[];
 }
 
+export interface CloseWorkstreamRequest {
+  /**
+   * Optional close reason persisted to `workstream_config` for
+   * postmortem. Capped at 512 UTF-8 bytes server-side; credential
+   * redaction is applied via the output guard.
+   */
+  reason?: string;
+}
+
 export interface WorkstreamInfo {
   // Renamed `id` → `ws_id` and added kind/parent_ws_id/user_id in
   // the Stage 2 list-verb lift. Pre-1.5 readers branching on

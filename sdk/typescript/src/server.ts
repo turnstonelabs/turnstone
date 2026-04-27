@@ -93,11 +93,16 @@ export class TurnstoneServer extends BaseClient {
     });
   }
 
-  async closeWorkstream(wsId: string): Promise<StatusResponse> {
+  async closeWorkstream(
+    wsId: string,
+    opts?: { reason?: string },
+  ): Promise<StatusResponse> {
+    const body: Record<string, unknown> = {};
+    if (opts?.reason !== undefined) body.reason = opts.reason;
     return this.request(
       "POST",
       `/v1/api/workstreams/${encodeURIComponent(wsId)}/close`,
-      { json: {} },
+      { json: body },
     );
   }
 

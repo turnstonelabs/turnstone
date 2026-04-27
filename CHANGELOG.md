@@ -38,8 +38,9 @@ Three release tracks are maintained:
   Calls to the old URLs return **404** on 1.5.0+. Bodies on the new
   URLs no longer carry ``ws_id`` (the path provides it); the
   ``SendRequest`` / ``ApproveRequest`` / ``CancelRequest`` Pydantic
-  schemas drop the field, and ``CloseWorkstreamRequest`` is removed
-  outright (its only field was ``ws_id``).
+  schemas drop the field, and ``CloseWorkstreamRequest`` slims to a
+  single optional ``reason`` field (the body is still required to be
+  valid JSON — send ``{}`` when omitting all fields).
 
   ``/v1/api/plan`` and ``/v1/api/command`` are unaffected and remain
   body-keyed in this release. The bundled web UI, channel adapters,

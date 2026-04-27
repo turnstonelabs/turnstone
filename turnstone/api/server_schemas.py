@@ -176,6 +176,26 @@ class CreateWorkstreamResponse(BaseModel):
     )
 
 
+class CloseWorkstreamRequest(BaseModel):
+    """Body for ``POST /v1/api/workstreams/{ws_id}/close``.
+
+    The body must be valid JSON; send ``{}`` when omitting all
+    fields. Pre-1.5 the model also carried a body-keyed ``ws_id``;
+    1.5 moved that to the path so the body shrinks to the optional
+    ``reason``. Coord ignores the body entirely (its close handler
+    is wired ``supports_close_reason=False``).
+    """
+
+    reason: str | None = Field(
+        default=None,
+        description=(
+            "Optional close reason persisted to ``workstream_config`` "
+            "for postmortem. Capped at 512 UTF-8 bytes server-side; "
+            "credential-redaction is applied via the output guard."
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # List / dashboard
 # ---------------------------------------------------------------------------

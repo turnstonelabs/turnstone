@@ -84,6 +84,7 @@ export type {
   CommandRequest,
   CreateWorkstreamRequest,
   CreateWorkstreamResponse,
+  CloseWorkstreamRequest,
   WorkstreamInfo,
   ListWorkstreamsResponse,
   DashboardWorkstream,

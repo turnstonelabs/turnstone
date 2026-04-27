@@ -180,10 +180,14 @@ class AsyncTurnstoneServer(_BaseClient):
             response_model=CreateWorkstreamResponse,
         )
 
-    async def close_workstream(self, ws_id: str) -> StatusResponse:
+    async def close_workstream(self, ws_id: str, *, reason: str | None = None) -> StatusResponse:
+        body: dict[str, Any] = {}
+        if reason is not None:
+            body["reason"] = reason
         return await self._request(
             "POST",
             f"/v1/api/workstreams/{ws_id}/close",
+            json_body=body,
             response_model=StatusResponse,
         )
 
@@ -618,8 +622,8 @@ class TurnstoneServer:
             )
         )
 
-    def close_workstream(self, ws_id: str) -> StatusResponse:
-        return self._runner.run(self._async.close_workstream(ws_id))
+    def close_workstream(self, ws_id: str, *, reason: str | None = None) -> StatusResponse:
+        return self._runner.run(self._async.close_workstream(ws_id, reason=reason))
 
     # -- chat interaction ----------------------------------------------------
 
