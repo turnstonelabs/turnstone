@@ -2308,7 +2308,22 @@ async def _proxy_sse(
     sse_auth: dict[str, str]
     if use_service_auth:
         proxy_token_mgr = getattr(request.app.state, "proxy_token_mgr", None)
-        sse_auth = dict(proxy_token_mgr.bearer_header) if proxy_token_mgr is not None else {}
+        if proxy_token_mgr is None:
+            # Fail fast on misconfig — without a service token the
+            # upstream 401/403s on every request and the browser's
+            # EventSource auto-retries forever, filling logs.
+            # Surface as 503 so the operator sees a single clear
+            # signal instead of a retry storm.
+            log.error(
+                "proxy.sse.no_service_token url=%s — proxy_token_mgr "
+                "not configured; events/global proxy unavailable",
+                target,
+            )
+            return JSONResponse(
+                {"error": "console service token unavailable"},
+                status_code=503,
+            )
+        sse_auth = dict(proxy_token_mgr.bearer_header)
     else:
         sse_auth = _proxy_auth_headers(request)
 

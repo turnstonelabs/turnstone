@@ -114,5 +114,8 @@ def test_coordinator_js_exposes_inline_approval_helpers():
     # node and never pushes a signal that reaches the coord, so
     # the row's pending_approval_detail with judge_pending=true
     # would freeze on heuristic verdicts forever without this
-    # poll loop.
-    assert "_maybePollForJudgeVerdict" in body
+    # poll loop. The poller is GLOBAL (not per-row) so off-screen
+    # rows still refresh — a per-row poller's scheduleLiveFetch
+    # call short-circuits on non-visible rows, leaving them stuck.
+    assert "_maybeStartJudgePoll" in body
+    assert "_judgePollTick" in body
