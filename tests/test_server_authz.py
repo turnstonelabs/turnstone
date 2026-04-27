@@ -105,8 +105,13 @@ class _FakeUI:
                     "judge_verdict": verdicts.get(cid),
                 }
             )
+        # Primary call_id must mirror the real serializer: first
+        # *non-empty* in list order, not just first. Aligning the
+        # fake here keeps test-vs-prod behavioural drift from
+        # masking a real-shape regression.
+        primary = next((cid for cid in call_ids if cid), "")
         return {
-            "call_id": call_ids[0] if call_ids else "",
+            "call_id": primary,
             "judge_pending": bool(pending.get("judge_pending", False)),
             "items": serialized,
         }

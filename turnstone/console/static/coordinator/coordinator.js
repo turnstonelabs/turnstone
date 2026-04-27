@@ -685,8 +685,13 @@
         // a row whose approval was resolved elsewhere; the next
         // scheduleLiveFetch from loadChildren's finally branch
         // (which fires for every visible row) repopulates with
-        // authoritative state.
-        liveBadgeCache.clear();
+        // authoritative state. Preserve `permanent: true` entries
+        // (set on 403/404 — denied by permission/identity, not by
+        // state) so a user lacking admin.cluster.inspect doesn't
+        // pay one 403 per denied id on every reconnect.
+        for (const [id, c] of liveBadgeCache) {
+          if (!c || !c.permanent) liveBadgeCache.delete(id);
+        }
       }
     };
     evtSource.onerror = function () {
@@ -1140,14 +1145,31 @@
   // emit None when no items).  Stays DOM-method-only to match the
   // zero-innerHTML XSS posture of the rest of the row template.
   // Risk-level → numeric severity for max-across-items computation.
-  // Values are ordinal: higher integer = higher severity. Unknown
-  // levels rank as "low" so the pill defaults to the safest reading.
-  const RISK_SEVERITY = { low: 0, medium: 1, med: 1, high: 2, crit: 3 };
+  // Values are ordinal: higher integer = higher severity. Both "crit"
+  // and "critical" map to 3 because production emitters disagree:
+  // turnstone/core/judge.py validates against ('low','medium','high',
+  // 'critical') and the heuristic seeds emit the full word, but
+  // earlier dock UI history used the abbreviation. Accept both.
+  // Unknown / malformed risk_level falls back to "high" rank so a
+  // schema drift fails *safe* (over-alert) rather than silently
+  // downgrading to a green pill — fixes the failure mode where
+  // "critical" was treated as unknown and rendered as low.
+  const RISK_SEVERITY = {
+    low: 0,
+    medium: 1,
+    med: 1,
+    high: 2,
+    crit: 3,
+    critical: 3,
+  };
+  const UNKNOWN_RISK_RANK = 2; // fail-safe: treat unknown as "high"
 
   function _riskRank(verdict) {
     if (!verdict) return -1;
     const risk = (verdict.risk_level || "").toLowerCase();
-    return RISK_SEVERITY[risk] != null ? RISK_SEVERITY[risk] : 0;
+    return RISK_SEVERITY[risk] != null
+      ? RISK_SEVERITY[risk]
+      : UNKNOWN_RISK_RANK;
   }
 
   // Pick the item carrying the highest risk_level — pill colour and
@@ -1223,7 +1245,12 @@
     const judge = severityItem.judge_verdict || null;
     const heuristic = severityItem.heuristic_verdict || null;
     const verdict = judge || heuristic;
-    const judgePending = !!detail.judge_pending && !judge;
+    // Pending pill should only show when there's *no* verdict to
+    // display — if a heuristic verdict is already present, the body
+    // renders intent_summary/reasoning from it and a "judge running"
+    // pill would contradict that. Only the judge-tier upgrade is
+    // genuinely pending; the heuristic itself is already final.
+    const judgePending = !!detail.judge_pending && !verdict;
     // Tool-policy denial detection — any item with .error set and
     // !needs_approval is server-blocked. Drives a banner instead of
     // buttons (clicking either would no-op since the call won't run).
@@ -1255,14 +1282,20 @@
       pill.textContent = "(judge unavailable)";
     } else if (verdict) {
       const risk = (verdict.risk_level || "").toLowerCase();
+      // Map verdict.risk_level → CSS class. Production emitters use
+      // both "crit" and "critical"; pills.css only defines .risk.crit
+      // so collapse the alias here. Unknown risk falls back to .high
+      // (matching UNKNOWN_RISK_RANK) — fail-safe over-alert.
       const riskCls =
-        risk === "crit"
+        risk === "crit" || risk === "critical"
           ? "crit"
           : risk === "high"
             ? "high"
             : risk === "medium" || risk === "med"
               ? "med"
-              : "low";
+              : risk === "low"
+                ? "low"
+                : "high";
       pill.classList.add("risk", riskCls);
       const conf = verdict.confidence;
       const confStr = typeof conf === "number" ? " " + conf.toFixed(2) : "";
@@ -1318,18 +1351,21 @@
     const evidence =
       verdict && Array.isArray(verdict.evidence) ? verdict.evidence : [];
     if (reasoning || evidence.length > 0 || items.length > 1) {
-      if (reasoning || evidence.length > 0) {
+      // Reasoning teaser line \u2014 only rendered when reasoning is
+      // present. Evidence-only is also possible (heuristic-only path
+      // can carry evidence with no prose); evidence falls into the
+      // disclosure below. Without this guard, an evidence-only
+      // verdict would append an empty <div class="approval-reasoning">.
+      if (reasoning) {
         const reasonLine = document.createElement("div");
         reasonLine.className = "approval-reasoning";
-        if (reasoning) {
-          const lead = document.createElement("span");
-          lead.className = "approval-reasoning-lead";
-          lead.textContent = "\u21b3 judge: ";
-          reasonLine.appendChild(lead);
-          const text = document.createElement("span");
-          text.textContent = reasoning;
-          reasonLine.appendChild(text);
-        }
+        const lead = document.createElement("span");
+        lead.className = "approval-reasoning-lead";
+        lead.textContent = "\u21b3 judge: ";
+        reasonLine.appendChild(lead);
+        const text = document.createElement("span");
+        text.textContent = reasoning;
+        reasonLine.appendChild(text);
         block.appendChild(reasonLine);
       }
       // Auto-expand for high/crit risk, recommendation=deny, or a
@@ -1344,7 +1380,11 @@
       const longPreview = previewLines > 4;
       const longReasoning = reasoning && reasoning.length > 240;
       const autoExpand =
-        risk === "high" || risk === "crit" || rec === "deny" || longPreview;
+        risk === "high" ||
+        risk === "crit" ||
+        risk === "critical" ||
+        rec === "deny" ||
+        longPreview;
       if (evidence.length > 0 || longReasoning || items.length > 1) {
         const disclosure = document.createElement("details");
         disclosure.className = "approval-disclosure";
@@ -1460,6 +1500,14 @@
         // Stale call_id \u2014 server has rolled to a new round (or
         // resolved already).  Force-refresh the row's live block
         // so the new pending_approval_detail surfaces (or clears).
+        // Re-enable the buttons here too: the urgent fetch is
+        // best-effort (could 5xx / network-fail), and a row whose
+        // approval truly *was* resolved elsewhere is about to be
+        // re-rendered from authoritative state \u2014 leaving the
+        // buttons disabled would strand the operator if the fetch
+        // also fails.
+        denyBtn.disabled = false;
+        approveBtn.disabled = false;
         invalidateLiveBadge(targetWsId);
         scheduleLiveFetch(targetWsId, { urgent: true });
         if (typeof toast !== "undefined" && toast.warn) {
@@ -1713,6 +1761,11 @@
   const LIVE_BADGE_BULK_FLUSH_MS = LIVE_BADGE_DEBOUNCE_MS;
   const pendingLiveIds = new Set();
   let liveBadgeFlushTimer = null;
+  // Urgent-flush coalesce flag — N urgent calls in the same JS tick
+  // would otherwise issue N single-id bulk fetches (bulk endpoint
+  // accepts up to LIVE_BADGE_BULK_CAP ids per request). queueMicrotask
+  // batches them into one request that drains pendingLiveIds.
+  let urgentFlushScheduled = false;
 
   function scheduleLiveFetch(childWsId, opts) {
     if (!childWsId) return;
@@ -1745,16 +1798,29 @@
     }
     if (!WS_ID_RE.test(childWsId)) return;
     pendingLiveIds.add(childWsId);
-    // Urgent: cancel the pending debounce and flush immediately.
-    // Other ids in the batch ride along on the same flush — the
-    // bulk endpoint dedups by ws_id so the urgent caller doesn't
-    // pay extra cost for them.
+    // Urgent: cancel the pending debounce and schedule a flush on
+    // the next microtask so N urgent calls in the same tick coalesce
+    // into one bulk request. Without the microtask hop, each urgent
+    // caller would drain pendingLiveIds with a single id and fire a
+    // separate fetch — defeating the bulk endpoint that accepts up
+    // to LIVE_BADGE_BULK_CAP ids per request.
     if (urgent) {
       if (liveBadgeFlushTimer !== null) {
         clearTimeout(liveBadgeFlushTimer);
         liveBadgeFlushTimer = null;
       }
-      flushLiveFetches();
+      if (!urgentFlushScheduled) {
+        urgentFlushScheduled = true;
+        const flush = () => {
+          urgentFlushScheduled = false;
+          flushLiveFetches();
+        };
+        if (typeof queueMicrotask === "function") {
+          queueMicrotask(flush);
+        } else {
+          setTimeout(flush, 0);
+        }
+      }
       return;
     }
     if (liveBadgeFlushTimer !== null) return;

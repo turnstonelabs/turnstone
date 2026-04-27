@@ -470,6 +470,64 @@ def test_serialize_pending_approval_detail_multi_item() -> None:
     assert detail["items"][1]["judge_verdict"]["recommendation"] == "deny"
 
 
+def test_serialize_pending_approval_detail_tool_policy_denied_passthrough() -> None:
+    """A tool-policy-denied item carries error + needs_approval=False
+    after WebUI.approve_tools mutates the items list. The serializer
+    must round-trip both fields so the JS can detect the
+    POLICY-BLOCKED matrix row and render the banner instead of
+    approve/deny buttons."""
+    ui = _make_ui()
+    ui._pending_approval = {
+        "type": "approve_request",
+        "items": [
+            {
+                "call_id": "c-1",
+                "func_name": "rm_rf",
+                "approval_label": "rm_rf",
+                "needs_approval": False,
+                "error": "Blocked by tool policy (pattern match for 'rm_rf')",
+            }
+        ],
+        "judge_pending": False,
+    }
+    detail = ui.serialize_pending_approval_detail()
+    assert detail is not None
+    item = detail["items"][0]
+    # Both fields are the JS detection keys for the POLICY-BLOCKED
+    # branch in renderApprovalBlock — drift here silently regresses
+    # to a buttoned approve UI on a server-blocked call.
+    assert item["needs_approval"] is False
+    assert item["error"] == "Blocked by tool policy (pattern match for 'rm_rf')"
+
+
+def test_serialize_pending_approval_detail_judge_unavailable_path() -> None:
+    """No judge_verdict + no heuristic_verdict + judge_pending=False
+    is the (judge unavailable) matrix row — the JS detects it via
+    !verdict && !judgePending && !policyBlocked. Verify the
+    serialized payload preserves the absence of all three signals."""
+    ui = _make_ui()
+    ui._pending_approval = {
+        "type": "approve_request",
+        "items": [
+            {
+                "call_id": "c-1",
+                "func_name": "bash",
+                "approval_label": "bash",
+                "needs_approval": True,
+            }
+        ],
+        "judge_pending": False,
+    }
+    detail = ui.serialize_pending_approval_detail()
+    assert detail is not None
+    assert detail["judge_pending"] is False
+    item = detail["items"][0]
+    assert item["judge_verdict"] is None
+    assert item["heuristic_verdict"] is None
+    assert item["needs_approval"] is True
+    assert item["error"] is None
+
+
 def test_serialize_pending_approval_detail_returned_dict_is_decoupled() -> None:
     """Mutating the returned dict must not corrupt the cached
     verdict, which other consumers may still read."""

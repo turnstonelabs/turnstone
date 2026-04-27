@@ -81,8 +81,26 @@ def test_coordinator_js_exposes_inline_approval_helpers():
     assert "{ urgent: true }" in body or "urgent: true" in body
     # Server-side payload field — drift here means the JS reads stale keys
     assert "pending_approval_detail" in body
-    # Reconnect parity (chunk 4): the SSE re-open handler must clear
-    # the live-badge cache so a stale pending_approval_detail (left
-    # from before the disconnect) can't render zombie approve/deny
-    # buttons on a row whose approval was resolved during the gap.
-    assert "liveBadgeCache.clear()" in body
+    # Reconnect parity (chunk 4): the SSE re-open handler must drop
+    # non-permanent entries from the live-badge cache so a stale
+    # pending_approval_detail (left from before the disconnect)
+    # can't render zombie approve/deny buttons on a row whose
+    # approval was resolved during the gap. The implementation
+    # iterates the cache and deletes only !permanent entries —
+    # asserting the literal Map iteration form keeps a refactor
+    # back to liveBadgeCache.clear() (which would re-pay 403s on
+    # every reconnect for denied ids) from sneaking in.
+    assert "liveBadgeCache.delete" in body
+    # Edge-case matrix sentinel labels — POLICY-BLOCKED renders when
+    # an item has error set + needs_approval=False (server-side
+    # tool policy already blocked the call); "(judge unavailable)"
+    # renders when no verdict (judge or heuristic) and no
+    # judge_pending. Refactors that drop either branch silently
+    # regress to a buttoned approve UI on the wrong state.
+    assert "POLICY-BLOCKED" in body
+    assert "judge unavailable" in body
+    # Critical-risk handling — bug-1 was that risk_level='critical'
+    # rendered as low because RISK_SEVERITY only mapped 'crit'.
+    # Both aliases must remain in the table so a 'critical' verdict
+    # ranks at 3 and renders with the .risk.crit pill.
+    assert "critical: 3" in body

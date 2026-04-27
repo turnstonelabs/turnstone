@@ -211,21 +211,32 @@
     border: 1px solid var(--hair);
     color: var(--ink-3);
   }
-  /* Recommendation colour-coding — same 12/38/70% colour-mix scheme
-     as the dock chips at #coord-approval-bar .dctx code.rec-*, but
-     hoisted to the row scope so the inline pill matches without
-     needing the dock parent. */
-  [data-design="v1"] .ch-row .approval-pill.rec-approve {
+  /* Recommendation chip inside the disclosure footer — same 12/38/70%
+     colour-mix scheme as the dock chips at `#coord-approval-bar
+     .dctx code.rec-*`, scoped to the row's disclosure so the inline
+     chip is actually styled (the dock-scoped rules don't reach this
+     surface). */
+  [data-design="v1"] .ch-row .approval-disclosure code.rec-approve,
+  [data-design="v1"] .ch-row .approval-disclosure code.rec-review,
+  [data-design="v1"] .ch-row .approval-disclosure code.rec-deny {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    border: 1px solid var(--hair);
+    margin-top: 4px;
+  }
+  [data-design="v1"] .ch-row .approval-disclosure code.rec-approve {
     color: color-mix(in srgb, var(--ok) 70%, var(--ink-2));
     border-color: color-mix(in srgb, var(--ok) 38%, var(--hair));
     background: color-mix(in srgb, var(--ok) 12%, var(--panel-2));
   }
-  [data-design="v1"] .ch-row .approval-pill.rec-review {
+  [data-design="v1"] .ch-row .approval-disclosure code.rec-review {
     color: color-mix(in srgb, var(--warn) 70%, var(--ink-2));
     border-color: color-mix(in srgb, var(--warn) 38%, var(--hair));
     background: var(--warn-tint);
   }
-  [data-design="v1"] .ch-row .approval-pill.rec-deny {
+  [data-design="v1"] .ch-row .approval-disclosure code.rec-deny {
     color: color-mix(in srgb, var(--err) 70%, var(--ink-2));
     border-color: color-mix(in srgb, var(--err) 38%, var(--hair));
     background: color-mix(in srgb, var(--err) 12%, var(--panel-2));
