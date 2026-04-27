@@ -23,6 +23,7 @@ JWTs carrying the real user's identity + scopes.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import secrets
 import threading
@@ -77,6 +78,35 @@ WAIT_MAX_TIMEOUT: float = 600.0
 # reads — still cheaper than the 20+ inspect_workstream model turns the
 # tool replaces.
 WAIT_POLL_INTERVAL: float = 0.5
+
+# Per-ws cap on the inline ``message`` field bundled into wait_for_workstream
+# results.  Sized so a fan-out of 32 children at the cap is ~192 KiB of
+# tool output — large but not catastrophic on commercial models, and
+# typical waits run with a handful of children.  Truncation is from the
+# END (the lead is usually more informative than the tail) and sets a
+# ``truncated=True`` flag so the model can opt into a follow-up read if
+# the trailing bytes matter.
+WAIT_MESSAGE_MAX_BYTES: int = 6 * 1024
+
+# How many tail messages ``wait_for_workstream`` reads when extracting a
+# child's last assistant turn.  The conversation tail almost always
+# contains the final assistant message within the last few rows
+# (assistant + a handful of tool results); 20 is generous head-room
+# without scanning the full history of a long-lived workstream.
+_WAIT_MESSAGE_TAIL_LIMIT: int = 20
+
+# Sentinel strings used when a terminal state has no usable assistant
+# content to return.  Pinned as constants so callers (and tests) can
+# rely on the exact text rather than a fuzzed message.  The
+# ``NO_RECENT_ASSISTANT`` sentinel is intentionally hedged ("recent")
+# rather than absolute — the message walk only looks at the
+# ``_WAIT_MESSAGE_TAIL_LIMIT`` row tail, so an assistant turn buried
+# beyond that window (e.g. a single burst of >18 parallel tool calls
+# followed by an error) would otherwise produce a sentinel that
+# falsely claims no output exists at all.
+_WAIT_SENTINEL_CLOSED = "(workstream closed)"
+_WAIT_SENTINEL_DENIED = "(workstream denied: not in coordinator subtree or does not exist)"
+_WAIT_SENTINEL_NO_RECENT_ASSISTANT = "(no recent assistant output)"
 
 _TASK_STATUSES = frozenset({"pending", "in_progress", "done", "blocked"})
 # Hard cap on tasks per coordinator — the full list is read and re-serialized
@@ -544,11 +574,21 @@ class CoordinatorClient:
         stays in the set so a legacy / synthetic-test row carrying
         that state still counts).  ``mode='all'`` returns once every
         ws_id has settled (real terminal OR ``denied``).  Returns
-        ``{"results": {ws_id: {state, tokens, updated}},
+        ``{"results": {ws_id: {state, tokens, updated, message, truncated}},
         "elapsed": float, "complete": bool, "mode": mode}``.  ``complete``
         is True when the wait condition was met before the deadline,
         False when the timeout fired (results carry whatever last state
         was observed).
+
+        ``message`` carries the child's last assistant message text for
+        ``idle`` / ``error`` states, or a short status sentinel for
+        ``closed`` / ``deleted`` / ``denied``; non-terminal entries
+        (e.g. ``running`` after a timeout) carry ``None``.  Capped at
+        ``WAIT_MESSAGE_MAX_BYTES`` UTF-8 bytes per ws — when the cap
+        triggers, ``truncated`` is ``True`` so the model can opt into a
+        follow-up ``inspect_workstream`` for the rest.  Bundled inline
+        so the coordinator LLM doesn't need an extra round-trip per
+        child to see what came back.
 
         ``since`` — optional prior snapshot (typically the ``results``
         dict from an earlier ``wait_for_workstream`` call).  When
@@ -757,8 +797,56 @@ class CoordinatorClient:
             if remaining <= 0:
                 break
             time.sleep(min(self._WAIT_POLL_INTERVAL, remaining))
+        # Bundle each terminal child's last assistant message inline so the
+        # coordinator LLM doesn't have to follow up with one
+        # ``inspect_workstream`` per ws.  Only ``idle`` / ``error`` ws_ids
+        # actually hit storage (``closed`` / ``denied`` return a sentinel
+        # without I/O), so split them and parallelize the storage-bound
+        # subset across a small thread pool — at the WAIT_MAX_WS_IDS=32
+        # cap, 8 workers cuts a worst-case all-idle fan-out from 32
+        # sequential storage round-trips down to 4 batches, which lands
+        # inside the WAIT_POLL_INTERVAL the model already tolerates
+        # between ticks.  Storage backends use SQLAlchemy with
+        # ``check_same_thread=False`` (SQLite) / a connection pool
+        # (Postgres), so concurrent reads from the worker pool are safe.
+        io_wids = [
+            wid
+            for wid, snap in last_results.items()
+            if str(snap.get("state") or "") in ("idle", "error")
+        ]
+        io_pairs: dict[str, tuple[str | None, bool]] = {}
+        if io_wids:
+
+            def _enrich(wid: str) -> tuple[str, str | None, bool]:
+                state = str(last_results[wid].get("state") or "")
+                msg, trunc = _wait_message_for(self._storage, wid, state)
+                return wid, msg, trunc
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(8, len(io_wids)),
+                thread_name_prefix="coord-wait-enrich",
+            ) as ex:
+                for wid, msg, trunc in ex.map(_enrich, io_wids):
+                    io_pairs[wid] = (msg, trunc)
+
+        # Build the final dict.  Fresh per-ws dicts (not in-place
+        # mutation) so any in-flight ``wait_progress`` SSE event still
+        # holds a reference to the tick's pre-enrichment snapshot — its
+        # shape is documented as separate from the returned tool result
+        # and must not silently grow new fields just because the wait
+        # completed.
+        enriched_results: dict[str, dict[str, Any]] = {}
+        for wid, snap in last_results.items():
+            state = str(snap.get("state") or "")
+            if wid in io_pairs:
+                msg, trunc = io_pairs[wid]
+            elif state in WAIT_TERMINAL_STATES:
+                msg, trunc = _wait_message_for(self._storage, wid, state)
+            else:
+                msg, trunc = None, False
+            enriched_results[wid] = {**snap, "message": msg, "truncated": trunc}
         return {
-            "results": last_results,
+            "results": enriched_results,
             "complete": complete,
             "elapsed": round(time.monotonic() - start, 3),
             "mode": mode,
@@ -1531,3 +1619,110 @@ def _serialize_verdicts(rows: list[Any]) -> list[dict[str, Any]]:
             except Exception:
                 out.append({"raw": str(r)})
     return out
+
+
+# ---------------------------------------------------------------------------
+# wait_for_workstream — last-message extraction
+# ---------------------------------------------------------------------------
+
+
+def _truncate_wait_message(text: str, max_bytes: int) -> tuple[str, bool]:
+    """Cap ``text`` to ``max_bytes`` UTF-8 bytes, truncating from the END.
+
+    Returns ``(text, truncated)``.  Encodes to UTF-8 first so the cap is a
+    real wire-size cap rather than a character-count proxy.  ``errors='ignore'``
+    on the decode silently drops a trailing partial codepoint when the byte
+    cut lands mid-multi-byte-sequence — keeps the truncated string valid
+    UTF-8 (so JSON serialization can't fail) without an explicit boundary
+    walk.
+    """
+    if max_bytes <= 0:
+        return "", bool(text)
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text, False
+    return encoded[:max_bytes].decode("utf-8", errors="ignore"), True
+
+
+def _last_assistant_text(storage: Any, ws_id: str) -> str | None:
+    """Walk the conversation tail backward and return the most recent
+    assistant message's text content.
+
+    Returns:
+    - The content string when the tail contains an assistant message
+      with a non-empty ``content`` field.
+    - Empty string when no qualifying assistant message exists in the
+      fetched tail (e.g. a workstream that errored before emitting any
+      assistant output, or one whose final assistant turn is buried
+      beyond the tail window).
+    - ``None`` when the storage read itself failed — distinct from the
+      empty-string case so callers can leave ``message: null`` instead
+      of substituting a sentinel.
+
+    The tail load is bounded by ``_WAIT_MESSAGE_TAIL_LIMIT`` so a
+    long-running workstream's full message log never has to be paged
+    in just to surface its final turn.
+    """
+    try:
+        rows = storage.load_messages(ws_id, limit=_WAIT_MESSAGE_TAIL_LIMIT)
+    except Exception:
+        log.debug("coord_client.wait.load_messages_failed ws=%s", ws_id, exc_info=True)
+        return None
+    for msg in reversed(rows):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+    return ""
+
+
+def _wait_message_for(
+    storage: Any,
+    ws_id: str,
+    state: str,
+    *,
+    max_bytes: int = WAIT_MESSAGE_MAX_BYTES,
+) -> tuple[str | None, bool]:
+    """Return ``(message, truncated)`` for a wait_for_workstream result entry.
+
+    The returned tuple is appended to each per-ws snapshot as
+    ``message`` / ``truncated`` so the coordinator LLM doesn't need a
+    follow-up ``inspect_workstream`` round-trip to read what each child
+    actually produced.
+
+    Branching by ``state``:
+
+    - ``idle`` / ``error`` — last assistant message text from the
+      conversation tail, or a hedged sentinel when the tail has no
+      assistant content (covers both 'never emitted a turn' and 'last
+      turn is buried beyond the tail window' — the sentinel doesn't
+      claim either way).
+    - ``closed`` / ``denied`` — short status sentinel.  No
+      message-history read because there's nothing meaningful to
+      return — a partial last message could be misleading mid-thought.
+    - any other state (e.g. ``running``, or a ``deleted`` synthetic /
+      legacy row) — ``(None, False)`` so the coordinator sees null
+      inline and knows to keep waiting / inspect explicitly.  Hard
+      deletes cascade rows out of storage, so the wait poll never
+      observes a real ``deleted`` state in normal operation.
+
+    Storage failures during the message read collapse to ``(None, False)``
+    so a transient read error degrades gracefully (the wait itself
+    already completed; the model just gets ``message: null`` for the
+    affected ws and can fall back to inspect).
+    """
+    if state == "denied":
+        return _WAIT_SENTINEL_DENIED, False
+    if state == "closed":
+        return _WAIT_SENTINEL_CLOSED, False
+    if state in ("idle", "error"):
+        text = _last_assistant_text(storage, ws_id)
+        if text is None:
+            return None, False
+        if not text:
+            return _WAIT_SENTINEL_NO_RECENT_ASSISTANT, False
+        return _truncate_wait_message(text, max_bytes)
+    return None, False

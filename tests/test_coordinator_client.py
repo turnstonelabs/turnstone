@@ -1390,6 +1390,295 @@ def test_wait_for_workstream_handles_non_string_mode(populated_storage):
 
 
 # ---------------------------------------------------------------------------
+# wait_for_workstream — last-message bundling
+# ---------------------------------------------------------------------------
+#
+# Each terminal child's last assistant turn (or a status sentinel) is
+# bundled inline so the coord LLM doesn't need a follow-up
+# inspect_workstream round-trip per ws.  The fields are additive
+# (``message`` / ``truncated``), so existing wait tests stay green.
+
+
+def test_wait_for_workstream_idle_returns_last_assistant_message(populated_storage):
+    """A child that finished normally surfaces its final assistant
+    turn inline so the coord doesn't have to inspect to read it."""
+    populated_storage.save_message("child-a", "user", "what's the answer?")
+    populated_storage.save_message("child-a", "assistant", "the answer is 42")
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    assert snap["state"] == "idle"
+    assert snap["message"] == "the answer is 42"
+    assert snap["truncated"] is False
+
+
+def test_wait_for_workstream_idle_walks_past_trailing_tool_messages(populated_storage):
+    """The most recent assistant turn often sits behind a few tool
+    messages (assistant emits tool_calls → tool results land → final
+    assistant content follows).  The walk must skip non-assistant
+    rows when picking the last assistant content."""
+    populated_storage.save_message("child-a", "user", "do the thing")
+    populated_storage.save_message("child-a", "assistant", "calling tool")
+    populated_storage.save_message("child-a", "tool", "tool output", tool_call_id="t1")
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    # The assistant message above is the most recent assistant turn —
+    # the trailing tool row must not block extraction.
+    assert result["results"]["child-a"]["message"] == "calling tool"
+
+
+def test_wait_for_workstream_idle_skips_empty_assistant_with_tool_calls(populated_storage):
+    """An assistant message with empty content + only tool_calls isn't
+    a final answer — walk further back for the last assistant message
+    that actually has text."""
+    populated_storage.save_message("child-a", "user", "first turn")
+    populated_storage.save_message("child-a", "assistant", "first assistant reply")
+    populated_storage.save_message("child-a", "user", "second turn")
+    populated_storage.save_message(
+        "child-a", "assistant", "", tool_calls='[{"id": "t1", "name": "x"}]'
+    )
+    populated_storage.save_message("child-a", "tool", "tool result", tool_call_id="t1")
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    # Last assistant with non-empty content is the FIRST assistant message
+    # — the empty-content tool-calls assistant must be skipped.
+    assert result["results"]["child-a"]["message"] == "first assistant reply"
+
+
+def test_wait_for_workstream_idle_no_assistant_returns_sentinel(populated_storage):
+    """A workstream that reaches idle without an assistant turn in the
+    tail (rare but possible for a freshly registered ws closed before
+    generation, or a long-running ws whose final assistant message is
+    buried beyond the tail window) gets a hedged sentinel rather than
+    null — the model can distinguish 'no recent output' from 'still
+    running'."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    assert snap["state"] == "idle"
+    # No messages were saved for child-a in this test — sentinel kicks in.
+    # Wording is hedged ("recent") because the tail-only walk can't
+    # actually prove no assistant output exists in the full history.
+    assert snap["message"] == "(no recent assistant output)"
+    assert snap["truncated"] is False
+
+
+def test_wait_for_workstream_error_returns_last_assistant_message(populated_storage):
+    """An errored child still gets its last assistant turn surfaced —
+    that's usually the most useful diagnostic ('I was about to ...
+    when the error happened')."""
+    populated_storage.update_workstream_state("child-a", "error")
+    populated_storage.save_message("child-a", "user", "hi")
+    populated_storage.save_message("child-a", "assistant", "partial output before crash")
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    assert snap["state"] == "error"
+    assert snap["message"] == "partial output before crash"
+
+
+def test_wait_for_workstream_error_with_no_output_returns_sentinel(populated_storage):
+    """When error fires with no assistant content in the tail (e.g. a
+    pre-flight provider auth failure that crashes before the model
+    speaks, or a >18-parallel-tool-call burst whose only assistant
+    row carries empty content), the same hedged sentinel applies.
+    The wording deliberately doesn't claim 'before producing output'
+    — the tail-only walk can't prove that.
+    """
+    populated_storage.update_workstream_state("child-a", "error")
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    assert snap["state"] == "error"
+    assert snap["message"] == "(no recent assistant output)"
+    assert snap["truncated"] is False
+
+
+def test_wait_for_workstream_closed_returns_sentinel(populated_storage):
+    """Closed children get a status sentinel rather than a partial
+    last message — a half-finished thought from a workstream the
+    operator explicitly closed isn't useful (and could be misleading)."""
+    populated_storage.update_workstream_state("child-a", "closed")
+    populated_storage.save_message("child-a", "assistant", "mid-thought when closed")
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    assert snap["state"] == "closed"
+    assert snap["message"] == "(workstream closed)"
+    assert snap["truncated"] is False
+
+
+def test_wait_for_workstream_denied_returns_sentinel(populated_storage):
+    """Cross-tenant / nonexistent ws_ids surface as denied — the
+    sentinel lets the coord LLM recognise the rejection without
+    parsing state strings on its own."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["unrelated"], timeout=5, mode="any")
+    snap = result["results"]["unrelated"]
+    assert snap["state"] == "denied"
+    assert snap["message"].startswith("(workstream denied")
+    assert snap["truncated"] is False
+
+
+def test_wait_for_workstream_running_child_message_is_null(populated_storage):
+    """A still-running child after a timeout must report
+    ``message=None`` — anything else would be a partial last message
+    pretending to be a final answer.  The coord uses null to know
+    'still working, inspect later'."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a", "child-b"], timeout=1.0, mode="all")
+    # mode='all' on (idle, running) hits the timeout — child-b is still
+    # running and must come back with message=None.
+    assert result["complete"] is False
+    assert result["results"]["child-b"]["state"] == "running"
+    assert result["results"]["child-b"]["message"] is None
+    assert result["results"]["child-b"]["truncated"] is False
+
+
+def test_wait_for_workstream_truncates_oversize_message(populated_storage):
+    """A message past WAIT_MESSAGE_MAX_BYTES is truncated from the
+    END (preserve the lead) and ``truncated=True`` so the coord LLM
+    knows to inspect for the rest if it needs the full text."""
+    from turnstone.console.coordinator_client import WAIT_MESSAGE_MAX_BYTES
+
+    big = "A" * (WAIT_MESSAGE_MAX_BYTES * 2)
+    populated_storage.save_message("child-a", "user", "hi")
+    populated_storage.save_message("child-a", "assistant", big)
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    # Truncated — exactly the cap in bytes (single-byte chars), with the
+    # head preserved.
+    assert snap["truncated"] is True
+    assert len(snap["message"].encode("utf-8")) == WAIT_MESSAGE_MAX_BYTES
+    assert snap["message"].startswith("AAAA")
+
+
+def test_wait_for_workstream_storage_failure_leaves_message_null(populated_storage, monkeypatch):
+    """A transient storage error during the message read must not
+    fail the wait — the coord still gets state/tokens/updated, and
+    the per-ws ``message`` collapses to None so the model can fall
+    back to inspect."""
+    populated_storage.update_workstream_state("child-a", "idle")
+
+    def _broken_load(*_a, **_kw):
+        raise RuntimeError("simulated storage outage")
+
+    monkeypatch.setattr(populated_storage, "load_messages", _broken_load)
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    assert snap["state"] == "idle"
+    assert snap["message"] is None
+    assert snap["truncated"] is False
+
+
+def test_wait_for_workstream_does_not_pollute_progress_callback(populated_storage):
+    """The wait_progress SSE event shape is documented as separate
+    from the tool result — the per-tick snapshot dicts handed to the
+    progress callback must NOT carry the new ``message`` /
+    ``truncated`` fields, since enrichment happens after the loop
+    exits."""
+    populated_storage.save_message("child-a", "assistant", "ok")
+    client = _make_read_client(populated_storage)
+    captured: list[dict[str, dict[str, Any]]] = []
+
+    def _cb(snap: dict[str, dict[str, Any]], _elapsed: float) -> None:
+        # Deep-copy so a later mutation by enrichment can't fool the
+        # assertion (we want the shape AT CALLBACK TIME, not at end).
+        import copy
+
+        captured.append(copy.deepcopy(snap))
+
+    client.wait_for_workstream(["child-a"], timeout=5, mode="any", progress_callback=_cb)
+    assert captured  # at least one tick fired
+    for tick in captured:
+        for per_ws in tick.values():
+            assert "message" not in per_ws
+            assert "truncated" not in per_ws
+
+
+# ---------------------------------------------------------------------------
+# wait_for_workstream — helper-function unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_truncate_wait_message_below_cap_is_passthrough():
+    from turnstone.console.coordinator_client import _truncate_wait_message
+
+    text, trunc = _truncate_wait_message("hello", 100)
+    assert text == "hello"
+    assert trunc is False
+
+
+def test_truncate_wait_message_exact_cap_is_passthrough():
+    from turnstone.console.coordinator_client import _truncate_wait_message
+
+    text, trunc = _truncate_wait_message("a" * 5, 5)
+    assert text == "aaaaa"
+    assert trunc is False
+
+
+def test_truncate_wait_message_oversize_truncates_to_byte_cap():
+    from turnstone.console.coordinator_client import _truncate_wait_message
+
+    text, trunc = _truncate_wait_message("a" * 10, 5)
+    assert text == "aaaaa"
+    assert trunc is True
+
+
+def test_truncate_wait_message_handles_utf8_boundary():
+    """A multi-byte codepoint must never be split — back off to a valid
+    UTF-8 boundary even if it lands a couple bytes under the cap."""
+    from turnstone.console.coordinator_client import _truncate_wait_message
+
+    # "café" is 5 bytes (c=1, a=1, f=1, é=2).  Cap at 4 bytes lands
+    # mid-codepoint on the é; truncation must back off to 3 bytes.
+    text, trunc = _truncate_wait_message("café", 4)
+    assert trunc is True
+    assert text == "caf"
+    # And the result must be valid UTF-8 — re-encoding doesn't error.
+    text.encode("utf-8")
+
+
+def test_truncate_wait_message_zero_or_negative_cap_returns_empty():
+    from turnstone.console.coordinator_client import _truncate_wait_message
+
+    text, trunc = _truncate_wait_message("anything", 0)
+    assert text == ""
+    assert trunc is True
+
+
+def test_last_assistant_text_returns_content_when_present(populated_storage):
+    """Pins the third leg of the tri-state contract: a populated tail
+    returns the actual assistant content string (not ``""``, not
+    ``None``).  Integration tests cover this through enrichment, but a
+    direct unit test makes the contract harder to break in a refactor."""
+    from turnstone.console.coordinator_client import _last_assistant_text
+
+    populated_storage.save_message("child-a", "user", "hello")
+    populated_storage.save_message("child-a", "assistant", "hi back")
+    assert _last_assistant_text(populated_storage, "child-a") == "hi back"
+
+
+def test_last_assistant_text_returns_empty_when_no_messages(populated_storage):
+    from turnstone.console.coordinator_client import _last_assistant_text
+
+    # child-a has no messages saved.
+    assert _last_assistant_text(populated_storage, "child-a") == ""
+
+
+def test_last_assistant_text_returns_none_on_storage_failure(populated_storage, monkeypatch):
+    from turnstone.console.coordinator_client import _last_assistant_text
+
+    def _broken(*_a, **_kw):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(populated_storage, "load_messages", _broken)
+    assert _last_assistant_text(populated_storage, "child-a") is None
+
+
+# ---------------------------------------------------------------------------
 # task_list
 # ---------------------------------------------------------------------------
 
