@@ -381,6 +381,111 @@ def test_on_output_warning_enqueues_and_persists() -> None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# serialize_pending_approval_detail — dashboard projection
+# ---------------------------------------------------------------------------
+
+
+def test_serialize_pending_approval_detail_returns_none_when_unset() -> None:
+    ui = _make_ui()
+    assert ui.serialize_pending_approval_detail() is None
+
+
+def test_serialize_pending_approval_detail_returns_none_when_items_empty() -> None:
+    ui = _make_ui()
+    ui._pending_approval = {"type": "approve_request", "items": [], "judge_pending": False}
+    assert ui.serialize_pending_approval_detail() is None
+
+
+def test_serialize_pending_approval_detail_merges_judge_verdict() -> None:
+    ui = _make_ui()
+    ui._pending_approval = {
+        "type": "approve_request",
+        "items": [
+            {
+                "call_id": "c-1",
+                "header": "bash",
+                "preview": "$ ls",
+                "func_name": "bash",
+                "approval_label": "bash",
+                "needs_approval": True,
+                "error": None,
+                "verdict": {"recommendation": "review", "tier": "heuristic"},
+            }
+        ],
+        "judge_pending": True,
+    }
+    ui._llm_verdicts["c-1"] = {
+        "verdict_id": "v-1",
+        "call_id": "c-1",
+        "risk_level": "high",
+        "recommendation": "deny",
+        "tier": "llm",
+    }
+    detail = ui.serialize_pending_approval_detail()
+    assert detail is not None
+    assert detail["call_id"] == "c-1"
+    assert detail["judge_pending"] is True
+    assert len(detail["items"]) == 1
+    item = detail["items"][0]
+    assert item["call_id"] == "c-1"
+    assert item["header"] == "bash"
+    assert item["preview"] == "$ ls"
+    assert item["heuristic_verdict"] == {"recommendation": "review", "tier": "heuristic"}
+    assert item["judge_verdict"]["recommendation"] == "deny"
+    assert item["judge_verdict"]["risk_level"] == "high"
+
+
+def test_serialize_pending_approval_detail_judge_verdict_none_when_missing() -> None:
+    """No cached verdict for the call_id → judge_verdict is None,
+    not absent or some sentinel."""
+    ui = _make_ui()
+    ui._pending_approval = {
+        "type": "approve_request",
+        "items": [{"call_id": "c-1", "func_name": "ls", "needs_approval": True}],
+        "judge_pending": True,
+    }
+    detail = ui.serialize_pending_approval_detail()
+    assert detail is not None
+    assert detail["items"][0]["judge_verdict"] is None
+    assert detail["items"][0]["heuristic_verdict"] is None
+
+
+def test_serialize_pending_approval_detail_multi_item() -> None:
+    ui = _make_ui()
+    ui._pending_approval = {
+        "type": "approve_request",
+        "items": [
+            {"call_id": "c-1", "func_name": "bash", "needs_approval": True},
+            {"call_id": "c-2", "func_name": "mcp__sf__query", "needs_approval": True},
+        ],
+        "judge_pending": False,
+    }
+    ui._llm_verdicts["c-2"] = {"recommendation": "deny", "risk_level": "crit"}
+    detail = ui.serialize_pending_approval_detail()
+    assert detail is not None
+    assert detail["call_id"] == "c-1"  # primary = first item
+    assert len(detail["items"]) == 2
+    assert detail["items"][0]["judge_verdict"] is None
+    assert detail["items"][1]["judge_verdict"]["recommendation"] == "deny"
+
+
+def test_serialize_pending_approval_detail_returned_dict_is_decoupled() -> None:
+    """Mutating the returned dict must not corrupt the cached
+    verdict, which other consumers may still read."""
+    ui = _make_ui()
+    ui._pending_approval = {
+        "type": "approve_request",
+        "items": [{"call_id": "c-1", "func_name": "bash", "needs_approval": True}],
+        "judge_pending": False,
+    }
+    ui._llm_verdicts["c-1"] = {"recommendation": "approve"}
+    detail = ui.serialize_pending_approval_detail()
+    assert detail is not None
+    detail["items"][0]["judge_verdict"]["recommendation"] = "MUTATED"
+    assert ui._llm_verdicts["c-1"]["recommendation"] == "approve"
+
+
 def test_concurrent_enqueue_and_listener_registration() -> None:
     """Fan-out under concurrent enqueue + register/unregister shouldn't
     drop events or crash on the lock. Sanity-level stress."""
