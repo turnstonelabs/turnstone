@@ -497,6 +497,7 @@ class ClusterCollector:
                         "content": new_w.get("content", ""),
                         "kind": WorkstreamKind.from_raw(new_w.get("kind")),
                         "parent_ws_id": new_w.get("parent_ws_id"),
+                        "activity_state": new_w.get("activity_state", ""),
                     }
                 )
             old_name = old_ws.get("title", "") or old_ws.get("name", "")
@@ -566,6 +567,7 @@ class ClusterCollector:
                             "content": data.get("content", ""),
                             "kind": WorkstreamKind.from_raw(ws.get("kind")),
                             "parent_ws_id": ws.get("parent_ws_id"),
+                            "activity_state": ws.get("activity_state", ""),
                         }
                     )
 
@@ -1146,6 +1148,7 @@ class ClusterCollector:
                 "content": content,
                 "kind": WorkstreamKind.COORDINATOR.value,
                 "parent_ws_id": None,
+                "activity_state": activity_state,
             }
         )
 

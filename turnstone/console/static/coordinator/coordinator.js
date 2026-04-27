@@ -506,6 +506,17 @@
     );
   }
 
+  // Generic approve POST — usable for both the coord-self dock and
+  // the per-child inline buttons in the children-tree. Returns the
+  // response so callers can inspect 409 (stale call_id) bodies and
+  // refresh their local state. Throws on transport errors.
+  async function approveWorkstream(targetWsId, body) {
+    return postJSON(
+      "/v1/api/workstreams/" + encodeURIComponent(targetWsId) + "/approve",
+      body,
+    );
+  }
+
   window.coordApprove = async function (approved, always) {
     if (!pendingApprovalCallId) return; // no-op if bar already resolved
     const body = {
@@ -515,10 +526,7 @@
     };
     setApprovalButtonsDisabled(true);
     try {
-      const resp = await postJSON(
-        "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/approve",
-        body,
-      );
+      const resp = await approveWorkstream(wsId, body);
       if (!resp.ok) throw new Error("approve failed: HTTP " + resp.status);
     } catch (e) {
       setApprovalButtonsDisabled(false);
@@ -1101,7 +1109,378 @@
       }
     }
     row.appendChild(meta);
+    // Inline approve/deny block \u2014 shown only when the live block
+    // carries pending_approval_detail (the rich payload added by the
+    // server-side dashboard projection).  A "\u2691 approval" badge alone
+    // means the child is in attention state but the rich detail hasn't
+    // arrived yet (urgent live-bulk fetch is in flight); the row gets
+    // re-rendered when it lands.
+    if (cached && cached.live && cached.live.pending_approval_detail) {
+      const block = renderApprovalBlock(
+        child,
+        cached.live.pending_approval_detail,
+      );
+      if (block) row.appendChild(block);
+    }
     return row;
+  }
+
+  // Build the inline approval block: severity pill, intent summary +
+  // judge reasoning, and approve/deny buttons.  Returns a DOM node or
+  // null if the detail is unusable (defensive \u2014 server is supposed to
+  // emit None when no items).  Stays DOM-method-only to match the
+  // zero-innerHTML XSS posture of the rest of the row template.
+  // Risk-level → numeric severity for max-across-items computation.
+  // Values are ordinal: higher integer = higher severity. Unknown
+  // levels rank as "low" so the pill defaults to the safest reading.
+  const RISK_SEVERITY = { low: 0, medium: 1, med: 1, high: 2, crit: 3 };
+
+  function _riskRank(verdict) {
+    if (!verdict) return -1;
+    const risk = (verdict.risk_level || "").toLowerCase();
+    return RISK_SEVERITY[risk] != null ? RISK_SEVERITY[risk] : 0;
+  }
+
+  // Pick the item carrying the highest risk_level — pill colour and
+  // body display follow the worst tool in the envelope so a low-risk
+  // item[0] can't visually mask a crit item[2].
+  function _maxSeverityItem(items) {
+    let best = items[0];
+    let bestRank = _riskRank(best.judge_verdict || best.heuristic_verdict);
+    for (let i = 1; i < items.length; i += 1) {
+      const v = items[i].judge_verdict || items[i].heuristic_verdict;
+      const r = _riskRank(v);
+      if (r > bestRank) {
+        best = items[i];
+        bestRank = r;
+      }
+    }
+    return best;
+  }
+
+  function _evidenceLineText(line) {
+    if (typeof line === "string") return line;
+    try {
+      return JSON.stringify(line);
+    } catch (_) {
+      return String(line);
+    }
+  }
+
+  function _renderSubItem(item) {
+    const sub = document.createElement("div");
+    sub.className = "approval-sub-item";
+    const head = document.createElement("div");
+    head.className = "approval-sub-head";
+    const name = document.createElement("span");
+    name.className = "approval-tool";
+    name.textContent = item.func_name || item.approval_label || "(tool)";
+    head.appendChild(name);
+    const v = item.judge_verdict || item.heuristic_verdict;
+    if (v) {
+      const tier = document.createElement("span");
+      tier.className = "approval-tier";
+      const tierLabel = v.tier || (item.judge_verdict ? "llm" : "heuristic");
+      tier.textContent = (tierLabel === "llm" ? "⚖" : "⚙") + " " + tierLabel;
+      head.appendChild(tier);
+    }
+    sub.appendChild(head);
+    if (v && v.intent_summary) {
+      const p = document.createElement("div");
+      p.className = "approval-summary";
+      p.textContent = v.intent_summary;
+      sub.appendChild(p);
+    }
+    if (item.preview) {
+      const pre = document.createElement("pre");
+      pre.className = "approval-preview";
+      pre.textContent = item.preview;
+      sub.appendChild(pre);
+    }
+    return sub;
+  }
+
+  function renderApprovalBlock(child, detail) {
+    if (!detail || !Array.isArray(detail.items) || detail.items.length === 0) {
+      return null;
+    }
+    const items = detail.items;
+    // Pill + body display follow the highest-risk item; tool-name
+    // summary still leads with item[0] (envelope-level approve resolves
+    // them all so leading with [0] keeps the operator's mental model
+    // anchored on "what the LLM dispatched first").
+    const primary = items[0];
+    const severityItem = _maxSeverityItem(items);
+    const judge = severityItem.judge_verdict || null;
+    const heuristic = severityItem.heuristic_verdict || null;
+    const verdict = judge || heuristic;
+    const judgePending = !!detail.judge_pending && !judge;
+    // Tool-policy denial detection — any item with .error set and
+    // !needs_approval is server-blocked. Drives a banner instead of
+    // buttons (clicking either would no-op since the call won't run).
+    const policyBlocked = items.some((it) => it.error && !it.needs_approval);
+    const judgeUnavailable = !verdict && !judgePending && !policyBlocked;
+
+    const block = document.createElement("div");
+    block.className = "approval-block";
+
+    // Header line: pill + tool name(s) + tier:model
+    const header = document.createElement("div");
+    header.className = "approval-header";
+
+    // Pill \u2014 risk-level drives colour (.risk.low/.med/.high/.crit
+    // from shared_static/design/primitives/pills.css), recommendation
+    // lives in the disclosure footer per the plan. Special pills for
+    // policy-blocked, judge-pending, and judge-unavailable matrix
+    // rows so every state has a visible header signal.
+    const pill = document.createElement("span");
+    pill.className = "approval-pill";
+    if (policyBlocked) {
+      pill.classList.add("risk", "crit");
+      pill.textContent = "POLICY-BLOCKED";
+    } else if (judgePending) {
+      pill.classList.add("approval-pill-pending");
+      pill.textContent = "\u23f3 judge running\u2026";
+    } else if (judgeUnavailable) {
+      pill.classList.add("approval-pill-pending");
+      pill.textContent = "(judge unavailable)";
+    } else if (verdict) {
+      const risk = (verdict.risk_level || "").toLowerCase();
+      const riskCls =
+        risk === "crit"
+          ? "crit"
+          : risk === "high"
+            ? "high"
+            : risk === "medium" || risk === "med"
+              ? "med"
+              : "low";
+      pill.classList.add("risk", riskCls);
+      const conf = verdict.confidence;
+      const confStr = typeof conf === "number" ? " " + conf.toFixed(2) : "";
+      pill.textContent = (verdict.risk_level || "").toUpperCase() + confStr;
+    }
+    header.appendChild(pill);
+
+    // Tool-name summary \u2014 first item, plus "+ N more" for envelopes.
+    const toolName = document.createElement("span");
+    toolName.className = "approval-tool";
+    const baseName = primary.func_name || primary.approval_label || "(tool)";
+    toolName.textContent =
+      items.length > 1
+        ? baseName + " + " + (items.length - 1) + " more"
+        : baseName;
+    header.appendChild(toolName);
+
+    // Tier + judge_model (e.g. "\u2696 llm:gpt-5" or "\u2699 heuristic").
+    if (verdict) {
+      const tier = document.createElement("span");
+      tier.className = "approval-tier";
+      const tierLabel = verdict.tier || (judge ? "llm" : "heuristic");
+      const glyph = tierLabel === "llm" ? "\u2696" : "\u2699";
+      const model = verdict.judge_model ? ":" + verdict.judge_model : "";
+      tier.textContent = glyph + " " + tierLabel + model;
+      header.appendChild(tier);
+    }
+
+    block.appendChild(header);
+
+    // Tool-policy denial: server-side policy already blocked at least
+    // one call in the envelope; render a banner instead of buttons
+    // (clicking either would no-op since the call won't run).
+    if (policyBlocked) {
+      const banner = document.createElement("div");
+      banner.className = "approval-policy-block";
+      const denied = items.find((it) => it.error && !it.needs_approval);
+      banner.textContent =
+        "\u26d4 " + ((denied && denied.error) || "blocked by tool policy");
+      block.appendChild(banner);
+      return block;
+    }
+
+    // Body: intent_summary (if any) + reasoning teaser + \u25b8 more.
+    const summary = verdict && verdict.intent_summary;
+    if (summary) {
+      const p = document.createElement("div");
+      p.className = "approval-summary";
+      p.textContent = summary;
+      block.appendChild(p);
+    }
+    const reasoning = verdict && verdict.reasoning;
+    const evidence =
+      verdict && Array.isArray(verdict.evidence) ? verdict.evidence : [];
+    if (reasoning || evidence.length > 0 || items.length > 1) {
+      if (reasoning || evidence.length > 0) {
+        const reasonLine = document.createElement("div");
+        reasonLine.className = "approval-reasoning";
+        if (reasoning) {
+          const lead = document.createElement("span");
+          lead.className = "approval-reasoning-lead";
+          lead.textContent = "\u21b3 judge: ";
+          reasonLine.appendChild(lead);
+          const text = document.createElement("span");
+          text.textContent = reasoning;
+          reasonLine.appendChild(text);
+        }
+        block.appendChild(reasonLine);
+      }
+      // Auto-expand for high/crit risk, recommendation=deny, or a
+      // long preview (>4 lines) \u2014 the plan's \u00a7Frontend visual design
+      // auto-expand rule. Operator sees the full context by default
+      // at the moment they most need it.
+      const risk = ((verdict && verdict.risk_level) || "").toLowerCase();
+      const rec = (verdict && verdict.recommendation) || "";
+      const previewLines = primary.preview
+        ? primary.preview.split("\n").length
+        : 0;
+      const longPreview = previewLines > 4;
+      const longReasoning = reasoning && reasoning.length > 240;
+      const autoExpand =
+        risk === "high" || risk === "crit" || rec === "deny" || longPreview;
+      if (evidence.length > 0 || longReasoning || items.length > 1) {
+        const disclosure = document.createElement("details");
+        disclosure.className = "approval-disclosure";
+        if (autoExpand) disclosure.open = true;
+        const sum = document.createElement("summary");
+        sum.textContent = "\u25b8 more";
+        disclosure.appendChild(sum);
+        // Recommendation chip footer \u2014 keeps recommendation surfacing
+        // even though the pill colour is now risk-driven (per plan).
+        if (rec) {
+          const recChip = document.createElement("code");
+          recChip.className =
+            rec === "approve"
+              ? "rec-approve"
+              : rec === "deny"
+                ? "rec-deny"
+                : "rec-review";
+          recChip.textContent = "judge recommends: " + rec;
+          disclosure.appendChild(recChip);
+        }
+        if (evidence.length > 0) {
+          const ul = document.createElement("ul");
+          ul.className = "approval-evidence";
+          evidence.forEach((line) => {
+            const li = document.createElement("li");
+            li.textContent = _evidenceLineText(line);
+            ul.appendChild(li);
+          });
+          disclosure.appendChild(ul);
+        }
+        // Stack items 2..N inside the disclosure with their own
+        // intent_summary + preview + tier badge so the operator can
+        // see what every call in the envelope does (one approve
+        // resolves them all per server semantics).
+        if (items.length > 1) {
+          const moreLabel = document.createElement("div");
+          moreLabel.className = "approval-more-label";
+          moreLabel.textContent =
+            "\u25b8 " + (items.length - 1) + " more tools";
+          disclosure.appendChild(moreLabel);
+          for (let i = 1; i < items.length; i += 1) {
+            disclosure.appendChild(_renderSubItem(items[i]));
+          }
+        }
+        block.appendChild(disclosure);
+      }
+    }
+
+    // Preview \u2014 what's actually being run for the primary item.
+    if (primary.preview) {
+      const pre = document.createElement("pre");
+      pre.className = "approval-preview";
+      pre.textContent = primary.preview;
+      block.appendChild(pre);
+    }
+
+    // Action row: Deny + Approve.  Buttons are addEventListener-bound
+    // (not inline onclick) since the row is dynamically created and
+    // re-rendered. Both declared before listener wiring to avoid the
+    // cross-reference TDZ-shaped read pattern.
+    const actions = document.createElement("div");
+    actions.className = "approval-actions";
+    const denyBtn = document.createElement("button");
+    const approveBtn = document.createElement("button");
+    denyBtn.type = "button";
+    denyBtn.className = "act danger sm";
+    denyBtn.textContent = "Deny";
+    approveBtn.type = "button";
+    approveBtn.className = "act primary sm";
+    approveBtn.textContent = "Approve";
+    denyBtn.addEventListener("click", () =>
+      submitChildApproval(child.ws_id, detail, false, denyBtn, approveBtn),
+    );
+    approveBtn.addEventListener("click", () =>
+      submitChildApproval(child.ws_id, detail, true, denyBtn, approveBtn),
+    );
+    actions.appendChild(denyBtn);
+    actions.appendChild(approveBtn);
+    block.appendChild(actions);
+
+    return block;
+  }
+
+  // Submit the approve POST + handle the result.  On success, locally
+  // clear pending_approval_detail so the row re-renders without
+  // buttons immediately (optimistic update \u2014 the next live-bulk poll
+  // confirms).  On 409 (stale call_id), refresh the live block so the
+  // row re-renders against the new round.
+  async function submitChildApproval(
+    targetWsId,
+    detail,
+    approved,
+    denyBtn,
+    approveBtn,
+  ) {
+    const callId =
+      (detail && detail.call_id) ||
+      (detail &&
+        Array.isArray(detail.items) &&
+        detail.items[0] &&
+        detail.items[0].call_id) ||
+      "";
+    if (!callId) return;
+    denyBtn.disabled = true;
+    approveBtn.disabled = true;
+    try {
+      const resp = await approveWorkstream(targetWsId, {
+        approved: !!approved,
+        always: false,
+        call_id: callId,
+      });
+      if (resp.status === 409) {
+        // Stale call_id \u2014 server has rolled to a new round (or
+        // resolved already).  Force-refresh the row's live block
+        // so the new pending_approval_detail surfaces (or clears).
+        invalidateLiveBadge(targetWsId);
+        scheduleLiveFetch(targetWsId, { urgent: true });
+        if (typeof toast !== "undefined" && toast.warn) {
+          toast.warn("Approval state changed \u2014 refreshed.");
+        } else {
+          console.warn("approval state changed for", targetWsId);
+        }
+        return;
+      }
+      if (!resp.ok) {
+        throw new Error("approve failed: HTTP " + resp.status);
+      }
+      // Optimistic clear \u2014 the next child_ws_state event will arrive
+      // shortly and trigger a real refresh, but clearing locally
+      // makes the buttons disappear immediately on click.
+      const cached = liveBadgeCache.get(targetWsId);
+      if (cached && cached.live) {
+        cached.live = Object.assign({}, cached.live, {
+          pending_approval: false,
+          pending_approval_detail: null,
+        });
+        liveBadgeCache.set(targetWsId, cached);
+      }
+      renderChildren();
+    } catch (e) {
+      denyBtn.disabled = false;
+      approveBtn.disabled = false;
+      if (typeof toast !== "undefined" && toast.error) toast.error(String(e));
+      else console.error(e);
+    }
   }
 
   // Coalesce repeated renderChildren() calls within a single frame so
@@ -1326,8 +1705,9 @@
   const pendingLiveIds = new Set();
   let liveBadgeFlushTimer = null;
 
-  function scheduleLiveFetch(childWsId) {
+  function scheduleLiveFetch(childWsId, opts) {
     if (!childWsId) return;
+    const urgent = !!(opts && opts.urgent);
     // Skip terminal-state children entirely — their live block will
     // never change again; fetching just burns a round-trip and caches
     // a stale value.  Renderer already styles closed/deleted rows.
@@ -1347,10 +1727,27 @@
       // change on any child triggers a fresh fetch → retry storm for
       // users who'll never have permission mid-session.
       if (cached.permanent) return;
-      if (Date.now() - cached.fetched < LIVE_BADGE_TTL_MS) return;
+      // Urgent fetches bypass the TTL — used when a child enters
+      // approval state and the row needs the rich pending_approval_detail
+      // payload (call_id, items, judge_verdict) to render inline buttons.
+      // Waiting for the next 5s TTL window would leave the operator
+      // staring at "⚑ approval" with no way to act.
+      if (!urgent && Date.now() - cached.fetched < LIVE_BADGE_TTL_MS) return;
     }
     if (!WS_ID_RE.test(childWsId)) return;
     pendingLiveIds.add(childWsId);
+    // Urgent: cancel the pending debounce and flush immediately.
+    // Other ids in the batch ride along on the same flush — the
+    // bulk endpoint dedups by ws_id so the urgent caller doesn't
+    // pay extra cost for them.
+    if (urgent) {
+      if (liveBadgeFlushTimer !== null) {
+        clearTimeout(liveBadgeFlushTimer);
+        liveBadgeFlushTimer = null;
+      }
+      flushLiveFetches();
+      return;
+    }
     if (liveBadgeFlushTimer !== null) return;
     liveBadgeFlushTimer = setTimeout(() => {
       liveBadgeFlushTimer = null;
@@ -1452,7 +1849,12 @@
       ws_id: childId,
       name: "",
     };
+    const prevActivity = existing.activity_state || "";
     existing.state = ev.state || existing.state;
+    existing.activity_state =
+      typeof ev.activity_state === "string"
+        ? ev.activity_state
+        : existing.activity_state || "";
     if (ev.node_id) existing.node_id = ev.node_id;
     childrenState.set(childId, existing);
     _touchChild(childId);
@@ -1463,7 +1865,25 @@
     // The TTL check in scheduleLiveFetch will refresh the badge on its
     // own schedule; identity-changing events (created/rename/closed)
     // still invalidate below.
-    scheduleLiveFetch(childId);
+    //
+    // Two activity_state transitions warrant an *urgent* (TTL-bypassing)
+    // fetch so the row carries pending_approval_detail in lockstep with
+    // the child's true state:
+    //   - "" / "tool" / "thinking" → "approval"  (need rich payload now
+    //     so the inline approve/deny buttons can render)
+    //   - "approval" → anything else            (need to drop the
+    //     stale payload so the buttons disappear; without this the
+    //     5s TTL leaves stale buttons on a row whose approval was
+    //     resolved elsewhere — e.g. the child's own UI tab)
+    const enteredApproval =
+      existing.activity_state === "approval" && prevActivity !== "approval";
+    const leftApproval =
+      prevActivity === "approval" && existing.activity_state !== "approval";
+    if (enteredApproval || leftApproval) {
+      scheduleLiveFetch(childId, { urgent: true });
+    } else {
+      scheduleLiveFetch(childId);
+    }
   }
 
   function handleChildClosed(ev) {
@@ -1472,6 +1892,11 @@
     const existing = childrenState.get(childId);
     if (!existing) return;
     existing.state = ev.reason === "deleted" ? "deleted" : "closed";
+    // Clearing the live cache eagerly on close prevents a stale
+    // pending_approval_detail from continuing to render approve/deny
+    // buttons on a closed row (its TTL would otherwise survive into
+    // the closed/deleted lifecycle until natural expiry).
+    invalidateLiveBadge(childId);
     childrenState.set(childId, existing);
     _touchChild(childId);
     renderChildren();

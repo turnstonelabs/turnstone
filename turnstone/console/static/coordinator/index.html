@@ -177,6 +177,187 @@
     color: var(--err);
     font-weight: 600;
   }
+
+  /* Inline approval block — rendered as a third sub-row inside
+     .ch-row when pending_approval_detail is present.  Layout is
+     column-stacked so the header / summary / reasoning / preview /
+     actions read top-down on every viewport.  Padding-left aligns
+     to the same 22px indent as .meta so the visual hierarchy stays
+     consistent with the rest of the row. */
+  [data-design="v1"] .ch-row .approval-block {
+    margin-top: 4px;
+    padding: 6px 8px 6px 22px;
+    border-top: 1px solid var(--hair);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1.4;
+  }
+  [data-design="v1"] .ch-row .approval-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 6px;
+  }
+  [data-design="v1"] .ch-row .approval-pill {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    border: 1px solid var(--hair);
+    color: var(--ink-3);
+  }
+  /* Recommendation colour-coding — same 12/38/70% colour-mix scheme
+     as the dock chips at #coord-approval-bar .dctx code.rec-*, but
+     hoisted to the row scope so the inline pill matches without
+     needing the dock parent. */
+  [data-design="v1"] .ch-row .approval-pill.rec-approve {
+    color: color-mix(in srgb, var(--ok) 70%, var(--ink-2));
+    border-color: color-mix(in srgb, var(--ok) 38%, var(--hair));
+    background: color-mix(in srgb, var(--ok) 12%, var(--panel-2));
+  }
+  [data-design="v1"] .ch-row .approval-pill.rec-review {
+    color: color-mix(in srgb, var(--warn) 70%, var(--ink-2));
+    border-color: color-mix(in srgb, var(--warn) 38%, var(--hair));
+    background: var(--warn-tint);
+  }
+  [data-design="v1"] .ch-row .approval-pill.rec-deny {
+    color: color-mix(in srgb, var(--err) 70%, var(--ink-2));
+    border-color: color-mix(in srgb, var(--err) 38%, var(--hair));
+    background: color-mix(in srgb, var(--err) 12%, var(--panel-2));
+  }
+  [data-design="v1"] .ch-row .approval-pill.approval-pill-pending {
+    color: var(--ink-3);
+    background: var(--panel-2);
+  }
+  [data-design="v1"] .ch-row .approval-tool {
+    font-weight: 600;
+    color: var(--ink);
+  }
+  [data-design="v1"] .ch-row .approval-tier {
+    color: var(--ink-3);
+    font-size: 10px;
+  }
+  [data-design="v1"] .ch-row .approval-summary {
+    color: var(--ink-2);
+  }
+  [data-design="v1"] .ch-row .approval-reasoning {
+    color: var(--ink-3);
+    font-style: italic;
+  }
+  [data-design="v1"] .ch-row .approval-reasoning-lead {
+    color: var(--ink-3);
+    font-style: normal;
+  }
+  [data-design="v1"] .ch-row .approval-disclosure {
+    color: var(--ink-3);
+  }
+  [data-design="v1"] .ch-row .approval-disclosure summary {
+    cursor: pointer;
+    font-size: 10px;
+    color: var(--accent);
+    user-select: none;
+  }
+  [data-design="v1"] .ch-row .approval-evidence {
+    margin: 4px 0 0 16px;
+    padding: 0;
+    color: var(--ink-3);
+  }
+  [data-design="v1"] .ch-row .approval-preview {
+    margin: 0;
+    padding: 4px 6px;
+    background: var(--panel-2);
+    color: var(--ink-2);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    border-radius: var(--r-sm);
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow-x: auto;
+    max-height: 6em;
+  }
+  [data-design="v1"] .ch-row .approval-policy-block {
+    color: var(--err);
+    font-weight: 600;
+    background: color-mix(in srgb, var(--err) 12%, var(--panel-2));
+    padding: 4px 6px;
+    border-radius: var(--r-sm);
+  }
+  [data-design="v1"] .ch-row .approval-actions {
+    display: flex;
+    gap: 6px;
+    justify-content: flex-end;
+    margin-top: 2px;
+  }
+  /* Inline .act buttons — duplicates the colour/border treatment from
+     shared_static/design/patterns/approval-dock.css :162-225 because
+     the dock rules are scoped to `.approval-dock button.act` and the
+     children-tree row isn't inside a dock. Compact sizing applied
+     via .sm. Keeping the duplication local-scoped means a future
+     hoist of the dock rules to a global `.act` primitive could
+     drop these without affecting the dock surface. */
+  [data-design="v1"] .ch-row .approval-actions .act {
+    padding: 3px 10px;
+    font: inherit;
+    font-size: 11px;
+    min-height: 24px;
+    font-weight: 500;
+    color: var(--ink-2);
+    background: var(--panel);
+    border: 1.5px solid var(--hair-2);
+    border-radius: var(--r-md);
+    cursor: pointer;
+    transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+  }
+  [data-design="v1"] .ch-row .approval-actions .act:hover {
+    color: var(--ink);
+    border-color: var(--ink-4);
+  }
+  [data-design="v1"] .ch-row .approval-actions .act:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  [data-design="v1"] .ch-row .approval-actions .act:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  [data-design="v1"] .ch-row .approval-actions .act.primary {
+    background: color-mix(in srgb, var(--ok) 28%, var(--panel));
+    color: var(--ok-text);
+    border-color: color-mix(in srgb, var(--ok) 65%, var(--hair));
+    font-weight: 600;
+  }
+  [data-design="v1"] .ch-row .approval-actions .act.primary:hover {
+    background: color-mix(in srgb, var(--ok) 40%, var(--panel));
+    color: var(--ink);
+    border-color: var(--ok);
+  }
+  [data-design="v1"] .ch-row .approval-actions .act.danger {
+    color: var(--err);
+    border-color: color-mix(in srgb, var(--err) 42%, var(--hair));
+  }
+  [data-design="v1"] .ch-row .approval-actions .act.danger:hover {
+    background: var(--err-soft);
+    color: var(--err);
+    border-color: var(--err);
+  }
+  /* Mobile (<700px) — hit targets must stay ≥44px tall on touch.
+     Buttons stretch to full row width and increase padding so the
+     accordion-collapsed sidebar remains thumb-usable. */
+  @media (max-width: 700px) {
+    [data-design="v1"] .ch-row .approval-actions {
+      flex-direction: row;
+    }
+    [data-design="v1"] .ch-row .approval-actions .act.sm {
+      flex: 1 1 0;
+      min-height: 44px;
+      font-size: 13px;
+    }
+  }
   [data-design="v1"] .task-row .title {
     font-weight: 500;
     color: var(--ink);

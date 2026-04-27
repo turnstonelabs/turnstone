@@ -52,3 +52,32 @@ def test_uppercase_hex_rejected(client):
     # Our ws_ids are lowercase hex; reject mixed/upper to avoid surprises.
     resp = client.get("/coordinator/" + "A" * 32)
     assert resp.status_code == 400
+
+
+def test_coordinator_js_exposes_inline_approval_helpers():
+    """Smoke guard for the Chunk 3 frontend wiring — the new helper
+    function names must remain reachable in the served JS so a refactor
+    accidentally renaming/removing them surfaces here instead of in
+    production where the children-tree's inline approve/deny buttons
+    silently stop rendering. Asserts string presence only — no DOM
+    parsing — since coord.js has no JS test framework today (per the
+    plan's testing notes)."""
+    from pathlib import Path
+
+    coord_js = Path(__file__).resolve().parent.parent / (
+        "turnstone/console/static/coordinator/coordinator.js"
+    )
+    body = coord_js.read_text(encoding="utf-8")
+    # Approval-block rendering helpers
+    assert "function renderApprovalBlock" in body
+    assert "function _maxSeverityItem" in body
+    assert "function _renderSubItem" in body
+    # The submit + 409 race-handling path
+    assert "function submitChildApproval" in body or "submitChildApproval(" in body
+    # The shared approve POST helper (parameterized for child ws_ids)
+    assert "function approveWorkstream" in body or "approveWorkstream(" in body
+    # The urgent live-bulk fetch option that fires on activity_state
+    # transitions in/out of "approval"
+    assert "{ urgent: true }" in body or "urgent: true" in body
+    # Server-side payload field — drift here means the JS reads stale keys
+    assert "pending_approval_detail" in body
