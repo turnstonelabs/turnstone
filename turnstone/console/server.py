@@ -607,6 +607,12 @@ _CLUSTER_WS_LIVE_KEYS = (
     "model_alias",
     "title",
     "name",
+    # Carries the inline approve/deny payload (items + judge_verdict)
+    # so coord live-bulk callers can render row-level UI without a
+    # per-child round-trip. ``None`` when no approval is pending.
+    # Cross-tenant exposure follows the trusted-team posture documented
+    # on ``SessionUIBase.serialize_pending_approval_detail``.
+    "pending_approval_detail",
 )
 
 
@@ -717,6 +723,17 @@ def _coordinator_live_snapshot(ws: Any) -> dict[str, Any]:
         val = getattr(obj, name, "") if obj else ""
         return val if isinstance(val, str) else ""
 
+    # Coord rows synthesize the same ``pending_approval_detail`` shape
+    # the node-side dashboard produces — single source of truth via
+    # ``SessionUIBase.serialize_pending_approval_detail``. The console
+    # coord LLM judge isn't wired today (``coordinator_ui.py:138``
+    # hardcodes ``judge_pending=False``), so ``judge_verdict`` will
+    # always be ``None`` for these rows; the coord-self stretch in
+    # the plan covers that follow-up. ``ui`` may be ``None`` in
+    # transient states (newly-created ws before activation); every
+    # active coord UI is a ``SessionUIBase`` and supports the method.
+    pending_approval_detail = ui.serialize_pending_approval_detail() if ui is not None else None
+
     return {
         "state": ws.state.value if hasattr(ws.state, "value") else str(ws.state),
         "tokens": 0,
@@ -729,6 +746,7 @@ def _coordinator_live_snapshot(ws: Any) -> dict[str, Any]:
         "title": "",
         "name": getattr(ws, "name", "") or "",
         "pending_approval": pending_approval,
+        "pending_approval_detail": pending_approval_detail,
     }
 
 

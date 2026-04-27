@@ -1710,6 +1710,58 @@ def test_cluster_inspect_node_backed_success(storage):
     assert live["pending_approval"] is False
 
 
+def test_cluster_inspect_node_backed_pending_approval_detail_passes_through(storage):
+    """Node /dashboard returns pending_approval_detail → live block carries
+    it through verbatim. Regression guard for the projection allowlist
+    `_CLUSTER_WS_LIVE_KEYS`: dropping the key from the tuple silently
+    breaks inline approve/deny buttons on remote-node child rows even
+    though coord rows still work via the in-process synthesis branch."""
+    mgr = _build_mgr(storage)
+    ws_id = "f0" * 16
+    _seed_node_workstream(storage, ws_id=ws_id, node_id="node-a")
+    detail = {
+        "call_id": "c-bash",
+        "judge_pending": False,
+        "items": [
+            {
+                "call_id": "c-bash",
+                "header": "bash",
+                "preview": "$ rm -rf /tmp/x",
+                "func_name": "bash",
+                "approval_label": "bash",
+                "needs_approval": True,
+                "error": None,
+                "heuristic_verdict": None,
+                "judge_verdict": {
+                    "recommendation": "deny",
+                    "risk_level": "crit",
+                    "tier": "llm",
+                },
+            }
+        ],
+    }
+    payload = {
+        "workstreams": [
+            {
+                "ws_id": ws_id,
+                "state": "attention",
+                "activity_state": "approval",
+                "activity": "awaiting approval",
+                "tokens": 100,
+                "pending_approval_detail": detail,
+            }
+        ]
+    }
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    _install_collector_with_node(client, "node-a", "http://node-a")
+    _install_proxy_client(client, httpx.MockTransport(lambda r: httpx.Response(200, json=payload)))
+    resp = client.get(f"/v1/api/cluster/ws/{ws_id}/detail", headers=_CLUSTER_HEADERS)
+    assert resp.status_code == 200
+    live = resp.json()["live"]
+    assert live["pending_approval"] is True  # derived bool, existing behavior
+    assert live["pending_approval_detail"] == detail  # full payload, new behavior
+
+
 def test_cluster_inspect_node_backed_pending_approval_synthesized(storage):
     """activity_state=='approval' from the node synthesizes pending_approval=True."""
     mgr = _build_mgr(storage)
