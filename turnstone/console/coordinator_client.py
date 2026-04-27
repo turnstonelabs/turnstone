@@ -234,20 +234,26 @@ class CoordinatorTokenManager:
 
 
 # URL paths on the console's routing proxy — must match the routes
-# registered in turnstone/console/server.py (_CONSOLE_ROUTES).  Tested
-# in test_coordinator_client.py against the live route table.
+# registered in turnstone/console/server.py.  Templates with
+# ``{ws_id}`` are formatted at call time in ``_post`` (path-keyed
+# shape post-#422 legacy URL adapter removal). The legacy body-keyed
+# variants (``/v1/api/route/{verb}`` with ws_id in the JSON body)
+# were deleted in the URL unification — keep this table aligned with
+# what's actually mounted, see ``test_coordinator_client_route_table``
+# for the live-route consistency check.
 _ROUTE_PATHS: dict[str, str] = {
     "spawn": "/v1/api/route/workstreams/new",
-    "send": "/v1/api/route/send",
-    "approve": "/v1/api/route/approve",
-    "cancel": "/v1/api/route/cancel",
-    "close": "/v1/api/route/workstreams/close",
+    "send": "/v1/api/route/workstreams/{ws_id}/send",
+    "approve": "/v1/api/route/workstreams/{ws_id}/approve",
+    "cancel": "/v1/api/route/workstreams/{ws_id}/cancel",
+    "close": "/v1/api/route/workstreams/{ws_id}/close",
+    # ``delete`` is the only surviving body-keyed routing proxy path
+    # — it has its own ``route_workstream_delete`` handler instead of
+    # going through the generic ``route_proxy``.
     "delete": "/v1/api/route/workstreams/delete",
     # The cascade endpoints live on the console itself (not a node), so
     # the path uses the coordinator ws_id in the URL rather than a
-    # routing-proxy prefix.  ``_post`` still formats against
-    # ``_base_url``; formatting of the ``{ws_id}`` slot happens at call
-    # time in ``close_all_children``.
+    # routing-proxy prefix.
     "close_all_children": "/v1/api/workstreams/{ws_id}/close_all_children",
 }
 
@@ -317,9 +323,27 @@ class CoordinatorClient:
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._token_factory()}"}
 
-    def _post(self, path_key: str, body: dict[str, Any]) -> dict[str, Any]:
-        path = _ROUTE_PATHS[path_key]
-        return self._post_url(f"{self._base_url}{path}", body, log_path=path)
+    def _post(
+        self,
+        path_key: str,
+        body: dict[str, Any],
+        *,
+        ws_id: str | None = None,
+    ) -> dict[str, Any]:
+        """POST to a routing-proxy path. ``ws_id`` is interpolated into
+        the path template when it has a ``{ws_id}`` slot (post-#422
+        path-keyed shape); body-keyed paths (delete, close_all_children
+        callsite) ignore the kwarg. ``log_path`` keeps the template
+        un-formatted so telemetry aggregates across sessions instead
+        of fragmenting on per-call ws_ids."""
+        template = _ROUTE_PATHS[path_key]
+        if "{ws_id}" in template:
+            if not ws_id:
+                raise ValueError(f"ws_id required for path key {path_key!r}")
+            path = template.format(ws_id=ws_id)
+        else:
+            path = template
+        return self._post_url(f"{self._base_url}{path}", body, log_path=template)
 
     def _post_url(
         self,
@@ -418,7 +442,7 @@ class CoordinatorClient:
     def send(self, ws_id: str, message: str) -> dict[str, Any]:
         if not self._is_own_subtree(ws_id):
             return {"error": f"workstream not in coordinator subtree: {ws_id}", "status": 404}
-        return self._post("send", {"ws_id": ws_id, "message": message})
+        return self._post("send", {"message": message}, ws_id=ws_id)
 
     def emit_audit(self, action: str, detail: dict[str, Any]) -> None:
         """Record an audit row attributed to this coordinator session.
@@ -442,10 +466,10 @@ class CoordinatorClient:
     def close_workstream(self, ws_id: str, reason: str = "") -> dict[str, Any]:
         if not self._is_own_subtree(ws_id):
             return {"error": f"workstream not in coordinator subtree: {ws_id}", "status": 404}
-        body: dict[str, Any] = {"ws_id": ws_id}
+        body: dict[str, Any] = {}
         if reason:
             body["reason"] = reason
-        return self._post("close", body)
+        return self._post("close", body, ws_id=ws_id)
 
     def close_all_children(self, reason: str = "") -> dict[str, Any]:
         """Soft-close every direct child of this coordinator (console-side fan-out).
@@ -456,16 +480,10 @@ class CoordinatorClient:
         size.  No tenant guard here: ownership is enforced on the
         endpoint via ``_resolve_coord_session``.
         """
-        # Pass the unformatted template as ``log_path`` so telemetry
-        # aggregates cleanly — the baked-in ws_id would fragment log
-        # grouping across sessions.  The URL itself still embeds the
-        # real ws_id.
-        log_path = _ROUTE_PATHS["close_all_children"]
-        path = log_path.format(ws_id=self._coord_ws_id)
         body: dict[str, Any] = {}
         if reason:
             body["reason"] = reason
-        return self._post_url(f"{self._base_url}{path}", body, log_path=log_path)
+        return self._post("close_all_children", body, ws_id=self._coord_ws_id)
 
     def delete(self, ws_id: str) -> dict[str, Any]:
         if not self._is_own_subtree(ws_id):
@@ -484,18 +502,17 @@ class CoordinatorClient:
         always: bool = False,
     ) -> dict[str, Any]:
         body = {
-            "ws_id": ws_id,
             "call_id": call_id,
             "approved": approved,
             "feedback": feedback,
             "always": always,
         }
-        return self._post("approve", body)
+        return self._post("approve", body, ws_id=ws_id)
 
     def cancel(self, ws_id: str) -> dict[str, Any]:
         if not self._is_own_subtree(ws_id):
             return {"error": f"workstream not in coordinator subtree: {ws_id}", "status": 404}
-        return self._post("cancel", {"ws_id": ws_id})
+        return self._post("cancel", {}, ws_id=ws_id)
 
     # -- model-invoked block-wait -----------------------------------------
 

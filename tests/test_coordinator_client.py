@@ -171,14 +171,56 @@ def test_route_map_matches_console_routes():
     mirrors the shape we expect.
     """
     assert _ROUTE_PATHS["spawn"] == "/v1/api/route/workstreams/new"
-    assert _ROUTE_PATHS["send"] == "/v1/api/route/send"
-    assert _ROUTE_PATHS["approve"] == "/v1/api/route/approve"
-    assert _ROUTE_PATHS["cancel"] == "/v1/api/route/cancel"
-    assert _ROUTE_PATHS["close"] == "/v1/api/route/workstreams/close"
+    assert _ROUTE_PATHS["send"] == "/v1/api/route/workstreams/{ws_id}/send"
+    assert _ROUTE_PATHS["approve"] == "/v1/api/route/workstreams/{ws_id}/approve"
+    assert _ROUTE_PATHS["cancel"] == "/v1/api/route/workstreams/{ws_id}/cancel"
+    assert _ROUTE_PATHS["close"] == "/v1/api/route/workstreams/{ws_id}/close"
+    # ``delete`` keeps the body-keyed shape — it has its own
+    # ``route_workstream_delete`` handler instead of going through
+    # the generic route_proxy.
     assert _ROUTE_PATHS["delete"] == "/v1/api/route/workstreams/delete"
     # Cascade endpoint lives on the console itself (not a node), so the
     # path slots in the coord ws_id rather than routing through a proxy.
     assert _ROUTE_PATHS["close_all_children"] == "/v1/api/workstreams/{ws_id}/close_all_children"
+
+
+def test_route_paths_match_actual_console_mounts():
+    """Every entry in ``_ROUTE_PATHS`` must correspond to an actually
+    mounted Starlette route on the console app. Catches the kind of
+    drift that broke close_workstream / close_all_children when the
+    #422 legacy URL adapter removal deleted the body-keyed
+    /v1/api/route/{verb} routes without a corresponding update to
+    the coord client's route table."""
+    from unittest.mock import MagicMock
+
+    from starlette.routing import Mount, Route
+
+    from turnstone.console.coordinator_client import _ROUTE_PATHS
+    from turnstone.console.server import create_app
+
+    app = create_app(
+        collector=MagicMock(),
+        jwt_secret="x" * 64,
+    )
+
+    def _walk(routes, prefix=""):
+        for r in routes:
+            if isinstance(r, Mount):
+                yield from _walk(r.routes, prefix=prefix + r.path)
+            elif isinstance(r, Route):
+                yield prefix + r.path
+
+    mounted = set(_walk(app.routes))
+
+    for key, template in _ROUTE_PATHS.items():
+        # Starlette's Route.path uses ``{name}`` placeholders just
+        # like our templates, so a literal containment check works.
+        assert template in mounted, (
+            f"_ROUTE_PATHS[{key!r}] = {template!r} is not a mounted "
+            f"console route. Mounted routes containing 'route' or "
+            f"'workstreams': "
+            f"{sorted(p for p in mounted if 'route' in p or 'workstreams' in p)}"
+        )
 
 
 def test_spawn_posts_to_routing_proxy_with_bearer_token():
@@ -220,24 +262,26 @@ def test_spawn_omits_optional_empty_fields():
 def test_send_posts_to_send_route():
     client, captured = _mock_client(_ok_json({"status": 200}))
     client.send("ws-x", "hello")
-    assert captured[0].url.path == "/v1/api/route/send"
+    # Path-keyed shape post-#422: ws_id rides in the URL, not the body.
+    assert captured[0].url.path == "/v1/api/route/workstreams/ws-x/send"
     body = json.loads(captured[0].content)
-    assert body == {"ws_id": "ws-x", "message": "hello"}
+    assert body == {"message": "hello"}
 
 
 def test_close_workstream_posts_to_close_route():
     client, captured = _mock_client(_ok_json({"status": 200}))
     client.close_workstream("ws-x")
-    assert captured[0].url.path == "/v1/api/route/workstreams/close"
+    assert captured[0].url.path == "/v1/api/route/workstreams/ws-x/close"
     body = json.loads(captured[0].content)
-    assert body == {"ws_id": "ws-x"}  # no reason → omitted
+    assert body == {}  # no reason → omitted; ws_id rides the path
 
 
 def test_close_workstream_includes_reason_when_provided():
     client, captured = _mock_client(_ok_json({"status": 200}))
     client.close_workstream("ws-x", reason="done")
+    assert captured[0].url.path == "/v1/api/route/workstreams/ws-x/close"
     body = json.loads(captured[0].content)
-    assert body == {"ws_id": "ws-x", "reason": "done"}
+    assert body == {"reason": "done"}
 
 
 def test_close_all_children_posts_to_console_endpoint():
@@ -301,11 +345,15 @@ def test_approve_and_cancel_hit_their_routes():
     client, captured = _mock_client(_ok_json({"status": 200}))
     client.approve("ws-x", call_id="c-1", approved=True, feedback="ok", always=True)
     client.cancel("ws-x")
-    assert captured[0].url.path == "/v1/api/route/approve"
-    assert captured[1].url.path == "/v1/api/route/cancel"
+    # Path-keyed shape post-#422: ws_id rides the URL.
+    assert captured[0].url.path == "/v1/api/route/workstreams/ws-x/approve"
+    assert captured[1].url.path == "/v1/api/route/workstreams/ws-x/cancel"
     approve_body = json.loads(captured[0].content)
     assert approve_body["approved"] is True
     assert approve_body["always"] is True
+    assert approve_body["call_id"] == "c-1"
+    # ws_id moved to the URL — make sure we didn't double-encode it.
+    assert "ws_id" not in approve_body
 
 
 def test_http_error_returns_structured_failure():
@@ -365,7 +413,7 @@ def test_mutating_ops_accept_self_ws_id():
     client, captured = _mock_client(_ok_json({"status": 200}))
     client.send("coord-1", "hi")
     assert len(captured) == 1
-    assert captured[0].url.path == "/v1/api/route/send"
+    assert captured[0].url.path == "/v1/api/route/workstreams/coord-1/send"
 
 
 # ---------------------------------------------------------------------------
