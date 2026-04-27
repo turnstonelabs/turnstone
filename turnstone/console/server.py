@@ -2200,7 +2200,19 @@ async def proxy_api(request: Request) -> Response:
         path.startswith("workstreams/") and path.endswith("/events")
     )
     if request.method == "GET" and is_sse:
-        return await _proxy_sse(request, server_url, path, api_prefix=api_prefix)
+        # ``events/global`` requires service scope on the upstream
+        # (carries cluster-wide cross-tenant inventory by design);
+        # end-user JWTs don't have it, so proxy as the console's
+        # service identity instead. Per-ws + bare events stay on
+        # the user's identity for upstream audit attribution.
+        use_service = path == "events/global"
+        return await _proxy_sse(
+            request,
+            server_url,
+            path,
+            api_prefix=api_prefix,
+            use_service_auth=use_service,
+        )
 
     if request.method in ("POST", "PUT", "DELETE"):
         return await _proxy_post(request, server_url, path, api_prefix=api_prefix)
@@ -2266,19 +2278,39 @@ async def _proxy_post(
 
 
 async def _proxy_sse(
-    request: Request, server_url: str, path: str, *, api_prefix: str = "api"
+    request: Request,
+    server_url: str,
+    path: str,
+    *,
+    api_prefix: str = "api",
+    use_service_auth: bool = False,
 ) -> Response:
     """Proxy an SSE stream from the target server to the browser.
 
     Relays raw bytes verbatim so server-side ping comments, event framing,
     and keepalives all pass through unchanged.
+
+    ``use_service_auth=True`` swaps the user's re-minted JWT for the
+    console's service token. The ``events/global`` upstream
+    (``server.py``'s ``global_events_sse``) requires ``service`` scope
+    by design — end-user JWTs lack it, so a user-scoped proxy call
+    would 403-loop forever as the browser's EventSource auto-retries.
+    Treating it as a service-to-service call mirrors how the cluster
+    collector itself subscribes; the user identity stays with the
+    console-side gate (the ``/node/{node_id}/v1/api/`` route is
+    already gated by the console's ``AuthMiddleware``).
     """
     target = f"{server_url}/{api_prefix}/{path}"
     if request.url.query:
         target += f"?{request.url.query}"
 
     sse_client: httpx.AsyncClient = request.app.state.proxy_sse_client
-    sse_auth = _proxy_auth_headers(request)
+    sse_auth: dict[str, str]
+    if use_service_auth:
+        proxy_token_mgr = getattr(request.app.state, "proxy_token_mgr", None)
+        sse_auth = dict(proxy_token_mgr.bearer_header) if proxy_token_mgr is not None else {}
+    else:
+        sse_auth = _proxy_auth_headers(request)
 
     async def raw_stream() -> AsyncGenerator[bytes, None]:
         try:
