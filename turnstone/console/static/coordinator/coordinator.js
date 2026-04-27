@@ -1552,24 +1552,25 @@
         call_id: callId,
       });
       if (resp.status === 409) {
-        // Stale call_id \u2014 server has rolled to a new round (or
-        // resolved already).  Force-refresh the row's live block
-        // so the new pending_approval_detail surfaces (or clears).
-        // Re-enable the buttons here too: the urgent fetch is
-        // best-effort (could 5xx / network-fail), and a row whose
-        // approval truly *was* resolved elsewhere is about to be
-        // re-rendered from authoritative state \u2014 leaving the
-        // buttons disabled would strand the operator if the fetch
-        // also fails.
-        denyBtn.disabled = false;
-        approveBtn.disabled = false;
+        // Stale call_id \u2014 server has rolled to a new round, or
+        // (more commonly) the approval was already resolved on
+        // another channel and this click raced. Keep both buttons
+        // disabled until the urgent refresh lands and re-renders
+        // the row: the row is about to be replaced wholesale, so
+        // the disabled DOM is dropped along with it. Re-enabling
+        // here was the bug \u2014 it opened a window where rapid clicks
+        // hit the same already-resolved approval, each producing a
+        // fresh 409, looping until the live-bulk eventually cleared
+        // the row. On the rare path where the urgent refresh fails
+        // entirely, the operator can hit the Refresh button on the
+        // children panel to force a full reload.
         invalidateLiveBadge(targetWsId);
         scheduleLiveFetch(targetWsId, { urgent: true });
-        if (typeof toast !== "undefined" && toast.warn) {
-          toast.warn("Approval state changed \u2014 refreshed.");
-        } else {
-          console.warn("approval state changed for", targetWsId);
-        }
+        // Quiet console-warn for diagnostics; no toast \u2014 the
+        // disappearing buttons / fresh row IS the operator-facing
+        // signal, and a toast on every rapid-click 409 would just
+        // add noise.
+        console.warn("approval state changed for", targetWsId);
         return;
       }
       if (!resp.ok) {
