@@ -1006,16 +1006,33 @@ def test_tasks_mixed_read_and_write_in_batch_rejected(coord_session):
 
 
 def test_tasks_all_writes_in_batch_permitted(coord_session):
-    """All-write batches are SAFE: writes serialise under
-    ``CoordinatorClient``'s per-ws lock and the result is
-    deterministic against the input set even if the dispatch order
-    isn't.  Four parallel ``tasks(add=...)`` is the canonical
-    "decompose plan into N tasks" shape."""
+    """All-write batches are SAFE: the dispatcher runs them serially
+    in input order (see ``test_tasks_writes_run_in_input_order``) so
+    the final task list ordering matches the model's emit order, and
+    each per-call lock acquisition under ``CoordinatorClient`` keeps
+    the storage row consistent.  Four parallel ``tasks(add=...)`` is
+    the canonical "decompose plan into N tasks" shape."""
     sess, coord, _ui = coord_session
-    coord.tasks_add.side_effect = lambda *a, **kw: {
-        "ok": True,
-        "task": {"id": "t1", "title": kw.get("title", ""), "status": "pending"},
-    }
+    # Real ``CoordinatorClient.tasks_add`` returns the task dict
+    # directly with top-level ``id`` / ``title`` / ``status`` /
+    # ``child_ws_id`` / ``created`` / ``updated``.  Stubbing with
+    # the matching shape so a future refactor that depends on the
+    # actual contract (``result.get("id")`` etc.) doesn't pass
+    # vacuously here.
+    next_task_num = [0]
+
+    def _tasks_add(*_a, **kw):
+        next_task_num[0] += 1
+        return {
+            "id": f"t{next_task_num[0]}",
+            "title": kw.get("title", ""),
+            "status": "pending",
+            "child_ws_id": kw.get("child_ws_id", ""),
+            "created": "2026-04-28T00:00:00",
+            "updated": "2026-04-28T00:00:00",
+        }
+
+    coord.tasks_add.side_effect = _tasks_add
     tool_calls = [
         _tc("tasks", {"action": "add", "title": f"task {i}"}, call_id=f"call-{i}") for i in range(4)
     ]
@@ -1023,6 +1040,73 @@ def test_tasks_all_writes_in_batch_permitted(coord_session):
     for _cid, output in results:
         assert "read-after-write" not in output.lower(), output
         assert "cannot run" not in output.lower(), output
+
+
+def test_tasks_writes_run_in_input_order(coord_session):
+    """Regression guard: ``tasks_add`` calls must reach the
+    coordinator client in the SAME order the model emitted them.
+    Pre-fix, ``ThreadPoolExecutor.map`` dispatched in
+    scheduler-dependent order — the SET of tasks ended up consistent
+    but the final list ordering (and timestamps/IDs) varied
+    run-to-run.  The fix runs any batch containing a tasks-write
+    serially in input order; this test pins the property by capturing
+    the title sequence as ``tasks_add`` sees it."""
+    sess, coord, _ui = coord_session
+    seen_titles: list[str] = []
+
+    def _tasks_add(*_a, **kw):
+        seen_titles.append(kw.get("title", ""))
+        return {
+            "id": f"t{len(seen_titles)}",
+            "title": kw.get("title", ""),
+            "status": "pending",
+            "child_ws_id": "",
+            "created": "2026-04-28T00:00:00",
+            "updated": "2026-04-28T00:00:00",
+        }
+
+    coord.tasks_add.side_effect = _tasks_add
+    titles = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"]
+    tool_calls = [
+        _tc("tasks", {"action": "add", "title": t}, call_id=f"call-{i}")
+        for i, t in enumerate(titles)
+    ]
+    sess._execute_tools(tool_calls)
+    # Exact input-order preservation — no scheduler-dependent
+    # interleaving.
+    assert seen_titles == titles
+
+
+def test_tasks_writes_serial_when_mixed_with_non_tasks_siblings(coord_session):
+    """Even when the batch mixes a tasks-write with non-tasks
+    siblings, the tasks-write path must still preserve input order
+    (the dispatcher runs the WHOLE batch serially in this case to
+    keep the implementation simple).  A coord adding 2 tasks +
+    listing nodes in one turn shouldn't see scheduler-shuffled task
+    titles."""
+    sess, coord, _ui = coord_session
+    seen_titles: list[str] = []
+
+    def _tasks_add(*_a, **kw):
+        seen_titles.append(kw.get("title", ""))
+        return {
+            "id": f"t{len(seen_titles)}",
+            "title": kw.get("title", ""),
+            "status": "pending",
+            "child_ws_id": "",
+            "created": "2026-04-28T00:00:00",
+            "updated": "2026-04-28T00:00:00",
+        }
+
+    coord.tasks_add.side_effect = _tasks_add
+    coord.list_nodes.return_value = {"nodes": [], "truncated": False}
+    tool_calls = [
+        _tc("tasks", {"action": "add", "title": "first"}, call_id="call-1"),
+        _tc("list_nodes", {}, call_id="call-2"),
+        _tc("tasks", {"action": "add", "title": "second"}, call_id="call-3"),
+    ]
+    sess._execute_tools(tool_calls)
+    assert seen_titles == ["first", "second"]
 
 
 def test_tasks_all_reads_in_batch_permitted(coord_session):
@@ -1053,9 +1137,15 @@ def test_tasks_write_with_non_tasks_sibling_permitted(coord_session):
     race regardless of dispatch order.  This is the natural batch
     shape for "add a task AND look up something else"."""
     sess, coord, _ui = coord_session
+    # Match real ``CoordinatorClient.tasks_add`` shape — dict
+    # returned directly, not wrapped in ``{"ok": True, "task": ...}``.
     coord.tasks_add.return_value = {
-        "ok": True,
-        "task": {"id": "t1", "title": "a", "status": "pending"},
+        "id": "t1",
+        "title": "a",
+        "status": "pending",
+        "child_ws_id": "",
+        "created": "2026-04-28T00:00:00",
+        "updated": "2026-04-28T00:00:00",
     }
     tool_calls = [
         _tc("tasks", {"action": "add", "title": "a"}, call_id="call-1"),

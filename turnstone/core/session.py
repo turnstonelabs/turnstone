@@ -3847,9 +3847,11 @@ class ChatSession:
         #
         # All-write and all-read batches are SAFE:
         #   - Writes serialise under the per-ws lock in
-        #     ``CoordinatorClient.tasks_*``; the result is
-        #     deterministic against the input set even if the
-        #     dispatch order isn't.
+        #     ``CoordinatorClient.tasks_*``, AND a batch containing
+        #     any ``tasks`` write runs serially in input order (see
+        #     the run-loop branch below) so the final task list
+        #     ordering matches what the model emitted, not the
+        #     scheduler's acquisition order.
         #   - Reads can't race against anything.
         #
         # The rule below only fires on the MIX, so the natural
@@ -3968,8 +3970,26 @@ class ChatSession:
         if len(items) == 1:
             results = [run_one(items[0])]
         else:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-                results = list(pool.map(run_one, items))
+            # When the batch contains any ``tasks`` write, run every
+            # item serially in input order.  ``tasks_add`` appends
+            # under a per-ws lock; a parallel ThreadPoolExecutor's
+            # scheduler-dependent acquisition order would otherwise
+            # produce a final task list whose ordering varies
+            # run-to-run, even though the SET of tasks is consistent.
+            # The model emitted the writes in a particular order;
+            # respecting that is the deterministic shape both
+            # operators and the model expect.  Other batches stay
+            # parallel — the perf payoff is real and there's no
+            # ordering hazard against state outside ``tasks``.
+            has_tasks_write = any(
+                it.get("func_name") == "tasks" and it.get("action") in _TASKS_WRITE_ACTIONS
+                for it in items
+            )
+            if has_tasks_write:
+                results = [run_one(it) for it in items]
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                    results = list(pool.map(run_one, items))
 
         # Post-plan gate: iterative review loop.  When the user gives
         # feedback the plan agent re-runs and the revised plan is shown
