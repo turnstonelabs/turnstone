@@ -51,6 +51,32 @@ _DEFAULT_LISTENER_QUEUE_MAX = 500
 _MAX_TURN_CONTENT_CHARS = 256 * 1024
 
 
+def fire_judge_verdict_metric(
+    metrics: Any,
+    verdict: dict[str, Any],
+    default_tier: str,
+) -> None:
+    """Fire ``record_judge_verdict`` on the given Prometheus collector.
+
+    Both :class:`turnstone.server.WebUI` (per-node ``MetricsCollector``)
+    and :class:`turnstone.console.coordinator_ui.ConsoleCoordinatorUI`
+    (console-side :class:`ConsoleMetrics`) route their hook overrides
+    through this helper. Pins the ``(tier, risk_level, latency_ms)``
+    extraction shape so a future signature change to
+    ``record_judge_verdict`` lands in one place instead of four.
+
+    ``default_tier`` is the call-site label (``"heuristic"`` or
+    ``"llm"``) used only when the verdict dict doesn't already carry
+    a ``tier`` key — both real producers always set it, but the
+    fallback keeps a malformed verdict on the right histogram bucket.
+    """
+    metrics.record_judge_verdict(
+        verdict.get("tier", default_tier),
+        verdict.get("risk_level", "medium"),
+        verdict.get("latency_ms", 0),
+    )
+
+
 class AutoApproveReason:
     """Source vocabulary for ``auto_approve_reason`` annotations.
 
@@ -327,6 +353,235 @@ class SessionUIBase:
         self._enqueue({"type": "plan_resolved", "feedback": feedback})
         self._plan_event.set()
 
+    def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]:
+        """Two-phase approval gate for a batch of tool calls.
+
+        Shared body for both interactive (:class:`turnstone.server.WebUI`)
+        and coordinator (:class:`turnstone.console.coordinator_ui.ConsoleCoordinatorUI`)
+        sessions. Order of resolution:
+
+        1. Reset the per-round verdict cache so late LLM verdicts from
+           the previous round can't leak onto this one.
+        2. Evaluate admin-defined tool policies (deny short-circuits;
+           allow tags items as auto-approved with ``AutoApproveReason.POLICY``).
+        3. Per-tool auto-approve via ``self.auto_approve_tools`` (skill
+           ``allowed_tools`` and operator "Approve + Always").
+        4. Budget-override carve-out + blanket ``self.auto_approve``.
+           Synthetic ``__budget_override__`` items always prompt.
+        5. Activity tagging + ``_broadcast_activity`` so the dashboard
+           reflects approval state.
+        6. Heuristic verdict persistence (one row per ``_heuristic_verdict``
+           item) + ``_record_judge_metric`` hook (subclass-overridden to
+           feed the node's or console's Prometheus collector).
+        7. Emit the ``approve_request`` and block on ``_approval_event``
+           up to ``_APPROVAL_WAIT_TIMEOUT``.
+
+        ``__budget_override__`` is interactive-only today (coord
+        workstreams don't have token budgets), but the carve-out check
+        is cheap (``any(...)`` over pending) and is a no-op on coord;
+        kept unconditional so a future coord-skill path picks it up
+        for free.
+        """
+        self._reset_approval_cycle()
+        pending = [it for it in items if it.get("needs_approval") and not it.get("error")]
+
+        # ``__budget_override__`` is a synthetic UI-only pseudo-tool injected
+        # by ChatSession.send when a skill's token budget is exhausted; its
+        # whole purpose is to force an operator prompt before the next turn
+        # spends past the cap. Read from the pre-filter ``items`` list (not
+        # ``pending``) so a wildcard ``*: allow`` policy or a stray entry in
+        # ``auto_approve_tools`` cannot strip the override from ``pending``
+        # before the carve-out gate at the auto-approve fall-through can see
+        # it. Same intent gates the policy block above.
+        has_budget_override = any(it.get("func_name") == "__budget_override__" for it in items)
+
+        # -- Tool policy evaluation -----------------------------------------------
+        # Check admin-defined tool policies before the auto_approve check.
+        # ``__budget_override__`` is excluded from policy matching: it is a
+        # synthetic UI-only pseudo-tool that exists specifically to force an
+        # operator prompt when a skill's token budget is exhausted, so a
+        # wildcard ``*: allow`` policy must never auto-approve it. Same
+        # rationale gates the carve-out check below at line 470.
+        if pending:
+            try:
+                from turnstone.core.policy import evaluate_tool_policies_batch
+                from turnstone.core.storage._registry import get_storage
+
+                storage = get_storage()
+                if storage is not None:
+                    tool_names = [
+                        it.get("approval_label", "") or it.get("func_name", "")
+                        for it in pending
+                        if it.get("func_name") and it.get("func_name") != "__budget_override__"
+                    ]
+                    if tool_names:
+                        verdicts = evaluate_tool_policies_batch(storage, tool_names)
+                        still_pending = []
+                        for it in pending:
+                            policy_name = it.get("approval_label", "") or it.get("func_name", "")
+                            # Synthetic budget-override item bypasses policy
+                            # matching entirely — falls through to the carve-out
+                            # gate so an operator always sees the prompt.
+                            if it.get("func_name") == "__budget_override__":
+                                still_pending.append(it)
+                                continue
+                            verdict = verdicts.get(policy_name)
+                            if verdict == "deny":
+                                it["denied"] = True
+                                it["denial_msg"] = (
+                                    f"Blocked by tool policy (pattern match for '{policy_name}')"
+                                )
+                            elif verdict == "allow":
+                                # Admin-defined ``allow`` rule fires the
+                                # auto-approve gate without any UI prompt.
+                                # Tag for /dashboard visibility so the
+                                # operator can see which calls bypassed
+                                # the prompt and why.
+                                it["needs_approval"] = False
+                                self._tag_auto_approved([it], AutoApproveReason.POLICY)
+                            else:
+                                still_pending.append(it)
+                        # If all were resolved by policy, check if any were denied
+                        if not still_pending:
+                            any_denied = any(it.get("denied") for it in items)
+                            if any_denied:
+                                # Record the policy-allowed siblings before
+                                # the early return — the fall-through
+                                # branch never runs on this path, so without
+                                # this the policy bypass is invisible to
+                                # /dashboard + audit.
+                                self._record_auto_approves(items)
+                                self._enqueue(
+                                    {
+                                        "type": "tool_info",
+                                        "items": self._serialize_approval_items(items),
+                                    }
+                                )
+                                return False, "Blocked by tool policy"
+                        pending = still_pending
+            except Exception:
+                log.debug("Tool policy evaluation failed", exc_info=True)
+        # -- End tool policy evaluation -------------------------------------------
+
+        # Per-tool auto-approve check (from workstream template or interactive "Always").
+        # Suppressed when a budget-override item is present so the carve-out
+        # at the next gate stays effective even if ``__budget_override__`` ever
+        # lands in ``auto_approve_tools`` (defensive — listings filter it out
+        # today, but the worker can be configured by a skill template).
+        if pending and self.auto_approve_tools and not has_budget_override:
+            pending_names = {
+                it.get("approval_label", "") or it.get("func_name", "")
+                for it in pending
+                if it.get("func_name")
+            }
+            if pending_names and pending_names.issubset(self.auto_approve_tools):
+                # Tag each formerly-pending item with the per-tool source
+                # recorded when ``auto_approve_tools`` was populated:
+                # ``skill`` (skill template's ``allowed_tools``) /
+                # ``always`` (user "Approve + Always" click) / fallback
+                # ``auto_approve_tools`` for legacy or unknown writers.
+                # Visibility for the skill-vs-explicit conflation
+                # flagged on the coord tree dashboard.
+                self._tag_auto_approved(
+                    pending,
+                    AutoApproveReason.AUTO_APPROVE_TOOLS,
+                    source_map=self._auto_approve_tools_source,
+                )
+                pending = []
+
+        # Budget override requires explicit approval — never auto-approved by
+        # blanket auto_approve (tool policies can still allow it explicitly,
+        # but the policy block above carves out ``__budget_override__`` so
+        # that path is unreachable too). ``has_budget_override`` was computed
+        # from the pre-filter ``items`` list at the top of the function so a
+        # policy/auto-approve pass that drained the override from ``pending``
+        # cannot disarm this gate.
+        blanket_active = self.auto_approve and not has_budget_override
+        if not pending or blanket_active:
+            if blanket_active and pending:
+                # Blanket flag drained the rest of pending — tag so the
+                # dashboard can distinguish from
+                # ``auto_approve_tools`` / ``policy``.  No need to
+                # clear ``pending`` here: the function returns inside
+                # this block without reading it again.
+                self._tag_auto_approved(pending, AutoApproveReason.BLANKET)
+            # Track auto-approved tool activity
+            first = items[0] if items else {}
+            label = first.get("func_name", "")
+            preview = first.get("preview", "")[:80]
+            with self._ws_lock:
+                self._ws_current_activity = f"⚙ {label}: {preview}" if label else ""
+                self._ws_activity_state = "tool" if label else ""
+            self._broadcast_activity()
+            self._record_auto_approves(items)
+            self._enqueue({"type": "tool_info", "items": self._serialize_approval_items(items)})
+            return True, None
+
+        # Track pending approval activity
+        first_pending = pending[0]
+        label = first_pending.get("func_name", "")
+        preview = first_pending.get("preview", "")[:60]
+        with self._ws_lock:
+            self._ws_current_activity = f"⏳ Awaiting approval: {label} — {preview}"
+            self._ws_activity_state = "approval"
+        self._broadcast_activity()
+
+        # Persist heuristic verdicts and track for user_decision update.
+        # Build list locally, then assign under lock to avoid racing with
+        # the judge daemon thread's on_intent_verdict() appends. Storage
+        # write goes through the bulk path so a tool-heavy turn pays one
+        # commit instead of N (was visible as time-to-render-prompt
+        # latency for fan-out turns); the per-item Prometheus call stays
+        # in the loop because it's a lock+increment, not a DB round-trip.
+        heuristic_verdicts: list[dict[str, Any]] = []
+        for item in items:
+            hv = item.get("_heuristic_verdict")
+            if hv:
+                heuristic_verdicts.append(hv)
+                # Subclass-overridden Prometheus surface: WebUI feeds
+                # the per-node /metrics endpoint, ConsoleCoordinatorUI
+                # feeds the console's /metrics endpoint via ConsoleMetrics.
+                self._record_judge_metric(hv)
+        self._persist_intent_verdicts_bulk(heuristic_verdicts, default_tier="heuristic")
+
+        with self._ws_lock:
+            self._pending_verdicts = heuristic_verdicts
+
+        # Record any items the policy block already auto-approved
+        # before falling through to the prompt — without this the
+        # mixed-policy-then-prompt path leaves the policy bypass
+        # invisible to /dashboard (the auto-approve fall-through never
+        # runs since pending is non-empty + blanket inactive).
+        # No-op when no items are auto-approve-tagged.
+        self._record_auto_approves(items)
+
+        # Send approval request and block
+        judge_pending = any(it.get("_heuristic_verdict") for it in items)
+        self._approval_event.clear()
+        self._pending_approval = {
+            "type": "approve_request",
+            "items": self._serialize_approval_items(items),
+            "judge_pending": judge_pending,
+        }
+        self._enqueue(self._pending_approval)
+        if not self._approval_event.wait(timeout=self._APPROVAL_WAIT_TIMEOUT):
+            # Approval timed out (e.g., user disconnected). Deny via
+            # resolve_approval so verdicts and state are updated consistently.
+            log.warning("Approval timed out for ws_id=%s", self.ws_id)
+            self.resolve_approval(False, "Approval timed out after 1 hour")
+        self._pending_approval = None
+        approved, feedback = self._approval_result
+
+        if not approved:
+            denial_msg = "Denied by user"
+            if feedback:
+                denial_msg += f": {feedback}"
+            for item in pending:
+                item["denied"] = True
+                item["denial_msg"] = denial_msg
+
+        return approved, feedback
+
     # ------------------------------------------------------------------
     # Intent-judge + output-guard plumbing
     # ------------------------------------------------------------------
@@ -334,6 +589,13 @@ class SessionUIBase:
     # Hard cap on the in-memory verdict cache so a long-running session
     # can't grow unbounded. FIFO eviction on insert.
     _LLM_VERDICT_CACHE_MAX = 50
+
+    # Hard cap on how long a worker thread blocks waiting for an
+    # approval / plan-review decision. Subclasses' ``approve_tools`` and
+    # ``on_plan_review`` reference this rather than the literal so a
+    # future ``settings.approval_timeout_seconds`` knob can swap it in
+    # one place.
+    _APPROVAL_WAIT_TIMEOUT = 3600
 
     def on_intent_verdict(self, verdict: dict[str, Any]) -> None:
         """Deliver an LLM intent-judge verdict to the frontend + persist.
@@ -373,7 +635,90 @@ class SessionUIBase:
         if decision:
             self._persist_verdict_decisions([verdict], decision)
 
-    def _persist_intent_verdict(self, verdict: dict[str, Any]) -> None:
+    def _record_judge_metric(self, verdict: dict[str, Any]) -> None:
+        """Extension point for transport-specific Prometheus metrics.
+
+        ``approve_tools`` calls this for each persisted heuristic
+        verdict. Subclasses override to fan the verdict into their
+        own metrics collector:
+
+        - ``WebUI`` writes to the per-node ``MetricsCollector`` so the
+          node's /metrics endpoint surfaces ``turnstone_judge_verdicts_total``.
+        - ``ConsoleCoordinatorUI`` writes to ``ConsoleMetrics`` so the
+          console's /metrics endpoint surfaces the same metric name —
+          a cluster-wide PromQL query rolls coord and interactive
+          verdicts up uniformly.
+
+        Default no-op covers test fixtures and any future SessionUI
+        impl that doesn't expose a /metrics surface. Mirrors the
+        pattern used for ``_broadcast_state`` / ``_broadcast_activity``.
+        """
+        del verdict  # default impl: no metrics surface
+
+    def _persist_intent_verdicts_bulk(
+        self,
+        verdicts: list[dict[str, Any]],
+        *,
+        default_tier: str = "heuristic",
+    ) -> None:
+        """Bulk-insert a list of intent-judge verdicts in one transaction.
+
+        Used by ``approve_tools`` so the per-turn heuristic-verdict
+        persistence doesn't block on N×commit before the approval UI
+        enqueues. Each verdict dict mirrors the keyword args of
+        :meth:`_persist_intent_verdict`; ``ws_id`` is stamped from
+        ``self.ws_id`` and ``evidence`` is JSON-encoded so the row
+        shape matches the per-row path. Storage failure is best-effort
+        (logged at debug) — the verdict cache and UI dispatch run
+        independently of the DB write.
+        """
+        if not verdicts:
+            return
+        try:
+            from turnstone.core.storage._registry import get_storage
+
+            storage = get_storage()
+            if storage is None:
+                return
+            rows = [
+                {
+                    "verdict_id": v.get("verdict_id", ""),
+                    "ws_id": self.ws_id,
+                    "call_id": v.get("call_id", ""),
+                    "func_name": v.get("func_name", ""),
+                    "func_args": v.get("func_args", ""),
+                    "intent_summary": v.get("intent_summary", ""),
+                    "risk_level": v.get("risk_level", "medium"),
+                    "confidence": v.get("confidence", 0.5),
+                    "recommendation": v.get("recommendation", "review"),
+                    "reasoning": v.get("reasoning", ""),
+                    "evidence": json.dumps(v.get("evidence", [])),
+                    "tier": v.get("tier", default_tier),
+                    "judge_model": v.get("judge_model", ""),
+                    "latency_ms": v.get("latency_ms", 0),
+                }
+                for v in verdicts
+            ]
+            storage.create_intent_verdicts_bulk(rows)
+        except Exception:
+            log.debug("Failed to bulk-persist intent verdicts", exc_info=True)
+
+    def _persist_intent_verdict(
+        self,
+        verdict: dict[str, Any],
+        *,
+        default_tier: str = "llm",
+    ) -> None:
+        """Persist an intent-judge verdict row.
+
+        Used by both the async LLM-tier path (``on_intent_verdict``,
+        default tier ``"llm"``) and the synchronous heuristic-tier
+        path (``approve_tools``, caller passes ``default_tier="heuristic"``).
+        ``default_tier`` only matters when the verdict dict doesn't
+        already carry a ``tier`` key — both real producers always set it,
+        but the fallback is the right call-site label so a malformed
+        verdict still lands on the correct row classification.
+        """
         try:
             from turnstone.core.storage._registry import get_storage
 
@@ -392,12 +737,12 @@ class SessionUIBase:
                 recommendation=verdict.get("recommendation", "review"),
                 reasoning=verdict.get("reasoning", ""),
                 evidence=json.dumps(verdict.get("evidence", [])),
-                tier=verdict.get("tier", "llm"),
+                tier=verdict.get("tier", default_tier),
                 judge_model=verdict.get("judge_model", ""),
                 latency_ms=verdict.get("latency_ms", 0),
             )
         except Exception:
-            log.debug("Failed to persist LLM verdict", exc_info=True)
+            log.debug("Failed to persist intent verdict", exc_info=True)
 
     def serialize_pending_approval_detail(self) -> dict[str, Any] | None:
         """Build the inline approval payload for dashboard projection.

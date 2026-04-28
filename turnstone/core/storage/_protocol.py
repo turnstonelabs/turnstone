@@ -1258,6 +1258,20 @@ class StorageBackend(Protocol):
         """Record an intent validation verdict."""
         ...
 
+    def create_intent_verdicts_bulk(self, verdicts: list[dict[str, Any]]) -> None:
+        """Insert many intent_verdict rows in one transaction.
+
+        Each dict mirrors :meth:`create_intent_verdict`'s keyword args
+        (``verdict_id`` / ``ws_id`` / ``call_id`` / ``func_name`` /
+        ``func_args`` / ``intent_summary`` / ``risk_level`` /
+        ``confidence`` / ``recommendation`` / ``reasoning`` / ``evidence`` /
+        ``tier`` / ``judge_model`` / ``latency_ms``). Used by the
+        synchronous heuristic-verdict persistence loop in
+        ``approve_tools`` so a tool-heavy turn doesn't pay N×commit
+        latency before the approval prompt renders.
+        """
+        ...
+
     def get_intent_verdict(self, verdict_id: str) -> dict[str, Any] | None:
         """Return intent verdict dict or None."""
         ...

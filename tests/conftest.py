@@ -95,3 +95,21 @@ def mock_openai_client():
     client = MagicMock()
     client.models.list.return_value.data = [MagicMock(id="test-model")]
     return client
+
+
+@pytest.fixture(autouse=True)
+def _clear_policy_cache():
+    """Drop the in-process tool-policy cache between tests.
+
+    The cache is keyed by org_id (default ``""``), so without this
+    autouse hook a policy created in test A would leak into test B's
+    ``evaluate_tool_policy`` call — distinct storage instances, same
+    cache slot. Production singleton storage doesn't see the leak
+    because there's only one storage instance for the process lifetime;
+    the test isolation requirement is what motivates the autouse.
+    """
+    from turnstone.core.policy import invalidate_policy_cache
+
+    invalidate_policy_cache()
+    yield
+    invalidate_policy_cache()

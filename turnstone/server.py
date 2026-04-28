@@ -77,7 +77,11 @@ from turnstone.core.session_routes import (
     make_send_handler,
     register_session_routes,
 )
-from turnstone.core.session_ui_base import AutoApproveReason, SessionUIBase
+from turnstone.core.session_ui_base import (
+    AutoApproveReason,
+    SessionUIBase,
+    fire_judge_verdict_metric,
+)
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
 from turnstone.core.web_helpers import version_html as _version_html
 from turnstone.core.workstream import (
@@ -222,196 +226,23 @@ class WebUI(SessionUIBase):
     # overridden below to layer Prometheus ``_metrics.record_*`` calls
     # (node-only) on top of the shared per-ws metric writes.
 
-    def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]:
-        self._reset_approval_cycle()
-        pending = [it for it in items if it.get("needs_approval") and not it.get("error")]
+    # ``approve_tools`` is inherited from :class:`SessionUIBase`. The
+    # node-level prometheus metric for heuristic verdicts is layered via
+    # the ``_record_judge_metric`` hook below so the lifted body stays
+    # transport-agnostic.
 
-        # -- Tool policy evaluation -----------------------------------------------
-        # Check admin-defined tool policies before the auto_approve check.
-        if pending:
-            try:
-                from turnstone.core.policy import evaluate_tool_policies_batch
-                from turnstone.core.storage._registry import get_storage
+    def _record_judge_metric(self, verdict: dict[str, Any]) -> None:
+        """Layer the per-node Prometheus metric on top of the shared body.
 
-                storage = get_storage()
-                if storage is not None:
-                    tool_names = [
-                        it.get("approval_label", "") or it.get("func_name", "")
-                        for it in pending
-                        if it.get("func_name")
-                    ]
-                    if tool_names:
-                        verdicts = evaluate_tool_policies_batch(storage, tool_names)
-                        still_pending = []
-                        for it in pending:
-                            policy_name = it.get("approval_label", "") or it.get("func_name", "")
-                            verdict = verdicts.get(policy_name)
-                            if verdict == "deny":
-                                it["denied"] = True
-                                it["denial_msg"] = (
-                                    f"Blocked by tool policy (pattern match for '{policy_name}')"
-                                )
-                            elif verdict == "allow":
-                                # Admin-defined ``allow`` rule fires the
-                                # auto-approve gate without any UI prompt.
-                                # Tag for /dashboard visibility so the
-                                # operator can see which calls bypassed
-                                # the prompt and why.
-                                it["needs_approval"] = False
-                                self._tag_auto_approved([it], AutoApproveReason.POLICY)
-                            else:
-                                still_pending.append(it)
-                        # If all were resolved by policy, check if any were denied
-                        if not still_pending:
-                            any_denied = any(it.get("denied") for it in items)
-                            if any_denied:
-                                # Record the policy-allowed siblings before
-                                # the early return — the line-325 fall-
-                                # through branch never runs on this path,
-                                # so without this the policy bypass is
-                                # invisible to /dashboard + audit.
-                                self._record_auto_approves(items)
-                                self._enqueue(
-                                    {
-                                        "type": "tool_info",
-                                        "items": self._serialize_approval_items(items),
-                                    }
-                                )
-                                return False, "Blocked by tool policy"
-                        pending = still_pending
-            except Exception:
-                log.debug("Tool policy evaluation failed", exc_info=True)
-        # -- End tool policy evaluation -------------------------------------------
-
-        # Per-tool auto-approve check (from workstream template or interactive "Always")
-        if pending and self.auto_approve_tools:
-            pending_names = {
-                it.get("approval_label", "") or it.get("func_name", "")
-                for it in pending
-                if it.get("func_name")
-            }
-            if pending_names and pending_names.issubset(self.auto_approve_tools):
-                # Tag each formerly-pending item with the per-tool source
-                # recorded when ``auto_approve_tools`` was populated:
-                # ``skill`` (skill template's ``allowed_tools``) /
-                # ``always`` (user "Approve + Always" click) / fallback
-                # ``auto_approve_tools`` for legacy or unknown writers.
-                # Visibility for the skill-vs-explicit conflation
-                # flagged on the coord tree dashboard.
-                self._tag_auto_approved(
-                    pending,
-                    AutoApproveReason.AUTO_APPROVE_TOOLS,
-                    source_map=self._auto_approve_tools_source,
-                )
-                pending = []
-
-        # Budget override requires explicit approval — never auto-approved by
-        # blanket auto_approve (tool policies can still allow it explicitly).
-        has_budget_override = any(it.get("func_name") == "__budget_override__" for it in pending)
-        blanket_active = self.auto_approve and not has_budget_override
-        if not pending or blanket_active:
-            if blanket_active and pending:
-                # Blanket flag drained the rest of pending \u2014 tag so the
-                # dashboard can distinguish from
-                # ``auto_approve_tools`` / ``policy``.  No need to
-                # clear ``pending`` here: the function returns inside
-                # this block without reading it again.
-                self._tag_auto_approved(pending, AutoApproveReason.BLANKET)
-            # Track auto-approved tool activity
-            first = items[0] if items else {}
-            label = first.get("func_name", "")
-            preview = first.get("preview", "")[:80]
-            with self._ws_lock:
-                self._ws_current_activity = f"\u2699 {label}: {preview}" if label else ""
-                self._ws_activity_state = "tool" if label else ""
-            self._broadcast_activity()
-            self._record_auto_approves(items)
-            self._enqueue({"type": "tool_info", "items": self._serialize_approval_items(items)})
-            return True, None
-
-        # Track pending approval activity
-        first_pending = pending[0]
-        label = first_pending.get("func_name", "")
-        preview = first_pending.get("preview", "")[:60]
-        with self._ws_lock:
-            self._ws_current_activity = f"\u23f3 Awaiting approval: {label} \u2014 {preview}"
-            self._ws_activity_state = "approval"
-        self._broadcast_activity()
-
-        # Persist heuristic verdicts and track for user_decision update.
-        # Build list locally, then assign under lock to avoid racing with
-        # the judge daemon thread's on_intent_verdict() appends.
-        heuristic_verdicts: list[dict[str, Any]] = []
-        for item in items:
-            hv = item.get("_heuristic_verdict")
-            if hv:
-                heuristic_verdicts.append(hv)
-                try:
-                    from turnstone.core.storage._registry import get_storage
-
-                    storage = get_storage()
-                    if storage is not None:
-                        storage.create_intent_verdict(
-                            verdict_id=hv.get("verdict_id", ""),
-                            ws_id=self.ws_id,
-                            call_id=hv.get("call_id", ""),
-                            func_name=hv.get("func_name", ""),
-                            func_args=hv.get("func_args", ""),
-                            intent_summary=hv.get("intent_summary", ""),
-                            risk_level=hv.get("risk_level", "medium"),
-                            confidence=hv.get("confidence", 0.5),
-                            recommendation=hv.get("recommendation", "review"),
-                            reasoning=hv.get("reasoning", ""),
-                            evidence=json.dumps(hv.get("evidence", [])),
-                            tier=hv.get("tier", "heuristic"),
-                            judge_model=hv.get("judge_model", ""),
-                            latency_ms=hv.get("latency_ms", 0),
-                        )
-                except Exception:
-                    log.debug("Failed to persist heuristic verdict", exc_info=True)
-                _metrics.record_judge_verdict(
-                    hv.get("tier", "heuristic"),
-                    hv.get("risk_level", "medium"),
-                    hv.get("latency_ms", 0),
-                )
-
-        with self._ws_lock:
-            self._pending_verdicts = heuristic_verdicts
-
-        # Record any items the policy block already auto-approved
-        # before falling through to the prompt — without this the
-        # mixed-policy-then-prompt path leaves the policy bypass
-        # invisible to /dashboard (the line-325 fall-through never
-        # runs since pending is non-empty + blanket inactive).
-        # No-op when no items are auto-approve-tagged.
-        self._record_auto_approves(items)
-
-        # Send approval request and block
-        judge_pending = bool(any(it.get("_heuristic_verdict") for it in items))
-        self._approval_event.clear()
-        self._pending_approval = {
-            "type": "approve_request",
-            "items": self._serialize_approval_items(items),
-            "judge_pending": judge_pending,
-        }
-        self._enqueue(self._pending_approval)
-        if not self._approval_event.wait(timeout=3600):
-            # Approval timed out (e.g., user disconnected). Deny via
-            # resolve_approval so verdicts and state are updated consistently.
-            log.warning("Approval timed out for ws_id=%s", self.ws_id)
-            self.resolve_approval(False, "Approval timed out after 1 hour")
-        self._pending_approval = None
-        approved, feedback = self._approval_result
-
-        if not approved:
-            denial_msg = "Denied by user"
-            if feedback:
-                denial_msg += f": {feedback}"
-            for item in pending:
-                item["denied"] = True
-                item["denial_msg"] = denial_msg
-
-        return approved, feedback
+        ``SessionUIBase.approve_tools`` calls this for each persisted
+        heuristic verdict; ``ConsoleCoordinatorUI`` overrides the same
+        hook to feed the console's ``ConsoleMetrics`` — same metric
+        name, so a cluster-wide PromQL query rolls coord and
+        interactive verdicts up uniformly. The LLM-tier counterpart
+        lives in ``on_intent_verdict`` below — same metric, different
+        tier label, same ``record_judge_verdict`` call.
+        """
+        fire_judge_verdict_metric(_metrics, verdict, "heuristic")
 
     def on_tool_result(
         self,
@@ -448,7 +279,7 @@ class WebUI(SessionUIBase):
         self._plan_event.clear()
         self._pending_plan_review = {"type": "plan_review", "content": content}
         self._enqueue(self._pending_plan_review)
-        if not self._plan_event.wait(timeout=3600):
+        if not self._plan_event.wait(timeout=self._APPROVAL_WAIT_TIMEOUT):
             log.warning("Plan review timed out for ws_id=%s", self.ws_id)
             self._plan_result = ""
         self._pending_plan_review = None
@@ -486,11 +317,7 @@ class WebUI(SessionUIBase):
         node-level prometheus metric update.
         """
         super().on_intent_verdict(verdict)
-        _metrics.record_judge_verdict(
-            verdict.get("tier", "llm"),
-            verdict.get("risk_level", "medium"),
-            verdict.get("latency_ms", 0),
-        )
+        fire_judge_verdict_metric(_metrics, verdict, "llm")
 
     # ``on_output_warning`` inherited from :class:`SessionUIBase`.
 

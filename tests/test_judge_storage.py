@@ -115,6 +115,59 @@ class TestIntentVerdictCRUD:
 
 
 # ---------------------------------------------------------------------------
+# Bulk insert
+# ---------------------------------------------------------------------------
+
+
+class TestIntentVerdictBulkInsert:
+    """Coverage for ``create_intent_verdicts_bulk`` — backs the
+    ``approve_tools`` per-turn heuristic-verdict persistence path so a
+    fan-out turn pays one commit instead of N.
+    """
+
+    def test_bulk_insert_creates_all_rows(self, db):
+        db.create_intent_verdicts_bulk(
+            [
+                _make_verdict_kwargs(verdict_id="b1", call_id="c1"),
+                _make_verdict_kwargs(verdict_id="b2", call_id="c2"),
+                _make_verdict_kwargs(verdict_id="b3", call_id="c3"),
+            ]
+        )
+        for vid in ("b1", "b2", "b3"):
+            v = db.get_intent_verdict(vid)
+            assert v is not None
+            assert v["verdict_id"] == vid
+
+    def test_bulk_insert_empty_list_is_noop(self, db):
+        # Must not raise and must not commit a phantom row.
+        db.create_intent_verdicts_bulk([])
+        assert db.list_intent_verdicts() == []
+
+    def test_bulk_insert_preserves_distinct_field_values(self, db):
+        db.create_intent_verdicts_bulk(
+            [
+                _make_verdict_kwargs(
+                    verdict_id="b1",
+                    risk_level="low",
+                    tier="heuristic",
+                    confidence=0.4,
+                ),
+                _make_verdict_kwargs(
+                    verdict_id="b2",
+                    risk_level="high",
+                    tier="llm",
+                    confidence=0.95,
+                ),
+            ]
+        )
+        v1 = db.get_intent_verdict("b1")
+        v2 = db.get_intent_verdict("b2")
+        assert v1 is not None and v2 is not None
+        assert v1["risk_level"] == "low" and v1["tier"] == "heuristic"
+        assert v2["risk_level"] == "high" and v2["tier"] == "llm"
+
+
+# ---------------------------------------------------------------------------
 # List queries
 # ---------------------------------------------------------------------------
 

@@ -2121,6 +2121,12 @@ class PostgreSQLBackend:
                 },
             )
             conn.commit()
+        # Drop the cached policy snapshot so the next ``evaluate_*``
+        # read picks up this rule. Storage-layer invalidation covers
+        # both the admin-API path and direct test fixtures.
+        from turnstone.core.policy import invalidate_policy_cache
+
+        invalidate_policy_cache(org_id)
 
     def get_tool_policy(self, policy_id: str) -> dict[str, Any] | None:
         with self._conn() as conn:
@@ -2154,7 +2160,12 @@ class PostgreSQLBackend:
                 .values(**fields)
             )
             conn.commit()
-            return result.rowcount > 0
+            updated = result.rowcount > 0
+        if updated:
+            from turnstone.core.policy import invalidate_policy_cache
+
+            invalidate_policy_cache()
+        return updated
 
     def delete_tool_policy(self, policy_id: str) -> bool:
         with self._conn() as conn:
@@ -2162,7 +2173,12 @@ class PostgreSQLBackend:
                 sa.delete(tool_policies).where(tool_policies.c.policy_id == policy_id)
             )
             conn.commit()
-            return result.rowcount > 0
+            deleted = result.rowcount > 0
+        if deleted:
+            from turnstone.core.policy import invalidate_policy_cache
+
+            invalidate_policy_cache()
+        return deleted
 
     # -- Prompt templates ------------------------------------------------------
 
@@ -2964,6 +2980,34 @@ class PostgreSQLBackend:
                     "created": now,
                 },
             )
+            conn.commit()
+
+    def create_intent_verdicts_bulk(self, verdicts: list[dict[str, Any]]) -> None:
+        if not verdicts:
+            return
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        rows = [
+            {
+                "verdict_id": v.get("verdict_id", ""),
+                "ws_id": v.get("ws_id", ""),
+                "call_id": v.get("call_id", ""),
+                "func_name": v.get("func_name", ""),
+                "func_args": v.get("func_args", ""),
+                "intent_summary": v.get("intent_summary", ""),
+                "risk_level": v.get("risk_level", "medium"),
+                "confidence": v.get("confidence", 0.5),
+                "recommendation": v.get("recommendation", "review"),
+                "reasoning": v.get("reasoning", ""),
+                "evidence": v.get("evidence", ""),
+                "tier": v.get("tier", "heuristic"),
+                "judge_model": v.get("judge_model", ""),
+                "latency_ms": v.get("latency_ms", 0),
+                "created": now,
+            }
+            for v in verdicts
+        ]
+        with self._conn() as conn:
+            conn.execute(sa.insert(intent_verdicts), rows)
             conn.commit()
 
     def get_intent_verdict(self, verdict_id: str) -> dict[str, Any] | None:

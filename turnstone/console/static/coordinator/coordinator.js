@@ -908,7 +908,10 @@
           { label: "queued" },
         );
         break;
-      case "tools_auto_approved":
+      case "tool_info":
+        // Renamed from ``tools_auto_approved`` when ``approve_tools``
+        // unified onto SessionUIBase — the shared body emits ``tool_info``
+        // for both kinds, matching the interactive payload name.
         (ev.items || []).forEach((it) => appendToolCall(it));
         break;
       // Child-workstream fan-out routed through the coordinator's own

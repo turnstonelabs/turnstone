@@ -3353,6 +3353,65 @@ class ChatSession:
                 it["func_args"] = {"prompt": it.get("prompt", "")[:200]}
             elif name == "plan_agent":
                 it["func_args"] = {"goal": it.get("prompt", "")[:200]}
+            # Coordinator tool args — only the ``needs_approval=True`` set
+            # reaches this point (read-only inspect / list_* / wait
+            # tools are filtered above), so this matches the auditable
+            # surface 1:1. Free-form fields capped to keep the verdict
+            # row size bounded.
+            elif name == "spawn_workstream":
+                it["func_args"] = {
+                    "skill": it.get("skill", ""),
+                    "initial_message": it.get("initial_message", "")[:200],
+                    "target_node": it.get("target_node", ""),
+                    "name": it.get("name", ""),
+                    "model": it.get("model", ""),
+                }
+            elif name == "spawn_batch":
+                # Project every child so the judge sees the full fan-out.
+                # First-child-only projection (the prior shape) hid a
+                # malicious mid-batch entry from both heuristic and LLM
+                # tiers. Tool schema caps ``children`` at 10, so worst
+                # case is ~3 KiB of JSON in the verdict row — comparable
+                # to the existing ``reasoning`` / ``evidence`` fields.
+                # ``name`` (cosmetic) and ``model`` (registry alias)
+                # skipped to keep the payload lean; risk-relevant fields
+                # are skill, initial_message, target_node.
+                children = it.get("children") or []
+                it["func_args"] = {
+                    "child_count": len(children),
+                    "children": [
+                        {
+                            "skill": c.get("skill", "") if isinstance(c, dict) else "",
+                            "initial_message": (
+                                c.get("initial_message", "")[:200] if isinstance(c, dict) else ""
+                            ),
+                            "target_node": (
+                                c.get("target_node", "") if isinstance(c, dict) else ""
+                            ),
+                        }
+                        for c in children
+                    ],
+                }
+            elif name == "send_to_workstream":
+                it["func_args"] = {
+                    "ws_id": it.get("ws_id", ""),
+                    "message": it.get("message", "")[:200],
+                }
+            elif name == "close_workstream":
+                it["func_args"] = {
+                    "ws_id": it.get("ws_id", ""),
+                    "reason": it.get("reason", ""),
+                }
+            elif name == "close_all_children":
+                it["func_args"] = {"reason": it.get("reason", "")}
+            elif name in ("cancel_workstream", "delete_workstream"):
+                it["func_args"] = {"ws_id": it.get("ws_id", "")}
+            elif name == "task_list":
+                it["func_args"] = {
+                    "action": it.get("action", ""),
+                    "task_id": it.get("task_id", ""),
+                    "title": it.get("title", "")[:100],
+                }
             elif it.get("mcp_args"):
                 it["func_args"] = it["mcp_args"]
 
