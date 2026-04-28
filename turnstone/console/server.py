@@ -64,6 +64,7 @@ from turnstone.core.session_routes import (
     make_cancel_handler,
     make_close_handler,
     make_create_handler,
+    make_dequeue_handler,
     make_detail_handler,
     make_events_handler,
     make_history_handler,
@@ -10190,6 +10191,7 @@ def create_app(
                 supports_close_reason=False,
             ),
             send=make_send_handler(coord_endpoint_config),  # lifted: shared body (P1.5)
+            dequeue=make_dequeue_handler(coord_endpoint_config),  # lifted: shared body
             approve=make_approve_handler(coord_endpoint_config),  # lifted: shared body
             cancel=make_cancel_handler(  # lifted: shared body
                 coord_endpoint_config,

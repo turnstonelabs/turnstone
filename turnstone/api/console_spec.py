@@ -128,6 +128,7 @@ from turnstone.api.schemas import (
     UserInfo,
 )
 from turnstone.api.server_schemas import (
+    DequeueRequest,
     ListAttachmentsResponse,
     ListSkillSummaryResponse,
     ListWorkstreamsResponse,
@@ -1188,6 +1189,23 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         ),
         response_model=CoordinatorOpenResponse,
         error_codes=[400, 403, 404, 500, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/send",
+        "DELETE",
+        "Cancel a queued coordinator message",
+        description=(
+            "Removes a previously-queued message identified by ``msg_id`` "
+            "from the coordinator session's pending queue. Returns "
+            "``status: removed`` when the queue had the entry, "
+            "``status: not_found`` otherwise. Reservations attached to "
+            "the dequeued message are released so the attachments can be "
+            "reused — parity with the interactive surface."
+        ),
+        request_model=DequeueRequest,
+        response_model=StatusResponse,
+        error_codes=[400, 403, 404, 503],
         tags=["Coordinator"],
     ),
     EndpointSpec(

@@ -269,6 +269,38 @@
   border-color: var(--err);
 }
 
+/* ==========================================================================
+   Drag-and-drop overlay — applied to #coord-main while the user is
+   dragging files from the OS over the chat pane. Composer wires this on
+   construction (dragDrop.targetEl=coord-main, dropClass=coord-drop-target).
+   The dashed outline + "Drop file to attach" overlay mirror the interactive
+   pane's pattern so the affordance reads the same in both surfaces.
+   ========================================================================== */
+#coord-main {
+  position: relative; /* anchors the ::after overlay */
+}
+#coord-main.coord-drop-target {
+  outline: 2px dashed var(--accent);
+  outline-offset: -6px;
+}
+#coord-main.coord-drop-target::after {
+  content: "Drop file to attach";
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  pointer-events: none;
+  z-index: 10;
+}
+
 /* Match .btn .kbd (in shared_static/ui-base.css) — --ink-3 clears AA at
    10px, --ink-4 is borderline on light panels. */
 .approval-dock button.act .kbd {

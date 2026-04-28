@@ -11,6 +11,7 @@ the lifted ``approve`` and ``close`` handlers from
 
 from __future__ import annotations
 
+from typing import cast
 from unittest.mock import MagicMock
 
 import httpx
@@ -62,6 +63,7 @@ from turnstone.core.session_routes import (
     make_cancel_handler,
     make_close_handler,
     make_create_handler,
+    make_dequeue_handler,
     make_detail_handler,
     make_history_handler,
     make_list_handler,
@@ -164,6 +166,11 @@ def _make_client(
                 "/v1/api/workstreams/{ws_id}/send",
                 make_send_handler(_coord_endpoint_config),
                 methods=["POST"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/send",
+                make_dequeue_handler(_coord_endpoint_config),
+                methods=["DELETE"],
             ),
             Route(
                 "/v1/api/workstreams/{ws_id}/approve",
@@ -740,6 +747,104 @@ def test_send_requires_message(storage):
         headers=_COORD_HEADERS,
     )
     assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Dequeue (DELETE /send) — lifted handler wired onto the coord endpoint
+# config. Pins the URL/scope contract so a regression in the route table
+# (wrong endpoint_config, wrong method, missing gate) trips a test.
+# ---------------------------------------------------------------------------
+
+
+def test_dequeue_removes_queued_coord_message(storage):
+    """POST /send while busy → queued; DELETE /send with msg_id → removed."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    # _build_mgr's session_factory returns a MagicMock posing as a
+    # ChatSession so the test can stub queue_message / dequeue_message.
+    session = cast(MagicMock, ws.session)
+
+    # Force the queue path by marking the worker as already running.
+    # The lifted send handler hands off to ``session_worker.send`` which
+    # picks ``enqueue`` over ``run`` when ``ws._worker_running`` is True.
+    ws._worker_running = True
+    session.queue_message.return_value = ("hi", "important", "msg-abc")
+    session.dequeue_message.return_value = True
+
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    send_resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/send",
+        json={"message": "hi"},
+        headers=_COORD_HEADERS,
+    )
+    assert send_resp.status_code == 200, send_resp.text
+    body = send_resp.json()
+    assert body["status"] == "queued"
+    assert body["msg_id"] == "msg-abc"
+
+    dequeue_resp = client.request(
+        "DELETE",
+        f"/v1/api/workstreams/{ws.id}/send",
+        json={"msg_id": "msg-abc"},
+        headers=_COORD_HEADERS,
+    )
+    assert dequeue_resp.status_code == 200, dequeue_resp.text
+    assert dequeue_resp.json() == {"status": "removed"}
+    session.dequeue_message.assert_called_with("msg-abc")
+
+
+def test_dequeue_unknown_msg_id_returns_not_found(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    cast(MagicMock, ws.session).dequeue_message.return_value = False
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.request(
+        "DELETE",
+        f"/v1/api/workstreams/{ws.id}/send",
+        json={"msg_id": "missing"},
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "not_found"}
+
+
+def test_dequeue_requires_msg_id(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.request(
+        "DELETE",
+        f"/v1/api/workstreams/{ws.id}/send",
+        json={},
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 400
+
+
+def test_dequeue_unknown_ws_returns_404(storage):
+    mgr = _build_mgr(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.request(
+        "DELETE",
+        "/v1/api/workstreams/0000000000000000000000000000000000000000000000000000000000000000/send",
+        json={"msg_id": "anything"},
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 404
+    assert "coordinator not found" in resp.json()["error"]
+
+
+def test_dequeue_requires_admin_coordinator_scope(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.request(
+        "DELETE",
+        f"/v1/api/workstreams/{ws.id}/send",
+        json={"msg_id": "msg-abc"},
+        headers={"X-Test-User": "user-1", "X-Test-Perms": "read"},
+    )
+    assert resp.status_code == 403
 
 
 def test_close_records_audit_and_removes_from_mgr(storage):

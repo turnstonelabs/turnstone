@@ -34,29 +34,68 @@
   }
 
   const messagesEl = document.getElementById("coord-messages");
+  const coordMain = document.getElementById("coord-main");
   const composerMount = document.getElementById("coord-composer-mount");
   const composer = new Composer(composerMount, {
     placeholder: "Message the coordinator\u2026",
     ariaLabel: "Coordinator input",
-    onSend: function (text) {
-      coordSend(text);
+    attachments: {
+      onAttach: function (file) {
+        attachments.upload(file);
+      },
     },
-    // Preserve the coordinator's pre-refactor Enter-on-touch behaviour
-    // — coordinator sessions are short and tap-to-send via the
-    // on-screen Return key is a quicker workflow than tapping a Send
-    // button.
+    stopBtn: true,
+    queueWhileBusy: true,
+    busyPlaceholder: "Queue a message\u2026 (!!! for urgent)",
+    onSend: function () {
+      coordSend();
+    },
+    onStop: function () {
+      cancelGeneration();
+    },
+    // Coord sessions are short — tap-to-send via the on-screen Return
+    // key is faster than tapping a Send button on touch.
     touchEnterSends: true,
-    // No attachments yet — coordinator-side attach mid-conversation
-    // requires a backend ingest path that doesn't exist; defer.
-    // No stopBtn — coordinator already has a header-mounted cancel
-    // button (#coord-cancel-btn) that fires coordCancel().
+    dragDrop: { targetEl: coordMain, dropClass: "coord-drop-target" },
   });
+  const stopBtn = composer.stopBtn;
+  const attachments = createAttachmentController({
+    chipsEl: composer.chipsEl,
+    getWsId: function () {
+      return wsId;
+    },
+  });
+  const queue = createQueueController({
+    messagesEl: messagesEl,
+    getWsId: function () {
+      return wsId;
+    },
+    // Coord chat bubbles wrap content in a .msg-body div (appendMsg
+    // below); the queue bubble matches so its border + padding align.
+    wrapInBody: true,
+    // Idle-edge cleanup of the cancel/force-stop timers — without
+    // this they fire on the *next* busy turn, relabel Stop to "Force
+    // Stop", and surface a misleading "Cancel didn't complete in
+    // time" toast unrelated to the new turn.
+    onIdle: function () {
+      if (cancelTimeoutId) {
+        clearTimeout(cancelTimeoutId);
+        cancelTimeoutId = null;
+      }
+      if (forceTimeoutId) {
+        clearTimeout(forceTimeoutId);
+        forceTimeoutId = null;
+      }
+    },
+  });
+  let busy = false;
+  let cancelTimeoutId = null;
+  let forceTimeoutId = null;
   const statusEl = document.getElementById("coord-status");
   const sseEl = document.getElementById("coord-sse-status");
   const nameEl = document.getElementById("coord-name");
   const approvalBar = document.getElementById("coord-approval-bar");
   const approvalTools = document.getElementById("coord-approval-tools");
-  const cancelBtn = document.getElementById("coord-cancel-btn");
   const childrenTreeEl = document.getElementById("coord-children-tree");
   const childrenCountEl = document.getElementById("coord-children-count");
   const childrenRefreshBtn = document.getElementById("coord-children-refresh");
@@ -578,38 +617,129 @@
   // Send / cancel / close
   // ------------------------------------------------------------------
 
-  window.coordSend = function (text) {
-    const msg = (text || "").trim();
-    if (!msg) return false;
+  // Busy reflects whether the worker is mid-turn. SSE state_change
+  // events drive it (running/thinking/attention → busy; idle/error →
+  // idle) so a server-side transition the user didn't initiate
+  // (another tab, judge reset) still keeps the composer in sync.
+  //
+  // composer.setBusy runs unconditionally so the Stop button label /
+  // dataset.forceCancel / placeholder stay canonical even on a
+  // redundant call — that idempotent reset is the contract any future
+  // caller relies on. queue.onIdleEdge runs only on the actual edge
+  // (it's the heavier work — querySelectorAll-driven promote sweep
+  // plus the cancel-timer cleanup wired via the onIdle hook above).
+  function setBusy(b) {
+    const next = !!b;
+    composer.setBusy(next);
+    const edge = next !== busy;
+    busy = next;
+    if (edge && !next) queue.onIdleEdge();
+  }
+
+  window.coordSend = function () {
+    const text = composer.value;
+    const trimmed = (text || "").trim();
+    if (!trimmed) return false;
+
+    const snap = attachments.snapshot();
+
+    let queuedEl = null;
+    if (busy) {
+      // Server re-parses the !!! prefix to set queue priority — the
+      // optimistic bubble strips it for display.
+      let displayText = trimmed;
+      let priority = "notice";
+      if (trimmed.startsWith("!!!")) {
+        displayText = trimmed.slice(3).trimStart();
+        priority = "important";
+      }
+      queuedEl = queue.addQueuedMessage(displayText, priority);
+    } else {
+      setBusy(true);
+      appendText("user", trimmed, { label: "you" });
+    }
     composer.clear();
-    composer.setBusy(true);
-    postJSON("/v1/api/workstreams/" + encodeURIComponent(wsId) + "/send", {
-      message: msg,
+
+    authFetch("/v1/api/workstreams/" + encodeURIComponent(wsId) + "/send", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message: trimmed,
+        attachment_ids: snap.attachment_ids,
+      }),
     })
-      .then((resp) => {
-        if (!resp.ok) {
-          return resp.text().then((txt) => {
-            throw new Error("send failed: " + resp.status + " " + txt);
+      .then((r) => r.json())
+      .then((data) => {
+        if (data && data.status === "queued" && data.msg_id && queuedEl) {
+          queue.bind(queuedEl, data.msg_id);
+          attachments.consume(data.attached_ids, data.dropped_attachment_ids);
+        } else if (data && data.status === "busy") {
+          if (queuedEl) queue.remove(queuedEl);
+          appendText("error", "Server is busy. Please wait.", {
+            label: "error",
           });
+          if (!queuedEl) setBusy(false);
+        } else if (data && data.status === "queue_full") {
+          if (queuedEl) queue.remove(queuedEl);
+          appendText("error", "Message queue full. Please wait.", {
+            label: "error",
+          });
+        } else {
+          attachments.consume(
+            data && data.attached_ids,
+            data && data.dropped_attachment_ids,
+          );
         }
-        appendText("user", msg, { label: "you" });
       })
       .catch((e) => {
-        if (typeof toast !== "undefined" && toast.error) toast.error(String(e));
-        else console.error(e);
-      })
-      .finally(() => {
-        composer.setBusy(false);
+        if (queuedEl) queue.remove(queuedEl);
+        appendText(
+          "error",
+          "Connection error: " + (e && e.message ? e.message : e),
+          { label: "error" },
+        );
+        if (!queuedEl) setBusy(false);
       });
     return false;
   };
 
-  window.coordCancel = function () {
-    postJSON(
-      "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/cancel",
-      {},
-    ).catch((e) => console.error(e));
-  };
+  function cancelGeneration() {
+    if (!busy || stopBtn.disabled) return;
+    const force = stopBtn.dataset.forceCancel === "true";
+    stopBtn.disabled = true;
+    authFetch("/v1/api/workstreams/" + encodeURIComponent(wsId) + "/cancel", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ force: force }),
+    })
+      .then(() => {
+        if (force) {
+          // Force cancel abandons the worker thread server-side; the
+          // SSE state_change → idle may not arrive (the thread may be
+          // stuck past the cancel checkpoint), so transition the UI
+          // directly. setBusy(false) clears cancel/force timers and
+          // composer.setBusy(false) resets the Stop button label,
+          // aria-label, and dataset.forceCancel — so the next turn
+          // starts in graceful-cancel mode without a stale Force Stop
+          // primed for the first click.
+          appendText("info", "Force stopped. Previous generation abandoned.", {
+            label: "info",
+          });
+          setBusy(false);
+        }
+      })
+      .catch((e) => {
+        appendText(
+          "error",
+          "Cancel error: " + (e && e.message ? e.message : e),
+          { label: "error" },
+        );
+        // Re-enable so the user can retry.
+        if (busy) stopBtn.disabled = false;
+      });
+  }
 
   window.coordCloseSession = async function () {
     if (
@@ -618,17 +748,63 @@
       )
     )
       return;
+    // Suspend SSE reconnect first — the moment the server pops the ws
+    // from coord_mgr the next reconnect would 404 and surface a stream
+    // error toast right before the redirect, which reads as "the end
+    // button broke" even though the close succeeded. On any failure
+    // path we MUST resume SSE before returning so the user isn't left
+    // staring at a stale page disconnected from a still-alive session.
+    const resumeSse = () => {
+      try {
+        connectSSE();
+      } catch (_) {
+        /* connectSSE schedules its own reconnect on failure */
+      }
+    };
     try {
-      const resp = await postJSON(
+      if (evtSource) evtSource.close();
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+    } catch (_) {
+      /* best-effort suspension */
+    }
+    let resp;
+    try {
+      resp = await postJSON(
         "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/close",
         {},
       );
-      if (!resp.ok) throw new Error("close failed: HTTP " + resp.status);
-      window.location.href = "/";
     } catch (e) {
-      if (typeof toast !== "undefined" && toast.error) toast.error(String(e));
-      else console.error(e);
+      // authFetch throws Error("auth") and shows the login modal on
+      // 401; other network failures land here too. Surface the cause
+      // visibly — silent toast.error wasn't enough for operators
+      // troubleshooting a stuck end-button.
+      const msg =
+        e && e.message === "auth"
+          ? "Sign-in required to end this session."
+          : "Close request failed: " + (e && e.message ? e.message : e);
+      if (typeof toast !== "undefined" && toast.error) toast.error(msg);
+      else window.alert(msg);
+      resumeSse();
+      return;
     }
+    if (!resp.ok) {
+      let detail = "HTTP " + resp.status;
+      try {
+        const body = await resp.json();
+        if (body && body.error) detail += " — " + body.error;
+      } catch (_) {
+        /* non-JSON body — fall back to status code */
+      }
+      const msg = "Could not end session: " + detail;
+      if (typeof toast !== "undefined" && toast.error) toast.error(msg);
+      else window.alert(msg);
+      resumeSse();
+      return;
+    }
+    window.location.href = "/";
   };
 
   // ------------------------------------------------------------------
@@ -891,22 +1067,74 @@
         break;
       case "state_change":
         statusEl.textContent = ev.state || "";
-        cancelBtn.style.display =
-          ev.state === "running" || ev.state === "thinking" ? "" : "none";
+        // Drive the composer's busy state from the canonical
+        // server-side workstream state so the Stop button + queue
+        // mode follow whatever the worker is doing — including
+        // transitions we didn't initiate (cross-tab cancel, judge
+        // reset, idle-after-error). Mirrors the interactive pane.
+        if (ev.state === "idle" || ev.state === "error") {
+          setBusy(false);
+        } else if (
+          ev.state === "running" ||
+          ev.state === "thinking" ||
+          ev.state === "attention"
+        ) {
+          setBusy(true);
+        }
         break;
       case "rename":
         nameEl.textContent = ev.name || "";
         break;
       case "message_queued":
-        // Live-worker reuse path: send appended to the running
-        // worker's pending queue rather than spawning a new one.
-        // Surface as an info row so operators see queueing happen
-        // instead of dropping the event silently.
-        appendText(
-          "info",
-          "Queued (priority: " + (ev.priority || "normal") + ")",
-          { label: "queued" },
-        );
+        // Server confirms the queued slot — the optimistic bubble
+        // already showed it; nothing to render here. (Earlier this
+        // surfaced an extra info row, which doubled up with the
+        // queued bubble once the composer started rendering one.)
+        break;
+      case "busy_error":
+        // Worker is still alive after a cancel attempt; re-arm the
+        // Stop button so the user can try again (or escalate to
+        // force-stop after the 2s window).
+        appendText("error", ev.message || "Server is busy.", {
+          label: "error",
+        });
+        if (busy) {
+          stopBtn.disabled = false;
+          stopBtn.textContent = "■ Stop";
+          stopBtn.setAttribute("aria-label", "Stop generation");
+          delete stopBtn.dataset.forceCancel;
+        }
+        break;
+      case "cancelled":
+        // Cancel was accepted; the worker may still be finishing
+        // (tool call in flight). Show "Cancelling…" and offer a
+        // Force Stop after 2s. state_change → idle is what actually
+        // clears busy; the 10s safety timer covers the connection-drop
+        // case.
+        if (!busy) break;
+        clearTimeout(cancelTimeoutId);
+        clearTimeout(forceTimeoutId);
+        stopBtn.disabled = true;
+        stopBtn.textContent = "Cancelling…";
+        stopBtn.setAttribute("aria-label", "Cancelling generation");
+        cancelTimeoutId = setTimeout(() => {
+          if (busy) {
+            stopBtn.disabled = false;
+            stopBtn.textContent = "⚠ Force Stop";
+            stopBtn.setAttribute("aria-label", "Force stop generation");
+            stopBtn.dataset.forceCancel = "true";
+          }
+        }, 2000);
+        forceTimeoutId = setTimeout(() => {
+          if (busy) {
+            appendText(
+              "info",
+              "Cancel didn't complete in time. You may need to resend your last message.",
+              { label: "info" },
+            );
+            setBusy(false);
+          }
+        }, 10000);
         break;
       case "tool_info":
         // Renamed from ``tools_auto_approved`` when ``approve_tools``
@@ -2352,6 +2580,9 @@
     // Load children + tasks in parallel — neither blocks SSE connection.
     loadChildren();
     loadTasks();
+    // Pull any in-flight attachment reservations (page reload / cross-tab
+    // switch) so the chips reappear instead of silently orphaning rows.
+    attachments.rehydrate();
     connectSSE();
   }
 

@@ -33,9 +33,6 @@ function Pane(wsId) {
   this._cancelTimeout = null;
   this._forceTimeout = null;
   this._pendingEditSend = null;
-  // Map<attachment_id, {filename, size_bytes, mime_type, kind}>
-  this.pendingAttachments = new Map();
-  this.attachChipsEl = null;
   this._createDOM();
 }
 
@@ -175,7 +172,7 @@ Pane.prototype._createDOM = function () {
   this.composer = new Composer(this.el, {
     attachments: {
       onAttach: function (file) {
-        self.uploadAttachment(file);
+        self.attachments.upload(file);
       },
     },
     stopBtn: true,
@@ -189,10 +186,43 @@ Pane.prototype._createDOM = function () {
     },
     dragDrop: { targetEl: this.el, dropClass: "pane-drop-target" },
   });
-  this.attachChipsEl = this.composer.chipsEl;
   this.inputEl = this.composer.inputEl;
   this.sendBtn = this.composer.sendBtn;
   this.stopBtn = this.composer.stopBtn;
+  // Lazy wsId read \u2014 a tab swap (Pane re-bound to a new workstream)
+  // changes the closure target without re-instantiating the controllers.
+  this.attachments = createAttachmentController({
+    chipsEl: this.composer.chipsEl,
+    getWsId: function () {
+      return self.wsId;
+    },
+    onError: function (msg) {
+      showToast(msg);
+    },
+  });
+  this.queue = createQueueController({
+    messagesEl: this.messagesEl,
+    getWsId: function () {
+      return self.wsId;
+    },
+    onAfterDequeue: function () {
+      self.attachments.rehydrate();
+    },
+    // Idle-edge cleanup of the cancel/force-stop timers — without
+    // this they fire on the *next* busy turn, relabel Stop to "Force
+    // Stop", and surface a misleading "Cancel didn't complete in
+    // time" toast about a turn the user already moved past.
+    onIdle: function () {
+      if (self._cancelTimeout) {
+        clearTimeout(self._cancelTimeout);
+        self._cancelTimeout = null;
+      }
+      if (self._forceTimeout) {
+        clearTimeout(self._forceTimeout);
+        self._forceTimeout = null;
+      }
+    },
+  });
 };
 
 Pane.prototype.reset = function () {
@@ -204,206 +234,7 @@ Pane.prototype.reset = function () {
   this.approvalBlockEl = null;
   this._pendingEditSend = null;
   this.inputEl.disabled = false;
-  this.clearAttachmentChips();
-};
-
-// ---------------------------------------------------------------------------
-// Attachment handling
-// ---------------------------------------------------------------------------
-
-Pane.prototype.clearAttachmentChips = function () {
-  if (this.pendingAttachments) this.pendingAttachments.clear();
-  if (this.attachChipsEl) this.attachChipsEl.textContent = "";
-};
-
-function _formatAttachSize(n) {
-  if (n < 1024) return n + " B";
-  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
-  return (n / (1024 * 1024)).toFixed(1) + " MB";
-}
-
-Pane.prototype._renderAttachmentChip = function (info) {
-  var self = this;
-  var chip = document.createElement("span");
-  chip.className = "composer-chip composer-chip-" + (info.kind || "other");
-  chip.setAttribute("role", "listitem");
-  chip.dataset.attachmentId = info.attachment_id;
-
-  var icon = document.createElement("span");
-  icon.className = "composer-chip-icon";
-  icon.setAttribute("aria-hidden", "true");
-  icon.textContent = info.kind === "image" ? "\ud83d\uddbc" : "\ud83d\udcc4";
-  chip.appendChild(icon);
-
-  var label = document.createElement("span");
-  label.className = "composer-chip-name";
-  label.textContent = info.filename || "(unnamed)";
-  label.title = info.filename || "";
-  chip.appendChild(label);
-
-  var size = document.createElement("span");
-  size.className = "composer-chip-size";
-  size.textContent = _formatAttachSize(info.size_bytes || 0);
-  chip.appendChild(size);
-
-  var remove = document.createElement("button");
-  remove.type = "button";
-  remove.className = "composer-chip-remove";
-  remove.setAttribute(
-    "aria-label",
-    "Remove attachment " + (info.filename || ""),
-  );
-  remove.title = "Remove";
-  remove.textContent = "\u00d7";
-  remove.onclick = function () {
-    self.removeAttachment(info.attachment_id);
-  };
-  chip.appendChild(remove);
-
-  this.attachChipsEl.appendChild(chip);
-};
-
-Pane.prototype.uploadAttachment = function (file) {
-  if (!this.wsId || !file) return;
-  var self = this;
-  var wsId = this.wsId;
-  var fd = new FormData();
-  fd.append("file", file, file.name);
-
-  // Placeholder chip with upload-in-flight state
-  var placeholderId = "__uploading_" + Date.now() + "_" + Math.random();
-  this.pendingAttachments.set(placeholderId, {
-    attachment_id: placeholderId,
-    filename: file.name,
-    size_bytes: file.size,
-    mime_type: file.type || "",
-    kind: (file.type || "").indexOf("image/") === 0 ? "image" : "text",
-    uploading: true,
-  });
-  this._renderAttachmentChip(this.pendingAttachments.get(placeholderId));
-
-  authFetch(
-    "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/attachments",
-    { method: "POST", body: fd },
-  )
-    .then(function (r) {
-      return r.json().then(function (body) {
-        return { ok: r.ok, status: r.status, body: body };
-      });
-    })
-    .then(function (res) {
-      if (!res.ok) {
-        // Drop the placeholder; nothing to swap in.
-        self._removeAttachmentChip(placeholderId);
-        showToast((res.body && res.body.error) || "Upload failed");
-        return;
-      }
-      // Swap placeholder → real id in place so chip and pending-Map
-      // ordering reflect user selection, not upload-completion order.
-      self._swapPlaceholderChip(placeholderId, res.body);
-    })
-    .catch(function (e) {
-      // Always clean up the placeholder (including auth failures) so
-      // an "uploading…" chip can't get stuck across re-auth.
-      self._removeAttachmentChip(placeholderId);
-      if ((e && e.message) !== "auth") {
-        showToast("Upload failed");
-      }
-    });
-};
-
-Pane.prototype._removeAttachmentChip = function (id) {
-  var chip = this.attachChipsEl.querySelector(
-    '[data-attachment-id="' + id + '"]',
-  );
-  if (chip) chip.remove();
-  this.pendingAttachments.delete(id);
-};
-
-Pane.prototype._swapPlaceholderChip = function (placeholderId, info) {
-  // Rebuild pendingAttachments preserving insertion order, swapping
-  // the placeholder key for the real attachment_id.  JS Map iteration
-  // is insertion-ordered, so naïve delete+set would move the entry to
-  // the end and reorder send().
-  var rebuilt = new Map();
-  this.pendingAttachments.forEach(function (val, key) {
-    if (key === placeholderId) {
-      rebuilt.set(info.attachment_id, info);
-    } else {
-      rebuilt.set(key, val);
-    }
-  });
-  this.pendingAttachments = rebuilt;
-
-  // Update the existing chip DOM in place so visual order matches.
-  var chip = this.attachChipsEl.querySelector(
-    '[data-attachment-id="' + placeholderId + '"]',
-  );
-  if (chip) {
-    chip.dataset.attachmentId = info.attachment_id;
-    var name = chip.querySelector(".composer-chip-name");
-    if (name) {
-      name.textContent = info.filename || "(unnamed)";
-      name.title = info.filename || "";
-    }
-    var size = chip.querySelector(".composer-chip-size");
-    if (size) size.textContent = _formatAttachSize(info.size_bytes || 0);
-  } else {
-    // Chip missing (user removed it mid-upload?); render fresh.
-    this._renderAttachmentChip(info);
-  }
-};
-
-Pane.prototype.removeAttachment = function (attachmentId) {
-  var wsId = this.wsId;
-  var info = this.pendingAttachments.get(attachmentId);
-  if (!info) return;
-  var chip = this.attachChipsEl.querySelector(
-    '[data-attachment-id="' + attachmentId + '"]',
-  );
-
-  // Optimistic remove
-  if (chip) chip.remove();
-  this.pendingAttachments.delete(attachmentId);
-
-  // In-flight placeholders have no server-side row yet
-  if (info.uploading) return;
-
-  authFetch(
-    "/v1/api/workstreams/" +
-      encodeURIComponent(wsId) +
-      "/attachments/" +
-      encodeURIComponent(attachmentId),
-    { method: "DELETE" },
-  ).catch(function (e) {
-    if ((e && e.message) !== "auth") {
-      showToast("Failed to remove attachment");
-    }
-  });
-};
-
-Pane.prototype.rehydrateAttachments = function () {
-  if (!this.wsId) return;
-  var self = this;
-  var wsId = this.wsId;
-  authFetch(
-    "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/attachments",
-    { method: "GET" },
-  )
-    .then(function (r) {
-      if (!r.ok) return null;
-      return r.json();
-    })
-    .then(function (body) {
-      // Tab may have switched between fire and response
-      if (!body || self.wsId !== wsId) return;
-      self.clearAttachmentChips();
-      (body.attachments || []).forEach(function (a) {
-        self.pendingAttachments.set(a.attachment_id, a);
-        self._renderAttachmentChip(a);
-      });
-    })
-    .catch(function () {});
+  this.attachments.clearChips();
 };
 
 Pane.prototype.updateWsName = function () {
@@ -431,30 +262,19 @@ Pane.prototype.disconnectSSE = function () {
   }
 };
 
+// composer.setBusy runs unconditionally so the Stop button label /
+// dataset.forceCancel / placeholder stay canonical even on a redundant
+// call (Pane.reset() and any future caller relies on that idempotent
+// reset). queue.onIdleEdge runs only on the actual edge — it carries
+// the heavier work (querySelectorAll-driven promote sweep + cancel-
+// timer cleanup wired via the queue's onIdle hook).
 Pane.prototype.setBusy = function (b) {
-  this.busy = b;
-  this.messagesEl.dataset.busy = b ? "true" : "false";
-  // Composer owns send/stop button display, label rotation, and the
-  // stop button's "■ Stop" / aria-label / dataset reset on every
-  // transition (so cancelGeneration's transient "Cancelling…" label
-  // doesn't persist into the next busy cycle).
-  this.composer.setBusy(b);
-  if (!b) this._promoteQueuedMessages();
-};
-
-Pane.prototype._promoteQueuedMessages = function () {
-  var queuedMsgs = this.messagesEl.querySelectorAll(".msg-queued");
-  for (var i = 0; i < queuedMsgs.length; i++) {
-    var el = queuedMsgs[i];
-    el.classList.remove("msg-queued", "msg-queued-important");
-    delete el.dataset.msgId;
-    el.removeAttribute("role");
-    el.removeAttribute("aria-label");
-    var badge = el.querySelector(".queued-badge");
-    if (badge) badge.remove();
-    var dismiss = el.querySelector(".queued-dismiss");
-    if (dismiss) dismiss.remove();
-  }
+  var next = !!b;
+  this.composer.setBusy(next);
+  this.messagesEl.dataset.busy = next ? "true" : "false";
+  var edge = next !== this.busy;
+  this.busy = next;
+  if (edge && !next) this.queue.onIdleEdge();
 };
 
 Pane.prototype.showEmptyState = function () {
@@ -477,8 +297,8 @@ Pane.prototype.connectSSE = function (wsId) {
   var wsChanged = this.wsId !== wsId;
   this.wsId = wsId;
   if (wsChanged) {
-    this.clearAttachmentChips();
-    this.rehydrateAttachments();
+    this.attachments.clearChips();
+    this.attachments.rehydrate();
   }
 
   this.evtSource = new EventSource(
@@ -881,74 +701,6 @@ Pane.prototype.addUserMessage = function (text, attachments) {
   this._addUserMsgActions(el, text);
   this.messagesEl.appendChild(el);
   this.scrollToBottom(true);
-};
-
-Pane.prototype.addQueuedMessage = function (text, priority) {
-  this.removeEmptyState();
-  var self = this;
-  var el = document.createElement("div");
-  el.className = "msg user msg-queued";
-  el.setAttribute("role", "status");
-  if (priority === "important") {
-    el.classList.add("msg-queued-important");
-    el.setAttribute("aria-label", "Important message queued: " + text);
-  } else {
-    el.setAttribute("aria-label", "Message queued: " + text);
-  }
-  var badge = document.createElement("span");
-  badge.className = "queued-badge";
-  badge.setAttribute("aria-hidden", "true");
-  badge.textContent = priority === "important" ? "queued (!!!) " : "queued ";
-  el.appendChild(badge);
-  el.appendChild(document.createTextNode(text));
-  // Dismiss button — remove from queue before injection
-  var dismiss = document.createElement("button");
-  dismiss.className = "queued-dismiss";
-  dismiss.title = "Remove from queue";
-  dismiss.setAttribute("aria-label", "Remove queued message");
-  dismiss.textContent = "\u00d7";
-  dismiss.addEventListener("click", function (e) {
-    e.stopPropagation();
-    self._dequeueMessage(el);
-  });
-  el.appendChild(dismiss);
-  this.messagesEl.appendChild(el);
-  this.scrollToBottom(true);
-  return el;
-};
-
-Pane.prototype._dequeueMessage = function (el) {
-  var self = this;
-  var msgId = el.dataset.msgId;
-  if (!msgId) {
-    // ID not yet set — mark for deferred DELETE when send response arrives
-    el.dataset.pendingDismiss = "true";
-    el.remove();
-    return;
-  }
-  authFetch("/v1/api/workstreams/" + encodeURIComponent(this.wsId) + "/send", {
-    method: "DELETE",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ msg_id: msgId }),
-  })
-    .then(function (r) {
-      return r.json();
-    })
-    .then(function (data) {
-      if (data.status === "removed") {
-        el.remove();
-      }
-      // Either path warrants a chip-strip refresh: a successful remove
-      // unreserves the attachments server-side, and a "not_found" means
-      // dispatch raced us so the actual pending state may differ from
-      // what the UI last saw.  Re-fetch to stay in sync.  (Leave the
-      // message bubble visible on not_found — the promote loop strips
-      // the queued styling on idle.)
-      self.rehydrateAttachments();
-    })
-    .catch(function () {
-      // Network error — don't remove, message may have been injected
-    });
 };
 
 Pane.prototype._addUserMsgActions = function (el, text) {
@@ -1803,31 +1555,22 @@ Pane.prototype.sendMessage = function () {
   var self = this;
   var isBusy = this.busy;
   var queuedEl = null;
-
-  // Snapshot attachments for this turn (stable-ids only — skip in-flight
-  // placeholders, which may not have server-assigned ids yet).
-  var attachmentList = [];
-  var attachmentIds = [];
-  this.pendingAttachments.forEach(function (info, id) {
-    if (info && !info.uploading) {
-      attachmentList.push(info);
-      attachmentIds.push(id);
-    }
-  });
+  var snap = this.attachments.snapshot();
 
   if (isBusy) {
-    // Queue message for injection at the next tool-result seam.
-    // Strip !!! prefix for display, show priority badge instead.
+    // Server re-parses the !!! prefix to set queue priority — the
+    // optimistic bubble strips it for display.
     var displayText = text;
     var priority = "notice";
     if (text.startsWith("!!!")) {
       displayText = text.slice(3).trimStart();
       priority = "important";
     }
-    queuedEl = this.addQueuedMessage(displayText, priority);
+    this.removeEmptyState();
+    queuedEl = this.queue.addQueuedMessage(displayText, priority);
   } else {
     this.setBusy(true);
-    this.addUserMessage(text, attachmentList);
+    this.addUserMessage(text, snap.attachments);
   }
   this.composer.clear();
 
@@ -1836,71 +1579,38 @@ Pane.prototype.sendMessage = function () {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       message: text,
-      attachment_ids: attachmentIds,
+      attachment_ids: snap.attachment_ids,
     }),
   })
     .then(function (r) {
       return r.json();
     })
     .then(function (data) {
-      // Clear only the chips that were actually reserved/attached on
-      // the server; leftover (dropped) ones stay in the composer so
-      // the user can see what's still pending.
-      var _consumeChips = function () {
-        var attached = Array.isArray(data.attached_ids)
-          ? data.attached_ids
-          : null;
-        if (attached) {
-          attached.forEach(function (id) {
-            var chip = self.attachChipsEl.querySelector(
-              '[data-attachment-id="' + id + '"]',
-            );
-            if (chip) chip.remove();
-            self.pendingAttachments.delete(id);
-          });
-          if (
-            Array.isArray(data.dropped_attachment_ids) &&
-            data.dropped_attachment_ids.length
-          ) {
-            showToast(
-              "Some attachments couldn't be included (" +
-                data.dropped_attachment_ids.length +
-                ") — they're still in your composer.",
-            );
-          }
-        } else {
-          self.clearAttachmentChips();
-        }
-      };
-
       if (data.status === "queued" && data.msg_id && queuedEl) {
-        if (queuedEl.dataset.pendingDismiss) {
-          // User dismissed before ID arrived — send deferred DELETE
-          authFetch(
-            "/v1/api/workstreams/" + encodeURIComponent(self.wsId) + "/send",
-            {
-              method: "DELETE",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ msg_id: data.msg_id }),
-            },
-          );
-        } else {
-          queuedEl.dataset.msgId = data.msg_id;
-        }
-        _consumeChips();
+        // bind() handles all three races (pre-bind dismiss, promote
+        // sweep raced ahead, normal accept) and DELETEs the slot when
+        // the bubble is no longer dequeue-able from the UI.
+        self.queue.bind(queuedEl, data.msg_id);
+        self.attachments.consume(
+          data.attached_ids,
+          data.dropped_attachment_ids,
+        );
       } else if (data.status === "busy") {
-        if (queuedEl) queuedEl.remove();
+        if (queuedEl) self.queue.remove(queuedEl);
         self.addErrorMessage("Server is busy. Please wait.");
         if (!isBusy) self.setBusy(false);
       } else if (data.status === "queue_full") {
-        if (queuedEl) queuedEl.remove();
+        if (queuedEl) self.queue.remove(queuedEl);
         self.addErrorMessage("Message queue full. Please wait.");
       } else {
-        _consumeChips();
+        self.attachments.consume(
+          data.attached_ids,
+          data.dropped_attachment_ids,
+        );
       }
     })
     .catch(function (err) {
-      if (queuedEl) queuedEl.remove();
+      if (queuedEl) self.queue.remove(queuedEl);
       self.addErrorMessage("Connection error: " + err.message);
       if (!isBusy) self.setBusy(false);
     });

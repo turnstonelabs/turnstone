@@ -452,6 +452,48 @@
 }
 
 /* ============================================================
+   Queued-message bubble — optimistic UI when the user sends
+   while the worker is still mid-turn (queueWhileBusy=true).
+   The bubble dims, gains a dashed border, and carries a
+   "queued" badge + dismiss button until the worker drains the
+   queue and promotes it to a normal user message via
+   ``setBusy(false)`` → ``promoteQueuedMessages``. The
+   "important" variant is the !!! priority prefix path.
+   ============================================================ */
+.msg-queued {
+  opacity: 0.65;
+  border-style: dashed;
+}
+.msg-queued-important {
+  opacity: 0.8;
+  border-color: var(--yellow, var(--warn));
+}
+.queued-badge {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--fg-dim, var(--ink-3));
+  margin-right: 4px;
+}
+.msg-queued-important .queued-badge {
+  color: var(--yellow, var(--warn));
+}
+.queued-dismiss {
+  background: none;
+  border: none;
+  color: var(--fg-dim, var(--ink-3));
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 4px;
+  margin-left: 8px;
+  float: right;
+  line-height: 1;
+}
+.queued-dismiss:hover {
+  color: var(--red, var(--err));
+}
+
+/* ============================================================
    Stacked layout — textarea above, actions row below.
    Used by creation forms (coordinator-create, future dashboard
    migration) where the input is visually dominant and the action
