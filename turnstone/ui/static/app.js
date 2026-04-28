@@ -1269,10 +1269,15 @@ Pane.prototype.replayHistory = function (messages) {
         }
         if (isToolError && !lastToolBlock.classList.contains("denied")) {
           lastToolBlock.classList.add("error");
-          var errorBdg = lastToolBlock.querySelector(".ts-approval-badge");
-          if (errorBdg) {
-            errorBdg.className = "ts-approval-badge ts-approval-badge--error";
-            errorBdg.textContent = "\u2717 error";
+          // Append the error badge as a sibling of the existing approved
+          // / denied pill so the approval verdict stays visible alongside
+          // the execution outcome.
+          if (!lastToolBlock.querySelector(".ts-approval-badge--error")) {
+            var errBadge = document.createElement("div");
+            errBadge.setAttribute("role", "status");
+            errBadge.className = "ts-approval-badge ts-approval-badge--error";
+            errBadge.textContent = "\u2717 error";
+            lastToolBlock.appendChild(errBadge);
           }
         }
       }
@@ -1598,10 +1603,15 @@ Pane.prototype.appendToolOutput = function (callId, name, output, isError) {
     var parentBlock = target.closest(".ts-approval");
     if (parentBlock && !parentBlock.classList.contains("denied")) {
       parentBlock.classList.add("error");
-      var badge = parentBlock.querySelector(".ts-approval-badge");
-      if (badge) {
-        badge.className = "ts-approval-badge ts-approval-badge--error";
-        badge.textContent = "\u2717 error";
+      // Append the error badge as a sibling of the existing approved
+      // pill so the approval verdict stays visible alongside the
+      // execution outcome.
+      if (!parentBlock.querySelector(".ts-approval-badge--error")) {
+        var errBadge = document.createElement("div");
+        errBadge.setAttribute("role", "status");
+        errBadge.className = "ts-approval-badge ts-approval-badge--error";
+        errBadge.textContent = "\u2717 error";
+        parentBlock.appendChild(errBadge);
       }
     }
   }
