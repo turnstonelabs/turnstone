@@ -85,7 +85,7 @@
    variant. */
 .home-panel-title {
   margin: 0;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 11px;
   font-weight: 600;
   color: var(--fg-dim);
@@ -123,7 +123,7 @@
    and nodes read as peer sections instead of one looking demoted. */
 .home-section-title {
   margin: 0;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 11px;
   font-weight: 600;
   color: var(--accent);
@@ -228,7 +228,7 @@
   color: var(--fg-dim);
   background: var(--bg-surface);
   border-bottom: 1px solid var(--border);
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   letter-spacing: 0.02em;
 }
 .breadcrumb a {
@@ -380,7 +380,7 @@
   font-size: 10px;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-weight: 500;
 }
 
@@ -413,7 +413,7 @@
 .csb-metric-label {
   color: var(--fg-dim);
   font-size: 10px;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   text-transform: uppercase;
   letter-spacing: 0.04em;
   opacity: 0.7;
@@ -447,7 +447,7 @@
   left: 50%;
   transform: translateX(-50%);
   font-size: 9px;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-weight: 600;
   color: var(--yellow);
   letter-spacing: 0.1em;
@@ -460,7 +460,7 @@
    Section headers
    ========================================================================== */
 .section-header {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 11px;
   font-weight: 600;
   color: var(--accent);
@@ -479,7 +479,7 @@
   background: var(--bg-surface);
   border-bottom: 1px solid var(--border-strong);
   font-size: 10px;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-weight: 600;
   color: var(--fg-dim);
   text-transform: uppercase;
@@ -582,7 +582,7 @@
 }
 .node-degraded-badge {
   font-size: 9px;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-weight: 600;
   color: var(--accent);
   background: var(--accent-dim);
@@ -614,7 +614,7 @@
 }
 .node-version-drift-badge {
   font-size: 9px;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-weight: 600;
   color: var(--yellow);
   background: var(--yellow-glow);
@@ -756,7 +756,7 @@
 }
 .node-group-badge {
   font-size: 10px;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   color: var(--fg-dim);
   background: var(--bg-highlight);
   border: 1px solid var(--border);
@@ -921,7 +921,7 @@
   color: var(--accent);
   font-size: 11px;
   text-decoration: none;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-weight: 500;
   letter-spacing: 0.02em;
   padding: 4px 0;
@@ -957,7 +957,7 @@
     background 0.15s,
     border-color 0.15s,
     color 0.15s;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-weight: 500;
 }
 .pagination button:hover {
@@ -1060,7 +1060,7 @@
   border-radius: 1px;
 }
 #new-ws-box h2 {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   color: var(--accent);
   font-size: 15px;
   font-weight: 700;
@@ -1069,7 +1069,7 @@
 }
 #new-ws-box label {
   display: block;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 10px;
   font-weight: 600;
   color: var(--fg-dim);
@@ -1155,7 +1155,7 @@
     background 0.15s,
     border-color 0.15s,
     color 0.15s;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-weight: 500;
   letter-spacing: 0.02em;
 }
@@ -1315,7 +1315,7 @@
   margin-bottom: 2px;
 }
 .admin-sidebar-group-label {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 9px;
   font-weight: 600;
   text-transform: uppercase;
@@ -1336,7 +1336,7 @@
   border: none;
   border-right: 2px solid transparent;
   color: var(--fg-dim);
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 12px;
   font-weight: 500;
   padding: 6px 14px 6px 16px;
@@ -1444,7 +1444,7 @@
   color: var(--bg);
   border: none;
   border-radius: var(--radius-sm);
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 11px;
   font-weight: 600;
   padding: 6px 14px;
@@ -1492,7 +1492,7 @@
   margin-bottom: 4px;
 }
 .admin-colheaders .admin-col {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
@@ -1569,7 +1569,7 @@
 /* Scope badges */
 .scope-badge {
   display: inline-block;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 9px;
   font-weight: 600;
   text-transform: uppercase;
@@ -1641,7 +1641,7 @@
   border-top: 1px solid var(--border);
 }
 .admin-field-heading {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
@@ -1684,7 +1684,7 @@
   background: none;
   border: 1px solid var(--red);
   color: var(--red);
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 10px;
   font-weight: 500;
   padding: 2px 8px;
@@ -1708,7 +1708,7 @@
   background: none;
   border: 1px solid var(--yellow);
   color: var(--yellow);
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 10px;
   font-weight: 500;
   padding: 2px 8px;
@@ -1732,7 +1732,7 @@
   background: none;
   border: 1px solid var(--border-strong);
   color: var(--fg-dim);
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 10px;
   font-weight: 500;
   padding: 2px 8px;
@@ -1803,7 +1803,7 @@
   margin-top: 0;
 }
 .modal-col-heading {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 9px;
   font-weight: 600;
   text-transform: uppercase;
@@ -1887,7 +1887,7 @@
   pointer-events: none;
 }
 .admin-modal h2 {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 15px;
   font-weight: 700;
   color: var(--accent);
@@ -1896,7 +1896,7 @@
 }
 .admin-modal label {
   display: block;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
@@ -2065,7 +2065,7 @@
 .admin-details summary {
   cursor: pointer;
   padding: 10px 0;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
@@ -2134,7 +2134,7 @@ h3.skill-spec-heading {
   margin-block: 0;
 }
 .skill-spec-heading {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
@@ -2178,7 +2178,7 @@ h3.skill-spec-heading {
 }
 
 .skill-vars-label {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
@@ -2207,7 +2207,7 @@ h3.skill-spec-heading {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 9px;
   font-weight: 700;
   text-transform: uppercase;
@@ -2261,7 +2261,7 @@ h3.skill-spec-heading {
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
   font: inherit;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 12px;
   font-weight: 500;
   cursor: pointer;
@@ -2287,7 +2287,7 @@ h3.skill-spec-heading {
   border: none;
   border-radius: var(--radius-sm);
   font: inherit;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
@@ -2347,7 +2347,7 @@ h3.skill-spec-heading {
 
 /* Token display (show-once) */
 .token-created-warning {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 11px;
   color: var(--yellow);
   margin-bottom: 12px;
@@ -2468,7 +2468,7 @@ h3.skill-spec-heading {
     justify-content: space-between;
     padding: 12px 16px;
     border-bottom: 1px solid var(--border);
-    font-family: var(--font-display);
+    font-family: var(--font-ui);
     font-size: 11px;
     font-weight: 600;
     text-transform: uppercase;
@@ -2538,7 +2538,7 @@ h3.skill-spec-heading {
 /* Policy action badges */
 .policy-badge {
   display: inline-block;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 9px;
   font-weight: 600;
   text-transform: uppercase;
@@ -2593,7 +2593,7 @@ h3.skill-spec-heading {
   border-bottom: 2px solid transparent;
   color: var(--fg-dim);
   cursor: pointer;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 13px;
   transition:
     color 0.15s,
@@ -2627,7 +2627,7 @@ h3.skill-spec-heading {
 /* Audit action badges */
 .audit-badge {
   display: inline-block;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 9px;
   font-weight: 600;
   text-transform: none;
@@ -2733,7 +2733,7 @@ h3.skill-spec-heading {
 }
 .mem-detail-label {
   font-size: 10px;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.08em;
@@ -2783,7 +2783,7 @@ h3.skill-spec-heading {
 }
 .usage-readout-label {
   font-size: 10px;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.08em;
@@ -2864,7 +2864,7 @@ h3.skill-spec-heading {
   background: var(--bg);
   color: var(--fg-dim);
   border: none;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
@@ -2900,7 +2900,7 @@ h3.skill-spec-heading {
   margin: 12px 0 0;
 }
 .perm-fieldset legend {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
@@ -3015,7 +3015,7 @@ h3.skill-spec-heading {
 .settings-section-header {
   cursor: pointer;
   padding: 8px 12px;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
@@ -3172,7 +3172,7 @@ h3.skill-spec-heading {
 .settings-save-btn {
   visibility: hidden;
   opacity: 0;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 10px;
   font-weight: 500;
   padding: 2px 8px;
@@ -3207,7 +3207,7 @@ h3.skill-spec-heading {
 
 /* Reset button */
 .settings-reset-btn {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 10px;
   font-weight: 500;
   padding: 2px 8px;
@@ -3236,7 +3236,7 @@ h3.skill-spec-heading {
 }
 .settings-restart-badge {
   display: none;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 9px;
   font-weight: 600;
   text-transform: uppercase;
@@ -3266,7 +3266,7 @@ h3.skill-spec-heading {
   color: var(--accent);
   font-size: 10px;
   font-weight: 600;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   cursor: pointer;
   vertical-align: middle;
   margin-left: 4px;
@@ -3310,7 +3310,7 @@ h3.skill-spec-heading {
   color: var(--accent);
   text-decoration: none;
   font-size: 11px;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   white-space: nowrap;
 }
 .settings-help-ref:hover {
@@ -3319,7 +3319,7 @@ h3.skill-spec-heading {
 
 /* Docs link in toolbar */
 .settings-docs-link {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 10px;
   font-weight: 500;
   color: var(--fg-dim);
@@ -3536,7 +3536,7 @@ h3.skill-spec-heading {
   background: var(--bg);
   color: var(--fg-dim);
   border: none;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
@@ -3676,7 +3676,7 @@ h3.skill-spec-heading {
   min-width: 0;
 }
 .mcp-reg-card-name {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 13px;
   font-weight: 600;
   color: var(--fg-bright);
@@ -3740,7 +3740,7 @@ h3.skill-spec-heading {
   color: var(--bg);
   border: none;
   border-radius: var(--radius-sm);
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 10px;
   font-weight: 600;
   padding: 5px 14px;
@@ -3771,7 +3771,7 @@ h3.skill-spec-heading {
 }
 .mcp-installed-badge {
   display: inline-block;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 9px;
   font-weight: 600;
   text-transform: uppercase;
@@ -3796,7 +3796,7 @@ h3.skill-spec-heading {
 
 /* -- MCP Install modal ---------------------------------------------------- */
 .mcp-install-summary-name {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 14px;
   font-weight: 600;
   color: var(--magenta);
@@ -3887,7 +3887,7 @@ h3.skill-spec-heading {
   background: var(--row-alt);
 }
 .oidc-detail-header {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 10px;
   text-transform: uppercase;
   letter-spacing: 0.08em;
@@ -4071,7 +4071,7 @@ h3.skill-spec-heading {
 
 /* Modal section divider for field groups */
 .modal-section-divider {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 9px;
   font-weight: 600;
   text-transform: uppercase;
@@ -4207,7 +4207,7 @@ h3.skill-spec-heading {
   border-collapse: collapse;
 }
 .nm-table th {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
@@ -4290,3 +4290,4 @@ h3.skill-spec-heading {
     transition: none;
   }
 }
+

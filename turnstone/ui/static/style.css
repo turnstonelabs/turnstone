@@ -34,7 +34,7 @@
   opacity: 1;
 }
 .skip-permissions-warning {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 11px;
   font-weight: 600;
   color: var(--yellow);
@@ -305,7 +305,7 @@
   border: none;
   color: var(--fg);
   font: inherit;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 13px;
   cursor: pointer;
   text-align: left;
@@ -587,7 +587,7 @@
   border: none;
   color: var(--fg);
   font: inherit;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 13px;
   cursor: pointer;
   text-align: left;
@@ -628,20 +628,17 @@
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 20px;
+  padding: 16px 12px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  /* No flexbox gap — .ts-msg / .msg supply their own margin-bottom for
+     inter-card spacing.  A 14px gap here was stacking with the 4px
+     card margin-bottom and pushing the per-card spacing to ~18px. */
 }
 /* .ts-msg (shared_static/chat.css) provides padding / border / radius /
    line-height / word-wrap / margin / background.  The interactive UI
-   adds a max-width cap so long messages don't stretch the full pane
-   on wide displays, and a brighter text colour on user messages so
-   "the thing I said" reads distinctly against the lower-chroma
-   assistant colour. */
-.ts-msg {
-  max-width: 95%;
-}
+   adds a brighter text colour on user messages so "the thing I said"
+   reads distinctly against the lower-chroma assistant colour. */
 .ts-msg--user {
   color: var(--fg-bright);
 }
@@ -688,14 +685,15 @@
 .ts-msg--tool {
   background: var(--bg-surface);
   border: 1px solid var(--border);
-  border-left: 3px solid var(--yellow);
+  /* Tool cards use --cyan to read distinctly from user (amber) and
+     assistant (neutral); the tool-name header carries the role
+     signal redundantly. */
+  border-left: 3px solid var(--cyan);
   font-size: 12px;
   padding: 8px 12px;
-  align-self: flex-start;
-  max-width: 95%;
 }
 .ts-msg--tool .tool-header {
-  color: var(--yellow);
+  color: var(--cyan);
   font-weight: 600;
   margin-bottom: 4px;
   font-size: 11px;
@@ -747,7 +745,7 @@ body {
 .ts-msg--assistant h6 {
   color: var(--accent);
   margin: 8px 0 4px;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
 }
 .ts-msg--assistant h1 {
   font-size: 18px;
@@ -1230,62 +1228,10 @@ body {
 }
 
 /* ==========================================================================
-   Message action toolbar (hover controls for retry / edit / rewind)
+   Action button icons — glyphs rendered inside .msg-action-btn (toolbar
+   chrome + hover/focus styling lives in the .msg-actions/.msg-action-btn
+   rules in shared_static/chat.css).
    ========================================================================== */
-.ts-msg--user,
-.ts-msg--assistant {
-  position: relative;
-}
-.msg-actions {
-  position: absolute;
-  top: 4px;
-  right: 4px;
-  display: flex;
-  gap: 1px;
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 0.12s ease;
-  background: var(--bg-surface);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  overflow: hidden;
-  z-index: 2;
-}
-.ts-msg--user:hover .msg-actions,
-.ts-msg--assistant:hover .msg-actions,
-.ts-msg--user:focus-within .msg-actions,
-.ts-msg--assistant:focus-within .msg-actions,
-.msg-actions:hover {
-  opacity: 1;
-  pointer-events: auto;
-}
-.msg-action-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 26px;
-  background: transparent;
-  border: none;
-  cursor: pointer;
-  color: var(--fg-dim);
-  transition:
-    color 0.1s ease,
-    background 0.1s ease;
-  padding: 0;
-}
-.msg-action-btn:hover {
-  color: var(--accent);
-  background: var(--bg-highlight);
-  box-shadow: 0 0 6px var(--accent-glow);
-}
-.msg-action-btn:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-}
-.msg-action-btn + .msg-action-btn {
-  border-left: 1px solid var(--border);
-}
 
 /* Icon: retry (circular arrow) */
 .icon-retry {
@@ -1379,7 +1325,7 @@ body {
   border: 1px solid var(--accent-dim);
   border-radius: var(--radius-sm);
   padding: 8px 10px;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 14px;
   line-height: 1.5;
   resize: vertical;
@@ -1398,7 +1344,7 @@ body {
 .msg-edit-btn {
   padding: 4px 14px;
   font-size: 12px;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-weight: 500;
   border-radius: var(--radius-sm);
   cursor: pointer;
@@ -1439,27 +1385,8 @@ body {
   cursor: not-allowed;
 }
 
-/* Touch devices: always show action buttons inline */
-@media (hover: none) and (pointer: coarse) {
-  .msg-actions {
-    opacity: 1;
-    pointer-events: auto;
-    position: static;
-    margin-top: 6px;
-    border: none;
-    background: transparent;
-    justify-content: flex-end;
-  }
-  .msg-action-btn {
-    width: 36px;
-    height: 36px;
-  }
-}
-
 /* Reduced motion */
 @media (prefers-reduced-motion: reduce) {
-  .msg-actions,
-  .msg-action-btn,
   .msg-edit-textarea,
   .msg-edit-btn {
     transition: none;
@@ -1630,7 +1557,7 @@ body {
   justify-content: center;
   background: var(--accent-dim, rgba(0, 0, 0, 0.1));
   color: var(--fg-bright, var(--fg));
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 14px;
   font-weight: 600;
   letter-spacing: 0.05em;
@@ -1692,7 +1619,7 @@ body {
     border-color 0.3s;
 }
 .ws-sb-model {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-weight: 500;
   color: var(--accent);
   font-size: 10px;
@@ -1755,11 +1682,10 @@ body {
 .ts-approval {
   background: var(--bg-surface);
   border: 1px solid var(--border);
-  border-left: 3px solid var(--yellow);
+  /* Cyan matches .ts-msg--tool — both are tool-role surfaces. */
+  border-left: 3px solid var(--cyan);
   border-radius: var(--radius);
   padding: 0;
-  align-self: flex-start;
-  max-width: 95%;
   font-size: 12px;
 }
 .ts-approval.approved {
@@ -1786,7 +1712,7 @@ body {
   border-bottom: none;
 }
 .ts-approval-tool .tool-name {
-  color: var(--yellow);
+  color: var(--cyan);
   font-weight: 600;
   font-size: 11px;
   margin-bottom: 3px;
@@ -1938,7 +1864,7 @@ body {
   background: linear-gradient(transparent, var(--code-bg) 60%);
   color: var(--fg-dim);
   font-size: 10px;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   cursor: pointer;
   letter-spacing: 0.03em;
 }
@@ -1969,7 +1895,7 @@ body {
   min-width: 0;
 }
 .media-card-title {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 14px;
   font-weight: 600;
   color: var(--fg-bright);
@@ -2113,7 +2039,7 @@ audio.media-player {
   border-radius: 1px;
 }
 #plan-dialog h3 {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   color: var(--accent);
   margin-bottom: 14px;
   font-size: 14px;
@@ -2157,7 +2083,7 @@ audio.media-player {
   padding: 8px 20px;
   border: none;
   border-radius: var(--radius-sm);
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 13px;
   cursor: pointer;
   font-weight: 600;
@@ -2205,7 +2131,7 @@ audio.media-player {
   background: var(--bg-surface);
   border-bottom: 1px solid var(--border);
   font-size: 12px;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-weight: 600;
   letter-spacing: 0.02em;
 }
@@ -2285,7 +2211,7 @@ audio.media-player {
   color: var(--fg-dim);
   text-align: center;
   padding: 48px 16px;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 13px;
   font-style: italic;
   opacity: 0.7;
@@ -2347,7 +2273,7 @@ audio.media-player {
   display: flex;
   align-items: center;
   justify-content: center;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 14px;
   font-weight: 600;
   letter-spacing: 0.06em;
@@ -2362,8 +2288,11 @@ audio.media-player {
   background: transparent;
   color: var(--fg);
   border: none;
-  /* Hairline below the textarea so it reads as an input even before focus */
-  border-bottom: 1px solid var(--border);
+  /* Hairline below the textarea so it reads as an input even before focus.
+     --border-strong (was --border) for light-mode visibility — at
+     rgba(0,0,0,0.08) the legacy --border was effectively invisible on
+     the white --bg-surface composer card. */
+  border-bottom: 1px solid var(--border-strong);
   border-radius: 0;
   padding: 6px 8px;
   font: inherit;
@@ -2478,8 +2407,12 @@ audio.media-player {
   gap: 6px 12px;
   align-items: center;
   padding: 8px;
-  background: var(--bg);
-  border: 1px solid var(--border);
+  /* Recessed surface — --bg matched the page background and was
+     invisible against the composer wrapper in light mode.
+     --bg-highlight is one step deeper (off-white in light, slightly
+     raised in dark) so the options zone reads as its own tier. */
+  background: var(--bg-highlight);
+  border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
   font-family: var(--font-mono);
   font-size: 12px;
@@ -2509,7 +2442,7 @@ audio.media-player {
   border-radius: var(--radius);
   padding: 12px 20px;
   font: inherit;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
@@ -2535,7 +2468,7 @@ audio.media-player {
   margin-bottom: 12px;
 }
 .dashboard-section-title {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
@@ -3045,7 +2978,7 @@ audio.media-player {
   border-radius: 1px;
 }
 #new-ws-box h3 {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   color: var(--accent);
   font-size: 14px;
   font-weight: 600;
@@ -3054,7 +2987,7 @@ audio.media-player {
 }
 #new-ws-box label {
   display: block;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 10px;
   font-weight: 600;
   color: var(--fg-dim);
@@ -3124,7 +3057,7 @@ audio.media-player {
   color: var(--fg);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 12px;
   font-weight: 500;
   cursor: pointer;
@@ -3145,7 +3078,7 @@ audio.media-player {
   color: var(--bg);
   border: 1px solid var(--accent);
   border-radius: var(--radius-sm);
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
@@ -3219,18 +3152,13 @@ audio.media-player {
 }
 
 /* ==========================================================================
-   DS migration — tool call + approval block overrides
-   Scoped under [data-design="v1"] so only applies under the opt-in root.
-   Approval blocks render on the legacy .ts-msg.ts-approval.ts-approval
-   --inline wrapper (NOT a DS .msg primitive — the dual-class approach
-   used for user/assistant/reasoning messages wasn't extended to approval
-   blocks).  These overrides give that outer card a DS-aligned surface
-   + accent treatment, then remap the inner approval structure
-   (.ts-approval-tool, .verdict-badge, .ts-approval-badge) away from the
-   legacy yellow/green/red palette onto DS semantic tokens.
+   Tool call + approval block — page-specific styling for the inline
+   approval card and its inner verdict + tool-output children.  Lives
+   here (not chat.css) because these classes only render on the
+   per-node UI surface; coord uses the .approval-dock pattern instead.
 
    DOM shape rendered by buildToolDiv() + renderVerdictBadge():
-     .ts-msg.ts-approval.ts-approval--inline[.approved]  ← DS .msg styled
+     .ts-msg.ts-approval.ts-approval--inline[.approved]  ← outer card
        .ts-approval-tool
          .tool-name                   ← tool function name
          .tool-cmd                    ← header / command
@@ -3241,14 +3169,21 @@ audio.media-player {
          button.verdict-expand
        .verdict-detail (hidden until expand)
        .ts-approval-badge[--approved|--denied]          ← auto-approved pill
+
+   The block uses the unified token palette (--cyan / --ink / --panel /
+   --ok / --err / --warn) rather than the older --yellow / --green /
+   --red literals; .ts-msg.msg:not(.tool) below also flips the body font
+   from --font-mono (legacy .ts-msg default) to --font-ui for prose
+   message variants, with .msg.tool retaining mono via chat.css.
    ========================================================================== */
 
-[data-design="v1"] .ts-msg.ts-approval--inline {
-  /* Accent (teal) for tool-call kind — matches .msg.tool convention.
+.ts-msg.ts-approval--inline {
+  /* Cyan for tool-role surfaces — matches .ts-msg--tool border + the
+     .ts-approval container in the chat-css approval theme.
      width: 100% forces consistent card width across tool calls; without
      it, cards shrink to content width (short-output cards read narrow,
      long-output cards read full-width → jagged column). */
-  border-left-color: var(--accent);
+  border-left-color: var(--cyan);
   background: var(--panel-2);
   width: 100%;
   box-sizing: border-box;
@@ -3258,42 +3193,42 @@ audio.media-player {
 /* Legacy .ts-msg rule forces font-family: var(--font-mono) on every
    chat turn.  Override for user/assistant/reasoning/info/error where
    body prose is meant to be UI font.  .msg.tool keeps mono via the
-   primitive's own rule (higher specificity inside [data-design=v1]). */
-[data-design="v1"] .ts-msg.msg:not(.tool) {
+   .msg.tool { font-family: var(--font-mono); } rule in chat.css. */
+.ts-msg.msg:not(.tool) {
   font-family: var(--font-ui);
 }
-[data-design="v1"] .ts-msg-body.msg-body {
+.ts-msg-body.msg-body {
   font-family: inherit;
 }
 
-[data-design="v1"] .ts-approval-tool {
+.ts-approval-tool {
   padding: 8px 12px;
   background: var(--panel);
   border: 1px solid var(--hair);
   border-radius: var(--r-sm);
 }
 
-[data-design="v1"] .ts-approval-tool + .ts-approval-tool {
+.ts-approval-tool + .ts-approval-tool {
   margin-top: 6px;
 }
 
-[data-design="v1"] .ts-approval-tool .tool-name {
+.ts-approval-tool .tool-name {
   font-family: var(--font-mono);
   font-size: 11px;
   font-weight: 600;
-  color: var(--accent);
+  color: var(--cyan);
   margin-bottom: 4px;
   letter-spacing: 0;
 }
 
 /* Error variant of the tool name (replaces the prior inline
    name.style.color = "var(--red)" in buildToolDiv — inline styles win
-   over CSS and broke the DS token mapping). */
-[data-design="v1"] .ts-approval-tool .tool-name--error {
+   over CSS and broke the token mapping). */
+.ts-approval-tool .tool-name--error {
   color: var(--err);
 }
 
-[data-design="v1"] .ts-approval-tool .tool-cmd {
+.ts-approval-tool .tool-cmd {
   color: var(--ink-2);
   font-family: var(--font-mono);
   font-size: 12px;
@@ -3301,29 +3236,29 @@ audio.media-player {
   word-break: break-all;
 }
 
-[data-design="v1"] .ts-approval-tool .tool-cmd .dollar {
+.ts-approval-tool .tool-cmd .dollar {
   color: var(--ok);
 }
 
-[data-design="v1"] .ts-approval-tool .tool-diff {
+.ts-approval-tool .tool-diff {
   white-space: pre-wrap;
   font-size: 12px;
   margin-top: 4px;
 }
-[data-design="v1"] .ts-approval-tool .tool-diff .diff-del {
+.ts-approval-tool .tool-diff .diff-del {
   color: var(--err);
 }
-[data-design="v1"] .ts-approval-tool .tool-diff .diff-add {
+.ts-approval-tool .tool-diff .diff-add {
   color: var(--ok);
 }
-[data-design="v1"] .ts-approval-tool .tool-diff .diff-warn {
+.ts-approval-tool .tool-diff .diff-warn {
   color: var(--warn);
 }
 
-/* Verdict badge — map to DS semantic colours using the same color-mix
-   pattern as DS k-badge (12% bg / 38% border / 70% text).  Risk level
-   drives the hue: low=ok, medium=warn, high/critical=err. */
-[data-design="v1"] .verdict-badge {
+/* Verdict badge — semantic palette via the 12% bg / 38% border / 70%
+   text color-mix pattern.  Risk level drives the hue:
+   low=ok, medium=warn, high/critical=err. */
+.verdict-badge {
   display: inline-flex;
   align-items: center;
   gap: 8px;
@@ -3340,58 +3275,58 @@ audio.media-player {
   max-width: max-content;
 }
 
-[data-design="v1"] .verdict-badge.verdict-low {
+.verdict-badge.verdict-low {
   color: color-mix(in srgb, var(--ok) 70%, var(--ink-2));
   border-color: color-mix(in srgb, var(--ok) 38%, var(--hair));
   border-left-color: var(--ok);
   background: color-mix(in srgb, var(--ok) 12%, var(--panel-2));
 }
-[data-design="v1"] .verdict-badge.verdict-medium {
+.verdict-badge.verdict-medium {
   color: color-mix(in srgb, var(--warn) 70%, var(--ink-2));
   border-color: color-mix(in srgb, var(--warn) 38%, var(--hair));
   border-left-color: var(--warn);
   background: var(--warn-tint);
 }
-[data-design="v1"] .verdict-badge.verdict-high,
-[data-design="v1"] .verdict-badge.verdict-critical {
+.verdict-badge.verdict-high,
+.verdict-badge.verdict-critical {
   color: color-mix(in srgb, var(--err) 70%, var(--ink-2));
   border-color: color-mix(in srgb, var(--err) 38%, var(--hair));
   border-left-color: var(--err);
   background: color-mix(in srgb, var(--err) 12%, var(--panel-2));
 }
 
-[data-design="v1"] .verdict-badge .verdict-risk {
+.verdict-badge .verdict-risk {
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.04em;
   font-size: 10px;
 }
-[data-design="v1"] .verdict-badge .verdict-rec {
+.verdict-badge .verdict-rec {
   color: inherit;
 }
-[data-design="v1"] .verdict-badge .verdict-conf {
+.verdict-badge .verdict-conf {
   color: var(--ink-3);
   font-size: 10px;
 }
 
-[data-design="v1"] .verdict-judge-spinner {
+.verdict-judge-spinner {
   display: inline-flex;
   align-items: center;
   gap: 4px;
   color: var(--ink-3);
   font-size: 10px;
 }
-[data-design="v1"] .verdict-judge-spinner .judge-spinner-dot {
+.verdict-judge-spinner .judge-spinner-dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
   background: var(--accent);
   animation: ts-pulse 1.2s infinite;
 }
-/* ts-pulse keyframe + prefers-reduced-motion guard are defined in
-   primitives/pills.css; no local duplicate needed. */
+/* ts-pulse keyframe is defined in shared_static/ui-base.css; no
+   local duplicate needed. */
 
-[data-design="v1"] .verdict-expand {
+.verdict-expand {
   background: transparent;
   border: none;
   padding: 0 4px;
@@ -3402,16 +3337,16 @@ audio.media-player {
   text-underline-offset: 2px;
   cursor: pointer;
 }
-[data-design="v1"] .verdict-expand:hover {
+.verdict-expand:hover {
   color: var(--ink);
 }
-[data-design="v1"] .verdict-expand:focus-visible {
+.verdict-expand:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
   border-radius: 2px;
 }
 
-[data-design="v1"] .verdict-detail {
+.verdict-detail {
   margin-top: 6px;
   padding: 8px 12px;
   font-size: 11px;
@@ -3421,30 +3356,30 @@ audio.media-player {
   border: 1px solid var(--hair);
   border-radius: var(--r-sm);
 }
-[data-design="v1"] .verdict-detail .verdict-summary {
+.verdict-detail .verdict-summary {
   color: var(--ink-2);
   font-weight: 600;
   margin-bottom: 4px;
 }
-[data-design="v1"] .verdict-detail .verdict-reasoning {
+.verdict-detail .verdict-reasoning {
   color: var(--ink-3);
   margin-bottom: 4px;
 }
-[data-design="v1"] .verdict-detail .verdict-evidence {
+.verdict-detail .verdict-evidence {
   color: var(--ink-4);
   font-style: italic;
   margin-bottom: 4px;
 }
-[data-design="v1"] .verdict-detail .verdict-tier {
+.verdict-detail .verdict-tier {
   color: var(--ink-4);
   font-size: 10px;
 }
 
-/* Auto-approved / denied badges — flat badge aesthetic (matches the DS
-   .risk primitive), not a button.  Uppercase mono label on a soft
-   semantic-coloured background, no border — reads as "status tag" not
-   "click me." */
-[data-design="v1"] .ts-approval-badge {
+/* Auto-approved / denied badges — flat badge aesthetic (matches the
+   .risk primitive in ui-base.css), not a button.  Uppercase mono label
+   on a soft semantic-coloured background, no border — reads as
+   "status tag" not "click me." */
+.ts-approval-badge {
   display: inline-flex;
   align-items: center;
   gap: 4px;
@@ -3459,35 +3394,35 @@ audio.media-player {
   max-width: max-content;
   border: none;
 }
-[data-design="v1"] .ts-approval-badge--approved {
+.ts-approval-badge--approved {
   color: var(--ok);
   background: var(--ok-soft);
 }
-[data-design="v1"] .ts-approval-badge--denied {
+.ts-approval-badge--denied {
   color: var(--err);
   background: var(--err-soft);
 }
-[data-design="v1"] .ts-approval-badge--error {
+.ts-approval-badge--error {
   color: #fff;
   background: var(--err-fill);
 }
 
-/* Tool output (streamed command/fetch result).  Map legacy --code-bg /
-   --fg-dim to DS panel / ink tokens. */
-[data-design="v1"] .tool-output {
+/* Tool output (streamed command/fetch result) — uses the panel / ink
+   tokens for surface + text colour. */
+.tool-output {
   background: var(--panel);
   color: var(--ink-2);
   border-radius: var(--r-sm);
   border: 1px solid var(--hair);
 }
-[data-design="v1"] .tool-output-error {
+.tool-output-error {
   color: var(--err);
 }
-[data-design="v1"] .tool-output-stream {
+.tool-output-stream {
   border-left: 2px solid var(--accent);
 }
 
-[data-design="v1"] .tool-output.collapsed::after {
+.tool-output.collapsed::after {
   background: linear-gradient(transparent, var(--panel) 70%);
   color: var(--ink-3);
   font-family: var(--font-mono);
@@ -3498,13 +3433,13 @@ audio.media-player {
 
 /* Verdict-glow halo on action buttons — soft coloured ring when the
    heuristic verdict suggests an action. */
-[data-design="v1"] .ts-verdict-glow--approve .ts-approval-btn--approve {
+.ts-verdict-glow--approve .ts-approval-btn--approve {
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--ok) 25%, transparent);
 }
-[data-design="v1"] .ts-verdict-glow--deny .ts-approval-btn--deny {
+.ts-verdict-glow--deny .ts-approval-btn--deny {
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--err) 25%, transparent);
 }
-[data-design="v1"] .ts-verdict-glow--review .ts-approval-btn--approve,
-[data-design="v1"] .ts-verdict-glow--review .ts-approval-btn--deny {
+.ts-verdict-glow--review .ts-approval-btn--approve,
+.ts-verdict-glow--review .ts-approval-btn--deny {
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--warn) 25%, transparent);
 }

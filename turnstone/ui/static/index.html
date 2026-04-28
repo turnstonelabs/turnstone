@@ -1,34 +1,21 @@
 <!doctype html>
-<html lang="en" data-design="v1">
+<html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>turnstone</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <!-- DS typography.css @imports Inter + JetBrains Mono from Google Fonts;
-     no separate font link for legacy Outfit/IBM Plex Mono (those were
-     removed to avoid loading two font stacks under data-design="v1"). -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="/shared/base.css" />
     <link rel="stylesheet" href="/shared/ui-base.css" />
     <link rel="stylesheet" href="/shared/chat.css" />
     <link rel="stylesheet" href="/shared/cards.css" />
     <link rel="stylesheet" href="/shared/katex-0.16.45/katex.min.css" />
-    <!-- Design system v1 — opt-in via data-design="v1" on <html>. Tokens
-     + primitives scope under the attribute selector so legacy styles
-     below continue to own anything not yet migrated. -->
-    <link rel="stylesheet" href="/shared/design/tokens.css" />
-    <link rel="stylesheet" href="/shared/design/typography.css" />
-    <link rel="stylesheet" href="/shared/design/chrome/appbar.css" />
-    <link rel="stylesheet" href="/shared/design/primitives/panel.css" />
-    <link rel="stylesheet" href="/shared/design/primitives/buttons.css" />
-    <link rel="stylesheet" href="/shared/design/primitives/pills.css" />
-    <link rel="stylesheet" href="/shared/design/primitives/message.css" />
-    <link rel="stylesheet" href="/shared/design/primitives/field.css" />
     <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body>
-    <div id="header" class="ts-header appbar">
+    <div id="ui-header" class="appbar">
       <h1 class="appbar-title">turnstone</h1>
       <span
         id="mcp-status"

@@ -810,7 +810,7 @@ Pane.prototype.handleEvent = function (evt) {
           warn.className = "skip-permissions-warning";
           warn.textContent =
             "\u26a0 Running with --skip-permissions: all tool calls are auto-approved";
-          document.getElementById("header").appendChild(warn);
+          document.getElementById("ui-header").appendChild(warn);
         }
       }
       break;
@@ -3621,7 +3621,7 @@ function closeWorkstream(wsId) {
 function showDashboard() {
   dashboardVisible = true;
   document.getElementById("dashboard").classList.add("active");
-  document.getElementById("header").inert = true;
+  document.getElementById("ui-header").inert = true;
   document.getElementById("tab-bar").inert = true;
   document.getElementById("split-root").inert = true;
   loadDashboard();
@@ -3637,7 +3637,7 @@ function showDashboard() {
 function hideDashboard() {
   dashboardVisible = false;
   document.getElementById("dashboard").classList.remove("active");
-  document.getElementById("header").inert = false;
+  document.getElementById("ui-header").inert = false;
   document.getElementById("tab-bar").inert = false;
   document.getElementById("split-root").inert = false;
   document.getElementById("dashboard-input").value = "";
