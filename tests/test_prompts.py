@@ -361,7 +361,7 @@ def test_coordinator_kind_selects_coord_tools() -> None:
             "list_workstreams",
             "list_nodes",
             "list_skills",
-            "task_list",
+            "tasks",
         }
     )
     result = compose_system_message(
@@ -373,7 +373,7 @@ def test_coordinator_kind_selects_coord_tools() -> None:
     # Coordinator tool patterns are present.
     assert "spawn_workstream" in result
     assert "inspect_workstream" in result
-    assert "task_list" in result
+    assert "tasks" in result
     # IC tool patterns are NOT present — the model must not be instructed
     # to call tools it doesn't have.
     for phantom in (
@@ -404,6 +404,26 @@ def test_coordinator_kind_uses_orchestrator_persona() -> None:
     # Orchestrator-framing phrases from base_coordinator.md should appear.
     assert "orchestrate" in result
     assert "delegate" in result
+
+
+def test_coordinator_kind_skips_env_block() -> None:
+    """Coordinators don't render rich output, so the ENV block is omitted.
+
+    Regression-locks the orchestration-vs-rendering split: a coordinator
+    composing a system message with any client_type must not pick up the
+    user-facing formatting principles (Mermaid / KaTeX / chat platform
+    quirks). client_type still validates — only the loaded content is
+    skipped.
+    """
+    for ct in (ClientType.WEB, ClientType.CLI, ClientType.CHAT):
+        result = compose_system_message(
+            ct,
+            _VALID_CTX,
+            frozenset({"spawn_workstream"}),
+            kind="coordinator",
+        )
+        for env_phrase in ("Output Environment", "Available rendering", "Formatting principles"):
+            assert env_phrase not in result, f"coordinator on {ct} leaked ENV phrase {env_phrase!r}"
 
 
 def test_interactive_kind_default_still_loads_ic_tools() -> None:

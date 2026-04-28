@@ -87,7 +87,7 @@ def test_record_audit_redacts_nested_strings(storage):
     record_audit(
         storage,
         "u1",
-        "task_list.update",
+        "tasks.update",
         detail={
             "tasks": [
                 {"title": "normal task"},

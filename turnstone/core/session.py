@@ -3406,7 +3406,7 @@ class ChatSession:
                 it["func_args"] = {"reason": it.get("reason", "")[:200]}
             elif name in ("cancel_workstream", "delete_workstream"):
                 it["func_args"] = {"ws_id": it.get("ws_id", "")}
-            elif name == "task_list":
+            elif name == "tasks":
                 it["func_args"] = {
                     "action": it.get("action", ""),
                     "task_id": it.get("task_id", ""),
@@ -3988,7 +3988,7 @@ class ChatSession:
             "list_workstreams": self._prepare_list_workstreams,
             "list_nodes": self._prepare_list_nodes,
             "list_skills": self._prepare_list_skills,
-            "task_list": self._prepare_task_list,
+            "tasks": self._prepare_tasks,
             "wait_for_workstream": self._prepare_wait_for_workstream,
         }
         preparer = preparers.get(func_name)
@@ -5781,33 +5781,33 @@ class ChatSession:
         self._report_tool_result(call_id, "list_skills", summary)
         return call_id, self._truncate_output(output)
 
-    def _prepare_task_list(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
-        """Prepare a task_list action — list is auto-approved, mutations gated."""
+    def _prepare_tasks(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Prepare a tasks action — list is auto-approved, mutations gated."""
         if self._coord_client is None:
-            return self._coord_tool_error(call_id, "task_list", "coordinator client unavailable")
+            return self._coord_tool_error(call_id, "tasks", "coordinator client unavailable")
         action = self._coord_str_arg(args, "action").strip().lower()
         if action not in {"add", "update", "remove", "reorder", "list"}:
             return self._coord_tool_error(
                 call_id,
-                "task_list",
+                "tasks",
                 "action must be one of: add, update, remove, reorder, list",
             )
         if action == "list":
             return {
                 "call_id": call_id,
-                "func_name": "task_list",
-                "header": "\u2699 task_list list",
+                "func_name": "tasks",
+                "header": "\u2699 tasks list",
                 "preview": "",
                 "needs_approval": False,
-                "execute": self._exec_task_list,
+                "execute": self._exec_tasks,
                 "action": "list",
             }
         # --- mutating actions -------------------------------------------------
         item: dict[str, Any] = {
             "call_id": call_id,
-            "func_name": "task_list",
+            "func_name": "tasks",
             "needs_approval": True,
-            "execute": self._exec_task_list,
+            "execute": self._exec_tasks,
             "action": action,
         }
         if action == "add":
@@ -5818,14 +5818,14 @@ class ChatSession:
                 raw = args.get(field_name)
                 if raw is not None and not isinstance(raw, str):
                     return self._coord_tool_error(
-                        call_id, "task_list", f"add: {field_name} must be a string"
+                        call_id, "tasks", f"add: {field_name} must be a string"
                     )
             title = self._coord_str_arg(args, "title").strip()
             if not title:
-                return self._coord_tool_error(call_id, "task_list", "add: title is required")
+                return self._coord_tool_error(call_id, "tasks", "add: title is required")
             status = self._coord_str_arg(args, "status", "pending").strip() or "pending"
             child_ws_id = self._coord_str_arg(args, "child_ws_id").strip()
-            item["header"] = f"\u2699 task_list add: {title[:60]}"
+            item["header"] = f"\u2699 tasks add: {title[:60]}"
             item["preview"] = f"status={status} child_ws_id={child_ws_id or '-'}"
             item["title"] = title
             item["status"] = status
@@ -5833,7 +5833,7 @@ class ChatSession:
         elif action == "update":
             task_id = self._coord_str_arg(args, "task_id").strip()
             if not task_id:
-                return self._coord_tool_error(call_id, "task_list", "update: task_id is required")
+                return self._coord_tool_error(call_id, "tasks", "update: task_id is required")
             # Reject non-string field values outright — avoids a
             # preview/execute divergence where the approver sees
             # ``title=42`` but the coercion below drops it to ``None`` and
@@ -5852,16 +5852,16 @@ class ChatSession:
                 if field_val is not None and not isinstance(field_val, str):
                     return self._coord_tool_error(
                         call_id,
-                        "task_list",
+                        "tasks",
                         f"update: {field_name} must be a string",
                     )
             if upd_title is None and upd_status is None and upd_child is None:
                 return self._coord_tool_error(
                     call_id,
-                    "task_list",
+                    "tasks",
                     "update: at least one of title / status / child_ws_id is required",
                 )
-            item["header"] = f"\u2699 task_list update: {task_id}"
+            item["header"] = f"\u2699 tasks update: {task_id}"
             bits: list[str] = []
             if upd_title is not None:
                 bits.append(f"title={upd_title[:60]}")
@@ -5877,40 +5877,40 @@ class ChatSession:
         elif action == "remove":
             task_id = self._coord_str_arg(args, "task_id").strip()
             if not task_id:
-                return self._coord_tool_error(call_id, "task_list", "remove: task_id is required")
-            item["header"] = f"\u2699 task_list remove: {task_id}"
+                return self._coord_tool_error(call_id, "tasks", "remove: task_id is required")
+            item["header"] = f"\u2699 tasks remove: {task_id}"
             item["preview"] = ""
             item["task_id"] = task_id
         elif action == "reorder":
             raw_ids = args.get("task_ids")
             if not isinstance(raw_ids, list) or not all(isinstance(x, str) for x in raw_ids):
                 return self._coord_tool_error(
-                    call_id, "task_list", "reorder: task_ids must be a list of strings"
+                    call_id, "tasks", "reorder: task_ids must be a list of strings"
                 )
-            item["header"] = f"\u2699 task_list reorder: {len(raw_ids)} ids"
+            item["header"] = f"\u2699 tasks reorder: {len(raw_ids)} ids"
             item["preview"] = ",".join(raw_ids[:6]) + ("..." if len(raw_ids) > 6 else "")
             item["task_ids"] = raw_ids
         return item
 
-    def _exec_task_list(self, item: dict[str, Any]) -> tuple[str, str]:
+    def _exec_tasks(self, item: dict[str, Any]) -> tuple[str, str]:
         call_id = item["call_id"]
         action = item["action"]
         try:
             if action == "list":
-                envelope = self._coord_client.task_list_get(self._ws_id)
+                envelope = self._coord_client.tasks_get(self._ws_id)
                 tasks = envelope.get("tasks", [])
                 truncated = len(tasks) > 200
                 tasks = tasks[:200]
                 result: dict[str, Any] = {"tasks": tasks, "truncated": truncated}
             elif action == "add":
-                result = self._coord_client.task_list_add(
+                result = self._coord_client.tasks_add(
                     self._ws_id,
                     title=item["title"],
                     status=item["status"],
                     child_ws_id=item["child_ws_id"],
                 )
             elif action == "update":
-                result = self._coord_client.task_list_update(
+                result = self._coord_client.tasks_update(
                     self._ws_id,
                     task_id=item["task_id"],
                     title=item["title"],
@@ -5918,16 +5918,14 @@ class ChatSession:
                     child_ws_id=item["child_ws_id"],
                 )
             elif action == "remove":
-                result = self._coord_client.task_list_remove(self._ws_id, task_id=item["task_id"])
+                result = self._coord_client.tasks_remove(self._ws_id, task_id=item["task_id"])
             elif action == "reorder":
-                result = self._coord_client.task_list_reorder(
-                    self._ws_id, task_ids=item["task_ids"]
-                )
+                result = self._coord_client.tasks_reorder(self._ws_id, task_ids=item["task_ids"])
             else:  # unreachable — _prepare validated the enum
                 result = {"error": f"unknown action: {action}"}
         except Exception as e:
-            msg = f"Error: task_list {action} failed: {e}"
-            self._report_tool_result(call_id, "task_list", msg, is_error=True)
+            msg = f"Error: tasks {action} failed: {e}"
+            self._report_tool_result(call_id, "tasks", msg, is_error=True)
             return call_id, msg
         output = json.dumps(result, separators=(",", ":"), default=str)
         if action == "list":
@@ -5948,7 +5946,7 @@ class ChatSession:
         else:
             summary = action
         is_error = "error" in result
-        self._report_tool_result(call_id, "task_list", summary, is_error=is_error)
+        self._report_tool_result(call_id, "tasks", summary, is_error=is_error)
         return call_id, self._truncate_output(output)
 
     def _prepare_wait_for_workstream(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:

@@ -912,6 +912,24 @@ Three release tracks are maintained:
     actually applied — keeps later session-side ``skill`` lookups
     working regardless of how dirty the inbound payload was.
 
+- **Coordinator scratchpad tool renamed: ``task_list`` → ``tasks``.**
+  The tool name on the LLM-facing schema, the audit event name
+  (``task_list.update`` → ``tasks.update``), the SSE
+  ``tool_result`` event name (the coord-tree UI keys
+  ``ev.name === "tasks"`` for /tasks-refetch debounce), and the
+  log tag (``task_list.corrupt_envelope`` → ``tasks.corrupt_envelope``)
+  all switch together. Operators with audit dashboards / SIEM filters
+  / log greps that pinned the old prefix should update; the rename
+  is observable on the wire, not just internal. Internal Python
+  surface follows: ``CoordinatorClient.task_list_*`` → ``tasks_*``,
+  ``ChatSession._prepare_task_list`` / ``_exec_task_list`` →
+  ``_prepare_tasks`` / ``_exec_tasks``, ``_TASK_LIST_MAX`` →
+  ``_TASKS_MAX``. The previous name compounded the bare word
+  ``task`` (which collides with chat-template channels on local
+  models — the same reason ``task_agent`` carries the suffix); the
+  plural form sidesteps the collision and is more accurate, since
+  the tool acts on the whole list rather than a single task.
+
 ### Security
 
 - **Coord attachment endpoints are now kind-strict**

@@ -112,7 +112,7 @@ _TASK_STATUSES = frozenset({"pending", "in_progress", "done", "blocked"})
 # Hard cap on tasks per coordinator — the full list is read and re-serialized
 # on every mutation, so unbounded growth is both a storage and a tool-output-size
 # hazard.  Hitting the cap is an explicit signal to prune done/blocked rows.
-_TASK_LIST_MAX = 500
+_TASKS_MAX = 500
 # Max task title length.  Exceeded titles return an error rather than
 # silently truncating — mutating the coordinator's planning state
 # under its nose masks real planning bugs (the model may rely on the
@@ -134,8 +134,15 @@ _SKILL_TOOLS_PROJECTION_CAP = 20
 
 
 def _utc_now_iso() -> str:
-    """ISO-8601 UTC timestamp with seconds precision — used for task timestamps."""
-    return datetime.now(UTC).replace(microsecond=0).isoformat()
+    """ISO-8601 UTC timestamp with seconds precision.
+
+    Format matches the storage row format used elsewhere in the codebase
+    (``YYYY-MM-DDTHH:MM:SS``, no trailing offset) — both sides are UTC by
+    convention, kept as bare ISO for visual consistency when an operator
+    grep-correlates a task envelope's ``created`` / ``updated`` against a
+    workstream row.  No code currently joins or sorts the two together.
+    """
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 def load_task_envelope(storage: Any, ws_id: str) -> tuple[dict[str, Any], bool]:
@@ -165,10 +172,10 @@ def load_task_envelope(storage: Any, ws_id: str) -> tuple[dict[str, Any], bool]:
     try:
         data = json.loads(payload)
     except (TypeError, ValueError):
-        log.warning("task_list.corrupt_envelope ws=%s (unparseable JSON)", ws_id)
+        log.warning("tasks.corrupt_envelope ws=%s (unparseable JSON)", ws_id)
         return empty, True
     if not (isinstance(data, dict) and isinstance(data.get("tasks"), list)):
-        log.warning("task_list.corrupt_envelope ws=%s (wrong shape)", ws_id)
+        log.warning("tasks.corrupt_envelope ws=%s (wrong shape)", ws_id)
         return empty, True
     return data, False
 
@@ -317,7 +324,7 @@ class CoordinatorClient:
         # with the coordinator session.
         self._http = http_client or httpx.Client(timeout=timeout)
         self._owns_http = http_client is None
-        # task_list per-ws lock cache — populated lazily by _task_lock().
+        # tasks per-ws lock cache — populated lazily by _task_lock().
         # Single-session so a plain dict behind a coarse lock is fine;
         # WeakValueDictionary isn't needed (entries live as long as the
         # CoordinatorClient instance).
@@ -1153,10 +1160,10 @@ class CoordinatorClient:
         return {"skills": skills, "truncated": truncated}
 
     # ------------------------------------------------------------------
-    # task_list — coordinator-local planning state persisted on workstream_config
+    # tasks — coordinator-local planning state persisted on workstream_config
     # ------------------------------------------------------------------
 
-    def task_list_get(self, ws_id: str) -> dict[str, Any]:
+    def tasks_get(self, ws_id: str) -> dict[str, Any]:
         """Return the task envelope ``{"version": 1, "tasks": [...]}``.
 
         Corrupt / legacy config rows return an empty envelope rather than
@@ -1181,7 +1188,7 @@ class CoordinatorClient:
             return empty, False
         return load_task_envelope(self._storage, ws_id)
 
-    def _save_task_list(self, ws_id: str, envelope: dict[str, Any]) -> None:
+    def _save_tasks(self, ws_id: str, envelope: dict[str, Any]) -> None:
         # Save only the ``tasks`` key so concurrent writers to other
         # workstream_config keys (e.g. reasoning_effort from the admin UI)
         # aren't clobbered by a read-modify-write on the full row.
@@ -1204,7 +1211,7 @@ class CoordinatorClient:
                 self._task_lock_cache[ws_id] = lk
             return lk
 
-    def task_list_add(
+    def tasks_add(
         self,
         ws_id: str,
         *,
@@ -1213,7 +1220,7 @@ class CoordinatorClient:
         child_ws_id: str = "",
     ) -> dict[str, Any]:
         if ws_id != self._coord_ws_id:
-            return {"error": f"task_list scope violation: {ws_id}"}
+            return {"error": f"tasks scope violation: {ws_id}"}
         clean_title = (title or "").strip()
         if not clean_title:
             return {"error": "title is required"}
@@ -1236,15 +1243,15 @@ class CoordinatorClient:
             if corrupt:
                 return {
                     "error": (
-                        "task_list envelope is corrupt on disk; refusing to "
+                        "tasks envelope is corrupt on disk; refusing to "
                         "overwrite.  Inspect workstream_config.tasks manually "
                         "or clear it before retrying."
                     )
                 }
-            if len(envelope["tasks"]) >= _TASK_LIST_MAX:
+            if len(envelope["tasks"]) >= _TASKS_MAX:
                 return {
                     "error": (
-                        f"task_list capacity reached ({_TASK_LIST_MAX}).  "
+                        f"tasks capacity reached ({_TASKS_MAX}).  "
                         "Remove completed tasks before adding more."
                     )
                 }
@@ -1258,10 +1265,10 @@ class CoordinatorClient:
                 "updated": now,
             }
             envelope["tasks"].append(task)
-            self._save_task_list(ws_id, envelope)
+            self._save_tasks(ws_id, envelope)
             return task
 
-    def task_list_update(
+    def tasks_update(
         self,
         ws_id: str,
         *,
@@ -1271,13 +1278,13 @@ class CoordinatorClient:
         child_ws_id: str | None = None,
     ) -> dict[str, Any]:
         if ws_id != self._coord_ws_id:
-            return {"error": f"task_list scope violation: {ws_id}"}
+            return {"error": f"tasks scope violation: {ws_id}"}
         if status is not None and status not in _TASK_STATUSES:
             return {"error": f"invalid status: {status}"}
         with self._task_lock(ws_id):
             envelope, corrupt = self._load_task_envelope(ws_id)
             if corrupt:
-                return {"error": ("task_list envelope is corrupt on disk; refusing to overwrite.")}
+                return {"error": ("tasks envelope is corrupt on disk; refusing to overwrite.")}
             for t in envelope["tasks"]:
                 if t.get("id") == task_id:
                     if title is not None:
@@ -1297,14 +1304,14 @@ class CoordinatorClient:
                     if child_ws_id is not None:
                         t["child_ws_id"] = child_ws_id
                     t["updated"] = _utc_now_iso()
-                    self._save_task_list(ws_id, envelope)
+                    self._save_tasks(ws_id, envelope)
                     # t is a dict pulled out of a json-decoded list; mypy
                     # sees it as Any from the decode path.  Cast back to
                     # the annotated return type.
                     return dict(t)
             return {"error": f"task not found: {task_id}"}
 
-    def task_list_remove(self, ws_id: str, *, task_id: str) -> dict[str, Any]:
+    def tasks_remove(self, ws_id: str, *, task_id: str) -> dict[str, Any]:
         """Remove a task by id.  Returns a result dict shaped like the
         other mutators — the caller can then distinguish scope violation
         vs corrupt envelope vs genuine not-found rather than collapsing
@@ -1312,16 +1319,16 @@ class CoordinatorClient:
         as "task not found" to the coordinator LLM).
         """
         if ws_id != self._coord_ws_id:
-            return {"error": f"task_list scope violation: {ws_id}"}
+            return {"error": f"tasks scope violation: {ws_id}"}
         with self._task_lock(ws_id):
             envelope, corrupt = self._load_task_envelope(ws_id)
             if corrupt:
-                return {"error": ("task_list envelope is corrupt on disk; refusing to overwrite.")}
+                return {"error": ("tasks envelope is corrupt on disk; refusing to overwrite.")}
             before = len(envelope["tasks"])
             envelope["tasks"] = [t for t in envelope["tasks"] if t.get("id") != task_id]
             if len(envelope["tasks"]) == before:
                 return {"error": f"task not found: {task_id}"}
-            self._save_task_list(ws_id, envelope)
+            self._save_tasks(ws_id, envelope)
             return {"ok": True, "task_id": task_id}
 
     def cleanup_dead_task_child_refs(self, ws_id: str) -> int:
@@ -1373,7 +1380,7 @@ class CoordinatorClient:
             if not blanked:
                 return 0
             try:
-                self._save_task_list(ws_id, envelope)
+                self._save_tasks(ws_id, envelope)
             except Exception:
                 # Write-side divergence — the task envelope on disk
                 # now disagrees with what the close path intended.
@@ -1389,16 +1396,16 @@ class CoordinatorClient:
                 return 0
             return blanked
 
-    def task_list_reorder(self, ws_id: str, *, task_ids: list[str]) -> dict[str, Any]:
+    def tasks_reorder(self, ws_id: str, *, task_ids: list[str]) -> dict[str, Any]:
         """Reject unless ``task_ids`` is an exact permutation of the
         current set — prevents silent task loss from a partial reorder.
         """
         if ws_id != self._coord_ws_id:
-            return {"error": f"task_list scope violation: {ws_id}"}
+            return {"error": f"tasks scope violation: {ws_id}"}
         with self._task_lock(ws_id):
             envelope, corrupt = self._load_task_envelope(ws_id)
             if corrupt:
-                return {"error": ("task_list envelope is corrupt on disk; refusing to overwrite.")}
+                return {"error": ("tasks envelope is corrupt on disk; refusing to overwrite.")}
             current = [t.get("id") for t in envelope["tasks"]]
             if set(task_ids) != set(current) or len(task_ids) != len(current):
                 return {
@@ -1409,7 +1416,7 @@ class CoordinatorClient:
                 }
             by_id = {t.get("id"): t for t in envelope["tasks"]}
             envelope["tasks"] = [by_id[tid] for tid in task_ids]
-            self._save_task_list(ws_id, envelope)
+            self._save_tasks(ws_id, envelope)
             return {"ok": True, "order": task_ids}
 
     def inspect(

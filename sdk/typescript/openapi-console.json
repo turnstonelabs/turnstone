@@ -5653,7 +5653,7 @@
         "tags": [
           "Coordinator"
         ],
-        "description": "Returns the ``{version, tasks}`` envelope persisted via the ``task_list`` model tool.  Corrupt envelopes return an empty list (the tool itself surfaces corruption errors on mutation).",
+        "description": "Returns the ``{version, tasks}`` envelope persisted via the ``tasks`` model tool.  Corrupt envelopes return an empty list (the tool itself surfaces corruption errors on mutation).",
         "parameters": [
           {
             "name": "ws_id",
@@ -7756,7 +7756,7 @@
         "type": "object"
       },
       "CoordinatorTasksResponse": {
-        "description": "Response body for GET /v1/api/workstreams/{ws_id}/tasks.\n\nMirrors the envelope the ``task_list(action='list')`` model tool returns.",
+        "description": "Response body for GET /v1/api/workstreams/{ws_id}/tasks.\n\nMirrors the envelope the ``tasks(action='list')`` model tool returns.",
         "properties": {
           "version": {
             "default": 1,

@@ -3141,6 +3141,14 @@ async def _fanout_on_children(
                 # failure that should fire alerts. Pre-lift coord
                 # silently no-op'd on placeholders; this keeps cascade
                 # behaviour parity with the pre-lift outcome.
+                # NOTE: this branch is reachable from the cancel-cascade
+                # caller (``stop_cascade``) but unreachable from the
+                # close-cascade caller (``close_all_children``); the
+                # close handler at ``session_routes.py:852-854`` 404s
+                # for both missing and already-closed-evicted rows and
+                # never emits a 400 "No session". Kept as shared code
+                # rather than gated by caller — the branch is cheap and
+                # the symmetry makes future cascade verbs easier to add.
                 if result.get("status") == 400 and result.get("error") == "No session":
                     return cid, "skipped"
                 return cid, "failed"
@@ -3466,11 +3474,11 @@ async def coordinator_tasks(request: Request) -> JSONResponse:
     """GET /v1/api/workstreams/{ws_id}/tasks — read task list envelope.
 
     Returns ``{"version": 1, "tasks": [...]}`` — the same shape the
-    ``task_list(action="list")`` tool returns (less the list-tool's
+    ``tasks(action="list")`` tool returns (less the list-tool's
     client-side 200-row slice; the UI handles its own pagination).
 
     Corrupt envelopes return an empty list for UI resilience.  The
-    ``task_list`` tool remains the authoritative write path and surfaces
+    ``tasks`` tool remains the authoritative write path and surfaces
     corruption errors to the model on mutation attempts.
     """
     from turnstone.core.web_helpers import require_storage_or_503

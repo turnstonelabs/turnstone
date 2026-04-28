@@ -1128,7 +1128,7 @@ class CoordinatorTaskInfo(BaseModel):
 class CoordinatorTasksResponse(BaseModel):
     """Response body for GET /v1/api/workstreams/{ws_id}/tasks.
 
-    Mirrors the envelope the ``task_list(action='list')`` model tool returns.
+    Mirrors the envelope the ``tasks(action='list')`` model tool returns.
     """
 
     version: int = Field(default=1)

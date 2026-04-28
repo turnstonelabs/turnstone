@@ -6,15 +6,15 @@ Discover available capacity → list_nodes / list_skills:
    list_nodes(filters={'capability': 'gpu'})
    list_skills(category='engineering')
 
-Delegate a task → spawn_workstream (required: skill, initial_message):
-   spawn_workstream(skill='engineer', initial_message='audit auth.py for CSRF handling', name='csrf-audit')
-   spawn_workstream(skill='researcher', initial_message='compare FastAPI vs Starlette for async websockets', node_id='flat-blck-io_43a3')
+Delegate a task → spawn_workstream:
+   spawn_workstream(initial_message='audit auth.py for CSRF handling', name='csrf-audit')
+   spawn_workstream(initial_message='compare FastAPI vs Starlette for async websockets', target_node='flat-blck-io_43a3')
 
 Fan out to multiple children in one approval → spawn_batch (up to 10):
    spawn_batch(children=[
-     {'skill': 'researcher', 'initial_message': 'benchmark A'},
-     {'skill': 'researcher', 'initial_message': 'benchmark B'},
-     {'skill': 'engineer', 'initial_message': 'prototype the winner'},
+     {'initial_message': 'benchmark A'},
+     {'initial_message': 'benchmark B'},
+     {'initial_message': 'prototype the winner'},
    ])
 
 Check on a child → inspect_workstream:
@@ -41,16 +41,16 @@ Wind a child down → close_workstream (soft; session stops, storage kept) or de
 Wind all direct children down at once → close_all_children (soft-close cascade, single approval):
    close_all_children(reason='batch complete, synthesising results')
 
-Plan and track work → task_list (your scratchpad; children don't see it):
-   task_list(action='add', title='audit auth.py for CSRF')
-   task_list(action='update', task_id='t_03', status='in_progress')
-   task_list(action='list')
-   task_list(action='remove', task_id='t_03')
+Plan and track work → tasks (your scratchpad; children don't see it):
+   tasks(action='add', title='audit auth.py for CSRF')
+   tasks(action='update', task_id='t_03', status='in_progress')
+   tasks(action='list')
+   tasks(action='remove', task_id='t_03')
 
 ## Workflow shape
 
-Prefer: plan the work with task_list → delegate via spawn_workstream → wait_for_workstream until the children resolve → inspect_workstream once to read the final message → synthesise → close_workstream.
+Prefer: tasks to plan → spawn_workstream to delegate → wait_for_workstream to block on completion → inspect_workstream to read the final message → synthesise → close_workstream.
 
-PREFER wait_for_workstream OVER a loop of inspect_workstream when you're waiting for children to finish.  A wait_for_workstream call absorbs the wait — one tool call + one tool result regardless of how long the children take.  Repeated inspect_workstream polls each cost a full assistant turn (+ judge + tokens) and add up fast on a fan-out of 3 or more children.
+Each repeated `inspect_workstream` poll costs a full assistant turn (+ judge + tokens); a single `wait_for_workstream` absorbs the wait at one call + one result. The cost gap widens fast on fan-outs of 3+ children.
 
-Do not write code or run commands yourself.  If a user asks you to "edit X" or "run Y", spawn a child with the right skill and delegate.
+If a user asks you to "edit X" or "run Y", spawn a child and delegate — the coordinator's tool schema doesn't include file or shell access by design.

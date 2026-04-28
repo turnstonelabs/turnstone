@@ -111,7 +111,7 @@ def compose_system_message(
         IC-focused ``tools.md`` with read_file / bash / write_file
         patterns; ``"coordinator"`` loads ``tools_coordinator.md``
         which documents spawn_workstream / send_to_workstream /
-        inspect_workstream / list_nodes / list_skills / task_list etc.
+        inspect_workstream / list_nodes / list_skills / tasks etc.
         A coordinator session has a disjoint tool schema (see
         COORDINATOR_TOOLS), so composing it with the IC tools block
         would instruct the model to hallucinate tool calls that fail.
@@ -130,10 +130,17 @@ def compose_system_message(
     base_module = "base_coordinator.md" if kind == WorkstreamKind.COORDINATOR else "base.md"
     parts.append(_load(base_module))
 
-    # 2. ENV — exactly one, selected by client type
+    # 2. ENV — exactly one, selected by client type.  Coordinators
+    #    skip ENV: they orchestrate rather than render rich output to
+    #    the user, so the rendering capability matrix (Mermaid, KaTeX,
+    #    terminal width, chat-platform table quirks) is not actionable
+    #    for them.  Synthesis output rides on the child's response or
+    #    the operator's renderer.  ``client_type`` still validates so
+    #    a malformed call fails loud.
     if client_type not in _ENV_MAP:
         raise ValueError(f"Unknown client_type: {client_type!r}")
-    parts.append(_load(_ENV_MAP[client_type]))
+    if kind != WorkstreamKind.COORDINATOR:
+        parts.append(_load(_ENV_MAP[client_type]))
 
     # 3. CONTEXT — built programmatically (no template engine)
     _validate_context(context)

@@ -2531,6 +2531,26 @@
             "default": "",
             "title": "User Id",
             "type": "string"
+          },
+          "pending_approval_detail": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PendingApprovalDetail"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Inline approval payload for the coordinator children-tree UI. Carries the merged ``_pending_approval`` items list + per-call_id LLM verdict cache so a coord can render approve/deny buttons + judge pill without a separate per-child round-trip. ``None`` when no approval is pending. Also surfaced (verbatim) on ``GET /v1/api/cluster/ws/live`` via the ``_CLUSTER_WS_LIVE_KEYS`` projection."
+          },
+          "recent_auto_approvals": {
+            "description": "Per-ws ring buffer (cap 10) of recent tool calls that bypassed the operator approval gate. Surfaces ``WebUI._recent_auto_approvals`` so the coord-tree row can render an 'auto-approved by ...' pill when the child's skill / blanket / admin-policy rules silently let a tool through. Also projected onto ``GET /v1/api/cluster/ws/live`` via ``_CLUSTER_WS_LIVE_KEYS``.",
+            "items": {
+              "$ref": "#/components/schemas/RecentAutoApproval"
+            },
+            "title": "Recent Auto Approvals",
+            "type": "array"
           }
         },
         "required": [
@@ -2539,6 +2559,141 @@
           "state"
         ],
         "title": "DashboardWorkstream",
+        "type": "object"
+      },
+      "PendingApprovalDetail": {
+        "description": "Inline approval payload merged into ``DashboardWorkstream``.\n\nSet when a workstream's ``approve_tools`` is parked on\n``_approval_event``; ``None`` (omitted) otherwise. Cross-tenant\nexposure here follows the same trusted-team posture as\n``activity`` / ``tokens`` \u2014 see ``server.py``'s ``dashboard``\nhandler comment.",
+        "properties": {
+          "call_id": {
+            "default": "",
+            "description": "Primary call_id \u2014 first non-empty call_id in items list order. Matches the 409 ``current_call_id`` response from ``POST /v1/api/workstreams/{ws_id}/approve`` so the UI can render the same identifier the server reports as current.",
+            "title": "Call Id",
+            "type": "string"
+          },
+          "judge_pending": {
+            "default": false,
+            "description": "LLM judge tier still running; heuristic verdicts may already be present on items.",
+            "title": "Judge Pending",
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/PendingApprovalItem"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "title": "PendingApprovalDetail",
+        "type": "object"
+      },
+      "PendingApprovalItem": {
+        "description": "One pending tool-call inside a ``PendingApprovalDetail`` envelope.\n\nMirrors the dict ``SessionUIBase.serialize_pending_approval_detail``\nemits per item. ``heuristic_verdict`` / ``judge_verdict`` are kept\nloosely-typed because the underlying verdict shape varies by tier;\nconsumers that want the full structure can decode against\n:class:`turnstone.sdk.events.IntentVerdictEvent`.",
+        "properties": {
+          "call_id": {
+            "default": "",
+            "title": "Call Id",
+            "type": "string"
+          },
+          "header": {
+            "default": "",
+            "title": "Header",
+            "type": "string"
+          },
+          "preview": {
+            "default": "",
+            "title": "Preview",
+            "type": "string"
+          },
+          "func_name": {
+            "default": "",
+            "title": "Func Name",
+            "type": "string"
+          },
+          "approval_label": {
+            "default": "",
+            "title": "Approval Label",
+            "type": "string"
+          },
+          "needs_approval": {
+            "default": false,
+            "title": "Needs Approval",
+            "type": "boolean"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error"
+          },
+          "heuristic_verdict": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Heuristic Verdict"
+          },
+          "judge_verdict": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Judge Verdict"
+          }
+        },
+        "title": "PendingApprovalItem",
+        "type": "object"
+      },
+      "RecentAutoApproval": {
+        "description": "One ring-buffer entry for ``DashboardWorkstream.recent_auto_approvals``.\n\nRecords a tool call that bypassed the operator approval gate\n(admin tool policy / skill ``allowed_tools`` allowlist / blanket\n``auto_approve`` / \"Approve + Always\" memory).  The coord-tree\npill reads this list to surface \"auto-approved by skill X\" so\nthe operator can see WHICH calls bypassed and WHY.",
+        "properties": {
+          "call_id": {
+            "default": "",
+            "title": "Call Id",
+            "type": "string"
+          },
+          "func_name": {
+            "default": "",
+            "title": "Func Name",
+            "type": "string"
+          },
+          "approval_label": {
+            "default": "",
+            "title": "Approval Label",
+            "type": "string"
+          },
+          "auto_approve_reason": {
+            "default": "",
+            "description": "Source that fired the bypass.  ``skill`` (skill template's ``allowed_tools``), ``always`` (user 'Approve + Always' click), ``policy`` (admin tool-policy ``allow`` rule), ``blanket`` (workstream-level ``auto_approve=True``), or ``auto_approve_tools`` (legacy / unknown writer).",
+            "title": "Auto Approve Reason",
+            "type": "string"
+          },
+          "ts": {
+            "default": 0.0,
+            "description": "Unix epoch seconds when the auto-approve fired.",
+            "title": "Ts",
+            "type": "number"
+          }
+        },
+        "title": "RecentAutoApproval",
         "type": "object"
       },
       "ListSavedWorkstreamsResponse": {
