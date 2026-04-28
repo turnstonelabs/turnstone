@@ -649,6 +649,95 @@ def test_list_nodes_prepare_drops_invalid_filter_types(coord_session):
     assert item["filters"] == {"arch": "x86_64"}
 
 
+def test_list_nodes_prepare_accepts_flat_args_as_filters(coord_session):
+    """The model frequently drops the ``filters`` nesting and passes
+    each filter as a top-level kwarg (``list_nodes(os="Linux",
+    has_gpu=true)``).  Operators saw this surface during shakedown:
+    flat-arg calls returned the full cluster because the strict-
+    nested prepare silently dropped the filter.  The relaxed prepare
+    treats every top-level non-reserved kwarg as a flat filter."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc("list_nodes", {"os": "Linux", "gpu_has_nvidia": True, "memory_gb": 64})
+    )
+    assert item["filters"] == {"os": "Linux", "gpu_has_nvidia": True, "memory_gb": 64}
+
+
+def test_list_nodes_prepare_reserves_paging_and_visibility_kwargs(coord_session):
+    """Top-level reserved kwargs (``limit``, ``include_network_detail``,
+    ``include_inactive``, ``filters``) are control parameters, NOT
+    filters.  A flat call like ``list_nodes(limit=10, os="Linux")``
+    must put ``limit`` on the paging path and ``os`` in the
+    filter dict — not vice-versa."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc(
+            "list_nodes",
+            {
+                "limit": 10,
+                "include_network_detail": True,
+                "include_inactive": True,
+                "os": "Linux",
+            },
+        )
+    )
+    assert item["limit"] == 10
+    assert item["include_network_detail"] is True
+    assert item["include_inactive"] is True
+    assert item["filters"] == {"os": "Linux"}
+
+
+def test_list_nodes_prepare_nested_wins_on_key_collision(coord_session):
+    """When the model accidentally passes the same filter key both
+    nested AND flat (rare but possible mid-refactor), the canonical
+    nested form wins so the call is deterministic."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc(
+            "list_nodes",
+            {
+                "filters": {"os": "Linux"},  # canonical
+                "os": "DifferentOS",  # flat — should NOT override
+            },
+        )
+    )
+    assert item["filters"] == {"os": "Linux"}
+
+
+def test_list_nodes_prepare_mixes_nested_and_flat(coord_session):
+    """A model can split filters across both shapes.  Both contribute
+    to the final filter set; nested wins only on direct collisions."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc(
+            "list_nodes",
+            {
+                "filters": {"os": "Linux"},
+                "gpu_has_nvidia": True,
+                "memory_gb": 64,
+            },
+        )
+    )
+    assert item["filters"] == {
+        "os": "Linux",
+        "gpu_has_nvidia": True,
+        "memory_gb": 64,
+    }
+
+
+def test_list_nodes_exec_dispatches_flat_arg_filters(coord_session):
+    """End-to-end: flat-arg filters must actually flow through to the
+    coordinator client's ``list_nodes(filters=...)`` call.  The bug
+    operators reported was the filters being silently dropped on the
+    way to storage; this test pins the prepare→exec wiring."""
+    sess, coord, _ui = coord_session
+    coord.list_nodes.return_value = {"nodes": [], "truncated": False}
+    item = sess._prepare_tool(_tc("list_nodes", {"os": "Linux"}))
+    sess._exec_list_nodes(item)
+    kwargs = coord.list_nodes.call_args.kwargs
+    assert kwargs["filters"] == {"os": "Linux"}
+
+
 def test_list_nodes_prepare_clamps_limit(coord_session):
     sess, _coord, _ui = coord_session
     over = sess._prepare_tool(_tc("list_nodes", {"limit": 9999}))

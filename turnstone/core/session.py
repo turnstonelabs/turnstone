@@ -203,6 +203,15 @@ _VALID_MEMORY_SCOPES: tuple[str, ...] = ("global", "workstream", "user", "coordi
 # :meth:`ChatSession._implicit_scope_walk`.
 _IMPLICIT_SCOPE_WALK: tuple[str, ...] = ("workstream", "user", "global")
 
+# ``list_nodes`` reserves four top-level kwargs for control parameters
+# (filters / paging / output verbosity / liveness toggle).  Anything
+# else the model passes at the top level is treated as a flat filter
+# entry — see :meth:`ChatSession._prepare_list_nodes`.
+_LIST_NODES_RESERVED_ARGS: frozenset[str] = frozenset(
+    {"filters", "limit", "include_network_detail", "include_inactive"}
+)
+
+
 # ``tasks`` action classifier — partitions actions into read vs write
 # so the parallel-batch guard can permit homogeneous batches (all
 # writes serialise under the per-ws lock and converge to a consistent
@@ -6059,15 +6068,35 @@ class ChatSession:
     def _prepare_list_nodes(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         if self._coord_client is None:
             return self._coord_tool_error(call_id, "list_nodes", "coordinator client unavailable")
+        # Metadata values are JSON-encoded at rest; the client handles
+        # the encode/decode so preserve the model's natural types (``4``
+        # stays an int, ``"gpu"`` stays a string) rather than
+        # stringifying here.
+        #
+        # Two accepted shapes:
+        #
+        #   list_nodes(filters={"os": "Linux"})   ← canonical, nested
+        #   list_nodes(os="Linux")                ← flat top-level args
+        #
+        # Several models drop the ``filters`` nesting and emit each
+        # filter as a top-level kwarg; the strict-nested-only shape
+        # silently degraded those calls to "no filter" and returned
+        # the full cluster, which an operator hit during shakedown
+        # ("``os="DefinitelyNotAnOS"`` returned all 10 nodes").
+        # Treating top-level non-reserved args as filters fixes the
+        # natural mistake without changing the canonical shape;
+        # nested entries still win on key collision.
         raw_filters = args.get("filters")
-        # Metadata values are JSON-encoded at rest; the client handles the
-        # encode/decode so preserve the model's natural types (``4`` stays
-        # an int, ``"gpu"`` stays a string) rather than stringifying here.
         filters: dict[str, Any] = {}
         if isinstance(raw_filters, dict):
             for k, v in raw_filters.items():
                 if isinstance(k, str) and k and isinstance(v, (str, int, float, bool)):
                     filters[k] = v
+        for k, v in args.items():
+            if k in _LIST_NODES_RESERVED_ARGS:
+                continue
+            if isinstance(k, str) and k and isinstance(v, (str, int, float, bool)):
+                filters.setdefault(k, v)
         try:
             limit = int(args.get("limit") or 100)
         except (TypeError, ValueError):
