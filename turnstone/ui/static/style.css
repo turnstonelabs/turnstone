@@ -1398,15 +1398,15 @@ body {
    ========================================================================== */
 
 /* Attachment chips — pill cluster above the textarea */
-.ts-composer-chips {
+.composer-chips {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
 }
-.ts-composer-chips:empty {
+.composer-chips:empty {
   display: none;
 }
-.ts-composer-chip {
+.composer-chip {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -1419,22 +1419,22 @@ body {
   font-size: 11px;
   max-width: 280px;
 }
-.ts-composer-chip-icon {
+.composer-chip-icon {
   font-size: 12px;
   opacity: 0.7;
 }
-.ts-composer-chip-name {
+.composer-chip-name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 180px;
 }
-.ts-composer-chip-size {
+.composer-chip-size {
   color: var(--fg-dim, var(--fg));
   opacity: 0.65;
   font-size: 10px;
 }
-.ts-composer-chip-remove {
+.composer-chip-remove {
   background: transparent;
   color: var(--fg-dim, var(--fg));
   border: none;
@@ -1444,11 +1444,11 @@ body {
   cursor: pointer;
   border-radius: 50%;
 }
-.ts-composer-chip-remove:hover {
+.composer-chip-remove:hover {
   color: var(--red, #c94040);
   background: var(--bg-surface);
 }
-.ts-composer-chip-remove:focus-visible {
+.composer-chip-remove:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
@@ -2197,7 +2197,7 @@ audio.media-player {
 /* Slightly thicker ring than chat.css (2px → 3px) — the interactive
    pane sits over denser pane-bottom chrome, so the ring needs more
    visual weight to pop. */
-.ts-composer-input:focus-visible {
+.composer-input:focus-visible {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-dim);
@@ -3126,7 +3126,7 @@ audio.media-player {
   .ts-approval-btn,
   .ts-approval-feedback,
   #plan-buttons button,
-  .ts-composer button,
+  .composer button,
   .dashboard-new-btn,
   .dashboard-input,
   #health-indicator,

@@ -225,31 +225,30 @@ function _formatAttachSize(n) {
 Pane.prototype._renderAttachmentChip = function (info) {
   var self = this;
   var chip = document.createElement("span");
-  chip.className =
-    "ts-composer-chip ts-composer-chip-" + (info.kind || "other");
+  chip.className = "composer-chip composer-chip-" + (info.kind || "other");
   chip.setAttribute("role", "listitem");
   chip.dataset.attachmentId = info.attachment_id;
 
   var icon = document.createElement("span");
-  icon.className = "ts-composer-chip-icon";
+  icon.className = "composer-chip-icon";
   icon.setAttribute("aria-hidden", "true");
   icon.textContent = info.kind === "image" ? "\ud83d\uddbc" : "\ud83d\udcc4";
   chip.appendChild(icon);
 
   var label = document.createElement("span");
-  label.className = "ts-composer-chip-name";
+  label.className = "composer-chip-name";
   label.textContent = info.filename || "(unnamed)";
   label.title = info.filename || "";
   chip.appendChild(label);
 
   var size = document.createElement("span");
-  size.className = "ts-composer-chip-size";
+  size.className = "composer-chip-size";
   size.textContent = _formatAttachSize(info.size_bytes || 0);
   chip.appendChild(size);
 
   var remove = document.createElement("button");
   remove.type = "button";
-  remove.className = "ts-composer-chip-remove";
+  remove.className = "composer-chip-remove";
   remove.setAttribute(
     "aria-label",
     "Remove attachment " + (info.filename || ""),
@@ -342,12 +341,12 @@ Pane.prototype._swapPlaceholderChip = function (placeholderId, info) {
   );
   if (chip) {
     chip.dataset.attachmentId = info.attachment_id;
-    var name = chip.querySelector(".ts-composer-chip-name");
+    var name = chip.querySelector(".composer-chip-name");
     if (name) {
       name.textContent = info.filename || "(unnamed)";
       name.title = info.filename || "";
     }
-    var size = chip.querySelector(".ts-composer-chip-size");
+    var size = chip.querySelector(".composer-chip-size");
     if (size) size.textContent = _formatAttachSize(info.size_bytes || 0);
   } else {
     // Chip missing (user removed it mid-upload?); render fresh.

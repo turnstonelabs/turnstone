@@ -272,7 +272,7 @@
    send button.  Coordinator omits chips + paperclip; interactive
    includes both.  Same wrapper, same textarea + send styling.
    ========================================================================== */
-.ts-composer {
+.composer {
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -285,16 +285,16 @@
   border-top: 1px solid var(--border-strong);
 }
 
-.ts-composer-chips {
+.composer-chips {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
 }
-.ts-composer-chips:empty {
+.composer-chips:empty {
   display: none;
 }
 
-.ts-composer-chip {
+.composer-chip {
   display: inline-flex;
   align-items: center;
   gap: 4px;
@@ -306,11 +306,11 @@
   border-radius: var(--radius-sm);
   color: var(--fg);
 }
-.ts-composer-chip-size {
+.composer-chip-size {
   color: var(--fg-dim);
   font-variant-numeric: tabular-nums;
 }
-.ts-composer-chip-remove {
+.composer-chip-remove {
   background: none;
   border: none;
   color: var(--fg-dim);
@@ -320,17 +320,17 @@
   font-size: 13px;
   line-height: 1;
 }
-.ts-composer-chip-remove:hover {
+.composer-chip-remove:hover {
   color: var(--red);
 }
 
-.ts-composer-row {
+.composer-row {
   display: flex;
   align-items: flex-end;
   gap: 6px;
 }
 
-.ts-composer-attach {
+.composer-attach {
   background: transparent;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
@@ -345,17 +345,17 @@
     color 0.12s,
     border-color 0.12s;
 }
-.ts-composer-attach:hover {
+.composer-attach:hover {
   background: var(--bg-highlight);
   color: var(--accent);
   border-color: var(--accent-dim);
 }
-.ts-composer-attach:focus-visible {
+.composer-attach:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
 
-.ts-composer-input {
+.composer-input {
   flex: 1;
   min-height: 32px;
   max-height: 160px;
@@ -374,21 +374,21 @@
     border-color 0.15s,
     box-shadow 0.15s;
 }
-.ts-composer-input:focus-visible {
+.composer-input:focus-visible {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 2px var(--accent-dim);
 }
-.ts-composer-input:disabled {
+.composer-input:disabled {
   opacity: 0.55;
   cursor: not-allowed;
 }
-.ts-composer-input::placeholder {
+.composer-input::placeholder {
   color: var(--fg-dim);
   opacity: 0.7;
 }
 
-.ts-composer-send {
+.composer-send {
   font: inherit;
   font-family: var(--font-mono);
   font-size: 12px;
@@ -403,24 +403,24 @@
   transition: filter 0.12s;
   letter-spacing: 0.02em;
 }
-.ts-composer-send:hover {
+.composer-send:hover {
   filter: brightness(1.08);
 }
-.ts-composer-send:focus-visible {
+.composer-send:focus-visible {
   outline: 2px solid var(--fg);
   outline-offset: 2px;
 }
-.ts-composer-send:disabled {
+.composer-send:disabled {
   opacity: 0.5;
   cursor: not-allowed;
   filter: none;
 }
-.ts-composer-send--queue {
+.composer-send--queue {
   background: transparent;
   color: var(--accent);
   border-color: var(--accent);
 }
-.ts-composer-send--queue:hover {
+.composer-send--queue:hover {
   background: var(--accent-dim);
   filter: none;
 }
@@ -428,7 +428,7 @@
 /* Stop button — only rendered when the composer was constructed with
    stopBtn=true.  Distinct red colour signals "interrupt the in-flight
    generation" rather than "send another message". */
-.ts-composer-stop {
+.composer-stop {
   background: var(--red, #c94040);
   min-width: 120px;
   text-align: center;
@@ -443,11 +443,11 @@
   cursor: pointer;
   height: 32px;
 }
-.ts-composer-stop:focus-visible {
+.composer-stop:focus-visible {
   outline: 2px solid var(--fg-bright, #e8ecf4);
   outline-offset: 2px;
 }
-[data-theme="light"] .ts-composer-stop {
+[data-theme="light"] .composer-stop {
   color: #fff;
 }
 
@@ -458,15 +458,15 @@
    row pairs an attach / options cluster on the left with a
    primary "Create" / "Start" button on the right.
    ============================================================ */
-.ts-composer--stacked {
+.composer--stacked {
   display: flex;
   flex-direction: column;
   gap: 8px;
 }
-.ts-composer--stacked .ts-composer-text {
+.composer--stacked .composer-text {
   display: flex;
 }
-.ts-composer--stacked .ts-composer-input {
+.composer--stacked .composer-input {
   flex: 1;
   min-height: 72px;
   /* Blend the textarea into its enclosing panel in stacked layout —
@@ -480,18 +480,18 @@
   padding: 6px 8px;
   resize: vertical;
 }
-.ts-composer--stacked .ts-composer-input:focus-visible {
+.composer--stacked .composer-input:focus-visible {
   box-shadow: none;
   border-bottom-color: var(--accent);
 }
-.ts-composer--stacked .ts-composer-row {
+.composer--stacked .composer-row {
   align-items: center;
 }
 /* Space the primary action button away from the left-clustered
    attach + options buttons in the stacked layout.  The send
    button is always the LAST element in the action row; push it
    to the right edge via margin-left:auto. */
-.ts-composer--stacked .ts-composer-send {
+.composer--stacked .composer-send {
   margin-left: auto;
 }
 
@@ -499,7 +499,7 @@
    Options disclosure — toggle button + collapsible panel.
    Rendered when the composer is constructed with opts.options.
    ============================================================ */
-.ts-composer-options-btn {
+.composer-options-btn {
   background: transparent;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
@@ -516,26 +516,26 @@
     background 0.12s,
     border-color 0.12s;
 }
-.ts-composer-options-btn:hover {
+.composer-options-btn:hover {
   background: var(--bg-highlight);
   border-color: var(--accent-dim);
 }
-.ts-composer-options-btn:focus-visible {
+.composer-options-btn:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
-.ts-composer-options-btn[aria-expanded="true"] .ts-composer-options-caret {
+.composer-options-btn[aria-expanded="true"] .composer-options-caret {
   /* Flip ▾ to ▴ via transform so the glyph file stays single-char. */
   display: inline-block;
   transform: rotate(180deg);
 }
-.ts-composer-options-summary {
+.composer-options-summary {
   color: var(--fg-dim);
   font-family: var(--font-mono);
   font-size: 11px;
   letter-spacing: 0.02em;
 }
-.ts-composer-options-panel {
+.composer-options-panel {
   display: grid;
   grid-template-columns: auto 1fr;
   gap: 6px 12px;
@@ -555,19 +555,19 @@
    and comes later in the cascade, so a bare [hidden] attribute
    alone doesn't hide the panel.  Override here so toggleOptions()
    works via the standard hidden attribute. */
-.ts-composer-options-panel[hidden] {
+.composer-options-panel[hidden] {
   display: none;
 }
-.ts-composer-options-field {
+.composer-options-field {
   display: contents;
 }
-.ts-composer-options-field > label {
+.composer-options-field > label {
   color: var(--fg-dim);
   text-transform: uppercase;
   font-size: 10px;
   letter-spacing: 0.05em;
 }
-.ts-composer-options-control {
+.composer-options-control {
   font-family: var(--font-mono);
   font-size: 12px;
   color: var(--fg);
@@ -577,14 +577,14 @@
   padding: 4px 6px;
   width: 100%;
 }
-.ts-composer-options-control:focus-visible {
+.composer-options-control:focus-visible {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 2px var(--accent-dim);
 }
 /* Active-state flip on the toggle button itself (mirrors the
    dashboard composer's affordance). */
-.ts-composer-options-btn[aria-expanded="true"] {
+.composer-options-btn[aria-expanded="true"] {
   color: var(--fg);
   background: var(--bg);
 }
@@ -759,15 +759,15 @@
     margin: 4px -6px;
     border-radius: 0;
   }
-  .ts-composer {
+  .composer {
     padding: 6px 10px;
   }
-  .ts-composer-input {
+  .composer-input {
     min-height: 40px;
     max-height: 120px;
     resize: none;
   }
-  .ts-composer-send {
+  .composer-send {
     height: 40px;
     padding: 6px 14px;
   }
@@ -788,9 +788,9 @@
   .msg-actions,
   .msg-action-btn,
   .ts-approval-btn,
-  .ts-composer-attach,
-  .ts-composer-input,
-  .ts-composer-send {
+  .composer-attach,
+  .composer-input,
+  .composer-send {
     transition: none;
   }
 }
