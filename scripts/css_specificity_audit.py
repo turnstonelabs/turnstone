@@ -270,6 +270,15 @@ def _parse_declarations(block: str) -> dict[str, tuple[str, bool]]:
         if m:
             important = True
             value = value[: m.start()].strip()
+        # Delete-then-insert so the last occurrence of `prop` lands at the
+        # *end* of the dict, not in its original slot.  Downstream
+        # `_expanded_declarations` iterates in dict order to mirror CSS
+        # within-rule cascade; without this re-ordering, a sequence like
+        # `font-size: 13px; font: inherit; font-size: 12px;` would iterate
+        # as (font-size, font) and resolve to font-size: inherit instead
+        # of the correct 12px.
+        if prop in decls:
+            del decls[prop]
         decls[prop] = (value, important)
     return decls
 
@@ -1103,6 +1112,14 @@ def audit(
                 applicable.append((r, s))
         if len(applicable) < 2:
             continue
+        # Cascade source order is per-page, not per-file: stylesheets are
+        # `<link>`-loaded in the order PAGE_STYLESHEETS lists them, so a rule
+        # at line 1000 of base.css comes BEFORE a rule at line 50 of style.css
+        # when both load on the same page.  Build a (file_index, line_no)
+        # ordering keyed off the element's stylesheet manifest.
+        sheet_index = {s: i for i, s in enumerate(elem.stylesheets)}
+        sheet_count = len(sheet_index)
+
         # Group by property — expand watched-shorthand declarations into
         # their longhands so e.g. `font: inherit` shadows `font-family`.
         by_prop: dict[str, list[Hit]] = {}
@@ -1131,9 +1148,14 @@ def audit(
                 if not candidates:
                     continue
                 # Pick the actual cascade winner: !important first, then spec,
-                # then source-later.
+                # then source-later (across the per-page stylesheet load order).
                 candidates.sort(
-                    key=lambda h: (h.important, h.specificity, h.rule.line_no),
+                    key=lambda h: (
+                        h.important,
+                        h.specificity,
+                        sheet_index.get(h.rule.source_file, sheet_count),
+                        h.rule.line_no,
+                    ),
                     reverse=True,
                 )
                 winner = candidates[0]
