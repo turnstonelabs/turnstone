@@ -31,7 +31,7 @@ var ALIAS_SETTING_KEYS = [
 var INHERIT_EMPTY_LABEL_KEYS = ["model.plan_effort", "model.task_effort"];
 
 // ---------------------------------------------------------------------------
-// View switching (called from app.js showOverview/drillDown pattern)
+// View switching (called from app.js showHome/drillDown pattern)
 // ---------------------------------------------------------------------------
 
 function showAdmin() {
@@ -50,7 +50,6 @@ function showAdmin() {
   currentView = "admin";
   var homeView = document.getElementById("view-home");
   if (homeView) homeView.style.display = "none";
-  document.getElementById("view-node").style.display = "none";
   document.getElementById("view-filtered").style.display = "none";
   document.getElementById("view-admin").style.display = "";
   document.getElementById("breadcrumb").style.display = "";

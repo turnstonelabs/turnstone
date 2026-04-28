@@ -67,9 +67,7 @@ window.onThemeChange = function (next) {
 })();
 
 // --- State ---
-var currentView = "home"; // "home" | "overview" | "node" | "filtered" | "admin"
-var currentNodeId = null;
-var currentServerUrl = "";
+var currentView = "home"; // "home" | "overview" | "filtered" | "admin"
 var currentFilter = { state: null, node: null, page: 1, per_page: 50 };
 var expandedGroups = {};
 var _lastOverviewJson = "";
@@ -218,8 +216,8 @@ function recomputeOverview() {
   Object.keys(clusterState.nodes).forEach(function (nid) {
     // Skip the "console" pseudo-node — coordinators aren't compute-
     // node workstreams, and counting them here would inflate the
-    // cluster-summary totals the home view renders.  The
-    // active-coordinators list surfaces them separately.
+    // cluster totals.  The active-coordinators list surfaces them
+    // separately.
     if (nid === "console") return;
     var node = clusterState.nodes[nid];
     var nodeWsTokens = 0;
@@ -302,8 +300,7 @@ function renderFromState() {
   if (currentView === "home") {
     _renderHomeView();
     // Home view also hosts the inline node-list (cluster details);
-    // render it so expanding the cluster-summary reveals the current
-    // state without waiting for the next SSE tick.
+    // render it so the next SSE tick doesn't leave it stale.
     var nodesList = Object.keys(clusterState.nodes)
       .filter(function (nid) {
         // Exclude the "console" pseudo-node from the nodes list — it's
@@ -318,34 +315,6 @@ function renderFromState() {
       return d !== 0 ? d : a.node_id.localeCompare(b.node_id);
     });
     renderNodeGroups(nodesList, nodesList.length);
-  } else if (currentView === "node" && currentNodeId) {
-    var snapNode = clusterState.nodes[currentNodeId];
-    if (snapNode) {
-      var wsList = snapNode.workstreams || [];
-      var active = wsList.filter(function (w) {
-        return w.state !== "idle";
-      }).length;
-      document.getElementById("node-ws-summary").textContent =
-        active + " active \u00b7 " + wsList.length + " total";
-      var mcpSumEl = document.getElementById("node-mcp-summary");
-      if (mcpSumEl) {
-        var mcpInfo = snapNode.health && snapNode.health.mcp;
-        if (mcpInfo && mcpInfo.servers > 0) {
-          mcpSumEl.textContent =
-            mcpInfo.servers +
-            " MCP server" +
-            (mcpInfo.servers !== 1 ? "s" : "") +
-            " \u00b7 " +
-            mcpInfo.resources +
-            " resources \u00b7 " +
-            mcpInfo.prompts +
-            " prompts";
-        } else {
-          mcpSumEl.textContent = "";
-        }
-      }
-      renderWsTable(document.getElementById("node-ws-table"), wsList);
-    }
   } else if (currentView === "filtered") {
     var allWs = [];
     Object.keys(clusterState.nodes).forEach(function (nid) {
@@ -463,16 +432,13 @@ function handleClusterEvent(data) {
 // --- Home View ---
 //
 // Coordinator-first landing: composer + active-coordinators list +
-// compact cluster summary.  The legacy #view-overview stays reachable
-// via the summary's expand button and the existing popstate / deep-
-// link wiring so `?view=overview` etc. still land on the node list.
+// inline node list.  The node list is self-collapsing (consecutive
+// same-prefix nodes group into a single row) so it stays visible
+// without dominating the page.
 function showHome() {
   currentView = "home";
-  currentNodeId = null;
-  currentServerUrl = "";
   currentFilter = { state: null, node: null, page: 1, per_page: 50 };
   _setLandingView("home");
-  _setClusterDetailsExpanded(false);
   var adminView = document.getElementById("view-admin");
   if (adminView) adminView.style.display = "none";
   var adminBtn = document.getElementById("admin-btn");
@@ -489,74 +455,15 @@ function showHome() {
 }
 
 function _setLandingView(which) {
-  // Toggle the three top-level landing panes.  The "overview" (node
-  // list) is no longer its own pane — it's an expandable section
-  // inside #view-home, toggled by toggleClusterDetails() — so every
-  // view transition only needs to choose between home / node /
-  // filtered.
-  var views = ["home", "node", "filtered"];
+  // Toggle the two top-level landing panes.  The node list lives inside
+  // #view-home as a sibling section, and clicking a node navigates
+  // straight to /node/<id>/ rather than swapping in a detail pane.
+  var views = ["home", "filtered"];
   views.forEach(function (name) {
     var el = document.getElementById("view-" + name);
     if (!el) return;
     el.style.display = name === which ? "" : "none";
   });
-}
-
-// Toggle the inline cluster-details (node list) panel inside
-// #view-home.  Replaces the old "swap to #view-overview" navigation so
-// operators never leave the landing page to see cluster state.
-function _setClusterDetailsExpanded(expanded) {
-  var details = document.getElementById("view-overview");
-  var btn = document.getElementById("cluster-summary-expand");
-  var caret = document.querySelector(".home-cluster-summary-caret");
-  if (!details) return;
-  if (expanded) {
-    details.removeAttribute("hidden");
-    if (btn) btn.setAttribute("aria-expanded", "true");
-    if (caret) caret.textContent = "\u25BE"; // ▾
-  } else {
-    details.setAttribute("hidden", "");
-    if (btn) btn.setAttribute("aria-expanded", "false");
-    if (caret) caret.textContent = "\u25B8"; // ▸
-  }
-}
-
-function toggleClusterDetails() {
-  var details = document.getElementById("view-overview");
-  if (!details) return;
-  _setClusterDetailsExpanded(details.hasAttribute("hidden"));
-}
-
-// --- Overview (alias: expanded cluster-details on the home view) ---
-// Preserved so breadcrumb "Cluster" links, popstate {view:"overview"},
-// and ?view=overview deep-links still land on a meaningful state.
-// Semantically equivalent to showHome() with the cluster-details
-// section forced open.
-function showOverview() {
-  currentView = "home";
-  currentNodeId = null;
-  currentServerUrl = "";
-  currentFilter = { state: null, node: null, page: 1, per_page: 50 };
-  _setLandingView("home");
-  _setClusterDetailsExpanded(true);
-  var adminView = document.getElementById("view-admin");
-  if (adminView) adminView.style.display = "none";
-  var adminBtn = document.getElementById("admin-btn");
-  if (adminBtn) {
-    adminBtn.classList.remove("active");
-    adminBtn.setAttribute("aria-expanded", "false");
-  }
-  document.getElementById("breadcrumb").style.display = "none";
-  if (clusterState) renderFromState();
-  else loadOverview();
-  if (!_navigatingFromPopstate) history.pushState({ view: "home" }, "");
-  // Scroll the details section into view so the click produces a
-  // visible reaction — the user expands the summary expecting to see
-  // the node list, not wonder whether the click worked.
-  var details = document.getElementById("view-overview");
-  if (details && typeof details.scrollIntoView === "function") {
-    details.scrollIntoView({ block: "start", behavior: "smooth" });
-  }
 }
 
 function loadOverview() {
@@ -865,13 +772,14 @@ function buildNodeRow(node) {
     healthPct +
     "%</span>";
 
+  var nodeUrl = "/node/" + encodeURIComponent(node.node_id) + "/";
   row.onclick = function () {
-    drillDownToNode(node.node_id, node.server_url);
+    window.location.href = nodeUrl;
   };
   row.onkeydown = function (e) {
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
-      drillDownToNode(node.node_id, node.server_url);
+      window.location.href = nodeUrl;
     }
   };
   return row;
@@ -1079,60 +987,6 @@ function renderNodeGroups(nodes, total) {
     groupEl.appendChild(body);
     table.appendChild(groupEl);
   });
-}
-
-// --- Drill-down: Node ---
-function drillDownToNode(nodeId, serverUrl) {
-  currentView = "node";
-  currentNodeId = nodeId;
-  currentServerUrl = serverUrl || "";
-  _setLandingView("node");
-  var adminView = document.getElementById("view-admin");
-  if (adminView) adminView.style.display = "none";
-  var adminBtn = document.getElementById("admin-btn");
-  if (adminBtn) {
-    adminBtn.classList.remove("active");
-    adminBtn.setAttribute("aria-expanded", "false");
-  }
-  document.getElementById("breadcrumb").style.display = "";
-  document.getElementById("breadcrumb-label").textContent = nodeId;
-  var link = document.getElementById("node-link");
-  // Use proxy path so users don't need direct server access
-  link.href = "/node/" + encodeURIComponent(nodeId) + "/";
-  link.style.display = "";
-  document.getElementById("main").scrollTop = 0;
-  if (clusterState && clusterState.nodes[nodeId]) {
-    renderFromState();
-  } else {
-    document.getElementById("node-ws-table").innerHTML =
-      '<div class="dashboard-empty">Loading workstreams...</div>';
-    loadNodeDetail(nodeId);
-  }
-  _loadNodeMetadataPanel(nodeId);
-  document.getElementById("breadcrumb-home").focus();
-  if (!_navigatingFromPopstate)
-    history.pushState(
-      { view: "node", nodeId: nodeId, serverUrl: serverUrl },
-      "",
-    );
-}
-
-function loadNodeDetail(nodeId) {
-  authFetch("/v1/api/cluster/snapshot")
-    .then(function (r) {
-      return r.json();
-    })
-    .then(function (data) {
-      applySnapshot(data);
-      if (!clusterState || !clusterState.nodes[nodeId]) {
-        document.getElementById("node-ws-table").innerHTML =
-          '<div class="dashboard-empty">Node not found</div>';
-      }
-    })
-    .catch(function () {
-      document.getElementById("node-ws-table").innerHTML =
-        '<div class="dashboard-empty">Failed to load</div>';
-    });
 }
 
 // --- Drill-down: Filtered ---
@@ -1564,254 +1418,16 @@ window.addEventListener("popstate", function (e) {
       showHome();
       return;
     }
-    if (e.state.view === "home") showHome();
-    else if (e.state.view === "overview") showOverview();
+    if (e.state.view === "home" || e.state.view === "overview") showHome();
     else if (e.state.view === "admin" && typeof showAdmin === "function")
       showAdmin();
-    else if (e.state.view === "node" && e.state.nodeId)
-      drillDownToNode(e.state.nodeId, e.state.serverUrl);
     else if (e.state.view === "filtered" && e.state.filter) {
       currentFilter = e.state.filter;
       if (currentFilter.state) drillDownByState(currentFilter.state);
       else if (currentFilter.node) drillDownByNode(currentFilter.node);
-    }
+    } else showHome();
   } finally {
     _navigatingFromPopstate = false;
-  }
-});
-
-// --- New Workstream Modal ---
-var _newWsTrapHandler = null;
-
-function showNewWsModal() {
-  // Don't open if login overlay is active
-  var login = document.getElementById("login-overlay");
-  if (login && login.style.display !== "none") return;
-
-  var overlay = document.getElementById("new-ws-overlay");
-  overlay.style.display = "flex";
-  document.body.style.overflow = "hidden";
-
-  // Backdrop click to dismiss
-  overlay.onclick = function (e) {
-    if (e.target === overlay) hideNewWsModal();
-  };
-
-  var select = document.getElementById("new-ws-node");
-  select.innerHTML =
-    '<option value="">Auto (best node by capacity)</option>' +
-    '<option value="pool">General pool (next available)</option>';
-  authFetch("/v1/api/cluster/nodes?sort=activity&limit=100")
-    .then(function (r) {
-      return r.json();
-    })
-    .then(function (data) {
-      (data.nodes || []).forEach(function (n) {
-        if (!n.reachable) return;
-        var opt = document.createElement("option");
-        opt.value = n.node_id;
-        opt.textContent =
-          n.node_id +
-          " (" +
-          (n.ws_total || 0) +
-          "/" +
-          (n.max_ws || 10) +
-          " ws)";
-        select.appendChild(opt);
-      });
-    })
-    .catch(function () {
-      /* ignore — auto is always available */
-    });
-  // Populate skill dropdown
-  var tplSelect = document.getElementById("new-ws-skill");
-  tplSelect.innerHTML = '<option value="">Use defaults</option>';
-  authFetch("/v1/api/skills")
-    .then(function (r) {
-      return r.json();
-    })
-    .then(function (data) {
-      (data.skills || []).forEach(function (t) {
-        var opt = document.createElement("option");
-        opt.value = t.name;
-        var label = t.name;
-        if (t.is_default) label += " (default)";
-        if (t.origin === "mcp") label += " [MCP]";
-        opt.textContent = label;
-        tplSelect.appendChild(opt);
-      });
-    })
-    .catch(function () {
-      /* ignore — defaults still work */
-    });
-  // Populate model dropdown
-  var modelSelect = document.getElementById("new-ws-model");
-  var judgeSelect = document.getElementById("new-ws-judge");
-  modelSelect.textContent = "";
-  judgeSelect.textContent = "";
-
-  var defaultOpt = document.createElement("option");
-  defaultOpt.value = "";
-  defaultOpt.textContent = "Default model";
-  modelSelect.appendChild(defaultOpt);
-
-  var defaultJudgeOpt = document.createElement("option");
-  defaultJudgeOpt.value = "";
-  defaultJudgeOpt.textContent = "Default (agent model)";
-  judgeSelect.appendChild(defaultJudgeOpt);
-
-  authFetch("/v1/api/models")
-    .then(function (r) {
-      return r.json();
-    })
-    .then(function (data) {
-      (data.models || []).forEach(function (m) {
-        var opt = document.createElement("option");
-        opt.value = m.alias;
-        opt.textContent =
-          m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
-        modelSelect.appendChild(opt);
-
-        var jOpt = document.createElement("option");
-        jOpt.value = m.alias;
-        jOpt.textContent = opt.textContent;
-        judgeSelect.appendChild(jOpt);
-      });
-    })
-    .catch(function () {
-      /* ignore — default model still works */
-    });
-  document.getElementById("new-ws-name").value = "";
-  modelSelect.value = "";
-  judgeSelect.value = "";
-  var taskEl = document.getElementById("new-ws-task");
-  taskEl.value = "";
-  var mod =
-    navigator.platform && navigator.platform.indexOf("Mac") > -1
-      ? "\u2318"
-      : "Ctrl";
-  taskEl.placeholder =
-    "What should this workstream work on? (" + mod + "+Enter to create)";
-  var errEl = document.getElementById("new-ws-error");
-  errEl.style.display = "none";
-  errEl.textContent = "";
-  var btn = document.getElementById("new-ws-submit");
-  btn.disabled = false;
-  btn.textContent = "Create";
-
-  // Focus trap (same pattern as login overlay)
-  if (_newWsTrapHandler)
-    document.removeEventListener("keydown", _newWsTrapHandler);
-  _newWsTrapHandler = function (e) {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      hideNewWsModal();
-      return;
-    }
-    if (e.key === "Tab") {
-      var box = document.getElementById("new-ws-box");
-      var focusable = box.querySelectorAll("select, input, textarea, button");
-      var first = focusable[0];
-      var last = focusable[focusable.length - 1];
-      if (e.shiftKey) {
-        if (document.activeElement === first) {
-          e.preventDefault();
-          last.focus();
-        }
-      } else {
-        if (document.activeElement === last) {
-          e.preventDefault();
-          first.focus();
-        }
-      }
-    }
-  };
-  document.addEventListener("keydown", _newWsTrapHandler);
-
-  setTimeout(function () {
-    document.getElementById("new-ws-task").focus();
-  }, 50);
-}
-
-function hideNewWsModal() {
-  document.getElementById("new-ws-overlay").style.display = "none";
-  document.body.style.overflow = "";
-  if (_newWsTrapHandler) {
-    document.removeEventListener("keydown", _newWsTrapHandler);
-    _newWsTrapHandler = null;
-  }
-  var triggerBtn = document.getElementById("new-ws-btn");
-  if (triggerBtn) triggerBtn.focus();
-}
-
-function submitNewWs() {
-  var nodeId = document.getElementById("new-ws-node").value;
-  var name = document.getElementById("new-ws-name").value.trim();
-  var model = document.getElementById("new-ws-model").value.trim();
-  var judgeModel = document.getElementById("new-ws-judge").value.trim();
-  var skill = document.getElementById("new-ws-skill").value;
-  var task = document.getElementById("new-ws-task").value.trim();
-  var errEl = document.getElementById("new-ws-error");
-  var btn = document.getElementById("new-ws-submit");
-
-  btn.disabled = true;
-  btn.textContent = "Creating\u2026";
-  errEl.style.display = "none";
-
-  var body = {};
-  if (nodeId) body.node_id = nodeId;
-  if (name) body.name = name;
-  if (model) body.model = model;
-  if (judgeModel) body.judge_model = judgeModel;
-  if (task) body.initial_message = task;
-  if (skill) body.skill = skill;
-
-  authFetch("/v1/api/cluster/workstreams/new", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  })
-    .then(function (r) {
-      return r.json();
-    })
-    .then(function (data) {
-      btn.disabled = false;
-      btn.textContent = "Create";
-      if (data.error) {
-        errEl.textContent = data.error;
-        errEl.style.display = "block";
-        return;
-      }
-      hideNewWsModal();
-      var label =
-        data.target_node === "pool"
-          ? "general pool"
-          : data.target_node || "auto";
-      showToast("Workstream created on " + label);
-    })
-    .catch(function () {
-      btn.disabled = false;
-      btn.textContent = "Create";
-      errEl.textContent = "Request failed";
-      errEl.style.display = "block";
-    });
-}
-
-// Escape closes the new-ws modal; Enter submits
-document.addEventListener("keydown", function (e) {
-  var overlay = document.getElementById("new-ws-overlay");
-  if (!overlay || overlay.style.display === "none") return;
-  if (e.key === "Escape") {
-    e.preventDefault();
-    hideNewWsModal();
-  }
-  if (e.key === "Enter") {
-    if (e.target.tagName === "SELECT") return;
-    if (e.target.tagName === "BUTTON") return; // let native click fire
-    if (e.target.tagName === "TEXTAREA" && !(e.ctrlKey || e.metaKey)) return;
-    e.preventDefault();
-    var btn = document.getElementById("new-ws-submit");
-    if (btn && !btn.disabled) submitNewWs();
   }
 });
 
@@ -2071,14 +1687,12 @@ document.addEventListener("keydown", function (e) {
   if (!_homeCoordComposer.sendBtn.disabled) submitHomeCoord();
 });
 
-// Fingerprints of the last home-view render — skip DOM rebuilds when
-// nothing visible in either region has changed.  renderFromState fires
-// on every SSE patch (state_change, ws_created, ws_closed, cluster
-// aggregate update...) and most of those don't affect the coord list or
-// the summary line — short-circuiting here avoids a replaceChildren +
-// tree-group rebuild on every activity tick.
+// Fingerprint of the last active-coordinators render — skip the
+// replaceChildren + tree-group rebuild when nothing visible in the
+// coord list has changed.  renderFromState fires on every SSE patch
+// (state_change, ws_created, ws_closed, ...) and most of those don't
+// affect the coord list.
 var _homeCoordsFingerprint = "";
-var _homeSummaryFingerprint = "";
 
 // Active-coordinators list is SSE-driven — the console collector
 // registers a "console" pseudo-node and the coordinator manager fans
@@ -2167,57 +1781,6 @@ function _renderHomeView() {
       }
     }
   }
-
-  // Cluster summary — one-line aggregate.  Mirrors the existing
-  // #cluster-summary header span (kept unchanged for deep-link callers)
-  // but with state counts inlined so operators don't have to expand
-  // to see the cluster's posture.
-  //
-  // The #cluster-summary header element is ALSO written by the overview
-  // branch of renderFromState with a different format ("1 nodes" vs
-  // "1 node").  Always rewrite it here so navigating overview → home
-  // doesn't leave the stale overview text behind when the cluster
-  // aggregate fingerprint hasn't actually changed.
-  var ovr = clusterState.overview || {};
-  var states = ovr.states || {};
-  var aggTokens = (ovr.aggregate || {}).total_tokens || 0;
-  var headerSum = document.getElementById("cluster-summary");
-  if (headerSum) {
-    headerSum.textContent =
-      (ovr.nodes || 0) +
-      " node" +
-      ((ovr.nodes || 0) === 1 ? "" : "s") +
-      " \u00b7 " +
-      formatCount(ovr.workstreams || 0) +
-      " workstreams";
-  }
-
-  var summaryFp =
-    (ovr.nodes || 0) +
-    "|" +
-    (ovr.workstreams || 0) +
-    "|" +
-    (states.running || 0) +
-    "|" +
-    (states.attention || 0) +
-    "|" +
-    (states.error || 0) +
-    "|" +
-    aggTokens;
-  if (summaryFp === _homeSummaryFingerprint) return;
-  _homeSummaryFingerprint = summaryFp;
-
-  var parts = [
-    (ovr.nodes || 0) + " node" + ((ovr.nodes || 0) === 1 ? "" : "s"),
-    formatCount(ovr.workstreams || 0) + " workstreams",
-  ];
-  if (states.running) parts.push(states.running + " running");
-  if (states.attention) parts.push(states.attention + " attention");
-  if (states.error) parts.push(states.error + " error");
-  if (aggTokens) parts.push(formatTokens(aggTokens) + " tokens");
-  var summaryText = parts.join(" \u00b7 ");
-  var line = document.getElementById("cluster-summary-line");
-  if (line) line.textContent = summaryText;
 }
 
 // ---------------------------------------------------------------------------
@@ -2340,10 +1903,10 @@ function _ensureSSE() {
 }
 history.replaceState({ view: "home" }, "");
 initLogin();
-// loadOverview fetches the cluster snapshot — both the cluster-summary
-// aggregates AND the active-coordinators list come from the same
-// snapshot + SSE patch pipeline (#9); the console pseudo-node carries
-// coordinator ws_created / ws_closed / cluster_state events.
+// loadOverview fetches the cluster snapshot — both the node list AND
+// the active-coordinators list come from the same snapshot + SSE patch
+// pipeline (#9); the console pseudo-node carries coordinator
+// ws_created / ws_closed / cluster_state events.
 loadOverview();
 _ensureHomeComposerInit();
 // Refresh the coord button visibility once auth.js has populated
@@ -2367,61 +1930,4 @@ if (
     _refreshHomeComposerVisibility();
     loadSavedCoordinators();
   }, 500);
-}
-
-// --- Node Metadata Panel (read-only in node detail view) ---
-function _loadNodeMetadataPanel(nodeId) {
-  var section = document.getElementById("node-metadata-section");
-  var table = document.getElementById("node-metadata-table");
-  if (!section || !table) return;
-  section.style.display = "none";
-  table.textContent = "";
-  authFetch("/v1/api/cluster/node/" + encodeURIComponent(nodeId))
-    .then(function (r) {
-      return r.ok ? r.json() : null;
-    })
-    .then(function (data) {
-      if (!data || !data.metadata || !data.metadata.length) return;
-      section.style.display = "";
-      var tbl = document.createElement("table");
-      tbl.className = "nm-table";
-      var thead = document.createElement("thead");
-      var hr = document.createElement("tr");
-      ["Key", "Value", "Source"].forEach(function (h) {
-        var th = document.createElement("th");
-        th.setAttribute("scope", "col");
-        th.textContent = h;
-        hr.appendChild(th);
-      });
-      thead.appendChild(hr);
-      tbl.appendChild(thead);
-      var tbody = document.createElement("tbody");
-      data.metadata.forEach(function (m) {
-        var tr = document.createElement("tr");
-        var tdKey = document.createElement("td");
-        tdKey.className = "nm-key";
-        tdKey.textContent = m.key;
-        tr.appendChild(tdKey);
-        var tdVal = document.createElement("td");
-        tdVal.className = "nm-val";
-        tdVal.textContent =
-          typeof m.value === "object"
-            ? JSON.stringify(m.value)
-            : String(m.value);
-        tdVal.title = tdVal.textContent;
-        tr.appendChild(tdVal);
-        var tdSrc = document.createElement("td");
-        var badge = document.createElement("span");
-        badge.className = "nm-source-badge nm-source-" + m.source;
-        badge.textContent = m.source;
-        tdSrc.appendChild(badge);
-        tr.appendChild(tdSrc);
-        tbody.appendChild(tr);
-      });
-      tbl.appendChild(tbody);
-      table.appendChild(tbl);
-    })
-    .catch(function () {
-      /* silent — metadata is supplementary */
-    });
 }
