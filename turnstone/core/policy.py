@@ -36,11 +36,12 @@ _POLICY_CACHE_TTL: float = 60.0
 class _PolicyCache:
     """TTL-keyed snapshot of ``storage.list_tool_policies`` per org_id.
 
-    Reads are lock-free on cache hit; on miss the caller fetches outside
-    the lock and writes back under it. Concurrent misses on the same
-    org_id can produce two SELECTs but only one cache slot — last-writer
-    wins, both writers see the same data within a tight window so the
-    benign double-fetch is acceptable.
+    Reads check the cache under ``self._lock`` (briefly held just long
+    enough to copy the policies reference and TTL stamp); on miss the
+    caller fetches outside the lock and writes back under it.
+    Concurrent misses on the same org_id can produce two SELECTs but
+    only one cache slot — last-writer wins, both writers see the same
+    data within a tight window so the benign double-fetch is acceptable.
     """
 
     def __init__(self) -> None:

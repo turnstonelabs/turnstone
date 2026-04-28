@@ -2121,12 +2121,18 @@ class PostgreSQLBackend:
                 },
             )
             conn.commit()
-        # Drop the cached policy snapshot so the next ``evaluate_*``
-        # read picks up this rule. Storage-layer invalidation covers
-        # both the admin-API path and direct test fixtures.
+        # Drop both the org-specific slot AND the default ``""`` slot.
+        # ``list_tool_policies("")`` returns rows for every org_id (no
+        # WHERE filter when org_id is falsy), and the default
+        # evaluators (``SessionUIBase.approve_tools`` / ``cli.py``) use
+        # ``org_id=""``, so an org-scoped insert that only invalidated
+        # the org slot would leave the default slot serving stale data
+        # until the TTL window expired.
         from turnstone.core.policy import invalidate_policy_cache
 
         invalidate_policy_cache(org_id)
+        if org_id != "":
+            invalidate_policy_cache("")
 
     def get_tool_policy(self, policy_id: str) -> dict[str, Any] | None:
         with self._conn() as conn:

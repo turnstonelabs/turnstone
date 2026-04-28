@@ -3400,10 +3400,10 @@ class ChatSession:
             elif name == "close_workstream":
                 it["func_args"] = {
                     "ws_id": it.get("ws_id", ""),
-                    "reason": it.get("reason", ""),
+                    "reason": it.get("reason", "")[:200],
                 }
             elif name == "close_all_children":
-                it["func_args"] = {"reason": it.get("reason", "")}
+                it["func_args"] = {"reason": it.get("reason", "")[:200]}
             elif name in ("cancel_workstream", "delete_workstream"):
                 it["func_args"] = {"ws_id": it.get("ws_id", "")}
             elif name == "task_list":
