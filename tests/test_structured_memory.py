@@ -220,6 +220,15 @@ class TestSanitizeErrorText:
     provider URL or a quoted response body can't park credentials in
     storage where the coordinator LLM later inhales them via the
     inspect/wait surface.
+
+    Sanitisation delegates to
+    :func:`turnstone.core.output_guard.redact_credentials` so the
+    pattern set is the same one audit logs and the post-tool guard
+    use.  The tests below assert the *behaviour* (the secret is gone)
+    rather than the exact replacement marker — output_guard owns the
+    marker format and the regex catalog, and pinning the marker here
+    would force two-place edits whenever output_guard adds a new
+    redaction label.
     """
 
     def test_strips_url_userinfo(self):
@@ -228,14 +237,28 @@ class TestSanitizeErrorText:
         # Misconfigured OPENAI_BASE_URL → httpx ConnectError carries
         # the userinfo verbatim in str(exc).
         msg = "ConnectError: connection failed to https://user:hunter2@api.example.com/v1/chat"
-        assert "hunter2" not in sanitize_error_text(msg)
-        assert "https://***@api.example.com" in sanitize_error_text(msg)
+        out = sanitize_error_text(msg)
+        # The password is gone but the host (useful for triage) stays.
+        assert "hunter2" not in out
+        assert "api.example.com" in out
 
     def test_strips_url_userinfo_http_too(self):
         from turnstone.core.memory import sanitize_error_text
 
         msg = "RequestError on http://admin:s3cret@internal.host/path"
-        assert "s3cret" not in sanitize_error_text(msg)
+        out = sanitize_error_text(msg)
+        assert "s3cret" not in out
+        assert "internal.host" in out
+
+    def test_strips_db_connection_string(self):
+        """Output_guard already covered DB connection-strings; assert
+        the delegation surfaces that coverage so a leaked
+        ``DATABASE_URL`` echoed in an error doesn't slip through."""
+        from turnstone.core.memory import sanitize_error_text
+
+        msg = "OperationalError: postgresql://app:topsecret@db.host/main"
+        out = sanitize_error_text(msg)
+        assert "topsecret" not in out
 
     def test_redacts_openai_keys(self):
         from turnstone.core.memory import sanitize_error_text
@@ -246,21 +269,22 @@ class TestSanitizeErrorText:
         )
         out = sanitize_error_text(msg)
         assert "sk-proj-AbCdEfGhIjKlMnOpQrStUv" not in out
-        assert "[redacted]" in out
 
     def test_redacts_bearer_tokens(self):
         from turnstone.core.memory import sanitize_error_text
 
-        msg = "401 Unauthorized — Bearer eyJabcDEFghiJKLmnoPQRstuVWX rejected"
+        msg = "401 Unauthorized - Bearer eyJabcDEFghiJKLmnoPQRstuVWX rejected"
         out = sanitize_error_text(msg)
         assert "eyJabcDEFghiJKLmnoPQRstuVWX" not in out
 
     def test_redacts_github_tokens(self):
         from turnstone.core.memory import sanitize_error_text
 
-        msg = "git push failed: ghp_ABCDEFGHIJKLMNOPQRST not authorized"
+        # The output_guard ghp pattern requires exactly 36 chars, so
+        # use a realistic-shaped token.
+        msg = "git push failed: ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij not authorized"
         out = sanitize_error_text(msg)
-        assert "ghp_ABCDEFGHIJKLMNOPQRST" not in out
+        assert "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij" not in out
 
     def test_redacts_aws_access_keys(self):
         from turnstone.core.memory import sanitize_error_text
@@ -332,8 +356,11 @@ class TestPersistLastError:
         register_workstream("ws-1", user_id="u1")
         persist_last_error("ws-1", "ConnectError: https://user:secret@host/")
         stored = load_last_error("ws-1")
+        # The secret is gone but the host (useful for triage) survives.
+        # We don't pin the redaction marker — output_guard owns the
+        # format and the assertion above is the behaviour we care about.
         assert "secret" not in stored
-        assert "https://***@host/" in stored
+        assert "host/" in stored
 
     def test_noop_on_empty_ws_id(self, tmp_db):
         from turnstone.core.memory import persist_last_error

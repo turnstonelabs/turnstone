@@ -1426,6 +1426,81 @@ class TestSafePrepareTool:
         ):
             session._safe_prepare_tool(tc)
 
+    def test_safe_prepare_tool_redacts_credentials_in_error_text(self, tmp_db):
+        """The error item returned by the shield carries
+        ``str(exc)`` of the failing preparer, which can include
+        credentials when an underlying provider/HTTP client embeds
+        the URL or auth header in its exception message.  The error
+        item flows back to the coord LLM via the tool_result, so it
+        MUST go through the same credential redaction the
+        fatal-error path uses (output_guard.redact_credentials)."""
+        from unittest.mock import patch
+
+        session = _make_session()
+        tc = {"id": "call_1", "function": {"name": "bash", "arguments": "{}"}}
+
+        # Embed a credential-shaped fragment in the simulated preparer
+        # exception — the redaction must scrub it before the error
+        # item is built.
+        leaky_msg = "ConnectError: bad config https://admin:hunter2@host/v1"
+        with patch.object(session, "_prepare_tool", side_effect=RuntimeError(leaky_msg)):
+            item = session._safe_prepare_tool(tc)
+
+        # Password gone, but the host (useful for triage) survives.
+        assert "hunter2" not in item["error"]
+        assert "host" in item["error"]
+        # Sanity: the surrounding template + class name stay intact.
+        assert "Internal error preparing bash" in item["error"]
+        assert "RuntimeError" in item["error"]
+
+    def test_run_one_redacts_credentials_in_runtime_error(self, tmp_db):
+        """The runtime exception path inside ``_execute_tools.run_one``
+        also routes ``str(exc)`` into the tool_result, with the same
+        credential-leak hazard as the prepare-side shield.  Pin the
+        sanitisation here so a future refactor doesn't drift."""
+        from unittest.mock import patch
+
+        session = _make_session()
+        # Synthesise an item that drives a runtime exception in the
+        # ``execute`` branch of run_one.  Bypassing ``_safe_prepare_tool``
+        # / ``_prepare_tool`` so the test stays focused on run_one's
+        # except path, not the prepare-side redaction.
+        leaky_msg = "ProviderError: 401 https://op:hunter3@host/v1 Bearer abc"
+
+        def _bad_execute(_item):
+            raise RuntimeError(leaky_msg)
+
+        item = {
+            "call_id": "call_run",
+            "func_name": "bash",
+            "execute": _bad_execute,
+        }
+
+        # Drive run_one directly via _execute_tools' inner closure.
+        # The closure isn't exposed; emulate it by calling _execute_tools
+        # with a fabricated tool_calls list.  Patch the prepare path to
+        # return our hand-built item, and stub the approval to skip UI.
+        with (
+            patch.object(session, "_safe_prepare_tool", return_value=item),
+            patch.object(session.ui, "approve_tools", return_value=(True, None)),
+        ):
+            tool_calls = [
+                {
+                    "id": "call_run",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{}"},
+                }
+            ]
+            results, _fb = session._execute_tools(tool_calls)
+        assert len(results) == 1
+        _, output = results[0]
+        # ``output`` is the stringified tool_result that goes back to
+        # the model.  Credentials must be redacted.
+        assert "hunter3" not in output
+        # Sanity: the diagnostic context survives.
+        assert "Error executing bash" in output
+        assert "RuntimeError" in output
+
 
 class TestCoordinatorMemoryScope:
     """Verify the ``coordinator`` memory scope's resolution + validation rules.

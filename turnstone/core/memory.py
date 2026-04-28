@@ -11,7 +11,6 @@ rather than silently swallowed.
 
 from __future__ import annotations
 
-import re
 from typing import TYPE_CHECKING, Any
 
 import sqlalchemy as sa
@@ -438,30 +437,18 @@ LAST_ERROR_CONFIG_KEY = "last_error"
 LAST_ERROR_MAX_LEN = 1024
 
 
-# Mask URL userinfo so a misconfigured ``https://user:pass@host`` base URL
-# doesn't leak credentials when httpx wraps it into ConnectError.__str__.
-_URL_USERINFO_PATTERN = re.compile(r"(https?://)[^/@\s]+@", re.IGNORECASE)
-
-# Common secret-shaped substrings.  These are conservative — false positives
-# are merely cosmetic, but a missed match is a real credential in storage.
-_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"sk-[A-Za-z0-9_\-]{16,}"),
-    re.compile(r"Bearer\s+[A-Za-z0-9._\-]{16,}", re.IGNORECASE),
-    re.compile(r"ghp_[A-Za-z0-9]{16,}"),
-    re.compile(r"github_pat_[A-Za-z0-9_]{16,}"),
-    re.compile(r"AKIA[A-Z0-9]{16}"),
-)
-
-
 def sanitize_error_text(text: str, *, max_len: int = LAST_ERROR_MAX_LEN) -> str:
-    """Strip credentials and cap length so storage and the coord LLM
-    don't ingest provider-error secrets verbatim.
+    """Strip credentials and cap length on a worker-thread fatal-error
+    string before it flows into storage / UI broadcasts / the coord
+    LLM's prompt.
 
-    - URL userinfo (``https://user:pass@host``) → ``https://***@host``.
-    - Common secret prefixes (sk-, Bearer, ghp_, github_pat_, AKIA) →
-      ``[redacted]``.
-    - Output truncated to ``max_len`` chars from the START (the lead is
-      usually more informative than the tail).
+    Credential redaction delegates to
+    :func:`turnstone.core.output_guard.redact_credentials` — the same
+    pattern set the audit log + post-tool guard use.  Reusing it keeps
+    a single source of truth for "what counts as a secret" instead of
+    drifting two parallel regex lists.  Length capping then trims the
+    output to ``max_len`` chars (truncation from the START — the lead
+    is usually more informative than the tail).
 
     Sanitisation is best-effort defence-in-depth — pairs with redaction
     at the provider boundary, doesn't replace it.  Operators who care
@@ -470,9 +457,13 @@ def sanitize_error_text(text: str, *, max_len: int = LAST_ERROR_MAX_LEN) -> str:
     """
     if not text:
         return text
-    cleaned = _URL_USERINFO_PATTERN.sub(r"\1***@", text)
-    for pat in _SECRET_PATTERNS:
-        cleaned = pat.sub("[redacted]", cleaned)
+    # Local import — the output_guard module pulls in a moderate set of
+    # regex tables we don't want to load at module-import time for
+    # every consumer of ``turnstone.core.memory``.  The fatal-error
+    # path is cold enough that import-on-first-call is fine.
+    from turnstone.core.output_guard import redact_credentials
+
+    cleaned = redact_credentials(text)
     if len(cleaned) > max_len:
         cleaned = cleaned[: max_len - 3] + "..."
     return cleaned

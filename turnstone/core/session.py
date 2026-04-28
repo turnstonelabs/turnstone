@@ -3840,6 +3840,8 @@ class ChatSession:
             except (KeyboardInterrupt, GenerationCancelled):
                 raise
             except Exception as e:
+                from turnstone.core.memory import sanitize_error_text
+
                 func = item.get("func_name", "unknown")
                 # Include the exception class so triage doesn't have
                 # to guess (RateLimitError vs. TimeoutError vs. a
@@ -3849,14 +3851,21 @@ class ChatSession:
                 # tool calls in this parallel batch returned their
                 # own results, the model can adapt instead of
                 # treating this as a session-wide failure.
+                #
+                # Redact before formatting both the log and the
+                # model-facing result: tool exceptions can carry
+                # credentials in their str() (HTTP error bodies, env
+                # values, etc.) and the same pattern set as the
+                # fatal-error path applies.
+                safe_exc_text = sanitize_error_text(f"{type(e).__name__}: {e}")
                 msg = (
-                    f"Error executing {func}: {type(e).__name__}: {e}\n"
+                    f"Error executing {func}: {safe_exc_text}\n"
                     f"This tool raised an unexpected exception. "
                     f"Sibling tool calls in this batch (if any) "
                     f"completed independently. You can retry with "
                     f"adjusted arguments or try a different approach."
                 )
-                log.warning("tool_exec.failed", tool=func, error=str(e), exc_info=True)
+                log.warning("tool_exec.failed", tool=func, error=safe_exc_text, exc_info=True)
                 self._report_tool_result(item["call_id"], func, msg, is_error=True)
                 return item["call_id"], msg
 
@@ -3974,6 +3983,8 @@ class ChatSession:
         synthesizes results for orphaned tool_calls in
         :meth:`_synthesize_cancelled_results`).
         """
+        from turnstone.core.memory import sanitize_error_text
+
         try:
             return self._prepare_tool(tc)
         except (KeyboardInterrupt, GenerationCancelled):
@@ -3987,11 +3998,18 @@ class ChatSession:
                 func_name = ""
             if not func_name:
                 func_name = "unknown"
+            # Redact before logging AND before returning.  The raw
+            # exception text can carry credentials (e.g. a misconfigured
+            # base URL with userinfo, an echoed Bearer token, a
+            # connection-string envvar) — both the structured log and
+            # the model-facing tool_result must scrub via the same
+            # pattern set the audit log + output guard use.
+            safe_exc_text = sanitize_error_text(f"{type(exc).__name__}: {exc}")
             log.warning(
                 "tool_prepare.failed tool=%s call_id=%s error=%s",
                 func_name,
                 call_id[:32],
-                exc,
+                safe_exc_text,
                 exc_info=True,
             )
             return {
@@ -4001,8 +4019,7 @@ class ChatSession:
                 "preview": "",
                 "needs_approval": False,
                 "error": (
-                    f"Internal error preparing {func_name}: "
-                    f"{type(exc).__name__}: {exc}\n"
+                    f"Internal error preparing {func_name}: {safe_exc_text}\n"
                     f"Sibling tool calls in this batch were unaffected. "
                     f"You can retry this tool with adjusted arguments "
                     f"or pick a different approach."
