@@ -9,219 +9,12 @@
    ========================================================================== */
 
 /* ==========================================================================
-   Messages — single-column left-aligned blocks
-   Differentiation is by left-border colour only (no role labels).
-   ========================================================================== */
-.ts-msg {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  padding: 8px 12px;
-  margin-bottom: 4px;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-left-width: 3px;
-  border-radius: var(--radius-sm);
-  font-family: var(--font-mono);
-  font-size: 13px;
-  line-height: 1.55;
-  word-wrap: break-word;
-  overflow-wrap: break-word;
-}
-
-.ts-msg--user {
-  border-left-color: var(--accent);
-}
-.ts-msg--assistant {
-  border-left-color: var(--border-strong);
-}
-.ts-msg--reasoning {
-  /* Dashed on the left-accent only — the other three sides keep the
-     solid 1px outline so the block stays a crisp card rather than
-     turning into a fully dotted box. */
-  border-left-style: dashed;
-  border-left-color: var(--fg-dim);
-  color: var(--fg-dim);
-  font-style: italic;
-}
-.ts-msg--tool {
-  font-family: var(--font-mono);
-  background: var(--code-bg);
-  border-left-color: var(--cyan);
-}
-.ts-msg--error {
-  border-left-color: var(--red);
-  color: var(--red);
-}
-.ts-msg--info {
-  border-left-color: var(--cyan);
-  color: var(--cyan);
-  font-size: 12px;
-}
-
-/* Content container.  Markdown renders here (streamingRender writes
-   innerHTML; renderer.js is the trust boundary for that sink).
-   ``white-space: normal`` is intentional: the markdown converter leaves
-   ``\n`` text nodes between block siblings (headings → paragraphs →
-   katex-display → ...).  ``pre-wrap`` rendered every one of those as
-   visible vertical space, stacking 20-30px gaps between every section.
-   ``<pre>`` blocks have ``white-space: pre`` built in, so fenced code
-   still preserves its formatting; mid-stream partial fences before the
-   closing ``\`\`\`` arrives render as collapsed text for a frame and
-   then snap back when the next render tick wraps them in ``<pre>``.
-   User-typed messages render through ``.msg-user-text`` (a separate
-   path that preserves its own newlines), so this change only affects
-   assistant markdown output. */
-.ts-msg-body {
-  min-width: 0;
-  white-space: normal;
-}
-.ts-msg-body > *:first-child {
-  margin-top: 0;
-}
-.ts-msg-body > *:last-child {
-  margin-bottom: 0;
-}
-/* Tighten paragraph rhythm to match the heading/list margins above —
-   without this, browser-default 1em top + 1em bottom (~28px stacked)
-   makes paragraphs read as if they're in a different document from
-   the surrounding headings. */
-.ts-msg-body p {
-  margin: 6px 0;
-}
-.ts-msg-body pre {
-  margin: 6px 0;
-  padding: 8px 10px;
-  background: var(--code-bg);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  overflow-x: auto;
-  font-size: 12px;
-}
-.ts-msg-body code {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  background: var(--bg-highlight);
-  padding: 1px 4px;
-  border-radius: 2px;
-  /* Preserve internal whitespace + allow wrapping.  The body sets
-     ``white-space: normal`` to collapse phantom inter-block ``\n`` text
-     nodes; inline ``<code>`` would inherit that and silently collapse
-     multiple spaces inside backtick spans.  ``<pre>`` blocks rely on
-     the user-agent ``pre { white-space: pre }`` rule and don't need
-     this override. */
-  white-space: pre-wrap;
-}
-.ts-msg-body pre code {
-  background: none;
-  padding: 0;
-  border-radius: 0;
-}
-.ts-msg-body a {
-  color: var(--accent);
-  text-decoration: underline;
-}
-.ts-msg-body h1,
-.ts-msg-body h2,
-.ts-msg-body h3,
-.ts-msg-body h4,
-.ts-msg-body h5,
-.ts-msg-body h6 {
-  font-family: var(--font-ui);
-  font-weight: 600;
-  margin: 8px 0 4px;
-  color: var(--fg-bright);
-}
-.ts-msg-body h1 {
-  font-size: 16px;
-}
-.ts-msg-body h2 {
-  font-size: 14px;
-}
-.ts-msg-body h3 {
-  font-size: 13px;
-}
-.ts-msg-body h4,
-.ts-msg-body h5,
-.ts-msg-body h6 {
-  font-size: 12px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-.ts-msg-body ul,
-.ts-msg-body ol {
-  margin: 4px 0 4px 20px;
-}
-.ts-msg-body li {
-  margin: 2px 0;
-}
-.ts-msg-body strong {
-  color: var(--fg-bright);
-}
-.ts-msg-body em {
-  font-style: italic;
-}
-.ts-msg-body blockquote {
-  border-left: 2px solid var(--border-strong);
-  padding-left: 10px;
-  margin: 6px 0;
-  color: var(--fg-dim);
-}
-
-/* Floating action toolbar — edit / rewind / retry / copy slots.
-   Absolute top-right so the message body stays full-width. */
-.ts-msg-actions {
-  position: absolute;
-  top: 4px;
-  right: 6px;
-  display: flex;
-  gap: 4px;
-  opacity: 0;
-  transition: opacity 0.15s;
-}
-.ts-msg:hover .ts-msg-actions,
-.ts-msg:focus-within .ts-msg-actions {
-  opacity: 1;
-}
-.ts-msg-action-btn {
-  background: transparent;
-  border: 1px solid var(--border);
-  color: var(--fg-dim);
-  border-radius: var(--radius-sm);
-  padding: 2px 6px;
-  font: inherit;
-  font-size: 11px;
-  cursor: pointer;
-  transition:
-    background 0.1s,
-    border-color 0.1s,
-    color 0.1s;
-}
-.ts-msg-action-btn:hover {
-  background: var(--bg-highlight);
-  color: var(--fg-bright);
-  border-color: var(--accent-dim);
-}
-.ts-msg-action-btn:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
-}
-
-/* On coarse-pointer / hover-none devices, keep the toolbar visible — no hover. */
-@media (hover: none) and (pointer: coarse) {
-  .ts-msg-actions {
-    opacity: 1;
-  }
-  .ts-msg-action-btn {
-    padding: 4px 8px;
-    font-size: 12px;
-  }
-}
-
-/* ==========================================================================
    Approval shell — shared by inline (per-tool, interactive UI) and
    batch (pinned bottom bar, coordinator).  Same visual vocabulary,
    different layout hook.
+
+   The message primitive (.msg / .msg-body / .msg-actions / .msg-action-btn)
+   used by inline approval blocks is defined further down in this file.
    ========================================================================== */
 .ts-approval {
   display: flex;
@@ -229,13 +22,15 @@
   gap: 6px;
 }
 
-/* Inline variant: an approval block living as a .ts-msg in the
-   message stream, one per tool call awaiting approval.  Cyan to match
-   the .ts-msg--tool execution-result colour — both are tool-role
-   surfaces, distinct from user (amber) and assistant (neutral). */
-.ts-msg.ts-approval--inline {
+/* Inline variant: an approval block living as a .msg in the message
+   stream, one per tool call awaiting approval.  Cyan to match the
+   .msg.tool execution-result colour — both are tool-role surfaces,
+   distinct from user (amber) and assistant (neutral).  Selector qualifier
+   choice (.msg.ts-approval--inline vs bare) is explained at the matching
+   rule in ui/static/style.css. */
+.msg.ts-approval--inline {
   border-left-color: var(--cyan);
-  background: var(--bg-elevated);
+  background: var(--panel-2);
 }
 
 /* Batch variant: pinned to the bottom of the chat pane, batches all
@@ -957,10 +752,10 @@
    Mobile (<700px) — chat.css components stack vertically.
    ========================================================================== */
 @media (max-width: 700px) {
-  .ts-msg {
+  .msg {
     padding: 6px 10px;
   }
-  .ts-msg-body pre {
+  .msg-body pre {
     margin: 4px -6px;
     border-radius: 0;
   }
@@ -990,8 +785,8 @@
    Reduced motion — disable chat.css transitions.
    ========================================================================== */
 @media (prefers-reduced-motion: reduce) {
-  .ts-msg-actions,
-  .ts-msg-action-btn,
+  .msg-actions,
+  .msg-action-btn,
   .ts-approval-btn,
   .ts-composer-attach,
   .ts-composer-input,
@@ -1003,9 +798,8 @@
 /* ==========================================================================
    Message primitive — chat-style single-column message block.  Semantic
    variant carries via 3px left-border colour (and text colour for
-   error/info).  Used by the coordinator chat view directly (pure .msg
-   classes) and by the per-node server chat UI dual-classed alongside
-   the .ts-msg family above (so the two rule families compose).
+   error/info).  Shared by the coordinator chat view and the per-node
+   server chat UI; both render pure .msg classes.
 
    Variants:
      .msg                 base (assistant / generic)
@@ -1059,9 +853,8 @@
 }
 .msg.tool {
   background: var(--panel);
-  /* Cyan to match the per-node UI's .ts-msg--tool and .ts-approval
-     borders — tool-role surfaces share one colour, distinct from
-     user (amber) and assistant (neutral). */
+  /* Cyan for tool-role surfaces — shared with .ts-approval borders so
+     user (amber) / assistant (neutral) / tool (cyan) read distinctly. */
   border-left-color: var(--cyan);
   font-family: var(--font-mono);
   font-size: 12px;
@@ -1095,10 +888,24 @@
 
 /* Markdown body — renderer.js writes innerHTML here; trust boundary
    lives there, not in CSS. Keep styles tight so streamed content
-   doesn't jitter layout as tokens arrive. */
+   doesn't jitter layout as tokens arrive.
+
+   ``white-space: normal`` is intentional (and explicit so a future edit
+   doesn't "simplify" by reaching for ``pre-wrap``).  The markdown
+   converter leaves ``\n`` text nodes between block siblings (headings →
+   paragraphs → katex-display → ...).  ``pre-wrap`` rendered every one
+   of those as visible vertical space, stacking 20-30px gaps between
+   every section.  ``<pre>`` blocks have ``white-space: pre`` built in
+   so fenced code still preserves formatting; mid-stream partial fences
+   before the closing ``\`\`\`` arrives render as collapsed text for a
+   frame and then snap back when the next render tick wraps them in
+   ``<pre>``.  User-typed messages render through ``.msg-user-text`` (a
+   separate path that preserves its own newlines), so this default only
+   affects assistant markdown output. */
 .msg-body {
   min-width: 0;
   max-width: 100%;
+  white-space: normal;
 }
 
 /* Streaming caret — append to the end of .msg-body when the message is
@@ -1148,9 +955,10 @@
   background: var(--panel);
   border: 1px solid var(--hair-2);
   border-radius: 3px;
-  /* Preserve internal whitespace + allow wrapping; see the matching
-     rule above for the rationale (the body's ``white-space: normal``
-     would otherwise collapse spaces inside backtick spans). */
+  /* Preserve internal whitespace + allow wrapping.  The body's
+     ``white-space: normal`` (above) would otherwise collapse multiple
+     spaces inside backtick spans; ``<pre>`` blocks rely on the
+     user-agent ``pre { white-space: pre }`` rule and don't need this. */
   white-space: pre-wrap;
 }
 

@@ -611,8 +611,7 @@ Pane.prototype.handleEvent = function (evt) {
       this.removeThinkingIndicator();
       if (!this.currentReasoningEl) {
         this.currentReasoningEl = document.createElement("div");
-        this.currentReasoningEl.className =
-          "ts-msg ts-msg--reasoning msg reasoning";
+        this.currentReasoningEl.className = "msg reasoning";
         this.messagesEl.appendChild(this.currentReasoningEl);
       }
       this.currentReasoningEl.textContent += evt.text;
@@ -626,15 +625,9 @@ Pane.prototype.handleEvent = function (evt) {
       }
       if (!this.currentAssistantEl) {
         this.currentAssistantEl = document.createElement("div");
-        this.currentAssistantEl.className =
-          "ts-msg ts-msg--assistant msg assistant";
-        // streamingRender targets a .ts-msg-body inner wrapper so the
-        // shared markdown rules in chat.css (h1/h2/h3/code/blockquote
-        // scoped to .ts-msg-body *) actually match on this page — the
-        // coordinator page uses the same .ts-msg-body wrapper so the
-        // two chat views stay visually aligned.
+        this.currentAssistantEl.className = "msg assistant";
         this.currentAssistantBodyEl = document.createElement("div");
-        this.currentAssistantBodyEl.className = "ts-msg-body msg-body";
+        this.currentAssistantBodyEl.className = "msg-body";
         this.currentAssistantEl.appendChild(this.currentAssistantBodyEl);
         this.messagesEl.appendChild(this.currentAssistantEl);
       }
@@ -860,7 +853,7 @@ Pane.prototype.removeThinkingIndicator = function () {
 Pane.prototype.addUserMessage = function (text, attachments) {
   this.removeEmptyState();
   var el = document.createElement("div");
-  el.className = "ts-msg ts-msg--user msg user";
+  el.className = "msg user";
   var textEl = document.createElement("div");
   textEl.className = "msg-user-text";
   textEl.textContent = text;
@@ -895,7 +888,7 @@ Pane.prototype.addQueuedMessage = function (text, priority) {
   this.removeEmptyState();
   var self = this;
   var el = document.createElement("div");
-  el.className = "ts-msg ts-msg--user msg user msg-queued";
+  el.className = "msg user msg-queued";
   el.setAttribute("role", "status");
   if (priority === "important") {
     el.classList.add("msg-queued-important");
@@ -962,12 +955,12 @@ Pane.prototype._dequeueMessage = function (el) {
 Pane.prototype._addUserMsgActions = function (el, text) {
   var self = this;
   var bar = document.createElement("div");
-  bar.className = "msg-actions ts-msg-actions";
+  bar.className = "msg-actions";
   bar.setAttribute("role", "toolbar");
   bar.setAttribute("aria-label", "Message actions");
   // Edit button
   var editBtn = document.createElement("button");
-  editBtn.className = "msg-action-btn ts-msg-action-btn";
+  editBtn.className = "msg-action-btn";
   editBtn.title = "Edit & resend";
   editBtn.setAttribute("aria-label", "Edit and resend this message");
   var editIcon = document.createElement("span");
@@ -981,7 +974,7 @@ Pane.prototype._addUserMsgActions = function (el, text) {
   bar.appendChild(editBtn);
   // Rewind-to-here button
   var rewindBtn = document.createElement("button");
-  rewindBtn.className = "msg-action-btn ts-msg-action-btn";
+  rewindBtn.className = "msg-action-btn";
   rewindBtn.title = "Rewind to before this message";
   rewindBtn.setAttribute(
     "aria-label",
@@ -1004,13 +997,13 @@ Pane.prototype._addRetryAction = function (el) {
   var bar = el.querySelector(".msg-actions");
   if (!bar) {
     bar = document.createElement("div");
-    bar.className = "msg-actions ts-msg-actions";
+    bar.className = "msg-actions";
     bar.setAttribute("role", "toolbar");
     bar.setAttribute("aria-label", "Message actions");
     el.appendChild(bar);
   }
   var btn = document.createElement("button");
-  btn.className = "msg-action-btn ts-msg-action-btn";
+  btn.className = "msg-action-btn";
   btn.title = "Retry (regenerate response)";
   btn.setAttribute("aria-label", "Retry last response");
   var icon = document.createElement("span");
@@ -1040,7 +1033,7 @@ Pane.prototype._rewindToMessage = function (msgEl) {
   if (this.busy) return;
   var self = this;
   // Count how many user messages come at or after this one
-  var userMsgs = this.messagesEl.querySelectorAll(".ts-msg--user");
+  var userMsgs = this.messagesEl.querySelectorAll(".msg.user");
   var idx = Array.prototype.indexOf.call(userMsgs, msgEl);
   if (idx < 0) return;
   var turnsToRewind = userMsgs.length - idx;
@@ -1124,7 +1117,7 @@ Pane.prototype._editAndResend = function (msgEl, newText) {
   if (this.busy) return;
   var self = this;
   // Count turns to rewind (from this message onward)
-  var userMsgs = this.messagesEl.querySelectorAll(".ts-msg--user");
+  var userMsgs = this.messagesEl.querySelectorAll(".msg.user");
   var idx = Array.prototype.indexOf.call(userMsgs, msgEl);
   if (idx < 0) return;
   var turnsToRewind = userMsgs.length - idx;
@@ -1177,7 +1170,7 @@ Pane.prototype.replayHistory = function (messages) {
           var wasDenied = !!msg.denied;
           var block = document.createElement("div");
           block.className =
-            "ts-msg ts-approval ts-approval--inline " +
+            "msg ts-approval ts-approval--inline " +
             (wasDenied ? "denied" : "approved");
           msg.tool_calls.forEach(function (tc) {
             var div = document.createElement("div");
@@ -1232,9 +1225,9 @@ Pane.prototype.replayHistory = function (messages) {
       }
       if (msg.content) {
         var el = document.createElement("div");
-        el.className = "ts-msg ts-msg--assistant msg assistant";
+        el.className = "msg assistant";
         var bodyEl = document.createElement("div");
-        bodyEl.className = "ts-msg-body msg-body";
+        bodyEl.className = "msg-body";
         var rendered = renderMarkdown(msg.content);
         bodyEl.innerHTML = rendered;
         el.appendChild(bodyEl);
@@ -1280,13 +1273,12 @@ Pane.prototype.replayHistory = function (messages) {
 
 Pane.prototype._attachRetryToLastAssistant = function () {
   // Remove any previous retry buttons
-  var old = this.messagesEl.querySelectorAll(".ts-msg--assistant .msg-actions");
+  var old = this.messagesEl.querySelectorAll(".msg.assistant .msg-actions");
   for (var i = 0; i < old.length; i++) old[i].parentNode.removeChild(old[i]);
   // Find the last assistant message with content and add retry.
-  // Reasoning blocks emit as .ts-msg--reasoning (distinct modifier)
-  // so the .ts-msg--assistant selector already excludes them — no
-  // extra guard needed.
-  var assistants = this.messagesEl.querySelectorAll(".ts-msg--assistant");
+  // Reasoning blocks emit as .msg.reasoning (distinct modifier) so the
+  // .msg.assistant selector already excludes them — no extra guard needed.
+  var assistants = this.messagesEl.querySelectorAll(".msg.assistant");
   if (assistants.length) {
     this._addRetryAction(assistants[assistants.length - 1]);
   }
@@ -1300,8 +1292,7 @@ Pane.prototype.showInlineToolBlock = function (
   var self = this;
   var block = document.createElement("div");
   block.className =
-    "ts-msg ts-approval ts-approval--inline" +
-    (autoApproved ? " approved" : "");
+    "msg ts-approval ts-approval--inline" + (autoApproved ? " approved" : "");
   if (!autoApproved) {
     block.setAttribute("role", "alertdialog");
     block.setAttribute("aria-label", "Tool approval required");
@@ -1735,7 +1726,7 @@ Pane.prototype.updateVerdictGlow = function (recommendation) {
 
 Pane.prototype.addInfoMessage = function (text) {
   var el = document.createElement("div");
-  el.className = "ts-msg ts-msg--info msg info";
+  el.className = "msg info";
   el.textContent = stripAnsi(text);
   this.messagesEl.appendChild(el);
   this.scrollToBottom();
@@ -1743,7 +1734,7 @@ Pane.prototype.addInfoMessage = function (text) {
 
 Pane.prototype.addErrorMessage = function (text) {
   var el = document.createElement("div");
-  el.className = "ts-msg ts-msg--error msg error";
+  el.className = "msg error";
   el.setAttribute("role", "alert");
   el.textContent = stripAnsi(text);
   this.messagesEl.appendChild(el);

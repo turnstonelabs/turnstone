@@ -631,15 +631,15 @@
   padding: 16px 12px;
   display: flex;
   flex-direction: column;
-  /* No flexbox gap — .ts-msg / .msg supply their own margin-bottom for
-     inter-card spacing.  A 14px gap here was stacking with the 4px
-     card margin-bottom and pushing the per-card spacing to ~18px. */
+  /* No flexbox gap — .msg supplies its own margin-bottom for inter-card
+     spacing.  A 14px gap here was stacking with the 4px card
+     margin-bottom and pushing the per-card spacing to ~18px. */
 }
-/* .ts-msg (shared_static/chat.css) provides padding / border / radius /
+/* .msg (shared_static/chat.css) provides padding / border / radius /
    line-height / word-wrap / margin / background.  The interactive UI
    adds a brighter text colour on user messages so "the thing I said"
    reads distinctly against the lower-chroma assistant colour. */
-.ts-msg--user {
+.msg.user {
   color: var(--fg-bright);
 }
 .msg-queued {
@@ -674,15 +674,14 @@
 .queued-dismiss:hover {
   color: var(--red);
 }
-/* .ts-msg--assistant / .ts-msg--info / .ts-msg--error alignment +
-   baseline visuals come from shared_static/chat.css.  Interactive UI
-   adds a pre-wrap override for info messages and a tightened
-   tool-message shape with the yellow accent bar the instrument-panel
-   look established. */
-.ts-msg--info {
+/* .msg.assistant / .msg.info / .msg.error alignment + baseline visuals
+   come from shared_static/chat.css.  Interactive UI adds a pre-wrap
+   override for info messages and a tightened tool-message shape with
+   the cyan accent bar the instrument-panel look established. */
+.msg.info {
   white-space: pre-wrap;
 }
-.ts-msg--tool {
+.msg.tool {
   background: var(--bg-surface);
   border: 1px solid var(--border);
   /* Tool cards use --cyan to read distinctly from user (amber) and
@@ -692,13 +691,13 @@
   font-size: 12px;
   padding: 8px 12px;
 }
-.ts-msg--tool .tool-header {
+.msg.tool .tool-header {
   color: var(--cyan);
   font-weight: 600;
   margin-bottom: 4px;
   font-size: 11px;
 }
-.ts-msg--tool .tool-preview {
+.msg.tool .tool-preview {
   color: var(--fg-dim);
   white-space: pre-wrap;
   font-size: 12px;
@@ -706,9 +705,8 @@
   overflow-y: auto;
 }
 
-/* Streaming content — .ts-msg--reasoning (chat.css) styles reasoning
-   bubbles; .reasoning was the legacy role class and is no longer
-   emitted. */
+/* Streaming content — .msg.reasoning (chat.css) styles reasoning
+   bubbles; .reasoning as a bare role class is no longer emitted. */
 .thinking-indicator {
   color: var(--fg-dim);
   font-size: 12px;
@@ -737,58 +735,58 @@
 body {
   position: static;
 }
-.ts-msg--assistant h1,
-.ts-msg--assistant h2,
-.ts-msg--assistant h3,
-.ts-msg--assistant h4,
-.ts-msg--assistant h5,
-.ts-msg--assistant h6 {
+.msg.assistant h1,
+.msg.assistant h2,
+.msg.assistant h3,
+.msg.assistant h4,
+.msg.assistant h5,
+.msg.assistant h6 {
   color: var(--accent);
   margin: 8px 0 4px;
   font-family: var(--font-ui);
 }
-.ts-msg--assistant h1 {
+.msg.assistant h1 {
   font-size: 18px;
 }
-.ts-msg--assistant h2 {
+.msg.assistant h2 {
   font-size: 16px;
 }
-.ts-msg--assistant h3 {
+.msg.assistant h3 {
   font-size: 14px;
 }
-.ts-msg--assistant h4 {
+.msg.assistant h4 {
   font-size: 13px;
   font-weight: 600;
 }
-.ts-msg--assistant h5 {
+.msg.assistant h5 {
   font-size: 12px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
-.ts-msg--assistant h6 {
+.msg.assistant h6 {
   font-size: 12px;
   font-weight: 500;
   color: var(--fg-dim);
 }
-.ts-msg--assistant strong {
+.msg.assistant strong {
   color: var(--fg-bright);
 }
-.ts-msg--assistant em {
+.msg.assistant em {
   color: var(--magenta);
 }
-.ts-msg--assistant del {
+.msg.assistant del {
   color: var(--fg-dim);
   text-decoration: line-through;
 }
-.ts-msg--assistant code {
+.msg.assistant code {
   background: var(--code-bg);
   padding: 2px 6px;
   border-radius: var(--radius-sm);
   font-size: 12px;
   border: 1px solid var(--border);
 }
-.ts-msg--assistant pre {
+.msg.assistant pre {
   background: var(--code-bg);
   padding: 12px 14px;
   border-radius: var(--radius);
@@ -796,90 +794,90 @@ body {
   margin: 8px 0;
   border: 1px solid var(--border);
 }
-.ts-msg--assistant pre code {
+.msg.assistant pre code {
   background: none;
   padding: 0;
   border: none;
 }
-.ts-msg--assistant ul,
-.ts-msg--assistant ol {
+.msg.assistant ul,
+.msg.assistant ol {
   margin: 4px 0 4px 20px;
 }
-.ts-msg--assistant li {
+.msg.assistant li {
   margin: 2px 0;
 }
-.ts-msg--assistant a {
+.msg.assistant a {
   color: var(--accent);
   text-decoration: underline;
 }
-.ts-msg--assistant blockquote {
+.msg.assistant blockquote {
   border-left: 3px solid var(--accent-dim);
   padding-left: 12px;
   color: var(--fg-dim);
   margin: 6px 0;
 }
-.ts-msg--assistant hr {
+.msg.assistant hr {
   border: none;
   border-top: 1px solid var(--border);
   margin: 8px 0;
 }
-.ts-msg--assistant p {
+.msg.assistant p {
   margin: 4px 0;
 }
-.ts-msg--assistant .table-wrap {
+.msg.assistant .table-wrap {
   overflow-x: auto;
   margin: 8px 0;
   -webkit-overflow-scrolling: touch;
 }
-.ts-msg--assistant .table-wrap:focus-visible {
+.msg.assistant .table-wrap:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
 }
-.ts-msg--assistant table {
+.msg.assistant table {
   border-collapse: collapse;
   width: auto;
   min-width: 50%;
   font-size: 13px;
 }
-.ts-msg--assistant thead {
+.msg.assistant thead {
   border-bottom: 2px solid var(--border-strong);
 }
-.ts-msg--assistant th {
+.msg.assistant th {
   background: var(--code-bg);
   font-weight: 600;
   color: var(--fg-bright);
 }
-.ts-msg--assistant th,
-.ts-msg--assistant td {
+.msg.assistant th,
+.msg.assistant td {
   padding: 6px 12px;
   border: 1px solid var(--border-strong);
 }
-.ts-msg--assistant tbody tr {
+.msg.assistant tbody tr {
   transition: background 0.12s ease;
 }
-.ts-msg--assistant tbody tr:nth-child(even) {
+.msg.assistant tbody tr:nth-child(even) {
   background: var(--row-alt);
 }
-.ts-msg--assistant tbody tr:hover {
+.msg.assistant tbody tr:hover {
   background: var(--bg-highlight);
 }
-.ts-msg--assistant .align-left {
+.msg.assistant .align-left {
   text-align: left;
 }
-.ts-msg--assistant .align-center {
+.msg.assistant .align-center {
   text-align: center;
 }
-.ts-msg--assistant .align-right {
+.msg.assistant .align-right {
   text-align: right;
 }
-.ts-msg--assistant img {
+.msg.assistant img {
   display: block;
   max-width: 100%;
   height: auto;
   border-radius: var(--radius);
   margin: 4px 0;
 }
-.ts-msg--assistant .img-placeholder {
+.msg.assistant .img-placeholder {
   display: inline-flex;
   align-items: center;
   gap: 8px;
@@ -891,49 +889,49 @@ body {
   cursor: pointer;
   transition: border-color 0.12s ease;
 }
-.ts-msg--assistant .img-placeholder:hover {
+.msg.assistant .img-placeholder:hover {
   border-color: var(--accent);
 }
-.ts-msg--assistant .img-placeholder:focus-visible {
+.msg.assistant .img-placeholder:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
 }
-.ts-msg--assistant .img-placeholder-icon {
+.msg.assistant .img-placeholder-icon {
   font-size: 16px;
 }
-.ts-msg--assistant .img-placeholder-label {
+.msg.assistant .img-placeholder-label {
   color: var(--fg-bright);
   font-size: 13px;
 }
-.ts-msg--assistant .img-placeholder-domain {
+.msg.assistant .img-placeholder-domain {
   color: var(--fg-dim);
   font-size: 11px;
 }
-.ts-msg--assistant li > input[type="checkbox"] {
+.msg.assistant li > input[type="checkbox"] {
   margin-right: 6px;
   vertical-align: middle;
   accent-color: var(--accent);
 }
-.ts-msg--assistant blockquote blockquote {
+.msg.assistant blockquote blockquote {
   margin: 4px 0;
   border-left-color: var(--border-strong);
 }
-.ts-msg--assistant blockquote blockquote blockquote {
+.msg.assistant blockquote blockquote blockquote {
   border-left-color: var(--border);
 }
-.ts-msg--assistant .katex-display {
+.msg.assistant .katex-display {
   margin: 8px 0;
   padding: 8px 0;
   overflow-x: auto;
   overflow-y: hidden;
 }
-.ts-msg--assistant .katex-error {
+.msg.assistant .katex-error {
   color: var(--red) !important;
   font-size: 12px;
 }
 
 /* Syntax highlighting — highlight.js theme (instrument panel) */
-.ts-msg--assistant pre code.hljs {
+.msg.assistant pre code.hljs {
   background: var(--code-bg);
   color: var(--fg);
   padding: 0;
@@ -1020,7 +1018,7 @@ body {
   display: inline-block;
   width: 100%;
 }
-.ts-msg--assistant pre.code-terminal {
+.msg.assistant pre.code-terminal {
   border-left: 2px solid var(--green);
 }
 [data-theme="light"] .hljs-addition {
@@ -1031,28 +1029,28 @@ body {
 }
 
 /* Mermaid diagrams */
-.ts-msg--assistant .mermaid-container {
+.msg.assistant .mermaid-container {
   margin: 8px 0;
   text-align: center;
   border-radius: var(--radius);
   overflow-x: auto;
   min-height: 40px;
 }
-.ts-msg--assistant .mermaid-container svg {
+.msg.assistant .mermaid-container svg {
   max-width: 100%;
   height: auto;
 }
-.ts-msg--assistant .mermaid-loading {
+.msg.assistant .mermaid-loading {
   padding: 16px;
   color: var(--fg-dim);
   font-size: 12px;
   background: var(--bg-surface);
   border: 1px solid var(--border);
 }
-.ts-msg--assistant .mermaid-error {
+.msg.assistant .mermaid-error {
   text-align: left;
 }
-.ts-msg--assistant .mermaid-error-msg {
+.msg.assistant .mermaid-error-msg {
   padding: 8px 12px;
   color: var(--red);
   font-size: 12px;
@@ -1060,36 +1058,36 @@ body {
   border-bottom: 1px solid var(--border);
 }
 @media (prefers-reduced-motion: reduce) {
-  .ts-msg--assistant .mermaid-container svg * {
+  .msg.assistant .mermaid-container svg * {
     animation: none !important;
   }
 }
 
 /* Safe HTML elements */
-.ts-msg--assistant details {
+.msg.assistant details {
   margin: 8px 0;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--bg-surface);
   overflow: hidden;
 }
-.ts-msg--assistant details summary {
+.msg.assistant details summary {
   padding: 8px 12px;
   cursor: pointer;
   font-weight: 600;
   color: var(--fg-bright);
   user-select: none;
 }
-.ts-msg--assistant details summary:hover {
+.msg.assistant details summary:hover {
   color: var(--accent);
 }
-.ts-msg--assistant details[open] > summary {
+.msg.assistant details[open] > summary {
   border-bottom: 1px solid var(--border);
 }
-.ts-msg--assistant details > :not(summary) {
+.msg.assistant details > :not(summary) {
   padding: 0 12px;
 }
-.ts-msg--assistant kbd {
+.msg.assistant kbd {
   background: var(--bg-highlight);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
@@ -1098,7 +1096,7 @@ body {
   font-family: var(--font-mono);
   box-shadow: 0 1px 0 var(--border-strong);
 }
-.ts-msg--assistant mark {
+.msg.assistant mark {
   background: var(--yellow-glow);
   color: var(--fg-bright);
   border-radius: 2px;
@@ -1106,14 +1104,14 @@ body {
 }
 
 /* GFM Callouts / Alerts */
-.ts-msg--assistant .callout {
+.msg.assistant .callout {
   border-left: 3px solid var(--border-strong);
   border-radius: var(--radius);
   background: var(--bg-surface);
   margin: 8px 0;
   overflow: hidden;
 }
-.ts-msg--assistant .callout-title {
+.msg.assistant .callout-title {
   padding: 8px 12px 4px;
   font-weight: 600;
   font-size: 13px;
@@ -1121,107 +1119,107 @@ body {
   align-items: center;
   gap: 6px;
 }
-.ts-msg--assistant .callout-icon {
+.msg.assistant .callout-icon {
   font-size: 14px;
 }
-.ts-msg--assistant .callout-body {
+.msg.assistant .callout-body {
   padding: 0 12px 8px;
   color: var(--fg);
 }
-.ts-msg--assistant .callout-body p:first-child {
+.msg.assistant .callout-body p:first-child {
   margin-top: 0;
 }
-.ts-msg--assistant .callout-body p:last-child {
+.msg.assistant .callout-body p:last-child {
   margin-bottom: 0;
 }
-.ts-msg--assistant .callout-note {
+.msg.assistant .callout-note {
   border-left-color: var(--cyan);
 }
-.ts-msg--assistant .callout-note .callout-title {
+.msg.assistant .callout-note .callout-title {
   color: var(--cyan);
 }
-.ts-msg--assistant .callout-tip {
+.msg.assistant .callout-tip {
   border-left-color: var(--green);
 }
-.ts-msg--assistant .callout-tip .callout-title {
+.msg.assistant .callout-tip .callout-title {
   color: var(--green);
 }
-.ts-msg--assistant .callout-important {
+.msg.assistant .callout-important {
   border-left-color: var(--magenta);
 }
-.ts-msg--assistant .callout-important .callout-title {
+.msg.assistant .callout-important .callout-title {
   color: var(--magenta);
 }
-.ts-msg--assistant .callout-warning {
+.msg.assistant .callout-warning {
   border-left-color: var(--yellow);
 }
-.ts-msg--assistant .callout-warning .callout-title {
+.msg.assistant .callout-warning .callout-title {
   color: var(--yellow);
 }
-.ts-msg--assistant .callout-caution {
+.msg.assistant .callout-caution {
   border-left-color: var(--red);
 }
-.ts-msg--assistant .callout-caution .callout-title {
+.msg.assistant .callout-caution .callout-title {
   color: var(--red);
 }
 
 /* Definition lists */
-.ts-msg--assistant dl {
+.msg.assistant dl {
   margin: 8px 0;
 }
-.ts-msg--assistant dt {
+.msg.assistant dt {
   font-weight: 600;
   color: var(--fg-bright);
   margin-top: 8px;
 }
-.ts-msg--assistant dt:first-child {
+.msg.assistant dt:first-child {
   margin-top: 0;
 }
-.ts-msg--assistant dd {
+.msg.assistant dd {
   margin: 2px 0 0 20px;
   padding-left: 12px;
   border-left: 2px solid var(--border-strong);
 }
 
 /* Footnotes */
-.ts-msg--assistant .footnotes {
+.msg.assistant .footnotes {
   margin-top: 16px;
   font-size: 12px;
   color: var(--fg-dim);
 }
-.ts-msg--assistant .footnotes-sep {
+.msg.assistant .footnotes-sep {
   border: none;
   border-top: 1px solid var(--border);
   margin-bottom: 8px;
 }
-.ts-msg--assistant .footnotes-list {
+.msg.assistant .footnotes-list {
   margin: 0 0 0 20px;
   padding: 0;
 }
-.ts-msg--assistant .footnote-item {
+.msg.assistant .footnote-item {
   margin: 4px 0;
   line-height: 1.5;
 }
-.ts-msg--assistant .fn-ref a {
+.msg.assistant .fn-ref a {
   color: var(--accent);
   text-decoration: none;
   font-size: 11px;
   font-weight: 600;
 }
-.ts-msg--assistant .fn-ref a:hover {
+.msg.assistant .fn-ref a:hover {
   text-decoration: underline;
 }
-.ts-msg--assistant .fn-backref {
+.msg.assistant .fn-backref {
   color: var(--accent);
   text-decoration: none;
   font-size: 11px;
   margin-left: 4px;
 }
-.ts-msg--assistant .fn-backref:hover {
+.msg.assistant .fn-backref:hover {
   text-decoration: underline;
 }
-.ts-msg--assistant .fn-ref a:focus-visible,
-.ts-msg--assistant .fn-backref:focus-visible {
+.msg.assistant .fn-ref a:focus-visible,
+.msg.assistant .fn-backref:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
   border-radius: 2px;
@@ -1682,7 +1680,7 @@ body {
 .ts-approval {
   background: var(--bg-surface);
   border: 1px solid var(--border);
-  /* Cyan matches .ts-msg--tool — both are tool-role surfaces. */
+  /* Cyan matches .msg.tool — both are tool-role surfaces. */
   border-left: 3px solid var(--cyan);
   border-radius: var(--radius);
   padding: 0;
@@ -3133,8 +3131,8 @@ audio.media-player {
   #health-indicator,
   #theme-toggle,
   #mcp-status,
-  .ts-msg--assistant tbody tr,
-  .ts-msg--assistant .img-placeholder,
+  .msg.assistant tbody tr,
+  .msg.assistant .img-placeholder,
   .media-play-btn,
   #new-ws-cancel,
   #new-ws-submit,
@@ -3158,7 +3156,7 @@ audio.media-player {
    per-node UI surface; coord uses the .approval-dock pattern instead.
 
    DOM shape rendered by buildToolDiv() + renderVerdictBadge():
-     .ts-msg.ts-approval.ts-approval--inline[.approved]  ← outer card
+     .msg.ts-approval.ts-approval--inline[.approved]  ← outer card
        .ts-approval-tool
          .tool-name                   ← tool function name
          .tool-cmd                    ← header / command
@@ -3172,14 +3170,15 @@ audio.media-player {
 
    The block uses the unified token palette (--cyan / --ink / --panel /
    --ok / --err / --warn) rather than the older --yellow / --green /
-   --red literals; .ts-msg.msg:not(.tool) below also flips the body font
-   from --font-mono (legacy .ts-msg default) to --font-ui for prose
-   message variants, with .msg.tool retaining mono via chat.css.
+   --red literals.
    ========================================================================== */
 
-.ts-msg.ts-approval--inline {
-  /* Cyan for tool-role surfaces — matches .ts-msg--tool border + the
-     .ts-approval container in the chat-css approval theme.
+.msg.ts-approval--inline {
+  /* Cyan for tool-role surfaces — matches .msg.tool border + the
+     .ts-approval container in the chat-css approval theme.  Selector
+     keeps the .msg qualifier so its (0,2,0) specificity ties with
+     .ts-approval.approved/.denied/.error and the later-cascade rule
+     here wins, holding the inline card cyan regardless of state.
      width: 100% forces consistent card width across tool calls; without
      it, cards shrink to content width (short-output cards read narrow,
      long-output cards read full-width → jagged column). */
@@ -3188,17 +3187,6 @@ audio.media-player {
   width: 100%;
   box-sizing: border-box;
   align-self: stretch;
-}
-
-/* Legacy .ts-msg rule forces font-family: var(--font-mono) on every
-   chat turn.  Override for user/assistant/reasoning/info/error where
-   body prose is meant to be UI font.  .msg.tool keeps mono via the
-   .msg.tool { font-family: var(--font-mono); } rule in chat.css. */
-.ts-msg.msg:not(.tool) {
-  font-family: var(--font-ui);
-}
-.ts-msg-body.msg-body {
-  font-family: inherit;
 }
 
 .ts-approval-tool {
