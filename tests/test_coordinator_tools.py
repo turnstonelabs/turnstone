@@ -1246,6 +1246,60 @@ def test_spawn_batch_evaluate_intent_handles_empty_children_defensively(coord_se
 
 
 # ---------------------------------------------------------------------------
+# Regression: tasks(update) without title — _prepare_tasks stores
+# ``item["title"] = None`` (title is optional on update), then
+# _evaluate_intent's projection sliced ``it.get("title", "")[:100]``.
+# dict.get returns the stored ``None`` (the default applies only when
+# the key is absent), so the slice raised TypeError and aborted the
+# whole batch.  Sibling tool calls in the same parallel batch then
+# surfaced as "Tool execution was cancelled" because the assistant
+# message had recorded the tool calls but the evaluator never wrote
+# tool-result entries.
+# ---------------------------------------------------------------------------
+
+
+def test_tasks_update_without_title_evaluates_intent_cleanly(coord_session, monkeypatch):
+    """tasks(update) with status only (no title) must not crash the
+    intent projection — the missing-but-optional title field stored as
+    None used to TypeError on the [:100] slice."""
+    sess, _coord, _ui = coord_session
+    _stub_judge_for_evaluate_intent(monkeypatch, sess)
+    item = sess._prepare_tool(
+        _tc("tasks", {"action": "update", "task_id": "tsk_1", "status": "in_progress"})
+    )
+    assert "error" not in item
+    # The crash trigger: item["title"] is None after _prepare_tasks.
+    assert item["title"] is None
+    sess._evaluate_intent([item])
+    assert item["func_args"] == {
+        "action": "update",
+        "task_id": "tsk_1",
+        "title": "",
+    }
+
+
+def test_tasks_update_without_title_in_parallel_batch_does_not_cancel_siblings(
+    coord_session, monkeypatch
+):
+    """Reproduce the parallel-batch failure mode: tasks(update) without
+    title alongside other tools.  Pre-fix, the evaluator raised before
+    any sibling executed, leaving every sibling reported as cancelled.
+    Post-fix, all items get func_args populated and the batch proceeds
+    to the judge."""
+    sess, _coord, _ui = coord_session
+    _stub_judge_for_evaluate_intent(monkeypatch, sess)
+    update_item = sess._prepare_tool(
+        _tc("tasks", {"action": "update", "task_id": "tsk_1", "status": "in_progress"})
+    )
+    # tasks(add) — sibling that previously got orphaned/cancelled.
+    add_item = sess._prepare_tool(_tc("tasks", {"action": "add", "title": "next step"}))
+    sess._evaluate_intent([update_item, add_item])
+    # Both items projected; neither carried over the None crash.
+    assert update_item["func_args"]["title"] == ""
+    assert add_item["func_args"]["title"] == "next step"
+
+
+# ---------------------------------------------------------------------------
 # close_all_children
 # ---------------------------------------------------------------------------
 
