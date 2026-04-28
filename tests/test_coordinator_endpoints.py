@@ -27,6 +27,7 @@ from starlette.testclient import TestClient
 from tests._coord_test_helpers import (
     _AuthMiddleware,
     _build_mgr,
+    _build_mgr_with_factory,
     _fake_registry,
     _FakeConfigStore,
 )
@@ -412,6 +413,107 @@ def test_create_returns_ws_id_and_records_audit(storage):
     events = storage.list_audit_events(user_id="user-1", limit=10)
     actions = [e["action"] for e in events]
     assert "coordinator.create" in actions
+
+
+def _capture_factory_pair():
+    """Return ``(factory, captured)`` — factory records model_alias +
+    judge_model into the captured dict on every call so tests can assert
+    the per-call override threading."""
+    captured: dict = {}
+
+    def _factory(ui, model_alias=None, ws_id=None, **kw):  # type: ignore[no-untyped-def]
+        captured["model_alias"] = model_alias
+        captured["judge_model"] = kw.get("judge_model")
+        return MagicMock()
+
+    return _factory, captured
+
+
+def test_create_forwards_model_and_judge_model_overrides(storage):
+    """Per-call ``model`` + ``judge_model`` body fields land on the
+    coord session factory (mirrors interactive's create surface)."""
+    factory, captured = _capture_factory_pair()
+    mgr = _build_mgr_with_factory(storage, factory)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        "/v1/api/workstreams/new",
+        json={
+            "name": "tuned-coord",
+            "model": "gpt-5",
+            "judge_model": "gpt-5-mini",
+        },
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    assert captured == {"model_alias": "gpt-5", "judge_model": "gpt-5-mini"}
+
+
+def test_create_empty_model_fields_collapse_to_none(storage):
+    """Empty-string ``model`` / ``judge_model`` body fields don't override
+    the ConfigStore default — they collapse to ``None`` so the factory
+    falls back to ``coordinator.model_alias`` / ``judge.model``."""
+    factory, captured = _capture_factory_pair()
+    mgr = _build_mgr_with_factory(storage, factory)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        "/v1/api/workstreams/new",
+        json={"name": "default-coord", "model": "  ", "judge_model": ""},
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    assert captured == {"model_alias": None, "judge_model": None}
+
+
+def test_create_503_factory_misconfig_message_is_sanitised(storage):
+    """503 response from a factory ``ValueError`` strips ASCII control
+    chars and caps the echoed alias text — defence-in-depth for the
+    user-controlled ``body["model"]`` reflection surface. Operators
+    keep the actionable message in the log; clients see a clean
+    bounded string."""
+
+    def _factory_raises(ui, model_alias=None, ws_id=None, **kw):  # type: ignore[no-untyped-def]
+        # Simulate the registry's actual exception shape, plus a
+        # control char + a long-tail attacker payload.
+        raise ValueError("Unknown model alias: \x00\x07attack\x1b[31m" + ("A" * 1000))
+
+    mgr = _build_mgr_with_factory(storage, _factory_raises)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        "/v1/api/workstreams/new",
+        json={"name": "c"},
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 503
+    err = resp.json()["error"]
+    # Cap enforced (hard-capped at _FACTORY_MISCONFIG_MAX_LEN total —
+    # the truncation reserves one codepoint for the ellipsis).
+    assert len(err) <= 200
+    assert "\x00" not in err
+    assert "\x1b" not in err
+    assert "Unknown model alias" in err
+    assert err.endswith("…")
+
+
+def test_create_non_string_model_fields_collapse_to_none(storage):
+    """Non-string ``model`` / ``judge_model`` body fields (e.g. a hostile
+    dict / list / int) collapse to ``None`` rather than reaching
+    ``.strip()`` and crashing into the lifted handler's generic 500
+    path. Defense-in-depth — the auth gate already requires
+    ``admin.coordinator``."""
+    factory, captured = _capture_factory_pair()
+    mgr = _build_mgr_with_factory(storage, factory)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        "/v1/api/workstreams/new",
+        json={
+            "name": "hostile-body",
+            "model": {"url": "http://evil"},
+            "judge_model": [1, 2, 3],
+        },
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    assert captured == {"model_alias": None, "judge_model": None}
 
 
 _PNG_1X1 = (

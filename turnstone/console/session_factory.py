@@ -88,6 +88,7 @@ def build_console_session_factory(
         client_type: str = "web",
         kind: WorkstreamKind = WorkstreamKind.COORDINATOR,
         parent_ws_id: str | None = None,
+        judge_model: str | None = None,
     ) -> ChatSession:
         assert ui is not None, "console session_factory requires a non-None UI"
         if kind != WorkstreamKind.COORDINATOR:
@@ -134,6 +135,28 @@ def build_console_session_factory(
         # name that provider may not even know about (e.g. coordinator on
         # Anthropic, judge alias pointing at OpenAI gpt-5-mini → silent
         # ``llm_fallback`` verdicts on every tool call).
+        if live_judge_config and judge_model:
+            import dataclasses
+
+            # Per-call judge_model override mirrors the server-side
+            # interactive factory: pin the alias on the JudgeConfig but
+            # leave alias→client/provider resolution to IntentJudge for
+            # the same reason as above.  ``registry.resolve`` is only
+            # called as a typo / unknown-alias guard so a misconfigured
+            # body field surfaces in the log instead of silently falling
+            # back to the session's provider.
+            try:
+                registry.resolve(judge_model)
+                live_judge_config = dataclasses.replace(
+                    live_judge_config,
+                    model=judge_model,
+                )
+            except Exception as e:
+                log.warning(
+                    "coord_factory.judge_model_resolve_failed alias=%r err=%s",
+                    judge_model,
+                    e,
+                )
 
         eff_temperature = (
             r_cfg.temperature

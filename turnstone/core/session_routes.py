@@ -52,6 +52,37 @@ if TYPE_CHECKING:
 log = get_logger(__name__)
 
 
+# Cap echoed factory-misconfig messages.  ``ValueError`` from the
+# session factory carries an operator-actionable remediation hint
+# (``"Unknown model alias: <alias>"`` etc.) that the lifted handlers
+# surface as a 503 — but the alias portion is user-controlled on the
+# create path (body ``model`` / ``judge_model`` fields) so a raw echo
+# reflects arbitrary input back into anything that renders the JSON
+# error verbatim.  Length cap + control-char strip keep the message
+# actionable for legit alias typos while neutralising hostile payloads.
+_FACTORY_MISCONFIG_MAX_LEN = 200
+
+
+def _safe_factory_misconfig_message(exc: BaseException) -> str:
+    """Sanitise a factory-misconfig ``ValueError`` for echo in a 503 body.
+
+    Strips ASCII control characters (``\\x00``-``\\x1f`` + ``\\x7f``)
+    and truncates to :data:`_FACTORY_MISCONFIG_MAX_LEN`.  Empty after
+    sanitisation falls back to a fixed generic message so a control-
+    char-only payload doesn't surface as ``"error": ""``.
+    """
+    text = str(exc)
+    cleaned = "".join(ch for ch in text if ch.isprintable())
+    if not cleaned:
+        return "session factory misconfigured"
+    if len(cleaned) > _FACTORY_MISCONFIG_MAX_LEN:
+        # Reserve one codepoint for the ellipsis so the returned string
+        # is hard-capped at _FACTORY_MISCONFIG_MAX_LEN total, not
+        # MAX_LEN+1.
+        cleaned = cleaned[: _FACTORY_MISCONFIG_MAX_LEN - 1] + "…"
+    return cleaned
+
+
 Handler = Callable[["Request"], Awaitable["Response"]]
 PermissionGate = Callable[["Request"], "JSONResponse | None"]
 ManagerLookup = Callable[["Request"], tuple["SessionManager | None", "JSONResponse | None"]]
@@ -1197,7 +1228,8 @@ def make_open_handler(
             # text as a 503 so the operator can fix it without
             # digging through stack traces. Same shape coord used
             # pre-lift; standardised across both kinds here.
-            return JSONResponse({"error": str(exc)}, status_code=503)
+            log.warning("ws.open.factory_misconfig ws_id=%s exc=%r", ws_id[:8], exc)
+            return JSONResponse({"error": _safe_factory_misconfig_message(exc)}, status_code=503)
         except Exception:
             # Bare ``Exception`` is intentional: ``mgr.open`` can
             # raise from ``adapter.build_session`` (no documented
@@ -1768,8 +1800,11 @@ def make_create_handler(
             # (model alias points at a model that no longer exists,
             # etc.). Surface the factory's remediation text as 503 so
             # operators get the actionable message instead of a
-            # stack-traced 500.
-            return JSONResponse({"error": str(exc)}, status_code=503)
+            # stack-traced 500. Sanitiser caps + scrubs the echoed
+            # text since the alias is user-controlled on the create
+            # path (body ``model`` / ``judge_model``).
+            log.warning("ws.create.factory_misconfig exc=%r", exc)
+            return JSONResponse({"error": _safe_factory_misconfig_message(exc)}, status_code=503)
         except Exception:
             # Don't echo the exception text — it can leak internal
             # paths / frame names. Log with a correlation id and
@@ -2235,7 +2270,10 @@ def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
                 # Session factory misconfig (e.g. a model alias that no
                 # longer resolves). Surface remediation text as 503
                 # mirroring :func:`make_open_handler`.
-                return JSONResponse({"error": str(exc)}, status_code=503)
+                log.warning("ws.detail.factory_misconfig ws_id=%s exc=%r", ws_id[:8], exc)
+                return JSONResponse(
+                    {"error": _safe_factory_misconfig_message(exc)}, status_code=503
+                )
             except Exception:
                 # Bare ``Exception`` is intentional — see
                 # :func:`make_open_handler` for the rationale

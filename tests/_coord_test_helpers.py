@@ -79,18 +79,18 @@ def _fake_registry() -> MagicMock:
     return reg
 
 
-def _build_mgr(storage: Any) -> SessionManager:
-    """Build a SessionManager(CoordinatorAdapter) with stub factories (test default)."""
+def _build_mgr_with_factory(storage: Any, session_factory: Any) -> SessionManager:
+    """Build a SessionManager(CoordinatorAdapter) with a caller-supplied factory.
 
-    def _sf(ui, model_alias=None, ws_id=None, **kw):  # type: ignore[no-untyped-def]
-        s = MagicMock()
-        s.send.return_value = None
-        return s
-
+    Used by tests that need to capture or assert factory kwargs (e.g.
+    per-call ``model`` / ``judge_model`` overrides). Plain :func:`_build_mgr`
+    is the right entry point when the test doesn't care about the
+    factory.
+    """
     adapter = CoordinatorAdapter(
         collector=MagicMock(),
         ui_factory=lambda ws: ConsoleCoordinatorUI(ws_id=ws.id, user_id=ws.user_id or ""),
-        session_factory=_sf,
+        session_factory=session_factory,
     )
     mgr = SessionManager(
         adapter,
@@ -101,6 +101,17 @@ def _build_mgr(storage: Any) -> SessionManager:
     )
     adapter.attach(mgr)
     return mgr
+
+
+def _build_mgr(storage: Any) -> SessionManager:
+    """Build a SessionManager(CoordinatorAdapter) with stub factories (test default)."""
+
+    def _sf(ui, model_alias=None, ws_id=None, **kw):  # type: ignore[no-untyped-def]
+        s = MagicMock()
+        s.send.return_value = None
+        return s
+
+    return _build_mgr_with_factory(storage, _sf)
 
 
 class MockStorage:
