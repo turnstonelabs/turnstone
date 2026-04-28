@@ -1,7 +1,49 @@
-/* turnstone design system — approval dock pattern
-   Bottom-pinned strip that appears when pending approvals exist. The
-   signature product pattern: a neutral dock (not a modal, not inline) that
-   surfaces the approval contract without hijacking focus.
+/* ==========================================================================
+   turnstone — coordinator.css
+   Coordinator-specific chrome.  Loaded only by coordinator/index.html;
+   not part of console/static/style.css (the admin dashboard sheet).
+   ==========================================================================
+   Tokens (--panel, --hair, --ok, --warn, etc.) come from shared_static/
+   base.css.  Form controls + .btn / .ghost / .appbar primitives come
+   from shared_static/ui-base.css.  This file holds the patterns specific
+   to the coordinator view: the right-rail sidebar and the pinned approval
+   dock.
+   ========================================================================== */
+
+/* ==========================================================================
+   Sidebar — coordinator right-rail container.  The .sidebar rule defines
+   the visual chrome (panel bg, hair border, padding); the coord page's
+   inline <style> overrides position/top/height/border-right to flex the
+   rail into its grid column.  Section labels are 10px uppercase.
+   ========================================================================== */
+.sidebar {
+  position: sticky;
+  top: 48px;
+  align-self: start;
+  height: calc(100vh - 48px);
+  padding: 16px 10px;
+  background: var(--panel);
+  border-right: 1px solid var(--hair);
+  overflow: auto;
+}
+
+.side-section {
+  margin-bottom: 18px;
+}
+
+.side-label {
+  padding: 0 8px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-4);
+}
+
+/* ==========================================================================
+   Approval dock — bottom-pinned strip that appears when pending approvals
+   exist.  Signature product pattern: a neutral dock (not a modal, not
+   inline) that surfaces the approval contract without hijacking focus.
 
    Layout:
      .approval-dock        position: fixed bottom
@@ -12,9 +54,12 @@
 
    Actions (action cluster):
      button.act           neutral default ("dismiss" / "view")
-     button.act.primary   warn-tinted amber — primary "Approve" action
-                          (NEVER green; amber signals "needs attention →
-                          resolving"). 1.5px border, --r-md squared.
+     button.act.primary   ok-tinted green per the .ts-approval-btn--approve
+                          convention in shared_static/chat.css.  The original
+                          Claude Design spec preferred amber; turnstone
+                          deliberately broke from it to keep colour-family
+                          parity with the Approve button's existing green.
+                          1.5px border, --r-md squared.
      button.act.always    dashed border — "Always approve for this rule"
      button.act.danger    err-tinted red — "Deny"
 
@@ -24,9 +69,9 @@
      ⇧A     → always approve
 
    Focus policy: when the dock opens, move focus to button.act.primary so
-   keyboard users can confirm without hunting. Do NOT trap focus. */
-
-[data-design="v1"] .approval-dock {
+   keyboard users can confirm without hunting.  Do NOT trap focus.
+   ========================================================================== */
+.approval-dock {
   position: fixed;
   left: 0;
   right: 0;
@@ -41,7 +86,7 @@
   box-shadow: 0 -6px 24px -12px rgba(21, 24, 27, 0.18);
 }
 
-[data-design="v1"] .approval-dock::before {
+.approval-dock::before {
   content: "";
   position: absolute;
   top: -1px;
@@ -56,7 +101,7 @@
   );
 }
 
-[data-design="v1"] .approval-dock .dhead {
+.approval-dock .dhead {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -67,12 +112,12 @@
   color: var(--warn);
 }
 
-[data-design="v1"] .approval-dock .dhead::before {
+.approval-dock .dhead::before {
   content: "⚠";
   font-size: 12px;
 }
 
-[data-design="v1"] .approval-dock .dhead .dcount {
+.approval-dock .dhead .dcount {
   margin-left: auto;
   font-family: var(--font-mono);
   font-size: 10px;
@@ -85,7 +130,7 @@
 /* Inline code-panel framing — the .dcall row reads as "the exact call you
    are approving," so we frame it like a mini inspectable code line rather
    than bare text on the dock surface. */
-[data-design="v1"] .approval-dock .dcall {
+.approval-dock .dcall {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -96,15 +141,15 @@
   border-radius: var(--r-sm);
 }
 
-[data-design="v1"] .approval-dock .dcall .risk { flex-shrink: 0; }
+.approval-dock .dcall .risk { flex-shrink: 0; }
 
-[data-design="v1"] .approval-dock .dcall .dfn {
+.approval-dock .dcall .dfn {
   font-family: var(--font-mono);
   font-weight: 600;
   color: var(--ink);
 }
 
-[data-design="v1"] .approval-dock .dcall .dargs {
+.approval-dock .dcall .dargs {
   flex: 1;
   min-width: 0;
   overflow: hidden;
@@ -115,7 +160,7 @@
   color: var(--ink-3);
 }
 
-[data-design="v1"] .approval-dock .dctx {
+.approval-dock .dctx {
   display: flex;
   gap: 14px;
   flex-wrap: wrap;
@@ -123,7 +168,7 @@
   color: var(--ink-3);
 }
 
-[data-design="v1"] .approval-dock .dctx code {
+.approval-dock .dctx code {
   padding: 0 4px;
   font-family: var(--font-mono);
   font-size: 10px;
@@ -133,15 +178,15 @@
   border-radius: 3px;
 }
 
-[data-design="v1"] .approval-dock .drow {
+.approval-dock .drow {
   display: flex;
   align-items: center;
   gap: 6px;
 }
 
-[data-design="v1"] .approval-dock .drow .spacer { flex: 1; }
+.approval-dock .drow .spacer { flex: 1; }
 
-[data-design="v1"] .approval-dock .drow .nav {
+.approval-dock .drow .nav {
   padding: 4px 8px;
   font-family: var(--font-mono);
   font-size: 11px;
@@ -152,14 +197,14 @@
   cursor: pointer;
 }
 
-[data-design="v1"] .approval-dock .drow .nav:hover {
+.approval-dock .drow .nav:hover {
   background: var(--panel-2);
   color: var(--ink);
 }
 
 /* Action buttons — 1.5px border, --r-md squared (NOT pill — these are
    primary-action surfaces, not inline buttons). */
-[data-design="v1"] .approval-dock button.act {
+.approval-dock button.act {
   padding: 7px 16px;
   font: inherit;
   font-size: 12px;
@@ -172,61 +217,61 @@
   transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
 }
 
-[data-design="v1"] .approval-dock button.act:hover {
+.approval-dock button.act:hover {
   color: var(--ink);
   border-color: var(--ink-4);
 }
 
-[data-design="v1"] .approval-dock button.act:focus-visible {
+.approval-dock button.act:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
 /* Approve and Always are siblings — same ok hue, differentiated by fill
-   (filled vs outlined) and border-style (solid vs dashed). Matches the
-   pre-refactor convention in turnstone/shared_static/chat.css (look for
-   .ts-approval-btn--approve using --green). Four stacked non-colour
-   cues for WCAG 1.4.1: fill state, border style, label, position. */
-[data-design="v1"] .approval-dock button.act.primary {
+   (filled vs outlined) and border-style (solid vs dashed).  Matches the
+   .ts-approval-btn--approve convention in shared_static/chat.css.  Four
+   stacked non-colour cues for WCAG 1.4.1: fill state, border style,
+   label, position. */
+.approval-dock button.act.primary {
   background: color-mix(in srgb, var(--ok) 28%, var(--panel));
   color: var(--ok-text);
   border-color: color-mix(in srgb, var(--ok) 65%, var(--hair));
   font-weight: 600;
 }
 
-[data-design="v1"] .approval-dock button.act.primary:hover {
+.approval-dock button.act.primary:hover {
   background: color-mix(in srgb, var(--ok) 40%, var(--panel));
   color: var(--ink);
   border-color: var(--ok);
 }
 
-[data-design="v1"] .approval-dock button.act.always {
+.approval-dock button.act.always {
   background: transparent;
   border-style: dashed;
   border-color: color-mix(in srgb, var(--ok) 65%, var(--hair));
   color: var(--ok-text);
 }
 
-[data-design="v1"] .approval-dock button.act.always:hover {
+.approval-dock button.act.always:hover {
   background: color-mix(in srgb, var(--ok) 15%, var(--panel));
   color: var(--ink);
   border-color: var(--ok);
 }
 
-[data-design="v1"] .approval-dock button.act.danger {
+.approval-dock button.act.danger {
   color: var(--err);
   border-color: color-mix(in srgb, var(--err) 42%, var(--hair));
 }
 
-[data-design="v1"] .approval-dock button.act.danger:hover {
+.approval-dock button.act.danger:hover {
   background: var(--err-soft);
   color: var(--err);
   border-color: var(--err);
 }
 
-/* Match .btn .kbd (primitives/buttons.css) — --ink-3 clears AA at 10px,
-   --ink-4 is borderline on light panels. */
-[data-design="v1"] .approval-dock button.act .kbd {
+/* Match .btn .kbd (in shared_static/ui-base.css) — --ink-3 clears AA at
+   10px, --ink-4 is borderline on light panels. */
+.approval-dock button.act .kbd {
   margin-left: 6px;
   padding: 0 3px;
   font-family: var(--font-mono);
@@ -236,7 +281,9 @@
   border-radius: 2px;
 }
 
-[data-design="v1"] .approval-dock button.act.primary .kbd {
-  color: color-mix(in srgb, var(--warn) 70%, var(--ink-3));
-  border-color: color-mix(in srgb, var(--warn) 40%, var(--hair));
+/* Tinted keycap on the primary Approve button — uses the parent's
+   --ok hue so the keycap reads as part of the green action surface. */
+.approval-dock button.act.primary .kbd {
+  color: color-mix(in srgb, var(--ok) 70%, var(--ink-3));
+  border-color: color-mix(in srgb, var(--ok) 40%, var(--hair));
 }

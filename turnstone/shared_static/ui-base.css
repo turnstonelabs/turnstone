@@ -1,17 +1,22 @@
 /* ==========================================================================
    turnstone — ui-base.css
-   Design-system layer shared between the coordinator page, per-node
+   Cross-page UI baseline shared between the coordinator page, per-node
    server UI, and the console dashboard.  Tokens (colors, typography,
-   glows) live in base.css; this file layers the "flat" form-control +
-   button + state-glyph baseline.  Size scale matches the 11/12/13px
-   established elsewhere in the codebase so these components slot into
-   existing layouts without dominating them.
+   glows) live in base.css; this file holds form controls, buttons, the
+   appbar chrome, and a few small primitives.
 
    Namespace rubric:
-     .ui-*   — cross-page reusable controls (buttons, inputs, pills)
-     .dash-* — legacy dashboard-row vocabulary (base.css)
-     .ts-*   — chat-view vocabulary (chat.css)
+     .ui-*   — original "Instrument Panel" controls (.ui-btn, .ui-input,
+               .ui-pill, .ui-panel) used by the admin dashboard.
+     .appbar* .btn .ghost .risk
+             — bare-class primitives used by coordinator + ui surfaces.
+     .dash-* — legacy dashboard-row vocabulary (base.css).
+     .ts-*   — chat-view vocabulary (chat.css).
      page-local classes stay unprefixed within their own stylesheet.
+
+   The .ui-* and bare-class families coexist deliberately: admin renders
+   the .ui-* family; coord + ui render the bare-class family.  No
+   collisions across families.
    ========================================================================== */
 
 /* ==========================================================================
@@ -138,7 +143,7 @@
 .ui-section-heading {
   margin: 0;
   padding: 6px 10px 4px;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
@@ -166,7 +171,7 @@
    Body text still inherits var(--font-mono) at 13px from base.css; these
    are opt-in overrides for headings / captions.
    ========================================================================== */
-.ui-heading { font-family: var(--font-display); font-weight: 600; color: var(--fg-bright); }
+.ui-heading { font-family: var(--font-ui); font-weight: 600; color: var(--fg-bright); }
 .ui-heading--sm { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--fg-dim); }
 .ui-heading--md { font-size: 13px; }
 .ui-heading--lg { font-size: 15px; }
@@ -179,3 +184,264 @@
   .ui-input, .ui-textarea, .ui-select,
   .ui-btn { transition: none; }
 }
+
+/* ==========================================================================
+   Appbar — chat-app header variant.  Distinct from .topbar (admin-style
+   with brand mark + nav + env metadata) — the appbar is for per-session
+   chat surfaces that need a back-link, title, session metadata, and a
+   right-cluster of action buttons (end / cancel / theme-toggle).
+
+   Shape:
+     [back]  title [subtitle/chip]              [status] [btn] [btn]
+     ←────┘  ├─ 14px 600                        └── --ink-3 11px mono
+             └─ optional 12px --ink-3 subtitle
+
+   Used in ui/static (server chat) and console coordinator.
+   ========================================================================== */
+.appbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 48px;
+  padding: 0 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--hair);
+}
+
+.appbar-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--ink-3);
+  text-decoration: none;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+
+.appbar-back:hover {
+  background: var(--hair-2);
+  color: var(--ink);
+}
+
+.appbar-back:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.appbar-back-arrow {
+  font-family: var(--font-mono);
+  font-size: 14px;
+}
+
+/* Title block — bold title + optional secondary label on the same line.
+   min-width: 0 is required for .dim's ellipsis to fire under a narrow
+   appbar — without it the flex container refuses to shrink below its
+   content's intrinsic width. */
+.appbar-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  flex-shrink: 1;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+  letter-spacing: -0.01em;
+}
+
+.appbar-title .dim {
+  font-weight: 400;
+  font-size: 13px;
+  color: var(--ink-3);
+  letter-spacing: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Spacer pushes the right cluster to the edge. Use as a flex filler
+   between the title and the action row. */
+.appbar-spacer { flex: 1; }
+
+/* Status text (SSE connection state, streaming indicator). Polite
+   aria-live lives on this span; the typography here intentionally
+   doesn't pulse so screen readers don't see layout churn. */
+.appbar-status {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-3);
+}
+
+/* Right cluster of action buttons. Match .btn sizing (28px / 12px) but
+   the pill shape optionally squares off when grouped tightly. */
+.appbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* ==========================================================================
+   Ghost button — low-emphasis tool button; lives inline in section
+   headings (e.g. coord sidebar refresh) or anywhere a tertiary action
+   needs to disappear into the surface.
+   ========================================================================== */
+.ghost {
+  height: 22px;
+  padding: 0 8px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--ink-3);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+
+.ghost:hover {
+  background: var(--hair-2);
+  color: var(--ink);
+}
+
+.ghost:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Darker accent on accent-soft — raw --accent on pale --accent-soft in
+   light mode falls below WCAG AA at 12px; mix 60% accent + 40% ink to
+   land comfortably above 4.5:1 in both themes. */
+.ghost.on {
+  background: var(--accent-soft);
+  color: color-mix(in srgb, var(--accent) 60%, var(--ink));
+}
+
+/* ==========================================================================
+   Button primitive — default shape is pill (999px) per the prototype;
+   approval-dock buttons get a 6px-radius squared shape in
+   console/static/style.css.
+
+   Variants:
+     .btn           neutral (hair border, panel bg)
+     .btn.primary   accent-tinted (used for key ok/continue actions)
+     .btn.deny      err-tinted (destructive secondary)
+     .btn.approve   ok-tinted (approval actions — green per existing
+                    turnstone chat.css convention, deliberately breaking
+                    the Claude Design spec which preferred amber. Amber
+                    remains the "needs attention" surface for k-badges
+                    and .pill.attn / .risk.med).
+   ========================================================================== */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 12px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ink-2);
+  background: var(--panel);
+  border: 1px solid var(--hair);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.btn:hover {
+  background: var(--panel-2);
+  color: var(--ink);
+  border-color: color-mix(in srgb, var(--ink-3) 30%, var(--hair));
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.btn.primary {
+  background: var(--accent-soft);
+  /* Raw --accent on pale --accent-soft is borderline AA at 12px; darken
+     with ink to push contrast > 4.5:1 in both themes. */
+  color: color-mix(in srgb, var(--accent) 60%, var(--ink));
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--hair));
+}
+
+.btn.primary:hover {
+  background: color-mix(in srgb, var(--accent-soft) 70%, var(--panel));
+  border-color: var(--accent);
+  color: var(--ink);
+}
+
+.btn.deny {
+  color: var(--err);
+  border-color: color-mix(in srgb, var(--err) 28%, var(--hair));
+}
+
+.btn.deny:hover {
+  background: var(--err-soft);
+  border-color: var(--err);
+}
+
+.btn.approve {
+  /* Green-on-green-tinted — greens don't mud through cool panels the way
+     warm colours do, so runtime color-mix is safe here. 28% fill gives
+     the button visible body against the panel without washing out the
+     text contrast. --ok-text is theme-aware (dark forest in light,
+     bright mint in dark) for ≥7:1 against the tinted bg in both. */
+  background: color-mix(in srgb, var(--ok) 28%, var(--panel));
+  color: var(--ok-text);
+  border-color: color-mix(in srgb, var(--ok) 65%, var(--hair));
+  font-weight: 600;
+}
+
+.btn.approve:hover {
+  background: color-mix(in srgb, var(--ok) 40%, var(--panel));
+  color: var(--ink);
+  border-color: var(--ok);
+}
+
+.btn .kbd {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-3);
+  padding: 1px 4px;
+  border: 1px solid var(--hair);
+  border-radius: 3px;
+}
+
+/* ==========================================================================
+   Risk severity tag — uppercase-mono tier indicator (low/med/high/crit).
+   Used by coordinator.js when surfacing approval risk. The ts-pulse
+   keyframe below is referenced by ui/static/style.css's verdict-judge
+   spinner.
+   ========================================================================== */
+@keyframes ts-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
+}
+
+.risk {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 6px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border-radius: 3px;
+}
+
+.risk.low  { background: var(--ok-soft);   color: var(--ok); }
+.risk.med  { background: var(--warn-soft); color: var(--warn); }
+.risk.high { background: var(--err-soft);  color: var(--err); }
+/* .risk.crit — darker filled red via --err-fill (bright --err as a fill
+   reads as alarm-loud). White text in both themes for max contrast. */
+.risk.crit { background: var(--err-fill);  color: #fff; }
+

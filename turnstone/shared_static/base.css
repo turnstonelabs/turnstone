@@ -6,11 +6,13 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
-  /* Surface palette — deep charcoal with blue undertone */
-  --bg: #0b0f19;
-  --bg-surface: #111827;
-  --bg-highlight: #1c2333;
-  --bg-elevated: #1f2a3d;
+  /* Surface palette — neutral charcoal aligned with the --panel /
+     --panel-2 family below (was blue-tinted #0b0f19 / #111827 / #1c2333 /
+     #1f2a3d before the unification). */
+  --bg: #0e1013;
+  --bg-surface: #15181c;
+  --bg-highlight: #1a1e23;
+  --bg-elevated: #1f2429;
 
   /* Text hierarchy */
   --fg: #d1d5e4;
@@ -51,22 +53,77 @@
   /* Structure */
   --border: rgba(255, 255, 255, 0.06);
   --border-strong: rgba(255, 255, 255, 0.1);
-  --code-bg: #0d1117;
+  --code-bg: #0a0c0f;
   --radius: 6px;
   --radius-sm: 3px;
   --dash-grid: 72px 120px 90px 100px 1fr 60px 48px;
   --row-alt: rgba(255, 255, 255, 0.01);
 
-  /* Typography */
-  --font-mono: 'IBM Plex Mono', 'SF Mono', 'Cascadia Code', monospace;
-  --font-display: 'Outfit', 'Segoe UI', system-ui, sans-serif;
+  /* Typography — Inter for UI, JetBrains Mono for code. */
+  --font-ui: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', 'IBM Plex Mono', Consolas, monospace;
+
+  /* ========================================================================
+     Design-system tokens — semantic palette + shape + rhythm.  These
+     coexist with the legacy --bg / --fg / --accent / --green / --red
+     family above; new code uses these names, the admin dashboard still
+     uses the legacy names.  Dark values are the :root default to match
+     the legacy "dark is default, light is conditional" convention.
+
+     Hue map:
+       --accent   75   (amber/gold, brand)
+       --ok       150  (green; approve / success / liveness)
+       --warn     80   (gold; attention / k-tools / risk-med)
+       --err      25   (red; deny / errors / risk-high / risk-crit)
+       --think    260  (indigo; thinking / judge)
+
+     Hard rules (do not drift):
+       - color-mix always uses `in srgb`, never `oklch`/`oklab`
+       - --warn stays ≤88; 90-130 is the yellow-green "puke" band
+       - --ok hue stays ≥145; below tips toward teal in dark
+       - approve UI uses the --ok family (green), NOT --warn
+     ======================================================================== */
+  --accent-h: 75;
+
+  /* Neutrals — dark default. */
+  --panel: #15181c;
+  --panel-2: #1a1e23;
+  --ink: #f2f3f5;
+  --ink-2: #d4d7db;
+  --ink-3: #a6abb3;
+  --ink-4: #808690;
+  --hair: #2a2e35;
+  --hair-2: #333842;
+
+  /* Semantic palette — dark default.  Unified L+C so ok/warn/err/think
+     feel like siblings; hue is the only discriminator. */
+  --accent-soft: oklch(0.29 0.07 var(--accent-h));
+  --ok: oklch(0.68 0.15 150);
+  --ok-live: oklch(0.78 0.2 150);   /* brighter — running / liveness */
+  --ok-soft: oklch(0.29 0.07 150);
+  --ok-text: oklch(0.86 0.18 150);  /* bright mint on dark ok-soft */
+  --warn: oklch(0.7 0.13 80);
+  --warn-soft: oklch(0.29 0.07 80);
+  --warn-tint: oklch(0.22 0.05 80);
+  --warn-tint-border: oklch(0.58 0.15 80);
+  --err: oklch(0.68 0.17 25);
+  --err-soft: oklch(0.29 0.07 25);
+  --err-fill: oklch(0.56 0.17 25);  /* darker filled red for .risk.crit */
+  --think: oklch(0.68 0.15 260);
+  --think-soft: oklch(0.29 0.07 260);
+
+  /* Shape */
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 8px;
+  --shadow-sm: 0 1px 0 rgba(21, 24, 27, 0.03), 0 1px 2px rgba(21, 24, 27, 0.04);
 }
 
 [data-theme="light"] {
-  --bg: #f3f4f6;
+  --bg: #f7f7f4;
   --bg-surface: #ffffff;
-  --bg-highlight: #e9ecf0;
-  --bg-elevated: #f9fafb;
+  --bg-highlight: #f0efe9;
+  --bg-elevated: #fbfbf8;
   --fg: #1e293b;
   --fg-dim: #576275;
   --fg-bright: #0f172a;
@@ -95,6 +152,30 @@
   --border-strong: rgba(0, 0, 0, 0.12);
   --code-bg: #f0f1f5;
   --row-alt: rgba(0, 0, 0, 0.015);
+
+  /* Design-system tokens — light overrides */
+  --panel: #ffffff;
+  --panel-2: #fbfbf8;
+  --ink: #101316;
+  --ink-2: #2d3238;
+  --ink-3: #565b63;
+  --ink-4: #7a7f87;
+  --hair: #dcdbd4;
+  --hair-2: #e7e5dc;
+  --accent-soft: oklch(0.94 0.05 var(--accent-h));
+  --ok: oklch(0.5 0.15 150);
+  --ok-live: oklch(0.58 0.19 150);
+  --ok-soft: oklch(0.94 0.05 150);
+  --ok-text: oklch(0.36 0.15 150);  /* dark forest on pale ok-soft */
+  --warn: oklch(0.58 0.13 80);
+  --warn-soft: oklch(0.94 0.05 80);
+  --warn-tint: oklch(0.92 0.1 80);
+  --warn-tint-border: oklch(0.64 0.15 80);
+  --err: oklch(0.5 0.17 25);
+  --err-soft: oklch(0.94 0.05 25);
+  --err-fill: oklch(0.45 0.17 25);
+  --think: oklch(0.5 0.15 260);
+  --think-soft: oklch(0.94 0.05 260);
 }
 
 html, body {
@@ -104,19 +185,30 @@ html, body {
   height: 100%;
   background: var(--bg);
   color: var(--fg);
-  font-family: var(--font-mono);
-  font-size: 13px;
-  line-height: 1.5;
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.45;
+  font-feature-settings: "ss01", "cv11";
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+code, pre, kbd {
+  font-family: var(--font-mono);
+  font-feature-settings: "zero", "ss01";
 }
 body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  /* Subtle warm vignette — amber on top-left, faded amber on
+     bottom-right.  Original second gradient used cyan (#67e8f9) which
+     read as a blue tint over the formerly-blue bg; on the unified
+     neutral charcoal palette, amber on both ends keeps the brand
+     family without reintroducing blue. */
   background-image:
     radial-gradient(ellipse at 20% 0%, rgba(229, 160, 66, 0.03) 0%, transparent 50%),
-    radial-gradient(ellipse at 80% 100%, rgba(103, 232, 249, 0.02) 0%, transparent 50%);
+    radial-gradient(ellipse at 80% 100%, rgba(229, 160, 66, 0.015) 0%, transparent 50%);
 }
 
 /* ==========================================================================
@@ -142,7 +234,7 @@ body {
   background: linear-gradient(90deg, transparent, var(--accent-dim), transparent);
 }
 #header h1 {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 15px;
   font-weight: 700;
   color: var(--accent);
@@ -181,7 +273,7 @@ body {
   border-bottom: none;
 }
 .dash-header-title {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   color: var(--accent);
   font-size: 11px;
   font-weight: 600;
@@ -196,7 +288,7 @@ body {
   background: var(--bg-surface);
   border-bottom: 1px solid var(--border-strong);
   font-size: 10px;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-weight: 600;
   color: var(--fg-dim);
   text-transform: uppercase;
@@ -318,7 +410,7 @@ body {
   border-radius: 1px;
 }
 #login-box > h2 {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   color: var(--accent);
   font-size: 16px;
   font-weight: 700;
@@ -346,7 +438,7 @@ body {
   border: none;
   border-radius: var(--radius-sm);
   font: inherit;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
@@ -357,7 +449,7 @@ body {
 #login-submit:focus-visible { outline: 2px solid var(--fg); outline-offset: 2px; }
 #login-submit:disabled { opacity: 0.4; cursor: not-allowed; filter: none; }
 .login-subtitle {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 11px;
   color: var(--fg-dim);
   margin-bottom: 18px;
@@ -366,7 +458,7 @@ body {
 }
 .login-label {
   display: block;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
@@ -382,7 +474,7 @@ body {
   background: none;
   border: none;
   color: var(--fg-dim);
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 11px;
   cursor: pointer;
   padding: 4px 8px;
@@ -403,7 +495,7 @@ body {
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
   font: inherit;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
@@ -436,7 +528,7 @@ body {
   background: var(--border-strong);
 }
 .oidc-divider span {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 10px;
   color: var(--fg-dim);
   text-transform: uppercase;
@@ -469,7 +561,7 @@ body {
   box-shadow: 0 24px 48px -12px rgba(0, 0, 0, 0.5);
 }
 #kb-box h2 {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   color: var(--accent);
   font-size: 13px;
   font-weight: 600;
@@ -488,9 +580,9 @@ body {
   font-size: 11px;
   white-space: nowrap;
 }
-.kb-desc { color: var(--fg-dim); font-family: var(--font-display); }
+.kb-desc { color: var(--fg-dim); font-family: var(--font-ui); }
 .kb-section {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   color: var(--fg-dim);
   font-size: 10px;
   font-weight: 600;
@@ -500,7 +592,7 @@ body {
   margin-bottom: 6px;
 }
 .kb-section:first-child { margin-top: 0; }
-#kb-box .kb-hint { color: var(--fg-dim); font-size: 11px; text-align: center; margin-top: 16px; font-family: var(--font-display); }
+#kb-box .kb-hint { color: var(--fg-dim); font-size: 11px; text-align: center; margin-top: 16px; font-family: var(--font-ui); }
 
 /* ==========================================================================
    Toast notification
@@ -545,7 +637,7 @@ body {
   font-size: 12px;
   padding: 24px 0;
   text-align: center;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-style: italic;
   opacity: 0.7;
 }

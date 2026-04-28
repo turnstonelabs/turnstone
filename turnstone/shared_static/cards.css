@@ -66,11 +66,7 @@
   color: var(--fg-dim);
   opacity: 0.45;
   margin-left: 6px;
-  /* Prefer the design-system token; fall back to a literal stack so
-     surfaces that don't load /shared/design/typography.css (i.e.
-     console, until it migrates onto data-design="v1") still get a
-     mono font here. */
-  font-family: var(--font-mono, "IBM Plex Mono", monospace);
+  font-family: var(--font-mono);
   letter-spacing: 0.02em;
   vertical-align: middle;
 }

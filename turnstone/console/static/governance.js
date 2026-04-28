@@ -2981,7 +2981,7 @@ function renderJudgeSettings() {
     html +=
       '<div style="margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid var(--border-strong)">' +
       '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">' +
-      '<code style="font-family:var(--font-display);font-size:12px;font-weight:600;color:var(--fg)">' +
+      '<code style="font-family:var(--font-ui);font-size:12px;font-weight:600;color:var(--fg)">' +
       shortKey +
       "</code>" +
       (isDefault

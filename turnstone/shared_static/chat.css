@@ -17,7 +17,7 @@
   display: flex;
   flex-direction: column;
   padding: 8px 12px;
-  margin-bottom: 8px;
+  margin-bottom: 4px;
   background: var(--bg-elevated);
   border: 1px solid var(--border);
   border-left-width: 3px;
@@ -127,7 +127,7 @@
 .ts-msg-body h4,
 .ts-msg-body h5,
 .ts-msg-body h6 {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-weight: 600;
   margin: 8px 0 4px;
   color: var(--fg-bright);
@@ -230,9 +230,11 @@
 }
 
 /* Inline variant: an approval block living as a .ts-msg in the
-   message stream, one per tool call awaiting approval. */
+   message stream, one per tool call awaiting approval.  Cyan to match
+   the .ts-msg--tool execution-result colour — both are tool-role
+   surfaces, distinct from user (amber) and assistant (neutral). */
 .ts-msg.ts-approval--inline {
-  border-left-color: var(--yellow);
+  border-left-color: var(--cyan);
   background: var(--bg-elevated);
 }
 
@@ -242,8 +244,8 @@
   position: relative;
   padding: 10px 14px;
   background: var(--bg-surface);
-  border-top: 1px solid var(--yellow);
-  border-left: 3px solid var(--yellow);
+  border-top: 1px solid var(--cyan);
+  border-left: 3px solid var(--cyan);
   display: none;
 }
 .ts-approval--batch.visible {
@@ -251,12 +253,12 @@
 }
 
 .ts-approval-header {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  color: var(--yellow);
+  color: var(--cyan);
   margin-bottom: 2px;
 }
 .ts-approval-tool {
@@ -271,7 +273,7 @@
   margin-top: 4px;
 }
 .ts-approval-tool-name {
-  color: var(--yellow);
+  color: var(--cyan);
   font-weight: 600;
 }
 .ts-approval-tool-cmd {
@@ -369,7 +371,7 @@
 }
 
 .ts-approval-badge {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 11px;
   font-weight: 600;
   padding: 2px 8px;
@@ -480,8 +482,12 @@
   flex-direction: column;
   gap: 6px;
   padding: 10px 14px;
-  background: var(--bg-surface);
-  border-top: 1px solid var(--border);
+  /* Recessed wrapper — the textarea inside reads as the prominent
+     input surface above this background.  In light mode --bg
+     (#f7f7f4) on --bg-surface (#ffffff) gave near-identical contrast
+     and made the textarea invisible; the inversion fixes both modes. */
+  background: var(--bg);
+  border-top: 1px solid var(--border-strong);
 }
 
 .ts-composer-chips {
@@ -561,8 +567,8 @@
   font-family: var(--font-mono);
   font-size: 13px;
   color: var(--fg);
-  background: var(--bg);
-  border: 1px solid var(--border);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
   padding: 6px 10px;
   /* resize: none — max-height + auto-resize handlers in app.js /
@@ -740,11 +746,11 @@
   gap: 6px 12px;
   align-items: center;
   padding: 8px;
-  /* Darker inset — visually distinct from the enclosing panel so
-     the options zone reads as its own settings surface.  Matches
-     the interactive dashboard composer's options-panel shade. */
-  background: var(--bg);
-  border: 1px solid var(--border);
+  /* Most recessed surface — sits below the wrapper (--bg) and
+     well below the textarea (--bg-surface) in the depth hierarchy
+     so the options zone reads as its own settings tier. */
+  background: var(--bg-highlight);
+  border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
   font-family: var(--font-mono);
   font-size: 12px;
@@ -826,7 +832,7 @@
   display: none;
 }
 .ts-header-title {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 13px;
   font-weight: 700;
   color: var(--accent);
@@ -919,7 +925,7 @@
 .ts-sidebar-section-heading {
   margin: 0;
   padding: 6px 10px;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
@@ -991,5 +997,307 @@
   .ts-composer-input,
   .ts-composer-send {
     transition: none;
+  }
+}
+
+/* ==========================================================================
+   Message primitive — chat-style single-column message block.  Semantic
+   variant carries via 3px left-border colour (and text colour for
+   error/info).  Used by the coordinator chat view directly (pure .msg
+   classes) and by the per-node server chat UI dual-classed alongside
+   the .ts-msg family above (so the two rule families compose).
+
+   Variants:
+     .msg                 base (assistant / generic)
+     .msg.user            user-authored turn (accent left-border)
+     .msg.assistant       explicit assistant (same as base, clarity class)
+     .msg.reasoning       <thinking> / reasoning trace — dashed left-border
+     .msg.tool            tool output / tool response — accent-tinted
+     .msg.error           error states — err red
+     .msg.info            transient info — think indigo, smaller
+     .msg.system          system-injected turns (policy notices, etc.)
+
+   Content sub-elements:
+     .msg-meta            author / timestamp / model label (optional);
+                          placed above .msg-body in mono 11px --ink-3
+     .msg-body            markdown target — styles code, pre, headings,
+                          lists, blockquotes, strong/em
+     .msg-actions         hover-revealed action buttons (copy / regenerate)
+
+   Streaming indicator: add `data-streaming="true"` to the .msg and a
+   blinking caret appears at the end of .msg-body. Avoids per-view
+   reinvention.
+   ========================================================================== */
+.msg {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  padding: 8px 12px;
+  margin-bottom: 4px;
+  background: var(--panel-2);
+  border: 1px solid var(--hair);
+  border-left-width: 3px;
+  border-radius: var(--r-sm);
+  font-size: 13px;
+  line-height: 1.55;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+}
+
+/* Variant left-borders */
+.msg.user {
+  border-left-color: var(--accent);
+}
+.msg.assistant {
+  border-left-color: var(--hair-2);
+}
+.msg.reasoning {
+  border-left-style: dashed;
+  border-left-color: var(--ink-4);
+  color: var(--ink-3);
+  font-style: italic;
+}
+.msg.tool {
+  background: var(--panel);
+  /* Cyan to match the per-node UI's .ts-msg--tool and .ts-approval
+     borders — tool-role surfaces share one colour, distinct from
+     user (amber) and assistant (neutral). */
+  border-left-color: var(--cyan);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.msg.error {
+  border-left-color: var(--err);
+  color: var(--err);
+}
+.msg.info {
+  border-left-color: var(--think);
+  color: color-mix(in srgb, var(--think) 70%, var(--ink));
+  font-size: 12px;
+}
+.msg.system {
+  border-left-color: var(--ink-4);
+  background: var(--panel);
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+/* Author / timestamp slot — optional label row above the body. Use
+   this for "assistant · 10:42:18 · claude-opus-4-7" style headers. */
+.msg-meta {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-3);
+}
+
+/* Markdown body — renderer.js writes innerHTML here; trust boundary
+   lives there, not in CSS. Keep styles tight so streamed content
+   doesn't jitter layout as tokens arrive. */
+.msg-body {
+  min-width: 0;
+  max-width: 100%;
+}
+
+/* Streaming caret — append to the end of .msg-body when the message is
+   still being streamed. Opt in via `data-streaming="true"` on the .msg. */
+.msg[data-streaming="true"] .msg-body::after {
+  content: "▍";
+  display: inline-block;
+  margin-left: 2px;
+  color: var(--accent);
+  animation: ts-caret 1s steps(2, start) infinite;
+}
+
+@keyframes ts-caret {
+  to {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .msg[data-streaming="true"] .msg-body::after {
+    animation: none;
+  }
+}
+
+.msg-body > *:first-child {
+  margin-top: 0;
+}
+.msg-body > *:last-child {
+  margin-bottom: 0;
+}
+
+.msg-body pre {
+  margin: 6px 0;
+  padding: 8px 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--panel);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-sm);
+  overflow-x: auto;
+}
+
+.msg-body code {
+  padding: 1px 4px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--panel);
+  border: 1px solid var(--hair-2);
+  border-radius: 3px;
+  /* Preserve internal whitespace + allow wrapping; see the matching
+     rule above for the rationale (the body's ``white-space: normal``
+     would otherwise collapse spaces inside backtick spans). */
+  white-space: pre-wrap;
+}
+
+.msg-body pre code {
+  padding: 0;
+  background: none;
+  border: none;
+  border-radius: 0;
+}
+
+/* Tool messages have a --panel background, same colour as the default
+   .msg-body pre bg — shift the pre/code inside tool blocks to --panel-2
+   so the inline code stands out from the message surface. */
+.msg.tool .msg-body pre,
+.msg.tool .msg-body code {
+  background: var(--panel-2);
+}
+
+.msg-body a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.msg-body h1,
+.msg-body h2,
+.msg-body h3,
+.msg-body h4,
+.msg-body h5,
+.msg-body h6 {
+  margin: 10px 0 4px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.msg-body h1 {
+  font-size: 16px;
+}
+.msg-body h2 {
+  font-size: 14px;
+}
+.msg-body h3 {
+  font-size: 13px;
+}
+.msg-body h4,
+.msg-body h5,
+.msg-body h6 {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-3);
+}
+
+.msg-body p {
+  margin: 6px 0;
+}
+
+.msg-body ul,
+.msg-body ol {
+  margin: 4px 0 4px 20px;
+  padding: 0;
+}
+.msg-body li {
+  margin: 2px 0;
+}
+
+.msg-body strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+.msg-body em {
+  font-style: italic;
+}
+
+.msg-body blockquote {
+  margin: 6px 0;
+  padding: 4px 10px;
+  border-left: 2px solid var(--hair);
+  color: var(--ink-3);
+}
+
+/* Hover-revealed action row — copy / regenerate / feedback buttons.
+   pointer-events toggles alongside opacity so the invisible toolbar
+   doesn't intercept clicks in the top-right corner of the message
+   (would otherwise break text selection on the last word of a short
+   one-line msg). */
+.msg-actions {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: flex;
+  gap: 2px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.msg:hover .msg-actions,
+.msg:focus-within .msg-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.msg-action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 24px;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-3);
+  background: transparent;
+  border: none;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  transition: color 120ms ease, background 120ms ease;
+}
+
+.msg-action-btn:hover {
+  background: var(--hair-2);
+  color: var(--ink);
+}
+
+.msg-action-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Touch-only: keep actions visible; hover-reveal isn't reachable.
+   `(pointer: coarse)` narrows the match to true touch devices —
+   `(hover: none)` alone fires on stylus and some laptops too. Matches
+   the `@media (hover: none) and (pointer: coarse)` convention above.
+   Keyboard users are handled by :focus-within on .msg above. */
+@media (hover: none) and (pointer: coarse) {
+  .msg-actions {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  /* WCAG 2.5.5 — 24×24 minimum touch target; we go to 36×36 to match
+     the previously-shipped ui/static/style.css override that the merge
+     replaced. */
+  .msg-action-btn {
+    min-width: 36px;
+    min-height: 36px;
+    padding: 4px 8px;
+    font-size: 12px;
   }
 }
