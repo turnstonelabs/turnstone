@@ -168,10 +168,18 @@ class TestCancelDuringStreaming:
         assert ui.states[-1] == "idle"
         # Check that "[Generation cancelled]" was emitted
         assert any("cancelled" in i.lower() for i in ui.infos)
-        # The partial content should be preserved as an assistant message
+        # The partial content should be preserved as an assistant
+        # message AND annotated with a marker that downstream readers
+        # (inspect_workstream, the next coord turn) can use to
+        # distinguish a cancelled fragment from a completed turn — the
+        # raw "Hello world" without a marker would look like the
+        # final assistant answer to a coord LLM reading the child's
+        # transcript.
         assistant_msgs = [m for m in session.messages if m["role"] == "assistant"]
         assert len(assistant_msgs) == 1
-        assert assistant_msgs[0]["content"] == "Hello world"
+        content = assistant_msgs[0]["content"]
+        assert content.startswith("Hello world")
+        assert "[generation cancelled before completion]" in content
         # No tool_calls in the partial message
         assert "tool_calls" not in assistant_msgs[0]
 
@@ -511,10 +519,13 @@ class TestStreamAbort:
         # Should complete as cancelled, not error
         assert "idle" in ui.states
         assert any("cancelled" in i.lower() for i in ui.infos)
-        # Partial content preserved
+        # Partial content preserved AND annotated with the
+        # cancelled-before-completion marker.
         assistant_msgs = [m for m in session.messages if m["role"] == "assistant"]
         assert len(assistant_msgs) == 1
-        assert assistant_msgs[0]["content"] == "Hello"
+        content = assistant_msgs[0]["content"]
+        assert content.startswith("Hello")
+        assert "[generation cancelled before completion]" in content
 
     def test_non_cancel_exception_not_swallowed(self, tmp_db):
         """Exceptions during streaming that aren't caused by cancel

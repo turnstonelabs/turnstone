@@ -1444,7 +1444,13 @@ class CoordinatorClient:
         calls get the trimmed shape.
         """
         full = self._storage.get_workstream(ws_id)
-        miss = {"error": f"workstream not found: {ws_id}", "ws_id": ws_id}
+        # Echoing the ws_id back inside the error STRING was a stylistic
+        # carry-over — the structured ``ws_id`` field already carries
+        # the value the caller asked about.  The bare error message
+        # ("workstream not found") is enough; the same shape is used
+        # for cross-tenant rows so the existence-leak guarantee is
+        # preserved either way.
+        miss = {"error": "workstream not found", "ws_id": ws_id}
         if full is None:
             return miss
         is_self = ws_id == self._coord_ws_id

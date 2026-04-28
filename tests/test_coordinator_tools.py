@@ -65,6 +65,9 @@ class _StubUI:
     def on_attention(self, header: str, preview: str = "") -> None:
         pass
 
+    def on_state_change(self, state: str) -> None:
+        pass
+
     def wait_for_approval(
         self,
         call_id: str,
@@ -199,6 +202,47 @@ def test_spawn_exec_calls_client_and_returns_summary(coord_session):
     assert kwargs["initial_message"] == "hi"
     assert call_id == "call-1"
     assert "child-7" in output
+
+
+def test_spawn_exec_does_not_surface_misleading_status_field(coord_session):
+    """The routing-proxy ``status`` is the HTTP code (always 200 on
+    success), not a lifecycle state — leaking it into the tool's
+    summary tempted callers to write ``if result["status"] == "idle"``
+    which silently never matched.  The summary now omits the field
+    entirely; lifecycle state lives on the workstream row and is read
+    via inspect_workstream."""
+    sess, coord, _ui = coord_session
+    coord.spawn.return_value = {
+        "ws_id": "child-7",
+        "name": "c",
+        "node_id": "node-1",
+        "status": 200,
+    }
+    item = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "hi"}))
+    _call_id, output = sess._exec_spawn_workstream(item)
+    body = json.loads(output)
+    assert "status" not in body
+    # The substantive fields are still here.
+    assert body["ws_id"] == "child-7"
+    assert body["node_id"] == "node-1"
+
+
+def test_spawn_batch_exec_does_not_surface_misleading_status_field(coord_session):
+    """Same shape constraint as ``spawn_workstream`` — per-result
+    entries omit ``status`` so the model can't be confused by the
+    HTTP-code-as-lifecycle-state ambiguity."""
+    sess, coord, _ui = coord_session
+    coord.spawn.return_value = {
+        "ws_id": "c-x",
+        "name": "n",
+        "node_id": "node",
+        "status": 200,
+    }
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": [{"initial_message": "solo"}]}))
+    _call_id, output = sess._exec_spawn_batch(item)
+    body = json.loads(output)
+    assert "0" in body["results"]
+    assert "status" not in body["results"]["0"]
 
 
 def test_spawn_exec_surfaces_client_error(coord_session):
@@ -848,6 +892,63 @@ def test_tasks_reorder_requires_list_of_strings(coord_session):
     sess, _coord, _ui = coord_session
     item = sess._prepare_tool(_tc("tasks", {"action": "reorder", "task_ids": [1, 2]}))
     assert "error" in item
+
+
+def test_tasks_rejected_when_called_in_parallel_batch(coord_session):
+    """``tasks(...)`` mutates an ordered list and supports a ``list``
+    action that reads it back — a parallel batch like
+    ``[tasks(add=...), tasks(list)]`` has unspecified ordering inside
+    ``run_one``'s ThreadPoolExecutor.  Rather than warn the model in
+    the tool description (cognitive overhead on every call), we
+    reject the call site explicitly when the violation actually
+    happens.  The error tells the model to retry serially."""
+    sess, _coord, ui = coord_session
+    # The stub UI doesn't expose ``approve_tools``; the dispatcher
+    # only consults it for items where ``needs_approval=True``, and
+    # the parallel-batch reject path sets ``needs_approval=False`` on
+    # the offending item so the guard fires before the approval
+    # prompt would.  Inject a permissive approver anyway so any
+    # sibling tools that need approval (none in these specific
+    # cases) don't block the dispatch.
+    ui.approve_tools = lambda items: (True, None)  # type: ignore[attr-defined]
+    tool_calls = [
+        _tc("tasks", {"action": "list"}, call_id="call-1"),
+        _tc("inspect_workstream", {"ws_id": "child-x"}, call_id="call-2"),
+    ]
+    results, _fb = sess._execute_tools(tool_calls)
+    # The tasks(...) call comes back as an error; the sibling
+    # inspect_workstream is unaffected.
+    by_id = dict(results)
+    assert "parallel tool batch" in by_id["call-1"].lower()
+    # The inspect call was permitted to dispatch — its result is
+    # NOT the parallel-batch error.
+    assert "parallel tool batch" not in by_id["call-2"].lower()
+
+
+def test_tasks_runs_normally_when_alone_in_batch(coord_session):
+    """A single ``tasks(...)`` call is unaffected by the
+    parallel-incompatible guard — only multi-call batches trip it."""
+    sess, _coord, ui = coord_session
+    ui.approve_tools = lambda items: (True, None)  # type: ignore[attr-defined]
+    results, _fb = sess._execute_tools([_tc("tasks", {"action": "list"})])
+    _call_id, output = results[0]
+    # Empty task list returns a clean payload, not the parallel-batch error.
+    assert "parallel tool batch" not in output.lower()
+
+
+def test_other_tools_unaffected_by_parallel_batch_guard(coord_session):
+    """Tools NOT in ``_PARALLEL_INCOMPATIBLE_TOOLS`` (e.g. inspect /
+    list) keep working in parallel batches — the guard is narrowly
+    scoped to tools whose semantics actually require serialisation."""
+    sess, _coord, ui = coord_session
+    ui.approve_tools = lambda items: (True, None)  # type: ignore[attr-defined]
+    tool_calls = [
+        _tc("inspect_workstream", {"ws_id": "child-a"}, call_id="call-1"),
+        _tc("list_workstreams", {}, call_id="call-2"),
+    ]
+    results, _fb = sess._execute_tools(tool_calls)
+    for _cid, output in results:
+        assert "parallel tool batch" not in output.lower()
 
 
 def test_tasks_exec_list_returns_tasks(coord_session):

@@ -113,8 +113,8 @@ owns it; the node is just currently unreachable.
 ```json
 {
   "results": {
-    "0": {"ws_id": "d4e5f6...", "name": "csrf-audit", "node_id": "gpu-3", "status": 200},
-    "2": {"ws_id": "f1a2b3...", "name": "xss-audit",  "node_id": "gpu-1", "status": 200}
+    "0": {"ws_id": "d4e5f6...", "name": "csrf-audit", "node_id": "gpu-3"},
+    "2": {"ws_id": "f1a2b3...", "name": "xss-audit",  "node_id": "gpu-1"}
   },
   "denied": [
     {"idx": 1, "reason": "skill not found: nonexistent-skill"}

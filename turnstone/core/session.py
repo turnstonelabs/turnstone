@@ -203,6 +203,16 @@ _VALID_MEMORY_SCOPES: tuple[str, ...] = ("global", "workstream", "user", "coordi
 # :meth:`ChatSession._implicit_scope_walk`.
 _IMPLICIT_SCOPE_WALK: tuple[str, ...] = ("workstream", "user", "global")
 
+# Tools that MUST run alone in their assistant batch.  ``tasks`` mutates
+# its own ordered list and supports a ``list`` action that reads it
+# back; a parallel batch like ``[tasks(add=...), tasks(list)]`` has
+# unspecified ordering inside ``_execute_tools.run_one``'s
+# ThreadPoolExecutor and the read can land before or after the write.
+# Rather than warn the model in the tool description (extra cognitive
+# overhead on every call), we reject the call site explicitly when
+# the violation actually happens — see ``_execute_tools``.
+_PARALLEL_INCOMPATIBLE_TOOLS: frozenset[str] = frozenset({"tasks"})
+
 # Matches resource paths referenced in skill content (scripts/foo.py, etc.)
 _RESOURCE_PATH_RE = re.compile(
     r"(?<![/\w-])(?:scripts|references|assets)/[\w./-]+\."
@@ -2497,20 +2507,36 @@ class ChatSession:
             # orphaned — skip all message mutations and state changes.
             if self._generation != my_generation:
                 return
-            # Cooperative cancellation — preserve partial content if available.
+            # Cooperative cancellation — preserve partial content if
+            # available and annotate it so downstream readers can
+            # distinguish a cancelled fragment from a completed turn.
+            # Without the annotation, an inspect_workstream / wait
+            # surface caller (or a coord-LLM reading the child's
+            # transcript on the next turn) sees a truncated-but-real
+            # text fragment with no marker and may treat it as the
+            # final answer — same hazard the operator-shakedown report
+            # flagged ("…cannot simultaneously guarantee Consistency,"
+            # surfaced as if it were a complete sentence).
             if self._cancelled_partial_msg:
                 # _stream_response was interrupted — save partial assistant msg
                 msg = self._cancelled_partial_msg
                 self._cancelled_partial_msg = None
+                content = msg.get("content", "")
+                if content:
+                    msg["content"] = content + "\n\n[generation cancelled before completion]"
+                    save_message(self._ws_id, "assistant", msg["content"])
+                # Append regardless of content — an empty-content
+                # partial still belongs in the conversation history
+                # so the next turn's full_messages reflects the
+                # cancelled attempt.  The token estimate is computed
+                # post-annotation so the budget accounting matches
+                # what we just persisted.
                 self.messages.append(msg)
                 tok_est = max(
                     1,
                     int(self._msg_char_count(msg) / self._chars_per_token),
                 )
                 self._msg_tokens.append(tok_est)
-                content = msg.get("content", "")
-                if content:
-                    save_message(self._ws_id, "assistant", content)
             else:
                 # Cancelled during tool execution — synthesize cancelled
                 # tool_result for any tool_calls that lack a matching result.
@@ -2850,16 +2876,25 @@ class ChatSession:
                 if chunk.provider_blocks:
                     provider_blocks = chunk.provider_blocks
         except GenerationCancelled:
-            # Flush whatever was buffered and build a partial message
+            # Flush whatever was buffered and build a partial message.
+            # Both ``tool_calls`` and ``_provider_content`` are
+            # DELIBERATELY OMITTED:
+            #   * ``tool_calls`` — incomplete, no matching tool_result;
+            #     re-emitting on the next turn would orphan them.
+            #   * ``_provider_content`` — the Anthropic provider reads
+            #     this lane verbatim ahead of plain ``content`` (see
+            #     ``providers/_anthropic.py``), and a cancellation can
+            #     leave partial tool_use blocks here too.  Keeping it
+            #     would also cause the next-turn replay to bypass the
+            #     ``[generation cancelled before completion]`` marker
+            #     the cancel handler appends to ``content``, hiding
+            #     the partial-output signal from the model.
             if pending:
                 _flush_text(pending, in_think)
             self.ui.on_stream_end()
             partial: dict[str, Any] = {"role": "assistant"}
             partial_content = "".join(content_parts)
             partial["content"] = partial_content or ""
-            # Deliberately omit tool_calls — they are incomplete
-            if provider_blocks:
-                partial["_provider_content"] = provider_blocks
             self._cancelled_partial_msg = partial
             raise
         except Exception:
@@ -2873,8 +2908,11 @@ class ChatSession:
                 self.ui.on_stream_end()
                 partial = {"role": "assistant"}
                 partial["content"] = "".join(content_parts) or ""
-                if provider_blocks:
-                    partial["_provider_content"] = provider_blocks
+                # Same reasoning as the cooperative-cancel branch
+                # above: ``_provider_content`` is omitted so the
+                # next-turn replay reads from the marker-bearing
+                # plain content and any partial tool_use blocks
+                # inside provider_blocks don't leak through.
                 self._cancelled_partial_msg = partial
                 raise GenerationCancelled() from None
             raise
@@ -3782,6 +3820,32 @@ class ChatSession:
         # the next turn (assistant tool_calls with no matching tool
         # results).  See the docstring on this method.
         items = [self._safe_prepare_tool(tc) for tc in tool_calls]
+
+        # Reject parallel-incompatible tools when the batch has more
+        # than one call.  Some tools have read-after-write semantics
+        # against their own state (``tasks`` is the canonical
+        # example: a parallel ``add`` + ``list`` has unspecified
+        # ordering), and the prior shape relied on the model to
+        # discipline itself via a docstring warning.  Turning the
+        # silent footgun into an explicit error means the model only
+        # has to think about it the moment it actually violates the
+        # rule, not on every single tool call.  Re-emit serially in
+        # a follow-up turn.
+        if len(items) > 1:
+            for item in items:
+                if (
+                    item.get("func_name") in _PARALLEL_INCOMPATIBLE_TOOLS
+                    and not item.get("error")
+                    and not item.get("denied")
+                ):
+                    item["error"] = (
+                        f"Error: {item['func_name']}(...) cannot be called in a "
+                        "parallel tool batch — its read-after-write ordering "
+                        "against sibling tool calls is not guaranteed. Re-emit "
+                        f"this {item['func_name']} call on its own in the next "
+                        "assistant turn."
+                    )
+                    item["needs_approval"] = False
 
         # Intent validation (advisory, non-blocking).
         # Cancel any prior judge thread before spawning a new one.
@@ -5348,14 +5412,21 @@ class ChatSession:
             return call_id, msg
         # Successful spawn — surface ws_id + node_id + name + routing
         # strategy so the coordinator can follow up with inspect / send
-        # and explain why a given node was chosen.
+        # and explain why a given node was chosen.  ``status`` was
+        # historically included but it was the routing-proxy's HTTP
+        # code (always 200 on this branch); the absence of an
+        # ``error`` field is the success signal.  Dropped here to
+        # avoid the silent footgun where ``if result["status"] ==
+        # "idle"`` looked plausible against the (incorrectly
+        # documented) lifecycle-state-string contract.  Lifecycle
+        # state lives on the workstream row — read it via
+        # ``inspect_workstream``.
         summary = json.dumps(
             {
                 "ws_id": result.get("ws_id"),
                 "name": result.get("name"),
                 "node_id": result.get("node_id"),
                 "routing_strategy": result.get("routing_strategy"),
-                "status": result.get("status"),
             },
             separators=(",", ":"),
         )
@@ -5493,7 +5564,11 @@ class ChatSession:
                 "ws_id": ws_id,
                 "name": result.get("name", ""),
                 "node_id": result.get("node_id", ""),
-                "status": result.get("status"),
+                # ``status`` deliberately omitted — see the matching
+                # comment in ``_exec_spawn_workstream``: the routing
+                # proxy fills it with HTTP 200 on success, which the
+                # model can't usefully act on.  Errors land in
+                # ``denied[]`` instead.
             }
 
         # ``truncated`` intentionally omitted — the prepare step

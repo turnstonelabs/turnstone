@@ -552,6 +552,36 @@ def test_inspect_missing_ws_returns_error(populated_storage):
     assert "error" in result
 
 
+def test_inspect_not_found_does_not_echo_ws_id_in_error_string(populated_storage):
+    """The error STRING is bare ("workstream not found") — the
+    structured ``ws_id`` field carries the queried id.  Pre-fix the
+    error message echoed the ws_id back at the caller who just sent
+    it, which was redundant and a stylistic departure from the rest
+    of the surface.  Echo-in-string is also one more place a
+    hostile/oversize ws_id could land in operator-facing text."""
+    client = _make_read_client(populated_storage)
+    result = client.inspect("does-not-exist-xyz")
+    assert result["error"] == "workstream not found"
+    # The structured field still carries the ws_id for context.
+    assert result["ws_id"] == "does-not-exist-xyz"
+
+
+def test_inspect_cross_tenant_returns_same_shape_as_missing(populated_storage):
+    """The cross-tenant guard MUST return the exact same shape as a
+    genuinely missing ws_id — that's the existence-leak defence the
+    error-string echo was carrying weight for too.  Asserting the
+    shape match here pins the property going forward."""
+    # ``unrelated`` exists in storage but is not a coord-1 child.
+    client = _make_read_client(populated_storage)
+    cross_tenant = client.inspect("unrelated")
+    missing = client.inspect("does-not-exist-abc")
+    # Same key set, same error string, only the ws_id field differs.
+    assert cross_tenant.keys() == missing.keys()
+    assert cross_tenant["error"] == missing["error"] == "workstream not found"
+    assert cross_tenant["ws_id"] == "unrelated"
+    assert missing["ws_id"] == "does-not-exist-abc"
+
+
 def test_list_children_excludes_closed_by_default(tmp_path):
     """Default ``list_children`` filters out closed / deleted rows —
     the common "what's still running?" query shouldn't have to

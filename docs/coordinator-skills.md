@@ -160,7 +160,7 @@ validates ws_id against `parent_ws_id=coord_ws_id` AND
   `cancel_workstream`, `delete_workstream`) return
   `{"error": "workstream not in coordinator subtree: <ws_id>", "status": 404}`
   — the skill should treat this as a tool error, not an empty result.
-- **`inspect_workstream`** returns `{"error": "workstream not found: <ws_id>"}`
+- **`inspect_workstream`** returns `{"error": "workstream not found", "ws_id": "<ws_id>"}`
   (same shape as a genuinely missing row, so the guard can't be
   used as an existence oracle).
 - **`wait_for_workstream`** reports the offending id with
@@ -170,9 +170,10 @@ validates ws_id against `parent_ws_id=coord_ws_id` AND
 
 Pattern: capture each spawn result in the next tool call's input.
 The JSON tool-result carries `{"ws_id": "...", "name": "...",
-"node_id": "...", "status": 200}`; the model should extract the
-ws_id and pass it to `inspect_workstream` / `wait_for_workstream` /
-`send_to_workstream` / `close_workstream` verbatim.
+"node_id": "...", "routing_strategy": "..."}`; the model should
+extract the ws_id and pass it to `inspect_workstream` /
+`wait_for_workstream` / `send_to_workstream` / `close_workstream`
+verbatim.
 
 A UI that wants human-readable identifiers should render the `name`
 field and keep the ws_id as the click-through key.
