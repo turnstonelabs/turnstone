@@ -706,7 +706,8 @@
 }
 
 /* Streaming content — .msg.reasoning (chat.css) styles reasoning
-   bubbles; .reasoning as a bare role class is no longer emitted. */
+   bubbles; .reasoning is never emitted on its own, only paired with
+   the .msg base class. */
 .thinking-indicator {
   color: var(--fg-dim);
   font-size: 12px;
