@@ -68,6 +68,11 @@ class _StubUI:
     def on_state_change(self, state: str) -> None:
         pass
 
+    def approve_tools(self, items: list) -> tuple[bool, str | None]:
+        # Permissive default — tests that exercise approval
+        # pathways override the method directly on the instance.
+        return True, None
+
     def wait_for_approval(
         self,
         call_id: str,
@@ -902,15 +907,7 @@ def test_tasks_rejected_when_called_in_parallel_batch(coord_session):
     the tool description (cognitive overhead on every call), we
     reject the call site explicitly when the violation actually
     happens.  The error tells the model to retry serially."""
-    sess, _coord, ui = coord_session
-    # The stub UI doesn't expose ``approve_tools``; the dispatcher
-    # only consults it for items where ``needs_approval=True``, and
-    # the parallel-batch reject path sets ``needs_approval=False`` on
-    # the offending item so the guard fires before the approval
-    # prompt would.  Inject a permissive approver anyway so any
-    # sibling tools that need approval (none in these specific
-    # cases) don't block the dispatch.
-    ui.approve_tools = lambda items: (True, None)  # type: ignore[attr-defined]
+    sess, _coord, _ui = coord_session
     tool_calls = [
         _tc("tasks", {"action": "list"}, call_id="call-1"),
         _tc("inspect_workstream", {"ws_id": "child-x"}, call_id="call-2"),
@@ -928,8 +925,7 @@ def test_tasks_rejected_when_called_in_parallel_batch(coord_session):
 def test_tasks_runs_normally_when_alone_in_batch(coord_session):
     """A single ``tasks(...)`` call is unaffected by the
     parallel-incompatible guard — only multi-call batches trip it."""
-    sess, _coord, ui = coord_session
-    ui.approve_tools = lambda items: (True, None)  # type: ignore[attr-defined]
+    sess, _coord, _ui = coord_session
     results, _fb = sess._execute_tools([_tc("tasks", {"action": "list"})])
     _call_id, output = results[0]
     # Empty task list returns a clean payload, not the parallel-batch error.
@@ -940,8 +936,7 @@ def test_other_tools_unaffected_by_parallel_batch_guard(coord_session):
     """Tools NOT in ``_PARALLEL_INCOMPATIBLE_TOOLS`` (e.g. inspect /
     list) keep working in parallel batches — the guard is narrowly
     scoped to tools whose semantics actually require serialisation."""
-    sess, _coord, ui = coord_session
-    ui.approve_tools = lambda items: (True, None)  # type: ignore[attr-defined]
+    sess, _coord, _ui = coord_session
     tool_calls = [
         _tc("inspect_workstream", {"ws_id": "child-a"}, call_id="call-1"),
         _tc("list_workstreams", {}, call_id="call-2"),

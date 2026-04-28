@@ -2518,19 +2518,27 @@ class ChatSession:
             # flagged ("…cannot simultaneously guarantee Consistency,"
             # surfaced as if it were a complete sentence).
             if self._cancelled_partial_msg:
-                # _stream_response was interrupted — save partial assistant msg
+                # _stream_response was interrupted — save partial
+                # assistant msg.  Two shapes:
+                #
+                # - Some text streamed before cancel: append the
+                #   marker so downstream readers can distinguish a
+                #   cancelled fragment from a completed turn.
+                # - Cancel landed before the first content token:
+                #   keep the marker AS the message so the in-memory
+                #   history and the persisted row stay consistent
+                #   (the prior shape skipped persistence in this
+                #   case, leaving the next-turn replay with an
+                #   empty-content assistant message in messages but
+                #   nothing in storage — divergent on rehydrate).
                 msg = self._cancelled_partial_msg
                 self._cancelled_partial_msg = None
                 content = msg.get("content", "")
                 if content:
                     msg["content"] = content + "\n\n[generation cancelled before completion]"
-                    save_message(self._ws_id, "assistant", msg["content"])
-                # Append regardless of content — an empty-content
-                # partial still belongs in the conversation history
-                # so the next turn's full_messages reflects the
-                # cancelled attempt.  The token estimate is computed
-                # post-annotation so the budget accounting matches
-                # what we just persisted.
+                else:
+                    msg["content"] = "[generation cancelled before completion]"
+                save_message(self._ws_id, "assistant", msg["content"])
                 self.messages.append(msg)
                 tok_est = max(
                     1,
