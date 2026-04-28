@@ -2128,9 +2128,13 @@
   margin-bottom: 0;
 }
 
-/* h3 used for screen-reader heading structure; reset UA defaults */
+/* h3 used for screen-reader heading structure; reset UA defaults.  We only
+   reset margin-block (the `margin` shorthand on .skill-spec-heading sets
+   physical margins but UA h3 uses logical margin-block-start/end); font-size
+   is left alone — .skill-spec-heading's font-size: 10px already beats the UA
+   h3 default on specificity, and an `inherit` here at (0,1,1) would silently
+   outrank the bare class at (0,1,0). */
 h3.skill-spec-heading {
-  font-size: inherit;
   margin-block: 0;
 }
 .skill-spec-heading {
@@ -2161,12 +2165,15 @@ h3.skill-spec-heading {
   flex-direction: column;
 }
 
-.skill-content-area {
+/* Chained `textarea.` so the rule beats `.admin-modal textarea` (0,1,1) on
+   source order — without that bump, min-height: 220px loses to the modal's
+   default min-height: 40px and the spec content textarea renders short. */
+textarea.skill-content-area {
   flex: 1;
   min-height: 220px;
-  font-family: var(--font-mono) !important;
-  font-size: 11.5px !important;
-  line-height: 1.65 !important;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.65;
 }
 
 .skill-vars-row {
