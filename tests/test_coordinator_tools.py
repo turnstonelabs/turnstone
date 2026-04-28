@@ -899,43 +899,104 @@ def test_tasks_reorder_requires_list_of_strings(coord_session):
     assert "error" in item
 
 
-def test_tasks_rejected_when_called_in_parallel_batch(coord_session):
-    """``tasks(...)`` mutates an ordered list and supports a ``list``
-    action that reads it back — a parallel batch like
-    ``[tasks(add=...), tasks(list)]`` has unspecified ordering inside
-    ``run_one``'s ThreadPoolExecutor.  Rather than warn the model in
-    the tool description (cognitive overhead on every call), we
-    reject the call site explicitly when the violation actually
-    happens.  The error tells the model to retry serially."""
+def test_tasks_mixed_read_and_write_in_batch_rejected(coord_session):
+    """The only shape the guard now rejects: ``tasks(list)`` paralleled
+    with a ``tasks`` mutating action.  Read-after-write ordering inside
+    ``run_one``'s ThreadPoolExecutor is unspecified, so the read can
+    land before or after the write and produce inconsistent state.
+    Both ``tasks(...)`` calls in the batch get the rejection error."""
     sess, _coord, _ui = coord_session
     tool_calls = [
-        _tc("tasks", {"action": "list"}, call_id="call-1"),
-        _tc("inspect_workstream", {"ws_id": "child-x"}, call_id="call-2"),
+        _tc("tasks", {"action": "add", "title": "a thing"}, call_id="call-1"),
+        _tc("tasks", {"action": "list"}, call_id="call-2"),
     ]
     results, _fb = sess._execute_tools(tool_calls)
-    # The tasks(...) call comes back as an error; the sibling
-    # inspect_workstream is unaffected.
     by_id = dict(results)
-    assert "parallel tool batch" in by_id["call-1"].lower()
-    # The inspect call was permitted to dispatch — its result is
-    # NOT the parallel-batch error.
-    assert "parallel tool batch" not in by_id["call-2"].lower()
+    assert "read" in by_id["call-1"].lower() and "write" in by_id["call-1"].lower()
+    assert "read" in by_id["call-2"].lower() and "write" in by_id["call-2"].lower()
+
+
+def test_tasks_all_writes_in_batch_permitted(coord_session):
+    """All-write batches are SAFE: writes serialise under
+    ``CoordinatorClient``'s per-ws lock and the result is
+    deterministic against the input set even if the dispatch order
+    isn't.  Four parallel ``tasks(add=...)`` is the canonical
+    "decompose plan into N tasks" shape."""
+    sess, coord, _ui = coord_session
+    coord.tasks_add.side_effect = lambda *a, **kw: {
+        "ok": True,
+        "task": {"id": "t1", "title": kw.get("title", ""), "status": "pending"},
+    }
+    tool_calls = [
+        _tc("tasks", {"action": "add", "title": f"task {i}"}, call_id=f"call-{i}") for i in range(4)
+    ]
+    results, _fb = sess._execute_tools(tool_calls)
+    for _cid, output in results:
+        assert "read-after-write" not in output.lower(), output
+        assert "cannot run" not in output.lower(), output
+
+
+def test_tasks_all_reads_in_batch_permitted(coord_session):
+    """All-read batches are SAFE: nothing to race against."""
+    sess, coord, _ui = coord_session
+    coord.tasks_get.return_value = {"tasks": []}
+    tool_calls = [
+        _tc("tasks", {"action": "list"}, call_id="call-1"),
+        _tc("tasks", {"action": "list"}, call_id="call-2"),
+    ]
+    results, _fb = sess._execute_tools(tool_calls)
+    for _cid, output in results:
+        assert "read-after-write" not in output.lower(), output
 
 
 def test_tasks_runs_normally_when_alone_in_batch(coord_session):
-    """A single ``tasks(...)`` call is unaffected by the
-    parallel-incompatible guard — only multi-call batches trip it."""
+    """A single ``tasks(...)`` call is unaffected by the read-after-
+    write guard — only multi-call batches with a mix can trip it."""
     sess, _coord, _ui = coord_session
     results, _fb = sess._execute_tools([_tc("tasks", {"action": "list"})])
     _call_id, output = results[0]
-    # Empty task list returns a clean payload, not the parallel-batch error.
-    assert "parallel tool batch" not in output.lower()
+    assert "read-after-write" not in output.lower()
 
 
-def test_other_tools_unaffected_by_parallel_batch_guard(coord_session):
-    """Tools NOT in ``_PARALLEL_INCOMPATIBLE_TOOLS`` (e.g. inspect /
-    list) keep working in parallel batches — the guard is narrowly
-    scoped to tools whose semantics actually require serialisation."""
+def test_tasks_write_with_non_tasks_sibling_permitted(coord_session):
+    """A ``tasks`` write paralleled with a non-``tasks`` sibling is
+    fine — the sibling doesn't touch tasks state, so there's no
+    race regardless of dispatch order.  This is the natural batch
+    shape for "add a task AND look up something else"."""
+    sess, coord, _ui = coord_session
+    coord.tasks_add.return_value = {
+        "ok": True,
+        "task": {"id": "t1", "title": "a", "status": "pending"},
+    }
+    tool_calls = [
+        _tc("tasks", {"action": "add", "title": "a"}, call_id="call-1"),
+        _tc("inspect_workstream", {"ws_id": "child-x"}, call_id="call-2"),
+    ]
+    results, _fb = sess._execute_tools(tool_calls)
+    for _cid, output in results:
+        assert "read-after-write" not in output.lower(), output
+
+
+def test_tasks_read_with_non_tasks_sibling_permitted(coord_session):
+    """Mirror of the write-with-sibling test for the read direction.
+    Common shape: ``tasks(list)`` paralleled with ``list_workstreams``
+    / ``list_nodes`` for a planning snapshot."""
+    sess, coord, _ui = coord_session
+    coord.tasks_get.return_value = {"tasks": []}
+    tool_calls = [
+        _tc("tasks", {"action": "list"}, call_id="call-1"),
+        _tc("list_workstreams", {}, call_id="call-2"),
+        _tc("list_nodes", {}, call_id="call-3"),
+    ]
+    results, _fb = sess._execute_tools(tool_calls)
+    for _cid, output in results:
+        assert "read-after-write" not in output.lower(), output
+
+
+def test_non_tasks_parallel_batch_unaffected(coord_session):
+    """Tools other than ``tasks`` keep working in parallel batches
+    regardless of read/write semantics — the guard is scoped only
+    to ``tasks``'s read-after-write hazard."""
     sess, _coord, _ui = coord_session
     tool_calls = [
         _tc("inspect_workstream", {"ws_id": "child-a"}, call_id="call-1"),
@@ -943,7 +1004,7 @@ def test_other_tools_unaffected_by_parallel_batch_guard(coord_session):
     ]
     results, _fb = sess._execute_tools(tool_calls)
     for _cid, output in results:
-        assert "parallel tool batch" not in output.lower()
+        assert "read-after-write" not in output.lower()
 
 
 def test_tasks_exec_list_returns_tasks(coord_session):

@@ -203,15 +203,14 @@ _VALID_MEMORY_SCOPES: tuple[str, ...] = ("global", "workstream", "user", "coordi
 # :meth:`ChatSession._implicit_scope_walk`.
 _IMPLICIT_SCOPE_WALK: tuple[str, ...] = ("workstream", "user", "global")
 
-# Tools that MUST run alone in their assistant batch.  ``tasks`` mutates
-# its own ordered list and supports a ``list`` action that reads it
-# back; a parallel batch like ``[tasks(add=...), tasks(list)]`` has
-# unspecified ordering inside ``_execute_tools.run_one``'s
-# ThreadPoolExecutor and the read can land before or after the write.
-# Rather than warn the model in the tool description (extra cognitive
-# overhead on every call), we reject the call site explicitly when
-# the violation actually happens — see ``_execute_tools``.
-_PARALLEL_INCOMPATIBLE_TOOLS: frozenset[str] = frozenset({"tasks"})
+# ``tasks`` action classifier — partitions actions into read vs write
+# so the parallel-batch guard can permit homogeneous batches (all
+# writes serialise under the per-ws lock and converge to a consistent
+# result; all reads can't race) and reject only the mixed read+write
+# shape where ``tasks(list)`` paralleled with ``tasks(add=...)`` has
+# unspecified ordering inside ``_execute_tools``'s ThreadPoolExecutor.
+_TASKS_READ_ACTIONS: frozenset[str] = frozenset({"list"})
+_TASKS_WRITE_ACTIONS: frozenset[str] = frozenset({"add", "update", "remove", "reorder"})
 
 # Matches resource paths referenced in skill content (scripts/foo.py, etc.)
 _RESOURCE_PATH_RE = re.compile(
@@ -3829,31 +3828,47 @@ class ChatSession:
         # results).  See the docstring on this method.
         items = [self._safe_prepare_tool(tc) for tc in tool_calls]
 
-        # Reject parallel-incompatible tools when the batch has more
-        # than one call.  Some tools have read-after-write semantics
-        # against their own state (``tasks`` is the canonical
-        # example: a parallel ``add`` + ``list`` has unspecified
-        # ordering), and the prior shape relied on the model to
-        # discipline itself via a docstring warning.  Turning the
-        # silent footgun into an explicit error means the model only
-        # has to think about it the moment it actually violates the
-        # rule, not on every single tool call.  Re-emit serially in
-        # a follow-up turn.
+        # Reject the read+write mix on ``tasks`` within a single
+        # parallel batch.  ``tasks`` mutates an ordered planning
+        # list and supports a ``list`` read; a batch like
+        # ``[tasks(add=...), tasks(list)]`` has unspecified
+        # ordering inside ``_execute_tools.run_one``'s
+        # ThreadPoolExecutor — the read can land before or after
+        # the write and produce inconsistent state to the model.
+        #
+        # All-write and all-read batches are SAFE:
+        #   - Writes serialise under the per-ws lock in
+        #     ``CoordinatorClient.tasks_*``; the result is
+        #     deterministic against the input set even if the
+        #     dispatch order isn't.
+        #   - Reads can't race against anything.
+        #
+        # The rule below only fires on the MIX, so the natural
+        # batch shapes ("add four tasks at once", "list nodes +
+        # list skills + tasks(list) for a planning snapshot") are
+        # both permitted; only the genuinely-broken shape gets
+        # rejected.  Non-tasks siblings paralleled with tasks()
+        # are unaffected — they don't touch the tasks state.
         if len(items) > 1:
-            for item in items:
-                if (
-                    item.get("func_name") in _PARALLEL_INCOMPATIBLE_TOOLS
-                    and not item.get("error")
-                    and not item.get("denied")
-                ):
-                    item["error"] = (
-                        f"Error: {item['func_name']}(...) cannot be called in a "
-                        "parallel tool batch — its read-after-write ordering "
-                        "against sibling tool calls is not guaranteed. Re-emit "
-                        f"this {item['func_name']} call on its own in the next "
-                        "assistant turn."
-                    )
-                    item["needs_approval"] = False
+            tasks_items = [
+                it
+                for it in items
+                if it.get("func_name") == "tasks" and not it.get("error") and not it.get("denied")
+            ]
+            if tasks_items:
+                has_read = any(it.get("action") in _TASKS_READ_ACTIONS for it in tasks_items)
+                has_write = any(it.get("action") in _TASKS_WRITE_ACTIONS for it in tasks_items)
+                if has_read and has_write:
+                    for it in tasks_items:
+                        it["error"] = (
+                            "Error: tasks(...) read (`list`) and write "
+                            "(`add` / `update` / `remove` / `reorder`) actions "
+                            "cannot run in the same parallel tool batch — the "
+                            "read-after-write ordering is not guaranteed. "
+                            "All-reads or all-writes are fine; mix only by "
+                            "splitting them across separate assistant turns."
+                        )
+                        it["needs_approval"] = False
 
         # Intent validation (advisory, non-blocking).
         # Cancel any prior judge thread before spawning a new one.
