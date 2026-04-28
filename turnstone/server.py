@@ -3106,12 +3106,17 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         _svc_storage.register_service("server", _svc_node_id, _svc_url)
         log.info("server.service_registered", node_id=_svc_node_id, url=_svc_url)
 
-        # Collect and store node metadata (auto + config)
+        # Collect and store node metadata (auto + config).
+        # ``collect_node_info`` runs synchronous probes (sysfs reads,
+        # /proc reads, IMDS HTTP requests).  Off-load to a worker
+        # thread so the IMDS path's worst-case latency (~1 s on a
+        # misidentified-cloud host) doesn't block the event loop
+        # during the rest of the lifespan startup work.
         try:
             from turnstone.core.config import load_config as _load_meta_config
             from turnstone.core.node_info import collect_node_info
 
-            _auto_info = collect_node_info()
+            _auto_info = await asyncio.to_thread(collect_node_info)
             _meta_entries: list[tuple[str, str, str]] = [
                 (k, json.dumps(v), "auto") for k, v in _auto_info.items()
             ]
