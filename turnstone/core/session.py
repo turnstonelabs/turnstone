@@ -3348,11 +3348,11 @@ class ChatSession:
                     "name": it.get("watch_name", ""),
                 }
             elif name == "notify":
-                it["func_args"] = {"message": it.get("message", "")[:200]}
+                it["func_args"] = {"message": (it.get("message") or "")[:200]}
             elif name == "task_agent":
-                it["func_args"] = {"prompt": it.get("prompt", "")[:200]}
+                it["func_args"] = {"prompt": (it.get("prompt") or "")[:200]}
             elif name == "plan_agent":
-                it["func_args"] = {"goal": it.get("prompt", "")[:200]}
+                it["func_args"] = {"goal": (it.get("prompt") or "")[:200]}
             # Coordinator tool args — only the ``needs_approval=True`` set
             # reaches this point (read-only inspect / list_* / wait
             # tools are filtered above), so this matches the auditable
@@ -3361,7 +3361,7 @@ class ChatSession:
             elif name == "spawn_workstream":
                 it["func_args"] = {
                     "skill": it.get("skill", ""),
-                    "initial_message": it.get("initial_message", "")[:200],
+                    "initial_message": (it.get("initial_message") or "")[:200],
                     "target_node": it.get("target_node", ""),
                     "name": it.get("name", ""),
                     "model": it.get("model", ""),
@@ -3383,7 +3383,9 @@ class ChatSession:
                         {
                             "skill": c.get("skill", "") if isinstance(c, dict) else "",
                             "initial_message": (
-                                c.get("initial_message", "")[:200] if isinstance(c, dict) else ""
+                                (c.get("initial_message") or "")[:200]
+                                if isinstance(c, dict)
+                                else ""
                             ),
                             "target_node": (
                                 c.get("target_node", "") if isinstance(c, dict) else ""
@@ -3395,22 +3397,31 @@ class ChatSession:
             elif name == "send_to_workstream":
                 it["func_args"] = {
                     "ws_id": it.get("ws_id", ""),
-                    "message": it.get("message", "")[:200],
+                    "message": (it.get("message") or "")[:200],
                 }
             elif name == "close_workstream":
                 it["func_args"] = {
                     "ws_id": it.get("ws_id", ""),
-                    "reason": it.get("reason", "")[:200],
+                    "reason": (it.get("reason") or "")[:200],
                 }
             elif name == "close_all_children":
-                it["func_args"] = {"reason": it.get("reason", "")[:200]}
+                it["func_args"] = {"reason": (it.get("reason") or "")[:200]}
             elif name in ("cancel_workstream", "delete_workstream"):
                 it["func_args"] = {"ws_id": it.get("ws_id", "")}
             elif name == "tasks":
+                # ``title`` is optional on update — _prepare_tasks stores
+                # ``None`` when omitted, so dict.get(x, "") returns None
+                # (not the default) and slicing crashes.  Collapse via
+                # ``or ""`` so absent and explicit-None both fall back to
+                # empty string.  The other projections above use the same
+                # pattern defensively — a future preparer that stores
+                # None for any of these fields shouldn't take down the
+                # whole batch (every sibling tool call gets reported as
+                # cancelled) on a single missing optional field.
                 it["func_args"] = {
                     "action": it.get("action", ""),
                     "task_id": it.get("task_id", ""),
-                    "title": it.get("title", "")[:100],
+                    "title": (it.get("title") or "")[:100],
                 }
             elif it.get("mcp_args"):
                 it["func_args"] = it["mcp_args"]
