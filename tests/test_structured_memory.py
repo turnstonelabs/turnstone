@@ -210,3 +210,206 @@ class TestScopeIsolation:
         ws2_only = list_structured_memories(scope="workstream", scope_id="ws2")
         assert len(ws2_only) == 1
         assert ws2_only[0]["name"] == "ws2_note"
+
+
+class TestSanitizeErrorText:
+    """Verify error-text sanitisation strips credentials and caps length.
+
+    Pairs with the ``persist_last_error`` writer — every persisted
+    string flows through ``sanitize_error_text`` so a misconfigured
+    provider URL or a quoted response body can't park credentials in
+    storage where the coordinator LLM later inhales them via the
+    inspect/wait surface.
+    """
+
+    def test_strips_url_userinfo(self):
+        from turnstone.core.memory import sanitize_error_text
+
+        # Misconfigured OPENAI_BASE_URL → httpx ConnectError carries
+        # the userinfo verbatim in str(exc).
+        msg = "ConnectError: connection failed to https://user:hunter2@api.example.com/v1/chat"
+        assert "hunter2" not in sanitize_error_text(msg)
+        assert "https://***@api.example.com" in sanitize_error_text(msg)
+
+    def test_strips_url_userinfo_http_too(self):
+        from turnstone.core.memory import sanitize_error_text
+
+        msg = "RequestError on http://admin:s3cret@internal.host/path"
+        assert "s3cret" not in sanitize_error_text(msg)
+
+    def test_redacts_openai_keys(self):
+        from turnstone.core.memory import sanitize_error_text
+
+        msg = (
+            "AuthenticationError: invalid api key sk-proj-AbCdEfGhIjKlMnOpQrStUv "
+            "(echoed from request body)"
+        )
+        out = sanitize_error_text(msg)
+        assert "sk-proj-AbCdEfGhIjKlMnOpQrStUv" not in out
+        assert "[redacted]" in out
+
+    def test_redacts_bearer_tokens(self):
+        from turnstone.core.memory import sanitize_error_text
+
+        msg = "401 Unauthorized — Bearer eyJabcDEFghiJKLmnoPQRstuVWX rejected"
+        out = sanitize_error_text(msg)
+        assert "eyJabcDEFghiJKLmnoPQRstuVWX" not in out
+
+    def test_redacts_github_tokens(self):
+        from turnstone.core.memory import sanitize_error_text
+
+        msg = "git push failed: ghp_ABCDEFGHIJKLMNOPQRST not authorized"
+        out = sanitize_error_text(msg)
+        assert "ghp_ABCDEFGHIJKLMNOPQRST" not in out
+
+    def test_redacts_aws_access_keys(self):
+        from turnstone.core.memory import sanitize_error_text
+
+        msg = "S3 error: signature mismatch for AKIAIOSFODNN7EXAMPLE"
+        out = sanitize_error_text(msg)
+        assert "AKIAIOSFODNN7EXAMPLE" not in out
+
+    def test_caps_length(self):
+        from turnstone.core.memory import LAST_ERROR_MAX_LEN, sanitize_error_text
+
+        msg = "X" * (LAST_ERROR_MAX_LEN * 2)
+        out = sanitize_error_text(msg)
+        assert len(out) <= LAST_ERROR_MAX_LEN
+        # Truncation marker preserved.
+        assert out.endswith("...")
+
+    def test_passes_through_clean_text(self):
+        from turnstone.core.memory import sanitize_error_text
+
+        msg = "TimeoutError: provider did not respond within 60s"
+        assert sanitize_error_text(msg) == msg
+
+    def test_handles_empty(self):
+        from turnstone.core.memory import sanitize_error_text
+
+        assert sanitize_error_text("") == ""
+
+
+class TestPersistLastError:
+    """Direct unit tests for the writer-side helper.
+
+    The reader-side tests in test_coordinator_client.py write to storage
+    via the raw backend, so the writer's contract — sanitize, no-op on
+    empty inputs, swallow storage failures, use the published constant
+    key — is unexercised without these.
+    """
+
+    def test_round_trip_uses_constant_key(self, tmp_db):
+        from turnstone.core.memory import (
+            LAST_ERROR_CONFIG_KEY,
+            load_last_error,
+            persist_last_error,
+            register_workstream,
+        )
+
+        # Pre-register a workstream so save_workstream_config has somewhere
+        # to land — workstream_config rows reference the workstreams table.
+        register_workstream("ws-1", user_id="u1")
+
+        persist_last_error("ws-1", "TimeoutError: provider stalled")
+        assert load_last_error("ws-1") == "TimeoutError: provider stalled"
+
+        # The persisted row uses the published constant key — pinning
+        # this catches future drift between the writer and the
+        # coordinator_client.py readers that import the same constant.
+        from turnstone.core.memory import load_workstream_config
+
+        cfg = load_workstream_config("ws-1")
+        assert LAST_ERROR_CONFIG_KEY in cfg
+
+    def test_sanitises_before_persist(self, tmp_db):
+        from turnstone.core.memory import (
+            load_last_error,
+            persist_last_error,
+            register_workstream,
+        )
+
+        register_workstream("ws-1", user_id="u1")
+        persist_last_error("ws-1", "ConnectError: https://user:secret@host/")
+        stored = load_last_error("ws-1")
+        assert "secret" not in stored
+        assert "https://***@host/" in stored
+
+    def test_noop_on_empty_ws_id(self, tmp_db):
+        from turnstone.core.memory import persist_last_error
+
+        # Must not raise; must not write anywhere observable.
+        persist_last_error("", "anything")  # no-op
+
+    def test_noop_on_empty_err_msg(self, tmp_db):
+        from turnstone.core.memory import (
+            load_last_error,
+            persist_last_error,
+            register_workstream,
+        )
+
+        register_workstream("ws-1", user_id="u1")
+        persist_last_error("ws-1", "")
+        # Empty err_msg is a no-op — the row stays absent rather than
+        # being upserted with an empty string.
+        assert load_last_error("ws-1") == ""
+
+    def test_swallows_storage_failure(self, tmp_db, monkeypatch):
+        """A storage failure must not propagate — error surfacing is
+        advisory, not safety-critical.  The exception path of a worker
+        thread already has enough trouble without this."""
+        from turnstone.core import memory as memory_mod
+        from turnstone.core.memory import persist_last_error
+
+        class _BoomStorage:
+            def save_workstream_config(self, *_args, **_kw):
+                raise RuntimeError("simulated storage failure")
+
+        monkeypatch.setattr(memory_mod, "get_storage", lambda: _BoomStorage())
+        # Must not raise.
+        persist_last_error("ws-1", "TimeoutError: x")
+
+
+class TestClearLastError:
+    """Verify clear_last_error wipes the row idempotently."""
+
+    def test_clears_existing(self, tmp_db):
+        from turnstone.core.memory import (
+            clear_last_error,
+            load_last_error,
+            persist_last_error,
+            register_workstream,
+        )
+
+        register_workstream("ws-1", user_id="u1")
+        persist_last_error("ws-1", "RuntimeError: boom")
+        assert load_last_error("ws-1") == "RuntimeError: boom"
+        clear_last_error("ws-1")
+        assert load_last_error("ws-1") == ""
+
+    def test_clear_preserves_other_config_keys(self, tmp_db):
+        """clear_last_error must not delete sibling config rows
+        (close_reason, tasks).  It writes an empty string to the
+        last_error key only — INSERT OR REPLACE per key, no row-wide
+        delete."""
+        from turnstone.core.memory import (
+            clear_last_error,
+            load_workstream_config,
+            persist_last_error,
+            register_workstream,
+            save_workstream_config,
+        )
+
+        register_workstream("ws-1", user_id="u1")
+        save_workstream_config("ws-1", {"close_reason": "user closed"})
+        persist_last_error("ws-1", "RuntimeError: boom")
+
+        clear_last_error("ws-1")
+        cfg = load_workstream_config("ws-1")
+        # close_reason untouched.
+        assert cfg.get("close_reason") == "user closed"
+
+    def test_noop_on_empty_ws_id(self, tmp_db):
+        from turnstone.core.memory import clear_last_error
+
+        clear_last_error("")  # must not raise

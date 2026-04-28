@@ -84,7 +84,7 @@ class TestToolsMetadata:
     def test_coordinator_tools_count(self):
         from turnstone.core.tools import COORDINATOR_TOOLS
 
-        assert len(COORDINATOR_TOOLS) == 13
+        assert len(COORDINATOR_TOOLS) == 14
         assert {t["function"]["name"] for t in COORDINATOR_TOOLS} == {
             "spawn_workstream",
             "spawn_batch",
@@ -99,6 +99,10 @@ class TestToolsMetadata:
             "list_skills",
             "tasks",
             "wait_for_workstream",
+            # ``memory`` is dual-kind (coordinator: true + interactive: true)
+            # so coords can persist orchestration context for their children
+            # via the new ``coordinator`` scope.
+            "memory",
         }
 
     def test_auto_approve_sets_match(self):

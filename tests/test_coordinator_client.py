@@ -1130,6 +1130,37 @@ def test_inspect_omits_close_reason_when_absent(populated_storage):
     assert "close_reason" not in result
 
 
+def test_inspect_surfaces_last_error_when_state_is_error(populated_storage):
+    """A child that crashed (e.g. provider 4xx after retry exhaustion)
+    has its exception text persisted to workstream_config.last_error
+    by the worker-thread error path; inspect surfaces it for terminal
+    error rows so the coordinator can triage without parsing the
+    assistant tail."""
+    populated_storage.update_workstream_state("child-a", "error")
+    populated_storage.save_workstream_config(
+        "child-a",
+        {"last_error": "AuthenticationError: invalid api key"},
+    )
+    client = _make_read_client(populated_storage)
+    result = client.inspect("child-a")
+    assert result.get("last_error") == "AuthenticationError: invalid api key"
+
+
+def test_inspect_omits_last_error_for_non_error_terminal_states(populated_storage):
+    """A historic last_error from an earlier failed turn that was later
+    closed cleanly must NOT surface on the close — the coord would
+    misread the close as an error close.  Gating on state=='error'
+    keeps the surface honest."""
+    populated_storage.update_workstream_state("child-a", "closed")
+    populated_storage.save_workstream_config(
+        "child-a",
+        {"last_error": "stale error from a previous failed turn"},
+    )
+    client = _make_read_client(populated_storage)
+    result = client.inspect("child-a")
+    assert "last_error" not in result
+
+
 def test_inspect_skips_workstream_config_read_for_live_workstreams(populated_storage, monkeypatch):
     """Hot-path optimisation: live (non-terminal) workstreams must NOT
     pay the per-inspect load_workstream_config round-trip.  close_reason
@@ -1492,6 +1523,39 @@ def test_wait_for_workstream_error_with_no_output_returns_sentinel(populated_sto
     assert snap["state"] == "error"
     assert snap["message"] == "(no recent assistant output)"
     assert snap["truncated"] is False
+
+
+def test_wait_for_workstream_error_prefers_persisted_last_error(populated_storage):
+    """When the worker thread persists ``last_error`` on a crash (e.g.
+    provider 429 after retry exhaustion, model misconfig), the error
+    text wins over the assistant tail — the actual cause is more
+    actionable than a half-finished prior turn."""
+    populated_storage.update_workstream_state("child-a", "error")
+    populated_storage.save_message("child-a", "assistant", "partial output before crash")
+    populated_storage.save_workstream_config(
+        "child-a",
+        {"last_error": "RateLimitError: 429 too many requests after 5 retries"},
+    )
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    assert snap["state"] == "error"
+    assert snap["message"] == "RateLimitError: 429 too many requests after 5 retries"
+    assert snap["truncated"] is False
+
+
+def test_wait_for_workstream_error_falls_back_to_assistant_when_no_last_error(populated_storage):
+    """Legacy / pre-fix error rows (state=error, no last_error config)
+    keep the existing assistant-tail behaviour — the upgrade is
+    additive."""
+    populated_storage.update_workstream_state("child-a", "error")
+    populated_storage.save_message("child-a", "user", "hi")
+    populated_storage.save_message("child-a", "assistant", "partial output before crash")
+    # Note: no save_workstream_config call.
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    assert snap["message"] == "partial output before crash"
 
 
 def test_wait_for_workstream_closed_returns_sentinel(populated_storage):

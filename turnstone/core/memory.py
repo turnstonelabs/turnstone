@@ -11,6 +11,7 @@ rather than silently swallowed.
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Any
 
 import sqlalchemy as sa
@@ -412,6 +413,123 @@ def load_workstream_config(ws_id: str) -> dict[str, str]:
     except Exception:
         log.warning("Failed to load workstream config ws=%s", ws_id, exc_info=True)
         return {}
+
+
+# -- Workstream last_error ---------------------------------------------------
+#
+# Worker-thread exception text persisted under workstream_config so the
+# coordinator's ``inspect_workstream`` and ``wait_for_workstream`` tools
+# can surface the actual cause (provider 4xx/5xx after retries, model
+# misconfig, MCP outage, etc.) instead of falling back to the
+# assistant-tail "(no recent assistant output)" sentinel.
+
+# Single source of truth for the workstream_config key — readers in
+# ``turnstone.console.coordinator_client`` import this so a future rename
+# can't desync writer and readers.
+LAST_ERROR_CONFIG_KEY = "last_error"
+
+# Hard cap on persisted error text. Provider error bodies are sometimes
+# multi-KiB JSON blobs (full request echo + headers); without a cap one
+# such error per workstream would bloat workstream_config and the model
+# prompt the coord LLM ingests on inspect.  1024 chars matches the
+# practical "useful for triage" length while staying well under the
+# WAIT_MESSAGE_MAX_BYTES (6 KiB) cap so the truncate happens here at
+# write time, not later at the wait surface.
+LAST_ERROR_MAX_LEN = 1024
+
+
+# Mask URL userinfo so a misconfigured ``https://user:pass@host`` base URL
+# doesn't leak credentials when httpx wraps it into ConnectError.__str__.
+_URL_USERINFO_PATTERN = re.compile(r"(https?://)[^/@\s]+@", re.IGNORECASE)
+
+# Common secret-shaped substrings.  These are conservative — false positives
+# are merely cosmetic, but a missed match is a real credential in storage.
+_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"sk-[A-Za-z0-9_\-]{16,}"),
+    re.compile(r"Bearer\s+[A-Za-z0-9._\-]{16,}", re.IGNORECASE),
+    re.compile(r"ghp_[A-Za-z0-9]{16,}"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{16,}"),
+    re.compile(r"AKIA[A-Z0-9]{16}"),
+)
+
+
+def sanitize_error_text(text: str, *, max_len: int = LAST_ERROR_MAX_LEN) -> str:
+    """Strip credentials and cap length so storage and the coord LLM
+    don't ingest provider-error secrets verbatim.
+
+    - URL userinfo (``https://user:pass@host``) → ``https://***@host``.
+    - Common secret prefixes (sk-, Bearer, ghp_, github_pat_, AKIA) →
+      ``[redacted]``.
+    - Output truncated to ``max_len`` chars from the START (the lead is
+      usually more informative than the tail).
+
+    Sanitisation is best-effort defence-in-depth — pairs with redaction
+    at the provider boundary, doesn't replace it.  Operators who care
+    deeply should also configure their provider SDKs to redact at log
+    time.
+    """
+    if not text:
+        return text
+    cleaned = _URL_USERINFO_PATTERN.sub(r"\1***@", text)
+    for pat in _SECRET_PATTERNS:
+        cleaned = pat.sub("[redacted]", cleaned)
+    if len(cleaned) > max_len:
+        cleaned = cleaned[: max_len - 3] + "..."
+    return cleaned
+
+
+def persist_last_error(ws_id: str, err_msg: str) -> None:
+    """Persist (sanitized) exception text so the coordinator's inspect /
+    wait_for_workstream can surface it on the next poll.
+
+    Best-effort: storage failures log + swallow.  No-op when ``ws_id``
+    or ``err_msg`` are empty.  Sanitization is applied unconditionally —
+    no caller currently has a use for the raw text in storage, and a
+    bug in a future caller that forgot to sanitize would silently leak
+    credentials.
+    """
+    if not ws_id or not err_msg:
+        return
+    sanitized = sanitize_error_text(err_msg)
+    try:
+        get_storage().save_workstream_config(ws_id, {LAST_ERROR_CONFIG_KEY: sanitized})
+    except Exception:
+        log.warning("Failed to persist last_error ws=%s", ws_id, exc_info=True)
+
+
+def clear_last_error(ws_id: str) -> None:
+    """Clear the persisted ``last_error`` row.
+
+    Called on successful recovery (state transitions from ``error`` back
+    to ``running`` or ``idle``) so a once-leaked exception body doesn't
+    persist for the workstream lifetime.  Writes an empty string rather
+    than deleting the row so the upsert idiom matches every other
+    workstream_config writer (``close_reason``, ``tasks``); other keys
+    on the row survive.
+    """
+    if not ws_id:
+        return
+    try:
+        get_storage().save_workstream_config(ws_id, {LAST_ERROR_CONFIG_KEY: ""})
+    except Exception:
+        log.warning("Failed to clear last_error ws=%s", ws_id, exc_info=True)
+
+
+def load_last_error(ws_id: str) -> str:
+    """Return the persisted ``last_error`` for ``ws_id`` or empty string.
+
+    Storage failures and missing rows both collapse to ``""`` so callers
+    can treat empty as "no error to surface".
+    """
+    if not ws_id:
+        return ""
+    try:
+        cfg = get_storage().load_workstream_config(ws_id) or {}
+    except Exception:
+        log.warning("Failed to load last_error ws=%s", ws_id, exc_info=True)
+        return ""
+    raw = cfg.get(LAST_ERROR_CONFIG_KEY)
+    return str(raw) if raw else ""
 
 
 # -- Skills -------------------------------------------------------------------

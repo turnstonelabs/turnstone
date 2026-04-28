@@ -308,7 +308,7 @@ class CoordinatorAdapter:
         def _run() -> None:
             try:
                 session.send(message, attachments=_attachments, send_id=_send_id)
-            except Exception as exc:
+            except Exception:
                 # Unreserve any attachments we soft-locked for this
                 # send_id so the rows return to pending and don't stay
                 # locked forever after a worker crash. Mirrors the
@@ -327,32 +327,14 @@ class CoordinatorAdapter:
                             exc_info=True,
                         )
                 log.exception("coord_adapter.worker_failed ws=%s", ws_ref.id[:8])
-                # Surface the failure to the coordinator's SSE stream
-                # so the operator sees what broke instead of a bare
-                # "error" badge — most common cause is a model-alias
-                # misconfig (wrong provider for the model) which the
-                # raw traceback narrows down quickly.
-                ui = ws_ref.ui
-                if ui is not None and hasattr(ui, "on_error"):
-                    try:
-                        ui.on_error(f"{type(exc).__name__}: {exc}")
-                    except Exception:
-                        log.debug(
-                            "coord_adapter.on_error_dispatch_failed ws=%s",
-                            ws_ref.id[:8],
-                            exc_info=True,
-                        )
-                # Also mark the workstream state=error so the cluster
-                # fan-out + dashboard reflect the failure.
-                if ui is not None and hasattr(ui, "on_state_change"):
-                    try:
-                        ui.on_state_change(WorkstreamState.ERROR.value)
-                    except Exception:
-                        log.debug(
-                            "coord_adapter.error_state_update_failed ws=%s",
-                            ws_ref.id[:8],
-                            exc_info=True,
-                        )
+                # ``session.send()`` already surfaced the failure to the
+                # SSE stream (``ui.on_error``), persisted the sanitized
+                # exception text into ``workstream_config.last_error``
+                # for the inspecting parent coord, and emitted state=
+                # error for the cluster fan-out / dashboard via
+                # :meth:`ChatSession._record_fatal_error`.  The adapter
+                # owns ONLY the worker-level cleanup (attachments,
+                # logging) above.
 
         def _enqueue() -> None:
             # ``queue_message`` takes attachment *ids* + ``queue_msg_id``

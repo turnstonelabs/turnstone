@@ -131,6 +131,13 @@ def test_coordinator_session_uses_coordinator_tools(coord_session):
         "list_skills",
         "tasks",
         "wait_for_workstream",
+        # Memory is dual-kind (coordinator: true + interactive: true) so
+        # the coord can persist orchestration context for its children
+        # via the ``coordinator`` scope. The system message preamble's
+        # "use memory(...)" hint is gated on the tool being in scope, so
+        # without this the model would see memories listed but no tool
+        # to act on them.
+        "memory",
     }
     # Sub-agent tool sets are zeroed on coordinator sessions.
     assert sess._task_tools == []

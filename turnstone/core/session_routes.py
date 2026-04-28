@@ -2578,20 +2578,21 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
                 if ws.worker_thread is me:
                     _emit_ui("on_stream_end")
                     _emit_ui("on_state_change", "idle")
-            except Exception as exc:
+            except Exception:
                 # Release the reservation so attachments don't stay
                 # soft-locked forever on a worker crash before the
                 # consume step. Idempotent: once consume cleared the
                 # token, a follow-up unreserve is a no-op.
                 _release_reservation_on_fail()
                 if ws.worker_thread is me:
-                    # ``type(exc).__name__: msg`` carries the exception
-                    # class — coord operators triaging worker failures
-                    # rely on the class name to disambiguate (model-
-                    # alias misconfig vs. tool-policy reject vs. etc.).
-                    _emit_ui("on_error", f"{type(exc).__name__}: {exc}")
+                    # ``session.send()`` already fired ``on_error``
+                    # (with sanitized text), persisted ``last_error``,
+                    # and emitted ``state='error'`` via
+                    # :meth:`ChatSession._record_fatal_error` before
+                    # re-raising.  The route handler only needs the
+                    # streaming-cleanup hook the worker contract owes
+                    # the UI listeners.
                     _emit_ui("on_stream_end")
-                    _emit_ui("on_state_change", "error")
 
         ok = session_worker.send(
             ws,

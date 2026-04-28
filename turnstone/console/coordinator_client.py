@@ -36,6 +36,7 @@ import httpx
 
 from turnstone.core.auth import JWT_AUD_CONSOLE, create_jwt
 from turnstone.core.log import get_logger
+from turnstone.core.memory import LAST_ERROR_CONFIG_KEY
 from turnstone.core.workstream import WorkstreamKind
 
 # ---------------------------------------------------------------------------
@@ -1477,8 +1478,9 @@ class CoordinatorClient:
             "verdicts": _serialize_verdicts(verdicts),
         }
         # Surface the operator-supplied close reason (persisted via
-        # workstream_config by the server's close handler).  Only the
-        # terminal-state shapes can carry a close_reason — gating on
+        # workstream_config by the server's close handler) and any
+        # last-error text persisted by the worker-thread error path.
+        # Only the terminal-state shapes can carry these — gating on
         # state avoids a per-inspect DB read on the hot live-child path.
         if full.get("state") in {"closed", "error", "deleted"}:
             try:
@@ -1489,6 +1491,18 @@ class CoordinatorClient:
             close_reason = cfg.get("close_reason")
             if close_reason:
                 result["close_reason"] = close_reason
+            last_error = cfg.get(LAST_ERROR_CONFIG_KEY)
+            if last_error and full.get("state") == "error":
+                # Only attach on error rows — closed/deleted may carry a
+                # historic last_error from a prior failed turn that was
+                # later resolved, and surfacing it would mislead the
+                # coordinator into thinking the close was an error close.
+                # The result key is the public API surface read by the
+                # coord LLM via inspect_workstream — match the storage
+                # key for symmetry, but don't import a constant that
+                # would couple internal storage layout to the model
+                # contract.
+                result["last_error"] = last_error
         live = self._fetch_cluster_live(ws_id)
         if live is not None:
             result["live"] = live
@@ -1689,6 +1703,33 @@ def _last_assistant_text(storage: Any, ws_id: str) -> str | None:
     return ""
 
 
+def _load_last_error(storage: Any, ws_id: str) -> str:
+    """Return the persisted ``last_error`` for ``ws_id`` or empty string.
+
+    Worker threads write the (sanitized) exception text into
+    ``workstream_config`` when a child enters the ``error`` terminal
+    state (see :func:`turnstone.core.memory.persist_last_error`);
+    reading it back lets ``wait_for_workstream`` and
+    ``inspect_workstream`` surface the actual cause (provider 4xx/5xx
+    after retries, model misconfig, etc.) instead of the assistant-tail
+    sentinel.
+
+    Reads via the per-storage handle the client was constructed with
+    rather than ``turnstone.core.memory.load_last_error`` (which uses
+    the process-global ``get_storage()``) so the wait path participates
+    in the test harness's per-call storage isolation.  Storage failures
+    collapse to empty so the caller can fall through to the existing
+    assistant-tail / sentinel path.
+    """
+    try:
+        cfg = storage.load_workstream_config(ws_id) or {}
+    except Exception:
+        log.debug("coord_client.wait.load_last_error_failed ws=%s", ws_id, exc_info=True)
+        return ""
+    raw = cfg.get(LAST_ERROR_CONFIG_KEY)
+    return str(raw) if raw else ""
+
+
 def _wait_message_for(
     storage: Any,
     ws_id: str,
@@ -1705,11 +1746,17 @@ def _wait_message_for(
 
     Branching by ``state``:
 
-    - ``idle`` / ``error`` — last assistant message text from the
-      conversation tail, or a hedged sentinel when the tail has no
-      assistant content (covers both 'never emitted a turn' and 'last
-      turn is buried beyond the tail window' — the sentinel doesn't
-      claim either way).
+    - ``idle`` — last assistant message text from the conversation
+      tail, or a hedged sentinel when the tail has no assistant
+      content (covers both 'never emitted a turn' and 'last turn is
+      buried beyond the tail window' — the sentinel doesn't claim
+      either way).
+    - ``error`` — persisted ``last_error`` (provider exception after
+      retries, model misconfig, etc.) when present, falling back to
+      the assistant tail otherwise.  An API error after retry
+      exhaustion is more actionable than the prior assistant turn,
+      and the prior shape's "(no recent assistant output)" sentinel
+      hid that signal entirely.
     - ``closed`` / ``denied`` — short status sentinel.  No
       message-history read because there's nothing meaningful to
       return — a partial last message could be misleading mid-thought.
@@ -1728,6 +1775,13 @@ def _wait_message_for(
         return _WAIT_SENTINEL_DENIED, False
     if state == "closed":
         return _WAIT_SENTINEL_CLOSED, False
+    if state == "error":
+        last_error = _load_last_error(storage, ws_id)
+        if last_error:
+            return _truncate_wait_message(last_error, max_bytes)
+        # No persisted error — fall through to the assistant-tail walk
+        # below so a legacy / pre-fix error row still surfaces SOMETHING
+        # (the last assistant turn before the failure, if any).
     if state in ("idle", "error"):
         text = _last_assistant_text(storage, ws_id)
         if text is None:
