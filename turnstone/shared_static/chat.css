@@ -1152,3 +1152,82 @@
     font-size: 12px;
   }
 }
+
+/* ==========================================================================
+   Per-workstream status bar — pinned above the composer.
+   Rendered by both the interactive pane (ui/static/app.js) and the
+   coordinator dashboard (console/static/coordinator/coordinator.js).
+   Both consume the same on_status SSE event shape (see
+   turnstone/core/session_ui_base.py SessionUI.on_status).
+   ========================================================================== */
+.ws-status-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 16px;
+  background: var(--bg-surface);
+  border-top: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--fg-dim);
+  flex-shrink: 0;
+  min-height: 22px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+  overflow: hidden;
+  transition:
+    background 0.3s,
+    border-color 0.3s;
+}
+.ws-sb-model {
+  font-family: var(--font-ui);
+  font-weight: 500;
+  color: var(--accent);
+  font-size: 10px;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ws-sb-tokens {
+  color: var(--fg-dim);
+  white-space: nowrap;
+}
+.ws-sb-tools {
+  color: var(--fg-dim);
+  white-space: nowrap;
+}
+.ws-sb-turns {
+  color: var(--fg-dim);
+  white-space: nowrap;
+  margin-left: auto;
+}
+.ws-status-bar.ws-sb-warn .ws-sb-tokens {
+  color: var(--yellow);
+  font-weight: 600;
+}
+.ws-status-bar.ws-sb-danger .ws-sb-tokens {
+  color: var(--red);
+  font-weight: 600;
+  text-shadow: 0 0 4px var(--red-glow);
+}
+[data-theme="light"] .ws-status-bar.ws-sb-danger .ws-sb-tokens {
+  text-shadow: none;
+}
+.ws-status-bar.ws-sb-disconnected {
+  border-top: 2px solid var(--red);
+  background: rgba(248, 113, 113, 0.04);
+}
+.ws-status-bar.ws-sb-disconnected .ws-sb-tokens {
+  color: var(--red);
+}
+.ws-status-bar.ws-sb-disconnected .ws-sb-model,
+.ws-status-bar.ws-sb-disconnected .ws-sb-tools,
+.ws-status-bar.ws-sb-disconnected .ws-sb-turns {
+  opacity: 0.4;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ws-status-bar {
+    transition: none;
+  }
+}

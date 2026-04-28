@@ -58,6 +58,7 @@ from turnstone.core.metrics import metrics as _metrics
 from turnstone.core.ratelimit import resolve_client_ip
 from turnstone.core.session import ChatSession, GenerationCancelled, SessionUI  # noqa: F401
 from turnstone.core.session_manager import SessionManager
+from turnstone.core.session_replay import session_replay_preamble
 from turnstone.core.session_routes import (
     AttachmentUploadHelpers,
     SessionEndpointConfig,
@@ -668,39 +669,10 @@ def _interactive_events_replay(
         # session can still be detached on the close-then-reopen path.
         return
 
-    # Connected event — model + skip-permissions ride here so the
-    # client can populate the per-tab status bar before any history
-    # arrives.
-    yield {
-        "type": "connected",
-        "model": session.model,
-        "model_alias": session.model_alias or "",
-        "skip_permissions": getattr(ui, "auto_approve", False),
-    }
-
-    # Status replay — only when last_usage exists so the client can
-    # populate the token / context-window bar on resume.
-    last_usage = session._last_usage
-    if last_usage is not None:
-        total_tok = last_usage["prompt_tokens"] + last_usage["completion_tokens"]
-        cw = session.context_window
-        pct = total_tok / cw * 100 if cw > 0 else 0
-        with ui._ws_lock:
-            turn_tool_calls = ui._ws_turn_tool_calls
-            turn_count = ui._ws_messages
-        yield {
-            "type": "status",
-            "prompt_tokens": last_usage["prompt_tokens"],
-            "completion_tokens": last_usage["completion_tokens"],
-            "total_tokens": total_tok,
-            "context_window": cw,
-            "pct": round(pct, 1),
-            "effort": session.reasoning_effort,
-            "cache_creation_tokens": last_usage.get("cache_creation_tokens", 0),
-            "cache_read_tokens": last_usage.get("cache_read_tokens", 0),
-            "tool_calls_this_turn": turn_tool_calls,
-            "turn_count": turn_count,
-        }
+    # Connected + status preamble — same shape coord replays use; the
+    # shared helper keeps the two surfaces from drifting on a future
+    # field add.
+    yield from session_replay_preamble(session, ui)
 
     # History replay — pending-approval flag rides on the last
     # assistant entry's tool_calls so the client renders them as

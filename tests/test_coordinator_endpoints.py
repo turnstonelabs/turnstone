@@ -1498,25 +1498,102 @@ def test_cancel_idle_workstream_does_not_broadcast_approval_resolved(storage):
 # ---------------------------------------------------------------------------
 
 
+from tests._replay_helpers import make_replay_mocks as _make_coord_replay_mocks  # noqa: E402
+
+
+def test_coord_events_replay_yields_connected_first():
+    """Pre-status-bar coord replay only re-injected pending_approval +
+    pending_plan_review. Post-status-bar parity with interactive
+    yields ``connected`` first so the dashboard's status bar populates
+    the model cell before any history arrives — mirrors the
+    interactive replay (turnstone/server.py:_interactive_events_replay)."""
+    from turnstone.console.server import _coord_events_replay
+
+    ws, ui, request = _make_coord_replay_mocks()
+    out = list(_coord_events_replay(ws, ui, request))
+    assert out[0]["type"] == "connected"
+    assert out[0]["model"] == "gpt-5"
+    assert out[0]["model_alias"] == "default"
+    assert out[0]["skip_permissions"] is False
+
+
+def test_coord_events_replay_includes_status_only_when_last_usage_present():
+    """The ``status`` event populates the per-tab token-usage bar on
+    resume. Skipped when ``session._last_usage`` is None (a freshly-
+    created coordinator that hasn't completed a turn) — matches
+    interactive behaviour."""
+    from turnstone.console.server import _coord_events_replay
+
+    ws, ui, request = _make_coord_replay_mocks()
+    out = list(_coord_events_replay(ws, ui, request))
+    assert "status" not in {ev["type"] for ev in out}
+
+
+def test_coord_events_replay_status_payload_shape():
+    """When ``last_usage`` exists, the replayed ``status`` event carries
+    every field the dashboard's updateStatusBar() reads — same shape
+    SessionUI.on_status emits live."""
+    from turnstone.console.server import _coord_events_replay
+
+    ws, ui, request = _make_coord_replay_mocks(
+        last_usage={
+            "prompt_tokens": 40000,
+            "completion_tokens": 6310,
+            "cache_creation_tokens": 100,
+            "cache_read_tokens": 50,
+        },
+        _ws_turn_tool_calls=3,
+        _ws_messages=7,
+    )
+    out = list(_coord_events_replay(ws, ui, request))
+    status = next(ev for ev in out if ev["type"] == "status")
+    assert status["prompt_tokens"] == 40000
+    assert status["completion_tokens"] == 6310
+    assert status["total_tokens"] == 46310
+    assert status["context_window"] == 100000
+    assert status["pct"] == round(46310 / 100000 * 100, 1)
+    assert status["effort"] == "medium"
+    assert status["tool_calls_this_turn"] == 3
+    assert status["turn_count"] == 7
+    assert status["cache_creation_tokens"] == 100
+    assert status["cache_read_tokens"] == 50
+
+
+def test_coord_events_replay_skips_session_block_when_no_session():
+    """Detached session (close-then-reopen race) — replay skips the
+    connected/status preamble and falls through to the pending-prompt
+    branches.  Mirrors interactive's defensive guard at
+    turnstone/server.py:665."""
+    from turnstone.console.server import _coord_events_replay
+
+    ws, ui, _request = _make_coord_replay_mocks()
+    ws.session = None
+    out = list(_coord_events_replay(ws, ui, MagicMock()))
+    assert out == []
+
+
 def test_coord_events_replay_yields_pending_approval_then_pending_plan():
-    """The lifted coord ``events_replay`` callback yields two things
-    on a fresh SSE connect: pending approval (if any) + pending plan
+    """The lifted coord ``events_replay`` callback yields, after the
+    connected preamble: pending approval (if any) + pending plan
     review (if any). Pre-lift coord pushed both onto the listener
     queue via ``put_nowait``; the lift restructures as a generator
     the lifted body iterates and yields as ``data:`` lines, but the
     payload identity is preserved. Pure-read — never mutates ``ui``."""
     from turnstone.console.server import _coord_events_replay
 
-    ui = MagicMock()
-    ui._pending_approval = {"type": "approve_request", "items": []}
-    ui._pending_plan_review = {"type": "plan_review", "content": "..."}
-    ws = MagicMock()
-    request = MagicMock()
+    ws, ui, request = _make_coord_replay_mocks(
+        _pending_approval={"type": "approve_request", "items": []},
+        _pending_plan_review={"type": "plan_review", "content": "..."},
+    )
 
     out = list(_coord_events_replay(ws, ui, request))
-    # Order matters — the pre-lift body re-injected approval first.
-    assert out[0]["type"] == "approve_request"
-    assert out[1]["type"] == "plan_review"
+    types = [ev["type"] for ev in out]
+    # Status preamble is yielded first (no last_usage → no status); the
+    # pending-approval / plan ordering then matches the pre-lift body.
+    assert types[0] == "connected"
+    approve_idx = types.index("approve_request")
+    plan_idx = types.index("plan_review")
+    assert approve_idx < plan_idx
 
 
 def test_coord_events_replay_yields_cached_verdicts_after_pending_approval():
@@ -1526,71 +1603,59 @@ def test_coord_events_replay_yields_cached_verdicts_after_pending_approval():
     until the operator re-invokes the action — intent_verdict is a
     one-shot SSE event with no late-subscriber push. Mirrors the
     interactive replay path."""
-    import threading
-
     from turnstone.console.server import _coord_events_replay
 
-    ui = MagicMock()
-    ui._pending_approval = {
-        "type": "approve_request",
-        "items": [{"call_id": "c-1"}],
-    }
-    ui._pending_plan_review = None
-    ui._llm_verdicts = {
-        "c-1": {
-            "verdict_id": "v-1",
-            "call_id": "c-1",
-            "recommendation": "deny",
-            "risk_level": "high",
-        }
-    }
-    ui._ws_lock = threading.Lock()
-    ws = MagicMock()
-    request = MagicMock()
+    ws, ui, request = _make_coord_replay_mocks(
+        _pending_approval={
+            "type": "approve_request",
+            "items": [{"call_id": "c-1"}],
+        },
+        _llm_verdicts={
+            "c-1": {
+                "verdict_id": "v-1",
+                "call_id": "c-1",
+                "recommendation": "deny",
+                "risk_level": "high",
+            }
+        },
+    )
 
     out = list(_coord_events_replay(ws, ui, request))
-    # approve_request first, then any cached verdicts.
-    assert out[0]["type"] == "approve_request"
-    assert out[1]["type"] == "intent_verdict"
-    assert out[1]["verdict_id"] == "v-1"
-    assert out[1]["recommendation"] == "deny"
+    types = [ev["type"] for ev in out]
+    approve_idx = types.index("approve_request")
+    verdict_idx = types.index("intent_verdict")
+    assert approve_idx < verdict_idx
+    verdict = out[verdict_idx]
+    assert verdict["verdict_id"] == "v-1"
+    assert verdict["recommendation"] == "deny"
 
 
 def test_coord_events_replay_skips_verdict_replay_without_pending_approval():
     """Verdict replay rides on top of pending_approval — no prompt,
     no chip. Stale verdicts from a previously-resolved round must
     not surface on a fresh connect."""
-    import threading
-
     from turnstone.console.server import _coord_events_replay
 
-    ui = MagicMock()
-    ui._pending_approval = None
-    ui._pending_plan_review = None
-    # Stale entries — should NOT be replayed.
-    ui._llm_verdicts = {"old": {"verdict_id": "stale"}}
-    ui._ws_lock = threading.Lock()
-    ws = MagicMock()
-    request = MagicMock()
+    ws, ui, request = _make_coord_replay_mocks(
+        _llm_verdicts={"old": {"verdict_id": "stale"}},
+    )
 
     out = list(_coord_events_replay(ws, ui, request))
-    assert out == []
+    types = [ev["type"] for ev in out]
+    assert "intent_verdict" not in types
+    assert "approve_request" not in types
+    assert "plan_review" not in types
 
 
-def test_coord_events_replay_yields_nothing_when_no_pending():
-    """A workstream with no pending approval / plan review yields
-    an empty replay. The lifted body falls through to the live loop
-    immediately."""
+def test_coord_events_replay_yields_only_connected_when_no_pending():
+    """A workstream with a session but no pending approval / plan
+    review and no last_usage yields just the ``connected`` preamble.
+    The lifted body falls through to the live loop immediately after."""
     from turnstone.console.server import _coord_events_replay
 
-    ui = MagicMock()
-    ui._pending_approval = None
-    ui._pending_plan_review = None
-    ws = MagicMock()
-    request = MagicMock()
-
+    ws, ui, request = _make_coord_replay_mocks()
     out = list(_coord_events_replay(ws, ui, request))
-    assert out == []
+    assert [ev["type"] for ev in out] == ["connected"]
 
 
 def test_coord_events_returns_404_on_missing_ws(storage):

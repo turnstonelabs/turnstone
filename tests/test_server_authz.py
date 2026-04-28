@@ -859,53 +859,7 @@ class TestInteractiveCancelLifted:
         assert resp.json()["error"] == "No session"
 
 
-def _make_interactive_replay_mocks(**overrides: Any) -> tuple[Any, Any, Any]:
-    """Build (ws, ui, request) MagicMock triples for
-    ``_interactive_events_replay`` tests.
-
-    Defaults match a fresh workstream that hasn't completed a turn
-    (no last_usage, no pending prompts). Per-test overrides come in
-    as kwargs and are applied via setattr on the returned mocks.
-
-    Why a fixture: each test exercises 1-2 attribute variations
-    while the rest of the mock surface (model, model_alias,
-    auto_approve, _pending_approval, _pending_plan_review,
-    _ws_lock, etc.) stays uniform. Helper isolates the per-test
-    intent from the boilerplate.
-    """
-    import threading
-
-    session = MagicMock()
-    session.model = "gpt-5"
-    session.model_alias = "default"
-    session._last_usage = None
-    session.context_window = 100000
-    session.reasoning_effort = "medium"
-    session.messages = []
-    ui = MagicMock()
-    ui.auto_approve = False
-    ui._pending_approval = None
-    ui._pending_plan_review = None
-    ui._llm_verdicts = {}
-    ui._ws_lock = threading.Lock()
-    ui._ws_turn_tool_calls = 0
-    ui._ws_messages = 0
-    ws = MagicMock()
-    ws.session = session
-    request = MagicMock()
-
-    for key, value in overrides.items():
-        # Dotted keys ("session.model_alias") drill into the nested
-        # MagicMock; bare keys set on the ws/ui directly.
-        if "." in key:
-            head, tail = key.split(".", 1)
-            target = {"session": session, "ui": ui, "ws": ws, "request": request}[head]
-            setattr(target, tail, value)
-        elif hasattr(ui, key) or key.startswith(("_", "auto_")):
-            setattr(ui, key, value)
-        else:
-            setattr(ws, key, value)
-    return ws, ui, request
+from tests._replay_helpers import make_replay_mocks as _make_interactive_replay_mocks  # noqa: E402
 
 
 class TestInteractiveEventsLifted:

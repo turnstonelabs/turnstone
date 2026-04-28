@@ -54,6 +54,7 @@ from turnstone.core.auth import (
     require_permission,
 )
 from turnstone.core.rendezvous import NoAvailableNodeError
+from turnstone.core.session_replay import session_replay_preamble
 from turnstone.core.session_routes import (
     AttachmentUploadHelpers,
     CoordOnlyVerbHandlers,
@@ -2565,23 +2566,32 @@ def _audit_cancel_coordinator(
 
 
 def _coord_events_replay(
-    ws: Workstream,  # noqa: ARG001 — coord replay reads ui only
+    ws: Workstream,
     ui: Any,
     request: Request,  # noqa: ARG001 — coord replay doesn't need request context
 ) -> Iterable[dict[str, Any]]:
     """Initial SSE replay payload for coord ``events`` connections.
 
-    Pre-lift ``coordinator_events`` re-injected just two things on
-    connect: the pending approval prompt (if any) and the pending
-    plan-review (if any). The lifted ``make_events_handler`` body
-    delegates to this callback so the kind-specific shape stays in
-    this module. Coord doesn't replay ``connected``/``status``/
-    ``history`` because its dashboard fetches conversation history
-    via a separate ``/history`` endpoint and doesn't render the
-    per-tab status bar (those are interactive-UX-specific).
+    Yields, in order:
 
-    Pure read — never mutates ``ui``.
+    1. ``connected`` + optional ``status`` via the shared
+       :func:`turnstone.core.session_replay.session_replay_preamble`
+       so the dashboard's status bar populates before any live tick.
+       Same payload shape interactive uses.
+    2. Pending approval prompt (if any) and the cached LLM verdicts
+       that fired since it surfaced.  Without this replay a refresh
+       loses the judge chip on the pending approval until the
+       operator re-invokes the action.
+    3. Pending plan-review (if any).
+
+    Coord still skips conversation history — the dashboard fetches it
+    via a separate ``GET /history`` endpoint and doesn't want a
+    multi-MB inline replay on every reconnect.
+
+    Pure read — never mutates ``ui`` / ``ws`` / ``session``.
     """
+    yield from session_replay_preamble(ws.session, ui)
+
     pending_approval = getattr(ui, "_pending_approval", None)
     if pending_approval is not None:
         yield pending_approval

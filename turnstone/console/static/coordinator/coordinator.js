@@ -111,6 +111,18 @@
   const tasksCountEl = document.getElementById("coord-tasks-count");
   const tasksRefreshBtn = document.getElementById("coord-tasks-refresh");
 
+  // Status bar — model alias, token / context-window usage, tool calls
+  // this turn, conversation turn.  Driven by the connected + status
+  // SSE events; mirrors the interactive pane (ui/static/app.js).
+  const statusBarEl = document.getElementById("coord-status-bar");
+  const sbModelEl = document.getElementById("coord-sb-model");
+  const sbTokensEl = document.getElementById("coord-sb-tokens");
+  const sbToolsEl = document.getElementById("coord-sb-tools");
+  const sbTurnsEl = document.getElementById("coord-sb-turns");
+  let coordModel = "";
+  let coordModelAlias = "";
+  let lastStatusEvt = null;
+
   let pendingApprovalCallId = null;
   let evtSource = null;
   let reconnectAttempts = 0;
@@ -283,6 +295,63 @@
       "</strong>" +
       (item.preview ? "<pre>" + esc(item.preview) + "</pre>" : "");
     return appendMsg("tool", html, { label: label, callId: item.call_id });
+  }
+
+  // Build an appendToolCall-shaped item from a persisted assistant
+  // tool_call.  Live calls land here with header / preview already
+  // computed by ChatSession._prepare_tool; history replay never sees
+  // those (only `function.name` + `function.arguments`), so synthesise
+  // the same fields so the rendered row reads the same on reload.
+  //
+  // Header rules mirror what _prepare_tool produces for the common
+  // tools — bash gets a "$ <command>" header so the operator sees the
+  // shell line at a glance; everything else gets "<name>: <key=val …>"
+  // with values truncated.  The full pretty-printed args drop into the
+  // preview block underneath, capped at a few hundred chars to match
+  // the live preview's footprint.
+  function synthesizeHistoricalToolCall(name, callId, parsedArgs, argsRaw) {
+    let header = name;
+    let preview = "";
+    const argEntries =
+      parsedArgs && typeof parsedArgs === "object" && !Array.isArray(parsedArgs)
+        ? Object.entries(parsedArgs)
+        : null;
+    if (name === "bash" && argEntries && argEntries.length) {
+      const cmd = String(
+        parsedArgs.command || Object.values(parsedArgs)[0] || "",
+      );
+      header = "$ " + (cmd.length > 80 ? cmd.slice(0, 77) + "…" : cmd);
+      preview = cmd.length > 80 ? cmd : "";
+    } else if (argEntries && argEntries.length) {
+      const summary = argEntries
+        .slice(0, 3)
+        .map(([k, v]) => {
+          let valStr =
+            v == null ? "null" : typeof v === "string" ? v : JSON.stringify(v);
+          if (valStr.length > 60) valStr = valStr.slice(0, 57) + "…";
+          return k + "=" + valStr;
+        })
+        .join(" ");
+      header = name + ": " + summary;
+      try {
+        preview = JSON.stringify(parsedArgs, null, 2);
+      } catch (_) {
+        preview = argsRaw || "";
+      }
+      if (preview.length > 600) preview = preview.slice(0, 600) + "…";
+    } else if (argsRaw) {
+      // Malformed JSON or non-object args — show the raw payload
+      // truncated.  Matches the interactive replay's substring(0, 100)
+      // fallback at ui/static/app.js Pane.prototype.replayHistory.
+      header = name;
+      preview = argsRaw.length > 200 ? argsRaw.slice(0, 200) + "…" : argsRaw;
+    }
+    return {
+      call_id: callId,
+      func_name: name,
+      header: header,
+      preview: preview,
+    };
   }
 
   function appendToolResult(name, callId, output, isError) {
@@ -644,6 +713,26 @@
     if (edge && !next) queue.onIdleEdge();
   }
 
+  // Update the four-cell status bar from an on_status SSE event.
+  // Delegates formatting to the shared StatusBar.paint helper
+  // (shared_static/status_bar.js) so the interactive pane and this
+  // dashboard render identical thresholds + suffix rules.
+  function updateStatusBar(evt) {
+    if (!evt) return;
+    StatusBar.paint(
+      {
+        rootEl: statusBarEl,
+        modelEl: sbModelEl,
+        tokensEl: sbTokensEl,
+        toolsEl: sbToolsEl,
+        turnsEl: sbTurnsEl,
+      },
+      evt,
+      { alias: coordModelAlias, model: coordModel },
+    );
+    lastStatusEvt = evt;
+  }
+
   window.coordSend = function () {
     const text = composer.value;
     const trimmed = (text || "").trim();
@@ -892,6 +981,17 @@
     evtSource.onopen = function () {
       reconnectAttempts = 0;
       setSseStatus("live", "ok");
+      // Lift the disconnected dim treatment + restore the last known
+      // counters; the replay phase will overwrite with authoritative
+      // server-side values on the next yields.  When no prior status
+      // event has been seen (a fresh coord that disconnected before
+      // its first turn), the onerror branch wrote "Reconnecting…"
+      // into the tokens cell — reset to the placeholder so the dim
+      // copy doesn't persist past a successful reconnect when the
+      // session never produces a status tick.
+      statusBarEl.classList.remove("ws-sb-disconnected");
+      if (lastStatusEvt) updateStatusBar(lastStatusEvt);
+      else StatusBar.resetTokensPlaceholder(sbTokensEl);
       if (wasReconnecting) {
         // Replace-mode refresh: the server is authoritative after a
         // gap; any SSE-only rows the client accumulated before
@@ -926,6 +1026,9 @@
     };
     evtSource.onerror = function () {
       setSseStatus("disconnected", "err");
+      // Dim the status bar so a stale reading doesn't read as live.
+      statusBarEl.classList.add("ws-sb-disconnected");
+      sbTokensEl.textContent = "Reconnecting…";
       try {
         evtSource.close();
       } catch (_) {
@@ -1081,6 +1184,22 @@
         // events; prior routing to "tool" gave them accent-tinted tool
         // styling which mis-categorised them as tool calls.
         appendText("info", ev.message || "", { label: "info" });
+        break;
+      case "connected":
+        // First yield from _coord_events_replay — populates the
+        // status bar's model cell before any history arrives.  Also
+        // re-fires on every SSE reconnect because the replay phase
+        // runs unconditionally on subscribe.
+        coordModel = ev.model || "";
+        coordModelAlias = ev.model_alias || ev.model || "";
+        sbModelEl.textContent = coordModelAlias || coordModel || "—";
+        sbModelEl.title = coordModel || "";
+        break;
+      case "status":
+        // Live token / context / tool / turn counters.  Replayed once
+        // on reconnect when last_usage is available, then ticked by
+        // SessionUI.on_status on every turn.
+        updateStatusBar(ev);
         break;
       case "state_change":
         statusEl.textContent = ev.state || "";
@@ -2512,8 +2631,49 @@
       const hist = await getJSON(
         "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/history",
       );
+      // Map call_id → tool name resolved from the most recent
+      // assistant tool_calls.  Storage's `tool` rows carry only
+      // tool_call_id + content; the function name lives on the
+      // matching assistant entry — without this map every replayed
+      // tool result rendered with the literal label "tool", which
+      // looked like the tool calls had been replaced by raw JSON.
+      const toolNameByCallId = new Map();
       (hist.messages || []).forEach((m) => {
         const role = m.role || "tool";
+
+        // Assistant tool calls — render each as a synthesized
+        // appendToolCall row with a header derived from the persisted
+        // tool name + arguments, mirroring what the live preparer
+        // would have shown when the call was first issued.  Without
+        // this branch the assistant row was empty (content="") and
+        // the operator saw only the raw tool result below it.
+        if (
+          role === "assistant" &&
+          Array.isArray(m.tool_calls) &&
+          m.tool_calls.length
+        ) {
+          m.tool_calls.forEach((tc) => {
+            const fn = (tc && tc.function) || {};
+            const name = String(fn.name || "tool");
+            const callId = String((tc && tc.id) || "");
+            const argsRaw = String(fn.arguments || "");
+            let parsedArgs = null;
+            try {
+              parsedArgs = JSON.parse(argsRaw || "{}");
+            } catch (_) {
+              /* malformed — fall back to raw string in preview */
+            }
+            const item = synthesizeHistoricalToolCall(
+              name,
+              callId,
+              parsedArgs,
+              argsRaw,
+            );
+            if (callId) toolNameByCallId.set(callId, name);
+            appendToolCall(item);
+          });
+        }
+
         // User messages with attachments arrive as multipart list
         // content (text + image_url/document parts) and may carry an
         // ``_attachments_meta`` side-channel with display metadata.
@@ -2556,15 +2716,21 @@
             " " +
             noun;
         }
-        if (!content) return;
         if (role === "tool") {
-          appendToolResult(
-            m.tool_name || "tool",
-            m.tool_call_id || "",
-            content,
-            false,
-          );
+          // Tool result content can legitimately be empty (e.g. a
+          // tool that returned ""); still render it so the call_id
+          // pairing stays visible.  Resolve the tool name from the
+          // matching assistant tool_call so the label reads e.g.
+          // "bash" instead of "tool".
+          const callId = m.tool_call_id || "";
+          const toolName =
+            (callId && toolNameByCallId.get(callId)) || m.tool_name || "tool";
+          appendToolResult(toolName, callId, content || "", false);
         } else if (role === "assistant") {
+          // Empty content with tool_calls only means the assistant
+          // turn was just tool dispatch — the synthesized tool-call
+          // rows above already cover it; skip the empty bubble.
+          if (!content) return;
           // Run assistant content through the markdown pipeline
           // (renderMarkdown + post-render hljs / mermaid / KaTeX) so a
           // reconnect / page-reload renders the same way a live stream
@@ -2584,6 +2750,7 @@
             body.textContent = content;
           }
         } else {
+          if (!content) return;
           // user / reasoning / system / other roles render as plain
           // text on history replay — matches the live-streaming paths
           // (appendReasoningToken uses textContent; user/system are

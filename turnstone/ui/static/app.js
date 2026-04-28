@@ -613,7 +613,7 @@ Pane.prototype.handleEvent = function (evt) {
     case "connected":
       this.model = evt.model || "";
       this.modelAlias = evt.model_alias || evt.model || "";
-      this._sbModel.textContent = this.modelAlias || this.model || "";
+      this._sbModel.textContent = this.modelAlias || this.model || "—";
       this._sbModel.title = this.model || "";
       if (evt.skip_permissions) {
         var existing = document.querySelector(".skip-permissions-warning");
@@ -1493,31 +1493,17 @@ Pane.prototype.addErrorMessage = function (text) {
 };
 
 Pane.prototype.updateStatus = function (evt) {
-  this._sbModel.textContent = this.modelAlias || this.model || "";
-  this._sbModel.title = this.model || "";
-
-  var tokenText =
-    evt.total_tokens.toLocaleString() +
-    " / " +
-    evt.context_window.toLocaleString() +
-    " (" +
-    evt.pct +
-    "%)";
-  if (evt.effort && evt.effort !== "medium")
-    tokenText += " \u00b7 " + evt.effort;
-  if (evt.pct >= 95) tokenText = "\u26a0 " + tokenText;
-  else if (evt.pct >= 80) tokenText = "\u25b2 " + tokenText;
-  this._sbTokens.textContent = tokenText;
-
-  var tc = evt.tool_calls_this_turn || 0;
-  this._sbTools.textContent = tc + " tool" + (tc !== 1 ? "s" : "");
-
-  var turns = evt.turn_count || 0;
-  this._sbTurns.textContent = "turn " + turns;
-
-  this.statusBarEl.classList.toggle("ws-sb-warn", evt.pct >= 80);
-  this.statusBarEl.classList.toggle("ws-sb-danger", evt.pct >= 95);
-
+  StatusBar.paint(
+    {
+      rootEl: this.statusBarEl,
+      modelEl: this._sbModel,
+      tokensEl: this._sbTokens,
+      toolsEl: this._sbTools,
+      turnsEl: this._sbTurns,
+    },
+    evt,
+    { alias: this.modelAlias, model: this.model },
+  );
   this._lastStatusEvt = evt;
 };
 
