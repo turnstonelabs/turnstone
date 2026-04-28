@@ -1450,6 +1450,8 @@ function _hasCoordPermission() {
 function _createCoordinator(opts) {
   var name = (opts.name || "").trim();
   var skill = opts.skill || "";
+  var model = (opts.model || "").trim();
+  var judgeModel = (opts.judge_model || "").trim();
   var task = (opts.task || "").trim();
   var errEl = opts.errEl;
   var setBusy = opts.setBusy || function () {};
@@ -1463,6 +1465,8 @@ function _createCoordinator(opts) {
   var body = {};
   if (name) body.name = name;
   if (skill) body.skill = skill;
+  if (model) body.model = model;
+  if (judgeModel) body.judge_model = judgeModel;
   if (task) body.initial_message = task;
 
   authFetch("/v1/api/workstreams/new", {
@@ -1527,6 +1531,7 @@ function _ensureHomeComposerInit() {
   _homeComposerInit = true;
   _mountHomeCoordComposer();
   _populateHomeSkillDropdown();
+  _populateHomeModelDropdowns();
   _probeCoordSubsystem();
   _refreshHomeComposerVisibility();
 }
@@ -1555,6 +1560,8 @@ function _mountHomeCoordComposer() {
         var bits = [];
         if (v.name) bits.push(v.name);
         if (v.skill) bits.push(v.skill);
+        if (v.model) bits.push(v.model);
+        if (v.judge_model) bits.push("judge: " + v.judge_model);
         return bits.join(" \u00b7 ");
       },
       fields: [
@@ -1570,6 +1577,18 @@ function _mountHomeCoordComposer() {
           label: "Skill",
           type: "select",
           choices: [{ value: "", text: "Use defaults" }],
+        },
+        {
+          id: "model",
+          label: "Model",
+          type: "select",
+          choices: [{ value: "", text: "Default model" }],
+        },
+        {
+          id: "judge_model",
+          label: "Judge Model",
+          type: "select",
+          choices: [{ value: "", text: "Default (agent model)" }],
         },
       ],
     },
@@ -1593,6 +1612,30 @@ function _populateHomeSkillDropdown() {
         };
       });
       _homeCoordComposer.setOptionChoices("skill", choices);
+    })
+    .catch(function () {
+      /* defaults still work even without the dropdown populated */
+    });
+}
+
+// Populate Model + Judge Model dropdowns from /v1/api/models — same
+// list the interactive new-ws modal uses.  Empty/default option stays
+// at the top so submitting without a choice falls back to the
+// ConfigStore-configured coordinator.model_alias / judge.model.
+function _populateHomeModelDropdowns() {
+  if (!_homeCoordComposer) return;
+  authFetch("/v1/api/models")
+    .then(function (r) {
+      return r.ok ? r.json() : { models: [] };
+    })
+    .then(function (data) {
+      var choices = (data.models || []).map(function (m) {
+        var label =
+          m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
+        return { value: m.alias, text: label };
+      });
+      _homeCoordComposer.setOptionChoices("model", choices);
+      _homeCoordComposer.setOptionChoices("judge_model", choices);
     })
     .catch(function () {
       /* defaults still work even without the dropdown populated */
@@ -1654,6 +1697,8 @@ function submitHomeCoord(textFromComposer) {
   _createCoordinator({
     name: opts.name || "",
     skill: opts.skill || "",
+    model: opts.model || "",
+    judge_model: opts.judge_model || "",
     task: task,
     errEl: document.getElementById("home-coord-error"),
     setBusy: function (b) {

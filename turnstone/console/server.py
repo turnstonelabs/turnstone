@@ -2636,12 +2636,14 @@ def _coord_create_build_kwargs(
 ) -> dict[str, Any]:
     """Build kwargs for ``coord_mgr.create`` from a parsed coord create body.
 
-    Coord's create takes a smaller set than interactive's (no
-    ``model`` / ``judge_model`` / ``client_type`` / ``parent_ws_id`` /
-    ``ws_id``) — those concepts either don't apply to coordinators
-    (no parent on coord; coord ws_id is always server-generated)
-    or live on a separate ConfigStore knob (the dashboard-managed
-    plan/task model + reasoning_effort settings).
+    Coord's create still takes a smaller set than interactive's
+    (no ``client_type`` / ``parent_ws_id`` / ``ws_id`` — coord ws_id
+    is always server-generated and coord has no parent), but
+    per-call ``model`` and ``judge_model`` overrides flow through
+    here onto the coord session factory the same way they flow
+    through interactive's: ConfigStore (``coordinator.model_alias``
+    / ``judge.model``) sets the default; this body field overrides
+    for one session.
     """
     # Use the canonical skill name from the resolved row when one was
     # found; falls back to the stripped body value (which is what the
@@ -2653,12 +2655,25 @@ def _coord_create_build_kwargs(
     else:
         canonical_skill = (body.get("skill") or "").strip() or None
     name = (body.get("name") or "").strip()
+    # Empty / non-string / whitespace-only body fields collapse to None
+    # so the factory falls back to ConfigStore defaults rather than
+    # treating "" (or a hostile dict / list) as a request to override
+    # with the empty alias.  The isinstance guard also keeps a
+    # truthy-non-string body (e.g. ``{"model": {"url": "x"}}``) from
+    # reaching ``.strip()`` and crashing into the lifted handler's
+    # generic 500 path.
+    model_raw = body.get("model")
+    judge_raw = body.get("judge_model")
+    model = (model_raw.strip() if isinstance(model_raw, str) else "") or None
+    judge_model = (judge_raw.strip() if isinstance(judge_raw, str) else "") or None
     return {
         "user_id": uid,
         "name": name,
         "skill": canonical_skill,
         "skill_id": skill_id,
         "skill_version": applied_skill_version,
+        "model": model,
+        "judge_model": judge_model,
     }
 
 
