@@ -168,8 +168,8 @@
 
 /* ==========================================================================
    Typography helpers — explicit tiers so the utility actually conveys size.
-   Body text still inherits var(--font-mono) at 13px from base.css; these
-   are opt-in overrides for headings / captions.
+   Opt-in overrides for headings / captions; do not redefine the shared
+   body typography defaults from base.css (var(--font-ui), 14px / 1.45).
    ========================================================================== */
 .ui-heading { font-family: var(--font-ui); font-weight: 600; color: var(--fg-bright); }
 .ui-heading--sm { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--fg-dim); }
