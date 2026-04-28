@@ -34,11 +34,6 @@
   color: var(--fg-dim);
   font-weight: 400;
 }
-#cluster-summary {
-  font-size: 11px;
-  color: var(--fg-dim);
-  letter-spacing: 0.03em;
-}
 #theme-toggle {
   color: var(--fg);
 }
@@ -148,52 +143,6 @@
   padding: 18px 0;
 }
 
-/* One-line cluster summary — button styled to look like an info strip
-   so the click affordance stays clear without dominating the layout. */
-.home-cluster-summary {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  width: 100%;
-  padding: 9px 14px;
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  color: var(--fg-dim);
-  font: inherit;
-  font-size: 12px;
-  cursor: pointer;
-  text-align: left;
-  transition:
-    background 0.12s,
-    border-color 0.12s,
-    color 0.12s;
-  font-variant-numeric: tabular-nums;
-}
-.home-cluster-summary:hover {
-  background: var(--bg-highlight);
-  border-color: var(--accent-dim);
-  color: var(--fg);
-}
-.home-cluster-summary:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-.home-cluster-summary-line {
-  flex: 1;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.home-cluster-summary-caret {
-  color: var(--fg-dim);
-  font-size: 10px;
-  transition: transform 0.12s;
-}
-.home-cluster-summary:hover .home-cluster-summary-caret {
-  transform: translateX(2px);
-}
-
 /* Sub-700px: collapse the composer row and tighten padding.  The
    phase-4 designer-review "composer wrap 340-699px" observation is
    fully covered by this full-stack rule — the flex math at ≥701px
@@ -206,16 +155,6 @@
   }
   #view-home {
     gap: 16px;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .home-cluster-summary,
-  .home-cluster-summary-caret {
-    transition: none;
-  }
-  .home-cluster-summary:hover .home-cluster-summary-caret {
-    transform: none;
   }
 }
 
@@ -903,36 +842,6 @@
 }
 
 /* ==========================================================================
-   MCP summary in node detail
-   ========================================================================== */
-#node-mcp-summary {
-  color: var(--magenta);
-  font-size: 11px;
-  font-family: var(--font-mono);
-  margin-left: 12px;
-}
-
-/* ==========================================================================
-   Node link
-   ========================================================================== */
-.node-link {
-  display: inline-block;
-  margin-top: 16px;
-  color: var(--accent);
-  font-size: 11px;
-  text-decoration: none;
-  font-family: var(--font-ui);
-  font-weight: 500;
-  letter-spacing: 0.02em;
-  padding: 4px 0;
-  border-bottom: 1px solid transparent;
-  transition: border-color 0.15s;
-}
-.node-link:hover {
-  border-bottom-color: var(--accent);
-}
-
-/* ==========================================================================
    Pagination
    ========================================================================== */
 .pagination {
@@ -979,23 +888,6 @@
   border-color: var(--border-strong);
 }
 
-/* ==========================================================================
-   Header accent button (+ new)
-   ========================================================================== */
-#header .header-btn-accent {
-  color: var(--accent);
-  border-color: var(--accent);
-  font-weight: 600;
-}
-#header .header-btn-accent:hover {
-  background: var(--accent-dim);
-  color: var(--accent);
-}
-#header .header-btn-accent:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
 /* Admin button — top accent line + active state */
 #admin-btn {
   position: relative;
@@ -1022,174 +914,6 @@
   background: var(--accent-dim);
 }
 
-/* ==========================================================================
-   New Workstream Modal
-   ========================================================================== */
-#new-ws-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.7);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 500;
-}
-#new-ws-box {
-  background: var(--bg-surface);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius);
-  padding: 32px;
-  width: 380px;
-  max-width: 90vw;
-  box-shadow:
-    0 0 0 1px rgba(255, 255, 255, 0.03),
-    0 24px 48px -12px rgba(0, 0, 0, 0.5),
-    0 0 80px -20px var(--accent-dim);
-  position: relative;
-}
-#new-ws-box::before {
-  content: "";
-  position: absolute;
-  top: -1px;
-  left: 20%;
-  right: 20%;
-  height: 2px;
-  background: linear-gradient(90deg, transparent, var(--accent), transparent);
-  border-radius: 1px;
-}
-#new-ws-box h2 {
-  font-family: var(--font-ui);
-  color: var(--accent);
-  font-size: 15px;
-  font-weight: 700;
-  margin-bottom: 18px;
-  letter-spacing: 0.02em;
-}
-#new-ws-box label {
-  display: block;
-  font-family: var(--font-ui);
-  font-size: 10px;
-  font-weight: 600;
-  color: var(--fg-dim);
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  margin-top: 14px;
-  margin-bottom: 5px;
-}
-.label-hint {
-  font-weight: 400;
-  text-transform: none;
-  letter-spacing: 0;
-  opacity: 0.75;
-}
-#new-ws-box label:first-of-type {
-  margin-top: 0;
-}
-#new-ws-box select,
-#new-ws-box input[type="text"],
-#new-ws-box textarea {
-  width: 100%;
-  padding: 9px 12px;
-  background: var(--bg);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  color: var(--fg);
-  font: inherit;
-  font-size: 13px;
-  transition:
-    border-color 0.15s,
-    box-shadow 0.15s;
-}
-#new-ws-box textarea {
-  resize: vertical;
-  min-height: 60px;
-}
-#new-ws-box textarea::placeholder {
-  color: var(--fg-dim);
-  opacity: 0.6;
-}
-#new-ws-box select:focus,
-#new-ws-box input:focus,
-#new-ws-box textarea:focus {
-  border-color: var(--accent);
-  outline: none;
-  box-shadow: 0 0 0 3px var(--accent-dim);
-}
-#new-ws-box input::placeholder {
-  color: var(--fg-dim);
-  opacity: 0.6;
-}
-#new-ws-box select {
-  cursor: pointer;
-  appearance: none;
-  -webkit-appearance: none;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%238a93ad' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 12px center;
-  padding-right: 32px;
-}
-#new-ws-error {
-  display: none;
-  color: var(--red);
-  font-size: 12px;
-  margin-bottom: 6px;
-}
-#new-ws-buttons {
-  display: flex;
-  gap: 10px;
-  margin-top: 22px;
-  justify-content: flex-end;
-}
-#new-ws-buttons button {
-  padding: 9px 20px;
-  border-radius: var(--radius-sm);
-  font: inherit;
-  font-size: 12px;
-  cursor: pointer;
-  border: 1px solid var(--border-strong);
-  background: var(--bg-highlight);
-  color: var(--fg);
-  transition:
-    background 0.15s,
-    border-color 0.15s,
-    color 0.15s;
-  font-family: var(--font-ui);
-  font-weight: 500;
-  letter-spacing: 0.02em;
-}
-#new-ws-cancel:hover {
-  background: var(--bg-elevated);
-  border-color: var(--border-strong);
-}
-#new-ws-cancel:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-#new-ws-submit {
-  background: var(--accent);
-  color: var(--bg);
-  border-color: var(--accent);
-  font-weight: 600;
-}
-#new-ws-submit:hover {
-  filter: brightness(1.1);
-}
-#new-ws-submit:focus-visible {
-  outline: 2px solid var(--fg);
-  outline-offset: 2px;
-}
-#new-ws-submit:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-  filter: none;
-}
-@media (max-width: 380px) {
-  #new-ws-box {
-    padding: 24px 18px;
-  }
-}
 
 /* ==========================================================================
    Responsive
@@ -1220,9 +944,6 @@
   }
   .ncol-health,
   .node-cell-health {
-    display: none;
-  }
-  #node-mcp-summary {
     display: none;
   }
   #main {
@@ -1838,7 +1559,7 @@
   margin: 0;
 }
 
-/* Admin modals (reuse new-ws-overlay pattern) */
+/* Admin modals */
 .admin-modal {
   background: var(--bg-surface);
   border: 1px solid var(--border-strong);
@@ -4110,18 +3831,12 @@ textarea.skill-content-area {
   .node-group-header {
     transition: none;
   }
-  .node-link,
   .dash-cell-node,
   .pagination button {
     transition: none;
   }
   .dash-row.has-link::after,
   .node-group-header::before {
-    transition: none;
-  }
-  #new-ws-box select,
-  #new-ws-box input,
-  #new-ws-buttons button {
     transition: none;
   }
   .admin-nav,

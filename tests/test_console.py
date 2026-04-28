@@ -825,16 +825,18 @@ class TestConsoleHTTPEndpoints:
         resp = client.get("/nonexistent")
         assert resp.status_code == 404
 
-    def test_index_has_new_ws_button(self, client):
+    def test_index_landing_surfaces(self, client):
         status, body, ct = self._get_raw(client, "/")
         assert status == 200
-        assert 'id="new-ws-btn"' in body
-        assert "showNewWsModal" in body
-
-    def test_index_has_new_ws_modal(self, client):
-        status, body, ct = self._get_raw(client, "/")
-        assert 'id="new-ws-overlay"' in body
-        assert 'id="new-ws-node"' in body
+        # Coordinator-first landing keeps the node list always-visible.
+        assert 'id="view-overview"' in body
+        assert 'id="node-table"' in body
+        # Removed in the 1.5.0 landing-page cleanup — guard against
+        # accidental reintroduction.
+        assert 'id="new-ws-overlay"' not in body
+        assert 'id="new-ws-btn"' not in body
+        assert 'id="cluster-summary-compact"' not in body
+        assert 'id="view-node"' not in body
 
 
 # ---------------------------------------------------------------------------

@@ -30,16 +30,7 @@
           >turnstone <span class="header-dim">console</span></a
         >
       </h1>
-      <span id="cluster-summary" aria-live="polite"></span>
       <span id="status-bar" role="status" aria-live="polite"></span>
-      <button
-        id="new-ws-btn"
-        class="header-btn header-btn-accent"
-        onclick="showNewWsModal()"
-        title="Create workstream"
-      >
-        + new
-      </button>
       <button
         id="admin-btn"
         class="header-btn"
@@ -78,7 +69,7 @@
         href="#"
         id="breadcrumb-home"
         onclick="
-          showOverview();
+          showHome();
           return false;
         "
         >Cluster</a
@@ -90,9 +81,9 @@
     <div id="main">
       <!-- HOME — coordinator-first landing.  The console's primary
        workflow on page load is "start / continue a coordinator task";
-       the cluster node list is demoted to an expandable one-line
-       summary below.  #view-overview / #view-node / #view-filtered
-       remain for deep-link compatibility. -->
+       the cluster node list sits below as a sibling section.
+       #view-overview / #view-filtered remain for deep-link
+       compatibility. -->
       <div id="view-home">
         <!-- Persistent "start a new coordinator task" composer.  Visibility is
          gated on the admin.coordinator permission (same rule the existing
@@ -183,39 +174,11 @@
           ></div>
         </section>
 
-        <!-- Cluster summary — one-line aggregate that toggles the node
-         list inline below.  Lives inside #view-home so operators
-         never "leave" the landing page to see cluster state;
-         showOverview() is preserved as an alias that opens the
-         details section so ?view=overview deep-links still work. -->
-        <section
-          id="cluster-summary-compact"
-          class="home-section"
-          aria-label="Cluster summary"
-        >
-          <button
-            type="button"
-            id="cluster-summary-expand"
-            class="home-cluster-summary"
-            aria-expanded="false"
-            aria-controls="view-overview"
-            onclick="toggleClusterDetails()"
-            title="Show / hide cluster nodes"
-          >
-            <span id="cluster-summary-line" class="home-cluster-summary-line"
-              >Loading cluster…</span
-            >
-            <span class="home-cluster-summary-caret" aria-hidden="true"
-              >&#9656;</span
-            >
-          </button>
-        </section>
-
-        <!-- Cluster details — node list, inline below the summary.
-         Hidden by default; toggleClusterDetails() flips it and
-         showOverview() forces it open so popstate + breadcrumb
-         callers land on the expanded state. -->
-        <div id="view-overview" hidden>
+        <!-- Cluster details — node list, always visible.  The list is
+         self-collapsing (consecutive same-prefix nodes group into a
+         single expandable row) so a separate summary toggle would be
+         redundant. -->
+        <div id="view-overview">
           <div class="section-header">NODES</div>
           <div
             id="node-table"
@@ -226,38 +189,6 @@
             <div class="dashboard-empty">Loading cluster data...</div>
           </div>
         </div>
-      </div>
-
-      <!-- NODE DRILL-DOWN -->
-      <div id="view-node" style="display: none">
-        <div class="dash-header">
-          <span class="dash-header-title">WORKSTREAMS</span>
-          <span class="dash-header-summary" id="node-ws-summary"></span>
-          <span id="node-mcp-summary" aria-label="MCP status"></span>
-        </div>
-        <div class="dash-colheaders" aria-hidden="true">
-          <span class="dash-col dash-col-state">STATE</span>
-          <span class="dash-col dash-col-name">NAME</span>
-          <span class="dash-col dash-col-model">MODEL</span>
-          <span class="dash-col dash-col-node">NODE</span>
-          <span class="dash-col dash-col-task">TASK</span>
-          <span class="dash-col dash-col-tokens">TOKENS</span>
-          <span class="dash-col dash-col-ctx">CTX</span>
-        </div>
-        <div
-          id="node-ws-table"
-          class="dash-table"
-          role="group"
-          aria-label="Workstreams"
-          aria-live="polite"
-        ></div>
-        <div id="node-metadata-section" style="margin-top: 16px; display: none">
-          <div class="dash-header">
-            <span class="dash-header-title">METADATA</span>
-          </div>
-          <div id="node-metadata-table" style="font-size: 0.85rem"></div>
-        </div>
-        <a id="node-link" class="node-link">Open node UI</a>
       </div>
 
       <!-- FILTERED WORKSTREAMS -->
@@ -2128,65 +2059,6 @@
     <script src="/shared/auth.js"></script>
     <script src="/shared/kb.js"></script>
     <script src="/shared/composer.js"></script>
-
-    <div
-      id="new-ws-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="new-ws-title"
-    >
-      <div id="new-ws-box">
-        <h2 id="new-ws-title">New Workstream</h2>
-        <div id="new-ws-error" role="alert" aria-live="assertive"></div>
-        <label for="new-ws-task"
-          >Task
-          <span class="label-hint"
-            >optional &mdash; sent as first message</span
-          ></label
-        >
-        <textarea
-          id="new-ws-task"
-          rows="4"
-          placeholder="What should this workstream work on?"
-        ></textarea>
-        <label for="new-ws-node">Node</label>
-        <select id="new-ws-node">
-          <option value="">Auto (best available)</option>
-        </select>
-        <label for="new-ws-name"
-          >Name <span class="label-hint">optional</span></label
-        >
-        <input
-          id="new-ws-name"
-          type="text"
-          placeholder="Auto-generated if empty"
-          autocomplete="off"
-        />
-        <label for="new-ws-model"
-          >Model <span class="label-hint">optional</span></label
-        >
-        <select id="new-ws-model">
-          <option value="">Default model</option>
-        </select>
-        <label for="new-ws-skill"
-          >Skill <span class="label-hint">optional</span></label
-        >
-        <select id="new-ws-skill">
-          <option value="">Use defaults</option>
-        </select>
-        <label for="new-ws-judge"
-          >Judge Model <span class="label-hint">optional</span></label
-        >
-        <select id="new-ws-judge">
-          <option value="">Default (agent model)</option>
-        </select>
-        <div id="new-ws-buttons">
-          <button id="new-ws-cancel" onclick="hideNewWsModal()">Cancel</button>
-          <button id="new-ws-submit" onclick="submitNewWs()">Create</button>
-        </div>
-      </div>
-    </div>
 
     <!-- GitHub Import Modal -->
     <div
