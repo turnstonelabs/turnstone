@@ -1269,16 +1269,7 @@ Pane.prototype.replayHistory = function (messages) {
         }
         if (isToolError && !lastToolBlock.classList.contains("denied")) {
           lastToolBlock.classList.add("error");
-          // Append the error badge as a sibling of the existing approved
-          // / denied pill so the approval verdict stays visible alongside
-          // the execution outcome.
-          if (!lastToolBlock.querySelector(".ts-approval-badge--error")) {
-            var errBadge = document.createElement("div");
-            errBadge.setAttribute("role", "status");
-            errBadge.className = "ts-approval-badge ts-approval-badge--error";
-            errBadge.textContent = "\u2717 error";
-            lastToolBlock.appendChild(errBadge);
-          }
+          appendToolErrorBadge(lastToolBlock);
         }
       }
     }
@@ -1603,16 +1594,7 @@ Pane.prototype.appendToolOutput = function (callId, name, output, isError) {
     var parentBlock = target.closest(".ts-approval");
     if (parentBlock && !parentBlock.classList.contains("denied")) {
       parentBlock.classList.add("error");
-      // Append the error badge as a sibling of the existing approved
-      // pill so the approval verdict stays visible alongside the
-      // execution outcome.
-      if (!parentBlock.querySelector(".ts-approval-badge--error")) {
-        var errBadge = document.createElement("div");
-        errBadge.setAttribute("role", "status");
-        errBadge.className = "ts-approval-badge ts-approval-badge--error";
-        errBadge.textContent = "\u2717 error";
-        parentBlock.appendChild(errBadge);
-      }
+      appendToolErrorBadge(parentBlock);
     }
   }
 
@@ -4947,6 +4929,20 @@ function toggleVerdictDetail(btn) {
     detail.style.display = isHidden ? "block" : "none";
     btn.textContent = isHidden ? "hide" : "details";
   }
+}
+
+// Append an "✗ error" pill to an approval block as a sibling of the
+// existing approved/denied/auto-approved pill, so the approval verdict
+// stays visible alongside the execution outcome. Idempotent — re-fires
+// (live + history rerender) do not stack badges.
+function appendToolErrorBadge(blockEl) {
+  if (!blockEl) return;
+  if (blockEl.querySelector(".ts-approval-badge--error")) return;
+  var errBadge = document.createElement("div");
+  errBadge.setAttribute("role", "status");
+  errBadge.className = "ts-approval-badge ts-approval-badge--error";
+  errBadge.textContent = "✗ error";
+  blockEl.appendChild(errBadge);
 }
 
 function makeCollapsible(el) {
