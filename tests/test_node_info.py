@@ -213,16 +213,41 @@ class TestDetectGPUs:
         gpus = _detect_gpus()
         assert gpus[0]["vendor"] == "intel"
 
-    def test_unknown_vendor_id_surfaces_as_unknown(self, tmp_path, monkeypatch):
-        """Vendor IDs not in our friendly-name table land as 'unknown'
-        but the raw IDs are still surfaced — operators can map them
-        out of band."""
+    def test_unknown_vendor_id_is_filtered_out(self, tmp_path, monkeypatch):
+        """A DRM ``cardN`` whose PCI vendor isn't in the GPU
+        allow-list (Hyper-V synthetic 0x1414, AWS Nitro VGA, QEMU
+        virtio-gpu, etc.) MUST NOT count as a GPU.  Counting them
+        mis-labels CPU-only VMs as GPU nodes — observed on a CI
+        runner."""
         drm_dir = _seed_drm_layout(tmp_path, [("card0", "0xdead", "0xbeef")])
         monkeypatch.setattr(node_info, "_DRM_DIR", drm_dir)
+        assert _detect_gpus() == []
+
+    def test_hyper_v_synthetic_adapter_is_filtered_out(self, tmp_path, monkeypatch):
+        """Specific regression: Hyper-V's synthetic display adapter
+        (vendor 0x1414, device 0x06) registers a ``/sys/class/drm/
+        card0`` entry on Linux but is NOT a compute GPU.  A CI
+        runner reproduced this and came back with ``gpu_count=1``
+        before the vendor allow-list filter."""
+        drm_dir = _seed_drm_layout(tmp_path, [("card0", "0x1414", "0x06")])
+        monkeypatch.setattr(node_info, "_DRM_DIR", drm_dir)
+        assert _detect_gpus() == []
+
+    def test_mixed_known_and_unknown_keeps_only_known(self, tmp_path, monkeypatch):
+        """A node with a real GPU (NVIDIA) AND a synthetic display
+        adapter (Hyper-V) only counts the real GPU."""
+        drm_dir = _seed_drm_layout(
+            tmp_path,
+            [
+                ("card0", "0x1414", "0x06"),  # Hyper-V synthetic
+                ("card1", "0x10de", "0x2330"),  # NVIDIA H100
+            ],
+        )
+        monkeypatch.setattr(node_info, "_DRM_DIR", drm_dir)
         gpus = _detect_gpus()
-        assert gpus[0]["vendor"] == "unknown"
-        assert gpus[0]["pci_vendor"] == "0xdead"
-        assert gpus[0]["pci_device"] == "0xbeef"
+        assert len(gpus) == 1
+        assert gpus[0]["vendor"] == "nvidia"
+        assert gpus[0]["index"] == "1"
 
     def test_skips_render_nodes(self, tmp_path, monkeypatch):
         """``renderD*`` nodes are per-card render-only interfaces that
@@ -582,31 +607,48 @@ class TestCollectNodeInfoCapabilityIntegration:
         )
         info = collect_node_info()
         assert info["gpu_count"] == 1
-        assert info["gpu_vendor"] == "nvidia"
+        assert info["has_gpu"] is True
         assert info["gpu_vendors"] == ["nvidia"]
+        assert info["gpu_has_nvidia"] is True
         assert info["gpus"][0]["pci_device"] == "0x2330"
+        # Singular ``gpu_vendor`` is intentionally NOT exposed —
+        # multi-vendor nodes would only be filterable under one
+        # vendor, hiding them from the other; per-vendor booleans
+        # avoid the false-negative.
+        assert "gpu_vendor" not in info
 
     def test_gpu_keys_absent_when_no_gpus(self, monkeypatch):
         monkeypatch.setattr(node_info, "_detect_gpus", lambda: [])
         info = collect_node_info()
-        for k in ("gpu_count", "gpu_vendor", "gpu_vendors", "gpus"):
+        for k in ("gpu_count", "gpu_vendors", "gpus", "has_gpu"):
             assert k not in info
+        # No spurious ``gpu_has_*`` keys when there are no GPUs.
+        assert not any(k.startswith("gpu_has_") for k in info)
 
-    def test_unknown_only_gpus_omits_vendor_keys(self, monkeypatch):
-        """A node where every detected GPU has unknown vendor still
-        gets gpu_count + gpus, but the flat gpu_vendor / gpu_vendors
-        keys are skipped (filtering on 'unknown' isn't useful)."""
+    def test_multi_vendor_node_filterable_under_each_vendor(self, monkeypatch):
+        """A mixed AMD+NVIDIA node MUST be filterable under both
+        vendors.  Pre-fix the singular ``gpu_vendor`` flat key was
+        set to ``vendors[0]`` (alphabetical first = ``amd``) and
+        ``filters={"gpu_vendor": "nvidia"}`` would mismatch the
+        NVIDIA card on the bus.  Per-vendor booleans avoid the
+        false-negative entirely."""
         monkeypatch.setattr(
             node_info,
             "_detect_gpus",
             lambda: [
-                {"index": "0", "vendor": "unknown", "pci_vendor": "0xdead", "pci_device": "0xbeef"},
+                {"index": "0", "vendor": "amd", "pci_vendor": "0x1002", "pci_device": "0x74a1"},
+                {"index": "1", "vendor": "nvidia", "pci_vendor": "0x10de", "pci_device": "0x2330"},
             ],
         )
         info = collect_node_info()
-        assert info["gpu_count"] == 1
-        assert "gpu_vendor" not in info
-        assert "gpu_vendors" not in info
+        # Both per-vendor flags True — filter under EITHER vendor matches.
+        assert info["gpu_has_amd"] is True
+        assert info["gpu_has_nvidia"] is True
+        # Sorted unique vendors carry the full list for tooling that
+        # wants the set.
+        assert info["gpu_vendors"] == ["amd", "nvidia"]
+        assert info["gpu_count"] == 2
+        assert info["has_gpu"] is True
 
     def test_memory_key_appears(self, monkeypatch):
         monkeypatch.setattr(node_info, "_detect_memory_gb", lambda: 256)
@@ -657,42 +699,19 @@ class TestCollectNodeInfoCapabilityIntegration:
         assert info["memory_gb"] == 64
         assert info["cpu_model"] == "AMD EPYC 9654"
 
-    def test_heterogeneous_gpu_first_unknown_uses_first_known_vendor(self, monkeypatch):
-        """Regression guard for the fix where ``gpu_vendor`` was set
-        from ``gpus[0]["vendor"]`` even when that was ``"unknown"``,
-        leaving the flat key unfilterable on a node that actually
-        has known-vendor GPUs.  The fix routes through the sorted
-        unique known-vendor set so the flat key reflects something
-        the operator can actually filter on."""
-        monkeypatch.setattr(
-            node_info,
-            "_detect_gpus",
-            lambda: [
-                # First card: unrecognized vendor (e.g. an exotic
-                # accelerator) — surfaces vendor=unknown but the
-                # node is otherwise nvidia.
-                {
-                    "index": "0",
-                    "vendor": "unknown",
-                    "pci_vendor": "0xdead",
-                    "pci_device": "0xbeef",
-                },
-                {
-                    "index": "1",
-                    "vendor": "nvidia",
-                    "pci_vendor": "0x10de",
-                    "pci_device": "0x2330",
-                },
-            ],
-        )
+    def test_synthetic_display_adapter_does_not_register_as_gpu(self, tmp_path, monkeypatch):
+        """End-to-end: a Hyper-V synthetic display adapter on the
+        host's /sys/class/drm doesn't reach ``collect_node_info``'s
+        GPU surface at all.  The vendor allow-list filter in
+        ``_detect_gpus`` drops it before it gets to ``has_gpu`` /
+        ``gpu_count`` / ``gpu_has_*``.  Pre-fix this would mis-label
+        a CPU-only Hyper-V VM as a GPU node."""
+        drm_dir = _seed_drm_layout(tmp_path, [("card0", "0x1414", "0x06")])
+        monkeypatch.setattr(node_info, "_DRM_DIR", drm_dir)
         info = collect_node_info()
-        # Flat key must reflect a vendor an operator can route on.
-        assert info["gpu_vendor"] == "nvidia"
-        assert info["gpu_vendors"] == ["nvidia"]
-        # Per-card detail still shows the unknown card so an
-        # operator can investigate.
-        assert info["gpus"][0]["vendor"] == "unknown"
-        assert info["gpu_count"] == 2
+        for k in ("gpu_count", "has_gpu", "gpus", "gpu_vendors"):
+            assert k not in info
+        assert not any(k.startswith("gpu_has_") for k in info)
 
 
 class TestIMDSFieldSanitiser:

@@ -103,18 +103,24 @@ _PCI_VENDOR_NAMES: dict[str, str] = {
 
 
 def _detect_gpus() -> list[dict[str, str]]:
-    """Enumerate GPUs via the Linux DRM sysfs interface.
+    """Enumerate compute-capable GPUs via the Linux DRM sysfs interface.
 
     For each ``/sys/class/drm/cardN`` directory, read the underlying
-    PCI device's ``vendor`` and ``device`` IDs.  Returns a list of
-    ``{"index", "vendor", "pci_vendor", "pci_device"}`` dicts.
+    PCI device's ``vendor`` and ``device`` IDs and KEEP only cards
+    whose PCI vendor is in :data:`_PCI_VENDOR_NAMES` (NVIDIA / AMD /
+    Intel / Apple).  Returns a list of ``{"index", "vendor",
+    "pci_vendor", "pci_device"}`` dicts.
 
-    Vendor-agnostic by design — works for NVIDIA, AMD, Intel, and any
-    future PCI GPU vendor without a vendor-specific tool on PATH.
-    Trade-off: we surface PCI vendor/device IDs (e.g. ``"nvidia"`` +
-    ``"0x2330"``) not human-readable model names (``"NVIDIA H100"``);
-    operators who need specific-model routing set ``gpu_model`` in
-    ``[metadata]`` config to override the auto layer.
+    Why filter on the vendor allow-list rather than count every DRM
+    card?  Hypervisor synthetic display adapters (Hyper-V's adapter
+    at vendor ``0x1414`` / device ``0x06``, AWS Nitro's basic VGA,
+    QEMU's ``virtio-gpu``, etc.) all register a ``cardN`` entry on
+    the host but are NOT compute-capable GPUs.  Counting them
+    mis-labels CPU-only VMs as GPU nodes — observed in CI on a
+    Hyper-V runner that came back with ``gpu_count=1``.  An exotic
+    accelerator that isn't in the allow-list lands as a no-op here;
+    operators who need to expose one set ``gpu_count`` + the relevant
+    flags in ``[metadata]`` config to override.
 
     Returns empty list on non-Linux, missing sysfs, or any read
     failure.  Containers see whatever DRM nodes the host mapped in;
@@ -138,10 +144,16 @@ def _detect_gpus() -> list[dict[str, str]]:
         device_id = _read_text(os.path.join(device_dir, "device"))
         if not vendor_id or not device_id:
             continue
+        vendor_name = _PCI_VENDOR_NAMES.get(vendor_id)
+        if vendor_name is None:
+            # Not on the GPU-vendor allow-list — skip to avoid
+            # mis-counting Hyper-V / QEMU / AWS Nitro synthetic
+            # display adapters as compute GPUs.
+            continue
         gpus.append(
             {
                 "index": name[4:],  # strip "card" prefix
-                "vendor": _PCI_VENDOR_NAMES.get(vendor_id, "unknown"),
+                "vendor": vendor_name,
                 "pci_vendor": vendor_id,
                 "pci_device": device_id,
             }
@@ -513,22 +525,23 @@ def collect_node_info() -> dict[str, Any]:
         if gpus:
             info["gpu_count"] = len(gpus)
             info["gpus"] = gpus
-            # Surface ``gpu_vendor`` (a single known vendor) and
-            # ``gpu_vendors`` (sorted unique known vendors) as flat
-            # keys so the ``list_nodes(filters={"gpu_vendor":
-            # "nvidia"})`` shape works without filter-on-list
-            # gymnastics.  Both keys consult only the KNOWN-vendor
-            # set: a heterogeneous node where ``gpus[0]`` happens to
-            # be a card we don't have a friendly name for would
-            # otherwise leak ``gpu_vendor="unknown"`` while
-            # ``gpu_vendors=["nvidia"]`` listed the actual hardware,
-            # and the flat-key filter would mismatch a real schedule
-            # target.  The full per-card list (including the unknown
-            # entries with their raw PCI IDs) lives in ``gpus``.
-            vendors = sorted({g["vendor"] for g in gpus if g["vendor"] != "unknown"})
-            if vendors:
-                info["gpu_vendor"] = vendors[0]
-                info["gpu_vendors"] = vendors
+            # ``has_gpu`` is the "any compute GPU at all" flag,
+            # filterable as ``list_nodes(filters={"has_gpu": True})``
+            # — exact-equality JSON match on a boolean.
+            info["has_gpu"] = True
+            vendors = sorted({g["vendor"] for g in gpus})
+            info["gpu_vendors"] = vendors
+            # Per-vendor boolean flags so a multi-vendor node is
+            # filterable under EVERY vendor present.  A singular
+            # ``gpu_vendor`` scalar would only match one vendor under
+            # JSON-equal filtering — a mixed AMD+NVIDIA node would
+            # be invisible to a coord searching for the other vendor.
+            # Per-vendor booleans avoid the false-negative entirely:
+            # a single ``filters={"gpu_has_nvidia": True}`` matches
+            # every node carrying at least one NVIDIA card,
+            # regardless of what else is on the bus.
+            for vendor in vendors:
+                info[f"gpu_has_{vendor}"] = True
     except Exception:
         log.debug("node_info: GPU detection failed", exc_info=True)
 
