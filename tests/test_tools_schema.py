@@ -97,7 +97,7 @@ class TestToolsMetadata:
             "list_workstreams",
             "list_nodes",
             "list_skills",
-            "task_list",
+            "tasks",
             "wait_for_workstream",
         }
 
@@ -151,7 +151,7 @@ class TestToolsMetadata:
             "close_workstream": "ws_id",
             "cancel_workstream": "ws_id",
             "delete_workstream": "ws_id",
-            "task_list": "action",
+            "tasks": "action",
         }
         assert expected == PRIMARY_KEY_MAP
 

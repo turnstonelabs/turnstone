@@ -1,6 +1,6 @@
 {
   "name": "spawn_batch",
-  "description": "Create up to 10 child workstreams in a single approval. Serialised spawns — children are created in input order so sibling ordering (by created_at) is deterministic. Returns {results: {idx: {ws_id, name, node_id, status}}, denied: [{idx, reason}]}. `results` is keyed by the input-array index (stringified). `denied[]` collects per-item validation / spawn failures. For >10 children, make additional calls (the batch hard-errors rather than truncating). Batch-level approval covers the whole list. Pair with `wait_for_workstream(ws_ids=[...], mode='all')` when the coordinator wants to synthesise the N outputs once every child has finished.",
+  "description": "Create up to 10 child workstreams in one call. Serialised in input order so sibling ordering (by `created_at`) is deterministic. Returns `{results: {idx: {ws_id, name, node_id, status}}, denied: [{idx, reason}]}` — `results` keyed by stringified input-array index, `denied` collects per-item validation / spawn failures. For >10 children make multiple calls (the batch hard-errors rather than truncating). Pair with `wait_for_workstream(ws_ids=[...], mode='all')` to synthesise the N outputs once every child has finished.",
   "parameters": {
     "type": "object",
     "properties": {

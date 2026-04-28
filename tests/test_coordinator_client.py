@@ -1679,7 +1679,7 @@ def test_last_assistant_text_returns_none_on_storage_failure(populated_storage, 
 
 
 # ---------------------------------------------------------------------------
-# task_list
+# tasks
 # ---------------------------------------------------------------------------
 
 
@@ -1689,177 +1689,177 @@ def _task_client(tmp_path) -> CoordinatorClient:
     return _make_read_client(st)
 
 
-def test_task_list_get_empty_envelope_on_fresh_ws(tmp_path):
+def test_tasks_get_empty_envelope_on_fresh_ws(tmp_path):
     client = _task_client(tmp_path)
-    env = client.task_list_get("coord-1")
+    env = client.tasks_get("coord-1")
     assert env == {"version": 1, "tasks": []}
 
 
-def test_task_list_add_then_get_roundtrip(tmp_path):
+def test_tasks_add_then_get_roundtrip(tmp_path):
     client = _task_client(tmp_path)
-    task = client.task_list_add("coord-1", title="spawn worker")
+    task = client.tasks_add("coord-1", title="spawn worker")
     assert task["title"] == "spawn worker"
     assert task["status"] == "pending"
-    env = client.task_list_get("coord-1")
+    env = client.tasks_get("coord-1")
     assert len(env["tasks"]) == 1
     assert env["tasks"][0]["id"] == task["id"]
 
 
-def test_task_list_add_rejects_empty_title(tmp_path):
+def test_tasks_add_rejects_empty_title(tmp_path):
     client = _task_client(tmp_path)
-    result = client.task_list_add("coord-1", title="   ")
+    result = client.tasks_add("coord-1", title="   ")
     assert "error" in result
 
 
-def test_task_list_add_rejects_invalid_status(tmp_path):
+def test_tasks_add_rejects_invalid_status(tmp_path):
     client = _task_client(tmp_path)
-    result = client.task_list_add("coord-1", title="x", status="nonsense")
+    result = client.tasks_add("coord-1", title="x", status="nonsense")
     assert "error" in result
 
 
-def test_task_list_add_rejects_title_over_200(tmp_path):
+def test_tasks_add_rejects_title_over_200(tmp_path):
     """Silent truncation is a data-integrity footgun: the model may
     rely on the title it sent, not the one stored.  Reject instead."""
     client = _task_client(tmp_path)
     long_title = "a" * 201
-    result = client.task_list_add("coord-1", title=long_title)
+    result = client.tasks_add("coord-1", title=long_title)
     assert "error" in result
     assert "too long" in result["error"]
     # Exactly 200 chars is the boundary and still accepted.
     boundary = "a" * 200
-    task = client.task_list_add("coord-1", title=boundary)
+    task = client.tasks_add("coord-1", title=boundary)
     assert "error" not in task
     assert len(task["title"]) == 200
 
 
-def test_task_list_update_rejects_title_over_200(tmp_path):
+def test_tasks_update_rejects_title_over_200(tmp_path):
     client = _task_client(tmp_path)
-    added = client.task_list_add("coord-1", title="original")
-    result = client.task_list_update("coord-1", task_id=added["id"], title="b" * 201)
+    added = client.tasks_add("coord-1", title="original")
+    result = client.tasks_update("coord-1", task_id=added["id"], title="b" * 201)
     assert "error" in result
     assert "too long" in result["error"]
     # Original title untouched when update rejected.
-    env = client.task_list_get("coord-1")
+    env = client.tasks_get("coord-1")
     assert env["tasks"][0]["title"] == "original"
 
 
-def test_task_list_update_by_id(tmp_path):
+def test_tasks_update_by_id(tmp_path):
     client = _task_client(tmp_path)
-    added = client.task_list_add("coord-1", title="plan")
-    updated = client.task_list_update(
+    added = client.tasks_add("coord-1", title="plan")
+    updated = client.tasks_update(
         "coord-1", task_id=added["id"], status="done", child_ws_id="ws-child"
     )
     assert updated["status"] == "done"
     assert updated["child_ws_id"] == "ws-child"
 
 
-def test_task_list_update_missing_id(tmp_path):
+def test_tasks_update_missing_id(tmp_path):
     client = _task_client(tmp_path)
-    result = client.task_list_update("coord-1", task_id="nope", status="done")
+    result = client.tasks_update("coord-1", task_id="nope", status="done")
     assert "error" in result
 
 
-def test_task_list_remove(tmp_path):
+def test_tasks_remove(tmp_path):
     client = _task_client(tmp_path)
-    added = client.task_list_add("coord-1", title="plan")
-    first = client.task_list_remove("coord-1", task_id=added["id"])
+    added = client.tasks_add("coord-1", title="plan")
+    first = client.tasks_remove("coord-1", task_id=added["id"])
     assert first.get("ok") is True
     assert first.get("task_id") == added["id"]
     # Second remove of the same id returns a distinguishable not-found
     # error (NOT a silent False that would mask a corrupt envelope).
-    second = client.task_list_remove("coord-1", task_id=added["id"])
+    second = client.tasks_remove("coord-1", task_id=added["id"])
     assert "error" in second
     assert "not found" in second["error"]
-    assert client.task_list_get("coord-1")["tasks"] == []
+    assert client.tasks_get("coord-1")["tasks"] == []
 
 
-def test_task_list_reorder_requires_permutation(tmp_path):
+def test_tasks_reorder_requires_permutation(tmp_path):
     client = _task_client(tmp_path)
-    a = client.task_list_add("coord-1", title="a")
-    b = client.task_list_add("coord-1", title="b")
+    a = client.tasks_add("coord-1", title="a")
+    b = client.tasks_add("coord-1", title="b")
     # Partial set — must reject.
-    bad = client.task_list_reorder("coord-1", task_ids=[a["id"]])
+    bad = client.tasks_reorder("coord-1", task_ids=[a["id"]])
     assert "error" in bad
     # Wrong id — reject.
-    wrong = client.task_list_reorder("coord-1", task_ids=[a["id"], "ghost"])
+    wrong = client.tasks_reorder("coord-1", task_ids=[a["id"], "ghost"])
     assert "error" in wrong
     # Valid permutation — accept.
-    ok = client.task_list_reorder("coord-1", task_ids=[b["id"], a["id"]])
+    ok = client.tasks_reorder("coord-1", task_ids=[b["id"], a["id"]])
     assert ok.get("ok") is True
-    env = client.task_list_get("coord-1")
+    env = client.tasks_get("coord-1")
     assert [t["id"] for t in env["tasks"]] == [b["id"], a["id"]]
 
 
-def test_task_list_cross_ws_scope_violation_is_noop(tmp_path):
+def test_tasks_cross_ws_scope_violation_is_noop(tmp_path):
     client = _task_client(tmp_path)
     # Client is bound to coord-1; anything else returns an empty envelope
     # or an error without touching storage.
-    assert client.task_list_get("other-ws") == {"version": 1, "tasks": []}
-    res_add = client.task_list_add("other-ws", title="sneak")
+    assert client.tasks_get("other-ws") == {"version": 1, "tasks": []}
+    res_add = client.tasks_add("other-ws", title="sneak")
     assert "error" in res_add
-    res_remove = client.task_list_remove("other-ws", task_id="x")
+    res_remove = client.tasks_remove("other-ws", task_id="x")
     assert "error" in res_remove
     assert "scope violation" in res_remove["error"]
 
 
-def test_task_list_corrupt_json_returns_empty_envelope(tmp_path):
+def test_tasks_corrupt_json_returns_empty_envelope(tmp_path):
     """A hand-edited / corrupt config row must not crash the tool."""
     st = SQLiteBackend(str(tmp_path / "tasks.db"))
     st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
     st.save_workstream_config("coord-1", {"tasks": "{not json"})
     client = _make_read_client(st)
-    env = client.task_list_get("coord-1")
+    env = client.tasks_get("coord-1")
     assert env == {"version": 1, "tasks": []}
 
 
-def test_task_list_mutations_refuse_corrupt_envelope(tmp_path):
+def test_tasks_mutations_refuse_corrupt_envelope(tmp_path):
     """When the envelope is corrupt on disk, mutators must error out
     (rather than silently overwrite — lost-data safety)."""
     st = SQLiteBackend(str(tmp_path / "tasks.db"))
     st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
     st.save_workstream_config("coord-1", {"tasks": "{not json"})
     client = _make_read_client(st)
-    add_result = client.task_list_add("coord-1", title="new")
+    add_result = client.tasks_add("coord-1", title="new")
     assert "error" in add_result
     assert "corrupt" in add_result["error"]
     # Also: the corrupt blob is preserved after the refused mutation.
     assert st.load_workstream_config("coord-1").get("tasks") == "{not json"
-    update_result = client.task_list_update("coord-1", task_id="x", status="done")
+    update_result = client.tasks_update("coord-1", task_id="x", status="done")
     assert "error" in update_result
-    reorder_result = client.task_list_reorder("coord-1", task_ids=[])
+    reorder_result = client.tasks_reorder("coord-1", task_ids=[])
     assert "error" in reorder_result
-    remove_result = client.task_list_remove("coord-1", task_id="x")
+    remove_result = client.tasks_remove("coord-1", task_id="x")
     assert "error" in remove_result
     assert "corrupt" in remove_result["error"]
 
 
-def test_task_list_add_enforces_capacity_cap(tmp_path, monkeypatch):
+def test_tasks_add_enforces_capacity_cap(tmp_path, monkeypatch):
     from turnstone.console import coordinator_client as cc_module
 
-    monkeypatch.setattr(cc_module, "_TASK_LIST_MAX", 3)
+    monkeypatch.setattr(cc_module, "_TASKS_MAX", 3)
     client = _task_client(tmp_path)
     for i in range(3):
-        client.task_list_add("coord-1", title=f"t{i}")
-    overflow = client.task_list_add("coord-1", title="no-room")
+        client.tasks_add("coord-1", title=f"t{i}")
+    overflow = client.tasks_add("coord-1", title="no-room")
     assert "error" in overflow
     assert "capacity" in overflow["error"]
     # After a remove, add succeeds again.
-    env = client.task_list_get("coord-1")
-    client.task_list_remove("coord-1", task_id=env["tasks"][0]["id"])
-    added = client.task_list_add("coord-1", title="retry")
+    env = client.tasks_get("coord-1")
+    client.tasks_remove("coord-1", task_id=env["tasks"][0]["id"])
+    added = client.tasks_add("coord-1", title="retry")
     assert "error" not in added
 
 
-def test_task_list_save_preserves_other_workstream_config_keys(tmp_path):
-    """_save_task_list writes only the 'tasks' key so other keys survive."""
+def test_tasks_save_preserves_other_workstream_config_keys(tmp_path):
+    """_save_tasks writes only the 'tasks' key so other keys survive."""
     st = SQLiteBackend(str(tmp_path / "tasks.db"))
     st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
     st.save_workstream_config("coord-1", {"reasoning_effort": "high"})
     client = _make_read_client(st)
-    client.task_list_add("coord-1", title="plan")
+    client.tasks_add("coord-1", title="plan")
     config = st.load_workstream_config("coord-1")
     assert config.get("reasoning_effort") == "high"
-    assert config.get("tasks")  # task_list wrote its key too
+    assert config.get("tasks")  # tasks wrote its key too
 
 
 def test_live_cache_lru_eviction_caps_memory(tmp_path):
@@ -2054,7 +2054,7 @@ def test_cleanup_dead_task_child_refs_blanks_dead_links(populated_storage):
     )
     blanked = client.cleanup_dead_task_child_refs("coord-1")
     assert blanked == 1
-    envelope = client.task_list_get("coord-1")
+    envelope = client.tasks_get("coord-1")
     tasks_by_id = {t["id"]: t for t in envelope["tasks"]}
     # Live link preserved.
     assert tasks_by_id["t1"]["child_ws_id"] == "child-a"
@@ -2090,9 +2090,9 @@ def test_cleanup_dead_task_child_refs_all_alive_is_noop(populated_storage):
 
 
 def test_cleanup_dead_task_child_refs_empty_envelope(populated_storage):
-    """A coordinator with no task_list persisted returns 0 without
+    """A coordinator with no tasks persisted returns 0 without
     raising — the cleanup runs on every close, including those that
-    never used the task_list tool."""
+    never used the tasks tool."""
     client = _make_read_client(populated_storage)
     blanked = client.cleanup_dead_task_child_refs("coord-1")
     assert blanked == 0
@@ -2109,7 +2109,7 @@ def test_cleanup_dead_task_child_refs_corrupt_envelope_skips(populated_storage):
 
 def test_cleanup_dead_task_child_refs_uses_task_lock(populated_storage):
     """The cleanup must acquire the same per-ws _task_lock that
-    task_list_add/update/remove/reorder hold, so a close racing an
+    tasks_add/update/remove/reorder hold, so a close racing an
     in-flight mutation can't lose writes (#bug-6).  Verified by
     swapping the cached lock for a stand-in that records acquisition."""
     client = _make_read_client(populated_storage)

@@ -1,6 +1,6 @@
 {
   "name": "inspect_workstream",
-  "description": "Read the persisted state of a workstream you previously spawned: state, title, skill, timestamps, and the last N messages. Auto-approved — safe, read-only. A `live` block from the owning node is merged when available (current tokens, activity, pending_approval). The `node_id` here is the spawn-time binding from storage; the actively-routed owner can differ if cluster membership changed since spawn (rendezvous re-derives per call). The `live` block, when present, reflects the node that currently holds the in-memory state. When the workstream was closed with a reason, that string surfaces as `close_reason`. Provider-native content blocks are stripped by default to keep the response compact; pass include_provider_content=true if you need the full fidelity payload for replay tooling.",
+  "description": "Read a workstream's persisted state: state, title, skill, timestamps, last N messages. A `live` block from the owning node merges in when available (current tokens, activity, `pending_approval`) and reflects the node currently holding in-memory state, which can differ from the stored `node_id` if cluster membership shifted since spawn. `close_reason` surfaces when the workstream was closed with one. Provider-native content blocks are stripped by default for compactness; pass `include_provider_content=true` for the full-fidelity payload (replay tooling).",
   "parameters": {
     "type": "object",
     "properties": {

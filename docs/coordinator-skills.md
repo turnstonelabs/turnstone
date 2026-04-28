@@ -65,7 +65,7 @@ or MCP config can do adds to it.  Current members:
 | `delete_workstream`       | wind-down       | Hard-delete one child.  Requires approval.                          |
 | `list_nodes`              | discover        | Enumerate live cluster nodes + capabilities.                        |
 | `list_skills`             | discover        | Coordinator-visible skills only (SkillKind filter above).           |
-| `task_list`               | plan            | Orchestrator-only scratchpad.  Children don't see it.               |
+| `tasks`                   | plan            | Orchestrator-only scratchpad.  Children don't see it.               |
 
 Explicitly **not** in the coordinator set:
 
@@ -108,9 +108,9 @@ the skill should end on.
 
 ---
 
-## `task_list` integration
+## `tasks` integration
 
-`task_list` is the coordinator's scratchpad — a persisted, ordered
+`tasks` is the coordinator's scratchpad — a persisted, ordered
 list of rows with fields `{id, title, status, child_ws_id, created,
 updated}` that only this coordinator sees.  Children don't see it;
 the user does via the sidebar.  Five actions: `add`, `update`,
@@ -125,13 +125,13 @@ a skill can set it to a placeholder before `spawn_workstream`
 returns or keep it pointing at a closed child for later audit.
 
 A skill's initial prompt can seed the task list by calling
-`task_list(action="add", title=...)` as its very first tool calls —
+`tasks(action="add", title=...)` as its very first tool calls —
 the user gets a visible plan before any child is spawned, and the
 coordinator's future self has something concrete to iterate on.
 Status transitions (`pending` → `in_progress` → `done` / `blocked`)
 are the skill's main feedback loop: mutate the task when the child
 covering it finishes, not when the child starts.  Use
-`task_list(action="update", task_id=..., child_ws_id=<ws_id>)` to
+`tasks(action="update", task_id=..., child_ws_id=<ws_id>)` to
 link a task to the child that owns it once spawn returns.
 
 A final gotcha: parallel tool dispatch does NOT serialise reads
@@ -215,12 +215,12 @@ to the user.  Appropriate when the user's request is "run the thing
 and tell me what happened" and the work fits in one workstream.
 
 ```
-task_list(action='add', title='audit /auth for CSRF')
+tasks(action='add', title='audit /auth for CSRF')
 spawn_workstream(skill='engineer', initial_message='audit /auth ...')
 wait_for_workstream(ws_ids=[<child>], timeout=300)
 inspect_workstream(ws_id=<child>)
 → synthesise the final message into a user-facing response
-task_list(action='update', task_id='t_01', status='done')
+tasks(action='update', task_id='t_01', status='done')
 close_workstream(ws_id=<child>, reason='audit complete')
 ```
 
@@ -231,7 +231,7 @@ waited-on together, then synthesised.  Appropriate when the user's
 request naturally decomposes into independent subtasks.
 
 ```
-task_list seeds:
+tasks seeds:
   t_01 benchmark Anthropic 4.7 latency on summarisation
   t_02 benchmark OpenAI GPT-5.2 latency on summarisation
   t_03 benchmark Gemini 2.5 latency on summarisation
@@ -239,7 +239,7 @@ spawn_batch(children=[...3 briefs...])
 wait_for_workstream(ws_ids=[c1, c2, c3], mode='all', timeout=600)
 inspect_workstream(ws_id=c1); ...(c2); ...(c3)
 → synthesise head-to-head comparison
-task_list → all done
+tasks → all done
 close_all_children(reason='benchmark complete')
 ```
 
@@ -252,20 +252,20 @@ approval each.
 ### Pattern 3 — plan-then-delegate
 
 The coordinator first uses its own reasoning to carve the plan,
-records it in `task_list`, then spawns children that each own one
+records it in `tasks`, then spawns children that each own one
 task.  Appropriate when the user's request is "figure out how to X"
 and the coordinator's planning step is itself valuable.
 
 ```
 → coord reasons about the shape of the work
-task_list(action='add', title='...') × N   # the plan, visible in the sidebar
+tasks(action='add', title='...') × N   # the plan, visible in the sidebar
 for task in tasks:
     spawn_workstream(skill=..., initial_message=task.brief)
-    task_list(action='update', task_id=task.id, notes='ws=<child_ws_id>')
+    tasks(action='update', task_id=task.id, notes='ws=<child_ws_id>')
 wait_for_workstream(ws_ids=[...], mode='all', timeout=...)
 for child in children:
     inspect_workstream(ws_id=child)
-    task_list(action='update', task_id=..., status='done', notes='result summary')
+    tasks(action='update', task_id=..., status='done', notes='result summary')
 → synthesise
 ```
 
@@ -297,7 +297,7 @@ For a new coordinator skill:
    `tests/test_coordinator_tools.py` show the helper (`_tc(name,
    args, call_id)`).
 4. Assert the skill's decision shape — which tools fire in what
-   order, what the task_list looks like at the end, which
+   order, what the tasks looks like at the end, which
    `_error` reasons appear on the denied-path.
 
 A full end-to-end test isn't required for every skill; a

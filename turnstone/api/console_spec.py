@@ -1351,7 +1351,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "Read the coordinator's task list envelope",
         description=(
             "Returns the ``{version, tasks}`` envelope persisted via the "
-            "``task_list`` model tool.  Corrupt envelopes return an empty "
+            "``tasks`` model tool.  Corrupt envelopes return an empty "
             "list (the tool itself surfaces corruption errors on mutation)."
         ),
         response_model=CoordinatorTasksResponse,

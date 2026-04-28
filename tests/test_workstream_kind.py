@@ -314,7 +314,7 @@ def test_chatsession_interactive_kind_excludes_coordinator_tools(tmp_db):
         "list_workstreams",
         "list_nodes",
         "list_skills",
-        "task_list",
+        "tasks",
         "wait_for_workstream",
     ):
         assert coord_name not in names, f"{coord_name} leaked into interactive session tools"

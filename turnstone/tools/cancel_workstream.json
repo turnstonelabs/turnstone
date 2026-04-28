@@ -1,6 +1,6 @@
 {
   "name": "cancel_workstream",
-  "description": "Cancel in-flight generation on a child workstream and unblock any pending approval / plan review. Does NOT close or delete the workstream — state moves to 'idle' so you can immediately follow up with send_to_workstream. Pair with close_workstream afterwards if you also want to retire the child. Approval required — cancelling drops tokens already spent on the in-flight call. Use when a child is stuck waiting on an approval you no longer want to grant, has gone off the rails on a long thinking turn, or simply needs a fresh prompt.",
+  "description": "Cancel in-flight generation on a child and unblock any pending approval / plan review. Does not close or delete — state moves to `idle`, so follow up with send_to_workstream or pair with close_workstream to retire. Drops tokens spent on the in-flight call. Use when a child is stuck on an approval you no longer want to grant, gone off the rails on a long thinking turn, or just needs a fresh prompt. Returns `{ws_id, cancelled, status, dropped?}`. `dropped` is included when the node captured forensics: it always carries `was_running: bool` (true mid-generation, false if the cancel arrived idle), and conditionally `pending_approval: {tool_names: [str], call_id: str}` when an approval was pending and `queued_messages: {count: int, first_preview: str}` when messages were queued behind the in-flight call. Read `was_running` first to judge whether the cancel actually interrupted work.",
   "parameters": {
     "type": "object",
     "properties": {
