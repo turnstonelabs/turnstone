@@ -73,6 +73,14 @@
     // Coord chat bubbles wrap content in a .msg-body div (appendMsg
     // below); the queue bubble matches so its border + padding align.
     wrapInBody: true,
+    // Re-fetch attachments after a dequeue so the user can see (and
+    // reuse) any reservations the server-side dequeue released. Trades
+    // a small in-flight-placeholder clobbering window for the strictly
+    // worse alternative of attachments lingering invisibly until the
+    // next page load.
+    onAfterDequeue: function () {
+      attachments.rehydrate();
+    },
     // Idle-edge cleanup of the cancel/force-stop timers — without
     // this they fire on the *next* busy turn, relabel Stop to "Force
     // Stop", and surface a misleading "Cancel didn't complete in
@@ -671,8 +679,17 @@
     })
       .then((r) => r.json())
       .then((data) => {
-        if (data && data.status === "queued" && data.msg_id && queuedEl) {
-          queue.bind(queuedEl, data.msg_id);
+        if (data && data.status === "queued" && data.msg_id) {
+          // Race: server returned queued but the client thought it was
+          // idle (SSE state_change hadn't arrived yet on initial load /
+          // reconnect). The optimistic user bubble is already in the
+          // log; we can't bind msg_id to a queued bubble retroactively
+          // without flipping the visual state mid-stream. Flip the busy
+          // flag so any subsequent send takes the queue path correctly,
+          // and accept the small UX gap (no in-UI dismiss for THIS
+          // message). The server still delivers it on worker drain.
+          if (queuedEl) queue.bind(queuedEl, data.msg_id);
+          else setBusy(true);
           attachments.consume(data.attached_ids, data.dropped_attachment_ids);
         } else if (data && data.status === "busy") {
           if (queuedEl) queue.remove(queuedEl);

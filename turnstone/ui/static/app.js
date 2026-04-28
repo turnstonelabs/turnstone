@@ -1586,11 +1586,17 @@ Pane.prototype.sendMessage = function () {
       return r.json();
     })
     .then(function (data) {
-      if (data.status === "queued" && data.msg_id && queuedEl) {
-        // bind() handles all three races (pre-bind dismiss, promote
-        // sweep raced ahead, normal accept) and DELETEs the slot when
-        // the bubble is no longer dequeue-able from the UI.
-        self.queue.bind(queuedEl, data.msg_id);
+      if (data.status === "queued" && data.msg_id) {
+        // queuedEl-present path: bind() handles the three known races
+        // (pre-bind dismiss, promote sweep raced ahead, normal accept).
+        // queuedEl-absent path: client thought it was idle but the
+        // server saw a live worker (SSE state_change hadn't arrived
+        // yet). Flip busy so subsequent sends queue correctly; the
+        // optimistic user bubble is already in the log and the server
+        // still delivers the message on worker drain — accept the
+        // small UX gap (no in-UI dismiss for THIS message).
+        if (queuedEl) self.queue.bind(queuedEl, data.msg_id);
+        else self.setBusy(true);
         self.attachments.consume(
           data.attached_ids,
           data.dropped_attachment_ids,

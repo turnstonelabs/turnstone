@@ -7,8 +7,8 @@
  * What this owns:
  *   - The queued-message bubble's DOM shape (msg-queued / queued-badge
  *     / queued-dismiss) and its dismiss-while-in-flight state machine.
- *   - The promote-on-idle sweep that strips queued styling once the
- *     worker drains (caller invokes promote() from its setBusy(false)).
+ *   - The on-idle sweep that strips queued styling once the worker
+ *     drains (caller invokes onIdleEdge() on the busy → idle edge).
  *
  * What this does NOT own:
  *   - Sending. Caller renders the bubble before the POST, then later
@@ -88,13 +88,18 @@
     }
 
     // Fire-and-forget DELETE — used by bind() on a raced-away bubble
-    // where the caller has no follow-up to do.
+    // where the caller has no DOM follow-up. Still invokes
+    // onAfterDequeue on success: the server-side reservation release
+    // freed any attachments the queued message held, and the caller
+    // typically rehydrates its chip pile so the user can reuse them.
     function _sendDelete(msgId) {
       var p = _deleteRequest(msgId);
-      if (p)
-        p.catch(function () {
-          /* network error — promote loop strips queued styling on idle */
-        });
+      if (!p) return;
+      p.then(function () {
+        if (onAfterDequeue) onAfterDequeue();
+      }).catch(function () {
+        /* network error — promote loop strips queued styling on idle */
+      });
     }
 
     function addQueuedMessage(text, priority) {

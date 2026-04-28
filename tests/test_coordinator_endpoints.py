@@ -762,7 +762,7 @@ def test_dequeue_removes_queued_coord_message(storage):
     ws = mgr.create(user_id="user-1")
     # _build_mgr's session_factory returns a MagicMock posing as a
     # ChatSession so the test can stub queue_message / dequeue_message.
-    session = cast(MagicMock, ws.session)
+    session = cast("MagicMock", ws.session)
 
     # Force the queue path by marking the worker as already running.
     # The lifted send handler hands off to ``session_worker.send`` which
@@ -796,7 +796,7 @@ def test_dequeue_removes_queued_coord_message(storage):
 def test_dequeue_unknown_msg_id_returns_not_found(storage):
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="user-1")
-    cast(MagicMock, ws.session).dequeue_message.return_value = False
+    cast("MagicMock", ws.session).dequeue_message.return_value = False
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.request(
         "DELETE",

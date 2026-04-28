@@ -455,10 +455,11 @@
    Queued-message bubble — optimistic UI when the user sends
    while the worker is still mid-turn (queueWhileBusy=true).
    The bubble dims, gains a dashed border, and carries a
-   "queued" badge + dismiss button until the worker drains the
-   queue and promotes it to a normal user message via
-   ``setBusy(false)`` → ``promoteQueuedMessages``. The
-   "important" variant is the !!! priority prefix path.
+   "queued" badge + dismiss button until the shared queue
+   controller observes the busy → idle edge via
+   ``queue.onIdleEdge()`` and promotes it to a normal user
+   message. The "important" variant is the !!! priority
+   prefix path.
    ============================================================ */
 .msg-queued {
   opacity: 0.65;
