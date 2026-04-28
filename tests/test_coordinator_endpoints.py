@@ -485,8 +485,9 @@ def test_create_503_factory_misconfig_message_is_sanitised(storage):
     )
     assert resp.status_code == 503
     err = resp.json()["error"]
-    # Cap enforced, control chars stripped, ellipsis added on truncation.
-    assert len(err) <= 201  # _FACTORY_MISCONFIG_MAX_LEN + 1 (ellipsis)
+    # Cap enforced (hard-capped at _FACTORY_MISCONFIG_MAX_LEN total —
+    # the truncation reserves one codepoint for the ellipsis).
+    assert len(err) <= 200
     assert "\x00" not in err
     assert "\x1b" not in err
     assert "Unknown model alias" in err

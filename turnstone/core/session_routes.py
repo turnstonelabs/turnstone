@@ -76,7 +76,10 @@ def _safe_factory_misconfig_message(exc: BaseException) -> str:
     if not cleaned:
         return "session factory misconfigured"
     if len(cleaned) > _FACTORY_MISCONFIG_MAX_LEN:
-        cleaned = cleaned[:_FACTORY_MISCONFIG_MAX_LEN] + "…"
+        # Reserve one codepoint for the ellipsis so the returned string
+        # is hard-capped at _FACTORY_MISCONFIG_MAX_LEN total, not
+        # MAX_LEN+1.
+        cleaned = cleaned[: _FACTORY_MISCONFIG_MAX_LEN - 1] + "…"
     return cleaned
 
 

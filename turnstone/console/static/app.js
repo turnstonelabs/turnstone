@@ -1588,7 +1588,11 @@ function _mountHomeCoordComposer() {
           id: "judge_model",
           label: "Judge Model",
           type: "select",
-          choices: [{ value: "", text: "Default (agent model)" }],
+          // Neutral label — the actual default is ConfigStore
+          // ``judge.model`` when set, IntentJudge's agent-model
+          // fallback when not.  "Default judge model" doesn't
+          // mislead either way.
+          choices: [{ value: "", text: "Default judge model" }],
         },
       ],
     },
