@@ -20,8 +20,12 @@ Mirrors ``turnstone.server.WebUI`` but scoped to the console's needs:
   broadcasts route through the cluster collector instead
   (``coord_adapter.emit_state`` for state changes;
   :meth:`_broadcast_activity` override for live activity ticks).
-- No per-node Prometheus metrics — the console has no /metrics
-  endpoint. WebUI's ``_metrics.record_*`` calls don't apply here.
+- Console-side Prometheus metrics — the console exposes ``/metrics``
+  backed by :class:`ConsoleMetrics` (lighter than the per-node
+  :class:`MetricsCollector` but the judge-verdict counter is parity
+  shape so a cluster-wide PromQL query rolls up coord + interactive
+  uniformly). Wired here via the ``_console_metrics`` class attribute
+  set at console startup.
 
 Contract: this class must conform to :class:`turnstone.core.session.SessionUI`.
 """
@@ -31,20 +35,15 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core.log import get_logger
-from turnstone.core.session_ui_base import AutoApproveReason, SessionUIBase
+from turnstone.core.session_ui_base import SessionUIBase, fire_judge_verdict_metric
 from turnstone.core.workstream import WorkstreamState
 
 if TYPE_CHECKING:
     from turnstone.console.collector import ClusterCollector
+    from turnstone.console.metrics import ConsoleMetrics
     from turnstone.core.session_manager import SessionManager
 
 log = get_logger(__name__)
-
-# Hard cap on how long a worker thread blocks waiting for an approval /
-# plan-review decision.  Exported as a constant so both blocking paths
-# stay in lockstep and a future `coordinator.approval_timeout_seconds`
-# setting can swap the literal.
-_APPROVAL_WAIT_TIMEOUT = 3600
 
 
 class ConsoleCoordinatorUI(SessionUIBase):
@@ -68,6 +67,13 @@ class ConsoleCoordinatorUI(SessionUIBase):
     # with CoordinatorManager; this replaces it without reviving the
     # closure-per-install pattern).
     _collector: ClusterCollector | None = None
+    # Shared reference to the console's :class:`ConsoleMetrics`
+    # instance. Set at console startup so ``_record_judge_metric`` and
+    # ``on_intent_verdict`` can fire ``turnstone_judge_verdicts_total``
+    # the same way the per-node ``WebUI`` does. ``None`` until the
+    # lifespan wires it (and during tests that don't spin up the full
+    # console app).
+    _console_metrics: ConsoleMetrics | None = None
 
     # ------------------------------------------------------------------
     # SessionUI protocol — streaming
@@ -87,98 +93,15 @@ class ConsoleCoordinatorUI(SessionUIBase):
 
     # ------------------------------------------------------------------
     # SessionUI protocol — approvals
+    #
+    # ``approve_tools`` / ``resolve_approval`` / ``resolve_plan`` are
+    # inherited from :class:`SessionUIBase`. The shared body covers
+    # tool-policy gating, per-tool auto-approve, blanket auto-approve,
+    # heuristic-verdict persistence, and activity tagging the same way
+    # interactive sessions get them. ``__budget_override__`` is
+    # interactive-only today; the carve-out in the shared body is a
+    # no-op on coord (coord workstreams don't have token budgets).
     # ------------------------------------------------------------------
-
-    def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]:
-        self._reset_approval_cycle()
-        pending = [it for it in items if it.get("needs_approval") and not it.get("error")]
-
-        if not pending:
-            # Nothing to approve; broadcast tool info anyway so the UI
-            # can render the tool preview.
-            if items:
-                self._enqueue(
-                    {
-                        "type": "tools_auto_approved",
-                        "items": self._serialize_approval_items(items),
-                    }
-                )
-            return True, None
-
-        # Per-tool auto-approve: 'Always approve this tool' adds the
-        # tool name to ``auto_approve_tools``.  This must short-circuit
-        # independently of the blanket ``auto_approve`` flag — matches
-        # the WebUI two-tier contract (turnstone/server.py).
-        if self.auto_approve_tools:
-            # Match WebUI's set-membership key: ``approval_label or
-            # func_name``.  ``auto_approve_tools`` is populated by
-            # both the skill template (bare func_name) and the
-            # "Approve + Always" handler (which tags via approval_label
-            # at session_routes.py).  Pre-fix the coord UI used only
-            # func_name, so an Always-added tool whose approval_label
-            # differs from func_name (e.g. ``skill__name``,
-            # ``mcp_resource__uri``) wouldn't match here and the
-            # operator would get prompted again on the coord page.
-            pending_names = {
-                it.get("approval_label", "") or it.get("func_name", "")
-                for it in pending
-                if it.get("func_name")
-            }
-            if pending_names and pending_names.issubset(self.auto_approve_tools):
-                # Tag for /dashboard visibility — matches WebUI shape so
-                # the coord-tree pill renders the same source string
-                # (``skill`` / ``always`` / generic) for both kinds.
-                self._tag_auto_approved(
-                    pending,
-                    AutoApproveReason.AUTO_APPROVE_TOOLS,
-                    source_map=self._auto_approve_tools_source,
-                )
-                self._record_auto_approves(items)
-                self._enqueue(
-                    {
-                        "type": "tools_auto_approved",
-                        "items": self._serialize_approval_items(items),
-                    }
-                )
-                return True, None
-
-        # Blanket auto-approve (set e.g. during scripted
-        # restart-rehydration) — also matches WebUI semantics.
-        if self.auto_approve:
-            self._tag_auto_approved(pending, AutoApproveReason.BLANKET)
-            self._record_auto_approves(items)
-            self._enqueue(
-                {
-                    "type": "tools_auto_approved",
-                    "items": self._serialize_approval_items(items),
-                }
-            )
-            return True, None
-
-        self._approval_event.clear()
-        self._pending_approval = {
-            "type": "approve_request",
-            "items": self._serialize_approval_items(items),
-            "judge_pending": False,
-        }
-        self._enqueue(self._pending_approval)
-        if not self._approval_event.wait(timeout=_APPROVAL_WAIT_TIMEOUT):
-            log.warning("coord_ui.approval_timeout ws=%s", self.ws_id)
-            self.resolve_approval(False, "Approval timed out after 1 hour")
-        self._pending_approval = None
-        approved, feedback = self._approval_result
-
-        if not approved:
-            denial_msg = "Denied by user"
-            if feedback:
-                denial_msg += f": {feedback}"
-            for item in pending:
-                item["denied"] = True
-                item["denial_msg"] = denial_msg
-
-        return approved, feedback
-
-    # ``resolve_approval`` inherited from :class:`SessionUIBase`.
 
     def on_plan_review(self, content: str) -> str:
         # Coordinator sessions don't fire plan_agent (AGENT_TOOLS is []
@@ -187,13 +110,11 @@ class ConsoleCoordinatorUI(SessionUIBase):
         self._plan_event.clear()
         self._pending_plan_review = {"type": "plan_review", "content": content}
         self._enqueue(self._pending_plan_review)
-        if not self._plan_event.wait(timeout=_APPROVAL_WAIT_TIMEOUT):
+        if not self._plan_event.wait(timeout=self._APPROVAL_WAIT_TIMEOUT):
             log.warning("coord_ui.plan_review_timeout ws=%s", self.ws_id)
             self.resolve_plan("reject")
         self._pending_plan_review = None
         return self._plan_result
-
-    # ``resolve_plan`` inherited from :class:`SessionUIBase`.
 
     # ------------------------------------------------------------------
     # SessionUI protocol — broadcast hook + state change + rename
@@ -299,7 +220,37 @@ class ConsoleCoordinatorUI(SessionUIBase):
                     exc_info=True,
                 )
 
-    # ``on_intent_verdict`` and ``on_output_warning`` inherited from
-    # :class:`SessionUIBase`. Coordinator sessions now persist verdicts
-    # and output assessments to storage alongside the interactive path
-    # (the "skip the persistence" deferral note has been retired).
+    # ``on_output_warning`` inherited from :class:`SessionUIBase`.
+    # Coordinator sessions persist verdicts and output assessments to
+    # storage alongside the interactive path.
+
+    # ------------------------------------------------------------------
+    # Prometheus metric hooks — fire ``turnstone_judge_verdicts_total``
+    # against the console's :class:`ConsoleMetrics` instance so the
+    # console's /metrics endpoint surfaces coord verdicts the same way
+    # the per-node /metrics surfaces interactive ones. Two call sites:
+    #
+    # - :meth:`_record_judge_metric` — heuristic tier, fired from the
+    #   shared ``approve_tools`` body during the synchronous
+    #   approval gate.
+    # - :meth:`on_intent_verdict` — LLM tier, fired by the daemon
+    #   judge thread asynchronously.
+    #
+    # Both end up at ``record_judge_verdict(tier, risk, latency_ms)`` —
+    # mirrors ``WebUI``'s pattern at ``server.py``. ``None`` guard
+    # covers the test-fixture case where the console lifespan didn't
+    # wire the class attribute.
+    # ------------------------------------------------------------------
+
+    def _record_judge_metric(self, verdict: dict[str, Any]) -> None:
+        cm = ConsoleCoordinatorUI._console_metrics
+        if cm is None:
+            return
+        fire_judge_verdict_metric(cm, verdict, "heuristic")
+
+    def on_intent_verdict(self, verdict: dict[str, Any]) -> None:
+        super().on_intent_verdict(verdict)
+        cm = ConsoleCoordinatorUI._console_metrics
+        if cm is None:
+            return
+        fire_judge_verdict_metric(cm, verdict, "llm")

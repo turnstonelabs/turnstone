@@ -1151,6 +1151,107 @@ def test_spawn_batch_exec_emits_batch_started_and_ended(coord_session):
 
 
 # ---------------------------------------------------------------------------
+# spawn_batch — _evaluate_intent func_args projection (sec-3 follow-up)
+# ---------------------------------------------------------------------------
+#
+# The judge (heuristic + LLM) reads ``item["func_args"]`` to reason about
+# what the coordinator is about to do. Pre-fix, spawn_batch projected only
+# the FIRST child's skill + initial_message — a malicious mid-batch entry
+# was invisible to both tiers. These tests pin the full-children projection.
+
+
+def _stub_judge_for_evaluate_intent(monkeypatch, sess):
+    """Stub _ensure_judge so _evaluate_intent's setup loop runs.
+
+    The actual judge.evaluate() is mocked to return one verdict per item
+    so the heuristic-attach loop doesn't IndexError. Tests assert on the
+    func_args populated BEFORE judge.evaluate is invoked.
+    """
+    fake_verdict = MagicMock()
+    fake_verdict.to_dict.return_value = {"verdict_id": "v0", "tier": "heuristic"}
+    fake_judge = MagicMock()
+    # judge.evaluate(items, messages, callback=, cancel_event=) → list[verdict]
+    fake_judge.evaluate.side_effect = lambda items, *_args, **_kw: [fake_verdict] * len(items)
+    monkeypatch.setattr(sess, "_ensure_judge", lambda: fake_judge)
+    return fake_judge
+
+
+def test_spawn_batch_evaluate_intent_projects_all_children(coord_session, monkeypatch):
+    sess, _coord, _ui = coord_session
+    _stub_judge_for_evaluate_intent(monkeypatch, sess)
+    item = sess._prepare_tool(
+        _tc(
+            "spawn_batch",
+            {
+                "children": [
+                    {"initial_message": "audit auth.py for CSRF", "skill": "engineer"},
+                    {"initial_message": "rm -rf the docs tree", "skill": "bash-runner"},
+                    {
+                        "initial_message": "compare FastAPI vs Starlette",
+                        "skill": "researcher",
+                        "target_node": "node-7",
+                    },
+                ]
+            },
+        )
+    )
+    sess._evaluate_intent([item])
+
+    fa = item["func_args"]
+    assert fa["child_count"] == 3
+    children = fa["children"]
+    assert len(children) == 3
+    assert children[0]["skill"] == "engineer"
+    assert children[0]["initial_message"] == "audit auth.py for CSRF"
+    assert children[0]["target_node"] == ""
+    # Mid-batch entry is fully visible — the bug this fix exists to close.
+    assert children[1]["skill"] == "bash-runner"
+    assert children[1]["initial_message"] == "rm -rf the docs tree"
+    assert children[2]["skill"] == "researcher"
+    assert children[2]["target_node"] == "node-7"
+
+
+def test_spawn_batch_evaluate_intent_truncates_long_messages(coord_session, monkeypatch):
+    sess, _coord, _ui = coord_session
+    _stub_judge_for_evaluate_intent(monkeypatch, sess)
+    long_msg = "x" * 500
+    item = sess._prepare_tool(
+        _tc("spawn_batch", {"children": [{"initial_message": long_msg, "skill": "researcher"}]})
+    )
+    sess._evaluate_intent([item])
+
+    children = item["func_args"]["children"]
+    assert len(children) == 1
+    # Cap is 200 chars — same shape every other coord-tool projection uses.
+    assert len(children[0]["initial_message"]) == 200
+    assert children[0]["initial_message"] == "x" * 200
+
+
+def test_spawn_batch_evaluate_intent_handles_empty_children_defensively(coord_session, monkeypatch):
+    """``_prepare_spawn_batch`` rejects an empty children list before this
+    code runs, so we shouldn't reach _evaluate_intent with one in
+    practice — but if a future caller bypasses the preparer the
+    projection must still produce a valid dict. Pinning the defensive
+    shape so the JSON-serialised verdict row stays well-formed."""
+    sess, _coord, _ui = coord_session
+    _stub_judge_for_evaluate_intent(monkeypatch, sess)
+    # Synthesise an item directly — bypassing _prepare_tool, since the
+    # preparer's empty-list rejection would prevent us reaching here.
+    fake_item = {
+        "call_id": "call-empty",
+        "func_name": "spawn_batch",
+        "needs_approval": True,
+        "approval_label": "spawn_batch",
+        "children": [],
+    }
+    sess._evaluate_intent([fake_item])
+
+    fa = fake_item["func_args"]
+    assert fa["child_count"] == 0
+    assert fa["children"] == []
+
+
+# ---------------------------------------------------------------------------
 # close_all_children
 # ---------------------------------------------------------------------------
 

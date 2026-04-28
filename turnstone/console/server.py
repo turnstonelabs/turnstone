@@ -2747,10 +2747,11 @@ def _coord_spawn_metrics(_request: Request, ui: Any) -> None:
     Wired onto :attr:`SessionEndpointConfig.spawn_metrics`. Increments
     ``_ws_messages`` and resets ``_ws_turn_tool_calls`` so the rich
     ``ws_state`` cluster broadcast renders the same per-turn shape
-    coord rows on the dashboard need. Coord doesn't have a Prometheus
-    endpoint to feed (the console isn't a node), so the
-    ``_metrics.record_message_sent()`` call interactive's analog
-    fires is omitted.
+    coord rows on the dashboard need. Console-side Prometheus runs
+    through :class:`ConsoleMetrics` (lighter than the per-node collector
+    — judge verdicts and routing/membership only); the interactive
+    analog ``_metrics.record_message_sent()`` has no console counterpart
+    yet, so this hook only owns the per-UI counter writes.
     """
     if (
         hasattr(ui, "_ws_lock")
@@ -3923,10 +3924,13 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                 coord_adapter.attach(coord_mgr)
                 app.state.coord_state_writer = coord_state_writer
                 # Shared refs so ConsoleCoordinatorUI.on_state_change
-                # flows state transitions through the unified manager
-                # and on_rename fans out to the cluster dashboard.
+                # flows state transitions through the unified manager,
+                # on_rename fans out to the cluster dashboard, and
+                # _record_judge_metric / on_intent_verdict feed the
+                # console's /metrics endpoint with coord verdicts.
                 ConsoleCoordinatorUI._coord_mgr = coord_mgr
                 ConsoleCoordinatorUI._collector = app.state.collector
+                ConsoleCoordinatorUI._console_metrics = app.state.console_metrics
                 app.state.coord_mgr = coord_mgr
                 app.state.coord_adapter = coord_adapter
                 # Wire the cluster-event subscription so the coordinator's
@@ -3981,6 +3985,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
 
         ConsoleCoordinatorUI._coord_mgr = None
         ConsoleCoordinatorUI._collector = None
+        ConsoleCoordinatorUI._console_metrics = None
     except Exception:
         log.debug("console.coord_ui_refs_reset_failed", exc_info=True)
     await app.state.proxy_sse_client.aclose()
@@ -5350,6 +5355,11 @@ async def admin_create_policy(request: Request) -> JSONResponse:
         enabled=enabled,
         created_by=audit_uid,
     )
+    # Drop the cached policy snapshot so the next ``approve_tools`` read
+    # picks up this rule without waiting for the TTL window to expire.
+    from turnstone.core.policy import invalidate_policy_cache
+
+    invalidate_policy_cache(org_id)
 
     record_audit(
         storage,
@@ -5408,6 +5418,12 @@ async def admin_update_policy(request: Request) -> JSONResponse:
         updates["enabled"] = bool(body["enabled"])
 
     storage.update_tool_policy(policy_id, **updates)
+    # Drop the cached policy snapshot so the next ``approve_tools`` read
+    # picks up this update without waiting for the TTL window. Use the
+    # existing row's org_id so the right slot is invalidated.
+    from turnstone.core.policy import invalidate_policy_cache
+
+    invalidate_policy_cache(existing.get("org_id", "") if isinstance(existing, dict) else None)
 
     audit_uid, ip = _audit_context(request)
     record_audit(storage, audit_uid, "policy.update", "policy", policy_id, updates, ip)
@@ -5435,6 +5451,11 @@ async def admin_delete_policy(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Policy not found"}, status_code=404)
 
     storage.delete_tool_policy(policy_id)
+    # Drop the cached policy snapshot so the next ``approve_tools`` read
+    # stops applying the deleted rule. Use the existing row's org_id.
+    from turnstone.core.policy import invalidate_policy_cache
+
+    invalidate_policy_cache(existing.get("org_id", "") if isinstance(existing, dict) else None)
 
     audit_uid, ip = _audit_context(request)
     record_audit(
@@ -10116,9 +10137,10 @@ def create_app(
         # cluster broadcast (PR #420) reads ``_ws_messages`` and
         # resets ``_ws_turn_tool_calls`` per turn so coord rows render
         # the same activity / per-turn counts interactive rows do.
-        # Coord doesn't fire Prometheus metrics (the console isn't a
-        # node and has no /metrics endpoint), but the per-UI counter
-        # writes match interactive's pattern.
+        # Judge verdicts on coord feed the console's /metrics endpoint
+        # via :class:`ConsoleCoordinatorUI._record_judge_metric` /
+        # ``on_intent_verdict``; this hook only owns the per-UI counter
+        # writes that match interactive's pattern.
         spawn_metrics=_coord_spawn_metrics,
         emit_message_queued=True,
         events_replay=_coord_events_replay,

@@ -37,6 +37,33 @@ class TestRecordRoute:
         assert "turnstone_router_request_duration_seconds_sum" in text
 
 
+class TestRecordJudgeVerdict:
+    """Coord-side intent-judge verdict counter."""
+
+    def test_single_verdict(self) -> None:
+        m = ConsoleMetrics()
+        m.record_judge_verdict("heuristic", "high", 12)
+
+        text = m.generate_text()
+        assert 'turnstone_judge_verdicts_total{tier="heuristic",risk_level="high"} 1' in text
+
+    def test_aggregates_by_tier_and_risk(self) -> None:
+        m = ConsoleMetrics()
+        m.record_judge_verdict("heuristic", "low", 5)
+        m.record_judge_verdict("heuristic", "low", 7)
+        m.record_judge_verdict("llm", "high", 250)
+
+        text = m.generate_text()
+        assert 'turnstone_judge_verdicts_total{tier="heuristic",risk_level="low"} 2' in text
+        assert 'turnstone_judge_verdicts_total{tier="llm",risk_level="high"} 1' in text
+
+    def test_section_omitted_when_empty(self) -> None:
+        """No verdicts recorded → don't emit the empty header block."""
+        m = ConsoleMetrics()
+        text = m.generate_text()
+        assert "turnstone_judge_verdicts_total" not in text
+
+
 class TestRouterInfo:
     """Live-membership gauge + refresh counter."""
 
