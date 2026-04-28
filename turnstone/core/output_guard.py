@@ -53,8 +53,17 @@ _RE_PRIVATE_KEY_BLOCK = re.compile(
     r"[\s\S]*?"
     r"-----END\s+(?:RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE\s+KEY-----",
 )
+# Database connection strings AND http(s) URLs that carry RFC-3986
+# userinfo (``user:pass@host``).  Adding http(s) here means a
+# misconfigured ``OPENAI_BASE_URL=https://user:pass@host`` that lands
+# in an httpx ``ConnectError.__str__`` is redacted by every caller of
+# ``redact_credentials`` — error persistence, audit details,
+# coordinator inspect/wait surfaces.  The structural form ``[^:@\s]+:
+# [^@\s]+@`` is specific enough that ``https://example.com:8080/path``
+# (host:port without ``@``) doesn't match.
 _RE_CONNECTION_STRING = re.compile(
-    r"(?:postgresql\+?(?:psycopg)?|mysql|mongodb|redis|amqp|sqlite)://[^:@\s]+:[^@\s]+@",
+    r"(?:postgresql\+?(?:psycopg)?|mysql|mongodb|redis|amqp|sqlite|https?)"
+    r"://[^:@\s]+:[^@\s]+@",
 )
 _RE_ENV_SECRET_LINE = re.compile(r"[A-Z][A-Z_0-9]+=\S+")
 _RE_ENV_SECRET_KEY = re.compile(

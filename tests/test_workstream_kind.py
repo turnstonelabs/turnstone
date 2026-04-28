@@ -258,22 +258,32 @@ def test_workstream_dataclass_accepts_parent():
 # ---------------------------------------------------------------------------
 
 
-def test_interactive_and_coordinator_tool_sets_are_disjoint():
-    """Interactive sessions must not see coordinator tools and vice versa.
+def test_interactive_and_coordinator_tool_sets_overlap_only_on_dual_kind():
+    """Interactive ∩ coordinator must be exactly the explicitly dual-kind tools.
 
-    Regression guard for the latent threshold bug where coordinator tools
-    counted against the interactive session's tool-search threshold, and
-    a future reader might naively expose ``TOOLS`` (the union) to an
-    interactive session.
+    Regression guard for the latent threshold bug where coordinator-only
+    tools counted against the interactive session's tool-search
+    threshold, and a future reader might naively expose ``TOOLS`` (the
+    union) to an interactive session.
+
+    A small, explicit overlap is allowed: tools tagged with BOTH
+    ``"coordinator": true`` and ``"interactive": true`` (e.g. ``memory``)
+    intentionally appear in both sets.  The whitelist below is the
+    canonical list of dual-kind tools — any drift here is a real
+    review-worthy change, not just a count tweak.
     """
     from turnstone.core.tools import COORDINATOR_TOOLS, INTERACTIVE_TOOLS, TOOLS
 
     interactive_names = {t["function"]["name"] for t in INTERACTIVE_TOOLS}
     coord_names = {t["function"]["name"] for t in COORDINATOR_TOOLS}
 
-    # No overlap.
-    assert interactive_names.isdisjoint(coord_names), (
-        f"interactive ∩ coordinator tools should be empty, got {interactive_names & coord_names}"
+    # Explicit dual-kind tools — deliberately in both sets.
+    dual_kind = {"memory"}
+
+    overlap = interactive_names & coord_names
+    assert overlap == dual_kind, (
+        f"interactive ∩ coordinator should be exactly {dual_kind}, got {overlap}. "
+        f"Update dual_kind if a new tool legitimately joins both sets."
     )
     # Coordinator set is non-empty (spawn/inspect/send/close/delete/list).
     assert coord_names, "expected at least one coordinator tool"
@@ -321,7 +331,14 @@ def test_chatsession_interactive_kind_excludes_coordinator_tools(tmp_db):
 
 
 def test_chatsession_coordinator_kind_excludes_interactive_tools(tmp_db):
-    """A coordinator ``ChatSession`` sees only coordinator tools."""
+    """A coordinator ``ChatSession`` sees only coordinator-kind tools.
+
+    ``memory`` IS in the coord set (it's marked dual-kind in
+    ``memory.json`` so coordinators can persist orchestration context
+    via the ``coordinator`` scope), but the IC-only tools (bash,
+    edit_file, ...) stay out — those operate on the local node and
+    have no meaningful semantics from the console.
+    """
     from unittest.mock import MagicMock
 
     from turnstone.core.session import ChatSession
@@ -341,11 +358,12 @@ def test_chatsession_coordinator_kind_excludes_interactive_tools(tmp_db):
         kind="coordinator",
     )
     names = {t["function"]["name"] for t in sess._tools}
-    # Coordinator tools present, interactive tools absent.
+    # Coordinator tools present, IC-only tools absent.
     assert "spawn_workstream" in names
     assert "bash" not in names
     assert "edit_file" not in names
-    assert "memory" not in names
+    # Memory is intentionally exposed — see docstring.
+    assert "memory" in names
     # Sub-agent tool lists are zeroed for coordinators.
     assert sess._task_tools == []
     assert sess._agent_tools == []

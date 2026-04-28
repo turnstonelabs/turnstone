@@ -1,6 +1,6 @@
 {
   "name": "memory",
-  "description": "Persistent memory across sessions. Actions: 'save' stores a memory, 'get' retrieves full content by name, 'search' finds memories by query, 'delete' removes a memory, 'list' shows all memories. Use 'get' to read full content — search/list truncate previews to 200 chars. Memories have a type (user/project/feedback/reference) and scope (global/workstream/user).",
+  "description": "Persistent memory across sessions. Actions: 'save' stores a memory, 'get' retrieves full content by name, 'search' finds memories by query, 'delete' removes a memory, 'list' shows all memories. Use 'get' to read full content — search/list truncate previews to 200 chars. Memories have a type (user/project/feedback/reference) and a scope.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -28,8 +28,8 @@
       },
       "scope": {
         "type": "string",
-        "enum": ["global", "workstream", "user"],
-        "description": "Memory scope. Default: 'global'. Use 'workstream' for context private to this workstream, 'user' for context that follows the user across workstreams."
+        "enum": ["global", "workstream", "user", "coordinator"],
+        "description": "Memory scope. Default: 'global'. 'workstream' for context private to this workstream, 'user' for context that follows the user across workstreams."
       },
       "query": {
         "type": "string",
@@ -41,6 +41,28 @@
       }
     },
     "required": ["action"]
+  },
+  "coordinator": true,
+  "interactive": true,
+  "kind_variants": {
+    "interactive": {
+      "description": "Persistent memory across sessions. Actions: 'save' stores a memory, 'get' retrieves full content by name, 'search' finds memories by query, 'delete' removes a memory, 'list' shows all memories. Use 'get' to read full content — search/list truncate previews to 200 chars. Memories have a type (user/project/feedback/reference) and scope (global/workstream/user). Default scope is 'global'.",
+      "parameter_overrides": {
+        "scope": {
+          "enum": ["global", "workstream", "user"],
+          "description": "Memory scope. Default: 'global'. 'workstream' for context private to this workstream, 'user' for context that follows the user across workstreams."
+        }
+      }
+    },
+    "coordinator": {
+      "description": "Persistent orchestration memory for this coordinator session. Actions: 'save' stores a memory, 'get' retrieves full content by name, 'search' finds memories by query, 'delete' removes a memory, 'list' shows all memories. Use 'get' to read full content — search/list truncate previews to 200 chars. Memories have a type (user/project/feedback/reference). Coordinator memories are private to this coordinator and survive across its turns; they are NOT visible to its child workstreams.",
+      "parameter_overrides": {
+        "scope": {
+          "enum": ["coordinator"],
+          "description": "Always 'coordinator' for coord sessions — coord memories are isolated to the coordinator's own orchestration namespace. This field can be omitted; it defaults to 'coordinator'."
+        }
+      }
+    }
   },
   "primary_key": "name"
 }

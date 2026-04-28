@@ -189,6 +189,20 @@ def _encode_image_data_uri(raw: bytes, mime: str) -> str:
 # Upper bound on total skill content injected into system messages
 _MAX_SKILL_CONTENT: int = 32768
 
+# Memory scopes accepted by the ``memory`` tool's preparer + executor.
+# Single source of truth — every action validator imports this rather
+# than literal-listing the four values, so adding a fifth scope is a
+# one-site change.  ``coordinator`` is COORDINATOR-only (see
+# :meth:`ChatSession._validate_scope`); the others are kind-agnostic.
+_VALID_MEMORY_SCOPES: tuple[str, ...] = ("global", "workstream", "user", "coordinator")
+
+# Implicit-scope walk for INTERACTIVE ``memory(action='get'/'delete')``
+# when no scope is specified.  Narrowest → widest so the most
+# session-specific row wins on a name collision.  Coord sessions use a
+# different walk (just ``("coordinator",)``) — see
+# :meth:`ChatSession._implicit_scope_walk`.
+_IMPLICIT_SCOPE_WALK: tuple[str, ...] = ("workstream", "user", "global")
+
 # Matches resource paths referenced in skill content (scripts/foo.py, etc.)
 _RESOURCE_PATH_RE = re.compile(
     r"(?<![/\w-])(?:scripts|references|assets)/[\w./-]+\."
@@ -444,6 +458,12 @@ class ChatSession:
         self._procs_lock = threading.Lock()
         self._cancelled_partial_msg: dict[str, Any] | None = None
         self._pending_retry: str | None = None
+        # True when a fatal exception's text has been persisted to
+        # workstream_config["last_error"] for the coord's inspect/wait
+        # surface.  Cleared when state transitions back to idle/running
+        # so a once-leaked exception body doesn't outlive the workstream
+        # — see ``_emit_state``.
+        self._has_persisted_error: bool = False
         # Intent validation judge (lazy-initialized)
         self._judge_config: JudgeConfig | None = judge_config
         self._judge: IntentJudge | None = None
@@ -1595,8 +1615,52 @@ class ChatSession:
         return self.system_messages + self.messages
 
     def _emit_state(self, state: str) -> None:
-        """Notify UI of a workstream state transition."""
+        """Notify UI of a workstream state transition.
+
+        Also clears any persisted ``last_error`` row when the transition
+        is a real recovery (``idle`` / ``running``) — a once-leaked
+        exception body shouldn't outlive the failure that produced it,
+        and the inspect/wait surface only displays ``last_error`` for
+        ``state=='error'`` rows so a stale value would be invisible to
+        the model but still queryable in storage forever.
+        """
+        if state in ("idle", "running") and self._has_persisted_error:
+            from turnstone.core.memory import clear_last_error
+
+            clear_last_error(self._ws_id)
+            self._has_persisted_error = False
         self.ui.on_state_change(state)
+
+    def _record_fatal_error(self, exc: BaseException) -> None:
+        """Surface, sanitize, and persist a fatal exception, then emit state=error.
+
+        Single chokepoint for the worker-thread fatal path: every
+        ``except`` branch in :meth:`send` routes here so the
+        sequence is fixed (sanitize → ``ui.on_error`` → persist →
+        emit state=error) and the persist always lands BEFORE the
+        synchronous state write in ``state_writer.record(flush_now=True)``.
+        That ordering is what makes a coord polling at the moment of
+        failure see ``state=error`` paired with a meaningful
+        ``last_error``, not bare state=error with a missing config row.
+
+        ``ui.on_error`` and the persist BOTH receive the sanitized
+        text — a misconfigured ``OPENAI_BASE_URL`` of the form
+        ``https://user:pass@host`` produces an httpx ``ConnectError``
+        whose ``str()`` carries the credentials verbatim, and they'd
+        otherwise land in (a) the dashboard via ``on_error`` and (b)
+        the coord LLM's prompt via inspect/wait.
+        """
+        from turnstone.core.memory import persist_last_error, sanitize_error_text
+
+        raw = f"{type(exc).__name__}: {exc}"
+        safe = sanitize_error_text(raw)
+        try:
+            self.ui.on_error(safe)
+        except Exception:
+            log.debug("session.on_error_dispatch_failed", exc_info=True)
+        persist_last_error(self._ws_id, safe)
+        self._has_persisted_error = True
+        self._emit_state("error")
 
     def _provider_extra_params(
         self,
@@ -2462,14 +2526,14 @@ class ChatSession:
             self._emit_state("idle")
             # Do NOT re-raise — return normally so server worker thread
             # completes cleanly.
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as exc:
             self._synthesize_cancelled_results("Interrupted by user.")
             self._flush_queued_messages()
-            self._emit_state("error")
+            self._record_fatal_error(exc)
             raise
-        except Exception:
+        except Exception as exc:
             self._flush_queued_messages()
-            self._emit_state("error")
+            self._record_fatal_error(exc)
             raise
 
     def _synthesize_cancelled_results(self, reason: str) -> None:
@@ -3698,9 +3762,26 @@ class ChatSession:
 
         Returns (results, user_feedback) where user_feedback is an optional
         message the user typed alongside their approval (e.g. "y, use full path").
+
+        Per-call exception isolation: a buggy preparer or runtime
+        failure is converted into an error tool_result for THAT call
+        only — sibling calls in a parallel batch keep running.  The
+        prior shape let a single ``_prepare_tool`` raise propagate out
+        of the list comprehension and abort the whole batch, leaving
+        the assistant's ``tool_calls`` orphaned (no matching
+        tool_results, conversation invalid for the next turn).
         """
-        # Phase 1: prepare all tool calls
-        items = [self._prepare_tool(tc) for tc in tool_calls]
+        # Phase 1: prepare all tool calls.  Each preparer call is
+        # individually shielded so a single failure (buggy preparer,
+        # MCP server in a weird state, etc.) becomes an error item
+        # for that call only — the other parallel siblings keep
+        # going.  Without the shield, the list comprehension would
+        # propagate, _execute_tools would raise to send()'s except
+        # clause, and EVERY tool_call in the batch would lose its
+        # result entry — the conversation would then be invalid on
+        # the next turn (assistant tool_calls with no matching tool
+        # results).  See the docstring on this method.
+        items = [self._safe_prepare_tool(tc) for tc in tool_calls]
 
         # Intent validation (advisory, non-blocking).
         # Cancel any prior judge thread before spawning a new one.
@@ -3759,9 +3840,32 @@ class ChatSession:
             except (KeyboardInterrupt, GenerationCancelled):
                 raise
             except Exception as e:
+                from turnstone.core.memory import sanitize_error_text
+
                 func = item.get("func_name", "unknown")
-                msg = f"Error executing {func}: {e}"
-                log.warning("tool_exec.failed", tool=func, error=str(e), exc_info=True)
+                # Include the exception class so triage doesn't have
+                # to guess (RateLimitError vs. TimeoutError vs. a
+                # tool-policy reject vs. a real bug all look very
+                # different to a coord trying to recover).  Append a
+                # short hint that the failure is local — sibling
+                # tool calls in this parallel batch returned their
+                # own results, the model can adapt instead of
+                # treating this as a session-wide failure.
+                #
+                # Redact before formatting both the log and the
+                # model-facing result: tool exceptions can carry
+                # credentials in their str() (HTTP error bodies, env
+                # values, etc.) and the same pattern set as the
+                # fatal-error path applies.
+                safe_exc_text = sanitize_error_text(f"{type(e).__name__}: {e}")
+                msg = (
+                    f"Error executing {func}: {safe_exc_text}\n"
+                    f"This tool raised an unexpected exception. "
+                    f"Sibling tool calls in this batch (if any) "
+                    f"completed independently. You can retry with "
+                    f"adjusted arguments or try a different approach."
+                )
+                log.warning("tool_exec.failed", tool=func, error=safe_exc_text, exc_info=True)
                 self._report_tool_result(item["call_id"], func, msg, is_error=True)
                 return item["call_id"], msg
 
@@ -3857,6 +3961,70 @@ class ChatSession:
         for tc in items:
             if not tc.get("id"):
                 tc["id"] = f"call_{uuid.uuid4().hex}"
+
+    def _safe_prepare_tool(self, tc: dict[str, Any]) -> dict[str, Any]:
+        """Wrap :meth:`_prepare_tool` so a single failing preparer is
+        an error item, not a propagating exception.
+
+        ``_prepare_tool`` is the per-call dispatcher into per-tool
+        preparers (validation, arg coercion, preview building).  A
+        bug in any one of those — KeyError on a missing optional, an
+        MCP client raising during ``is_mcp_tool``, anything — would
+        otherwise blow up the list comprehension in
+        :meth:`_execute_tools` and abort EVERY sibling call in the
+        same parallel batch.  Worse, the caught-too-late exception
+        leaves the assistant message's ``tool_calls`` orphaned
+        (no matching ``tool_result`` rows), which makes the next
+        turn invalid for both OpenAI and Anthropic schemas.
+
+        Cancellation semantics: ``KeyboardInterrupt`` /
+        ``GenerationCancelled`` re-raise so the cooperative cancel
+        path still works (the worker thread observes the cancel and
+        synthesizes results for orphaned tool_calls in
+        :meth:`_synthesize_cancelled_results`).
+        """
+        from turnstone.core.memory import sanitize_error_text
+
+        try:
+            return self._prepare_tool(tc)
+        except (KeyboardInterrupt, GenerationCancelled):
+            raise
+        except Exception as exc:
+            call_id = str(tc.get("id") or f"call_{uuid.uuid4().hex}")
+            func_name = ""
+            try:
+                func_name = str(tc.get("function", {}).get("name", "") or "").strip()
+            except Exception:
+                func_name = ""
+            if not func_name:
+                func_name = "unknown"
+            # Redact before logging AND before returning.  The raw
+            # exception text can carry credentials (e.g. a misconfigured
+            # base URL with userinfo, an echoed Bearer token, a
+            # connection-string envvar) — both the structured log and
+            # the model-facing tool_result must scrub via the same
+            # pattern set the audit log + output guard use.
+            safe_exc_text = sanitize_error_text(f"{type(exc).__name__}: {exc}")
+            log.warning(
+                "tool_prepare.failed tool=%s call_id=%s error=%s",
+                func_name,
+                call_id[:32],
+                safe_exc_text,
+                exc_info=True,
+            )
+            return {
+                "call_id": call_id,
+                "func_name": func_name,
+                "header": f"✗ {func_name}: prepare failed",
+                "preview": "",
+                "needs_approval": False,
+                "error": (
+                    f"Internal error preparing {func_name}: {safe_exc_text}\n"
+                    f"Sibling tool calls in this batch were unaffected. "
+                    f"You can retry this tool with adjusted arguments "
+                    f"or pick a different approach."
+                ),
+            }
 
     def _prepare_tool(self, tc: dict[str, Any]) -> dict[str, Any]:
         """Parse a tool call and prepare preview info for display."""
@@ -4813,15 +4981,56 @@ class ChatSession:
         }
 
     def _resolve_scope_id(self, scope: str) -> str:
-        """Map a scope name to its scope_id."""
+        """Map a scope name to its scope_id.
+
+        ``coordinator`` is COORDINATOR-only \u2014 the coord can save and
+        read memories in its own private namespace, but its child
+        interactive workstreams cannot see or write the row.  This
+        closes the cross-session prompt-injection lane that an
+        adversarially-steered child would otherwise have through the
+        coord's system message: the coord's children consume external
+        content (MCP tool output, attachments) which can be steered to
+        plant instructions, and the new scope must not become a
+        delivery channel back into the parent's prompt.
+        """
         if scope == "workstream":
             return self._ws_id
         if scope == "user":
             return self._user_id
+        if scope == "coordinator":
+            return self._coordinator_scope_id()
+        return ""
+
+    def _coordinator_scope_id(self) -> str:
+        """Return the ws_id anchoring the ``coordinator`` memory scope, or ``""``.
+
+        Only a coordinator session has a coord scope \u2014 returns
+        ``self._ws_id`` for ``kind == COORDINATOR``, ``""`` otherwise.
+        Children of a coord get an empty scope_id, which
+        :meth:`_validate_scope` translates into an explicit reject \u2014
+        children must use ``workstream`` or ``user`` scope for their
+        own memories.
+
+        See :meth:`_resolve_scope_id`'s docstring for the security
+        rationale (cross-session prompt-injection containment).
+        """
+        if self._kind == WorkstreamKind.COORDINATOR:
+            return self._ws_id
         return ""
 
     def _validate_scope(self, scope: str, call_id: str) -> dict[str, Any] | None:
-        """Return an error dict if scope is invalid, None if OK."""
+        """Return an error dict if scope is invalid, None if OK.
+
+        Coord sessions are isolated to coord-scope: they reject every
+        other scope (``global`` / ``workstream`` / ``user``) so the
+        coord's memory namespace stays focused on orchestration and
+        doesn't accidentally mutate or read user-context rows.
+
+        Interactive sessions reject ``coordinator`` for the symmetric
+        reason \u2014 coord-scope rows are private to a coordinator
+        session, and an IC writer could otherwise be a cross-session
+        prompt-injection lane into the parent coord's system message.
+        """
         if scope == "user" and not self._user_id:
             return {
                 "call_id": call_id,
@@ -4831,10 +5040,75 @@ class ChatSession:
                 "needs_approval": False,
                 "error": "Error: 'user' scope requires authenticated user identity",
             }
+        if self._kind == WorkstreamKind.COORDINATOR and scope != "coordinator":
+            return {
+                "call_id": call_id,
+                "func_name": "memory",
+                "header": f"\u2717 memory: scope '{scope}' unavailable to coordinator",
+                "preview": "",
+                "needs_approval": False,
+                "error": (
+                    f"Error: '{scope}' scope is not available to coordinator "
+                    "sessions. Coord sessions only see and write the "
+                    "'coordinator' scope \u2014 their orchestration namespace is "
+                    "isolated from the user's interactive memory. Use "
+                    "scope='coordinator' or omit scope (it defaults to "
+                    "'coordinator' for coord sessions)."
+                ),
+            }
+        if scope == "coordinator" and self._kind != WorkstreamKind.COORDINATOR:
+            return {
+                "call_id": call_id,
+                "func_name": "memory",
+                "header": "\u2717 memory: coordinator scope unavailable",
+                "preview": "",
+                "needs_approval": False,
+                "error": (
+                    "Error: 'coordinator' scope is only valid for coordinator "
+                    "sessions. This is an interactive workstream \u2014 use "
+                    "'workstream' or 'user' scope for context private to this "
+                    "session, or ask the parent coordinator to manage shared "
+                    "context on your behalf."
+                ),
+            }
         return None
 
+    def _default_memory_scope(self) -> str:
+        """Default ``scope`` for a memory(action='save') with no explicit scope.
+
+        Coord sessions default to ``coordinator`` (the only scope they
+        can write); interactive sessions default to ``global`` to match
+        the existing IC behaviour.
+        """
+        if self._kind == WorkstreamKind.COORDINATOR:
+            return "coordinator"
+        return "global"
+
+    def _implicit_scope_walk(self) -> tuple[str, ...]:
+        """Walk for memory(action='get'/'delete') with no explicit scope.
+
+        Coord sessions only walk ``coordinator`` \u2014 anything else would
+        search namespaces the coord can't write to.  Interactive sessions
+        keep the narrowest-first walk (workstream \u2192 user \u2192 global); a
+        ``coordinator`` step there would always resolve to empty
+        scope_id and be a wasted lookup.
+        """
+        if self._kind == WorkstreamKind.COORDINATOR:
+            return ("coordinator",)
+        return _IMPLICIT_SCOPE_WALK
+
     def _visible_memory_count(self) -> int:
-        """Count memories visible to this session (cheap — counts only)."""
+        """Count memories visible to this session.
+
+        Coord sessions are isolated to their own coord-scope namespace —
+        they don't see global / workstream / user rows.  The orchestration
+        role doesn't need user-context memory and pulling those rows in
+        would also surface memories from sibling interactive sessions
+        (same user, different workstream) into the coord's system
+        message, which the coord shouldn't be reasoning over.
+        """
+        if self._kind == WorkstreamKind.COORDINATOR:
+            return count_structured_memories(scope="coordinator", scope_id=self._ws_id)
         n = count_structured_memories(scope="global")
         n += count_structured_memories(scope="workstream", scope_id=self._ws_id)
         if self._user_id:
@@ -4842,7 +5116,17 @@ class ChatSession:
         return n
 
     def _list_visible_memories(self, mem_type: str = "", limit: int = 50) -> list[dict[str, str]]:
-        """List memories visible to this session with optional type filter."""
+        """List memories visible to this session with optional type filter.
+
+        See :meth:`_visible_memory_count` for the coord-isolation rule.
+        """
+        if self._kind == WorkstreamKind.COORDINATOR:
+            return list_structured_memories(
+                mem_type=mem_type,
+                scope="coordinator",
+                scope_id=self._ws_id,
+                limit=limit,
+            )
         global_mems = list_structured_memories(mem_type=mem_type, scope="global", limit=limit)
         ws_mems = list_structured_memories(
             mem_type=mem_type, scope="workstream", scope_id=self._ws_id, limit=limit
@@ -4859,7 +5143,18 @@ class ChatSession:
     def _search_visible_memories(
         self, query: str, mem_type: str = "", limit: int = 20
     ) -> list[dict[str, str]]:
-        """Search memories visible to this session (scope-filtered)."""
+        """Search memories visible to this session (scope-filtered).
+
+        See :meth:`_visible_memory_count` for the coord-isolation rule.
+        """
+        if self._kind == WorkstreamKind.COORDINATOR:
+            return search_structured_memories(
+                query,
+                mem_type=mem_type,
+                scope="coordinator",
+                scope_id=self._ws_id,
+                limit=limit,
+            )
         global_mems = search_structured_memories(
             query, mem_type=mem_type, scope="global", limit=limit
         )
@@ -6177,9 +6472,13 @@ class ChatSession:
             mem_type = (args.get("type") or "project").strip().lower()
             if mem_type not in ("user", "project", "feedback", "reference"):
                 mem_type = "project"
-            scope = (args.get("scope") or "global").strip().lower()
-            if scope not in ("global", "workstream", "user"):
-                scope = "global"
+            # Default scope is kind-aware: coord sessions default to
+            # ``coordinator`` (their only writable scope); IC sessions
+            # default to ``global`` (matches pre-fix behaviour).
+            default_scope = self._default_memory_scope()
+            scope = (args.get("scope") or default_scope).strip().lower()
+            if scope not in _VALID_MEMORY_SCOPES:
+                scope = default_scope
             scope_err = self._validate_scope(scope, call_id)
             if scope_err:
                 return scope_err
@@ -6212,7 +6511,7 @@ class ChatSession:
                     "error": "Error: 'name' is required for get",
                 }
             explicit_scope = (args.get("scope") or "").strip().lower()
-            valid_scopes = ("global", "workstream", "user")
+            valid_scopes = _VALID_MEMORY_SCOPES
             if explicit_scope and explicit_scope not in valid_scopes:
                 return {
                     "call_id": call_id,
@@ -6228,8 +6527,12 @@ class ChatSession:
                     return scope_err
                 scopes_to_try = [(explicit_scope, self._resolve_scope_id(explicit_scope))]
             else:
+                # Implicit fallback walk \u2014 kind-aware narrowest-to-widest.
+                # Coord sessions only walk ``coordinator``; IC sessions
+                # walk workstream \u2192 user \u2192 global.  See
+                # :meth:`_implicit_scope_walk`.
                 scopes_to_try = []
-                for s in ("workstream", "user", "global"):
+                for s in self._implicit_scope_walk():
                     sid = self._resolve_scope_id(s)
                     if sid or s == "global":
                         scopes_to_try.append((s, sid))
@@ -6257,7 +6560,7 @@ class ChatSession:
                     "error": "Error: name is required for delete",
                 }
             explicit_scope = (args.get("scope") or "").strip().lower()
-            valid_scopes = ("global", "workstream", "user")
+            valid_scopes = _VALID_MEMORY_SCOPES
             if explicit_scope and explicit_scope not in valid_scopes:
                 return {
                     "call_id": call_id,
@@ -6277,9 +6580,11 @@ class ChatSession:
                 scope_id = self._resolve_scope_id(explicit_scope)
                 scopes_to_try = [(explicit_scope, scope_id)]
             else:
-                # No scope specified — try narrowest first: workstream → user → global
+                # Kind-aware implicit walk — coord sessions stay in coord-scope;
+                # IC sessions walk narrowest-to-widest (workstream → user → global).
+                # See :meth:`_implicit_scope_walk`.
                 scopes_to_try = []
-                for s in ("workstream", "user", "global"):
+                for s in self._implicit_scope_walk():
                     sid = self._resolve_scope_id(s)
                     if sid or s == "global":
                         scopes_to_try.append((s, sid))
@@ -6301,7 +6606,7 @@ class ChatSession:
             if mem_type and mem_type not in ("user", "project", "feedback", "reference"):
                 mem_type = ""
             scope = (args.get("scope") or "").strip().lower()
-            if scope and scope not in ("global", "workstream", "user"):
+            if scope and scope not in _VALID_MEMORY_SCOPES:
                 scope = ""
             if scope:
                 scope_err = self._validate_scope(scope, call_id)
@@ -6334,7 +6639,7 @@ class ChatSession:
             if mem_type and mem_type not in ("user", "project", "feedback", "reference"):
                 mem_type = ""
             scope = (args.get("scope") or "").strip().lower()
-            if scope and scope not in ("global", "workstream", "user"):
+            if scope and scope not in _VALID_MEMORY_SCOPES:
                 scope = ""
             if scope:
                 scope_err = self._validate_scope(scope, call_id)
@@ -7717,7 +8022,7 @@ class ChatSession:
                 scope = item.get("scope", "")
                 scope_id = item.get("scope_id", "")
                 # Defense-in-depth: reject scoped queries with empty scope_id
-                if scope in ("user", "workstream") and not scope_id:
+                if scope in ("user", "workstream", "coordinator") and not scope_id:
                     msg = f"Error: '{scope}' scope requires a valid identity"
                     self._report_tool_result(call_id, "memory", msg, is_error=True)
                     return call_id, msg
@@ -7759,7 +8064,7 @@ class ChatSession:
             if action == "list":
                 scope = item.get("scope", "")
                 scope_id = item.get("scope_id", "")
-                if scope in ("user", "workstream") and not scope_id:
+                if scope in ("user", "workstream", "coordinator") and not scope_id:
                     msg = f"Error: '{scope}' scope requires a valid identity"
                     self._report_tool_result(call_id, "memory", msg, is_error=True)
                     return call_id, msg
