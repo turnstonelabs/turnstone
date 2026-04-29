@@ -179,6 +179,18 @@
       .replace(/'/g, "&#39;");
   }
 
+  // ANSI-escape stripper — mirrors ui/static/app.js so a tool that
+  // emits CSI sequences (rare on the coord tool surface, but bash
+  // through MCP / the underlying child node still can) lands as
+  // readable text inside the tool-batch result block.
+  function stripAnsi(s) {
+    return String(s == null ? "" : s).replace(
+      // eslint-disable-next-line no-control-regex
+      /\x1b(?:\[[0-9;?]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[()#][A-Za-z0-9]|.)/g,
+      "",
+    );
+  }
+
   // Post-process tool-output JSON: wrap known ws_id + node_id pairs in a
   // link pointing at /node/{node_id}/?ws_id={child_ws_id}.  Only applies
   // when BOTH keys are present and look like valid hex ids.
@@ -426,17 +438,69 @@
     return s;
   }
 
+  // Pick the highest-tier verdict across items for the initial batch
+  // tier badge.  LLM beats heuristic; first LLM verdict's judge_model
+  // wins (heterogeneous models within a single envelope is unusual but
+  // we default to the leading one for stability).
   function _pickBatchTier(items) {
+    let llmModel = null;
+    let hasHeuristic = false;
     for (const it of items) {
       const v = it.judge_verdict || it.heuristic_verdict;
-      if (v) {
-        const tierLabel = v.tier || (it.judge_verdict ? "llm" : "heuristic");
-        const glyph = tierLabel === "llm" ? "⚖" : "⚙";
-        const model = v.judge_model ? ":" + v.judge_model : "";
-        return glyph + " " + tierLabel + model;
+      if (!v) continue;
+      const tier = v.tier || (it.judge_verdict ? "llm" : "heuristic");
+      if (tier === "llm" && llmModel === null) {
+        llmModel = v.judge_model || "";
+      } else if (tier === "heuristic") {
+        hasHeuristic = true;
       }
     }
+    if (llmModel !== null) {
+      return "⚖ llm" + (llmModel ? ":" + llmModel : "");
+    }
+    if (hasHeuristic) {
+      return "⚙ heuristic";
+    }
     return "";
+  }
+
+  // Recompute the batch's header tier badge from per-row dataset
+  // tags.  Called whenever a row verdict updates (e.g. an
+  // intent_verdict SSE event lands an LLM verdict on a row that was
+  // previously showing heuristic) so the header escalates from
+  // ``⚙ heuristic`` to ``⚖ llm[:model]`` without waiting for a full
+  // re-render.
+  function _refreshBatchTier(batch) {
+    if (!batch) return;
+    let llmModel = null;
+    let hasHeuristic = false;
+    batch.querySelectorAll(".coord-tool-row").forEach((r) => {
+      const t = r.dataset.verdictTier;
+      if (t === "llm" && llmModel === null) {
+        llmModel = r.dataset.verdictModel || "";
+      } else if (t === "heuristic") {
+        hasHeuristic = true;
+      }
+    });
+    const head = batch.querySelector(".coord-tool-batch-head");
+    if (!head) return;
+    let tierEl = head.querySelector(".coord-tool-batch-tier");
+    let label = "";
+    if (llmModel !== null) {
+      label = "⚖ llm" + (llmModel ? ":" + llmModel : "");
+    } else if (hasHeuristic) {
+      label = "⚙ heuristic";
+    }
+    if (label) {
+      if (!tierEl) {
+        tierEl = document.createElement("span");
+        tierEl.className = "coord-tool-batch-tier";
+        head.appendChild(tierEl);
+      }
+      if (tierEl.textContent !== label) tierEl.textContent = label;
+    } else if (tierEl) {
+      tierEl.remove();
+    }
   }
 
   function _renderBatchRow(item, indexLabel) {
@@ -566,6 +630,23 @@
       // the rationale from the chip it explains.
       line.insertAdjacentElement("afterend", det);
     }
+    // Persist the verdict's tier on the row so the batch's header
+    // tier badge can escalate from ⚙ heuristic → ⚖ llm when a later
+    // intent_verdict lands an LLM verdict.  Default to "heuristic"
+    // when tier is absent — heuristic verdicts ship without an
+    // explicit tier marker on every server emitter.
+    if (verdict) {
+      row.dataset.verdictTier = verdict.tier || "heuristic";
+      if (verdict.judge_model) {
+        row.dataset.verdictModel = verdict.judge_model;
+      } else {
+        delete row.dataset.verdictModel;
+      }
+    } else {
+      delete row.dataset.verdictTier;
+      delete row.dataset.verdictModel;
+    }
+    _refreshBatchTier(row.closest(".coord-tool-batch"));
     return line;
   }
 
@@ -599,8 +680,26 @@
     lead.className = "coord-tool-row-result-lead";
     lead.textContent = isError ? "✗ error: " : "↳ result: ";
     block.appendChild(lead);
+    // Pretty-print JSON when the output parses; coord tool surfaces
+    // (list_nodes, tasks, spawn_workstream, ...) emit JSON by default,
+    // and a single-line dump is unreadable for a multi-key result.
+    // The parent .coord-tool-row-result has white-space: pre-wrap, so
+    // a textContent assignment with embedded \n preserves the
+    // formatting without needing a nested <pre>.
+    const cleaned = stripAnsi(output || "");
     const body = document.createElement("span");
-    body.textContent = stripAnsi(output || "");
+    let pretty = cleaned;
+    if (cleaned) {
+      try {
+        const parsed = JSON.parse(cleaned);
+        if (parsed && typeof parsed === "object") {
+          pretty = JSON.stringify(parsed, null, 2);
+        }
+      } catch (_) {
+        /* not JSON — fall through to raw text */
+      }
+    }
+    body.textContent = pretty;
     block.appendChild(body);
     row.appendChild(block);
   }
@@ -1558,12 +1657,18 @@
         // Cache the verdict so a late-arriving approve_request (or a
         // SSE replay reorder) still surfaces it.  _cacheJudgeVerdict
         // soft-caps the Map to bound long-session memory growth.
+        // intent_verdict is the LLM judge's signal by definition, so
+        // tag the cache entry as tier="llm" — _refreshBatchTier reads
+        // this off the row dataset to escalate the header badge from
+        // ⚙ heuristic → ⚖ llm when the late verdict lands.
         if (ev.call_id) {
           _cacheJudgeVerdict(ev.call_id, {
             recommendation: ev.recommendation,
             risk_level: ev.risk_level,
             confidence: ev.confidence,
             reasoning: ev.reasoning,
+            tier: ev.tier || "llm",
+            judge_model: ev.judge_model || "",
           });
           const entry = toolRows.get(ev.call_id);
           if (entry) {
