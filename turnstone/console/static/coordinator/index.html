@@ -514,6 +514,19 @@
          don't re-announce partial content on every token. -->
     <div id="coord-messages" role="log" aria-live="polite"></div>
 
+    <!-- Off-screen assertive live region for action-required SR
+         announcements ("Approval required: spawn_workstream + 9
+         more"). Pending tool-batches go into the polite #coord-messages
+         log, which gets flipped to aria-live="off" during token
+         streaming, so without this dedicated assertive region a
+         screen reader could miss the gate landing.  Visually hidden
+         via inline style; no layout impact. -->
+    <div id="coord-sr-announcer"
+         role="status"
+         aria-live="assertive"
+         aria-atomic="true"
+         style="position:absolute;left:-10000px;width:1px;height:1px;overflow:hidden"></div>
+
     <!-- Per-coordinator status bar — pinned above the composer.
          Mirrors the interactive pane's `.ws-status-bar`: model alias,
          token / context-window usage with effort suffix, tool calls

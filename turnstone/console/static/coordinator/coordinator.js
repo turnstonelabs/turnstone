@@ -108,6 +108,22 @@
   const tasksEl = document.getElementById("coord-tasks");
   const tasksCountEl = document.getElementById("coord-tasks-count");
   const tasksRefreshBtn = document.getElementById("coord-tasks-refresh");
+  // Off-screen aria-live="assertive" region — pending tool-batches
+  // append into the polite messages log, which gets flipped to
+  // aria-live="off" during streaming.  Routing the action-required
+  // announcement through this dedicated region ensures SR users hear
+  // the gate land regardless of streaming state.
+  const srAnnouncerEl = document.getElementById("coord-sr-announcer");
+  function _announcePolitelyAssertive(text) {
+    if (!srAnnouncerEl) return;
+    // Briefly clearing then setting forces SR reading even if the
+    // text is identical to the previous announcement (some SRs only
+    // read on textContent change).
+    srAnnouncerEl.textContent = "";
+    requestAnimationFrame(() => {
+      srAnnouncerEl.textContent = text;
+    });
+  }
 
   // Status bar — model alias, token / context-window usage, tool calls
   // this turn, conversation turn.  Driven by the connected + status
@@ -428,6 +444,14 @@
     row.className = "coord-tool-row";
     if (item.call_id) row.dataset.callId = item.call_id;
     if (item.func_name) row.dataset.funcName = item.func_name;
+    // Tag rows whose call_id is genuinely in pending_items (not auto-
+    // approved, not policy-blocked).  _resolveBatchAction reads this
+    // to pick a call_id the server will accept — auto-approved items
+    // appear in approve_request payloads too but resolving against
+    // them yields a 409 since they're not in pending_items.
+    if (item.needs_approval && !item.error) {
+      row.dataset.needsApproval = "1";
+    }
 
     const callLine = document.createElement("div");
     callLine.className = "coord-tool-row-call";
@@ -598,6 +622,19 @@
     return btn;
   }
 
+  // Concise, screen-reader friendly summary of a pending batch — used
+  // both as the .coord-tool-batch[role=region] aria-label and as the
+  // text fed to the off-screen assertive announcer when the gate
+  // appears.  "Approval required: spawn_workstream + 9 more" reads
+  // cleanly through a SR without revealing every nested arg.
+  function _approvalAriaLabel(items) {
+    const first =
+      (items && items[0] && (items[0].func_name || items[0].approval_label)) ||
+      "tool";
+    const rest = items.length > 1 ? " + " + (items.length - 1) + " more" : "";
+    return "Approval required: " + first + rest;
+  }
+
   function _buildBatchActions(batch, items) {
     const actions = document.createElement("div");
     actions.className = "coord-tool-actions";
@@ -648,9 +685,14 @@
   }
 
   async function _resolveBatchAction(batch, approved, always) {
-    const pendingRow = Array.from(
-      batch.querySelectorAll(".coord-tool-row"),
-    ).find((r) => r.dataset.callId && !r.classList.contains("error"));
+    // Pick a call_id from a row that's actually in the server's
+    // pending_items (data-needs-approval="1").  approve_request
+    // envelopes carry the FULL items list including auto-approved /
+    // policy-blocked siblings; resolving against one of those would
+    // 409 since the server's pending_items wouldn't recognise it.
+    const pendingRow = batch.querySelector(
+      '.coord-tool-row[data-needs-approval="1"][data-call-id]',
+    );
     const callId = pendingRow && pendingRow.dataset.callId;
     if (!callId) return;
     _setBatchActionsDisabled(batch, true);
@@ -716,6 +758,10 @@
     batch.classList.add(
       opts.approved ? "coord-tool-batch--approved" : "coord-tool-batch--denied",
     );
+    // Drop the [role=region] approval landmark so the resolved batch
+    // stops claiming "Approval required" in SR landmark navigation.
+    batch.removeAttribute("role");
+    batch.removeAttribute("aria-label");
     const actions = batch.querySelector(".coord-tool-actions");
     if (actions) actions.replaceWith(_buildStatusPill(opts));
     if (activeBatch === batch) activeBatch = null;
@@ -739,15 +785,21 @@
   // Build (or update) a batch construct for `items`.  Idempotent on
   // SSE reconnect: when every item's call_id already has a row in the
   // DOM, returns the existing batch + folds in any newly-cached
-  // verdicts.
+  // verdicts (and upgrades the batch's state class when SSE arrives
+  // with a more specific state than history replay used).
   //
-  // opts:
-  //   pending (bool)       — show approval action row, mark pending
-  //   auto (bool)          — mark .coord-tool-batch--auto (no actions)
+  // opts (mutually exclusive states):
+  //   pending (bool)       — show approval action row, mark --pending
+  //   auto (bool)          — mark --auto (no actions; auto-approved)
+  //   running (bool)       — mark --running (no actions; replay-time
+  //                          orphan with no result yet — could be
+  //                          pending OR auto-approved + in-flight,
+  //                          ambiguous until SSE clarifies)
+  //   resolved ({approved,denied,feedback,always}) — historical
+  //                          resolved batch (status pill prefilled)
   //   judgePending (bool)  — show "judge evaluating…" placeholders
-  //   resolved ({approved,denied,feedback,always}) — replay of a
-  //                          historical resolved batch (status pill
-  //                          prefilled, no actions)
+  //                          on rows with needs_approval=true (only
+  //                          meaningful with pending)
   function appendToolBatch(items, opts) {
     items = (items || []).filter(Boolean);
     if (items.length === 0) return null;
@@ -758,14 +810,16 @@
     );
     if (allMapped) {
       const existing = toolRows.get(items[0].call_id).batch;
-      // Upgrade-in-place: when the second emit promotes the existing
-      // batch to pending (e.g. history replay rendered the call_ids as
-      // orphan-pending placeholders before SSE connected, then the SSE
-      // approve_request replay arrives with opts.pending=true), morph
-      // the existing shell instead of leaving stale chrome.  Without
-      // this, the replayed pending event was a no-op against any
-      // already-resolved or non-pending shell — the operator would
-      // never see action buttons in this tab.
+      // Upgrade-in-place: when SSE arrives with a more specific state
+      // than the placeholder history replay rendered, morph the
+      // existing shell instead of leaving stale chrome.  The two real
+      // upgrade transitions:
+      //   --running → --pending  (SSE approve_request fires for an
+      //                            orphan turn that was actually
+      //                            awaiting approval at reload)
+      //   --running → --auto     (SSE tool_info fires for an orphan
+      //                            turn that was actually auto-
+      //                            approved + in-flight at reload)
       if (
         opts.pending &&
         !existing.classList.contains("coord-tool-batch--pending")
@@ -774,9 +828,22 @@
           "coord-tool-batch--approved",
           "coord-tool-batch--denied",
           "coord-tool-batch--auto",
+          "coord-tool-batch--running",
           "coord-tool-batch--error",
         );
         existing.classList.add("coord-tool-batch--pending");
+        existing.setAttribute("role", "region");
+        existing.setAttribute("aria-label", _approvalAriaLabel(items));
+        // Tag rows that just gained needs_approval=true via the SSE
+        // upgrade so _resolveBatchAction can pick the right call_id.
+        items.forEach((it) => {
+          if (!it.call_id) return;
+          const entry = toolRows.get(it.call_id);
+          if (!entry) return;
+          if (it.needs_approval && !it.error) {
+            entry.row.dataset.needsApproval = "1";
+          }
+        });
         const kicker = existing.querySelector(".coord-tool-batch-kicker");
         if (kicker) {
           kicker.textContent =
@@ -791,10 +858,18 @@
         else if (actionsEl) actionsEl.replaceWith(newActions);
         else existing.appendChild(newActions);
         activeBatch = existing;
+        _announcePolitelyAssertive(_approvalAriaLabel(items));
+      } else if (
+        opts.auto &&
+        existing.classList.contains("coord-tool-batch--running")
+      ) {
+        existing.classList.remove("coord-tool-batch--running");
+        existing.classList.add("coord-tool-batch--auto");
       } else if (opts.pending) {
         // Already pending — keep the action row, just refresh
         // activeBatch so kb shortcut + approval_resolved routing
-        // target the right construct.
+        // target the right construct.  Don't re-announce; SR already
+        // heard about this gate.
         activeBatch = existing;
       }
       items.forEach((it) => {
@@ -824,6 +899,7 @@
     );
     if (opts.pending) batch.classList.add("coord-tool-batch--pending");
     else if (opts.auto) batch.classList.add("coord-tool-batch--auto");
+    else if (opts.running) batch.classList.add("coord-tool-batch--running");
     else if (opts.resolved) {
       batch.classList.add(
         opts.resolved.approved
@@ -841,6 +917,9 @@
         items.length >= 2
           ? "⚠ Approval · Parallel " + items.length
           : "⚠ Approval";
+    } else if (opts.running) {
+      kicker.textContent =
+        items.length >= 2 ? "Running · Parallel " + items.length : "Running";
     } else if (items.length >= 2) {
       kicker.textContent = "Parallel · " + items.length + " tools";
     } else {
@@ -894,7 +973,14 @@
 
     if (opts.pending) {
       batch.appendChild(_buildBatchActions(batch, items));
+      // Mark the construct as a navigable landmark for SR users +
+      // route the action-required announcement through the dedicated
+      // assertive live region (the chat log itself is polite and
+      // gets muted during streaming).
+      batch.setAttribute("role", "region");
+      batch.setAttribute("aria-label", _approvalAriaLabel(items));
       activeBatch = batch;
+      _announcePolitelyAssertive(_approvalAriaLabel(items));
     } else if (opts.resolved) {
       batch.appendChild(_buildStatusPill(opts.resolved));
     }
@@ -2985,14 +3071,18 @@
       // Pre-scan every tool message's tool_call_id so the
       // assistant.tool_calls branch below knows whether each call_id
       // already has a result persisted.  An assistant tool_calls turn
-      // with NO matching tool result for some call_ids = orphan
-      // (approval was pending when the page reloaded); rendering it
-      // as resolved-approved would lock the operator out of the
-      // pending approval (the SSE approve_request replay would then
-      // fold into the "already mapped" branch and never paint
-      // actions).  Pre-scanning lets us flag the turn as pending
-      // up-front so SSE either upgrades it in place or finds a
-      // pre-existing pending shell to merge with.
+      // with NO matching tool result for some call_ids = orphan: the
+      // tool was dispatched but didn't complete before the reload
+      // captured this history snapshot.  Orphans are ambiguous — the
+      // tool could have been (a) awaiting approval at reload, (b)
+      // auto-approved + still in flight, or (c) approved + still in
+      // flight.  We render orphans as a neutral --running shell with
+      // no actions; SSE then upgrades to --pending when it replays
+      // approve_request (case a) or to --auto when it replays
+      // tool_info (case b), and tool_result events land in the rows
+      // for case c.  Without this neutral state, painting Approve
+      // buttons on a non-pending orphan was misleading and could
+      // 409-on-submit because the call_id wasn't in pending_items.
       const resolvedCallIds = new Set();
       (hist.messages || []).forEach((m) => {
         if ((m.role || "tool") === "tool" && m.tool_call_id) {
@@ -3007,11 +3097,10 @@
         // assistant turn so a parallel fan-out (tool_calls.length ≥ 2)
         // reads as one cohesive dispatch, matching how live SSE
         // renders the same flow via approve_request / tool_info.
-        // The batch is marked resolved-approved when every call_id has
-        // a matching tool result message; otherwise it's an orphan
-        // (approval pending at reload) and renders as pending so the
-        // operator can act + SSE can fold its approve_request replay
-        // into this same shell via the upgrade-in-place path.
+        // Resolved when every call_id has a matching tool result;
+        // otherwise --running (see the resolvedCallIds rationale
+        // above).  SSE upgrades --running in place when it knows
+        // more.
         if (
           role === "assistant" &&
           Array.isArray(m.tool_calls) &&
@@ -3035,10 +3124,11 @@
               parsedArgs,
               argsRaw,
             );
-            // Synthesized items default to needs_approval=true so the
-            // upgrade-in-place path (when SSE later folds in) can
-            // render judge placeholders and the approve POST has a
-            // call_id to send.  Resolved-batch path ignores it.
+            // needs_approval is unknown at replay time — server didn't
+            // persist that bit on the assistant.tool_calls.  Set true
+            // so that if SSE later promotes the batch to --pending,
+            // _resolveBatchAction can find a row to send the approve
+            // POST against.  Ignored by --running / --resolved paths.
             item.needs_approval = true;
             return item;
           });
@@ -3048,7 +3138,7 @@
           if (allResolved) {
             appendToolBatch(items, { resolved: { approved: true } });
           } else {
-            appendToolBatch(items, { pending: true, judgePending: true });
+            appendToolBatch(items, { running: true });
           }
         }
 

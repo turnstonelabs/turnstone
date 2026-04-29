@@ -100,6 +100,10 @@
      .coord-tool-batch--approved resolved approve
      .coord-tool-batch--denied   resolved deny — rows dimmed
      .coord-tool-batch--auto     all auto-approved, no gate ever shown
+     .coord-tool-batch--running  replay-time orphan (dispatched but no
+                                 matching tool_result yet) — no actions.
+                                 SSE upgrades to --pending or --auto
+                                 when it knows more.
    ========================================================================== */
 .coord-tool-batch {
   margin: 4px 0;
@@ -125,6 +129,12 @@
 }
 .coord-tool-batch--auto {
   border-left-color: var(--hair-2);
+}
+.coord-tool-batch--running {
+  /* Subtle accent stripe so the operator can tell a still-in-flight
+     replayed batch apart from a resolved one without it screaming
+     for attention.  Not warn (which would imply approval-needed). */
+  border-left-color: color-mix(in srgb, var(--accent) 50%, var(--hair-2));
 }
 .coord-tool-batch--denied,
 .coord-tool-batch--error {
@@ -379,9 +389,13 @@
   background: color-mix(in srgb, var(--err) 12%, var(--panel-2));
 }
 
-/* Tool result block — paired under its row, mono pre-block with
-   collapse-when-tall affordance.  Maxes at 240px and reveals an
-   "expand" affordance like .tool-output.collapsed in the interactive UI. */
+/* Tool result block — paired under its row, mono pre-block.  Capped
+   at 240px with internal scroll so a long tool output doesn't push
+   the rest of the chat off-screen.  The interactive UI uses a
+   click-to-expand "collapsed" affordance (see ui/static/style.css
+   .tool-output.collapsed) — coord deliberately doesn't, since the
+   construct is read-only history once results land and a scroll
+   pane is the lower-friction read for a diagnostic surface. */
 .coord-tool-row-result {
   margin-top: 6px;
   padding: 6px 10px;
