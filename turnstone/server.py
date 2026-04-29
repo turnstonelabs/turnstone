@@ -3544,6 +3544,11 @@ def main() -> None:
         default=8080,
         help="Port to listen on (default: 8080)",
     )
+    parser.add_argument(
+        "--skip-permissions",
+        action="store_true",
+        help="Auto-approve all tool calls (no confirmation prompts)",
+    )
     # MCP config path is bootstrap-critical (needed before ConfigStore for tool loading)
     parser.add_argument(
         "--mcp-config",
@@ -3971,7 +3976,7 @@ def main() -> None:
         ws = manager.create(user_id="", name="resumed")
         if not isinstance(ws.ui, WebUI):
             raise TypeError(f"Expected WebUI, got {type(ws.ui).__name__}")
-        if config_store.get("tools.skip_permissions"):
+        if args.skip_permissions or config_store.get("tools.skip_permissions"):
             ws.ui.auto_approve = True
         assert ws.session is not None
         ws.session.set_watch_runner(
@@ -4009,7 +4014,7 @@ def main() -> None:
         _advertise_host = args.host if args.host not in ("0.0.0.0", "::") else socket.gethostname()
         _advertise_url = f"http://{_advertise_host}:{args.port}"
 
-    _skip_perms = config_store.get("tools.skip_permissions")
+    _skip_perms = args.skip_permissions or config_store.get("tools.skip_permissions")
     app = create_app(
         workstreams=manager,
         global_queue=global_queue,
