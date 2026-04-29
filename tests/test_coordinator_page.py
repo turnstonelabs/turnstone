@@ -55,13 +55,16 @@ def test_uppercase_hex_rejected(client):
 
 
 def test_coordinator_js_exposes_inline_approval_helpers():
-    """Smoke guard for the Chunk 3 frontend wiring — the new helper
-    function names must remain reachable in the served JS so a refactor
-    accidentally renaming/removing them surfaces here instead of in
-    production where the children-tree's inline approve/deny buttons
-    silently stop rendering. Asserts string presence only — no DOM
-    parsing — since coord.js has no JS test framework today (per the
-    plan's testing notes)."""
+    """Smoke guard for two layers of the coord chat frontend: the
+    children-tree inline approve/deny block (the original Chunk 3
+    landing) and the PR #447 tool-batch construct that replaced the
+    pinned approval dock for the coord-self surface.  Both layers'
+    helper symbols must remain reachable in the served JS so a
+    refactor that accidentally renames or removes them surfaces here
+    instead of in production where the affected gates silently stop
+    rendering.  Asserts string presence only — no DOM parsing —
+    since coord.js has no JS test framework today (per the plan's
+    testing notes)."""
     from pathlib import Path
 
     coord_js = Path(__file__).resolve().parent.parent / (
@@ -125,3 +128,27 @@ def test_coordinator_js_exposes_inline_approval_helpers():
     # Approve/Deny before SSE replay arrives.
     assert "wsSnapshot.pending_approval_detail" in body
     assert "appendToolBatch(pendingDetail.items" in body
+    # Tool-batch construct (PR #447) — the inline replacement for the
+    # pinned approval-dock pattern.  These helpers carry the
+    # state-machine that pairs each tool call with its result and
+    # embeds the approval flow.  Refactors that rename or drop them
+    # silently regress the entire coord-self approval surface — the
+    # most novel and risky behavior in the PR.
+    assert "function appendToolBatch" in body
+    assert "function _morphBatchResolved" in body
+    assert "function _resolveBatchAction" in body
+    assert "function _refreshBatchTier" in body
+    assert "function _refreshRowStatus" in body
+    # State modifiers driven by the upgrade-in-place path
+    # (--running orphan promoted to --pending or --auto when SSE
+    # arrives with the authoritative shape).  Both class names must
+    # remain reachable from JS — dropping either breaks the reload
+    # state machine that PR #447's review pass surfaced.
+    assert "coord-tool-batch--running" in body
+    assert "coord-tool-batch--pending" in body
+    # History replay's outcome classifier — denied / errored tool
+    # turns must render with the correct batch state on reload, not
+    # the contradictory "✓ approved" pill that pre-fix showed for
+    # any prior denial.  bug-1 / bug-3 from the second /review pass.
+    assert "Denied by user" in body
+    assert "callOutcomes" in body

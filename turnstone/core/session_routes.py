@@ -786,7 +786,12 @@ def make_approve_handler(cfg: SessionEndpointConfig) -> Handler:
                 if source_map is not None:
                     for t in tool_names:
                         source_map[t] = AutoApproveReason.ALWAYS
-        ui.resolve_approval(approved, feedback)
+        # Forward ``always`` so the resulting ``approval_resolved`` SSE
+        # event carries the intent — peer tabs that didn't click but
+        # are subscribed to the same workstream can render the right
+        # status pill ("✓ approved · always" vs plain "✓ approved")
+        # without needing a side-channel broadcast.
+        ui.resolve_approval(approved, feedback, always=always)
         return JSONResponse({"status": "ok"})
 
     return approve
@@ -2173,6 +2178,21 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
         if not ws_id:
             return JSONResponse({"error": "ws_id is required"}, status_code=400)
 
+        # Cross-tenant gate.  Pre-PR-447 the response carried only
+        # message rows that an owning user wrote and that owning
+        # user's tools produced — sensitive but bounded to the same
+        # ``user_id`` as the workstream.  Even so, every other lifted
+        # session verb (send / approve / close / cancel / events /
+        # attachments) calls ``cfg.tenant_check`` and history was the
+        # outlier.  Coord wires ``tenant_check=None`` (the
+        # cluster-wide ``admin.coordinator`` permission_gate covers
+        # it); interactive wires ``_interactive_tenant_check`` and
+        # this call now restores parity with the rest of the surface.
+        if cfg.tenant_check is not None:
+            err_tenant = cfg.tenant_check(request, ws_id, mgr)
+            if err_tenant is not None:
+                return err_tenant
+
         # Existence + kind check. The workstream may live only in
         # storage (closed coordinators are still readable via /history
         # without rehydrating; persisted-but-not-loaded interactives
@@ -2262,6 +2282,21 @@ def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
         if not ws_id:
             return JSONResponse({"error": "ws_id is required"}, status_code=400)
 
+        # Cross-tenant gate.  PR 447 added ``pending_approval_detail``
+        # to the response (tool previews, function arguments, LLM
+        # judge reasoning) — a richer payload than the pre-PR
+        # ``{ws_id, name, state, user_id, kind}`` tuple.  Coord wires
+        # ``tenant_check=None`` (the cluster-wide ``admin.coordinator``
+        # permission_gate covers it); interactive wires
+        # ``_interactive_tenant_check`` so any authenticated user that
+        # GETs another user's ``ws_id`` 404s here instead of reading
+        # the in-flight tool-call payload.  Brings detail in line with
+        # every other lifted session verb.
+        if cfg.tenant_check is not None:
+            err_tenant = cfg.tenant_check(request, ws_id, mgr)
+            if err_tenant is not None:
+                return err_tenant
+
         ws = mgr.get(ws_id)
         if ws is None:
             try:
@@ -2316,7 +2351,7 @@ def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
         # ``SessionUIBase._pending_approval``) so a MagicMock-based
         # unit test or other non-dict sentinel doesn't trip the path.
         pending_approval = False
-        pending_approval_detail: Any = None
+        pending_approval_detail: dict[str, Any] | None = None
         ui = ws.ui
         pending_raw = getattr(ui, "_pending_approval", None) if ui is not None else None
         if isinstance(pending_raw, dict):

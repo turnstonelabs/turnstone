@@ -10,6 +10,7 @@ import pytest
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 from starlette.testclient import TestClient
 
@@ -740,26 +741,38 @@ class TestUpdateInterfaceSetting:
 # These tests pin the interactive wiring against the same factory.
 
 
-def _interactive_endpoint_cfg(mock_mgr: Any) -> SessionEndpointConfig:
+def _interactive_endpoint_cfg(
+    mock_mgr: Any,
+    tenant_check: Any = None,
+) -> SessionEndpointConfig:
     """Interactive-shaped cfg wired the same way ``server.py`` does.
 
     Shared by both :func:`_build_history_app` and :func:`_build_detail_app`
     — every field both factories actually read is present (the detail
     factory ignores ``list_kind`` since it relies on ``mgr.open()`` for
     cross-kind isolation, but the field is harmless to set).
+
+    The optional ``tenant_check`` lets a regression test wire the same
+    cross-tenant gate ``server.py`` uses (``_interactive_tenant_check``)
+    so the lifted handlers can be exercised with the production-shape
+    auth posture, not just the bypass shape.
     """
     return SessionEndpointConfig(
         permission_gate=None,  # auth middleware covers it
         manager_lookup=lambda _r: (mock_mgr, None),
-        tenant_check=None,
+        tenant_check=tenant_check,
         not_found_label="Workstream not found",
         audit_action_prefix="workstream",
         list_kind=WorkstreamKind.INTERACTIVE,
     )
 
 
-def _build_history_app(mock_mgr: Any, storage: Any) -> TestClient:
-    cfg = _interactive_endpoint_cfg(mock_mgr)
+def _build_history_app(
+    mock_mgr: Any,
+    storage: Any,
+    tenant_check: Any = None,
+) -> TestClient:
+    cfg = _interactive_endpoint_cfg(mock_mgr, tenant_check=tenant_check)
     handler = make_history_handler(cfg)
     app = Starlette(
         routes=[
@@ -777,8 +790,11 @@ def _build_history_app(mock_mgr: Any, storage: Any) -> TestClient:
     return TestClient(app)
 
 
-def _build_detail_app(mock_mgr: Any) -> TestClient:
-    cfg = _interactive_endpoint_cfg(mock_mgr)
+def _build_detail_app(
+    mock_mgr: Any,
+    tenant_check: Any = None,
+) -> TestClient:
+    cfg = _interactive_endpoint_cfg(mock_mgr, tenant_check=tenant_check)
     handler = make_detail_handler(cfg)
     app = Starlette(
         routes=[
@@ -1084,3 +1100,116 @@ class TestDetailInteractive:
         assert "correlation_id=" in body["error"]
         # Per-kind noun via cfg.audit_action_prefix.
         assert "workstream" in body["error"]
+
+
+class TestTenantCheckOnReadEndpoints:
+    """Regression coverage for the cross-tenant gate on the lifted
+    ``GET /workstreams/{ws_id}`` (detail) and ``/history`` endpoints.
+
+    Both handlers used to skip ``cfg.tenant_check`` while every other
+    lifted session verb invoked it.  Pre-PR-447 the gap was a minor
+    info leak (5 display fields on detail; conversation history); PR
+    #447 made it real by adding ``pending_approval_detail`` to detail
+    (tool previews + LLM judge reasoning).  These tests pin the gate
+    so a future cfg refactor can't silently regress it.
+    """
+
+    def test_detail_404s_when_tenant_check_rejects(self):
+        """A non-owning interactive caller reading another user's ws_id
+        through the detail endpoint must 404 before any data flows."""
+        ws_id = "ws-other-user"
+        loaded_ws = MagicMock()
+        loaded_ws.id = ws_id
+        loaded_ws.name = "owned-by-stranger"
+        loaded_ws.state = MagicMock()
+        loaded_ws.state.value = "idle"
+        loaded_ws.user_id = "owner"
+        loaded_ws.kind = "interactive"
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = loaded_ws
+
+        # Tenant check returns a 404 just like ``_require_ws_access``
+        # does on owner-mismatch.  We can't import the production
+        # helper here (it pulls the whole server module into the test
+        # graph) so we ape its return shape.
+        def deny(_request: Any, _ws_id: str, _mgr: Any) -> JSONResponse:
+            return JSONResponse({"error": "Workstream not found"}, status_code=404)
+
+        client = _build_detail_app(mock_mgr, tenant_check=deny)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}")
+        assert r.status_code == 404
+        body = r.json()
+        # Sensitive fields the PR added must not surface for a
+        # non-owning caller.
+        assert "name" not in body
+        assert "pending_approval_detail" not in body
+        assert "user_id" not in body
+        # And mgr.get was NEVER consulted — the gate fires first.
+        mock_mgr.get.assert_not_called()
+        mock_mgr.open.assert_not_called()
+
+    def test_detail_succeeds_when_tenant_check_allows(self):
+        """A passing tenant_check (returns ``None``) lets the handler
+        proceed normally — the ``pending_approval`` defaults still
+        appear in the response."""
+        ws_id = "ws-mine"
+        loaded_ws = MagicMock()
+        loaded_ws.id = ws_id
+        loaded_ws.name = "owned"
+        loaded_ws.state = MagicMock()
+        loaded_ws.state.value = "idle"
+        loaded_ws.user_id = "test-user"
+        loaded_ws.kind = "interactive"
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = loaded_ws
+
+        def allow(_request: Any, _ws_id: str, _mgr: Any) -> None:
+            return None
+
+        client = _build_detail_app(mock_mgr, tenant_check=allow)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ws_id"] == ws_id
+        assert body["pending_approval"] is False
+        assert body["pending_approval_detail"] is None
+
+    def test_history_404s_when_tenant_check_rejects(self, _inject_storage):
+        """A non-owning interactive caller reading another user's ws_id
+        through the history endpoint must 404 before any storage
+        access — owner messages are sensitive content."""
+        ws_id = "ws-other-user-hist"
+        _inject_storage.register_workstream(ws_id, kind="interactive", user_id="owner")
+        _inject_storage.save_message(ws_id, "user", "private message")
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = None
+
+        def deny(_request: Any, _ws_id: str, _mgr: Any) -> JSONResponse:
+            return JSONResponse({"error": "Workstream not found"}, status_code=404)
+
+        client = _build_history_app(mock_mgr, _inject_storage, tenant_check=deny)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}/history")
+        assert r.status_code == 404
+        # Owner's content must not have leaked into the response.
+        assert "private message" not in r.text
+
+    def test_history_succeeds_when_tenant_check_allows(self, _inject_storage):
+        ws_id = "ws-mine-hist"
+        _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
+        _inject_storage.save_message(ws_id, "user", "hello")
+        mock_ws = MagicMock()
+        mock_ws.id = ws_id
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = mock_ws
+
+        def allow(_request: Any, _ws_id: str, _mgr: Any) -> None:
+            return None
+
+        client = _build_history_app(mock_mgr, _inject_storage, tenant_check=allow)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}/history")
+        assert r.status_code == 200
+        assert any(m.get("content") == "hello" for m in r.json()["messages"])

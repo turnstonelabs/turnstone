@@ -114,7 +114,7 @@
   // announcement through this dedicated region ensures SR users hear
   // the gate land regardless of streaming state.
   const srAnnouncerEl = document.getElementById("coord-sr-announcer");
-  function _announcePolitelyAssertive(text) {
+  function _announceAssertive(text) {
     if (!srAnnouncerEl) return;
     // Briefly clearing then setting forces SR reading even if the
     // text is identical to the previous announcement (some SRs only
@@ -443,6 +443,21 @@
     return s;
   }
 
+  // Single source of truth for the batch tier badge text.  Both the
+  // initial-render path (_pickBatchTier reading from items[]) and the
+  // live-refresh path (_refreshBatchTier reading from row dataset)
+  // route through here so the literal label can't drift between
+  // surfaces.
+  function _formatTierLabel(llmModel, hasHeuristic) {
+    if (llmModel !== null) {
+      return "⚖ llm" + (llmModel ? ":" + llmModel : "");
+    }
+    if (hasHeuristic) {
+      return "⚙ heuristic";
+    }
+    return "";
+  }
+
   // Pick the highest-tier verdict across items for the initial batch
   // tier badge.  LLM beats heuristic; first LLM verdict's judge_model
   // wins (heterogeneous models within a single envelope is unusual but
@@ -460,23 +475,35 @@
         hasHeuristic = true;
       }
     }
-    if (llmModel !== null) {
-      return "⚖ llm" + (llmModel ? ":" + llmModel : "");
-    }
-    if (hasHeuristic) {
-      return "⚙ heuristic";
-    }
-    return "";
+    return _formatTierLabel(llmModel, hasHeuristic);
   }
 
-  // Recompute the batch's header tier badge from per-row dataset
-  // tags.  Called whenever a row verdict updates (e.g. an
-  // intent_verdict SSE event lands an LLM verdict on a row that was
-  // previously showing heuristic) so the header escalates from
-  // ``⚙ heuristic`` to ``⚖ llm[:model]`` without waiting for a full
-  // re-render.
+  // Coalesce _refreshBatchTier scans across a microtask so a burst of
+  // verdict updates on the same batch (e.g. 10 intent_verdict SSE
+  // events for a 10-row fan-out arriving in the same tick) collapse
+  // into ONE querySelectorAll + DOM compare.  Without this each
+  // verdict triggered an O(N-rows) scan, yielding O(N²) DOM walks
+  // per batch render or burst.
+  const _tierDirtyBatches = new Set();
+  let _tierFlushScheduled = false;
   function _refreshBatchTier(batch) {
     if (!batch) return;
+    _tierDirtyBatches.add(batch);
+    if (_tierFlushScheduled) return;
+    _tierFlushScheduled = true;
+    queueMicrotask(() => {
+      _tierFlushScheduled = false;
+      const dirty = Array.from(_tierDirtyBatches);
+      _tierDirtyBatches.clear();
+      dirty.forEach(_refreshBatchTierImmediate);
+    });
+  }
+
+  // Synchronous tier-badge recompute.  Called from the microtask
+  // flush; do not invoke directly from render-hot paths — go through
+  // _refreshBatchTier for the burst-coalescing benefit.
+  function _refreshBatchTierImmediate(batch) {
+    if (!batch || !batch.isConnected) return;
     let llmModel = null;
     let hasHeuristic = false;
     batch.querySelectorAll(".coord-tool-row").forEach((r) => {
@@ -490,12 +517,7 @@
     const head = batch.querySelector(".coord-tool-batch-head");
     if (!head) return;
     let tierEl = head.querySelector(".coord-tool-batch-tier");
-    let label = "";
-    if (llmModel !== null) {
-      label = "⚖ llm" + (llmModel ? ":" + llmModel : "");
-    } else if (hasHeuristic) {
-      label = "⚙ heuristic";
-    }
+    const label = _formatTierLabel(llmModel, hasHeuristic);
     if (label) {
       if (!tierEl) {
         tierEl = document.createElement("span");
@@ -566,7 +588,6 @@
     const row = document.createElement("div");
     row.className = "coord-tool-row";
     if (item.call_id) row.dataset.callId = item.call_id;
-    if (item.func_name) row.dataset.funcName = item.func_name;
 
     const callLine = document.createElement("div");
     callLine.className = "coord-tool-row-call";
@@ -601,11 +622,19 @@
   // /reasoning) flips the signature and re-renders.
   function _verdictSig(verdict) {
     if (!verdict) return "";
+    // ``tier`` + ``judge_model`` are part of the signature because a
+    // heuristic→llm transition can otherwise share the four core
+    // fields (rec / risk / conf / reasoning).  ``dataset.verdictTier``
+    // is only updated when the rebuild runs, so dropping the tier from
+    // the signature would lock the header on ``⚙ heuristic`` even
+    // after the LLM verdict lands.
     return [
       verdict.recommendation || "",
       verdict.risk_level || "",
       verdict.confidence != null ? String(verdict.confidence) : "",
       verdict.reasoning || "",
+      verdict.tier || "",
+      verdict.judge_model || "",
     ].join("");
   }
 
@@ -730,14 +759,29 @@
     const cleaned = stripAnsi(output || "");
     const body = document.createElement("span");
     let pretty = cleaned;
-    if (cleaned) {
-      try {
-        const parsed = JSON.parse(cleaned);
-        if (parsed && typeof parsed === "object") {
-          pretty = JSON.stringify(parsed, null, 2);
+    // Pretty-print JSON only when:
+    //  - the payload looks like JSON (first non-space char is { or [),
+    //    so we don't waste a parse on plain text or HTML, AND
+    //  - it's small enough that the parse + restringify is cheap
+    //    (cap at 32 KiB).  A 100 KiB tool output can deepen into a
+    //    multi-MB object graph and stall the main thread for hundreds
+    //    of ms; the parent CSS is white-space: pre-wrap so raw text
+    //    still wraps and stays readable past the cap.
+    const PRETTY_PRINT_CAP = 32 * 1024;
+    if (cleaned && cleaned.length <= PRETTY_PRINT_CAP) {
+      const head = cleaned.charCodeAt(0);
+      // 0x7B = '{', 0x5B = '['  — leading whitespace would also fail
+      // the cheap heuristic; that's intentional, the pretty-print is
+      // a UX nice-to-have not a contract.
+      if (head === 0x7b || head === 0x5b) {
+        try {
+          const parsed = JSON.parse(cleaned);
+          if (parsed && typeof parsed === "object") {
+            pretty = JSON.stringify(parsed, null, 2);
+          }
+        } catch (_) {
+          /* not JSON — fall through to raw text */
         }
-      } catch (_) {
-        /* not JSON — fall through to raw text */
       }
     }
     body.textContent = pretty;
@@ -773,6 +817,16 @@
       "tool";
     const rest = items.length > 1 ? " + " + (items.length - 1) + " more" : "";
     return "Approval required: " + first + rest;
+  }
+
+  // Header kicker text for a pending batch.  Both the upgrade-in-place
+  // and fresh-build paths in appendToolBatch render this; pulling the
+  // string into one place keeps the two paths from drifting on a
+  // future label tweak.
+  function _pendingKickerText(items) {
+    return items.length >= 2
+      ? "⚠ Approval · Parallel " + items.length
+      : "⚠ Approval";
   }
 
   function _buildBatchActions(batch, items) {
@@ -836,10 +890,13 @@
     const callId = pendingRow && pendingRow.dataset.callId;
     if (!callId) return;
     _setBatchActionsDisabled(batch, true);
-    // Stash the "always" intent on the batch so the approval_resolved
-    // SSE handler can render the right status pill — the server's
-    // resolved event doesn't echo the always flag, only `approved` +
-    // `feedback`.  Echoes back to the operator that the click landed.
+    // Stash the "always" intent on the batch as a backward-compat
+    // fallback for the approval_resolved SSE handler.  Server now
+    // echoes `always` on the resolved event (post-PR-447) so peer
+    // tabs render the right status pill in cross-tab scenarios; the
+    // dataset is only consulted during a hot-deploy window where the
+    // SSE event might briefly omit the field.  Also echoes back to
+    // the operator that the click landed.
     batch.dataset.requestedAlways = always ? "1" : "";
     try {
       const resp = await approveWorkstream(wsId, {
@@ -948,6 +1005,27 @@
     const allMapped = items.every(
       (it) => it.call_id && toolRows.has(it.call_id),
     );
+    // Partial-overlap guard.  If only SOME of the incoming call_ids
+    // are mapped (i.e. they belong to a different prior batch),
+    // overwriting toolRows in the create-new path below would orphan
+    // those prior rows — they'd stay in their old batch's DOM but
+    // tool_result / intent_verdict events for them would route into
+    // the new batch.  This shape doesn't occur in normal operation
+    // (the server never sends overlapping envelopes), so we log it +
+    // unmap the stale entries before the new batch claims them.
+    if (!allMapped) {
+      const partial = items.filter(
+        (it) => it.call_id && toolRows.has(it.call_id),
+      );
+      if (partial.length > 0) {
+        console.warn(
+          "coord_ui: partial-overlap envelope — unmapping",
+          partial.length,
+          "stale call_ids before new batch claims them",
+        );
+        partial.forEach((it) => toolRows.delete(it.call_id));
+      }
+    }
     if (allMapped) {
       const existing = toolRows.get(items[0].call_id).batch;
       // Upgrade-in-place: when SSE arrives with a more specific state
@@ -976,10 +1054,7 @@
         existing.setAttribute("aria-label", _approvalAriaLabel(items));
         const kicker = existing.querySelector(".coord-tool-batch-kicker");
         if (kicker) {
-          kicker.textContent =
-            items.length >= 2
-              ? "⚠ Approval · Parallel " + items.length
-              : "⚠ Approval";
+          kicker.textContent = _pendingKickerText(items);
         }
         const statusEl = existing.querySelector(".coord-tool-status");
         const actionsEl = existing.querySelector(".coord-tool-actions");
@@ -988,7 +1063,7 @@
         else if (actionsEl) actionsEl.replaceWith(newActions);
         else existing.appendChild(newActions);
         activeBatch = existing;
-        _announcePolitelyAssertive(_approvalAriaLabel(items));
+        _announceAssertive(_approvalAriaLabel(items));
       } else if (
         opts.auto &&
         existing.classList.contains("coord-tool-batch--running")
@@ -1050,10 +1125,7 @@
     const kicker = document.createElement("span");
     kicker.className = "coord-tool-batch-kicker";
     if (opts.pending) {
-      kicker.textContent =
-        items.length >= 2
-          ? "⚠ Approval · Parallel " + items.length
-          : "⚠ Approval";
+      kicker.textContent = _pendingKickerText(items);
     } else if (opts.running) {
       kicker.textContent =
         items.length >= 2 ? "Running · Parallel " + items.length : "Running";
@@ -1129,7 +1201,7 @@
       batch.setAttribute("role", "region");
       batch.setAttribute("aria-label", _approvalAriaLabel(items));
       activeBatch = batch;
-      _announcePolitelyAssertive(_approvalAriaLabel(items));
+      _announceAssertive(_approvalAriaLabel(items));
     } else if (opts.resolved) {
       batch.appendChild(_buildStatusPill(opts.resolved));
     }
@@ -1683,8 +1755,12 @@
         // Server-driven resolution.  Morph the active pending batch
         // (the construct that posted the approve POST).  The server
         // event carries `approved` + `feedback` only — the "always"
-        // intent was stashed on the batch by _resolveBatchAction so
-        // the status pill reads "approved · always" when set.
+        // intent.  Server now echoes ``always`` on the SSE payload
+        // (post-PR-447) so cross-tab resolution renders the right
+        // status pill on every subscribed tab — not just the one
+        // that clicked.  Fall back to this tab's stashed dataset
+        // flag for backward compat with a server hot-deploy where
+        // the SSE event might briefly omit the field.
         // Fall back to a DOM lookup if activeBatch was never set
         // (e.g. cross-tab resolution where this tab never rendered
         // the approval gate before the resolved event landed).
@@ -1694,7 +1770,9 @@
             ".coord-tool-batch.coord-tool-batch--pending",
           );
         if (target) {
-          const wasAlways = target.dataset.requestedAlways === "1";
+          const wasAlways =
+            ev.always === true ||
+            (ev.always === undefined && target.dataset.requestedAlways === "1");
           _morphBatchResolved(target, {
             approved: ev.approved !== false,
             always: wasAlways,
@@ -3239,11 +3317,46 @@
       // for case c.  Without this neutral state, painting Approve
       // buttons on a non-pending orphan was misleading and could
       // 409-on-submit because the call_id wasn't in pending_items.
-      const resolvedCallIds = new Set();
+      // Pre-scan classifies each tool message's content as
+      // "denied" (server emits "Denied by user[: feedback]" /
+      // "Blocked by tool policy ..." for any deny path), "error"
+      // (Error: prefix from the standard tool error envelope), or
+      // "ok" (anything else).  Map keys are call_ids; the assistant
+      // tool_calls render below reads these to mark the resulting
+      // batch as resolved-denied (vs the default resolved-approved)
+      // and the tool-result render below propagates the error flag
+      // to appendToolResult so the row gets the .error class /
+      // --error stripe / "✗ error:" lead.  Without this both denied
+      // and errored tools rendered as plain "✓ approved" successes
+      // on every reload.
+      const callOutcomes = new Map();
       (hist.messages || []).forEach((m) => {
-        if ((m.role || "tool") === "tool" && m.tool_call_id) {
-          resolvedCallIds.add(m.tool_call_id);
+        if ((m.role || "tool") !== "tool" || !m.tool_call_id) return;
+        // Tool message content is usually a string but the multipart
+        // shape (text + image_url parts) is technically allowed.
+        let txt = "";
+        if (typeof m.content === "string") {
+          txt = m.content;
+        } else if (Array.isArray(m.content)) {
+          for (const part of m.content) {
+            if (part && typeof part === "object" && part.type === "text") {
+              txt += String(part.text || "");
+            }
+          }
         }
+        // Server signals override prefix detection when present.
+        let outcome = "ok";
+        if (m.is_error) {
+          outcome = "error";
+        } else if (
+          txt.startsWith("Denied by user") ||
+          txt.startsWith("Blocked by tool policy")
+        ) {
+          outcome = "denied";
+        } else if (txt.startsWith("Error:")) {
+          outcome = "error";
+        }
+        callOutcomes.set(m.tool_call_id, outcome);
       });
 
       (hist.messages || []).forEach((m) => {
@@ -3289,13 +3402,23 @@
             // row as needing approval.
             return item;
           });
-          const allResolved = items.every(
-            (it) => !it.call_id || resolvedCallIds.has(it.call_id),
+          // Classify the batch as a whole:
+          //   - any call_id without an outcome at all → orphan,
+          //     render as --running (SSE will upgrade in place)
+          //   - any call_id outcome === "denied" → resolved-denied
+          //   - else → resolved-approved (a runtime error doesn't
+          //     change the approval verdict; the per-row .error class
+          //     comes from the tool_result branch below)
+          const outcomes = items.map((it) =>
+            it.call_id ? callOutcomes.get(it.call_id) : "ok",
           );
-          if (allResolved) {
-            appendToolBatch(items, { resolved: { approved: true } });
-          } else {
+          const allResolved = outcomes.every((o) => o !== undefined);
+          if (!allResolved) {
             appendToolBatch(items, { running: true });
+          } else if (outcomes.some((o) => o === "denied")) {
+            appendToolBatch(items, { resolved: { approved: false } });
+          } else {
+            appendToolBatch(items, { resolved: { approved: true } });
           }
         }
 
@@ -3346,11 +3469,18 @@
           // tool that returned ""); still render it so the call_id
           // pairing stays visible.  Resolve the tool name from the
           // matching assistant tool_call so the label reads e.g.
-          // "bash" instead of "tool".
+          // "bash" instead of "tool".  Pass isError when the
+          // pre-scan classified this call_id as an error so the row
+          // gets the .error class / --error stripe / "✗ error:" lead
+          // — without it a failed tool reads on reload as a normal
+          // successful result.  Denials still get the deny-resolved
+          // batch state (no per-row error needed there; the row's
+          // content reads "Denied by user").
           const callId = m.tool_call_id || "";
           const toolName =
             (callId && toolNameByCallId.get(callId)) || m.tool_name || "tool";
-          appendToolResult(toolName, callId, content || "", false);
+          const isError = callOutcomes.get(callId) === "error";
+          appendToolResult(toolName, callId, content || "", isError);
         } else if (role === "assistant") {
           // Empty content with tool_calls only means the assistant
           // turn was just tool dispatch — the synthesized tool-call

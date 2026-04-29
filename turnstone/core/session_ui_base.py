@@ -286,7 +286,13 @@ class SessionUIBase:
             self._last_verdict_decision = ""
             self._llm_verdicts.clear()
 
-    def resolve_approval(self, approved: bool, feedback: str | None = None) -> None:
+    def resolve_approval(
+        self,
+        approved: bool,
+        feedback: str | None = None,
+        *,
+        always: bool = False,
+    ) -> None:
         """Unblock a pending approval with the caller's decision.
 
         Broadcasts ``approval_resolved`` so every connected tab can
@@ -294,6 +300,14 @@ class SessionUIBase:
         phone approves). Updates ``user_decision`` on every LLM
         intent-verdict that fired during this approval round — the
         audit trail reflects what the user actually chose.
+
+        ``always`` reports whether the resolving caller asked for
+        "Approve + Always" (the tool name has been added to
+        ``auto_approve_tools`` upstream by the HTTP handler — this
+        method only echoes the intent on the SSE event so peer tabs
+        can label their resolved-status pill correctly).  Keyword-only
+        + default ``False`` so the four pre-existing callers (cancel,
+        timeout, channel adapters) compile unchanged.
         """
         decision_str = "approved" if approved else "denied"
         # Swap-and-clear + set decision under lock to avoid racing
@@ -310,6 +324,7 @@ class SessionUIBase:
                 "type": "approval_resolved",
                 "approved": approved,
                 "feedback": feedback or "",
+                "always": bool(always),
             }
         )
         self._approval_event.set()
