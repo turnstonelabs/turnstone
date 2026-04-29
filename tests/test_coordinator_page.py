@@ -119,3 +119,9 @@ def test_coordinator_js_exposes_inline_approval_helpers():
     # call short-circuits on non-visible rows, leaving them stuck.
     assert "_maybeStartJudgePoll" in body
     assert "_judgePollTick" in body
+    # Reload parity for the coord-self approval gate: init() must
+    # consume the authoritative GET /workstreams snapshot's
+    # pending_approval_detail so a freshly opened tab can render
+    # Approve/Deny before SSE replay arrives.
+    assert "wsSnapshot.pending_approval_detail" in body
+    assert "appendToolBatch(pendingDetail.items" in body

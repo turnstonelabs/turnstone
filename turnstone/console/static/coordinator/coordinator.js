@@ -3046,12 +3046,13 @@
   // ------------------------------------------------------------------
 
   async function init() {
+    let wsSnapshot = null;
     try {
-      const data = await getJSON(
+      wsSnapshot = await getJSON(
         "/v1/api/workstreams/" + encodeURIComponent(wsId),
       );
-      nameEl.textContent = data.name || "";
-      statusEl.textContent = data.state || "";
+      nameEl.textContent = wsSnapshot.name || "";
+      statusEl.textContent = wsSnapshot.state || "";
     } catch (e) {
       appendText("error", "Failed to load coordinator: " + e.message);
       return;
@@ -3226,6 +3227,24 @@
           appendText(role, content, { label: role });
         }
       });
+      // History alone can't tell whether an orphaned assistant
+      // tool_calls turn is awaiting approval or merely still running.
+      // The live workstream snapshot can: if pending_approval_detail is
+      // present, upgrade the matching batch immediately so a reload
+      // still exposes Approve/Deny even before SSE reconnects.
+      const pendingDetail =
+        wsSnapshot &&
+        wsSnapshot.pending_approval &&
+        wsSnapshot.pending_approval_detail &&
+        Array.isArray(wsSnapshot.pending_approval_detail.items)
+          ? wsSnapshot.pending_approval_detail
+          : null;
+      if (pendingDetail) {
+        appendToolBatch(pendingDetail.items, {
+          pending: true,
+          judgePending: !!pendingDetail.judge_pending,
+        });
+      }
     } catch (e) {
       console.warn("history load failed", e);
     }
