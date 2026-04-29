@@ -1222,12 +1222,14 @@ class TestTenantCheckOnReadEndpoints:
 
         Wires the real :func:`resolve_workstream_owner` as the
         tenant_check (instead of the fake ``allow``/``deny`` of the
-        sibling tests above), forces ``mgr.get`` to miss, and asserts
-        the handler still resolves through the storage row.  The
-        previous ``cfg.tenant_check(...)`` call shape would
-        fall-through to ``get_workstream_owner`` inline on the loop
-        thread; the wrapped shape offloads the chain end-to-end.
+        sibling tests above), forces ``mgr.get`` to miss, asserts
+        the handler still resolves through the storage row, and
+        spies on ``asyncio.to_thread`` to pin the offload — reverting
+        the wrap to a sync ``cfg.tenant_check(...)`` call would leave
+        the storage fallback working but trip the spy assertion.
         """
+        import asyncio
+
         from turnstone.core.web_helpers import resolve_workstream_owner
 
         ws_id = "ws-cold-cache-hist"
@@ -1243,11 +1245,25 @@ class TestTenantCheckOnReadEndpoints:
             )
             return err
 
-        client = _build_history_app(mock_mgr, _inject_storage, tenant_check=cold_check)
+        offloaded: list[Any] = []
+        real_to_thread = asyncio.to_thread
 
-        r = client.get(f"/v1/api/workstreams/{ws_id}/history")
+        async def spy_to_thread(func: Any, *args: Any, **kwargs: Any) -> Any:
+            offloaded.append(func)
+            return await real_to_thread(func, *args, **kwargs)
+
+        client = _build_history_app(mock_mgr, _inject_storage, tenant_check=cold_check)
+        with patch("asyncio.to_thread", spy_to_thread):
+            r = client.get(f"/v1/api/workstreams/{ws_id}/history")
+
         assert r.status_code == 200
         assert any(m.get("content") == "from cold storage" for m in r.json()["messages"])
+        # Pin the offload — reverting ``await asyncio.to_thread(cfg.tenant_check, ...)``
+        # to ``cfg.tenant_check(...)`` leaves the response shape intact
+        # but drops ``cold_check`` from the spy's call list.
+        assert cold_check in offloaded, (
+            f"tenant_check must be invoked through asyncio.to_thread; got {offloaded}"
+        )
 
     def test_detail_cold_cache_falls_through_to_storage_via_thread(self, _inject_storage):
         """Detail counterpart to the cold-cache history test.
@@ -1255,8 +1271,11 @@ class TestTenantCheckOnReadEndpoints:
         Forces ``mgr.get`` to miss and pins the lazy-rehydrate to a
         mocked ``mgr.open`` so the test covers the path where the
         wrapped ``tenant_check`` resolves through storage *before* the
-        handler reaches its rehydrate ladder.
+        handler reaches its rehydrate ladder.  Same ``asyncio.to_thread``
+        spy as the history test pins the offload itself.
         """
+        import asyncio
+
         from turnstone.core.web_helpers import resolve_workstream_owner
 
         ws_id = "ws-cold-cache-detail"
@@ -1280,9 +1299,17 @@ class TestTenantCheckOnReadEndpoints:
             )
             return err
 
-        client = _build_detail_app(mock_mgr, tenant_check=cold_check)
+        offloaded: list[Any] = []
+        real_to_thread = asyncio.to_thread
 
-        r = client.get(f"/v1/api/workstreams/{ws_id}")
+        async def spy_to_thread(func: Any, *args: Any, **kwargs: Any) -> Any:
+            offloaded.append(func)
+            return await real_to_thread(func, *args, **kwargs)
+
+        client = _build_detail_app(mock_mgr, tenant_check=cold_check)
+        with patch("asyncio.to_thread", spy_to_thread):
+            r = client.get(f"/v1/api/workstreams/{ws_id}")
+
         assert r.status_code == 200
         body = r.json()
         assert body["ws_id"] == ws_id
@@ -1290,3 +1317,7 @@ class TestTenantCheckOnReadEndpoints:
         # Lazy rehydrate path engaged — the handler called mgr.open after
         # the cold-cache tenant_check resolved through storage.
         mock_mgr.open.assert_called_once_with(ws_id)
+        # Pin the offload — see the history test for the rationale.
+        assert cold_check in offloaded, (
+            f"tenant_check must be invoked through asyncio.to_thread; got {offloaded}"
+        )
