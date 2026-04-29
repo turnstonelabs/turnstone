@@ -1213,3 +1213,80 @@ class TestTenantCheckOnReadEndpoints:
         r = client.get(f"/v1/api/workstreams/{ws_id}/history")
         assert r.status_code == 200
         assert any(m.get("content") == "hello" for m in r.json()["messages"])
+
+    def test_history_cold_cache_falls_through_to_storage_via_thread(self, _inject_storage):
+        """Regression: ``cfg.tenant_check`` is invoked through
+        ``await asyncio.to_thread(...)`` so the synchronous
+        ``resolve_workstream_owner`` storage fallback no longer
+        blocks the event loop on a cold cache.
+
+        Wires the real :func:`resolve_workstream_owner` as the
+        tenant_check (instead of the fake ``allow``/``deny`` of the
+        sibling tests above), forces ``mgr.get`` to miss, and asserts
+        the handler still resolves through the storage row.  The
+        previous ``cfg.tenant_check(...)`` call shape would
+        fall-through to ``get_workstream_owner`` inline on the loop
+        thread; the wrapped shape offloads the chain end-to-end.
+        """
+        from turnstone.core.web_helpers import resolve_workstream_owner
+
+        ws_id = "ws-cold-cache-hist"
+        _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
+        _inject_storage.save_message(ws_id, "user", "from cold storage")
+        mock_mgr = MagicMock()
+        # Cold cache: nothing in memory, owner row only in storage.
+        mock_mgr.get.return_value = None
+
+        def cold_check(request: Any, ws_id: str, mgr: Any) -> JSONResponse | None:
+            _owner, err = resolve_workstream_owner(
+                request, ws_id, mgr=mgr, not_found_label="Workstream not found"
+            )
+            return err
+
+        client = _build_history_app(mock_mgr, _inject_storage, tenant_check=cold_check)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}/history")
+        assert r.status_code == 200
+        assert any(m.get("content") == "from cold storage" for m in r.json()["messages"])
+
+    def test_detail_cold_cache_falls_through_to_storage_via_thread(self, _inject_storage):
+        """Detail counterpart to the cold-cache history test.
+
+        Forces ``mgr.get`` to miss and pins the lazy-rehydrate to a
+        mocked ``mgr.open`` so the test covers the path where the
+        wrapped ``tenant_check`` resolves through storage *before* the
+        handler reaches its rehydrate ladder.
+        """
+        from turnstone.core.web_helpers import resolve_workstream_owner
+
+        ws_id = "ws-cold-cache-detail"
+        _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
+
+        rehydrated = MagicMock()
+        rehydrated.id = ws_id
+        rehydrated.name = "rehydrated-ws"
+        rehydrated.state = MagicMock()
+        rehydrated.state.value = "idle"
+        rehydrated.user_id = "test-user"
+        rehydrated.kind = "interactive"
+        rehydrated.ui = None  # bypass pending-approval serializer
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = None
+        mock_mgr.open.return_value = rehydrated
+
+        def cold_check(request: Any, ws_id: str, mgr: Any) -> JSONResponse | None:
+            _owner, err = resolve_workstream_owner(
+                request, ws_id, mgr=mgr, not_found_label="Workstream not found"
+            )
+            return err
+
+        client = _build_detail_app(mock_mgr, tenant_check=cold_check)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ws_id"] == ws_id
+        assert body["name"] == "rehydrated-ws"
+        # Lazy rehydrate path engaged — the handler called mgr.open after
+        # the cold-cache tenant_check resolved through storage.
+        mock_mgr.open.assert_called_once_with(ws_id)

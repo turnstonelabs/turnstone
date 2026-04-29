@@ -312,6 +312,12 @@ class SessionEndpointConfig:
       scope is the cluster-wide gate). Coord sets this to ``None``
       and relies on ``admin.coordinator`` from ``permission_gate``
       plus an in-memory ``coord_mgr`` lookup at handler time.
+      Always invoked via ``await asyncio.to_thread(...)`` at handler
+      sites: the interactive resolver short-circuits on
+      ``mgr.get(ws_id)`` for warm cache but falls through to a
+      synchronous storage read (:func:`get_workstream_owner`) on a
+      manager-cache miss, so offloading keeps the event loop free
+      during cold-cache lookups.
     - ``not_found_label``: the message body for the 404 returned when
       the manager has no such ws_id ("Workstream not found" for
       interactive; "coordinator not found" for coord).
@@ -692,6 +698,8 @@ def make_approve_handler(cfg: SessionEndpointConfig) -> Handler:
     from turnstone.core.web_helpers import read_json_or_400
 
     async def approve(request: Request) -> Response:
+        import asyncio
+
         if cfg.permission_gate is not None:
             err = cfg.permission_gate(request)
             if err is not None:
@@ -712,7 +720,7 @@ def make_approve_handler(cfg: SessionEndpointConfig) -> Handler:
         feedback = body.get("feedback")
         always = bool(body.get("always", False))
         if cfg.tenant_check is not None:
-            err_tenant = cfg.tenant_check(request, ws_id, mgr)
+            err_tenant = await asyncio.to_thread(cfg.tenant_check, request, ws_id, mgr)
             if err_tenant is not None:
                 return err_tenant
         ws = mgr.get(ws_id)
@@ -850,6 +858,8 @@ def make_close_handler(
     """
 
     async def close(request: Request) -> Response:
+        import asyncio
+
         if cfg.permission_gate is not None:
             err = cfg.permission_gate(request)
             if err is not None:
@@ -879,7 +889,7 @@ def make_close_handler(
                 reason = redact_credentials(capped)
 
         if cfg.tenant_check is not None:
-            err_tenant = cfg.tenant_check(request, ws_id, mgr)
+            err_tenant = await asyncio.to_thread(cfg.tenant_check, request, ws_id, mgr)
             if err_tenant is not None:
                 return err_tenant
 
@@ -992,6 +1002,8 @@ def make_cancel_handler(
     """
 
     async def cancel(request: Request) -> Response:
+        import asyncio
+
         from turnstone.core.web_helpers import read_json_or_400
 
         if cfg.permission_gate is not None:
@@ -1019,7 +1031,7 @@ def make_cancel_handler(
             force = body.get("force", False) is True
 
         if cfg.tenant_check is not None:
-            err_tenant = cfg.tenant_check(request, ws_id, mgr)
+            err_tenant = await asyncio.to_thread(cfg.tenant_check, request, ws_id, mgr)
             if err_tenant is not None:
                 return err_tenant
 
@@ -1383,7 +1395,7 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
             return JSONResponse({"error": "ws_id is required"}, status_code=400)
 
         if cfg.tenant_check is not None:
-            err_tenant = cfg.tenant_check(request, ws_id, mgr)
+            err_tenant = await asyncio.to_thread(cfg.tenant_check, request, ws_id, mgr)
             if err_tenant is not None:
                 return err_tenant
 
@@ -2189,7 +2201,7 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
         # it); interactive wires ``_interactive_tenant_check`` and
         # this call now restores parity with the rest of the surface.
         if cfg.tenant_check is not None:
-            err_tenant = cfg.tenant_check(request, ws_id, mgr)
+            err_tenant = await asyncio.to_thread(cfg.tenant_check, request, ws_id, mgr)
             if err_tenant is not None:
                 return err_tenant
 
@@ -2269,6 +2281,8 @@ def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
     """
 
     async def detail(request: Request) -> Response:
+        import asyncio
+
         if cfg.permission_gate is not None:
             err = cfg.permission_gate(request)
             if err is not None:
@@ -2293,7 +2307,7 @@ def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
         # the in-flight tool-call payload.  Brings detail in line with
         # every other lifted session verb.
         if cfg.tenant_check is not None:
-            err_tenant = cfg.tenant_check(request, ws_id, mgr)
+            err_tenant = await asyncio.to_thread(cfg.tenant_check, request, ws_id, mgr)
             if err_tenant is not None:
                 return err_tenant
 
@@ -2462,7 +2476,7 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
             return JSONResponse({"error": "message is required"}, status_code=400)
 
         if cfg.tenant_check is not None:
-            err_tenant = cfg.tenant_check(request, ws_id, mgr)
+            err_tenant = await asyncio.to_thread(cfg.tenant_check, request, ws_id, mgr)
             if err_tenant is not None:
                 return err_tenant
 
@@ -2955,6 +2969,8 @@ def make_dequeue_handler(cfg: SessionEndpointConfig) -> Handler:
     from turnstone.core.web_helpers import read_json_or_400
 
     async def dequeue(request: Request) -> Response:
+        import asyncio
+
         if cfg.permission_gate is not None:
             err = cfg.permission_gate(request)
             if err is not None:
@@ -2973,7 +2989,7 @@ def make_dequeue_handler(cfg: SessionEndpointConfig) -> Handler:
 
         ws_id = request.path_params.get("ws_id", "")
         if cfg.tenant_check is not None:
-            err_tenant = cfg.tenant_check(request, ws_id, mgr)
+            err_tenant = await asyncio.to_thread(cfg.tenant_check, request, ws_id, mgr)
             if err_tenant is not None:
                 return err_tenant
 
