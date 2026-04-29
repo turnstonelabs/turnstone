@@ -2303,6 +2303,41 @@ def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
                 # mismatch, and tombstoned rows — all surface as 404.
                 return JSONResponse({"error": cfg.not_found_label}, status_code=404)
 
+        # Pending-approval snapshot — lets a freshly-loaded chat tab
+        # paint the inline approval gate from this single response
+        # instead of waiting for the SSE approve_request replay (which
+        # introduces a brief --running flash on reload).  The UI
+        # protocol doesn't mandate the approval surface; CLI / channel
+        # UIs that don't expose ``serialize_pending_approval_detail``
+        # leave the field as ``None`` and the JSON omits the section.
+        # ``_pending_approval`` is asserted as ``dict`` (its only real
+        # production shape — see ``SessionUIBase._pending_approval``)
+        # so a MagicMock-based unit test or other non-dict sentinel
+        # doesn't trip the path.
+        pending_approval = False
+        pending_approval_detail: Any = None
+        ui = ws.ui
+        pending_raw = getattr(ui, "_pending_approval", None) if ui is not None else None
+        if isinstance(pending_raw, dict):
+            pending_approval = True
+            serializer = getattr(ui, "serialize_pending_approval_detail", None)
+            if callable(serializer):
+                try:
+                    serialized = serializer()
+                    if isinstance(serialized, dict) or serialized is None:
+                        pending_approval_detail = serialized
+                except Exception:
+                    # Defensive: a malformed verdict object inside the
+                    # serializer shouldn't fail the entire detail
+                    # response.  The boolean still informs the UI that
+                    # an approval is pending; SSE replay carries the
+                    # full payload.
+                    log.warning(
+                        "ws.detail.pending_serialize_failed ws_id=%s",
+                        ws_id[:8] if ws_id else "",
+                        exc_info=True,
+                    )
+
         return JSONResponse(
             {
                 "ws_id": ws.id,
@@ -2310,6 +2345,8 @@ def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
                 "state": ws.state.value,
                 "user_id": ws.user_id,
                 "kind": ws.kind,
+                "pending_approval": pending_approval,
+                "pending_approval_detail": pending_approval_detail,
             }
         )
 

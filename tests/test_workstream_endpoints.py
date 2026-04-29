@@ -906,6 +906,10 @@ class TestDetailInteractive:
         loaded_ws.state = ws_state
         loaded_ws.user_id = "test-user"
         loaded_ws.kind = "interactive"
+        # No pending approval — leave .ui's MagicMock attrs alone; the
+        # handler isinstance-checks ``_pending_approval`` against ``dict``
+        # before treating it as live, so MagicMock attribute pollution
+        # doesn't trigger the pending path.
         mock_mgr = MagicMock()
         mock_mgr.get.return_value = loaded_ws
         client = _build_detail_app(mock_mgr)
@@ -919,7 +923,101 @@ class TestDetailInteractive:
             "state": "idle",
             "user_id": "test-user",
             "kind": "interactive",
+            "pending_approval": False,
+            "pending_approval_detail": None,
         }
+
+    def test_pending_approval_fields_propagate_from_ui(self):
+        """When the workstream's UI is parked on an approval, the detail
+        response surfaces ``pending_approval=True`` + the serialized
+        ``pending_approval_detail`` so a freshly-loaded chat tab can
+        paint the inline gate without waiting for the SSE
+        ``approve_request`` replay (which would otherwise produce a
+        brief ``--running`` flash on reload)."""
+        ws_id = "ws-pending-1"
+        ws_state = MagicMock()
+        ws_state.value = "attention"
+        loaded_ws = MagicMock()
+        loaded_ws.id = ws_id
+        loaded_ws.name = "coord-1"
+        loaded_ws.state = ws_state
+        loaded_ws.user_id = "test-user"
+        loaded_ws.kind = "coordinator"
+        # Realistic _pending_approval shape (mirrors what
+        # SessionUIBase.approve_tools assigns) + a serializer that
+        # returns the merged-with-verdicts payload.
+        loaded_ws.ui._pending_approval = {
+            "type": "approve_request",
+            "items": [
+                {
+                    "call_id": "c-1",
+                    "func_name": "spawn_workstream",
+                    "needs_approval": True,
+                },
+            ],
+            "judge_pending": True,
+        }
+        loaded_ws.ui.serialize_pending_approval_detail = MagicMock(
+            return_value={
+                "call_id": "c-1",
+                "judge_pending": True,
+                "items": [
+                    {
+                        "call_id": "c-1",
+                        "func_name": "spawn_workstream",
+                        "needs_approval": True,
+                        "heuristic_verdict": {
+                            "recommendation": "approve",
+                            "risk_level": "low",
+                            "confidence": 0.9,
+                        },
+                    }
+                ],
+            }
+        )
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = loaded_ws
+        client = _build_detail_app(mock_mgr)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["pending_approval"] is True
+        assert body["pending_approval_detail"]["call_id"] == "c-1"
+        assert body["pending_approval_detail"]["judge_pending"] is True
+        items = body["pending_approval_detail"]["items"]
+        assert len(items) == 1
+        assert items[0]["func_name"] == "spawn_workstream"
+        assert items[0]["needs_approval"] is True
+
+    def test_pending_serializer_failure_falls_back_to_bool_only(self):
+        """A malformed verdict that crashes ``serialize_pending_approval_detail``
+        must NOT fail the detail response — the boolean still informs
+        the UI that an approval is pending; SSE replay carries the
+        authoritative payload.  Defensive against a future serializer
+        regression silently 500ing every page load."""
+        ws_id = "ws-pending-broken"
+        ws_state = MagicMock()
+        ws_state.value = "attention"
+        loaded_ws = MagicMock()
+        loaded_ws.id = ws_id
+        loaded_ws.name = "coord-broken"
+        loaded_ws.state = ws_state
+        loaded_ws.user_id = "test-user"
+        loaded_ws.kind = "coordinator"
+        loaded_ws.ui._pending_approval = {"items": []}
+        loaded_ws.ui.serialize_pending_approval_detail = MagicMock(
+            side_effect=RuntimeError("verdict object is malformed"),
+        )
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = loaded_ws
+        client = _build_detail_app(mock_mgr)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["pending_approval"] is True
+        assert body["pending_approval_detail"] is None
 
     def test_lazy_rehydrates_on_miss(self):
         """``mgr.get`` miss → ``mgr.open`` rehydrate. Same flow as coord;

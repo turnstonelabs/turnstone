@@ -424,6 +424,26 @@ class WorkstreamDetailResponse(BaseModel):
     state: str
     user_id: str
     kind: WorkstreamKind = WorkstreamKind.INTERACTIVE
+    pending_approval: bool = Field(
+        default=False,
+        description=(
+            "True when the workstream is parked on ``_approval_event`` "
+            "awaiting an operator approve/deny.  Mirrors the same field "
+            "on ``DashboardWorkstream`` / cluster live projections so a "
+            "freshly-loaded chat tab can render the inline approval gate "
+            "from the detail snapshot before SSE replay arrives."
+        ),
+    )
+    pending_approval_detail: PendingApprovalDetail | None = Field(
+        default=None,
+        description=(
+            "Inline approval payload — same shape as ``DashboardWorkstream"
+            ".pending_approval_detail``.  ``None`` when no approval is "
+            "pending.  Lets a reload paint the action row + judge "
+            "verdicts immediately instead of relying on the SSE "
+            "approve_request replay timing window."
+        ),
+    )
 
 
 class WorkstreamHistoryResponse(BaseModel):
