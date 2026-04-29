@@ -59,13 +59,14 @@ _ENV_MAP: dict[ClientType, str] = {
 }
 
 
-def _build_context(ctx: SessionContext) -> str:
+def _build_context(ctx: SessionContext, kind: WorkstreamKind) -> str:
     """Build the CONTEXT module from session variables."""
     return (
         "## Session Context\n"
         "\n"
         f"- **Current date/time:** {ctx.current_datetime} ({ctx.timezone})\n"
-        f"- **User:** {ctx.username}"
+        f"- **User:** {ctx.username}\n"
+        f"- **Session kind:** {kind.value}"
     )
 
 
@@ -123,6 +124,11 @@ def compose_system_message(
     """
     parts: list[str] = []
 
+    # Coerce kind: callers (and tests) sometimes pass the raw string from a
+    # DB row or HTTP payload. WorkstreamKind is a StrEnum so equality works
+    # either way, but ``.value`` access does not — normalise once here.
+    kind = WorkstreamKind.from_raw(kind)
+
     # 1. BASE — kind-specific persona.  The default base.md frames the
     #    model as an IC engineer ("you read before you edit, commits
     #    you make..."); coordinators need an orchestrator framing
@@ -144,7 +150,7 @@ def compose_system_message(
 
     # 3. CONTEXT — built programmatically (no template engine)
     _validate_context(context)
-    parts.append(_build_context(context))
+    parts.append(_build_context(context, kind))
 
     # 4. TOOLS — kind-specific patterns.  Coordinators get the
     #    orchestrator block; interactive sessions get the IC block.

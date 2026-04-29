@@ -89,11 +89,40 @@ class UserInterjection:
         return f"{preamble}\n\nUser message: {self.message}"
 
 
+@dataclass(frozen=True)
+class MetacognitiveAdvisory:
+    """Advisory carrying a metacognitive nudge attached to a tool result.
+
+    Used for nudges that respond to model behaviour at a tool boundary
+    (``tool_error``, ``repeat``).  Nudges that respond to user behaviour
+    (``correction``, ``denial``, ``resume``, ``start``, ``completion``)
+    splice into the next user message instead, so they share the same
+    ``<system-reminder>`` envelope but skip this advisory path.
+    """
+
+    nudge_type: str
+    message: str
+
+    @property
+    def advisory_type(self) -> str:
+        return f"metacognitive_{self.nudge_type}"
+
+    def render(self) -> str:
+        return self.message
+
+
 # -- Wrapper ------------------------------------------------------------------
 
 
-def _escape_wrapper_tags(text: str) -> str:
-    """Escape sequences that could break the wrapper tag structure."""
+def escape_wrapper_tags(text: str) -> str:
+    """Neutralise sequences that would break the advisory envelope.
+
+    Replaces ``<tool_output>`` and ``<system-reminder>`` (open and close)
+    with their HTML-entity-encoded forms so adjacent untrusted text
+    cannot fabricate or close one of the wrapper blocks. Use this on any
+    untrusted content that is glued next to a wrapper tag — tool output,
+    user message bodies, and (defense-in-depth) advisory render output.
+    """
     return (
         text.replace("</tool_output>", "&lt;/tool_output&gt;")
         .replace("<tool_output>", "&lt;tool_output&gt;")
@@ -109,16 +138,31 @@ def wrap_tool_result(
     """Wrap tool output with advisory blocks when advisories are present.
 
     When *advisories* is empty or ``None`` the raw *output* is returned
-    unchanged — no tags, no overhead.  Tool output is escaped to prevent
-    tag injection that could break the wrapper structure.
+    unchanged — no tags, no overhead.  Both the tool output and each
+    advisory's render text are escaped before interpolation: a future
+    caller wiring user-controlled text through the advisory layer
+    cannot close the ``<system-reminder>`` envelope from inside.
     """
     if not advisories:
         return output
 
-    parts = [f"<tool_output>\n{_escape_wrapper_tags(output)}\n</tool_output>"]
+    parts = [f"<tool_output>\n{escape_wrapper_tags(output)}\n</tool_output>"]
     for advisory in advisories:
-        parts.append(f"\n<system-reminder>\n{advisory.render()}\n</system-reminder>")
+        parts.append(
+            f"\n<system-reminder>\n{escape_wrapper_tags(advisory.render())}\n</system-reminder>"
+        )
     return "\n".join(parts)
+
+
+def render_system_reminder(text: str) -> str:
+    """Render a standalone ``<system-reminder>`` block.
+
+    For attaching out-of-band guidance to a non-tool message — currently
+    the user-message metacognitive channel.  ``wrap_tool_result`` builds
+    the same envelope inline for tool results; this helper exists so the
+    user-message path uses the exact same envelope and escaping rules.
+    """
+    return f"<system-reminder>\n{escape_wrapper_tags(text)}\n</system-reminder>"
 
 
 def parse_priority(text: str) -> tuple[str, str]:

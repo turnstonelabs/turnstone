@@ -445,3 +445,24 @@ def test_tools_included_when_tools_available() -> None:
         _ALL_TOOLS,
     )
     assert "TOOL PATTERNS" in result
+
+
+def test_session_kind_in_context_interactive() -> None:
+    """Default interactive kind appears next to the user line."""
+    result = compose_system_message(
+        ClientType.CLI,
+        _VALID_CTX,
+        _ALL_TOOLS,
+    )
+    assert "Session kind:** interactive" in result
+
+
+def test_session_kind_in_context_coordinator() -> None:
+    """Coordinator kind appears in the context block."""
+    result = compose_system_message(
+        ClientType.CLI,
+        _VALID_CTX,
+        frozenset({"spawn_workstream"}),
+        kind="coordinator",
+    )
+    assert "Session kind:** coordinator" in result
