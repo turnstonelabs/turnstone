@@ -102,8 +102,6 @@
   const statusEl = document.getElementById("coord-status");
   const sseEl = document.getElementById("coord-sse-status");
   const nameEl = document.getElementById("coord-name");
-  const approvalBar = document.getElementById("coord-approval-bar");
-  const approvalTools = document.getElementById("coord-approval-tools");
   const childrenTreeEl = document.getElementById("coord-children-tree");
   const childrenCountEl = document.getElementById("coord-children-count");
   const childrenRefreshBtn = document.getElementById("coord-children-refresh");
@@ -123,24 +121,31 @@
   let coordModelAlias = "";
   let lastStatusEvt = null;
 
-  let pendingApprovalCallId = null;
   let evtSource = null;
   let reconnectAttempts = 0;
   let reconnectTimer = null;
 
-  // Cache of judge verdicts keyed by call_id.  Judge events (intent_verdict)
-  // and approval events (approve_request) are async and can arrive in either
-  // order; the cache lets each handler apply data to the other without
-  // assuming ordering.
+  // Cache of judge verdicts keyed by call_id.  intent_verdict and
+  // approve_request are async and may arrive in either order; the
+  // cache lets each handler apply data to the other without assuming
+  // ordering.  Soft-capped at JUDGE_VERDICTS_CAP entries — Maps
+  // preserve insertion order, so the oldest entry is the one yielded
+  // by .keys().next() and is evicted when the cap is exceeded.  Cap
+  // is generous because verdicts are small (~few hundred bytes each)
+  // and the only consumer is the rare race where SSE re-fires
+  // approve_request after the originally-cached entry has been
+  // applied.
+  const JUDGE_VERDICTS_CAP = 500;
   const judgeVerdicts = new Map();
-
-  // Approval focus is deferred until the judge returns a verdict so the
-  // Approve button doesn't pre-emptively light up (could read as "already
-  // approved").  No fallback — if the judge never responds (disabled /
-  // slow), focus simply never moves; keyboard users tab from the
-  // composer to reach the buttons manually.  A fallback would produce
-  // an ambiguous focus ring that could be misread as "judge approved."
-  let approvalFocusClaimed = false;
+  function _cacheJudgeVerdict(callId, verdict) {
+    if (!callId) return;
+    judgeVerdicts.set(callId, verdict);
+    while (judgeVerdicts.size > JUDGE_VERDICTS_CAP) {
+      const oldest = judgeVerdicts.keys().next().value;
+      if (oldest === undefined) break;
+      judgeVerdicts.delete(oldest);
+    }
+  }
 
   // ------------------------------------------------------------------
   // HTML escaping and safe ws_id linkification
@@ -241,6 +246,21 @@
   // Message append helpers
   // ------------------------------------------------------------------
 
+  // Coalesce scrollTop writes through requestAnimationFrame so the
+  // bulk history-replay loop doesn't fire one synchronous reflow per
+  // appended message — for histories with hundreds of turns the
+  // un-coalesced version visibly stalls the page.  Live SSE streaming
+  // also benefits: token-rate scrolls collapse into one paint.
+  let _scrollPending = false;
+  function _scheduleScroll() {
+    if (_scrollPending) return;
+    _scrollPending = true;
+    requestAnimationFrame(() => {
+      _scrollPending = false;
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    });
+  }
+
   // Map raw role → .msg variant (DS primitives/message.css).  "error"
   // overloads the role slot for styling; opts.label still carries the
   // tool name so SR text like "error · bash" stays meaningful on the
@@ -279,7 +299,7 @@
     body.innerHTML = html;
     el.appendChild(body);
     messagesEl.appendChild(el);
-    messagesEl.scrollTop = messagesEl.scrollHeight;
+    _scheduleScroll();
     return el;
   }
 
@@ -287,17 +307,7 @@
     return appendMsg(role, esc(text), opts);
   }
 
-  function appendToolCall(item) {
-    const label = item.func_name || "tool";
-    const html =
-      "<strong>" +
-      esc(item.header || label) +
-      "</strong>" +
-      (item.preview ? "<pre>" + esc(item.preview) + "</pre>" : "");
-    return appendMsg("tool", html, { label: label, callId: item.call_id });
-  }
-
-  // Build an appendToolCall-shaped item from a persisted assistant
+  // Build a tool-batch item from a persisted assistant
   // tool_call.  Live calls land here with header / preview already
   // computed by ChatSession._prepare_tool; history replay never sees
   // those (only `function.name` + `function.arguments`), so synthesise
@@ -355,12 +365,543 @@
   }
 
   function appendToolResult(name, callId, output, isError) {
+    if (callId && toolRows.has(callId)) {
+      const entry = toolRows.get(callId);
+      _appendResultToRow(entry.row, output, isError);
+      return entry.row;
+    }
     const html = renderToolOutput(output);
     const el = appendMsg(isError ? "error" : "tool", html, {
       label: (isError ? "error · " : "") + (name || "tool"),
       callId: callId,
     });
     return el;
+  }
+
+  // ------------------------------------------------------------------
+  // Tool batch construct — paired tool calls + approval + results
+  //
+  // Replaces the prior pinned approval dock + duplicate .msg.tool
+  // bubble pattern.  One construct per dispatch turn:
+  //   - solo (1 call, serial):  .coord-tool-batch--solo
+  //   - parallel (≥2 calls):    .coord-tool-batch--parallel
+  // The approval gate, judge verdicts, and tool results all render
+  // inside the construct so the operator reads call → verdict → result
+  // as one cohesive unit.
+  // ------------------------------------------------------------------
+
+  // call_id → { batch, row }.  Routes intent_verdict + tool_result
+  // events to the correct row.  Holds DOM refs only; the originating
+  // item payload is intentionally not retained (long sessions would
+  // pin per-call preview / parsed-args memory for the page lifetime).
+  const toolRows = new Map();
+
+  // Most-recently-rendered batch with an open approval gate.  Used for
+  // keyboard focus claiming and approval_resolved fallbacks.
+  let activeBatch = null;
+
+  function _formatBatchArgs(item) {
+    let s = item.header || item.approval_label || item.preview || "";
+    if (item.func_name && s.startsWith(item.func_name + ":")) {
+      s = s.slice(item.func_name.length + 1).trim();
+    } else if (item.func_name === "bash" && s.startsWith("$ ")) {
+      s = s.slice(2);
+    }
+    return s;
+  }
+
+  function _pickBatchTier(items) {
+    for (const it of items) {
+      const v = it.judge_verdict || it.heuristic_verdict;
+      if (v) {
+        const tierLabel = v.tier || (it.judge_verdict ? "llm" : "heuristic");
+        const glyph = tierLabel === "llm" ? "⚖" : "⚙";
+        const model = v.judge_model ? ":" + v.judge_model : "";
+        return glyph + " " + tierLabel + model;
+      }
+    }
+    return "";
+  }
+
+  function _renderBatchRow(item, indexLabel) {
+    const row = document.createElement("div");
+    row.className = "coord-tool-row";
+    if (item.call_id) row.dataset.callId = item.call_id;
+    if (item.func_name) row.dataset.funcName = item.func_name;
+
+    const callLine = document.createElement("div");
+    callLine.className = "coord-tool-row-call";
+
+    if (indexLabel) {
+      const idx = document.createElement("span");
+      idx.className = "coord-tool-row-idx";
+      idx.textContent = indexLabel;
+      callLine.appendChild(idx);
+    }
+
+    const name = document.createElement("span");
+    name.className = "coord-tool-row-name";
+    name.textContent = item.func_name || "(unknown tool)";
+    callLine.appendChild(name);
+
+    const args = document.createElement("span");
+    args.className = "coord-tool-row-args";
+    args.textContent = _formatBatchArgs(item);
+    callLine.appendChild(args);
+
+    if (item.auto_approved && !item.needs_approval) {
+      const pill = document.createElement("span");
+      pill.className = "coord-tool-row-status coord-tool-row-status--auto";
+      const reason = _normaliseAutoApproveReason(item.auto_approve_reason);
+      pill.textContent = "✓ " + reason;
+      pill.title = "auto-approved (no operator prompt) — reason: " + reason;
+      callLine.appendChild(pill);
+    }
+
+    if (item.error && !item.needs_approval) {
+      const errPill = document.createElement("span");
+      errPill.className = "coord-tool-row-status coord-tool-row-status--error";
+      errPill.textContent = "✗ " + (item.error || "blocked");
+      callLine.appendChild(errPill);
+      row.classList.add("error");
+    }
+
+    row.appendChild(callLine);
+    return row;
+  }
+
+  // Stable signature for a verdict — used to skip the DOM rebuild when
+  // an SSE replay (or duplicate intent_verdict event) carries the same
+  // verdict body we already painted.  Any field change (rec/risk/conf
+  // /reasoning) flips the signature and re-renders.
+  function _verdictSig(verdict) {
+    if (!verdict) return "";
+    return [
+      verdict.recommendation || "",
+      verdict.risk_level || "",
+      verdict.confidence != null ? String(verdict.confidence) : "",
+      verdict.reasoning || "",
+    ].join("");
+  }
+
+  function _appendVerdictLineTo(row, verdict) {
+    // Dedupe by signature so reconnect storms don't tear down + rebuild
+    // an unchanged verdict line.  _appendVerdictLineTo(row, null) is
+    // used by _appendJudgePendingLineTo to clear and start fresh — that
+    // path explicitly bypasses the dedupe (sig of null is "").
+    const sig = _verdictSig(verdict);
+    if (verdict && row.dataset.verdictSig === sig) {
+      return row.querySelector(".coord-tool-row-verdict");
+    }
+    row.dataset.verdictSig = sig;
+
+    let line = row.querySelector(".coord-tool-row-verdict");
+    if (!line) {
+      line = document.createElement("div");
+      line.className = "coord-tool-row-verdict";
+      const callEl = row.querySelector(".coord-tool-row-call");
+      if (callEl && callEl.nextSibling) {
+        row.insertBefore(line, callEl.nextSibling);
+      } else {
+        row.appendChild(line);
+      }
+    }
+    line.replaceChildren();
+    if (verdict) {
+      const chip = document.createElement("code");
+      const rec = verdict.recommendation || "?";
+      const risk = verdict.risk_level || "?";
+      chip.textContent = "judge: " + rec + " · risk: " + risk;
+      if (rec === "approve") chip.classList.add("rec-approve");
+      else if (rec === "review") chip.classList.add("rec-review");
+      else if (rec === "deny") chip.classList.add("rec-deny");
+      line.appendChild(chip);
+      if (verdict.confidence != null) {
+        const conf = document.createElement("code");
+        const v = verdict.confidence;
+        conf.textContent = typeof v === "number" ? v.toFixed(2) : String(v);
+        line.appendChild(conf);
+      }
+    }
+    const oldRationale = row.querySelector(".coord-tool-row-rationale");
+    if (oldRationale) oldRationale.remove();
+    if (verdict && verdict.reasoning) {
+      const det = document.createElement("details");
+      det.className = "coord-tool-row-rationale";
+      const sum = document.createElement("summary");
+      sum.textContent = "rationale";
+      det.appendChild(sum);
+      const body = document.createElement("div");
+      body.className = "coord-tool-row-rationale-body";
+      body.textContent = verdict.reasoning;
+      det.appendChild(body);
+      // Insert immediately after the verdict line so the rationale
+      // stays adjacent to the chip even when a result block has
+      // already landed below — DOM order otherwise reads as
+      // [call, verdict, result, rationale], which visually disconnects
+      // the rationale from the chip it explains.
+      line.insertAdjacentElement("afterend", det);
+    }
+    return line;
+  }
+
+  function _appendJudgePendingLineTo(row) {
+    const line = _appendVerdictLineTo(row, null);
+    const chip = document.createElement("code");
+    chip.className = "judging";
+    const spin = document.createElement("span");
+    spin.className = "spin";
+    spin.setAttribute("aria-hidden", "true");
+    chip.appendChild(spin);
+    chip.appendChild(document.createTextNode("judge evaluating…"));
+    line.appendChild(chip);
+  }
+
+  function _appendResultToRow(row, output, isError) {
+    if (!row) return;
+    const existing = row.querySelector(".coord-tool-row-result");
+    if (existing) existing.remove();
+    if (isError) {
+      row.classList.add("error");
+      // Lift the row's error onto the enclosing batch so the left
+      // stripe + status pill (--error) cue the operator at the batch
+      // level too.  Idempotent — re-fires don't stack.
+      const batch = row.closest(".coord-tool-batch");
+      if (batch) batch.classList.add("coord-tool-batch--error");
+    }
+    const block = document.createElement("div");
+    block.className = "coord-tool-row-result";
+    const lead = document.createElement("span");
+    lead.className = "coord-tool-row-result-lead";
+    lead.textContent = isError ? "✗ error: " : "↳ result: ";
+    block.appendChild(lead);
+    const body = document.createElement("span");
+    body.textContent = stripAnsi(output || "");
+    block.appendChild(body);
+    row.appendChild(block);
+  }
+
+  function _makeActionButton(label, role, kbdHint, ariaLabel) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "act";
+    btn.dataset.role = role;
+    btn.appendChild(document.createTextNode(label));
+    if (kbdHint) {
+      const kbd = document.createElement("span");
+      kbd.className = "kbd";
+      kbd.setAttribute("aria-hidden", "true");
+      kbd.textContent = kbdHint;
+      btn.appendChild(kbd);
+    }
+    if (ariaLabel) btn.setAttribute("aria-label", ariaLabel);
+    return btn;
+  }
+
+  function _buildBatchActions(batch, items) {
+    const actions = document.createElement("div");
+    actions.className = "coord-tool-actions";
+    const spacer = document.createElement("div");
+    spacer.className = "spacer";
+    actions.appendChild(spacer);
+
+    const denyBtn = _makeActionButton("Deny", "deny", "D", "Deny (D)");
+    denyBtn.classList.add("danger");
+    denyBtn.addEventListener("click", () =>
+      _resolveBatchAction(batch, false, false),
+    );
+    actions.appendChild(denyBtn);
+
+    const alwaysNames = items
+      .filter(
+        (it) =>
+          it.needs_approval &&
+          it.func_name &&
+          it.func_name !== "__budget_override__" &&
+          !it.error,
+      )
+      .map((it) => it.approval_label || it.func_name);
+    if (alwaysNames.length > 0) {
+      const ariaAlways = "Always approve " + alwaysNames.join(", ");
+      const alwaysBtn = _makeActionButton("Always", "always", "⇧A", ariaAlways);
+      alwaysBtn.classList.add("always");
+      alwaysBtn.title = ariaAlways;
+      alwaysBtn.addEventListener("click", () =>
+        _resolveBatchAction(batch, true, true),
+      );
+      actions.appendChild(alwaysBtn);
+    }
+
+    const approveBtn = _makeActionButton(
+      "Approve",
+      "approve",
+      "⏎",
+      "Approve (Enter)",
+    );
+    approveBtn.classList.add("primary");
+    approveBtn.addEventListener("click", () =>
+      _resolveBatchAction(batch, true, false),
+    );
+    actions.appendChild(approveBtn);
+
+    return actions;
+  }
+
+  async function _resolveBatchAction(batch, approved, always) {
+    const pendingRow = Array.from(
+      batch.querySelectorAll(".coord-tool-row"),
+    ).find((r) => r.dataset.callId && !r.classList.contains("error"));
+    const callId = pendingRow && pendingRow.dataset.callId;
+    if (!callId) return;
+    _setBatchActionsDisabled(batch, true);
+    // Stash the "always" intent on the batch so the approval_resolved
+    // SSE handler can render the right status pill — the server's
+    // resolved event doesn't echo the always flag, only `approved` +
+    // `feedback`.  Echoes back to the operator that the click landed.
+    batch.dataset.requestedAlways = always ? "1" : "";
+    try {
+      const resp = await approveWorkstream(wsId, {
+        approved: !!approved,
+        always: !!always,
+        call_id: callId,
+      });
+      if (!resp.ok) throw new Error("approve failed: HTTP " + resp.status);
+    } catch (e) {
+      _setBatchActionsDisabled(batch, false);
+      delete batch.dataset.requestedAlways;
+      if (typeof toast !== "undefined" && toast.error) toast.error(String(e));
+      else console.error(e);
+      return;
+    }
+    // approval_resolved SSE event will morph the batch authoritatively.
+  }
+
+  function _setBatchActionsDisabled(batch, disabled) {
+    batch.querySelectorAll(".coord-tool-actions button").forEach((b) => {
+      b.disabled = !!disabled;
+    });
+  }
+
+  // Build the resolved-state status pill.  Shared between the live
+  // _morphBatchResolved path (post-approve, post-deny) and the
+  // history-replay path inside appendToolBatch (renders resolved
+  // batches without ever showing actions).
+  function _buildStatusPill(opts) {
+    const status = document.createElement("div");
+    status.className = "coord-tool-status";
+    status.classList.add(
+      opts.approved
+        ? "coord-tool-status--approved"
+        : "coord-tool-status--denied",
+    );
+    const label = document.createElement("span");
+    if (opts.approved) {
+      label.textContent = opts.always ? "✓ approved · always" : "✓ approved";
+    } else {
+      label.textContent = "✗ denied";
+    }
+    status.appendChild(label);
+    if (opts.feedback) {
+      const fb = document.createElement("span");
+      fb.className = "coord-tool-status-feedback";
+      fb.textContent = "— " + opts.feedback;
+      status.appendChild(fb);
+    }
+    return status;
+  }
+
+  function _morphBatchResolved(batch, opts) {
+    if (!batch) return;
+    batch.classList.remove("coord-tool-batch--pending");
+    batch.classList.add(
+      opts.approved ? "coord-tool-batch--approved" : "coord-tool-batch--denied",
+    );
+    const actions = batch.querySelector(".coord-tool-actions");
+    if (actions) actions.replaceWith(_buildStatusPill(opts));
+    if (activeBatch === batch) activeBatch = null;
+  }
+
+  function _focusBatchPrimary(batch, prefer) {
+    if (!batch) return;
+    const role = prefer === "deny" ? "deny" : "approve";
+    const btn = batch.querySelector(
+      '.coord-tool-actions button[data-role="' + role + '"]',
+    );
+    if (btn) {
+      try {
+        btn.focus({ preventScroll: false });
+      } catch (_) {
+        /* noop */
+      }
+    }
+  }
+
+  // Build (or update) a batch construct for `items`.  Idempotent on
+  // SSE reconnect: when every item's call_id already has a row in the
+  // DOM, returns the existing batch + folds in any newly-cached
+  // verdicts.
+  //
+  // opts:
+  //   pending (bool)       — show approval action row, mark pending
+  //   auto (bool)          — mark .coord-tool-batch--auto (no actions)
+  //   judgePending (bool)  — show "judge evaluating…" placeholders
+  //   resolved ({approved,denied,feedback,always}) — replay of a
+  //                          historical resolved batch (status pill
+  //                          prefilled, no actions)
+  function appendToolBatch(items, opts) {
+    items = (items || []).filter(Boolean);
+    if (items.length === 0) return null;
+    opts = opts || {};
+
+    const allMapped = items.every(
+      (it) => it.call_id && toolRows.has(it.call_id),
+    );
+    if (allMapped) {
+      const existing = toolRows.get(items[0].call_id).batch;
+      // Upgrade-in-place: when the second emit promotes the existing
+      // batch to pending (e.g. history replay rendered the call_ids as
+      // orphan-pending placeholders before SSE connected, then the SSE
+      // approve_request replay arrives with opts.pending=true), morph
+      // the existing shell instead of leaving stale chrome.  Without
+      // this, the replayed pending event was a no-op against any
+      // already-resolved or non-pending shell — the operator would
+      // never see action buttons in this tab.
+      if (
+        opts.pending &&
+        !existing.classList.contains("coord-tool-batch--pending")
+      ) {
+        existing.classList.remove(
+          "coord-tool-batch--approved",
+          "coord-tool-batch--denied",
+          "coord-tool-batch--auto",
+          "coord-tool-batch--error",
+        );
+        existing.classList.add("coord-tool-batch--pending");
+        const kicker = existing.querySelector(".coord-tool-batch-kicker");
+        if (kicker) {
+          kicker.textContent =
+            items.length >= 2
+              ? "⚠ Approval · Parallel " + items.length
+              : "⚠ Approval";
+        }
+        const statusEl = existing.querySelector(".coord-tool-status");
+        const actionsEl = existing.querySelector(".coord-tool-actions");
+        const newActions = _buildBatchActions(existing, items);
+        if (statusEl) statusEl.replaceWith(newActions);
+        else if (actionsEl) actionsEl.replaceWith(newActions);
+        else existing.appendChild(newActions);
+        activeBatch = existing;
+      } else if (opts.pending) {
+        // Already pending — keep the action row, just refresh
+        // activeBatch so kb shortcut + approval_resolved routing
+        // target the right construct.
+        activeBatch = existing;
+      }
+      items.forEach((it) => {
+        const entry = toolRows.get(it.call_id);
+        if (!entry) return;
+        const cached = judgeVerdicts.get(it.call_id);
+        const v = it.judge_verdict || it.heuristic_verdict || cached;
+        if (v) {
+          _appendVerdictLineTo(entry.row, v);
+        } else if (
+          it.needs_approval &&
+          opts.judgePending &&
+          !entry.row.querySelector(".coord-tool-row-verdict")
+        ) {
+          _appendJudgePendingLineTo(entry.row);
+        }
+      });
+      return existing;
+    }
+
+    const batch = document.createElement("div");
+    batch.className = "coord-tool-batch";
+    batch.classList.add(
+      items.length >= 2
+        ? "coord-tool-batch--parallel"
+        : "coord-tool-batch--solo",
+    );
+    if (opts.pending) batch.classList.add("coord-tool-batch--pending");
+    else if (opts.auto) batch.classList.add("coord-tool-batch--auto");
+    else if (opts.resolved) {
+      batch.classList.add(
+        opts.resolved.approved
+          ? "coord-tool-batch--approved"
+          : "coord-tool-batch--denied",
+      );
+    }
+
+    const head = document.createElement("div");
+    head.className = "coord-tool-batch-head";
+    const kicker = document.createElement("span");
+    kicker.className = "coord-tool-batch-kicker";
+    if (opts.pending) {
+      kicker.textContent =
+        items.length >= 2
+          ? "⚠ Approval · Parallel " + items.length
+          : "⚠ Approval";
+    } else if (items.length >= 2) {
+      kicker.textContent = "Parallel · " + items.length + " tools";
+    } else {
+      kicker.textContent = "Tool";
+    }
+    head.appendChild(kicker);
+
+    const summary = document.createElement("span");
+    summary.className = "coord-tool-batch-summary";
+    const firstName =
+      items[0] && (items[0].func_name || items[0].approval_label)
+        ? items[0].func_name || items[0].approval_label
+        : "tool";
+    summary.textContent =
+      items.length >= 2
+        ? firstName + " + " + (items.length - 1) + " more"
+        : firstName;
+    head.appendChild(summary);
+
+    const tier = _pickBatchTier(items);
+    if (tier) {
+      const tierEl = document.createElement("span");
+      tierEl.className = "coord-tool-batch-tier";
+      tierEl.textContent = tier;
+      head.appendChild(tierEl);
+    }
+    batch.appendChild(head);
+
+    let anyRowError = false;
+    items.forEach((it, idx) => {
+      const indexLabel = items.length >= 2 ? idx + 1 + "/" + items.length : "";
+      const row = _renderBatchRow(it, indexLabel);
+      batch.appendChild(row);
+      if (it.call_id) {
+        toolRows.set(it.call_id, { batch, row });
+      }
+      if (row.classList.contains("error")) anyRowError = true;
+      const cached = it.call_id ? judgeVerdicts.get(it.call_id) : null;
+      const verdict = it.judge_verdict || it.heuristic_verdict || cached;
+      if (verdict) {
+        _appendVerdictLineTo(row, verdict);
+      } else if (it.needs_approval && opts.judgePending) {
+        _appendJudgePendingLineTo(row);
+      }
+    });
+    // Lift any policy-blocked row's error onto the enclosing batch so
+    // the left stripe + status pill cue the operator at the batch
+    // level too.  _appendResultToRow does the same for runtime errors
+    // arriving via tool_result.
+    if (anyRowError) batch.classList.add("coord-tool-batch--error");
+
+    if (opts.pending) {
+      batch.appendChild(_buildBatchActions(batch, items));
+      activeBatch = batch;
+    } else if (opts.resolved) {
+      batch.appendChild(_buildStatusPill(opts.resolved));
+    }
+
+    messagesEl.appendChild(batch);
+    _scheduleScroll();
+    return batch;
   }
 
   // ------------------------------------------------------------------
@@ -397,7 +938,7 @@
     } else if (body) {
       body.textContent = currentAssistantBuf;
     }
-    messagesEl.scrollTop = messagesEl.scrollHeight;
+    _scheduleScroll();
   }
 
   function appendReasoningToken(text) {
@@ -414,7 +955,7 @@
     currentReasoningBuf += text;
     const body = currentReasoningEl.querySelector(".msg-body");
     if (body) body.textContent = currentReasoningBuf;
-    messagesEl.scrollTop = messagesEl.scrollHeight;
+    _scheduleScroll();
   }
 
   function finishAssistantStream() {
@@ -441,225 +982,40 @@
   }
 
   // ------------------------------------------------------------------
-  // Approval UI
+  // Approval UI — entry point used by the approve_request SSE handler.
+  // The legacy dock + its public surface (hideApproval / coordApprove)
+  // were removed when approvals moved into the inline batch construct.
+  // The SSE approval_resolved handler now drives _morphBatchResolved
+  // directly, and inline action buttons drive _resolveBatchAction.
   // ------------------------------------------------------------------
 
-  function showApproval(items) {
-    approvalTools.replaceChildren();
-    const pending = (items || []).filter((it) => it.needs_approval);
-    // Count badge — shown in the .dhead row's trailing .dcount slot.
-    // The "Approval required" kicker is static in the HTML so the
-    // screen-reader label stays stable across open/close cycles.
-    const countEl = document.getElementById("coord-approval-count");
-    if (countEl) {
-      countEl.textContent = pending.length ? pending.length + " pending" : "";
-    }
-    let firstCallId = null;
-    pending.forEach((it, idx) => {
-      if (!firstCallId) firstCallId = it.call_id;
-      // Each pending tool call renders as a .dcall row — the DS pattern
-      // frames this like a mini inspectable call line.  If we've already
-      // received a judge verdict for this call_id, its risk_level takes
-      // precedence; otherwise default to "low" until a verdict arrives.
-      const row = document.createElement("div");
-      row.className = "dcall";
-      if (it.call_id) row.dataset.callId = it.call_id;
-      if (pending.length > 1) {
-        const idx_ = document.createElement("span");
-        idx_.className = "risk low";
-        idx_.textContent = idx + 1 + "/" + pending.length;
-        row.appendChild(idx_);
-      }
-      const fn = document.createElement("span");
-      fn.className = "dfn";
-      fn.textContent = it.func_name || "(unknown tool)";
-      row.appendChild(fn);
-      const args = document.createElement("span");
-      args.className = "dargs";
-      const preview = it.header || it.approval_label || it.preview || "";
-      args.textContent = preview;
-      row.appendChild(args);
-      approvalTools.appendChild(row);
-      // If the judge already delivered a verdict for this call before the
-      // approval surfaced, render it into the dock immediately.  Otherwise
-      // render a spinner placeholder so the reviewer sees "the judge is
-      // still thinking" instead of silence.
-      if (it.call_id && judgeVerdicts.has(it.call_id)) {
-        applyJudgeVerdictToRow(row, judgeVerdicts.get(it.call_id));
-      } else {
-        applyJudgePendingToRow(row);
-      }
+  function showApproval(items, judgePending) {
+    const list = (items || []).filter(Boolean);
+    if (list.length === 0) return;
+    const batch = appendToolBatch(list, {
+      pending: true,
+      judgePending: !!judgePending,
     });
-    pendingApprovalCallId = firstCallId;
-    approvalBar.hidden = false;
-    // Defer focus until the judge returns a verdict.  If the verdict is
-    // already cached (rare race), claim focus immediately.  Otherwise
-    // wait for intent_verdict — no fallback.
-    approvalFocusClaimed = false;
-    if (firstCallId && judgeVerdicts.has(firstCallId)) {
-      claimApprovalFocusForVerdict(judgeVerdicts.get(firstCallId));
+    const firstPending = list.find((it) => it.needs_approval);
+    if (batch && firstPending && firstPending.call_id) {
+      const cached = judgeVerdicts.get(firstPending.call_id);
+      if (cached) _focusBatchPrimary(batch, cached.recommendation);
     }
   }
 
-  // Claim approval-bar focus for a specific button.  Idempotent — further
-  // calls after the first are noops so we don't bounce focus across
-  // multiple buttons as verdicts arrive for a batch.
-  function claimApprovalFocus(btnId) {
-    if (approvalFocusClaimed) return;
-    approvalFocusClaimed = true;
-    const btn = document.getElementById(btnId);
-    if (btn) {
-      try {
-        btn.focus({ preventScroll: false });
-      } catch (_) {
-        /* noop */
-      }
-    }
-  }
-
-  // Focus the appropriate action based on the judge's recommendation:
-  // deny → Deny button (judge is warning; reviewer should default to
-  // blocking), approve/review/other → Approve button.
-  function claimApprovalFocusForVerdict(verdict) {
-    const rec = (verdict && verdict.recommendation) || "";
-    claimApprovalFocus(rec === "deny" ? "coord-deny-btn" : "coord-approve-btn");
-  }
-
-  // Ensure a .dctx sibling exists for the given .dcall row, tagged with
-  // the row's call_id.  Returns the .dctx element ready to be populated.
-  function ensureDctxAfterRow(row) {
-    if (!row) return null;
-    const callId = row.dataset.callId;
-    let dctx = row.nextElementSibling;
-    if (
-      !dctx ||
-      !dctx.classList.contains("dctx") ||
-      dctx.dataset.forCall !== callId
-    ) {
-      dctx = document.createElement("div");
-      dctx.className = "dctx";
-      if (callId) dctx.dataset.forCall = callId;
-      row.insertAdjacentElement("afterend", dctx);
-    }
-    return dctx;
-  }
-
-  // Remove any existing .drationale sibling for the given call_id so
-  // repeated verdicts don't stack.
-  function removeRationale(callId) {
-    if (!callId) return;
-    const existing = approvalTools.querySelector(
-      '.drationale[data-for-call="' + cssEscape(callId) + '"]',
-    );
-    if (existing) existing.remove();
-  }
-
-  // Render a "judge evaluating…" placeholder into the .dctx so the
-  // reviewer sees the judge is still thinking while awaiting verdict.
-  function applyJudgePendingToRow(row) {
-    const dctx = ensureDctxAfterRow(row);
-    if (!dctx) return;
-    removeRationale(row.dataset.callId);
-    dctx.replaceChildren();
-    const chip = document.createElement("code");
-    chip.className = "judging";
-    const spin = document.createElement("span");
-    spin.className = "spin";
-    spin.setAttribute("aria-hidden", "true");
-    chip.appendChild(spin);
-    chip.appendChild(document.createTextNode("judge evaluating…"));
-    dctx.appendChild(chip);
-  }
-
-  // Render a judge verdict into a specific .dcall row.  Builds:
-  //   .dctx    <code>judge: rec (risk: lvl)</code> + optional confidence
-  //   .drationale  judge.reasoning text (wrapped prose block)
-  // The judge chip colour-codes by recommendation: approve=ok/green,
-  // review=warn/amber, deny=err/red — so reviewers can triage at a
-  // glance without reading.  Repeated calls for the same row (e.g.
-  // re-evaluation) replace prior content.
-  function applyJudgeVerdictToRow(row, verdict) {
-    if (!row || !verdict) return;
-    const callId = row.dataset.callId;
-    const dctx = ensureDctxAfterRow(row);
-    removeRationale(callId);
-    dctx.replaceChildren();
-    const chip = document.createElement("code");
-    const rec = verdict.recommendation || "?";
-    const risk = verdict.risk_level || "?";
-    chip.textContent = "judge: " + rec + " (risk: " + risk + ")";
-    if (rec === "approve") chip.classList.add("rec-approve");
-    else if (rec === "review") chip.classList.add("rec-review");
-    else if (rec === "deny") chip.classList.add("rec-deny");
-    dctx.appendChild(chip);
-    if (verdict.confidence != null) {
-      const conf = document.createElement("code");
-      conf.textContent = "confidence: " + verdict.confidence;
-      dctx.appendChild(conf);
-    }
-    if (verdict.reasoning) {
-      const rationale = document.createElement("div");
-      rationale.className = "drationale";
-      if (callId) rationale.dataset.forCall = callId;
-      rationale.textContent = verdict.reasoning;
-      dctx.insertAdjacentElement("afterend", rationale);
-    }
-  }
-
-  function hideApproval() {
-    approvalBar.hidden = true;
-    approvalTools.replaceChildren();
-    const countEl = document.getElementById("coord-approval-count");
-    if (countEl) countEl.textContent = "";
-    pendingApprovalCallId = null;
-    approvalFocusClaimed = false;
-    // Prune the verdict cache — verdicts are only used while the dock
-    // is visible, so keeping them across resolve cycles would leak
-    // memory over long sessions.
-    if (judgeVerdicts && typeof judgeVerdicts.clear === "function") {
-      judgeVerdicts.clear();
-    }
-    setApprovalButtonsDisabled(false);
-    // Return focus to the composer for keyboard users.  Only if the
-    // approval bar itself was the focus holder — don't steal focus from
-    // e.g. a user who clicked into the history log.
-    if (
-      document.activeElement &&
-      approvalBar.contains(document.activeElement)
-    ) {
-      try {
-        composer.focus();
-      } catch (_) {
-        /* noop */
-      }
-    }
-  }
-
-  function setApprovalButtonsDisabled(disabled) {
-    // Disable all three approval buttons during an in-flight POST to
-    // prevent double-submit via double-click / Enter-hold.  The bar
-    // either dismisses on success or re-enables on error.
-    ["coord-approve-btn", "coord-approve-always-btn", "coord-deny-btn"].forEach(
-      (id) => {
-        const btn = document.getElementById(id);
-        if (btn) btn.disabled = !!disabled;
-      },
-    );
-  }
-
-  // Generic approve POST — usable for both the coord-self dock and
-  // the per-child inline buttons in the children-tree. Returns the
+  // Generic approve POST — usable for both the coord-self batch and
+  // the per-child inline buttons in the children-tree.  Returns the
   // response so callers can inspect 409 (stale call_id) bodies and
   // refresh their local state.
   //
-  // The path differs by target: the coord workstream is hosted on
-  // the console process itself (lifted verbs at /v1/api/workstreams/
+  // The path differs by target: the coord workstream is hosted on the
+  // console process itself (lifted verbs at /v1/api/workstreams/
   // {coord_ws_id}/approve), but child workstreams live on cluster
   // nodes and need to round-trip through the routing proxy at
-  // /v1/api/route/workstreams/{child_ws_id}/approve which resolves
-  // the ws_id to its owning node and forwards the body verbatim.
-  // Without the /route/ prefix children always 404 because the
-  // console doesn't host them.
+  // /v1/api/route/workstreams/{child_ws_id}/approve which resolves the
+  // ws_id to its owning node and forwards the body verbatim.  Without
+  // the /route/ prefix children always 404 because the console
+  // doesn't host them.
   async function approveWorkstream(targetWsId, body) {
     const isSelf = targetWsId === wsId;
     const path = isSelf
@@ -669,26 +1025,6 @@
         "/approve";
     return postJSON(path, body);
   }
-
-  window.coordApprove = async function (approved, always) {
-    if (!pendingApprovalCallId) return; // no-op if bar already resolved
-    const body = {
-      approved: !!approved,
-      always: !!always,
-      call_id: pendingApprovalCallId,
-    };
-    setApprovalButtonsDisabled(true);
-    try {
-      const resp = await approveWorkstream(wsId, body);
-      if (!resp.ok) throw new Error("approve failed: HTTP " + resp.status);
-    } catch (e) {
-      setApprovalButtonsDisabled(false);
-      if (typeof toast !== "undefined" && toast.error) toast.error(String(e));
-      else console.error(e);
-      return;
-    }
-    hideApproval();
-  };
 
   // ------------------------------------------------------------------
   // Send / cancel / close
@@ -1103,50 +1439,54 @@
         }
         break;
       case "approve_request":
-        showApproval(ev.items);
-        // Surface each tool for context.  Dedupe by call_id: the console
-        // replays _pending_approval into every new SSE subscriber (the
-        // events SSE handler's coord-side replay), so without this check
-        // an SSE reconnect would render each tool row a second time.
-        (ev.items || []).forEach((it) => {
-          if (!it.needs_approval) return;
-          if (
-            it.call_id &&
-            document.querySelector(
-              '.msg[data-call-id="' + cssEscape(it.call_id) + '"]',
-            )
-          ) {
-            return; // already rendered in this pane — skip
-          }
-          appendToolCall(it);
-        });
+        // appendToolBatch is idempotent on call_ids — the console replays
+        // _pending_approval into every new SSE subscriber, so reconnect
+        // won't double-render the construct.
+        showApproval(ev.items, !!ev.judge_pending);
         break;
-      case "approval_resolved":
-        hideApproval();
+      case "approval_resolved": {
+        // Server-driven resolution.  Morph the active pending batch
+        // (the construct that posted the approve POST).  The server
+        // event carries `approved` + `feedback` only — the "always"
+        // intent was stashed on the batch by _resolveBatchAction so
+        // the status pill reads "approved · always" when set.
+        // Fall back to a DOM lookup if activeBatch was never set
+        // (e.g. cross-tab resolution where this tab never rendered
+        // the approval gate before the resolved event landed).
+        const target =
+          activeBatch ||
+          messagesEl.querySelector(
+            ".coord-tool-batch.coord-tool-batch--pending",
+          );
+        if (target) {
+          const wasAlways = target.dataset.requestedAlways === "1";
+          _morphBatchResolved(target, {
+            approved: ev.approved !== false,
+            always: wasAlways,
+            feedback: ev.feedback || null,
+          });
+        }
         break;
+      }
       case "intent_verdict":
-        // Prefer rendering the verdict inside the approval dock — the
-        // judge always evaluates a specific call_id, and the verdict is
-        // decision context for that pending approval, not a chat
-        // message.  Cache the verdict so late-arriving approve_request
-        // events can also pick it up (see showApproval).
+        // Cache the verdict so a late-arriving approve_request (or a
+        // SSE replay reorder) still surfaces it.  _cacheJudgeVerdict
+        // soft-caps the Map to bound long-session memory growth.
         if (ev.call_id) {
-          judgeVerdicts.set(ev.call_id, {
+          _cacheJudgeVerdict(ev.call_id, {
             recommendation: ev.recommendation,
             risk_level: ev.risk_level,
             confidence: ev.confidence,
             reasoning: ev.reasoning,
           });
-          const row = approvalTools.querySelector(
-            '.dcall[data-call-id="' + cssEscape(ev.call_id) + '"]',
-          );
-          if (row) {
-            applyJudgeVerdictToRow(row, judgeVerdicts.get(ev.call_id));
-            // Claim focus now that the reviewer has context to act on.
-            // Only for the first-pending call so batch approvals don't
-            // fight over focus as verdicts trickle in.
-            if (ev.call_id === pendingApprovalCallId && !approvalFocusClaimed) {
-              claimApprovalFocusForVerdict(judgeVerdicts.get(ev.call_id));
+          const entry = toolRows.get(ev.call_id);
+          if (entry) {
+            _appendVerdictLineTo(entry.row, judgeVerdicts.get(ev.call_id));
+            // Focus the construct's primary action once the verdict
+            // gives the reviewer context to act on — judge=deny defaults
+            // focus to Deny, otherwise Approve.
+            if (entry.batch.classList.contains("coord-tool-batch--pending")) {
+              _focusBatchPrimary(entry.batch, ev.recommendation);
             }
             break;
           }
@@ -1275,8 +1615,11 @@
       case "tool_info":
         // Renamed from ``tools_auto_approved`` when ``approve_tools``
         // unified onto SessionUIBase — the shared body emits ``tool_info``
-        // for both kinds, matching the interactive payload name.
-        (ev.items || []).forEach((it) => appendToolCall(it));
+        // for both kinds, matching the interactive payload name.  All
+        // items in a single ``tool_info`` envelope share a dispatch
+        // turn, so render them as one batch construct (parallel when
+        // ≥2, solo otherwise) rather than N separate bubbles.
+        appendToolBatch(ev.items || [], { auto: true });
         break;
       // Child-workstream fan-out routed through the coordinator's own
       // SSE stream.  CoordinatorManager filters the cluster event bus
@@ -2638,21 +2981,43 @@
       // tool result rendered with the literal label "tool", which
       // looked like the tool calls had been replaced by raw JSON.
       const toolNameByCallId = new Map();
+
+      // Pre-scan every tool message's tool_call_id so the
+      // assistant.tool_calls branch below knows whether each call_id
+      // already has a result persisted.  An assistant tool_calls turn
+      // with NO matching tool result for some call_ids = orphan
+      // (approval was pending when the page reloaded); rendering it
+      // as resolved-approved would lock the operator out of the
+      // pending approval (the SSE approve_request replay would then
+      // fold into the "already mapped" branch and never paint
+      // actions).  Pre-scanning lets us flag the turn as pending
+      // up-front so SSE either upgrades it in place or finds a
+      // pre-existing pending shell to merge with.
+      const resolvedCallIds = new Set();
+      (hist.messages || []).forEach((m) => {
+        if ((m.role || "tool") === "tool" && m.tool_call_id) {
+          resolvedCallIds.add(m.tool_call_id);
+        }
+      });
+
       (hist.messages || []).forEach((m) => {
         const role = m.role || "tool";
 
-        // Assistant tool calls — render each as a synthesized
-        // appendToolCall row with a header derived from the persisted
-        // tool name + arguments, mirroring what the live preparer
-        // would have shown when the call was first issued.  Without
-        // this branch the assistant row was empty (content="") and
-        // the operator saw only the raw tool result below it.
+        // Assistant tool_calls — synthesize one batch construct per
+        // assistant turn so a parallel fan-out (tool_calls.length ≥ 2)
+        // reads as one cohesive dispatch, matching how live SSE
+        // renders the same flow via approve_request / tool_info.
+        // The batch is marked resolved-approved when every call_id has
+        // a matching tool result message; otherwise it's an orphan
+        // (approval pending at reload) and renders as pending so the
+        // operator can act + SSE can fold its approve_request replay
+        // into this same shell via the upgrade-in-place path.
         if (
           role === "assistant" &&
           Array.isArray(m.tool_calls) &&
           m.tool_calls.length
         ) {
-          m.tool_calls.forEach((tc) => {
+          const items = m.tool_calls.map((tc) => {
             const fn = (tc && tc.function) || {};
             const name = String(fn.name || "tool");
             const callId = String((tc && tc.id) || "");
@@ -2663,15 +3028,28 @@
             } catch (_) {
               /* malformed — fall back to raw string in preview */
             }
+            if (callId) toolNameByCallId.set(callId, name);
             const item = synthesizeHistoricalToolCall(
               name,
               callId,
               parsedArgs,
               argsRaw,
             );
-            if (callId) toolNameByCallId.set(callId, name);
-            appendToolCall(item);
+            // Synthesized items default to needs_approval=true so the
+            // upgrade-in-place path (when SSE later folds in) can
+            // render judge placeholders and the approve POST has a
+            // call_id to send.  Resolved-batch path ignores it.
+            item.needs_approval = true;
+            return item;
           });
+          const allResolved = items.every(
+            (it) => !it.call_id || resolvedCallIds.has(it.call_id),
+          );
+          if (allResolved) {
+            appendToolBatch(items, { resolved: { approved: true } });
+          } else {
+            appendToolBatch(items, { pending: true, judgePending: true });
+          }
         }
 
         // User messages with attachments arrive as multipart list

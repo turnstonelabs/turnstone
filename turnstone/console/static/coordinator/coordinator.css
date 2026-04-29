@@ -6,8 +6,9 @@
    Tokens (--panel, --hair, --ok, --warn, etc.) come from shared_static/
    base.css.  Form controls + .btn / .ghost / .appbar primitives come
    from shared_static/ui-base.css.  This file holds the patterns specific
-   to the coordinator view: the right-rail sidebar and the pinned approval
-   dock.
+   to the coordinator view: the right-rail sidebar, the inline tool-batch
+   construct (paired tool calls + approval flow + results), and the
+   drag-and-drop overlay.
    ========================================================================== */
 
 /* ==========================================================================
@@ -38,235 +39,6 @@
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--ink-4);
-}
-
-/* ==========================================================================
-   Approval dock — bottom-pinned strip that appears when pending approvals
-   exist.  Signature product pattern: a neutral dock (not a modal, not
-   inline) that surfaces the approval contract without hijacking focus.
-
-   Layout:
-     .approval-dock        position: fixed bottom
-       .dhead              11px uppercase warn kicker + count on right
-       .dcall              risk pill + function name + arg preview
-       .dctx               context code snippets
-       .drow               right-aligned action cluster + nav spacer
-
-   Actions (action cluster):
-     button.act           neutral default ("dismiss" / "view")
-     button.act.primary   ok-tinted green per the .ts-approval-btn--approve
-                          convention in shared_static/chat.css.  The original
-                          Claude Design spec preferred amber; turnstone
-                          deliberately broke from it to keep colour-family
-                          parity with the Approve button's existing green.
-                          1.5px border, --r-md squared.
-     button.act.always    dashed border — "Always approve for this rule"
-     button.act.danger    err-tinted red — "Deny"
-
-   Keyboard shortcuts (wired in coordinator.js):
-     Enter  → primary approve
-     D      → deny
-     ⇧A     → always approve
-
-   Focus policy: when the dock opens, move focus to button.act.primary so
-   keyboard users can confirm without hunting.  Do NOT trap focus.
-   ========================================================================== */
-.approval-dock {
-  position: fixed;
-  left: 0;
-  right: 0;
-  bottom: 22px; /* clears the statusbar if one is present */
-  z-index: 20;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 14px 20px;
-  background: var(--panel);
-  border-top: 1px solid var(--hair);
-  box-shadow: 0 -6px 24px -12px rgba(21, 24, 27, 0.18);
-}
-
-.approval-dock::before {
-  content: "";
-  position: absolute;
-  top: -1px;
-  left: 0;
-  right: 0;
-  height: 2px;
-  background: linear-gradient(
-    to right,
-    transparent,
-    color-mix(in srgb, var(--warn) 50%, transparent),
-    transparent
-  );
-}
-
-.approval-dock .dhead {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--warn);
-}
-
-.approval-dock .dhead::before {
-  content: "⚠";
-  font-size: 12px;
-}
-
-.approval-dock .dhead .dcount {
-  margin-left: auto;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 500;
-  letter-spacing: 0;
-  text-transform: none;
-  color: var(--ink-3);
-}
-
-/* Inline code-panel framing — the .dcall row reads as "the exact call you
-   are approving," so we frame it like a mini inspectable code line rather
-   than bare text on the dock surface. */
-.approval-dock .dcall {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-  padding: 6px 10px;
-  background: var(--panel);
-  border: 1px solid var(--hair);
-  border-radius: var(--r-sm);
-}
-
-.approval-dock .dcall .risk { flex-shrink: 0; }
-
-.approval-dock .dcall .dfn {
-  font-family: var(--font-mono);
-  font-weight: 600;
-  color: var(--ink);
-}
-
-.approval-dock .dcall .dargs {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  color: var(--ink-3);
-}
-
-.approval-dock .dctx {
-  display: flex;
-  gap: 14px;
-  flex-wrap: wrap;
-  font-size: 11px;
-  color: var(--ink-3);
-}
-
-.approval-dock .dctx code {
-  padding: 0 4px;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--ink-2);
-  background: var(--panel-2);
-  border: 1px solid var(--hair);
-  border-radius: 3px;
-}
-
-.approval-dock .drow {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.approval-dock .drow .spacer { flex: 1; }
-
-.approval-dock .drow .nav {
-  padding: 4px 8px;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--ink-3);
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: 3px;
-  cursor: pointer;
-}
-
-.approval-dock .drow .nav:hover {
-  background: var(--panel-2);
-  color: var(--ink);
-}
-
-/* Action buttons — 1.5px border, --r-md squared (NOT pill — these are
-   primary-action surfaces, not inline buttons). */
-.approval-dock button.act {
-  padding: 7px 16px;
-  font: inherit;
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--ink-2);
-  background: var(--panel);
-  border: 1.5px solid var(--hair-2);
-  border-radius: var(--r-md);
-  cursor: pointer;
-  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
-}
-
-.approval-dock button.act:hover {
-  color: var(--ink);
-  border-color: var(--ink-4);
-}
-
-.approval-dock button.act:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
-/* Approve and Always are siblings — same ok hue, differentiated by fill
-   (filled vs outlined) and border-style (solid vs dashed).  Matches the
-   .ts-approval-btn--approve convention in shared_static/chat.css.  Four
-   stacked non-colour cues for WCAG 1.4.1: fill state, border style,
-   label, position. */
-.approval-dock button.act.primary {
-  background: color-mix(in srgb, var(--ok) 28%, var(--panel));
-  color: var(--ok-text);
-  border-color: color-mix(in srgb, var(--ok) 65%, var(--hair));
-  font-weight: 600;
-}
-
-.approval-dock button.act.primary:hover {
-  background: color-mix(in srgb, var(--ok) 40%, var(--panel));
-  color: var(--ink);
-  border-color: var(--ok);
-}
-
-.approval-dock button.act.always {
-  background: transparent;
-  border-style: dashed;
-  border-color: color-mix(in srgb, var(--ok) 65%, var(--hair));
-  color: var(--ok-text);
-}
-
-.approval-dock button.act.always:hover {
-  background: color-mix(in srgb, var(--ok) 15%, var(--panel));
-  color: var(--ink);
-  border-color: var(--ok);
-}
-
-.approval-dock button.act.danger {
-  color: var(--err);
-  border-color: color-mix(in srgb, var(--err) 42%, var(--hair));
-}
-
-.approval-dock button.act.danger:hover {
-  background: var(--err-soft);
-  color: var(--err);
-  border-color: var(--err);
 }
 
 /* ==========================================================================
@@ -301,9 +73,411 @@
   z-index: 10;
 }
 
-/* Match .btn .kbd (in shared_static/ui-base.css) — --ink-3 clears AA at
-   10px, --ink-4 is borderline on light panels. */
-.approval-dock button.act .kbd {
+/* ==========================================================================
+   Tool batch construct — pairs tool calls with their results and
+   embeds the approval flow.  Replaces the bottom approval dock + the
+   duplicate .msg.tool bubbles for tool-call rendering.
+
+   One construct per dispatch turn:
+     - solo (1 call, serial):       .coord-tool-batch--solo
+     - parallel (≥2 calls):         .coord-tool-batch--parallel
+                                    rows share a left rail so the
+                                    operator reads them as siblings
+                                    of one assistant decision.
+
+   Sub-elements:
+     .coord-tool-batch-head      label + count + tier glyph
+     .coord-tool-row             per-call row (call line + verdict + result)
+       .coord-tool-row-call      [idx] name args ellipsized
+       .coord-tool-row-verdict   judge verdict chip + rationale teaser
+       .coord-tool-row-result    paired tool_result <pre> under the row
+       .coord-tool-row-status    per-row pill (auto-approved / error)
+     .coord-tool-actions         approve / deny / always
+     .coord-tool-status          resolved status pill (replaces actions)
+
+   States (modifiers on the batch):
+     .coord-tool-batch--pending  approval gate visible
+     .coord-tool-batch--approved resolved approve
+     .coord-tool-batch--denied   resolved deny — rows dimmed
+     .coord-tool-batch--auto     all auto-approved, no gate ever shown
+   ========================================================================== */
+.coord-tool-batch {
+  margin: 4px 0;
+  background: var(--panel);
+  border: 1px solid var(--hair);
+  border-left: 3px solid var(--hair-2);
+  border-radius: var(--r-sm);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow: hidden;
+}
+
+/* State left-stripe — neutral default; warn when gating; ok when
+   resolved-approved; err when denied or any row errored.  Three stacked
+   non-colour cues for WCAG 1.4.1: pill text in the head, rail colour,
+   row dimming on deny. */
+.coord-tool-batch--pending {
+  border-left-color: var(--warn);
+}
+.coord-tool-batch--approved {
+  border-left-color: color-mix(in srgb, var(--ok) 65%, var(--hair-2));
+}
+.coord-tool-batch--auto {
+  border-left-color: var(--hair-2);
+}
+.coord-tool-batch--denied,
+.coord-tool-batch--error {
+  border-left-color: var(--err);
+}
+.coord-tool-batch--denied .coord-tool-row {
+  opacity: 0.6;
+}
+
+/* Header strip — small uppercase kicker + per-batch metadata. */
+.coord-tool-batch-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--hair);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.coord-tool-batch-kicker {
+  color: var(--ink-3);
+}
+.coord-tool-batch--pending .coord-tool-batch-kicker {
+  color: var(--warn);
+}
+.coord-tool-batch--approved .coord-tool-batch-kicker {
+  color: color-mix(in srgb, var(--ok) 70%, var(--ink-2));
+}
+.coord-tool-batch--denied .coord-tool-batch-kicker {
+  color: var(--err);
+}
+.coord-tool-batch-summary {
+  font-family: var(--font-mono);
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--ink-2);
+}
+.coord-tool-batch-tier {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--ink-4);
+  font-size: 10px;
+}
+
+/* Row container.  In parallel batches, rows are framed by a left rail
+   so they read as siblings of a single assistant decision; in solo
+   batches the rail is suppressed to keep visual weight low. */
+.coord-tool-row {
+  position: relative;
+  padding: 8px 10px;
+}
+.coord-tool-row + .coord-tool-row {
+  border-top: 1px solid var(--hair);
+}
+.coord-tool-batch--parallel .coord-tool-row {
+  padding-left: 28px;
+}
+.coord-tool-batch--parallel .coord-tool-row::before {
+  /* Vertical rail tick — connects rows visually as a parallel group.
+     Stops 4px short of the row's top + bottom edges so consecutive
+     rows look continuous; the dot at the row's center marks the call. */
+  content: "";
+  position: absolute;
+  left: 14px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--hair-2);
+}
+.coord-tool-batch--parallel .coord-tool-row:first-of-type::before {
+  top: 4px;
+}
+.coord-tool-batch--parallel .coord-tool-row:last-of-type::before {
+  bottom: 4px;
+}
+.coord-tool-batch--parallel .coord-tool-row::after {
+  content: "";
+  position: absolute;
+  left: 11px;
+  top: 14px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--panel);
+  border: 1.5px solid var(--hair-2);
+}
+.coord-tool-batch--parallel.coord-tool-batch--approved .coord-tool-row::after {
+  border-color: color-mix(in srgb, var(--ok) 65%, var(--hair-2));
+}
+.coord-tool-batch--parallel.coord-tool-batch--denied .coord-tool-row::after,
+.coord-tool-row.error::after {
+  border-color: var(--err);
+}
+
+/* Call line — index/N pill, monospace tool name, ellipsized args. */
+.coord-tool-row-call {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.coord-tool-row-idx {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--ink-3);
+  background: var(--panel-2);
+  border: 1px solid var(--hair);
+  border-radius: 3px;
+}
+.coord-tool-row-name {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--ink);
+}
+.coord-tool-row.error .coord-tool-row-name {
+  color: var(--err);
+}
+.coord-tool-row-args {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  color: var(--ink-3);
+}
+
+/* Verdict line — judge chip + optional rationale teaser. */
+.coord-tool-row-verdict {
+  margin-top: 4px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--ink-3);
+}
+.coord-tool-row-verdict code {
+  padding: 1px 6px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-2);
+  background: var(--panel-2);
+  border: 1px solid var(--hair);
+  border-radius: 3px;
+}
+.coord-tool-row-verdict code.rec-approve {
+  color: color-mix(in srgb, var(--ok) 70%, var(--ink-2));
+  border-color: color-mix(in srgb, var(--ok) 38%, var(--hair));
+  background: color-mix(in srgb, var(--ok) 12%, var(--panel-2));
+}
+.coord-tool-row-verdict code.rec-review {
+  color: color-mix(in srgb, var(--warn) 70%, var(--ink-2));
+  border-color: color-mix(in srgb, var(--warn) 38%, var(--hair));
+  background: var(--warn-tint);
+}
+.coord-tool-row-verdict code.rec-deny {
+  color: color-mix(in srgb, var(--err) 70%, var(--ink-2));
+  border-color: color-mix(in srgb, var(--err) 38%, var(--hair));
+  background: color-mix(in srgb, var(--err) 12%, var(--panel-2));
+}
+.coord-tool-row-verdict code.judging {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--ink-3);
+}
+.coord-tool-row-verdict code.judging .spin {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1.5px solid var(--accent);
+  border-top-color: transparent;
+  animation: ts-spin 0.9s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .coord-tool-row-verdict code.judging .spin { animation: none; }
+}
+
+/* Rationale disclosure — collapsible block under a row.  Renders the
+   judge's reasoning prose; `details` element so a click toggles without
+   stealing focus. */
+.coord-tool-row-rationale {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--ink-3);
+}
+.coord-tool-row-rationale > summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-size: 11px;
+  list-style: none;
+  user-select: none;
+}
+.coord-tool-row-rationale > summary::before {
+  content: "▸ ";
+  display: inline-block;
+  margin-right: 2px;
+  transition: transform 120ms ease;
+}
+.coord-tool-row-rationale[open] > summary::before {
+  transform: rotate(90deg);
+}
+.coord-tool-row-rationale-body {
+  margin: 4px 0 0 14px;
+  padding: 6px 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ink-3);
+  background: var(--panel-2);
+  border-left: 2px solid var(--hair);
+  border-radius: 0 3px 3px 0;
+  white-space: pre-wrap;
+}
+
+/* Per-row status pill (auto-approved, error). */
+.coord-tool-row-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border-radius: 3px;
+  border: 1px solid var(--hair);
+  color: var(--ink-3);
+}
+.coord-tool-row-status--auto {
+  color: color-mix(in srgb, var(--ok) 70%, var(--ink-2));
+  border-color: color-mix(in srgb, var(--ok) 38%, var(--hair));
+  background: color-mix(in srgb, var(--ok) 12%, var(--panel-2));
+}
+.coord-tool-row-status--error {
+  color: var(--err);
+  border-color: color-mix(in srgb, var(--err) 38%, var(--hair));
+  background: color-mix(in srgb, var(--err) 12%, var(--panel-2));
+}
+
+/* Tool result block — paired under its row, mono pre-block with
+   collapse-when-tall affordance.  Maxes at 240px and reveals an
+   "expand" affordance like .tool-output.collapsed in the interactive UI. */
+.coord-tool-row-result {
+  margin-top: 6px;
+  padding: 6px 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ink-2);
+  background: var(--panel-2);
+  border-left: 2px solid var(--hair);
+  border-radius: 0 3px 3px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow: auto;
+}
+.coord-tool-row.error .coord-tool-row-result {
+  border-left-color: var(--err);
+  color: color-mix(in srgb, var(--err) 75%, var(--ink-2));
+}
+.coord-tool-row-result-lead {
+  display: inline-block;
+  margin-right: 4px;
+  color: var(--ink-4);
+  font-weight: 600;
+}
+
+/* Action row — Approve / Deny / Always.  Renders inside a pending
+   tool-batch construct as the operator's gate for the dispatch.  The
+   .act button vocabulary (primary/always/danger) is local to this
+   surface; the children-tree's .ch-row .approval-actions reuses the
+   same colour/border treatment in compact .sm sizing. */
+.coord-tool-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  background: var(--panel-2);
+  border-top: 1px solid var(--hair);
+}
+.coord-tool-actions .spacer { flex: 1; }
+.coord-tool-actions button.act {
+  padding: 6px 14px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ink-2);
+  background: var(--panel);
+  border: 1.5px solid var(--hair-2);
+  border-radius: var(--r-md);
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+.coord-tool-actions button.act:hover {
+  color: var(--ink);
+  border-color: var(--ink-4);
+}
+.coord-tool-actions button.act:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.coord-tool-actions button.act:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.coord-tool-actions button.act.primary {
+  background: color-mix(in srgb, var(--ok) 28%, var(--panel));
+  color: var(--ok-text);
+  border-color: color-mix(in srgb, var(--ok) 65%, var(--hair));
+  font-weight: 600;
+}
+.coord-tool-actions button.act.primary:hover {
+  background: color-mix(in srgb, var(--ok) 40%, var(--panel));
+  color: var(--ink);
+  border-color: var(--ok);
+}
+.coord-tool-actions button.act.always {
+  background: transparent;
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--ok) 65%, var(--hair));
+  color: var(--ok-text);
+}
+.coord-tool-actions button.act.always:hover {
+  background: color-mix(in srgb, var(--ok) 15%, var(--panel));
+  color: var(--ink);
+  border-color: var(--ok);
+}
+.coord-tool-actions button.act.danger {
+  color: var(--err);
+  border-color: color-mix(in srgb, var(--err) 42%, var(--hair));
+}
+.coord-tool-actions button.act.danger:hover {
+  background: var(--err-soft);
+  color: var(--err);
+  border-color: var(--err);
+}
+.coord-tool-actions button.act .kbd {
   margin-left: 6px;
   padding: 0 3px;
   font-family: var(--font-mono);
@@ -312,10 +486,44 @@
   border: 1px solid var(--hair);
   border-radius: 2px;
 }
-
-/* Tinted keycap on the primary Approve button — uses the parent's
-   --ok hue so the keycap reads as part of the green action surface. */
-.approval-dock button.act.primary .kbd {
+.coord-tool-actions button.act.primary .kbd {
   color: color-mix(in srgb, var(--ok) 70%, var(--ink-3));
   border-color: color-mix(in srgb, var(--ok) 40%, var(--hair));
+}
+
+/* Resolved status pill — replaces the action row after approve/deny. */
+.coord-tool-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--panel-2);
+  border-top: 1px solid var(--hair);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--ink-3);
+}
+.coord-tool-status--approved {
+  color: color-mix(in srgb, var(--ok) 70%, var(--ink-2));
+}
+.coord-tool-status--denied,
+.coord-tool-status--error {
+  color: var(--err);
+}
+.coord-tool-status-feedback {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-3);
+}
+
+/* Mobile (<700px) — keep action targets ≥44px for WCAG 2.5.5. */
+@media (max-width: 700px) {
+  .coord-tool-actions {
+    flex-wrap: wrap;
+  }
+  .coord-tool-actions button.act {
+    flex: 1 1 30%;
+    min-height: 44px;
+    font-size: 13px;
+  }
 }

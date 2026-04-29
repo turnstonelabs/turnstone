@@ -14,14 +14,15 @@
 <link rel="stylesheet" href="/static/style.css">
 <link rel="stylesheet" href="/static/coordinator/coordinator.css">
 <style>
-  /* Coordinator-specific layout glue.  Messages, header, approval dock,
-     and sidebar chrome live in shared_static/{chat,ui-base}.css and
-     console/static/style.css; what remains here is the page-level flex
-     wiring (chat pane + right sidebar), tree-view row metadata (indent,
-     state dots, child highlight), and the <700px responsive accordion.
-     Rules that target .msg / .appbar / .sidebar / .approval-dock are
-     intentionally absent — those primitives ship from the shared sheets
-     and we don't restyle them here. */
+  /* Coordinator-specific layout glue.  Messages, header, and sidebar
+     chrome live in shared_static/{chat,ui-base}.css and
+     console/static/style.css; the inline tool-batch construct lives
+     in coordinator.css.  What remains here is the page-level flex
+     wiring (chat pane + right sidebar), tree-view row metadata
+     (indent, state dots, child highlight), and the <700px responsive
+     accordion.  Rules that target .msg / .appbar / .sidebar are
+     intentionally absent — those primitives ship from the shared
+     sheets and we don't restyle them here. */
   body { display: flex; flex-direction: column; height: 100vh; margin: 0; }
 
   /* Main layout — chat pane (2fr) + sidebar (1fr) with shared
@@ -219,10 +220,10 @@
     color: var(--ink-3);
   }
   /* Recommendation chip inside the disclosure footer — same 12/38/70%
-     colour-mix scheme as the dock chips at `#coord-approval-bar
-     .dctx code.rec-*`, scoped to the row's disclosure so the inline
-     chip is actually styled (the dock-scoped rules don't reach this
-     surface). */
+     colour-mix scheme as the inline tool-batch verdict chips
+     (.coord-tool-row-verdict code.rec-*), scoped here to the row's
+     disclosure since this children-tree surface uses its own
+     .approval-disclosure container. */
   .ch-row .approval-disclosure code.rec-approve,
   .ch-row .approval-disclosure code.rec-review,
   .ch-row .approval-disclosure code.rec-deny {
@@ -311,13 +312,13 @@
     justify-content: flex-end;
     margin-top: 2px;
   }
-  /* Inline .act buttons — duplicates the colour/border treatment from
-     shared_static/design/patterns/approval-dock.css :162-225 because
-     the dock rules are scoped to `.approval-dock button.act` and the
-     children-tree row isn't inside a dock. Compact sizing applied
-     via .sm. Keeping the duplication local-scoped means a future
-     hoist of the dock rules to a global `.act` primitive could
-     drop these without affecting the dock surface. */
+  /* Inline .act buttons for the children-tree approval block —
+     compact (.sm) variant of the colour/border treatment used by the
+     coord chat's tool-batch action row (coordinator.css
+     .coord-tool-actions button.act).  Duplicated locally because the
+     children-tree row sits in the right-rail sidebar with its own
+     parent class; if we ever lift `.act` to a shared primitive these
+     local overrides can drop. */
   .ch-row .approval-actions .act {
     padding: 3px 10px;
     font: inherit;
@@ -436,94 +437,10 @@
     .ch-row.highlight { transition: none; }
   }
 
-  /* Override the .approval-dock pattern's viewport-pinned positioning.
-     The pattern defaults to position: fixed bottom:22px (designed for
-     the fleet dashboard overlay case); in the coordinator chat we need
-     it inline above the composer so it doesn't cover the input area.
-     Dock sits as the second flex child inside #coord-main between
-     messages and composer, with a hair top border as the
-     separator. */
-  #coord-approval-bar.approval-dock {
-    position: static;
-    bottom: auto;
-    left: auto;
-    right: auto;
-    z-index: auto;
-    box-shadow: none;
-    flex: 0 0 auto;
-  }
-  /* Keep the warm top-stripe cue; just make it hug the top edge of the
-     in-flow dock instead of the top of a fixed viewport bar. */
-  #coord-approval-bar.approval-dock::before {
-    top: -1px;
-  }
-  /* Hide the dock when no approval is pending.  [hidden] toggle; the
-     approval-dock pattern defines display: flex so we need the
-     !important override to win specificity. */
-  .approval-dock[hidden] { display: none !important; }
-
-  /* Judge verdict chips — colour-code by recommendation so the
-     reviewer can triage at a glance without reading the chip text.
-     approve=ok, review=warn, deny=err.  Uses the same 12/38/70% mix
-     scheme as the primitive k-badge tokens. */
-  #coord-approval-bar .dctx code.rec-approve {
-    color: color-mix(in srgb, var(--ok) 70%, var(--ink-2));
-    border-color: color-mix(in srgb, var(--ok) 38%, var(--hair));
-    background: color-mix(in srgb, var(--ok) 12%, var(--panel-2));
-  }
-  #coord-approval-bar .dctx code.rec-review {
-    color: color-mix(in srgb, var(--warn) 70%, var(--ink-2));
-    border-color: color-mix(in srgb, var(--warn) 38%, var(--hair));
-    background: var(--warn-tint);
-  }
-  #coord-approval-bar .dctx code.rec-deny {
-    color: color-mix(in srgb, var(--err) 70%, var(--ink-2));
-    border-color: color-mix(in srgb, var(--err) 38%, var(--hair));
-    background: color-mix(in srgb, var(--err) 12%, var(--panel-2));
-  }
-
-  /* Local @keyframes ts-spin — primitives/feed.css owns the canonical
-     definition but this page doesn't link feed.css (no .feed-item
-     usage).  Defined here so the .judging .spin chip below animates. */
+  /* @keyframes ts-spin — drives the .coord-tool-row-verdict
+     code.judging spinner.  Defined here because this page doesn't
+     link feed.css (no .feed-item usage). */
   @keyframes ts-spin { to { transform: rotate(360deg); } }
-
-  /* "judge evaluating…" spinner chip — shown while a .dcall is
-     pending a verdict. */
-  #coord-approval-bar .dctx code.judging {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    color: var(--ink-3);
-  }
-  #coord-approval-bar .dctx code.judging .spin {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    border: 1.5px solid var(--accent);
-    border-top-color: transparent;
-    animation: ts-spin 0.9s linear infinite;
-  }
-  @media (prefers-reduced-motion: reduce) {
-    #coord-approval-bar .dctx code.judging .spin {
-      animation: none;
-    }
-  }
-
-  /* Judge rationale — the judge's reasoning text, rendered below the
-     dctx chips as a block quote.  Full text wraps; no truncation —
-     justification is the whole point of showing this. */
-  #coord-approval-bar .drationale {
-    margin-top: 4px;
-    padding: 6px 10px;
-    font-family: var(--font-mono);
-    font-size: 11px;
-    line-height: 1.5;
-    color: var(--ink-3);
-    background: var(--panel-2);
-    border-left: 2px solid var(--hair);
-    border-radius: 0 3px 3px 0;
-    white-space: pre-wrap;
-  }
 
   /* Sidebar mobile toggle (desktop hides; mobile shows via media query
      below). */
@@ -596,37 +513,6 @@
          streaming and back to "polite" on stream_end so screen readers
          don't re-announce partial content on every token. -->
     <div id="coord-messages" role="log" aria-live="polite"></div>
-
-    <!-- Approval dock — overridden to inline positioning (see the
-         position: static override in the style block above).  Sits
-         between the message log and the composer so it doesn't occlude
-         the user input. role="region" (not alertdialog) because we do
-         not trap focus; buttons are reachable in normal tab order.
-         aria-live="assertive" preserves announce-on-queue behaviour. -->
-    <aside id="coord-approval-bar"
-           class="approval-dock"
-           role="region"
-           aria-label="Approval required"
-           aria-live="assertive"
-           hidden>
-      <div id="coord-approval-label" class="dhead">
-        Approval required
-        <span id="coord-approval-count" class="dcount"></span>
-      </div>
-      <div id="coord-approval-tools"></div>
-      <div class="drow">
-        <div class="spacer"></div>
-        <button id="coord-deny-btn" class="act danger" type="button" onclick="coordApprove(false, false)">
-          Deny<span class="kbd">D</span>
-        </button>
-        <button id="coord-approve-always-btn" class="act always" type="button" onclick="coordApprove(true, true)">
-          Always<span class="kbd">⇧A</span>
-        </button>
-        <button id="coord-approve-btn" class="act primary" type="button" onclick="coordApprove(true, false)">
-          Approve<span class="kbd">⏎</span>
-        </button>
-      </div>
-    </aside>
 
     <!-- Per-coordinator status bar — pinned above the composer.
          Mirrors the interactive pane's `.ws-status-bar`: model alias,
