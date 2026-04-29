@@ -396,6 +396,11 @@
     if (callId && toolRows.has(callId)) {
       const entry = toolRows.get(callId);
       _appendResultToRow(entry.row, output, isError);
+      // Result blocks grow scrollHeight; without this the user pinned
+      // at the bottom loses their pin when the row inflates.  appendMsg
+      // already routes through _scheduleScroll on the legacy path; this
+      // branch was the gap.
+      _scheduleScroll();
       return entry.row;
     }
     const html = renderToolOutput(output);
@@ -503,19 +508,65 @@
     }
   }
 
+  // Apply / refresh per-row status state from an item payload:
+  //  - data-needs-approval="1" when item.needs_approval && !item.error
+  //  - .coord-tool-row-status--auto pill when item.auto_approved
+  //  - .coord-tool-row-status--error pill + .error class when policy-
+  //    blocked (item.error && !needs_approval)
+  // Idempotent: clears any prior status pills + the data attribute
+  // before re-applying so an upgrade-in-place (e.g. SSE folding tool
+  // _info / approve_request items into a previously rendered
+  // --running batch) doesn't leave stale markers.  Runtime errors
+  // arriving via tool_result are tracked via row.classList.add("error")
+  // in _appendResultToRow and intentionally not cleared here — they
+  // reflect execution outcome, not the static item payload.
+  function _refreshRowStatus(row, item) {
+    if (!row || !item) return;
+    const callLine = row.querySelector(".coord-tool-row-call");
+    if (callLine) {
+      callLine
+        .querySelectorAll(".coord-tool-row-status")
+        .forEach((p) => p.remove());
+    }
+    delete row.dataset.needsApproval;
+    // Don't clear .error here when it came from a result (no
+    // matching item.error); only clear the static-policy marker.
+    // Approximate by re-deriving solely from item below.
+    row.classList.remove("error");
+    if (item.needs_approval && !item.error) {
+      row.dataset.needsApproval = "1";
+    }
+    if (callLine && item.auto_approved && !item.needs_approval) {
+      const pill = document.createElement("span");
+      pill.className = "coord-tool-row-status coord-tool-row-status--auto";
+      const reason = _normaliseAutoApproveReason(item.auto_approve_reason);
+      pill.textContent = "✓ " + reason;
+      pill.title = "auto-approved (no operator prompt) — reason: " + reason;
+      callLine.appendChild(pill);
+    }
+    if (callLine && item.error && !item.needs_approval) {
+      const errPill = document.createElement("span");
+      errPill.className = "coord-tool-row-status coord-tool-row-status--error";
+      errPill.textContent = "✗ " + (item.error || "blocked");
+      callLine.appendChild(errPill);
+      row.classList.add("error");
+    }
+    // If a runtime tool_result already landed an .error on this row,
+    // re-derive it from the result block's presence so we don't
+    // accidentally drop the cue when refreshing from a non-error
+    // item shape.
+    if (
+      row.querySelector(".coord-tool-row-result.coord-tool-row-result--error")
+    ) {
+      row.classList.add("error");
+    }
+  }
+
   function _renderBatchRow(item, indexLabel) {
     const row = document.createElement("div");
     row.className = "coord-tool-row";
     if (item.call_id) row.dataset.callId = item.call_id;
     if (item.func_name) row.dataset.funcName = item.func_name;
-    // Tag rows whose call_id is genuinely in pending_items (not auto-
-    // approved, not policy-blocked).  _resolveBatchAction reads this
-    // to pick a call_id the server will accept — auto-approved items
-    // appear in approve_request payloads too but resolving against
-    // them yields a 409 since they're not in pending_items.
-    if (item.needs_approval && !item.error) {
-      row.dataset.needsApproval = "1";
-    }
 
     const callLine = document.createElement("div");
     callLine.className = "coord-tool-row-call";
@@ -537,24 +588,10 @@
     args.textContent = _formatBatchArgs(item);
     callLine.appendChild(args);
 
-    if (item.auto_approved && !item.needs_approval) {
-      const pill = document.createElement("span");
-      pill.className = "coord-tool-row-status coord-tool-row-status--auto";
-      const reason = _normaliseAutoApproveReason(item.auto_approve_reason);
-      pill.textContent = "✓ " + reason;
-      pill.title = "auto-approved (no operator prompt) — reason: " + reason;
-      callLine.appendChild(pill);
-    }
-
-    if (item.error && !item.needs_approval) {
-      const errPill = document.createElement("span");
-      errPill.className = "coord-tool-row-status coord-tool-row-status--error";
-      errPill.textContent = "✗ " + (item.error || "blocked");
-      callLine.appendChild(errPill);
-      row.classList.add("error");
-    }
-
     row.appendChild(callLine);
+    // Apply status pills + data-needs-approval through the shared
+    // helper so initial render and upgrade-in-place can't drift.
+    _refreshRowStatus(row, item);
     return row;
   }
 
@@ -676,6 +713,10 @@
     }
     const block = document.createElement("div");
     block.className = "coord-tool-row-result";
+    // Marker class so _refreshRowStatus can preserve the row's
+    // .error state across upgrade-in-place when the error came from
+    // a tool_result (not a static item.error).
+    if (isError) block.classList.add("coord-tool-row-result--error");
     const lead = document.createElement("span");
     lead.className = "coord-tool-row-result-lead";
     lead.textContent = isError ? "✗ error: " : "↳ result: ";
@@ -933,16 +974,6 @@
         existing.classList.add("coord-tool-batch--pending");
         existing.setAttribute("role", "region");
         existing.setAttribute("aria-label", _approvalAriaLabel(items));
-        // Tag rows that just gained needs_approval=true via the SSE
-        // upgrade so _resolveBatchAction can pick the right call_id.
-        items.forEach((it) => {
-          if (!it.call_id) return;
-          const entry = toolRows.get(it.call_id);
-          if (!entry) return;
-          if (it.needs_approval && !it.error) {
-            entry.row.dataset.needsApproval = "1";
-          }
-        });
         const kicker = existing.querySelector(".coord-tool-batch-kicker");
         if (kicker) {
           kicker.textContent =
@@ -974,6 +1005,13 @@
       items.forEach((it) => {
         const entry = toolRows.get(it.call_id);
         if (!entry) return;
+        // Refresh per-row status from the authoritative SSE item:
+        // clears any stale data-needs-approval / status pills the
+        // earlier shell rendered (e.g. replay-time orphan rows had
+        // no auto/error info; SSE tool_info / approve_request items
+        // do).  Preserves runtime tool_result errors via the
+        // .coord-tool-row-result--error marker.
+        _refreshRowStatus(entry.row, it);
         const cached = judgeVerdicts.get(it.call_id);
         const v = it.judge_verdict || it.heuristic_verdict || cached;
         if (v) {
@@ -1048,10 +1086,12 @@
     batch.appendChild(head);
 
     let anyRowError = false;
+    const renderedRows = [];
     items.forEach((it, idx) => {
       const indexLabel = items.length >= 2 ? idx + 1 + "/" + items.length : "";
       const row = _renderBatchRow(it, indexLabel);
       batch.appendChild(row);
+      renderedRows.push(row);
       if (it.call_id) {
         toolRows.set(it.call_id, { batch, row });
       }
@@ -1064,6 +1104,16 @@
         _appendJudgePendingLineTo(row);
       }
     });
+    // Tuck the parallel rail 4px in from the first / last row's
+    // top + bottom edges via class markers (CSS :first-of-type would
+    // miss because the batch has other div siblings — head + actions
+    // — coming before/after the row group).
+    if (renderedRows.length > 0) {
+      renderedRows[0].classList.add("coord-tool-row--first");
+      renderedRows[renderedRows.length - 1].classList.add(
+        "coord-tool-row--last",
+      );
+    }
     // Lift any policy-blocked row's error onto the enclosing batch so
     // the left stripe + status pill cue the operator at the batch
     // level too.  _appendResultToRow does the same for runtime errors
@@ -3230,12 +3280,13 @@
               parsedArgs,
               argsRaw,
             );
-            // needs_approval is unknown at replay time — server didn't
-            // persist that bit on the assistant.tool_calls.  Set true
-            // so that if SSE later promotes the batch to --pending,
-            // _resolveBatchAction can find a row to send the approve
-            // POST against.  Ignored by --running / --resolved paths.
-            item.needs_approval = true;
+            // needs_approval is unknown at replay time (the
+            // assistant.tool_calls history payload doesn't persist
+            // the bit).  Leave it unset; the upgrade-in-place path
+            // refreshes per-row state via _refreshRowStatus from the
+            // authoritative SSE item when approve_request /
+            // tool_info actually arrives, so we never tag the wrong
+            // row as needing approval.
             return item;
           });
           const allResolved = items.every(

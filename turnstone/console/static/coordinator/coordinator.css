@@ -213,10 +213,17 @@
   width: 1px;
   background: var(--hair-2);
 }
-.coord-tool-batch--parallel .coord-tool-row:first-of-type::before {
+/* Tuck the rail 4px in from the very first / last row's edge so the
+   line doesn't butt against the batch's inner top/bottom.  Class
+   markers (set in JS at row-build time) instead of :first-of-type /
+   :last-of-type because the batch contains other ``<div>`` siblings
+   (.coord-tool-batch-head, .coord-tool-actions / .coord-tool-status)
+   that are also of type ``div`` — :first-of-type would never select
+   the first .coord-tool-row, and the rule would silently no-op. */
+.coord-tool-batch--parallel .coord-tool-row.coord-tool-row--first::before {
   top: 4px;
 }
-.coord-tool-batch--parallel .coord-tool-row:last-of-type::before {
+.coord-tool-batch--parallel .coord-tool-row.coord-tool-row--last::before {
   bottom: 4px;
 }
 .coord-tool-batch--parallel .coord-tool-row::after {

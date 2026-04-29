@@ -2306,14 +2306,15 @@ def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
         # Pending-approval snapshot — lets a freshly-loaded chat tab
         # paint the inline approval gate from this single response
         # instead of waiting for the SSE approve_request replay (which
-        # introduces a brief --running flash on reload).  The UI
-        # protocol doesn't mandate the approval surface; CLI / channel
-        # UIs that don't expose ``serialize_pending_approval_detail``
-        # leave the field as ``None`` and the JSON omits the section.
-        # ``_pending_approval`` is asserted as ``dict`` (its only real
-        # production shape — see ``SessionUIBase._pending_approval``)
-        # so a MagicMock-based unit test or other non-dict sentinel
-        # doesn't trip the path.
+        # introduces a brief --running flash on reload).  Both keys
+        # (``pending_approval`` + ``pending_approval_detail``) are
+        # always present in the response: a UI that doesn't expose
+        # ``serialize_pending_approval_detail`` (CLI / channel
+        # adapters) reports ``False`` / ``null`` for them.  The
+        # ``_pending_approval`` lookup is asserted as ``dict`` (its
+        # only real production shape — see
+        # ``SessionUIBase._pending_approval``) so a MagicMock-based
+        # unit test or other non-dict sentinel doesn't trip the path.
         pending_approval = False
         pending_approval_detail: Any = None
         ui = ws.ui
