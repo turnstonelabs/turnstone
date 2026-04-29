@@ -420,7 +420,8 @@ class TestSkillCatalogDisclosure:
         session.system_messages = []
         session._agent_system_messages = []
         session.reasoning_effort = "medium"
-        session._pending_nudge = []
+        session._pending_tool_advisories = []
+        session._pending_user_advisories = []
         session._tool_search = None
         session._mcp_client = None
         session._notify_on_complete = "{}"

@@ -446,9 +446,20 @@ class ChatSession:
         self._watch_runner: Any = None  # WatchRunner | None
         self._watch_pending: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=20)
         self._watch_dispatch_depth = 0
-        # Metacognitive nudges: ephemeral prompts for proactive memory use
+        # Metacognitive nudges: ephemeral prompts for proactive memory use.
+        # Two buffers, one per delivery channel — the system message no
+        # longer carries nudges, so neither buffer triggers a system-prefix
+        # rebuild (and therefore neither busts the prompt cache):
+        #   - tool advisories drain into the next tool-result envelope via
+        #     _collect_advisories (alongside GuardAdvisory / UserInterjection)
+        #   - user advisories splice as <system-reminder> blocks at the
+        #     end of the next user message in _append_user_turn
+        # Both store ``(nudge_type, text)`` so readers don't have to track
+        # which channel boxes its payload — the tool channel constructs
+        # ``MetacognitiveAdvisory`` at drain time inside _collect_advisories.
         self._metacog_state: dict[str, float] = {}
-        self._pending_nudge: list[tuple[str, str]] = []  # (type, text)
+        self._pending_tool_advisories: list[tuple[str, str]] = []  # (type, text)
+        self._pending_user_advisories: list[tuple[str, str]] = []  # (type, text)
         # User message queue: messages sent while model is executing.
         # OrderedDict preserves FIFO order and supports O(1) removal by ID.
         #
@@ -1398,7 +1409,7 @@ class ChatSession:
             memory_count=self._visible_memory_count(),
             cooldown_secs=self._mem_cfg.nudge_cooldown,
         ):
-            self._pending_nudge.append(("resume", format_nudge("resume")))
+            self._queue_user_advisory("resume", format_nudge("resume"))
         self._init_system_messages()
         return True
 
@@ -1464,8 +1475,13 @@ class ChatSession:
             except Exception:
                 log.debug("Failed to load prompt policies from storage", exc_info=True)
             now = datetime.now().astimezone()
+            # Round to the top of the hour. Anthropic and OpenAI both cache the
+            # system prefix; minute-precision time stamps invalidated the cache
+            # on every turn that crossed a minute boundary. Hour-precision still
+            # gives the model time-of-day awareness without paying for a full
+            # prefix recompute every ~60 seconds.
             ctx = SessionContext(
-                current_datetime=now.strftime("%Y-%m-%dT%H:%M"),
+                current_datetime=now.strftime("%Y-%m-%dT%H:00"),
                 timezone=now.tzname() or "UTC",
                 username=self._username or self._user_id or "unknown",
             )
@@ -1612,16 +1628,6 @@ class ChatSession:
                     f"You have {len(visible_mems)} memories in scope. "
                     "Use memory(action='search') or memory(action='list') for more."
                 )
-        if self._pending_nudge:
-            types = []
-            for nudge_type, nudge_text in self._pending_nudge:
-                dev_parts.append("")
-                dev_parts.append(nudge_text)
-                types.append(nudge_type)
-            # Surface nudge activity to the user so they can see
-            # the metacognitive prompts being applied.
-            self.ui.on_info(f"{GRAY}[metacognition: nudge injected — {', '.join(types)}]{RESET}")
-            self._pending_nudge.clear()
         new_system_messages.append({"role": "system", "content": "\n".join(dev_parts)})
         # Atomic swap — readers see either old or new, never partial
         self.system_messages = new_system_messages
@@ -2104,6 +2110,15 @@ class ChatSession:
                 }
                 for a in attachments
             ]
+        # Metacognitive user-channel drain: any nudges queued via
+        # _queue_user_advisory (correction/start/completion from this
+        # turn, denial from the previous tool batch, resume from
+        # rehydrate) splice in as <system-reminder> blocks at the
+        # trailing edge of the user content. The DB row stores
+        # ``user_input`` only (line below) so these blocks stay
+        # ephemeral — they advise the next assistant turn and do not
+        # persist across reloads.
+        self._splice_pending_user_advisories(user_msg)
         self.messages.append(user_msg)
         self._msg_tokens.append(max(1, int(self._msg_char_count(user_msg) / self._chars_per_token)))
         # DB row stores the raw text only; attachments are joined back in
@@ -2170,13 +2185,15 @@ class ChatSession:
         self._cancel_event = threading.Event()
         self._cancelled_partial_msg = None
 
-        self._append_user_turn(user_input, attachments or (), send_id=send_id)
-
         # Metacognitive nudge: check for correction/completion signals
+        # before _append_user_turn so any fired nudge (plus any nudges
+        # queued earlier — e.g. denial during the previous tool batch,
+        # resume on rehydrate) splice into this user message body.
         nudge = self._check_metacognitive_nudge(user_input)
         if nudge:
-            self._pending_nudge.append(nudge)
-            self._init_system_messages()
+            self._queue_user_advisory(*nudge)
+
+        self._append_user_turn(user_input, attachments or (), send_id=send_id)
 
         try:
             while True:
@@ -2372,8 +2389,35 @@ class ChatSession:
                         message_count=len(self.messages),
                         cooldown_secs=self._mem_cfg.nudge_cooldown,
                     ):
-                        self._pending_nudge.append(("repeat", format_nudge("repeat")))
-                        self._init_system_messages()
+                        self._queue_tool_advisory("repeat", format_nudge("repeat"))
+
+                # Tool-error nudge — checked here (pre-iteration) so the
+                # MetacognitiveAdvisory rides the same _collect_advisories
+                # drain pass that handles guard findings and user
+                # interjections.  Cooldown gating in should_nudge keeps
+                # this to one nudge per batch even with many failing
+                # tools.
+                if (
+                    self._mem_cfg.nudges
+                    and any(
+                        isinstance(out, str)
+                        and (
+                            out.startswith("Error")
+                            or " error: " in out[:50]
+                            or out.startswith("Command timed out")
+                            or out.startswith("Unknown tool:")
+                        )
+                        for _, out in results
+                    )
+                    and should_nudge(
+                        "tool_error",
+                        self._metacog_state,
+                        message_count=len(self.messages),
+                        memory_count=self._visible_memory_count(),
+                        cooldown_secs=self._mem_cfg.nudge_cooldown,
+                    )
+                ):
+                    self._queue_tool_advisory("tool_error", format_nudge("tool_error"))
 
                 # Map tool_call_id → tool name for logging
                 from turnstone.core.tool_advisory import wrap_tool_result
@@ -2471,29 +2515,6 @@ class ChatSession:
                             _tname,
                             tool_call_id=tc_id,
                         )
-                # Metacognitive nudge: check memories on tool error
-                if (
-                    self._mem_cfg.nudges
-                    and any(
-                        isinstance(out, str)
-                        and (
-                            out.startswith("Error")
-                            or " error: " in out[:50]
-                            or out.startswith("Command timed out")
-                            or out.startswith("Unknown tool:")
-                        )
-                        for _, out in results
-                    )
-                    and should_nudge(
-                        "tool_error",
-                        self._metacog_state,
-                        message_count=len(self.messages),
-                        memory_count=self._visible_memory_count(),
-                        cooldown_secs=self._mem_cfg.nudge_cooldown,
-                    )
-                ):
-                    self._pending_nudge.append(("tool_error", format_nudge("tool_error")))
-                    self._init_system_messages()
                 # Inject user feedback from approval prompt (e.g. "y, use full path")
                 if user_feedback:
                     self.messages.append({"role": "user", "content": user_feedback})
@@ -2562,6 +2583,10 @@ class ChatSession:
             # Drain any queued user messages so they appear in the
             # conversation and are visible on the next send().
             self._flush_queued_messages()
+            # Tool-channel nudges queued earlier in this generation
+            # (tool_error, repeat) belong to the abandoned batch — drop
+            # them so they don't bleed into the next send()'s tool loop.
+            self._pending_tool_advisories.clear()
             # No need to clear _cancel_event — it's replaced per-generation
             # in send(), so this generation's event is simply discarded.
             self.ui.on_info("[Generation cancelled]")
@@ -2571,10 +2596,12 @@ class ChatSession:
         except KeyboardInterrupt as exc:
             self._synthesize_cancelled_results("Interrupted by user.")
             self._flush_queued_messages()
+            self._pending_tool_advisories.clear()
             self._record_fatal_error(exc)
             raise
         except Exception as exc:
             self._flush_queued_messages()
+            self._pending_tool_advisories.clear()
             self._record_fatal_error(exc)
             raise
 
@@ -3766,9 +3793,13 @@ class ChatSession:
 
         # When the model doesn't support advisory tags, still drain queued
         # messages so they aren't silently orphaned — flush them as regular
-        # user messages instead.
+        # user messages instead. Metacognitive tool advisories (tool_error
+        # / repeat) are dropped silently: the model wouldn't reliably parse
+        # them anyway, and the user-channel nudges still fire on the next
+        # user turn.
         if not caps.supports_tool_advisories:
             if is_last_in_batch:
+                self._pending_tool_advisories.clear()
                 self._flush_queued_messages()
             return []
 
@@ -3777,6 +3808,19 @@ class ChatSession:
         # Output guard advisory
         if assessment is not None:
             advisories.append(GuardAdvisory(assessment=assessment, func_name=func_name))
+
+        # Metacognitive tool-channel drain — fires once per batch on the
+        # last result. Queued by _queue_tool_advisory from the
+        # tool_error and repeat detection paths just before this loop.
+        if is_last_in_batch and self._pending_tool_advisories:
+            from turnstone.core.tool_advisory import MetacognitiveAdvisory
+
+            drained = list(self._pending_tool_advisories)
+            self._pending_tool_advisories.clear()
+            advisories.extend(
+                MetacognitiveAdvisory(nudge_type=nt, message=text) for nt, text in drained
+            )
+            self._emit_nudge_ping(nt for nt, _ in drained)
 
         # Drain queued user messages on the last result in the batch.
         # Attachment-bearing items fall back to a full multipart user
@@ -3912,8 +3956,7 @@ class ChatSession:
                 memory_count=self._visible_memory_count(),
                 cooldown_secs=self._mem_cfg.nudge_cooldown,
             ):
-                self._pending_nudge.append(("denial", format_nudge("denial")))
-                self._init_system_messages()
+                self._queue_user_advisory("denial", format_nudge("denial"))
 
         # Phase 3: execute (check cancellation before starting)
         self._check_cancelled()
@@ -5287,14 +5330,19 @@ class ChatSession:
         return combined[:limit]
 
     def _check_metacognitive_nudge(self, user_message: str) -> tuple[str, str] | None:
-        """Check if a metacognitive nudge should be injected.
+        """Check if a metacognitive nudge should fire for *user_message*.
 
-        Returns (nudge_type, nudge_text) or None.
+        Called *before* the user turn is appended to ``self.messages``,
+        so ``msg_count`` counts the about-to-be-appended message — this
+        keeps the ``should_nudge('start', ..., message_count=1)`` semantic
+        intact (one user message = first turn).
+
+        Returns ``(nudge_type, nudge_text)`` or ``None``.
         """
         if not self._mem_cfg.nudges:
             return None
         mem_count = self._visible_memory_count()
-        msg_count = len(self.messages)
+        msg_count = len(self.messages) + 1
         cd = self._mem_cfg.nudge_cooldown
 
         if should_nudge(
@@ -5325,6 +5373,73 @@ class ChatSession:
             return ("completion", format_nudge("completion"))
 
         return None
+
+    def _queue_user_advisory(self, nudge_type: str, text: str) -> None:
+        """Queue a metacognitive nudge for the next user turn.
+
+        Drains in ``_append_user_turn`` as a ``<system-reminder>`` block
+        appended to the user message body. Used for nudges that respond
+        to user behaviour: ``correction``, ``denial``, ``resume``,
+        ``start``, ``completion``.
+        """
+        self._pending_user_advisories.append((nudge_type, text))
+
+    def _splice_pending_user_advisories(self, user_msg: dict[str, Any]) -> None:
+        """Drain ``_pending_user_advisories`` into *user_msg*'s content.
+
+        Mutates *user_msg* in place — the caller appends it after.
+        Renders each queued nudge as a ``<system-reminder>`` block
+        (same envelope as ``wrap_tool_result``) and attaches them to
+        the trailing edge of the user content. Every text segment in
+        the user content is passed through ``escape_wrapper_tags``
+        first so a user typing literal ``<system-reminder>`` cannot
+        fabricate an envelope the model would treat as a
+        Turnstone-issued reminder. For attachment-bearing turns the
+        blocks land on the trailing text part so they stay glued to
+        the same multipart turn.
+        """
+        if not self._pending_user_advisories:
+            return
+        from turnstone.core.tool_advisory import escape_wrapper_tags, render_system_reminder
+
+        items = list(self._pending_user_advisories)
+        self._pending_user_advisories.clear()
+
+        block = "\n\n" + "\n\n".join(render_system_reminder(text) for _, text in items)
+        content = user_msg["content"]
+        if isinstance(content, str):
+            user_msg["content"] = escape_wrapper_tags(content) + block
+        else:
+            text_parts = [p for p in content if isinstance(p, dict) and p.get("type") == "text"]
+            for part in text_parts:
+                part["text"] = escape_wrapper_tags(part.get("text", ""))
+            if text_parts:
+                text_parts[-1]["text"] = text_parts[-1]["text"] + block
+            else:
+                content.append({"type": "text", "text": block})
+
+        self._emit_nudge_ping(nudge_type for nudge_type, _ in items)
+
+    def _emit_nudge_ping(self, types: Iterable[str]) -> None:
+        """Surface the ``[metacognition: nudge injected — …]`` UI line.
+
+        Centralised so both drain sites (tool channel via
+        ``_collect_advisories``, user channel via
+        ``_splice_pending_user_advisories``) emit the same wording.
+        """
+        joined = ", ".join(types)
+        if joined:
+            self.ui.on_info(f"{GRAY}[metacognition: nudge injected — {joined}]{RESET}")
+
+    def _queue_tool_advisory(self, nudge_type: str, text: str) -> None:
+        """Queue a metacognitive nudge for the next tool-result batch.
+
+        Drains in ``_collect_advisories`` alongside guard findings and
+        user interjections; ``wrap_tool_result`` then renders it inside
+        the tool-result envelope. Used for nudges that respond to model
+        behaviour at a tool boundary: ``tool_error``, ``repeat``.
+        """
+        self._pending_tool_advisories.append((nudge_type, text))
 
     # ------------------------------------------------------------------
     # Coordinator tools — reachable only when ``kind == "coordinator"``.
