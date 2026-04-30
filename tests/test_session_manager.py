@@ -18,13 +18,19 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
 from turnstone.core.session_manager import SessionKindAdapter, SessionManager
-from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamState
+from turnstone.core.workstream import (
+    BULK_CLOSE_STATE_VALUES,
+    Workstream,
+    WorkstreamKind,
+    WorkstreamState,
+)
 
 # ---------------------------------------------------------------------------
 # Test fixtures
@@ -156,6 +162,8 @@ class _Row:
     kind: str
     state: str = "idle"
     parent_ws_id: str | None = None
+    updated: str = ""
+    node_id: str | None = None
 
 
 class FakeStorage:
@@ -164,8 +172,13 @@ class FakeStorage:
     def __init__(self) -> None:
         self.rows: dict[str, _Row] = {}
         self.state_updates: list[tuple[str, str]] = []
+        self.touch_calls: list[str] = []
         self.register_raises = False
         self.lock = threading.Lock()
+
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
 
     def register_workstream(
         self,
@@ -178,6 +191,8 @@ class FakeStorage:
         parent_ws_id: str | None = None,
         skill_id: str = "",
         skill_version: int = 0,
+        state: str = "idle",
+        updated: str | None = None,
     ) -> None:
         if self.register_raises:
             raise RuntimeError("register forced failure")
@@ -188,14 +203,50 @@ class FakeStorage:
                 user_id=user_id or "",
                 name=name,
                 kind=kind_str,
+                state=state,
                 parent_ws_id=parent_ws_id,
+                updated=updated if updated is not None else self._now_iso(),
+                node_id=node_id,
             )
+
+    def touch_workstream(self, ws_id: str) -> None:
+        with self.lock:
+            self.touch_calls.append(ws_id)
+            if ws_id in self.rows:
+                self.rows[ws_id].updated = self._now_iso()
 
     def update_workstream_state(self, ws_id: str, state: str) -> None:
         with self.lock:
             self.state_updates.append((ws_id, state))
             if ws_id in self.rows:
                 self.rows[ws_id].state = state
+                self.rows[ws_id].updated = self._now_iso()
+
+    def bulk_close_stale_orphans(
+        self,
+        kind: WorkstreamKind | str,
+        cutoff: str,
+        exclude_ws_ids: list[str],
+        node_id: str | None = None,
+    ) -> list[str]:
+        kind_str = kind.value if isinstance(kind, WorkstreamKind) else str(kind)
+        excluded = set(exclude_ws_ids)
+        now = self._now_iso()
+        closed: list[str] = []
+        with self.lock:
+            for ws_id, row in self.rows.items():
+                if (
+                    row.kind == kind_str
+                    and row.state in BULK_CLOSE_STATE_VALUES
+                    and row.updated < cutoff
+                    and ws_id not in excluded
+                    and (node_id is None or row.node_id == node_id)
+                ):
+                    row.state = "closed"
+                    row.updated = now
+                    self.state_updates.append((ws_id, "closed"))
+                    closed.append(ws_id)
+        return closed
 
     def get_workstream(self, ws_id: str) -> dict[str, Any] | None:
         with self.lock:
@@ -228,6 +279,7 @@ def _make_manager(
     max_active: int = 5,
     storage: FakeStorage | None = None,
     event_emitter: Any = _EMITTER_DEFAULT,
+    node_id: str | None = None,
 ) -> tuple[SessionManager, FakeAdapter, FakeStorage]:
     """Build a SessionManager wired to a FakeAdapter for both Protocols.
 
@@ -246,6 +298,7 @@ def _make_manager(
         storage=storage,
         max_active=max_active,
         event_emitter=emitter,
+        node_id=node_id,
     )
     return mgr, adapter, storage
 
@@ -579,6 +632,24 @@ def test_open_resurrects_closed_state() -> None:
     assert ws_id in [e.ws_id for e in adapter.events_of("rehydrated")]
 
 
+def test_open_touches_workstream_on_rehydrate() -> None:
+    """Rehydrating a workstream must bump its ``updated`` so a concurrent
+    close_idle pass-2 in this same process can't clobber the freshly-loaded
+    row to ``closed`` because its DB ``updated`` is older than the cutoff.
+    The touch is best-effort (try/except in open()) but must fire on the
+    happy path."""
+    mgr, _, storage = _make_manager()
+    ws = mgr.create(user_id="u1")
+    ws_id = ws.id
+    mgr.close(ws_id)
+    storage.touch_calls.clear()  # only care about touches from rehydrate
+
+    reopened = mgr.open(ws_id)
+
+    assert reopened is not None
+    assert ws_id in storage.touch_calls
+
+
 def test_open_ignores_owner_mismatch() -> None:
     # Turnstone is a trusted-team tool; row-level ownership is
     # metadata, not an access boundary.  ``open`` no longer cares
@@ -825,6 +896,125 @@ def test_close_idle_closes_old_idle_and_keeps_active() -> None:
 def test_close_idle_on_empty_manager_returns_empty_list() -> None:
     mgr, _, _ = _make_manager()
     assert mgr.close_idle(max_age_seconds=1.0) == []
+
+
+def test_close_idle_runs_db_orphan_pass() -> None:
+    """DB rows of this kind that aren't loaded into the manager get
+    bulk-closed when their ``updated`` is older than the cutoff.  Catches
+    the orphan-after-process-restart case the original close_idle missed."""
+    mgr, _, storage = _make_manager()
+    # Orphan rows live in storage but were never loaded via mgr.create.
+    storage.register_workstream(
+        "orphan-1",
+        kind=WorkstreamKind.INTERACTIVE,
+        updated="2020-01-01T00:00:00",
+    )
+    storage.register_workstream(
+        "orphan-2",
+        kind=WorkstreamKind.INTERACTIVE,
+        state="thinking",
+        updated="2020-01-01T00:00:00",
+    )
+
+    closed = mgr.close_idle(max_age_seconds=0.0)
+
+    assert set(closed) == {"orphan-1", "orphan-2"}
+    assert ("orphan-1", "closed") in storage.state_updates
+    assert ("orphan-2", "closed") in storage.state_updates
+    assert storage.rows["orphan-1"].state == "closed"
+    assert storage.rows["orphan-2"].state == "closed"
+
+
+def test_close_idle_excludes_loaded_workstreams_from_db_pass() -> None:
+    """A workstream loaded into memory must NOT be reaped by the DB
+    orphan pass even when its storage ``updated`` is stale — the
+    in-memory pass owns those.  Verifies the exclude_ws_ids plumbing."""
+    mgr, _, storage = _make_manager()
+    ws = mgr.create(user_id="u1")
+    # Force the storage row's ``updated`` to look stale.  In practice
+    # ``set_state`` would bump it, but we're simulating a long-running
+    # active workstream whose updated drifted older than the cutoff.
+    storage.rows[ws.id].updated = "2020-01-01T00:00:00"
+
+    # Huge timeout so the in-memory IDLE pass skips it (stays loaded).
+    closed = mgr.close_idle(max_age_seconds=10_000.0)
+
+    assert ws.id not in closed
+    assert mgr.get(ws.id) is not None
+    assert storage.rows[ws.id].state == "idle"
+
+
+def test_close_idle_filters_db_orphans_by_kind() -> None:
+    """An interactive manager's close_idle must not touch coordinator
+    rows in storage and vice versa.  Without this filter, both managers
+    would race to close each other's rows."""
+    mgr, _, storage = _make_manager()  # interactive by default
+    storage.register_workstream(
+        "coord-orphan",
+        kind=WorkstreamKind.COORDINATOR,
+        updated="2020-01-01T00:00:00",
+    )
+    storage.register_workstream(
+        "interactive-orphan",
+        kind=WorkstreamKind.INTERACTIVE,
+        updated="2020-01-01T00:00:00",
+    )
+
+    closed = mgr.close_idle(max_age_seconds=0.0)
+
+    assert "interactive-orphan" in closed
+    assert "coord-orphan" not in closed
+    assert storage.rows["coord-orphan"].state == "idle"
+    assert storage.rows["interactive-orphan"].state == "closed"
+
+
+def test_close_idle_scopes_db_orphan_pass_to_self_node_id() -> None:
+    """Multi-node correctness: each node's close_idle must only reap rows
+    it owns.  Without node_id scoping, sibling nodes race to close each
+    other's loaded workstreams (a row may be IDLE on node A and stale-
+    looking from node B's perspective if no set_state has fired
+    recently)."""
+    mgr, _, storage = _make_manager(node_id="node-a")
+    storage.register_workstream(
+        "ours",
+        node_id="node-a",
+        kind=WorkstreamKind.INTERACTIVE,
+        updated="2020-01-01T00:00:00",
+    )
+    storage.register_workstream(
+        "theirs",
+        node_id="node-b",
+        kind=WorkstreamKind.INTERACTIVE,
+        updated="2020-01-01T00:00:00",
+    )
+
+    closed = mgr.close_idle(max_age_seconds=0.0)
+
+    assert closed == ["ours"]
+    assert storage.rows["ours"].state == "closed"
+    assert storage.rows["theirs"].state == "idle"
+
+
+def test_close_idle_with_no_node_id_reaps_all_rows() -> None:
+    """``node_id=None`` (single-process console / tests / backfill) skips
+    the node filter — any orphan of the right kind gets reaped."""
+    mgr, _, storage = _make_manager()  # node_id=None by default
+    storage.register_workstream(
+        "any-node-1",
+        node_id="node-a",
+        kind=WorkstreamKind.INTERACTIVE,
+        updated="2020-01-01T00:00:00",
+    )
+    storage.register_workstream(
+        "any-node-2",
+        node_id="node-b",
+        kind=WorkstreamKind.INTERACTIVE,
+        updated="2020-01-01T00:00:00",
+    )
+
+    closed = mgr.close_idle(max_age_seconds=0.0)
+
+    assert set(closed) == {"any-node-1", "any-node-2"}
 
 
 def test_list_all_returns_creation_order() -> None:
