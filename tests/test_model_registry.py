@@ -770,16 +770,76 @@ class TestRegistryReload:
         assert reg.has_alias("b")
         assert reg.default == "b"
 
-    def test_reload_clears_clients(self) -> None:
-        models = {"a": ModelConfig("a", "http://x/v1", "key", "m")}
+    def test_reload_keeps_clients_when_connection_target_unchanged(self) -> None:
+        """Selective teardown: a model edit that leaves base_url / api_key /
+        provider intact (e.g. admin tweaks the underlying ``model`` name or
+        ``temperature``) keeps the cached HTTP client warm — no need to
+        re-establish TLS+pool when the endpoint is the same."""
+        models = {"a": ModelConfig("a", "http://x/v1", "key", "m1", provider="openai")}
         reg = ModelRegistry(models=models, default="a")
-        # Force client creation
         reg.get_client("a")
-        assert "a" in reg._clients
+        client_before = reg._clients["a"]
+        provider_before = reg.get_provider("a")
 
-        # Reload with same models — clients should be cleared
-        reg.reload(dict(models), "a")
+        # Same endpoint (base_url, api_key, provider), only ``model`` changed.
+        new_models = {"a": ModelConfig("a", "http://x/v1", "key", "m2", provider="openai")}
+        reg.reload(new_models, "a")
+
+        assert "a" in reg._clients
+        assert reg._clients["a"] is client_before
+        assert "a" in reg._providers
+        assert reg._providers["a"] is provider_before
+
+    def test_reload_drops_client_when_base_url_changes(self) -> None:
+        """A ``base_url`` change drops the cached client (different
+        endpoint = new connection) but keeps the cached provider —
+        ``LLMProvider`` is keyed only on the provider string, which
+        didn't change."""
+        models = {"a": ModelConfig("a", "http://x/v1", "key", "m", provider="openai")}
+        reg = ModelRegistry(models=models, default="a")
+        reg.get_client("a")
+        provider_before = reg.get_provider("a")
+
+        new_models = {"a": ModelConfig("a", "http://y/v1", "key", "m", provider="openai")}
+        reg.reload(new_models, "a")
+
         assert "a" not in reg._clients
+        assert "a" in reg._providers
+        assert reg._providers["a"] is provider_before
+
+    def test_reload_drops_provider_when_provider_string_changes(self) -> None:
+        """A provider-type swap (e.g. openai → anthropic) drops both the
+        client AND the provider so the next resolve picks up the right
+        ``LLMProvider`` implementation against the new SDK."""
+        models = {"a": ModelConfig("a", "http://x/v1", "key", "m", provider="openai")}
+        reg = ModelRegistry(models=models, default="a")
+        reg.get_client("a")
+        reg.get_provider("a")
+
+        new_models = {"a": ModelConfig("a", "http://x/v1", "key", "m", provider="anthropic")}
+        reg.reload(new_models, "a")
+
+        assert "a" not in reg._clients
+        assert "a" not in reg._providers
+
+    def test_reload_drops_clients_for_removed_aliases(self) -> None:
+        """Aliases removed from the registry must release their cached
+        clients — otherwise a deleted endpoint's connection pool would
+        outlive the alias indefinitely."""
+        models = {
+            "a": ModelConfig("a", "http://x/v1", "key", "m"),
+            "b": ModelConfig("b", "http://y/v1", "key", "m"),
+        }
+        reg = ModelRegistry(models=models, default="a")
+        reg.get_client("a")
+        reg.get_client("b")
+
+        # Drop "b" entirely.
+        new_models = {"a": ModelConfig("a", "http://x/v1", "key", "m")}
+        reg.reload(new_models, "a")
+
+        assert "a" in reg._clients  # unchanged endpoint, kept warm
+        assert "b" not in reg._clients
 
     def test_reload_validates_default(self) -> None:
         models_a = {"a": ModelConfig("a", "x", "x", "m")}
