@@ -173,14 +173,15 @@ def test_helper_preserves_registry_when_load_fails(
     assert state.coord_registry.get_config("local").model == "old-model"
 
 
-def test_helper_preserves_registry_when_db_probe_fails(
+def test_helper_preserves_registry_when_strict_load_fails(
     storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``load_model_registry`` swallows storage read errors internally
-    and would return a config.toml-only registry on a transient DB
-    outage — applying that via ``reload()`` would silently drop every
-    DB-sourced alias.  The explicit probe in the helper turns that
-    failure into a no-op so the existing registry survives."""
+    """``load_model_registry`` normally swallows storage read errors and
+    would return a config.toml-only registry on a transient DB outage —
+    applying that via ``reload()`` would silently drop every DB-sourced
+    alias.  The helper passes ``strict=True`` so the loader re-raises
+    instead, the helper's outer except catches it, and the existing
+    registry survives intact."""
     _seed_model_def(storage, definition_id="m1", alias="local", model="db-model")
     state = _AppState()
     state.coord_registry = _make_registry(alias="local", model="db-model")
@@ -192,8 +193,9 @@ def test_helper_preserves_registry_when_db_probe_fails(
     _refresh_coord_registry(state, storage)
 
     assert state.coord_registry is not None
-    # Existing registry untouched — the probe caught the failure before
-    # the loader's silent fallback could mutate registry state.
+    # Existing registry untouched — strict=True surfaced the storage
+    # error to the helper before the loader's silent fallback could
+    # produce a truncated registry for reload().
     assert state.coord_registry.get_config("local").model == "db-model"
 
 
