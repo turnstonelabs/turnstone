@@ -557,6 +557,28 @@ Pane.prototype.handleEvent = function (evt) {
       this.addErrorMessage(evt.message);
       break;
 
+    case "user_reminder":
+      // Metacognitive nudges — render as their own bubble above the
+      // user message they advise.  The originating tab's optimistic
+      // addUserMessage already ran when the user clicked send, so by
+      // the time this SSE event arrives the just-sent user bubble is
+      // at the bottom of messagesEl and addUserReminder's "anchor to
+      // most recent .msg.user" lookup finds it correctly.
+      //
+      // Multi-tab caveat: the server emits no user_message SSE event
+      // today, so a non-originating tab open on the same workstream
+      // sees the reminder without a paired user-message render — the
+      // anchor falls on a stale prior user bubble, mis-positioning
+      // the reminder.  The next /history reload corrects it (the
+      // entry["reminders"] propagation in _build_history is
+      // anchor-stable because replayHistory runs addUserMessage first
+      // for every turn).  Acceptable cost for stage 1; closing the
+      // gap is a follow-up that adds a user_message SSE event.
+      if (Array.isArray(evt.reminders) && evt.reminders.length) {
+        this.addUserReminder(evt.reminders);
+      }
+      break;
+
     case "message_queued":
       // Confirmation from server that a queued message was accepted.
       // The UI already showed the message optimistically in addQueuedMessage.
@@ -667,6 +689,41 @@ Pane.prototype.addThinkingIndicator = function () {
 Pane.prototype.removeThinkingIndicator = function () {
   var el = this.messagesEl.querySelector(".thinking-indicator");
   if (el) el.remove();
+};
+
+Pane.prototype.addUserReminder = function (reminders) {
+  // Render each metacognitive reminder as its own bubble visually
+  // anchored above the user message it advises.  Always called AFTER
+  // the corresponding addUserMessage (live: optimistic local render
+  // ran before the SSE event arrived; replay: replayHistory now
+  // renders the user message first), so "most recent .msg.user" is
+  // always THIS turn's bubble — insertBefore drops the reminder
+  // directly above it.  When no .msg.user exists at all (e.g. a
+  // non-originating tab receiving a stage-1 reminder before any user
+  // turn has rendered) we append; the next /history reload corrects
+  // any anchor anomaly.
+  this.removeEmptyState();
+  var userBubbles = this.messagesEl.querySelectorAll(".msg.user");
+  var anchor = userBubbles.length ? userBubbles[userBubbles.length - 1] : null;
+  for (var i = 0; i < reminders.length; i++) {
+    var r = reminders[i] || {};
+    var el = document.createElement("div");
+    el.className = "msg user-reminder";
+    var labelEl = document.createElement("span");
+    labelEl.className = "msg-user-reminder-label";
+    labelEl.textContent = "metacog" + (r.type ? " · " + String(r.type) : "");
+    var textEl = document.createElement("span");
+    textEl.className = "msg-user-reminder-text";
+    textEl.textContent = r.text || "";
+    el.appendChild(labelEl);
+    el.appendChild(textEl);
+    if (anchor) {
+      this.messagesEl.insertBefore(el, anchor);
+    } else {
+      this.messagesEl.appendChild(el);
+    }
+  }
+  this.scrollToBottom(true);
 };
 
 Pane.prototype.addUserMessage = function (text, attachments) {
@@ -911,7 +968,15 @@ Pane.prototype.replayHistory = function (messages) {
   for (var i = 0; i < messages.length; i++) {
     var msg = messages[i];
     if (msg.role === "user") {
+      // addUserMessage first so addUserReminder's "anchor to most
+      // recent .msg.user" lookup finds THIS message's bubble (not the
+      // previous user message's, which would mis-place the reminder
+      // above the wrong turn).  insertBefore then drops the reminder
+      // directly above the just-rendered user bubble.
       this.addUserMessage(msg.content || "", msg.attachments || null);
+      if (Array.isArray(msg.reminders) && msg.reminders.length) {
+        this.addUserReminder(msg.reminders);
+      }
       lastToolBlock = null;
     } else if (msg.role === "assistant") {
       if (msg.tool_calls && msg.tool_calls.length) {

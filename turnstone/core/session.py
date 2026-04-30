@@ -91,6 +91,7 @@ from turnstone.core.providers import create_provider
 from turnstone.core.safety import is_command_blocked, sanitize_command
 from turnstone.core.sandbox import execute_math_sandboxed
 from turnstone.core.storage._registry import get_storage
+from turnstone.core.tool_advisory import escape_wrapper_tags, render_system_reminder
 from turnstone.core.tool_search import ToolSearchManager
 from turnstone.core.tools import (
     AGENT_AUTO_TOOLS,
@@ -276,6 +277,7 @@ class SessionUI(Protocol):
     def on_plan_review(self, content: str) -> str: ...
     def on_info(self, message: str) -> None: ...
     def on_error(self, message: str) -> None: ...
+    def on_user_reminder(self, reminders: list[dict[str, str]]) -> None: ...
     def on_state_change(self, state: str) -> None: ...
     def on_rename(self, name: str) -> None: ...
     def on_intent_verdict(self, verdict: dict[str, Any]) -> None:
@@ -1643,6 +1645,106 @@ class ChatSession:
         """System messages + conversation history."""
         return self.system_messages + self.messages
 
+    def _apply_reminders_for_provider(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Return a transient copy of *messages* with ``_reminders`` rendered
+        inline for the model.
+
+        Metacognitive user-channel nudges live on the message dict's
+        ``_reminders`` side-channel, not inside ``content`` — so
+        ``self.messages`` and every downstream consumer (UI replay,
+        compaction, title gen, channel adapters, DB) see clean user
+        text.  Only the wire-bound copy carries the rendered reminder.
+
+        For each message that has ``_reminders`` AND has not yet been
+        flagged delivered, build a shallow copy and splice the reminders
+        as ``<system-reminder>`` blocks onto the trailing edge of the
+        copy's ``content`` — string content gets a tail block, list
+        content gets the block on the trailing text part (or a new text
+        part if there isn't one).  Messages without ``_reminders`` (or
+        already delivered) pass through unchanged (same object
+        reference) so the common case is allocation-free.
+
+        **Reminder lifecycle.**  After a successful provider stream
+        ``_mark_reminders_delivered`` flips ``_reminders_delivered`` to
+        ``True`` on every user message that carried reminders into that
+        call, so subsequent provider calls skip them — the model sees
+        each reminder once, the turn it advised.  The
+        ``_reminders`` key itself stays on the message dict for the
+        lifetime of the in-memory session so ``/history`` (reconnecting
+        tabs, multi-tab live mirrors) still renders the same nudge
+        bubbles the originating tab saw; only the wire-side replay is
+        suppressed.  Compaction is the natural full drain (it replaces
+        ``self.messages`` wholesale).
+
+        ``sanitize_messages`` later drops both leading-underscore sibling
+        keys (``_reminders`` and ``_reminders_delivered``) on the way to
+        the wire, so the provider sees only ``content`` with the
+        reminder spliced in.
+
+        **Read-only contract on the returned list.**  The pass-through
+        path returns the original ``msg`` by reference; callers must
+        not mutate the returned dicts in place (today's only callers —
+        ``sanitize_messages`` + provider conversion — construct new
+        dicts, so the contract holds).  Mutations on the spliced copy
+        are safe; mutations on a pass-through reference would bleed
+        back into ``self.messages``.
+        """
+        out: list[dict[str, Any]] = []
+        for msg in messages:
+            reminders = msg.get("_reminders")
+            if not reminders or msg.get("_reminders_delivered"):
+                out.append(msg)
+                continue
+            block = "\n\n" + "\n\n".join(
+                render_system_reminder(r.get("text", "")) for r in reminders
+            )
+            copy = dict(msg)
+            content = copy.get("content")
+            if isinstance(content, str):
+                copy["content"] = escape_wrapper_tags(content) + block
+            elif isinstance(content, list):
+                # Shallow-copy the parts list and any text parts we'll
+                # mutate so the original list/dicts in self.messages stay
+                # untouched.
+                new_parts = [
+                    dict(p) if isinstance(p, dict) and p.get("type") == "text" else p
+                    for p in content
+                ]
+                text_parts = [
+                    p for p in new_parts if isinstance(p, dict) and p.get("type") == "text"
+                ]
+                for part in text_parts:
+                    part["text"] = escape_wrapper_tags(part.get("text", ""))
+                if text_parts:
+                    text_parts[-1]["text"] = text_parts[-1]["text"] + block
+                else:
+                    new_parts.append({"type": "text", "text": block})
+                copy["content"] = new_parts
+            else:
+                # Unexpected shape (None, etc.) — attach as a text-only
+                # content rather than dropping the reminder silently.
+                copy["content"] = block.lstrip()
+            out.append(copy)
+        return out
+
+    def _mark_reminders_delivered(self) -> None:
+        """Flag every user-message ``_reminders`` as delivered.
+
+        Called after a successful provider stream.  Subsequent calls to
+        ``_apply_reminders_for_provider`` skip messages with this flag,
+        so the model sees each reminder exactly once (the turn it
+        advised).  The flag is a sibling key like ``_reminders`` itself;
+        ``sanitize_messages`` strips both before the wire and
+        ``_build_history`` ignores the delivered flag entirely so UI
+        replay parity is preserved across reconnects.
+        """
+        for msg in self.messages:
+            if msg.get("_reminders") and not msg.get("_reminders_delivered"):
+                msg["_reminders_delivered"] = True
+
     def _emit_state(self, state: str) -> None:
         """Notify UI of a workstream state transition.
 
@@ -2123,7 +2225,7 @@ class ChatSession:
         # ``user_input`` only (line below) so these blocks stay
         # ephemeral — they advise the next assistant turn and do not
         # persist across reloads.
-        self._splice_pending_user_advisories(user_msg)
+        self._attach_pending_user_reminders(user_msg)
         self.messages.append(user_msg)
         self._msg_tokens.append(max(1, int(self._msg_char_count(user_msg) / self._chars_per_token)))
         # DB row stores the raw text only; attachments are joined back in
@@ -2203,7 +2305,7 @@ class ChatSession:
         try:
             while True:
                 self._check_cancelled(my_generation)
-                msgs = self._full_messages()
+                msgs = self._apply_reminders_for_provider(self._full_messages())
 
                 if self.debug:
                     self._debug_print_request(msgs)
@@ -2240,7 +2342,7 @@ class ChatSession:
                         self.ui.on_thinking_stop()
                         try:
                             self._compact_messages(auto=True)
-                            msgs = self._full_messages()
+                            msgs = self._apply_reminders_for_provider(self._full_messages())
                             self.ui.on_thinking_start()
                             stream = self._create_stream_with_retry(msgs)
                         except Exception:
@@ -2262,7 +2364,19 @@ class ChatSession:
                 if self._generation != my_generation:
                     return
 
-                self._update_token_table(assistant_msg)
+                # Reuse the wire-bound ``msgs`` we already built for the
+                # stream call instead of re-applying the reminder splice
+                # (perf-2).  After mark-delivered runs below, a fresh
+                # _apply_reminders_for_provider would skip the
+                # just-rendered reminders and undercount; passing the
+                # already-rendered list keeps calibration char count
+                # aligned with what the provider actually counted.
+                self._update_token_table(assistant_msg, msgs=msgs)
+                # Reminders that rode this stream have now reached the
+                # model; flag delivered so the next provider call skips
+                # them (one-shot semantics for the wire; UI replay still
+                # surfaces ``_reminders`` for reconnect parity).
+                self._mark_reminders_delivered()
                 self._print_status_line()  # Report usage for EVERY API call
                 self.messages.append(assistant_msg)
                 self._msg_tokens.append(
@@ -2506,10 +2620,7 @@ class ChatSession:
             # Drain any queued user messages so they appear in the
             # conversation and are visible on the next send().
             self._flush_queued_messages()
-            # Tool-channel nudges queued earlier in this generation
-            # (tool_error, repeat) belong to the abandoned batch — drop
-            # them so they don't bleed into the next send()'s tool loop.
-            self._pending_tool_advisories.clear()
+            self._drain_pending_advisories()
             # No need to clear _cancel_event — it's replaced per-generation
             # in send(), so this generation's event is simply discarded.
             self.ui.on_info("[Generation cancelled]")
@@ -2519,14 +2630,28 @@ class ChatSession:
         except KeyboardInterrupt as exc:
             self._synthesize_cancelled_results("Interrupted by user.")
             self._flush_queued_messages()
-            self._pending_tool_advisories.clear()
+            self._drain_pending_advisories()
             self._record_fatal_error(exc)
             raise
         except Exception as exc:
             self._flush_queued_messages()
-            self._pending_tool_advisories.clear()
+            self._drain_pending_advisories()
             self._record_fatal_error(exc)
             raise
+
+    def _drain_pending_advisories(self) -> None:
+        """Drop both advisory channels' pending buffers.
+
+        Both channels are scoped to the current generation: tool-channel
+        nudges (``tool_error``, ``repeat``) queued earlier in this batch
+        and user-channel nudges (``correction``, ``denial``, …) queued
+        during ``_check_metacognitive_nudge`` but not yet drained.  When
+        a generation is abandoned (cancel, KeyboardInterrupt, unexpected
+        exception) both must drop so they don't bleed into the next
+        send's tool loop or next user turn.
+        """
+        self._pending_tool_advisories.clear()
+        self._pending_user_advisories.clear()
 
     def _synthesize_cancelled_results(self, reason: str) -> None:
         """Synthesize tool_result messages for orphaned tool_calls after cancel.
@@ -3060,8 +3185,24 @@ class ChatSession:
         text_chars, images, doc_chars = self._msg_text_chars(msg)
         return text_chars + doc_chars + int(images * self._IMAGE_TOKENS * self._chars_per_token)
 
-    def _update_token_table(self, assistant_msg: dict[str, Any]) -> None:
-        """Update per-message token estimates using API usage data."""
+    def _update_token_table(
+        self,
+        assistant_msg: dict[str, Any],
+        *,
+        msgs: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Update per-message token estimates using API usage data.
+
+        *msgs* (optional) is the wire-bound message list already built
+        for the stream call — passing it avoids a redundant
+        ``_apply_reminders_for_provider`` walk and, more importantly,
+        ensures the char count matches the bytes the provider counted
+        even after ``_mark_reminders_delivered`` has flipped the flag
+        on the reminders that rode the stream.  When *msgs* is None the
+        caller didn't pre-build (rare path) — fall back to applying
+        the splice on the fly, but be aware the result will be
+        reminder-free if delivered flags are already set.
+        """
         if not self._last_usage:
             return
 
@@ -3071,8 +3212,16 @@ class ChatSession:
         # Calibrate chars_per_token ratio from actual usage.
         # Images get a fixed token budget (subtracted).  Documents
         # tokenize non-linearly depending on provider — excluded from
-        # calibration so they don't skew the text ratio.
-        all_msgs = self._full_messages()  # system + self.messages (before append)
+        # calibration so they don't skew the text ratio.  ``all_msgs``
+        # must reflect what the provider actually counted in
+        # ``prompt_tokens``: when called from the loop with the
+        # pre-built ``msgs``, that's exact; without it, fall back to
+        # applying the splice fresh (post-mark-delivered the result
+        # may undercount, but no caller currently takes this path
+        # after a successful stream).
+        all_msgs = (
+            msgs if msgs is not None else self._apply_reminders_for_provider(self._full_messages())
+        )  # system + self.messages (before append)
         active_tools = self._get_active_tools() or []
         tool_def_chars = sum(len(json.dumps(t)) for t in active_tools)
         text_chars = 0
@@ -5307,55 +5456,60 @@ class ChatSession:
     def _queue_user_advisory(self, nudge_type: str, text: str) -> None:
         """Queue a metacognitive nudge for the next user turn.
 
-        Drains in ``_append_user_turn`` as a ``<system-reminder>`` block
-        appended to the user message body. Used for nudges that respond
-        to user behaviour: ``correction``, ``denial``, ``resume``,
+        Drains in ``_append_user_turn`` onto the user message dict's
+        ``_reminders`` side-channel.  Used for nudges that respond to
+        user behaviour: ``correction``, ``denial``, ``resume``,
         ``start``, ``completion``.
         """
         self._pending_user_advisories.append((nudge_type, text))
 
-    def _splice_pending_user_advisories(self, user_msg: dict[str, Any]) -> None:
-        """Drain ``_pending_user_advisories`` into *user_msg*'s content.
+    def _attach_pending_user_reminders(self, user_msg: dict[str, Any]) -> None:
+        """Drain ``_pending_user_advisories`` onto *user_msg*'s ``_reminders``
+        sibling key (a side-channel, never inside ``content``).
 
-        Mutates *user_msg* in place — the caller appends it after.
-        Renders each queued nudge as a ``<system-reminder>`` block
-        (same envelope as ``wrap_tool_result``) and attaches them to
-        the trailing edge of the user content. Every text segment in
-        the user content is passed through ``escape_wrapper_tags``
-        first so a user typing literal ``<system-reminder>`` cannot
-        fabricate an envelope the model would treat as a
-        Turnstone-issued reminder. For attachment-bearing turns the
-        blocks land on the trailing text part so they stay glued to
-        the same multipart turn.
+        Mutates *user_msg* in place — the caller appends it after.  The
+        rendered ``<system-reminder>`` envelope is built later in
+        ``_apply_reminders_for_provider`` against a transient copy, so
+        the model still sees the reminder spliced into ``content`` at
+        the wire boundary while ``self.messages`` and every downstream
+        consumer (UI replay, compaction, title gen, channel adapters,
+        DB) see clean user text.
+
+        ``_reminders`` rides the leading-underscore convention used by
+        other internal sibling metadata (``_attachments_meta``,
+        ``_provider_content``); ``sanitize_messages`` strips it before
+        the wire on its own pass.
+
+        Also fires the live ``on_user_reminder`` UI hook so any open
+        SSE consumers (other browser tabs, CLI mirrors, eventual
+        channel adapters) can render the reminder bubble in lockstep
+        with the originating tab's optimistic render.  Hook failures
+        are logged and swallowed: the side-channel write is the
+        load-bearing op, and a UI implementation throwing here must
+        not abort the user's send (which would otherwise drop both the
+        user message and the queued nudges).
         """
         if not self._pending_user_advisories:
             return
-        from turnstone.core.tool_advisory import escape_wrapper_tags, render_system_reminder
 
         items = list(self._pending_user_advisories)
         self._pending_user_advisories.clear()
 
-        block = "\n\n" + "\n\n".join(render_system_reminder(text) for _, text in items)
-        content = user_msg["content"]
-        if isinstance(content, str):
-            user_msg["content"] = escape_wrapper_tags(content) + block
-        else:
-            text_parts = [p for p in content if isinstance(p, dict) and p.get("type") == "text"]
-            for part in text_parts:
-                part["text"] = escape_wrapper_tags(part.get("text", ""))
-            if text_parts:
-                text_parts[-1]["text"] = text_parts[-1]["text"] + block
-            else:
-                content.append({"type": "text", "text": block})
+        reminders = [{"type": nudge_type, "text": text} for nudge_type, text in items]
+        user_msg["_reminders"] = reminders
 
         self._emit_nudge_ping(nudge_type for nudge_type, _ in items)
+        try:
+            self.ui.on_user_reminder(reminders)
+        except Exception:
+            log.warning("ui.on_user_reminder failed; reminder still attached", exc_info=True)
 
     def _emit_nudge_ping(self, types: Iterable[str]) -> None:
         """Surface the ``[metacognition: nudge injected — …]`` UI line.
 
         Centralised so both drain sites (tool channel via
         ``_collect_advisories``, user channel via
-        ``_splice_pending_user_advisories``) emit the same wording.
+        ``_attach_pending_user_reminders``) emit the same wording.
         """
         joined = ", ".join(types)
         if joined:

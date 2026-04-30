@@ -1293,6 +1293,20 @@ class SessionUIBase:
     def on_error(self, message: str) -> None:
         self._enqueue({"type": "error", "message": message})
 
+    def on_user_reminder(self, reminders: list[dict[str, str]]) -> None:
+        """Surface a metacognitive nudge as its own UI element.
+
+        Reminders live on the user message dict's ``_reminders``
+        side-channel and are spliced into ``content`` only at the
+        provider boundary; this event is what lets every connected
+        SSE consumer (other browser tabs, CLI mirrors, future channel
+        adapters) render the reminder bubble in lockstep with the
+        originating tab.  The history-replay path surfaces the same
+        shape via ``_build_history`` so a tab reconnecting later
+        renders the same bubble.
+        """
+        self._enqueue({"type": "user_reminder", "reminders": reminders})
+
     # ------------------------------------------------------------------
     # Broadcast hooks — kind-specific transport.
     #

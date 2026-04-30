@@ -224,6 +224,25 @@ class TestOpenAIProvider:
         sanitize_messages([original])
         assert original["content"] is None
 
+    def test_sanitize_messages_strips_underscore_sibling_keys(self) -> None:
+        """Internal sibling metadata (``_reminders``, ``_reminders_delivered``,
+        ``_attachments_meta``, ``_provider_content``) must be stripped
+        before the wire — the OpenAI-compat APIs reject unknown fields."""
+        msgs = [
+            {
+                "role": "user",
+                "content": "hi",
+                "_reminders": [{"type": "correction", "text": "watch"}],
+                "_reminders_delivered": True,
+                "_attachments_meta": [{"kind": "image"}],
+            }
+        ]
+        result = sanitize_messages(msgs)
+        assert result == [{"role": "user", "content": "hi"}]
+        assert "_reminders" not in result[0]
+        assert "_reminders_delivered" not in result[0]
+        assert "_attachments_meta" not in result[0]
+
     # -- sanitize_messages: orphan detection -----------------------------------
 
     def test_sanitize_orphaned_tool_call_synthesized(self) -> None:

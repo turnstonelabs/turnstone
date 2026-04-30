@@ -359,6 +359,12 @@ def _build_history(
     issued the tool calls is also marked ``"denied": True`` so the
     client can render the correct badge.
     """
+    # Metacognitive nudges live on the user message dict's ``_reminders``
+    # side-channel and are surfaced separately on each entry so the UI
+    # can render them as their own bubble (live + replay).  ``content``
+    # never carries the ``<system-reminder>`` envelope — that splice is
+    # transient, applied to a wire-bound copy in
+    # ``ChatSession._apply_reminders_for_provider``.
     history = []
     for msg in session.messages:
         content = msg.get("content")
@@ -404,6 +410,23 @@ def _build_history(
         entry = {"role": msg["role"], "content": content}
         if attachments_meta:
             entry["attachments"] = attachments_meta
+        # Surface the ``_reminders`` side-channel so a tab reconnecting
+        # via /history renders the same metacognitive nudge bubble as
+        # the originating tab saw via the live ``user_reminder`` SSE
+        # event.  Reminders are in-memory only (not persisted to DB),
+        # so this only fires for the originating session.
+        reminders = msg.get("_reminders")
+        if isinstance(reminders, list):
+            # Filter first so an all-malformed _reminders doesn't set the
+            # field to []; absent vs. empty-list should mean the same
+            # thing on the wire.
+            clean_reminders = [
+                {"type": str(r.get("type") or ""), "text": str(r.get("text") or "")}
+                for r in reminders
+                if isinstance(r, dict)
+            ]
+            if clean_reminders:
+                entry["reminders"] = clean_reminders
         if msg.get("tool_calls"):
             entry["tool_calls"] = [
                 {
