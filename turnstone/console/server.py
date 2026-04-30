@@ -23,6 +23,7 @@ import queue
 import re
 import secrets
 import textwrap
+import threading
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
@@ -89,6 +90,7 @@ if TYPE_CHECKING:
     from starlette.requests import Request
 
     from turnstone.core.session import ChatSession
+    from turnstone.core.session_manager import SessionManager
     from turnstone.core.storage._protocol import StorageBackend
 
 log = logging.getLogger("turnstone.console.server")
@@ -3687,6 +3689,50 @@ async def _verify_collector_service_scope(app: Starlette, client: httpx.AsyncCli
     )
 
 
+def _coord_idle_cleanup_thread(
+    mgr: SessionManager,
+    timeout_sec: float,
+    stop_event: threading.Event | None = None,
+) -> None:
+    """Periodically reap idle + DB-orphan coordinator workstreams.
+
+    Mirrors the regular server's ``_idle_cleanup_thread`` (turnstone/server.py)
+    but skips the rate-limiter / global-queue arms — the console doesn't have
+    those.  ``mgr.close_idle`` does the work: closes loaded IDLE rows AND
+    bulk-closes DB rows of this kind whose ``updated`` is past the cutoff
+    and which aren't currently loaded.  The latter pass catches coords left
+    behind by prior console process incarnations.
+
+    Runs an initial sweep BEFORE the first sleep so cold-start orphans are
+    reaped immediately rather than waiting one ``check_every`` interval (~30
+    min on default 2h timeout).  This intentionally diverges from the regular
+    server pattern, which has no initial sweep — the regular server runs
+    inside a normal request-handling lifecycle, the console-side coord pool
+    is a small fixed-size cache where orphans dominate the row count after
+    a cold boot.
+
+    ``stop_event`` is for tests — when set, the thread exits cleanly after
+    the next loop check.  Production callers pass ``None`` (the daemon is
+    process-lifetime).
+    """
+    check_every = min(300.0, timeout_sec / 4)
+    # Initial sweep — runs once before entering the sleep loop.
+    try:
+        mgr.close_idle(timeout_sec)
+    except Exception:
+        log.debug("console.coord_idle_cleanup_initial_failed", exc_info=True)
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            return
+        time.sleep(check_every)
+        if stop_event is not None and stop_event.is_set():
+            return
+        try:
+            mgr.close_idle(timeout_sec)
+        except Exception:
+            log.debug("console.coord_idle_cleanup_failed", exc_info=True)
+
+
 @asynccontextmanager
 async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     # Create async HTTP clients for proxy routes.  Auth headers are NOT baked
@@ -3992,6 +4038,27 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                     coord_adapter.start_child_event_fanout(app.state.collector)
                 except Exception:
                     log.warning("console.coordinator_child_fanout_init_failed", exc_info=True)
+                # Idle cleanup: closes loaded-but-stale coords AND DB orphans
+                # left behind by prior console processes.  The thread runs an
+                # initial sweep on entry (no synchronous lifespan call needed —
+                # see ``_coord_idle_cleanup_thread``) so cold-start cleanup
+                # doesn't block startup.  Reuses the regular-server
+                # ``server.workstream_idle_timeout`` setting — the same cadence
+                # makes sense for both kinds and avoids a redundant config knob.
+                try:
+                    idle_minutes = int(config_store.get("server.workstream_idle_timeout"))
+                except Exception:
+                    idle_minutes = 0
+                if idle_minutes > 0:
+                    timeout_sec = float(idle_minutes * 60)
+                    cleanup_thread = threading.Thread(
+                        target=_coord_idle_cleanup_thread,
+                        args=(coord_mgr, timeout_sec),
+                        name="coord-idle-cleanup",
+                        daemon=True,
+                    )
+                    cleanup_thread.start()
+                    app.state.coord_idle_cleanup_thread = cleanup_thread
                 log.info(
                     "console.coordinator_mgr_ready max_active=%s",
                     config_store.get("coordinator.max_active"),
