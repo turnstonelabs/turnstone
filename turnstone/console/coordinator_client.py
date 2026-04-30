@@ -81,13 +81,13 @@ WAIT_MAX_TIMEOUT: float = 600.0
 WAIT_POLL_INTERVAL: float = 0.5
 
 # Per-ws cap on the inline ``message`` field bundled into wait_for_workstream
-# results.  Sized so a fan-out of 32 children at the cap is ~192 KiB of
+# results.  Sized so a fan-out of 32 children at the cap is ~320 KiB of
 # tool output — large but not catastrophic on commercial models, and
 # typical waits run with a handful of children.  Truncation is from the
 # END (the lead is usually more informative than the tail) and sets a
 # ``truncated=True`` flag so the model can opt into a follow-up read if
 # the trailing bytes matter.
-WAIT_MESSAGE_MAX_BYTES: int = 6 * 1024
+WAIT_MESSAGE_MAX_BYTES: int = 10 * 1024
 
 # How many tail messages ``wait_for_workstream`` reads when extracting a
 # child's last assistant turn.  The conversation tail almost always
