@@ -5569,31 +5569,28 @@ class ChatSession:
         timestamp via ``should_nudge``), and emits a ``[repeat: …]`` UI line
         on each detection.
 
-        ``_tool_error_flags`` is the authoritative is_error signal — set by
-        ``_report_tool_result`` for every error path including bash non-zero
-        exits with normal stdout, denials, parse errors, and blocked
-        commands.  Flags are read here and consumed by ``.pop()`` later in
-        the per-result loop in ``_run_loop``, so the read here is safe.
+        Repeat detection's job is to nudge a flaky local model out of a
+        loop where it keeps making the same tool call ("``bash(cmd='echo
+        test')`` × 3" being the canonical example).  It fires on the
+        consecutive-streak signal alone, with no regard for the tool's
+        success / failure / output content — same (name, args) for N
+        turns in a row is by definition stuck.  ``RepeatDetector.record``
+        already resets the streak on any different signature, so an
+        intervening tool call (read, write, anything different) breaks
+        the streak naturally without an explicit clear here.
+
+        ``_tool_error_flags`` is the authoritative is_error signal —
+        consumed below for the tool-error nudge gate; the per-result
+        loop in ``_run_loop`` ``.pop``s it after this returns.
         """
         # Repeat detection: warn when a tool is called with identical
-        # args as a previous call in this session, regardless of
-        # whether the previous call succeeded or failed.  Repeatedly
-        # calling the same tool — even one that keeps erroring — is
-        # the stuck-loop behaviour the nudge is meant to catch.  JSON
-        # outputs (MCP structured results) are tracked but exempt
-        # from the inline warning text (appending text would corrupt
-        # the payload).
+        # args N times in a row.  Independent of success/failure — the
+        # stuck-loop pattern is sig-driven, not state-driven.  JSON
+        # outputs (MCP structured results) are tracked but exempt from
+        # the inline warning text (appending text would corrupt the
+        # payload).
         _tc_by_id = {c["id"]: c for c in tool_calls}
         _repeat_detected = False
-
-        # Clear streak when a write tool executed successfully — the
-        # state has changed so re-running a read tool is valid.
-        _write_tools = frozenset({"write_file", "edit_file", "bash"})
-        if any(
-            tc["function"]["name"] in _write_tools and not self._tool_error_flags.get(tc["id"])
-            for tc in tool_calls
-        ):
-            self._repeat_detector.clear()
 
         for i, (tc_id, output) in enumerate(results):
             tc = _tc_by_id.get(tc_id)
