@@ -716,37 +716,69 @@ class SQLiteBackend:
     ) -> list[str]:
         norm_kind = WorkstreamKind(kind).value
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        # SQLite has no RETURNING precedent in this file — do SELECT-then-UPDATE
-        # in one transaction.  SQLite serializes writes so the two statements
-        # see consistent state.
-        select_stmt = sa.select(workstreams.c.ws_id).where(
+        # SQLite has no RETURNING precedent in this file — do SELECT-then-
+        # UPDATE in one transaction, with the SAME WHERE predicates re-applied
+        # to the UPDATE.  Re-application defends against a same-process race:
+        # ``SessionManager.open()`` calls ``touch_workstream`` between the
+        # SELECT and the UPDATE could have bumped a row's ``updated`` past
+        # ``cutoff`` (or ``set_state`` could have flipped its state out of
+        # the bulk-close set).  Without the re-applied WHERE the UPDATE
+        # closes those rows anyway; with it, the UPDATE skips rows that
+        # became ineligible after the SELECT and the row stays open.
+        # Chunked through ``_in_chunks`` so the ``IN`` clause never exceeds
+        # SQLite's bind-parameter limit (default 999) on a large reap.
+        candidate_conditions = [
             workstreams.c.kind == norm_kind,
             workstreams.c.state.in_(BULK_CLOSE_STATE_VALUES),
             workstreams.c.updated < cutoff,
-        )
+        ]
         if live_node_ids is not None and live_node_ids:
             # Protect rows owned by heartbeating services.  NULL node_id is
             # always eligible.  Empty list means "no nodes alive" — every
             # row is unprotected; the absence of this predicate is
             # equivalent to "match all," so we just skip it.
-            select_stmt = select_stmt.where(
+            candidate_conditions.append(
                 sa.or_(
                     workstreams.c.node_id.is_(None),
                     ~workstreams.c.node_id.in_(live_node_ids),
                 )
             )
         if exclude_ws_ids:
-            select_stmt = select_stmt.where(~workstreams.c.ws_id.in_(exclude_ws_ids))
+            candidate_conditions.append(~workstreams.c.ws_id.in_(exclude_ws_ids))
+        select_stmt = sa.select(workstreams.c.ws_id).where(*candidate_conditions)
+        closed: list[str] = []
+        # Match the chunk size used by ``prune_workstreams`` (line 453) — keeps
+        # ``IN`` clauses well below SQLite's default 999-bind-param limit even
+        # on very large reaps.
+        chunk_size = 500
         with self._conn() as conn:
-            ids = [row[0] for row in conn.execute(select_stmt)]
-            if ids:
+            candidate_ids = [row[0] for row in conn.execute(select_stmt)]
+            for i in range(0, len(candidate_ids), chunk_size):
+                chunk = candidate_ids[i : i + chunk_size]
+                # Re-apply the eligibility predicates on the UPDATE so a row
+                # that became fresh between the SELECT and the UPDATE is not
+                # clobbered.  Then SELECT back by ``state='closed' AND updated=now``
+                # to determine which rows actually transitioned this commit —
+                # the returned list reflects reality even when re-application
+                # filters out some candidates.
                 conn.execute(
                     sa.update(workstreams)
-                    .where(workstreams.c.ws_id.in_(ids))
+                    .where(workstreams.c.ws_id.in_(chunk), *candidate_conditions)
                     .values(state="closed", updated=now)
                 )
+                actually_closed = [
+                    row[0]
+                    for row in conn.execute(
+                        sa.select(workstreams.c.ws_id).where(
+                            workstreams.c.ws_id.in_(chunk),
+                            workstreams.c.state == "closed",
+                            workstreams.c.updated == now,
+                        )
+                    )
+                ]
+                closed.extend(actually_closed)
             conn.commit()
-            return ids
+            return closed
 
     def touch_workstream(self, ws_id: str) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")

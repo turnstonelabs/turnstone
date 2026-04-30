@@ -785,19 +785,22 @@ class TestBulkCloseStaleOrphans:
         assert set(closed) == {"o-idle", "o-thinking", "o-attention", "o-running"}
 
     def test_bumps_updated_on_close(self, backend):
+        stale_updated = "2020-01-01T00:00:00"
         backend.register_workstream("orphan", kind="interactive")
-        _force_updated(backend, "orphan", "2020-01-01T00:00:00")
+        _force_updated(backend, "orphan", stale_updated)
 
         backend.bulk_close_stale_orphans(
             "interactive", cutoff="2024-01-01T00:00:00", exclude_ws_ids=[]
         )
 
-        # ``updated`` should now be bumped to ~now (post-2024 cutoff).
+        # ``updated`` must change away from the forced stale value.  Asserting
+        # inequality from the seed (rather than ``> "2024-01-01..."``) keeps
+        # the test independent of wall-clock date.
         with backend._engine.connect() as conn:
             row = conn.execute(
                 sa.select(workstreams.c.updated).where(workstreams.c.ws_id == "orphan")
             ).one()
-        assert row[0] > "2024-01-01T00:00:00"
+        assert row[0] != stale_updated
 
     def test_protects_rows_owned_by_live_services(self, backend):
         """Liveness scoping (post-#384 rendezvous-routing world): rows
@@ -912,9 +915,10 @@ class TestTouchWorkstream:
         reaper clobbering a freshly-loaded row.  Must not change ``state``
         (the open() path explicitly avoids state writes to dodge a race
         with concurrent close())."""
+        stale_updated = "2020-01-01T00:00:00"
         backend.register_workstream("ws-touch", kind="interactive")
         backend.update_workstream_state("ws-touch", "closed")  # simulate prior close
-        _force_updated(backend, "ws-touch", "2020-01-01T00:00:00")
+        _force_updated(backend, "ws-touch", stale_updated)
 
         backend.touch_workstream("ws-touch")
 
@@ -925,7 +929,9 @@ class TestTouchWorkstream:
                 )
             ).one()
         assert row[0] == "closed", "state must not be modified by touch"
-        assert row[1] > "2024-01-01T00:00:00", "updated must be bumped"
+        # Compare against the forced stale value rather than a fixed calendar
+        # date so the test is independent of wall-clock time.
+        assert row[1] != stale_updated, "updated must be bumped"
 
     def test_unknown_id_is_noop(self, backend):
         """Touch on a missing id must not raise — open()'s exception
