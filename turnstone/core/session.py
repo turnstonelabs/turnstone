@@ -278,6 +278,7 @@ class SessionUI(Protocol):
     def on_info(self, message: str) -> None: ...
     def on_error(self, message: str) -> None: ...
     def on_user_reminder(self, reminders: list[dict[str, str]]) -> None: ...
+    def on_tool_reminder(self, reminders: list[dict[str, str]], tool_call_id: str) -> None: ...
     def on_state_change(self, state: str) -> None: ...
     def on_rename(self, name: str) -> None: ...
     def on_intent_verdict(self, verdict: dict[str, Any]) -> None:
@@ -1694,8 +1695,17 @@ class ChatSession:
         """
         out: list[dict[str, Any]] = []
         for msg in messages:
-            reminders = msg.get("_reminders")
-            if not reminders or msg.get("_reminders_delivered"):
+            raw_reminders = msg.get("_reminders")
+            if not raw_reminders or msg.get("_reminders_delivered"):
+                out.append(msg)
+                continue
+            # Defensive filter — only dict entries are valid; a string /
+            # None / other shape from corruption or partial state must
+            # not abort the whole send via an AttributeError on .get().
+            # Mirrors the same filter ``_build_history`` applies on the
+            # wire-out side.
+            reminders = [r for r in raw_reminders if isinstance(r, dict)]
+            if not reminders:
                 out.append(msg)
                 continue
             block = "\n\n" + "\n\n".join(
@@ -2493,19 +2503,30 @@ class ChatSession:
                     # Capture raw output for DB storage before advisory wrapping
                     raw_output = output
 
-                    # Advisory injection: wrap tool output with advisories
-                    # (output guard findings, queued user messages, etc.)
-                    advisories = self._collect_advisories(
+                    # Advisory injection: persistent advisories (output
+                    # guard findings, queued user interjections) wrap
+                    # into the tool-result envelope and stay in
+                    # self.messages.  Metacognitive tool-channel
+                    # reminders (tool_error / repeat) ride a side-channel
+                    # — never inside content — so the model sees the
+                    # splice only at the wire boundary via
+                    # _apply_reminders_for_provider, while UI/replay
+                    # surfaces them as a themed bubble below the tool
+                    # result.
+                    persistent_advisories, metacog_reminders = self._collect_advisories(
                         assessment, _tc_names.get(tc_id, ""), _ri == _last_idx
                     )
                     if isinstance(output, str):
-                        output = wrap_tool_result(output, advisories)
-                    elif isinstance(output, list) and advisories:
+                        output = wrap_tool_result(output, persistent_advisories)
+                    elif isinstance(output, list) and persistent_advisories:
                         # Structured/image output — append advisories as a
                         # text part so they aren't silently dropped.
                         output = [
                             *output,
-                            {"type": "text", "text": wrap_tool_result("", advisories)},
+                            {
+                                "type": "text",
+                                "text": wrap_tool_result("", persistent_advisories),
+                            },
                         ]
 
                     tool_msg: dict[str, Any] = {
@@ -2515,6 +2536,15 @@ class ChatSession:
                     }
                     if self._tool_error_flags.pop(tc_id, False):
                         tool_msg["is_error"] = True
+                    if metacog_reminders:
+                        tool_msg["_reminders"] = metacog_reminders
+                        try:
+                            self.ui.on_tool_reminder(metacog_reminders, tc_id)
+                        except Exception:
+                            log.warning(
+                                "ui.on_tool_reminder failed; reminder still attached",
+                                exc_info=True,
+                            )
                     self.messages.append(tool_msg)
 
                     # Token estimation — image content uses a fixed heuristic
@@ -3852,12 +3882,26 @@ class ChatSession:
         assessment: OutputAssessment | None,
         func_name: str,
         is_last_in_batch: bool,
-    ) -> list[ToolAdvisory]:
+    ) -> tuple[list[ToolAdvisory], list[dict[str, str]]]:
         """Gather advisories to attach to a tool result message.
 
-        Returns an empty list when no advisories apply (common case).
-        Guard advisories attach per-result; user messages drain on the
-        last result in the batch only.
+        Returns ``(persistent, metacog_reminders)``:
+
+        - ``persistent`` — guard findings + user interjections that ride
+          inside the tool-result envelope via ``wrap_tool_result``.
+          These are conversation history and must persist in
+          ``self.messages``.
+        - ``metacog_reminders`` — list of ``{"type", "text"}`` dicts for
+          ``tool_error`` / ``repeat`` nudges that the caller attaches to
+          the tool message dict's ``_reminders`` side-channel.  Like
+          user-channel reminders, they are spliced into ``content`` only
+          at the wire boundary by ``_apply_reminders_for_provider`` and
+          surfaced separately on the UI as a themed bubble below the
+          tool result.
+
+        Both lists are empty when no advisories apply (common case).
+        Guard advisories attach per-result; user messages and
+        metacognitive nudges drain on the last result in the batch only.
         """
         from turnstone.core.tool_advisory import GuardAdvisory, UserInterjection
 
@@ -3873,26 +3917,25 @@ class ChatSession:
             if is_last_in_batch:
                 self._pending_tool_advisories.clear()
                 self._flush_queued_messages()
-            return []
+            return [], []
 
-        advisories: list[ToolAdvisory] = []
+        persistent: list[ToolAdvisory] = []
+        metacog_reminders: list[dict[str, str]] = []
 
-        # Output guard advisory
+        # Output guard advisory — persists with the tool result.
         if assessment is not None:
-            advisories.append(GuardAdvisory(assessment=assessment, func_name=func_name))
+            persistent.append(GuardAdvisory(assessment=assessment, func_name=func_name))
 
         # Metacognitive tool-channel drain — fires once per batch on the
-        # last result. Queued by _queue_tool_advisory from the
-        # tool_error and repeat detection paths just before this loop.
+        # last result.  Queued by _queue_tool_advisory from the
+        # tool_error / repeat detection paths just before this loop.
+        # Lands on the tool message dict's ``_reminders`` side-channel
+        # (caller's responsibility) so it stays out of persisted content
+        # and rides the wire only via the transient-copy splice.
         if is_last_in_batch and self._pending_tool_advisories:
-            from turnstone.core.tool_advisory import MetacognitiveAdvisory
-
             drained = list(self._pending_tool_advisories)
             self._pending_tool_advisories.clear()
-            advisories.extend(
-                MetacognitiveAdvisory(nudge_type=nt, message=text) for nt, text in drained
-            )
-            self._emit_nudge_ping(nt for nt, _ in drained)
+            metacog_reminders.extend({"type": nt, "text": text} for nt, text in drained)
 
         # Drain queued user messages on the last result in the batch.
         # Attachment-bearing items fall back to a full multipart user
@@ -3906,7 +3949,7 @@ class ChatSession:
                 if att_ids:
                     attachment_items.append((queue_msg_id, msg, priority, att_ids))
                 else:
-                    advisories.append(UserInterjection(message=msg, priority=priority))
+                    persistent.append(UserInterjection(message=msg, priority=priority))
             if attachment_items:
                 from turnstone.core.tool_advisory import PRIORITY_IMPORTANT
 
@@ -3917,7 +3960,7 @@ class ChatSession:
                     )
                     self._append_user_turn(text, resolved, send_id=queue_msg_id)
 
-        return advisories
+        return persistent, metacog_reminders
 
     # -- Two-phase tool execution -----------------------------------------------
     #
@@ -5498,22 +5541,10 @@ class ChatSession:
         reminders = [{"type": nudge_type, "text": text} for nudge_type, text in items]
         user_msg["_reminders"] = reminders
 
-        self._emit_nudge_ping(nudge_type for nudge_type, _ in items)
         try:
             self.ui.on_user_reminder(reminders)
         except Exception:
             log.warning("ui.on_user_reminder failed; reminder still attached", exc_info=True)
-
-    def _emit_nudge_ping(self, types: Iterable[str]) -> None:
-        """Surface the ``[metacognition: nudge injected — …]`` UI line.
-
-        Centralised so both drain sites (tool channel via
-        ``_collect_advisories``, user channel via
-        ``_attach_pending_user_reminders``) emit the same wording.
-        """
-        joined = ", ".join(types)
-        if joined:
-            self.ui.on_info(f"{GRAY}[metacognition: nudge injected — {joined}]{RESET}")
 
     def _queue_tool_advisory(self, nudge_type: str, text: str) -> None:
         """Queue a metacognitive nudge for the next tool-result batch.

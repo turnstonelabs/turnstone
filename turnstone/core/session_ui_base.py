@@ -1294,7 +1294,8 @@ class SessionUIBase:
         self._enqueue({"type": "error", "message": message})
 
     def on_user_reminder(self, reminders: list[dict[str, str]]) -> None:
-        """Surface a metacognitive nudge as its own UI element.
+        """Surface a metacognitive user-channel nudge as its own UI
+        element.
 
         Reminders live on the user message dict's ``_reminders``
         side-channel and are spliced into ``content`` only at the
@@ -1306,6 +1307,27 @@ class SessionUIBase:
         renders the same bubble.
         """
         self._enqueue({"type": "user_reminder", "reminders": reminders})
+
+    def on_tool_reminder(self, reminders: list[dict[str, str]], tool_call_id: str) -> None:
+        """Surface a metacognitive tool-channel nudge (``tool_error`` /
+        ``repeat``) as its own UI element below the tool result that
+        triggered it.
+
+        Tool-channel reminders ride the same ``_reminders``
+        side-channel pattern as the user channel — kept out of
+        ``content`` so compaction / title-gen / channel adapters never
+        see the nudge text, spliced into the wire only via
+        ``_apply_reminders_for_provider``.  ``tool_call_id`` is the
+        anchor the frontend uses to render the bubble below the
+        specific tool result that triggered the batch's reminder.
+        """
+        self._enqueue(
+            {
+                "type": "tool_reminder",
+                "reminders": reminders,
+                "tool_call_id": tool_call_id,
+            }
+        )
 
     # ------------------------------------------------------------------
     # Broadcast hooks — kind-specific transport.
