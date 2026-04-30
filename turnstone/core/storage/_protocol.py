@@ -431,6 +431,56 @@ class StorageBackend(Protocol):
         """Update a workstream's state and bump updated timestamp."""
         ...
 
+    def bulk_close_stale_orphans(
+        self,
+        kind: WorkstreamKind | str,
+        cutoff: str,
+        exclude_ws_ids: list[str],
+        node_id: str | None = None,
+    ) -> list[str]:
+        """Close DB-side workstream rows of *kind* whose state is in
+        ``BULK_CLOSE_STATE_VALUES`` and whose ``updated`` is lex-older than
+        *cutoff*, excluding rows currently loaded in memory.  Sets
+        ``state='closed'`` and bumps ``updated``.  Returns the list of ws_ids
+        actually transitioned.
+
+        ``cutoff`` is a UTC ``YYYY-MM-DDTHH:MM:SS`` string matching the on-disk
+        format ``update_workstream_state`` writes — lex compare is safe for
+        same-offset timestamps.  Empty ``exclude_ws_ids`` means no exclusion.
+
+        ``node_id`` scopes the reap to rows owned by a single node — required
+        for multi-node interactive deployments, where each node only has
+        authority over its own ``workstreams.node_id`` partition.  Pass
+        ``None`` to skip the node filter (single-process console / tests /
+        operator backfill scripts).
+
+        Asymmetric with ``SessionManager.close_idle``'s in-memory pass on
+        purpose: that pass closes only ``IDLE`` (legitimately-attentive rows
+        stay), this method closes the broader ``BULK_CLOSE_STATE_VALUES`` set
+        because any row matching here is — for the scoped node — by definition
+        not loaded and cannot be in a live interaction (its owning process
+        died with the transient state unresolved).
+        """
+        ...
+
+    def touch_workstream(self, ws_id: str) -> None:
+        """Bump a workstream row's ``updated`` timestamp without touching its
+        state.
+
+        Used by ``SessionManager.open()`` on cold rehydrate so a freshly-
+        loaded row's ``updated`` can't be older than the orphan-reaper cutoff
+        — protects against a same-process race where a parallel
+        ``close_idle`` pass-2 snapshots loaded keys after the storage read
+        but before the in-memory install.  Distinct from
+        ``update_workstream_state(ws_id, current_state)`` because the
+        rehydrate path explicitly avoids a state write (see the
+        ``open()`` no-DB-state-flip-on-resurrect comment): a state write
+        could race a concurrent ``close()`` and resurrect a closed row.
+        Bumping only ``updated`` is safe — close still wins on the state
+        column.
+        """
+        ...
+
     def update_workstream_name(self, ws_id: str, name: str) -> None:
         """Update a workstream's display name."""
         ...

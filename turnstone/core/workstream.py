@@ -77,6 +77,25 @@ class WorkstreamState(enum.Enum):
     ERROR = "error"  # last operation failed
 
 
+# States the orphan reaper (``SessionManager.close_idle`` pass 2 +
+# ``StorageBackend.bulk_close_stale_orphans``) is allowed to flip to
+# ``closed`` for rows past the staleness cutoff.  Excludes ``ERROR``
+# deliberately — error rows are user-investigatable and shouldn't be
+# auto-reaped — and excludes ``CLOSED`` (terminal).  Centralized here
+# so the storage backends and FakeStorage all agree; if a new transient
+# state is added to ``WorkstreamState``, deciding whether it joins
+# this set is part of the change rather than an after-the-fact
+# audit across three files.
+BULK_CLOSE_STATE_VALUES: frozenset[str] = frozenset(
+    {
+        WorkstreamState.IDLE.value,
+        WorkstreamState.THINKING.value,
+        WorkstreamState.RUNNING.value,
+        WorkstreamState.ATTENTION.value,
+    }
+)
+
+
 # ---------------------------------------------------------------------------
 # Workstream dataclass
 # ---------------------------------------------------------------------------

@@ -97,7 +97,7 @@ from turnstone.core.storage._utils import sanitize_text
 from turnstone.core.storage._utils import (
     scan_skill_content as _scan_skill_content,
 )
-from turnstone.core.workstream import WorkstreamKind
+from turnstone.core.workstream import BULK_CLOSE_STATE_VALUES, WorkstreamKind
 
 log = get_logger(__name__)
 
@@ -592,6 +592,48 @@ class PostgreSQLBackend:
                 sa.update(workstreams)
                 .where(workstreams.c.ws_id == ws_id)
                 .values(state=state, updated=now)
+            )
+            conn.commit()
+
+    def bulk_close_stale_orphans(
+        self,
+        kind: WorkstreamKind | str,
+        cutoff: str,
+        exclude_ws_ids: list[str],
+        node_id: str | None = None,
+    ) -> list[str]:
+        norm_kind = WorkstreamKind(kind).value
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        stmt = (
+            sa.update(workstreams)
+            .where(
+                workstreams.c.kind == norm_kind,
+                workstreams.c.state.in_(BULK_CLOSE_STATE_VALUES),
+                workstreams.c.updated < cutoff,
+            )
+            .values(state="closed", updated=now)
+            .returning(workstreams.c.ws_id)
+        )
+        if node_id is not None:
+            # Multi-node interactive: each node only reaps rows it owns;
+            # ``workstreams.node_id`` is the routing-layer authority assigned
+            # at register time.
+            stmt = stmt.where(workstreams.c.node_id == node_id)
+        if exclude_ws_ids:
+            # Skip ``NOT IN ()`` when nothing to exclude — keeps the SQL clean
+            # and avoids SQLAlchemy's empty-collection warning.
+            stmt = stmt.where(~workstreams.c.ws_id.in_(exclude_ws_ids))
+        with self._conn() as conn:
+            result = conn.execute(stmt)
+            ids = [row[0] for row in result]
+            conn.commit()
+            return ids
+
+    def touch_workstream(self, ws_id: str) -> None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            conn.execute(
+                sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(updated=now)
             )
             conn.commit()
 

@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
+import sqlalchemy as sa
+
+from turnstone.core.storage._schema import workstreams
+
 # -- Workstream registration ---------------------------------------------------
 
 
@@ -662,6 +666,203 @@ class TestBatchPrimitives:
     def test_sum_workstream_tokens_batch_missing_id_defaults_zero(self, backend):
         result = backend.sum_workstream_tokens_batch(["never-seen"])
         assert result == {"never-seen": 0}
+
+
+# -- bulk_close_stale_orphans --------------------------------------------------
+
+
+def _force_updated(backend: Any, ws_id: str, updated: str) -> None:
+    """Stamp a workstream row's ``updated`` column directly.
+
+    The public surface only sets ``updated`` to ``now``, which makes it
+    impossible to fabricate a stale row through register/update calls.
+    Reaches into ``backend._engine`` — same access pattern conftest uses
+    for cross-backend cleanup.
+    """
+    with backend._engine.connect() as conn:
+        conn.execute(
+            sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(updated=updated)
+        )
+        conn.commit()
+
+
+class TestBulkCloseStaleOrphans:
+    def test_closes_stale_non_terminal_rows_of_kind(self, backend):
+        backend.register_workstream("stale-idle", kind="interactive")
+        backend.register_workstream("stale-thinking", kind="interactive")
+        backend.update_workstream_state("stale-thinking", "thinking")
+        backend.register_workstream("fresh-idle", kind="interactive")
+        _force_updated(backend, "stale-idle", "2020-01-01T00:00:00")
+        _force_updated(backend, "stale-thinking", "2020-01-01T00:00:00")
+        # fresh-idle stays at registration time (effectively now)
+
+        closed = backend.bulk_close_stale_orphans(
+            "interactive", cutoff="2024-01-01T00:00:00", exclude_ws_ids=[]
+        )
+
+        assert set(closed) == {"stale-idle", "stale-thinking"}
+        rows = backend.get_workstreams_batch(["stale-idle", "stale-thinking", "fresh-idle"])
+        assert rows["stale-idle"]["state"] == "closed"
+        assert rows["stale-thinking"]["state"] == "closed"
+        assert rows["fresh-idle"]["state"] == "idle"
+
+    def test_skips_already_closed(self, backend):
+        backend.register_workstream("already-closed", kind="interactive")
+        backend.update_workstream_state("already-closed", "closed")
+        _force_updated(backend, "already-closed", "2020-01-01T00:00:00")
+
+        closed = backend.bulk_close_stale_orphans(
+            "interactive", cutoff="2024-01-01T00:00:00", exclude_ws_ids=[]
+        )
+
+        assert closed == []
+
+    def test_filters_by_kind(self, backend):
+        backend.register_workstream("interactive-stale", kind="interactive")
+        backend.register_workstream("coord-stale", kind="coordinator")
+        _force_updated(backend, "interactive-stale", "2020-01-01T00:00:00")
+        _force_updated(backend, "coord-stale", "2020-01-01T00:00:00")
+
+        closed = backend.bulk_close_stale_orphans(
+            "interactive", cutoff="2024-01-01T00:00:00", exclude_ws_ids=[]
+        )
+
+        assert closed == ["interactive-stale"]
+        rows = backend.get_workstreams_batch(["interactive-stale", "coord-stale"])
+        assert rows["interactive-stale"]["state"] == "closed"
+        assert rows["coord-stale"]["state"] == "idle"
+
+    def test_excludes_loaded_ws_ids(self, backend):
+        backend.register_workstream("ws-keep", kind="interactive")
+        backend.register_workstream("ws-close", kind="interactive")
+        _force_updated(backend, "ws-keep", "2020-01-01T00:00:00")
+        _force_updated(backend, "ws-close", "2020-01-01T00:00:00")
+
+        closed = backend.bulk_close_stale_orphans(
+            "interactive", cutoff="2024-01-01T00:00:00", exclude_ws_ids=["ws-keep"]
+        )
+
+        assert closed == ["ws-close"]
+        rows = backend.get_workstreams_batch(["ws-keep", "ws-close"])
+        assert rows["ws-keep"]["state"] == "idle"
+        assert rows["ws-close"]["state"] == "closed"
+
+    def test_empty_exclude_list_does_not_break_sql(self, backend):
+        backend.register_workstream("orphan", kind="interactive")
+        _force_updated(backend, "orphan", "2020-01-01T00:00:00")
+
+        closed = backend.bulk_close_stale_orphans(
+            "interactive", cutoff="2024-01-01T00:00:00", exclude_ws_ids=[]
+        )
+
+        assert closed == ["orphan"]
+
+    def test_no_orphans_returns_empty(self, backend):
+        backend.register_workstream("fresh", kind="interactive")
+
+        closed = backend.bulk_close_stale_orphans(
+            "interactive", cutoff="2024-01-01T00:00:00", exclude_ws_ids=[]
+        )
+
+        assert closed == []
+
+    def test_closes_all_non_terminal_states(self, backend):
+        for ws_id, state in [
+            ("o-idle", "idle"),
+            ("o-thinking", "thinking"),
+            ("o-attention", "attention"),
+            ("o-running", "running"),
+        ]:
+            backend.register_workstream(ws_id, kind="interactive")
+            if state != "idle":
+                backend.update_workstream_state(ws_id, state)
+            _force_updated(backend, ws_id, "2020-01-01T00:00:00")
+
+        closed = backend.bulk_close_stale_orphans(
+            "interactive", cutoff="2024-01-01T00:00:00", exclude_ws_ids=[]
+        )
+
+        assert set(closed) == {"o-idle", "o-thinking", "o-attention", "o-running"}
+
+    def test_bumps_updated_on_close(self, backend):
+        backend.register_workstream("orphan", kind="interactive")
+        _force_updated(backend, "orphan", "2020-01-01T00:00:00")
+
+        backend.bulk_close_stale_orphans(
+            "interactive", cutoff="2024-01-01T00:00:00", exclude_ws_ids=[]
+        )
+
+        # ``updated`` should now be bumped to ~now (post-2024 cutoff).
+        with backend._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(workstreams.c.updated).where(workstreams.c.ws_id == "orphan")
+            ).one()
+        assert row[0] > "2024-01-01T00:00:00"
+
+    def test_filters_by_node_id_when_provided(self, backend):
+        """Multi-node correctness: each node's reaper must only touch its
+        own rows.  Without this, sibling nodes race to close each other's
+        loaded workstreams."""
+        backend.register_workstream("node-a-stale", node_id="node-a", kind="interactive")
+        backend.register_workstream("node-b-stale", node_id="node-b", kind="interactive")
+        _force_updated(backend, "node-a-stale", "2020-01-01T00:00:00")
+        _force_updated(backend, "node-b-stale", "2020-01-01T00:00:00")
+
+        closed = backend.bulk_close_stale_orphans(
+            "interactive",
+            cutoff="2024-01-01T00:00:00",
+            exclude_ws_ids=[],
+            node_id="node-a",
+        )
+
+        assert closed == ["node-a-stale"]
+        rows = backend.get_workstreams_batch(["node-a-stale", "node-b-stale"])
+        assert rows["node-a-stale"]["state"] == "closed"
+        assert rows["node-b-stale"]["state"] == "idle"
+
+    def test_node_id_none_skips_filter(self, backend):
+        """``node_id=None`` is the single-process / operator-backfill mode —
+        all rows of *kind* are eligible regardless of which node owns them."""
+        backend.register_workstream("node-a", node_id="node-a", kind="interactive")
+        backend.register_workstream("node-b", node_id="node-b", kind="interactive")
+        _force_updated(backend, "node-a", "2020-01-01T00:00:00")
+        _force_updated(backend, "node-b", "2020-01-01T00:00:00")
+
+        closed = backend.bulk_close_stale_orphans(
+            "interactive", cutoff="2024-01-01T00:00:00", exclude_ws_ids=[]
+        )
+
+        assert set(closed) == {"node-a", "node-b"}
+
+
+# -- touch_workstream ----------------------------------------------------------
+
+
+class TestTouchWorkstream:
+    def test_bumps_updated_only(self, backend):
+        """Used by ``open()`` on rehydrate to defend against the orphan
+        reaper clobbering a freshly-loaded row.  Must not change ``state``
+        (the open() path explicitly avoids state writes to dodge a race
+        with concurrent close())."""
+        backend.register_workstream("ws-touch", kind="interactive")
+        backend.update_workstream_state("ws-touch", "closed")  # simulate prior close
+        _force_updated(backend, "ws-touch", "2020-01-01T00:00:00")
+
+        backend.touch_workstream("ws-touch")
+
+        with backend._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(workstreams.c.state, workstreams.c.updated).where(
+                    workstreams.c.ws_id == "ws-touch"
+                )
+            ).one()
+        assert row[0] == "closed", "state must not be modified by touch"
+        assert row[1] > "2024-01-01T00:00:00", "updated must be bumped"
+
+    def test_unknown_id_is_noop(self, backend):
+        """Touch on a missing id must not raise — open()'s exception
+        handler is best-effort."""
+        backend.touch_workstream("nonexistent")  # must not raise
 
 
 # -- Lifecycle -----------------------------------------------------------------
