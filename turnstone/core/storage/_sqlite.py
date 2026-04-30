@@ -97,7 +97,7 @@ from turnstone.core.storage._utils import sanitize_text
 from turnstone.core.storage._utils import (
     scan_skill_content as _scan_skill_content,
 )
-from turnstone.core.workstream import WorkstreamKind
+from turnstone.core.workstream import BULK_CLOSE_STATE_VALUES, WorkstreamKind
 
 log = get_logger(__name__)
 
@@ -704,6 +704,46 @@ class SQLiteBackend:
                 sa.update(workstreams)
                 .where(workstreams.c.ws_id == ws_id)
                 .values(state=state, updated=now)
+            )
+            conn.commit()
+
+    def bulk_close_stale_orphans(
+        self,
+        kind: WorkstreamKind | str,
+        cutoff: str,
+        exclude_ws_ids: list[str],
+        node_id: str | None = None,
+    ) -> list[str]:
+        norm_kind = WorkstreamKind(kind).value
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        # SQLite has no RETURNING precedent in this file — do SELECT-then-UPDATE
+        # in one transaction.  SQLite serializes writes so the two statements
+        # see consistent state.
+        select_stmt = sa.select(workstreams.c.ws_id).where(
+            workstreams.c.kind == norm_kind,
+            workstreams.c.state.in_(BULK_CLOSE_STATE_VALUES),
+            workstreams.c.updated < cutoff,
+        )
+        if node_id is not None:
+            select_stmt = select_stmt.where(workstreams.c.node_id == node_id)
+        if exclude_ws_ids:
+            select_stmt = select_stmt.where(~workstreams.c.ws_id.in_(exclude_ws_ids))
+        with self._conn() as conn:
+            ids = [row[0] for row in conn.execute(select_stmt)]
+            if ids:
+                conn.execute(
+                    sa.update(workstreams)
+                    .where(workstreams.c.ws_id.in_(ids))
+                    .values(state="closed", updated=now)
+                )
+            conn.commit()
+            return ids
+
+    def touch_workstream(self, ws_id: str) -> None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            conn.execute(
+                sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(updated=now)
             )
             conn.commit()
 
