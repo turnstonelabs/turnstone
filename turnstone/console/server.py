@@ -8001,11 +8001,10 @@ def _refresh_console_coord_registry(app_state: Any, storage: Any) -> None:
 
     The console-side coordinator session factory closes over the
     ``coord_registry`` instance built at lifespan startup
-    (see ``console/server.py``'s lifespan setup and
-    ``console/session_factory.py``).  Replacing the attribute would
-    orphan the closure — new sessions would still resolve through the
-    stale object.  Mutating in place via ``ModelRegistry.reload()``
-    preserves identity, so:
+    (see this module's lifespan setup and ``console/session_factory.py``).
+    Replacing the attribute would orphan the closure — new sessions would
+    still resolve through the stale object.  Mutating in place via
+    ``ModelRegistry.reload()`` preserves identity, so:
 
     - new coordinator sessions see the new state at create-time;
     - active coordinator sessions auto-pick up the swap at next ``send()``
@@ -8013,43 +8012,27 @@ def _refresh_console_coord_registry(app_state: Any, storage: Any) -> None:
       check compares ``cfg.model`` against ``self.model`` and re-resolves
       on mismatch).
 
-    No-op when ``coord_registry`` is ``None``.  Lifespan only sets it
-    when DB model rows existed at boot; with no rows the entire coord
-    subsystem stays disabled (no ``coord_mgr``, no ``coord_adapter``,
-    no ``session_factory`` — see the lifespan setup in this module).
-    Bootstrapping that whole stack on the fly is out of scope for this
-    helper, so a console restart remains required after the operator
-    adds the first model row.
-
     Errors are logged + swallowed.  The DB write that triggered this
     refresh has already succeeded, and the explicit reload button
     remains the user-facing recovery path.  Validation failures
     (e.g. admin deleted the alias that ``registry.default`` points at)
     leave the existing registry intact rather than tearing down a
     working coordinator.
-
-    DB read failures are detected by an explicit probe before calling
-    ``load_model_registry``: the loader swallows storage errors
-    internally and would otherwise return a config.toml-only registry,
-    which would silently drop DB-sourced aliases when applied via
-    ``ModelRegistry.reload``.
     """
     from turnstone.core.model_registry import load_model_registry
 
     existing = getattr(app_state, "coord_registry", None)
     if existing is None:
-        return
-    # Strict DB probe — load_model_registry swallows storage errors
-    # internally (logs + continues with config.toml-only models).  Without
-    # this fail-fast, a transient DB outage would let the helper apply a
-    # truncated registry that drops every DB-sourced alias.
-    try:
-        storage.list_model_definitions(enabled_only=True)
-    except Exception:
-        log.warning("console.coord_registry_refresh_db_probe_failed", exc_info=True)
+        # Lifespan didn't build a coord_registry (no DB model rows at boot)
+        # — the entire coord subsystem stayed uninitialized, so a console
+        # restart is required after the operator adds the first row.
         return
     try:
-        new_registry = load_model_registry(storage=storage)
+        # ``strict=True`` so a transient DB read error surfaces here.
+        # Without it, the loader degrades to a config.toml-only registry
+        # and ``existing.reload()`` would silently drop every DB-sourced
+        # alias.
+        new_registry = load_model_registry(storage=storage, strict=True)
     except ValueError:
         # All rows disabled/deleted — ModelRegistry.__init__ rejects an
         # empty model dict.  Leave the existing registry in place so
@@ -8074,9 +8057,14 @@ def _refresh_console_coord_registry(app_state: Any, storage: Any) -> None:
     except Exception:
         log.warning("console.coord_registry_refresh_reload_failed", exc_info=True)
     finally:
-        # Close any clients the throwaway registry created during DB
-        # load, regardless of whether the in-place reload succeeded.
-        new_registry.shutdown()
+        # Close any clients the throwaway registry created during DB load.
+        # An exception here would otherwise escape after a successful
+        # in-place reload, surfacing as 500 with the registry actually
+        # mutated and the audit row recording success.
+        try:
+            new_registry.shutdown()
+        except Exception:
+            log.warning("console.coord_registry_refresh_shutdown_failed", exc_info=True)
 
 
 async def _notify_nodes_model_reload(request: Request) -> dict[str, Any]:

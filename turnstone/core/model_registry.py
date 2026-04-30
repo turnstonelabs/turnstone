@@ -300,6 +300,7 @@ def load_model_registry(
     context_window: int = 32768,
     provider: str = "openai",
     storage: Any | None = None,
+    strict: bool = False,
 ) -> ModelRegistry:
     """Build a ModelRegistry from CLI args, ``config.toml``, and database.
 
@@ -317,6 +318,15 @@ def load_model_registry(
        ``[model].plan_effort``, ``[model].task_effort`` control routing.
        ``plan_model``/``task_model`` override ``agent_model`` per sub-agent
        role; both fall back to it when unset.
+
+    ``strict``: when True, a storage read failure during the DB-rows step
+    re-raises instead of degrading to a config.toml-only registry.
+    Callers that hot-reload an existing registry need this so a transient
+    DB outage doesn't silently drop every DB-sourced alias when the
+    truncated result is applied via ``ModelRegistry.reload``.  Callers
+    that build a fresh registry from scratch (CLI, lifespan startup) want
+    the default behaviour — boot succeeds with a config-only fallback
+    rather than crashing on a flaky DB.
     """
     import json as _json
 
@@ -370,6 +380,8 @@ def load_model_registry(
                     server_compat=row_server_compat,
                 )
         except Exception:
+            if strict:
+                raise
             log.warning("Failed to load model definitions from storage", exc_info=True)
 
     # 2. Build configs from [models.*] sections (overrides DB for same alias)
