@@ -8033,12 +8033,13 @@ def _refresh_coord_registry(app_state: Any, storage: Any) -> None:
         # and ``existing.reload()`` would silently drop every DB-sourced
         # alias.
         new_registry = load_model_registry(storage=storage, strict=True)
-    except ValueError:
-        # All rows disabled/deleted — ModelRegistry.__init__ rejects an
-        # empty model dict.  Leave the existing registry in place so
-        # active coord sessions stay usable; the operator will see the
-        # empty state in the model-definitions UI.
-        log.warning("console.coord_registry_refresh_skipped reason=no_enabled_rows")
+    except ValueError as exc:
+        # ModelRegistry.__init__ raises ValueError for several distinct
+        # config issues — empty models, default/fallback/agent/plan/task
+        # alias not present in the loaded set.  Log the actual reason so
+        # operators can tell "no enabled rows" from "default alias typo
+        # in config.toml".  Existing registry stays in place either way.
+        log.warning("console.coord_registry_refresh_skipped reason=%s", exc)
         return
     except Exception:
         log.warning("console.coord_registry_refresh_load_failed", exc_info=True)
@@ -8057,10 +8058,14 @@ def _refresh_coord_registry(app_state: Any, storage: Any) -> None:
     except Exception:
         log.warning("console.coord_registry_refresh_reload_failed", exc_info=True)
     finally:
-        # Close any clients the throwaway registry created during DB load.
-        # An exception here would otherwise escape after a successful
-        # in-place reload, surfacing as 500 with the registry actually
-        # mutated and the audit row recording success.
+        # Defensive — load_model_registry doesn't eagerly create clients
+        # (ModelRegistry.__init__ leaves _clients/_providers empty; they
+        # populate lazily on first resolve), so shutdown() iterates empty
+        # dicts in practice.  Kept against the day the loader grows
+        # eager-init or a future caller pre-warms the throwaway, and
+        # wrapped because shutdown() in finally would otherwise escape
+        # after a successful in-place reload — surfacing as 500 with the
+        # registry actually mutated and the audit row recording success.
         try:
             new_registry.shutdown()
         except Exception:
