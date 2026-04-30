@@ -3178,8 +3178,11 @@
     if (ev.node_id) existing.node_id = ev.node_id;
     childrenState.set(childId, existing);
     _touchChild(childId);
-    // pending_approval_detail rides on every ws_state event (see
-    // turnstone/server.py WebUI._broadcast_state) so we mutate
+    // pending_approval_detail rides on the ws_state event when an
+    // approval is pending (see turnstone/server.py
+    // WebUI._broadcast_state — gated on ``_pending_approval is not
+    // None``, so absent on the steady state and possibly null on a
+    // node mid-rolling-upgrade).  When present we mutate
     // liveBadgeCache directly here — inline approve/deny buttons
     // render in lockstep with the activity_state transition without
     // a separate live-bulk fetch.  The cache entry is tagged
