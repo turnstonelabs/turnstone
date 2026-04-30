@@ -312,6 +312,29 @@ class TerminalUI(SessionUI):
         sys.stdout.write(f"{RED}{message}{RESET}\n")
         sys.stdout.flush()
 
+    def _print_reminder(self, reminders: list[dict[str, str]]) -> None:
+        """Render a metacognitive reminder list as ``[metacognition · type] text``
+        lines in the terminal — the CLI's equivalent of the web UI's
+        yellow themed bubble.  Used by both ``on_user_reminder`` and
+        ``on_tool_reminder``; the rendering is identical because
+        terminal output is anchor-by-flow rather than DOM-by-anchor.
+        """
+        for r in reminders:
+            nt = str(r.get("type", "") or "")
+            text = str(r.get("text", "") or "")
+            label = "metacognition" + (f" · {nt}" if nt else "")
+            sys.stdout.write(f"{YELLOW}[{label}]{RESET} {text}\n")
+        sys.stdout.flush()
+
+    def on_user_reminder(self, reminders: list[dict[str, str]]) -> None:
+        self._print_reminder(reminders)
+
+    def on_tool_reminder(self, reminders: list[dict[str, str]], tool_call_id: str) -> None:
+        # tool_call_id ignored — the CLI anchors by output sequence
+        # (the line lands directly after the tool result that
+        # triggered the batch's reminder).
+        self._print_reminder(reminders)
+
     def on_state_change(self, state: str) -> None:
         pass  # base TerminalUI ignores state changes
 
