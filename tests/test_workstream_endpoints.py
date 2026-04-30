@@ -899,6 +899,138 @@ class TestHistoryInteractive:
         assert client.get(base, params={"limit": 999}).status_code == 200
 
 
+class TestBuildHistoryReminderPropagation:
+    """``_build_history`` must surface the ``_reminders`` side-channel on
+    each entry so a tab reconnecting via ``/history`` renders the same
+    metacognitive nudge bubble the originating tab saw via the live
+    ``user_reminder`` SSE event.
+    """
+
+    def _session_with_messages(self, messages: list[dict]) -> MagicMock:
+        session = MagicMock()
+        session.messages = messages
+        return session
+
+    def test_reminders_sidechannel_surfaces_on_entry(self):
+        from turnstone.server import _build_history
+
+        session = self._session_with_messages(
+            [
+                {
+                    "role": "user",
+                    "content": "ah no",
+                    "_reminders": [{"type": "correction", "text": "watch out"}],
+                }
+            ]
+        )
+        history = _build_history(session)
+        assert history[0]["content"] == "ah no"
+        assert history[0]["reminders"] == [{"type": "correction", "text": "watch out"}]
+
+    def test_no_reminders_key_when_sidechannel_absent(self):
+        from turnstone.server import _build_history
+
+        session = self._session_with_messages([{"role": "user", "content": "just a message"}])
+        history = _build_history(session)
+        assert "reminders" not in history[0]
+
+    def test_no_reminders_key_when_sidechannel_empty(self):
+        from turnstone.server import _build_history
+
+        session = self._session_with_messages([{"role": "user", "content": "hi", "_reminders": []}])
+        history = _build_history(session)
+        assert "reminders" not in history[0]
+
+    def test_multiple_reminders_preserved_in_order(self):
+        from turnstone.server import _build_history
+
+        session = self._session_with_messages(
+            [
+                {
+                    "role": "user",
+                    "content": "x",
+                    "_reminders": [
+                        {"type": "denial", "text": "FIRST"},
+                        {"type": "correction", "text": "SECOND"},
+                    ],
+                }
+            ]
+        )
+        history = _build_history(session)
+        assert history[0]["reminders"] == [
+            {"type": "denial", "text": "FIRST"},
+            {"type": "correction", "text": "SECOND"},
+        ]
+
+    def test_reminders_coexist_with_attachments(self):
+        from turnstone.server import _build_history
+
+        session = self._session_with_messages(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "look"},
+                        {"type": "image_url", "image_url": {"url": "data:..."}},
+                    ],
+                    "_reminders": [{"type": "correction", "text": "watch"}],
+                }
+            ]
+        )
+        history = _build_history(session)
+        assert history[0]["content"] == "look"
+        assert history[0]["attachments"] == [{"kind": "image", "filename": "", "mime_type": ""}]
+        assert history[0]["reminders"] == [{"type": "correction", "text": "watch"}]
+
+    def test_malformed_reminders_filtered_out(self):
+        """Defensive: a non-dict element in the list (corruption / bug)
+        is dropped rather than crashing the history serialisation."""
+        from turnstone.server import _build_history
+
+        session = self._session_with_messages(
+            [
+                {
+                    "role": "user",
+                    "content": "x",
+                    "_reminders": [
+                        {"type": "correction", "text": "ok"},
+                        "not-a-dict",
+                        {"type": "denial"},  # missing text
+                    ],
+                }
+            ]
+        )
+        history = _build_history(session)
+        # Non-dicts dropped; missing-text fills with empty string.
+        assert history[0]["reminders"] == [
+            {"type": "correction", "text": "ok"},
+            {"type": "denial", "text": ""},
+        ]
+
+    def test_clean_message_passes_through_unchanged(self):
+        """No reminders, plain content — _build_history is a no-op for the
+        reminder field and ``content`` rides through verbatim."""
+        from turnstone.server import _build_history
+
+        session = self._session_with_messages(
+            [{"role": "user", "content": "just a normal message"}]
+        )
+        history = _build_history(session)
+        assert history[0]["content"] == "just a normal message"
+        assert "reminders" not in history[0]
+
+    def test_assistant_content_with_literal_reminder_tag_unchanged(self):
+        """Assistant output may legitimately reference the tag (e.g. when
+        the model is explaining the reminder system itself).  No
+        transformation should ever apply to assistant content."""
+        from turnstone.server import _build_history
+
+        content = "Here is a <system-reminder> tag in assistant output."
+        session = self._session_with_messages([{"role": "assistant", "content": content}])
+        history = _build_history(session)
+        assert history[0]["content"] == content
+
+
 class TestDetailInteractive:
     """Interactive parity for the lifted ``GET /v1/api/workstreams/{ws_id}``.
 

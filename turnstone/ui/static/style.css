@@ -642,6 +642,28 @@
 .msg.user {
   color: var(--fg-bright);
 }
+/* Metacognitive reminder — pinned above the user message it advises.
+   Yellow accent reads as "advisory metadata" against the amber-ish
+   user colour and the cyan tool cards; deliberately quieter than the
+   user bubble so it doesn't compete for attention. */
+.msg.user-reminder {
+  align-self: flex-end;
+  max-width: min(78ch, 100%);
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--yellow);
+  color: var(--fg-dim);
+  font-size: 12px;
+  padding: 6px 10px;
+  margin-bottom: 2px;
+  white-space: pre-wrap;
+}
+.msg.user-reminder .msg-user-reminder-label {
+  color: var(--yellow);
+  font-weight: 600;
+  margin-right: 6px;
+  text-transform: lowercase;
+}
 /* .msg.assistant / .msg.info / .msg.error alignment + baseline visuals
    come from shared_static/chat.css.  Interactive UI adds a pre-wrap
    override for info messages and a tightened tool-message shape with
