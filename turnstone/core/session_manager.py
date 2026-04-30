@@ -29,6 +29,22 @@ if TYPE_CHECKING:
 log = get_logger(__name__)
 
 
+# Maps each workstream kind to the ``services.service_type`` its hosting
+# process registers under.  Used by ``SessionManager.close_idle`` pass 2
+# to enumerate live peer processes for orphan-reaper liveness scoping.
+# Server processes register as ``("server", node_id, ...)`` (see
+# ``turnstone/server.py``); the console process as ``("console",
+# "console", ...)`` (see ``turnstone/console/server.py``).  Deriving from
+# kind here removes a duplicated-config footgun: any caller that builds
+# a ``SessionManager`` automatically gets the correct service_type for
+# its kind, with no risk of miswiring INTERACTIVE→"console" or vice
+# versa.
+_KIND_SERVICE_TYPE: dict[WorkstreamKind, str] = {
+    WorkstreamKind.INTERACTIVE: "server",
+    WorkstreamKind.COORDINATOR: "console",
+}
+
+
 class SessionKindAdapter(Protocol):
     """Per-kind construction + cleanup policies the shared ``SessionManager`` delegates to.
 
@@ -217,6 +233,16 @@ class SessionManager:
     @property
     def kind(self) -> WorkstreamKind:
         return self._adapter.kind
+
+    @property
+    def _service_type(self) -> str | None:
+        """``services.service_type`` this manager's hosting process registers
+        under, derived from its ``kind``.  Used by ``close_idle`` pass 2 to
+        enumerate live peer processes.  Returns ``None`` for kinds that have
+        no production service mapping (only the two existing kinds map
+        today; ``None`` would be a marker for a future kind without a
+        clustered hosting model)."""
+        return _KIND_SERVICE_TYPE.get(self.kind)
 
     @property
     def count(self) -> int:
@@ -834,7 +860,26 @@ class SessionManager:
           /restart leaves rows in non-terminal states forever
           otherwise.  Closes ``idle/thinking/attention/running``
           because any matching row is by definition not loaded by any
-          process and cannot be in a live interaction.
+          live process and cannot be in a live interaction.
+
+          **Liveness scoping** (the rendezvous router's primitive
+          since PR #384): when ``self._service_type`` resolves to a
+          known service type — both production kinds do — pass 2
+          calls ``storage.list_services`` to enumerate peer processes
+          with recent heartbeats and protects rows whose ``node_id``
+          matches a live ``service_id`` from reap, even when *this*
+          manager is on a different node.  This is essential for
+          containerized deployments with dynamic hostnames: dead-pod
+          rows fall out of the live set after the heartbeat window
+          and become reapable; alive-pod rows stay protected as long
+          as the owner heartbeats.  A future kind with no service
+          registration would resolve ``_service_type`` to ``None``
+          and skip the live-services lookup (single-process / CLI).
+
+          **Conservative fallback**: if ``list_services`` raises,
+          pass 2 is skipped entirely this tick — never reap when
+          liveness state is unknown.  Pass 1 still runs.  Next tick
+          retries the lookup.
 
         Returns the combined list of closed ws_ids (in-memory first,
         then DB orphans).  Pass 1 emits ``ws_closed``; pass 2 does
@@ -892,22 +937,52 @@ class SessionManager:
         # Pass 2: reap DB orphans of this kind older than the cutoff.
         # Snapshot loaded keys under self._lock briefly so a concurrent
         # create/load doesn't get its row clobbered by the UPDATE; release
-        # before the DB call.  Scope by self._node_id so a sibling process
-        # on another node can't reap rows we own (multi-node interactive).
+        # before the DB call.
+        #
+        # Liveness scoping uses ``services.last_heartbeat`` — the same
+        # primitive the rendezvous router (PR #384) uses for routing.  A
+        # row's ``node_id`` is stamped at create time and never updated;
+        # in containerized deployments with dynamic hostnames the dead
+        # pod's ``node_id`` points at a service that's no longer
+        # heartbeating, so the row falls through to reap.  Conversely,
+        # rows whose ``node_id`` matches a heartbeating service are
+        # protected even when *this* manager is on a different node —
+        # the alive peer may legitimately have them loaded.
         with self._lock:
             loaded = list(self._workstreams.keys())
         cutoff = (datetime.now(UTC) - timedelta(seconds=max_age_seconds)).strftime(
             "%Y-%m-%dT%H:%M:%S"
         )
-        try:
-            orphans = self._storage.bulk_close_stale_orphans(
-                self.kind, cutoff, loaded, node_id=self._node_id
-            )
-        except Exception:
-            log.debug(
-                "session_mgr.bulk_close_orphans_failed kind=%s", self.kind.value, exc_info=True
-            )
-            orphans = []
+        live_node_ids: list[str] | None = None
+        skip_pass_2 = False
+        if self._service_type is not None:
+            try:
+                live_services = self._storage.list_services(self._service_type)
+                live_node_ids = [
+                    str(svc["service_id"]) for svc in live_services if svc.get("service_id")
+                ]
+            except Exception:
+                # Conservative fallback: skip pass 2 entirely this tick
+                # so we can't accidentally reap rows whose owners we
+                # failed to enumerate.  Next tick retries.
+                log.debug(
+                    "session_mgr.list_services_failed kind=%s",
+                    self.kind.value,
+                    exc_info=True,
+                )
+                skip_pass_2 = True
+        orphans: list[str] = []
+        if not skip_pass_2:
+            try:
+                orphans = self._storage.bulk_close_stale_orphans(
+                    self.kind, cutoff, loaded, live_node_ids=live_node_ids
+                )
+            except Exception:
+                log.debug(
+                    "session_mgr.bulk_close_orphans_failed kind=%s",
+                    self.kind.value,
+                    exc_info=True,
+                )
         if orphans:
             log.info(
                 "session_mgr.bulk_close_orphans count=%d kind=%s",

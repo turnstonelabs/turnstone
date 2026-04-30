@@ -600,7 +600,7 @@ class PostgreSQLBackend:
         kind: WorkstreamKind | str,
         cutoff: str,
         exclude_ws_ids: list[str],
-        node_id: str | None = None,
+        live_node_ids: list[str] | None = None,
     ) -> list[str]:
         norm_kind = WorkstreamKind(kind).value
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
@@ -614,11 +614,20 @@ class PostgreSQLBackend:
             .values(state="closed", updated=now)
             .returning(workstreams.c.ws_id)
         )
-        if node_id is not None:
-            # Multi-node interactive: each node only reaps rows it owns;
-            # ``workstreams.node_id`` is the routing-layer authority assigned
-            # at register time.
-            stmt = stmt.where(workstreams.c.node_id == node_id)
+        # Protect rows whose owning process is still heartbeating in the
+        # services table (rendezvous router's liveness primitive).  NULL
+        # node_id rows have no owner identity — always eligible.  The
+        # ``and live_node_ids`` short-circuits both ``None`` (skip the
+        # filter entirely — single-process / operator backfill) and ``[]``
+        # (no nodes alive — every row unprotected, no extra predicate
+        # needed since absence equals match-all).
+        if live_node_ids is not None and live_node_ids:
+            stmt = stmt.where(
+                sa.or_(
+                    workstreams.c.node_id.is_(None),
+                    ~workstreams.c.node_id.in_(live_node_ids),
+                )
+            )
         if exclude_ws_ids:
             # Skip ``NOT IN ()`` when nothing to exclude — keeps the SQL clean
             # and avoids SQLAlchemy's empty-collection warning.
