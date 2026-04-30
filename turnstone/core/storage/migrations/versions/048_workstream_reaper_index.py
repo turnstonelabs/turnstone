@@ -7,7 +7,7 @@ on every server and console process.  Its WHERE shape is:
     WHERE kind = ?
       AND state IN ('idle', 'thinking', 'attention', 'running')
       AND updated < ?
-      AND node_id = ?           -- multi-node interactive only
+      AND (node_id IS NULL OR node_id NOT IN (alive_service_ids))
 
 At current scale (low-thousands of workstream rows) the existing single-
 column indexes are sufficient — ``idx_workstreams_state`` prunes to the
@@ -18,21 +18,22 @@ periodic run.
 A **partial** index covering only ``BULK_CLOSE_STATE_VALUES`` rows
 matches the reaper's query exactly while staying tiny — closed rows
 (typically 95%+ of the table per empirical diagnosis) and ``error``
-rows are excluded, so the index is roughly 5% the size of a full
-multi-column index would be.  Write amplification only kicks in for
-transitions that touch one of the four covered states; pure
-closed→closed updates (none today) and error-state writes don't pay
-the cost.
+rows are excluded, so the index is roughly 5% the size a full multi-
+column index would be.  Write amplification only kicks in for
+transitions that touch one of the four covered states.
 
-Column order ``(node_id, kind, updated)``:
+Column order ``(kind, updated)``:
 
-- ``node_id`` first because multi-node interactive partitions rows by
-  node, so equality on it is the most selective filter for the common
-  reaper invocation (each server prunes to its own node's rows).
-- ``kind`` second so coord-only and interactive-only queries within a
-  node still get index-only scans.
+- ``kind`` first because the reaper always supplies it as an equality
+  predicate; partitions the partial index into interactive vs
+  coordinator subtrees.
 - ``updated`` last so the range comparison rides the trailing column —
-  classic composite-index pattern for ``WHERE eq AND eq AND range``.
+  classic composite-index pattern for ``WHERE eq AND range``.
+
+``node_id`` is intentionally NOT in the index.  The reaper's predicate
+on it is ``NOT IN (small list)`` against an unbounded-cardinality
+column, which planners don't index well; including it would just add
+write cost for negligible read benefit.
 
 PostgreSQL uses ``CREATE INDEX CONCURRENTLY`` so the build is
 non-blocking on a live system; SQLite has no concurrent concept and
@@ -64,14 +65,14 @@ def upgrade() -> None:
         with op.get_context().autocommit_block():
             op.execute(
                 "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_workstreams_reaper "
-                "ON workstreams (node_id, kind, updated) "
+                "ON workstreams (kind, updated) "
                 f"WHERE {_REAPER_PARTIAL_WHERE}"
             )
     else:
         op.create_index(
             "idx_workstreams_reaper",
             "workstreams",
-            ["node_id", "kind", "updated"],
+            ["kind", "updated"],
             sqlite_where=sa.text(_REAPER_PARTIAL_WHERE),
         )
 

@@ -436,7 +436,7 @@ class StorageBackend(Protocol):
         kind: WorkstreamKind | str,
         cutoff: str,
         exclude_ws_ids: list[str],
-        node_id: str | None = None,
+        live_node_ids: list[str] | None = None,
     ) -> list[str]:
         """Close DB-side workstream rows of *kind* whose state is in
         ``BULK_CLOSE_STATE_VALUES`` and whose ``updated`` is lex-older than
@@ -448,18 +448,30 @@ class StorageBackend(Protocol):
         format ``update_workstream_state`` writes — lex compare is safe for
         same-offset timestamps.  Empty ``exclude_ws_ids`` means no exclusion.
 
-        ``node_id`` scopes the reap to rows owned by a single node — required
-        for multi-node interactive deployments, where each node only has
-        authority over its own ``workstreams.node_id`` partition.  Pass
-        ``None`` to skip the node filter (single-process console / tests /
-        operator backfill scripts).
+        ``live_node_ids`` is the set of ``services.service_id`` values whose
+        ``last_heartbeat`` is recent (i.e. owning processes still alive);
+        rows whose ``node_id`` matches one of these are protected because
+        their owning process may legitimately have them loaded on another
+        worker.  ``None`` skips the filter entirely (single-process / tests
+        / operator backfill).  Empty list ``[]`` treats every node as dead —
+        useful when operator scripts want to reap regardless of liveness.
+
+        Rows with ``NULL`` ``node_id`` are always eligible: they have no
+        meaningful owner identity, so age alone gates the reap.
+
+        Liveness scoping replaces an earlier ``node_id == self`` heuristic.
+        That heuristic broke in the post-rendezvous-routing world (PR #384):
+        ``workstreams.node_id`` is stamped at create time and never updated,
+        so dead-pod orphans in containerized deployments with dynamic
+        hostnames couldn't be reclaimed.  ``services.last_heartbeat`` is the
+        rendezvous router's authoritative liveness primitive — using it here
+        keeps reap scoping aligned with routing.
 
         Asymmetric with ``SessionManager.close_idle``'s in-memory pass on
         purpose: that pass closes only ``IDLE`` (legitimately-attentive rows
         stay), this method closes the broader ``BULK_CLOSE_STATE_VALUES`` set
-        because any row matching here is — for the scoped node — by definition
-        not loaded and cannot be in a live interaction (its owning process
-        died with the transient state unresolved).
+        because any row matching here is by definition not loaded by any
+        live process and cannot be in a live interaction.
         """
         ...
 

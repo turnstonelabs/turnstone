@@ -712,7 +712,7 @@ class SQLiteBackend:
         kind: WorkstreamKind | str,
         cutoff: str,
         exclude_ws_ids: list[str],
-        node_id: str | None = None,
+        live_node_ids: list[str] | None = None,
     ) -> list[str]:
         norm_kind = WorkstreamKind(kind).value
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
@@ -724,8 +724,17 @@ class SQLiteBackend:
             workstreams.c.state.in_(BULK_CLOSE_STATE_VALUES),
             workstreams.c.updated < cutoff,
         )
-        if node_id is not None:
-            select_stmt = select_stmt.where(workstreams.c.node_id == node_id)
+        if live_node_ids is not None and live_node_ids:
+            # Protect rows owned by heartbeating services.  NULL node_id is
+            # always eligible.  Empty list means "no nodes alive" — every
+            # row is unprotected; the absence of this predicate is
+            # equivalent to "match all," so we just skip it.
+            select_stmt = select_stmt.where(
+                sa.or_(
+                    workstreams.c.node_id.is_(None),
+                    ~workstreams.c.node_id.in_(live_node_ids),
+                )
+            )
         if exclude_ws_ids:
             select_stmt = select_stmt.where(~workstreams.c.ws_id.in_(exclude_ws_ids))
         with self._conn() as conn:

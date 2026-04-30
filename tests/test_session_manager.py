@@ -175,6 +175,12 @@ class FakeStorage:
         self.touch_calls: list[str] = []
         self.register_raises = False
         self.lock = threading.Lock()
+        # Live-services lookup target for close_idle pass 2.  Map
+        # service_type → list of live service_ids.  Tests that exercise
+        # liveness scoping populate this directly; default empty means
+        # "no peers alive" (every row unprotected by liveness).
+        self.live_services: dict[str, list[str]] = {}
+        self.list_services_raises = False
 
     @staticmethod
     def _now_iso() -> str:
@@ -227,10 +233,11 @@ class FakeStorage:
         kind: WorkstreamKind | str,
         cutoff: str,
         exclude_ws_ids: list[str],
-        node_id: str | None = None,
+        live_node_ids: list[str] | None = None,
     ) -> list[str]:
         kind_str = kind.value if isinstance(kind, WorkstreamKind) else str(kind)
         excluded = set(exclude_ws_ids)
+        live_set = set(live_node_ids) if live_node_ids else set()
         now = self._now_iso()
         closed: list[str] = []
         with self.lock:
@@ -240,13 +247,28 @@ class FakeStorage:
                     and row.state in BULK_CLOSE_STATE_VALUES
                     and row.updated < cutoff
                     and ws_id not in excluded
-                    and (node_id is None or row.node_id == node_id)
                 ):
+                    # Liveness gate: when live_node_ids was provided AND
+                    # non-empty, protect rows whose owner is in the live
+                    # set.  NULL node_id is always eligible.  When
+                    # live_node_ids is None or empty, no protection
+                    # (mirror of the real backends).
+                    if live_node_ids and row.node_id is not None and row.node_id in live_set:
+                        continue
                     row.state = "closed"
                     row.updated = now
                     self.state_updates.append((ws_id, "closed"))
                     closed.append(ws_id)
         return closed
+
+    def list_services(self, service_type: str, max_age_seconds: int = 120) -> list[dict[str, str]]:
+        if self.list_services_raises:
+            raise RuntimeError("list_services forced failure")
+        with self.lock:
+            return [
+                {"service_id": sid, "service_type": service_type}
+                for sid in self.live_services.get(service_type, [])
+            ]
 
     def get_workstream(self, ws_id: str) -> dict[str, Any] | None:
         with self.lock:
@@ -968,21 +990,26 @@ def test_close_idle_filters_db_orphans_by_kind() -> None:
     assert storage.rows["interactive-orphan"].state == "closed"
 
 
-def test_close_idle_scopes_db_orphan_pass_to_self_node_id() -> None:
-    """Multi-node correctness: each node's close_idle must only reap rows
-    it owns.  Without node_id scoping, sibling nodes race to close each
-    other's loaded workstreams (a row may be IDLE on node A and stale-
-    looking from node B's perspective if no set_state has fired
-    recently)."""
-    mgr, _, storage = _make_manager(node_id="node-a")
+def test_close_idle_protects_rows_owned_by_live_services() -> None:
+    """Multi-node correctness: rows whose ``node_id`` matches a service
+    with a recent heartbeat must NOT be reaped, even when *this* manager
+    is on a different node — the alive peer may legitimately have them
+    loaded.  Liveness is the rendezvous router's primitive (post-PR-#384);
+    using it here keeps reap scoping aligned with routing.
+
+    Default ``_make_manager`` uses an INTERACTIVE adapter, which derives
+    ``service_type='server'`` — so live_services seeded under "server"
+    are what the manager queries."""
+    mgr, _, storage = _make_manager()
+    storage.live_services["server"] = ["node-b"]  # only node-b is alive
     storage.register_workstream(
-        "ours",
-        node_id="node-a",
+        "ours-from-dead-node",
+        node_id="node-a",  # dead pod (not in live_services)
         kind=WorkstreamKind.INTERACTIVE,
         updated="2020-01-01T00:00:00",
     )
     storage.register_workstream(
-        "theirs",
+        "theirs-still-alive",
         node_id="node-b",
         kind=WorkstreamKind.INTERACTIVE,
         updated="2020-01-01T00:00:00",
@@ -990,15 +1017,63 @@ def test_close_idle_scopes_db_orphan_pass_to_self_node_id() -> None:
 
     closed = mgr.close_idle(max_age_seconds=0.0)
 
-    assert closed == ["ours"]
-    assert storage.rows["ours"].state == "closed"
-    assert storage.rows["theirs"].state == "idle"
+    assert closed == ["ours-from-dead-node"]
+    assert storage.rows["ours-from-dead-node"].state == "closed"
+    assert storage.rows["theirs-still-alive"].state == "idle"
 
 
-def test_close_idle_with_no_node_id_reaps_all_rows() -> None:
-    """``node_id=None`` (single-process console / tests / backfill) skips
-    the node filter — any orphan of the right kind gets reaped."""
-    mgr, _, storage = _make_manager()  # node_id=None by default
+def test_close_idle_protects_live_services_for_coordinator_kind() -> None:
+    """Coord-side parity: a coordinator manager derives
+    ``service_type='console'``, so live_services seeded under "console"
+    are what gets queried.  Mirrors the interactive test to ensure both
+    halves of the production wiring are exercised."""
+    coord_adapter = FakeAdapter(kind=WorkstreamKind.COORDINATOR)
+    mgr, _, storage = _make_manager(coord_adapter)
+    storage.live_services["console"] = ["console"]  # console is alive
+    storage.register_workstream(
+        "alive-console-coord",
+        node_id="console",
+        kind=WorkstreamKind.COORDINATOR,
+        updated="2020-01-01T00:00:00",
+    )
+    storage.register_workstream(
+        "dead-console-coord",
+        node_id="dead-console-instance",  # not in live set
+        kind=WorkstreamKind.COORDINATOR,
+        updated="2020-01-01T00:00:00",
+    )
+
+    closed = mgr.close_idle(max_age_seconds=0.0)
+
+    assert closed == ["dead-console-coord"]
+    assert storage.rows["alive-console-coord"].state == "idle"
+    assert storage.rows["dead-console-coord"].state == "closed"
+
+
+def test_close_idle_reaps_rows_with_null_node_id() -> None:
+    """A row with no ``node_id`` has no owner identity — age alone gates
+    the reap.  Defends against a NULL silently propagating through ``NOT
+    IN (live)`` and protecting orphans forever."""
+    mgr, _, storage = _make_manager()
+    storage.live_services["server"] = ["node-a"]
+    storage.register_workstream(
+        "no-owner",
+        node_id=None,
+        kind=WorkstreamKind.INTERACTIVE,
+        updated="2020-01-01T00:00:00",
+    )
+
+    closed = mgr.close_idle(max_age_seconds=0.0)
+
+    assert closed == ["no-owner"]
+
+
+def test_close_idle_reaps_all_orphans_when_no_peers_alive() -> None:
+    """When ``list_services`` returns an empty list (no heartbeating
+    peers), every stale orphan is unprotected and gets reaped.  This is
+    the cold-start / single-process / dead-cluster-recovery case."""
+    mgr, _, storage = _make_manager()
+    # storage.live_services["server"] left empty — no peers heartbeating
     storage.register_workstream(
         "any-node-1",
         node_id="node-a",
@@ -1015,6 +1090,25 @@ def test_close_idle_with_no_node_id_reaps_all_rows() -> None:
     closed = mgr.close_idle(max_age_seconds=0.0)
 
     assert set(closed) == {"any-node-1", "any-node-2"}
+
+
+def test_close_idle_skips_pass_2_when_list_services_fails() -> None:
+    """Conservative fallback: if list_services fails we can't enumerate
+    live owners safely, so pass 2 must skip rather than reap blind.  Pass
+    1 (in-memory IDLE) still runs."""
+    mgr, _, storage = _make_manager()
+    storage.list_services_raises = True
+    storage.register_workstream(
+        "would-be-orphan",
+        node_id="node-a",
+        kind=WorkstreamKind.INTERACTIVE,
+        updated="2020-01-01T00:00:00",
+    )
+
+    closed = mgr.close_idle(max_age_seconds=0.0)
+
+    assert closed == []
+    assert storage.rows["would-be-orphan"].state == "idle"
 
 
 def test_list_all_returns_creation_order() -> None:
