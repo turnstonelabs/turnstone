@@ -147,19 +147,44 @@ def test_helper_noop_when_coord_registry_none(storage: SQLiteBackend) -> None:
 def test_helper_preserves_registry_when_load_fails(
     storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Storage failure during rebuild must not tear down a working
+    """An unexpected error from ``load_model_registry`` (e.g. config.toml
+    parse failure, programming bug) must not tear down a working
     registry — log + leave the existing instance intact."""
     state = _AppState()
     state.coord_registry = _make_registry(alias="local", model="old-model")
 
     def _boom(**_kw: Any) -> ModelRegistry:
-        raise RuntimeError("simulated storage outage")
+        raise RuntimeError("simulated loader failure")
 
     monkeypatch.setattr("turnstone.core.model_registry.load_model_registry", _boom)
     _refresh_console_coord_registry(state, storage)
 
     assert state.coord_registry is not None
     assert state.coord_registry.get_config("local").model == "old-model"
+
+
+def test_helper_preserves_registry_when_db_probe_fails(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``load_model_registry`` swallows storage read errors internally
+    and would return a config.toml-only registry on a transient DB
+    outage — applying that via ``reload()`` would silently drop every
+    DB-sourced alias.  The explicit probe in the helper turns that
+    failure into a no-op so the existing registry survives."""
+    _seed_model_def(storage, definition_id="m1", alias="local", model="db-model")
+    state = _AppState()
+    state.coord_registry = _make_registry(alias="local", model="db-model")
+
+    def _broken(**_kw: Any) -> Any:
+        raise RuntimeError("simulated transient DB outage")
+
+    monkeypatch.setattr(storage, "list_model_definitions", _broken)
+    _refresh_console_coord_registry(state, storage)
+
+    assert state.coord_registry is not None
+    # Existing registry untouched — the probe caught the failure before
+    # the loader's silent fallback could mutate registry state.
+    assert state.coord_registry.get_config("local").model == "db-model"
 
 
 def test_helper_preserves_registry_when_no_enabled_rows(storage: SQLiteBackend) -> None:
