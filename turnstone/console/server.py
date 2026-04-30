@@ -2453,7 +2453,7 @@ def _require_admin_coordinator(
     )
 
 
-def _resolve_coordinator_or_404(
+async def _resolve_coordinator_or_404(
     request: Request,
     coord_mgr: Any,
     storage: Any,
@@ -2484,7 +2484,11 @@ def _resolve_coordinator_or_404(
         if storage is None:
             return None, miss
         try:
-            row = storage.get_workstream(ws_id)
+            # Cold-cache path (every console restart, eviction, console
+            # proxy hop) — offload the sync DB call so the coord
+            # children/tasks handlers don't block the event loop on the
+            # same DB the rest of the handler is unblocking.
+            row = await asyncio.to_thread(storage.get_workstream, ws_id)
         except Exception:
             log.debug("resolve_coordinator.storage_failed ws=%s", ws_id[:8], exc_info=True)
             return None, miss
@@ -2910,7 +2914,7 @@ async def coordinator_children(request: Request) -> JSONResponse:
     if not _VALID_WS_ID_RE.match(ws_id):
         return JSONResponse({"error": "invalid ws_id"}, status_code=400)
     user_id = _auth_user_id(request)
-    _ws, err404 = _resolve_coordinator_or_404(request, coord_mgr, storage, ws_id, user_id)
+    _ws, err404 = await _resolve_coordinator_or_404(request, coord_mgr, storage, ws_id, user_id)
     if err404 is not None:
         return err404
 
@@ -2918,7 +2922,8 @@ async def coordinator_children(request: Request) -> JSONResponse:
     # the full child subtree.  ``user_id`` stays on each row as
     # metadata, not a filter.
     try:
-        raw = storage.list_workstreams(
+        raw = await asyncio.to_thread(
+            storage.list_workstreams,
             limit=_CHILDREN_PAGE_LIMIT + 1,
             parent_ws_id=ws_id,
             kind=None,
@@ -3033,7 +3038,7 @@ async def coordinator_metrics(request: Request) -> JSONResponse:
     if not _VALID_WS_ID_RE.match(ws_id):
         return JSONResponse({"error": "invalid ws_id"}, status_code=400)
     user_id = _auth_user_id(request)
-    _ws, err404 = _resolve_coordinator_or_404(request, coord_mgr, storage, ws_id, user_id)
+    _ws, err404 = await _resolve_coordinator_or_404(request, coord_mgr, storage, ws_id, user_id)
     if err404 is not None:
         return err404
 
@@ -3233,7 +3238,7 @@ async def _resolve_coord_session(
     if not _VALID_WS_ID_RE.match(ws_id):
         return JSONResponse({"error": "invalid ws_id"}, status_code=400)
     user_id = _auth_user_id(request)
-    ws, err404 = _resolve_coordinator_or_404(request, coord_mgr, storage, ws_id, user_id)
+    ws, err404 = await _resolve_coordinator_or_404(request, coord_mgr, storage, ws_id, user_id)
     if err404 is not None:
         return err404
     if ws is None or ws.session is None:
@@ -3523,11 +3528,11 @@ async def coordinator_tasks(request: Request) -> JSONResponse:
     if not _VALID_WS_ID_RE.match(ws_id):
         return JSONResponse({"error": "invalid ws_id"}, status_code=400)
     user_id = _auth_user_id(request)
-    _ws, err404 = _resolve_coordinator_or_404(request, coord_mgr, storage, ws_id, user_id)
+    _ws, err404 = await _resolve_coordinator_or_404(request, coord_mgr, storage, ws_id, user_id)
     if err404 is not None:
         return err404
 
-    envelope, _corrupt = load_task_envelope(storage, ws_id)
+    envelope, _corrupt = await asyncio.to_thread(load_task_envelope, storage, ws_id)
     return JSONResponse(envelope)
 
 
