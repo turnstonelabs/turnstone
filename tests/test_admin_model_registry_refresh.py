@@ -318,20 +318,32 @@ def test_update_endpoint_refreshes_registry(storage: SQLiteBackend) -> None:
     assert registry.get_config("local").model == "new-model"
 
 
-def test_update_endpoint_with_empty_body_does_not_blow_up(
-    storage: SQLiteBackend,
+def test_update_endpoint_skips_refresh_on_empty_body(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An empty PUT body skips the storage write (``if updates:``) and
-    therefore the registry refresh — registry stays at the prior state.
-    Locks the conditional so we don't accidentally do a no-op refresh
-    on every PUT (load_model_registry is non-trivial)."""
+    """An empty PUT body must skip the registry refresh — the
+    ``if updates:`` gate exists because ``load_model_registry`` is
+    non-trivial and a no-op refresh on every PUT would burn cycles
+    rebuilding state that hasn't changed.  Spy on the helper to lock
+    the gate down: a regression that drops the conditional would
+    register a call here and trip the assertion.
+    """
+    from turnstone.console import server as server_module
+
     _seed_model_def(storage, definition_id="m1", alias="local", model="locked-in")
     registry = _make_registry(alias="local", model="locked-in")
     client = _make_client(storage, registry)
 
+    calls: list[tuple[Any, Any]] = []
+
+    def _spy(app_state: Any, storage: Any) -> None:
+        calls.append((app_state, storage))
+
+    monkeypatch.setattr(server_module, "_refresh_console_coord_registry", _spy)
+
     resp = client.put("/v1/api/admin/model-definitions/m1", json={})
     assert resp.status_code == 200, resp.text
-    assert registry.get_config("local").model == "locked-in"
+    assert calls == []  # gate held: empty body did not trigger a refresh
 
 
 def test_delete_endpoint_refreshes_registry(storage: SQLiteBackend) -> None:
