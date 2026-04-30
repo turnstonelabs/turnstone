@@ -7,7 +7,7 @@ through the UI sees the DB change immediately but coordinator sessions
 keep calling the prior model name — the on-disk truth diverges from the
 in-process registry until the console is restarted.
 
-These tests cover both the helper (``_refresh_console_coord_registry``)
+These tests cover both the helper (``_refresh_coord_registry``)
 and the four wired endpoints (create / update / delete / explicit reload)
 to lock in:
 
@@ -28,18 +28,17 @@ from unittest.mock import MagicMock
 import pytest
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
+from tests._coord_test_helpers import _AuthMiddleware
 from turnstone.console.server import (
-    _refresh_console_coord_registry,
+    _refresh_coord_registry,
     admin_create_model_definition,
     admin_delete_model_definition,
     admin_model_reload,
     admin_update_model_definition,
 )
-from turnstone.core.auth import AuthResult
 from turnstone.core.model_registry import ModelConfig, ModelRegistry
 from turnstone.core.storage._sqlite import SQLiteBackend
 
@@ -77,13 +76,8 @@ def _seed_model_def(
     )
 
 
-def _make_registry(*, alias: str = "local", model: str = "old-model") -> ModelRegistry:
-    """Build a real ModelRegistry seeded with one alias.
-
-    ModelRegistry.__init__ rejects an empty model dict so tests that
-    want to exercise the helper need at least one entry.
-    """
-    cfg = ModelConfig(
+def _make_config(alias: str, model: str) -> ModelConfig:
+    return ModelConfig(
         alias=alias,
         base_url="http://localhost:8000/v1",
         api_key="sk-test",
@@ -92,7 +86,23 @@ def _make_registry(*, alias: str = "local", model: str = "old-model") -> ModelRe
         provider="openai-compatible",
         source="db",
     )
-    return ModelRegistry({alias: cfg}, default=alias)
+
+
+def _make_registry(
+    *,
+    alias: str = "local",
+    model: str = "old-model",
+    extras: dict[str, str] | None = None,
+) -> ModelRegistry:
+    """Build a real ModelRegistry seeded with ``alias`` (the default) plus
+    any ``extras`` (alias → model).  ``ModelRegistry.__init__`` rejects an
+    empty model dict so tests that exercise the helper need at least one
+    entry; pass ``extras`` for multi-alias scenarios (e.g. delete-by-alias).
+    """
+    configs = {alias: _make_config(alias, model)}
+    for extra_alias, extra_model in (extras or {}).items():
+        configs[extra_alias] = _make_config(extra_alias, extra_model)
+    return ModelRegistry(configs, default=alias)
 
 
 class _AppState:
@@ -102,7 +112,7 @@ class _AppState:
 
 
 # ---------------------------------------------------------------------------
-# Helper-level tests — ``_refresh_console_coord_registry`` semantics
+# Helper-level tests — ``_refresh_coord_registry`` semantics
 # ---------------------------------------------------------------------------
 
 
@@ -112,7 +122,7 @@ def test_helper_rebuilds_registry_from_db(storage: SQLiteBackend) -> None:
     state = _AppState()
     state.coord_registry = _make_registry(alias="local", model="old-model")
 
-    _refresh_console_coord_registry(state, storage)
+    _refresh_coord_registry(state, storage)
 
     assert state.coord_registry is not None
     assert state.coord_registry.get_config("local").model == "new-model"
@@ -126,7 +136,7 @@ def test_helper_preserves_object_identity(storage: SQLiteBackend) -> None:
     state.coord_registry = _make_registry()
     before = id(state.coord_registry)
 
-    _refresh_console_coord_registry(state, storage)
+    _refresh_coord_registry(state, storage)
 
     assert id(state.coord_registry) == before
 
@@ -139,7 +149,7 @@ def test_helper_noop_when_coord_registry_none(storage: SQLiteBackend) -> None:
     state = _AppState()
     state.coord_registry = None
 
-    _refresh_console_coord_registry(state, storage)  # must not raise
+    _refresh_coord_registry(state, storage)  # must not raise
 
     assert state.coord_registry is None
 
@@ -157,7 +167,7 @@ def test_helper_preserves_registry_when_load_fails(
         raise RuntimeError("simulated loader failure")
 
     monkeypatch.setattr("turnstone.core.model_registry.load_model_registry", _boom)
-    _refresh_console_coord_registry(state, storage)
+    _refresh_coord_registry(state, storage)
 
     assert state.coord_registry is not None
     assert state.coord_registry.get_config("local").model == "old-model"
@@ -179,7 +189,7 @@ def test_helper_preserves_registry_when_db_probe_fails(
         raise RuntimeError("simulated transient DB outage")
 
     monkeypatch.setattr(storage, "list_model_definitions", _broken)
-    _refresh_console_coord_registry(state, storage)
+    _refresh_coord_registry(state, storage)
 
     assert state.coord_registry is not None
     # Existing registry untouched — the probe caught the failure before
@@ -195,7 +205,7 @@ def test_helper_preserves_registry_when_no_enabled_rows(storage: SQLiteBackend) 
     state = _AppState()
     state.coord_registry = _make_registry(alias="local", model="cached-model")
 
-    _refresh_console_coord_registry(state, storage)
+    _refresh_coord_registry(state, storage)
 
     assert state.coord_registry is not None
     assert state.coord_registry.get_config("local").model == "cached-model"
@@ -214,7 +224,7 @@ def test_helper_preserves_registry_on_reload_validation_error(
         raise ValueError("simulated reload validation failure")
 
     monkeypatch.setattr(state.coord_registry, "reload", _broken_reload)
-    _refresh_console_coord_registry(state, storage)
+    _refresh_coord_registry(state, storage)
 
     # Existing registry still reachable; the broken reload was a no-op
     # at the public-facing level.
@@ -227,21 +237,13 @@ def test_helper_preserves_registry_on_reload_validation_error(
 # ---------------------------------------------------------------------------
 
 
-class _AuthMiddleware(BaseHTTPMiddleware):
-    """Inject an admin AuthResult so the permission gate passes."""
-
-    async def dispatch(self, request, call_next):  # type: ignore[no-untyped-def]
-        request.state.auth_result = AuthResult(
-            user_id="admin",
-            scopes=frozenset({"approve"}),
-            token_source="test",
-            permissions=frozenset({"admin.models"}),
-        )
-        return await call_next(request)
-
-
 def _make_client(storage: SQLiteBackend, registry: ModelRegistry | None) -> TestClient:
-    """Build a TestClient wired to the four model-definition endpoints."""
+    """Build a TestClient wired to the four model-definition endpoints.
+
+    Uses the shared header-driven ``_AuthMiddleware`` from
+    ``tests/_coord_test_helpers``; default headers below grant
+    ``admin.models`` permission so the endpoint gate passes.
+    """
     app = Starlette(
         routes=[
             Route(
@@ -276,7 +278,9 @@ def _make_client(storage: SQLiteBackend, registry: ModelRegistry | None) -> Test
     app.state.collector.get_all_nodes.return_value = []
     app.state.proxy_client = MagicMock()
     app.state.config_store = MagicMock()
-    return TestClient(app)
+    client = TestClient(app)
+    client.headers.update({"X-Test-User": "admin", "X-Test-Perms": "admin.models"})
+    return client
 
 
 def test_create_endpoint_refreshes_registry(storage: SQLiteBackend) -> None:
@@ -339,7 +343,7 @@ def test_update_endpoint_skips_refresh_on_empty_body(
     def _spy(app_state: Any, storage: Any) -> None:
         calls.append((app_state, storage))
 
-    monkeypatch.setattr(server_module, "_refresh_console_coord_registry", _spy)
+    monkeypatch.setattr(server_module, "_refresh_coord_registry", _spy)
 
     resp = client.put("/v1/api/admin/model-definitions/m1", json={})
     assert resp.status_code == 200, resp.text
@@ -352,26 +356,7 @@ def test_delete_endpoint_refreshes_registry(storage: SQLiteBackend) -> None:
     otherwise hit a stale cached client."""
     _seed_model_def(storage, definition_id="m1", alias="local", model="m")
     _seed_model_def(storage, definition_id="m2", alias="extra", model="x")
-    # Registry seeded with both so the post-delete state is checkable
-    cfg_local = ModelConfig(
-        alias="local",
-        base_url="http://localhost:8000/v1",
-        api_key="sk-test",
-        model="m",
-        context_window=8192,
-        provider="openai-compatible",
-        source="db",
-    )
-    cfg_extra = ModelConfig(
-        alias="extra",
-        base_url="http://localhost:8000/v1",
-        api_key="sk-test",
-        model="x",
-        context_window=8192,
-        provider="openai-compatible",
-        source="db",
-    )
-    registry = ModelRegistry({"local": cfg_local, "extra": cfg_extra}, default="local")
+    registry = _make_registry(alias="local", model="m", extras={"extra": "x"})
     client = _make_client(storage, registry)
 
     resp = client.delete("/v1/api/admin/model-definitions/m2")

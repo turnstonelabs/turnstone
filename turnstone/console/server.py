@@ -7996,7 +7996,7 @@ async def _collect_model_status(
     return {nid: models for nid, models in results if models is not None}
 
 
-def _refresh_console_coord_registry(app_state: Any, storage: Any) -> None:
+def _refresh_coord_registry(app_state: Any, storage: Any) -> None:
     """Rebuild ``app_state.coord_registry`` in place from DB model definitions.
 
     The console-side coordinator session factory closes over the
@@ -8303,7 +8303,7 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
         ip,
     )
 
-    _refresh_console_coord_registry(request.app.state, storage)
+    await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
 
     created = storage.get_model_definition(definition_id)
     if created is None:
@@ -8463,7 +8463,7 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
     )
 
     if updates:
-        _refresh_console_coord_registry(request.app.state, storage)
+        await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
 
     model_def = storage.get_model_definition(definition_id)
     return JSONResponse(_mask_model_secrets(model_def or {}))
@@ -8500,7 +8500,7 @@ async def admin_delete_model_definition(request: Request) -> JSONResponse:
         ip,
     )
 
-    _refresh_console_coord_registry(request.app.state, storage)
+    await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
 
     return JSONResponse({"status": "ok", "definition_id": definition_id})
 
@@ -8526,7 +8526,7 @@ async def admin_model_reload(request: Request) -> JSONResponse:
     # sessions itself and must mutate its in-process registry too —
     # otherwise the coord LLM keeps calling the prior model name even
     # after a successful reload.
-    _refresh_console_coord_registry(request.app.state, storage)
+    await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
 
     results = await _notify_nodes_model_reload(request)
     return JSONResponse({"status": "ok", "results": results})
