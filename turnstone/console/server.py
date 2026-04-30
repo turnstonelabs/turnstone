@@ -3750,6 +3750,18 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     audit_exec = ThreadPoolExecutor(max_workers=4, thread_name_prefix="coord-audit")
     app.state.audit_executor = audit_exec
     _set_audit_executor(audit_exec)
+    # Dedicated executor for coord SSE queue polling, mirroring the
+    # interactive-side ``sse_executor`` in ``turnstone/server.py``.
+    # Each coord ``events`` SSE listener parks a thread on
+    # ``client_queue.get(timeout=5)`` for the connection lifetime.
+    # Without this pool, those parks land on Python's default
+    # ThreadPoolExecutor (~min(32, cpu_count+4)) and compete with
+    # every other ``asyncio.to_thread`` caller — a few coord tabs
+    # against a multi-child workstream are enough to stall new
+    # request handlers.
+    app.state.coord_sse_executor = ThreadPoolExecutor(
+        max_workers=200, thread_name_prefix="coord-sse"
+    )
     # Populate the router's services cache if a router is configured
     _router: ConsoleRouter | None = getattr(app.state, "router", None)
     if _router is not None:
@@ -4029,6 +4041,15 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     if audit_exec_shutdown is not None:
         _set_audit_executor(None)
         audit_exec_shutdown.shutdown(wait=True)
+    # Drain the coord SSE pool AFTER ``coord_adapter.shutdown()`` above:
+    # adapter shutdown deregisters listeners so no new events handlers
+    # arrive at this pool; in-flight ``client_queue.get`` futures
+    # already running are bounded by their 5s timeout and finish
+    # naturally. ``cancel_futures=True`` discards any queued-but-not-
+    # started futures so we don't block lifespan teardown on them.
+    coord_sse_exec_shutdown = getattr(app.state, "coord_sse_executor", None)
+    if coord_sse_exec_shutdown is not None:
+        coord_sse_exec_shutdown.shutdown(wait=True, cancel_futures=True)
 
 
 # ---------------------------------------------------------------------------
@@ -10286,6 +10307,14 @@ def create_app(
         # tombstones are non-resurrectable.
         saved_state_filter="closed",
         saved_loaded_lookup=_coord_saved_loaded_lookup,
+        # Isolate coord SSE polling on its own 200-thread pool so a
+        # handful of coord tabs (each parking a thread on
+        # ``client_queue.get``) can't starve the default executor and
+        # stall every other ``asyncio.to_thread`` caller (storage,
+        # router, audit). Mirrors the interactive endpoint's
+        # ``sse_executor_lookup`` wiring on ``interactive_endpoint_config``
+        # in ``turnstone/server.py``.
+        sse_executor_lookup=lambda request: request.app.state.coord_sse_executor,
     )
     coord_workstream_routes: list[Any] = []
     register_session_routes(

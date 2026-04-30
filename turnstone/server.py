@@ -3323,8 +3323,9 @@ def create_app(
         # ``sse_executor`` so SSE polling stayed isolated from
         # every other ``asyncio.to_thread`` caller in the process
         # (storage, router, audit). Restore that isolation under
-        # the lifted contract — coord wires ``None`` and falls
-        # back to the default executor.
+        # the lifted contract. The console's coord endpoint wires
+        # its own ``coord_sse_executor`` on the same lookup hook —
+        # see ``turnstone/console/server.py``.
         sse_executor_lookup=lambda request: request.app.state.sse_executor,
         create_supports_attachments=True,
         create_supports_user_id_override=True,
