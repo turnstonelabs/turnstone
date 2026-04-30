@@ -335,6 +335,73 @@
     return appendMsg(role, esc(text), opts);
   }
 
+  // Metacognitive reminder bubble (user-channel correction / denial /
+  // resume / start / completion AND tool-channel tool_error / repeat).
+  // Mirrors Pane.prototype.addUserReminder / addToolReminder in the
+  // interactive UI — yellow themed bubble slotted directly below the
+  // message it advises.  ``anchor`` is the DOM element to anchor below;
+  // when null, append at the bottom of messagesEl.
+  function appendReminderBubble(reminders, anchor) {
+    if (!Array.isArray(reminders) || !reminders.length) return;
+    let cursor = anchor;
+    for (let i = 0; i < reminders.length; i++) {
+      const r = reminders[i] || {};
+      const el = document.createElement("div");
+      el.className = "msg user-reminder";
+      el.setAttribute("role", "article");
+      el.setAttribute("data-ts-role", "metacognition");
+      el.setAttribute("aria-label", "metacognition");
+      const body = document.createElement("div");
+      body.className = "msg-body";
+      const labelEl = document.createElement("span");
+      labelEl.className = "msg-user-reminder-label";
+      labelEl.textContent =
+        "metacognition" + (r.type ? " · " + String(r.type) : "");
+      const textEl = document.createElement("span");
+      textEl.className = "msg-user-reminder-text";
+      textEl.textContent = r.text || "";
+      body.appendChild(labelEl);
+      body.appendChild(textEl);
+      el.appendChild(body);
+      if (cursor) {
+        cursor.insertAdjacentElement("afterend", el);
+        cursor = el;
+      } else {
+        messagesEl.appendChild(el);
+      }
+    }
+    _scheduleScroll();
+  }
+
+  // Live SSE for user-channel reminders — anchors below the most
+  // recent user message.  On a non-originating tab there may be no
+  // user message rendered yet; we append and the next /history reload
+  // corrects.  (Same caveat as the interactive UI; tracked there.)
+  function appendUserReminderLive(reminders) {
+    const userMsgs = messagesEl.querySelectorAll(".msg.user");
+    const anchor = userMsgs.length ? userMsgs[userMsgs.length - 1] : null;
+    appendReminderBubble(reminders, anchor);
+  }
+
+  // Live SSE for tool-channel reminders — anchors below the
+  // .coord-tool-batch construct that produced the tool result.  Looks
+  // up the row by data-call-id and walks to the parent batch; falls
+  // back to the most recent batch if not found.
+  function appendToolReminderLive(reminders, toolCallId) {
+    let anchor = null;
+    if (toolCallId) {
+      const entry = toolRows.get(toolCallId);
+      if (entry && entry.batch) {
+        anchor = entry.batch;
+      }
+    }
+    if (!anchor) {
+      const batches = messagesEl.querySelectorAll(".coord-tool-batch");
+      if (batches.length) anchor = batches[batches.length - 1];
+    }
+    appendReminderBubble(reminders, anchor);
+  }
+
   // Build a tool-batch item from a persisted assistant
   // tool_call.  Live calls land here with header / preview already
   // computed by ChatSession._prepare_tool; history replay never sees
@@ -1843,6 +1910,22 @@
         // events; prior routing to "tool" gave them accent-tinted tool
         // styling which mis-categorised them as tool calls.
         appendText("info", ev.message || "", { label: "info" });
+        break;
+      case "user_reminder":
+        // Metacognitive user-channel nudge — render below the most
+        // recent user message as a yellow themed bubble.  Same shape
+        // as the interactive UI's case.
+        if (Array.isArray(ev.reminders) && ev.reminders.length) {
+          appendUserReminderLive(ev.reminders);
+        }
+        break;
+      case "tool_reminder":
+        // Metacognitive tool-channel nudge — render below the
+        // .coord-tool-batch that produced the tool result identified
+        // by ev.tool_call_id.
+        if (Array.isArray(ev.reminders) && ev.reminders.length) {
+          appendToolReminderLive(ev.reminders, ev.tool_call_id || "");
+        }
         break;
       case "connected":
         // First yield from _coord_events_replay — populates the
@@ -3543,6 +3626,12 @@
             (callId && toolNameByCallId.get(callId)) || m.tool_name || "tool";
           const isError = callOutcomes.get(callId) === "error";
           appendToolResult(toolName, callId, content || "", isError);
+          // Tool-channel metacog reminders ride the same _reminders
+          // side-channel as the user channel; surface as a themed
+          // bubble below the .coord-tool-batch construct.
+          if (Array.isArray(m.reminders) && m.reminders.length) {
+            appendToolReminderLive(m.reminders, callId);
+          }
         } else if (role === "assistant") {
           // Empty content with tool_calls only means the assistant
           // turn was just tool dispatch — the synthesized tool-call
@@ -3573,6 +3662,15 @@
           // (appendReasoningToken uses textContent; user/system are
           // typed verbatim and don't carry markdown structure).
           appendText(role, content, { label: role });
+          // User-channel metacog reminders attach to the just-appended
+          // user bubble (the most recent .msg.user in messagesEl).
+          if (
+            role === "user" &&
+            Array.isArray(m.reminders) &&
+            m.reminders.length
+          ) {
+            appendUserReminderLive(m.reminders);
+          }
         }
       });
       // History alone can't tell whether an orphaned assistant

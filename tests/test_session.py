@@ -50,6 +50,9 @@ class NullUI:
     def on_user_reminder(self, reminders):
         pass
 
+    def on_tool_reminder(self, reminders, tool_call_id):
+        pass
+
     def on_state_change(self, state):
         pass
 
@@ -2011,20 +2014,25 @@ class TestMetacognitiveBuffers:
             return caps
 
     def test_collect_advisories_drains_tool_buffer_on_last_result(self, tmp_db):
-        from turnstone.core.tool_advisory import MetacognitiveAdvisory
-
+        """Tool-channel metacog reminders no longer ride the persistent
+        advisory list (which would write them into tool content via
+        wrap_tool_result).  They drain to the second tuple element so
+        the caller can attach them to the tool message dict's
+        ``_reminders`` side-channel — same architecture as the user
+        channel."""
         session = _make_session()
         session._queue_tool_advisory("tool_error", "ALERT")
         caps = MagicMock()
         caps.supports_tool_advisories = True
         with patch.object(session, "_get_capabilities", return_value=caps):
-            advisories = session._collect_advisories(
+            persistent, metacog = session._collect_advisories(
                 assessment=None, func_name="bash", is_last_in_batch=True
             )
-        assert any(
-            isinstance(a, MetacognitiveAdvisory) and a.nudge_type == "tool_error"
-            for a in advisories
-        )
+        # Persistent list is empty (no guard / interjection here);
+        # MetacognitiveAdvisory does NOT appear among persistent
+        # advisories anymore.
+        assert persistent == []
+        assert metacog == [{"type": "tool_error", "text": "ALERT"}]
         # Buffer drained.
         assert session._pending_tool_advisories == []
 
@@ -2034,11 +2042,12 @@ class TestMetacognitiveBuffers:
         caps = MagicMock()
         caps.supports_tool_advisories = True
         with patch.object(session, "_get_capabilities", return_value=caps):
-            mid = session._collect_advisories(
+            persistent, metacog = session._collect_advisories(
                 assessment=None, func_name="bash", is_last_in_batch=False
             )
         # Not yet drained — only fires on the last result.
-        assert mid == []
+        assert persistent == []
+        assert metacog == []
         assert len(session._pending_tool_advisories) == 1
 
     def test_collect_advisories_drops_tool_buffer_when_caps_unsupported(self, tmp_db):
@@ -2049,10 +2058,11 @@ class TestMetacognitiveBuffers:
         caps = MagicMock()
         caps.supports_tool_advisories = False
         with patch.object(session, "_get_capabilities", return_value=caps):
-            advisories = session._collect_advisories(
+            persistent, metacog = session._collect_advisories(
                 assessment=None, func_name="bash", is_last_in_batch=True
             )
-        assert advisories == []
+        assert persistent == []
+        assert metacog == []
         # And the buffer is cleared so no stale nudge sticks around.
         assert session._pending_tool_advisories == []
 
@@ -2101,22 +2111,26 @@ class TestMetacognitiveBuffers:
         # And the buffer drained.
         assert session._pending_user_advisories == []
 
-    def test_attach_emits_visibility_ping(self, tmp_db):
-        """The user-channel splice must surface the [metacognition: nudge
-        injected — ...] line so the operator sees the harness is acting."""
+    def test_attach_does_not_emit_visibility_ping(self, tmp_db):
+        """The themed reminder bubble (via ``on_user_reminder``) is now
+        the canonical operator-visible signal for user-channel nudges
+        — the legacy ``[metacognition: nudge injected — …]`` gray info
+        line was duplicating it and is gone.  No ``on_info`` call
+        should fire from the splice."""
         session = _make_session()
         session.ui = MagicMock()
         session._queue_user_advisory("correction", "watch out")
         msg = {"role": "user", "content": "noted"}
         session._attach_pending_user_reminders(msg)
-        # Find the metacognition ping among any ui.on_info calls.
         info_lines = [call.args[0] for call in session.ui.on_info.call_args_list if call.args]
-        assert any(
-            "metacognition: nudge injected" in line and "correction" in line for line in info_lines
-        ), f"expected ping in {info_lines!r}"
+        assert not any("metacognition: nudge injected" in line for line in info_lines), (
+            f"expected NO legacy ping, got {info_lines!r}"
+        )
 
-    def test_collect_advisories_emits_visibility_ping(self, tmp_db):
-        """The tool-channel drain must surface the same ping."""
+    def test_collect_advisories_does_not_emit_visibility_ping(self, tmp_db):
+        """Tool-channel parity: the themed bubble (via
+        ``on_tool_reminder``) is the canonical signal.  The legacy
+        gray info line is gone."""
         session = _make_session()
         session.ui = MagicMock()
         session._queue_tool_advisory("tool_error", "alert")
@@ -2125,9 +2139,9 @@ class TestMetacognitiveBuffers:
         with patch.object(session, "_get_capabilities", return_value=caps):
             session._collect_advisories(assessment=None, func_name="bash", is_last_in_batch=True)
         info_lines = [call.args[0] for call in session.ui.on_info.call_args_list if call.args]
-        assert any(
-            "metacognition: nudge injected" in line and "tool_error" in line for line in info_lines
-        ), f"expected ping in {info_lines!r}"
+        assert not any("metacognition: nudge injected" in line for line in info_lines), (
+            f"expected NO legacy ping, got {info_lines!r}"
+        )
 
     def test_attach_emits_user_reminder_ui_event(self, tmp_db):
         """The splice must fire the live ``on_user_reminder`` UI hook so
@@ -2526,6 +2540,46 @@ class TestApplyRemindersForProvider:
         # Source untouched.
         assert msg["content"] is None
 
+    def test_malformed_reminders_filtered_out(self, tmp_db):
+        """Defensive: a non-dict element in ``_reminders`` (corruption,
+        partial state, future-shape rollback) must be silently skipped
+        rather than aborting ``send`` via ``AttributeError`` on the
+        ``.get`` call.  Mirrors the filter in ``_build_history``."""
+        session = _make_session()
+        msg = {
+            "role": "user",
+            "content": "hi",
+            "_reminders": [
+                {"type": "correction", "text": "ok"},
+                "not-a-dict",  # would crash a naive r.get
+                None,  # ditto
+                {"type": "denial", "text": "second"},
+            ],
+        }
+        out = session._apply_reminders_for_provider([msg])
+        wire = out[0]["content"]
+        # Both valid dicts spliced in order; malformed entries dropped.
+        assert "<system-reminder>" in wire
+        assert wire.count("<system-reminder>") == 2
+        assert "ok" in wire
+        assert "second" in wire
+        # Source untouched (transient-copy invariant still holds).
+        assert msg["_reminders"][1] == "not-a-dict"
+
+    def test_all_malformed_reminders_passes_through(self, tmp_db):
+        """If every reminder entry is malformed the message passes
+        through unchanged — same effect as having no reminders."""
+        session = _make_session()
+        msg = {
+            "role": "user",
+            "content": "hi",
+            "_reminders": ["bad", None, 42],
+        }
+        out = session._apply_reminders_for_provider([msg])
+        # Pass-through by reference (allocation-free path).
+        assert out[0] is msg
+        assert out[0]["content"] == "hi"
+
     def test_delivered_flag_skips_splice_for_already_delivered(self, tmp_db):
         """Once ``_mark_reminders_delivered`` flips the flag the next
         provider call must not re-render the same reminder — model sees
@@ -2796,3 +2850,32 @@ class TestSessionUIBaseUserReminderHook:
         reminders = [{"type": "correction", "text": "watch out"}]
         ui.on_user_reminder(reminders)
         assert ui.events == [{"type": "user_reminder", "reminders": reminders}]
+
+
+class TestSessionUIBaseToolReminderHook:
+    """Parallel to ``on_user_reminder`` but on the tool channel —
+    ``on_tool_reminder`` enqueues a ``tool_reminder`` SSE event carrying
+    a ``tool_call_id`` anchor so the frontend can render the bubble
+    below the specific tool result that triggered the batch's reminder."""
+
+    def test_on_tool_reminder_enqueues_sse_event(self):
+        from turnstone.core.session_ui_base import SessionUIBase
+
+        class _RecordingUI(SessionUIBase):
+            def __init__(self) -> None:
+                super().__init__()
+                self.events: list[dict] = []
+
+            def _enqueue(self, data: dict) -> None:  # type: ignore[override]
+                self.events.append(data)
+
+        ui = _RecordingUI()
+        reminders = [{"type": "tool_error", "text": "check memories"}]
+        ui.on_tool_reminder(reminders, "call_abc123")
+        assert ui.events == [
+            {
+                "type": "tool_reminder",
+                "reminders": reminders,
+                "tool_call_id": "call_abc123",
+            }
+        ]

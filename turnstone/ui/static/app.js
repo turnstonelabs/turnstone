@@ -579,6 +579,19 @@ Pane.prototype.handleEvent = function (evt) {
       }
       break;
 
+    case "tool_reminder":
+      // Metacognitive tool-channel nudge (tool_error / repeat) —
+      // render as the same yellow themed bubble used for user-channel
+      // reminders, anchored below the .ts-approval block whose tool
+      // result triggered the batch's reminder.  evt.tool_call_id
+      // identifies the specific tool element; addToolReminder walks
+      // up to its parent approval block and inserts the bubble
+      // immediately after.
+      if (Array.isArray(evt.reminders) && evt.reminders.length) {
+        this.addToolReminder(evt.reminders, evt.tool_call_id || "");
+      }
+      break;
+
     case "message_queued":
       // Confirmation from server that a queued message was accepted.
       // The UI already showed the message optimistically in addQueuedMessage.
@@ -692,16 +705,17 @@ Pane.prototype.removeThinkingIndicator = function () {
 };
 
 Pane.prototype.addUserReminder = function (reminders) {
-  // Render each metacognitive reminder as its own bubble visually
-  // anchored above the user message it advises.  Always called AFTER
-  // the corresponding addUserMessage (live: optimistic local render
-  // ran before the SSE event arrived; replay: replayHistory now
-  // renders the user message first), so "most recent .msg.user" is
-  // always THIS turn's bubble — insertBefore drops the reminder
-  // directly above it.  When no .msg.user exists at all (e.g. a
-  // non-originating tab receiving a stage-1 reminder before any user
-  // turn has rendered) we append; the next /history reload corrects
-  // any anchor anomaly.
+  // Render each metacognitive reminder as its own bubble immediately
+  // BELOW the user message it advises — semantically the reminder is
+  // a hint to the model right before the assistant turn.  Always
+  // called AFTER the corresponding addUserMessage (live: optimistic
+  // local render ran before the SSE event arrived; replay:
+  // replayHistory renders the user message first), so "most recent
+  // .msg.user" is always THIS turn's bubble — insertAdjacentElement
+  // afterend drops the reminder directly below it.  When no .msg.user
+  // exists at all (e.g. a non-originating tab receiving a reminder
+  // before any user turn has rendered) we append; the next /history
+  // reload corrects any anchor anomaly.
   this.removeEmptyState();
   var userBubbles = this.messagesEl.querySelectorAll(".msg.user");
   var anchor = userBubbles.length ? userBubbles[userBubbles.length - 1] : null;
@@ -711,14 +725,69 @@ Pane.prototype.addUserReminder = function (reminders) {
     el.className = "msg user-reminder";
     var labelEl = document.createElement("span");
     labelEl.className = "msg-user-reminder-label";
-    labelEl.textContent = "metacog" + (r.type ? " · " + String(r.type) : "");
+    labelEl.textContent =
+      "metacognition" + (r.type ? " · " + String(r.type) : "");
     var textEl = document.createElement("span");
     textEl.className = "msg-user-reminder-text";
     textEl.textContent = r.text || "";
     el.appendChild(labelEl);
     el.appendChild(textEl);
     if (anchor) {
-      this.messagesEl.insertBefore(el, anchor);
+      anchor.insertAdjacentElement("afterend", el);
+      // Anchor advances so multiple reminders stack below the user
+      // message in queued order (rather than each landing
+      // immediately-after the user msg, which would reverse them).
+      anchor = el;
+    } else {
+      this.messagesEl.appendChild(el);
+    }
+  }
+  this.scrollToBottom(true);
+};
+
+Pane.prototype.addToolReminder = function (reminders, toolCallId) {
+  // Render each metacognitive tool-channel reminder (tool_error /
+  // repeat) as the same yellow themed bubble used for user-channel
+  // reminders, anchored below the .ts-approval block that produced
+  // the tool result.  toolCallId is the live-path anchor (SSE event
+  // carries it); during replay it's an empty string and we fall back
+  // to "last .ts-approval block in messagesEl", which is correct
+  // because messages render in order — the assistant block carrying
+  // the tool batch is always the most recent approval block by the
+  // time we hit the tool message that owns the reminder.
+  this.removeEmptyState();
+  var anchor = null;
+  if (toolCallId) {
+    var escapedId = CSS.escape(toolCallId);
+    var toolEl = this.messagesEl.querySelector(
+      '.ts-approval-tool[data-call-id="' + escapedId + '"]',
+    );
+    if (toolEl) {
+      anchor = toolEl.closest(".ts-approval");
+    }
+  }
+  if (!anchor) {
+    var blocks = this.messagesEl.querySelectorAll(".ts-approval");
+    if (blocks.length) anchor = blocks[blocks.length - 1];
+  }
+  for (var i = 0; i < reminders.length; i++) {
+    var r = reminders[i] || {};
+    var el = document.createElement("div");
+    // Same .msg.user-reminder class — visual treatment is shared
+    // across user and tool channels (both are metacog nudges).
+    el.className = "msg user-reminder";
+    var labelEl = document.createElement("span");
+    labelEl.className = "msg-user-reminder-label";
+    labelEl.textContent =
+      "metacognition" + (r.type ? " · " + String(r.type) : "");
+    var textEl = document.createElement("span");
+    textEl.className = "msg-user-reminder-text";
+    textEl.textContent = r.text || "";
+    el.appendChild(labelEl);
+    el.appendChild(textEl);
+    if (anchor) {
+      anchor.insertAdjacentElement("afterend", el);
+      anchor = el;
     } else {
       this.messagesEl.appendChild(el);
     }
@@ -1080,6 +1149,15 @@ Pane.prototype.replayHistory = function (messages) {
           lastToolBlock.classList.add("error");
           appendToolErrorBadge(lastToolBlock);
         }
+      }
+      // Tool-channel metacog reminders (tool_error / repeat) attach
+      // to the LAST tool message in a batch; on replay we render the
+      // bubble immediately below the .ts-approval block that owns
+      // the tool result.  addToolReminder's empty-toolCallId fallback
+      // resolves to "last .ts-approval block" — which is exactly
+      // lastToolBlock here.
+      if (Array.isArray(msg.reminders) && msg.reminders.length) {
+        this.addToolReminder(msg.reminders, "");
       }
     }
   }

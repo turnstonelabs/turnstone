@@ -885,6 +885,27 @@
 .msg.user {
   border-left-color: var(--accent);
 }
+/* Metacognitive reminder — slotted directly below the message it
+   advises (user message for correction/denial/etc., tool result for
+   tool_error/repeat).  Yellow accent reads as "advisory metadata"
+   against the amber-ish user colour and the cyan tool cards;
+   deliberately quieter than the surrounding bubbles so it doesn't
+   compete for attention.  Lives in the shared stylesheet so both
+   the interactive UI and the console coord viewer render the same
+   themed bubble. */
+.msg.user-reminder {
+  border-left-color: var(--yellow);
+  color: var(--fg-dim);
+  font-size: 12px;
+  padding: 6px 10px;
+  white-space: pre-wrap;
+}
+.msg.user-reminder .msg-user-reminder-label {
+  color: var(--yellow);
+  font-weight: 600;
+  margin-right: 6px;
+  text-transform: lowercase;
+}
 .msg.assistant {
   border-left-color: var(--hair-2);
 }
