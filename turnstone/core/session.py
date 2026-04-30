@@ -1653,11 +1653,15 @@ class ChatSession:
         """Return a transient copy of *messages* with ``_reminders`` rendered
         inline for the model.
 
-        Metacognitive user-channel nudges live on the message dict's
-        ``_reminders`` side-channel, not inside ``content`` — so
+        Metacognitive nudges live on the message dict's ``_reminders``
+        side-channel regardless of role — user messages carry
+        user-channel nudges (correction / denial / resume / start /
+        completion), tool messages carry tool-channel nudges
+        (tool_error / repeat).  Both ride the same side-channel so
         ``self.messages`` and every downstream consumer (UI replay,
-        compaction, title gen, channel adapters, DB) see clean user
-        text.  Only the wire-bound copy carries the rendered reminder.
+        compaction, title gen, channel adapters, DB) see clean
+        ``content``; only the wire-bound copy here carries the
+        rendered reminder.
 
         For each message that has ``_reminders`` AND has not yet been
         flagged delivered, build a shallow copy and splice the reminders
@@ -1670,9 +1674,9 @@ class ChatSession:
 
         **Reminder lifecycle.**  After a successful provider stream
         ``_mark_reminders_delivered`` flips ``_reminders_delivered`` to
-        ``True`` on every user message that carried reminders into that
-        call, so subsequent provider calls skip them — the model sees
-        each reminder once, the turn it advised.  The
+        ``True`` on every message (user or tool) that carried reminders
+        into that call, so subsequent provider calls skip them — the
+        model sees each reminder once, the turn it advised.  The
         ``_reminders`` key itself stays on the message dict for the
         lifetime of the in-memory session so ``/history`` (reconnecting
         tabs, multi-tab live mirrors) still renders the same nudge
@@ -1741,15 +1745,20 @@ class ChatSession:
         return out
 
     def _mark_reminders_delivered(self) -> None:
-        """Flag every user-message ``_reminders`` as delivered.
+        """Flag every message's ``_reminders`` as delivered.
 
-        Called after a successful provider stream.  Subsequent calls to
-        ``_apply_reminders_for_provider`` skip messages with this flag,
-        so the model sees each reminder exactly once (the turn it
-        advised).  The flag is a sibling key like ``_reminders`` itself;
-        ``sanitize_messages`` strips both before the wire and
-        ``_build_history`` ignores the delivered flag entirely so UI
-        replay parity is preserved across reconnects.
+        Role-agnostic — both user-channel reminders (set by
+        ``_attach_pending_user_reminders`` on user messages) and
+        tool-channel reminders (set by the per-result loop on tool
+        messages) ride the same ``_reminders`` side-channel and the
+        same delivered flag.  Called after a successful provider
+        stream; subsequent calls to ``_apply_reminders_for_provider``
+        skip messages with this flag, so the model sees each reminder
+        exactly once (the turn it advised).  The flag is a sibling key
+        like ``_reminders`` itself; ``sanitize_messages`` strips both
+        before the wire and ``_build_history`` ignores the delivered
+        flag entirely so UI replay parity is preserved across
+        reconnects.
         """
         for msg in self.messages:
             if msg.get("_reminders") and not msg.get("_reminders_delivered"):
@@ -2230,11 +2239,12 @@ class ChatSession:
         # Metacognitive user-channel drain: any nudges queued via
         # _queue_user_advisory (correction/start/completion from this
         # turn, denial from the previous tool batch, resume from
-        # rehydrate) splice in as <system-reminder> blocks at the
-        # trailing edge of the user content. The DB row stores
-        # ``user_input`` only (line below) so these blocks stay
-        # ephemeral — they advise the next assistant turn and do not
-        # persist across reloads.
+        # rehydrate) attach to the user message dict's ``_reminders``
+        # side-channel — content stays clean.  The wire-side splice
+        # happens later in _apply_reminders_for_provider against a
+        # transient copy.  The DB row stores ``user_input`` only (line
+        # below) so reminders stay in-memory only and don't persist
+        # across reloads.
         self._attach_pending_user_reminders(user_msg)
         self.messages.append(user_msg)
         self._msg_tokens.append(max(1, int(self._msg_char_count(user_msg) / self._chars_per_token)))
