@@ -5,7 +5,50 @@ from __future__ import annotations
 import re
 import time
 
-_COOLDOWN_SECS = 300  # 5 minutes between nudges of the same type
+# Default cooldown (s) between nudges of the same type.  Production
+# paths pass ``cooldown_secs`` explicitly from
+# ``MemoryConfig.nudge_cooldown`` (config-store ``memory.nudge_cooldown``,
+# default 300); this constant is the fallback for tests and unit-style
+# callers without a ``MemoryConfig`` and is kept aligned with that
+# canonical default so both paths behave the same.
+_COOLDOWN_SECS = 300
+
+# Repeat-detection threshold — number of *consecutive* identical tool
+# calls (same name + same arguments) before a repeat warning fires.
+# Two-in-a-row is too noisy because legitimate retries on transient
+# failures look identical; three-in-a-row is the cheapest signal that
+# the model is stuck on the same call.
+_REPEAT_THRESHOLD = 3
+
+
+class RepeatDetector:
+    """Detect a streak of identical tool-call signatures.
+
+    ``record(sig)`` returns ``True`` once *sig* has been recorded
+    ``threshold`` times in a row (default 3).  Recording a different
+    signature resets the streak — interleaved tool calls aren't a
+    stuck loop, only repeated identical ones are.  After a fire, the
+    caller is expected to call ``clear()`` to start a fresh streak.
+    """
+
+    def __init__(self, threshold: int = _REPEAT_THRESHOLD) -> None:
+        self._threshold = threshold
+        self._sig: str | None = None
+        self._count = 0
+
+    def record(self, sig: str) -> bool:
+        """Record *sig*; return ``True`` when the streak hits the threshold."""
+        if sig == self._sig:
+            self._count += 1
+        else:
+            self._sig = sig
+            self._count = 1
+        return self._count >= self._threshold
+
+    def clear(self) -> None:
+        self._sig = None
+        self._count = 0
+
 
 # ---------------------------------------------------------------------------
 # Nudge messages (brief, model-facing hints)
