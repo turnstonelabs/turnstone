@@ -432,7 +432,7 @@ LAST_ERROR_CONFIG_KEY = "last_error"
 # such error per workstream would bloat workstream_config and the model
 # prompt the coord LLM ingests on inspect.  1024 chars matches the
 # practical "useful for triage" length while staying well under the
-# WAIT_MESSAGE_MAX_BYTES (6 KiB) cap so the truncate happens here at
+# WAIT_MESSAGE_MAX_BYTES (10 KiB) cap so the truncate happens here at
 # write time, not later at the wait surface.
 LAST_ERROR_MAX_LEN = 1024
 
