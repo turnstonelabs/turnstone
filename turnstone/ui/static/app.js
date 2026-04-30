@@ -558,12 +558,15 @@ Pane.prototype.handleEvent = function (evt) {
       break;
 
     case "user_reminder":
-      // Metacognitive nudges — render as their own bubble above the
-      // user message they advise.  The originating tab's optimistic
+      // Metacognitive nudges — render as their own bubble below the
+      // user message they advise (semantically: a hint to the model
+      // right before its turn).  The originating tab's optimistic
       // addUserMessage already ran when the user clicked send, so by
       // the time this SSE event arrives the just-sent user bubble is
       // at the bottom of messagesEl and addUserReminder's "anchor to
-      // most recent .msg.user" lookup finds it correctly.
+      // most recent .msg.user" lookup finds it correctly; the
+      // insertAdjacentElement('afterend', el) call drops the bubble
+      // immediately below.
       //
       // Multi-tab caveat: the server emits no user_message SSE event
       // today, so a non-originating tab open on the same workstream
@@ -1039,9 +1042,10 @@ Pane.prototype.replayHistory = function (messages) {
     if (msg.role === "user") {
       // addUserMessage first so addUserReminder's "anchor to most
       // recent .msg.user" lookup finds THIS message's bubble (not the
-      // previous user message's, which would mis-place the reminder
-      // above the wrong turn).  insertBefore then drops the reminder
-      // directly above the just-rendered user bubble.
+      // previous user message's, which would associate the reminder
+      // with the wrong turn).  addUserReminder then drops the bubble
+      // immediately below the just-rendered user message via
+      // insertAdjacentElement('afterend', el).
       this.addUserMessage(msg.content || "", msg.attachments || null);
       if (Array.isArray(msg.reminders) && msg.reminders.length) {
         this.addUserReminder(msg.reminders);
