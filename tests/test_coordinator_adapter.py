@@ -558,3 +558,54 @@ class TestCoordinatorAdapterDispatchChildEvent:
             }
         )
         assert recorder.enqueued[0]["ws_id"] == "coord-a"
+
+    def test_dispatch_cluster_state_forwards_pending_approval_detail(self) -> None:
+        """The rich approval payload now rides on child_ws_state directly so
+        the browser can mutate liveBadgeCache without a separate live-bulk
+        fetch.  Drift here means the inline approve/deny buttons would
+        regress to chasing the dashboard cache (the load-storm pattern
+        Shape A is unwinding)."""
+        adapter, recorder, _ = self._setup()
+        with adapter._children_lock:
+            adapter._merge_child_ids_locked("coord-a", ["child-a1"])
+        detail = {
+            "items": [{"call_id": "c1", "header": "tool x"}],
+            "judge_pending": False,
+        }
+        adapter._dispatch_child_event(
+            {
+                "type": "cluster_state",
+                "ws_id": "child-a1",
+                "state": "running",
+                "activity_state": "approval",
+                "pending_approval_detail": detail,
+            }
+        )
+        assert len(recorder.enqueued) == 1
+        payload = recorder.enqueued[0]
+        assert payload["type"] == "child_ws_state"
+        assert payload["activity_state"] == "approval"
+        assert payload["pending_approval_detail"] == detail
+
+    def test_dispatch_cluster_state_pending_approval_detail_none_passes_through(
+        self,
+    ) -> None:
+        """Missing pending_approval_detail (no approval pending, or pre-fix
+        node mid-rolling-upgrade) must forward as None — not raise, not
+        omit — so the browser's handleChildState treats it as "no SSE-
+        supplied detail, fall back to cached value"."""
+        adapter, recorder, _ = self._setup()
+        with adapter._children_lock:
+            adapter._merge_child_ids_locked("coord-a", ["child-a1"])
+        adapter._dispatch_child_event(
+            {
+                "type": "cluster_state",
+                "ws_id": "child-a1",
+                "state": "running",
+                "activity_state": "tool",
+            }
+        )
+        assert len(recorder.enqueued) == 1
+        payload = recorder.enqueued[0]
+        assert "pending_approval_detail" in payload
+        assert payload["pending_approval_detail"] is None
