@@ -1318,6 +1318,19 @@ Pane.prototype.appendToolOutput = function (callId, name, output, isError) {
   var stripped = stripAnsi(output || "").trim();
   if (!stripped) return;
 
+  // Skip rendering for denied/blocked tool results — the ✗ denied
+  // badge from resolveApproval already shows the denial reason; the
+  // SSE tool_result event would otherwise duplicate the text.  Mirror
+  // the guard in the history-replay path (the live path used to be
+  // safe because no tool_result event was ever emitted for denied
+  // items, but we now emit one so _tool_error_flags gets set).
+  var parentBlock = target.closest(".ts-approval");
+  var isDenied =
+    (parentBlock && parentBlock.classList.contains("denied")) ||
+    /^Denied by user/.test(stripped) ||
+    /^Blocked/.test(stripped);
+  if (isDenied) return;
+
   // Detect structured media output and render interactive embed
   if (!isError) {
     var media = tryParseMedia(stripped);
@@ -1332,12 +1345,9 @@ Pane.prototype.appendToolOutput = function (callId, name, output, isError) {
   var out = renderToolOutput(stripped, isError);
 
   // Mark the parent approval block as errored
-  if (isError) {
-    var parentBlock = target.closest(".ts-approval");
-    if (parentBlock && !parentBlock.classList.contains("denied")) {
-      parentBlock.classList.add("error");
-      appendToolErrorBadge(parentBlock);
-    }
+  if (isError && parentBlock && !parentBlock.classList.contains("denied")) {
+    parentBlock.classList.add("error");
+    appendToolErrorBadge(parentBlock);
   }
 
   if (out.textContent.split("\n").length > 10) {

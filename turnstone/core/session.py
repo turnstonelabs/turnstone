@@ -81,6 +81,7 @@ from turnstone.core.memory_relevance import (
     score_memories,
 )
 from turnstone.core.metacognition import (
+    RepeatDetector,
     detect_completion,
     detect_correction,
     format_nudge,
@@ -474,8 +475,12 @@ class ChatSession:
             collections.OrderedDict()
         )
         self._queued_lock = threading.Lock()
-        # Repeat detection: track recent tool call signatures
-        self._recent_tool_sigs: set[str] = set()
+        # Repeat detection: streak counter over tool-call signatures.
+        # Fires when a (name, args) signature has been seen N times in
+        # a row; recording any different signature resets the streak.
+        # Also cleared after a write tool succeeds (state changed) or
+        # after a warning fires (clean slate, re-fire on the next streak).
+        self._repeat_detector = RepeatDetector()
         # Tool error tracking: call_id → is_error for message persistence
         self._tool_error_flags: dict[str, bool] = {}
         # Cooperative cancellation: set from outside to stop generation
@@ -1293,7 +1298,7 @@ class ChatSession:
             self._ws_id = ws_id
         self.messages = messages
         self._read_files.clear()
-        self._recent_tool_sigs.clear()
+        self._repeat_detector.clear()
         self._last_usage = None
         self._calibrated_msg_count = 0
         self._title_generated = True  # don't re-title resumed workstreams
@@ -2332,92 +2337,10 @@ class ChatSession:
                 if self._generation != my_generation:
                     return
 
-                # Repeat detection: warn when a tool is called with identical args.
-                # Skip error outputs — retrying a failed tool is valid.
-                # Skip JSON outputs (MCP structured results) — appending
-                # text would corrupt the payload.
-                _tc_by_id = {c["id"]: c for c in tool_calls}
-                _repeat_detected = False
-                _error_prefixes = (
-                    "Error",
-                    "JSON parse error",
-                    "Unknown tool",
-                    "Command timed out",
-                    "Blocked:",
-                    "Denied",
-                )
-
-                # Clear dedup sigs when a write tool executed successfully —
-                # the state has changed so re-running a read tool is valid.
-                _write_tools = frozenset({"write_file", "edit_file", "bash"})
-                if any(
-                    tc["function"]["name"] in _write_tools
-                    and not any(
-                        cid == tc["id"] and isinstance(out, str) and out.startswith(_error_prefixes)
-                        for cid, out in results
-                    )
-                    for tc in tool_calls
-                ):
-                    self._recent_tool_sigs.clear()
-                for i, (tc_id, output) in enumerate(results):
-                    tc = _tc_by_id.get(tc_id)
-                    if tc and isinstance(output, str) and not output.startswith(_error_prefixes):
-                        raw = tc["function"]["name"] + ":" + tc["function"]["arguments"]
-                        sig = hashlib.sha256(raw.encode()).hexdigest()
-                        is_json = output.lstrip().startswith(("{", "["))
-                        if sig in self._recent_tool_sigs:
-                            _repeat_detected = True
-                            if not is_json:
-                                output += (
-                                    "\n\n⚠ Warning: this is an identical repeat of a "
-                                    "previous tool call. The result is the same. "
-                                    "Try a different approach."
-                                )
-                                results[i] = (tc_id, output)
-                            self.ui.on_info(
-                                f"{GRAY}[repeat: {tc['function']['name']}() "
-                                f"called with same arguments]{RESET}"
-                            )
-                        self._recent_tool_sigs.add(sig)
-                if _repeat_detected:
-                    # Reset so the model gets a clean slate after the warning.
-                    # If it repeats again, a new warning fires.
-                    self._recent_tool_sigs.clear()
-                    if self._mem_cfg.nudges and should_nudge(
-                        "repeat",
-                        self._metacog_state,
-                        message_count=len(self.messages),
-                        cooldown_secs=self._mem_cfg.nudge_cooldown,
-                    ):
-                        self._queue_tool_advisory("repeat", format_nudge("repeat"))
-
-                # Tool-error nudge — checked here (pre-iteration) so the
-                # MetacognitiveAdvisory rides the same _collect_advisories
-                # drain pass that handles guard findings and user
-                # interjections.  Cooldown gating in should_nudge keeps
-                # this to one nudge per batch even with many failing
-                # tools.
-                if (
-                    self._mem_cfg.nudges
-                    and any(
-                        isinstance(out, str)
-                        and (
-                            out.startswith("Error")
-                            or " error: " in out[:50]
-                            or out.startswith("Command timed out")
-                            or out.startswith("Unknown tool:")
-                        )
-                        for _, out in results
-                    )
-                    and should_nudge(
-                        "tool_error",
-                        self._metacog_state,
-                        message_count=len(self.messages),
-                        memory_count=self._visible_memory_count(),
-                        cooldown_secs=self._mem_cfg.nudge_cooldown,
-                    )
-                ):
-                    self._queue_tool_advisory("tool_error", format_nudge("tool_error"))
+                # Repeat-detection + tool-error nudge.  Mutates *results*
+                # in place to inject inline warning text on identical
+                # repeats; queues advisories for the next drain pass.
+                self._apply_post_execute_advisories(tool_calls, results)
 
                 # Map tool_call_id → tool name for logging
                 from turnstone.core.tool_advisory import wrap_tool_result
@@ -3391,7 +3314,7 @@ class ChatSession:
         self.messages = [summary_user, summary_asst]
         # File contents are gone after compaction — force re-read before edit_file
         self._read_files.clear()
-        self._recent_tool_sigs.clear()
+        self._repeat_detector.clear()
 
         # Rebuild token table
         su_tok = max(1, int(self._msg_char_count(summary_user) / self._chars_per_token))
@@ -3974,7 +3897,14 @@ class ChatSession:
                 )
                 return item["call_id"], item["error"]
             if item.get("denied"):
-                return item["call_id"], item.get("denial_msg", "Denied by user")
+                msg = item.get("denial_msg", "Denied by user")
+                self._report_tool_result(
+                    item["call_id"],
+                    item.get("func_name", "unknown"),
+                    msg,
+                    is_error=True,
+                )
+                return item["call_id"], msg
             try:
                 result: tuple[str, str | list[dict[str, Any]]] = item["execute"](item)
                 return result
@@ -5440,6 +5370,94 @@ class ChatSession:
         behaviour at a tool boundary: ``tool_error``, ``repeat``.
         """
         self._pending_tool_advisories.append((nudge_type, text))
+
+    def _apply_post_execute_advisories(
+        self,
+        tool_calls: list[dict[str, Any]],
+        results: list[tuple[str, str | list[dict[str, Any]]]],
+    ) -> None:
+        """Run repeat detection + tool-error nudge over a freshly-executed batch.
+
+        Mutates *results* in place when an identical-repeat warning is
+        appended to a tool's text output.  Updates ``self._repeat_detector``,
+        ``self._pending_tool_advisories``, ``self._metacog_state`` (cooldown
+        timestamp via ``should_nudge``), and emits a ``[repeat: …]`` UI line
+        on each detection.
+
+        ``_tool_error_flags`` is the authoritative is_error signal — set by
+        ``_report_tool_result`` for every error path including bash non-zero
+        exits with normal stdout, denials, parse errors, and blocked
+        commands.  Flags are read here and consumed by ``.pop()`` later in
+        the per-result loop in ``_run_loop``, so the read here is safe.
+        """
+        # Repeat detection: warn when a tool is called with identical
+        # args as a previous call in this session, regardless of
+        # whether the previous call succeeded or failed.  Repeatedly
+        # calling the same tool — even one that keeps erroring — is
+        # the stuck-loop behaviour the nudge is meant to catch.  JSON
+        # outputs (MCP structured results) are tracked but exempt
+        # from the inline warning text (appending text would corrupt
+        # the payload).
+        _tc_by_id = {c["id"]: c for c in tool_calls}
+        _repeat_detected = False
+
+        # Clear streak when a write tool executed successfully — the
+        # state has changed so re-running a read tool is valid.
+        _write_tools = frozenset({"write_file", "edit_file", "bash"})
+        if any(
+            tc["function"]["name"] in _write_tools and not self._tool_error_flags.get(tc["id"])
+            for tc in tool_calls
+        ):
+            self._repeat_detector.clear()
+
+        for i, (tc_id, output) in enumerate(results):
+            tc = _tc_by_id.get(tc_id)
+            if tc and isinstance(output, str):
+                raw = tc["function"]["name"] + ":" + tc["function"]["arguments"]
+                sig = hashlib.sha256(raw.encode()).hexdigest()
+                is_json = output.lstrip().startswith(("{", "["))
+                if self._repeat_detector.record(sig):
+                    _repeat_detected = True
+                    if not is_json:
+                        output += (
+                            "\n\n⚠ Warning: this is an identical repeat of a "
+                            "previous tool call. The result is the same. "
+                            "Try a different approach."
+                        )
+                        results[i] = (tc_id, output)
+                    self.ui.on_info(
+                        f"{GRAY}[repeat: {tc['function']['name']}() "
+                        f"called with same arguments]{RESET}"
+                    )
+
+        if _repeat_detected:
+            # Reset so the model gets a clean slate after the warning.
+            # If it repeats again, a new warning fires.
+            self._repeat_detector.clear()
+            if self._mem_cfg.nudges and should_nudge(
+                "repeat",
+                self._metacog_state,
+                message_count=len(self.messages),
+                cooldown_secs=self._mem_cfg.nudge_cooldown,
+            ):
+                self._queue_tool_advisory("repeat", format_nudge("repeat"))
+
+        # Tool-error nudge — queued so the MetacognitiveAdvisory rides
+        # the same _collect_advisories drain pass as guard findings and
+        # user interjections.  Cooldown gating in should_nudge keeps
+        # this to one nudge per batch even with many failing tools.
+        if (
+            self._mem_cfg.nudges
+            and any(self._tool_error_flags.get(tc_id) for tc_id, _ in results)
+            and should_nudge(
+                "tool_error",
+                self._metacog_state,
+                message_count=len(self.messages),
+                memory_count=self._visible_memory_count(),
+                cooldown_secs=self._mem_cfg.nudge_cooldown,
+            )
+        ):
+            self._queue_tool_advisory("tool_error", format_nudge("tool_error"))
 
     # ------------------------------------------------------------------
     # Coordinator tools — reachable only when ``kind == "coordinator"``.
@@ -9203,7 +9221,7 @@ class ChatSession:
         elif cmd == "/clear":
             self.messages.clear()
             self._read_files.clear()
-            self._recent_tool_sigs.clear()
+            self._repeat_detector.clear()
             self._last_usage = None
             self._calibrated_msg_count = 0
             self._msg_tokens = []
@@ -9214,7 +9232,7 @@ class ChatSession:
 
             self.messages.clear()
             self._read_files.clear()
-            self._recent_tool_sigs.clear()
+            self._repeat_detector.clear()
             self._last_usage = None
             self._calibrated_msg_count = 0
             self._msg_tokens = []

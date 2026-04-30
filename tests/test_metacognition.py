@@ -8,6 +8,7 @@ from turnstone.core.metacognition import (
     NUDGE_RESUME,
     NUDGE_START,
     NUDGE_TOOL_ERROR,
+    RepeatDetector,
     detect_completion,
     detect_correction,
     format_nudge,
@@ -308,3 +309,70 @@ class TestRepeatNudge:
         """Repeat nudge should fire even with zero memories."""
         state: dict[str, float] = {}
         assert should_nudge("repeat", state, message_count=5, memory_count=0) is True
+
+
+class TestRepeatDetector:
+    """Repeat-detection streak machine — fires only when the same signature
+    is recorded ``threshold`` times *consecutively* (default 3).  Recording
+    any different signature resets the streak, so an interrupted repeat
+    isn't flagged as a stuck loop."""
+
+    def test_below_threshold_does_not_fire(self):
+        det = RepeatDetector()
+        assert det.record("a") is False
+        assert det.record("a") is False  # second call still under threshold
+
+    def test_at_threshold_fires(self):
+        det = RepeatDetector()
+        det.record("a")
+        det.record("a")
+        assert det.record("a") is True
+
+    def test_continues_to_fire_past_threshold(self):
+        # Caller is responsible for clearing after a fire — until they do,
+        # subsequent identical calls keep returning True.
+        det = RepeatDetector()
+        det.record("a")
+        det.record("a")
+        assert det.record("a") is True
+        assert det.record("a") is True
+
+    def test_clear_resets_count(self):
+        det = RepeatDetector()
+        det.record("a")
+        det.record("a")
+        det.clear()
+        assert det.record("a") is False  # back to 1 after clear
+
+    def test_intervening_sig_resets_streak(self):
+        # The streak is consecutive: recording any other sig mid-streak
+        # discards the in-progress count.  An alternating pattern like
+        # [A, A, B, A, A] is two short streaks of 2, not a streak of 4.
+        det = RepeatDetector()
+        det.record("a")
+        det.record("a")
+        assert det.record("b") is False  # b at count 1; a's streak is gone
+        assert det.record("a") is False  # a starts fresh at 1
+        assert det.record("a") is False  # a at 2
+        assert det.record("a") is True  # a hits 3 — fresh streak completes
+
+    def test_errored_signature_counts_toward_repeat(self):
+        # Regression: when metacog was split out of the system message,
+        # the error-output skip got reintroduced and stuck-loop detection
+        # silently broke for tools that kept failing.  Detector itself is
+        # signature-only — error vs. success is the caller's policy.
+        det = RepeatDetector()
+        # Caller records an errored call's sig the same as a successful one;
+        # the streak is what matters.
+        for _ in range(3):
+            last = det.record("bash:ls /nonexistent")
+        assert last is True
+
+    def test_custom_threshold(self):
+        det = RepeatDetector(threshold=2)
+        assert det.record("a") is False
+        assert det.record("a") is True
+
+    def test_threshold_one_fires_immediately(self):
+        det = RepeatDetector(threshold=1)
+        assert det.record("a") is True

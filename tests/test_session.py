@@ -2190,3 +2190,188 @@ class TestMetacognitiveBuffers:
 
         # Buffer cleared by the cancel handler — no leak into next send().
         assert session._pending_tool_advisories == []
+
+
+class TestApplyPostExecuteAdvisories:
+    """End-to-end coverage of the per-batch advisory hook in _run_loop —
+    repeat detection (with the streak semantics restored after the split)
+    and tool-error nudge.  Drives ``_apply_post_execute_advisories``
+    directly, simulating the post-_execute_tools state.
+    """
+
+    @staticmethod
+    def _tc(tc_id: str, name: str, args: str) -> dict:
+        return {"id": tc_id, "function": {"name": name, "arguments": args}}
+
+    @staticmethod
+    def _prime(session) -> None:
+        """Enable nudges and bump message_count above the should_nudge floor.
+
+        ``should_nudge`` skips nudging on message_count <= 1; in production
+        the per-batch hook runs after at least a user→assistant exchange,
+        so seed two messages to mirror that.
+        """
+        session._mem_cfg.nudges = True
+        session.messages.append({"role": "user", "content": "hi"})
+        session.messages.append({"role": "assistant", "content": "ok"})
+
+    def test_three_identical_calls_fire_warning_and_advisory(self, tmp_db):
+        session = _make_session()
+        self._prime(session)
+        for i in range(3):
+            tc_id = f"tc_{i}"
+            results = [(tc_id, "file contents")]
+            session._apply_post_execute_advisories(
+                [self._tc(tc_id, "read_file", '{"path": "x"}')],
+                results,
+            )
+            if i < 2:
+                # Streak below threshold — no inline warning, no advisory yet.
+                assert results[0][1] == "file contents"
+                assert all(t != "repeat" for t, _ in session._pending_tool_advisories)
+            else:
+                assert "⚠ Warning: this is an identical repeat" in results[0][1]
+        assert any(t == "repeat" for t, _ in session._pending_tool_advisories)
+
+    def test_errored_calls_count_toward_streak(self, tmp_db):
+        """Regression: when metacog was split out of the system message,
+        errored tool calls stopped counting toward repeats — so a model
+        stuck on a failing call wouldn't get warned. Three identical
+        bash failures must still fire the streak."""
+        session = _make_session()
+        self._prime(session)
+        with patch.object(session, "_visible_memory_count", return_value=0):
+            for i in range(3):
+                tc_id = f"tc_{i}"
+                session._tool_error_flags[tc_id] = True
+                session._apply_post_execute_advisories(
+                    [self._tc(tc_id, "bash", '{"command": "ls /missing"}')],
+                    [(tc_id, "ls: cannot access /missing")],
+                )
+        assert any(t == "repeat" for t, _ in session._pending_tool_advisories)
+
+    def test_intervening_different_sig_resets_streak(self, tmp_db):
+        """Streak semantics: [A, A, B, A] does NOT fire — B breaks the run."""
+        session = _make_session()
+        self._prime(session)
+        sequence = [
+            ("read_file", '{"path": "a"}'),
+            ("read_file", '{"path": "a"}'),
+            ("read_file", '{"path": "b"}'),  # different — resets
+            ("read_file", '{"path": "a"}'),
+        ]
+        with patch.object(session, "_visible_memory_count", return_value=0):
+            for i, (name, args) in enumerate(sequence):
+                tc_id = f"tc_{i}"
+                session._apply_post_execute_advisories(
+                    [self._tc(tc_id, name, args)],
+                    [(tc_id, "ok")],
+                )
+        assert all(t != "repeat" for t, _ in session._pending_tool_advisories)
+
+    def test_successful_write_clears_streak(self, tmp_db):
+        """A successful write tool changes file state, so re-reading the
+        same path is valid again — streak clears."""
+        session = _make_session()
+        self._prime(session)
+        with patch.object(session, "_visible_memory_count", return_value=0):
+            for i in range(2):
+                tc_id = f"r_{i}"
+                session._apply_post_execute_advisories(
+                    [self._tc(tc_id, "read_file", '{"path": "x"}')],
+                    [(tc_id, "contents")],
+                )
+            # Successful write — clears streak.
+            session._apply_post_execute_advisories(
+                [self._tc("w", "write_file", '{"path": "x", "content": "y"}')],
+                [("w", "ok")],
+            )
+            # Two more identical reads — would have been streak=4 without
+            # the clear, so a fire would prove it didn't clear.  Streak
+            # restarts at 1 instead.
+            for i in range(2):
+                tc_id = f"r2_{i}"
+                session._apply_post_execute_advisories(
+                    [self._tc(tc_id, "read_file", '{"path": "x"}')],
+                    [(tc_id, "contents")],
+                )
+        assert all(t != "repeat" for t, _ in session._pending_tool_advisories)
+
+    def test_failed_write_does_not_clear_streak(self, tmp_db):
+        """A failing bash command does NOT change state, so the streak
+        must persist — otherwise a model bashing the same broken
+        command never gets warned."""
+        session = _make_session()
+        self._prime(session)
+        with patch.object(session, "_visible_memory_count", return_value=0):
+            for i in range(3):
+                tc_id = f"b_{i}"
+                session._tool_error_flags[tc_id] = True
+                session._apply_post_execute_advisories(
+                    [self._tc(tc_id, "bash", '{"command": "ls /missing"}')],
+                    [(tc_id, "ls: cannot access /missing")],
+                )
+        assert any(t == "repeat" for t, _ in session._pending_tool_advisories)
+
+    def test_json_output_tracked_but_not_inline_warned(self, tmp_db):
+        """MCP-shape JSON outputs are tracked toward the streak but the
+        warning text is NOT appended — that would corrupt the payload."""
+        session = _make_session()
+        self._prime(session)
+        json_out = '{"result": "data"}'
+        with patch.object(session, "_visible_memory_count", return_value=0):
+            for i in range(3):
+                tc_id = f"j_{i}"
+                results = [(tc_id, json_out)]
+                session._apply_post_execute_advisories(
+                    [self._tc(tc_id, "search", '{"q": "x"}')],
+                    results,
+                )
+                if i == 2:
+                    # JSON content untouched even though streak fired.
+                    assert results[0][1] == json_out
+        assert any(t == "repeat" for t, _ in session._pending_tool_advisories)
+
+    def test_tool_error_nudge_fires_when_memories_exist(self, tmp_db):
+        session = _make_session()
+        self._prime(session)
+        tc_id = "tc"
+        session._tool_error_flags[tc_id] = True
+        with patch.object(session, "_visible_memory_count", return_value=3):
+            session._apply_post_execute_advisories(
+                [self._tc(tc_id, "bash", '{"command": "false"}')],
+                [(tc_id, "command failed")],
+            )
+        assert any(t == "tool_error" for t, _ in session._pending_tool_advisories)
+
+    def test_tool_error_nudge_skipped_with_zero_memories(self, tmp_db):
+        """Without memories the tool_error nudge has nothing useful to point
+        at — should_nudge gates it off."""
+        session = _make_session()
+        self._prime(session)
+        tc_id = "tc"
+        session._tool_error_flags[tc_id] = True
+        with patch.object(session, "_visible_memory_count", return_value=0):
+            session._apply_post_execute_advisories(
+                [self._tc(tc_id, "bash", '{"command": "false"}')],
+                [(tc_id, "command failed")],
+            )
+        assert all(t != "tool_error" for t, _ in session._pending_tool_advisories)
+
+    def test_emit_repeat_ui_line_on_streak_fire(self, tmp_db):
+        """The grey ``[repeat: tool() called with same arguments]`` UI
+        line is the user-visible signal that the warning fired."""
+        session = _make_session()
+        self._prime(session)
+        with (
+            patch.object(session.ui, "on_info") as m_info,
+            patch.object(session, "_visible_memory_count", return_value=0),
+        ):
+            for i in range(3):
+                tc_id = f"tc_{i}"
+                session._apply_post_execute_advisories(
+                    [self._tc(tc_id, "read_file", '{"path": "x"}')],
+                    [(tc_id, "ok")],
+                )
+        msgs = [c.args[0] for c in m_info.call_args_list]
+        assert any("[repeat: read_file()" in m for m in msgs)
