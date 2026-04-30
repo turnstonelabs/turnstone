@@ -2274,9 +2274,13 @@ class TestApplyPostExecuteAdvisories:
                 )
         assert all(t != "repeat" for t, _ in session._pending_tool_advisories)
 
-    def test_successful_write_clears_streak(self, tmp_db):
-        """A successful write tool changes file state, so re-reading the
-        same path is valid again — streak clears."""
+    def test_intervening_different_call_resets_streak(self, tmp_db):
+        """Streak detection is consecutive-only: any intervening call
+        with a different signature resets the streak naturally via
+        ``RepeatDetector.record``.  Simulates 2 reads → 1 write → 2
+        reads — five calls but no streak ever hits the threshold of
+        three because the write breaks the read streak and the second
+        run of reads only reaches 2."""
         session = _make_session()
         self._prime(session)
         with patch.object(session, "_visible_memory_count", return_value=0):
@@ -2286,14 +2290,12 @@ class TestApplyPostExecuteAdvisories:
                     [self._tc(tc_id, "read_file", '{"path": "x"}')],
                     [(tc_id, "contents")],
                 )
-            # Successful write — clears streak.
+            # Different signature — write_file(...) — resets the
+            # ``read_file:x`` streak by virtue of being a different sig.
             session._apply_post_execute_advisories(
                 [self._tc("w", "write_file", '{"path": "x", "content": "y"}')],
                 [("w", "ok")],
             )
-            # Two more identical reads — would have been streak=4 without
-            # the clear, so a fire would prove it didn't clear.  Streak
-            # restarts at 1 instead.
             for i in range(2):
                 tc_id = f"r2_{i}"
                 session._apply_post_execute_advisories(
@@ -2302,10 +2304,36 @@ class TestApplyPostExecuteAdvisories:
                 )
         assert all(t != "repeat" for t, _ in session._pending_tool_advisories)
 
-    def test_failed_write_does_not_clear_streak(self, tmp_db):
-        """A failing bash command does NOT change state, so the streak
-        must persist — otherwise a model bashing the same broken
-        command never gets warned."""
+    def test_sequential_bash_same_command_fires_repeat(self, tmp_db):
+        """Regression: small local models flaking out and looping on the
+        same call across sequential turns must trigger the nudge,
+        independent of whether the tool ``is_error``.  Pre-fix a
+        write-tool-success-clear branch dropped the streak between
+        turns whenever the call succeeded, so ``bash('echo test') × 3``
+        across three turns never fired even though it's the canonical
+        stuck-loop pattern.
+        """
+        session = _make_session()
+        self._prime(session)
+        with patch.object(session, "_visible_memory_count", return_value=0):
+            # Three sequential successful bash calls (no _tool_error_flags
+            # set), one batch each.  Pre-fix: streak cleared on every
+            # turn because bash is in the write_tools set.  Post-fix:
+            # streak builds 1, 2, 3 and fires on the third.
+            for i in range(3):
+                tc_id = f"b_{i}"
+                session._apply_post_execute_advisories(
+                    [self._tc(tc_id, "bash", '{"command": "echo test"}')],
+                    [(tc_id, "test\n")],
+                )
+        assert any(t == "repeat" for t, _ in session._pending_tool_advisories)
+
+    def test_sequential_bash_failures_fire_repeat(self, tmp_db):
+        """Same shape as the success case, but with each call setting
+        ``_tool_error_flags`` (e.g. ``ls /missing`` exiting non-zero).
+        Errors must count toward the streak — a model stuck on the
+        same broken command is exactly the pattern the nudge is meant
+        to catch."""
         session = _make_session()
         self._prime(session)
         with patch.object(session, "_visible_memory_count", return_value=0):
