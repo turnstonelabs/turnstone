@@ -13,6 +13,7 @@ import contextlib
 import threading
 import time
 import uuid
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Protocol
 
 from turnstone.core.log import get_logger
@@ -604,6 +605,22 @@ class SessionManager:
                 # last close(). The next set_state() call syncs it
                 # naturally; writing 'idle' here could race a concurrent
                 # close() that writes 'closed' under self._lock.
+                #
+                # Bump only ``updated`` (no state write) so this row's
+                # timestamp is fresh against the orphan-reaper cutoff —
+                # otherwise a concurrent close_idle pass-2 in this same
+                # process could clobber a freshly-rehydrated row whose
+                # ``updated`` is older than the cutoff.  The pure-
+                # timestamp write is safe against concurrent close()
+                # because close still wins on the state column.
+                try:
+                    self._storage.touch_workstream(ws_id)
+                except Exception:
+                    log.debug(
+                        "session_mgr.touch_workstream_failed ws=%s",
+                        ws_id[:8],
+                        exc_info=True,
+                    )
                 if self._event_emitter is not None:
                     self._event_emitter.emit_rehydrated(ws)
                 return ws
@@ -804,15 +821,33 @@ class SessionManager:
     def close_idle(self, max_age_seconds: float) -> list[str]:
         """Close IDLE workstreams inactive for more than ``max_age_seconds``.
 
-        Returns the list of closed ws_ids. Unlike the old WSM version,
-        this does NOT skip the last workstream — the default-startup
-        relic is gone, callers can handle the 0-workstream case.
+        Two-pass shape:
+
+        - Pass 1 (in-memory): close loaded ``IDLE`` rows whose
+          ``ws.last_active`` (monotonic) is past timeout.  Closes only
+          ``IDLE`` so legitimately-attentive rows (waiting for user
+          response) stay live.
+        - Pass 2 (DB orphans): bulk-close DB rows of this manager's
+          kind whose ``updated`` is past the wall-clock cutoff and
+          which are not currently loaded.  This catches workstreams
+          left behind by prior process incarnations — a process crash
+          /restart leaves rows in non-terminal states forever
+          otherwise.  Closes ``idle/thinking/attention/running``
+          because any matching row is by definition not loaded by any
+          process and cannot be in a live interaction.
+
+        Returns the combined list of closed ws_ids (in-memory first,
+        then DB orphans).  Pass 1 emits ``ws_closed``; pass 2 does
+        not, because never-loaded rows have no SSE listeners
+        expecting them.
 
         Atomic pop per victim under ``self._lock`` (bug-5): a pending
         tool result can flip state IDLE→RUNNING between the snapshot
         and the close, so the state test + pop must run together.
         Batches every pop under one ``self._lock`` acquisition (perf-5)
-        rather than locking once per victim.
+        rather than locking once per victim.  The DB pass runs OUTSIDE
+        ``self._lock`` — only a brief lock to snapshot loaded keys —
+        so a slow UPDATE doesn't block create/get/set_state.
         """
         now = time.monotonic()
         popped: list[Workstream] = []
@@ -853,6 +888,33 @@ class SessionManager:
             if self._event_emitter is not None:
                 self._event_emitter.emit_closed(ws.id, name=ws.name)
             closed_ids.append(ws.id)
+
+        # Pass 2: reap DB orphans of this kind older than the cutoff.
+        # Snapshot loaded keys under self._lock briefly so a concurrent
+        # create/load doesn't get its row clobbered by the UPDATE; release
+        # before the DB call.  Scope by self._node_id so a sibling process
+        # on another node can't reap rows we own (multi-node interactive).
+        with self._lock:
+            loaded = list(self._workstreams.keys())
+        cutoff = (datetime.now(UTC) - timedelta(seconds=max_age_seconds)).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+        try:
+            orphans = self._storage.bulk_close_stale_orphans(
+                self.kind, cutoff, loaded, node_id=self._node_id
+            )
+        except Exception:
+            log.debug(
+                "session_mgr.bulk_close_orphans_failed kind=%s", self.kind.value, exc_info=True
+            )
+            orphans = []
+        if orphans:
+            log.info(
+                "session_mgr.bulk_close_orphans count=%d kind=%s",
+                len(orphans),
+                self.kind.value,
+            )
+        closed_ids.extend(orphans)
         return closed_ids
 
     def _close_if_idle_locked(self, ws_id: str) -> Workstream | None:
