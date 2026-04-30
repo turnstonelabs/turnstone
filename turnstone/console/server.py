@@ -8013,10 +8013,13 @@ def _refresh_console_coord_registry(app_state: Any, storage: Any) -> None:
       check compares ``cfg.model`` against ``self.model`` and re-resolves
       on mismatch).
 
-    No-op when ``coord_registry`` is ``None`` — lifespan typically leaves
-    it unset only when no model rows existed at boot; admins fix that
-    via the model-definitions UI, then click reload (which has its own
-    boot-from-empty story).
+    No-op when ``coord_registry`` is ``None``.  Lifespan only sets it
+    when DB model rows existed at boot; with no rows the entire coord
+    subsystem stays disabled (no ``coord_mgr``, no ``coord_adapter``,
+    no ``session_factory`` — see the lifespan setup in this module).
+    Bootstrapping that whole stack on the fly is out of scope for this
+    helper, so a console restart remains required after the operator
+    adds the first model row.
 
     Errors are logged + swallowed.  The DB write that triggered this
     refresh has already succeeded, and the explicit reload button
@@ -8024,11 +8027,26 @@ def _refresh_console_coord_registry(app_state: Any, storage: Any) -> None:
     (e.g. admin deleted the alias that ``registry.default`` points at)
     leave the existing registry intact rather than tearing down a
     working coordinator.
+
+    DB read failures are detected by an explicit probe before calling
+    ``load_model_registry``: the loader swallows storage errors
+    internally and would otherwise return a config.toml-only registry,
+    which would silently drop DB-sourced aliases when applied via
+    ``ModelRegistry.reload``.
     """
     from turnstone.core.model_registry import load_model_registry
 
     existing = getattr(app_state, "coord_registry", None)
     if existing is None:
+        return
+    # Strict DB probe — load_model_registry swallows storage errors
+    # internally (logs + continues with config.toml-only models).  Without
+    # this fail-fast, a transient DB outage would let the helper apply a
+    # truncated registry that drops every DB-sourced alias.
+    try:
+        storage.list_model_definitions(enabled_only=True)
+    except Exception:
+        log.warning("console.coord_registry_refresh_db_probe_failed", exc_info=True)
         return
     try:
         new_registry = load_model_registry(storage=storage)
