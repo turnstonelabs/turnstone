@@ -5575,9 +5575,12 @@ class ChatSession:
 
         Mutates *results* in place when an identical-repeat warning is
         appended to a tool's text output.  Updates ``self._repeat_detector``,
-        ``self._pending_tool_advisories``, ``self._metacog_state`` (cooldown
-        timestamp via ``should_nudge``), and emits a ``[repeat: …]`` UI line
-        on each detection.
+        ``self._pending_tool_advisories``, and ``self._metacog_state``
+        (cooldown timestamp via ``should_nudge``).  The operator-visible
+        signal is the themed ``tool_reminder`` bubble below the tool
+        block — emitted by the per-result loop downstream when the
+        drained metacog reminders attach to the tool message dict's
+        ``_reminders`` side-channel.
 
         Repeat detection's job is to nudge a flaky local model out of a
         loop where it keeps making the same tool call ("``bash(cmd='echo
@@ -5617,10 +5620,11 @@ class ChatSession:
                             "Try a different approach."
                         )
                         results[i] = (tc_id, output)
-                    self.ui.on_info(
-                        f"{GRAY}[repeat: {tc['function']['name']}() "
-                        f"called with same arguments]{RESET}"
-                    )
+                    # The themed ``tool_reminder`` bubble below the tool
+                    # block carries the operator-visible signal; the
+                    # tool-name context comes from the visible tool
+                    # block immediately above the bubble, so a separate
+                    # diagnostic info line would just duplicate it.
 
         if _repeat_detected:
             # Reset so the model gets a clean slate after the warning.

@@ -2391,9 +2391,13 @@ class TestApplyPostExecuteAdvisories:
             )
         assert all(t != "tool_error" for t, _ in session._pending_tool_advisories)
 
-    def test_emit_repeat_ui_line_on_streak_fire(self, tmp_db):
-        """The grey ``[repeat: tool() called with same arguments]`` UI
-        line is the user-visible signal that the warning fired."""
+    def test_no_legacy_repeat_info_line_on_streak_fire(self, tmp_db):
+        """The legacy gray ``[repeat: tool() called with same arguments]``
+        info line is gone — the themed ``tool_reminder`` bubble below
+        the tool block is the canonical operator signal now (and the
+        tool name comes from the visible tool block right above the
+        bubble, not a duplicate diagnostic line).
+        """
         session = _make_session()
         self._prime(session)
         with (
@@ -2406,8 +2410,10 @@ class TestApplyPostExecuteAdvisories:
                     [self._tc(tc_id, "read_file", '{"path": "x"}')],
                     [(tc_id, "ok")],
                 )
-        msgs = [c.args[0] for c in m_info.call_args_list]
-        assert any("[repeat: read_file()" in m for m in msgs)
+        msgs = [c.args[0] for c in m_info.call_args_list if c.args]
+        assert not any("[repeat:" in m for m in msgs), (
+            f"expected no legacy repeat info line, got {msgs!r}"
+        )
 
 
 class TestApplyRemindersForProvider:
