@@ -230,6 +230,7 @@ class ModelRegistry:
         if task_model and task_model not in models:
             raise ValueError(f"Task model '{task_model}' not found in registry")
         with self._client_lock:
+            old_models = self._models
             self._models = dict(models)
             self.default = default
             self.fallback = list(fallback) if fallback else []
@@ -238,11 +239,32 @@ class ModelRegistry:
             self.task_model = task_model
             self.plan_effort = plan_effort
             self.task_effort = task_effort
-            for client in self._clients.values():
-                if hasattr(client, "close"):
-                    client.close()
-            self._clients.clear()
-            self._providers.clear()
+            # Selective teardown — close + drop only clients whose
+            # connection target actually changed (alias removed, or
+            # base_url / api_key / provider differs).  Keeps connection
+            # pools warm for the common admin-edit case where only
+            # ``model`` / ``temperature`` / ``context_window`` changed.
+            for alias, client in list(self._clients.items()):
+                old_cfg = old_models.get(alias)
+                new_cfg = self._models.get(alias)
+                if (
+                    new_cfg is None
+                    or old_cfg is None
+                    or old_cfg.base_url != new_cfg.base_url
+                    or old_cfg.api_key != new_cfg.api_key
+                    or old_cfg.provider != new_cfg.provider
+                ):
+                    if hasattr(client, "close"):
+                        client.close()
+                    del self._clients[alias]
+            # Providers are keyed on alias but only depend on
+            # ``cfg.provider`` — drop only when the provider string
+            # changed or the alias was removed.
+            for alias in list(self._providers.keys()):
+                old_cfg = old_models.get(alias)
+                new_cfg = self._models.get(alias)
+                if new_cfg is None or old_cfg is None or old_cfg.provider != new_cfg.provider:
+                    del self._providers[alias]
 
     def shutdown(self) -> None:
         """Close all cached client connections."""
