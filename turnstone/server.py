@@ -359,11 +359,15 @@ def _build_history(
     issued the tool calls is also marked ``"denied": True`` so the
     client can render the correct badge.
     """
-    # Metacognitive nudges live on the user message dict's ``_reminders``
-    # side-channel and are surfaced separately on each entry so the UI
-    # can render them as their own bubble (live + replay).  ``content``
-    # never carries the ``<system-reminder>`` envelope — that splice is
-    # transient, applied to a wire-bound copy in
+    # Metacognitive nudges live on the message dict's ``_reminders``
+    # side-channel — user messages carry user-channel nudges
+    # (correction / denial / resume / start / completion), tool
+    # messages carry tool-channel nudges (tool_error / repeat).  Both
+    # are surfaced separately on each entry so the UI can render them
+    # as their own bubble (live via ``user_reminder`` /
+    # ``tool_reminder`` SSE events; replay via this propagation).
+    # ``content`` never carries the ``<system-reminder>`` envelope —
+    # that splice is transient, applied to a wire-bound copy in
     # ``ChatSession._apply_reminders_for_provider``.
     history = []
     for msg in session.messages:
@@ -411,10 +415,11 @@ def _build_history(
         if attachments_meta:
             entry["attachments"] = attachments_meta
         # Surface the ``_reminders`` side-channel so a tab reconnecting
-        # via /history renders the same metacognitive nudge bubble as
-        # the originating tab saw via the live ``user_reminder`` SSE
-        # event.  Reminders are in-memory only (not persisted to DB),
-        # so this only fires for the originating session.
+        # via /history renders the same metacognitive nudge bubble the
+        # originating tab saw live (user-channel reminders via
+        # ``user_reminder`` SSE; tool-channel via ``tool_reminder``).
+        # Reminders are in-memory only (not persisted to DB), so this
+        # only fires for the originating session.
         reminders = msg.get("_reminders")
         if isinstance(reminders, list):
             # Filter first so an all-malformed _reminders doesn't set the
