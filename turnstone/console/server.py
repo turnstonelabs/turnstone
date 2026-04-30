@@ -7996,6 +7996,71 @@ async def _collect_model_status(
     return {nid: models for nid, models in results if models is not None}
 
 
+def _refresh_console_coord_registry(app_state: Any, storage: Any) -> None:
+    """Rebuild ``app_state.coord_registry`` in place from DB model definitions.
+
+    The console-side coordinator session factory closes over the
+    ``coord_registry`` instance built at lifespan startup
+    (see ``console/server.py``'s lifespan setup and
+    ``console/session_factory.py``).  Replacing the attribute would
+    orphan the closure — new sessions would still resolve through the
+    stale object.  Mutating in place via ``ModelRegistry.reload()``
+    preserves identity, so:
+
+    - new coordinator sessions see the new state at create-time;
+    - active coordinator sessions auto-pick up the swap at next ``send()``
+      via ``ChatSession._refresh_model_from_registry`` (the per-send
+      check compares ``cfg.model`` against ``self.model`` and re-resolves
+      on mismatch).
+
+    No-op when ``coord_registry`` is ``None`` — lifespan typically leaves
+    it unset only when no model rows existed at boot; admins fix that
+    via the model-definitions UI, then click reload (which has its own
+    boot-from-empty story).
+
+    Errors are logged + swallowed.  The DB write that triggered this
+    refresh has already succeeded, and the explicit reload button
+    remains the user-facing recovery path.  Validation failures
+    (e.g. admin deleted the alias that ``registry.default`` points at)
+    leave the existing registry intact rather than tearing down a
+    working coordinator.
+    """
+    from turnstone.core.model_registry import load_model_registry
+
+    existing = getattr(app_state, "coord_registry", None)
+    if existing is None:
+        return
+    try:
+        new_registry = load_model_registry(storage=storage)
+    except ValueError:
+        # All rows disabled/deleted — ModelRegistry.__init__ rejects an
+        # empty model dict.  Leave the existing registry in place so
+        # active coord sessions stay usable; the operator will see the
+        # empty state in the model-definitions UI.
+        log.warning("console.coord_registry_refresh_skipped reason=no_enabled_rows")
+        return
+    except Exception:
+        log.warning("console.coord_registry_refresh_load_failed", exc_info=True)
+        return
+    try:
+        existing.reload(
+            new_registry.models,
+            new_registry.default,
+            new_registry.fallback,
+            new_registry.agent_model,
+            plan_model=new_registry.plan_model,
+            task_model=new_registry.task_model,
+            plan_effort=new_registry.plan_effort,
+            task_effort=new_registry.task_effort,
+        )
+    except Exception:
+        log.warning("console.coord_registry_refresh_reload_failed", exc_info=True)
+    finally:
+        # Close any clients the throwaway registry created during DB
+        # load, regardless of whether the in-place reload succeeded.
+        new_registry.shutdown()
+
+
 async def _notify_nodes_model_reload(request: Request) -> dict[str, Any]:
     """Tell all nodes to re-read model definitions from DB and rebuild registry."""
     collector: ClusterCollector = request.app.state.collector
@@ -8232,6 +8297,8 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
         ip,
     )
 
+    _refresh_console_coord_registry(request.app.state, storage)
+
     created = storage.get_model_definition(definition_id)
     if created is None:
         return JSONResponse(
@@ -8389,6 +8456,9 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         ip,
     )
 
+    if updates:
+        _refresh_console_coord_registry(request.app.state, storage)
+
     model_def = storage.get_model_definition(definition_id)
     return JSONResponse(_mask_model_secrets(model_def or {}))
 
@@ -8424,6 +8494,8 @@ async def admin_delete_model_definition(request: Request) -> JSONResponse:
         ip,
     )
 
+    _refresh_console_coord_registry(request.app.state, storage)
+
     return JSONResponse({"status": "ok", "definition_id": definition_id})
 
 
@@ -8442,6 +8514,13 @@ async def admin_model_reload(request: Request) -> JSONResponse:
     # Ensure config (including model.default_alias) is fresh on all nodes
     # before they rebuild their model registries.
     await _publish_config_change(request)
+
+    # Refresh the console's own coord_registry first.  The node fan-out
+    # below carries DB→nodes propagation; the console hosts coordinator
+    # sessions itself and must mutate its in-process registry too —
+    # otherwise the coord LLM keeps calling the prior model name even
+    # after a successful reload.
+    _refresh_console_coord_registry(request.app.state, storage)
 
     results = await _notify_nodes_model_reload(request)
     return JSONResponse({"status": "ok", "results": results})
