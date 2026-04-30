@@ -314,6 +314,48 @@ class TestCollectorSnapshot:
         assert event["ws_id"] == "ws1"
         assert event["state"] == "running"
 
+    def test_apply_snapshot_state_change_forwards_pending_approval_detail(self):
+        """Reconnect-via-snapshot is the resync path after every console
+        restart or network blip.  Without forwarding the field here,
+        a child sitting in approval-pending across the gap renders as
+        ``activity_state=approval`` with no buttons until the next
+        state change — broken UX during the most common re-sync event."""
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a",
+            server_url="http://a:8080",
+            workstreams={"ws1": {"id": "ws1", "name": "same", "state": "idle"}},
+        )
+        q: queue.Queue[dict] = queue.Queue()
+        c.register_listener(q)
+
+        detail = {
+            "items": [{"call_id": "c1", "header": "tool x"}],
+            "judge_pending": False,
+        }
+        c._apply_snapshot(
+            "node-a",
+            {
+                "type": "node_snapshot",
+                "node_id": "node-a",
+                "workstreams": [
+                    {
+                        "id": "ws1",
+                        "name": "same",
+                        "state": "running",
+                        "activity_state": "approval",
+                        "pending_approval_detail": detail,
+                    }
+                ],
+                "health": {},
+                "aggregate": {},
+            },
+        )
+
+        event = q.get_nowait()
+        assert event["type"] == "cluster_state"
+        assert event["pending_approval_detail"] == detail
+
     def test_apply_snapshot_skips_empty_id_workstream(self):
         c = _make_collector()
         c._nodes["node-a"] = NodeSnapshot(node_id="node-a", server_url="http://a:8080")
@@ -358,6 +400,40 @@ class TestCollectorDelta:
         assert event["state"] == "running"
         # Verify in-memory state was updated
         assert c._nodes["node-a"].workstreams["ws1"]["state"] == "running"
+
+    def test_apply_delta_ws_state_forwards_pending_approval_detail(self):
+        """The rich approval payload now travels on the cluster bus so
+        coord tabs can render inline approve/deny buttons in lockstep
+        with the activity_state transition.  Collector must forward
+        the field verbatim — the adapter does the child-routing on
+        top, but the bus carries the data."""
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a",
+            server_url="http://a:8080",
+            workstreams={"ws1": {"id": "ws1", "name": "test", "state": "idle"}},
+        )
+        q: queue.Queue[dict] = queue.Queue()
+        c.register_listener(q)
+
+        detail = {
+            "items": [{"call_id": "c1", "header": "tool x"}],
+            "judge_pending": False,
+        }
+        c._apply_delta(
+            "node-a",
+            {
+                "type": "ws_state",
+                "ws_id": "ws1",
+                "state": "running",
+                "activity_state": "approval",
+                "pending_approval_detail": detail,
+            },
+        )
+
+        event = q.get_nowait()
+        assert event["type"] == "cluster_state"
+        assert event["pending_approval_detail"] == detail
 
     def test_apply_delta_ws_created(self):
         c = _make_collector()

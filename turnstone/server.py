@@ -194,6 +194,18 @@ class WebUI(SessionUIBase):
             }
             if state == "idle":
                 event["content"] = payload["content"]
+            # Coord tree-UI renders inline approve/deny buttons off
+            # ``pending_approval_detail``; carrying it on the
+            # state-change broadcast lets the cluster bus update those
+            # buttons in lockstep with ``activity_state`` instead of
+            # forcing the browser to chase a separate dashboard fetch.
+            # Gated on existence so we don't pay the serializer's
+            # per-broadcast verdict-cache deepcopy on the common
+            # no-approval-pending path.
+            if self._pending_approval is not None:
+                detail = self.serialize_pending_approval_detail()
+                if detail is not None:
+                    event["pending_approval_detail"] = detail
             try:
                 WebUI._global_queue.put_nowait(event)
             except queue.Full:
@@ -823,6 +835,16 @@ def _build_node_snapshot(app_state: Any) -> dict[str, Any]:
         title = ""
         if ws.session:
             title = get_workstream_display_name(ws.session.ws_id) or ""
+        # ``pending_approval_detail`` mirrors the dashboard handler's
+        # projection so the console collector's reconnect-via-snapshot
+        # path (``_reconcile_node``) can carry the rich approval payload
+        # across reconnects — without it, a child sitting in approval-
+        # pending across a console restart or network blip would render
+        # with no buttons until the next state change. Same data, same
+        # ``read`` scope as ``/v1/api/dashboard``.
+        approval_detail: dict[str, Any] | None = None
+        if ui is not None and hasattr(ui, "serialize_pending_approval_detail"):
+            approval_detail = ui.serialize_pending_approval_detail()
         ws_list.append(
             {
                 "id": ws.id,
@@ -839,6 +861,7 @@ def _build_node_snapshot(app_state: Any) -> dict[str, Any]:
                 "kind": ws.kind,
                 "parent_ws_id": ws.parent_ws_id,
                 "user_id": ws.user_id,
+                "pending_approval_detail": approval_detail,
             }
         )
     return {

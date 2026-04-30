@@ -498,6 +498,7 @@ class ClusterCollector:
                         "kind": WorkstreamKind.from_raw(new_w.get("kind")),
                         "parent_ws_id": new_w.get("parent_ws_id"),
                         "activity_state": new_w.get("activity_state", ""),
+                        "pending_approval_detail": new_w.get("pending_approval_detail"),
                     }
                 )
             old_name = old_ws.get("title", "") or old_ws.get("name", "")
@@ -557,6 +558,18 @@ class ClusterCollector:
                         ws["kind"] = data["kind"]
                     if "parent_ws_id" in data:
                         ws["parent_ws_id"] = data["parent_ws_id"]
+                    # ``pending_approval_detail`` overwrites (no
+                    # ``ws.get`` fallback): the node's broadcast gate
+                    # on ``_pending_approval is not None`` means the
+                    # field is absent from ``data`` exactly when no
+                    # approval is pending — falling back to the cached
+                    # value would resurrect a stale detail after the
+                    # approval resolved.  Without this assignment the
+                    # cached ``node.workstreams`` dict served by
+                    # ``get_node_detail`` / ``get_snapshot`` between
+                    # reconciliations would render stale approve/deny
+                    # buttons on closed approvals.
+                    ws["pending_approval_detail"] = data.get("pending_approval_detail")
                     pending_events.append(
                         {
                             "type": "cluster_state",
@@ -568,6 +581,7 @@ class ClusterCollector:
                             "kind": WorkstreamKind.from_raw(ws.get("kind")),
                             "parent_ws_id": ws.get("parent_ws_id"),
                             "activity_state": ws.get("activity_state", ""),
+                            "pending_approval_detail": data.get("pending_approval_detail"),
                         }
                     )
 

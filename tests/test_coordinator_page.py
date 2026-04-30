@@ -152,3 +152,95 @@ def test_coordinator_js_exposes_inline_approval_helpers():
     # any prior denial.  bug-1 / bug-3 from the second /review pass.
     assert "Denied by user" in body
     assert "callOutcomes" in body
+
+
+def test_coordinator_js_handle_child_state_reads_sse_pending_approval_detail():
+    """Lock the Shape A behavior change: child_ws_state SSE events now
+    carry ``pending_approval_detail`` directly so the browser mutates
+    ``liveBadgeCache`` without firing an urgent live-bulk fetch on
+    every activity_state transition into/out of approval.  A refactor
+    that re-introduces the urgent-fetch path on routine transitions
+    (or drops the SSE-source merge guard in flushLiveFetches) would
+    re-open the load-storm pattern this PR is fixing.
+
+    Structural assertions (regex against multi-line source) — symbol-
+    presence alone wouldn't catch a guard that keeps the names but
+    inverts the comparison or drops the ``prev.live`` check.  This
+    codebase has no JS test framework, so locking the guard's shape
+    here is the next-best thing to a behavioral test."""
+    import re
+    from pathlib import Path
+
+    coord_js = Path(__file__).resolve().parent.parent / (
+        "turnstone/console/static/coordinator/coordinator.js"
+    )
+    body = coord_js.read_text(encoding="utf-8")
+
+    # handleChildState now reads the SSE-supplied detail.
+    assert "ev.pending_approval_detail" in body
+    # The pre-fix urgent-fetch on activity_state transitions is
+    # gone (the 409 retry path keeps its own ``{ urgent: true }``
+    # for stale-call_id refresh — that's a different scenario).
+    assert "enteredApproval" not in body
+    assert "leftApproval" not in body
+
+    # SSE-authoritative window constant is defined and used.
+    assert re.search(r"\bconst\s+SSE_AUTHORITATIVE_MS\s*=\s*\d+", body), (
+        "SSE_AUTHORITATIVE_MS constant must be defined as a numeric literal"
+    )
+
+    # handleChildState writes sseUpdatedAt = Date.now() into the cache
+    # entry it sets.  This is the SSE-source tag; without it, the
+    # merge guard in flushLiveFetches has nothing to gate on.
+    assert re.search(
+        r"sseUpdatedAt:\s*Date\.now\(\)",
+        body,
+    ), "handleChildState must write sseUpdatedAt: Date.now() onto liveBadgeCache entries"
+
+    # flushLiveFetches' merge guard structure: SSE-set pending_approval
+    # / _detail wins over a stale bulk-poll snapshot when (live) AND
+    # (prev exists) AND (prev.sseUpdatedAt set) AND (within window)
+    # AND (prev.live exists).  Inverting the comparison or dropping
+    # any of these guards reopens the clobber bug.
+    merge_guard = re.search(
+        r"if\s*\(\s*live\s*&&\s*prev\s*&&\s*prev\.sseUpdatedAt\s*&&\s*"
+        r"now\s*-\s*prev\.sseUpdatedAt\s*<\s*SSE_AUTHORITATIVE_MS\s*&&\s*"
+        r"prev\.live\s*\)",
+        body,
+    )
+    assert merge_guard is not None, (
+        "flushLiveFetches merge guard must be the conjunction "
+        "(live && prev && prev.sseUpdatedAt && now - prev.sseUpdatedAt < "
+        "SSE_AUTHORITATIVE_MS && prev.live).  An inverted comparison or "
+        "missing prev.live check would let a stale bulk-poll clobber a "
+        "fresh SSE-set approval."
+    )
+
+    # The merge body must preserve BOTH pending_approval and
+    # pending_approval_detail from prev — preserving only one would
+    # render a row with a phantom badge but no buttons (or vice versa).
+    merge_body = re.search(
+        r"mergedLive\s*=\s*Object\.assign\(\s*\{\}\s*,\s*live\s*,\s*\{"
+        r"[^}]*pending_approval:\s*prev\.live\.pending_approval[^}]*"
+        r"pending_approval_detail:\s*prev\.live\.pending_approval_detail",
+        body,
+    )
+    assert merge_body is not None, (
+        "Merge body must preserve both pending_approval AND "
+        "pending_approval_detail from prev.live — preserving only one "
+        "creates a half-rendered approval row."
+    )
+
+    # flushLiveFetches must forward sseUpdatedAt onto the new cache
+    # entry so the SSE-source tag survives the bulk-poll write back —
+    # without this, every bulk-poll resets the window and the next
+    # late-arriving poll silently clobbers.
+    assert re.search(
+        r"sseUpdatedAt:\s*prev\s*\?\s*prev\.sseUpdatedAt",
+        body,
+    ), (
+        "flushLiveFetches must forward prev.sseUpdatedAt onto the new "
+        "cache entry (preserving the SSE-source window across bulk-poll "
+        "cycles) — without this, the second bulk-poll after an SSE "
+        "transition silently clobbers."
+    )

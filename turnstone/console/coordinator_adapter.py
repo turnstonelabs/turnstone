@@ -685,11 +685,13 @@ class CoordinatorAdapter:
                     "tokens": event.get("tokens", 0),
                     "node_id": event.get("node_id", ""),
                     # activity_state lets the JS detect approval-state
-                    # transitions and fire urgent live-bulk fetches so
-                    # inline approve/deny buttons render in lockstep
-                    # with the child entering attention (instead of
-                    # waiting up to 5s for the next TTL window).
+                    # transitions; pending_approval_detail rides on
+                    # the same event so the browser can mutate
+                    # liveBadgeCache directly and render inline
+                    # approve/deny buttons in lockstep with the
+                    # transition, no separate dashboard refetch.
                     "activity_state": event.get("activity_state", ""),
+                    "pending_approval_detail": event.get("pending_approval_detail"),
                 }
             elif etype == "ws_closed":
                 child_event = {

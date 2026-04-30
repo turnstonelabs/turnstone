@@ -155,3 +155,87 @@ class TestContentAccumulation:
         assert len(idle_events) == 1
         # Content should be capped, not contain everything
         assert len(idle_events[0]["content"]) <= _MAX_TURN_CONTENT_CHARS + 1024
+
+
+class TestPendingApprovalDetailGate:
+    """The Shape A SSE plumbing carries ``pending_approval_detail`` on the
+    ``ws_state`` event so the coord tree UI can render inline approve/deny
+    buttons in lockstep with the activity_state transition.  The gate
+    (``if self._pending_approval is not None``) keeps the per-broadcast
+    serializer cost off the common no-approval-pending path — these tests
+    lock both branches down."""
+
+    def test_state_broadcast_omits_field_when_no_approval_pending(self):
+        """Common case: no approval pending → field absent from event so the
+        per-broadcast verdict-cache deepcopy in
+        ``serialize_pending_approval_detail`` never runs.  A regression
+        that drops the gate would silently 10x the cost of every state
+        broadcast in the steady state."""
+        ui = _make_ui()
+        assert ui._pending_approval is None
+        ui._broadcast_state("running")
+
+        events = _drain_global()
+        running_events = [e for e in events if e.get("state") == "running"]
+        assert len(running_events) == 1
+        assert "pending_approval_detail" not in running_events[0]
+
+    def test_state_broadcast_includes_field_when_approval_pending(self):
+        """When an approval is pending the broadcast must carry the rich
+        payload — the coord tree UI reads it directly to render inline
+        approve/deny buttons.  Without this, a coord browser would have
+        to chase a separate ``cluster/ws/live`` fetch on every
+        activity_state transition (the load-storm pattern Shape A is
+        unwinding)."""
+        ui = _make_ui()
+        # Mirror the shape ``pause_for_approval`` writes (session_ui_base
+        # lines 576-580) — items with call_id + header is the minimum
+        # the serializer needs to project.
+        ui._pending_approval = {
+            "type": "approve_request",
+            "items": [
+                {
+                    "call_id": "c1",
+                    "header": "tool x",
+                    "func_args": "{}",
+                    "intent_summary": "do x",
+                    "needs_approval": True,
+                }
+            ],
+            "judge_pending": False,
+        }
+        ui._broadcast_state("attention")
+
+        events = _drain_global()
+        attn = [e for e in events if e.get("state") == "attention"]
+        assert len(attn) == 1
+        # Field present and structurally sound — the serializer's
+        # full shape is covered by tests/test_session_ui_base.py;
+        # here we only need to confirm the gate fires and the
+        # serializer's output is what lands on the event.
+        assert "pending_approval_detail" in attn[0]
+        detail = attn[0]["pending_approval_detail"]
+        assert detail is not None
+        assert detail.get("items")
+        assert detail["items"][0]["call_id"] == "c1"
+
+    def test_field_cleared_after_approval_resolves(self):
+        """Once ``_pending_approval`` is cleared, subsequent state
+        broadcasts must drop the field again — without this, the
+        browser would render stale approve/deny buttons until the
+        next bulk-poll TTL window expired."""
+        ui = _make_ui()
+        ui._pending_approval = {
+            "type": "approve_request",
+            "items": [{"call_id": "c1", "header": "x"}],
+            "judge_pending": False,
+        }
+        ui._broadcast_state("attention")
+        _drain_global()  # discard the with-detail event
+
+        ui._pending_approval = None
+        ui._broadcast_state("running")
+        events = _drain_global()
+        running = [e for e in events if e.get("state") == "running"]
+        assert len(running) == 1
+        assert "pending_approval_detail" not in running[0]

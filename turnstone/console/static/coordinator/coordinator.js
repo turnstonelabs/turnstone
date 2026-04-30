@@ -2085,6 +2085,14 @@
   const TERMINAL_CHILD_STATES = new Set(["closed", "deleted"]);
   const LIVE_BADGE_TTL_MS = 5000;
   const LIVE_BADGE_DEBOUNCE_MS = 250;
+  // After handleChildState mutates liveBadgeCache from a child_ws_state
+  // SSE event, a bulk-poll landing within this window must NOT
+  // overwrite the SSE-supplied pending_approval / _detail fields with
+  // its own (potentially stale) snapshot — the upstream node
+  // /dashboard cache has its own ~2s TTL so a poll right after a
+  // transition can carry pre-transition state.  3s covers the worst
+  // case (upstream TTL + console TTL minus a margin).
+  const SSE_AUTHORITATIVE_MS = 3000;
   // Debounce window for /tasks refreshes triggered by ``tasks``
   // tool_result SSE events.  Without it, a model that runs
   // ``add → list`` (or any back-to-back mutation pair) double-fetches
@@ -2192,9 +2200,11 @@
     // Inline approve/deny block \u2014 shown only when the live block
     // carries pending_approval_detail (the rich payload added by the
     // server-side dashboard projection).  A "\u2691 approval" badge alone
-    // means the child is in attention state but the rich detail hasn't
-    // arrived yet (urgent live-bulk fetch is in flight); the row gets
-    // re-rendered when it lands.
+    // means the child is in attention state but the rich detail
+    // hasn't arrived on the cache yet \u2014 a rare cross-version race
+    // (e.g. a node mid-rolling-upgrade emitted ws_state without
+    // pending_approval_detail before this PR landed).  The next SSE
+    // tick or the 5s TTL bulk-poll catches up and re-renders.
     if (cached && cached.live && cached.live.pending_approval_detail) {
       const detail = cached.live.pending_approval_detail;
       const block = renderApprovalBlock(child, detail);
@@ -3066,12 +3076,35 @@
           ? results[id]
           : null;
         const wasDenied = denied.indexOf(id) !== -1;
+        const prev = liveBadgeCache.get(id);
+        // SSE-set pending_approval / _detail wins over a stale
+        // bulk-poll snapshot for SSE_AUTHORITATIVE_MS after the
+        // SSE update.  Without this guard, a poll landing right
+        // after a child_ws_state transition can clobber freshly-
+        // mutated approval state with pre-transition data from
+        // the upstream /dashboard cache (which has its own ~2s
+        // TTL).  Other fields (tokens, context_ratio) still track
+        // the bulk response — only the approval surface is gated.
+        let mergedLive = live;
+        if (
+          live &&
+          prev &&
+          prev.sseUpdatedAt &&
+          now - prev.sseUpdatedAt < SSE_AUTHORITATIVE_MS &&
+          prev.live
+        ) {
+          mergedLive = Object.assign({}, live, {
+            pending_approval: prev.live.pending_approval,
+            pending_approval_detail: prev.live.pending_approval_detail,
+          });
+        }
         liveBadgeCache.set(id, {
-          live: live,
+          live: mergedLive,
           fetched: now,
           // Denied ids are permission/identity misses — mark permanent
           // so SSE state ticks on those rows don't retry every window.
           permanent: wasDenied,
+          sseUpdatedAt: prev ? prev.sseUpdatedAt || 0 : 0,
         });
         const row = childrenTreeEl.querySelector(
           '.ch-row[data-ws-id="' + cssEscape(id) + '"]',
@@ -3092,10 +3125,12 @@
       const isPermanent = e && /HTTP 403/.test(e.message || "");
       const now = Date.now();
       ids.forEach((id) => {
+        const prev = liveBadgeCache.get(id);
         liveBadgeCache.set(id, {
           live: null,
           fetched: now,
           permanent: isPermanent,
+          sseUpdatedAt: prev ? prev.sseUpdatedAt || 0 : 0,
         });
       });
       if (!isPermanent) console.warn("flushLiveFetches failed", e);
@@ -3135,7 +3170,6 @@
       ws_id: childId,
       name: "",
     };
-    const prevActivity = existing.activity_state || "";
     existing.state = ev.state || existing.state;
     existing.activity_state =
       typeof ev.activity_state === "string"
@@ -3144,32 +3178,57 @@
     if (ev.node_id) existing.node_id = ev.node_id;
     childrenState.set(childId, existing);
     _touchChild(childId);
-    renderChildren();
-    // Do NOT invalidateLiveBadge on routine state ticks — that defeats
-    // the 5s TTL cache and devolves rate-limiting to the 250ms
-    // debouncer, hitting cluster_ws_detail ~4 req/s per chatty child.
-    // The TTL check in scheduleLiveFetch will refresh the badge on its
-    // own schedule; identity-changing events (created/rename/closed)
-    // still invalidate below.
-    //
-    // Two activity_state transitions warrant an *urgent* (TTL-bypassing)
-    // fetch so the row carries pending_approval_detail in lockstep with
-    // the child's true state:
-    //   - "" / "tool" / "thinking" → "approval"  (need rich payload now
-    //     so the inline approve/deny buttons can render)
-    //   - "approval" → anything else            (need to drop the
-    //     stale payload so the buttons disappear; without this the
-    //     5s TTL leaves stale buttons on a row whose approval was
-    //     resolved elsewhere — e.g. the child's own UI tab)
-    const enteredApproval =
-      existing.activity_state === "approval" && prevActivity !== "approval";
-    const leftApproval =
-      prevActivity === "approval" && existing.activity_state !== "approval";
-    if (enteredApproval || leftApproval) {
-      scheduleLiveFetch(childId, { urgent: true });
+    // pending_approval_detail rides on every ws_state event (see
+    // turnstone/server.py WebUI._broadcast_state) so we mutate
+    // liveBadgeCache directly here — inline approve/deny buttons
+    // render in lockstep with the activity_state transition without
+    // a separate live-bulk fetch.  The cache entry is tagged
+    // ``sseUpdatedAt`` so a bulk-poll landing within
+    // SSE_AUTHORITATIVE_MS preserves the SSE-supplied fields
+    // (the upstream /dashboard cache's ~2s TTL would otherwise
+    // clobber a fresh transition with pre-transition state).
+    const pendingApproval = existing.activity_state === "approval";
+    const evDetail =
+      ev.pending_approval_detail !== undefined
+        ? ev.pending_approval_detail
+        : null;
+    const cached = liveBadgeCache.get(childId);
+    // When pending, prefer SSE-supplied detail.  If SSE didn't
+    // carry it (rare race; e.g. a node mid-rolling-upgrade), keep
+    // any existing cached detail rather than blanking the row —
+    // the next bulk-poll catches up.  When not pending, hard-clear.
+    let nextDetail;
+    if (pendingApproval) {
+      nextDetail =
+        evDetail !== null
+          ? evDetail
+          : cached && cached.live
+            ? cached.live.pending_approval_detail
+            : null;
     } else {
-      scheduleLiveFetch(childId);
+      nextDetail = null;
     }
+    const nextLive = Object.assign({}, (cached && cached.live) || {}, {
+      pending_approval: pendingApproval,
+      pending_approval_detail: nextDetail,
+    });
+    liveBadgeCache.set(childId, {
+      live: nextLive,
+      // Preserve prior bulk-poll fetched timestamp so a fresh SSE
+      // tick doesn't artificially extend the 5s TTL gate in
+      // scheduleLiveFetch — the bulk-poll still drives slower-
+      // moving fields (tokens, context_ratio) on its own schedule.
+      fetched: cached ? cached.fetched : 0,
+      permanent: !!(cached && cached.permanent),
+      sseUpdatedAt: Date.now(),
+    });
+    renderChildren();
+    // Do NOT invalidateLiveBadge on routine state ticks — that
+    // defeats the 5s TTL cache and devolves rate-limiting to the
+    // 250ms debouncer.  The TTL check in scheduleLiveFetch handles
+    // refresh cadence for slower-moving fields; identity-changing
+    // events (created/rename/closed) still invalidate below.
+    scheduleLiveFetch(childId);
   }
 
   function handleChildClosed(ev) {
