@@ -1851,6 +1851,16 @@ var _savedCoordsRetry = false;
 
 function loadSavedCoordinators() {
   if (!_hasCoordPermission()) return;
+  // Freeze the list while the user is multi-selecting — re-rendering
+  // mid-mode would shuffle the visible page out from under them.  The
+  // delete-mode wrapper drains the retry flag on cancel/onClose.
+  if (
+    typeof _coordDeleteController !== "undefined" &&
+    _coordDeleteController.inMode()
+  ) {
+    _savedCoordsRetry = true;
+    return;
+  }
   if (_savedCoordsInFlight) {
     _savedCoordsRetry = true;
     return;
@@ -1861,6 +1871,16 @@ function loadSavedCoordinators() {
       return r.ok ? r.json() : { workstreams: [] };
     })
     .then(function (data) {
+      // Belt-and-braces: if the user entered delete mode while this
+      // fetch was already in flight, defer the render — re-rendering
+      // mid-selection would shuffle visible cards and reshape selections.
+      if (
+        typeof _coordDeleteController !== "undefined" &&
+        _coordDeleteController.inMode()
+      ) {
+        _savedCoordsRetry = true;
+        return;
+      }
       renderSavedCoordinators(data.workstreams || []);
     })
     .catch(function () {
@@ -1878,7 +1898,52 @@ function loadSavedCoordinators() {
     });
 }
 
+// Saved Coordinators: paginated card list + multi-select delete.
+// The shared controller (createSavedCardsController in /shared/cards.js)
+// owns mode state, checkbox decoration, the toolbar, and the modal.
+// Pagination caps Select-All fan-out at COORD_PAGE_SIZE — the controller
+// only ever sees the visible page, so a confirm-all batch is bounded to
+// COORD_PAGE_SIZE parallel POSTs against the routing proxy.
+var COORD_PAGE_SIZE = 24;
+var _coordPage = 0;
+var _coordSavedItems = [];
+var _coordDeleteController = createSavedCardsController({
+  idPrefix: "coord-delete",
+  buttonId: "coord-delete-btn",
+  noun: "coordinator",
+  activateLabel: function (s) {
+    return "Resume coordinator: " + (s.alias || s.title || s.name || s.ws_id);
+  },
+  // Coordinators live on whichever node owns the ws_id, so we can't fire
+  // a path-keyed delete the way ui/static does.  The router proxy reads
+  // ws_id from the body, resolves the owning node via the consistent-
+  // hash ring, and forwards to that node's POST workstreams/{ws_id}/delete.
+  buildDeleteRequest: function (wsId) {
+    return {
+      url: "/v1/api/route/workstreams/delete",
+      options: {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ws_id: wsId }),
+      },
+    };
+  },
+  render: function () {
+    renderSavedCoordinators(_coordSavedItems);
+  },
+  onClose: function () {
+    // Drain queued retries before the explicit reload — without this,
+    // _savedCoordsRetry is still true from SSE events that arrived
+    // during the freeze, so loadSavedCoordinators's .finally() would
+    // re-fire a second fetch immediately after the first resolves.
+    // Same idiom as cancelCoordDeleteMode below.
+    _savedCoordsRetry = false;
+    loadSavedCoordinators();
+  },
+});
+
 function renderSavedCoordinators(items) {
+  _coordSavedItems = items;
   var section = document.getElementById("saved-coordinators");
   var cards = document.getElementById("saved-coord-cards");
   var countEl = document.getElementById("saved-coord-count");
@@ -1887,24 +1952,31 @@ function renderSavedCoordinators(items) {
     section.style.display = "none";
     cards.replaceChildren();
     if (countEl) countEl.textContent = "";
+    _coordPage = 0;
+    if (_coordDeleteController.inMode()) _coordDeleteController.cancel();
+    _renderCoordPagination();
     return;
   }
+  // Clamp the page index after deletes (or upstream churn) shrink the list.
+  var pages = Math.max(1, Math.ceil(items.length / COORD_PAGE_SIZE));
+  if (_coordPage > pages - 1) _coordPage = pages - 1;
+  if (_coordPage < 0) _coordPage = 0;
+  var visible = items.slice(
+    _coordPage * COORD_PAGE_SIZE,
+    (_coordPage + 1) * COORD_PAGE_SIZE,
+  );
+  _coordDeleteController.setItems(visible);
+
   section.style.display = "";
   if (countEl) countEl.textContent = "(" + items.length + ")";
   cards.replaceChildren();
-  items.forEach(function (sess) {
+  visible.forEach(function (sess) {
     var card = renderSessionCard(sess, {
-      ariaLabel: function (s) {
-        return (
-          "Resume coordinator: " + (s.alias || s.title || s.name || s.ws_id)
-        );
-      },
+      ariaLabel: _coordDeleteController.ariaLabel,
       onActivate: function (s, cardEl) {
+        if (_coordDeleteController.blockActivate()) return;
         // POST /open BEFORE navigating so capacity issues surface as a
-        // toast instead of a broken-looking detail page.  The /open
-        // endpoint calls the same lazy-rehydrate path the GET would,
-        // but we get the status code synchronously so the user learns
-        // "all slots in use" instead of staring at a 404.
+        // toast instead of a broken-looking detail page.
         cardEl.classList.add("is-busy");
         authFetch(
           "/v1/api/workstreams/" + encodeURIComponent(s.ws_id) + "/open",
@@ -1936,8 +2008,86 @@ function renderSavedCoordinators(items) {
           });
       },
     });
+    _coordDeleteController.decorateCard(card, sess);
     cards.appendChild(card);
   });
+  if (_coordDeleteController.inMode()) _coordDeleteController.refreshBar();
+  _renderCoordPagination();
+}
+
+function _renderCoordPagination() {
+  var pag = document.getElementById("coord-pagination");
+  if (!pag) return;
+  var total = _coordSavedItems.length;
+  var pages = Math.max(1, Math.ceil(total / COORD_PAGE_SIZE));
+  // Single-page lists and delete-mode hide the controls — page changes
+  // would invalidate the user's checkbox selections, so we lock them out.
+  if (pages <= 1 || _coordDeleteController.inMode()) {
+    pag.style.display = "none";
+    return;
+  }
+  pag.style.display = "";
+  var label = document.getElementById("coord-page-label");
+  if (label) {
+    /* Visible text uses the terse "X / Y" form to match the
+       filtered-pagination control elsewhere in the console; the long
+       form sits on the parent's aria-label so screen readers still get
+       a full sentence. */
+    label.textContent = _coordPage + 1 + " / " + pages;
+    pag.setAttribute(
+      "aria-label",
+      "Saved coordinators pagination — page " +
+        (_coordPage + 1) +
+        " of " +
+        pages,
+    );
+  }
+  var prev = document.getElementById("coord-page-prev");
+  if (prev) prev.disabled = _coordPage <= 0;
+  var next = document.getElementById("coord-page-next");
+  if (next) next.disabled = _coordPage >= pages - 1;
+}
+
+function coordPagePrev() {
+  if (_coordPage > 0) {
+    _coordPage--;
+    renderSavedCoordinators(_coordSavedItems);
+  }
+}
+
+function coordPageNext() {
+  var pages = Math.max(1, Math.ceil(_coordSavedItems.length / COORD_PAGE_SIZE));
+  if (_coordPage < pages - 1) {
+    _coordPage++;
+    renderSavedCoordinators(_coordSavedItems);
+  }
+}
+
+// HTML inline-onclick wrappers — keep the global names the markup binds
+// to and forward to the shared controller.
+function startCoordDeleteMode() {
+  _coordDeleteController.start();
+}
+function cancelCoordDeleteMode() {
+  _coordDeleteController.cancel();
+  // The freeze gate (see loadSavedCoordinators) may have queued retries
+  // while we were multi-selecting; drain them now that we're idle again.
+  if (_savedCoordsRetry) {
+    _savedCoordsRetry = false;
+    loadSavedCoordinators();
+  }
+}
+function toggleCoordSelectAll() {
+  _coordDeleteController.toggleAll();
+}
+function confirmCoordDeleteSelection() {
+  _coordDeleteController.confirmSelection();
+}
+function cancelCoordDelete() {
+  _coordDeleteController.closeModal();
+}
+function confirmCoordDelete() {
+  _coordDeleteController.confirm();
 }
 
 // --- Init ---

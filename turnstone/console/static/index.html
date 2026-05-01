@@ -165,6 +165,14 @@
           <h2 class="home-section-title">
             <span>Saved Coordinators</span>
             <span id="saved-coord-count" class="home-section-count"></span>
+            <button
+              id="coord-delete-btn"
+              class="ws-delete-btn home-section-action"
+              onclick="startCoordDeleteMode()"
+              title="Delete coordinators"
+            >
+              <span aria-hidden="true">&#x1f5d1;</span> Delete
+            </button>
           </h2>
           <div
             id="saved-coord-cards"
@@ -172,6 +180,61 @@
             role="list"
             aria-live="polite"
           ></div>
+          <div
+            id="coord-pagination"
+            class="pagination"
+            style="display: none"
+            role="navigation"
+            aria-label="Saved coordinators pagination"
+          >
+            <button
+              id="coord-page-prev"
+              type="button"
+              onclick="coordPagePrev()"
+            >
+              &#x25c4; Prev
+            </button>
+            <span id="coord-page-label" aria-live="polite" aria-atomic="true">
+            </span>
+            <button
+              id="coord-page-next"
+              type="button"
+              onclick="coordPageNext()"
+            >
+              Next &#x25ba;
+            </button>
+          </div>
+          <div id="coord-delete-bar" class="ws-delete-bar">
+            <span
+              class="ws-delete-count-label"
+              id="coord-delete-bar-count"
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+              >0 selected</span
+            >
+            <button
+              class="ws-delete-cancel-btn"
+              onclick="cancelCoordDeleteMode()"
+            >
+              Cancel
+            </button>
+            <button
+              class="ws-delete-selectall-btn"
+              id="coord-delete-bar-select-all"
+              onclick="toggleCoordSelectAll()"
+            >
+              Select All
+            </button>
+            <button
+              class="ws-delete-bar-btn"
+              id="coord-delete-bar-delete"
+              onclick="confirmCoordDeleteSelection()"
+              disabled
+            >
+              Delete Selected
+            </button>
+          </div>
         </section>
 
         <!-- Cluster details — node list, always visible.  The list is
@@ -3902,6 +3965,40 @@
             onclick="submitCreateModel()"
           >
             Create
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Delete coordinators confirmation modal (batch) -->
+    <div
+      id="coord-delete-overlay"
+      class="ws-delete-modal-overlay"
+      style="display: none"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="coord-delete-title"
+    >
+      <div id="coord-delete-box" class="ws-delete-modal-box">
+        <h3 id="coord-delete-title">Delete Coordinators</h3>
+        <div id="coord-delete-error" role="alert" aria-live="assertive"></div>
+        <p id="coord-delete-count"></p>
+        <div id="coord-delete-list" class="ws-delete-modal-list"></div>
+        <div id="coord-delete-buttons" class="ws-delete-modal-buttons">
+          <button
+            id="coord-delete-cancel-btn"
+            type="button"
+            onclick="cancelCoordDelete()"
+          >
+            Cancel
+          </button>
+          <button
+            id="coord-delete-confirm-btn"
+            class="ws-delete-confirm"
+            type="button"
+            onclick="confirmCoordDelete()"
+          >
+            Delete
           </button>
         </div>
       </div>
