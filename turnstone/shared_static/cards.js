@@ -364,14 +364,27 @@ function createSavedCardsController(opts) {
       document.removeEventListener("keydown", batchTrap);
       batchTrap = null;
     }
-    if (prevFocus && typeof prevFocus.focus === "function") {
+    /* Pick the most useful focus target:
+         1. prevFocus (where the user came from), if it's still in the
+            DOM and visible.  Esc / Cancel paths land here — the bar is
+            still on screen, so focus returns to "Delete Selected".
+         2. The section toggle button — always present, semantic exit
+            point for the flow.  Used when prevFocus has been hidden by
+            cancel() (post-delete Close path: cancel() ran first and
+            put `.ws-delete-bar` at display:none, so the bar's button
+            is no longer focusable). */
+    var target = prevFocus;
+    if (!target || target.offsetParent === null) {
+      target = document.getElementById(opts.buttonId);
+    }
+    if (target && typeof target.focus === "function") {
       try {
-        prevFocus.focus();
+        target.focus();
       } catch (_) {
         /* node detached between open and close — give up silently */
       }
-      prevFocus = null;
     }
+    prevFocus = null;
   }
 
   function confirm() {

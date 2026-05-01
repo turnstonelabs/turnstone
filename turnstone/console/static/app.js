@@ -1932,8 +1932,12 @@ var _coordDeleteController = createSavedCardsController({
     renderSavedCoordinators(_coordSavedItems);
   },
   onClose: function () {
-    // The list was frozen during delete mode (see loadSavedCoordinators);
-    // pull latest now that the user committed.
+    // Drain queued retries before the explicit reload — without this,
+    // _savedCoordsRetry is still true from SSE events that arrived
+    // during the freeze, so loadSavedCoordinators's .finally() would
+    // re-fire a second fetch immediately after the first resolves.
+    // Same idiom as cancelCoordDeleteMode below.
+    _savedCoordsRetry = false;
     loadSavedCoordinators();
   },
 });
