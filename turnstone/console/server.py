@@ -846,8 +846,20 @@ async def _fetch_live_block(
             live = {k: entry.get(k) for k in _CLUSTER_WS_LIVE_KEYS if k in entry}
             # Derived field — kept in lockstep with
             # _coordinator_live_snapshot so both origins produce the
-            # same keys.
-            live["pending_approval"] = live.get("activity_state") == "approval"
+            # same keys. ``state="attention"`` is the canonical signal;
+            # ``activity_state="approval"`` is set inside approve_tools
+            # AFTER the state transition fires, so a bulk fetch that
+            # races with that window can see state=attention and
+            # activity_state="" simultaneously. A non-null
+            # ``pending_approval_detail`` is also a definitive signal
+            # (the serializer only emits non-None when ``_pending_approval``
+            # is set on the UI). Any of the three flips this true; the
+            # frontend reducer mirrors the same disjunction.
+            live["pending_approval"] = (
+                live.get("activity_state") == "approval"
+                or entry.get("state") == "attention"
+                or live.get("pending_approval_detail") is not None
+            )
             return live
     return None
 

@@ -1377,8 +1377,13 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
         import asyncio
         import json
         import queue
+        import time
 
         from sse_starlette import EventSourceResponse
+
+        from turnstone.core.session_ui_base import (
+            _DEFAULT_LISTENER_QUEUE_MAX,
+        )
 
         if cfg.permission_gate is not None:
             err = cfg.permission_gate(request)
@@ -1474,9 +1479,32 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                 # cancel-detection latency the timeout would otherwise
                 # gate; shortening to 1s 5x'd the wakeup rate without
                 # any client-observable benefit).
+                #
+                # Periodic ``_queue_stats`` emission carries the
+                # per-tab listener queue depth so the browser can
+                # surface backed-up SSE consumers in the status bar
+                # (slow tab / browser throttling / network stall
+                # would otherwise be invisible until events visibly
+                # stop arriving). 2s cadence is observational — the
+                # JSON payload is tiny and won't measurably grow the
+                # queue itself.
+                queue_stats_interval_s = 2.0
+                last_queue_stats_at = 0.0
                 while True:
                     if await request.is_disconnected():
                         return
+                    now_mono = time.monotonic()
+                    if now_mono - last_queue_stats_at >= queue_stats_interval_s:
+                        last_queue_stats_at = now_mono
+                        yield {
+                            "data": json.dumps(
+                                {
+                                    "type": "_queue_stats",
+                                    "depth": client_queue.qsize(),
+                                    "max": _DEFAULT_LISTENER_QUEUE_MAX,
+                                }
+                            )
+                        }
                     try:
                         event = await loop.run_in_executor(
                             live_executor,

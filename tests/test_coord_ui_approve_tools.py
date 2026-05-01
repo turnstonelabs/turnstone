@@ -464,3 +464,148 @@ def test_coord_budget_override_survives_wildcard_allow_policy() -> None:
     assert approved is True
     types = [e.get("type") for e in captured_events]
     assert "approve_request" in types, "Wildcard allow must not strip the budget-override prompt"
+
+
+# ---------------------------------------------------------------------------
+# Cluster-bus broadcast hooks — _broadcast_intent_verdict / _approval_resolved
+# ---------------------------------------------------------------------------
+
+
+class TestBroadcastIntentVerdict:
+    """``ConsoleCoordinatorUI._broadcast_intent_verdict`` overrides the
+    no-op base hook to push the verdict onto the cluster bus via
+    ``ClusterCollector.emit_console_ws_intent_verdict``. The far more
+    common path is the per-node ``WebUI`` override (covered in
+    test_webui_content.py); this lights up the rare coord-self path
+    (a coord that runs its own LLM judge).
+    """
+
+    def test_calls_collector_emit_with_ws_id_and_verdict(self) -> None:
+        ui = ConsoleCoordinatorUI(ws_id="coord-a", user_id="u1")
+        collector = MagicMock()
+        ConsoleCoordinatorUI._collector = collector
+        try:
+            verdict = {
+                "call_id": "c1",
+                "risk_level": "high",
+                "confidence": 0.91,
+            }
+            ui._broadcast_intent_verdict(verdict)
+            collector.emit_console_ws_intent_verdict.assert_called_once_with(
+                "coord-a",
+                verdict,
+            )
+        finally:
+            ConsoleCoordinatorUI._collector = None
+
+    def test_no_op_when_collector_unset(self) -> None:
+        ui = ConsoleCoordinatorUI(ws_id="coord-a", user_id="u1")
+        ConsoleCoordinatorUI._collector = None
+        # Doesn't raise.
+        ui._broadcast_intent_verdict({"call_id": "c1"})
+
+    def test_collector_exception_swallowed(self) -> None:
+        ui = ConsoleCoordinatorUI(ws_id="coord-a", user_id="u1")
+        collector = MagicMock()
+        collector.emit_console_ws_intent_verdict.side_effect = RuntimeError("boom")
+        ConsoleCoordinatorUI._collector = collector
+        try:
+            # Doesn't raise — collector failures are observational only.
+            ui._broadcast_intent_verdict({"call_id": "c1"})
+        finally:
+            ConsoleCoordinatorUI._collector = None
+
+
+class TestBroadcastApprovalResolved:
+    """``ConsoleCoordinatorUI._broadcast_approval_resolved`` overrides
+    the base hook to push the resolution onto the cluster bus via
+    ``ClusterCollector.emit_console_ws_approval_resolved``."""
+
+    def test_calls_collector_with_decision_fields(self) -> None:
+        ui = ConsoleCoordinatorUI(ws_id="coord-a", user_id="u1")
+        collector = MagicMock()
+        ConsoleCoordinatorUI._collector = collector
+        try:
+            ui._broadcast_approval_resolved(True, "lgtm", always=True)
+            collector.emit_console_ws_approval_resolved.assert_called_once_with(
+                "coord-a",
+                approved=True,
+                feedback="lgtm",
+                always=True,
+            )
+        finally:
+            ConsoleCoordinatorUI._collector = None
+
+    def test_normalises_none_feedback_to_empty_string(self) -> None:
+        ui = ConsoleCoordinatorUI(ws_id="coord-a", user_id="u1")
+        collector = MagicMock()
+        ConsoleCoordinatorUI._collector = collector
+        try:
+            ui._broadcast_approval_resolved(False, None)
+            collector.emit_console_ws_approval_resolved.assert_called_once_with(
+                "coord-a",
+                approved=False,
+                feedback="",
+                always=False,
+            )
+        finally:
+            ConsoleCoordinatorUI._collector = None
+
+    def test_no_op_when_collector_unset(self) -> None:
+        ui = ConsoleCoordinatorUI(ws_id="coord-a", user_id="u1")
+        ConsoleCoordinatorUI._collector = None
+        # Doesn't raise.
+        ui._broadcast_approval_resolved(True, None)
+
+    def test_collector_exception_swallowed(self) -> None:
+        ui = ConsoleCoordinatorUI(ws_id="coord-a", user_id="u1")
+        collector = MagicMock()
+        collector.emit_console_ws_approval_resolved.side_effect = RuntimeError("boom")
+        ConsoleCoordinatorUI._collector = collector
+        try:
+            # Doesn't raise.
+            ui._broadcast_approval_resolved(True, "ok")
+        finally:
+            ConsoleCoordinatorUI._collector = None
+
+
+class TestBroadcastApproveRequest:
+    """Coord-side override for the approve_request push. Same rationale
+    as the WebUI override — the coord-self path is rare today, but
+    parity keeps the override symmetric with the rest of the broadcast
+    family."""
+
+    def test_calls_collector_emit_with_ws_id_and_detail(self) -> None:
+        ui = ConsoleCoordinatorUI(ws_id="coord-a", user_id="u1")
+        collector = MagicMock()
+        ConsoleCoordinatorUI._collector = collector
+        try:
+            detail = {
+                "type": "approve_request",
+                "items": [{"call_id": "c1", "header": "tool x"}],
+                "judge_pending": True,
+            }
+            ui._broadcast_approve_request(detail)
+            collector.emit_console_ws_approve_request.assert_called_once_with(
+                "coord-a",
+                detail,
+            )
+        finally:
+            ConsoleCoordinatorUI._collector = None
+
+    def test_no_op_when_collector_unset(self) -> None:
+        ui = ConsoleCoordinatorUI(ws_id="coord-a", user_id="u1")
+        ConsoleCoordinatorUI._collector = None
+        # Doesn't raise.
+        ui._broadcast_approve_request({"items": []})
+
+    def test_collector_exception_swallowed(self) -> None:
+        ui = ConsoleCoordinatorUI(ws_id="coord-a", user_id="u1")
+        collector = MagicMock()
+        collector.emit_console_ws_approve_request.side_effect = RuntimeError("boom")
+        ConsoleCoordinatorUI._collector = collector
+        try:
+            # Doesn't raise.
+            ui._broadcast_approve_request({"items": []})
+        finally:
+            ConsoleCoordinatorUI._collector = None

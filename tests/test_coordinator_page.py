@@ -79,9 +79,10 @@ def test_coordinator_js_exposes_inline_approval_helpers():
     assert "function submitChildApproval" in body or "submitChildApproval(" in body
     # The shared approve POST helper (parameterized for child ws_ids)
     assert "function approveWorkstream" in body or "approveWorkstream(" in body
-    # The urgent live-bulk fetch option that fires on activity_state
-    # transitions in/out of "approval"
-    assert "{ urgent: true }" in body or "urgent: true" in body
+    # The 409 stale-call_id retry path uses invalidateLiveBadge +
+    # scheduleLiveFetch (Stage 3 cleanup removed the urgent flag —
+    # cache invalidation makes the TTL gate fall through naturally).
+    assert "invalidateLiveBadge(targetWsId)" in body
     # Server-side payload field — drift here means the JS reads stale keys
     assert "pending_approval_detail" in body
     # Reconnect parity (chunk 4): the SSE re-open handler must drop
@@ -90,10 +91,10 @@ def test_coordinator_js_exposes_inline_approval_helpers():
     # can't render zombie approve/deny buttons on a row whose
     # approval was resolved during the gap. The implementation
     # iterates the cache and deletes only !permanent entries —
-    # asserting the literal Map iteration form keeps a refactor
-    # back to liveBadgeCache.clear() (which would re-pay 403s on
-    # every reconnect for denied ids) from sneaking in.
-    assert "liveBadgeCache.delete" in body
+    # asserting the literal helper call keeps a refactor back to
+    # _liveBadgeCacheClear() (which would re-pay 403s on every
+    # reconnect for denied ids) from sneaking in.
+    assert "_liveBadgeCacheDelete" in body
     # Edge-case matrix sentinel labels — POLICY-BLOCKED renders when
     # an item has error set + needs_approval=False (server-side
     # tool policy already blocked the call); "(judge unavailable)"
@@ -113,15 +114,19 @@ def test_coordinator_js_exposes_inline_approval_helpers():
     # coord-self ws_id (the coord lives on the console process).
     # Children live on cluster nodes and 404 without the prefix.
     assert "/v1/api/route/workstreams/" in body
-    # Late-judge polling — the LLM judge runs async on the child
-    # node and never pushes a signal that reaches the coord, so
-    # the row's pending_approval_detail with judge_pending=true
-    # would freeze on heuristic verdicts forever without this
-    # poll loop. The poller is GLOBAL (not per-row) so off-screen
-    # rows still refresh — a per-row poller's scheduleLiveFetch
-    # call short-circuits on non-visible rows, leaving them stuck.
-    assert "_maybeStartJudgePoll" in body
-    assert "_judgePollTick" in body
+    # Late-arriving LLM judge verdicts — Stage 3 Step 5 promoted
+    # ``intent_verdict`` and ``approval_resolved`` to first-class
+    # cluster-bus event types, so the coord adapter dispatches them
+    # as ``child_ws_intent_verdict`` / ``child_ws_approval_resolved``
+    # on the parent's SSE stream. The browser handlers write
+    # directly to liveBadgeCache (bypassing scheduleLiveFetch's
+    # visibility gate cleanly) so off-screen rows pick up verdicts
+    # without polling. Replaced the old ``_judgePollTick`` 90-second
+    # global poll loop and its visibility-gate-bypass workaround.
+    assert "handleChildIntentVerdict" in body
+    assert "handleChildApprovalResolved" in body
+    assert "child_ws_intent_verdict" in body
+    assert "child_ws_approval_resolved" in body
     # Reload parity for the coord-self approval gate: init() must
     # consume the authoritative GET /workstreams snapshot's
     # pending_approval_detail so a freshly opened tab can render
@@ -154,18 +159,19 @@ def test_coordinator_js_exposes_inline_approval_helpers():
     assert "callOutcomes" in body
 
 
-def test_coordinator_js_handle_child_state_reads_sse_pending_approval_detail():
-    """Lock the Shape A behavior change: child_ws_state SSE events now
-    carry ``pending_approval_detail`` directly so the browser mutates
-    ``liveBadgeCache`` without firing an urgent live-bulk fetch on
-    every activity_state transition into/out of approval.  A refactor
-    that re-introduces the urgent-fetch path on routine transitions
-    (or drops the SSE-source merge guard in flushLiveFetches) would
-    re-open the load-storm pattern this PR is fixing.
+def test_coordinator_js_handle_child_state_no_longer_reads_sse_pending_approval_detail():
+    """Stage 3 cleanup — ``pending_approval_detail`` is no longer
+    piggybacked on child_ws_state events. Approval items now arrive
+    via bulk fetch on the activity_state="approval" transition;
+    verdicts via the explicit ``child_ws_intent_verdict`` event class;
+    resolution via ``child_ws_approval_resolved``. A refactor that
+    re-introduces the piggyback would silently re-open the
+    duplicate-path race the dedicated event classes were added to
+    eliminate.
 
     Structural assertions (regex against multi-line source) — symbol-
     presence alone wouldn't catch a guard that keeps the names but
-    inverts the comparison or drops the ``prev.live`` check.  This
+    inverts the comparison or drops the ``prev.live`` check. This
     codebase has no JS test framework, so locking the guard's shape
     here is the next-best thing to a behavioral test."""
     import re
@@ -176,26 +182,46 @@ def test_coordinator_js_handle_child_state_reads_sse_pending_approval_detail():
     )
     body = coord_js.read_text(encoding="utf-8")
 
-    # handleChildState now reads the SSE-supplied detail.
-    assert "ev.pending_approval_detail" in body
-    # The pre-fix urgent-fetch on activity_state transitions is
-    # gone (the 409 retry path keeps its own ``{ urgent: true }``
-    # for stale-call_id refresh — that's a different scenario).
+    # The piggyback read is gone from handleChildState. (The string
+    # may still appear elsewhere — e.g. handleChildIntentVerdict
+    # reading from cache, or comments — but never as ``ev.pending_approval_detail``.)
+    assert "ev.pending_approval_detail" not in body
+    # The pre-fix urgent-fetch on activity_state transitions is gone.
     assert "enteredApproval" not in body
     assert "leftApproval" not in body
+    # ``pendingApproval`` flag derivation must check BOTH state and
+    # activity_state. The worker thread can fire the state transition
+    # to "attention" before approve_tools updates activity_state, so
+    # checking only activity_state misses children that legitimately
+    # need approval. Pin the disjunction so the regression doesn't
+    # silently re-introduce.
+    assert re.search(
+        r'existing\.state\s*===\s*"attention"\s*\|\|\s*'
+        r'existing\.activity_state\s*===\s*"approval"',
+        body,
+    ), (
+        "handleChildState must derive pendingApproval from "
+        "(state==='attention' || activity_state==='approval')"
+    )
 
     # SSE-authoritative window constant is defined and used.
     assert re.search(r"\bconst\s+SSE_AUTHORITATIVE_MS\s*=\s*\d+", body), (
         "SSE_AUTHORITATIVE_MS constant must be defined as a numeric literal"
     )
 
-    # handleChildState writes sseUpdatedAt = Date.now() into the cache
-    # entry it sets.  This is the SSE-source tag; without it, the
-    # merge guard in flushLiveFetches has nothing to gate on.
+    # SSE writers tag entries with sseUpdatedAt: Date.now() so the
+    # merge guard in flushLiveFetches preserves them against stale
+    # bulk-fetch responses. handleChildState only stamps when it
+    # AUTHORITATIVELY clears the detail (off-approval transition);
+    # writers that stamp unconditionally are intent_verdict (verdict
+    # stamp), approval_resolved (clear), and the optimistic-clear
+    # path in submitChildApproval. Pinning the literal Date.now()
+    # call keeps a refactor that drops the SSE-source tag entirely
+    # from sneaking in.
     assert re.search(
         r"sseUpdatedAt:\s*Date\.now\(\)",
         body,
-    ), "handleChildState must write sseUpdatedAt: Date.now() onto liveBadgeCache entries"
+    ), "Critical SSE writers must stamp sseUpdatedAt: Date.now()"
 
     # flushLiveFetches' merge guard structure: SSE-set pending_approval
     # / _detail wins over a stale bulk-poll snapshot when (live) AND

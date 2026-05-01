@@ -41,6 +41,56 @@ log = get_logger(__name__)
 # from bloating memory.
 _DEFAULT_LISTENER_QUEUE_MAX = 500
 
+# Event types whose delivery is load-bearing for correctness — not
+# observational fluff. When a listener queue is full, ``_enqueue``
+# evicts the oldest event to make room for these rather than dropping
+# them on the floor (the default ``queue.Full`` swallow). Token-stream
+# / status / activity events drop equally as today; an approval
+# request or verdict landing during a chatty mid-generation burst
+# would otherwise be silently lost on a backed-up tab.
+_CRITICAL_EVENT_TYPES = frozenset(
+    {
+        "intent_verdict",
+        "intent_pending",
+        "approval_resolved",
+        "approve_request",
+        "plan_review",
+        "ws_closed",
+        "child_ws_intent_verdict",
+        "child_ws_approval_resolved",
+        "child_ws_closed",
+        "child_ws_created",
+    }
+)
+
+
+def _put_with_priority(
+    q: queue.Queue[dict[str, Any]],
+    data: dict[str, Any],
+    *,
+    critical: bool,
+) -> None:
+    """Put ``data`` onto ``q`` with selective drop-on-full semantics.
+
+    Critical events evict one oldest item from ``q`` if it's full,
+    then retry the put. Best-effort events drop themselves on full
+    (matches the historical ``contextlib.suppress(queue.Full)``
+    behaviour). The eviction is bounded — one drop is enough since
+    the queue was already at capacity before we tried.
+    """
+    if critical:
+        try:
+            q.put_nowait(data)
+        except queue.Full:
+            with contextlib.suppress(queue.Empty):
+                q.get_nowait()
+            with contextlib.suppress(queue.Full):
+                q.put_nowait(data)
+    else:
+        with contextlib.suppress(queue.Full):
+            q.put_nowait(data)
+
+
 # Cap on the per-turn assistant content accumulator. The accumulator
 # is piggybacked onto the ``ws_state:idle`` broadcast payload so the
 # cluster collector / dashboard can render the freshly-emitted assistant
@@ -246,14 +296,22 @@ class SessionUIBase:
         browser can validate it belongs to the pane's current
         workstream. Shallow-copies on stamp to avoid mutating a
         caller-owned dict.
+
+        Critical event types (see :data:`_CRITICAL_EVENT_TYPES`)
+        evict one oldest item from a full queue rather than dropping
+        themselves — a chatty mid-generation burst can fill the
+        500-slot per-tab queue, and silently dropping an
+        ``approve_request`` or ``intent_verdict`` because we couldn't
+        squeeze past a backlog of token-stream events would be a real
+        UX regression. Best-effort events drop on full as before.
         """
         if "ws_id" not in data:
             data = {**data, "ws_id": self.ws_id}
+        critical = data.get("type") in _CRITICAL_EVENT_TYPES
         with self._listeners_lock:
             snapshot = list(self._listeners)
         for lq in snapshot:
-            with contextlib.suppress(queue.Full):
-                lq.put_nowait(data)
+            _put_with_priority(lq, data, critical=critical)
 
     def _register_listener(
         self, maxsize: int = _DEFAULT_LISTENER_QUEUE_MAX
@@ -327,6 +385,11 @@ class SessionUIBase:
                 "always": bool(always),
             }
         )
+        # Kind-specific cross-stream broadcast — ConsoleCoordinatorUI
+        # overrides to push onto the cluster bus so a coord parent's
+        # tree UI clears the pending-approval pill in lockstep with
+        # the actual decision. Stage 3 Step 4.
+        self._broadcast_approval_resolved(approved, feedback, always=always)
         self._approval_event.set()
 
     @staticmethod
@@ -579,6 +642,20 @@ class SessionUIBase:
             "judge_pending": judge_pending,
         }
         self._enqueue(self._pending_approval)
+        # Cross-stream broadcast — push the items via the cluster bus
+        # so a coord parent's tree UI can render the inline approve/deny
+        # block without waiting for a bulk fetch. Without this, the
+        # bulk fetch races with this assignment: the state transition
+        # to ATTENTION fires upstream BEFORE approve_tools runs (see
+        # session.py:_emit_state("attention") preceding ui.approve_tools),
+        # so a bulk fetch landing in the ~50-200ms window between
+        # _emit_state and this point sees ``_pending_approval=None``
+        # and returns ``pending_approval_detail: null``. The 5s TTL
+        # then locks the coord row on a "loading" placeholder until
+        # the next state event triggers a refresh — which never comes
+        # while parked on _approval_event.wait. The push path
+        # eliminates the race.
+        self._broadcast_approve_request(self._pending_approval)
         if not self._approval_event.wait(timeout=self._APPROVAL_WAIT_TIMEOUT):
             # Approval timed out (e.g., user disconnected). Deny via
             # resolve_approval so verdicts and state are updated consistently.
@@ -632,6 +709,12 @@ class SessionUIBase:
                     del self._llm_verdicts[oldest_key]
                 self._llm_verdicts[call_id] = verdict
         self._enqueue({"type": "intent_verdict", **verdict})
+        # Kind-specific cross-stream broadcast — ConsoleCoordinatorUI
+        # overrides to push onto the cluster bus so a coord parent's
+        # tree UI sees the verdict without polling. Default is no-op
+        # (the per-ws ``_enqueue`` above already covers WebUI's own
+        # SSE listeners). Stage 3 Step 4.
+        self._broadcast_intent_verdict(verdict)
         self._persist_intent_verdict(verdict)
         # Decision check + either queue or flag-for-persist happen
         # under ONE lock acquisition so resolve_approval can't swap-
@@ -1349,6 +1432,42 @@ class SessionUIBase:
         """Fan a current-activity snapshot out to the kind's transport.
 
         Default: no-op. Subclasses override.
+        """
+
+    def _broadcast_intent_verdict(self, verdict: dict[str, Any]) -> None:  # noqa: ARG002 — hook stub
+        """Fan an LLM intent-judge verdict out to the kind's transport.
+
+        Default: no-op. ``ConsoleCoordinatorUI`` overrides to push a
+        ``intent_verdict`` event onto the cluster bus so the parent
+        coordinator's tree UI can render the risk pill + verdict
+        result without polling. Stage 3 Step 4: hook only — the
+        cluster-bus event class lands in Step 5.
+        """
+
+    def _broadcast_approval_resolved(
+        self,
+        approved: bool,  # noqa: ARG002 — hook stub
+        feedback: str | None = None,  # noqa: ARG002 — hook stub
+        *,
+        always: bool = False,  # noqa: ARG002 — hook stub
+    ) -> None:
+        """Fan an ``approval_resolved`` decision out to the kind's transport.
+
+        Default: no-op. ``ConsoleCoordinatorUI`` overrides to push to
+        the cluster bus so the parent coordinator's tree UI can clear
+        the pending-approval pill in sync with the actual decision.
+        """
+
+    def _broadcast_approve_request(self, detail: dict[str, Any]) -> None:  # noqa: ARG002 — hook stub
+        """Fan an ``approve_request`` payload out to the kind's transport.
+
+        Default: no-op. ``WebUI`` and ``ConsoleCoordinatorUI`` override
+        to push the items list (the same dict that landed in
+        ``_pending_approval``) onto their respective transports. The
+        push path eliminates the bulk-fetch race that otherwise
+        leaves coord rows stuck on a loading placeholder when the
+        bulk fetch lands in the gap between the state transition to
+        ATTENTION and ``_pending_approval`` being set.
         """
 
     # ------------------------------------------------------------------

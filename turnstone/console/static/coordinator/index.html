@@ -181,6 +181,42 @@
     font-family: var(--font-mono);
     font-size: 11px;
     line-height: 1.4;
+    /* Smooth the auto-expand on judge-verdict landing so the eye can
+       track sibling rows shifting down rather than them snapping. */
+    transition: max-height 200ms ease-out;
+    max-height: 80vh;
+    overflow: hidden;
+  }
+  /* Loading-state placeholder rendered while the bulk fetch is
+     in-flight. Same outer container as the real block so the row
+     height is stable when the real content swaps in. */
+  .ch-row .approval-block-loading {
+    color: var(--ink-3);
+  }
+  .ch-row .approval-loading-spin {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    border: 1.5px solid var(--accent);
+    border-top-color: transparent;
+    margin-right: 5px;
+    animation: ts-spin 0.9s linear infinite;
+    vertical-align: middle;
+  }
+  /* Inline status note shown when the operator clicks Approve/Deny
+     but the call_id is stale (already resolved on another channel).
+     Quieter than a toast — the row is about to be replaced wholesale
+     by the refresh, so this only needs to bridge ~350ms. */
+  .ch-row .approval-stale-note {
+    font-size: 11px;
+    color: var(--ink-3);
+    font-style: italic;
+    margin-top: 4px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .ch-row .approval-block { transition: none; }
+    .ch-row .approval-loading-spin { animation: none; }
   }
   /* Auto-approved pill — same 22px indent as .approval-block / .meta
      so a child row showing both stacks cleanly.  Lower visual weight
@@ -442,6 +478,22 @@
      link feed.css (no .feed-item usage). */
   @keyframes ts-spin { to { transform: rotate(360deg); } }
 
+  /* SSE queue depth indicator — populated by the periodic
+     ``_queue_stats`` event in the events SSE handler. Color escalates
+     so a backed-up queue (slow consumer / browser throttling
+     background tabs) is glanceable from the status bar. */
+  .ws-status-bar .ws-sb-sse-queue {
+    color: var(--ink-3);
+    font-size: 11px;
+  }
+  .ws-status-bar .ws-sb-sse-queue.warn {
+    color: var(--warn);
+  }
+  .ws-status-bar .ws-sb-sse-queue.danger {
+    color: var(--err);
+    font-weight: 600;
+  }
+
   /* Sidebar mobile toggle (desktop hides; mobile shows via media query
      below). */
   #coord-sidebar-toggle {
@@ -542,6 +594,12 @@
       <span id="coord-sb-tokens" class="ws-sb-tokens" aria-label="Token usage">0 / —</span>
       <span id="coord-sb-tools" class="ws-sb-tools" aria-label="Tool calls this turn">0 tools</span>
       <span id="coord-sb-turns" class="ws-sb-turns" aria-label="Conversation turn">turn 0</span>
+      <!-- Server-side per-coord SSE listener queue depth — populated
+           by the periodic ``_queue_stats`` event. Hidden until the
+           first sample lands so the bar isn't permanently cluttered
+           on connections that never report depth. -->
+      <span id="coord-sb-sse-queue" class="ws-sb-sse-queue"
+            aria-label="SSE queue depth" hidden>queue 0/500</span>
     </div>
 
     <!-- Composer DOM is built by shared_static/composer.js into this mount. -->

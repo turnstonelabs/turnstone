@@ -314,12 +314,14 @@ class TestCollectorSnapshot:
         assert event["ws_id"] == "ws1"
         assert event["state"] == "running"
 
-    def test_apply_snapshot_state_change_forwards_pending_approval_detail(self):
-        """Reconnect-via-snapshot is the resync path after every console
-        restart or network blip.  Without forwarding the field here,
-        a child sitting in approval-pending across the gap renders as
-        ``activity_state=approval`` with no buttons until the next
-        state change — broken UX during the most common re-sync event."""
+    def test_apply_snapshot_state_change_does_not_carry_pending_approval_detail(self):
+        """Stage 3 cleanup — the snapshot-resync cluster_state event no
+        longer piggybacks ``pending_approval_detail`` (the field is
+        gone from cluster_state entirely). On reconnect the browser's
+        bulk fetch — triggered by the ``activity_state="approval"``
+        transition in the reducer — pulls the items directly from
+        ``ui.serialize_pending_approval_detail()`` via the dashboard
+        endpoint."""
         c = _make_collector()
         c._nodes["node-a"] = NodeSnapshot(
             node_id="node-a",
@@ -329,10 +331,6 @@ class TestCollectorSnapshot:
         q: queue.Queue[dict] = queue.Queue()
         c.register_listener(q)
 
-        detail = {
-            "items": [{"call_id": "c1", "header": "tool x"}],
-            "judge_pending": False,
-        }
         c._apply_snapshot(
             "node-a",
             {
@@ -344,7 +342,6 @@ class TestCollectorSnapshot:
                         "name": "same",
                         "state": "running",
                         "activity_state": "approval",
-                        "pending_approval_detail": detail,
                     }
                 ],
                 "health": {},
@@ -354,7 +351,8 @@ class TestCollectorSnapshot:
 
         event = q.get_nowait()
         assert event["type"] == "cluster_state"
-        assert event["pending_approval_detail"] == detail
+        assert event["activity_state"] == "approval"
+        assert "pending_approval_detail" not in event
 
     def test_apply_snapshot_skips_empty_id_workstream(self):
         c = _make_collector()
@@ -401,12 +399,12 @@ class TestCollectorDelta:
         # Verify in-memory state was updated
         assert c._nodes["node-a"].workstreams["ws1"]["state"] == "running"
 
-    def test_apply_delta_ws_state_forwards_pending_approval_detail(self):
-        """The rich approval payload now travels on the cluster bus so
-        coord tabs can render inline approve/deny buttons in lockstep
-        with the activity_state transition.  Collector must forward
-        the field verbatim — the adapter does the child-routing on
-        top, but the bus carries the data."""
+    def test_apply_delta_ws_state_does_not_carry_pending_approval_detail(self):
+        """Stage 3 cleanup — ``cluster_state`` no longer carries the
+        ``pending_approval_detail`` piggyback. Approval items now arrive
+        via bulk fetch on activity_state transition; verdicts via the
+        explicit ``intent_verdict`` event class. Symmetric event flow,
+        no piggyback to dedupe against."""
         c = _make_collector()
         c._nodes["node-a"] = NodeSnapshot(
             node_id="node-a",
@@ -416,10 +414,6 @@ class TestCollectorDelta:
         q: queue.Queue[dict] = queue.Queue()
         c.register_listener(q)
 
-        detail = {
-            "items": [{"call_id": "c1", "header": "tool x"}],
-            "judge_pending": False,
-        }
         c._apply_delta(
             "node-a",
             {
@@ -427,13 +421,13 @@ class TestCollectorDelta:
                 "ws_id": "ws1",
                 "state": "running",
                 "activity_state": "approval",
-                "pending_approval_detail": detail,
             },
         )
 
         event = q.get_nowait()
         assert event["type"] == "cluster_state"
-        assert event["pending_approval_detail"] == detail
+        assert event["activity_state"] == "approval"
+        assert "pending_approval_detail" not in event
 
     def test_apply_delta_ws_created(self):
         c = _make_collector()
@@ -479,6 +473,139 @@ class TestCollectorDelta:
         assert event["type"] == "ws_rename"
         assert event["name"] == "new-name"
         assert c._nodes["node-a"].workstreams["ws1"]["name"] == "new-name"
+
+    def test_apply_delta_intent_verdict_forwards_verbatim(self):
+        """Stage 3 Step 5 — node-emitted intent_verdict events flow
+        through _apply_delta to cluster fan-out so coord adapters can
+        re-emit as child_ws_intent_verdict on the parent's SSE."""
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a",
+            server_url="http://a:8080",
+            workstreams={"ws1": {"id": "ws1", "name": "test", "state": "idle"}},
+        )
+        q: queue.Queue[dict] = queue.Queue()
+        c.register_listener(q)
+
+        verdict = {
+            "call_id": "c1",
+            "risk_level": "low",
+            "confidence": 0.9,
+            "recommendation": "approve",
+        }
+        c._apply_delta(
+            "node-a",
+            {"type": "intent_verdict", "ws_id": "ws1", "verdict": verdict},
+        )
+
+        event = q.get_nowait()
+        assert event["type"] == "intent_verdict"
+        assert event["ws_id"] == "ws1"
+        assert event["node_id"] == "node-a"
+        assert event["verdict"] == verdict
+
+    def test_apply_delta_intent_verdict_drops_when_ws_id_missing(self):
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(node_id="node-a", server_url="http://a:8080")
+        q: queue.Queue[dict] = queue.Queue()
+        c.register_listener(q)
+
+        c._apply_delta("node-a", {"type": "intent_verdict", "verdict": {}})
+
+        assert q.empty()
+
+    def test_apply_delta_approval_resolved_forwards_verbatim(self):
+        """Stage 3 Step 5 — paired with intent_verdict; clears the
+        coord tree's pending-approval pill in lockstep with the
+        actual decision rather than waiting for the state-change
+        piggyback."""
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a",
+            server_url="http://a:8080",
+            workstreams={"ws1": {"id": "ws1", "name": "test", "state": "idle"}},
+        )
+        q: queue.Queue[dict] = queue.Queue()
+        c.register_listener(q)
+
+        c._apply_delta(
+            "node-a",
+            {
+                "type": "approval_resolved",
+                "ws_id": "ws1",
+                "approved": True,
+                "feedback": "lgtm",
+                "always": False,
+            },
+        )
+
+        event = q.get_nowait()
+        assert event["type"] == "approval_resolved"
+        assert event["ws_id"] == "ws1"
+        assert event["node_id"] == "node-a"
+        assert event["approved"] is True
+        assert event["feedback"] == "lgtm"
+        assert event["always"] is False
+
+    def test_apply_delta_approve_request_forwards_detail(self):
+        """Push path for the initial approval items — eliminates the
+        bulk-fetch race that left the coord row stuck on a loading
+        placeholder when the bulk fetch landed in the gap between
+        _emit_state(ATTENTION) and approve_tools setting _pending_approval."""
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a",
+            server_url="http://a:8080",
+            workstreams={"ws1": {"id": "ws1", "name": "test", "state": "idle"}},
+        )
+        q: queue.Queue[dict] = queue.Queue()
+        c.register_listener(q)
+
+        detail = {
+            "type": "approve_request",
+            "items": [{"call_id": "c1", "header": "tool x"}],
+            "judge_pending": True,
+        }
+        c._apply_delta(
+            "node-a",
+            {"type": "approve_request", "ws_id": "ws1", "detail": detail},
+        )
+
+        event = q.get_nowait()
+        assert event["type"] == "approve_request"
+        assert event["ws_id"] == "ws1"
+        assert event["node_id"] == "node-a"
+        assert event["detail"] == detail
+
+    def test_apply_delta_approve_request_drops_when_ws_id_missing(self):
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(node_id="node-a", server_url="http://a:8080")
+        q: queue.Queue[dict] = queue.Queue()
+        c.register_listener(q)
+
+        c._apply_delta("node-a", {"type": "approve_request", "detail": {}})
+
+        assert q.empty()
+
+    def test_apply_delta_approval_resolved_coerces_missing_fields(self):
+        """Defensive: ``approved`` / ``always`` / ``feedback`` may be
+        omitted by older nodes mid-rolling-upgrade; collector coerces
+        to safe defaults."""
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a",
+            server_url="http://a:8080",
+            workstreams={"ws1": {"id": "ws1", "name": "test", "state": "idle"}},
+        )
+        q: queue.Queue[dict] = queue.Queue()
+        c.register_listener(q)
+
+        c._apply_delta("node-a", {"type": "approval_resolved", "ws_id": "ws1"})
+
+        event = q.get_nowait()
+        assert event["approved"] is False
+        assert event["feedback"] == ""
+        assert event["always"] is False
 
     def test_apply_delta_health_changed(self):
         c = _make_collector()

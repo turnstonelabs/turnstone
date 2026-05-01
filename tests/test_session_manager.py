@@ -19,7 +19,10 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 from unittest.mock import MagicMock
 
 import pytest
@@ -1368,3 +1371,127 @@ class TestSessionManagerWithStateWriter:
         assert "running" not in ws_writes, (
             f"set_state after close enqueued through buffer: {ws_writes}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Multi-subscriber observer — subscribe_to_state / unsubscribe_from_state
+# ---------------------------------------------------------------------------
+
+
+class TestStateSubscribers:
+    """Multi-subscriber observer for ``set_state``.
+
+    Used by the CLI's background-attention notifier and by
+    ``SameNodeChildSource``. Subscribe / unsubscribe must be safe under
+    concurrent dispatch, and dispatch must not skip / repeat callbacks
+    when subscribers register or unregister mid-iteration.
+    """
+
+    def test_subscribe_fires_on_set_state(self) -> None:
+        mgr, _, _ = _make_manager()
+        ws = mgr.create(user_id="u1", name="ws", skill=None)
+        events: list[tuple[str, str]] = []
+
+        def cb(ws_id: str, state: WorkstreamState) -> None:
+            events.append((ws_id, state.value))
+
+        mgr.subscribe_to_state(cb)
+        mgr.set_state(ws.id, WorkstreamState.RUNNING)
+        assert events == [(ws.id, "running")]
+
+    def test_unsubscribe_stops_firing(self) -> None:
+        mgr, _, _ = _make_manager()
+        ws = mgr.create(user_id="u1", name="ws", skill=None)
+        events: list[str] = []
+
+        def cb(_ws_id: str, state: WorkstreamState) -> None:
+            events.append(state.value)
+
+        mgr.subscribe_to_state(cb)
+        mgr.unsubscribe_from_state(cb)
+        mgr.set_state(ws.id, WorkstreamState.RUNNING)
+        assert events == []
+
+    def test_unsubscribe_unknown_is_noop(self) -> None:
+        mgr, _, _ = _make_manager()
+        # Doesn't raise.
+        mgr.unsubscribe_from_state(lambda *_: None)
+
+    def test_multiple_subscribers_fire_in_registration_order(self) -> None:
+        mgr, _, _ = _make_manager()
+        ws = mgr.create(user_id="u1", name="ws", skill=None)
+        order: list[int] = []
+
+        def make(i: int) -> Callable[[str, WorkstreamState], None]:
+            def cb(_ws_id: str, _state: WorkstreamState) -> None:
+                order.append(i)
+
+            return cb
+
+        mgr.subscribe_to_state(make(1))
+        mgr.subscribe_to_state(make(2))
+        mgr.subscribe_to_state(make(3))
+        mgr.set_state(ws.id, WorkstreamState.IDLE)
+        assert order == [1, 2, 3]
+
+    def test_subscriber_exception_does_not_block_others(self) -> None:
+        mgr, _, _ = _make_manager()
+        ws = mgr.create(user_id="u1", name="ws", skill=None)
+        survived: list[str] = []
+
+        def boom(*_: Any) -> None:
+            raise RuntimeError("subscriber crash")
+
+        def good(_ws_id: str, state: WorkstreamState) -> None:
+            survived.append(state.value)
+
+        mgr.subscribe_to_state(boom)
+        mgr.subscribe_to_state(good)
+        mgr.set_state(ws.id, WorkstreamState.RUNNING)
+        assert survived == ["running"]
+
+    @pytest.mark.parametrize("n_threads", [10, 50])
+    def test_concurrent_subscribe(self, n_threads: int) -> None:
+        """Subscribe from many threads; all callbacks land in the list.
+
+        Validates the lock around mutation — without it the underlying
+        list.append could lose entries under contention.
+        """
+        mgr, _, _ = _make_manager()
+        callbacks = [lambda *_, i=i: None for i in range(n_threads)]
+        threads = [threading.Thread(target=mgr.subscribe_to_state, args=(cb,)) for cb in callbacks]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # Snapshot under the lock to read the count safely.
+        with mgr._state_subscribers_lock:
+            assert len(mgr._state_subscribers) == n_threads
+
+    def test_subscribe_during_dispatch_does_not_corrupt_iteration(self) -> None:
+        """A subscriber that calls subscribe_to_state during its own
+        callback must not affect the in-flight dispatch (snapshot
+        isolation). This is the bug-1 invariant: mutation during
+        iteration can't shift the iterator's index because dispatch
+        iterates a snapshot, not the live list.
+        """
+        mgr, _, _ = _make_manager()
+        ws = mgr.create(user_id="u1", name="ws", skill=None)
+        fired: list[str] = []
+
+        def late(_ws_id: str, state: WorkstreamState) -> None:
+            fired.append("late:" + state.value)
+
+        def first(_ws_id: str, state: WorkstreamState) -> None:
+            fired.append("first:" + state.value)
+            mgr.subscribe_to_state(late)  # mid-dispatch addition
+
+        mgr.subscribe_to_state(first)
+        mgr.set_state(ws.id, WorkstreamState.RUNNING)
+        # ``late`` was added during dispatch but the snapshot was
+        # already frozen — so it doesn't fire on this round.
+        assert fired == ["first:running"]
+        # Next round it does fire, in registration order after first.
+        fired.clear()
+        mgr.set_state(ws.id, WorkstreamState.IDLE)
+        assert fired == ["first:idle", "late:idle"]
