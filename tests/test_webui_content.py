@@ -157,20 +157,17 @@ class TestContentAccumulation:
         assert len(idle_events[0]["content"]) <= _MAX_TURN_CONTENT_CHARS + 1024
 
 
-class TestPendingApprovalDetailGate:
-    """The Shape A SSE plumbing carries ``pending_approval_detail`` on the
-    ``ws_state`` event so the coord tree UI can render inline approve/deny
-    buttons in lockstep with the activity_state transition.  The gate
-    (``if self._pending_approval is not None``) keeps the per-broadcast
-    serializer cost off the common no-approval-pending path — these tests
-    lock both branches down."""
+class TestPendingApprovalDetailNotPiggybacked:
+    """Stage 3 cleanup — ``pending_approval_detail`` is no longer
+    piggybacked on ``ws_state`` events. Approval items now arrive via
+    bulk fetch when the coord tree's reducer sees the
+    ``activity_state="approval"`` transition; verdicts via the explicit
+    ``intent_verdict`` event class; resolution via
+    ``approval_resolved``. These tests lock the no-piggyback contract
+    down so a future regression doesn't silently re-introduce the
+    duplicated path."""
 
     def test_state_broadcast_omits_field_when_no_approval_pending(self):
-        """Common case: no approval pending → field absent from event so the
-        per-broadcast verdict-cache deepcopy in
-        ``serialize_pending_approval_detail`` never runs.  A regression
-        that drops the gate would silently 10x the cost of every state
-        broadcast in the steady state."""
         ui = _make_ui()
         assert ui._pending_approval is None
         ui._broadcast_state("running")
@@ -180,17 +177,12 @@ class TestPendingApprovalDetailGate:
         assert len(running_events) == 1
         assert "pending_approval_detail" not in running_events[0]
 
-    def test_state_broadcast_includes_field_when_approval_pending(self):
-        """When an approval is pending the broadcast must carry the rich
-        payload — the coord tree UI reads it directly to render inline
-        approve/deny buttons.  Without this, a coord browser would have
-        to chase a separate ``cluster/ws/live`` fetch on every
-        activity_state transition (the load-storm pattern Shape A is
-        unwinding)."""
+    def test_state_broadcast_omits_field_even_when_approval_pending(self):
+        """The piggyback is gone: even when ``_pending_approval`` is set,
+        the state broadcast must NOT carry ``pending_approval_detail``.
+        The browser triggers a bulk fetch off the
+        ``activity_state="approval"`` transition to get the items."""
         ui = _make_ui()
-        # Mirror the shape ``pause_for_approval`` writes (session_ui_base
-        # lines 576-580) — items with call_id + header is the minimum
-        # the serializer needs to project.
         ui._pending_approval = {
             "type": "approve_request",
             "items": [
@@ -209,21 +201,9 @@ class TestPendingApprovalDetailGate:
         events = _drain_global()
         attn = [e for e in events if e.get("state") == "attention"]
         assert len(attn) == 1
-        # Field present and structurally sound — the serializer's
-        # full shape is covered by tests/test_session_ui_base.py;
-        # here we only need to confirm the gate fires and the
-        # serializer's output is what lands on the event.
-        assert "pending_approval_detail" in attn[0]
-        detail = attn[0]["pending_approval_detail"]
-        assert detail is not None
-        assert detail.get("items")
-        assert detail["items"][0]["call_id"] == "c1"
+        assert "pending_approval_detail" not in attn[0]
 
-    def test_field_cleared_after_approval_resolves(self):
-        """Once ``_pending_approval`` is cleared, subsequent state
-        broadcasts must drop the field again — without this, the
-        browser would render stale approve/deny buttons until the
-        next bulk-poll TTL window expired."""
+    def test_field_stays_absent_after_approval_resolves(self):
         ui = _make_ui()
         ui._pending_approval = {
             "type": "approve_request",
@@ -231,7 +211,7 @@ class TestPendingApprovalDetailGate:
             "judge_pending": False,
         }
         ui._broadcast_state("attention")
-        _drain_global()  # discard the with-detail event
+        _drain_global()
 
         ui._pending_approval = None
         ui._broadcast_state("running")
@@ -239,3 +219,115 @@ class TestPendingApprovalDetailGate:
         running = [e for e in events if e.get("state") == "running"]
         assert len(running) == 1
         assert "pending_approval_detail" not in running[0]
+
+
+class TestBroadcastIntentVerdict:
+    """Producer-side coverage for ``WebUI._broadcast_intent_verdict``.
+
+    The collector-side test (``test_apply_delta_intent_verdict_*`` in
+    test_console.py) covers consumption; this pins the event shape the
+    producer puts on the global queue. A field rename or missed key
+    here would slip past the consumer test because the consumer reads
+    via ``data.get(...)``.
+    """
+
+    def test_pushes_intent_verdict_event_to_global_queue(self):
+        ui = _make_ui()
+        verdict = {
+            "call_id": "c1",
+            "risk_level": "low",
+            "confidence": 0.92,
+            "recommendation": "approve",
+            "reasoning": "tool reads only",
+        }
+        ui._broadcast_intent_verdict(verdict)
+
+        events = _drain_global()
+        assert len(events) == 1
+        ev = events[0]
+        assert ev["type"] == "intent_verdict"
+        assert ev["ws_id"] == "ws-test"
+        assert ev["verdict"] == verdict
+
+    def test_no_op_when_global_queue_unset(self):
+        WebUI._global_queue = None
+        ui = _make_ui()
+        # Doesn't raise.
+        ui._broadcast_intent_verdict({"call_id": "c1"})
+
+    def test_queue_full_swallowed(self):
+        # Force a tiny queue then fill it so the next put_nowait
+        # raises queue.Full — the broadcast must absorb it without
+        # propagating (matches _broadcast_state's queue.Full handling).
+        WebUI._global_queue = queue.Queue(maxsize=1)
+        WebUI._global_queue.put_nowait({"sentinel": True})
+        ui = _make_ui()
+        # Doesn't raise.
+        ui._broadcast_intent_verdict({"call_id": "c1"})
+
+
+class TestBroadcastApprovalResolved:
+    """Producer-side coverage for ``WebUI._broadcast_approval_resolved``."""
+
+    def test_pushes_approval_resolved_event_to_global_queue(self):
+        ui = _make_ui()
+        ui._broadcast_approval_resolved(True, "lgtm", always=False)
+
+        events = _drain_global()
+        assert len(events) == 1
+        ev = events[0]
+        assert ev["type"] == "approval_resolved"
+        assert ev["ws_id"] == "ws-test"
+        assert ev["approved"] is True
+        assert ev["feedback"] == "lgtm"
+        assert ev["always"] is False
+
+    def test_normalises_none_feedback_to_empty_string(self):
+        ui = _make_ui()
+        ui._broadcast_approval_resolved(False, None)
+
+        events = _drain_global()
+        assert events[0]["feedback"] == ""
+        assert events[0]["approved"] is False
+        assert events[0]["always"] is False
+
+    def test_always_kwarg_propagates(self):
+        ui = _make_ui()
+        ui._broadcast_approval_resolved(True, "ok", always=True)
+        events = _drain_global()
+        assert events[0]["always"] is True
+
+    def test_no_op_when_global_queue_unset(self):
+        WebUI._global_queue = None
+        ui = _make_ui()
+        # Doesn't raise.
+        ui._broadcast_approval_resolved(True, None)
+
+
+class TestBroadcastApproveRequest:
+    """Producer-side coverage for ``WebUI._broadcast_approve_request`` —
+    push path for the initial approval items so a coord parent's tree
+    UI can render the inline approve/deny block immediately without
+    waiting for a bulk-fetch round-trip."""
+
+    def test_pushes_approve_request_event_to_global_queue(self):
+        ui = _make_ui()
+        detail = {
+            "type": "approve_request",
+            "items": [{"call_id": "c1", "header": "tool x"}],
+            "judge_pending": True,
+        }
+        ui._broadcast_approve_request(detail)
+
+        events = _drain_global()
+        assert len(events) == 1
+        ev = events[0]
+        assert ev["type"] == "approve_request"
+        assert ev["ws_id"] == "ws-test"
+        assert ev["detail"] == detail
+
+    def test_no_op_when_global_queue_unset(self):
+        WebUI._global_queue = None
+        ui = _make_ui()
+        # Doesn't raise.
+        ui._broadcast_approve_request({"items": []})

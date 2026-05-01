@@ -12,16 +12,22 @@ import asyncio
 import contextlib
 import json
 import logging
-import queue
 import random
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+if TYPE_CHECKING:
+    import queue
+
 import httpx
 import httpx_sse
 
+from turnstone.core.session_ui_base import (
+    _CRITICAL_EVENT_TYPES,
+    _put_with_priority,
+)
 from turnstone.core.workstream import WorkstreamKind
 
 if TYPE_CHECKING:
@@ -157,11 +163,19 @@ class ClusterCollector:
         log.info("ClusterCollector stopped")
 
     def _fanout(self, event: dict[str, Any]) -> None:
-        """Copy an event to all registered SSE listener queues."""
+        """Copy an event to all registered SSE listener queues.
+
+        Critical event types (verdicts, approval resolutions, child
+        lifecycle) evict one oldest queue entry to make room rather
+        than dropping themselves on a full queue. Best-effort events
+        (state ticks, activity) drop as before. See
+        :data:`turnstone.core.session_ui_base._CRITICAL_EVENT_TYPES`
+        for the canonical list.
+        """
+        critical = event.get("type") in _CRITICAL_EVENT_TYPES
         with self._listeners_lock:
             for q in self._listeners:
-                with contextlib.suppress(queue.Full):
-                    q.put_nowait(event)
+                _put_with_priority(q, event, critical=critical)
 
     # -- auth helpers --------------------------------------------------------
 
@@ -498,7 +512,6 @@ class ClusterCollector:
                         "kind": WorkstreamKind.from_raw(new_w.get("kind")),
                         "parent_ws_id": new_w.get("parent_ws_id"),
                         "activity_state": new_w.get("activity_state", ""),
-                        "pending_approval_detail": new_w.get("pending_approval_detail"),
                     }
                 )
             old_name = old_ws.get("title", "") or old_ws.get("name", "")
@@ -558,18 +571,6 @@ class ClusterCollector:
                         ws["kind"] = data["kind"]
                     if "parent_ws_id" in data:
                         ws["parent_ws_id"] = data["parent_ws_id"]
-                    # ``pending_approval_detail`` overwrites (no
-                    # ``ws.get`` fallback): the node's broadcast gate
-                    # on ``_pending_approval is not None`` means the
-                    # field is absent from ``data`` exactly when no
-                    # approval is pending — falling back to the cached
-                    # value would resurrect a stale detail after the
-                    # approval resolved.  Without this assignment the
-                    # cached ``node.workstreams`` dict served by
-                    # ``get_node_detail`` / ``get_snapshot`` between
-                    # reconciliations would render stale approve/deny
-                    # buttons on closed approvals.
-                    ws["pending_approval_detail"] = data.get("pending_approval_detail")
                     pending_events.append(
                         {
                             "type": "cluster_state",
@@ -581,7 +582,6 @@ class ClusterCollector:
                             "kind": WorkstreamKind.from_raw(ws.get("kind")),
                             "parent_ws_id": ws.get("parent_ws_id"),
                             "activity_state": ws.get("activity_state", ""),
-                            "pending_approval_detail": data.get("pending_approval_detail"),
                         }
                     )
 
@@ -647,6 +647,60 @@ class ClusterCollector:
                 if ws and name:
                     ws["name"] = name
                 pending_events.append({"type": "ws_rename", "ws_id": ws_id, "name": name})
+
+            elif etype == "intent_verdict":
+                # Pure pass-through for LLM judge verdicts. The node's
+                # WebUI._broadcast_intent_verdict pushes onto the
+                # global queue (Stage 3 Step 5); the cluster fan-out
+                # forwards to subscribers (e.g. CoordinatorAdapter,
+                # which dispatches to the parent's coord SSE as
+                # ``child_ws_intent_verdict``).
+                ws_id = data.get("ws_id", "")
+                if ws_id:
+                    pending_events.append(
+                        {
+                            "type": "intent_verdict",
+                            "ws_id": ws_id,
+                            "node_id": node_id,
+                            "verdict": data.get("verdict") or {},
+                        }
+                    )
+
+            elif etype == "approval_resolved":
+                # Pure pass-through for approve/deny resolutions. Pairs
+                # with ``intent_verdict`` above so the parent
+                # coordinator's tree UI can clear the pending-approval
+                # pill the moment the user decides, rather than waiting
+                # for the subsequent state-change piggyback.
+                ws_id = data.get("ws_id", "")
+                if ws_id:
+                    pending_events.append(
+                        {
+                            "type": "approval_resolved",
+                            "ws_id": ws_id,
+                            "node_id": node_id,
+                            "approved": bool(data.get("approved", False)),
+                            "feedback": data.get("feedback", "") or "",
+                            "always": bool(data.get("always", False)),
+                        }
+                    )
+
+            elif etype == "approve_request":
+                # Push path for the initial approval items. Eliminates
+                # the bulk-fetch race that otherwise leaves the coord
+                # tree stuck on a loading placeholder when the bulk
+                # fetch lands in the gap between the state transition
+                # to ATTENTION and ``_pending_approval`` being set.
+                ws_id = data.get("ws_id", "")
+                if ws_id:
+                    pending_events.append(
+                        {
+                            "type": "approve_request",
+                            "ws_id": ws_id,
+                            "node_id": node_id,
+                            "detail": data.get("detail") or {},
+                        }
+                    )
 
             elif etype == "health_changed":
                 # Update the health dict's backend status in-place
@@ -1217,3 +1271,70 @@ class ClusterCollector:
                 return
             entry["name"] = name
         self._fanout({"type": "ws_rename", "ws_id": ws_id, "name": name})
+
+    def emit_console_ws_intent_verdict(self, ws_id: str, verdict: dict[str, Any]) -> None:
+        """Fan an LLM intent-judge verdict for a console-pseudo-node ws.
+
+        Gives coord-spawned approval flows a first-class cluster-bus
+        event so the parent's tree UI can render the risk pill +
+        verdict result without polling.
+        ``CoordinatorAdapter._dispatch_child_event`` re-emits these as
+        ``child_ws_intent_verdict`` for the parent coordinator's SSE
+        stream. The dispatch path filters by registry membership;
+        downstream subscribers tolerate verdicts for ws_ids they don't
+        own (silently drop), so we skip the membership pre-check that
+        would otherwise add a lock acquisition per emit on a path
+        that fires once per tool-call during heuristic+LLM judging.
+        """
+        self._fanout(
+            {
+                "type": "intent_verdict",
+                "ws_id": ws_id,
+                "node_id": self.CONSOLE_PSEUDO_NODE_ID,
+                "verdict": verdict,
+            }
+        )
+
+    def emit_console_ws_approval_resolved(
+        self,
+        ws_id: str,
+        *,
+        approved: bool,
+        feedback: str = "",
+        always: bool = False,
+    ) -> None:
+        """Fan an ``approval_resolved`` decision for a console-pseudo-node ws.
+
+        Paired with :meth:`emit_console_ws_intent_verdict` so the
+        coord tree UI clears the pending-approval pill in lockstep
+        with the actual decision. Same lock-skip rationale as the
+        intent-verdict emit above.
+        """
+        self._fanout(
+            {
+                "type": "approval_resolved",
+                "ws_id": ws_id,
+                "node_id": self.CONSOLE_PSEUDO_NODE_ID,
+                "approved": approved,
+                "feedback": feedback,
+                "always": always,
+            }
+        )
+
+    def emit_console_ws_approve_request(self, ws_id: str, detail: dict[str, Any]) -> None:
+        """Fan an ``approve_request`` payload for a console-pseudo-node ws.
+
+        Push path for the initial approval items so a coord parent's
+        tree UI can render the inline approve/deny block immediately
+        without a bulk-fetch round-trip. ``CoordinatorAdapter._dispatch_child_event``
+        re-emits as ``child_ws_approve_request`` for the parent
+        coordinator's SSE stream.
+        """
+        self._fanout(
+            {
+                "type": "approve_request",
+                "ws_id": ws_id,
+                "node_id": self.CONSOLE_PSEUDO_NODE_ID,
+                "detail": detail,
+            }
+        )

@@ -1730,7 +1730,7 @@
         // state) so a user lacking admin.cluster.inspect doesn't
         // pay one 403 per denied id on every reconnect.
         for (const [id, c] of liveBadgeCache) {
-          if (!c || !c.permanent) liveBadgeCache.delete(id);
+          if (!c || !c.permanent) _liveBadgeCacheDelete(id);
         }
       }
     };
@@ -2038,6 +2038,21 @@
       case "child_ws_rename":
         handleChildRename(ev);
         break;
+      // Stage 3 Step 7 — explicit verdict + approval-resolved events
+      // arrive without piggybacking on cluster_state, so verdicts that
+      // land while a child is in `attention` (no state transition)
+      // reach the parent's tree UI promptly. Reducer writes
+      // liveBadgeCache directly (bypassing scheduleLiveFetch) so
+      // off-screen rows update too.
+      case "child_ws_intent_verdict":
+        handleChildIntentVerdict(ev);
+        break;
+      case "child_ws_approval_resolved":
+        handleChildApprovalResolved(ev);
+        break;
+      case "child_ws_approve_request":
+        handleChildApproveRequest(ev);
+        break;
       // wait_for_workstream observability (#14) — the worker thread
       // can block up to 600s inside the tool; these events drive a
       // sidebar indicator so operators see the coordinator is alive.
@@ -2050,10 +2065,38 @@
       case "wait_ended":
         handleWaitEnded(ev);
         break;
+      // Server-side SSE queue depth — debug aid surfaced in the
+      // status bar so operators can spot a backed-up tab (slow
+      // consumer / browser throttling) without devtools.
+      case "_queue_stats":
+        handleQueueStats(ev);
+        break;
       default:
         // Unknown event type — ignore silently.
         break;
     }
+  }
+
+  // ------------------------------------------------------------------
+  // SSE queue depth indicator
+  // ------------------------------------------------------------------
+  //
+  // The server emits a periodic ``_queue_stats`` event carrying the
+  // per-tab listener queue depth. Surface in the coord status bar
+  // with color escalation (default → warn at >50% → danger at >80%)
+  // so a backed-up consumer is glanceable. The element starts
+  // hidden; first sample reveals it.
+  function handleQueueStats(ev) {
+    const el = document.getElementById("coord-sb-sse-queue");
+    if (!el) return;
+    const depth = typeof ev.depth === "number" ? ev.depth : 0;
+    const max = typeof ev.max === "number" && ev.max > 0 ? ev.max : 500;
+    el.hidden = false;
+    el.textContent = "queue " + depth + "/" + max;
+    el.classList.remove("warn", "danger");
+    const ratio = depth / max;
+    if (ratio > 0.8) el.classList.add("danger");
+    else if (ratio > 0.5) el.classList.add("warn");
   }
 
   // ------------------------------------------------------------------
@@ -2154,6 +2197,37 @@
   const childrenState = new Map();
   // ws_id -> {live: <dict>, fetched: <ms>} for the 5s TTL live-badge cache.
   const liveBadgeCache = new Map();
+  // Incrementally-maintained set of ws_ids currently flagged
+  // ``pending_approval`` in the cache. Updated at every cache mutation
+  // via ``_liveBadgeCacheSet`` / ``_liveBadgeCacheDelete`` /
+  // ``_liveBadgeCacheClear`` below so the sidebar pending-count read
+  // is O(1) instead of an O(N) walk over the cache on every render
+  // (caught by /review perf-1).
+  const pendingApprovalIds = new Set();
+  // The helpers reach into the Map's prototype directly so a future
+  // edit can't accidentally rewrite the body's ``liveBadgeCache.set``
+  // into the helper name and create infinite recursion (already
+  // happened once when bulk-replacing call sites — caught at runtime
+  // as "InternalError: too much recursion").
+  const _mapSet = Map.prototype.set;
+  const _mapDelete = Map.prototype.delete;
+  const _mapClear = Map.prototype.clear;
+  function _liveBadgeCacheSet(id, entry) {
+    _mapSet.call(liveBadgeCache, id, entry);
+    if (entry && entry.live && entry.live.pending_approval) {
+      pendingApprovalIds.add(id);
+    } else {
+      pendingApprovalIds.delete(id);
+    }
+  }
+  function _liveBadgeCacheDelete(id) {
+    _mapDelete.call(liveBadgeCache, id);
+    pendingApprovalIds.delete(id);
+  }
+  function _liveBadgeCacheClear() {
+    _mapClear.call(liveBadgeCache);
+    pendingApprovalIds.clear();
+  }
   // ws_ids currently visible in the viewport — only these trigger
   // live-fetch on SSE state changes.  Populated by an
   // IntersectionObserver attached to each rendered .ch-row so a
@@ -2280,23 +2354,22 @@
       }
     }
     row.appendChild(meta);
-    // Inline approve/deny block \u2014 shown only when the live block
-    // carries pending_approval_detail (the rich payload added by the
-    // server-side dashboard projection).  A "\u2691 approval" badge alone
-    // means the child is in attention state but the rich detail
-    // hasn't arrived on the cache yet \u2014 a rare cross-version race
-    // (e.g. a node mid-rolling-upgrade emitted ws_state without
-    // pending_approval_detail before this PR landed).  The next SSE
-    // tick or the 5s TTL bulk-poll catches up and re-renders.
-    if (cached && cached.live && cached.live.pending_approval_detail) {
+    // Inline approve/deny block \u2014 the detail arrives via the bulk
+    // fetch triggered by handleChildState off the activity_state="approval"
+    // transition. Verdicts that land later arrive via
+    // child_ws_intent_verdict and update the cached detail in place;
+    // resolution arrives via child_ws_approval_resolved and clears it.
+    // While the bulk fetch is in flight (~250ms debounce + ~100ms HTTP)
+    // we render a loading placeholder so the row keeps its height
+    // stable AND so a screen reader has a labelled region to land on
+    // \u2014 without it the operator sees a "demand for action" badge
+    // with no actionable content.
+    if (cached && cached.live && cached.live.pending_approval) {
       const detail = cached.live.pending_approval_detail;
-      const block = renderApprovalBlock(child, detail);
+      const block = detail
+        ? renderApprovalBlock(child, detail)
+        : renderApprovalPlaceholder(child);
       if (block) row.appendChild(block);
-      // Late-arriving LLM judge: see comment above
-      // _maybeStartJudgePoll for the why. Hooks into a single
-      // global poller (not per-row) so off-screen rows still
-      // refresh and one bulk request covers every pending row.
-      _maybeStartJudgePoll();
     }
     // Recent auto-approves — tools that bypassed the operator gate
     // (skill ``allowed_tools`` allowlist / blanket / admin policy /
@@ -2368,78 +2441,6 @@
       .join("\n");
     pill.title = tooltip;
     return pill;
-  }
-
-  // Late-judge polling — single global timer driving a bulk
-  // re-fetch of every row whose `pending_approval_detail.judge_pending`
-  // is true and not every item has a `judge_verdict` yet.  Necessary
-  // because the LLM judge runs async on the child node and never
-  // pushes a signal that reaches the coord; without polling the
-  // operator would stare at a "heuristic"-tier pill forever.
-  //
-  // Why a global poller instead of per-row:
-  //  1. Per-row would invalidate the cache and call scheduleLiveFetch
-  //     for off-screen rows, but scheduleLiveFetch returns early on
-  //     non-visible ids — leaving the cache empty AND no fetch in
-  //     flight.  Result: off-screen rows stuck on stale heuristic.
-  //  2. A single bulk request covers every pending row in one
-  //     round-trip; the per-row design would issue N microtask-
-  //     batched fetches that share the bulk path anyway.
-  const JUDGE_POLL_INTERVAL_MS = 2000;
-  // Cap by total wall-clock time, not attempts. Real LLM judges
-  // (esp. with reasoning effort) can exceed 30s — a 6-attempt /
-  // 12s cap was prematurely giving up.
-  const JUDGE_POLL_MAX_DURATION_MS = 90_000;
-  let judgePollTimer = null;
-  let judgePollStartedAt = 0;
-
-  function _maybeStartJudgePoll() {
-    if (judgePollTimer !== null) return; // already polling
-    judgePollStartedAt = Date.now();
-    judgePollTimer = setTimeout(_judgePollTick, JUDGE_POLL_INTERVAL_MS);
-  }
-
-  function _judgePollTick() {
-    judgePollTimer = null;
-    if (Date.now() - judgePollStartedAt > JUDGE_POLL_MAX_DURATION_MS) {
-      // Failed / timed-out judge — give up so we don't poll forever.
-      // Operator can hit the Refresh button to force a fresh fetch.
-      return;
-    }
-    // Walk the full childrenState — not just visible — so off-screen
-    // rows still get refreshed.  scheduleLiveFetch's visibility gate
-    // exists to keep idle rows from burning round-trips; here we
-    // explicitly want every pending-judge row in the next bulk
-    // regardless of viewport.
-    let stillPending = false;
-    for (const [wsId, entry] of childrenState) {
-      if (TERMINAL_CHILD_STATES.has(entry.state)) continue;
-      const cached = liveBadgeCache.get(wsId);
-      if (!cached || !cached.live) continue;
-      const detail = cached.live.pending_approval_detail;
-      if (!detail || !detail.judge_pending) continue;
-      const items = Array.isArray(detail.items) ? detail.items : [];
-      const allHaveJudge =
-        items.length > 0 && items.every((it) => it.judge_verdict);
-      if (allHaveJudge) continue;
-      // Bypass scheduleLiveFetch entirely (skips visibility + TTL
-      // gates) by adding to pendingLiveIds directly. flushLiveFetches
-      // will batch every pending row into one request.
-      if (WS_ID_RE.test(wsId)) {
-        pendingLiveIds.add(wsId);
-        stillPending = true;
-      }
-    }
-    if (!stillPending) return; // every verdict landed — done
-    // Cancel any debounce that's still pending so our flush runs
-    // now instead of waiting for it. Then flush directly so the
-    // bulk request fires before the next tick re-arms.
-    if (liveBadgeFlushTimer !== null) {
-      clearTimeout(liveBadgeFlushTimer);
-      liveBadgeFlushTimer = null;
-    }
-    flushLiveFetches();
-    judgePollTimer = setTimeout(_judgePollTick, JUDGE_POLL_INTERVAL_MS);
   }
 
   // Build the inline approval block: severity pill, intent summary +
@@ -2534,6 +2535,37 @@
     return sub;
   }
 
+  // Loading-state placeholder rendered while the bulk fetch is
+  // in-flight. Same outer ``.approval-block`` class so the row's
+  // height stays stable when the real content swaps in (no shove of
+  // sibling rows mid-mouse-movement). Carries an aria-label so a
+  // screen reader announces the pending approval; the actual
+  // assertive ``announceApproval`` call in handleChildState fires
+  // once on the rising edge so the operator hears the demand even
+  // before the bulk fetch lands.
+  function renderApprovalPlaceholder(child) {
+    const block = document.createElement("div");
+    block.className = "approval-block approval-block-loading";
+    block.setAttribute("role", "region");
+    block.setAttribute(
+      "aria-label",
+      "Approval required for " +
+        (child.name || child.ws_id || "child") +
+        " — loading details",
+    );
+    const header = document.createElement("div");
+    header.className = "approval-header";
+    const pill = document.createElement("span");
+    pill.className = "approval-pill approval-pill-pending";
+    const spin = document.createElement("span");
+    spin.className = "approval-loading-spin";
+    pill.appendChild(spin);
+    pill.appendChild(document.createTextNode(" loading…"));
+    header.appendChild(pill);
+    block.appendChild(header);
+    return block;
+  }
+
   function renderApprovalBlock(child, detail) {
     if (!detail || !Array.isArray(detail.items) || detail.items.length === 0) {
       return null;
@@ -2562,6 +2594,16 @@
 
     const block = document.createElement("div");
     block.className = "approval-block";
+    block.setAttribute("role", "region");
+    block.setAttribute(
+      "aria-label",
+      "Approval required for " +
+        (child.name || child.ws_id || "child") +
+        " — " +
+        (primary && primary.header
+          ? primary.header
+          : items.length + " tool calls"),
+    );
 
     // Header line: pill + tool name(s) + tier:model
     const header = document.createElement("div");
@@ -2603,6 +2645,22 @@
       const conf = verdict.confidence;
       const confStr = typeof conf === "number" ? " " + conf.toFixed(2) : "";
       pill.textContent = (verdict.risk_level || "").toUpperCase() + confStr;
+      // SR-friendly label: spell out the risk level + optional
+      // confidence so a screen reader doesn't read "LOW 0.85" as
+      // a string of letters and a number. Visual text stays compact.
+      const riskWord =
+        riskCls === "crit"
+          ? "critical"
+          : riskCls === "high"
+            ? "high"
+            : riskCls === "med"
+              ? "medium"
+              : "low";
+      const confLabel =
+        typeof conf === "number"
+          ? ", confidence " + Math.round(conf * 100) + "%"
+          : "";
+      pill.setAttribute("aria-label", riskWord + " risk" + confLabel);
     }
     header.appendChild(pill);
 
@@ -2803,17 +2861,33 @@
         // Stale call_id \u2014 server has rolled to a new round, or
         // (more commonly) the approval was already resolved on
         // another channel and this click raced. Keep both buttons
-        // disabled until the urgent refresh lands and re-renders
-        // the row: the row is about to be replaced wholesale, so
-        // the disabled DOM is dropped along with it. Re-enabling
-        // here was the bug \u2014 it opened a window where rapid clicks
-        // hit the same already-resolved approval, each producing a
-        // fresh 409, looping until the live-bulk eventually cleared
-        // the row. On the rare path where the urgent refresh fails
-        // entirely, the operator can hit the Refresh button on the
-        // children panel to force a full reload.
+        // disabled until the refresh lands and re-renders the row:
+        // the row is about to be replaced wholesale, so the disabled
+        // DOM is dropped along with it. Re-enabling here was the bug
+        // \u2014 it opened a window where rapid clicks hit the same
+        // already-resolved approval, each producing a fresh 409,
+        // looping until the live-bulk eventually cleared the row.
+        // On the rare path where the refresh fails entirely, the
+        // operator can hit the Refresh button on the children panel
+        // to force a full reload. invalidateLiveBadge clears the
+        // cached entry so the next scheduleLiveFetch falls through
+        // the TTL gate (no cached entry to compare against); the
+        // standard 250ms debounce batches with any other in-flight
+        // pending ids.
+        // Inline note so the operator's "did my click work?" question
+        // gets answered without a noisy toast. Stays in the row until
+        // the refresh replaces the whole approval block.
+        const block = denyBtn.closest(".approval-block");
+        if (block && !block.querySelector(".approval-stale-note")) {
+          const note = document.createElement("div");
+          note.className = "approval-stale-note";
+          note.setAttribute("role", "status");
+          note.textContent =
+            "\u21bb already resolved elsewhere \u2014 refreshing\u2026";
+          block.appendChild(note);
+        }
         invalidateLiveBadge(targetWsId);
-        scheduleLiveFetch(targetWsId, { urgent: true });
+        scheduleLiveFetch(targetWsId);
         // Quiet console-warn for diagnostics; no toast \u2014 the
         // disappearing buttons / fresh row IS the operator-facing
         // signal, and a toast on every rapid-click 409 would just
@@ -2826,14 +2900,30 @@
       }
       // Optimistic clear \u2014 the next child_ws_state event will arrive
       // shortly and trigger a real refresh, but clearing locally
-      // makes the buttons disappear immediately on click.
+      // makes the buttons disappear immediately on click. The
+      // ``sseUpdatedAt`` bump is load-bearing: ``flushLiveFetches``'s
+      // merge guard preserves cleared pending_approval / _detail
+      // against an in-flight bulk fetch only while
+      // ``now - prev.sseUpdatedAt < SSE_AUTHORITATIVE_MS`` \u2014 without
+      // bumping, a bulk fetch landing in the gap reverts the
+      // cleared state from the upstream cache and the approve/deny
+      // pill flickers back. (Caught by /review bug-4.)
       const cached = liveBadgeCache.get(targetWsId);
       if (cached && cached.live) {
         cached.live = Object.assign({}, cached.live, {
           pending_approval: false,
           pending_approval_detail: null,
         });
-        liveBadgeCache.set(targetWsId, cached);
+        cached.sseUpdatedAt = Date.now();
+        _liveBadgeCacheSet(targetWsId, cached);
+      }
+      // Also clear the activity_state mirror so the row's "⚑ approval"
+      // badge in .meta disappears immediately too — without this, the
+      // row shows the badge with no buttons for ~50-150ms until the
+      // child_ws_approval_resolved push or next state event lands.
+      const childState = childrenState.get(targetWsId);
+      if (childState && childState.activity_state === "approval") {
+        childState.activity_state = "";
       }
       renderChildren();
     } catch (e) {
@@ -2902,7 +2992,49 @@
     return _childObserver;
   }
 
+  // Focus preservation helpers shared by _renderChildrenNow and
+  // _updateChildRow. ``replaceChildren()`` / ``replaceWith()`` blow
+  // away the focused element silently — without restore, the operator
+  // gets bounced to <body> mid-Tab whenever any state event fires for
+  // a row in the children tree.
+  function _captureRowFocusKey(scopeEl) {
+    const active = document.activeElement;
+    if (!active || !scopeEl || !scopeEl.contains(active)) return null;
+    const row = active.closest(".ch-row");
+    if (!row || !row.dataset.wsId) return null;
+    return {
+      wsId: row.dataset.wsId,
+      marker: active.className || active.tagName,
+    };
+  }
+
+  function _restoreRowFocus(scopeEl, focusKey) {
+    if (!focusKey || !scopeEl) return;
+    const sel = '.ch-row[data-ws-id="' + cssEscape(focusKey.wsId) + '"]';
+    const row = scopeEl.matches(sel) ? scopeEl : scopeEl.querySelector(sel);
+    if (!row) return;
+    let target = null;
+    if (focusKey.marker) {
+      // CSS.escape can't safely round-trip a class list with spaces,
+      // so we walk focusables and string-compare. A future refactor
+      // could swap to a stable ``data-focus-key`` attribute on each
+      // focusable element to dodge class-string identity entirely
+      // (see /review bug-2 — currently low risk because all
+      // focusables in renderChildRow / renderApprovalBlock carry
+      // single-class names).
+      const candidates = row.querySelectorAll("button, [tabindex], a, summary");
+      for (const el of candidates) {
+        if ((el.className || el.tagName) === focusKey.marker) {
+          target = el;
+          break;
+        }
+      }
+    }
+    if (target) target.focus({ preventScroll: true });
+  }
+
   function _renderChildrenNow() {
+    const focusKey = _captureRowFocusKey(childrenTreeEl);
     childrenTreeEl.setAttribute("aria-busy", "false");
     const rows = Array.from(childrenState.values());
     // Sort: non-terminal states first, then by name.
@@ -2934,7 +3066,42 @@
         else visibleChildIds.add(r.ws_id); // fallback: treat all visible
       });
     }
-    childrenCountEl.textContent = rows.length ? "(" + rows.length + ")" : "";
+    // Sidebar count: total + pending-approval annotation. The
+    // pending count is maintained incrementally on cache mutations
+    // (see ``pendingApprovalIds`` near the cache definition) so this
+    // is O(1) per render rather than an O(N) walk over the cache.
+    const pending = pendingApprovalIds.size;
+    childrenCountEl.textContent = rows.length
+      ? "(" +
+        rows.length +
+        (pending > 0 ? " · " + pending + " pending" : "") +
+        ")"
+      : "";
+    _restoreRowFocus(childrenTreeEl, focusKey);
+  }
+
+  // Targeted single-row update — used by handlers that only touch
+  // one row's state (verdict landing, approval resolved). Avoids
+  // the tree-wide rebuild ``_renderChildrenNow`` does so a 200-child
+  // tree doesn't re-paint 199 unaffected rows on every verdict
+  // arrival. Falls back to the full render if the row isn't in the
+  // DOM yet (first-time render). Preserves keyboard focus across
+  // the row swap — the same invariant ``_renderChildrenNow`` keeps
+  // for tree-wide rebuilds (caught by /review bug-3).
+  function _updateChildRow(childId) {
+    const sel = '.ch-row[data-ws-id="' + cssEscape(childId) + '"]';
+    const row = childrenTreeEl.querySelector(sel);
+    const entry = childrenState.get(childId);
+    if (row && entry) {
+      const focusKey = _captureRowFocusKey(row);
+      const replacement = renderChildRow(entry);
+      row.replaceWith(replacement);
+      const obs = _getChildObserver();
+      if (obs) obs.observe(replacement);
+      _restoreRowFocus(replacement, focusKey);
+    } else {
+      renderChildren();
+    }
   }
 
   function renderTaskRow(task) {
@@ -3065,15 +3232,9 @@
   const LIVE_BADGE_BULK_FLUSH_MS = LIVE_BADGE_DEBOUNCE_MS;
   const pendingLiveIds = new Set();
   let liveBadgeFlushTimer = null;
-  // Urgent-flush coalesce flag — N urgent calls in the same JS tick
-  // would otherwise issue N single-id bulk fetches (bulk endpoint
-  // accepts up to LIVE_BADGE_BULK_CAP ids per request). queueMicrotask
-  // batches them into one request that drains pendingLiveIds.
-  let urgentFlushScheduled = false;
 
-  function scheduleLiveFetch(childWsId, opts) {
+  function scheduleLiveFetch(childWsId) {
     if (!childWsId) return;
-    const urgent = !!(opts && opts.urgent);
     // Skip terminal-state children entirely — their live block will
     // never change again; fetching just burns a round-trip and caches
     // a stale value.  Renderer already styles closed/deleted rows.
@@ -3093,40 +3254,16 @@
       // change on any child triggers a fresh fetch → retry storm for
       // users who'll never have permission mid-session.
       if (cached.permanent) return;
-      // Urgent fetches bypass the TTL — used when a child enters
-      // approval state and the row needs the rich pending_approval_detail
-      // payload (call_id, items, judge_verdict) to render inline buttons.
-      // Waiting for the next 5s TTL window would leave the operator
-      // staring at "⚑ approval" with no way to act.
-      if (!urgent && Date.now() - cached.fetched < LIVE_BADGE_TTL_MS) return;
+      // TTL gate — slower-moving fields (tokens, context_ratio) refresh
+      // on this cadence. Approval state is event-driven (intent_verdict
+      // / approval_resolved push, plus the bulk fetch on initial
+      // approval entry); callers wanting a forced re-fetch
+      // (e.g. 409 stale-call_id retry) call invalidateLiveBadge first
+      // so the cache is empty and this gate falls through.
+      if (Date.now() - cached.fetched < LIVE_BADGE_TTL_MS) return;
     }
     if (!WS_ID_RE.test(childWsId)) return;
     pendingLiveIds.add(childWsId);
-    // Urgent: cancel the pending debounce and schedule a flush on
-    // the next microtask so N urgent calls in the same tick coalesce
-    // into one bulk request. Without the microtask hop, each urgent
-    // caller would drain pendingLiveIds with a single id and fire a
-    // separate fetch — defeating the bulk endpoint that accepts up
-    // to LIVE_BADGE_BULK_CAP ids per request.
-    if (urgent) {
-      if (liveBadgeFlushTimer !== null) {
-        clearTimeout(liveBadgeFlushTimer);
-        liveBadgeFlushTimer = null;
-      }
-      if (!urgentFlushScheduled) {
-        urgentFlushScheduled = true;
-        const flush = () => {
-          urgentFlushScheduled = false;
-          flushLiveFetches();
-        };
-        if (typeof queueMicrotask === "function") {
-          queueMicrotask(flush);
-        } else {
-          setTimeout(flush, 0);
-        }
-      }
-      return;
-    }
     if (liveBadgeFlushTimer !== null) return;
     liveBadgeFlushTimer = setTimeout(() => {
       liveBadgeFlushTimer = null;
@@ -3181,7 +3318,7 @@
             pending_approval_detail: prev.live.pending_approval_detail,
           });
         }
-        liveBadgeCache.set(id, {
+        _liveBadgeCacheSet(id, {
           live: mergedLive,
           fetched: now,
           // Denied ids are permission/identity misses — mark permanent
@@ -3209,7 +3346,7 @@
       const now = Date.now();
       ids.forEach((id) => {
         const prev = liveBadgeCache.get(id);
-        liveBadgeCache.set(id, {
+        _liveBadgeCacheSet(id, {
           live: null,
           fetched: now,
           permanent: isPermanent,
@@ -3221,7 +3358,7 @@
   }
 
   function invalidateLiveBadge(childWsId) {
-    liveBadgeCache.delete(childWsId);
+    _liveBadgeCacheDelete(childWsId);
   }
 
   // --- SSE handlers for child_ws_* events ----------------------------
@@ -3261,44 +3398,54 @@
     if (ev.node_id) existing.node_id = ev.node_id;
     childrenState.set(childId, existing);
     _touchChild(childId);
-    // pending_approval_detail rides on the ws_state event when an
-    // approval is pending (see turnstone/server.py
-    // WebUI._broadcast_state — gated on ``_pending_approval is not
-    // None``, so absent on the steady state and possibly null on a
-    // node mid-rolling-upgrade).  When present we mutate
-    // liveBadgeCache directly here — inline approve/deny buttons
-    // render in lockstep with the activity_state transition without
-    // a separate live-bulk fetch.  The cache entry is tagged
-    // ``sseUpdatedAt`` so a bulk-poll landing within
-    // SSE_AUTHORITATIVE_MS preserves the SSE-supplied fields
-    // (the upstream /dashboard cache's ~2s TTL would otherwise
-    // clobber a fresh transition with pre-transition state).
-    const pendingApproval = existing.activity_state === "approval";
-    const evDetail =
-      ev.pending_approval_detail !== undefined
-        ? ev.pending_approval_detail
-        : null;
+    // Track ``pending_approval`` flag from BOTH state and
+    // activity_state. ``state="attention"`` is the canonical signal
+    // that the workstream needs operator attention; ``activity_state
+    // ="approval"`` is the secondary signal set by approve_tools.
+    // We trust either: in practice the worker thread can fire the
+    // state transition before approve_tools has updated activity_state
+    // (the two writes happen on different lines under different
+    // locks), so a state-attention event with empty activity_state
+    // is a real and common case — checking only activity_state
+    // misses 30+ children all sitting in attention. (Caught manual
+    // testing: 30 children all state=attention rendered with no
+    // approval blocks because pendingApproval was always false.)
+    const pendingApproval =
+      existing.state === "attention" || existing.activity_state === "approval";
     const cached = liveBadgeCache.get(childId);
-    // When pending, prefer SSE-supplied detail.  If SSE didn't
-    // carry it (rare race; e.g. a node mid-rolling-upgrade), keep
-    // any existing cached detail rather than blanking the row —
-    // the next bulk-poll catches up.  When not pending, hard-clear.
-    let nextDetail;
-    if (pendingApproval) {
-      nextDetail =
-        evDetail !== null
-          ? evDetail
-          : cached && cached.live
-            ? cached.live.pending_approval_detail
-            : null;
-    } else {
-      nextDetail = null;
+    const cachedLive = (cached && cached.live) || {};
+    // Rising-edge detection BEFORE we mutate the cache. The chat-pane
+    // tool batches already announce assertively
+    // (renderApprovalDock / appendToolBatch); the children-tree was
+    // silent for SR users — fixing that here so a blind operator
+    // hears the demand for action.
+    const wasPendingApproval = cachedLive.pending_approval === true;
+    if (pendingApproval && !wasPendingApproval) {
+      _announceAssertive(
+        "Approval required: " + (existing.name || childId.slice(0, 8)),
+      );
     }
-    const nextLive = Object.assign({}, (cached && cached.live) || {}, {
+    const nextLive = Object.assign({}, cachedLive, {
       pending_approval: pendingApproval,
-      pending_approval_detail: nextDetail,
     });
-    liveBadgeCache.set(childId, {
+    // Off-approval transition is the ONLY case here that
+    // authoritatively writes a value the bulk fetch must not
+    // resurrect (a stale bulk-fetch landing within
+    // SSE_AUTHORITATIVE_MS would otherwise re-render the cleared
+    // approval block). Setting ``pending_approval=true`` does NOT
+    // claim cache authority — the bulk fetch is the source of
+    // truth for ``pending_approval_detail``, and bumping
+    // sseUpdatedAt here makes the merge guard in flushLiveFetches
+    // preserve our stale (often null) detail over the bulk
+    // fetch's actual data, leaving the row stuck on the loading
+    // placeholder. (Caught when the screenshot showed buttons
+    // briefly then loading replaced them.)
+    const detailClearedAuthoritatively =
+      !pendingApproval && cachedLive.pending_approval === true;
+    if (!pendingApproval) {
+      nextLive.pending_approval_detail = null;
+    }
+    _liveBadgeCacheSet(childId, {
       live: nextLive,
       // Preserve prior bulk-poll fetched timestamp so a fresh SSE
       // tick doesn't artificially extend the 5s TTL gate in
@@ -3306,7 +3453,11 @@
       // moving fields (tokens, context_ratio) on its own schedule.
       fetched: cached ? cached.fetched : 0,
       permanent: !!(cached && cached.permanent),
-      sseUpdatedAt: Date.now(),
+      sseUpdatedAt: detailClearedAuthoritatively
+        ? Date.now()
+        : cached
+          ? cached.sseUpdatedAt || 0
+          : 0,
     });
     renderChildren();
     // Do NOT invalidateLiveBadge on routine state ticks — that
@@ -3344,6 +3495,104 @@
     renderChildren();
   }
 
+  // Stage 3 Step 7 — verdict + approval reducer.
+  //
+  // Both write directly to liveBadgeCache and skip scheduleLiveFetch,
+  // which sidesteps the visibility gate in that path so off-screen
+  // rows pick up the new cache value the moment they scroll back in.
+  // Both are idempotent — the bulk-fetch (single source of truth for
+  // the items list) and the explicit intent_verdict event can deliver
+  // overlapping data; receiving twice re-stamps the same value.
+  //
+  // Both call ``_updateChildRow`` (targeted single-row swap) instead
+  // of ``renderChildren`` so a verdict landing on row 3 doesn't rebuild
+  // every other row in a 200-child sidebar — which would also blow
+  // away keyboard focus on whatever row the operator was tabbing to.
+
+  function handleChildIntentVerdict(ev) {
+    const childId = ev.child_ws_id || ev.ws_id;
+    if (!childId) return;
+    const verdict = ev.verdict || {};
+    const callId = verdict.call_id || "";
+    if (!callId) return;
+    const cached = liveBadgeCache.get(childId);
+    const cachedLive = (cached && cached.live) || {};
+    const detail = cachedLive.pending_approval_detail;
+    if (!detail) {
+      // No pending_approval_detail to stamp the verdict onto. The
+      // verdict is still durable in storage; the next bulk fetch
+      // will hydrate the detail and include the verdict via the
+      // existing serialize path.
+      return;
+    }
+    // Stamp on the matching item (UI render reads judge_verdict per
+    // item) AND on the by-call_id map (matches the
+    // serialize_pending_approval_detail shape).
+    const items = Array.isArray(detail.items) ? detail.items : [];
+    for (const item of items) {
+      if (item && item.call_id === callId) {
+        item.judge_verdict = verdict;
+        break;
+      }
+    }
+    if (!detail.llm_verdicts) detail.llm_verdicts = {};
+    detail.llm_verdicts[callId] = verdict;
+    // judge_pending flips false once every item has a verdict —
+    // matches the server-side serializer's logic.
+    if (items.length > 0) {
+      detail.judge_pending = !items.every((it) => it && it.judge_verdict);
+    }
+    _liveBadgeCacheSet(childId, {
+      live: cachedLive,
+      fetched: cached ? cached.fetched : 0,
+      permanent: !!(cached && cached.permanent),
+      sseUpdatedAt: Date.now(),
+    });
+    _updateChildRow(childId);
+  }
+
+  function handleChildApprovalResolved(ev) {
+    const childId = ev.child_ws_id || ev.ws_id;
+    if (!childId) return;
+    const cached = liveBadgeCache.get(childId);
+    const cachedLive = (cached && cached.live) || {};
+    cachedLive.pending_approval = false;
+    cachedLive.pending_approval_detail = null;
+    _liveBadgeCacheSet(childId, {
+      live: cachedLive,
+      fetched: cached ? cached.fetched : 0,
+      permanent: !!(cached && cached.permanent),
+      sseUpdatedAt: Date.now(),
+    });
+    _updateChildRow(childId);
+  }
+
+  // Push path for the initial approval items — eliminates the
+  // bulk-fetch race that previously left rows stuck on a loading
+  // placeholder when the bulk fetch landed in the gap between the
+  // state transition to ATTENTION and ``_pending_approval`` being
+  // set inside ``approve_tools``. Stamps the items into the cache
+  // directly; the bulk fetch remains as a reconnect / refresh
+  // fallback. Idempotent — receiving the same approve_request twice
+  // re-stamps the same detail.
+  function handleChildApproveRequest(ev) {
+    const childId = ev.child_ws_id || ev.ws_id;
+    if (!childId) return;
+    const detail = ev.detail || null;
+    if (!detail) return;
+    const cached = liveBadgeCache.get(childId);
+    const cachedLive = (cached && cached.live) || {};
+    cachedLive.pending_approval = true;
+    cachedLive.pending_approval_detail = detail;
+    _liveBadgeCacheSet(childId, {
+      live: cachedLive,
+      fetched: cached ? cached.fetched : 0,
+      permanent: !!(cached && cached.permanent),
+      sseUpdatedAt: Date.now(),
+    });
+    _updateChildRow(childId);
+  }
+
   // Periodic sweep of stale terminal rows.  Operator tabs left open all
   // day would otherwise accumulate entries for every child the
   // coordinator ever spawned — rows the user can still see (state !=
@@ -3359,7 +3608,7 @@
       if (terminal && now - lastSeen > CHILDREN_TERMINAL_GRACE_MS) {
         childrenState.delete(id);
         childrenLastSeen.delete(id);
-        liveBadgeCache.delete(id);
+        _liveBadgeCacheDelete(id);
         visibleChildIds.delete(id);
         removed += 1;
       }
@@ -3375,7 +3624,7 @@
         const id = byAge[i][0];
         childrenState.delete(id);
         childrenLastSeen.delete(id);
-        liveBadgeCache.delete(id);
+        _liveBadgeCacheDelete(id);
         visibleChildIds.delete(id);
         removed += 1;
       }
@@ -3388,7 +3637,7 @@
 
   if (childrenRefreshBtn) {
     childrenRefreshBtn.addEventListener("click", () => {
-      liveBadgeCache.clear();
+      _liveBadgeCacheClear();
       // Explicit refresh wipes SSE-discovered rows the server no
       // longer knows about — the operator asked for a clean snapshot.
       loadChildren({ replace: true });

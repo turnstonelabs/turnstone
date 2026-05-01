@@ -214,13 +214,21 @@ class SessionManager:
         # manager never reads them.
         self._active_id: str | None = None
         self._eviction_count: int = 0
-        # Optional state-change observer. The CLI sets this to a
-        # callback that prints a background-attention notification
-        # when a non-focused workstream transitions to ATTENTION.
-        # Web/coord paths use the event_emitter's emit_state for their
-        # own fan-out; this is a second, manager-level hook for callers
-        # that don't consume SSE.
-        self._on_state_change: Callable[[str, WorkstreamState], None] | None = None
+        # State-change subscribers. Multi-subscriber to support the
+        # CLI's background-attention notification AND the in-process
+        # ``SameNodeChildSource`` strategy that delivers child
+        # workstream state changes to a parent's UI without going
+        # through the cluster bus. Each callback fires under
+        # exception-suppression so one failing subscriber doesn't
+        # block the others. Subscribers register via
+        # :meth:`subscribe_to_state`. ``_state_subscribers_lock``
+        # guards mutation + snapshot — set_state copies the list
+        # under the lock then iterates the snapshot unlocked so a
+        # slow subscriber doesn't block subscribe/unsubscribe (and
+        # so concurrent subscribe/unsubscribe during a state event
+        # can't shift the iterator's index — caught by /review bug-1).
+        self._state_subscribers: list[Callable[[str, WorkstreamState], None]] = []
+        self._state_subscribers_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Properties
@@ -816,9 +824,36 @@ class SessionManager:
                     log.debug("session_mgr.state_update_failed ws=%s", ws_id[:8], exc_info=True)
         if self._event_emitter is not None:
             self._event_emitter.emit_state(ws, state)
-        if self._on_state_change is not None:
+        # Snapshot under the subscribers lock so concurrent
+        # subscribe / unsubscribe can't shift the iterator's index
+        # mid-dispatch (skipping or repeating callbacks). Iterate
+        # the snapshot WITHOUT the lock so a slow callback doesn't
+        # block subscribe / unsubscribe.
+        with self._state_subscribers_lock:
+            subscribers = list(self._state_subscribers)
+        for callback in subscribers:
             with contextlib.suppress(Exception):
-                self._on_state_change(ws_id, state)
+                callback(ws_id, state)
+
+    # ------------------------------------------------------------------
+    # State-change subscription
+    # ------------------------------------------------------------------
+
+    def subscribe_to_state(self, callback: Callable[[str, WorkstreamState], None]) -> None:
+        """Register ``callback`` to fire on every workstream state change.
+
+        Multiple subscribers are supported and fire in registration order.
+        Each callback is wrapped in exception-suppression so a failing
+        subscriber doesn't block the others. Use
+        :meth:`unsubscribe_from_state` to remove.
+        """
+        with self._state_subscribers_lock:
+            self._state_subscribers.append(callback)
+
+    def unsubscribe_from_state(self, callback: Callable[[str, WorkstreamState], None]) -> None:
+        """Remove a previously-registered state-change callback. No-op if absent."""
+        with self._state_subscribers_lock, contextlib.suppress(ValueError):
+            self._state_subscribers.remove(callback)
 
     def cancel(self, ws_id: str) -> bool:
         """Cancel in-flight generation and unblock any pending approval / plan.

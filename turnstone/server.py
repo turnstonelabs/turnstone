@@ -81,6 +81,7 @@ from turnstone.core.session_routes import (
 from turnstone.core.session_ui_base import (
     AutoApproveReason,
     SessionUIBase,
+    _put_with_priority,
     fire_judge_verdict_metric,
 )
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
@@ -194,18 +195,14 @@ class WebUI(SessionUIBase):
             }
             if state == "idle":
                 event["content"] = payload["content"]
-            # Coord tree-UI renders inline approve/deny buttons off
-            # ``pending_approval_detail``; carrying it on the
-            # state-change broadcast lets the cluster bus update those
-            # buttons in lockstep with ``activity_state`` instead of
-            # forcing the browser to chase a separate dashboard fetch.
-            # Gated on existence so we don't pay the serializer's
-            # per-broadcast verdict-cache deepcopy on the common
-            # no-approval-pending path.
-            if self._pending_approval is not None:
-                detail = self.serialize_pending_approval_detail()
-                if detail is not None:
-                    event["pending_approval_detail"] = detail
+            # ``pending_approval_detail`` is NO LONGER piggybacked on
+            # state-change events (Stage 3 cleanup). Symmetric event
+            # flow now: initial approval items arrive via bulk fetch
+            # triggered by the ``activity_state="approval"`` transition,
+            # individual verdicts via the explicit
+            # ``intent_verdict`` event class, and resolution via
+            # ``approval_resolved``. Reducer no longer has to dedupe
+            # the piggyback path against the explicit one.
             try:
                 WebUI._global_queue.put_nowait(event)
             except queue.Full:
@@ -229,6 +226,82 @@ class WebUI(SessionUIBase):
                         "parent_ws_id": parent_ws_id,
                     }
                 )
+
+    def _broadcast_intent_verdict(self, verdict: dict[str, Any]) -> None:
+        """Send an LLM intent-judge verdict to the global SSE channel.
+
+        Stage 3 Step 5 — the cluster collector's ``_apply_delta``
+        forwards this verbatim to the cluster bus, where coord
+        adapters dispatch it as ``child_ws_intent_verdict`` for the
+        owning parent's tree UI. Unlike the existing
+        ``pending_approval_detail`` piggyback on ``ws_state``, this
+        fires WHENEVER a verdict lands — including the common case
+        where the judge daemon writes during ``attention`` with no
+        state transition to ride along on.
+        """
+        if WebUI._global_queue is not None:
+            # Critical event — evict an oldest item if the global
+            # queue is full rather than dropping the verdict.
+            _put_with_priority(
+                WebUI._global_queue,
+                {
+                    "type": "intent_verdict",
+                    "ws_id": self.ws_id,
+                    "verdict": verdict,
+                },
+                critical=True,
+            )
+
+    def _broadcast_approval_resolved(
+        self,
+        approved: bool,
+        feedback: str | None = None,
+        *,
+        always: bool = False,
+    ) -> None:
+        """Send an ``approval_resolved`` decision to the global SSE channel.
+
+        Clears the parent's pending-approval pill in lockstep with
+        the actual decision rather than waiting for the next
+        state-change piggyback.
+        """
+        if WebUI._global_queue is not None:
+            # Critical event — evict an oldest item if the global
+            # queue is full rather than dropping the resolution.
+            _put_with_priority(
+                WebUI._global_queue,
+                {
+                    "type": "approval_resolved",
+                    "ws_id": self.ws_id,
+                    "approved": approved,
+                    "feedback": feedback or "",
+                    "always": bool(always),
+                },
+                critical=True,
+            )
+
+    def _broadcast_approve_request(self, detail: dict[str, Any]) -> None:
+        """Send an ``approve_request`` payload to the global SSE channel.
+
+        Push path for the initial approval items so a coord parent's
+        tree UI can render the inline approve/deny block immediately
+        without waiting for a bulk-fetch round-trip. The bulk fetch
+        races with ``_pending_approval`` being set inside
+        ``approve_tools`` (the state transition to ATTENTION fires
+        upstream first); the push path eliminates that race entirely.
+        """
+        if WebUI._global_queue is not None:
+            # Critical event — evict an oldest item if the global
+            # queue is full rather than dropping the items.
+            _put_with_priority(
+                WebUI._global_queue,
+                {
+                    "type": "approve_request",
+                    "ws_id": self.ws_id,
+                    "detail": detail,
+                },
+                critical=True,
+            )
 
     # --- SessionUI protocol ---
     #

@@ -1242,7 +1242,7 @@ def main() -> None:
                 )
                 sys.stderr.flush()
 
-    manager._on_state_change = _bg_attention_notify
+    manager.subscribe_to_state(_bg_attention_notify)
 
     # Print banner
     print(f"\n{bold('Chat')} with {cyan(model)}")

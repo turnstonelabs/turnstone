@@ -35,11 +35,10 @@ def _seed_children(
     The production path populates the registry via the cluster-event
     fan-out thread observing ``ws_created`` events. These tests just
     need a known-children set for the endpoint handlers to iterate —
-    inject directly under ``_children_lock`` rather than spinning up
-    the collector + fan-out plumbing.
+    inject directly via the registry's bulk-merge surface rather than
+    spinning up the collector + fan-out plumbing.
     """
-    with adapter._children_lock:
-        adapter._merge_child_ids_locked(coord_ws_id, child_ws_ids)
+    adapter._registry.merge_children(coord_ws_id, child_ws_ids)
 
 
 class _AuthMiddleware(BaseHTTPMiddleware):

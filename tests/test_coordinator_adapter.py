@@ -378,13 +378,21 @@ class TestCoordinatorAdapterWorkerDispatch:
 
 
 class TestCoordinatorAdapterChildrenRegistry:
-    def test_emit_created_seeds_empty_children_set(self) -> None:
+    """Adapter-level integration with :class:`ChildrenRegistry`.
+
+    Pure-registry invariants (forward/reverse consistency, idempotent
+    merge, locking) live in ``test_children_registry.py``. These
+    tests cover the adapter's wiring: that ``emit_*`` paths drive the
+    registry correctly and that the snapshot-priming bridge between
+    a collector snapshot and the registry preserves merge semantics.
+    """
+
+    def test_emit_created_installs_parent(self) -> None:
         adapter, _ = _make_adapter()
         ws = _make_ws()
         adapter.emit_created(ws)
-        assert ws.id in adapter._children
-        assert adapter._children[ws.id] == set()
-        assert adapter._active_coords[ws.id] is ws.ui
+        assert adapter._registry.children_of(ws.id) == []
+        assert adapter._registry.ui_for(ws.id) is ws.ui
 
     def test_emit_rehydrated_calls_rebuild(self) -> None:
         adapter, _ = _make_adapter()
@@ -398,42 +406,36 @@ class TestCoordinatorAdapterChildrenRegistry:
         adapter.emit_rehydrated(ws)
         assert calls == [ws.id]
 
-    def test_emit_closed_clears_forward_and_reverse_indexes(self) -> None:
+    def test_emit_closed_uninstalls_parent_and_clears_children(self) -> None:
         adapter, _ = _make_adapter()
-        with adapter._children_lock:
-            adapter._merge_child_ids_locked("coord-a", ["child-a1", "child-a2"])
-            adapter._merge_child_ids_locked("coord-b", ["child-b1"])
-            adapter._active_coords["coord-a"] = object()
-            adapter._active_coords["coord-b"] = object()
+        adapter._registry.install("coord-a", object())
+        adapter._registry.install("coord-b", object())
+        adapter._registry.merge_children("coord-a", ["child-a1", "child-a2"])
+        adapter._registry.merge_children("coord-b", ["child-b1"])
 
         adapter.emit_closed("coord-a")
 
-        assert "coord-a" not in adapter._children
-        assert "coord-a" not in adapter._active_coords
-        assert "child-a1" not in adapter._child_to_coord
-        assert "child-a2" not in adapter._child_to_coord
+        assert adapter._registry.ui_for("coord-a") is None
+        assert adapter._registry.children_of("coord-a") == []
+        assert adapter._registry.parent_for("child-a1") is None
+        assert adapter._registry.parent_for("child-a2") is None
         # coord-b untouched
-        assert adapter._child_to_coord["child-b1"] == "coord-b"
-        assert "coord-b" in adapter._children
-
-    def test_merge_child_ids_locked_is_idempotent(self) -> None:
-        adapter, _ = _make_adapter()
-        with adapter._children_lock:
-            adapter._merge_child_ids_locked("coord-a", ["child-1"])
-            adapter._merge_child_ids_locked("coord-a", ["child-1"])
-        assert adapter._children["coord-a"] == {"child-1"}
-        assert adapter._child_to_coord == {"child-1": "coord-a"}
+        assert adapter._registry.parent_for("child-b1") == "coord-b"
+        assert adapter._registry.ui_for("coord-b") is not None
 
     def test_prime_children_from_snapshot_merges_without_overwriting(self) -> None:
+        # Snapshot priming now lives on ClusterChildSource (production
+        # path). The adapter no longer carries its own duplicate copy.
+        from turnstone.core.child_source import ClusterChildSource
+
         adapter, _ = _make_adapter()
-        # Seed one in-memory coord + one existing child
-        coord_ws = _make_ws()
-        coord_ws.id = "coord-a"
-        mgr = MagicMock()
-        mgr.list_all.return_value = [coord_ws]
-        adapter.attach(mgr)
-        with adapter._children_lock:
-            adapter._merge_child_ids_locked("coord-a", ["child-a1"])
+        adapter._registry.merge_children("coord-a", ["child-a1"])
+
+        source = ClusterChildSource(
+            collector=MagicMock(),
+            registry=adapter._registry,
+            parents_provider=lambda: ["coord-a"],
+        )
 
         snapshot = {
             "nodes": [
@@ -448,10 +450,13 @@ class TestCoordinatorAdapterChildrenRegistry:
                 },
             ],
         }
-        adapter._prime_children_from_snapshot(snapshot)
-        assert adapter._children["coord-a"] == {"child-a1", "child-a2"}
-        assert adapter._child_to_coord["child-a2"] == "coord-a"
-        assert "child-x" not in adapter._child_to_coord
+        source._prime_from_snapshot(snapshot)
+        assert set(adapter._registry.children_of("coord-a")) == {
+            "child-a1",
+            "child-a2",
+        }
+        assert adapter._registry.parent_for("child-a2") == "coord-a"
+        assert adapter._registry.parent_for("child-x") is None
 
 
 # ---------------------------------------------------------------------------
@@ -478,9 +483,7 @@ class TestCoordinatorAdapterDispatchChildEvent:
         coord_ws.id = coord_id
         recorder = _UIRecorder()
         coord_ws.ui = recorder  # type: ignore[assignment]
-        with adapter._children_lock:
-            adapter._children.setdefault(coord_id, set())
-            adapter._active_coords[coord_id] = recorder
+        adapter._registry.install(coord_id, recorder)
         adapter.attach(_StubManager(coord_ws))  # type: ignore[arg-type]
         return adapter, recorder, coord_ws
 
@@ -510,12 +513,11 @@ class TestCoordinatorAdapterDispatchChildEvent:
         assert payload["child_ws_id"] == "child-a1"
         assert payload["parent_ws_id"] == "coord-a"
         # Reverse index updated for subsequent cluster_state events.
-        assert adapter._child_to_coord["child-a1"] == "coord-a"
+        assert adapter._registry.parent_for("child-a1") == "coord-a"
 
     def test_dispatch_cluster_state_routes_via_reverse_index(self) -> None:
         adapter, recorder, _ = self._setup()
-        with adapter._children_lock:
-            adapter._merge_child_ids_locked("coord-a", ["child-a1"])
+        adapter._registry.merge_children("coord-a", ["child-a1"])
         adapter._dispatch_child_event(
             {
                 "type": "cluster_state",
@@ -533,8 +535,7 @@ class TestCoordinatorAdapterDispatchChildEvent:
 
     def test_dispatch_ws_closed_routes_to_parent_coord(self) -> None:
         adapter, recorder, _ = self._setup()
-        with adapter._children_lock:
-            adapter._merge_child_ids_locked("coord-a", ["child-a1"])
+        adapter._registry.merge_children("coord-a", ["child-a1"])
         adapter._dispatch_child_event(
             {"type": "ws_closed", "ws_id": "child-a1", "reason": "evicted"}
         )
@@ -548,8 +549,7 @@ class TestCoordinatorAdapterDispatchChildEvent:
         """perf-6: _enqueue_on_ui mutates the payload dict in place with
         the coord's ws_id so the browser can discriminate child events."""
         adapter, recorder, _ = self._setup()
-        with adapter._children_lock:
-            adapter._merge_child_ids_locked("coord-a", ["child-a1"])
+        adapter._registry.merge_children("coord-a", ["child-a1"])
         adapter._dispatch_child_event(
             {
                 "type": "cluster_state",
@@ -559,53 +559,160 @@ class TestCoordinatorAdapterDispatchChildEvent:
         )
         assert recorder.enqueued[0]["ws_id"] == "coord-a"
 
-    def test_dispatch_cluster_state_forwards_pending_approval_detail(self) -> None:
-        """The rich approval payload now rides on child_ws_state directly so
-        the browser can mutate liveBadgeCache without a separate live-bulk
-        fetch.  Drift here means the inline approve/deny buttons would
-        regress to chasing the dashboard cache (the load-storm pattern
-        Shape A is unwinding)."""
+    def test_dispatch_cluster_state_does_not_carry_pending_approval_detail(
+        self,
+    ) -> None:
+        """Stage 3 cleanup — the ``pending_approval_detail`` piggyback
+        on ``cluster_state`` is gone. Approval items now arrive via
+        bulk fetch (triggered by ``activity_state="approval"`` in the
+        browser); verdicts via ``child_ws_intent_verdict``; resolution
+        via ``child_ws_approval_resolved``. The state event carries
+        only state + activity_state — no detail field."""
         adapter, recorder, _ = self._setup()
-        with adapter._children_lock:
-            adapter._merge_child_ids_locked("coord-a", ["child-a1"])
-        detail = {
-            "items": [{"call_id": "c1", "header": "tool x"}],
-            "judge_pending": False,
-        }
+        adapter._registry.merge_children("coord-a", ["child-a1"])
         adapter._dispatch_child_event(
             {
                 "type": "cluster_state",
                 "ws_id": "child-a1",
                 "state": "running",
                 "activity_state": "approval",
-                "pending_approval_detail": detail,
             }
         )
         assert len(recorder.enqueued) == 1
         payload = recorder.enqueued[0]
         assert payload["type"] == "child_ws_state"
         assert payload["activity_state"] == "approval"
-        assert payload["pending_approval_detail"] == detail
+        assert "pending_approval_detail" not in payload
 
-    def test_dispatch_cluster_state_pending_approval_detail_none_passes_through(
-        self,
-    ) -> None:
-        """Missing pending_approval_detail (no approval pending, or pre-fix
-        node mid-rolling-upgrade) must forward as None — not raise, not
-        omit — so the browser's handleChildState treats it as "no SSE-
-        supplied detail, fall back to cached value"."""
+    def test_dispatch_intent_verdict_emits_child_ws_intent_verdict(self) -> None:
+        """Stage 3 Step 6 — explicit verdict events are re-emitted as
+        child_ws_intent_verdict on the parent's SSE so the tree UI
+        renders the risk pill without polling."""
         adapter, recorder, _ = self._setup()
-        with adapter._children_lock:
-            adapter._merge_child_ids_locked("coord-a", ["child-a1"])
+        adapter._registry.merge_children("coord-a", ["child-a1"])
+        verdict = {
+            "call_id": "c1",
+            "risk_level": "low",
+            "confidence": 0.92,
+            "recommendation": "approve",
+        }
         adapter._dispatch_child_event(
             {
-                "type": "cluster_state",
+                "type": "intent_verdict",
                 "ws_id": "child-a1",
-                "state": "running",
-                "activity_state": "tool",
+                "node_id": "node-1",
+                "verdict": verdict,
             }
         )
         assert len(recorder.enqueued) == 1
         payload = recorder.enqueued[0]
-        assert "pending_approval_detail" in payload
-        assert payload["pending_approval_detail"] is None
+        assert payload["type"] == "child_ws_intent_verdict"
+        assert payload["child_ws_id"] == "child-a1"
+        assert payload["parent_ws_id"] == "coord-a"
+        assert payload["node_id"] == "node-1"
+        assert payload["verdict"] == verdict
+
+    def test_dispatch_intent_verdict_unknown_child_drops(self) -> None:
+        adapter, recorder, _ = self._setup()
+        adapter._dispatch_child_event(
+            {
+                "type": "intent_verdict",
+                "ws_id": "ws-orphan",
+                "verdict": {"call_id": "c1"},
+            }
+        )
+        assert recorder.enqueued == []
+
+    def test_dispatch_approval_resolved_emits_child_ws_approval_resolved(
+        self,
+    ) -> None:
+        """Stage 3 Step 6 — paired with intent_verdict; clears the
+        pending-approval pill on the parent's tree UI in lockstep
+        with the actual decision."""
+        adapter, recorder, _ = self._setup()
+        adapter._registry.merge_children("coord-a", ["child-a1"])
+        adapter._dispatch_child_event(
+            {
+                "type": "approval_resolved",
+                "ws_id": "child-a1",
+                "node_id": "node-1",
+                "approved": True,
+                "feedback": "lgtm",
+                "always": False,
+            }
+        )
+        assert len(recorder.enqueued) == 1
+        payload = recorder.enqueued[0]
+        assert payload["type"] == "child_ws_approval_resolved"
+        assert payload["child_ws_id"] == "child-a1"
+        assert payload["parent_ws_id"] == "coord-a"
+        assert payload["approved"] is True
+        assert payload["feedback"] == "lgtm"
+        assert payload["always"] is False
+
+    def test_dispatch_approval_resolved_coerces_missing_fields(self) -> None:
+        """Older nodes mid-rolling-upgrade may omit approved / always /
+        feedback; dispatch coerces to safe defaults."""
+        adapter, recorder, _ = self._setup()
+        adapter._registry.merge_children("coord-a", ["child-a1"])
+        adapter._dispatch_child_event({"type": "approval_resolved", "ws_id": "child-a1"})
+        assert len(recorder.enqueued) == 1
+        payload = recorder.enqueued[0]
+        assert payload["approved"] is False
+        assert payload["feedback"] == ""
+        assert payload["always"] is False
+
+    def test_dispatch_approval_resolved_unknown_child_drops(self) -> None:
+        """Symmetric to the intent_verdict drop test — events for
+        ws_ids the registry doesn't know about silently drop instead
+        of fanning out to a parent that has no business seeing them."""
+        adapter, recorder, _ = self._setup()
+        adapter._dispatch_child_event(
+            {
+                "type": "approval_resolved",
+                "ws_id": "ws-orphan",
+                "approved": True,
+            },
+        )
+        assert recorder.enqueued == []
+
+    def test_dispatch_approve_request_emits_child_ws_approve_request(
+        self,
+    ) -> None:
+        """Push path for the initial approval items — eliminates the
+        bulk-fetch race that left the coord row stuck on a loading
+        placeholder when the bulk fetch landed in the gap between
+        _emit_state(ATTENTION) and approve_tools setting _pending_approval."""
+        adapter, recorder, _ = self._setup()
+        adapter._registry.merge_children("coord-a", ["child-a1"])
+        detail = {
+            "type": "approve_request",
+            "items": [{"call_id": "c1", "header": "tool x"}],
+            "judge_pending": True,
+        }
+        adapter._dispatch_child_event(
+            {
+                "type": "approve_request",
+                "ws_id": "child-a1",
+                "node_id": "node-1",
+                "detail": detail,
+            },
+        )
+        assert len(recorder.enqueued) == 1
+        payload = recorder.enqueued[0]
+        assert payload["type"] == "child_ws_approve_request"
+        assert payload["child_ws_id"] == "child-a1"
+        assert payload["parent_ws_id"] == "coord-a"
+        assert payload["node_id"] == "node-1"
+        assert payload["detail"] == detail
+
+    def test_dispatch_approve_request_unknown_child_drops(self) -> None:
+        adapter, recorder, _ = self._setup()
+        adapter._dispatch_child_event(
+            {
+                "type": "approve_request",
+                "ws_id": "ws-orphan",
+                "detail": {"items": []},
+            },
+        )
+        assert recorder.enqueued == []

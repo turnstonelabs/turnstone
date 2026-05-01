@@ -181,6 +181,81 @@ class ConsoleCoordinatorUI(SessionUIBase):
         with self._ws_lock:
             self._last_broadcast_activity = current
 
+    def _broadcast_intent_verdict(self, verdict: dict[str, Any]) -> None:
+        """Fan an LLM intent-judge verdict to the cluster collector.
+
+        Stage 3 Step 5 — overrides the no-op base hook so a coord
+        workstream that produces its own verdict (rare — coord agents
+        don't typically run the LLM judge) gets a first-class
+        cluster-bus event for the parent's tree UI. The far more
+        common path is a CHILD workstream firing its verdict on a
+        real node; that path goes through ``WebUI._broadcast_intent_verdict``
+        → global SSE → collector ``_apply_delta``.
+        """
+        collector = ConsoleCoordinatorUI._collector
+        if collector is None:
+            return
+        try:
+            collector.emit_console_ws_intent_verdict(self.ws_id, verdict)
+        except Exception:
+            log.debug(
+                "coord_ui.intent_verdict_fanout_failed ws=%s",
+                self.ws_id,
+                exc_info=True,
+            )
+
+    def _broadcast_approval_resolved(
+        self,
+        approved: bool,
+        feedback: str | None = None,
+        *,
+        always: bool = False,
+    ) -> None:
+        """Fan an ``approval_resolved`` decision to the cluster collector.
+
+        Stage 3 Step 5 — paired with :meth:`_broadcast_intent_verdict`.
+        Same rationale: coord-direct approvals are rare; the typical
+        path is a child workstream resolving on its node, with that
+        node's WebUI broadcasting through the global queue.
+        """
+        collector = ConsoleCoordinatorUI._collector
+        if collector is None:
+            return
+        try:
+            collector.emit_console_ws_approval_resolved(
+                self.ws_id,
+                approved=approved,
+                feedback=feedback or "",
+                always=always,
+            )
+        except Exception:
+            log.debug(
+                "coord_ui.approval_resolved_fanout_failed ws=%s",
+                self.ws_id,
+                exc_info=True,
+            )
+
+    def _broadcast_approve_request(self, detail: dict[str, Any]) -> None:
+        """Fan an ``approve_request`` payload to the cluster collector.
+
+        Push path for the initial approval items. Same rationale as
+        the other two broadcast hooks: coord-self approvals are rare
+        (the LLM judge isn't wired on the console coord today), but
+        the override exists for symmetry and lights up the same path
+        a future coord-self gate would use.
+        """
+        collector = ConsoleCoordinatorUI._collector
+        if collector is None:
+            return
+        try:
+            collector.emit_console_ws_approve_request(self.ws_id, detail)
+        except Exception:
+            log.debug(
+                "coord_ui.approve_request_fanout_failed ws=%s",
+                self.ws_id,
+                exc_info=True,
+            )
+
     def on_state_change(self, state: str) -> None:
         # Flow state transitions through the unified SessionManager so
         # the storage write + adapter emit_state fan-out stay in lockstep
