@@ -92,3 +92,71 @@ def test_tool_error_does_not_overwrite_approval_badge() -> None:
         "badge instead so the approval verdict stays visible alongside "
         "the error."
     )
+
+
+def test_replay_history_renders_content_before_tool_block() -> None:
+    """In ``replayHistory``'s ``role === "assistant"`` branch, the
+    ``msg.content`` render must precede the ``msg.tool_calls`` render.
+
+    Two reasons, both load-bearing:
+
+    1. **Structural** — the next loop iteration's ``role === "tool"``
+       message anchors to ``lastToolBlock``. The tool-block branch sets
+       that anchor; the content branch clears it. If content runs after
+       the tool block, the clear silently drops the upcoming tool
+       result. Pre-fix, every interactive tool result was missing from
+       saved-workstream replays whenever the assistant turn carried
+       both narration and tool calls (very common output shape).
+
+    2. **Visual** — the live SSE path renders content first
+       (``stream_text`` streams before ``tool_info`` /
+       ``approve_request``), so replay should match.
+
+    The test pins the order via the offsets of the ``msg.content`` and
+    ``msg.tool_calls`` branch headers inside the function body."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    start = body.index("Pane.prototype.replayHistory = function")
+    end = body.index("Pane.prototype._attachRetryToLastAssistant", start)
+    fn = body[start:end]
+    # Locate the assistant branch and bound the search to its body —
+    # the function also handles user / tool roles which would otherwise
+    # confuse the offset comparison.
+    asst_start = fn.index('msg.role === "assistant"')
+    asst_end = fn.index('msg.role === "tool"', asst_start)
+    asst = fn[asst_start:asst_end]
+    content_idx = asst.index("if (msg.content)")
+    tool_calls_idx = asst.index("if (msg.tool_calls && msg.tool_calls.length)")
+    assert content_idx < tool_calls_idx, (
+        "replayHistory must render msg.content BEFORE msg.tool_calls "
+        "inside the assistant branch — otherwise the lastToolBlock "
+        "anchor is clobbered before the next iteration's tool result "
+        "can attach to it (and the visual order also drifts from the "
+        "live SSE flow)."
+    )
+
+
+def test_replay_history_renders_persisted_verdict_badge() -> None:
+    """Saved-workstream replays must paint the persisted intent verdict
+    next to each tool div, using the same ``renderVerdictBadge`` helper
+    the live ``showInlineToolBlock`` path uses. Pre-fix the audit trail
+    was complete in storage (``intent_verdicts`` table) but never
+    surfaced on replay — operators reviewing a saved workstream
+    couldn't see what the heuristic / LLM judge thought of any tool
+    call. This test pins the call site so a refactor that drops the
+    decoration regresses the audit surface."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    start = body.index("Pane.prototype.replayHistory = function")
+    end = body.index("Pane.prototype._attachRetryToLastAssistant", start)
+    fn = body[start:end]
+    # Match a `renderVerdictBadge(<something>.verdict, ...)` call inside
+    # the replay loop.  Loose on whitespace + identifier so a future
+    # rename of the iteration variable doesn't trip CI.
+    badge_call_re = re.compile(
+        r"renderVerdictBadge\(\s*\w+\.verdict\b",
+    )
+    assert badge_call_re.search(fn), (
+        "replayHistory must call renderVerdictBadge(tc.verdict, ...) "
+        "when a persisted verdict is attached to a tool_call entry — "
+        "otherwise the audit-trail data persisted to intent_verdicts "
+        "doesn't surface on saved-workstream replays."
+    )

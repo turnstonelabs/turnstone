@@ -396,6 +396,87 @@
   background: color-mix(in srgb, var(--err) 12%, var(--panel-2));
 }
 
+/* Output-guard finding rendered under its specific .coord-tool-row.
+   Stays anchored to the call that tripped the guard rather than
+   floating into the chat log as a generic "[output guard]" line —
+   matches interactive's `.output-warning` placement convention.
+   Severity drives the hue (matches .verdict-badge.verdict-* palette
+   so an operator scanning a workstream reads risk consistently
+   across both surfaces). */
+.coord-tool-row-warning {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  border: 1px solid var(--hair);
+  border-radius: 3px;
+  border-left-width: 3px;
+  background: var(--panel-2);
+  color: var(--ink-2);
+  max-width: max-content;
+}
+.coord-tool-row-warning--low {
+  color: color-mix(in srgb, var(--ok) 70%, var(--ink-2));
+  border-left-color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 12%, var(--panel-2));
+}
+.coord-tool-row-warning--medium {
+  color: color-mix(in srgb, var(--warn) 70%, var(--ink-2));
+  border-left-color: var(--warn);
+  background: var(--warn-tint);
+}
+.coord-tool-row-warning--high,
+.coord-tool-row-warning--critical {
+  color: color-mix(in srgb, var(--err) 70%, var(--ink-2));
+  border-left-color: var(--err);
+  background: color-mix(in srgb, var(--err) 12%, var(--panel-2));
+}
+.coord-tool-row-warning-redacted {
+  color: var(--ink-3);
+  font-size: 10px;
+}
+
+/* Storage-truncation indicator — same convention as the interactive
+   UI's `.tool-output-truncated` pill (transparent bg, dim border,
+   small font) so the operator reads the affordance the same way on
+   both surfaces.  Sibling node next to .coord-tool-row-result rather
+   than text-in-content so a future "best-effort JSON repair" pass
+   on the result body doesn't have to strip a marker string. */
+.coord-tool-truncated {
+  display: inline-block;
+  margin-top: 4px;
+  margin-left: 6px;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--ink-3);
+  background: transparent;
+  border: 1px solid var(--ink-3);
+  border-radius: 3px;
+}
+
+/* memory/recall calls are background metadata — the audit trail is
+   useful but they crowd the tree on workstreams with heavy memory
+   usage.  Dim the row by default; full opacity on hover so they
+   stay inspectable.  Mirrors the interactive UI's metacog dim rule
+   (style.css `.ts-approval-tool[data-func-name="memory"]`).  The
+   row stamps `data-tool-name` from item.func_name in coordinator.js
+   so this selector has something to match. */
+.coord-tool-row[data-tool-name="memory"],
+.coord-tool-row[data-tool-name="recall"] {
+  opacity: 0.55;
+  transition: opacity 120ms ease-out;
+}
+.coord-tool-row[data-tool-name="memory"]:hover,
+.coord-tool-row[data-tool-name="memory"]:focus-within,
+.coord-tool-row[data-tool-name="recall"]:hover,
+.coord-tool-row[data-tool-name="recall"]:focus-within {
+  opacity: 1;
+}
+
 /* Tool result block — paired under its row, mono pre-block.  Capped
    at 240px with internal scroll so a long tool output doesn't push
    the rest of the chat off-screen.  The interactive UI uses a

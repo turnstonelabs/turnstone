@@ -2414,16 +2414,7 @@ class ChatSession:
                 if assistant_msg.get("_provider_content"):
                     provider_data = json.dumps(assistant_msg["_provider_content"])
 
-                # Build tool_calls JSON (excluding memory tools)
-                tool_calls_json: str | None = None
-                if tc:
-                    filtered_tc = [
-                        call
-                        for call in tc
-                        if call.get("function", {}).get("name", "") not in ("memory", "recall")
-                    ]
-                    if filtered_tc:
-                        tool_calls_json = json.dumps(filtered_tc)
+                tool_calls_json: str | None = json.dumps(tc) if tc else None
 
                 # Save assistant message atomically (content + tool_calls in one row)
                 if content or provider_data is not None or tool_calls_json:
@@ -2571,27 +2562,27 @@ class ChatSession:
                         tok_est = max(1, int(len(output) / self._chars_per_token))
                     self._msg_tokens.append(tok_est)
 
-                    # Log tool result (skip memory tools to avoid noise).
-                    # Use raw_output (pre-advisory-wrap) so DB stores clean
-                    # tool output without ephemeral advisory XML.
+                    # Log tool result.  Use raw_output (pre-advisory-wrap)
+                    # so the DB stores clean tool output without ephemeral
+                    # advisory XML.  memory/recall persist alongside every
+                    # other tool: replays show the full audit trail, and
+                    # output already passes through _truncate_output above
+                    # so size is bounded by the same budget every other
+                    # tool uses.
                     _tname = _tc_names.get(tc_id, "")
-                    if _tname not in (
-                        "memory",
-                        "recall",
-                    ):
-                        if isinstance(raw_output, list):
-                            store_text = " ".join(
-                                p.get("text", "") for p in raw_output if p.get("type") == "text"
-                            )[:2000]
-                        else:
-                            store_text = raw_output[:2000]
-                        save_message(
-                            self._ws_id,
-                            "tool",
-                            store_text,
-                            _tname,
-                            tool_call_id=tc_id,
-                        )
+                    if isinstance(raw_output, list):
+                        store_text = " ".join(
+                            p.get("text", "") for p in raw_output if p.get("type") == "text"
+                        )[:2000]
+                    else:
+                        store_text = raw_output[:2000]
+                    save_message(
+                        self._ws_id,
+                        "tool",
+                        store_text,
+                        _tname,
+                        tool_call_id=tc_id,
+                    )
                 # Inject user feedback from approval prompt (e.g. "y, use full path")
                 if user_feedback:
                     self.messages.append({"role": "user", "content": user_feedback})

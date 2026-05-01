@@ -394,6 +394,15 @@ class SessionEndpointConfig:
     # separate ``/history`` endpoint and doesn't render the per-tab
     # status bar). Kinds that don't need pre-replay wire ``None``.
     events_replay: EventsReplay | None = None
+    # async (ws, ui, request) -> None. Kind-specific async pre-step
+    # the lifted ``events`` body awaits BEFORE iterating
+    # ``events_replay``. Lets a kind move blocking storage I/O off
+    # the event loop (via ``asyncio.to_thread``) and stash results
+    # on ``request.state`` for the sync replay generator to read.
+    # Interactive uses it to pre-load intent_verdicts +
+    # output_assessments so ``_build_history``'s decoration stays
+    # off the hot path. Coord wires ``None``.
+    events_replay_prepare: Callable[..., Any] | None = None
     # (request) -> Executor for the SSE live-loop's blocking
     # ``queue.get`` wait. Interactive returns the dedicated
     # ``request.app.state.sse_executor`` (200-thread pool) so SSE
@@ -1454,6 +1463,20 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                 # 500-slot cap on a chatty mid-generation workstream)
                 # while replay was being built.
                 if replay_cb is not None:
+                    # Kind-specific async prep — runs before the sync
+                    # replay generator iterates so blocking storage
+                    # I/O lands in the executor pool rather than the
+                    # event loop's hot path. Interactive uses this
+                    # to pre-load verdict indexes; coord skips.
+                    if cfg.events_replay_prepare is not None:
+                        try:
+                            await cfg.events_replay_prepare(ws, ui, request)
+                        except Exception:
+                            log.debug(
+                                "ws.events.replay_prepare_failed ws=%s",
+                                ws_id[:8],
+                                exc_info=True,
+                            )
                     try:
                         for ev in replay_cb(ws, ui, request):
                             yield {"data": json.dumps(ev)}
@@ -2240,6 +2263,34 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
                 messages = await asyncio.to_thread(storage.load_messages, ws_id, limit=limit)
             except Exception:
                 log.debug("ws.history.load_failed ws=%s", ws_id[:8], exc_info=True)
+        # Audit-trail decoration — attach persisted intent_verdict and
+        # output_assessment data to each assistant.tool_calls entry so
+        # the dashboard's history replay paints the same verdict pills
+        # / output-warning bubbles the live SSE path shows.  Both
+        # storage queries are off-loop via ``to_thread``.  Best-effort:
+        # any failure leaves messages undecorated — replay degrades to
+        # the pre-decoration shape rather than 500-ing.
+        if messages:
+            try:
+                from turnstone.core.history_decoration import (
+                    decorate_history_messages,
+                    load_verdict_indexes,
+                )
+
+                indexes = await asyncio.to_thread(load_verdict_indexes, ws_id)
+                decorate_history_messages(messages, indexes[0], indexes[1])
+            except Exception:
+                # Operationally interesting: a persistent decoration
+                # failure (missing migration, driver mismatch, schema
+                # drift) silently strips verdict pills + output
+                # warnings from every reload of every workstream.
+                # Log at warning so it surfaces in normal log review
+                # rather than only when DEBUG is on.
+                log.warning(
+                    "ws.history.decoration_failed ws=%s",
+                    ws_id[:8],
+                    exc_info=True,
+                )
         return JSONResponse({"ws_id": ws_id, "messages": messages})
 
     return history
