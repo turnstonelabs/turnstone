@@ -181,9 +181,13 @@ class TestDecorateHistoryMessages:
         assessments = {
             "call_a": {"risk_level": "high", "flags": '["secret"]', "redacted": 1},
         }
-        # Tool result content of exactly 2000 chars hits the storage
-        # cap; longer is impossible (storage clamps at 2000).
-        truncated_content = "x" * 2000
+        # Tool result content of exactly TOOL_RESULT_STORAGE_CAP chars
+        # hits the storage cap (longer is impossible — storage clamps
+        # at the cap).  Reference the constant rather than a literal so
+        # this test stays correct if the cap moves again.
+        from turnstone.core.history_decoration import TOOL_RESULT_STORAGE_CAP
+
+        truncated_content = "x" * TOOL_RESULT_STORAGE_CAP
         messages: list[dict[str, object]] = [
             {"role": "user", "content": "hi"},
             {

@@ -1212,6 +1212,8 @@ def make_open_handler(
     """
 
     async def open_ws(request: Request) -> Response:
+        import asyncio
+
         if cfg.permission_gate is not None:
             err = cfg.permission_gate(request)
             if err is not None:
@@ -1313,7 +1315,14 @@ def make_open_handler(
         # emit_rehydrated path).
         if cfg.open_post_load is not None:
             try:
-                cfg.open_post_load(request, ws)
+                # Off-loop: interactive's post_load runs the sync
+                # ``_build_history`` (storage I/O for verdict
+                # indexes + message reconstruction) — without the
+                # to_thread wrap this blocks the event loop on every
+                # workstream open, mirroring the SSE replay path
+                # that's already protected via
+                # ``events_replay_prepare``.
+                await asyncio.to_thread(cfg.open_post_load, request, ws)
             except Exception:
                 # Post-load is observational — never let a hook bug
                 # block the open. Log + continue.

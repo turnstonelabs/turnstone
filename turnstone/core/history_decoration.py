@@ -25,11 +25,20 @@ from turnstone.core.log import get_logger
 
 log = get_logger(__name__)
 
-# Tool results are clamped at this length per row in
-# ``ChatSession._save_tool_result`` (see session.py).  Keeping the
-# constant here lets ``mark_truncated_tool_messages`` stay in sync
-# without a magic number duplicated across server.py / session.py.
-TOOL_RESULT_STORAGE_CAP = 2000
+# Tool results are clamped at this length per row at storage time
+# (see ``session.py``'s ``store_text = raw_output[:TOOL_RESULT_STORAGE_CAP]``).
+# Keeping the constant here lets the truncation flag detection in
+# ``decorate_history_messages`` stay in sync without a magic number
+# duplicated across server.py / session.py.
+#
+# Raised from 2000 → 10000 because a 2000-char clip routinely cut
+# the body of a single grep / file read mid-line, leaving the
+# historical record useless for retrospective debugging.  FTS5
+# index + row size grow proportionally; the per-tool upper bound is
+# still bounded upstream by ``_truncate_output``'s context-budget
+# clamp (so a single huge result can't blow past the live context
+# window).
+TOOL_RESULT_STORAGE_CAP = 10000
 
 
 def load_verdict_indexes(

@@ -54,6 +54,9 @@ from turnstone.core.auth import (
     jwt_version_slot,
 )
 from turnstone.core.history_decoration import (
+    TOOL_RESULT_STORAGE_CAP,
+)
+from turnstone.core.history_decoration import (
     decorate_tool_call as _decorate_tool_call,
 )
 from turnstone.core.history_decoration import (
@@ -562,11 +565,14 @@ def _build_history(
             result_call_id = msg.get("tool_call_id")
             if result_call_id:
                 entry["tool_call_id"] = str(result_call_id)
-            # Tool results are clamped to 2000 chars per row at storage
-            # time (session.py).  Surface that on replay so the user
-            # knows the visible output is a clipped view of what the
-            # live session saw, rather than the full result.
-            if isinstance(content, str) and len(content) >= 2000:
+            # Tool results are clamped to TOOL_RESULT_STORAGE_CAP
+            # chars per row at storage time (session.py).  Surface
+            # that on replay so the user knows the visible output is
+            # a clipped view of what the live session saw, rather
+            # than the full result.  Reference the shared constant
+            # rather than a literal so the UI pill logic can't
+            # silently desync if the cap ever changes.
+            if isinstance(content, str) and len(content) >= TOOL_RESULT_STORAGE_CAP:
                 entry["truncated"] = True
             if isinstance(content, str):
                 if content.startswith("Denied by user") or content.startswith("Blocked"):

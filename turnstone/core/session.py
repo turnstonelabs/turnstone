@@ -44,6 +44,7 @@ from turnstone.core.attachments import (
 )
 from turnstone.core.config import get_tavily_key
 from turnstone.core.edit import find_occurrences, pick_nearest
+from turnstone.core.history_decoration import TOOL_RESULT_STORAGE_CAP
 from turnstone.core.log import get_logger
 from turnstone.core.memory import (
     count_structured_memories,
@@ -2573,9 +2574,9 @@ class ChatSession:
                     if isinstance(raw_output, list):
                         store_text = " ".join(
                             p.get("text", "") for p in raw_output if p.get("type") == "text"
-                        )[:2000]
+                        )[:TOOL_RESULT_STORAGE_CAP]
                     else:
-                        store_text = raw_output[:2000]
+                        store_text = raw_output[:TOOL_RESULT_STORAGE_CAP]
                     save_message(
                         self._ws_id,
                         "tool",

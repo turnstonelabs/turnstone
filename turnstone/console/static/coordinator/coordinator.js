@@ -902,7 +902,7 @@
       pill.className = "coord-tool-truncated";
       pill.textContent = "… truncated in storage";
       pill.title =
-        "Full tool output was sent to the model live; only the first 2000 characters are persisted to the conversation row.";
+        "Full tool output was sent to the model live; only the first 10000 characters are persisted to the conversation row.";
       row.appendChild(pill);
     }
   }

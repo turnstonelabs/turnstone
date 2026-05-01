@@ -1661,10 +1661,28 @@ body {
   opacity: 0.55;
   transition: opacity 120ms ease-out;
 }
+/* Reveal on hover OR focus-within across the entire dimmed
+   subtree.  Without :focus-within on the siblings, a keyboard user
+   tabbing into a link or collapsible toggle inside .tool-output
+   sees the content remain dimmed — a11y regression.  Cover the
+   warning + truncation pills too so they fully reveal alongside
+   the result they decorate. */
 .ts-approval-tool[data-func-name="memory"] ~ .tool-output:hover,
 .ts-approval-tool[data-func-name="recall"] ~ .tool-output:hover,
+.ts-approval-tool[data-func-name="memory"] ~ .tool-output:focus-within,
+.ts-approval-tool[data-func-name="recall"] ~ .tool-output:focus-within,
 .ts-approval-tool[data-func-name="memory"] ~ .media-embed:hover,
-.ts-approval-tool[data-func-name="recall"] ~ .media-embed:hover {
+.ts-approval-tool[data-func-name="recall"] ~ .media-embed:hover,
+.ts-approval-tool[data-func-name="memory"] ~ .media-embed:focus-within,
+.ts-approval-tool[data-func-name="recall"] ~ .media-embed:focus-within,
+.ts-approval-tool[data-func-name="memory"] ~ .output-warning:hover,
+.ts-approval-tool[data-func-name="recall"] ~ .output-warning:hover,
+.ts-approval-tool[data-func-name="memory"] ~ .output-warning:focus-within,
+.ts-approval-tool[data-func-name="recall"] ~ .output-warning:focus-within,
+.ts-approval-tool[data-func-name="memory"] ~ .tool-output-truncated:hover,
+.ts-approval-tool[data-func-name="recall"] ~ .tool-output-truncated:hover,
+.ts-approval-tool[data-func-name="memory"] ~ .tool-output-truncated:focus-within,
+.ts-approval-tool[data-func-name="recall"] ~ .tool-output-truncated:focus-within {
   opacity: 1;
 }
 /* Truncation indicator — the persisted tool result is clamped at
