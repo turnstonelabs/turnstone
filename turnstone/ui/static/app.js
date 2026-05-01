@@ -3668,12 +3668,35 @@ function updateDashFooter(agg) {
   }
 }
 
-var _wsDeleteMode = false;
-var _wsDeleteSelected = {};
+// Saved Workstreams cache + multi-select delete controller.  The
+// controller (from /shared/cards.js) owns mode state, checkbox
+// decoration, the toolbar wiring, and the confirmation modal — see
+// createSavedCardsController for the shared bits.
 var _wsSavedItems = [];
+var _wsDeleteController = createSavedCardsController({
+  idPrefix: "ws-delete",
+  buttonId: "ws-delete-btn",
+  noun: "workstream",
+  activateLabel: function (s) {
+    return "Resume: " + (s.alias || s.title || s.ws_id);
+  },
+  buildDeleteRequest: function (wsId) {
+    return {
+      url: "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/delete",
+      options: { method: "POST" },
+    };
+  },
+  render: function () {
+    renderSavedWorkstreams(_wsSavedItems);
+  },
+  onClose: function () {
+    loadDashboard();
+  },
+});
 
 function renderSavedWorkstreams(items) {
   _wsSavedItems = items;
+  _wsDeleteController.setItems(items);
   var c = document.getElementById("dashboard-saved-cards");
   c.replaceChildren();
   if (!items.length) {
@@ -3684,289 +3707,39 @@ function renderSavedWorkstreams(items) {
     return;
   }
   items.forEach(function (sess) {
-    // Default card shape (title + meta + wsid + Resume click) comes from
-    // the shared /shared/cards.js helper so console (Saved Coordinators)
-    // and ui/static (Saved Workstreams) stay in lock-step.  Delete mode
-    // is interactive-only; we layer the checkbox + selection wiring on
-    // top of the shared card after construction.
     var card = renderSessionCard(sess, {
-      ariaLabel: function (s) {
-        var label = s.alias || s.title || s.ws_id;
-        return _wsDeleteMode ? "Select: " + label : "Resume: " + label;
-      },
+      ariaLabel: _wsDeleteController.ariaLabel,
       onActivate: function (s) {
-        // Suppressed in delete mode \u2014 the layered checkbox handler below
-        // owns clicks while delete-mode is active.
-        if (_wsDeleteMode) return;
+        if (_wsDeleteController.blockActivate()) return;
         dashboardResumeSession(s.ws_id);
       },
     });
-
-    if (_wsDeleteMode) {
-      card.classList.add("ws-delete-mode");
-      card.removeAttribute("role"); // becomes a checkbox host, not a button
-      var chk = document.createElement("input");
-      chk.type = "checkbox";
-      chk.className = "ws-card-check";
-      chk.checked = !!_wsDeleteSelected[sess.ws_id];
-      var label = sess.alias || sess.title || sess.ws_id;
-      chk.setAttribute("aria-label", "Select " + label + " for deletion");
-      chk.onclick = function (e) {
-        e.stopPropagation();
-        if (chk.checked) _wsDeleteSelected[sess.ws_id] = true;
-        else delete _wsDeleteSelected[sess.ws_id];
-        card.classList.toggle("ws-selected", chk.checked);
-        updateWsDeleteBar();
-      };
-      card.insertBefore(chk, card.firstChild);
-      // Override the shared helper's onclick/onkeydown \u2014 in delete mode
-      // a card click toggles the checkbox instead of activating Resume.
-      card.onclick = function (e) {
-        if (e.target === chk) return;
-        chk.checked = !chk.checked;
-        chk.onclick(e);
-      };
-      card.onkeydown = function (e) {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          chk.checked = !chk.checked;
-          chk.onclick(e);
-        }
-      };
-      if (_wsDeleteSelected[sess.ws_id]) card.classList.add("ws-selected");
-    }
-
+    _wsDeleteController.decorateCard(card, sess);
     c.appendChild(card);
   });
+  if (_wsDeleteController.inMode()) _wsDeleteController.refreshBar();
 }
 
+// HTML inline-onclick wrappers — keep the global names the existing
+// markup binds to (`onclick="startWsDeleteMode()"` etc.) and forward
+// to the controller.
 function startWsDeleteMode() {
-  _wsDeleteMode = true;
-  _wsDeleteSelected = {};
-  renderSavedWorkstreams(_wsSavedItems);
-  var btn = document.getElementById("ws-delete-btn");
-  if (btn) {
-    btn.textContent = "\u2715 Cancel";
-    btn.onclick = cancelWsDeleteMode;
-  }
-  var bar = document.getElementById("ws-delete-bar");
-  if (bar) bar.classList.add("visible");
+  _wsDeleteController.start();
 }
-
 function cancelWsDeleteMode() {
-  _wsDeleteMode = false;
-  _wsDeleteSelected = {};
-  renderSavedWorkstreams(_wsSavedItems);
-  var btn = document.getElementById("ws-delete-btn");
-  if (btn) {
-    btn.innerHTML = "&#x1f5d1; Delete";
-    btn.onclick = startWsDeleteMode;
-  }
-  var bar = document.getElementById("ws-delete-bar");
-  if (bar) bar.classList.remove("visible");
+  _wsDeleteController.cancel();
 }
-
-function updateWsDeleteBar() {
-  var count = Object.keys(_wsDeleteSelected).length;
-  var label = document.getElementById("ws-delete-bar-count");
-  if (label) label.textContent = count + " selected";
-  var delBtn = document.getElementById("ws-delete-bar-delete");
-  if (delBtn) delBtn.disabled = count === 0;
-  var selBtn = document.getElementById("ws-delete-bar-select-all");
-  if (selBtn) {
-    var allSelected =
-      count === _wsSavedItems.length && _wsSavedItems.length > 0;
-    selBtn.textContent = allSelected ? "Deselect All" : "Select All";
-  }
-}
-
 function toggleSelectAll() {
-  var allSelected =
-    Object.keys(_wsDeleteSelected).length === _wsSavedItems.length &&
-    _wsSavedItems.length > 0;
-  if (allSelected) {
-    _wsDeleteSelected = {};
-  } else {
-    _wsSavedItems.forEach(function (s) {
-      _wsDeleteSelected[s.ws_id] = true;
-    });
-  }
-  renderSavedWorkstreams(_wsSavedItems);
-  updateWsDeleteBar();
+  _wsDeleteController.toggleAll();
 }
-
-var _wsDeleteBatchTrap = null;
-
 function confirmWsDeleteSelection() {
-  var selected = Object.keys(_wsDeleteSelected);
-  if (!selected.length) {
-    showToast("No workstreams selected", "warning");
-    return;
-  }
-  var overlay = document.getElementById("ws-delete-overlay");
-  var countEl = document.getElementById("ws-delete-count");
-  var listEl = document.getElementById("ws-delete-list");
-  var errorEl = document.getElementById("ws-delete-error");
-  errorEl.textContent = "";
-  countEl.textContent =
-    selected.length + " workstream(s) will be permanently deleted:";
-  listEl.innerHTML = "";
-  selected.forEach(function (wsId) {
-    var item = _wsSavedItems.find(function (s) {
-      return s.ws_id === wsId;
-    });
-    var name = item ? item.alias || item.title || wsId : wsId;
-    var div = document.createElement("div");
-    div.className = "ws-delete-item";
-    div.textContent = name;
-    listEl.appendChild(div);
-  });
-  // Reset confirm button handler (may have been overwritten to "Close" by previous run)
-  var delBtn = document.getElementById("ws-delete-confirm-btn");
-  if (delBtn) {
-    delBtn.textContent = "Delete";
-    delBtn.disabled = false;
-    delBtn.classList.remove("ws-delete-close");
-    delBtn.onclick = confirmWsDelete;
-  }
-  var cancelBtn = document.getElementById("ws-delete-cancel-btn");
-  if (cancelBtn) cancelBtn.disabled = false;
-  overlay.style.display = "flex";
-
-  // Focus trap + Escape
-  if (_wsDeleteBatchTrap)
-    document.removeEventListener("keydown", _wsDeleteBatchTrap);
-  _wsDeleteBatchTrap = function (e) {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      cancelWsDelete();
-      return;
-    }
-    if (e.key === "Tab") {
-      var box = document.getElementById("ws-delete-box");
-      var focusable = box.querySelectorAll("button:not(:disabled)");
-      var first = focusable[0];
-      var last = focusable[focusable.length - 1];
-      if (e.shiftKey && document.activeElement === first) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && document.activeElement === last) {
-        e.preventDefault();
-        first.focus();
-      }
-    }
-  };
-  document.addEventListener("keydown", _wsDeleteBatchTrap);
-  if (cancelBtn) cancelBtn.focus();
+  _wsDeleteController.confirmSelection();
 }
-
 function cancelWsDelete() {
-  document.getElementById("ws-delete-overlay").style.display = "none";
-  if (_wsDeleteBatchTrap) {
-    document.removeEventListener("keydown", _wsDeleteBatchTrap);
-    _wsDeleteBatchTrap = null;
-  }
+  _wsDeleteController.closeModal();
 }
-
 function confirmWsDelete() {
-  var selected = Object.keys(_wsDeleteSelected);
-  if (!selected.length) return;
-  var overlay = document.getElementById("ws-delete-overlay");
-  var errorEl = document.getElementById("ws-delete-error");
-  var listEl = document.getElementById("ws-delete-list");
-  var countEl = document.getElementById("ws-delete-count");
-  var delBtn = document.getElementById("ws-delete-confirm-btn");
-  var cancelBtn = document.getElementById("ws-delete-cancel-btn");
-  errorEl.textContent = "";
-
-  // Disable buttons during deletion
-  if (delBtn) {
-    delBtn.disabled = true;
-    delBtn.textContent = "Deleting...";
-  }
-  if (cancelBtn) cancelBtn.disabled = true;
-
-  var results = [];
-  var promises = selected.map(function (wsId) {
-    var shortId = wsId.substring(0, 8);
-    var item = _wsSavedItems.find(function (s) {
-      return s.ws_id === wsId;
-    });
-    var name = item ? item.alias || item.title || wsId : wsId;
-    var url = "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/delete";
-
-    return authFetch(url, { method: "POST" })
-      .then(function (r) {
-        var status = r.status;
-        var contentType = r.headers.get("content-type") || "";
-        if (r.ok) {
-          results.push({ name: name, shortId: shortId, ok: true });
-          return;
-        }
-        // Read body as text first to avoid JSON parse errors
-        return r.text().then(function (body) {
-          var errMsg = shortId + ": HTTP " + status;
-          if (contentType.includes("json")) {
-            try {
-              var j = JSON.parse(body);
-              if (j.error) errMsg = shortId + ": " + j.error;
-            } catch (_) {
-              /* fall through */
-            }
-          } else if (body) {
-            errMsg = shortId + ": " + body.substring(0, 200);
-          }
-          results.push({
-            name: name,
-            shortId: shortId,
-            ok: false,
-            error: errMsg,
-          });
-        });
-      })
-      .catch(function (err) {
-        results.push({
-          name: name,
-          shortId: shortId,
-          ok: false,
-          error: shortId + ": " + err.message,
-        });
-      });
-  });
-
-  Promise.all(promises).then(function () {
-    // Rebuild the list with results
-    listEl.innerHTML = "";
-    results.forEach(function (r) {
-      var div = document.createElement("div");
-      div.className = "ws-delete-item" + (r.ok ? "" : " ws-delete-error");
-      div.textContent =
-        (r.ok ? "\u2713 " : "\u2717 ") +
-        r.name +
-        (r.error ? " — " + r.error : "");
-      listEl.appendChild(div);
-    });
-
-    var okCount = results.filter(function (r) {
-      return r.ok;
-    }).length;
-    var failCount = results.filter(function (r) {
-      return !r.ok;
-    }).length;
-    countEl.textContent = okCount + " deleted, " + failCount + " failed";
-
-    if (delBtn) {
-      delBtn.disabled = false;
-      delBtn.textContent = "Close";
-      delBtn.classList.add("ws-delete-close");
-      delBtn.onclick = function () {
-        cancelWsDelete();
-        cancelWsDeleteMode();
-        loadDashboard();
-      };
-    }
-    if (cancelBtn) cancelBtn.disabled = false;
-  });
+  _wsDeleteController.confirm();
 }
 
 // --- Workstream title management ---
