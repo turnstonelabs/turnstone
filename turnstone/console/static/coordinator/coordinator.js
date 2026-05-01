@@ -459,10 +459,10 @@
     };
   }
 
-  function appendToolResult(name, callId, output, isError) {
+  function appendToolResult(name, callId, output, isError, opts) {
     if (callId && toolRows.has(callId)) {
       const entry = toolRows.get(callId);
-      _appendResultToRow(entry.row, output, isError);
+      _appendResultToRow(entry.row, output, isError, opts);
       // Result blocks grow scrollHeight; without this the user pinned
       // at the bottom loses their pin when the row inflates.  appendMsg
       // already routes through _scheduleScroll on the legacy path; this
@@ -655,6 +655,11 @@
     const row = document.createElement("div");
     row.className = "coord-tool-row";
     if (item.call_id) row.dataset.callId = item.call_id;
+    // Stamp the function name so the metacog dim rule for memory /
+    // recall (coordinator.css `.coord-tool-row[data-tool-name=...]`)
+    // has something to match.  Cheap; lets long workstreams with
+    // heavy memory usage stay readable without per-call JS work.
+    if (item.func_name) row.dataset.toolName = item.func_name;
 
     const callLine = document.createElement("div");
     callLine.className = "coord-tool-row-call";
@@ -681,6 +686,35 @@
     // helper so initial render and upgrade-in-place can't drift.
     _refreshRowStatus(row, item);
     return row;
+  }
+
+  // Attach an output-guard finding chip to a specific .coord-tool-row.
+  // Idempotent — replacing an existing chip in place lets the live
+  // SSE handler upgrade severity without stacking duplicates when a
+  // late event arrives after replay seeded an initial chip.
+  function _attachOutputWarningChip(row, oa) {
+    if (!row || !oa) return;
+    const risk = String(oa.risk_level || "medium");
+    const flags = oa.flags || [];
+    const existing = row.querySelector(".coord-tool-row-warning");
+    const chip = existing || document.createElement("div");
+    chip.className = "coord-tool-row-warning coord-tool-row-warning--" + risk;
+    chip.setAttribute("role", "status");
+    chip.textContent = "";
+    const label = document.createElement("span");
+    label.className = "coord-tool-row-warning-label";
+    label.textContent = "⚠ " + risk.toUpperCase();
+    chip.appendChild(label);
+    if (flags.length) {
+      chip.appendChild(document.createTextNode(" " + flags.join(", ")));
+    }
+    if (oa.redacted) {
+      const redacted = document.createElement("span");
+      redacted.className = "coord-tool-row-warning-redacted";
+      redacted.textContent = " (credentials redacted)";
+      chip.appendChild(redacted);
+    }
+    if (!existing) row.appendChild(chip);
   }
 
   // Stable signature for a verdict — used to skip the DOM rebuild when
@@ -795,10 +829,14 @@
     line.appendChild(chip);
   }
 
-  function _appendResultToRow(row, output, isError) {
+  function _appendResultToRow(row, output, isError, opts) {
     if (!row) return;
     const existing = row.querySelector(".coord-tool-row-result");
     if (existing) existing.remove();
+    // Re-fires (cancel + rerun, error + retry) clear any prior
+    // truncation pill so it doesn't stack on the new result.
+    const existingTrunc = row.querySelector(".coord-tool-truncated");
+    if (existingTrunc) existingTrunc.remove();
     if (isError) {
       row.classList.add("error");
       // Lift the row's error onto the enclosing batch so the left
@@ -854,6 +892,19 @@
     body.textContent = pretty;
     block.appendChild(body);
     row.appendChild(block);
+    // Storage-truncation indicator — sibling pill (not text inside
+    // the result body) so renderers / parsers / copy-as-text paths
+    // see the unmodified output.  Same convention as interactive's
+    // .tool-output-truncated; styled by .coord-tool-truncated in
+    // coordinator.css.
+    if (opts && opts.truncated) {
+      const pill = document.createElement("span");
+      pill.className = "coord-tool-truncated";
+      pill.textContent = "… truncated in storage";
+      pill.title =
+        "Full tool output was sent to the model live; only the first 10000 characters are persisted to the conversation row.";
+      row.appendChild(pill);
+    }
   }
 
   function _makeActionButton(label, role, kbdHint, ariaLabel) {
@@ -1891,14 +1942,27 @@
         );
         break;
       case "output_warning":
-        appendText(
-          "error",
-          "[output guard] " +
-            (ev.risk_level || "?") +
-            ": " +
-            (ev.flags || []).join(","),
-          { label: "warning" },
-        );
+        // Anchor the finding to the specific .coord-tool-row that
+        // tripped the guard so the operator reads call → finding
+        // adjacency on both live and replay surfaces.  Falls back
+        // to a chat line only when the call_id no longer maps to a
+        // row (e.g. event arrived after the row was evicted).
+        if (ev.call_id && toolRows.has(ev.call_id)) {
+          _attachOutputWarningChip(toolRows.get(ev.call_id).row, {
+            risk_level: ev.risk_level,
+            flags: ev.flags,
+            redacted: ev.redacted,
+          });
+        } else {
+          appendText(
+            "info",
+            "[output guard] " +
+              (ev.risk_level || "?") +
+              ": " +
+              (ev.flags || []).join(","),
+            { label: "warning" },
+          );
+        }
         break;
       case "error":
         appendText("error", ev.message || "(unknown error)", {
@@ -3759,6 +3823,33 @@
               parsedArgs,
               argsRaw,
             );
+            // Server attaches the persisted intent_verdict to each
+            // tc on /history (newest-wins per call_id; LLM upgrade
+            // beats heuristic when both exist).  Stamp on the item
+            // under the field name the render path already consumes
+            // (judge_verdict for LLM tier, heuristic_verdict
+            // otherwise) so the verdict pill paints on history rows
+            // without a render-path fork.  Also seed the
+            // judgeVerdicts cache so a later live SSE event for the
+            // same call_id reads "already painted" and skips the
+            // rebuild.
+            if (tc && tc.verdict) {
+              if (tc.verdict.tier === "llm") {
+                item.judge_verdict = tc.verdict;
+              } else {
+                item.heuristic_verdict = tc.verdict;
+              }
+              if (callId) _cacheJudgeVerdict(callId, tc.verdict);
+            }
+            // Output-guard finding — surface as the same
+            // "[output guard] ..." chat line the live handler emits
+            // (case "output_warning" above).  Stamp on the item so
+            // the post-batch loop below can read + emit; rendering
+            // anchored next to the call gives the operator the same
+            // adjacency they'd see live.
+            if (tc && tc.output_assessment) {
+              item.output_assessment = tc.output_assessment;
+            }
             // needs_approval is unknown at replay time (the
             // assistant.tool_calls history payload doesn't persist
             // the bit).  Leave it unset; the upgrade-in-place path
@@ -3785,6 +3876,22 @@
             appendToolBatch(items, { resolved: { approved: false } });
           } else {
             appendToolBatch(items, { resolved: { approved: true } });
+          }
+          // Output-guard findings — render each one as a chip
+          // anchored to the .coord-tool-row that tripped the guard
+          // rather than a generic "[output guard]" chat line.
+          // Anchored placement preserves per-call adjacency on
+          // multi-tool batches (live + replay) and the chip's
+          // severity styling makes the visual weight match the
+          // verdict pill on the same row.
+          for (let oi = 0; oi < items.length; oi++) {
+            const oa = items[oi].output_assessment;
+            if (!oa || !oa.risk_level || oa.risk_level === "none") continue;
+            const cid = items[oi].call_id || "";
+            if (!cid) continue;
+            const entry = toolRows.get(cid);
+            if (!entry || !entry.row) continue;
+            _attachOutputWarningChip(entry.row, oa);
           }
         }
 
@@ -3846,7 +3953,14 @@
           const toolName =
             (callId && toolNameByCallId.get(callId)) || m.tool_name || "tool";
           const isError = callOutcomes.get(callId) === "error";
-          appendToolResult(toolName, callId, content || "", isError);
+          // Storage truncation surfaces as a sibling pill next to
+          // the result (see _appendResultToRow's opts.truncated
+          // branch) rather than as text inside the result body — a
+          // future "best-effort JSON repair" pass would otherwise
+          // need to strip a marker string before parsing.
+          appendToolResult(toolName, callId, content || "", isError, {
+            truncated: !!m.truncated,
+          });
           // Tool-channel metacog reminders ride the same _reminders
           // side-channel as the user channel; surface as a themed
           // bubble below the .coord-tool-batch construct.

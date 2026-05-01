@@ -1631,6 +1631,77 @@ body {
 .ts-approval-tool .tool-diff .diff-warn {
   color: var(--yellow);
 }
+/* memory/recall calls are background metadata — the audit trail is
+   valuable but they crowd the narrative when a workstream contains
+   dozens of them.  Dim by default; full opacity on hover/focus so
+   they remain inspectable without permanently competing for
+   attention.  General-sibling combinator (~) extends the fade past
+   any verdict-badge or output-warning sitting between the tool row
+   and its output, so the whole sub-tree fades together rather than
+   leaving a full-opacity badge stranded next to a dim row. */
+.ts-approval-tool[data-func-name="memory"],
+.ts-approval-tool[data-func-name="recall"] {
+  opacity: 0.55;
+  transition: opacity 120ms ease-out;
+}
+.ts-approval-tool[data-func-name="memory"]:hover,
+.ts-approval-tool[data-func-name="memory"]:focus-within,
+.ts-approval-tool[data-func-name="recall"]:hover,
+.ts-approval-tool[data-func-name="recall"]:focus-within {
+  opacity: 1;
+}
+.ts-approval-tool[data-func-name="memory"] ~ .tool-output,
+.ts-approval-tool[data-func-name="recall"] ~ .tool-output,
+.ts-approval-tool[data-func-name="memory"] ~ .media-embed,
+.ts-approval-tool[data-func-name="recall"] ~ .media-embed,
+.ts-approval-tool[data-func-name="memory"] ~ .output-warning,
+.ts-approval-tool[data-func-name="recall"] ~ .output-warning,
+.ts-approval-tool[data-func-name="memory"] ~ .tool-output-truncated,
+.ts-approval-tool[data-func-name="recall"] ~ .tool-output-truncated {
+  opacity: 0.55;
+  transition: opacity 120ms ease-out;
+}
+/* Reveal on hover OR focus-within across the entire dimmed
+   subtree.  Without :focus-within on the siblings, a keyboard user
+   tabbing into a link or collapsible toggle inside .tool-output
+   sees the content remain dimmed — a11y regression.  Cover the
+   warning + truncation pills too so they fully reveal alongside
+   the result they decorate. */
+.ts-approval-tool[data-func-name="memory"] ~ .tool-output:hover,
+.ts-approval-tool[data-func-name="recall"] ~ .tool-output:hover,
+.ts-approval-tool[data-func-name="memory"] ~ .tool-output:focus-within,
+.ts-approval-tool[data-func-name="recall"] ~ .tool-output:focus-within,
+.ts-approval-tool[data-func-name="memory"] ~ .media-embed:hover,
+.ts-approval-tool[data-func-name="recall"] ~ .media-embed:hover,
+.ts-approval-tool[data-func-name="memory"] ~ .media-embed:focus-within,
+.ts-approval-tool[data-func-name="recall"] ~ .media-embed:focus-within,
+.ts-approval-tool[data-func-name="memory"] ~ .output-warning:hover,
+.ts-approval-tool[data-func-name="recall"] ~ .output-warning:hover,
+.ts-approval-tool[data-func-name="memory"] ~ .output-warning:focus-within,
+.ts-approval-tool[data-func-name="recall"] ~ .output-warning:focus-within,
+.ts-approval-tool[data-func-name="memory"] ~ .tool-output-truncated:hover,
+.ts-approval-tool[data-func-name="recall"] ~ .tool-output-truncated:hover,
+.ts-approval-tool[data-func-name="memory"] ~ .tool-output-truncated:focus-within,
+.ts-approval-tool[data-func-name="recall"] ~ .tool-output-truncated:focus-within {
+  opacity: 1;
+}
+/* Truncation indicator — the persisted tool result is clamped at
+   2000 chars per row in storage; surface that on replay so users
+   know they're seeing a clipped view rather than the full output
+   the live session saw.  Aligns with .output-warning's left gutter
+   (margin-left: 16px) and uses transparent background + dim border
+   so it reads as quiet metadata rather than a foreign element. */
+.tool-output-truncated {
+  display: inline-block;
+  margin-top: 4px;
+  margin-left: 16px;
+  padding: 1px 6px;
+  font-size: 10px;
+  color: var(--fg-dim);
+  background: transparent;
+  border-radius: 3px;
+  border: 1px solid var(--fg-dim);
+}
 /* .ts-approval (chat.css) stacks its children with flex gap, so a
    border-top on the body would float above a strip of container
    background instead of sitting flush against the previous tool row.
@@ -2475,38 +2546,13 @@ audio.media-player {
   }
 }
 
-/* ==========================================================================
-   Verdict badges (intent judge)
-   ========================================================================== */
-.verdict-badge {
-  padding: 4px 10px;
-  font-size: 11px;
-  font-weight: 600;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 2px;
-  /* No top separator — .ts-verdict-badge (chat.css) shrinks to
-     max-content width, and a 1px border-top would extend only under
-     the badge text and read as a truncated line. */
-}
-.verdict-low {
-  color: var(--green);
-  border-left: 3px solid var(--green);
-}
-.verdict-medium {
-  color: var(--yellow);
-  border-left: 3px solid var(--yellow);
-}
-.verdict-high {
-  color: var(--red);
-  border-left: 3px solid var(--red);
-}
-.verdict-critical {
-  color: var(--red);
-  border-left: 3px solid var(--red);
-  background: rgba(255, 80, 80, 0.05);
-}
+/* Verdict-badge styling lives in the color-mix block further down
+   in this file (.verdict-badge.verdict-{low,medium,high,critical}).
+   The earlier flat-palette duplicate that lived here was removed —
+   two competing .verdict-badge rule sets caused subtle cascade drift
+   (the color-mix block won for backgrounds, the flat one won for the
+   bare .verdict-low/medium/high/critical class names) which made
+   tweaks fragile. Single source of truth now. */
 
 .verdict-detail {
   padding: 6px 12px;

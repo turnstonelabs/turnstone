@@ -53,6 +53,15 @@ from turnstone.core.auth import (
     _DenyFilter,
     jwt_version_slot,
 )
+from turnstone.core.history_decoration import (
+    TOOL_RESULT_STORAGE_CAP,
+)
+from turnstone.core.history_decoration import (
+    decorate_tool_call as _decorate_tool_call,
+)
+from turnstone.core.history_decoration import (
+    load_verdict_indexes as _load_verdict_indexes,
+)
 from turnstone.core.log import get_logger
 from turnstone.core.metrics import metrics as _metrics
 from turnstone.core.ratelimit import resolve_client_ip
@@ -408,8 +417,20 @@ class WebUI(SessionUIBase):
 # ---------------------------------------------------------------------------
 
 
+# Verdict + output-assessment decoration helpers (``_decorate_tool_call``,
+# ``_load_verdict_indexes``) are imported at module top alongside the
+# rest of ``turnstone.core.*``.  Both this builder and
+# :func:`make_history_handler` (the /history REST endpoint coord uses
+# as its primary history loader) share them so the two surfaces don't
+# drift on the wire shape they emit.
+
+
 def _build_history(
-    session: ChatSession, has_pending_approval: bool = False
+    session: ChatSession,
+    has_pending_approval: bool = False,
+    *,
+    verdicts: dict[str, dict[str, Any]] | None = None,
+    assessments: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Build a history replay list from ChatSession messages.
 
@@ -421,6 +442,12 @@ def _build_history(
     ``"denied": True``, and the corresponding assistant entry that
     issued the tool calls is also marked ``"denied": True`` so the
     client can render the correct badge.
+
+    ``verdicts`` and ``assessments`` are optional pre-loaded
+    ``{call_id → row}`` dicts (see :func:`_load_verdict_indexes`).
+    Async callers should pre-load via ``asyncio.to_thread`` and pass
+    them in to avoid blocking the event loop on storage I/O. When
+    omitted, the storage call runs inline (sync call sites).
     """
     # Metacognitive nudges live on the message dict's ``_reminders``
     # side-channel — user messages carry user-channel nudges
@@ -432,6 +459,18 @@ def _build_history(
     # ``content`` never carries the ``<system-reminder>`` envelope —
     # that splice is transient, applied to a wire-bound copy in
     # ``ChatSession._apply_reminders_for_provider``.
+    #
+    # Verdict + output-assessment lookup tables — populated either
+    # inline (sync call sites) or pre-loaded by an async caller via
+    # asyncio.to_thread (see _load_verdict_indexes).  Pre-loading is
+    # what keeps _build_history off the event loop's hot path on the
+    # SSE replay generator path.
+    if verdicts is not None and assessments is not None:
+        verdicts_by_call_id = verdicts
+        assessments_by_call_id = assessments
+    else:
+        ws_id = getattr(session, "_ws_id", "") or ""
+        verdicts_by_call_id, assessments_by_call_id = _load_verdict_indexes(ws_id)
     history = []
     for msg in session.messages:
         content = msg.get("content")
@@ -496,17 +535,45 @@ def _build_history(
             if clean_reminders:
                 entry["reminders"] = clean_reminders
         if msg.get("tool_calls"):
-            entry["tool_calls"] = [
-                {
-                    "id": tc.get("id", ""),
+            tc_entries: list[dict[str, Any]] = []
+            for tc in msg["tool_calls"]:
+                tc_entry: dict[str, Any] = {
+                    "id": tc.get("id", "") or "",
                     "name": tc["function"]["name"],
                     "arguments": tc["function"].get("arguments", ""),
                 }
-                for tc in msg["tool_calls"]
-            ]
+                # Decorate with persisted verdict + output_assessment
+                # via the shared helper (also used by
+                # ``make_history_handler``).  Skips unflagged
+                # ("risk_level == 'none'") rows so the wire stays
+                # tight; ships only the fields the UI renders.
+                _decorate_tool_call(
+                    tc_entry,
+                    verdicts_by_call_id,
+                    assessments_by_call_id,
+                )
+                tc_entries.append(tc_entry)
+            entry["tool_calls"] = tc_entries
         # Detect denied/blocked/errored tool results by their content prefix.
         if msg.get("role") == "tool":
             content = msg.get("content", "")
+            # Propagate tool_call_id so replayHistory can anchor the
+            # rendered output to the specific .ts-approval-tool element
+            # by data-call-id (mirrors the live appendToolOutput path).
+            # Without this, multi-tool batches render every result at
+            # the bottom of the block rather than under each header.
+            result_call_id = msg.get("tool_call_id")
+            if result_call_id:
+                entry["tool_call_id"] = str(result_call_id)
+            # Tool results are clamped to TOOL_RESULT_STORAGE_CAP
+            # chars per row at storage time (session.py).  Surface
+            # that on replay so the user knows the visible output is
+            # a clipped view of what the live session saw, rather
+            # than the full result.  Reference the shared constant
+            # rather than a literal so the UI pill logic can't
+            # silently desync if the cap ever changes.
+            if isinstance(content, str) and len(content) >= TOOL_RESULT_STORAGE_CAP:
+                entry["truncated"] = True
             if isinstance(content, str):
                 if content.startswith("Denied by user") or content.startswith("Blocked"):
                     entry["denied"] = True
@@ -747,6 +814,31 @@ def _audit_close_workstream(
     )
 
 
+async def _interactive_events_replay_prepare(ws: Workstream, ui: Any, request: Request) -> None:
+    """Async pre-step run before ``_interactive_events_replay`` iterates.
+
+    Loads ``intent_verdicts`` + ``output_assessments`` for the
+    workstream off the event loop (via ``asyncio.to_thread``) and
+    stashes the result on ``request.state.verdict_indexes``. The sync
+    replay generator reads from there and passes the dicts into
+    ``_build_history`` so the storage I/O never blocks the event loop
+    on the SSE replay path.
+
+    Best-effort: if the workstream has no session or no ws_id, leaves
+    ``request.state.verdict_indexes`` unset and ``_build_history``
+    falls back to the inline storage call (sync path).
+    """
+    del ui  # not needed; lookup is keyed on ws.session._ws_id
+    session = ws.session
+    if session is None:
+        return
+    ws_id = getattr(session, "_ws_id", "") or ""
+    if not ws_id:
+        return
+    indexes = await asyncio.to_thread(_load_verdict_indexes, ws_id)
+    request.state.verdict_indexes = indexes
+
+
 def _interactive_events_replay(
     ws: Workstream, ui: Any, request: Request
 ) -> Iterable[dict[str, Any]]:
@@ -764,7 +856,6 @@ def _interactive_events_replay(
 
     Pure read — never mutates ``ws`` / ``ui`` / ``session``.
     """
-    del request  # not needed; replay reads ws/ui/session state
     session = ws.session
     if session is None:
         # Defensive — the lifted body's UI presence check guarantees
@@ -779,9 +870,22 @@ def _interactive_events_replay(
 
     # History replay — pending-approval flag rides on the last
     # assistant entry's tool_calls so the client renders them as
-    # awaiting approval rather than already approved.
+    # awaiting approval rather than already approved.  Verdict /
+    # assessment indexes were pre-loaded off the event loop by
+    # _interactive_events_replay_prepare; passing them in here keeps
+    # _build_history's storage I/O out of the sync generator path.
     pending_approval = getattr(ui, "_pending_approval", None)
-    history = _build_history(session, has_pending_approval=pending_approval is not None)
+    cached_indexes = getattr(request.state, "verdict_indexes", None)
+    if isinstance(cached_indexes, tuple) and len(cached_indexes) == 2:
+        verdicts, assessments = cached_indexes
+    else:
+        verdicts, assessments = None, None
+    history = _build_history(
+        session,
+        has_pending_approval=pending_approval is not None,
+        verdicts=verdicts,
+        assessments=assessments,
+    )
     if history:
         yield {"type": "history", "messages": history}
 
@@ -1456,13 +1560,13 @@ async def command(request: Request) -> JSONResponse:
             ui._enqueue({"type": "clear_ui"})
         elif cmd_word == "/resume":
             ui._enqueue({"type": "clear_ui"})
-            history = _build_history(ws.session)
+            history = await asyncio.to_thread(_build_history, ws.session)
             if history:
                 ui._enqueue({"type": "history", "messages": history})
         elif cmd_word in ("/rewind", "/retry"):
             # Refresh frontend with truncated history
             ui._enqueue({"type": "clear_ui"})
-            history = _build_history(ws.session)
+            history = await asyncio.to_thread(_build_history, ws.session)
             if history:
                 ui._enqueue({"type": "history", "messages": history})
             # Audit trail
@@ -1937,7 +2041,7 @@ async def _interactive_create_post_install(
             ui = ws.ui
             if isinstance(ui, WebUI):
                 ui._enqueue({"type": "clear_ui"})
-                history = _build_history(ws.session)
+                history = await asyncio.to_thread(_build_history, ws.session)
                 if history:
                     ui._enqueue({"type": "history", "messages": history})
             with contextlib.suppress(queue.Full):
@@ -3433,6 +3537,7 @@ def create_app(
         open_resolve_alias=_resolve_workstream_alias,
         open_post_load=_interactive_open_post_load,
         events_replay=_interactive_events_replay,
+        events_replay_prepare=_interactive_events_replay_prepare,
         # Pre-lift ``events_sse`` used the dedicated 200-thread
         # ``sse_executor`` so SSE polling stayed isolated from
         # every other ``asyncio.to_thread`` caller in the process
