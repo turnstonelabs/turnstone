@@ -133,6 +133,17 @@
   font-size: 11px;
   font-variant-numeric: tabular-nums;
 }
+/* Right-align action buttons (e.g. Saved Coordinators "Delete") inside
+   .home-section-title without breaking the count's natural left position. */
+.home-section-title .home-section-action {
+  margin-left: auto;
+}
+
+/* Saved Coordinators reuses the existing .pagination control (see the
+   "Pagination" block below) — the visible page is capped at
+   COORD_PAGE_SIZE so Select-All fan-out is bounded.  Pagination is
+   hidden in delete mode and when there's only one page (see
+   _renderCoordPagination). */
 
 .home-coord-list {
   border: 1px solid var(--border);
