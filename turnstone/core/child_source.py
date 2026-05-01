@@ -56,9 +56,11 @@ class _CollectorProtocol(Protocol):
     type signature without subclassing the real collector.
     """
 
-    def get_snapshot_and_register(self, q: queue.Queue[dict[str, Any]]) -> dict[str, Any]: ...
+    def get_snapshot_and_register(self, q: queue.Queue[dict[str, Any]]) -> dict[str, Any]:
+        """Register ``q`` and return the current snapshot."""
 
-    def unregister_listener(self, q: queue.Queue[dict[str, Any]]) -> None: ...
+    def unregister_listener(self, q: queue.Queue[dict[str, Any]]) -> None:
+        """Drop ``q`` from the listener set."""
 
 
 class _ManagerProtocol(Protocol):
@@ -68,9 +70,11 @@ class _ManagerProtocol(Protocol):
     without forcing a full SessionManager construction.
     """
 
-    def subscribe_to_state(self, callback: Callable[[str, WorkstreamState], None]) -> None: ...
+    def subscribe_to_state(self, callback: Callable[[str, WorkstreamState], None]) -> None:
+        """Register ``callback`` for state-change events."""
 
-    def unsubscribe_from_state(self, callback: Callable[[str, WorkstreamState], None]) -> None: ...
+    def unsubscribe_from_state(self, callback: Callable[[str, WorkstreamState], None]) -> None:
+        """Remove a previously-registered ``callback``."""
 
 
 class SameNodeChildSource:

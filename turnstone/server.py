@@ -81,7 +81,6 @@ from turnstone.core.session_routes import (
 from turnstone.core.session_ui_base import (
     AutoApproveReason,
     SessionUIBase,
-    _put_with_priority,
     fire_judge_verdict_metric,
 )
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
@@ -240,17 +239,14 @@ class WebUI(SessionUIBase):
         state transition to ride along on.
         """
         if WebUI._global_queue is not None:
-            # Critical event — evict an oldest item if the global
-            # queue is full rather than dropping the verdict.
-            _put_with_priority(
-                WebUI._global_queue,
-                {
-                    "type": "intent_verdict",
-                    "ws_id": self.ws_id,
-                    "verdict": verdict,
-                },
-                critical=True,
-            )
+            with contextlib.suppress(queue.Full):
+                WebUI._global_queue.put_nowait(
+                    {
+                        "type": "intent_verdict",
+                        "ws_id": self.ws_id,
+                        "verdict": verdict,
+                    }
+                )
 
     def _broadcast_approval_resolved(
         self,
@@ -266,19 +262,16 @@ class WebUI(SessionUIBase):
         state-change piggyback.
         """
         if WebUI._global_queue is not None:
-            # Critical event — evict an oldest item if the global
-            # queue is full rather than dropping the resolution.
-            _put_with_priority(
-                WebUI._global_queue,
-                {
-                    "type": "approval_resolved",
-                    "ws_id": self.ws_id,
-                    "approved": approved,
-                    "feedback": feedback or "",
-                    "always": bool(always),
-                },
-                critical=True,
-            )
+            with contextlib.suppress(queue.Full):
+                WebUI._global_queue.put_nowait(
+                    {
+                        "type": "approval_resolved",
+                        "ws_id": self.ws_id,
+                        "approved": approved,
+                        "feedback": feedback or "",
+                        "always": bool(always),
+                    }
+                )
 
     def _broadcast_approve_request(self, detail: dict[str, Any]) -> None:
         """Send an ``approve_request`` payload to the global SSE channel.
@@ -291,17 +284,14 @@ class WebUI(SessionUIBase):
         upstream first); the push path eliminates that race entirely.
         """
         if WebUI._global_queue is not None:
-            # Critical event — evict an oldest item if the global
-            # queue is full rather than dropping the items.
-            _put_with_priority(
-                WebUI._global_queue,
-                {
-                    "type": "approve_request",
-                    "ws_id": self.ws_id,
-                    "detail": detail,
-                },
-                critical=True,
-            )
+            with contextlib.suppress(queue.Full):
+                WebUI._global_queue.put_nowait(
+                    {
+                        "type": "approve_request",
+                        "ws_id": self.ws_id,
+                        "detail": detail,
+                    }
+                )
 
     # --- SessionUI protocol ---
     #
