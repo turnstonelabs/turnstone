@@ -3953,7 +3953,7 @@
             } else if (part.type === "image_url") {
               userAttachments.push({ kind: "image", filename: "" });
             } else if (part.type === "document") {
-              const doc = (part && part.document) || {};
+              const doc = part.document || {};
               userAttachments.push({
                 kind: "text",
                 filename: String(doc.name || ""),

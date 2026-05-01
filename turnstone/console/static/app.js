@@ -1881,6 +1881,17 @@ function submitHomeCoord(textFromComposer) {
   // the multipart payload (the actual reset only fires on the success
   // branch, after the response lands).
   var files = _homeStagedFiles.slice();
+  // Files-without-text would upload pending attachment rows but the
+  // server's _coord_create_post_install only reserves+dispatches when
+  // initial_message is non-empty — uploaded files would orphan as
+  // pending storage rows until the GC sweep.  Require text whenever
+  // attachments are staged so the first turn always picks them up.
+  if (files.length > 0 && !(task || "").trim()) {
+    _homeShowError(
+      "Add a task message — attachments need an initial turn to dispatch on.",
+    );
+    return;
+  }
   _createCoordinator({
     name: opts.name || "",
     skill: opts.skill || "",

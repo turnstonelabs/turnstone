@@ -129,11 +129,12 @@
 
 /* Cap chip filename width inside the home composer so a long-name
    attachment doesn't push the strip wider than the textarea or wrap
-   unpredictably across multiple rows.  The shared chip rule
-   (shared_static/chat.css `.composer-chip-name`) doesn't truncate by
-   default — chat panes have wider real estate.  The home creator sits
-   in a narrower column, so apply the same ellipsis cap the
-   .msg-user-attach-pill already uses. */
+   unpredictably across multiple rows.  shared_static/chat.css defines
+   .composer-chip / .composer-chip-size / .composer-chip-remove but
+   leaves .composer-chip-name unstyled — the span just inherits the
+   .composer-chip font with no width cap, fine for chat-pane width but
+   too loose for the narrower home column.  Apply the same ellipsis
+   cap the .msg-user-attach-pill rule uses on the user bubble. */
 #home-coord-composer-mount .composer-chip-name {
   max-width: 200px;
   overflow: hidden;
