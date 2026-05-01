@@ -2065,38 +2065,10 @@
       case "wait_ended":
         handleWaitEnded(ev);
         break;
-      // Server-side SSE queue depth — debug aid surfaced in the
-      // status bar so operators can spot a backed-up tab (slow
-      // consumer / browser throttling) without devtools.
-      case "_queue_stats":
-        handleQueueStats(ev);
-        break;
       default:
         // Unknown event type — ignore silently.
         break;
     }
-  }
-
-  // ------------------------------------------------------------------
-  // SSE queue depth indicator
-  // ------------------------------------------------------------------
-  //
-  // The server emits a periodic ``_queue_stats`` event carrying the
-  // per-tab listener queue depth. Surface in the coord status bar
-  // with color escalation (default → warn at >50% → danger at >80%)
-  // so a backed-up consumer is glanceable. The element starts
-  // hidden; first sample reveals it.
-  function handleQueueStats(ev) {
-    const el = document.getElementById("coord-sb-sse-queue");
-    if (!el) return;
-    const depth = typeof ev.depth === "number" ? ev.depth : 0;
-    const max = typeof ev.max === "number" && ev.max > 0 ? ev.max : 500;
-    el.hidden = false;
-    el.textContent = "queue " + depth + "/" + max;
-    el.classList.remove("warn", "danger");
-    const ratio = depth / max;
-    if (ratio > 0.8) el.classList.add("danger");
-    else if (ratio > 0.5) el.classList.add("warn");
   }
 
   // ------------------------------------------------------------------

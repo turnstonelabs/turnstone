@@ -41,55 +41,6 @@ log = get_logger(__name__)
 # from bloating memory.
 _DEFAULT_LISTENER_QUEUE_MAX = 500
 
-# Event types whose delivery is load-bearing for correctness — not
-# observational fluff. When a listener queue is full, ``_enqueue``
-# evicts the oldest event to make room for these rather than dropping
-# them on the floor (the default ``queue.Full`` swallow). Token-stream
-# / status / activity events drop equally as today; an approval
-# request or verdict landing during a chatty mid-generation burst
-# would otherwise be silently lost on a backed-up tab.
-_CRITICAL_EVENT_TYPES = frozenset(
-    {
-        "intent_verdict",
-        "intent_pending",
-        "approval_resolved",
-        "approve_request",
-        "plan_review",
-        "ws_closed",
-        "child_ws_intent_verdict",
-        "child_ws_approval_resolved",
-        "child_ws_closed",
-        "child_ws_created",
-    }
-)
-
-
-def _put_with_priority(
-    q: queue.Queue[dict[str, Any]],
-    data: dict[str, Any],
-    *,
-    critical: bool,
-) -> None:
-    """Put ``data`` onto ``q`` with selective drop-on-full semantics.
-
-    Critical events evict one oldest item from ``q`` if it's full,
-    then retry the put. Best-effort events drop themselves on full
-    (matches the historical ``contextlib.suppress(queue.Full)``
-    behaviour). The eviction is bounded — one drop is enough since
-    the queue was already at capacity before we tried.
-    """
-    if critical:
-        try:
-            q.put_nowait(data)
-        except queue.Full:
-            with contextlib.suppress(queue.Empty):
-                q.get_nowait()
-            with contextlib.suppress(queue.Full):
-                q.put_nowait(data)
-    else:
-        with contextlib.suppress(queue.Full):
-            q.put_nowait(data)
-
 
 # Cap on the per-turn assistant content accumulator. The accumulator
 # is piggybacked onto the ``ws_state:idle`` broadcast payload so the
@@ -296,22 +247,14 @@ class SessionUIBase:
         browser can validate it belongs to the pane's current
         workstream. Shallow-copies on stamp to avoid mutating a
         caller-owned dict.
-
-        Critical event types (see :data:`_CRITICAL_EVENT_TYPES`)
-        evict one oldest item from a full queue rather than dropping
-        themselves — a chatty mid-generation burst can fill the
-        500-slot per-tab queue, and silently dropping an
-        ``approve_request`` or ``intent_verdict`` because we couldn't
-        squeeze past a backlog of token-stream events would be a real
-        UX regression. Best-effort events drop on full as before.
         """
         if "ws_id" not in data:
             data = {**data, "ws_id": self.ws_id}
-        critical = data.get("type") in _CRITICAL_EVENT_TYPES
         with self._listeners_lock:
             snapshot = list(self._listeners)
         for lq in snapshot:
-            _put_with_priority(lq, data, critical=critical)
+            with contextlib.suppress(queue.Full):
+                lq.put_nowait(data)
 
     def _register_listener(
         self, maxsize: int = _DEFAULT_LISTENER_QUEUE_MAX

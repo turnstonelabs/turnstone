@@ -12,22 +12,16 @@ import asyncio
 import contextlib
 import json
 import logging
+import queue
 import random
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-if TYPE_CHECKING:
-    import queue
-
 import httpx
 import httpx_sse
 
-from turnstone.core.session_ui_base import (
-    _CRITICAL_EVENT_TYPES,
-    _put_with_priority,
-)
 from turnstone.core.workstream import WorkstreamKind
 
 if TYPE_CHECKING:
@@ -163,19 +157,11 @@ class ClusterCollector:
         log.info("ClusterCollector stopped")
 
     def _fanout(self, event: dict[str, Any]) -> None:
-        """Copy an event to all registered SSE listener queues.
-
-        Critical event types (verdicts, approval resolutions, child
-        lifecycle) evict one oldest queue entry to make room rather
-        than dropping themselves on a full queue. Best-effort events
-        (state ticks, activity) drop as before. See
-        :data:`turnstone.core.session_ui_base._CRITICAL_EVENT_TYPES`
-        for the canonical list.
-        """
-        critical = event.get("type") in _CRITICAL_EVENT_TYPES
+        """Copy an event to all registered SSE listener queues."""
         with self._listeners_lock:
             for q in self._listeners:
-                _put_with_priority(q, event, critical=critical)
+                with contextlib.suppress(queue.Full):
+                    q.put_nowait(event)
 
     # -- auth helpers --------------------------------------------------------
 
