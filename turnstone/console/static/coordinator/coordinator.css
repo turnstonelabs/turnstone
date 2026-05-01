@@ -618,6 +618,43 @@
   color: var(--ink-3);
 }
 
+/* User-message attachment pills — rendered beneath the bubble for
+   live sends and on history replay.  Mirrors the .msg-user-attach*
+   rules in turnstone/ui/static/style.css so coord and interactive
+   surfaces show the same affordance for attached files. */
+.msg-user-attach {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+.msg-user-attach-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  /* --panel (not --panel-2) — the .msg bubble is already --panel-2,
+     so pulling the pill onto the alternate surface keeps it visible
+     against the bubble in both themes (WCAG 1.4.11 non-text contrast).
+     Mirrors the interactive UI's --bg-surface vs .msg --panel-2 split. */
+  background: var(--panel);
+  color: var(--ink-2);
+  border: 1px solid var(--hair);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+.msg-user-attach-icon {
+  font-size: 11px;
+  opacity: 0.7;
+}
+.msg-user-attach-name {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Mobile (<700px) — keep action targets ≥44px for WCAG 2.5.5. */
 @media (max-width: 700px) {
   .coord-tool-actions {

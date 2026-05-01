@@ -104,9 +104,42 @@
 }
 
 .home-composer-error {
+  /* Always rendered (no display toggle in JS) so toggling validation
+     messages doesn't reflow the active-coordinators list below.  The
+     min-height holds a single 12px line + padding so an empty state
+     reserves the same space the rendered error will occupy. */
+  min-height: 20px;
   color: var(--red);
   font-size: 12px;
   padding: 4px 2px 0;
+}
+
+/* Drag-over feedback for the home coord composer — wired by Composer's
+   dragDrop option (dropClass: home-coord-drop) on the composer mount.
+   Mirrors the dashed-outline affordance on coord-main so users see the
+   same drop visual the in-coord composer uses. */
+#home-coord-composer-mount {
+  position: relative;
+}
+#home-coord-composer-mount.home-coord-drop {
+  outline: 2px dashed var(--accent);
+  outline-offset: -6px;
+  border-radius: var(--radius);
+}
+
+/* Cap chip filename width inside the home composer so a long-name
+   attachment doesn't push the strip wider than the textarea or wrap
+   unpredictably across multiple rows.  shared_static/chat.css defines
+   .composer-chip / .composer-chip-size / .composer-chip-remove but
+   leaves .composer-chip-name unstyled — the span just inherits the
+   .composer-chip font with no width cap, fine for chat-pane width but
+   too loose for the narrower home column.  Apply the same ellipsis
+   cap the .msg-user-attach-pill rule uses on the user bubble. */
+#home-coord-composer-mount .composer-chip-name {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .home-section {

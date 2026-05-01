@@ -1458,7 +1458,10 @@ function _createCoordinator(opts) {
   var on503 = opts.on503 || function () {};
   var onSuccess = opts.onSuccess || function () {};
 
-  errEl.style.display = "none";
+  // Error region is always rendered with reserved min-height (see
+  // .home-composer-error in style.css) so toggling validation messages
+  // doesn't reflow the active-coordinators list below — clear the
+  // textContent only, no display toggle.
   errEl.textContent = "";
   setBusy(true);
 
@@ -1469,11 +1472,30 @@ function _createCoordinator(opts) {
   if (judgeModel) body.judge_model = judgeModel;
   if (task) body.initial_message = task;
 
-  authFetch("/v1/api/workstreams/new", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  })
+  // Multipart when files are staged — the coord create endpoint
+  // accepts a `meta` JSON field plus zero-or-more `file` parts and
+  // reserves attachments for the very first turn (same flow the
+  // interactive UI's new-ws modal uses against the server).  Plain
+  // JSON stays the default when no files are attached.
+  var files = Array.isArray(opts.files) ? opts.files : [];
+  var fetchOpts;
+  if (files.length > 0) {
+    var form = new FormData();
+    form.append("meta", JSON.stringify(body));
+    for (var i = 0; i < files.length; i++) {
+      form.append("file", files[i], files[i].name);
+    }
+    // Don't set Content-Type — the browser adds the correct boundary.
+    fetchOpts = { method: "POST", body: form };
+  } else {
+    fetchOpts = {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    };
+  }
+
+  authFetch("/v1/api/workstreams/new", fetchOpts)
     .then(function (r) {
       return r.json().then(function (data) {
         return { ok: r.ok, status: r.status, data: data };
@@ -1488,7 +1510,6 @@ function _createCoordinator(opts) {
       if (!res.ok || !res.data || !res.data.ws_id) {
         errEl.textContent =
           (res.data && res.data.error) || "HTTP " + res.status;
-        errEl.style.display = "block";
         return;
       }
       onSuccess(res);
@@ -1498,7 +1519,6 @@ function _createCoordinator(opts) {
     .catch(function () {
       setBusy(false);
       errEl.textContent = "Request failed";
-      errEl.style.display = "block";
     });
 }
 
@@ -1514,6 +1534,159 @@ var _homeComposerInit = false;
 var _homeCoordReady = null; // tri-state: null = unknown, true = ready, false = 503
 var _homeCoordComposer = null; // shared Composer instance
 var _homeCoordBusy = false;
+
+// Attachment staging for the home coord composer.  The coord ws_id
+// doesn't exist until the create POST resolves, so we hold File
+// objects in memory and ship them as multipart parts on submit (same
+// pattern interactive uses for its new-ws modal + dashboard composer).
+var _homeStagedFiles = [];
+
+// Per-kind size caps + allowlist mirrored from turnstone/core/attachments.py
+// so the browser can fail fast.  Keep in sync with the interactive
+// UI's _ATTACH_* constants in turnstone/ui/static/app.js.
+var _HOME_IMAGE_CAP = 4 * 1024 * 1024;
+var _HOME_TEXT_CAP = 512 * 1024;
+var _HOME_MAX_FILES = 10;
+var _HOME_IMAGE_MIMES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+var _HOME_TEXT_APP_MIMES = [
+  "application/json",
+  "application/xml",
+  "application/x-yaml",
+  "application/yaml",
+  "application/toml",
+];
+var _HOME_TEXT_EXTENSIONS = [
+  ".c",
+  ".conf",
+  ".cpp",
+  ".css",
+  ".go",
+  ".h",
+  ".hpp",
+  ".html",
+  ".ini",
+  ".java",
+  ".js",
+  ".json",
+  ".jsx",
+  ".md",
+  ".py",
+  ".rs",
+  ".sh",
+  ".sql",
+  ".toml",
+  ".ts",
+  ".tsx",
+  ".txt",
+  ".xml",
+  ".yaml",
+  ".yml",
+];
+
+function _homeFormatSize(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+function _homeIsAttachmentAllowed(file) {
+  var mime = (file.type || "").toLowerCase();
+  if (_HOME_IMAGE_MIMES.indexOf(mime) !== -1) return true;
+  if (mime.indexOf("text/") === 0) return true;
+  if (_HOME_TEXT_APP_MIMES.indexOf(mime) !== -1) return true;
+  var name = (file.name || "").toLowerCase();
+  var dot = name.lastIndexOf(".");
+  if (dot >= 0 && _HOME_TEXT_EXTENSIONS.indexOf(name.substr(dot)) !== -1) {
+    return true;
+  }
+  return false;
+}
+
+function _homeShowError(msg) {
+  var errEl = document.getElementById("home-coord-error");
+  if (!errEl) return;
+  // Element is always rendered (min-height reserves the row); just
+  // toggle the message text so layout doesn't shift on validation.
+  errEl.textContent = msg || "";
+}
+
+function _homeRenderChips() {
+  if (!_homeCoordComposer || !_homeCoordComposer.chipsEl) return;
+  var chipsEl = _homeCoordComposer.chipsEl;
+  chipsEl.textContent = "";
+  for (var i = 0; i < _homeStagedFiles.length; i++) {
+    (function (idx) {
+      var f = _homeStagedFiles[idx];
+      var isImage = (f.type || "").indexOf("image/") === 0;
+      var chip = document.createElement("span");
+      chip.className =
+        "composer-chip composer-chip-" + (isImage ? "image" : "text");
+      chip.setAttribute("role", "listitem");
+
+      var icon = document.createElement("span");
+      icon.className = "composer-chip-icon";
+      icon.setAttribute("aria-hidden", "true");
+      icon.textContent = isImage ? "🖼" : "📄";
+      chip.appendChild(icon);
+
+      var name = document.createElement("span");
+      name.className = "composer-chip-name";
+      name.textContent = f.name;
+      name.title = f.name + " (" + f.size + " bytes)";
+      chip.appendChild(name);
+
+      var size = document.createElement("span");
+      size.className = "composer-chip-size";
+      size.textContent = _homeFormatSize(f.size);
+      chip.appendChild(size);
+
+      var rm = document.createElement("button");
+      rm.type = "button";
+      rm.className = "composer-chip-remove";
+      rm.setAttribute("aria-label", "Remove " + f.name);
+      rm.title = "Remove";
+      rm.textContent = "×";
+      rm.onclick = function () {
+        _homeStagedFiles.splice(idx, 1);
+        _homeRenderChips();
+      };
+      chip.appendChild(rm);
+      chipsEl.appendChild(chip);
+    })(i);
+  }
+}
+
+function _homeStageFile(file) {
+  if (!file) return;
+  if (_homeStagedFiles.length >= _HOME_MAX_FILES) {
+    _homeShowError(
+      "At most " + _HOME_MAX_FILES + " attachments per coordinator",
+    );
+    return;
+  }
+  if (!_homeIsAttachmentAllowed(file)) {
+    _homeShowError(
+      "Unsupported file type: " +
+        file.name +
+        " (allowed: png/jpeg/gif/webp images, text)",
+    );
+    return;
+  }
+  var isImage = (file.type || "").indexOf("image/") === 0;
+  var cap = isImage ? _HOME_IMAGE_CAP : _HOME_TEXT_CAP;
+  if (file.size > cap) {
+    _homeShowError(file.name + " exceeds the " + _homeFormatSize(cap) + " cap");
+    return;
+  }
+  _homeShowError("");
+  _homeStagedFiles.push(file);
+  _homeRenderChips();
+}
+
+function _homeClearStagedFiles() {
+  _homeStagedFiles = [];
+  _homeRenderChips();
+}
 
 // Single owner for sendBtn.disabled: disabled if EITHER busy OR the
 // subsystem probe flipped to 503.  Every setter for _homeCoordBusy /
@@ -1596,6 +1769,12 @@ function _mountHomeCoordComposer() {
         },
       ],
     },
+    attachments: {
+      onAttach: function (file) {
+        _homeStageFile(file);
+      },
+    },
+    dragDrop: { targetEl: mount, dropClass: "home-coord-drop" },
     onSend: function (text) {
       submitHomeCoord(text);
     },
@@ -1698,12 +1877,28 @@ function submitHomeCoord(textFromComposer) {
   var task =
     textFromComposer != null ? textFromComposer : _homeCoordComposer.value;
   var opts = _homeCoordComposer.getOptionValues();
+  // Snapshot at submit time so a chip remove mid-request can't race
+  // the multipart payload (the actual reset only fires on the success
+  // branch, after the response lands).
+  var files = _homeStagedFiles.slice();
+  // Files-without-text would upload pending attachment rows but the
+  // server's _coord_create_post_install only reserves+dispatches when
+  // initial_message is non-empty — uploaded files would orphan as
+  // pending storage rows until the GC sweep.  Require text whenever
+  // attachments are staged so the first turn always picks them up.
+  if (files.length > 0 && !(task || "").trim()) {
+    _homeShowError(
+      "Add a task message — attachments need an initial turn to dispatch on.",
+    );
+    return;
+  }
   _createCoordinator({
     name: opts.name || "",
     skill: opts.skill || "",
     model: opts.model || "",
     judge_model: opts.judge_model || "",
     task: task,
+    files: files,
     errEl: document.getElementById("home-coord-error"),
     setBusy: function (b) {
       _homeCoordBusy = b;
@@ -1715,6 +1910,9 @@ function submitHomeCoord(textFromComposer) {
       var banner = document.getElementById("coord-composer-503");
       if (banner) banner.style.display = "";
       _refreshHomeCoordSubmitEnabled();
+    },
+    onSuccess: function () {
+      _homeClearStagedFiles();
     },
   });
 }

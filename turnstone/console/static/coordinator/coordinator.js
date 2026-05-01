@@ -335,6 +335,39 @@
     return appendMsg(role, esc(text), opts);
   }
 
+  // User-message bubble with attachment-pill cluster appended below
+  // the text.  Mirrors Pane.prototype.addUserMessage in the
+  // interactive UI so live-send and history-replay both render the
+  // same chip strip the composer staged on submit.  Attachments is a
+  // list of {kind, filename}; falsy/empty falls through to plain text.
+  function appendUserMessageWithAttachments(text, attachments, opts) {
+    const el = appendText("user", text, opts);
+    if (!Array.isArray(attachments) || attachments.length === 0) return el;
+    const pills = document.createElement("div");
+    pills.className = "msg-user-attach";
+    pills.setAttribute("role", "list");
+    attachments.forEach((a) => {
+      const kind = (a && a.kind) || "other";
+      const pill = document.createElement("span");
+      pill.className = "msg-user-attach-pill msg-user-attach-pill-" + kind;
+      pill.setAttribute("role", "listitem");
+      const icon = document.createElement("span");
+      icon.className = "msg-user-attach-icon";
+      icon.setAttribute("aria-hidden", "true");
+      icon.textContent = kind === "image" ? "🖼" : "📄";
+      pill.appendChild(icon);
+      const name = document.createElement("span");
+      name.className = "msg-user-attach-name";
+      name.textContent =
+        (a && a.filename) || (kind === "image" ? "image" : "document");
+      pill.appendChild(name);
+      pills.appendChild(pill);
+    });
+    el.appendChild(pills);
+    _scheduleScroll();
+    return el;
+  }
+
   // Metacognitive reminder bubble (user-channel correction / denial /
   // resume / start / completion AND tool-channel tool_error / repeat).
   // Mirrors Pane.prototype.addUserReminder / addToolReminder in the
@@ -1514,7 +1547,13 @@
       queuedEl = queue.addQueuedMessage(displayText, priority);
     } else {
       setBusy(true);
-      appendText("user", trimmed, { label: "you" });
+      // snap.attachments carries the chip metadata (kind + filename)
+      // for every stable chip the composer holds; pass it through so
+      // the optimistic user bubble shows the same pill cluster the
+      // history-replay path renders below.
+      appendUserMessageWithAttachments(trimmed, snap.attachments, {
+        label: "you",
+      });
     }
     composer.clear();
 
@@ -3897,13 +3936,12 @@
 
         // User messages with attachments arrive as multipart list
         // content (text + image_url/document parts) and may carry an
-        // ``_attachments_meta`` side-channel with display metadata.
-        // Extract the text portion + attachment count for a readable
-        // history replay; chip-rendering parity with the interactive
-        // pane is deferred (the coord dashboard is diagnostic-leaning
-        // — primary use is monitoring, not authoring).
+        // ``_attachments_meta`` side-channel with display metadata
+        // (kind + filename + mime_type).  Extract the text portion and
+        // build a structured attachment list so the user bubble can
+        // render the same pill cluster the interactive pane shows.
         let content;
-        let attachmentCount = 0;
+        const userAttachments = [];
         if (typeof m.content === "string") {
           content = m.content;
         } else if (Array.isArray(m.content)) {
@@ -3912,8 +3950,14 @@
             if (!part || typeof part !== "object") continue;
             if (part.type === "text") {
               textParts.push(String(part.text || ""));
-            } else if (part.type === "image_url" || part.type === "document") {
-              attachmentCount += 1;
+            } else if (part.type === "image_url") {
+              userAttachments.push({ kind: "image", filename: "" });
+            } else if (part.type === "document") {
+              const doc = part.document || {};
+              userAttachments.push({
+                kind: "text",
+                filename: String(doc.name || ""),
+              });
             }
           }
           content = textParts.join("\n");
@@ -3923,19 +3967,18 @@
         const meta = Array.isArray(m._attachments_meta)
           ? m._attachments_meta
           : null;
-        if (meta && meta.length > attachmentCount) {
-          // Prefer the side-channel count when present — it covers
-          // attachments whose multipart parts couldn't be reconstructed.
-          attachmentCount = meta.length;
-        }
-        if (attachmentCount > 0) {
-          const noun = attachmentCount === 1 ? "attachment" : "attachments";
-          content =
-            (content ? content + "\n\n" : "") +
-            "📎 " +
-            attachmentCount +
-            " " +
-            noun;
+        if (meta && meta.length) {
+          // Side-channel is authoritative — it carries filenames that
+          // image_url data URIs can't express, and covers attachments
+          // whose multipart parts couldn't be reconstructed.
+          userAttachments.length = 0;
+          for (const a of meta) {
+            if (!a || typeof a !== "object") continue;
+            userAttachments.push({
+              kind: String(a.kind || "other"),
+              filename: String(a.filename || ""),
+            });
+          }
         }
         if (role === "tool") {
           // Tool result content can legitimately be empty (e.g. a
@@ -3991,20 +4034,26 @@
             body.textContent = content;
           }
         } else {
-          if (!content) return;
           // user / reasoning / system / other roles render as plain
           // text on history replay — matches the live-streaming paths
           // (appendReasoningToken uses textContent; user/system are
-          // typed verbatim and don't carry markdown structure).
-          appendText(role, content, { label: role });
-          // User-channel metacog reminders attach to the just-appended
-          // user bubble (the most recent .msg.user in messagesEl).
-          if (
-            role === "user" &&
-            Array.isArray(m.reminders) &&
-            m.reminders.length
-          ) {
-            appendUserReminderLive(m.reminders);
+          // typed verbatim and don't carry markdown structure).  User
+          // bubbles additionally render the pill strip beneath the
+          // text when the message carried attachments — even when the
+          // text portion is empty (image-only sends).
+          if (role === "user") {
+            if (!content && userAttachments.length === 0) return;
+            appendUserMessageWithAttachments(content, userAttachments, {
+              label: role,
+            });
+            // User-channel metacog reminders attach to the just-appended
+            // user bubble (the most recent .msg.user in messagesEl).
+            if (Array.isArray(m.reminders) && m.reminders.length) {
+              appendUserReminderLive(m.reminders);
+            }
+          } else {
+            if (!content) return;
+            appendText(role, content, { label: role });
           }
         }
       });

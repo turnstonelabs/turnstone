@@ -157,6 +157,16 @@ def test_coordinator_js_exposes_inline_approval_helpers():
     # any prior denial.  bug-1 / bug-3 from the second /review pass.
     assert "Denied by user" in body
     assert "callOutcomes" in body
+    # User-message attachment pills — both live send (coordSend) and
+    # history replay route through appendUserMessageWithAttachments.
+    # Renaming or dropping the helper would silently regress the
+    # attachment affordance to the pre-fix plain-text bubble, which
+    # would only surface in manual testing of an attached-file flow.
+    # The CSS class is the visual anchor (coordinator.css) — keeping
+    # both literals in the smoke layer covers JS↔CSS drift in either
+    # direction.
+    assert "function appendUserMessageWithAttachments" in body
+    assert "msg-user-attach" in body
 
 
 def test_coordinator_js_handle_child_state_no_longer_reads_sse_pending_approval_detail():
