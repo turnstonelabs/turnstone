@@ -3,7 +3,7 @@ Description=Turnstone channel gateway (Discord, Slack, ...)
 Documentation=https://github.com/turnstone-ai/turnstone
 # The channel reaches Discord/Slack APIs over the network at startup, so
 # wait for network-online.target. Discovers server/console URLs from
-# Postgres on startup (~60s budget); ordering against postgresql.service
+# Postgres on startup (~30s budget per _DISCOVERY_BUDGET_S); ordering against postgresql.service
 # is best-effort (no-op when remote).
 Wants=network-online.target
 After=network-online.target postgresql.service turnstone-server.service turnstone-console.service

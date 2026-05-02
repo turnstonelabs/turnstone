@@ -222,8 +222,11 @@ RHEL: `postgresql-setup --initdb && systemctl enable --now postgresql`.
 Schema migrations run automatically on first `turnstone-server`
 start (Alembic via `init_storage(run_migrations=True)`).
 
-For remote Postgres: confirm reachability with `PGPASSWORD=<pw> psql
--h <host> -U <user> -d <db> -c 'select 1;'` before continuing.
+For remote Postgres: confirm reachability with `pg_isready -h <host>
+-p <port>` (no credentials needed). If pg_isready passes, the actual
+connection test happens at first server start with the credentials
+already in `config.toml` — don't run another `psql` here, that would
+put the password in your tool-call transcript.
 
 ### Step 5 — Config directory
 
@@ -320,8 +323,10 @@ Verify with `systemd-analyze verify
 
 ### Step 8 — Enable + start
 
-`systemctl enable --now turnstone.target`. If Q3=no channels:
-`systemctl disable --now turnstone-channel.service`.
+`systemctl enable --now turnstone.target` brings up server + console.
+The channel unit is intentionally separate from the target — if
+Q3=channels, also run `systemctl enable --now
+turnstone-channel.service`. If Q3=no channels, do nothing further.
 
 ### Step 9 — Health checks
 

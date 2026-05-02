@@ -337,3 +337,21 @@ def test_init_storage_from_args_empty_string_falls_through(monkeypatch):
     config_mod.init_storage_from_args(args)
     assert captured["url"] == "postgres://env"
     assert captured["backend"] == "sqlite"
+
+
+def test_init_storage_from_args_pool_size_zero_honored(monkeypatch):
+    """db_pool_size=0 is a legitimate setting (disable pooling) — must not
+    fall through to the default 2. Regression guard against the original
+    `or`-chain implementation which treated 0 as falsy and silently
+    rewrote it to the default."""
+    _reset_cache()
+    captured = {}
+    monkeypatch.setattr(
+        "turnstone.core.storage._registry.init_storage",
+        lambda **kw: captured.update(kw),
+    )
+    args = argparse.Namespace(
+        db_backend="postgresql", db_url="postgres://x", db_path="", db_pool_size=0
+    )
+    config_mod.init_storage_from_args(args)
+    assert captured["pool_size"] == 0

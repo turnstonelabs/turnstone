@@ -531,3 +531,60 @@ class TestScheduleAPINotifyTargets:
             json={"notify_targets": "not json"},
         )
         assert resp.status_code == 400
+
+
+class TestNotifyAuthHeadersTomlFirst:
+    """Regression: server -> channel notify must read the JWT secret via
+    load_jwt_secret() so the systemd TOML-only secrets path works.
+    Pre-fix the function read os.environ directly and produced an
+    empty Authorization header on systemd hosts."""
+
+    def test_uses_load_jwt_secret(self, monkeypatch):
+        """Secret in [auth] jwt_secret (no env) → header is set."""
+        import os
+
+        from turnstone.core import session as session_mod
+
+        # Reset cached token manager so the monkeypatched secret takes effect.
+        session_mod._notify_token_manager = None
+
+        secret = "a" * 64
+        monkeypatch.setattr(
+            "turnstone.core.config.load_config",
+            lambda *a, **kw: {"jwt_secret": secret} if (a and a[0] == "auth") else {},
+        )
+        monkeypatch.delenv("TURNSTONE_JWT_SECRET", raising=False)
+        monkeypatch.delenv("TURNSTONE_CHANNEL_AUTH_TOKEN", raising=False)
+        os.environ.pop("TURNSTONE_JWT_SECRET", None)
+
+        headers = session_mod._notify_auth_headers()
+        assert "Authorization" in headers
+        assert headers["Authorization"].startswith("Bearer ")
+
+    def test_returns_empty_when_no_secret(self, monkeypatch):
+        """No env, no TOML → empty headers (don't crash; let channel reject)."""
+        from turnstone.core import session as session_mod
+
+        session_mod._notify_token_manager = None
+
+        monkeypatch.setattr("turnstone.core.config.load_config", lambda *a, **kw: {})
+        monkeypatch.delenv("TURNSTONE_JWT_SECRET", raising=False)
+        monkeypatch.delenv("TURNSTONE_CHANNEL_AUTH_TOKEN", raising=False)
+
+        headers = session_mod._notify_auth_headers()
+        assert headers == {}
+
+    def test_static_token_takes_precedence(self, monkeypatch):
+        """TURNSTONE_CHANNEL_AUTH_TOKEN env wins over JWT (legacy escape hatch)."""
+        from turnstone.core import session as session_mod
+
+        session_mod._notify_token_manager = None
+
+        monkeypatch.setenv("TURNSTONE_CHANNEL_AUTH_TOKEN", "static-test-token")
+        monkeypatch.setattr(
+            "turnstone.core.config.load_config",
+            lambda *a, **kw: {"jwt_secret": "b" * 64} if (a and a[0] == "auth") else {},
+        )
+
+        headers = session_mod._notify_auth_headers()
+        assert headers == {"Authorization": "Bearer static-test-token"}

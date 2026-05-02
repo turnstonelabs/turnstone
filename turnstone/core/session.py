@@ -308,9 +308,15 @@ def _notify_auth_headers() -> dict[str, str]:
     if static_token:
         return {"Authorization": f"Bearer {static_token}"}
 
-    # JWT via ServiceTokenManager
-    jwt_secret = os.environ.get("TURNSTONE_JWT_SECRET", "").strip()
-    if not jwt_secret:
+    # JWT via ServiceTokenManager — read via load_jwt_secret() so the
+    # TOML-first secrets path on systemd hosts works. The static
+    # TURNSTONE_CHANNEL_AUTH_TOKEN above is a separate, env-only escape
+    # hatch (preserved for legacy docker-compose deployments).
+    from turnstone.core.auth import load_jwt_secret
+
+    try:
+        jwt_secret = load_jwt_secret()
+    except SystemExit:
         return {}
 
     with _notify_token_lock:

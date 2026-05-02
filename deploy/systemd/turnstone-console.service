@@ -2,9 +2,12 @@
 Description=Turnstone console (cluster dashboard + routing proxy)
 Documentation=https://github.com/turnstone-ai/turnstone
 # The console hard-fails without storage (service discovery depends
-# on it). Add `Requires=postgresql.service` via a drop-in for colocated
-# Postgres installs.
-After=network.target postgresql.service
+# on it). Postgres may be remote, so wait for network-online so a
+# slow-DHCP boot doesn't burn through StartLimitBurst before psycopg
+# can connect. Add `Requires=postgresql.service` via a drop-in for
+# colocated Postgres installs.
+Wants=network-online.target
+After=network-online.target postgresql.service
 PartOf=turnstone.target
 StartLimitIntervalSec=60
 StartLimitBurst=5

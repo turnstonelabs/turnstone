@@ -1,10 +1,12 @@
 [Unit]
 Description=Turnstone server (chat workstreams + LLM gateway)
 Documentation=https://github.com/turnstone-ai/turnstone
-# Postgres is required. After= orders against a colocated
-# postgresql.service when present and silently no-ops otherwise; for
-# colocated installs add `Requires=postgresql.service` via a drop-in.
-After=network.target postgresql.service
+# Postgres is required and may be remote. We need the network actually
+# online (not just the interface configured), otherwise a slow-DHCP
+# host burns through StartLimitBurst before psycopg can connect. For
+# colocated PG, also add `Requires=postgresql.service` via a drop-in.
+Wants=network-online.target
+After=network-online.target postgresql.service
 PartOf=turnstone.target
 StartLimitIntervalSec=60
 StartLimitBurst=5
