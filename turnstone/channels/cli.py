@@ -134,11 +134,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _build_token_factories(
     jwt_secret: str,
-) -> tuple[Callable[[], str] | None, Callable[[], str] | None]:
-    """Return ``(console_factory, server_factory)`` when a JWT secret is set."""
-    if not jwt_secret:
-        return None, None
+) -> tuple[Callable[[], str], Callable[[], str]]:
+    """Return ``(console_factory, server_factory)`` for cross-service auth.
 
+    ``jwt_secret`` is required — :func:`load_jwt_secret` raises before
+    we get here if it's missing or too short. Every channel-side request
+    to console/server is JWT-signed, so unauthenticated mode would just
+    produce 401s.
+    """
     from turnstone.core.auth import JWT_AUD_CONSOLE, JWT_AUD_SERVER, ServiceTokenManager
 
     scopes = frozenset({"read", "write", "approve", "service"})
@@ -371,21 +374,30 @@ async def _run_gateway(
 def main() -> None:
     """Parse arguments, initialize storage, and run adapters."""
     from turnstone.channels._http import create_channel_app
-    from turnstone.core.storage._registry import get_storage, init_storage
+    from turnstone.core.auth import load_jwt_secret
+    from turnstone.core.config import (
+        add_config_arg,
+        apply_config,
+        init_storage_from_args,
+    )
+    from turnstone.core.storage._registry import get_storage
 
     parser = _build_parser()
+    add_config_arg(parser)
+    # Layers TOML defaults on top of argparse env defaults — precedence
+    # becomes CLI > TOML > env. Systemd hosts ship secrets in config.toml
+    # (mode 0640 root:turnstone) and never set the env vars, keeping
+    # Discord/Slack tokens + DB URL out of os.environ where a prompt-
+    # injected tool could dump them.
+    apply_config(parser, ["discord", "slack", "database"])
     args = parser.parse_args()
 
     configure_logging_from_args(args, "channel")
 
-    init_storage(
-        backend=os.environ.get("TURNSTONE_DB_BACKEND", "sqlite"),
-        url=os.environ.get("TURNSTONE_DB_URL", ""),
-        path=os.environ.get("TURNSTONE_DB_PATH", ""),
-    )
+    init_storage_from_args(args)
     storage = get_storage()
 
-    jwt_secret = os.environ.get("TURNSTONE_JWT_SECRET", "").strip()
+    jwt_secret = load_jwt_secret()
     console_token_factory, server_token_factory = _build_token_factories(jwt_secret)
 
     console_url, server_url = _resolve_service_urls(

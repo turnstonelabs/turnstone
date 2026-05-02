@@ -1664,16 +1664,14 @@ class TestIsSecureRequest:
 
 class TestSecretStrength:
     def test_short_secret_exits(self):
-        old = os.environ.get("TURNSTONE_JWT_SECRET", "")
-        os.environ["TURNSTONE_JWT_SECRET"] = "short"
-        try:
-            with pytest.raises(SystemExit):
-                load_jwt_secret()
-        finally:
-            if old:
-                os.environ["TURNSTONE_JWT_SECRET"] = old
-            else:
-                os.environ.pop("TURNSTONE_JWT_SECRET", None)
+        # Mock load_config so a real config.toml on the dev host doesn't
+        # shadow the env value we're testing.
+        with (
+            patch("turnstone.core.config.load_config", return_value={}),
+            patch.dict(os.environ, {"TURNSTONE_JWT_SECRET": "short"}, clear=False),
+            pytest.raises(SystemExit),
+        ):
+            load_jwt_secret()
 
     def test_missing_secret_exits(self):
         with (
@@ -1682,6 +1680,21 @@ class TestSecretStrength:
             pytest.raises(SystemExit),
         ):
             load_jwt_secret()
+
+    def test_toml_wins_over_env(self):
+        # Threat model: secrets in os.environ are exfiltrable via prompt
+        # injection; TOML must take precedence so the env value is ignored
+        # entirely when the TOML value is set.
+        long_secret = "a" * 64
+        env_secret = "b" * 64
+        with (
+            patch(
+                "turnstone.core.config.load_config",
+                return_value={"jwt_secret": long_secret},
+            ),
+            patch.dict(os.environ, {"TURNSTONE_JWT_SECRET": env_secret}, clear=False),
+        ):
+            assert load_jwt_secret() == long_secret
 
 
 class TestCorsConfigurable:

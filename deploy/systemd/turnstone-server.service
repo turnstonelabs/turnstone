@@ -1,0 +1,99 @@
+[Unit]
+Description=Turnstone server (chat workstreams + LLM gateway)
+Documentation=https://github.com/turnstone-ai/turnstone
+# Postgres is required. After= orders against a colocated
+# postgresql.service when present and silently no-ops otherwise; for
+# colocated installs add `Requires=postgresql.service` via a drop-in.
+After=network.target postgresql.service
+PartOf=turnstone.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=turnstone
+Group=turnstone
+
+# Where the secrets live. config.toml carries the JWT secret, Postgres
+# URL+password, LLM API key, and Discord/Slack tokens — all kept out of
+# os.environ so a prompt-injected tool can't dump them via `env`.
+Environment=TURNSTONE_CONFIG=/etc/turnstone/config.toml
+Environment=TURNSTONE_LOG_LEVEL=info
+# pool_size lives in [database] in config.toml; setting it here
+# would be unreachable (TOML wins via apply_config).
+
+Slice=turnstone.slice
+
+# Multi-node identity goes in a per-host drop-in, e.g.:
+#   /etc/systemd/system/turnstone-server.service.d/node.conf
+#   [Service]
+#   Environment=TURNSTONE_NODE_ID=node-1
+#   Environment=TURNSTONE_ADVERTISE_URL=https://node-1.internal:8080
+
+StateDirectory=turnstone
+StateDirectoryMode=0750
+LogsDirectory=turnstone
+LogsDirectoryMode=0750
+WorkingDirectory=/var/lib/turnstone
+
+# Bind defaults baked in as literals — the install runbook rewrites this
+# line if :8080 is already taken on the host. No ${VAR} substitution
+# means no missing-env-file foot-gun.
+ExecStart=/usr/local/bin/turnstone-server --host 127.0.0.1 --port 8080
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=120
+TimeoutStopSec=30
+KillSignal=SIGTERM
+KillMode=mixed
+
+# --- Resource limits ---
+# SSE keeps a fd per active workstream + outbound LLM stream + MCP stdio
+# pipes. 65k is comfortable for hundreds of concurrent workstreams.
+LimitNOFILE=65535
+LimitNPROC=8192
+TasksMax=8192
+LimitCORE=0
+
+# Memory budget is on the slice (turnstone.slice) so server + console +
+# channel share one host-level cap rather than independently summing.
+
+# --- Hardening ---
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+PrivateTmp=true
+# PrivateDevices= and ProcSubset= deliberately omitted — turnstone runs
+# in-process tools that legitimately need /proc/loadavg, /proc/meminfo,
+# /proc/cpuinfo (blocked by ProcSubset=pid) and /dev/nvidiactl, /dev/dri
+# (blocked by PrivateDevices=true) for "how's the host doing" queries.
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+# @resources excluded so OpenMP/MKL pinned-thread paths in numpy/scipy
+# sandbox tools don't fall back to free-scheduling. Capabilities are
+# already empty so sched_setaffinity isn't a real attack surface.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @mount
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=turnstone-server
+
+[Install]
+WantedBy=multi-user.target

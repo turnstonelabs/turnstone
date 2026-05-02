@@ -260,3 +260,80 @@ def test_set_config_path_overrides_env_var(tmp_path, monkeypatch):
     set_config_path(str(explicit_cfg))
 
     assert load_config("api") == {"base_url": "http://explicit"}
+
+
+# -- init_storage_from_args ------------------------------------------------
+
+
+def test_init_storage_from_args_uses_args_first(tmp_path, monkeypatch):
+    """args > env precedence — args.db_url wins when both are set."""
+    _reset_cache()
+    captured = {}
+
+    def fake_init_storage(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("turnstone.core.storage._registry.init_storage", fake_init_storage)
+    monkeypatch.setenv("TURNSTONE_DB_URL", "postgres://env")
+    args = argparse.Namespace(db_backend="postgresql", db_url="postgres://args", db_path="")
+    config_mod.init_storage_from_args(args)
+    assert captured["url"] == "postgres://args"
+    assert captured["backend"] == "postgresql"
+
+
+def test_init_storage_from_args_falls_back_to_env(monkeypatch):
+    """When args are missing/empty, env fills in."""
+    _reset_cache()
+    captured = {}
+    monkeypatch.setattr(
+        "turnstone.core.storage._registry.init_storage",
+        lambda **kw: captured.update(kw),
+    )
+    monkeypatch.setenv("TURNSTONE_DB_URL", "postgres://env")
+    monkeypatch.setenv("TURNSTONE_DB_SSLMODE", "require")
+    args = argparse.Namespace()
+    config_mod.init_storage_from_args(args)
+    assert captured["url"] == "postgres://env"
+    assert captured["sslmode"] == "require"
+    assert captured["backend"] == "sqlite"  # hardcoded default
+
+
+def test_init_storage_from_args_forwards_all_ssl_kwargs(monkeypatch):
+    """Regression: bug-3 — channel CLI used to drop SSL kwargs."""
+    _reset_cache()
+    captured = {}
+    monkeypatch.setattr(
+        "turnstone.core.storage._registry.init_storage",
+        lambda **kw: captured.update(kw),
+    )
+    args = argparse.Namespace(
+        db_backend="postgresql",
+        db_url="postgres://x",
+        db_path="",
+        db_sslmode="verify-full",
+        db_sslrootcert="/etc/ca.pem",
+        db_sslcert="/etc/c.pem",
+        db_sslkey="/etc/k.pem",
+        db_pool_size=25,
+    )
+    config_mod.init_storage_from_args(args)
+    assert captured["sslmode"] == "verify-full"
+    assert captured["sslrootcert"] == "/etc/ca.pem"
+    assert captured["sslcert"] == "/etc/c.pem"
+    assert captured["sslkey"] == "/etc/k.pem"
+    assert captured["pool_size"] == 25
+
+
+def test_init_storage_from_args_empty_string_falls_through(monkeypatch):
+    """Empty-string args (systemd ${VAR} for unset vars) fall through to env."""
+    _reset_cache()
+    captured = {}
+    monkeypatch.setattr(
+        "turnstone.core.storage._registry.init_storage",
+        lambda **kw: captured.update(kw),
+    )
+    monkeypatch.setenv("TURNSTONE_DB_URL", "postgres://env")
+    args = argparse.Namespace(db_backend="", db_url="", db_path="")
+    config_mod.init_storage_from_args(args)
+    assert captured["url"] == "postgres://env"
+    assert captured["backend"] == "sqlite"

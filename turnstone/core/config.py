@@ -160,6 +160,17 @@ _CONFIG_MAP: dict[str, dict[str, str]] = {
         "nudge_cooldown": "memory_nudge_cooldown",
         "nudges": "memory_nudges",
     },
+    "discord": {
+        "token": "discord_token",
+        "guild": "discord_guild",
+        "channels": "discord_channels",
+    },
+    "slack": {
+        "token": "slack_token",
+        "app_token": "slack_app_token",
+        "channels": "slack_channels",
+        "slash_command": "slack_slash_command",
+    },
 }
 
 # -- Tavily API key (cached) --------------------------------------------------
@@ -215,6 +226,45 @@ def apply_config(parser: argparse.ArgumentParser, sections: list[str]) -> None:
                 defaults[argparse_dest] = section_data[config_key]
     if defaults:
         parser.set_defaults(**defaults)
+
+
+def init_storage_from_args(args: argparse.Namespace) -> None:
+    """Initialize the storage backend from argparse + env fallback.
+
+    Resolves DB connection settings via the standard precedence
+    (CLI flag > config.toml > env > hardcoded default). Empty strings on
+    any layer fall through to the next, matching systemd's ``${VAR}``
+    substitution semantics for unset variables. Callers must register
+    DB args (typically via ``apply_config(parser, ['database'])``)
+    before invoking this.
+
+    Replaces ~10 lines of duplicated args/env wiring per service entry
+    point. Returns None; the storage registry is module-global, so
+    subsequent ``get_storage()`` calls pick up the initialized backend.
+    """
+    from turnstone.core.storage._registry import init_storage
+
+    def _r(arg: str, env: str, default: str = "") -> str:
+        # Use explicit None / empty checks (not `or` chains) so a
+        # legitimately set int 0 — e.g. db_pool_size=0 to disable
+        # pooling — isn't silently rewritten to the default.
+        v = getattr(args, arg, None)
+        if v is None or v == "":
+            v = os.environ.get(env)
+        if v is None or v == "":
+            v = default
+        return str(v)
+
+    init_storage(
+        backend=_r("db_backend", "TURNSTONE_DB_BACKEND", "sqlite"),
+        url=_r("db_url", "TURNSTONE_DB_URL"),
+        path=_r("db_path", "TURNSTONE_DB_PATH"),
+        pool_size=int(_r("db_pool_size", "TURNSTONE_DB_POOL_SIZE", "2")),
+        sslmode=_r("db_sslmode", "TURNSTONE_DB_SSLMODE"),
+        sslrootcert=_r("db_sslrootcert", "TURNSTONE_DB_SSLROOTCERT"),
+        sslcert=_r("db_sslcert", "TURNSTONE_DB_SSLCERT"),
+        sslkey=_r("db_sslkey", "TURNSTONE_DB_SSLKEY"),
+    )
 
 
 def add_config_arg(parser: argparse.ArgumentParser) -> None:

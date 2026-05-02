@@ -1,0 +1,11 @@
+[Unit]
+Description=Turnstone services (server + console + channel gateway)
+# Group-target so operators can `systemctl start turnstone.target` and
+# bring the whole stack up/down. Individual units list `PartOf=turnstone.target`
+# so a stop on the target propagates to its members.
+Requires=turnstone-server.service turnstone-console.service
+Wants=turnstone-channel.service
+After=turnstone-server.service turnstone-console.service turnstone-channel.service
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+[Unit]
+Description=Turnstone services slice (server + console + channel)
+Documentation=https://github.com/turnstone-ai/turnstone
+Before=slices.target
+
+[Slice]
+# Combined memory budget for turnstone-server + turnstone-console +
+# turnstone-channel. Postgres lives in its own slice (system.slice
+# typically) and isn't counted here.
+#
+# Without a slice, each unit's MemoryMax= is enforced independently
+# — three units at 85% each can sum to 255% of host RAM before any is
+# throttled, which defeats the limit entirely. Putting them under a
+# shared slice makes the budget hierarchical: the slice cap is the
+# real ceiling, units throttle / OOM individually only when one is
+# starving the others.
+#
+# Adjust if the host runs other meaningful workloads alongside
+# Turnstone (e.g. NAS services, monitoring, etc).
+MemoryHigh=70%
+MemoryMax=85%
+TasksMax=16384

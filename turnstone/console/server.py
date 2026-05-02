@@ -10994,7 +10994,7 @@ def main() -> None:
     from turnstone.core.config import add_config_arg, apply_config
 
     add_config_arg(parser)
-    apply_config(parser, ["console", "auth"])
+    apply_config(parser, ["console", "auth", "database"])
     args = parser.parse_args()
 
     from turnstone.core.log import configure_logging_from_args
@@ -11008,20 +11008,11 @@ def main() -> None:
     # Initialize storage early — the collector needs it for service discovery.
     auth_storage = None
     try:
-        from turnstone.core.storage import init_storage
+        from turnstone.core.config import init_storage_from_args
+        from turnstone.core.storage import get_storage
 
-        db_backend = os.environ.get("TURNSTONE_DB_BACKEND", "sqlite")
-        db_url = os.environ.get("TURNSTONE_DB_URL", "")
-        db_path = os.environ.get("TURNSTONE_DB_PATH", "")
-        auth_storage = init_storage(
-            db_backend,
-            path=db_path,
-            url=db_url,
-            sslmode=os.environ.get("TURNSTONE_DB_SSLMODE", ""),
-            sslrootcert=os.environ.get("TURNSTONE_DB_SSLROOTCERT", ""),
-            sslcert=os.environ.get("TURNSTONE_DB_SSLCERT", ""),
-            sslkey=os.environ.get("TURNSTONE_DB_SSLKEY", ""),
-        )
+        init_storage_from_args(args)
+        auth_storage = get_storage()
     except Exception:
         log.info("Console storage not available — admin API disabled, JWT-only auth")
 

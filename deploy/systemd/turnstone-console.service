@@ -1,0 +1,77 @@
+[Unit]
+Description=Turnstone console (cluster dashboard + routing proxy)
+Documentation=https://github.com/turnstone-ai/turnstone
+# The console hard-fails without storage (service discovery depends
+# on it). Add `Requires=postgresql.service` via a drop-in for colocated
+# Postgres installs.
+After=network.target postgresql.service
+PartOf=turnstone.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=turnstone
+Group=turnstone
+
+Environment=TURNSTONE_CONFIG=/etc/turnstone/config.toml
+Environment=TURNSTONE_LOG_LEVEL=info
+
+Slice=turnstone.slice
+
+StateDirectory=turnstone
+StateDirectoryMode=0750
+LogsDirectory=turnstone
+LogsDirectoryMode=0750
+WorkingDirectory=/var/lib/turnstone
+
+ExecStart=/usr/local/bin/turnstone-console --host 127.0.0.1 --port 8090
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=60
+TimeoutStopSec=30
+KillSignal=SIGTERM
+KillMode=mixed
+
+# --- Resource limits ---
+# Console multiplexes one upstream SSE per node + one downstream SSE per
+# dashboard tab. 65k covers a 100-node cluster with comfortable headroom.
+LimitNOFILE=65535
+LimitNPROC=4096
+TasksMax=4096
+LimitCORE=0
+# Memory budget is on the slice (turnstone.slice).
+
+# --- Hardening ---
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+PrivateTmp=true
+# PrivateDevices= / ProcSubset= omitted — see comment in the server unit.
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @mount
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=turnstone-console
+
+[Install]
+WantedBy=multi-user.target

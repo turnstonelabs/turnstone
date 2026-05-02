@@ -329,17 +329,27 @@ def parse_scopes(scopes_str: str) -> frozenset[str]:
 
 
 def load_jwt_secret() -> str:
-    """Load JWT signing secret from env or config.
+    """Load JWT signing secret from config.toml or env.
 
-    Raises :class:`SystemExit` if no secret is configured.  A JWT secret
-    is required for auth, inter-service communication, and session tokens.
+    Precedence: config.toml ``[auth] jwt_secret`` first, then
+    ``TURNSTONE_JWT_SECRET`` env. TOML-first keeps the secret out of
+    ``os.environ`` on the systemd path (where a prompt-injected tool
+    could dump env via ``bash -c 'env'``); the env fallback preserves
+    docker-compose / legacy setups.
+
+    Always required — every deployed service (server, console,
+    channel) signs cross-service requests with this secret, so
+    missing or too-short raises :class:`SystemExit`. Standalone
+    operator CLIs (``turnstone``, ``turnstone-admin``) read the
+    env directly and tolerate its absence; they don't go through
+    here.
     """
-    secret = os.environ.get("TURNSTONE_JWT_SECRET", "").strip()
-    if not secret:
-        from turnstone.core.config import load_config
+    from turnstone.core.config import load_config
 
-        auth_cfg = load_config("auth")
-        secret = str(auth_cfg.get("jwt_secret", "")).strip()
+    auth_cfg = load_config("auth")
+    secret = str(auth_cfg.get("jwt_secret", "")).strip()
+    if not secret:
+        secret = os.environ.get("TURNSTONE_JWT_SECRET", "").strip()
 
     if not secret:
         log.error(

@@ -1,0 +1,82 @@
+[Unit]
+Description=Turnstone channel gateway (Discord, Slack, ...)
+Documentation=https://github.com/turnstone-ai/turnstone
+# The channel reaches Discord/Slack APIs over the network at startup, so
+# wait for network-online.target. Discovers server/console URLs from
+# Postgres on startup (~60s budget); ordering against postgresql.service
+# is best-effort (no-op when remote).
+Wants=network-online.target
+After=network-online.target postgresql.service turnstone-server.service turnstone-console.service
+PartOf=turnstone.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=turnstone
+Group=turnstone
+
+# Discord/Slack tokens, JWT secret, Postgres URL all come from
+# /etc/turnstone/config.toml — never the process env.
+Environment=TURNSTONE_CONFIG=/etc/turnstone/config.toml
+Environment=TURNSTONE_LOG_LEVEL=info
+
+Slice=turnstone.slice
+
+StateDirectory=turnstone
+StateDirectoryMode=0750
+LogsDirectory=turnstone
+LogsDirectoryMode=0750
+WorkingDirectory=/var/lib/turnstone
+
+ExecStart=/usr/local/bin/turnstone-channel --http-host 127.0.0.1 --http-port 8091
+
+Restart=on-failure
+RestartSec=5s
+# Service discovery has its own retry budget (~60s); allow it to play out.
+TimeoutStartSec=180
+TimeoutStopSec=30
+KillSignal=SIGTERM
+KillMode=mixed
+
+# --- Resource limits ---
+# Each adapter holds long-lived websockets/SSE — one fd per active
+# channel plus the server stream. 32k is generous for a single gateway.
+LimitNOFILE=32768
+LimitNPROC=4096
+TasksMax=4096
+LimitCORE=0
+# Memory budget is on the slice (turnstone.slice).
+
+# --- Hardening ---
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+PrivateTmp=true
+# PrivateDevices= / ProcSubset= omitted — see comment in the server unit.
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @mount
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=turnstone-channel
+
+[Install]
+WantedBy=multi-user.target

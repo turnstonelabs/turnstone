@@ -1,0 +1,59 @@
+# /etc/turnstone/config.toml — the only secrets file.
+#
+# Why TOML, not env:
+#   turnstone-server runs untrusted code in-process (tool execution).
+#   Anything in os.environ is one shell call away from exfiltration:
+#   `bash -c 'env'`, `subprocess.check_output(['env'])`, and `cat
+#   /proc/self/environ` all dump the lot, and subprocesses inherit env
+#   automatically. Reading secrets from a file the application opens
+#   at startup keeps them out of os.environ — the attacker now has to
+#   know the path AND have a tool that reads files AND choose it over
+#   the trivial env dump.
+#
+# Permissions:
+#   sudo install -m 0640 -o root -g turnstone config.example.toml /etc/turnstone/config.toml
+#   sudoedit /etc/turnstone/config.toml
+#
+# 0640 root:turnstone — root edits, the turnstone service user reads,
+# nobody else touches it. Verify with `stat /etc/turnstone/config.toml`.
+
+# ---------------------------------------------------------------------------
+# Auth — REQUIRED. Same secret on every node + console + channel host.
+# ---------------------------------------------------------------------------
+[auth]
+# Generate with:  python3 -c "import secrets; print(secrets.token_hex(32))"
+# Min 32 chars; the binary refuses shorter secrets.
+jwt_secret = "REPLACE_WITH_64_HEX_CHARS"
+
+# ---------------------------------------------------------------------------
+# Database — REQUIRED. PostgreSQL only on the systemd path.
+# ---------------------------------------------------------------------------
+[database]
+backend = "postgresql"
+# psycopg driver wins on speed; SQLAlchemy picks it up from the URL scheme.
+url = "postgresql+psycopg://turnstone:CHANGEME@127.0.0.1:5432/turnstone"
+# Pool size 10 + max_overflow 3 (binary default) = 13 connections, vs
+# max_workstreams=50 default. 25 covers a 50-workstream burst. Bump
+# higher when you raise --workers or max_workstreams.
+pool_size = 25
+
+# Optional TLS to Postgres
+# sslmode = "require"          # disable | allow | prefer | require | verify-ca | verify-full
+# sslrootcert = "/etc/turnstone/pg-ca.pem"
+# sslcert = "/etc/turnstone/pg-client.pem"
+# sslkey = "/etc/turnstone/pg-client.key"
+
+# ---------------------------------------------------------------------------
+# Channel gateway — Discord and/or Slack adapters.
+# Required only when running turnstone-channel; ignored by server/console.
+# ---------------------------------------------------------------------------
+[discord]
+# token = "xxx"                # bot token
+# guild = 0                    # 0 = all guilds; otherwise restrict to one
+# channels = ""                # comma-separated channel IDs (default: all)
+
+[slack]
+# token = "xoxb-..."           # bot token
+# app_token = "xapp-..."       # app-level token for Socket Mode
+# channels = ""                # comma-separated channel IDs (default: all)
+# slash_command = "/turnstone" # default: /turnstone
