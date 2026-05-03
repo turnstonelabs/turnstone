@@ -32,6 +32,9 @@ class MetricsCollector:
         # counters (continued)
         self._ratelimit_rejects: int = 0  # counter: total 429 responses
         self._evictions: int = 0  # counter: workstreams evicted
+        # node_models publish (heartbeat-loop refresh of node_metadata.models)
+        self._node_models_publish_written: int = 0
+        self._node_models_publish_skipped: int = 0
         # judge metrics
         self._judge_verdicts: dict[tuple[str, str], int] = defaultdict(int)
         self._judge_latency: dict[str, Any] = {
@@ -104,6 +107,22 @@ class MetricsCollector:
         with self._lock:
             self._evictions += 1
 
+    def record_node_models_publish(self, *, written: bool) -> None:
+        """Record one heartbeat-loop attempt to refresh ``node_metadata.models``.
+
+        ``written=True`` means the projected payload differed from the
+        cached one and we ran an UPSERT.  ``written=False`` means the
+        cache short-circuited the call.  In a stable cluster the
+        skipped:written ratio runs ~100:1 — a sustained drop in that
+        ratio is the signal an operator wants (backend health flapping
+        or a runaway model-reload loop).
+        """
+        with self._lock:
+            if written:
+                self._node_models_publish_written += 1
+            else:
+                self._node_models_publish_skipped += 1
+
     def set_judge_enabled(self, enabled: bool) -> None:
         with self._lock:
             self._judge_enabled = enabled
@@ -170,6 +189,8 @@ class MetricsCollector:
             judge_verdicts = dict(self._judge_verdicts)
             judge_latency = dict(self._judge_latency)
             judge_enabled = self._judge_enabled
+            node_models_publish_written = self._node_models_publish_written
+            node_models_publish_skipped = self._node_models_publish_skipped
 
         # turnstone_build_info
         lines.append("# HELP turnstone_build_info Server version and model info")
@@ -275,6 +296,25 @@ class MetricsCollector:
             "turnstone_workstreams_evicted_total",
             "Total workstreams evicted to make room for new ones",
             evictions,
+        )
+
+        # turnstone_node_models_publish_total — split by outcome so an
+        # operator can compute hit-rate as
+        # ``rate(skipped) / (rate(skipped) + rate(written))``.  In a
+        # stable cluster this ratio sits very close to 1.0; sustained
+        # dips signal backend health flapping or reload churn.
+        lines.append(
+            "# HELP turnstone_node_models_publish_total "
+            "node_metadata.models refresh attempts by outcome"
+        )
+        lines.append("# TYPE turnstone_node_models_publish_total counter")
+        lines.append(
+            f'turnstone_node_models_publish_total{{outcome="written"}} '
+            f"{node_models_publish_written}"
+        )
+        lines.append(
+            f'turnstone_node_models_publish_total{{outcome="skipped"}} '
+            f"{node_models_publish_skipped}"
         )
 
         # turnstone_judge_enabled

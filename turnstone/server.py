@@ -3039,6 +3039,13 @@ def internal_model_reload(request: Request) -> JSONResponse:
     # `model` parameter descriptions reflect the current registry.
     _broadcast_agent_tool_schema_refresh(request.app.state)
 
+    # Refresh the per-node ``models`` metadata entry the coord reads on
+    # ``list_nodes``.  Without this, the heartbeat loop's 30s tick would
+    # be the coord's first chance to see new aliases an admin just added.
+    node_id = getattr(request.app.state, "node_id", "")
+    if node_id:
+        _publish_models_metadata(request.app.state, get_storage(), node_id)
+
     return JSONResponse({"status": "ok", "aliases": registry.list_aliases()})
 
 
@@ -3062,6 +3069,103 @@ def internal_model_status(request: Request) -> JSONResponse:
             "reasoning_effort": cfg.reasoning_effort,
         }
     return JSONResponse({"models": models})
+
+
+def _collect_node_models_metadata(app_state: Any) -> tuple[str, str, str] | None:
+    """Build the ``("models", json_value, "auto")`` node_metadata entry.
+
+    Each model alias on the live registry is projected to
+    ``{alias, provider, healthy}`` — the alias is what the coordinator
+    passes back as ``spawn_workstream(model=...)``, ``provider`` lets
+    coordinators classify or filter (e.g. "any anthropic node"), and
+    ``healthy`` reflects the backend's :class:`BackendHealthTracker`
+    state at call time.  The underlying model identifier (``cfg.model``)
+    is intentionally omitted — coordinators kept reaching for the
+    provider-side string when they should have been passing the local
+    alias, and dropping it removes the footgun.  Operators who need
+    the model string can hit ``/v1/api/_internal/model-status`` on the
+    node directly.
+
+    Trackers are eagerly seeded for every alias at server startup and
+    on every model-reload, so ``health_reg.get_tracker(...)`` returns
+    the existing tracker rather than minting a fresh one in steady
+    state.  In the unlikely race where a tracker hasn't been seeded
+    yet, the freshly created tracker reports ``is_healthy=True``
+    (default state) — which matches the prior "default to True when
+    no tracker" behavior, just routed through the tracker object.
+
+    Returns ``None`` when the registry has not yet been built (caller
+    should skip the write rather than zero out a previous snapshot).
+    """
+    registry = getattr(app_state, "registry", None)
+    if registry is None:
+        return None
+    health_reg = getattr(app_state, "health_registry", None)
+    aliases_info: list[dict[str, Any]] = []
+    for alias in registry.list_aliases():
+        try:
+            cfg = registry.get_config(alias)
+        except (ValueError, KeyError):
+            continue
+        healthy = True
+        if health_reg is not None:
+            # Direct keyed lookup — ``get_tracker_for_alias`` would
+            # do a second ``registry.get_config(alias)`` internally,
+            # but ``cfg`` is already in hand here.
+            tracker = health_reg.get_tracker(provider=cfg.provider, base_url=cfg.base_url)
+            healthy = tracker.is_healthy
+        aliases_info.append(
+            {
+                "alias": alias,
+                "provider": cfg.provider,
+                "healthy": healthy,
+            }
+        )
+    return ("models", json.dumps(aliases_info), "auto")
+
+
+def _publish_models_metadata(app_state: Any, storage: Any, node_id: str) -> None:
+    """Refresh the per-node ``models`` row when the projection changed.
+
+    Caches the last-written JSON on ``app_state._last_models_payload``
+    so back-to-back heartbeat ticks with no health flip don't churn
+    the row — without this, the ``updated`` timestamp on every node's
+    ``models`` row advances every 30s across the whole cluster.
+
+    Records the cache outcome on the metrics collector so
+    ``turnstone_node_models_publish_total{outcome=...}`` exposes the
+    hit/miss ratio to Prometheus.  Storage-error attempts don't
+    record either outcome — the next call will retry and the
+    counters reflect actual cache decisions, not transient DB
+    failures.
+
+    Sync — callers on the asyncio loop wrap with ``asyncio.to_thread``.
+    Concurrent callers (heartbeat tick vs. ``internal_model_reload``)
+    can race on the cache attribute; the worst case is a redundant
+    write, never a stale row, so we skip the lock.
+    """
+    from turnstone.core.storage._registry import StorageUnavailableError
+
+    try:
+        entry = _collect_node_models_metadata(app_state)
+    except Exception:
+        log.warning("server.node_models_projection_failed", exc_info=True)
+        return
+    if entry is None:
+        return
+    payload = entry[1]
+    if payload == getattr(app_state, "_last_models_payload", None):
+        _metrics.record_node_models_publish(written=False)
+        return
+    try:
+        storage.set_node_metadata_bulk(node_id, [entry])
+    except StorageUnavailableError:
+        return  # storage layer already logged
+    except Exception:
+        log.exception("server.node_models_publish_failed")
+        return
+    app_state._last_models_payload = payload
+    _metrics.record_node_models_publish(written=True)
 
 
 # ---------------------------------------------------------------------------
@@ -3340,6 +3444,22 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
             ]
             _cfg_meta = _load_meta_config("metadata")
             _meta_entries.extend((k, json.dumps(v), "config") for k, v in _cfg_meta.items())
+            # Project the live model registry into a ``models`` entry so
+            # coord-side ``list_nodes`` can surface healthy aliases per
+            # node without a fan-out HTTP probe.  Re-collected on each
+            # heartbeat tick so health flips converge within ~30s.
+            # Wrapped in its own try/except so a projection failure
+            # doesn't take out the auto+config metadata write — losing
+            # the discovery surface is recoverable on the next heartbeat
+            # tick, but losing ``arch`` / ``os`` / ``cpu_count`` blinds
+            # the cluster's capability filters until the next restart.
+            try:
+                _models_entry = _collect_node_models_metadata(app.state)
+            except Exception:
+                log.warning("server.node_models_projection_failed", exc_info=True)
+                _models_entry = None
+            if _models_entry is not None:
+                _meta_entries.append(_models_entry)
             if _meta_entries:
                 # Clear stale auto/config rows from a prior run before upserting
                 _svc_storage.delete_node_metadata_by_source(_svc_node_id, "auto")
@@ -3350,11 +3470,26 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                     node_id=_svc_node_id,
                     count=len(_meta_entries),
                 )
+                # Seed the publish-cache so the first heartbeat tick
+                # doesn't redundant-write the same payload we just put
+                # in the bulk above.
+                if _models_entry is not None:
+                    app.state._last_models_payload = _models_entry[1]
         except Exception:
             log.warning("server.node_metadata_failed", node_id=_svc_node_id, exc_info=True)
 
         async def _heartbeat_loop() -> None:
-            """Periodically update service heartbeat."""
+            """Periodically update service heartbeat and refresh models metadata.
+
+            The ``models`` entry on ``node_metadata`` doubles as the
+            coord-side discovery surface for healthy model aliases per
+            node — refreshed every 30s so health flips and registry
+            reloads converge promptly without a fan-out HTTP probe on
+            the coord's ``list_nodes`` path.  The publish step short-
+            circuits when the projection is byte-identical to the
+            last write (cache lives on ``app.state``), so a stable
+            cluster doesn't pay UPSERT churn here.
+            """
             from turnstone.core.storage._registry import StorageUnavailableError
 
             while True:
@@ -3365,6 +3500,12 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                     pass  # already logged by storage layer
                 except Exception:
                     log.exception("server.heartbeat_failed")
+                # Both projection and write happen in the worker thread
+                # — keeps the registry-lock acquisition off the loop and
+                # bundles the round-trip into a single offload.
+                await asyncio.to_thread(
+                    _publish_models_metadata, app.state, _svc_storage, _svc_node_id
+                )
 
         _heartbeat_task = asyncio.create_task(_heartbeat_loop())
 
@@ -3372,6 +3513,13 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     # Shutdown
     if _heartbeat_task is not None:
         _heartbeat_task.cancel()
+        # Wait for the cancel to land before we run the metadata
+        # delete below — a heartbeat tick mid-write would otherwise
+        # complete its ``set_node_metadata_bulk`` AFTER our
+        # ``delete_node_metadata_by_source(..., "auto")`` and
+        # resurrect the row we just cleared.
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await _heartbeat_task
     if _svc_node_id and _svc_url:
         from turnstone.core.storage import get_storage as _get_svc_dereg
 
