@@ -2791,7 +2791,8 @@ var _eogpTriggerEl = null;
 function switchJudgeSection(section) {
   var sections = document.querySelectorAll(".judge-section");
   for (var i = 0; i < sections.length; i++) sections[i].style.display = "none";
-  var btns = document.querySelectorAll(".judge-section-btn");
+  var switcher = document.querySelector("#admin-judge .admin-subtab-switcher");
+  var btns = switcher ? switcher.querySelectorAll(".admin-subtab-btn") : [];
   for (var i = 0; i < btns.length; i++) {
     var isActive = btns[i].getAttribute("data-section") === section;
     btns[i].classList.toggle("active", isActive);
@@ -2804,15 +2805,15 @@ function switchJudgeSection(section) {
 
 // Arrow key navigation for judge sub-section tabs
 (function () {
-  var switcher = document.querySelector(".judge-section-switcher");
+  var switcher = document.querySelector("#admin-judge .admin-subtab-switcher");
   if (!switcher) return;
   switcher.addEventListener("keydown", function (e) {
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
-    var btns = switcher.querySelectorAll(".judge-section-btn");
+    var btns = switcher.querySelectorAll(".admin-subtab-btn");
     var secs = [];
     for (var i = 0; i < btns.length; i++)
       secs.push(btns[i].getAttribute("data-section"));
-    var current = switcher.querySelector(".judge-section-btn.active");
+    var current = switcher.querySelector(".admin-subtab-btn.active");
     var idx = secs.indexOf(current ? current.getAttribute("data-section") : "");
     if (e.key === "ArrowRight") idx = (idx + 1) % secs.length;
     else idx = (idx - 1 + secs.length) % secs.length;
@@ -2874,6 +2875,7 @@ function renderJudgeSettings() {
   var html = "";
   for (var i = 0; i < _judgeSettings.length; i++) {
     var s = _judgeSettings[i];
+    if (s.key === "judge.model") continue;
     var shortKey = s.key.replace("judge.", "");
     var inputHtml = "";
     var currentVal = s.value;
