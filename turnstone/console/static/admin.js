@@ -4487,7 +4487,33 @@ var MODEL_ROLES = [
   },
 ];
 
+// Roles sub-tab reads/writes via ``/v1/api/admin/settings`` which
+// requires ``admin.settings`` — different from the ``admin.models``
+// permission gating the Models tab itself.  When the user has Models
+// access but not Settings, hide the sub-tab button + force the
+// Definitions panel visible so they don't see a perpetual 403 loader.
+function _modelRolesAccessible() {
+  var perms = sessionStorage.getItem("turnstone_permissions") || "";
+  return perms.split(",").indexOf("admin.settings") !== -1;
+}
+
+function _applyModelRolesPermission() {
+  var btn = document.getElementById("models-tab-roles");
+  if (!btn) return;
+  if (_modelRolesAccessible()) {
+    btn.style.display = "";
+    return;
+  }
+  btn.style.display = "none";
+  // If Roles was the active sub-tab, snap back to Definitions so the
+  // user isn't staring at a hidden panel.
+  if (btn.classList.contains("active")) {
+    switchModelsSection("models-list");
+  }
+}
+
 function loadAdminModels() {
+  _applyModelRolesPermission();
   authFetch("/v1/api/admin/model-definitions")
     .then(function (r) {
       if (!r.ok) throw new Error("Failed");
@@ -4497,9 +4523,12 @@ function loadAdminModels() {
       _modelDefs = data.models || [];
       _modelDefaultAlias = data.default_alias || "";
       _renderModels(_modelDefs);
-      // Render the Roles sub-tab off the same model list so the
-      // dropdowns stay in sync with the current set of aliases.
-      loadAdminModelRoles();
+      // Roles sub-tab piggybacks on the model list; skip it when the
+      // user has no settings permission since the underlying API will
+      // 403 anyway.
+      if (_modelRolesAccessible()) {
+        loadAdminModelRoles();
+      }
     })
     .catch(function () {
       var el = document.getElementById("admin-models-table");
@@ -4557,10 +4586,12 @@ function _modelRolesError(container, msg) {
 function loadAdminModelRoles() {
   var c = document.getElementById("admin-models-roles-container");
   if (!c) return;
-  // Re-fetch model-definitions alongside settings so the alias dropdown
-  // reflects the live enabled set even if the user toggled a model in
-  // the Definitions sub-tab between renders.  Saving a role also calls
-  // back here, keeping the dropdown in sync without a tab switch.
+  // Reads ``_modelDefs`` / ``_modelDefaultAlias`` populated by the most
+  // recent ``loadAdminModels`` — both entry points into the Models tab
+  // (initial open + ``models_changed`` SSE refresh) go through
+  // ``loadAdminModels`` first, so the cached snapshot is fresh.  Role
+  // saves don't change model definitions, so the snapshot stays
+  // accurate after ``_saveModelRole`` chains back here.
   Promise.all([
     authFetch("/v1/api/admin/settings").then(function (r) {
       if (!r.ok) throw new Error("settings " + r.status);
@@ -4568,10 +4599,6 @@ function loadAdminModelRoles() {
     }),
     authFetch("/v1/api/admin/settings/schema").then(function (r) {
       if (!r.ok) throw new Error("schema " + r.status);
-      return r.json();
-    }),
-    authFetch("/v1/api/admin/model-definitions").then(function (r) {
-      if (!r.ok) throw new Error("models " + r.status);
       return r.json();
     }),
   ])
@@ -4582,8 +4609,6 @@ function loadAdminModelRoles() {
       var schema = {};
       var sa = results[1].schema || [];
       for (var j = 0; j < sa.length; j++) schema[sa[j].key] = sa[j];
-      _modelDefs = results[2].models || _modelDefs;
-      _modelDefaultAlias = results[2].default_alias || _modelDefaultAlias;
       _renderModelRoles(c, values, schema);
     })
     .catch(function () {
