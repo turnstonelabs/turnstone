@@ -949,6 +949,137 @@ def test_list_nodes_empty_on_no_matching_filters(storage_with_nodes):
     assert result["truncated"] is False
 
 
+def test_list_nodes_surfaces_healthy_model_aliases(tmp_path):
+    """The node's heartbeat loop projects its registry into a ``models``
+    metadata entry shaped like ``[{alias, provider, healthy}, ...]``.
+    ``list_nodes`` flattens that to the healthy-alias list at the top
+    level (under ``model_aliases``) so a coordinator can pass aliases
+    straight to ``spawn_workstream(model=)`` without having to
+    introspect the metadata blob.  The provider-side model identifier
+    (``cfg.model``) is intentionally NOT in the payload — coords kept
+    reaching for it when they should pass the local alias."""
+    st = SQLiteBackend(str(tmp_path / "nodes.db"))
+    _set_meta(
+        st,
+        "node-x",
+        [
+            ("arch", "x86_64", "auto"),
+            (
+                "models",
+                [
+                    {"alias": "gpt5", "provider": "openai", "healthy": True},
+                    {"alias": "claude-opus-47", "provider": "anthropic", "healthy": True},
+                    {"alias": "broken", "provider": "openai", "healthy": False},
+                ],
+                "auto",
+            ),
+        ],
+    )
+    _register_service(st, "node-x")
+    client = _make_read_client(st)
+    result = client.list_nodes()
+    node = result["nodes"][0]
+    assert node["model_aliases"] == ["gpt5", "claude-opus-47"]
+    # Full per-alias info still available under metadata for callers
+    # that want provider / healthy detail (e.g. surfacing degraded
+    # aliases in a UI).
+    full = node["metadata"]["models"]["value"]
+    assert {row["alias"] for row in full} == {"gpt5", "claude-opus-47", "broken"}
+    # ``model`` (the provider-side identifier) is intentionally absent
+    # — keep the payload to the three values a coord actually uses.
+    for row in full:
+        assert "model" not in row
+
+
+def test_list_nodes_model_aliases_distinct_from_metadata_models(tmp_path):
+    """Pin the naming distinction explicitly: the top-level shortlist
+    (``model_aliases``, list of strings) and the rich metadata blob
+    (``metadata.models.value``, list of dicts) live under different
+    keys so a caller that confuses them gets a clear KeyError rather
+    than a silent shape mismatch."""
+    st = SQLiteBackend(str(tmp_path / "nodes.db"))
+    _set_meta(
+        st,
+        "node-x",
+        [
+            (
+                "models",
+                [{"alias": "a", "provider": "openai", "healthy": True}],
+                "auto",
+            ),
+        ],
+    )
+    _register_service(st, "node-x")
+    client = _make_read_client(st)
+    node = client.list_nodes()["nodes"][0]
+    # No top-level ``models`` field — only ``model_aliases``.
+    assert "models" not in node
+    assert node["model_aliases"] == ["a"]
+    # Rich shape stays under metadata.
+    assert isinstance(node["metadata"]["models"]["value"], list)
+    assert isinstance(node["metadata"]["models"]["value"][0], dict)
+
+
+def test_list_nodes_model_aliases_empty_when_node_has_not_published(tmp_path):
+    """Nodes from older builds — or a node mid-startup before its first
+    metadata write — won't have a ``models`` entry.  The top-level
+    ``model_aliases`` field defaults to ``[]`` rather than being
+    omitted so coordinators can rely on the key being present."""
+    st = SQLiteBackend(str(tmp_path / "nodes.db"))
+    _set_meta(st, "node-y", [("arch", "x86_64", "auto")])
+    _register_service(st, "node-y")
+    client = _make_read_client(st)
+    result = client.list_nodes()
+    assert result["nodes"][0]["model_aliases"] == []
+
+
+def test_list_nodes_models_tolerates_malformed_entries(tmp_path):
+    """If a node ever stores a malformed ``models`` entry (wrong outer
+    type, missing alias, non-bool healthy), the projection drops the
+    bad rows rather than raising — the rest of the response should
+    still be useful."""
+    st = SQLiteBackend(str(tmp_path / "nodes.db"))
+    _set_meta(
+        st,
+        "node-z",
+        [
+            (
+                "models",
+                [
+                    {"alias": "ok", "provider": "p", "healthy": True},
+                    "not-a-dict",
+                    {"provider": "p", "healthy": True},  # missing alias
+                    {"alias": "", "healthy": True},  # empty alias
+                    {"alias": "degraded", "healthy": False},
+                    {"alias": 42, "healthy": True},  # non-string alias
+                ],
+                "auto",
+            ),
+        ],
+    )
+    _register_service(st, "node-z")
+    client = _make_read_client(st)
+    result = client.list_nodes()
+    assert result["nodes"][0]["model_aliases"] == ["ok"]
+
+
+def test_list_nodes_models_handles_non_list_payload(tmp_path):
+    """A node with a corrupted models entry (dict, scalar, null) shouldn't
+    blow up the whole list_nodes call.  ``model_aliases`` falls back to ``[]``."""
+    st = SQLiteBackend(str(tmp_path / "nodes.db"))
+    _set_meta(
+        st,
+        "node-w",
+        [
+            ("models", {"oops": "not a list"}, "auto"),
+        ],
+    )
+    _register_service(st, "node-w")
+    client = _make_read_client(st)
+    result = client.list_nodes()
+    assert result["nodes"][0]["model_aliases"] == []
+
+
 # ---------------------------------------------------------------------------
 # list_skills
 # ---------------------------------------------------------------------------

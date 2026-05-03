@@ -1081,7 +1081,38 @@ class CoordinatorClient:
                     "value": decoded,
                     "source": str(r.get("source", "")),
                 }
-            nodes.append({"node_id": nid, "metadata": meta})
+            # Project ``metadata.models`` (a list of
+            # ``{alias, provider, healthy}`` written by the node's
+            # heartbeat loop — see ``_collect_node_models_metadata``
+            # in ``turnstone/server.py``) down to the healthy-alias
+            # shortlist the coordinator passes back as ``model=`` to
+            # ``spawn_workstream`` / ``spawn_batch``.  The top-level
+            # field is named ``model_aliases`` (not ``models``) so it
+            # doesn't collide with ``metadata.models`` — the two
+            # carry different shapes (list of strings vs list of
+            # dicts) and a coord that conflates them gets a runtime
+            # error.  Empty list when the node hasn't published a
+            # models entry yet — older nodes without the heartbeat-
+            # side projection, or a brand new node mid-startup before
+            # the first metadata write.
+            models_entry = meta.get("models", {}).get("value")
+            healthy_aliases: list[str] = []
+            if isinstance(models_entry, list):
+                for row in models_entry:
+                    if not isinstance(row, dict):
+                        continue
+                    if not row.get("healthy", False):
+                        continue
+                    alias = row.get("alias")
+                    if isinstance(alias, str) and alias:
+                        healthy_aliases.append(alias)
+            nodes.append(
+                {
+                    "node_id": nid,
+                    "metadata": meta,
+                    "model_aliases": healthy_aliases,
+                }
+            )
         return {"nodes": nodes, "truncated": truncated}
 
     def list_skills(
