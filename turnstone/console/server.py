@@ -6993,6 +6993,10 @@ def _emit_models_changed(request: Request) -> None:
 _MODEL_AFFECTING_SETTING_KEYS: frozenset[str] = frozenset(
     {
         "model.default_alias",
+        "model.plan_alias",
+        "model.plan_effort",
+        "model.task_alias",
+        "model.task_effort",
         "coordinator.model_alias",
         "coordinator.reasoning_effort",
         "judge.model",

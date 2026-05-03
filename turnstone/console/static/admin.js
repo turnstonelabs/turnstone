@@ -2626,18 +2626,21 @@ function loadSettings() {
       }
 
       // Merge values + schema.  Skip role-assignment settings owned by
-      // the Models tab (judge.* live on the Judge tab; coordinator
-      // model+effort lifted into Models → Roles).
+      // the Models → Roles sub-tab (judge.* settings still live on the
+      // Judge tab; the four model-tab roles render only there).
       var merged = {};
+      var roleKeys = {
+        "coordinator.model_alias": 1,
+        "coordinator.reasoning_effort": 1,
+        "model.plan_alias": 1,
+        "model.plan_effort": 1,
+        "model.task_alias": 1,
+        "model.task_effort": 1,
+      };
       for (var j = 0; j < valuesArr.length; j++) {
         var v = valuesArr[j];
         if (v.key.startsWith("judge.")) continue;
-        if (
-          v.key === "coordinator.model_alias" ||
-          v.key === "coordinator.reasoning_effort"
-        ) {
-          continue;
-        }
+        if (roleKeys[v.key]) continue;
         var s = schemaMap[v.key] || {};
         merged[v.key] = {
           key: v.key,
@@ -4467,6 +4470,20 @@ var MODEL_ROLES = [
     description:
       "Intent-validation judge that scores tool calls before approval.",
     aliasKey: "judge.model",
+  },
+  {
+    label: "Plan agent",
+    description:
+      "plan_agent sub-agent — produces high-level plans before task dispatch.",
+    aliasKey: "model.plan_alias",
+    effortKey: "model.plan_effort",
+  },
+  {
+    label: "Task agent",
+    description:
+      "task_agent sub-agent — runs autonomous subtasks dispatched by the parent.",
+    aliasKey: "model.task_alias",
+    effortKey: "model.task_effort",
   },
 ];
 
