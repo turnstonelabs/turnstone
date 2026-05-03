@@ -89,6 +89,14 @@ class TestSuggestProfile:
         p = suggest_profile("vllm", "Google/GEMMA-4-31B-IT")
         assert p["capabilities"]["thinking_mode"] == "manual"
 
+    def test_vllm_mistral_medium_responses_surface(self) -> None:
+        """Mistral medium open-weights on vLLM is routed through the Responses API."""
+        p = suggest_profile("vllm", "mistralai/Mistral-Medium-3-Instruct")
+        assert p["server_compat"]["server_type"] == "vllm"
+        assert p["server_compat"]["api_surface"] == "responses"
+        # No chat_template thinking_param — Responses handles reasoning natively.
+        assert "capabilities" not in p
+
     def test_holo_requires_holo2(self) -> None:
         """Short 'holo' prefix shouldn't false-match; 'holo2' should match."""
         p_short = suggest_profile("vllm", "some-org/hologram-7b")
@@ -110,32 +118,47 @@ class TestSuggestProfile:
 
 
 class TestMergeServerCompat:
-    def test_empty_compat_returns_base_only(self) -> None:
+    def test_empty_base_and_compat_is_empty(self) -> None:
+        """No base, no compat → no extra_body needed."""
+        assert merge_server_compat(None, {}) == {}
+        assert merge_server_compat({}, {}) == {}
+
+    def test_explicit_base_passes_through(self) -> None:
+        """Explicit chat_template_kwargs base is forwarded as-is."""
         base = {"reasoning_effort": "medium"}
         result = merge_server_compat(base, {})
         assert result == {"chat_template_kwargs": {"reasoning_effort": "medium"}}
 
-    def test_extra_body_merged_top_level(self) -> None:
-        base = {"reasoning_effort": "medium"}
-        compat = {"extra_body": {"skip_special_tokens": False}}
-        result = merge_server_compat(base, compat)
-        assert result["skip_special_tokens"] is False
-        assert "chat_template_kwargs" in result
+    def test_extra_body_merged_top_level_no_base(self) -> None:
+        """Server-level overrides forward without a chat_template_kwargs wrapper."""
+        result = merge_server_compat(None, {"extra_body": {"skip_special_tokens": False}})
+        assert result == {"skip_special_tokens": False}
 
-    def test_full_vllm_gemma_compat(self) -> None:
-        base = {"reasoning_effort": "medium"}
+    def test_full_vllm_gemma_compat_no_base(self) -> None:
+        """vLLM workaround forwards on its own."""
         compat = {
             "server_type": "vllm",
             "extra_body": {"skip_special_tokens": False},
         }
-        result = merge_server_compat(base, compat)
+        result = merge_server_compat(None, compat)
+        assert result == {"skip_special_tokens": False}
+
+    def test_operator_chat_template_kwargs_only(self) -> None:
+        """Operator can set chat_template_kwargs explicitly without seeding the base."""
+        compat = {
+            "extra_body": {
+                "chat_template_kwargs": {"reasoning_effort": "high"},
+                "skip_special_tokens": False,
+            },
+        }
+        result = merge_server_compat(None, compat)
         assert result == {
-            "chat_template_kwargs": {"reasoning_effort": "medium"},
+            "chat_template_kwargs": {"reasoning_effort": "high"},
             "skip_special_tokens": False,
         }
 
-    def test_extra_body_chat_template_kwargs_deep_merged(self) -> None:
-        """chat_template_kwargs in extra_body is deep-merged, operator wins."""
+    def test_extra_body_chat_template_kwargs_deep_merged_with_base(self) -> None:
+        """Operator chat_template_kwargs deep-merges over the seeded base."""
         base = {"reasoning_effort": "medium"}
         compat = {
             "extra_body": {
@@ -144,17 +167,15 @@ class TestMergeServerCompat:
             },
         }
         result = merge_server_compat(base, compat)
-        # Operator values win over base
         assert result["chat_template_kwargs"]["custom_flag"] is True
+        # Operator value wins over seeded base
         assert result["chat_template_kwargs"]["reasoning_effort"] == "high"
         assert result["skip_special_tokens"] is False
 
     def test_extra_body_chat_template_kwargs_non_dict_ignored(self) -> None:
         """Non-dict chat_template_kwargs in extra_body is safely ignored."""
-        base = {"reasoning_effort": "medium"}
         compat = {"extra_body": {"chat_template_kwargs": "bad"}}
-        result = merge_server_compat(base, compat)
-        assert result["chat_template_kwargs"] == {"reasoning_effort": "medium"}
+        assert merge_server_compat(None, compat) == {}
 
     def test_base_not_mutated(self) -> None:
         base = {"reasoning_effort": "medium"}
@@ -164,9 +185,7 @@ class TestMergeServerCompat:
 
     def test_non_dict_extra_body_ignored(self) -> None:
         """Gracefully handle malformed server_compat."""
-        base = {"reasoning_effort": "medium"}
-        result = merge_server_compat(base, {"extra_body": 42})
-        assert result == {"chat_template_kwargs": {"reasoning_effort": "medium"}}
+        assert merge_server_compat(None, {"extra_body": 42}) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -178,45 +197,58 @@ class TestEndToEndRequestShaping:
     """Compose both layers — session builds extra_params, provider applies thinking."""
 
     def test_vllm_gemma_full_flow(self) -> None:
-        """Session merges server workarounds, provider adds thinking param."""
+        """Session forwards server workarounds, provider adds thinking param."""
         caps = ModelCapabilities(thinking_mode="manual", thinking_param="enable_thinking")
-        base_ctk = {"reasoning_effort": "medium"}
         server_compat = {
             "server_type": "vllm",
             "extra_body": {"skip_special_tokens": False},
         }
-        # Step 1: session merges
-        extra_params = merge_server_compat(base_ctk, server_compat)
-        # Step 2: provider finalises
+        # Step 1: session forwards (no auto-injection of reasoning_effort).
+        extra_params = merge_server_compat(None, server_compat)
+        # Step 2: provider injects thinking param into chat_template_kwargs.
         extra_body = dict(extra_params)
         OpenAIChatCompletionsProvider._apply_thinking_mode(extra_body, caps)
 
         assert extra_body == {
-            "chat_template_kwargs": {
-                "reasoning_effort": "medium",
-                "enable_thinking": True,
-            },
+            "chat_template_kwargs": {"enable_thinking": True},
             "skip_special_tokens": False,
         }
 
     def test_granite_thinking_key(self) -> None:
         """Granite uses 'thinking' instead of 'enable_thinking'."""
         caps = ModelCapabilities(thinking_mode="manual", thinking_param="thinking")
-        extra_params = merge_server_compat({"reasoning_effort": "low"}, {})
+        extra_params = merge_server_compat(None, {})
         extra_body = dict(extra_params)
         OpenAIChatCompletionsProvider._apply_thinking_mode(extra_body, caps)
 
-        assert extra_body["chat_template_kwargs"]["thinking"] is True
-        assert "enable_thinking" not in extra_body["chat_template_kwargs"]
+        assert extra_body == {"chat_template_kwargs": {"thinking": True}}
 
     def test_non_thinking_model_no_injection(self) -> None:
-        """Non-thinking model gets no thinking params."""
+        """Non-thinking model gets no chat_template_kwargs at all."""
         caps = ModelCapabilities()  # thinking_mode="none"
-        extra_params = merge_server_compat({"reasoning_effort": "medium"}, {})
+        extra_params = merge_server_compat(None, {})
         extra_body = dict(extra_params)
         OpenAIChatCompletionsProvider._apply_thinking_mode(extra_body, caps)
 
-        assert extra_body == {"chat_template_kwargs": {"reasoning_effort": "medium"}}
+        assert extra_body == {}
+
+    def test_operator_reasoning_effort_passthrough(self) -> None:
+        """Operator-supplied reasoning_effort under chat_template_kwargs is preserved."""
+        caps = ModelCapabilities(thinking_mode="manual", thinking_param="enable_thinking")
+        compat = {
+            "server_type": "vllm",
+            "extra_body": {"chat_template_kwargs": {"reasoning_effort": "high"}},
+        }
+        extra_params = merge_server_compat(None, compat)
+        extra_body = dict(extra_params)
+        OpenAIChatCompletionsProvider._apply_thinking_mode(extra_body, caps)
+
+        assert extra_body == {
+            "chat_template_kwargs": {
+                "reasoning_effort": "high",
+                "enable_thinking": True,
+            },
+        }
 
 
 # ---------------------------------------------------------------------------

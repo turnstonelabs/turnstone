@@ -1383,6 +1383,34 @@ class TestProviderFactory:
         p2 = create_provider("openai")
         assert p1 is p2
 
+    def test_create_provider_compat_responses_surface(self) -> None:
+        """openai-compatible + api_surface=responses returns the Responses provider."""
+        from turnstone.core.providers import OpenAIResponsesProvider, create_provider
+
+        provider = create_provider("openai-compatible", api_surface="responses")
+        assert isinstance(provider, OpenAIResponsesProvider)
+
+    def test_create_provider_compat_chat_surface_default(self) -> None:
+        """openai-compatible defaults to Chat Completions."""
+        from turnstone.core.providers import create_provider
+
+        for surface in (None, "", "chat"):
+            provider = create_provider("openai-compatible", api_surface=surface)
+            assert isinstance(provider, OpenAIChatCompletionsProvider)
+
+    def test_create_provider_invalid_api_surface(self) -> None:
+        from turnstone.core.providers import create_provider
+
+        with pytest.raises(ValueError, match="Unknown api_surface"):
+            create_provider("openai-compatible", api_surface="bogus")
+
+    def test_create_provider_openai_ignores_api_surface(self) -> None:
+        """Cloud OpenAI is always Responses regardless of api_surface."""
+        from turnstone.core.providers import OpenAIResponsesProvider, create_provider
+
+        provider = create_provider("openai", api_surface="chat")
+        assert isinstance(provider, OpenAIResponsesProvider)
+
     # -- Google provider -------------------------------------------------------
 
     def test_create_provider_google(self) -> None:

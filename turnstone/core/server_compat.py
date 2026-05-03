@@ -1,14 +1,20 @@
 """Server compatibility profiles for OpenAI-compatible backends.
 
 Different local model servers (vLLM, llama.cpp, SGLang) need different
-request shaping.  This module separates two concerns:
+request shaping.  This module separates three concerns:
 
 1. **Model capabilities** — ``thinking_mode`` and ``thinking_param`` are
    properties of the *model* (Gemma thinks, Llama doesn't).  These go
    into the ``capabilities`` dict and flow through ``ModelCapabilities``
    so the provider can act on them (just like Anthropic's thinking mode).
 
-2. **Server workarounds** — ``extra_body`` overrides like
+2. **API surface** — ``api_surface`` selects which OpenAI-compatible
+   API surface the provider talks to: ``"chat"`` (Chat Completions,
+   the default) or ``"responses"`` (Responses API, native reasoning).
+   Stored under ``server_compat`` because it's an endpoint property,
+   not a model property.
+
+3. **Server workarounds** — ``extra_body`` overrides like
    ``skip_special_tokens=false`` are properties of the *server* (vLLM
    bug workaround).  These stay in ``server_compat`` and get merged
    into the request's ``extra_body`` at call time.
@@ -82,6 +88,17 @@ _PROFILES: dict[str, dict[str, Any]] = {
             "server_type": "vllm",
         },
     },
+    "vllm-mistral-medium": {
+        # Mistral medium open-weights served by vLLM exposes reasoning via the
+        # Responses API (``reasoning.effort``) rather than the Chat Completions
+        # ``chat_template_kwargs`` path, so route this profile at the Responses
+        # surface.  Reasoning effort is selected per-request like any other
+        # Responses-API model.
+        "server_compat": {
+            "server_type": "vllm",
+            "api_surface": "responses",
+        },
+    },
     "vllm": {
         "server_compat": {
             "server_type": "vllm",
@@ -125,6 +142,8 @@ _VLLM_MODEL_PROFILES: list[tuple[str, str]] = [
     ("granite3", "vllm-granite-thinking"),
     ("deepseek-r1", "vllm-deepseek-thinking"),
     ("holo2", "vllm-holo-thinking"),
+    ("mistral-medium", "vllm-mistral-medium"),
+    ("mistralai/mistral-medium", "vllm-mistral-medium"),
 ]
 
 # llama.cpp model-family → profile key mapping.
@@ -175,31 +194,39 @@ def suggest_profile(server_type: str, model_id: str) -> dict[str, Any]:
 
 
 def merge_server_compat(
-    base_chat_template_kwargs: dict[str, Any],
+    base_chat_template_kwargs: dict[str, Any] | None,
     server_compat: dict[str, Any],
 ) -> dict[str, Any]:
     """Build the ``extra_body`` dict by merging server compat into base kwargs.
 
-    *base_chat_template_kwargs* always contains at least ``reasoning_effort``.
-    *server_compat* comes from ``ModelConfig.server_compat``.
+    *base_chat_template_kwargs* is an explicit ``chat_template_kwargs`` dict
+    to seed the request with, or ``None``/empty to skip seeding.  Operator-
+    supplied entries in ``server_compat["extra_body"]["chat_template_kwargs"]``
+    are deep-merged on top.  Top-level ``extra_body`` keys (``skip_special_tokens``,
+    ``reasoning_format``, etc.) are forwarded as-is.
 
     Note: thinking-mode params (``enable_thinking``, ``thinking``) are **not**
     merged here — the provider handles those via ``ModelCapabilities``.
-    This function only merges server workarounds from ``extra_body``.
+    This function only merges what the operator stored in ``server_compat``.
 
     Returns the complete dict to pass as ``extra_body`` to the OpenAI client.
+    May be empty when there is nothing to send.
     """
-    extra: dict[str, Any] = {"chat_template_kwargs": dict(base_chat_template_kwargs)}
+    extra: dict[str, Any] = {}
+    if base_chat_template_kwargs:
+        extra["chat_template_kwargs"] = dict(base_chat_template_kwargs)
 
     # Merge top-level extra_body overrides (skip_special_tokens, etc.)
     compat_eb = server_compat.get("extra_body")
     if isinstance(compat_eb, dict):
         for key, value in compat_eb.items():
             if key == "chat_template_kwargs":
-                # Deep-merge: operator values in extra_body win over the
-                # base dict (which has reasoning_effort).  This lets
-                # operators intentionally extend chat_template_kwargs.
+                # Deep-merge with operator values winning so an operator
+                # can intentionally extend chat_template_kwargs (e.g. set
+                # ``reasoning_effort`` for gpt-oss-style local templates).
                 if isinstance(value, dict):
+                    if "chat_template_kwargs" not in extra:
+                        extra["chat_template_kwargs"] = {}
                     extra["chat_template_kwargs"].update(value)
                 continue
             extra[key] = value

@@ -5001,6 +5001,7 @@ function showCreateModelModal() {
   document.getElementById("model-max-tokens").value = "";
   document.getElementById("model-reasoning-effort").value = "";
   document.getElementById("model-server-type").value = "";
+  document.getElementById("model-api-surface").value = "";
   document.getElementById("model-thinking-mode").value = "";
   document.getElementById("model-thinking-param").value = "";
   document.getElementById("model-thinking-param-row").style.display = "none";
@@ -5077,8 +5078,9 @@ function showEditModelModal(definitionId) {
         document.getElementById("model-thinking-param").value = "";
       }
       _toggleThinkingParam();
-      // Server compat: server_type and extra_body workarounds
+      // Server compat: server_type, api_surface, and extra_body workarounds
       document.getElementById("model-server-type").value = sc.server_type || "";
+      document.getElementById("model-api-surface").value = sc.api_surface || "";
       var eb = sc.extra_body || {};
       var ebText = JSON.stringify(eb, null, 2);
       document.getElementById("model-extra-body").value =
@@ -5164,6 +5166,8 @@ function submitCreateModel() {
   var serverCompat = {};
   var serverType = document.getElementById("model-server-type").value;
   if (serverType) serverCompat.server_type = serverType;
+  var apiSurface = document.getElementById("model-api-surface").value;
+  if (apiSurface) serverCompat.api_surface = apiSurface;
   var ebEl = document.getElementById("model-extra-body");
   var ebText = ebEl.value.trim();
   ebEl.removeAttribute("aria-invalid");
@@ -5410,6 +5414,13 @@ function detectModel() {
           stOpts2.indexOf(ssc.server_type) !== -1
         )
           stEl2.value = ssc.server_type;
+        // Restrict to the known set so a hostile detect response can't
+        // smuggle a non-listed value into the form.
+        var _SURFACE_SUGGESTABLE = { chat: 1, responses: 1 };
+        if (ssc.api_surface && _SURFACE_SUGGESTABLE[ssc.api_surface]) {
+          var asEl = document.getElementById("model-api-surface");
+          if (!asEl.value) asEl.value = ssc.api_surface;
+        }
         if (ssc.extra_body) {
           var ebEl2 = document.getElementById("model-extra-body");
           if (!ebEl2.value.trim()) {
