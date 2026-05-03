@@ -333,6 +333,42 @@ class TestCompositionCandidateSelection:
         # ``wanted`` reached BM25 via the union and matched "host" → injected.
         assert "host_config_v2" in joined
 
+    def test_recency_tail_preserved_when_search_adds_distinct_hits(self, tmp_db):
+        """SUPERSET invariant: every recency item is in the candidate pool
+        when search adds hits, even if the resulting union exceeds
+        fetch_limit.  Truncating the union at fetch_limit (the prior
+        behavior) evicted the recency tail — which is exactly where
+        ancient-but-recently-touched memories live, the recall this PR
+        sets out to improve.
+        """
+        session = _make_session(fetch_limit=10, relevance_k=3)
+        session.messages = [{"role": "user", "content": "alpha"}]
+
+        # 5 search hits, none of which appear in recency.
+        search_hits = [
+            _make_mem(f"search_{i}", content="alpha", memory_id=f"ms{i}") for i in range(5)
+        ]
+        # 10 recency items; without the union uncap, the 5 oldest of these
+        # would be displaced by the 5 search hits.
+        recency = [_make_mem(f"recency_{i}", memory_id=f"mr{i}") for i in range(10)]
+
+        with (
+            patch.object(session, "_search_visible_memories", return_value=search_hits),
+            patch.object(session, "_list_visible_memories", return_value=recency),
+        ):
+            candidates, source = session._select_memory_candidates("alpha")
+
+        candidate_ids = {c["memory_id"] for c in candidates}
+        # Pool is search_hits ∪ recency — 15 items, no truncation.
+        assert len(candidates) == 15
+        assert source == "union"
+        # Every recency item present (no tail eviction).
+        for i in range(10):
+            assert f"mr{i}" in candidate_ids, f"recency item {i} evicted"
+        # And every search hit is also in the pool.
+        for i in range(5):
+            assert f"ms{i}" in candidate_ids, f"search hit {i} missing"
+
     def test_coord_scope_isolated_visibility(self, tmp_db):
         """Coord composition queries the coord scope alone, never the
         global/workstream/user union."""

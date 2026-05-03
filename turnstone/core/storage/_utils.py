@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import json
+import re
 from typing import Any
 
 from turnstone.core.attachments import unreadable_placeholder
@@ -59,12 +60,18 @@ def _attachment_to_content_part(att: dict[str, Any]) -> dict[str, Any] | None:
 _MAX_SEARCH_TERMS = 16
 _MIN_TERM_LEN = 2
 
+# Streaming tokenizer — finditer doesn't allocate a full list up front,
+# so a multi-KB pasted query stops being scanned the moment the cap is
+# hit instead of after splitting every token.
+_TOKEN_RE = re.compile(r"\S+")
+
 
 def normalize_search_terms(query: str) -> list[str]:
     """De-dupe (case-insensitive), drop short tokens, and cap at MAX terms."""
     seen: set[str] = set()
     terms: list[str] = []
-    for raw in query.split():
+    for match in _TOKEN_RE.finditer(query):
+        raw = match.group()
         lowered = raw.lower()
         if len(lowered) < _MIN_TERM_LEN or lowered in seen:
             continue

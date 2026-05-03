@@ -94,6 +94,7 @@ from turnstone.core.providers import create_provider
 from turnstone.core.safety import is_command_blocked, sanitize_command
 from turnstone.core.sandbox import execute_math_sandboxed
 from turnstone.core.storage._registry import get_storage
+from turnstone.core.storage._utils import normalize_search_terms
 from turnstone.core.tool_advisory import escape_wrapper_tags, render_system_reminder
 from turnstone.core.tool_search import ToolSearchManager
 from turnstone.core.tools import (
@@ -5482,19 +5483,24 @@ class ChatSession:
         """Pick the candidate set fed into BM25 ranking.
 
         Returns ``(memories, source_label)`` where source is one of:
-        ``recency`` (no context), ``search`` (search alone filled the
-        candidate pool), or ``union`` (search hits + recency fillers,
-        deduped by memory_id).
+        ``recency`` (no context, or search returned nothing),
+        ``search`` (search saturated the fetch_limit budget alone), or
+        ``union`` (search hits ∪ recency, deduped by memory_id).
 
         Invariant: the candidate pool is always a SUPERSET of the
-        recency-only pool the original bug used — recency is unioned
-        whenever search leaves room in the ``fetch_limit`` budget.
-        Guarantees BM25 input never shrinks vs. the prior behavior, so
-        a noisy query that fails to surface a relevant old memory via
-        search still has the recency-50 to fall back on.  BM25's
-        score>0 cutoff (bm25.py) ignores recency fillers that don't
-        match the query — adding them costs nothing on irrelevant
-        candidates and saves the relevant ones.
+        recency-only pool the original bug used — recency is fully
+        preserved (not truncated) whenever it gets unioned.  Worst
+        case the union is 2 × fetch_limit candidates (~100 with
+        defaults), which BM25 ranks in pure Python in well under a
+        millisecond.  BM25's score>0 cutoff in bm25.py drops anything
+        that doesn't match the query, so unranked recency tail items
+        cost nothing on irrelevant candidates while saving the
+        relevant ones.
+
+        Capping the union at fetch_limit (the prior behavior) would
+        evict the recency tail when search added distinct hits — and
+        the recency tail is exactly where ancient-but-recently-touched
+        memories live, which is the recall the PR sets out to improve.
         """
         fetch_limit = self._mem_cfg.fetch_limit
         if not context:
@@ -5506,8 +5512,8 @@ class ChatSession:
         seen = {m["memory_id"] for m in search_hits}
         extra = [m for m in recency if m["memory_id"] not in seen]
         if not search_hits:
-            return extra[:fetch_limit], "recency"
-        return (search_hits + extra)[:fetch_limit], ("union" if extra else "search")
+            return extra, "recency"
+        return search_hits + extra, ("union" if extra else "search")
 
     def _check_metacognitive_nudge(self, user_message: str) -> tuple[str, str] | None:
         """Check if a metacognitive nudge should fire for *user_message*.
@@ -8568,7 +8574,7 @@ class ChatSession:
                     )
                 log.info(
                     "memory.search",
-                    term_count=len(item["query"].split()),
+                    term_count=len(normalize_search_terms(item["query"])),
                     result_count=len(rows),
                     query=item["query"][:120],
                 )
