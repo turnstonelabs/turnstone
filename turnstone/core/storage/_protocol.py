@@ -386,6 +386,34 @@ class StorageBackend(Protocol):
         """Search structured memories by query. Returns matching memory dicts."""
         ...
 
+    def list_visible_structured_memories(
+        self,
+        scopes: list[tuple[str, str]],
+        mem_type: str = "",
+        limit: int = 100,
+    ) -> list[dict[str, str]]:
+        """List memories matching ANY of the (scope, scope_id) pairs in *scopes*.
+
+        A pair with an empty ``scope_id`` matches the scope alone (used for
+        ``("global", "")``).  Single SQL query — replaces the per-scope fan-out
+        pattern that issued one query per visible scope.
+        """
+        ...
+
+    def search_visible_structured_memories(
+        self,
+        query: str,
+        scopes: list[tuple[str, str]],
+        mem_type: str = "",
+        limit: int = 20,
+    ) -> list[dict[str, str]]:
+        """OR-of-terms search across memories visible under *scopes*.
+
+        Single SQL query joining the scope OR-group with the term OR-group.
+        Ranking is the caller's job (BM25 downstream).
+        """
+        ...
+
     def touch_structured_memories(self, keys: list[tuple[str, str, str]]) -> int:
         """Batch-touch multiple memories.
 
