@@ -87,33 +87,16 @@
       <div id="view-home">
         <!-- Persistent "start a new coordinator task" composer.  Visibility is
          gated on the admin.coordinator permission (same rule the existing
-         +coordinator header button + modal use).  Shows a remediation
-         banner when the create endpoint would return 503 (no coordinator
-         model alias resolves). -->
+         +coordinator header button + modal use).  Submission errors surface
+         inline via #home-coord-error; the create endpoint falls back to
+         the registry default model when ``coordinator.model_alias`` is
+         unset, so no proactive readiness probe is needed. -->
         <section
           id="coord-composer-panel"
           class="home-panel"
           style="display: none"
           aria-label="Start a new orchestration task"
         >
-          <div
-            id="coord-composer-503"
-            class="home-composer-banner"
-            role="status"
-            style="display: none"
-          >
-            Coordinator subsystem not configured —
-            <a
-              href="#"
-              onclick="
-                showAdmin();
-                switchAdminTab('models');
-                return false;
-              "
-              >open Admin → Models</a
-            >
-            to set <code>coordinator.model_alias</code> or a registry default.
-          </div>
           <!-- Composer DOM is built by shared_static/composer.js into this
            mount — stacked layout (textarea above, options toggle +
            Start button below) with Name + Skill in an Options
@@ -882,13 +865,13 @@
 
               <!-- Sub-panel switcher -->
               <div
-                class="judge-section-switcher"
+                class="admin-subtab-switcher"
                 role="tablist"
                 aria-label="Judge sections"
               >
                 <button
                   id="judge-tab-settings"
-                  class="judge-section-btn active"
+                  class="admin-subtab-btn active"
                   role="tab"
                   aria-selected="true"
                   aria-controls="judge-settings-section"
@@ -900,7 +883,7 @@
                 </button>
                 <button
                   id="judge-tab-heuristic"
-                  class="judge-section-btn"
+                  class="admin-subtab-btn"
                   role="tab"
                   aria-selected="false"
                   aria-controls="judge-heuristic-section"
@@ -912,7 +895,7 @@
                 </button>
                 <button
                   id="judge-tab-output-guard"
-                  class="judge-section-btn"
+                  class="admin-subtab-btn"
                   role="tab"
                   aria-selected="false"
                   aria-controls="judge-output-guard-section"
@@ -1795,37 +1778,106 @@
               style="display: none"
             >
               <div class="admin-toolbar">
-                <span class="section-header">Models</span>
-                <button
-                  id="model-sync-btn"
-                  class="admin-action-btn admin-action-btn-ghost"
-                  onclick="reloadModelNodes()"
-                  title="Push model config to all cluster nodes"
-                >
-                  Sync to Nodes
-                </button>
-                <button
-                  class="admin-action-btn"
-                  onclick="showCreateModelModal()"
-                >
-                  + Add Model
-                </button>
+                <span class="section-header" style="margin: 0">MODELS</span>
               </div>
-              <div class="admin-colheaders models-grid" aria-hidden="true">
-                <span class="admin-col">ALIAS</span>
-                <span class="admin-col">MODEL</span>
-                <span class="admin-col">PROVIDER</span>
-                <span class="admin-col">CTX WINDOW</span>
-                <span class="admin-col">STATUS</span>
-                <span class="admin-col">ACTIONS</span>
-              </div>
+
+              <!-- Sub-panel switcher -->
               <div
-                id="admin-models-table"
-                role="list"
-                aria-label="Model definitions"
-                aria-live="polite"
+                class="admin-subtab-switcher"
+                role="tablist"
+                aria-label="Models sections"
               >
-                <div class="dashboard-empty">Loading...</div>
+                <button
+                  id="models-tab-list"
+                  class="admin-subtab-btn active"
+                  role="tab"
+                  aria-selected="true"
+                  aria-controls="models-list-section"
+                  tabindex="0"
+                  data-section="models-list"
+                  onclick="switchModelsSection('models-list')"
+                >
+                  Definitions
+                </button>
+                <button
+                  id="models-tab-roles"
+                  class="admin-subtab-btn"
+                  role="tab"
+                  aria-selected="false"
+                  aria-controls="models-roles-section"
+                  tabindex="-1"
+                  data-section="models-roles"
+                  onclick="switchModelsSection('models-roles')"
+                >
+                  Roles
+                </button>
+              </div>
+
+              <!-- Models list section -->
+              <div
+                id="models-list-section"
+                class="models-section"
+                role="tabpanel"
+                aria-labelledby="models-tab-list"
+              >
+                <div class="admin-toolbar" style="margin-bottom: 12px">
+                  <span style="font-size: 13px; color: var(--fg-dim)"
+                    >Model definitions used by sessions across the cluster</span
+                  >
+                  <button
+                    id="model-sync-btn"
+                    class="admin-action-btn admin-action-btn-ghost"
+                    onclick="reloadModelNodes()"
+                    title="Push model config to all cluster nodes"
+                  >
+                    Sync to Nodes
+                  </button>
+                  <button
+                    class="admin-action-btn"
+                    onclick="showCreateModelModal()"
+                  >
+                    + Add Model
+                  </button>
+                </div>
+                <div class="admin-colheaders models-grid" aria-hidden="true">
+                  <span class="admin-col">ALIAS</span>
+                  <span class="admin-col">MODEL</span>
+                  <span class="admin-col">PROVIDER</span>
+                  <span class="admin-col">CTX WINDOW</span>
+                  <span class="admin-col">STATUS</span>
+                  <span class="admin-col">ACTIONS</span>
+                </div>
+                <div
+                  id="admin-models-table"
+                  role="list"
+                  aria-label="Model definitions"
+                  aria-live="polite"
+                >
+                  <div class="dashboard-empty">Loading...</div>
+                </div>
+              </div>
+
+              <!-- Roles section (Coordinator / Judge / future perception roles) -->
+              <div
+                id="models-roles-section"
+                class="models-section"
+                role="tabpanel"
+                aria-labelledby="models-tab-roles"
+                style="display: none"
+              >
+                <div style="margin-bottom: 12px">
+                  <span style="font-size: 13px; color: var(--fg-dim)"
+                    >Per-role model assignments. Empty = use the default
+                    model.</span
+                  >
+                </div>
+                <div
+                  id="admin-models-roles-container"
+                  aria-live="polite"
+                  style="max-width: 720px"
+                >
+                  <div class="dashboard-empty">Loading&hellip;</div>
+                </div>
               </div>
             </div>
 

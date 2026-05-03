@@ -1258,6 +1258,17 @@ class ClusterCollector:
             entry["name"] = name
         self._fanout({"type": "ws_rename", "ws_id": ws_id, "name": name})
 
+    def emit_models_changed(self) -> None:
+        """Fan out a ``models_changed`` notice to all SSE listeners.
+
+        Browsers re-fetch :http:get:`/v1/api/models` on receipt so the
+        coordinator-composer model dropdown + the admin Models tab
+        reflect alias / underlying-model edits without a manual reload.
+        Body is intentionally empty — listeners refetch authoritative
+        state rather than diffing the event payload.
+        """
+        self._fanout({"type": "models_changed"})
+
     def emit_console_ws_intent_verdict(self, ws_id: str, verdict: dict[str, Any]) -> None:
         """Fan an LLM intent-judge verdict for a console-pseudo-node ws.
 

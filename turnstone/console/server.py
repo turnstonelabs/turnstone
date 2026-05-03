@@ -2413,7 +2413,7 @@ def _require_coord_mgr(request: Request) -> tuple[Any, JSONResponse | None]:
     if coord_mgr is None:
         registry_err = getattr(request.app.state, "coord_registry_error", "") or ""
         msg = "Coordinator subsystem not initialized. " + (
-            registry_err or "Check coordinator.model_alias and Models tab configuration."
+            registry_err or "Add a model definition in the admin Models tab."
         )
         return None, JSONResponse({"error": msg}, status_code=503)
     if config_store is None:
@@ -2444,8 +2444,7 @@ def _require_coord_mgr(request: Request) -> tuple[Any, JSONResponse | None]:
             {
                 "error": (
                     f"{hint} does not resolve: {exc}. "
-                    "Configure a model in the admin Models tab, or set "
-                    "``coordinator.model_alias`` in Settings to an existing alias."
+                    "Add or enable a model in the admin Models tab."
                 )
             },
             status_code=503,
@@ -6976,6 +6975,31 @@ async def admin_delete_memory(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+def _emit_models_changed(request: Request) -> None:
+    """Fan a ``models_changed`` SSE notice to connected browsers, if any.
+
+    Best-effort: silently no-ops when the collector isn't attached
+    (e.g. test fixtures that bypass the cluster collector).
+    """
+    collector = getattr(request.app.state, "collector", None)
+    if collector is not None:
+        collector.emit_models_changed()
+
+
+# Settings whose change should refresh the model dropdown / Roles UI in
+# every connected browser — covers the global default plus the per-role
+# overrides surfaced in the admin Models → Roles sub-tab.  Additions
+# here are purely additive (e.g. future ``perception.*.model`` keys).
+_MODEL_AFFECTING_SETTING_KEYS: frozenset[str] = frozenset(
+    {
+        "model.default_alias",
+        "coordinator.model_alias",
+        "coordinator.reasoning_effort",
+        "judge.model",
+    }
+)
+
+
 async def _publish_config_change(request: Request) -> None:
     """Fan out config-reload to all known server nodes (best-effort, async).
 
@@ -7178,6 +7202,8 @@ async def admin_update_setting(request: Request) -> JSONResponse:
     )
 
     await _publish_config_change(request)
+    if key in _MODEL_AFFECTING_SETTING_KEYS:
+        _emit_models_changed(request)
 
     return JSONResponse(
         {
@@ -7233,6 +7259,8 @@ async def admin_delete_setting(request: Request) -> JSONResponse:
     )
 
     await _publish_config_change(request)
+    if key in _MODEL_AFFECTING_SETTING_KEYS:
+        _emit_models_changed(request)
 
     return JSONResponse({"status": "ok", "key": key, "default": defn.default})
 
@@ -8414,6 +8442,7 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     )
 
     await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
+    _emit_models_changed(request)
 
     created = storage.get_model_definition(definition_id)
     if created is None:
@@ -8574,6 +8603,7 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
 
     if updates:
         await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
+        _emit_models_changed(request)
 
     model_def = storage.get_model_definition(definition_id)
     return JSONResponse(_mask_model_secrets(model_def or {}))
@@ -8611,6 +8641,7 @@ async def admin_delete_model_definition(request: Request) -> JSONResponse:
     )
 
     await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
+    _emit_models_changed(request)
 
     return JSONResponse({"status": "ok", "definition_id": definition_id})
 
@@ -8637,6 +8668,7 @@ async def admin_model_reload(request: Request) -> JSONResponse:
     # otherwise the coord LLM keeps calling the prior model name even
     # after a successful reload.
     await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
+    _emit_models_changed(request)
 
     results = await _notify_nodes_model_reload(request)
     return JSONResponse({"status": "ok", "results": results})
@@ -9127,6 +9159,8 @@ async def admin_update_judge_setting(request: Request) -> JSONResponse:
         ip,
     )
     await _publish_config_change(request)
+    if key in _MODEL_AFFECTING_SETTING_KEYS:
+        _emit_models_changed(request)
 
     effective = config_store.get(key, defn.default)
     return JSONResponse(
@@ -9163,6 +9197,8 @@ async def admin_delete_judge_setting(request: Request) -> JSONResponse:
     audit_uid, ip = _audit_context(request)
     record_audit(storage, audit_uid, "setting.delete", "setting", key, {}, ip)
     await _publish_config_change(request)
+    if key in _MODEL_AFFECTING_SETTING_KEYS:
+        _emit_models_changed(request)
 
     return JSONResponse({"status": "ok", "key": key, "default": defn.default})
 

@@ -5,16 +5,12 @@ window.onLoginSuccess = function () {
   if (typeof _refreshHomeComposerVisibility === "function") {
     _refreshHomeComposerVisibility();
   }
-  // Re-populate the home-composer skill dropdown and re-probe the
-  // coordinator subsystem now that auth has landed.  The initial
-  // page-load pass runs before login completes, so /v1/api/skills
-  // and /v1/api/workstreams both 401; without this re-run the
-  // dropdown stays empty and the 503 banner never flips correctly.
+  // Re-populate the home-composer skill dropdown now that auth has
+  // landed.  The initial page-load pass runs before login completes,
+  // so /v1/api/skills 401s; without this re-run the dropdown stays
+  // empty.
   if (typeof _populateHomeSkillDropdown === "function") {
     _populateHomeSkillDropdown();
-  }
-  if (typeof _probeCoordSubsystem === "function") {
-    _probeCoordSubsystem();
   }
   // Active-coordinators list is SSE-driven via the console pseudo-node
   // (#9) — no poller to restart after login.  The home-view renderer
@@ -426,6 +422,22 @@ function handleClusterEvent(data) {
   }
   if (data.type === "ws_closed" && data.reason === "evicted") {
     showToast("Evicted" + (data.name ? ": " + data.name : "") + " (capacity)");
+  }
+  if (data.type === "models_changed") {
+    // Server emits this when a model definition or a role-assignment
+    // setting (model.default_alias, judge.model, coordinator.model_alias,
+    // coordinator.reasoning_effort) changes.  Refresh anything that
+    // renders model aliases so labels stay accurate without a reload.
+    if (typeof _populateHomeModelDropdowns === "function") {
+      _populateHomeModelDropdowns();
+    }
+    if (
+      typeof _adminTab !== "undefined" &&
+      _adminTab === "models" &&
+      typeof loadAdminModels === "function"
+    ) {
+      loadAdminModels();
+    }
   }
 }
 
@@ -1445,8 +1457,8 @@ function _hasCoordPermission() {
 // POST /v1/api/workstreams/new.  Accepts the three request fields
 // directly + an errEl / setBusy callback so the caller owns the
 // loading-state UX (button label swap, composer disabled flag, etc.).
-// On success redirects to /coordinator/{ws_id}; on 503 invokes on503
-// so the caller can surface the "subsystem not configured" banner.
+// On success redirects to /coordinator/{ws_id}; on failure surfaces
+// the server's error text inline through errEl.
 function _createCoordinator(opts) {
   var name = (opts.name || "").trim();
   var skill = opts.skill || "";
@@ -1455,7 +1467,6 @@ function _createCoordinator(opts) {
   var task = (opts.task || "").trim();
   var errEl = opts.errEl;
   var setBusy = opts.setBusy || function () {};
-  var on503 = opts.on503 || function () {};
   var onSuccess = opts.onSuccess || function () {};
 
   // Error region is always rendered with reserved min-height (see
@@ -1503,10 +1514,6 @@ function _createCoordinator(opts) {
     })
     .then(function (res) {
       setBusy(false);
-      if (res.status === 503) {
-        on503(res);
-        return;
-      }
       if (!res.ok || !res.data || !res.data.ws_id) {
         errEl.textContent =
           (res.data && res.data.error) || "HTTP " + res.status;
@@ -1531,7 +1538,6 @@ function _createCoordinator(opts) {
 // ---------------------------------------------------------------------------
 
 var _homeComposerInit = false;
-var _homeCoordReady = null; // tri-state: null = unknown, true = ready, false = 503
 var _homeCoordComposer = null; // shared Composer instance
 var _homeCoordBusy = false;
 
@@ -1688,15 +1694,10 @@ function _homeClearStagedFiles() {
   _homeRenderChips();
 }
 
-// Single owner for sendBtn.disabled: disabled if EITHER busy OR the
-// subsystem probe flipped to 503.  Every setter for _homeCoordBusy /
-// _homeCoordReady ends with a call here so the two inputs can't drift
-// out of sync (and a probe resolving mid-submit can't re-enable the
-// button under an in-flight request).
+// Sole owner of sendBtn.disabled: disables while a submit is in flight.
 function _refreshHomeCoordSubmitEnabled() {
   if (!_homeCoordComposer) return;
-  _homeCoordComposer.sendBtn.disabled =
-    _homeCoordBusy || _homeCoordReady === false;
+  _homeCoordComposer.sendBtn.disabled = _homeCoordBusy;
 }
 
 function _ensureHomeComposerInit() {
@@ -1705,7 +1706,6 @@ function _ensureHomeComposerInit() {
   _mountHomeCoordComposer();
   _populateHomeSkillDropdown();
   _populateHomeModelDropdowns();
-  _probeCoordSubsystem();
   _refreshHomeComposerVisibility();
 }
 
@@ -1825,40 +1825,6 @@ function _populateHomeModelDropdowns() {
     });
 }
 
-// Probe GET /v1/api/workstreams — 200 = subsystem ready; 503 = no model
-// alias resolvable, show remediation banner.  4xx (auth / permission) is
-// treated as "unknown, don't flip the banner" because the probe cannot
-// actually tell us anything about subsystem readiness in that case —
-// the caller is expected to re-invoke this after login lands so a real
-// answer can arrive.  Leaving the submit button enabled on unknown
-// keeps first-paint usable; a subsequent 503 from the actual submit
-// flips the banner via _createCoordinator's on503 hook.
-//
-// Skip the probe entirely for users without admin.coordinator — they
-// can't see the composer anyway (see _refreshHomeComposerVisibility),
-// and the endpoint returns 403 for them, producing a useless network
-// round-trip on every login.
-function _probeCoordSubsystem() {
-  if (!_hasCoordPermission()) return;
-  authFetch("/v1/api/workstreams")
-    .then(function (r) {
-      if (r.status === 503) {
-        _homeCoordReady = false;
-      } else if (r.ok) {
-        _homeCoordReady = true;
-      } else {
-        _homeCoordReady = null;
-        return;
-      }
-      var banner = document.getElementById("coord-composer-503");
-      if (banner) banner.style.display = _homeCoordReady ? "none" : "";
-      _refreshHomeCoordSubmitEnabled();
-    })
-    .catch(function () {
-      /* network error — leave banner hidden; submit will surface a retryable error */
-    });
-}
-
 function _refreshHomeComposerVisibility() {
   var panel = document.getElementById("coord-composer-panel");
   if (!panel) return;
@@ -1905,12 +1871,6 @@ function submitHomeCoord(textFromComposer) {
       if (_homeCoordComposer) _homeCoordComposer.setBusy(b);
       _refreshHomeCoordSubmitEnabled();
     },
-    on503: function () {
-      _homeCoordReady = false;
-      var banner = document.getElementById("coord-composer-503");
-      if (banner) banner.style.display = "";
-      _refreshHomeCoordSubmitEnabled();
-    },
     onSuccess: function () {
       _homeClearStagedFiles();
     },
@@ -1928,9 +1888,6 @@ document.addEventListener("keydown", function (e) {
   var mount = document.getElementById("home-coord-composer-mount");
   if (!mount || !mount.contains(e.target)) return;
   e.preventDefault();
-  // sendBtn.disabled is the single reconciler of busy + 503-ready —
-  // checking it here is enough to avoid double-submits or submits
-  // while the subsystem is down.
   if (!_homeCoordComposer.sendBtn.disabled) submitHomeCoord();
 });
 
