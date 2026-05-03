@@ -2967,13 +2967,14 @@ def internal_model_reload(request: Request) -> JSONResponse:
     if registry is None or cli_args is None:
         return JSONResponse({"status": "error", "reason": "no registry"}, status_code=503)
 
+    storage = get_storage()
     new_registry = load_model_registry(
         base_url=cli_args["base_url"],
         api_key=cli_args["api_key"],
         model=cli_args["model"],
         context_window=cli_args["context_window"],
         provider=cli_args["provider"],
-        storage=get_storage(),
+        storage=storage,
     )
     cs = getattr(request.app.state, "config_store", None)
     if cs is not None:
@@ -3044,7 +3045,7 @@ def internal_model_reload(request: Request) -> JSONResponse:
     # be the coord's first chance to see new aliases an admin just added.
     node_id = getattr(request.app.state, "node_id", "")
     if node_id:
-        _publish_models_metadata(request.app.state, get_storage(), node_id)
+        _publish_models_metadata(request.app.state, storage, node_id)
 
     return JSONResponse({"status": "ok", "aliases": registry.list_aliases()})
 
@@ -3102,7 +3103,13 @@ def _collect_node_models_metadata(app_state: Any) -> tuple[str, str, str] | None
         return None
     health_reg = getattr(app_state, "health_registry", None)
     aliases_info: list[dict[str, Any]] = []
-    for alias in registry.list_aliases():
+    # Iterate aliases in a stable order — ``list_aliases`` returns dict
+    # insertion order, so two structurally identical registries built
+    # from different sources (config.toml vs. DB rows in different
+    # commit order) would otherwise serialize to different JSON and
+    # defeat the publish-cache hit-rate that the
+    # ``turnstone_node_models_publish_total`` metric tracks.
+    for alias in sorted(registry.list_aliases()):
         try:
             cfg = registry.get_config(alias)
         except (ValueError, KeyError):

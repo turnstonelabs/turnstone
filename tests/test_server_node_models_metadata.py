@@ -22,6 +22,7 @@ from turnstone.core.healthcheck import HealthTrackerRegistry
 from turnstone.core.model_registry import ModelConfig, ModelRegistry
 from turnstone.server import (
     _collect_node_models_metadata,
+    _metrics,
     _publish_models_metadata,
 )
 
@@ -165,9 +166,7 @@ def test_publish_records_metric_outcome(monkeypatch):
         calls.append(written)
 
     # Patch the metrics binding the helper closes over.
-    import turnstone.server as srv
-
-    monkeypatch.setattr(srv._metrics, "record_node_models_publish", _record)
+    monkeypatch.setattr(_metrics, "record_node_models_publish", _record)
 
     _publish_models_metadata(state, storage, "node-a")  # first → write
     _publish_models_metadata(state, storage, "node-a")  # second → skip
@@ -321,10 +320,9 @@ def test_heartbeat_write_awaits_before_shutdown_delete():
     that catches the regression cheaply.
     """
     import inspect
+    import sys
 
-    import turnstone.server as srv
-
-    src = inspect.getsource(srv)
+    src = inspect.getsource(sys.modules[_collect_node_models_metadata.__module__])
     cancel_idx = src.find("_heartbeat_task.cancel()")
     delete_idx = src.find('delete_node_metadata_by_source, _svc_node_id, "auto"')
     await_idx = src.find("await _heartbeat_task", cancel_idx)
