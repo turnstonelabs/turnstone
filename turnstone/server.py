@@ -4019,7 +4019,17 @@ def main() -> None:
         assert ui is not None
         # Resolve the effective alias once and use it consistently
         # for both client resolution and ChatSession.model_alias.
-        model_alias = model_alias or _effective_default_alias()
+        # Caller-supplied alias may be stale on the rehydrate path:
+        # ``SessionManager.open`` threads the persisted alias through
+        # so reopened workstreams keep their original model, but an
+        # operator may have removed that alias from the registry since
+        # the workstream was created.  Treat unknown aliases the same
+        # as unset and fall back to the runtime default — the
+        # alternative is a hard 500 on every reopen of the affected
+        # workstream.  Mirrors ``_effective_default_alias``'s own
+        # ``has_alias`` guard against a stale ConfigStore default.
+        if not model_alias or not registry.has_alias(model_alias):
+            model_alias = _effective_default_alias()
         r_client, r_model, r_cfg = registry.resolve(model_alias)
         # Read MCP client from shared ref — may have been replaced after startup
         # by internal_mcp_reload (Sync to Nodes) when no --mcp-config was passed.

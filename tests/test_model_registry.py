@@ -1317,6 +1317,122 @@ class TestWorkstreamModelParam:
         assert captured_alias is None
 
 
+class TestConsoleSessionFactoryStaleAlias:
+    """``SessionManager.open`` threads the persisted ``model_alias`` into
+    ``build_session`` so reopened coordinator workstreams keep the model
+    they were created with.  An operator may have removed that alias
+    from the registry since — the factory must fall back to the
+    registry default rather than raising, otherwise every reopen of an
+    affected workstream 500s.  See ``turnstone/console/session_factory.py``
+    and the rehydrate path in ``turnstone/core/session_manager.py``.
+    """
+
+    def _make_registry(self) -> ModelRegistry:
+        models = {
+            "default": ModelConfig(
+                "default", "https://api.openai.com/v1", "sk-test", "gpt-4o", 128000
+            ),
+            "live-alias": ModelConfig(
+                "live-alias", "https://api.openai.com/v1", "sk-test", "gpt-4o-mini", 128000
+            ),
+        }
+        return ModelRegistry(models=models, default="default")
+
+    def _build_factory(self, registry: ModelRegistry) -> Any:
+        from unittest.mock import MagicMock
+
+        from turnstone.console.session_factory import build_console_session_factory
+
+        config_store = MagicMock()
+        # Return reasonable defaults for every config_store.get(...) the
+        # factory consults — enough to construct a ChatSession without
+        # touching a real backend.
+        config_store.get.side_effect = lambda key, default=None: {
+            "judge.enabled": False,
+            "judge.model": "",
+            "judge.confidence_threshold": 0.5,
+            "judge.max_context_ratio": 0.5,
+            "judge.timeout": 5,
+            "judge.read_only_tools": [],
+            "judge.output_guard": False,
+            "judge.redact_secrets": False,
+            "memory.relevance_k": 0,
+            "memory.fetch_limit": 0,
+            "memory.max_content": 0,
+            "memory.nudge_cooldown": 0,
+            "memory.nudges": False,
+            "session.instructions": "",
+            "session.compact_max_tokens": 32768,
+            "session.auto_compact_pct": 0.8,
+            "tools.timeout": 30,
+            "tools.agent_max_turns": -1,
+            "tools.truncation": 0,
+            "tools.search": "auto",
+            "tools.search_threshold": 20,
+            "tools.search_max_results": 5,
+            "tools.web_search_backend": "",
+            "model.temperature": 0.5,
+            "model.max_tokens": 1000,
+            "model.reasoning_effort": "medium",
+            "coordinator.reasoning_effort": "medium",
+            "coordinator.model_alias": "",
+        }.get(key, default)
+        config_store.storage = None
+        return build_console_session_factory(
+            registry=registry,
+            config_store=config_store,
+            node_id="test-node",
+            coord_client_factory=lambda ws_id, uid: MagicMock(),
+        )
+
+    def test_unknown_alias_falls_back_to_default(self) -> None:
+        """When the persisted alias has been removed from the registry,
+        the factory must build the session with the registry default —
+        not raise ``ValueError`` from ``registry.resolve``."""
+        from unittest.mock import MagicMock, patch
+
+        registry = self._make_registry()
+        factory = self._build_factory(registry)
+
+        ui = MagicMock()
+        ui._user_id = ""
+
+        captured: dict[str, Any] = {}
+
+        class _StubSession:
+            def __init__(self, **kwargs: Any) -> None:
+                captured.update(kwargs)
+
+        with patch("turnstone.console.session_factory.ChatSession", _StubSession):
+            factory(ui, "since-removed-alias", "ws-id-1")
+
+        assert captured["model_alias"] == "default"
+        assert captured["model"] == "gpt-4o"
+
+    def test_known_alias_is_honoured(self) -> None:
+        """Sanity: a still-live alias must be passed through unchanged
+        — the fallback only fires for stale aliases."""
+        from unittest.mock import MagicMock, patch
+
+        registry = self._make_registry()
+        factory = self._build_factory(registry)
+
+        ui = MagicMock()
+        ui._user_id = ""
+
+        captured: dict[str, Any] = {}
+
+        class _StubSession:
+            def __init__(self, **kwargs: Any) -> None:
+                captured.update(kwargs)
+
+        with patch("turnstone.console.session_factory.ChatSession", _StubSession):
+            factory(ui, "live-alias", "ws-id-2")
+
+        assert captured["model_alias"] == "live-alias"
+        assert captured["model"] == "gpt-4o-mini"
+
+
 # ---------------------------------------------------------------------------
 # CreateWorkstreamRequest model field
 # ---------------------------------------------------------------------------

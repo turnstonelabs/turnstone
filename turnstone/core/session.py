@@ -579,7 +579,15 @@ class ChatSession:
         self._skill_resources_dir: str | None = None
         self._load_skills()
         self._init_system_messages()
-        self._save_config()
+        # Skip on rehydrate — ``_save_config`` is ``INSERT OR
+        # REPLACE`` per-key, and the persisted row is what
+        # ``ChatSession.resume`` is about to read back.  Pairs with
+        # ``SessionManager.open``'s saved-alias threading; together
+        # they keep reopened workstreams on their original model and
+        # settings instead of silently resetting to constructor
+        # defaults.
+        if not load_workstream_config(self._ws_id):
+            self._save_config()
 
     @property
     def ws_id(self) -> str:

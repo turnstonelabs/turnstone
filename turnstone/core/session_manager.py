@@ -603,8 +603,21 @@ class SessionManager:
                             evicted.id, reason="evicted", name=evicted.name
                         )
 
+                # Thread the persisted ``model_alias`` into
+                # ``build_session`` so reopened workstreams keep the
+                # model they were created with.  Pairs with the
+                # ``ChatSession.__init__`` skip-save guard: without
+                # both halves, ``_save_config`` clobbers persisted
+                # config with constructor defaults before
+                # ``ChatSession.resume`` reads them back.  The
+                # session_factory's ``has_alias`` fallback covers the
+                # case where the saved alias has since been removed
+                # from the registry.
+                saved_cfg = self._storage.load_workstream_config(ws_id)
+                saved_alias = (saved_cfg.get("model_alias") or None) if saved_cfg else None
+
                 try:
-                    ws.session = self._adapter.build_session(ws)
+                    ws.session = self._adapter.build_session(ws, model=saved_alias)
                 except Exception:
                     # Clean up the UI the adapter built before re-raising
                     # so any listener/lock resources are released.
