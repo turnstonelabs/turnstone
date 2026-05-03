@@ -330,6 +330,7 @@ def _make_manager(
     storage: FakeStorage | None = None,
     event_emitter: Any = _EMITTER_DEFAULT,
     node_id: str | None = None,
+    model_validator: Callable[[str], bool] | None = None,
 ) -> tuple[SessionManager, FakeAdapter, FakeStorage]:
     """Build a SessionManager wired to a FakeAdapter for both Protocols.
 
@@ -349,6 +350,7 @@ def _make_manager(
         max_active=max_active,
         event_emitter=emitter,
         node_id=node_id,
+        model_validator=model_validator,
     )
     return mgr, adapter, storage
 
@@ -709,6 +711,53 @@ def test_open_threads_saved_model_alias_into_build_session() -> None:
 
     assert reopened is not None
     assert adapter.last_build_model == "gpt-5-pro"
+
+
+def test_open_drops_saved_alias_when_validator_rejects() -> None:
+    """When the persisted alias is no longer in the registry, the
+    manager must drop it before reaching ``build_session``. The
+    factory still raises on unknown aliases on the fresh-create path
+    (so a typo in body.model surfaces as 503), so the rehydrate path
+    has to filter the alias here rather than relying on factory-side
+    fallback. Without this filter, every reopen of a workstream pinned
+    to a since-removed alias 500s."""
+    mgr, adapter, storage = _make_manager(
+        # Validator says "alias is no longer in the registry".
+        model_validator=lambda alias: False,
+    )
+    ws = mgr.create(user_id="u1")
+    ws_id = ws.id
+    storage.ws_config[ws_id] = {"model_alias": "since-removed-alias"}
+    mgr.close(ws_id)
+    adapter.last_build_model = "<unset>"
+
+    reopened = mgr.open(ws_id)
+
+    assert reopened is not None
+    assert adapter.last_build_model is None  # alias dropped before reaching build_session
+
+
+def test_open_keeps_saved_alias_when_validator_accepts() -> None:
+    """Sanity: an alias that still resolves must be passed through
+    unchanged. Filter only fires for stale aliases."""
+    accepted: list[str] = []
+
+    def validator(alias: str) -> bool:
+        accepted.append(alias)
+        return True
+
+    mgr, adapter, storage = _make_manager(model_validator=validator)
+    ws = mgr.create(user_id="u1")
+    ws_id = ws.id
+    storage.ws_config[ws_id] = {"model_alias": "still-live"}
+    mgr.close(ws_id)
+    adapter.last_build_model = "<unset>"
+
+    reopened = mgr.open(ws_id)
+
+    assert reopened is not None
+    assert accepted == ["still-live"]
+    assert adapter.last_build_model == "still-live"
 
 
 def test_open_falls_back_to_none_when_no_saved_alias() -> None:
