@@ -22,7 +22,6 @@ from turnstone.core.healthcheck import HealthTrackerRegistry
 from turnstone.core.model_registry import ModelConfig, ModelRegistry
 from turnstone.server import (
     _collect_node_models_metadata,
-    _metrics,
     _publish_models_metadata,
 )
 
@@ -157,16 +156,25 @@ def test_publish_records_metric_outcome(monkeypatch):
     """The publish helper feeds ``record_node_models_publish`` so
     Prometheus can expose the hit-rate.  Storage failures must NOT
     record either outcome — counters should reflect actual cache
-    decisions, not transient DB errors that will retry."""
+    decisions, not transient DB errors that will retry.
+
+    Replaces the module-level ``turnstone.server._metrics`` binding
+    via string-form monkeypatch (with auto-restore) rather than
+    patching an instance attribute on the imported singleton.  Other
+    tests in the suite reassign ``srv_mod._metrics`` (some without
+    using monkeypatch), so an instance captured at import time can
+    diverge from the binding the live ``_publish_models_metadata``
+    reads on each call.
+    """
     state = _publish_state()
     storage = MagicMock()
     calls: list[bool] = []
 
-    def _record(*, written: bool) -> None:
-        calls.append(written)
+    class _FakeMetrics:
+        def record_node_models_publish(self, *, written: bool) -> None:
+            calls.append(written)
 
-    # Patch the metrics binding the helper closes over.
-    monkeypatch.setattr(_metrics, "record_node_models_publish", _record)
+    monkeypatch.setattr("turnstone.server._metrics", _FakeMetrics())
 
     _publish_models_metadata(state, storage, "node-a")  # first → write
     _publish_models_metadata(state, storage, "node-a")  # second → skip
