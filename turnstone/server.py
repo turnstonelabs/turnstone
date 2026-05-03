@@ -4019,17 +4019,14 @@ def main() -> None:
         assert ui is not None
         # Resolve the effective alias once and use it consistently
         # for both client resolution and ChatSession.model_alias.
-        # Caller-supplied alias may be stale on the rehydrate path:
-        # ``SessionManager.open`` threads the persisted alias through
-        # so reopened workstreams keep their original model, but an
-        # operator may have removed that alias from the registry since
-        # the workstream was created.  Treat unknown aliases the same
-        # as unset and fall back to the runtime default — the
-        # alternative is a hard 500 on every reopen of the affected
-        # workstream.  Mirrors ``_effective_default_alias``'s own
-        # ``has_alias`` guard against a stale ConfigStore default.
-        if not model_alias or not registry.has_alias(model_alias):
-            model_alias = _effective_default_alias()
+        # Unknown aliases here raise ValueError — the create handler
+        # maps that to a 503 with operator-friendly text so a typo or
+        # removed alias in body.model surfaces instead of silently
+        # starting on the default. SessionManager.open's rehydrate
+        # path is the one place where unknown aliases must NOT fail
+        # loud; the manager filters those out via its model_validator
+        # before the alias reaches this factory.
+        model_alias = model_alias or _effective_default_alias()
         r_client, r_model, r_cfg = registry.resolve(model_alias)
         # Read MCP client from shared ref — may have been replaced after startup
         # by internal_mcp_reload (Sync to Nodes) when no --mcp-config was passed.
@@ -4158,6 +4155,10 @@ def main() -> None:
         # emit_rehydrated are no-ops because those events fire from
         # out-of-band paths (create handler + WebUI._broadcast_state).
         event_emitter=interactive_adapter,
+        # Filter out persisted aliases that no longer resolve so a
+        # workstream pinned to a since-removed alias still rehydrates
+        # (on the registry default) instead of 500-ing on every reopen.
+        model_validator=registry.has_alias,
     )
     interactive_adapter.attach(manager)
     WebUI._workstream_mgr = manager

@@ -180,6 +180,7 @@ class SessionManager:
         node_id: str | None = None,
         state_writer: StateWriter | None = None,
         event_emitter: SessionEventEmitter | None = None,
+        model_validator: Callable[[str], bool] | None = None,
     ) -> None:
         if max_active < 1:
             raise ValueError(f"max_active must be >= 1, got {max_active}")
@@ -199,6 +200,15 @@ class SessionManager:
         # effects, and reserved for future kinds whose lifecycle
         # transitions don't fan out anywhere.
         self._event_emitter = event_emitter
+        # Optional registry-membership check applied to the persisted
+        # ``model_alias`` on the rehydrate path before threading it
+        # into ``build_session``.  Production wiring passes
+        # ``registry.has_alias``; an alias that has been removed from
+        # the registry since the workstream was created is filtered
+        # out so the session_factory falls back to its default rather
+        # than raising.  Restricted to the rehydrate path — fresh
+        # creates still want unknown aliases to surface as 503.
+        self._model_validator = model_validator
         self._node_id = node_id
         self._workstreams: dict[str, Workstream] = {}
         self._order: list[str] = []
@@ -609,12 +619,25 @@ class SessionManager:
                 # ``ChatSession.__init__`` skip-save guard: without
                 # both halves, ``_save_config`` clobbers persisted
                 # config with constructor defaults before
-                # ``ChatSession.resume`` reads them back.  The
-                # session_factory's ``has_alias`` fallback covers the
-                # case where the saved alias has since been removed
-                # from the registry.
+                # ``ChatSession.resume`` reads them back.  When
+                # ``model_validator`` is wired and the saved alias is
+                # no longer in the registry, drop it so the factory
+                # falls back to its default — the session_factory
+                # itself still raises on unknown aliases, since
+                # fresh-create paths want that to surface as a 503.
                 saved_cfg = self._storage.load_workstream_config(ws_id)
                 saved_alias = (saved_cfg.get("model_alias") or None) if saved_cfg else None
+                if (
+                    saved_alias
+                    and self._model_validator is not None
+                    and not self._model_validator(saved_alias)
+                ):
+                    log.warning(
+                        "session_mgr.stale_alias_dropped ws=%s alias=%s",
+                        ws_id[:8],
+                        saved_alias,
+                    )
+                    saved_alias = None
 
                 try:
                     ws.session = self._adapter.build_session(ws, model=saved_alias)

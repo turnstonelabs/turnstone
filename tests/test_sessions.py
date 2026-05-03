@@ -523,8 +523,15 @@ class TestWorkstreamConfig:
         assert session.instructions == "be concise"
         assert session.creative_mode is True
 
-    def test_resume_restores_model(self, tmp_db):
-        """ChatSession.resume() should restore the model from workstream config."""
+    def test_resume_keeps_defaults_when_alias_unresolvable(self, tmp_db):
+        """When the saved alias is empty or no longer in the registry,
+        ``resume()`` must NOT copy ``saved_model`` onto the constructor's
+        default provider.  Pairing a removed model name with a default
+        provider that doesn't know about it produces a broken session
+        whose next API call fails — the exact regression Copilot flagged
+        on PR #465.  The constructor already resolved a coherent default
+        (provider + model + capabilities); resume should leave it intact
+        and just log the unreachable saved values."""
         client = MagicMock()
         client.models.list.return_value.data = [MagicMock(id="test-model")]
         ui = MagicMock()
@@ -533,13 +540,14 @@ class TestWorkstreamConfig:
         ui.on_state_change = MagicMock()
         ui.on_rename = MagicMock()
 
-        # Create a workstream that was using a specific model
         register_workstream("model_ws")
         save_message("model_ws", "user", "hello")
         save_message("model_ws", "assistant", "hi")
+        # Empty alias + an orphan model name — same shape resume sees
+        # when an operator removes an alias from the registry that the
+        # workstream was originally pinned to.
         save_workstream_config("model_ws", {"model": "gpt-5", "model_alias": ""})
 
-        # Resume into a session that was created with a different model
         session = ChatSession(
             client=client,
             model="gpt-5-nano",
@@ -552,7 +560,9 @@ class TestWorkstreamConfig:
         assert session.model == "gpt-5-nano"
         result = session.resume("model_ws")
         assert result is True
-        assert session.model == "gpt-5"
+        # Constructor's coherent default is preserved — saved orphan
+        # model name is NOT copied over.
+        assert session.model == "gpt-5-nano"
 
     def test_init_does_not_clobber_existing_config(self, tmp_db):
         """ChatSession.__init__ must NOT overwrite existing

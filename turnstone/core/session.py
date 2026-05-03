@@ -1348,16 +1348,23 @@ class ChatSession:
                     model_name,
                     cfg.context_window,
                 )
-            elif saved_model and saved_model != self.model:
-                # No alias or alias no longer in registry — at least set the model name
-                self.model = saved_model
-                self._model_alias = None
-                self._cached_capabilities = None
+            elif saved_alias or saved_model:
+                # Saved alias is unset or no longer in the registry.
+                # Don't copy ``saved_model`` onto the constructor's
+                # default provider/client — pairing a removed model
+                # name with the default provider produces an API call
+                # the default provider can't service, which is exactly
+                # the broken state operators see today on the reopen
+                # path.  The constructor already resolved a coherent
+                # default; keep it intact and warn so the missing
+                # alias is auditable.
                 log.warning(
-                    "Resume: alias %r not in registry, keeping default provider=%s for model=%s",
+                    "Resume: saved alias=%r model=%r unreachable; "
+                    "keeping default provider=%s model=%s",
                     saved_alias,
-                    type(self._provider).__name__,
                     saved_model,
+                    type(self._provider).__name__,
+                    self.model,
                 )
             if "temperature" in config:
                 self.temperature = float(config["temperature"])

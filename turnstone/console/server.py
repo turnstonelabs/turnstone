@@ -4025,6 +4025,11 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                     # the cluster collector's pseudo-node so the
                     # dashboard tree mirrors child state.
                     event_emitter=coord_adapter,
+                    # Filter out persisted aliases that no longer resolve
+                    # so a coordinator pinned to a since-removed alias
+                    # still rehydrates (on the registry default) instead
+                    # of 500-ing on every reopen.
+                    model_validator=coord_registry.has_alias,
                 )
                 # Late-bind the manager onto the adapter so
                 # ``_rebuild_children_registry`` / ``send`` /
