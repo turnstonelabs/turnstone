@@ -8097,9 +8097,12 @@ _API_SURFACE_CHOICES = frozenset({"chat", "responses"})
 def _validate_api_surface(caps: Any) -> str | None:
     """Return an error message if ``caps["server_compat"]["api_surface"]`` is invalid.
 
-    The provider factory raises ``ValueError`` at request time for an unknown
-    surface; validating here turns that runtime trap into a 400 at write time
-    so an admin can't poison a model alias via direct API calls.
+    Strict equality match (no strip/lower normalisation): the persisted value
+    is bound directly to the admin ``<select>`` whose options are the canonical
+    ``"chat"`` / ``"responses"`` strings, so anything else fails to round-trip
+    through edit/save.  The provider factory raises ``ValueError`` at request
+    time for an unknown surface; validating here turns that into a 400 at
+    write time so an admin can't poison a model alias via direct API calls.
     """
     if not isinstance(caps, dict):
         return None
@@ -8109,7 +8112,7 @@ def _validate_api_surface(caps: Any) -> str | None:
     raw = sc.get("api_surface")
     if raw is None or raw == "":
         return None
-    if not isinstance(raw, str) or raw.strip().lower() not in _API_SURFACE_CHOICES:
+    if not isinstance(raw, str) or raw not in _API_SURFACE_CHOICES:
         return f"Invalid server_compat.api_surface: {raw!r}"
     return None
 

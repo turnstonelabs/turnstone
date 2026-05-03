@@ -33,16 +33,14 @@ __all__ = [
     "lookup_model_capabilities",
 ]
 
-# Singleton instances (stateless, safe to share)
+# Singleton instances (stateless, safe to share).  ``_openai_provider``
+# is reused for both cloud OpenAI and ``openai-compatible`` with
+# ``api_surface="responses"`` — see the ``create_provider`` docstring.
 _provider_lock = threading.Lock()
-_openai_responses_provider = OpenAIResponsesProvider()
-_openai_chat_provider = OpenAIChatCompletionsProvider()
+_openai_provider = OpenAIResponsesProvider()
+_openai_compat_provider = OpenAIChatCompletionsProvider()
 _anthropic_provider: LLMProvider | None = None
 _google_provider: LLMProvider | None = None
-
-# Backwards-compatible aliases (kept module-private; some tests reference them).
-_openai_provider = _openai_responses_provider
-_openai_compat_provider = _openai_chat_provider
 
 
 _VALID_API_SURFACES = ("chat", "responses")
@@ -75,7 +73,7 @@ def create_provider(
     """
     global _anthropic_provider, _google_provider  # noqa: PLW0603
     if provider_name == "openai":
-        return _openai_responses_provider
+        return _openai_provider
     if provider_name == "openai-compatible":
         normalised = (api_surface or "").strip().lower()
         if normalised and normalised not in _VALID_API_SURFACES:
@@ -83,8 +81,8 @@ def create_provider(
                 f"Unknown api_surface: {api_surface!r}. Supported: {', '.join(_VALID_API_SURFACES)}"
             )
         if normalised == "responses":
-            return _openai_responses_provider
-        return _openai_chat_provider
+            return _openai_provider
+        return _openai_compat_provider
     if provider_name == "anthropic":
         with _provider_lock:
             if _anthropic_provider is None:

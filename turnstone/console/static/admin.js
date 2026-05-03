@@ -5162,28 +5162,34 @@ function submitCreateModel() {
     if (savedParam) caps.thinking_param = savedParam;
   }
 
-  // Build server_compat from structured fields
+  // Build server_compat from structured fields.  Only meaningful for
+  // openai-compatible aliases — for other providers the section is hidden
+  // but the form values can linger after a provider switch, so gate the
+  // whole block on the active provider to keep persisted state honest.
   var serverCompat = {};
-  var serverType = document.getElementById("model-server-type").value;
-  if (serverType) serverCompat.server_type = serverType;
-  var apiSurface = document.getElementById("model-api-surface").value;
-  if (apiSurface) serverCompat.api_surface = apiSurface;
+  var providerVal = document.getElementById("model-provider").value;
   var ebEl = document.getElementById("model-extra-body");
-  var ebText = ebEl.value.trim();
   ebEl.removeAttribute("aria-invalid");
   ebEl.style.borderColor = "";
-  if (ebText) {
-    try {
-      var ebParsed = JSON.parse(ebText);
-      if (!_isPlainObject(ebParsed)) {
-        throw new Error("not an object");
+  if (providerVal === "openai-compatible") {
+    var serverType = document.getElementById("model-server-type").value;
+    if (serverType) serverCompat.server_type = serverType;
+    var apiSurface = document.getElementById("model-api-surface").value;
+    if (apiSurface) serverCompat.api_surface = apiSurface;
+    var ebText = ebEl.value.trim();
+    if (ebText) {
+      try {
+        var ebParsed = JSON.parse(ebText);
+        if (!_isPlainObject(ebParsed)) {
+          throw new Error("not an object");
+        }
+        serverCompat.extra_body = ebParsed;
+      } catch (e) {
+        ebEl.setAttribute("aria-invalid", "true");
+        ebEl.style.borderColor = "var(--red)";
+        _showModelError("Extra body params must be a JSON object");
+        return;
       }
-      serverCompat.extra_body = ebParsed;
-    } catch (e) {
-      ebEl.setAttribute("aria-invalid", "true");
-      ebEl.style.borderColor = "var(--red)";
-      _showModelError("Extra body params must be a JSON object");
-      return;
     }
   }
   if (Object.keys(serverCompat).length > 0) {

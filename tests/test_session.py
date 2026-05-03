@@ -1206,12 +1206,18 @@ class TestProviderExtraParams:
         assert session._provider_extra_params() is None
 
     def test_no_reasoning_effort_kwarg(self, tmp_db):
-        """reasoning_effort is not part of the surface; passing it should TypeError."""
+        """reasoning_effort is not part of the surface; passing it should TypeError.
+
+        Splatted via ``**kwargs`` so static analyzers (CodeQL "wrong-name
+        argument" / mypy) don't flag the call — the point of this test is the
+        runtime contract, not the static type.
+        """
         import pytest
 
+        bad_kwargs = {"reasoning_effort": "high"}
         session = self._session_with_provider("openai-compatible", tmp_db)
         with pytest.raises(TypeError):
-            session._provider_extra_params(reasoning_effort="high")  # type: ignore[call-arg]
+            session._provider_extra_params(**bad_kwargs)
 
     def test_server_compat_extra_body_passes_through(self, tmp_db):
         """server_compat.extra_body workarounds forward as extra_params."""
