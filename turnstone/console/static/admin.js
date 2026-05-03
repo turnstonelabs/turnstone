@@ -2625,11 +2625,19 @@ function loadSettings() {
         schemaMap[schemaArr[i].key] = schemaArr[i];
       }
 
-      // Merge values + schema
+      // Merge values + schema.  Skip role-assignment settings owned by
+      // the Models tab (judge.* live on the Judge tab; coordinator
+      // model+effort lifted into Models → Roles).
       var merged = {};
       for (var j = 0; j < valuesArr.length; j++) {
         var v = valuesArr[j];
         if (v.key.startsWith("judge.")) continue;
+        if (
+          v.key === "coordinator.model_alias" ||
+          v.key === "coordinator.reasoning_effort"
+        ) {
+          continue;
+        }
         var s = schemaMap[v.key] || {};
         merged[v.key] = {
           key: v.key,
@@ -4440,6 +4448,28 @@ var _modelDefaultAlias = "";
 var _modelCreateTrap = null;
 var _modelCreateTrigger = null;
 
+// Roles surfaced in the Models → Roles sub-tab.  Each entry maps a
+// settings-registry key onto a UX label.  ``effortKey`` is optional —
+// roles whose registry entry has a paired ``*.reasoning_effort``
+// setting render a second selector inline.  Adding a new role (e.g.
+// ``perception.audio.model``) is purely additive: drop a row here once
+// the SettingDef lands in turnstone/core/settings_registry.py.
+var MODEL_ROLES = [
+  {
+    label: "Coordinator",
+    description:
+      "Console-hosted coordinator sessions that drive child workstreams.",
+    aliasKey: "coordinator.model_alias",
+    effortKey: "coordinator.reasoning_effort",
+  },
+  {
+    label: "Judge",
+    description:
+      "Intent-validation judge that scores tool calls before approval.",
+    aliasKey: "judge.model",
+  },
+];
+
 function loadAdminModels() {
   authFetch("/v1/api/admin/model-definitions")
     .then(function (r) {
@@ -4450,6 +4480,9 @@ function loadAdminModels() {
       _modelDefs = data.models || [];
       _modelDefaultAlias = data.default_alias || "";
       _renderModels(_modelDefs);
+      // Render the Roles sub-tab off the same model list so the
+      // dropdowns stay in sync with the current set of aliases.
+      loadAdminModelRoles();
     })
     .catch(function () {
       var el = document.getElementById("admin-models-table");
@@ -4458,6 +4491,227 @@ function loadAdminModels() {
       d.className = "dashboard-empty";
       d.textContent = "Failed to load models";
       el.appendChild(d);
+    });
+}
+
+function switchModelsSection(section) {
+  var sections = document.querySelectorAll("#admin-models .models-section");
+  for (var i = 0; i < sections.length; i++) sections[i].style.display = "none";
+  var switcher = document.querySelector("#admin-models .admin-subtab-switcher");
+  var btns = switcher ? switcher.querySelectorAll(".admin-subtab-btn") : [];
+  for (var k = 0; k < btns.length; k++) {
+    var isActive = btns[k].getAttribute("data-section") === section;
+    btns[k].classList.toggle("active", isActive);
+    btns[k].setAttribute("aria-selected", isActive ? "true" : "false");
+    btns[k].setAttribute("tabindex", isActive ? "0" : "-1");
+  }
+  var target = document.getElementById(section + "-section");
+  if (target) target.style.display = "";
+}
+
+// Arrow key navigation for Models sub-tabs (matches the Judge tab).
+(function () {
+  var switcher = document.querySelector("#admin-models .admin-subtab-switcher");
+  if (!switcher) return;
+  switcher.addEventListener("keydown", function (e) {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    var btns = switcher.querySelectorAll(".admin-subtab-btn");
+    var secs = [];
+    for (var i = 0; i < btns.length; i++)
+      secs.push(btns[i].getAttribute("data-section"));
+    var current = switcher.querySelector(".admin-subtab-btn.active");
+    var idx = secs.indexOf(current ? current.getAttribute("data-section") : "");
+    if (e.key === "ArrowRight") idx = (idx + 1) % secs.length;
+    else idx = (idx - 1 + secs.length) % secs.length;
+    e.preventDefault();
+    switchModelsSection(secs[idx]);
+    btns[idx].focus();
+  });
+})();
+
+function _modelRolesError(container, msg) {
+  while (container.firstChild) container.removeChild(container.firstChild);
+  var d = document.createElement("div");
+  d.className = "dashboard-empty";
+  d.textContent = msg;
+  container.appendChild(d);
+}
+
+function loadAdminModelRoles() {
+  var c = document.getElementById("admin-models-roles-container");
+  if (!c) return;
+  // Re-fetch model-definitions alongside settings so the alias dropdown
+  // reflects the live enabled set even if the user toggled a model in
+  // the Definitions sub-tab between renders.  Saving a role also calls
+  // back here, keeping the dropdown in sync without a tab switch.
+  Promise.all([
+    authFetch("/v1/api/admin/settings").then(function (r) {
+      if (!r.ok) throw new Error("settings " + r.status);
+      return r.json();
+    }),
+    authFetch("/v1/api/admin/settings/schema").then(function (r) {
+      if (!r.ok) throw new Error("schema " + r.status);
+      return r.json();
+    }),
+    authFetch("/v1/api/admin/model-definitions").then(function (r) {
+      if (!r.ok) throw new Error("models " + r.status);
+      return r.json();
+    }),
+  ])
+    .then(function (results) {
+      var values = {};
+      var arr = results[0].settings || [];
+      for (var i = 0; i < arr.length; i++) values[arr[i].key] = arr[i];
+      var schema = {};
+      var sa = results[1].schema || [];
+      for (var j = 0; j < sa.length; j++) schema[sa[j].key] = sa[j];
+      _modelDefs = results[2].models || _modelDefs;
+      _modelDefaultAlias = results[2].default_alias || _modelDefaultAlias;
+      _renderModelRoles(c, values, schema);
+    })
+    .catch(function () {
+      _modelRolesError(c, "Failed to load roles");
+    });
+}
+
+function _renderModelRoles(container, values, schema) {
+  var enabledAliases = [];
+  for (var i = 0; i < _modelDefs.length; i++) {
+    if (_modelDefs[i].enabled) enabledAliases.push(_modelDefs[i]);
+  }
+  container.textContent = "";
+  for (var r = 0; r < MODEL_ROLES.length; r++) {
+    var role = MODEL_ROLES[r];
+    var aliasInfo = values[role.aliasKey];
+    if (!aliasInfo) continue; // setting not registered (e.g. older server)
+
+    var row = document.createElement("div");
+    row.className = "model-role-row";
+
+    // The dropdown's selected-option text is the single source of
+    // truth for default vs override — when nothing is set it shows
+    // "(default — <alias>)", otherwise it shows the chosen alias.  No
+    // separate badge: redundant with the select, and prone to
+    // confusing color contrasts on freshly-rendered rows.
+    var head = document.createElement("div");
+    head.className = "model-role-head";
+    var nameEl = document.createElement("span");
+    nameEl.className = "model-role-label";
+    nameEl.textContent = role.label;
+    head.appendChild(nameEl);
+    row.appendChild(head);
+
+    if (role.description) {
+      var desc = document.createElement("div");
+      desc.className = "model-role-desc";
+      desc.textContent = role.description;
+      row.appendChild(desc);
+    }
+
+    var controls = document.createElement("div");
+    controls.className = "model-role-controls";
+
+    // Alias dropdown
+    var aliasWrap = document.createElement("label");
+    aliasWrap.className = "model-role-control";
+    var aliasLabel = document.createElement("span");
+    aliasLabel.className = "model-role-control-label";
+    aliasLabel.textContent = "Model";
+    aliasWrap.appendChild(aliasLabel);
+    var aliasSel = document.createElement("select");
+    aliasSel.setAttribute("data-role-key", role.aliasKey);
+    aliasSel.setAttribute(
+      "aria-label",
+      role.label + " model (empty = default)",
+    );
+    var blank = document.createElement("option");
+    blank.value = "";
+    blank.textContent = _modelDefaultAlias
+      ? "(default — " + _modelDefaultAlias + ")"
+      : "(default)";
+    aliasSel.appendChild(blank);
+    var currentAlias = aliasInfo.value || "";
+    var matched = false;
+    for (var m = 0; m < enabledAliases.length; m++) {
+      var md = enabledAliases[m];
+      var opt = document.createElement("option");
+      opt.value = md.alias;
+      opt.textContent =
+        md.alias === md.model ? md.alias : md.alias + " (" + md.model + ")";
+      if (currentAlias && currentAlias === md.alias) {
+        opt.selected = true;
+        matched = true;
+      }
+      aliasSel.appendChild(opt);
+    }
+    if (currentAlias && !matched) {
+      var manual = document.createElement("option");
+      manual.value = currentAlias;
+      manual.textContent = currentAlias + " (manual)";
+      manual.selected = true;
+      aliasSel.appendChild(manual);
+    }
+    aliasSel.addEventListener("change", function () {
+      _saveModelRole(this.getAttribute("data-role-key"), this.value);
+    });
+    aliasWrap.appendChild(aliasSel);
+    controls.appendChild(aliasWrap);
+
+    // Optional reasoning effort dropdown
+    if (role.effortKey && values[role.effortKey] && schema[role.effortKey]) {
+      var effortWrap = document.createElement("label");
+      effortWrap.className = "model-role-control";
+      var effortLabel = document.createElement("span");
+      effortLabel.className = "model-role-control-label";
+      effortLabel.textContent = "Reasoning effort";
+      effortWrap.appendChild(effortLabel);
+      var effortSel = document.createElement("select");
+      effortSel.setAttribute("data-role-key", role.effortKey);
+      effortSel.setAttribute("aria-label", role.label + " reasoning effort");
+      var choices = schema[role.effortKey].choices || [];
+      var currentEffort = values[role.effortKey].value;
+      for (var c2 = 0; c2 < choices.length; c2++) {
+        var eo = document.createElement("option");
+        eo.value = choices[c2];
+        eo.textContent = choices[c2] === "" ? "(inherit)" : choices[c2];
+        if (currentEffort === choices[c2]) eo.selected = true;
+        effortSel.appendChild(eo);
+      }
+      effortSel.addEventListener("change", function () {
+        _saveModelRole(this.getAttribute("data-role-key"), this.value);
+      });
+      effortWrap.appendChild(effortSel);
+      controls.appendChild(effortWrap);
+    }
+
+    row.appendChild(controls);
+    container.appendChild(row);
+  }
+
+  if (!container.children.length) {
+    _modelRolesError(container, "No model roles configured");
+  }
+}
+
+function _saveModelRole(key, value) {
+  authFetch("/v1/api/admin/settings/" + encodeURIComponent(key), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ value: value }),
+  })
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Failed");
+        });
+      return r.json();
+    })
+    .then(function () {
+      showToast("Saved");
+      loadAdminModelRoles();
+    })
+    .catch(function (e) {
+      showToast("Error: " + (e && e.message ? e.message : "save failed"));
     });
 }
 

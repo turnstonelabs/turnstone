@@ -88,21 +88,6 @@
   text-transform: uppercase;
 }
 
-.home-composer-banner {
-  background: var(--bg-surface);
-  border: 1px solid var(--yellow);
-  border-left-width: 3px;
-  border-radius: var(--radius-sm);
-  padding: 8px 10px;
-  color: var(--fg-bright);
-  font-size: 12px;
-}
-.home-composer-banner a {
-  color: var(--accent);
-  text-decoration: underline;
-  text-decoration-thickness: 2px;
-}
-
 .home-composer-error {
   /* Always rendered (no display toggle in JS) so toggling validation
      messages doesn't reflow the active-coordinators list below.  The
@@ -2350,15 +2335,15 @@ textarea.skill-content-area {
 }
 
 /* ==========================================================================
-   Judge sub-section tabs
+   Admin sub-section tabs (used by Judge + Models tabs)
    ========================================================================== */
-.judge-section-switcher {
+.admin-subtab-switcher {
   display: flex;
   gap: 8px;
   margin: 12px 0 16px;
   border-bottom: 1px solid var(--border-strong);
 }
-.judge-section-btn {
+.admin-subtab-btn {
   padding: 6px 14px;
   background: none;
   border: none;
@@ -2371,14 +2356,14 @@ textarea.skill-content-area {
     color 0.15s,
     border-color 0.15s;
 }
-.judge-section-btn:hover {
+.admin-subtab-btn:hover {
   color: var(--fg);
 }
-.judge-section-btn.active {
+.admin-subtab-btn.active {
   border-bottom-color: var(--accent);
   color: var(--fg);
 }
-.judge-section-btn:focus-visible {
+.admin-subtab-btn:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
 }
@@ -3841,6 +3826,64 @@ textarea.skill-content-area {
   letter-spacing: 0.02em;
 }
 
+/* Models → Roles sub-tab rows */
+.model-role-row {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border-strong);
+}
+.model-role-row:last-child {
+  border-bottom: none;
+}
+.model-role-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.model-role-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+}
+.model-role-desc {
+  font-size: 11px;
+  color: var(--fg-dim);
+  margin-bottom: 8px;
+}
+.model-role-controls {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) minmax(180px, auto);
+  column-gap: 16px;
+  row-gap: 8px;
+  align-items: end;
+}
+.model-role-control {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.model-role-control-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-dim);
+}
+.model-role-control select {
+  width: 100%;
+  padding: 4px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  color: var(--fg);
+  border-radius: 3px;
+  font-family: var(--font-ui);
+  font-size: 12px;
+}
+.model-role-control select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 /* Modal section divider for field groups */
 .modal-section-divider {
   font-family: var(--font-ui);
@@ -3888,7 +3931,7 @@ textarea.skill-content-area {
   .admin-btn-danger,
   .admin-btn-caution,
   .admin-btn-action,
-  .judge-section-btn {
+  .admin-subtab-btn {
     transition: none;
   }
   .settings-toggle-slider,
