@@ -3920,6 +3920,17 @@
             <option value="llama.cpp">llama.cpp</option>
             <option value="openai-compatible">Other OpenAI-compatible</option>
           </select>
+          <label for="model-api-surface"
+            >API Surface
+            <span style="font-weight: 400; text-transform: none"
+              >(Chat Completions vs Responses)</span
+            ></label
+          >
+          <select id="model-api-surface">
+            <option value="">Inherit (Chat Completions)</option>
+            <option value="chat">Chat Completions (pinned)</option>
+            <option value="responses">Responses API</option>
+          </select>
           <label for="model-thinking-mode"
             >Thinking Mode
             <span style="font-weight: 400; text-transform: none"

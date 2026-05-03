@@ -1126,24 +1126,57 @@ class TestSessionAgentModel:
     def _captured_effort(captured: dict[str, Any]) -> str | None:
         """Pull reasoning_effort out of provider-specific shapes.
 
-        openai-compatible servers receive it via extra_body.chat_template_kwargs;
-        commercial providers receive it as a top-level kwarg.
+        Chat Completions delivers it as a top-level ``reasoning_effort`` kwarg
+        (when the model's caps permit it).  Operators who route reasoning_effort
+        through ``chat_template_kwargs`` (gpt-oss-style local templates) get
+        it inside ``extra_body.chat_template_kwargs``.
         """
+        if "reasoning_effort" in captured:
+            return captured["reasoning_effort"]
         eb = captured.get("extra_body") or {}
         ctk = eb.get("chat_template_kwargs") or {}
-        return ctk.get("reasoning_effort") or captured.get("reasoning_effort")
+        return ctk.get("reasoning_effort")
+
+    @staticmethod
+    def _effort_caps() -> dict[str, Any]:
+        """Capabilities that allow Chat-Completions reasoning_effort to flow."""
+        return {
+            "reasoning_effort_values": [
+                "minimal",
+                "low",
+                "medium",
+                "high",
+                "max",
+            ],
+        }
 
     def _three_model_registry(self, **kwargs: Any) -> ModelRegistry:
+        caps = self._effort_caps()
         return ModelRegistry(
             models={
                 "main": ModelConfig(
-                    "main", "http://m/v1", "k", "main-model", provider="openai-compatible"
+                    "main",
+                    "http://m/v1",
+                    "k",
+                    "main-model",
+                    provider="openai-compatible",
+                    capabilities=dict(caps),
                 ),
                 "smart": ModelConfig(
-                    "smart", "http://s/v1", "k", "smart-model", provider="openai-compatible"
+                    "smart",
+                    "http://s/v1",
+                    "k",
+                    "smart-model",
+                    provider="openai-compatible",
+                    capabilities=dict(caps),
                 ),
                 "fast": ModelConfig(
-                    "fast", "http://f/v1", "k", "fast-model", provider="openai-compatible"
+                    "fast",
+                    "http://f/v1",
+                    "k",
+                    "fast-model",
+                    provider="openai-compatible",
+                    capabilities=dict(caps),
                 ),
             },
             default="main",
@@ -1248,6 +1281,45 @@ class TestSessionAgentModel:
         captured = self._capture(reg, "fast")
         session._run_agent([{"role": "user", "content": "x"}], label="plan", agent_alias="fast")
         assert captured["model"] == "fast-model"
+
+    def test_session_fallback_inherits_primary_alias_for_caps(self) -> None:
+        """When _run_agent has no registry agent route, it must fall back to
+        the session's primary alias for capability and server_compat lookup —
+        otherwise per-model caps (reasoning_effort_values, server_compat) get
+        silently dropped on the agent path."""
+        reg = self._three_model_registry()  # no agent_model / plan_model set
+        session = _make_session(registry=reg, model_alias="main")
+        # Probe what _run_agent passes to _provider_extra_params and
+        # _resolve_capabilities by recording the model_alias on each call.
+        captured_extra_alias: list[str | None] = []
+        captured_resolve_alias: list[str | None] = []
+        original_extra = session._provider_extra_params
+        original_resolve = session._resolve_capabilities
+
+        def spy_extra(*args: Any, **kwargs: Any) -> Any:
+            captured_extra_alias.append(kwargs.get("model_alias"))
+            return original_extra(*args, **kwargs)
+
+        def spy_resolve(*args: Any, **kwargs: Any) -> Any:
+            # _resolve_capabilities(provider, model, alias)
+            alias = args[2] if len(args) >= 3 else kwargs.get("alias")
+            captured_resolve_alias.append(alias)
+            return original_resolve(*args, **kwargs)
+
+        session._provider_extra_params = spy_extra  # type: ignore[method-assign]
+        session._resolve_capabilities = spy_resolve  # type: ignore[method-assign]
+
+        self._capture_on(session.client)  # patch client.chat.completions.create
+        session._run_agent([{"role": "user", "content": "x"}], label="plan")
+
+        assert captured_extra_alias and captured_extra_alias[-1] == "main", (
+            f"agent fallback path did not inherit primary alias for extra_params: "
+            f"{captured_extra_alias!r}"
+        )
+        assert captured_resolve_alias and captured_resolve_alias[-1] == "main", (
+            f"agent fallback path did not inherit primary alias for caps: "
+            f"{captured_resolve_alias!r}"
+        )
 
     def test_invalid_alias_raises_in_run_agent(self) -> None:
         """Defence-in-depth: _prepare_* validates first, but _run_agent

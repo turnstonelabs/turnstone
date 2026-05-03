@@ -1182,7 +1182,7 @@ class TestAgentOutputGuard:
 
 
 class TestProviderExtraParams:
-    """Tests for _provider_extra_params — local-only chat_template_kwargs."""
+    """Tests for _provider_extra_params — server_compat passthrough only."""
 
     def _session_with_provider(self, provider_name: str, tmp_db) -> ChatSession:
         from turnstone.core.providers import create_provider
@@ -1191,68 +1191,36 @@ class TestProviderExtraParams:
         session._provider = create_provider(provider_name)
         return session
 
-    def test_openai_compatible_returns_chat_template_kwargs(self, tmp_db):
+    def test_openai_compatible_no_compat_returns_none(self, tmp_db):
+        """No server_compat → no extra_body needed (no auto-injection)."""
         session = self._session_with_provider("openai-compatible", tmp_db)
-        result = session._provider_extra_params()
-        assert result is not None
-        assert "chat_template_kwargs" in result
-        assert result["chat_template_kwargs"]["reasoning_effort"] == "medium"
+        assert session._provider_extra_params() is None
 
-    def test_openai_commercial_returns_none(self, tmp_db):
+    def test_openai_commercial_no_compat_returns_none(self, tmp_db):
+        """Cloud OpenAI without server_compat → None."""
         session = self._session_with_provider("openai", tmp_db)
-        result = session._provider_extra_params()
-        assert result is None
+        assert session._provider_extra_params() is None
 
     def test_anthropic_returns_none(self, tmp_db):
         session = self._session_with_provider("anthropic", tmp_db)
-        result = session._provider_extra_params()
-        assert result is None
+        assert session._provider_extra_params() is None
 
-    def test_reasoning_effort_override(self, tmp_db):
+    def test_no_reasoning_effort_kwarg(self, tmp_db):
+        """reasoning_effort is not part of the surface; passing it should TypeError.
+
+        Splatted via ``**kwargs`` so static analyzers (CodeQL "wrong-name
+        argument" / mypy) don't flag the call — the point of this test is the
+        runtime contract, not the static type.
+        """
+        import pytest
+
+        bad_kwargs = {"reasoning_effort": "high"}
         session = self._session_with_provider("openai-compatible", tmp_db)
-        result = session._provider_extra_params(reasoning_effort="high")
-        assert result is not None
-        assert result["chat_template_kwargs"]["reasoning_effort"] == "high"
+        with pytest.raises(TypeError):
+            session._provider_extra_params(**bad_kwargs)
 
-    def test_explicit_openai_provider_overrides_session(self, tmp_db):
-        """Passing an explicit commercial OpenAI provider returns None even
-        when the session's own provider is openai-compatible."""
-        from turnstone.core.providers import create_provider
-
-        session = self._session_with_provider("openai-compatible", tmp_db)
-        openai_prov = create_provider("openai")
-        result = session._provider_extra_params(provider=openai_prov)
-        assert result is None
-
-    def test_server_compat_extra_body_merged(self, tmp_db):
-        """server_compat.extra_body workarounds are merged into extra_params."""
-        from turnstone.core.model_registry import ModelConfig, ModelRegistry
-
-        session = self._session_with_provider("openai-compatible", tmp_db)
-        cfg = ModelConfig(
-            alias="test",
-            base_url="http://localhost:8000/v1",
-            api_key="none",
-            model="google/gemma-4-31B-it",
-            server_compat={
-                "extra_body": {"skip_special_tokens": False},
-            },
-        )
-        session._registry = ModelRegistry(models={"test": cfg}, default="test")
-        session._model_alias = "test"
-        result = session._provider_extra_params()
-        assert result is not None
-        assert result["chat_template_kwargs"]["reasoning_effort"] == "medium"
-        assert result["skip_special_tokens"] is False
-
-    def test_empty_server_compat_backwards_compatible(self, tmp_db):
-        """Empty server_compat produces same output as before."""
-        session = self._session_with_provider("openai-compatible", tmp_db)
-        result = session._provider_extra_params()
-        assert result == {"chat_template_kwargs": {"reasoning_effort": "medium"}}
-
-    def test_server_compat_with_reasoning_effort_override(self, tmp_db):
-        """reasoning_effort override works alongside server_compat."""
+    def test_server_compat_extra_body_passes_through(self, tmp_db):
+        """server_compat.extra_body workarounds forward as extra_params."""
         from turnstone.core.model_registry import ModelConfig, ModelRegistry
 
         session = self._session_with_provider("openai-compatible", tmp_db)
@@ -1265,10 +1233,25 @@ class TestProviderExtraParams:
         )
         session._registry = ModelRegistry(models={"test": cfg}, default="test")
         session._model_alias = "test"
-        result = session._provider_extra_params(reasoning_effort="high")
-        assert result is not None
-        assert result["chat_template_kwargs"]["reasoning_effort"] == "high"
-        assert result["skip_special_tokens"] is False
+        result = session._provider_extra_params()
+        assert result == {"skip_special_tokens": False}
+
+    def test_operator_chat_template_kwargs_pass_through(self, tmp_db):
+        """Operator-set chat_template_kwargs (e.g. for gpt-oss) forwards verbatim."""
+        from turnstone.core.model_registry import ModelConfig, ModelRegistry
+
+        session = self._session_with_provider("openai-compatible", tmp_db)
+        cfg = ModelConfig(
+            alias="test",
+            base_url="http://localhost:8000/v1",
+            api_key="none",
+            model="openai/gpt-oss-120b",
+            server_compat={"extra_body": {"chat_template_kwargs": {"reasoning_effort": "high"}}},
+        )
+        session._registry = ModelRegistry(models={"test": cfg}, default="test")
+        session._model_alias = "test"
+        result = session._provider_extra_params()
+        assert result == {"chat_template_kwargs": {"reasoning_effort": "high"}}
 
     def test_model_alias_resolves_target_compat(self, tmp_db):
         """model_alias parameter selects compat from the target, not the primary."""
@@ -1297,14 +1280,9 @@ class TestProviderExtraParams:
         session._model_alias = "primary"
 
         # Primary alias → gets Gemma workaround
-        result_primary = session._provider_extra_params()
-        assert result_primary is not None
-        assert result_primary["skip_special_tokens"] is False
-
-        # Fallback alias → no compat, just base kwargs
-        result_fallback = session._provider_extra_params(model_alias="fallback")
-        assert result_fallback == {"chat_template_kwargs": {"reasoning_effort": "medium"}}
-        assert "skip_special_tokens" not in result_fallback
+        assert session._provider_extra_params() == {"skip_special_tokens": False}
+        # Fallback alias → no compat at all
+        assert session._provider_extra_params(model_alias="fallback") is None
 
 
 class TestSafePrepareTool:
