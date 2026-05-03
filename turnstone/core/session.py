@@ -1458,11 +1458,6 @@ class ChatSession:
         """
         new_system_messages: list[dict[str, Any]] = []
 
-        # -- Chat template kwargs --
-        self._chat_template_kwargs_base: dict[str, Any] = {
-            "reasoning_effort": self.reasoning_effort,
-        }
-
         # -- Developer message --
         if self.creative_mode:
             dev_parts = [
@@ -1844,48 +1839,48 @@ class ChatSession:
 
     def _provider_extra_params(
         self,
-        reasoning_effort: str | None = None,
         provider: LLMProvider | None = None,
         model_alias: str | None = None,
     ) -> dict[str, Any] | None:
         """Build provider-specific extra parameters.
 
-        ``chat_template_kwargs`` is only meaningful for local model servers
-        (``openai-compatible``).  Commercial OpenAI rejects it as an unknown
-        parameter, and handles ``reasoning_effort`` natively.
+        Forwards operator-supplied ``server_compat["extra_body"]`` overrides
+        (``skip_special_tokens``, ``reasoning_format``, or explicit
+        ``chat_template_kwargs``) to the OpenAI SDK ``extra_body``.  Operators
+        running gpt-oss-style local templates that consume ``reasoning_effort``
+        from ``chat_template_kwargs`` should set it explicitly under
+        ``server_compat["extra_body"]["chat_template_kwargs"]``.
 
-        Merges server workarounds (``skip_special_tokens``, etc.) from
-        ``ModelConfig.server_compat`` into the request's ``extra_body``.
-        Thinking-mode params (``enable_thinking``) are handled separately
-        by the provider based on ``ModelCapabilities.thinking_mode``.
+        Thinking-mode params (``enable_thinking``, ``thinking``) are added
+        separately by ``OpenAIChatCompletionsProvider._apply_thinking_mode``
+        based on ``ModelCapabilities.thinking_mode`` — the Responses API
+        surface handles reasoning natively and ignores ``extra_body``.
 
-        *model_alias* controls which model config supplies server compat
+        *model_alias* selects which stored config supplies server compat
         settings.  When ``None``, defaults to the session's primary alias.
         """
         from turnstone.core.server_compat import merge_server_compat
 
         prov = provider or self._provider
-        if prov.provider_name == "openai-compatible":
-            ctk_base = dict(self._chat_template_kwargs_base)
-            if reasoning_effort:
-                ctk_base["reasoning_effort"] = reasoning_effort
-            return merge_server_compat(
-                ctk_base,
-                self._get_server_compat(model_alias),
-            )
-        return None
+        # Only OpenAI-shaped providers consume extra_body.  Anthropic/Google
+        # have their own param paths handled inside their providers.
+        if prov.provider_name not in ("openai", "openai-compatible"):
+            return None
+        extra = merge_server_compat(None, self._get_server_compat(model_alias))
+        return extra or None
 
     def _get_server_compat(self, model_alias: str | None = None) -> dict[str, Any]:
         """Get server compatibility settings from a model config.
 
         *model_alias* selects the config to read.  Falls back to the
-        session's primary alias when ``None``.
+        session's primary alias when ``None``.  The returned dict is the
+        live ``ModelConfig.server_compat`` reference — callers must not
+        mutate it.  ``merge_server_compat`` reads only.
         """
         alias = model_alias or self._model_alias
         if self._registry and alias:
             try:
-                cfg = self._registry.get_config(alias)
-                return dict(cfg.server_compat)
+                return self._registry.get_config(alias).server_compat
             except (ValueError, KeyError):
                 pass
         return {}
@@ -1914,7 +1909,7 @@ class ChatSession:
             max_tokens=clamped,
             temperature=temperature,
             reasoning_effort=reasoning_effort,
-            extra_params=self._provider_extra_params(reasoning_effort=reasoning_effort),
+            extra_params=self._provider_extra_params(),
             capabilities=caps,
         )
 
@@ -8037,6 +8032,10 @@ class ChatSession:
             agent_client = self.client
             agent_model = self.model
             agent_provider = self._provider
+            # When falling through to the session's primary model, use the
+            # session's primary alias for capability and server_compat
+            # resolution so the agent sees the same caps as the main loop.
+            agent_alias = self._model_alias
 
         # Per-kind reasoning effort.  Explicit caller arg wins; otherwise
         # delegate to the registry which knows the per-kind default (plan
@@ -8059,7 +8058,6 @@ class ChatSession:
         # Build extra params for agent calls — resolve server compat from the
         # agent's own model alias, not the session's primary model.
         agent_extra = self._provider_extra_params(
-            reasoning_effort=reasoning_effort,
             provider=agent_provider,
             model_alias=agent_alias,
         )

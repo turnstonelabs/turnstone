@@ -8090,6 +8090,33 @@ _MODEL_PROVIDERS = frozenset({"openai", "anthropic", "openai-compatible", "googl
 _REASONING_EFFORT_CHOICES = frozenset(
     {"", "none", "minimal", "low", "medium", "high", "xhigh", "max"}
 )
+# Keep in sync with turnstone.core.providers._VALID_API_SURFACES.
+_API_SURFACE_CHOICES = frozenset({"chat", "responses"})
+
+
+def _validate_api_surface(caps: Any) -> str | None:
+    """Return an error message if ``caps["server_compat"]["api_surface"]`` is invalid.
+
+    Strict equality match (no strip/lower normalisation): the persisted value
+    is bound directly to the admin ``<select>`` whose options are the canonical
+    ``"chat"`` / ``"responses"`` strings, so anything else fails to round-trip
+    through edit/save.  The provider factory raises ``ValueError`` at request
+    time for an unknown surface; validating here turns that into a 400 at
+    write time so an admin can't poison a model alias via direct API calls.
+    """
+    if not isinstance(caps, dict):
+        return None
+    sc = caps.get("server_compat")
+    if not isinstance(sc, dict):
+        return None
+    raw = sc.get("api_surface")
+    if raw is None or raw == "":
+        return None
+    if not isinstance(raw, str) or raw not in _API_SURFACE_CHOICES:
+        return f"Invalid server_compat.api_surface: {raw!r}"
+    return None
+
+
 # Keep in sync with turnstone.core.providers._google.GOOGLE_DEFAULT_BASE_URL
 _PROVIDER_DEFAULT_URLS: dict[str, str] = {
     "openai": "https://api.openai.com/v1",
@@ -8391,6 +8418,9 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     ctx_raw = body.get("context_window", 32768)
     context_window = max(0, int(ctx_raw)) if isinstance(ctx_raw, (int, float)) else 0
     caps = body.get("capabilities", {})
+    err_msg = _validate_api_surface(caps)
+    if err_msg:
+        return JSONResponse({"error": err_msg}, status_code=400)
     capabilities = json.dumps(caps) if isinstance(caps, dict) else "{}"
     enabled = bool(body.get("enabled", True))
 
@@ -8545,6 +8575,9 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         updates["context_window"] = max(0, int(ctx_raw)) if isinstance(ctx_raw, (int, float)) else 0
     if "capabilities" in body:
         caps = body["capabilities"]
+        err_msg = _validate_api_surface(caps)
+        if err_msg:
+            return JSONResponse({"error": err_msg}, status_code=400)
         updates["capabilities"] = json.dumps(caps) if isinstance(caps, dict) else "{}"
     if "enabled" in body:
         updates["enabled"] = bool(body["enabled"])

@@ -352,6 +352,90 @@ def test_update_endpoint_skips_refresh_on_empty_body(
     assert calls == []  # gate held: empty body did not trigger a refresh
 
 
+def test_create_rejects_invalid_api_surface(storage: SQLiteBackend) -> None:
+    """POST with a bogus server_compat.api_surface returns 400 rather than
+    persisting a value that would make get_provider() raise on every later
+    ChatSession init for the alias."""
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    registry = _make_registry(alias="local", model="m")
+    client = _make_client(storage, registry)
+
+    resp = client.post(
+        "/v1/api/admin/model-definitions",
+        json={
+            "alias": "bad",
+            "model": "x",
+            "provider": "openai-compatible",
+            "base_url": "http://localhost:9000/v1",
+            "api_key": "sk-x",
+            "capabilities": {"server_compat": {"api_surface": "BOGUS"}},
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert "api_surface" in resp.json()["error"]
+    # And the alias is not persisted
+    assert not registry.has_alias("bad")
+
+
+def test_create_rejects_non_canonical_api_surface(storage: SQLiteBackend) -> None:
+    """Strict validation: ' Responses ' / 'CHAT' don't round-trip through the
+    admin <select>, so they're rejected even though they'd survive a
+    case-insensitive membership check."""
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    registry = _make_registry(alias="local", model="m")
+    client = _make_client(storage, registry)
+
+    for bad in (" responses ", "RESPONSES", "Chat"):
+        resp = client.post(
+            "/v1/api/admin/model-definitions",
+            json={
+                "alias": "noncanon",
+                "model": "x",
+                "provider": "openai-compatible",
+                "base_url": "http://localhost:9000/v1",
+                "api_key": "sk-x",
+                "capabilities": {"server_compat": {"api_surface": bad}},
+            },
+        )
+        assert resp.status_code == 400, f"{bad!r}: {resp.text}"
+
+
+def test_create_accepts_valid_api_surface(storage: SQLiteBackend) -> None:
+    """Canonical 'chat' / 'responses' / unset are all accepted and persisted."""
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    registry = _make_registry(alias="local", model="m")
+    client = _make_client(storage, registry)
+
+    resp = client.post(
+        "/v1/api/admin/model-definitions",
+        json={
+            "alias": "responses-alias",
+            "model": "x",
+            "provider": "openai-compatible",
+            "base_url": "http://localhost:9000/v1",
+            "api_key": "sk-x",
+            "capabilities": {"server_compat": {"api_surface": "responses"}},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert registry.has_alias("responses-alias")
+
+
+def test_update_rejects_invalid_api_surface(storage: SQLiteBackend) -> None:
+    """PUT path also gates the validation, so an admin can't smuggle a bad
+    value into an existing alias."""
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    registry = _make_registry(alias="local", model="m")
+    client = _make_client(storage, registry)
+
+    resp = client.put(
+        "/v1/api/admin/model-definitions/m1",
+        json={"capabilities": {"server_compat": {"api_surface": "junk"}}},
+    )
+    assert resp.status_code == 400, resp.text
+    assert "api_surface" in resp.json()["error"]
+
+
 def test_delete_endpoint_refreshes_registry(storage: SQLiteBackend) -> None:
     """DELETE drops the alias from the in-process registry too — a
     coord session that tried to resolve the deleted alias would

@@ -44,6 +44,19 @@ class ModelConfig:
     server_compat: dict[str, Any] = field(default_factory=dict)
 
 
+def _api_surface_of(cfg: ModelConfig) -> str | None:
+    """Extract the operator-pinned api_surface from *cfg*, or ``None``.
+
+    Used both at provider-cache lookup time and at reload-eviction time so the
+    two sites stay in sync.  Returns ``None`` when the field is absent, blank,
+    or not a string — matching the "inherit provider default" semantics.
+    """
+    raw = cfg.server_compat.get("api_surface") if isinstance(cfg.server_compat, dict) else None
+    if isinstance(raw, str) and raw.strip():
+        return raw
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -127,7 +140,9 @@ class ModelRegistry:
                 raise ValueError(f"Unknown model alias: {alias}")
             if alias not in self._providers:
                 cfg = self._models[alias]
-                self._providers[alias] = create_provider(cfg.provider)
+                self._providers[alias] = create_provider(
+                    cfg.provider, api_surface=_api_surface_of(cfg)
+                )
             return self._providers[alias]
 
     def get_config(self, alias: str) -> ModelConfig:
@@ -257,13 +272,18 @@ class ModelRegistry:
                     if hasattr(client, "close"):
                         client.close()
                     del self._clients[alias]
-            # Providers are keyed on alias but only depend on
-            # ``cfg.provider`` — drop only when the provider string
-            # changed or the alias was removed.
+            # Providers are keyed on alias and depend on (cfg.provider,
+            # cfg.server_compat["api_surface"]) — drop when either changes
+            # or the alias was removed.
             for alias in list(self._providers.keys()):
                 old_cfg = old_models.get(alias)
                 new_cfg = self._models.get(alias)
-                if new_cfg is None or old_cfg is None or old_cfg.provider != new_cfg.provider:
+                if (
+                    new_cfg is None
+                    or old_cfg is None
+                    or old_cfg.provider != new_cfg.provider
+                    or _api_surface_of(old_cfg) != _api_surface_of(new_cfg)
+                ):
                     del self._providers[alias]
 
     def shutdown(self) -> None:
