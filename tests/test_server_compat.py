@@ -89,13 +89,26 @@ class TestSuggestProfile:
         p = suggest_profile("vllm", "Google/GEMMA-4-31B-IT")
         assert p["capabilities"]["thinking_mode"] == "manual"
 
-    def test_vllm_mistral_medium_responses_surface(self) -> None:
-        """Mistral medium open-weights on vLLM is routed through the Responses API."""
+    def test_vllm_mistral_medium_not_auto_suggested(self) -> None:
+        """Mistral medium falls back to the generic vLLM profile.
+
+        We don't auto-suggest the Responses surface for Mistral medium because
+        vLLM's Responses API tool-call parser isn't wired up for it yet —
+        operators who want per-request reasoning effort must pick "Responses
+        API" manually in the admin UI and accept the tool-calling limitation.
+        """
         p = suggest_profile("vllm", "mistralai/Mistral-Medium-3-Instruct")
         assert p["server_compat"]["server_type"] == "vllm"
-        assert p["server_compat"]["api_surface"] == "responses"
-        # No chat_template thinking_param — Responses handles reasoning natively.
+        assert "api_surface" not in p["server_compat"]
         assert "capabilities" not in p
+
+    def test_vllm_mistral_medium_profile_still_available(self) -> None:
+        """The vllm-mistral-medium profile remains in _PROFILES so an operator
+        who explicitly opts in via the admin UI gets the Responses surface."""
+        from turnstone.core.server_compat import _PROFILES
+
+        assert "vllm-mistral-medium" in _PROFILES
+        assert _PROFILES["vllm-mistral-medium"]["server_compat"]["api_surface"] == "responses"
 
     def test_holo_requires_holo2(self) -> None:
         """Short 'holo' prefix shouldn't false-match; 'holo2' should match."""

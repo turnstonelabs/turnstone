@@ -89,11 +89,17 @@ _PROFILES: dict[str, dict[str, Any]] = {
         },
     },
     "vllm-mistral-medium": {
-        # Mistral medium open-weights served by vLLM exposes reasoning via the
-        # Responses API (``reasoning.effort``) rather than the Chat Completions
-        # ``chat_template_kwargs`` path, so route this profile at the Responses
-        # surface.  Reasoning effort is selected per-request like any other
-        # Responses-API model.
+        # Mistral medium open-weights served by vLLM can deliver reasoning
+        # via either surface, but the trade-off is asymmetric:
+        #   * Chat Completions — tool calling works (``--tool-call-parser
+        #     mistral``); reasoning is enabled via the vLLM CLI
+        #     (``--reasoning-parser``) rather than per-request.
+        #   * Responses API   — reasoning effort is per-request and clean,
+        #     but as of vLLM 0.x the tool-call parser is not wired up on
+        #     this surface so tool calls leak as ``[TOOL_CALLS]`` text.
+        # We do **not** auto-suggest this profile from Detect; an operator
+        # who needs per-request effort and accepts the tool-calling
+        # limitation can pick "Responses API" manually in the admin UI.
         "server_compat": {
             "server_type": "vllm",
             "api_surface": "responses",
@@ -142,8 +148,9 @@ _VLLM_MODEL_PROFILES: list[tuple[str, str]] = [
     ("granite3", "vllm-granite-thinking"),
     ("deepseek-r1", "vllm-deepseek-thinking"),
     ("holo2", "vllm-holo-thinking"),
-    ("mistral-medium", "vllm-mistral-medium"),
-    ("mistralai/mistral-medium", "vllm-mistral-medium"),
+    # Mistral medium intentionally omitted — see ``vllm-mistral-medium``
+    # profile docstring for the Chat-vs-Responses trade-off; operator
+    # picks manually rather than letting Detect auto-suggest Responses.
 ]
 
 # llama.cpp model-family → profile key mapping.
