@@ -49,6 +49,33 @@ def _attachment_to_content_part(att: dict[str, Any]) -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------
+# Search-term normalization
+# ---------------------------------------------------------------------------
+
+# Composition can hand a multi-KB pasted user message to ILIKE-based search;
+# without a cap, every distinct token would emit one unindexable predicate
+# per scope-fanned query, producing hundreds of seq-scan clauses on a single
+# rebuild.  Cap + dedupe + length filter keeps the SQL bounded.
+_MAX_SEARCH_TERMS = 16
+_MIN_TERM_LEN = 2
+
+
+def normalize_search_terms(query: str) -> list[str]:
+    """De-dupe (case-insensitive), drop short tokens, and cap at MAX terms."""
+    seen: set[str] = set()
+    terms: list[str] = []
+    for raw in query.split():
+        lowered = raw.lower()
+        if len(lowered) < _MIN_TERM_LEN or lowered in seen:
+            continue
+        seen.add(lowered)
+        terms.append(raw)
+        if len(terms) >= _MAX_SEARCH_TERMS:
+            break
+    return terms
+
+
+# ---------------------------------------------------------------------------
 # Text sanitization
 # ---------------------------------------------------------------------------
 
