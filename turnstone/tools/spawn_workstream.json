@@ -18,7 +18,7 @@
       },
       "model": {
         "type": "string",
-        "description": "Optional model alias from the registry. Omit to use the coordinator's default model (or the one the skill prescribes)."
+        "description": "Optional model alias from the registry. Discover available aliases per node via `list_nodes` (the `model_aliases` field on each row lists the healthy aliases that node will accept). Omit to use the coordinator's default model (or the one the skill prescribes)."
       },
       "target_node": {
         "type": "string",

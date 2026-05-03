@@ -24,7 +24,7 @@
             },
             "model": {
               "type": "string",
-              "description": "Optional model alias."
+              "description": "Optional model alias. Discover available aliases per node via `list_nodes.model_aliases`."
             },
             "target_node": {
               "type": "string",
