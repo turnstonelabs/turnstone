@@ -30,9 +30,25 @@ def _full_hdr() -> dict[str, str]:
     }
 
 
+@pytest.fixture(autouse=True)
+def _isolate_metrics(monkeypatch):
+    """Swap ``turnstone.server._metrics`` for a fresh collector
+    per-test, with auto-restore.
+
+    Bare ``srv_mod._metrics = MetricsCollector()`` (the prior
+    pattern) leaks into any test file that already bound the name
+    via ``from turnstone.server import _metrics`` at import time —
+    those tests' patches then operate on a different instance from
+    the one the live ``_publish_models_metadata`` reads, and the
+    monkeypatch silently no-ops.  ``monkeypatch.setattr`` restores
+    after the test, so the leak is contained.
+    """
+    fresh = MetricsCollector()
+    fresh.model = "test-model"
+    monkeypatch.setattr(srv_mod, "_metrics", fresh)
+
+
 def _make_app(storage: Any) -> TestClient:
-    srv_mod._metrics = MetricsCollector()
-    srv_mod._metrics.model = "test-model"
     mock_session = MagicMock()
     mock_ws = MagicMock()
     mock_ws.id = "ws-target"
