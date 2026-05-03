@@ -101,6 +101,7 @@ class FakeAdapter:
         self.cleaned_up: list[str] = []
         self.build_session_calls = 0
         self.build_session_raises = build_session_raises
+        self.last_build_model: object | None = None
         # Slow down session build so concurrent tests can race.
         self.build_session_delay = 0.0
 
@@ -144,8 +145,13 @@ class FakeAdapter:
     def build_ui(self, ws: Workstream) -> Any:
         return FakeUI()
 
-    def build_session(self, ws: Workstream, **_: object) -> Any:
+    def build_session(self, ws: Workstream, **kwargs: object) -> Any:
         self.build_session_calls += 1
+        # Record the ``model`` kwarg (None on fresh-create, the saved
+        # alias on rehydrate) so tests can assert SessionManager.open()
+        # threads the persisted alias through to construction instead
+        # of letting the adapter resolve the *current* default alias.
+        self.last_build_model = kwargs.get("model")
         if self.build_session_delay:
             time.sleep(self.build_session_delay)
         if self.build_session_raises:
@@ -184,6 +190,13 @@ class FakeStorage:
         # "no peers alive" (every row unprotected by liveness).
         self.live_services: dict[str, list[str]] = {}
         self.list_services_raises = False
+        # Per-ws config (model_alias, temperature, …).  Populated by
+        # tests that exercise the rehydrate-preserves-config path; the
+        # SessionManager.open() rehydrate path reads this through
+        # ``self._storage.load_workstream_config`` so it can pass the
+        # saved alias into ``build_session`` and avoid clobbering the
+        # original on construction.
+        self.ws_config: dict[str, dict[str, str]] = {}
 
     @staticmethod
     def _now_iso() -> str:
@@ -293,6 +306,18 @@ class FakeStorage:
 
     def count_skill_versions(self, template_id: str) -> int:
         return 0
+
+    def load_workstream_config(self, ws_id: str) -> dict[str, str]:
+        with self.lock:
+            return dict(self.ws_config.get(ws_id, {}))
+
+    def save_workstream_config(self, ws_id: str, config: dict[str, str]) -> None:
+        # Mirrors the real backend's INSERT OR REPLACE per-key semantics
+        # — callers expect a partial save to overwrite only the keys
+        # they pass, not the whole row.
+        with self.lock:
+            row = self.ws_config.setdefault(ws_id, {})
+            row.update(config)
 
 
 _EMITTER_DEFAULT = object()
@@ -655,6 +680,55 @@ def test_open_resurrects_closed_state() -> None:
     # gate any extra resurrect-only setup on it (e.g. coord's
     # storage-seeded children rebuild).
     assert ws_id in [e.ws_id for e in adapter.events_of("rehydrated")]
+
+
+def test_open_threads_saved_model_alias_into_build_session() -> None:
+    """Reopening a closed ws must build the session with the *original*
+    model alias, not the current registry default.
+
+    Without this, ``build_session(ws)`` is called with ``model=None`` →
+    the production session_factory resolves ``_effective_default_alias()``
+    → ChatSession's ``__init__`` writes those defaults to
+    ``workstream_config`` (INSERT OR REPLACE) → the subsequent
+    ``resume()`` restores what is now the default. Net effect: every
+    persisted knob (model, temperature, reasoning_effort, max_tokens,
+    skill, creative_mode, instructions, …) silently resets on every
+    reopen and on every service restart.
+    """
+    mgr, adapter, storage = _make_manager()
+    ws = mgr.create(user_id="u1")
+    ws_id = ws.id
+    # Pretend the user set a non-default alias when the ws was created;
+    # the real path goes through ChatSession._save_config but the
+    # FakeSession in this suite doesn't model that, so seed directly.
+    storage.ws_config[ws_id] = {"model_alias": "gpt-5-pro"}
+    mgr.close(ws_id)
+    adapter.last_build_model = "<unset>"  # sentinel — must be overwritten
+
+    reopened = mgr.open(ws_id)
+
+    assert reopened is not None
+    assert adapter.last_build_model == "gpt-5-pro"
+
+
+def test_open_falls_back_to_none_when_no_saved_alias() -> None:
+    """Reopening a ws with no saved alias must pass ``model=None`` to
+    ``build_session`` so the adapter's session_factory can fall back to
+    the current default — matching the user's intent: best effort
+    restore, default when the original is gone."""
+    mgr, adapter, storage = _make_manager()
+    ws = mgr.create(user_id="u1")
+    ws_id = ws.id
+    # No ws_config row — simulates "alias was never saved" or "saved
+    # alias was empty string".
+    assert ws_id not in storage.ws_config
+    mgr.close(ws_id)
+    adapter.last_build_model = "<unset>"
+
+    reopened = mgr.open(ws_id)
+
+    assert reopened is not None
+    assert adapter.last_build_model is None
 
 
 def test_open_touches_workstream_on_rehydrate() -> None:

@@ -107,7 +107,17 @@ def build_console_session_factory(
         # fall through to a generic OpenAI-compat provider — which
         # mismatches when the default is Anthropic/Google-backed.
         explicit_alias = model_alias or (config_store.get("coordinator.model_alias") or "").strip()
-        effective_alias = explicit_alias or registry.default
+        # ``SessionManager.open`` passes the persisted ``model_alias``
+        # through on the rehydrate path so reopened coordinators keep
+        # the model they were created with.  An operator may have
+        # removed that alias from the registry since — fall back to
+        # the registry default in that case rather than 500-ing every
+        # reopen.  Same fall-through covers an unset / empty
+        # ``coordinator.model_alias`` ConfigStore value.
+        if not explicit_alias or not registry.has_alias(explicit_alias):
+            effective_alias = registry.default
+        else:
+            effective_alias = explicit_alias
 
         r_client, r_model, r_cfg = registry.resolve(effective_alias)
 

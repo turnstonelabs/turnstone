@@ -554,6 +554,99 @@ class TestWorkstreamConfig:
         assert result is True
         assert session.model == "gpt-5"
 
+    def test_init_does_not_clobber_existing_config(self, tmp_db):
+        """ChatSession.__init__ must NOT overwrite existing
+        ``workstream_config`` keys when constructing for an already-
+        persisted ws_id.
+
+        This is the fix for the rehydrate bug: ``SessionManager.open()``
+        builds a ChatSession with the persisted ws_id; the legacy
+        ``__init__`` unconditionally called ``_save_config()`` which is
+        ``INSERT OR REPLACE`` per-key — silently resetting model_alias,
+        temperature, reasoning_effort, max_tokens, skill, creative_mode,
+        and instructions to the constructor defaults *before*
+        ``resume()`` got a chance to read them back.
+        """
+        client = MagicMock()
+        client.models.list.return_value.data = [MagicMock(id="test-model")]
+        ui = MagicMock()
+        ui.on_info = MagicMock()
+        ui.on_error = MagicMock()
+        ui.on_state_change = MagicMock()
+        ui.on_rename = MagicMock()
+
+        register_workstream("rehydrate_ws")
+        save_workstream_config(
+            "rehydrate_ws",
+            {
+                "model": "gpt-5-pro",
+                "model_alias": "gpt-5-pro",
+                "temperature": "0.2",
+                "reasoning_effort": "high",
+                "max_tokens": "8192",
+                "creative_mode": "True",
+                "instructions": "preserve me",
+            },
+        )
+
+        ChatSession(
+            client=client,
+            model="some-default-model",
+            ui=ui,
+            instructions=None,
+            temperature=0.7,
+            max_tokens=4096,
+            tool_timeout=30,
+            reasoning_effort="medium",
+            ws_id="rehydrate_ws",
+        )
+
+        loaded = load_workstream_config("rehydrate_ws")
+        assert loaded["model"] == "gpt-5-pro"
+        assert loaded["model_alias"] == "gpt-5-pro"
+        assert loaded["temperature"] == "0.2"
+        assert loaded["reasoning_effort"] == "high"
+        assert loaded["max_tokens"] == "8192"
+        assert loaded["creative_mode"] == "True"
+        assert loaded["instructions"] == "preserve me"
+
+    def test_init_writes_config_on_fresh_create(self, tmp_db):
+        """The opposite half of the contract: when no config row exists
+        yet, ``__init__`` must still persist the constructor's values so
+        a later resume can find them. This is the path that previously
+        worked — the fix must not break it."""
+        client = MagicMock()
+        client.models.list.return_value.data = [MagicMock(id="test-model")]
+        ui = MagicMock()
+        ui.on_info = MagicMock()
+        ui.on_error = MagicMock()
+        ui.on_state_change = MagicMock()
+        ui.on_rename = MagicMock()
+
+        # No save_workstream_config() before ChatSession() — this is
+        # the fresh-create path the SessionManager.create() flow takes.
+        register_workstream("fresh_ws")
+        assert load_workstream_config("fresh_ws") == {}
+
+        ChatSession(
+            client=client,
+            model="gpt-5-mini",
+            ui=ui,
+            instructions="be terse",
+            temperature=0.4,
+            max_tokens=2048,
+            tool_timeout=30,
+            reasoning_effort="low",
+            ws_id="fresh_ws",
+        )
+
+        loaded = load_workstream_config("fresh_ws")
+        assert loaded["model"] == "gpt-5-mini"
+        assert loaded["temperature"] == "0.4"
+        assert loaded["reasoning_effort"] == "low"
+        assert loaded["max_tokens"] == "2048"
+        assert loaded["instructions"] == "be terse"
+
 
 # ── Prune workstreams ─────────────────────────────────────────────────
 
