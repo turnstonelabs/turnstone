@@ -67,6 +67,42 @@ class TestSearchStructuredMemories:
         assert len(results) >= 1
         assert any(r["name"] == "db_host" for r in results)
 
+    def test_multiword_or_matches_partial(self, tmp_db):
+        """OR-of-terms: memory matching only 1 of 3 query terms is returned."""
+        save_structured_memory("postgres_config", "host=localhost port=5432")
+        save_structured_memory("redis_config", "host=redis port=6379")
+        save_structured_memory("unrelated", "nothing relevant here")
+
+        # "postgres missing_word_a missing_word_b": only postgres_config matches "postgres"
+        results = search_structured_memories("postgres missing_word_a missing_word_b")
+        names = {r["name"] for r in results}
+        assert "postgres_config" in names
+        assert "unrelated" not in names
+
+    def test_multiword_or_multiple_partial_matches(self, tmp_db):
+        """Multiple memories each matching different terms are all returned."""
+        save_structured_memory("key_alpha", "alpha content here")
+        save_structured_memory("key_beta", "beta content here")
+        save_structured_memory("key_other", "completely different")
+
+        results = search_structured_memories("alpha beta")
+        names = {r["name"] for r in results}
+        assert "key_alpha" in names
+        assert "key_beta" in names
+        assert "key_other" not in names
+
+    def test_search_scope_filtering_preserved(self, tmp_db):
+        """Search with scope filter only returns memories in that scope."""
+        save_structured_memory("ws1_fact", "alpha info", scope="workstream", scope_id="ws1")
+        save_structured_memory("ws2_fact", "alpha info", scope="workstream", scope_id="ws2")
+        save_structured_memory("global_fact", "alpha info", scope="global")
+
+        results = search_structured_memories("alpha", scope="workstream", scope_id="ws1")
+        names = {r["name"] for r in results}
+        assert "ws1_fact" in names
+        assert "ws2_fact" not in names
+        assert "global_fact" not in names
+
 
 class TestGetStructuredMemoryByName:
     def test_get_existing(self, tmp_db):

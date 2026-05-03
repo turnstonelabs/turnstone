@@ -88,6 +88,9 @@ from turnstone.core.storage._utils import (
     VERDICT_MUTABLE as _VERDICT_MUTABLE,
 )
 from turnstone.core.storage._utils import (
+    normalize_search_terms as _normalize_search_terms,
+)
+from turnstone.core.storage._utils import (
     reconstruct_messages as _reconstruct_messages,
 )
 from turnstone.core.storage._utils import (
@@ -3315,7 +3318,10 @@ class PostgreSQLBackend:
         limit: int = 100,
     ) -> list[dict[str, str]]:
         with self._conn() as conn:
-            q = sa.select(structured_memories).order_by(structured_memories.c.updated.desc())
+            q = sa.select(structured_memories).order_by(
+                structured_memories.c.updated.desc(),
+                structured_memories.c.memory_id.asc(),
+            )
             if mem_type:
                 q = q.where(structured_memories.c.type == mem_type)
             if scope:
@@ -3334,11 +3340,16 @@ class PostgreSQLBackend:
         scope_id: str = "",
         limit: int = 20,
     ) -> list[dict[str, str]]:
+        """OR-of-terms ILIKE search; ranking is the caller's job (BM25 downstream)."""
         if not query or not query.strip():
             return self.list_structured_memories(
                 mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit
             )
-        terms = query.split()
+        terms = _normalize_search_terms(query)
+        if not terms:
+            return self.list_structured_memories(
+                mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit
+            )
         with self._conn() as conn:
             clauses = []
             params: dict[str, str] = {}
@@ -3352,24 +3363,115 @@ class PostgreSQLBackend:
                 params[f"n{i}"] = f"%{escaped}%"
                 params[f"d{i}"] = f"%{escaped}%"
                 params[f"c{i}"] = f"%{escaped}%"
-            where = " AND ".join(clauses)
+            term_clause = " OR ".join(clauses)
+            scope_filters = ""
             if mem_type:
-                where += " AND type = :type_filter"
+                scope_filters += " AND type = :type_filter"
                 params["type_filter"] = mem_type
             if scope:
-                where += " AND scope = :scope_filter"
+                scope_filters += " AND scope = :scope_filter"
                 params["scope_filter"] = scope
             if scope_id and scope:
-                where += " AND scope_id = :scope_id_filter"
+                scope_filters += " AND scope_id = :scope_id_filter"
                 params["scope_id_filter"] = scope_id
             rows = conn.execute(
                 sa.text(
-                    f"SELECT * FROM structured_memories WHERE {where} "
-                    f"ORDER BY updated DESC LIMIT :lim"
+                    f"SELECT * FROM structured_memories WHERE ({term_clause}){scope_filters} "
+                    f"ORDER BY updated DESC, memory_id ASC LIMIT :lim"
                 ),
                 {**params, "lim": limit},
             ).fetchall()
             return [dict(r._mapping) for r in rows]
+
+    def list_visible_structured_memories(
+        self,
+        scopes: list[tuple[str, str]],
+        mem_type: str = "",
+        limit: int = 100,
+    ) -> list[dict[str, str]]:
+        """Single-query union across visible (scope, scope_id) pairs.
+
+        Replaces the per-scope fan-out (one query per visible scope) so the
+        composition path issues 1 round-trip instead of 3.
+        """
+        if not scopes:
+            return []
+        with self._conn() as conn:
+            scope_clauses, params = self._build_scope_or_clause(scopes)
+            extra = ""
+            if mem_type:
+                extra = " AND type = :type_filter"
+                params["type_filter"] = mem_type
+            rows = conn.execute(
+                sa.text(
+                    f"SELECT * FROM structured_memories WHERE ({scope_clauses}){extra} "
+                    f"ORDER BY updated DESC, memory_id ASC LIMIT :lim"
+                ),
+                {**params, "lim": limit},
+            ).fetchall()
+            return [dict(r._mapping) for r in rows]
+
+    def search_visible_structured_memories(
+        self,
+        query: str,
+        scopes: list[tuple[str, str]],
+        mem_type: str = "",
+        limit: int = 20,
+    ) -> list[dict[str, str]]:
+        """OR-of-terms search joined with a single visibility OR-group.
+
+        Replaces the per-scope search fan-out; ranking is the caller's job.
+        """
+        if not scopes:
+            return []
+        if not query or not query.strip():
+            return self.list_visible_structured_memories(scopes, mem_type=mem_type, limit=limit)
+        terms = _normalize_search_terms(query)
+        if not terms:
+            return self.list_visible_structured_memories(scopes, mem_type=mem_type, limit=limit)
+        with self._conn() as conn:
+            scope_clauses, params = self._build_scope_or_clause(scopes)
+            term_clauses = []
+            for i, t in enumerate(terms):
+                escaped = _escape_ilike(t)
+                term_clauses.append(
+                    f"(name ILIKE :n{i} ESCAPE '\\' "
+                    f"OR description ILIKE :d{i} ESCAPE '\\' "
+                    f"OR content ILIKE :c{i} ESCAPE '\\')"
+                )
+                params[f"n{i}"] = f"%{escaped}%"
+                params[f"d{i}"] = f"%{escaped}%"
+                params[f"c{i}"] = f"%{escaped}%"
+            term_clause = " OR ".join(term_clauses)
+            extra = ""
+            if mem_type:
+                extra = " AND type = :type_filter"
+                params["type_filter"] = mem_type
+            rows = conn.execute(
+                sa.text(
+                    f"SELECT * FROM structured_memories "
+                    f"WHERE ({scope_clauses}) AND ({term_clause}){extra} "
+                    f"ORDER BY updated DESC, memory_id ASC LIMIT :lim"
+                ),
+                {**params, "lim": limit},
+            ).fetchall()
+            return [dict(r._mapping) for r in rows]
+
+    @staticmethod
+    def _build_scope_or_clause(
+        scopes: list[tuple[str, str]],
+    ) -> tuple[str, dict[str, str]]:
+        """Build a parameterized OR-group of (scope[, scope_id]) predicates."""
+        params: dict[str, str] = {}
+        clauses: list[str] = []
+        for i, (s, sid) in enumerate(scopes):
+            params[f"sc{i}"] = s
+            if sid:
+                params[f"sid{i}"] = sid
+                clauses.append(f"(scope = :sc{i} AND scope_id = :sid{i})")
+            else:
+                clauses.append(f"scope = :sc{i}")
+        return " OR ".join(clauses), params
 
     def touch_structured_memories(self, keys: list[tuple[str, str, str]]) -> int:
         """Batch-touch multiple memories by (name, scope, scope_id)."""

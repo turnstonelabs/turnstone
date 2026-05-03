@@ -58,6 +58,7 @@ from turnstone.core.memory import (
     list_default_skills,
     list_skills_by_activation,
     list_structured_memories,
+    list_visible_structured_memories,
     list_workstreams_with_history,
     load_messages,
     load_workstream_config,
@@ -71,6 +72,7 @@ from turnstone.core.memory import (
     search_history,
     search_history_recent,
     search_structured_memories,
+    search_visible_structured_memories,
     set_workstream_alias,
     unreserve_attachments,
     update_workstream_title,
@@ -92,6 +94,7 @@ from turnstone.core.providers import create_provider
 from turnstone.core.safety import is_command_blocked, sanitize_command
 from turnstone.core.sandbox import execute_math_sandboxed
 from turnstone.core.storage._registry import get_storage
+from turnstone.core.storage._utils import normalize_search_terms
 from turnstone.core.tool_advisory import escape_wrapper_tags, render_system_reminder
 from turnstone.core.tool_search import ToolSearchManager
 from turnstone.core.tools import (
@@ -428,6 +431,11 @@ class ChatSession:
             except Exception:
                 log.debug("rule_registry.init_failed", exc_info=True)
         self._memory_config = memory_config or MemoryConfig()
+        # Per-turn cache for _search_visible_memories — _init_system_messages
+        # fires many times within one turn (state transitions, MCP refresh,
+        # tool results) and the recent-context string is identical across
+        # them.  Invalidated on user-turn append and on memory write/delete.
+        self._mem_search_cache: dict[tuple[str, str, int], list[dict[str, str]]] = {}
         self._ws_id = ws_id or uuid.uuid4().hex
         self._title_generated = False
         self._read_files: set[str] = set()
@@ -1633,10 +1641,16 @@ class ChatSession:
         if self.instructions:
             dev_parts.append("")
             dev_parts.append(self.instructions)
-        visible_mems = self._list_visible_memories(limit=self._mem_cfg.fetch_limit)
+        context = extract_recent_context(self.messages)
+        visible_mems, candidate_source = self._select_memory_candidates(context)
         if visible_mems:
-            context = extract_recent_context(self.messages)
             relevant = score_memories(visible_mems, context, k=self._mem_cfg.relevance_k)
+            log.info(
+                "memory.composition",
+                source=candidate_source,
+                candidates=len(visible_mems),
+                injected=len(relevant),
+            )
             if relevant:
                 dev_parts.append("")
                 dev_parts.append(build_memory_context(relevant))
@@ -2194,6 +2208,9 @@ class ChatSession:
         consume step adds it to the WHERE clause so a stale send can't
         steal rows reserved to a different one.
         """
+        # New user content invalidates the per-turn memory-search cache
+        # (composition will see a different recent-context string).
+        self._invalidate_memory_cache()
         user_content: str | list[dict[str, Any]]
         if attachments:
             parts: list[dict[str, Any]] = [{"type": "text", "text": user_input}]
@@ -5413,60 +5430,90 @@ class ChatSession:
             n += count_structured_memories(scope="user", scope_id=self._user_id)
         return n
 
+    def _visible_scopes(self) -> list[tuple[str, str]]:
+        """Return the (scope, scope_id) pairs visible to this session.
+
+        Coord sessions see ONLY their coord-scope; interactive sessions see
+        global + their workstream + their user (when uid present).  Drives
+        the single-query visibility helpers.
+        """
+        if self._kind == WorkstreamKind.COORDINATOR:
+            return [("coordinator", self._ws_id)]
+        scopes: list[tuple[str, str]] = [("global", ""), ("workstream", self._ws_id)]
+        if self._user_id:
+            scopes.append(("user", self._user_id))
+        return scopes
+
     def _list_visible_memories(self, mem_type: str = "", limit: int = 50) -> list[dict[str, str]]:
         """List memories visible to this session with optional type filter.
 
+        Single SQL round-trip — collapses the prior per-scope fan-out.
         See :meth:`_visible_memory_count` for the coord-isolation rule.
         """
-        if self._kind == WorkstreamKind.COORDINATOR:
-            return list_structured_memories(
-                mem_type=mem_type,
-                scope="coordinator",
-                scope_id=self._ws_id,
-                limit=limit,
-            )
-        global_mems = list_structured_memories(mem_type=mem_type, scope="global", limit=limit)
-        ws_mems = list_structured_memories(
-            mem_type=mem_type, scope="workstream", scope_id=self._ws_id, limit=limit
+        return list_visible_structured_memories(
+            self._visible_scopes(), mem_type=mem_type, limit=limit
         )
-        user_mems: list[dict[str, str]] = []
-        if self._user_id:
-            user_mems = list_structured_memories(
-                mem_type=mem_type, scope="user", scope_id=self._user_id, limit=limit
-            )
-        combined = global_mems + ws_mems + user_mems
-        combined.sort(key=lambda m: m.get("updated", ""), reverse=True)
-        return combined[:limit]
 
     def _search_visible_memories(
         self, query: str, mem_type: str = "", limit: int = 20
     ) -> list[dict[str, str]]:
         """Search memories visible to this session (scope-filtered).
 
+        Single SQL round-trip with a per-turn cache: ``_init_system_messages``
+        is invoked many times within a turn (state transitions, MCP refresh,
+        tool results) and the recent-context query is identical across them.
+        Cache is cleared on each new user turn and after memory writes/deletes.
         See :meth:`_visible_memory_count` for the coord-isolation rule.
         """
-        if self._kind == WorkstreamKind.COORDINATOR:
-            return search_structured_memories(
-                query,
-                mem_type=mem_type,
-                scope="coordinator",
-                scope_id=self._ws_id,
-                limit=limit,
-            )
-        global_mems = search_structured_memories(
-            query, mem_type=mem_type, scope="global", limit=limit
+        cache_key = (query, mem_type, limit)
+        cached = self._mem_search_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        rows = search_visible_structured_memories(
+            query, self._visible_scopes(), mem_type=mem_type, limit=limit
         )
-        ws_mems = search_structured_memories(
-            query, mem_type=mem_type, scope="workstream", scope_id=self._ws_id, limit=limit
-        )
-        user_mems: list[dict[str, str]] = []
-        if self._user_id:
-            user_mems = search_structured_memories(
-                query, mem_type=mem_type, scope="user", scope_id=self._user_id, limit=limit
-            )
-        combined = global_mems + ws_mems + user_mems
-        combined.sort(key=lambda m: m.get("updated", ""), reverse=True)
-        return combined[:limit]
+        self._mem_search_cache[cache_key] = rows
+        return rows
+
+    def _invalidate_memory_cache(self) -> None:
+        """Drop the per-turn search cache; call on user-turn append + memory writes."""
+        self._mem_search_cache.clear()
+
+    def _select_memory_candidates(self, context: str) -> tuple[list[dict[str, str]], str]:
+        """Pick the candidate set fed into BM25 ranking.
+
+        Returns ``(memories, source_label)`` where source is one of:
+        ``recency`` (no context, or search returned nothing),
+        ``search`` (search saturated the fetch_limit budget alone), or
+        ``union`` (search hits ∪ recency, deduped by memory_id).
+
+        Invariant: the candidate pool is always a SUPERSET of the
+        recency-only pool the original bug used — recency is fully
+        preserved (not truncated) whenever it gets unioned.  Worst
+        case the union is 2 × fetch_limit candidates (~100 with
+        defaults), which BM25 ranks in pure Python in well under a
+        millisecond.  BM25's score>0 cutoff in bm25.py drops anything
+        that doesn't match the query, so unranked recency tail items
+        cost nothing on irrelevant candidates while saving the
+        relevant ones.
+
+        Capping the union at fetch_limit (the prior behavior) would
+        evict the recency tail when search added distinct hits — and
+        the recency tail is exactly where ancient-but-recently-touched
+        memories live, which is the recall the PR sets out to improve.
+        """
+        fetch_limit = self._mem_cfg.fetch_limit
+        if not context:
+            return self._list_visible_memories(limit=fetch_limit), "recency"
+        search_hits = self._search_visible_memories(context, limit=fetch_limit)
+        if len(search_hits) >= fetch_limit:
+            return search_hits, "search"
+        recency = self._list_visible_memories(limit=fetch_limit)
+        seen = {m["memory_id"] for m in search_hits}
+        extra = [m for m in recency if m["memory_id"] not in seen]
+        if not search_hits:
+            return extra, "recency"
+        return search_hits + extra, ("union" if extra else "search")
 
     def _check_metacognitive_nudge(self, user_message: str) -> tuple[str, str] | None:
         """Check if a metacognitive nudge should fire for *user_message*.
@@ -8451,6 +8498,7 @@ class ChatSession:
                     msg = f"Error: failed to save memory '{item['name']}'"
                     self._report_tool_result(call_id, "memory", msg, is_error=True)
                     return call_id, msg
+                self._invalidate_memory_cache()
                 self._init_system_messages()
                 if old is not None:
                     msg = f"Updated memory '{item['name']}' (type={item['mem_type']}, scope={item['scope']})"
@@ -8496,6 +8544,7 @@ class ChatSession:
                     msg = f"Error: memory '{item['name']}' not found (searched scopes: {tried})"
                     self._report_tool_result(call_id, "memory", msg, is_error=True)
                 else:
+                    self._invalidate_memory_cache()
                     self._init_system_messages()
                     msg = f"Deleted memory '{item['name']}' (scope={deleted_scope})"
                     self._report_tool_result(call_id, "memory", msg)
@@ -8523,6 +8572,12 @@ class ChatSession:
                         mem_type=item.get("mem_type", ""),
                         limit=item["limit"],
                     )
+                log.info(
+                    "memory.search",
+                    term_count=len(normalize_search_terms(item["query"])),
+                    result_count=len(rows),
+                    query=item["query"][:120],
+                )
                 if rows:
                     lines = []
                     for m in rows:

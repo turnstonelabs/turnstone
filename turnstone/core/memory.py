@@ -757,6 +757,37 @@ def search_structured_memories(
         return []
 
 
+def list_visible_structured_memories(
+    scopes: list[tuple[str, str]],
+    mem_type: str = "",
+    limit: int = 100,
+) -> list[dict[str, str]]:
+    """Single-query union across visible (scope, scope_id) pairs."""
+    try:
+        return get_storage().list_visible_structured_memories(
+            scopes, mem_type=mem_type, limit=limit
+        )
+    except Exception:
+        log.warning("Failed to list visible structured memories", exc_info=True)
+        return []
+
+
+def search_visible_structured_memories(
+    query: str,
+    scopes: list[tuple[str, str]],
+    mem_type: str = "",
+    limit: int = 20,
+) -> list[dict[str, str]]:
+    """OR-of-terms search joined with a single visibility OR-group."""
+    try:
+        return get_storage().search_visible_structured_memories(
+            query, scopes, mem_type=mem_type, limit=limit
+        )
+    except Exception:
+        log.warning("Failed to search visible structured memories", exc_info=True)
+        return []
+
+
 def touch_structured_memories(keys: list[tuple[str, str, str]]) -> int:
     """Batch-touch memories (bump last_accessed, increment access_count).
 
