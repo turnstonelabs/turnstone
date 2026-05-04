@@ -40,6 +40,7 @@ are set.
 | `TURNSTONE_OIDC_ROLE_MAP` | No | — | Mapping from claim values to Turnstone role IDs (see [Role Mapping](#role-mapping)) |
 | `TURNSTONE_OIDC_PASSWORD_ENABLED` | No | `true` | Set to `false` to hide the password form and block all username/password logins (including admin). API tokens continue to work. |
 | `TURNSTONE_OIDC_REDIRECT_BASE` | Yes | — | Externally-reachable origin for the OIDC redirect URI (e.g. `https://app.example.com`). Without this, OIDC will refuse to start. The previous Host-header fallback was unsafe under permissive reverse proxies. |
+| `TURNSTONE_OIDC_TRUSTED_ENDPOINT_HOSTS` | No | — | Comma-separated list of additional hostnames whose endpoints the IdP discovery document is allowed to reference. See [Cross-host endpoints](#cross-host-endpoints). |
 
 All four required fields — issuer, client ID, client secret, and
 `TURNSTONE_OIDC_REDIRECT_BASE` — must be set. If any are missing OIDC
@@ -64,6 +65,39 @@ OIDC will refuse to start when this variable is unset. There is no
 Host-header fallback: a permissive reverse proxy or direct backend access
 would otherwise let an attacker spoof `Host` and steer the IdP redirect
 to a callback origin they control.
+
+### Cross-host endpoints
+
+By default, every endpoint in the IdP discovery document
+(`token_endpoint`, `jwks_uri`, `userinfo_endpoint`) must share the
+issuer's `(scheme, host, port)`. This prevents a hostile or compromised
+IdP from redirecting the token-exchange POST (which carries
+`client_secret`) to an arbitrary host, and prevents JWKS fetches from
+being aimed at internal services.
+
+A few public IdPs legitimately split endpoints across hostnames. Google
+is the canonical example:
+
+| Field | Hostname |
+|-------|----------|
+| issuer | `accounts.google.com` |
+| token_endpoint | `oauth2.googleapis.com` |
+| jwks_uri | `www.googleapis.com` |
+| userinfo_endpoint | `openidconnect.googleapis.com` |
+
+Google's set is built in — operators using `https://accounts.google.com`
+need no extra configuration.
+
+For other IdPs whose discovery document references a non-issuer host,
+extend the allow-list explicitly:
+
+```bash
+TURNSTONE_OIDC_TRUSTED_ENDPOINT_HOSTS=token.example.com,keys.example.com
+```
+
+The same scheme / no-userinfo / SSRF rules apply to allow-listed hosts —
+this knob only relaxes the same-origin check, not the security gates.
+Each entry is a hostname (no scheme, no path).
 
 ### config.toml alternative
 
@@ -393,10 +427,27 @@ callback validation. Entries are automatically cleaned up after 5 minutes.
 
 ### "OIDC not configured"
 
-All three required environment variables must be set:
-`TURNSTONE_OIDC_ISSUER`, `TURNSTONE_OIDC_CLIENT_ID`, and
-`TURNSTONE_OIDC_CLIENT_SECRET`. Check that none are empty or
-whitespace-only.
+All four required environment variables must be set:
+`TURNSTONE_OIDC_ISSUER`, `TURNSTONE_OIDC_CLIENT_ID`,
+`TURNSTONE_OIDC_CLIENT_SECRET`, and `TURNSTONE_OIDC_REDIRECT_BASE`.
+Check that none are empty or whitespace-only.
+
+### "OIDC enabled but TURNSTONE_OIDC_REDIRECT_BASE is unset"
+
+This error is logged when the three credential variables are set but
+`TURNSTONE_OIDC_REDIRECT_BASE` is missing. OIDC is disabled at startup
+to prevent Host-header-derived redirect URI spoofing. Set the variable
+to your service's externally-visible origin (e.g.
+`https://app.example.com`) and restart the server. See
+[Redirect base](#redirect-base-required) for the rationale.
+
+### Discovery silently disables OIDC with "host does not match issuer"
+
+The IdP discovery document points `token_endpoint`, `jwks_uri`, or
+`userinfo_endpoint` at a hostname that doesn't share the issuer's
+origin. If the IdP is legitimate, add the additional hostname(s) to
+`TURNSTONE_OIDC_TRUSTED_ENDPOINT_HOSTS`. Google is allow-listed
+automatically; see [Cross-host endpoints](#cross-host-endpoints).
 
 ### "Login session expired"
 
