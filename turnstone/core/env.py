@@ -75,6 +75,15 @@ _EXPLICIT_SCRUB: frozenset[str] = frozenset(
         "GOOGLE_APPLICATION_CREDENTIALS",
         "DATABASE_URL",  # conventional name (Heroku, Railway, etc.) — kept for defence-in-depth
         "TURNSTONE_DB_URL",
+        # Tool-config env vars whose target files can directly load
+        # executable directives (preprocessor commands, pagers, etc.).
+        # Defence-in-depth alongside the on-CLI ``--no-config`` we pass
+        # to ripgrep — if a future caller forgets that flag, an attacker
+        # who can set one of these can plant a config that runs commands.
+        "RIPGREP_CONFIG_PATH",
+        "GIT_CONFIG",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
     }
 )
 
