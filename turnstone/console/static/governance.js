@@ -839,6 +839,179 @@ function _renderGovSkills(items) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// SKILL.md paste auto-fill — sniff frontmatter on paste, hit the parse
+// endpoint, and populate the form so users don't have to retype name /
+// description / tags / etc. when importing an Anthropic-style skill.
+// ---------------------------------------------------------------------------
+
+// Trigger on any paste whose first non-whitespace bytes look like an opening
+// YAML frontmatter delimiter — restrictive enough to ignore normal markdown
+// pastes, permissive enough to catch CRLF and trailing-space variants.
+var _SKILL_FRONTMATTER_RE = /^---\s*\r?\n/;
+
+var _SKILL_FIELD_MAP = {
+  name: "ctm-name",
+  description: "skill-description",
+  tags: "skill-tags",
+  author: "skill-author",
+  version: "skill-version",
+  license: "skill-license",
+  compatibility: "skill-compatibility",
+  allowed_tools: "csk-allowed-tools",
+};
+
+// Inflight paste-parse fetch — referenced from hideCreateTemplateModal so a
+// modal close cancels the request, and from _handleSkillContentPaste so a
+// fresh paste supersedes the previous one.  Acts as a generation token: any
+// callback that observes _ctmPasteController != its captured controller knows
+// the modal moved on and must not touch the DOM.
+var _ctmPasteController = null;
+
+// Returns "filled" if we set the value, "skipped" if the field was already
+// non-empty (we don't clobber user input), or "absent" if we couldn't find or
+// match the option.  Tracking this lets the caller report what actually
+// happened so the user knows whether their pre-typed values survived.
+function _setSkillFormField(id, value) {
+  var el = document.getElementById(id);
+  if (!el) return "absent";
+  if (el.value && String(el.value).trim()) return "skipped";
+  if (el.tagName === "SELECT") {
+    // License is a fixed option list — only set the value if it matches an
+    // option.  Custom licenses fall through to the default "— not specified —"
+    // and the user can edit manually.
+    for (var i = 0; i < el.options.length; i++) {
+      if (el.options[i].value === value) {
+        el.value = value;
+        return "filled";
+      }
+    }
+    return "absent";
+  }
+  el.value = value;
+  return "filled";
+}
+
+function _applyParsedSkill(parsed, contentTextarea, fieldMap) {
+  // The textarea is the explicit paste target — replacing its full content
+  // matches the user's mental model ("I pasted a SKILL.md, the body should
+  // become the content").  Side metadata fields use the non-destructive
+  // _setSkillFormField rule below so half-typed values aren't lost.
+  contentTextarea.value = parsed.content || "";
+  contentTextarea.dispatchEvent(new Event("input", { bubbles: true }));
+
+  var filled = 0;
+  var skipped = 0;
+  function _apply(id, value) {
+    var outcome = _setSkillFormField(id, value);
+    if (outcome === "filled") filled++;
+    else if (outcome === "skipped") skipped++;
+  }
+
+  if (parsed.name) _apply(fieldMap.name, parsed.name);
+  if (parsed.description) _apply(fieldMap.description, parsed.description);
+  if (parsed.tags && parsed.tags.length)
+    _apply(fieldMap.tags, parsed.tags.join(", "));
+  if (parsed.author) _apply(fieldMap.author, parsed.author);
+  if (parsed.version) _apply(fieldMap.version, parsed.version);
+  if (parsed.license) _apply(fieldMap.license, parsed.license);
+  if (parsed.compatibility)
+    _apply(fieldMap.compatibility, parsed.compatibility);
+  if (parsed.allowed_tools && parsed.allowed_tools.length)
+    _apply(fieldMap.allowed_tools, parsed.allowed_tools.join(", "));
+
+  return { filled: filled, skipped: skipped };
+}
+
+function _setSkillPasteHintBusy(busy) {
+  var hint = document.getElementById("ctm-paste-hint");
+  if (!hint) return;
+  var rest = hint.querySelector(".skill-paste-hint-rest");
+  var busyEl = hint.querySelector(".skill-paste-hint-busy");
+  if (rest) rest.style.display = busy ? "none" : "";
+  if (busyEl) busyEl.style.display = busy ? "" : "none";
+}
+
+function _handleSkillContentPaste(event, fieldMap) {
+  var clipboard = event.clipboardData || window.clipboardData;
+  if (!clipboard) return;
+  var text = clipboard.getData("text/plain");
+  if (!text || !_SKILL_FRONTMATTER_RE.test(text)) return;
+
+  event.preventDefault();
+  var textarea = event.target;
+
+  // Cancel any prior paste fetch — a fresh paste supersedes whatever was in
+  // flight.  The previous handler's callbacks see _ctmPasteController !=
+  // their captured controller and bail before touching the DOM.
+  if (_ctmPasteController) _ctmPasteController.abort();
+  var controller = new AbortController();
+  _ctmPasteController = controller;
+
+  // Optimistic paint — drop the raw text into the textarea immediately so the
+  // user sees their paste landed, then disable the field and flip the hint
+  // line into a "Parsing..." state.  On a slow network the round-trip can
+  // stretch past 400ms; without a visible state the user thinks nothing
+  // happened and re-pastes (or hits Create with empty fields).
+  textarea.value = text;
+  textarea.disabled = true;
+  textarea.setAttribute("aria-busy", "true");
+  textarea.dispatchEvent(new Event("input", { bubbles: true }));
+  _setSkillPasteHintBusy(true);
+
+  function _isCurrent() {
+    return _ctmPasteController === controller;
+  }
+
+  authFetch("/v1/api/admin/skills/parse", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ raw: text }),
+    signal: controller.signal,
+  })
+    .then(function (r) {
+      return r.json().then(function (d) {
+        return { ok: r.ok, data: d };
+      });
+    })
+    .then(function (res) {
+      if (!_isCurrent()) return;
+      if (res.ok) {
+        var counts = _applyParsedSkill(res.data, textarea, fieldMap);
+        var msg = "Populated from SKILL.md";
+        if (counts.skipped) {
+          msg += " (" + counts.filled + " set, " + counts.skipped + " kept)";
+        }
+        showToast(msg);
+      } else {
+        // Frontmatter looked plausible but the parser rejected it (missing
+        // name, malformed YAML beyond the retry, etc).  The raw text is
+        // already in the textarea from the optimistic paint above so the
+        // user can fix the YAML in place.
+        showToast(
+          "Couldn't parse SKILL.md: " +
+            ((res.data && res.data.error) || "unknown error"),
+          "error",
+        );
+      }
+    })
+    .catch(function (err) {
+      if (!_isCurrent()) return;
+      // AbortError fires when the modal closed or a fresher paste superseded
+      // this one — silent, the new lifecycle owns the UI.
+      if (err && err.name === "AbortError") return;
+      showToast("Network error — pasted as plain text", "error");
+    })
+    .finally(function () {
+      if (!_isCurrent()) return;
+      _ctmPasteController = null;
+      textarea.disabled = false;
+      textarea.removeAttribute("aria-busy");
+      _setSkillPasteHintBusy(false);
+      textarea.focus();
+    });
+}
+
 function _detectTemplateVars(content) {
   var matches = content.match(/\{\{(\w+)\}\}/g) || [];
   var seen = {};
@@ -874,10 +1047,14 @@ function showCreateTemplateModal() {
   document.getElementById("skill-license").value = "";
   document.getElementById("skill-compatibility").value = "";
   document.getElementById("skill-activation").value = "named";
-  document.getElementById("ctm-content").value = "";
+  var ctmContent = document.getElementById("ctm-content");
+  ctmContent.value = "";
   document.getElementById("ctm-variables").textContent = "(none)";
-  document.getElementById("ctm-content").oninput = function () {
+  ctmContent.oninput = function () {
     _updateVarsDisplay("ctm-content", "ctm-variables");
+  };
+  ctmContent.onpaste = function (event) {
+    _handleSkillContentPaste(event, _SKILL_FIELD_MAP);
   };
   document.getElementById("ctm-default").checked = false;
   // Session config fields
@@ -907,6 +1084,13 @@ function showCreateTemplateModal() {
 }
 
 function hideCreateTemplateModal() {
+  // Cancel any inflight paste-parse so a late response can't reach into a
+  // closed (or freshly reopened) modal and clobber state.  AbortController
+  // also short-circuits the .then chain — see _handleSkillContentPaste.
+  if (_ctmPasteController) {
+    _ctmPasteController.abort();
+    _ctmPasteController = null;
+  }
   document.getElementById("create-template-overlay").style.display = "none";
   _ctmTrapHandler = _removeTrap(_ctmTrapHandler);
   if (_ctmTriggerEl && _ctmTriggerEl.focus) {
