@@ -560,6 +560,120 @@ class TestOIDCCallback:
         assert "oidc_error" in resp.headers["location"]
         assert "Too+many" in resp.headers["location"]
 
+    @patch("turnstone.core.oidc.provision_oidc_user")
+    @patch("turnstone.core.oidc.validate_id_token")
+    @patch("turnstone.core.oidc.exchange_code", new_callable=AsyncMock)
+    def test_setup_gate_uses_count_users_not_full_scan(
+        self,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        authorize_client: TestClient,
+        storage: SQLiteBackend,
+    ) -> None:
+        """Callback's setup-complete gate must call count_users, not list_users."""
+        from unittest.mock import patch as obj_patch
+
+        self._seed_pending_state(storage)
+        mock_exchange.return_value = {"id_token": "fake.jwt.token"}
+        mock_validate.return_value = {
+            "sub": "u1",
+            "email": "u@example.com",
+            "nonce": "test-nonce",
+        }
+        mock_provision.return_value = {"user_id": "test-admin", "username": "testadmin"}
+
+        with (
+            obj_patch.object(storage, "count_users", wraps=storage.count_users) as count_spy,
+            obj_patch.object(storage, "list_users", wraps=storage.list_users) as list_spy,
+        ):
+            resp = authorize_client.get(
+                "/v1/api/auth/oidc/callback?code=authcode&state=valid-state",
+                follow_redirects=False,
+            )
+
+        assert resp.status_code == 302
+        assert "oidc_success=1" in resp.headers["location"]
+        count_spy.assert_called_once_with()
+        list_spy.assert_not_called()
+
+    @patch("turnstone.core.oidc.provision_oidc_user")
+    @patch("turnstone.core.oidc.validate_id_token")
+    @patch("turnstone.core.oidc.exchange_code", new_callable=AsyncMock)
+    def test_state_cleanup_is_gated(
+        self,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        authorize_client: TestClient,
+        storage: SQLiteBackend,
+    ) -> None:
+        """Cleanup runs once per cleanup-interval window, not every callback."""
+        from unittest.mock import patch as obj_patch
+
+        # First call seeds the cleanup timestamp; subsequent calls within
+        # _OIDC_STATE_CLEANUP_INTERVAL_S must NOT trigger cleanup again.
+        mock_exchange.return_value = {"id_token": "fake.jwt.token"}
+        mock_validate.return_value = {
+            "sub": "u1",
+            "email": "u@example.com",
+            "nonce": "test-nonce",
+        }
+        mock_provision.return_value = {"user_id": "test-admin", "username": "testadmin"}
+
+        with obj_patch.object(
+            storage, "cleanup_expired_oidc_states", wraps=storage.cleanup_expired_oidc_states
+        ) as cleanup_spy:
+            for state in ("s1", "s2", "s3"):
+                self._seed_pending_state(storage, state=state, nonce="test-nonce")
+                authorize_client.get(
+                    f"/v1/api/auth/oidc/callback?code=c&state={state}",
+                    follow_redirects=False,
+                )
+
+        assert cleanup_spy.call_count == 1
+
+    @patch("turnstone.core.oidc.provision_oidc_user")
+    @patch("turnstone.core.oidc.validate_id_token")
+    @patch("turnstone.core.oidc.fetch_jwks", new_callable=AsyncMock)
+    @patch("turnstone.core.oidc.exchange_code", new_callable=AsyncMock)
+    def test_jwks_refetch_dedup_when_kid_appears(
+        self,
+        mock_exchange: AsyncMock,
+        mock_fetch_jwks: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        authorize_client: TestClient,
+        storage: SQLiteBackend,
+    ) -> None:
+        """If a concurrent caller already refreshed JWKS, second caller skips fetch."""
+        from unittest.mock import patch as obj_patch
+
+        self._seed_pending_state(storage)
+        mock_exchange.return_value = {"id_token": "fake.jwt.token"}
+        mock_provision.return_value = {"user_id": "test-admin", "username": "testadmin"}
+
+        # First validate raises kid-not-found; second succeeds.
+        mock_validate.side_effect = [
+            OIDCKeyNotFoundError("Signing key 'k-rotated' not found"),
+            {"sub": "u1", "email": "u@example.com", "nonce": "test-nonce"},
+        ]
+
+        # Pre-populate the JWKS cache so the rotated kid is already
+        # present — analog of a concurrent caller having won the lock.
+        # The retry path must short-circuit and skip the network fetch.
+        authorize_client.app.state.jwks_data = {"keys": [{"kid": "k-rotated", "kty": "RSA"}]}
+
+        with obj_patch("jwt.get_unverified_header", return_value={"kid": "k-rotated"}):
+            resp = authorize_client.get(
+                "/v1/api/auth/oidc/callback?code=authcode&state=valid-state",
+                follow_redirects=False,
+            )
+
+        assert resp.status_code == 302
+        assert "oidc_success=1" in resp.headers["location"]
+        mock_fetch_jwks.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Admin OIDC identity endpoint tests

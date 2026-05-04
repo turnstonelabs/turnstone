@@ -4473,6 +4473,9 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         log.debug("console.coord_ui_refs_reset_failed", exc_info=True)
     await app.state.proxy_sse_client.aclose()
     await app.state.proxy_client.aclose()
+    from turnstone.core.oidc import close_oidc_state
+
+    await close_oidc_state(app.state)
     app.state.collector.stop()
     audit_exec_shutdown = getattr(app.state, "audit_executor", None)
     if audit_exec_shutdown is not None:
