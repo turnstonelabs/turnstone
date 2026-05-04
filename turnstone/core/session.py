@@ -15,6 +15,7 @@ import contextlib
 import copy
 import dataclasses
 import difflib
+import functools
 import hashlib
 import json
 import mimetypes
@@ -194,6 +195,283 @@ def _encode_image_data_uri(raw: bytes, mime: str) -> str:
 
 # Upper bound on total skill content injected into system messages
 _MAX_SKILL_CONTENT: int = 32768
+
+# Cap on the *content portion* (text after ``path:lineno:``) of an
+# emitted search result line. Defends the context budget against
+# pathological lines (minified blobs, base64 data, etc.).
+_MAX_SEARCH_LINE_LENGTH: int = 1024
+# Margin over the per-line cap before re-truncating, so backend-supplied
+# preview markers (e.g. ripgrep's ``[... omitted end of long line]``) pass
+# through cleanly without redundant " ...[truncated]" stacking.
+_SEARCH_LINE_MARGIN: int = 128
+_SEARCH_TRUNCATION_SUFFIX: str = f"...[truncated, line length > {_MAX_SEARCH_LINE_LENGTH}]"
+_SEARCH_ALL_TRUNCATED_MSG: str = (
+    "(all matches returned were malformed -- re-check your search query, "
+    "if the issue persists there may be a problem with the search backend or the filesystem)"
+)
+# Total search-output budget (chars). Chosen well under ``tool_truncation``
+# (typically 256 KB+) so the head+tail ``_truncate_output`` strategy never
+# kicks in for search results — that strategy silently drops middle files
+# alphabetically, which is exactly the wrong shape for a grep result.
+_SEARCH_OUTPUT_BUDGET: int = 32_768
+# Hard cap on raw bytes read from the search subprocess. Defends against
+# pathological single-line files (multi-GB JSONL training records, etc.)
+# that would otherwise OOM the parent process via ``subprocess.run``.
+_SEARCH_RAW_BYTE_CAP: int = 4 * 1024 * 1024
+# Files larger than this are skipped entirely (ripgrep only — grep has no
+# native equivalent and falls back to the byte cap above).
+_SEARCH_MAX_FILESIZE: str = "10M"
+# Per-file sample-count ladder for Tier 2 degradation. Each step is tried in
+# order; the first K whose total emission fits the budget wins. The full
+# 5/3/1 curve documents the degradation: prefer 5 samples per file, fall to
+# 3, then a single representative sample before giving up to Tier 3.
+_SEARCH_TIER2_SAMPLE_LADDER: tuple[int, ...] = (5, 3, 1)
+# Bytes reserved at the end of the Tier 3 body for the
+# "(plus N more files with M matches between them)" tail line, so we don't
+# blow the budget when the count list itself is enormous.
+_SEARCH_TIER3_TAIL_RESERVE: int = 80
+# Stderr-drain knobs for ``_search_capture``: bound the captured stderr so
+# a hostile child can't grow the buffer indefinitely, and drain in
+# moderate-sized chunks so the OS pipe buffer doesn't deadlock the child.
+_SEARCH_STDERR_CAP: int = 64 * 1024
+_SEARCH_DRAIN_CHUNK: int = 8192
+# How long we wait for the stderr drain thread to finish after the child
+# exits. The thread reads from a closed pipe at that point; a small
+# timeout keeps shutdown bounded if the OS hasn't propagated EOF yet.
+_SEARCH_DRAIN_JOIN_TIMEOUT: float = 2.0
+# Excluded directory patterns — hit by both backends. ripgrep also respects
+# ``.gitignore`` and skips hidden directories by default, so most of these
+# are belt-and-suspenders for the rg path; they're load-bearing for grep.
+_SEARCH_EXCLUDE_DIRS: tuple[str, ...] = (
+    ".git",
+    "node_modules",
+    "target",
+    "__pycache__",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".pytest_cache",
+    "dist",
+    "build",
+    "*.egg-info",
+    ".tox",
+    ".venv",
+    "venv",
+    "vendor",
+)
+
+
+@functools.cache
+def _detect_search_backend() -> str:
+    """Return ``'rg'`` if ripgrep is on PATH, else ``'grep'``. Cached."""
+    return "rg" if shutil.which("rg") else "grep"
+
+
+def _build_search_args(pattern: str, path: str, backend: str) -> list[str]:
+    """Build subprocess args for the chosen search backend.
+
+    The ripgrep flag set is the load-bearing one: ``--max-columns`` +
+    ``--max-columns-preview`` bound per-line bytes natively (no Python-side
+    re-search needed), ``--max-filesize`` skips multi-MB JSONL/training
+    files entirely, and ``--max-count`` matches grep's ``-m`` per-file cap.
+    """
+    if backend == "rg":
+        args = [
+            "rg",
+            "-n",  # line numbers
+            "-H",  # always show filename
+            "--no-heading",  # path:line:content format like grep
+            "--color=never",
+            "--no-config",  # ignore ~/.ripgreprc for reproducibility
+            "--no-messages",  # suppress filesystem error noise
+            "--max-count",
+            "100",
+            "--max-columns",
+            str(_MAX_SEARCH_LINE_LENGTH),
+            "--max-columns-preview",  # show first N cols + omitted-marker
+            "--max-filesize",
+            _SEARCH_MAX_FILESIZE,
+        ]
+        for d in _SEARCH_EXCLUDE_DIRS:
+            args.extend(["-g", f"!{d}"])
+        # ``-e`` protects the pattern from being parsed as a flag; ``--``
+        # protects the path the same way. Without ``--`` an attacker who
+        # can prompt-inject the agent could pass ``path="--pre=COMMAND"``
+        # and ripgrep would execute COMMAND as a per-file preprocessor.
+        args.extend(["-e", pattern, "--", path])
+        return args
+    # grep fallback
+    args = ["grep", "-rn", "-I", "-E", "-m", "100", "--color=never"]
+    for d in _SEARCH_EXCLUDE_DIRS:
+        args.append(f"--exclude-dir={d}")
+    args.extend(["--", pattern, path])
+    return args
+
+
+def _parse_search_records(stdout: bytes) -> list[tuple[str, str, str]]:
+    """Parse ``path:lineno:content`` records from search backend stdout.
+
+    Drops malformed lines (need ≥2 colons, numeric line-number, non-empty
+    path). Decodes bytes leniently for display. Lines that exceed the
+    per-line cap *plus* a small margin for backend-supplied truncation
+    markers are re-truncated with ``_SEARCH_TRUNCATION_SUFFIX``; this is
+    the load-bearing defense for the grep fallback (rg already enforces
+    ``--max-columns`` upstream).
+    """
+    cap = _MAX_SEARCH_LINE_LENGTH
+    margin = _SEARCH_LINE_MARGIN
+    # Decode the whole buffer once rather than per-line — a cap-hit
+    # invocation can yield ~50K lines, and the per-line ``decode()`` was
+    # showing up in profiles.
+    text = stdout.decode("utf-8", errors="replace")
+    records: list[tuple[str, str, str]] = []
+    for line in text.splitlines():
+        path, sep1, rest = line.partition(":")
+        if not sep1 or not path:
+            continue
+        lineno, sep2, content = rest.partition(":")
+        if not sep2 or not lineno.isdigit():
+            continue
+        if len(content) > cap + margin:
+            content = content[:cap] + _SEARCH_TRUNCATION_SUFFIX
+        records.append((path, lineno, content))
+    return records
+
+
+def _format_search_results(
+    records: list[tuple[str, str, str]],
+    capped: bool,
+) -> str:
+    """Format match records with tiered degradation when output > budget.
+
+    Tier 1: full ``path:line:content`` lines, stream-emitted with a running
+    cost check that short-circuits as soon as the budget would be exceeded.
+    Tier 2: K samples per file plus an ``…and N more in <path>`` note. K is
+    seeded from a per-file size estimate, then stepped down through the
+    (5, 3, 1) ladder from the highest rung ≤ the estimate until the
+    emission fits. This guarantees every file is at least mentioned, which
+    prevents the alphabetic-bias dropout that head+tail truncation produced.
+    Tier 3 (fallback): per-file counts only, sorted by descending count.
+    """
+    by_file: dict[str, list[tuple[str, str]]] = {}
+    for path, lineno, content in records:
+        by_file.setdefault(path, []).append((lineno, content))
+    total = len(records)
+    files = len(by_file)
+    if not total:
+        # Caller distinguishes "no matches" from "all malformed" via rc.
+        return _SEARCH_ALL_TRUNCATED_MSG
+
+    summary = f"\n\n({total} matches across {files} files)"
+    if capped:
+        summary += " (raw output exceeded byte cap; results may be incomplete)"
+
+    chunks: list[str] = []
+    used = 0
+    overflow = False
+    for path, matches in by_file.items():
+        for lineno, content in matches:
+            line = f"{path}:{lineno}:{content}"
+            cost = len(line) + 1
+            if used + cost + len(summary) > _SEARCH_OUTPUT_BUDGET:
+                overflow = True
+                break
+            chunks.append(line)
+            used += cost
+        if overflow:
+            break
+    if not overflow:
+        return "\n".join(chunks) + summary
+
+    # Tier 2 header is added on return; budget for it up front so the
+    # final emission stays strictly within ``_SEARCH_OUTPUT_BUDGET`` and
+    # ``_truncate_output``'s head+tail strategy never kicks in (that
+    # strategy silently drops middle files alphabetically — exactly the
+    # shape we're trying to avoid for search results).
+    def _tier2_header(k_value: int) -> str:
+        h = (
+            f"({total} matches across {files} files — "
+            f"showing first {k_value}/file. Narrow the query or read_file "
+            f"a specific path for full content.)"
+        )
+        if capped:
+            h += " (raw output capped; counts may underreport.)"
+        return h
+
+    # Sample the first ~32 records for an emitted-line-length estimate,
+    # then seed K from ``budget / (files * avg)`` so we usually skip
+    # ladder rungs that won't fit in one pass. Floor avg at 80 so a
+    # corpus of unusually short lines doesn't push K artificially high
+    # (the estimate would underweight the per-line newline + trailing
+    # "...and N more in <path>" notes). The ladder iteration below is
+    # the safety net — the estimate is approximate.
+    sample = records[:32]
+    avg = max(
+        80,
+        sum(len(p) + len(ln) + len(c) + 3 for p, ln, c in sample) // max(1, len(sample)),
+    )
+    estimated_k = max(1, _SEARCH_OUTPUT_BUDGET // max(1, files * (avg + 1)))
+    # Iterate the ladder starting from the highest rung that's ≤ our
+    # estimate. If the chosen K's actual emission doesn't fit (the
+    # estimate ignored the header and over-counts compression from
+    # shared paths), step down to the next rung instead of jumping
+    # straight to Tier 3. The ``or [...]`` is defence against future
+    # changes to the ladder constant; with the current (5, 3, 1) it
+    # never fires because ``estimated_k`` is floored at 1 above.
+    candidates = [k for k in _SEARCH_TIER2_SAMPLE_LADDER if k <= estimated_k] or [
+        _SEARCH_TIER2_SAMPLE_LADDER[-1]
+    ]
+    for k in candidates:
+        header = _tier2_header(k)
+        # Budget for header + the "\n\n" separator on return.
+        body_budget = _SEARCH_OUTPUT_BUDGET - len(header) - 2
+        chunks2: list[str] = []
+        used2 = 0
+        fit = True
+        for path, matches in by_file.items():
+            head = matches[:k]
+            for lineno, content in head:
+                line = f"{path}:{lineno}:{content}"
+                chunks2.append(line)
+                used2 += len(line) + 1
+            if len(matches) > k:
+                note = f"  ...and {len(matches) - k} more in {path}"
+                chunks2.append(note)
+                used2 += len(note) + 1
+            if used2 > body_budget:
+                fit = False
+                break
+        if fit:
+            return header + "\n\n" + "\n".join(chunks2)
+
+    counts = sorted(by_file.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    tier3_header = (
+        f"({total} matches across {files} files — too many to show inline. "
+        f"Counts only; narrow the query or read_file a specific path.)"
+    )
+    if capped:
+        tier3_header += " (raw output capped; counts may underreport.)"
+    # Budget for header + the "\n\n" separator + the trailing
+    # "(plus N more files)" line so the final emission stays within
+    # ``_SEARCH_OUTPUT_BUDGET`` even when the count list is enormous.
+    tier3_body_budget = _SEARCH_OUTPUT_BUDGET - len(tier3_header) - 2 - _SEARCH_TIER3_TAIL_RESERVE
+    body_lines: list[str] = []
+    body_used = 0
+    shown = 0
+    for p, m in counts:
+        line = f"{p}: {len(m)} matches"
+        if body_used + len(line) + 1 > tier3_body_budget:
+            break
+        body_lines.append(line)
+        body_used += len(line) + 1
+        shown += 1
+    if shown < files:
+        omitted_matches = sum(len(m) for _p, m in counts[shown:])
+        body_lines.append(
+            f"(plus {files - shown} more files with {omitted_matches} matches between them)"
+        )
+    body = "\n".join(body_lines)
+    return tier3_header + "\n\n" + body
+
 
 # Memory scopes accepted by the ``memory`` tool's preparer + executor.
 # Single source of truth — every action validator imports this rather
@@ -7862,69 +8140,157 @@ class ChatSession:
         self._report_tool_result(call_id, "read_file", f"image ({len(raw):,} bytes)")
         return call_id, content_parts
 
+    def _search_capture(self, args: list[str]) -> tuple[bytes, int, bytes, bool]:
+        """Run a search subprocess with a streaming, byte-capped stdout read.
+
+        Returns ``(stdout, returncode, stderr, capped)``. Drains stderr in a
+        background thread to avoid pipe deadlock when the child writes a lot
+        to stderr while we're still reading stdout.
+
+        The byte cap is the load-bearing defense for pathological inputs
+        (multi-GB JSONL, single-line minified bundles): on overflow, we
+        kill the child and trim to the last newline so the parser never
+        sees a partial trailing line.
+        """
+        from turnstone.core.env import scrubbed_env
+
+        proc = subprocess.Popen(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=scrubbed_env(),
+        )
+
+        # Watchdog: ``proc.stdout.read`` is a blocking pipe read with no
+        # timeout, so a child stuck in kernel I/O (NFS, FUSE, broken
+        # backend) would hang forever despite ``tool_timeout``. The timer
+        # arms ``proc.kill`` after the deadline; we detect "child was
+        # killed by us, not by the byte cap" by setting ``timed_out``
+        # before invoking kill.
+        timed_out = [False]
+
+        def _watchdog() -> None:
+            timed_out[0] = True
+            with contextlib.suppress(Exception):
+                proc.kill()
+
+        watchdog = threading.Timer(self.tool_timeout, _watchdog)
+        watchdog.daemon = True
+        watchdog.start()
+
+        stderr_chunks: list[bytes] = []
+
+        def _drain_stderr() -> None:
+            if not proc.stderr:
+                return
+            total = 0
+            try:
+                while total < _SEARCH_STDERR_CAP:
+                    chunk = proc.stderr.read(_SEARCH_DRAIN_CHUNK)
+                    if not chunk:
+                        return
+                    stderr_chunks.append(chunk)
+                    total += len(chunk)
+                while proc.stderr.read(_SEARCH_DRAIN_CHUNK):
+                    pass  # discard tail so the child can finish writing
+            except Exception:
+                pass  # best-effort: pipe may be torn down by proc.kill()/child exit
+
+        drain_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        drain_thread.start()
+
+        capped = False
+        try:
+            stdout = proc.stdout.read(_SEARCH_RAW_BYTE_CAP + 1) if proc.stdout else b""
+            if len(stdout) > _SEARCH_RAW_BYTE_CAP:
+                capped = True
+                proc.kill()
+                stdout = stdout[:_SEARCH_RAW_BYTE_CAP]
+                last_nl = stdout.rfind(b"\n")
+                if last_nl >= 0:
+                    stdout = stdout[:last_nl]
+            rc = proc.wait()
+        finally:
+            watchdog.cancel()
+            drain_thread.join(timeout=_SEARCH_DRAIN_JOIN_TIMEOUT)
+            for stream in (proc.stdout, proc.stderr):
+                # best-effort: pipe may be torn down by proc.kill()/OS
+                with contextlib.suppress(Exception):
+                    if stream is not None:
+                        stream.close()
+
+        if timed_out[0]:
+            raise subprocess.TimeoutExpired(args, self.tool_timeout)
+        return stdout, rc, b"".join(stderr_chunks), capped
+
     def _exec_search(self, item: dict[str, Any]) -> tuple[str, str]:
-        """Search file contents for a regex pattern using grep."""
+        """Search file contents for a regex pattern via ripgrep (preferred) or grep."""
         call_id = item["call_id"]
         pattern, path = item["pattern"], item["path"]
         try:
-            from turnstone.core.env import scrubbed_env
+            backend = _detect_search_backend()
+            args = _build_search_args(pattern, path, backend)
+            stdout, rc, stderr, capped = self._search_capture(args)
 
-            result = subprocess.run(
-                [
-                    "grep",
-                    "-rn",
-                    "-I",
-                    "-E",
-                    "-m",
-                    "200",  # max matches per file
-                    "--color=never",  # no ANSI codes in output
-                    # Skip common build/vendor/VCS directories
-                    "--exclude-dir=.git",
-                    "--exclude-dir=node_modules",
-                    "--exclude-dir=target",
-                    "--exclude-dir=__pycache__",
-                    "--exclude-dir=.mypy_cache",
-                    "--exclude-dir=.ruff_cache",
-                    "--exclude-dir=.pytest_cache",
-                    "--exclude-dir=dist",
-                    "--exclude-dir=build",
-                    "--exclude-dir=*.egg-info",
-                    "--exclude-dir=.tox",
-                    "--exclude-dir=.venv",
-                    "--exclude-dir=venv",
-                    "--exclude-dir=vendor",
-                    "--",
-                    pattern,
-                    path,  # -- prevents pattern as flag
-                ],
-                capture_output=True,
-                text=True,
-                timeout=self.tool_timeout,
-                env=scrubbed_env(),
-            )
-            output = result.stdout.strip()
-            if result.returncode == 1:
-                output = "(no matches)"
-            elif result.returncode > 1:
-                output = result.stderr.strip() or f"grep error (exit {result.returncode})"
+            # ripgrep and grep share rc semantics: 0 = matches, 1 = no
+            # matches, ≥2 = error. When ``capped`` is True we killed the
+            # child intentionally (byte-cap), so a negative rc is from
+            # our SIGKILL — normalise to 0 so the partial output flows
+            # through. But preserve a non-negative rc: there's a narrow
+            # race where the child can exit naturally between our read
+            # and our kill, and we don't want to silently swallow rg's
+            # rc=2 ("matches found but some files had errors") just
+            # because we also tripped the byte cap.
+            if capped and rc < 0:
+                rc = 0
 
-            # Count matches and files BEFORE truncation
-            match_count = output.count("\n") + 1 if result.returncode == 0 and output else 0
-            if match_count:
-                files = {line.split(":", 1)[0] for line in output.splitlines() if ":" in line}
-                file_count = len(files)
-            else:
-                file_count = 0
+            if rc == 1:
+                self._report_tool_result(call_id, "search", "no matches")
+                return call_id, "(no matches)"
+            if rc < 0:
+                # Signal-killed by something other than us (OOM killer,
+                # external SIGTERM). Surface it instead of parsing the
+                # truncated stdout as if the search had completed.
+                msg = f"{backend} killed by signal {-rc}"
+                self._report_tool_result(call_id, "search", msg, is_error=True)
+                return call_id, msg
+            if rc > 1:
+                err_text = stderr.decode("utf-8", errors="replace").strip()
+                msg = err_text or f"{backend} error (exit {rc})"
+                self._report_tool_result(call_id, "search", msg, is_error=True)
+                return call_id, msg
 
-            # Append summary footer before truncation so it counts toward the limit
-            original_len = len(output)
-            if match_count:
-                output += f"\n\n({match_count} matches across {file_count} files)"
-            output = self._truncate_output(output)
+            records = _parse_search_records(stdout)
+            original_len = len(stdout)
 
-            desc = f"{match_count} matches" if match_count else "no matches"
+            if not records:
+                if capped:
+                    # The byte cap fired before any parseable line
+                    # completed (typical shape: a single multi-MB line
+                    # without a newline, e.g. minified bundle / training
+                    # JSONL record). The malformed-output message would
+                    # blame the query; surface the real cause instead.
+                    msg = (
+                        "(search output exceeded the raw byte cap before "
+                        "any parseable line completed — narrow your query "
+                        "or restrict the path)"
+                    )
+                    self._report_tool_result(call_id, "search", "byte cap hit", is_error=True)
+                    return call_id, msg
+                # rc 0 with no parseable records means matches were found
+                # but every line was malformed.
+                self._report_tool_result(call_id, "search", "all matches malformed", is_error=True)
+                return call_id, _SEARCH_ALL_TRUNCATED_MSG
+
+            output = _format_search_results(records, capped)
+            output = self._truncate_output(output)  # belt-and-suspenders
+
+            match_count = len(records)
+            desc = f"{match_count} matches"
             if original_len > 500:
-                desc += f" ({original_len} chars)"
+                desc += f" ({original_len} bytes raw)"
+            if capped:
+                desc += " [capped]"
             self._report_tool_result(call_id, "search", desc)
 
             return call_id, output
