@@ -19,6 +19,7 @@ from turnstone.core.oidc import (
     OIDCConfig,
     OIDCError,
     OIDCKeyNotFoundError,
+    _ensure_default_role,
     _sanitize_log_text,
     apply_role_mapping,
     build_authorize_url,
@@ -1661,6 +1662,161 @@ class TestProvisionOIDCUser:
         with pytest.raises(OIDCError, match="OIDC identity already linked"):
             provision_oidc_user(storage, config, claims)
 
+        storage.assign_role.assert_not_called()
+
+    def test_existing_identity_self_heals_zero_roles(self):
+        """Existing identity user with zero roles -> safety-net assigns builtin-viewer.
+
+        Models the bug-1 strand: a prior login committed user + identity but
+        ``apply_role_mapping`` raised before reaching the safety-net.  On the
+        next login the existing-identity branch must self-heal.
+        """
+        config = _make_config()
+        existing_user = {
+            "user_id": "u-stranded",
+            "username": "alice",
+            "display_name": "Alice",
+            "password_hash": "!oidc",
+        }
+        existing_identity = {
+            "issuer": "https://idp.example.com",
+            "subject": "sub-stranded",
+            "user_id": "u-stranded",
+            "email": "alice@example.com",
+            "created": "2024-01-01T00:00:00",
+            "last_login": "2024-01-01T00:00:00",
+        }
+        storage = _mock_storage(
+            identity=existing_identity,
+            user=existing_user,
+            role={"role_id": "builtin-viewer", "name": "Viewer"},
+        )
+        storage.list_user_roles.return_value = []
+
+        claims = {"sub": "sub-stranded", "email": "alice@example.com", "name": "Alice"}
+        user = provision_oidc_user(storage, config, claims)
+
+        assert user["user_id"] == "u-stranded"
+        storage.list_user_roles.assert_called_once_with("u-stranded")
+        storage.assign_role.assert_called_once_with("u-stranded", "builtin-viewer", "oidc-default")
+
+    def test_existing_identity_does_not_re_assign_when_user_has_roles(self):
+        """User already has at least one role -> safety-net no-ops."""
+        config = _make_config()
+        existing_user = {
+            "user_id": "u1",
+            "username": "alice",
+            "display_name": "Alice",
+            "password_hash": "!oidc",
+        }
+        existing_identity = {
+            "issuer": "https://idp.example.com",
+            "subject": "sub-123",
+            "user_id": "u1",
+            "email": "alice@example.com",
+            "created": "2024-01-01T00:00:00",
+            "last_login": "2024-01-01T00:00:00",
+        }
+        storage = _mock_storage(
+            identity=existing_identity,
+            user=existing_user,
+            role={"role_id": "builtin-viewer", "name": "Viewer"},
+        )
+        storage.list_user_roles.return_value = [{"role_id": "builtin-operator"}]
+
+        claims = {"sub": "sub-123", "email": "alice@example.com"}
+        provision_oidc_user(storage, config, claims)
+
+        storage.list_user_roles.assert_called_once_with("u1")
+        storage.assign_role.assert_not_called()
+
+    def test_existing_identity_with_claim_mapped_roles_skips_default(self):
+        """Claim-driven mapping populated roles -> hint short-circuits the helper."""
+        config = _make_config(
+            role_claim="groups",
+            role_map={"admin": "builtin-admin"},
+        )
+        existing_user = {
+            "user_id": "u1",
+            "username": "alice",
+            "display_name": "Alice",
+            "password_hash": "!oidc",
+        }
+        existing_identity = {
+            "issuer": "https://idp.example.com",
+            "subject": "sub-123",
+            "user_id": "u1",
+            "email": "alice@example.com",
+            "created": "2024-01-01T00:00:00",
+            "last_login": "2024-01-01T00:00:00",
+        }
+        storage = _mock_storage(
+            identity=existing_identity,
+            user=existing_user,
+            role={"role_id": "builtin-admin", "name": "Admin"},
+        )
+
+        claims = {"sub": "sub-123", "groups": "admin"}
+        provision_oidc_user(storage, config, claims)
+
+        storage.list_user_roles.assert_not_called()
+        storage.assign_role.assert_not_called()
+
+    def test_new_user_safety_net_still_fires(self):
+        """Fresh user with no IdP-mapped roles -> builtin-viewer fallback applied."""
+        config = _make_config()
+        storage = _mock_storage(role={"role_id": "builtin-viewer", "name": "Viewer"})
+        storage.list_user_roles.return_value = []
+        new_user = {
+            "user_id": "u-new",
+            "username": "bob",
+            "display_name": "Bob",
+            "password_hash": "!oidc",
+        }
+        storage.get_user.return_value = new_user
+
+        claims = {"sub": "sub-new", "preferred_username": "bob", "email": "bob@example.com"}
+        provision_oidc_user(storage, config, claims)
+
+        storage.assign_role.assert_called_once()
+        called_args = storage.assign_role.call_args[0]
+        assert called_args[1] == "builtin-viewer"
+        assert called_args[2] == "oidc-default"
+
+    def test_new_user_safety_net_skipped_when_apply_role_mapping_assigns_role(self):
+        """Claim-driven mapping populates roles -> safety-net hint short-circuits."""
+        config = _make_config(
+            role_claim="groups",
+            role_map={"admin": "builtin-admin"},
+        )
+        storage = _mock_storage(role={"role_id": "builtin-admin", "name": "Admin"})
+        new_user = {
+            "user_id": "u-new",
+            "username": "bob",
+            "display_name": "Bob",
+            "password_hash": "!oidc",
+        }
+        storage.get_user.return_value = new_user
+
+        claims = {
+            "sub": "sub-new",
+            "preferred_username": "bob",
+            "email": "bob@example.com",
+            "groups": "admin",
+        }
+        provision_oidc_user(storage, config, claims)
+
+        storage.list_user_roles.assert_not_called()
+        storage.assign_role.assert_not_called()
+
+    def test_ensure_default_role_noop_when_builtin_viewer_missing(self):
+        """builtin-viewer absent from role table -> helper does nothing."""
+        storage = _mock_storage(role=None)
+
+        _ensure_default_role(storage, "u1")
+
+        storage.get_role.assert_called_once_with("builtin-viewer")
+        storage.list_user_roles.assert_not_called()
         storage.assign_role.assert_not_called()
 
 

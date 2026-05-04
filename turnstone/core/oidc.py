@@ -826,6 +826,41 @@ def validate_id_token(
 # ---------------------------------------------------------------------------
 
 
+def _ensure_default_role(
+    storage: Any,
+    user_id: str,
+    desired_role_ids: set[str] | None = None,
+) -> None:
+    """Self-heal safety-net: assign builtin-viewer if the user has zero roles.
+
+    Runs after :func:`apply_role_mapping` on both the new-user and
+    existing-identity paths so a user stranded by a transient failure
+    during initial role mapping (e.g. a DB blip after ``create_oidc_user``
+    committed) recovers on next login.  ``assigned_by="oidc-default"``
+    deliberately differs from ``"oidc"`` so claim-driven revocation in
+    ``apply_role_mapping`` leaves it alone.
+
+    The optional ``desired_role_ids`` is a hint: when the caller already
+    knows claim-driven mapping populated at least one role, we skip the
+    ``list_user_roles`` query.
+
+    No-op when builtin-viewer is unavailable (admin removed it from the
+    role table) or the user already has at least one role.
+
+    Note: if an admin manually strips all roles from an OIDC user, this
+    helper will re-grant viewer on the next login.  The documented way to
+    deny an OIDC user access is to unlink their OIDC identity, not to
+    strip roles.
+    """
+    if desired_role_ids:
+        return
+    if storage.get_role("builtin-viewer") is None:
+        return
+    if storage.list_user_roles(user_id):
+        return
+    storage.assign_role(user_id, "builtin-viewer", "oidc-default")
+
+
 def provision_oidc_user(
     storage: Any,
     config: OIDCConfig,
@@ -852,7 +887,8 @@ def provision_oidc_user(
     if identity is not None:
         user_id = identity["user_id"]
         storage.update_oidc_identity_login(issuer, sub)
-        apply_role_mapping(storage, user_id, claims, config)
+        desired_role_ids = apply_role_mapping(storage, user_id, claims, config)
+        _ensure_default_role(storage, user_id, desired_role_ids)
         user: dict[str, str] | None = storage.get_user(user_id)
         if user is None:
             raise OIDCError(f"OIDC identity references missing user: {user_id}")
@@ -876,19 +912,7 @@ def provision_oidc_user(
         raise OIDCError(f"OIDC provisioning failed: {exc}") from exc
 
     desired_role_ids = apply_role_mapping(storage, user_id, claims, config)
-
-    # Fresh user with no IdP-mapped roles: fall back to builtin-viewer so
-    # they can access the app.  Skipping the per-row list_user_roles
-    # round-trip is safe because nothing else has had a chance to assign
-    # a role to this just-created user_id.
-    #
-    # ``assigned_by="oidc-default"`` deliberately differs from the
-    # ``"oidc"`` marker used by claim-driven role mapping: ``apply_role_mapping``
-    # only revokes rows tagged ``"oidc"`` when the corresponding claim
-    # disappears, so the safety-net role survives every subsequent login
-    # regardless of what the IdP sends in the claim.
-    if not desired_role_ids and storage.get_role("builtin-viewer") is not None:
-        storage.assign_role(user_id, "builtin-viewer", "oidc-default")
+    _ensure_default_role(storage, user_id, desired_role_ids)
 
     created_user: dict[str, str] | None = storage.get_user(user_id)
     if created_user is None:
