@@ -51,7 +51,6 @@ from turnstone.core.memory import (
     delete_messages_after,
     delete_structured_memory,
     delete_workstream,
-    get_attachments,
     get_skill_by_name,
     get_structured_memory_by_name,
     get_workstream_display_name,
@@ -74,7 +73,6 @@ from turnstone.core.memory import (
     search_structured_memories,
     search_visible_structured_memories,
     set_workstream_alias,
-    unreserve_attachments,
     update_workstream_title,
 )
 from turnstone.core.memory_relevance import (
@@ -143,6 +141,24 @@ class GenerationCancelled(BaseException):
 
     Subclasses ``BaseException`` so that broad ``except Exception`` handlers
     in tool execution code do not accidentally swallow it.
+    """
+
+
+class AttachmentsNotQueueableError(Exception):
+    """Raised by ``ChatSession.queue_message`` when called with non-empty
+    ``attachment_ids``.
+
+    Queued messages are injected at the next tool-result advisory seam
+    where they ride inside the tool envelope as text-only
+    ``UserInterjection`` advisories.  Attachments can't ride that path
+    (advisories don't carry image / file blocks), so an attachment-
+    bearing queued item would have to be appended as a separate
+    ``user`` turn — which would inject ``user`` between
+    ``assistant(tool_calls)`` and ``tool``, a role sequence strict
+    providers (Mistral, Anthropic) reject.
+
+    Callers surface this to the user as "wait for the current turn
+    before attaching".
     """
 
 
@@ -475,15 +491,10 @@ class ChatSession:
         self._pending_user_advisories: list[tuple[str, str]] = []  # (type, text)
         # User message queue: messages sent while model is executing.
         # OrderedDict preserves FIFO order and supports O(1) removal by ID.
-        #
-        # Entry shape: ``(cleaned_text, priority, attachment_ids)``.
-        # Attachment lifecycle:
-        #     pending   — uploaded, not tied to any turn
-        #     reserved  — soft-locked at queue time (reserved_for_msg_id = queue id)
-        #     consumed  — committed to a saved message (message_id = conv row id)
-        # queue_message transitions pending → reserved for its attachments;
-        # _flush_queued_messages (dequeue) transitions reserved → consumed.
-        self._queued_messages: collections.OrderedDict[str, tuple[str, str, tuple[str, ...]]] = (
+        # Queued user turns never carry attachments — see
+        # ``AttachmentsNotQueueableError`` for the role-ordering reason —
+        # so the entry tuple is just ``(cleaned, priority)``.
+        self._queued_messages: collections.OrderedDict[str, tuple[str, str]] = (
             collections.OrderedDict()
         )
         self._queued_lock = threading.Lock()
@@ -3781,15 +3792,25 @@ class ChatSession:
 
         Thread-safe — called from the HTTP handler while the worker thread
         is executing.  Returns ``(cleaned_text, priority, msg_id)``.
-        Raises ``queue.Full`` if the queue is saturated.
+        Raises ``queue.Full`` if the queue is saturated.  Raises
+        :class:`AttachmentsNotQueueableError` when ``attachment_ids`` is
+        non-empty: attachments cannot ride the advisory seam (which is
+        text-only), and appending them as a separate user turn would
+        violate strict-provider role-ordering rules.  Callers surface
+        this rejection to the user — interactive UIs typically wait for
+        the current turn to finish before allowing an attached send.
 
-        ``attachment_ids`` (ordered) are resolved and consumed at dequeue
-        time so queued multimodal turns don't silently lose their files.
         ``queue_msg_id`` lets the caller supply the id (so it matches the
         attachment-reservation token already taken server-side) — when
         omitted, an id is generated.
         """
         from turnstone.core.tool_advisory import parse_priority
+
+        if attachment_ids:
+            raise AttachmentsNotQueueableError(
+                "Cannot queue a message with attachments — wait for the "
+                "current turn to finish before sending an attachment."
+            )
 
         cleaned, priority = parse_priority(text)
         # Cap individual message length to prevent context bloat
@@ -3800,118 +3821,38 @@ class ChatSession:
         # workstream_attachments, and a 48-bit truncation narrows the
         # birthday bound unnecessarily.
         msg_id = queue_msg_id or uuid.uuid4().hex
-        att_ids = tuple(attachment_ids or ())
         with self._queued_lock:
             if len(self._queued_messages) >= self._QUEUE_MAX:
                 raise queue.Full()
-            self._queued_messages[msg_id] = (cleaned, priority, att_ids)
+            self._queued_messages[msg_id] = (cleaned, priority)
         return cleaned, priority, msg_id
 
     def dequeue_message(self, msg_id: str) -> bool:
-        """Remove a queued message by ID.  Returns True if removed.
-
-        Releases any attachment reservation held by the queued message
-        so the user can re-use or delete those files.
-        """
+        """Remove a queued message by ID.  Returns True if removed."""
         with self._queued_lock:
             popped = self._queued_messages.pop(msg_id, None)
-        if popped is None:
-            return False
-        # popped == (cleaned, priority, attachment_ids_tuple)
-        if popped[2]:
-            unreserve_attachments(msg_id, self._ws_id, self._user_id)
-        return True
-
-    def _resolve_attachment_ids(
-        self,
-        attachment_ids: tuple[str, ...] | list[str],
-        allow_reserved_for: str | None = None,
-    ) -> list[Attachment]:
-        """Fetch+scope-check attachment ids, preserving request order.
-
-        Silently drops ids that don't belong to this session's ws+user,
-        are already consumed, or are reserved for a different queued
-        message.  When ``allow_reserved_for`` is set, attachments whose
-        ``reserved_for_msg_id`` matches are accepted (dequeue path
-        passes the originating queue msg id so its own reservation
-        releases cleanly).
-        """
-        ids = [str(x) for x in attachment_ids if x]
-        if not ids:
-            return []
-        rows = get_attachments(ids)
-        by_id = {str(r["attachment_id"]): r for r in rows}
-        resolved: list[Attachment] = []
-        for aid in ids:
-            r = by_id.get(aid)
-            if (
-                not r
-                or r.get("ws_id") != self._ws_id
-                or r.get("user_id") != self._user_id
-                or r.get("message_id") is not None
-            ):
-                continue
-            reserved = r.get("reserved_for_msg_id")
-            if reserved and reserved != allow_reserved_for:
-                continue
-            content = r.get("content")
-            if not isinstance(content, bytes):
-                continue
-            resolved.append(
-                Attachment(
-                    attachment_id=str(r["attachment_id"]),
-                    filename=str(r.get("filename") or ""),
-                    mime_type=str(r.get("mime_type") or "application/octet-stream"),
-                    kind=str(r.get("kind") or ""),
-                    content=content,
-                )
-            )
-        return resolved
+        return popped is not None
 
     def _flush_queued_messages(self) -> bool:
-        """Drain queued messages.
+        """Drain queued messages into a single combined user turn.
 
-        Items without attachments are combined into a single user turn
-        to avoid back-to-back user messages that some models handle
-        poorly.  Items with attachments flush as separate multipart user
-        turns (combining text+files across distinct queued sends would
-        misrepresent ordering).
+        Queued items are always text-only (attachments are rejected at
+        ``queue_message`` time — see :class:`AttachmentsNotQueueableError`),
+        so a single combined turn avoids back-to-back user messages
+        that some models handle poorly.
 
         Returns ``True`` when any items drained, ``False`` otherwise.
         """
         from turnstone.core.tool_advisory import PRIORITY_IMPORTANT
 
         with self._queued_lock:
-            # .items() so we keep the queue msg id for reservation lookup
-            items = list(self._queued_messages.items())
+            items = list(self._queued_messages.values())
             self._queued_messages.clear()
         if not items:
             return False
 
-        # Collapse contiguous attachment-free items into one combined text
-        # to preserve the prior behaviour; flush attachment-bearing items
-        # inline as their own multipart turns.
-        text_run: list[tuple[str, str]] = []
-
-        def _flush_text_run() -> None:
-            if not text_run:
-                return
-            parts = [
-                f"[IMPORTANT] {msg}" if pri == PRIORITY_IMPORTANT else msg for msg, pri in text_run
-            ]
-            combined = "\n\n".join(parts)
-            self._append_user_turn(combined, ())
-            text_run.clear()
-
-        for queue_msg_id, (cleaned, priority, att_ids) in items:
-            if att_ids:
-                _flush_text_run()
-                text = f"[IMPORTANT] {cleaned}" if priority == PRIORITY_IMPORTANT else cleaned
-                resolved = self._resolve_attachment_ids(att_ids, allow_reserved_for=queue_msg_id)
-                self._append_user_turn(text, resolved, send_id=queue_msg_id)
-            else:
-                text_run.append((cleaned, priority))
-        _flush_text_run()
+        parts = [f"[IMPORTANT] {msg}" if pri == PRIORITY_IMPORTANT else msg for msg, pri in items]
+        self._append_user_turn("\n\n".join(parts), ())
         return True
 
     def _collect_advisories(
@@ -3961,27 +3902,16 @@ class ChatSession:
             metacog_reminders.extend({"type": nt, "text": text} for nt, text in drained)
 
         # Drain queued user messages on the last result in the batch.
-        # Attachment-bearing items fall back to a full multipart user
-        # turn (advisories are text-only and can't carry image blocks).
+        # Items are always text-only (attachments rejected at
+        # queue_message time), so they ride inside the tool envelope
+        # as text advisories — preserves the assistant→tool role
+        # sequence on the wire.
         if is_last_in_batch:
             with self._queued_lock:
-                items = list(self._queued_messages.items())
+                items = list(self._queued_messages.values())
                 self._queued_messages.clear()
-            attachment_items: list[tuple[str, str, str, tuple[str, ...]]] = []
-            for queue_msg_id, (msg, priority, att_ids) in items:
-                if att_ids:
-                    attachment_items.append((queue_msg_id, msg, priority, att_ids))
-                else:
-                    persistent.append(UserInterjection(message=msg, priority=priority))
-            if attachment_items:
-                from turnstone.core.tool_advisory import PRIORITY_IMPORTANT
-
-                for queue_msg_id, msg, priority, att_ids in attachment_items:
-                    text = f"[IMPORTANT] {msg}" if priority == PRIORITY_IMPORTANT else msg
-                    resolved = self._resolve_attachment_ids(
-                        att_ids, allow_reserved_for=queue_msg_id
-                    )
-                    self._append_user_turn(text, resolved, send_id=queue_msg_id)
+            for msg, priority in items:
+                persistent.append(UserInterjection(message=msg, priority=priority))
 
         return persistent, metacog_reminders
 

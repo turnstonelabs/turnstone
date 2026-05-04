@@ -1591,6 +1591,17 @@
           appendText("error", "Message queue full. Please wait.", {
             label: "error",
           });
+        } else if (data && data.status === "attachments_busy") {
+          // Attachments can't ride a queued user turn — server held
+          // the reservations long enough to bounce the request and
+          // released them. Chips stay in the composer; user retries
+          // once the assistant finishes.
+          if (queuedEl) queue.remove(queuedEl);
+          appendText(
+            "error",
+            "Attachments can't be sent while the assistant is working. Send a text-only message now, or wait and resend with attachments.",
+            { label: "error" },
+          );
         } else {
           attachments.consume(
             data && data.attached_ids,

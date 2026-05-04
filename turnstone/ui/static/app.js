@@ -1921,6 +1921,16 @@ Pane.prototype.sendMessage = function () {
       } else if (data.status === "queue_full") {
         if (queuedEl) self.queue.remove(queuedEl);
         self.addErrorMessage("Message queue full. Please wait.");
+      } else if (data.status === "attachments_busy") {
+        // Attachments can't ride a queued user turn — server held the
+        // chips' reservations long enough to bounce the request and
+        // released them. Surface to the user; chips stay in the
+        // composer so they can retry once the assistant finishes.
+        if (queuedEl) self.queue.remove(queuedEl);
+        self.addErrorMessage(
+          "Attachments can't be sent while the assistant is working. " +
+            "Send a text-only message now, or wait and resend with attachments.",
+        );
       } else {
         self.attachments.consume(
           data.attached_ids,
