@@ -13,9 +13,12 @@ COPY --from=ghcr.io/astral-sh/uv:0.11.8 /uv /usr/local/bin/uv
 # Remove the slim image's man page exclusion so man-db has actual content
 RUN rm -f /etc/dpkg/dpkg.cfg.d/docker
 
-# System dependencies: psycopg (libpq5), developer tooling for agent workflows
+# System dependencies: psycopg (libpq5), developer tooling for agent workflows.
+# ripgrep is the preferred backend for the search tool — natively bounds
+# per-line, per-file, and per-filesize so pathological inputs (minified
+# bundles, training-data JSONL with multi-MB single records) can't OOM us.
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
-    libpq5 git curl jq man-db manpages procps file \
+    libpq5 git curl jq man-db manpages procps file ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js LTS (for npx-based MCP servers like @modelcontextprotocol/server-github)

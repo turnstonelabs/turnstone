@@ -15,6 +15,16 @@ class TestIsSecret:
         assert _is_secret("TURNSTONE_JWT_SECRET") is True
         assert _is_secret("AWS_SECRET_ACCESS_KEY") is True
 
+    def test_tool_config_paths_scrubbed(self):
+        """Tool-config env vars whose target files load executable
+        directives must be scrubbed even though they don't match a
+        secret-suffix pattern. Defence-in-depth alongside on-CLI
+        ``--no-config`` for ripgrep and friends."""
+        assert _is_secret("RIPGREP_CONFIG_PATH") is True
+        assert _is_secret("GIT_CONFIG") is True
+        assert _is_secret("GIT_CONFIG_GLOBAL") is True
+        assert _is_secret("GIT_CONFIG_SYSTEM") is True
+
     def test_suffix_matching(self):
         assert _is_secret("MY_CUSTOM_API_KEY") is True
         assert _is_secret("DB_PASSWORD") is True

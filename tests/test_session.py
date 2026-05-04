@@ -3,7 +3,10 @@
 import base64
 import contextlib
 import json
+import subprocess
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from turnstone.core.session import _IMAGE_EXTENSIONS, _IMAGE_SIZE_CAP, ChatSession
 
@@ -81,6 +84,25 @@ def _make_session(
     )
     defaults.update(kwargs)
     return ChatSession(**defaults)
+
+
+def _run_exec_search(session, capture_return):
+    """Patch ``_search_capture`` to ``capture_return`` and run ``_exec_search``.
+
+    Returns the formatted output string. The fixed call args
+    (``call_id``/``pattern``/``path``) are deliberately uniform across the
+    line-truncation tests — only the captured stdout/rc/stderr/capped tuple
+    varies between cases.
+    """
+    with patch.object(session, "_search_capture", return_value=capture_return):
+        _, output = session._exec_search(
+            {
+                "call_id": "test_call",
+                "pattern": "test_pattern",
+                "path": "/workspace/turnstone",
+            }
+        )
+    return output
 
 
 class TestChatSessionConstruction:
@@ -2891,3 +2913,377 @@ class TestSessionUIBaseToolReminderHook:
                 "tool_call_id": "call_abc123",
             }
         ]
+
+
+class TestSearchLineTruncation:
+    """Tests for search tool line truncation to prevent context overflow."""
+
+    def test_search_truncates_long_lines_preserves_path(self):
+        """Long lines are truncated but path:line: prefix is preserved for file counting."""
+        from turnstone.core.session import (
+            _MAX_SEARCH_LINE_LENGTH,
+            _SEARCH_LINE_MARGIN,
+            _SEARCH_TRUNCATION_SUFFIX,
+        )
+
+        # path:line:content where content is way over the cap+margin
+        long_content = "x" * 5000
+        stdout = f"turnstone/core/session.py:100:{long_content}\n".encode()
+
+        output = _run_exec_search(_make_session(), (stdout, 0, b"", False))
+
+        assert _SEARCH_TRUNCATION_SUFFIX in output
+        assert "turnstone/core/session.py" in output
+        # The *content portion* (after the 2nd colon) is what's bounded by
+        # the per-line cap; the path prefix is unbounded.
+        max_content_len = (
+            _MAX_SEARCH_LINE_LENGTH + len(_SEARCH_TRUNCATION_SUFFIX) + _SEARCH_LINE_MARGIN
+        )
+        for line in output.splitlines():
+            if "matches across" in line or not line.strip():
+                continue
+            parts = line.split(":", 2)
+            if len(parts) == 3:
+                assert len(parts[2]) <= max_content_len
+
+    def test_search_file_counting_with_truncated_lines(self):
+        """File counting works correctly even with truncated lines."""
+        stdout = (
+            "turnstone/core/session.py:100:" + "x" * 5000 + "\n"
+            "turnstone/core/auth.py:50:normal line\n"
+            "turnstone/core/session.py:200:" + "y" * 3000 + "\n"
+        ).encode()
+
+        output = _run_exec_search(_make_session(), (stdout, 0, b"", False))
+
+        assert "3 matches across 2 files" in output
+        assert "turnstone/core/session.py" in output
+        assert "turnstone/core/auth.py" in output
+
+    def test_search_drops_lines_without_colon(self):
+        """Lines without any colon are dropped at the parsing step."""
+        from turnstone.core.session import _SEARCH_ALL_TRUNCATED_MSG
+
+        # No colon anywhere — parsed records list is empty.
+        stdout = ("turnstone/core/session.py" + "x" * 5000 + "\n").encode()
+
+        output = _run_exec_search(_make_session(), (stdout, 0, b"", False))
+
+        assert output == _SEARCH_ALL_TRUNCATED_MSG
+
+    def test_search_handles_single_colon_lines(self):
+        """Lines with one colon and a non-numeric line-number portion are dropped."""
+        from turnstone.core.session import _SEARCH_ALL_TRUNCATED_MSG
+
+        # path:100xxxxx... — partition's lineno chunk has trailing junk, .isdigit() fails
+        stdout = ("turnstone/core/session.py:100" + "x" * 5000 + "\n").encode()
+
+        output = _run_exec_search(_make_session(), (stdout, 0, b"", False))
+
+        assert output == _SEARCH_ALL_TRUNCATED_MSG
+
+    def test_search_no_truncation_for_short_lines(self):
+        """Short lines pass through unchanged."""
+        stdout = b"turnstone/core/session.py:100:short line\n"
+
+        output = _run_exec_search(_make_session(), (stdout, 0, b"", False))
+
+        assert "...[truncated" not in output
+        assert "short line" in output
+
+    def test_search_no_matches(self):
+        """rc==1 (no matches) returns the friendly no-matches sentinel."""
+        output = _run_exec_search(_make_session(), (b"", 1, b"", False))
+        assert output == "(no matches)"
+
+    def test_search_error_propagates_stderr(self):
+        """rc>1 surfaces stderr text, not a generic message, when stderr is non-empty."""
+        output = _run_exec_search(
+            _make_session(),
+            (b"", 2, b"grep: foo: No such file or directory\n", False),
+        )
+        assert "No such file or directory" in output
+
+    def test_search_capped_flag_in_output(self):
+        """When raw stdout is byte-capped, results note the partial output."""
+        stdout = b"a/b.py:1:line1\na/b.py:2:line2\n"
+        output = _run_exec_search(_make_session(), (stdout, 0, b"", True))
+        assert "byte cap" in output or "capped" in output
+
+
+class TestSearchBackendSelection:
+    """Tests for backend detection (rg vs grep) and arg construction."""
+
+    def test_detect_uses_rg_when_on_path(self):
+        from turnstone.core.session import _detect_search_backend
+
+        # Reset cache so the patch takes effect.
+        _detect_search_backend.cache_clear()
+        try:
+            with patch("turnstone.core.session.shutil.which", return_value="/usr/bin/rg"):
+                assert _detect_search_backend() == "rg"
+        finally:
+            _detect_search_backend.cache_clear()
+
+    def test_detect_falls_back_to_grep(self):
+        from turnstone.core.session import _detect_search_backend
+
+        _detect_search_backend.cache_clear()
+        try:
+            with patch("turnstone.core.session.shutil.which", return_value=None):
+                assert _detect_search_backend() == "grep"
+        finally:
+            _detect_search_backend.cache_clear()
+
+    def test_detect_caches_result(self):
+        from turnstone.core.session import _detect_search_backend
+
+        _detect_search_backend.cache_clear()
+        try:
+            with patch(
+                "turnstone.core.session.shutil.which", return_value="/usr/bin/rg"
+            ) as mock_which:
+                _detect_search_backend()
+                _detect_search_backend()
+                _detect_search_backend()
+                assert mock_which.call_count == 1
+        finally:
+            _detect_search_backend.cache_clear()
+
+    def test_rg_args_include_size_and_column_caps(self):
+        from turnstone.core.session import (
+            _MAX_SEARCH_LINE_LENGTH,
+            _SEARCH_MAX_FILESIZE,
+            _build_search_args,
+        )
+
+        args = _build_search_args("foo", "/some/path", "rg")
+        assert args[0] == "rg"
+        # Per-line cap with preview marker (the load-bearing flag pair)
+        assert "--max-columns" in args
+        assert str(_MAX_SEARCH_LINE_LENGTH) in args
+        assert "--max-columns-preview" in args
+        # Per-file size guard against multi-MB JSONL records
+        assert "--max-filesize" in args
+        assert _SEARCH_MAX_FILESIZE in args
+        # Per-file match cap
+        assert "--max-count" in args
+        # ``-e <pattern>`` form so patterns starting with ``-`` are safe;
+        # ``--`` separator before the path so paths starting with ``-``
+        # (e.g. ``--pre=/tmp/x``) cannot be parsed as ripgrep flags.
+        assert "-e" in args
+        e_idx = args.index("-e")
+        assert args[e_idx + 1] == "foo"
+        assert "--" in args
+        sep = args.index("--")
+        assert args[sep + 1] == "/some/path"
+        assert args[-1] == "/some/path"
+
+    def test_rg_args_protect_path_from_flag_injection(self):
+        """A ``path`` starting with ``-`` cannot inject ripgrep flags.
+
+        Regression test for an RCE vector: without the ``--`` separator,
+        ``path="--pre=/tmp/x.sh"`` would have made ripgrep execute the
+        script as a per-file preprocessor and surface its stdout as
+        search results.
+        """
+        from turnstone.core.session import _build_search_args
+
+        args = _build_search_args("foo", "--pre=/tmp/evil.sh", "rg")
+        assert "--" in args
+        sep = args.index("--")
+        assert args[sep + 1] == "--pre=/tmp/evil.sh"
+        # And the malicious path is the last token, not interspersed with flags.
+        assert args[-1] == "--pre=/tmp/evil.sh"
+
+    def test_grep_args_include_excludes_and_separator(self):
+        from turnstone.core.session import _build_search_args
+
+        args = _build_search_args("foo", "/some/path", "grep")
+        assert args[0] == "grep"
+        assert "-rn" in args
+        assert "-I" in args
+        assert "-E" in args
+        # Excludes for noisy build dirs
+        assert any(a == "--exclude-dir=node_modules" for a in args)
+        assert any(a == "--exclude-dir=.git" for a in args)
+        # ``--`` separator is what protects pattern-as-flag in grep
+        assert "--" in args
+        sep = args.index("--")
+        assert args[sep + 1] == "foo"
+        assert args[sep + 2] == "/some/path"
+
+
+class TestSearchOutputBudget:
+    """Tests for tier-based degradation when output exceeds the budget."""
+
+    def test_tier1_fits_full_output(self):
+        from turnstone.core.session import _format_search_results
+
+        records = [
+            ("foo.py", "1", "small match"),
+            ("bar.py", "2", "another match"),
+            ("foo.py", "3", "third match"),
+        ]
+        out = _format_search_results(records, capped=False)
+        assert "foo.py:1:small match" in out
+        assert "bar.py:2:another match" in out
+        assert "foo.py:3:third match" in out
+        assert "3 matches across 2 files" in out
+
+    def test_tier2_samples_when_over_budget(self):
+        """Many matches per file → degrade to K samples per file with overflow notes."""
+        from turnstone.core.session import _SEARCH_OUTPUT_BUDGET, _format_search_results
+
+        # 3 files × 200 matches/file × ~80 chars/line ≈ 48 KB → over the 32 KB budget
+        records = []
+        line = "x" * 60
+        for f in ("a.py", "b.py", "c.py"):
+            for i in range(200):
+                records.append((f, str(i), line))
+        out = _format_search_results(records, capped=False)
+        # Should have collapsed to per-file samples + overflow note
+        assert "showing first" in out
+        assert "more in a.py" in out
+        assert "more in b.py" in out
+        assert "more in c.py" in out
+        assert len(out) <= _SEARCH_OUTPUT_BUDGET + 512  # small slack for header
+
+    def test_tier3_counts_only_when_too_many_files(self):
+        """Thousands of files × matches → degrade to per-file counts."""
+        from turnstone.core.session import _SEARCH_OUTPUT_BUDGET, _format_search_results
+
+        records = []
+        # 2000 files × 50 matches × 80 chars = 8 MB; well past budget even at 1/file
+        line = "x" * 60
+        for f_idx in range(2000):
+            for i in range(50):
+                records.append((f"path/to/file_{f_idx:04}.py", str(i), line))
+        out = _format_search_results(records, capped=False)
+        assert "Counts only" in out
+        assert "path/to/file_0000.py: 50 matches" in out
+        assert len(out) <= _SEARCH_OUTPUT_BUDGET + 512
+
+    def test_tier1_preserves_file_order(self):
+        """Tier 1 emits files in insertion order (so first-seen file appears first)."""
+        from turnstone.core.session import _format_search_results
+
+        records = [
+            ("z.py", "1", "first"),
+            ("a.py", "2", "second"),
+            ("z.py", "3", "third"),
+        ]
+        out = _format_search_results(records, capped=False)
+        z_idx = out.index("z.py:1:")
+        a_idx = out.index("a.py:2:")
+        assert z_idx < a_idx, "first-seen file (z.py) should appear before later-seen (a.py)"
+
+    def test_capped_flag_propagates_to_summary(self):
+        from turnstone.core.session import _format_search_results
+
+        records = [("foo.py", "1", "match")]
+        out = _format_search_results(records, capped=True)
+        assert "byte cap" in out or "capped" in out
+
+
+class TestSearchCaptureStreaming:
+    """Direct tests for ``_search_capture`` — the streaming subprocess
+    layer that backs ``_exec_search``. These tests do NOT mock subprocess;
+    they spawn small ``python -c`` writers so the byte-cap, last-newline
+    trim, and timeout paths actually execute in real OS processes.
+    """
+
+    def test_byte_cap_trims_to_last_newline(self):
+        """Writer emits >cap bytes of well-formed lines; capture caps and
+        trims to the last newline so the parser never sees a partial
+        trailing line."""
+        import sys
+
+        from turnstone.core.session import _SEARCH_RAW_BYTE_CAP
+
+        session = _make_session()
+        # Each line is "p:1:" + 1023 'x' chars + '\n' = 1028 bytes; emit
+        # enough lines to comfortably exceed the 4 MB cap.
+        line_count = (_SEARCH_RAW_BYTE_CAP // 1028) + 100
+        writer = (
+            "import sys\n"
+            f"line = 'p:1:' + ('x' * 1023) + '\\n'\n"
+            f"sys.stdout.buffer.write(line.encode() * {line_count})\n"
+        )
+        stdout, rc, stderr, capped = session._search_capture([sys.executable, "-c", writer])
+        assert capped is True
+        assert len(stdout) <= _SEARCH_RAW_BYTE_CAP
+        # Trim was applied — every parsed line is well-formed (no partial
+        # trailing line). The buffer is sliced at the last newline, which
+        # discards the (possibly partial) bytes after it.
+        lines = stdout.splitlines()
+        assert lines, "expected at least one complete line"
+        for raw in lines:
+            assert raw.startswith(b"p:1:")
+            assert len(raw) == 1027  # "p:1:" + 1023 x's, no trailing \n
+
+    def test_byte_cap_mega_line_no_newline(self):
+        """A single multi-MB line with no newline is the worst-case input
+        (think a JSONL training record on one line). The cap fires and
+        ``last_nl == -1`` skips the trim — _exec_search distinguishes
+        this from 'all malformed' via the dedicated byte-cap message."""
+        import sys
+
+        from turnstone.core.session import _SEARCH_RAW_BYTE_CAP
+
+        session = _make_session()
+        # 5 MB of bytes, no newlines anywhere.
+        writer = "import sys\nsys.stdout.buffer.write(b'a' * (5 * 1024 * 1024))\n"
+        stdout, rc, stderr, capped = session._search_capture([sys.executable, "-c", writer])
+        assert capped is True
+        assert len(stdout) == _SEARCH_RAW_BYTE_CAP
+        assert b"\n" not in stdout
+
+    def test_timeout_raises_even_when_child_writes_nothing(self):
+        """Watchdog enforces tool_timeout regardless of whether the
+        child has written anything to stdout — ``proc.stdout.read`` is a
+        blocking pipe read that wouldn't otherwise honour the timeout.
+        Regression test for bug-1.
+        """
+        import sys
+
+        session = _make_session(tool_timeout=1)
+        # Sleep silently — never writes to stdout — so the read blocks.
+        sleeper = "import time; time.sleep(30)\n"
+        with pytest.raises(subprocess.TimeoutExpired):
+            session._search_capture([sys.executable, "-c", sleeper])
+
+    def test_clean_exit_returns_full_output_uncapped(self):
+        """A child that writes a small amount and exits cleanly returns
+        ``capped=False`` and the full output verbatim."""
+        import sys
+
+        session = _make_session()
+        writer = "import sys; sys.stdout.write('a.py:1:hello\\n')\n"
+        stdout, rc, stderr, capped = session._search_capture([sys.executable, "-c", writer])
+        assert capped is False
+        assert rc == 0
+        assert stdout == b"a.py:1:hello\n"
+
+    def test_stderr_drained_without_deadlock(self):
+        """If a child writes stderr in parallel with stdout, the drain
+        thread must keep the pipe flowing so the child doesn't block on
+        a full stderr buffer while we're reading stdout."""
+        import sys
+
+        session = _make_session()
+        # Write more to stderr than the OS pipe buffer (~64KB) while
+        # also writing stdout. Without the drain thread, the child
+        # blocks on stderr.write and we deadlock waiting for stdout EOF.
+        writer = (
+            "import sys\n"
+            "sys.stderr.buffer.write(b'e' * (200 * 1024))\n"
+            "sys.stdout.buffer.write(b'a.py:1:done\\n')\n"
+        )
+        stdout, rc, stderr, capped = session._search_capture([sys.executable, "-c", writer])
+        assert rc == 0
+        assert stdout == b"a.py:1:done\n"
+        # stderr was drained; the captured prefix is bounded by the cap.
+        from turnstone.core.session import _SEARCH_STDERR_CAP
+
+        assert len(stderr) <= _SEARCH_STDERR_CAP
