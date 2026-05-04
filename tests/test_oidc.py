@@ -920,42 +920,13 @@ class TestValidateDiscoveredEndpoint:
 class TestBuildOIDCRedirectURI:
     """Tests for ``_build_oidc_redirect_uri`` in auth.py."""
 
-    def _make_request(self, host="app.example.com", scheme="https", forwarded_proto=""):
-        """Build a minimal mock Starlette Request."""
-        req = MagicMock()
-        headers = {"host": host}
-        if forwarded_proto:
-            headers["x-forwarded-proto"] = forwarded_proto
-        req.headers = headers
-        req.url.scheme = scheme
-        return req
-
-    def test_pinned_redirect_base(self):
-        """When redirect_base is set, Host header is ignored."""
+    def test_build_redirect_uri_uses_redirect_base_only(self):
+        """The redirect URI is built solely from ``redirect_base``."""
         from turnstone.core.auth import _build_oidc_redirect_uri
 
-        config = _make_config(redirect_base="https://public.example.com")
-        req = self._make_request(host="internal-host:8080", scheme="http")
-        result = _build_oidc_redirect_uri(req, config)
-        assert result == "https://public.example.com/v1/api/auth/oidc/callback"
-
-    def test_fallback_to_host_header(self):
-        """When redirect_base is empty, redirect URI uses Host header."""
-        from turnstone.core.auth import _build_oidc_redirect_uri
-
-        config = _make_config(redirect_base="")
-        req = self._make_request(host="app.example.com", scheme="https")
-        result = _build_oidc_redirect_uri(req, config)
-        assert result == "https://app.example.com/v1/api/auth/oidc/callback"
-
-    def test_fallback_x_forwarded_proto(self):
-        """When redirect_base is empty and X-Forwarded-Proto is https, scheme is https."""
-        from turnstone.core.auth import _build_oidc_redirect_uri
-
-        config = _make_config(redirect_base="")
-        req = self._make_request(host="app.example.com", scheme="http", forwarded_proto="https")
-        result = _build_oidc_redirect_uri(req, config)
-        assert result == "https://app.example.com/v1/api/auth/oidc/callback"
+        config = _make_config(redirect_base="https://example.com")
+        result = _build_oidc_redirect_uri(config)
+        assert result == "https://example.com/v1/api/auth/oidc/callback"
 
 
 # ---------------------------------------------------------------------------
@@ -1673,9 +1644,31 @@ class TestInitializeOIDCState:
         assert state.oidc_config.enabled is False
         assert state.jwks_data is None
 
+    def test_initialize_disables_when_redirect_base_unset(self, caplog):
+        """Discovery succeeds but redirect_base is empty -> disable + log error."""
+        cfg = _make_config(redirect_base="")
+        state = types.SimpleNamespace(oidc_config=cfg, jwks_data=None)
+
+        async def _ok(c):
+            return c
+
+        async def _jwks_unexpected(_uri):
+            raise AssertionError("fetch_jwks must not be called when redirect_base is empty")
+
+        with (
+            patch("turnstone.core.oidc.discover_oidc", side_effect=_ok),
+            patch("turnstone.core.oidc.fetch_jwks", side_effect=_jwks_unexpected),
+            caplog.at_level("ERROR", logger="turnstone.core.oidc"),
+        ):
+            asyncio.run(initialize_oidc_state(state))
+
+        assert state.oidc_config.enabled is False
+        assert state.jwks_data is None
+        assert any("TURNSTONE_OIDC_REDIRECT_BASE" in record.message for record in caplog.records)
+
     def test_initialize_keeps_enabled_but_no_jwks_on_jwks_failure(self):
         """JWKS fetch failure preserves enabled=True for lazy retry."""
-        cfg = _make_config()
+        cfg = _make_config(redirect_base="https://app.example.com")
         state = types.SimpleNamespace(oidc_config=cfg, jwks_data=None)
 
         async def _ok(c):
@@ -1696,7 +1689,7 @@ class TestInitializeOIDCState:
 
     def test_initialize_success(self):
         """Both discovery and JWKS prefetch succeed."""
-        cfg = _make_config()
+        cfg = _make_config(redirect_base="https://app.example.com")
         state = types.SimpleNamespace(oidc_config=cfg, jwks_data=None)
 
         jwks = {"keys": [{"kid": "k1", "kty": "RSA"}]}
