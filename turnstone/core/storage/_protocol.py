@@ -8,6 +8,16 @@ if TYPE_CHECKING:
     from turnstone.core.workstream import WorkstreamKind
 
 
+class StorageConflictError(Exception):
+    """Raised by storage methods when a unique-constraint violation occurs.
+
+    Backends raise this so callers don't need to inspect dialect-specific
+    ``IntegrityError`` payloads.  The message identifies which constraint
+    conflicted (e.g. ``"users.username"`` vs ``"oidc_identities.PRIMARY"``)
+    when the backend can distinguish them.
+    """
+
+
 @runtime_checkable
 class StorageBackend(Protocol):
     """Protocol that every storage backend adapter must implement.
@@ -670,6 +680,32 @@ class StorageBackend(Protocol):
         ...
 
     # -- OIDC identity ---------------------------------------------------------
+
+    def create_oidc_user(
+        self,
+        user_id: str,
+        username: str,
+        display_name: str,
+        password_hash: str,
+        issuer: str,
+        subject: str,
+        email: str,
+    ) -> None:
+        """Atomically create a user row and bind their OIDC identity.
+
+        Both inserts run in a single transaction so concurrent callbacks for
+        the same ``(issuer, subject)`` pair (or username TOCTOU between
+        :meth:`get_user_by_username` and this call) cannot leave orphan
+        ``users`` rows or orphan ``user_role`` rows pointing at a user that
+        was rolled back.
+
+        Raises :class:`StorageConflictError` on UNIQUE / PK violations
+        (username already taken, or ``(issuer, subject)`` already linked)
+        so callers don't have to inspect dialect-specific ``IntegrityError``
+        details.  The user / identity rows are rolled back together on any
+        conflict.
+        """
+        ...
 
     def create_oidc_identity(self, issuer: str, subject: str, user_id: str, email: str) -> None:
         """Link an OIDC subject to a turnstone user. No-op if exists."""

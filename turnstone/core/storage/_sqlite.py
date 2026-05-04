@@ -3951,6 +3951,57 @@ class SQLiteBackend:
 
     # -- OIDC identity ---------------------------------------------------------
 
+    def create_oidc_user(
+        self,
+        user_id: str,
+        username: str,
+        display_name: str,
+        password_hash: str,
+        issuer: str,
+        subject: str,
+        email: str,
+    ) -> None:
+        from turnstone.core.storage._protocol import StorageConflictError
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            try:
+                # BEGIN IMMEDIATE upgrades to a write lock up front so the
+                # two inserts can't be interleaved with a parallel writer.
+                conn.execute(sa.text("BEGIN IMMEDIATE"))
+                conn.execute(
+                    sa.insert(users),
+                    {
+                        "user_id": user_id,
+                        "username": username,
+                        "display_name": display_name,
+                        "password_hash": password_hash,
+                        "created": now,
+                    },
+                )
+                conn.execute(
+                    sa.insert(oidc_identities),
+                    {
+                        "issuer": issuer,
+                        "subject": subject,
+                        "user_id": user_id,
+                        "email": email,
+                        "created": now,
+                        "last_login": now,
+                    },
+                )
+            except sa.exc.IntegrityError as exc:
+                conn.rollback()
+                msg = str(exc.orig) if exc.orig is not None else str(exc)
+                if "users.username" in msg:
+                    raise StorageConflictError(f"username already taken: {username}") from exc
+                if "oidc_identities" in msg:
+                    raise StorageConflictError(
+                        f"OIDC identity already linked: ({issuer}, {subject})"
+                    ) from exc
+                raise StorageConflictError(f"OIDC user provisioning conflict: {msg}") from exc
+            conn.commit()
+
     def create_oidc_identity(self, issuer: str, subject: str, user_id: str, email: str) -> None:
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
