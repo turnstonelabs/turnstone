@@ -1134,8 +1134,7 @@ async def handle_auth_status(request: Request) -> Response:
     has_users = False
     if storage is not None:
         try:
-            users = storage.list_users()
-            has_users = len(users) > 0
+            has_users = await asyncio.to_thread(storage.count_users) > 0
         except Exception:
             log.warning("Failed to check user existence for auth status", exc_info=True)
 
