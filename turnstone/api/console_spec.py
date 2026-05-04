@@ -560,7 +560,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "Parse a SKILL.md document and return its frontmatter fields and body",
         request_model=ParseSkillRequest,
         response_model=ParseSkillResponse,
-        error_codes=[400],
+        error_codes=[400, 413],
         tags=["Admin"],
     ),
     # --- Governance: Skills ---

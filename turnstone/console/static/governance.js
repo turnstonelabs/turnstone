@@ -1087,9 +1087,19 @@ function hideCreateTemplateModal() {
   // Cancel any inflight paste-parse so a late response can't reach into a
   // closed (or freshly reopened) modal and clobber state.  AbortController
   // also short-circuits the .then chain — see _handleSkillContentPaste.
+  // After abort, the handler's .catch/.finally bail via _isCurrent() before
+  // resetting the textarea, so we proactively restore the paste-induced
+  // visible state here.  Otherwise reopening would land on a disabled
+  // textarea stuck on "Parsing…".
   if (_ctmPasteController) {
     _ctmPasteController.abort();
     _ctmPasteController = null;
+    var ctmContent = document.getElementById("ctm-content");
+    if (ctmContent) {
+      ctmContent.disabled = false;
+      ctmContent.removeAttribute("aria-busy");
+    }
+    _setSkillPasteHintBusy(false);
   }
   document.getElementById("create-template-overlay").style.display = "none";
   _ctmTrapHandler = _removeTrap(_ctmTrapHandler);

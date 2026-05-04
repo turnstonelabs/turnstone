@@ -209,8 +209,9 @@ Body.
     def test_oversized_content_length_returns_413(self, client: TestClient) -> None:
         # Content-Length pre-check rejects oversized bodies before they're
         # buffered into memory.  Caps worker memory against an admin-token
-        # holder spraying multi-GB JSON.
-        oversized = "---\nname: big\n---\n" + ("a" * 33_000)
+        # holder spraying multi-GB JSON.  The threshold is generous (~4×
+        # the per-string cap) so payload here must clearly exceed it.
+        oversized = "a" * 200_000
         resp = client.post("/v1/api/admin/skills/parse", json={"raw": oversized})
         assert resp.status_code == 413
 

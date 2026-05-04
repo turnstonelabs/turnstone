@@ -6975,12 +6975,19 @@ def _get_discovery_url(request: Request) -> str:
     return DEFAULT_DISCOVERY_URL
 
 
-# Cap is in code points to match ``ParseSkillRequest.raw``'s Pydantic
-# ``max_length`` and ``admin_create_skill``'s ``content[:32768]`` truncation.
-# Content-Length below uses the same number on byte units — close enough for
-# the HTTP-buffer guard, which only needs to reject obviously oversized
-# payloads before ``request.json()`` allocates them.
+# Authoritative cap on ``raw`` itself — code points, matching the Pydantic
+# ``max_length`` on ``ParseSkillRequest.raw`` and the ``content[:32768]``
+# truncation in ``admin_create_skill``.
 _PARSE_SKILL_MAX_CHARS = 32_768
+
+# Generous coarse Content-Length pre-check.  The HTTP body carries the JSON
+# wrapper (``{"raw":"..."}`` + escaping) plus any UTF-8 multi-byte expansion,
+# so a legitimate max-length ``raw`` produces a body well above the char cap
+# — rejecting at exactly 32 KiB would 413 valid near-max requests.  This
+# threshold only needs to refuse obviously oversized payloads before
+# ``request.json()`` buffers them; the per-string ``len(raw)`` check below
+# is the authoritative limit.
+_PARSE_SKILL_MAX_BODY_BYTES = _PARSE_SKILL_MAX_CHARS * 4
 
 
 async def admin_parse_skill(request: Request) -> JSONResponse:
@@ -7005,10 +7012,11 @@ async def admin_parse_skill(request: Request) -> JSONResponse:
         return err
 
     # Reject oversized bodies before buffering — protects worker memory from
-    # an admin token spraying multi-GB JSON.  Bytes here approximate the
-    # char cap below; the per-string check is the authoritative limit.
+    # an admin token spraying multi-GB JSON.  Threshold is generous enough
+    # to admit a max-length ``raw`` plus its JSON wrapper and escaping; the
+    # per-string check below enforces the exact 32 KiB rule.
     cl = request.headers.get("content-length")
-    if cl and cl.isdigit() and int(cl) > _PARSE_SKILL_MAX_CHARS:
+    if cl and cl.isdigit() and int(cl) > _PARSE_SKILL_MAX_BODY_BYTES:
         return JSONResponse({"error": "request body too large"}, status_code=413)
 
     body = await read_json_or_400(request)
