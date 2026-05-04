@@ -533,6 +533,13 @@ def required_scope(method: str, path: str) -> str:
     if method == "POST" and normalized in APPROVE_PATHS:
         return "approve"
 
+    # Path-keyed internal admin actions: /api/_internal/mcp-{refresh,reconnect}/{name}
+    if method == "POST" and (
+        normalized.startswith("/api/_internal/mcp-refresh/")
+        or normalized.startswith("/api/_internal/mcp-reconnect/")
+    ):
+        return "approve"
+
     # Write endpoints
     if method == "POST" and normalized in WRITE_PATHS:
         return "write"
@@ -593,6 +600,10 @@ def required_scope(method: str, path: str) -> str:
         proxied = _extract_proxied_path(normalized)
         if proxied:
             if proxied in APPROVE_PATHS:
+                return "approve"
+            if proxied.startswith("/api/_internal/mcp-refresh/") or proxied.startswith(
+                "/api/_internal/mcp-reconnect/"
+            ):
                 return "approve"
             if proxied in WRITE_PATHS:
                 return "write"

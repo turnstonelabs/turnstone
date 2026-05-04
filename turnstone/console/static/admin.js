@@ -3316,9 +3316,17 @@ function _renderMcpServers(items) {
     var detailAttr = isConfig
       ? 'data-mcp-detail-name="' + escapeHtml(s.name) + '"'
       : 'data-mcp-detail="' + escapeHtml(s.server_id) + '"';
+    var actionBtns =
+      '<button class="admin-btn-action" data-mcp-refresh="' +
+      escapeHtml(s.name) +
+      '">refresh</button>' +
+      '<button class="admin-btn-action" data-mcp-reconnect="' +
+      escapeHtml(s.name) +
+      '">reconnect</button>';
     var actions = isConfig
-      ? ""
-      : '<button class="admin-btn-action" data-mcp-edit="' +
+      ? actionBtns
+      : actionBtns +
+        '<button class="admin-btn-action" data-mcp-edit="' +
         escapeHtml(s.server_id) +
         '">edit</button>' +
         '<button class="admin-btn-danger" data-mcp-delete="' +
@@ -3381,6 +3389,46 @@ function _renderMcpServers(items) {
   el.querySelectorAll("[data-mcp-edit]").forEach(function (btn) {
     btn.addEventListener("click", function () {
       showEditMcpModal(this.getAttribute("data-mcp-edit"));
+    });
+  });
+  el.querySelectorAll("[data-mcp-refresh]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var name = this.getAttribute("data-mcp-refresh");
+      authFetch(
+        "/v1/api/admin/mcp-servers/" + encodeURIComponent(name) + "/refresh",
+        { method: "POST" },
+      )
+        .then(function (r) {
+          if (!r.ok) throw new Error();
+          return r.json();
+        })
+        .then(function () {
+          showToast("Refreshed " + name);
+          loadAdminMcp();
+        })
+        .catch(function () {
+          showToast("Failed to refresh " + name);
+        });
+    });
+  });
+  el.querySelectorAll("[data-mcp-reconnect]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var name = this.getAttribute("data-mcp-reconnect");
+      authFetch(
+        "/v1/api/admin/mcp-servers/" + encodeURIComponent(name) + "/reconnect",
+        { method: "POST" },
+      )
+        .then(function (r) {
+          if (!r.ok) throw new Error();
+          return r.json();
+        })
+        .then(function () {
+          showToast("Reconnected " + name);
+          loadAdminMcp();
+        })
+        .catch(function () {
+          showToast("Failed to reconnect " + name);
+        });
     });
   });
   el.querySelectorAll("[data-mcp-delete]").forEach(function (btn) {

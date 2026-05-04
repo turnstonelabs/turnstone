@@ -8,12 +8,10 @@ synchronous.  We bridge the two by running a dedicated asyncio event loop
 in a daemon thread.  ``call_tool_sync`` dispatches coroutines onto that loop
 via ``asyncio.run_coroutine_threadsafe``.
 
-Refresh: three mechanisms keep tool/resource/prompt lists up-to-date:
+Refresh: two mechanisms keep tool/resource/prompt lists up-to-date:
   1. Push notifications — servers declaring ``listChanged`` on the
      respective capability trigger immediate refresh.
-  2. Periodic timer — servers *without* push support are polled on a
-     staggered interval (configurable, default 4 h, seeded at launch).
-  3. Manual — ``/mcp refresh [server]`` triggers ``refresh_sync()``.
+  2. Manual — ``/mcp refresh [server]`` triggers ``refresh_sync()``.
 """
 
 from __future__ import annotations
@@ -22,7 +20,6 @@ import asyncio
 import concurrent.futures
 import contextlib
 import json
-import os
 import random
 import threading
 import time
@@ -43,8 +40,6 @@ from turnstone.core.config import load_config
 from turnstone.core.log import get_logger
 
 log = get_logger("turnstone.mcp")
-
-_DEFAULT_REFRESH_INTERVAL: float = 14400  # 4 hours
 
 
 # ---------------------------------------------------------------------------
@@ -88,12 +83,8 @@ class MCPClientManager:
     def __init__(
         self,
         server_configs: dict[str, dict[str, Any]],
-        *,
-        refresh_interval: float = _DEFAULT_REFRESH_INTERVAL,
     ) -> None:
         self._server_configs = server_configs
-        if refresh_interval < 0:
-            refresh_interval = 0.0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._exit_stack: AsyncExitStack | None = None
@@ -147,10 +138,6 @@ class MCPClientManager:
         self._storage: Any = None
         self._sync_lock = threading.Lock()
 
-        # Periodic refresh for servers without push notifications
-        self._refresh_interval = refresh_interval
-        self._refresh_task: asyncio.Task[None] | None = None
-
         # Circuit breaker (per-server) — prevents repeated calls to broken servers
         self._consecutive_failures: dict[str, int] = {}
         self._circuit_open_until: dict[str, float] = {}  # monotonic timestamp
@@ -162,10 +149,6 @@ class MCPClientManager:
 
         # Notification debounce (per-server)
         self._last_notification_refresh: dict[str, float] = {}
-
-        # Periodic refresh backoff (per-server)
-        self._refresh_failures: dict[str, int] = {}
-        self._refresh_backoff_until: dict[str, float] = {}  # monotonic timestamp
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -201,22 +184,6 @@ class MCPClientManager:
 
         self._connected.set()
 
-        # Start periodic refresh for servers without push notifications
-        needs_periodic = any(
-            not self._supports_list_changed.get(name, False)
-            or (
-                self._supports_resources.get(name, False)
-                and not self._supports_resource_list_changed.get(name, False)
-            )
-            or (
-                self._supports_prompts.get(name, False)
-                and not self._supports_prompt_list_changed.get(name, False)
-            )
-            for name in self._sessions
-        )
-        if needs_periodic and self._refresh_interval > 0:
-            self._refresh_task = asyncio.get_running_loop().create_task(self._periodic_refresh())
-
     _CONNECT_TIMEOUT = 30  # seconds — prevents hung connections on broken remotes
     _TCP_PROBE_TIMEOUT = 5  # seconds — fast TCP pre-flight for HTTP transports
 
@@ -227,10 +194,6 @@ class MCPClientManager:
 
     # Notification debounce
     _NOTIFICATION_DEBOUNCE = 5.0  # seconds between refreshes per server
-
-    # Periodic refresh backoff
-    _REFRESH_BACKOFF_BASE = 60.0  # seconds
-    _REFRESH_BACKOFF_MAX = 3600.0  # 1 hour
 
     # -- circuit breaker (per-server) -----------------------------------------
 
@@ -666,9 +629,12 @@ class MCPClientManager:
         Returns ``(added_tools, removed_tools)`` names (tool diff only,
         for backward compatibility with ``/mcp refresh`` output).
         """
-        added, removed = await self._refresh_server_tools(name)
-        await self._refresh_server_resources(name)
-        await self._refresh_server_prompts(name)
+        tool_diff, _, _ = await asyncio.gather(
+            self._refresh_server_tools(name),
+            self._refresh_server_resources(name),
+            self._refresh_server_prompts(name),
+        )
+        added, removed = tool_diff
         self._last_error.pop(name, None)
         return added, removed
 
@@ -727,85 +693,6 @@ class MCPClientManager:
         except concurrent.futures.TimeoutError:
             future.cancel()
             raise TimeoutError(f"MCP refresh timed out after {timeout}s") from None
-
-    async def _periodic_refresh(self) -> None:
-        """Periodically refresh servers that lack push notifications.
-
-        Applies per-server exponential backoff on failure and attempts
-        reconnection for disconnected servers.
-        """
-        # Stagger start using a launch-time seed so cluster nodes don't
-        # all hit MCP servers simultaneously.
-        seed = random.Random(time.monotonic_ns() ^ os.getpid()).random()
-        initial_delay = seed * self._refresh_interval
-        await asyncio.sleep(initial_delay)
-        while True:
-            for name in list(self._server_configs):
-                now = time.monotonic()
-
-                # Check per-server backoff
-                backoff_until = self._refresh_backoff_until.get(name, 0.0)
-                if now < backoff_until:
-                    continue  # still in backoff
-
-                if name not in self._sessions:
-                    # Attempt reconnection for disconnected servers
-                    cfg = self._server_configs.get(name)
-                    if cfg:
-                        try:
-                            log.info("Periodic reconnect attempt for '%s'", name)
-                            await self._connect_one(name, cfg)
-                            self._refresh_failures.pop(name, None)
-                            self._refresh_backoff_until.pop(name, None)
-                            self._cb_record_success(name)
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception as exc:
-                            failures = self._refresh_failures.get(name, 0) + 1
-                            self._refresh_failures[name] = failures
-                            backoff = min(
-                                self._REFRESH_BACKOFF_BASE * (2 ** (failures - 1)),
-                                self._REFRESH_BACKOFF_MAX,
-                            )
-                            self._refresh_backoff_until[name] = time.monotonic() + backoff
-                            log.warning(
-                                "Periodic reconnect failed for '%s' (attempt %d, backoff %.0fs)",
-                                name,
-                                failures,
-                                backoff,
-                            )
-                            self._set_error(name, f"Reconnect failed: {exc}")
-                    continue
-
-                try:
-                    if not self._supports_list_changed.get(name, False):
-                        await self._refresh_server_tools(name)
-                    if not self._supports_resource_list_changed.get(name, False):
-                        await self._refresh_server_resources(name)
-                    if not self._supports_prompt_list_changed.get(name, False):
-                        await self._refresh_server_prompts(name)
-                    self._last_error.pop(name, None)
-                    self._refresh_failures.pop(name, None)
-                    self._refresh_backoff_until.pop(name, None)
-                except Exception as exc:
-                    failures = self._refresh_failures.get(name, 0) + 1
-                    self._refresh_failures[name] = failures
-                    backoff = min(
-                        self._REFRESH_BACKOFF_BASE * (2 ** (failures - 1)),
-                        self._REFRESH_BACKOFF_MAX,
-                    )
-                    self._refresh_backoff_until[name] = time.monotonic() + backoff
-                    log.warning(
-                        "Periodic refresh failed for '%s' (attempt %d, backoff %.0fs)",
-                        name,
-                        failures,
-                        backoff,
-                    )
-                    self._set_error(name, f"Periodic refresh failed: {exc}")
-            # Note: per-server backoff (max 1h) is only meaningful when
-            # refresh_interval is shorter than _REFRESH_BACKOFF_MAX.  With
-            # the default 4h interval this sleep already bounds retry frequency.
-            await asyncio.sleep(self._refresh_interval)
 
     # -- resource refresh ----------------------------------------------------
 
@@ -1142,10 +1029,6 @@ class MCPClientManager:
 
     def shutdown(self) -> None:
         """Close all MCP sessions and stop the background loop."""
-        # Cancel periodic refresh
-        if self._refresh_task and self._loop:
-            self._loop.call_soon_threadsafe(self._refresh_task.cancel)
-
         # Close all per-server stacks (transports + sessions)
         if self._loop and self._per_server_stacks:
 
@@ -1204,8 +1087,6 @@ class MCPClientManager:
         self._circuit_trip_count.clear()
         self._server_streams.clear()
         self._last_notification_refresh.clear()
-        self._refresh_failures.clear()
-        self._refresh_backoff_until.clear()
 
         log.info("MCP client shut down")
 
@@ -1252,6 +1133,77 @@ class MCPClientManager:
             "error": "",
         }
 
+    def reconnect_sync(self, name: str, timeout: int = 30) -> dict[str, Any]:
+        """Force a fresh connection to an MCP server (blocks the calling thread).
+
+        Tears down the current session/transport (if any), clears the circuit
+        breaker, and runs a new ``_connect_one``.  Returns status dict with
+        keys: connected, tools, resources, prompts, error (parity with
+        ``add_server_sync``).
+        """
+        if name not in self._server_configs:
+            return {
+                "connected": False,
+                "tools": 0,
+                "resources": 0,
+                "prompts": 0,
+                "error": "unknown server",
+            }
+        if self._loop is None:
+            return {
+                "connected": False,
+                "tools": 0,
+                "resources": 0,
+                "prompts": 0,
+                "error": "MCP event loop not running",
+            }
+
+        cfg = self._server_configs[name]
+
+        async def _reconnect() -> None:
+            self._cb_clear(name)
+            self._sessions.pop(name, None)
+            await self._pre_close_streams(name)
+            stack = self._per_server_stacks.pop(name, None)
+            if stack is not None:
+                await self._safe_close_stack(stack)
+            try:
+                await self._connect_one(name, cfg)
+            except Exception:
+                # Connect failed mid-reconnect — drop the stale per-server
+                # catalog so the merged tool/resource/prompt maps don't keep
+                # advertising entries with no live session behind them.
+                self._per_server_tools.pop(name, None)
+                self._per_server_resources.pop(name, None)
+                self._per_server_prompts.pop(name, None)
+                self._rebuild_tools()
+                self._rebuild_resources()
+                self._rebuild_prompts()
+                raise
+
+        future = asyncio.run_coroutine_threadsafe(_reconnect(), self._loop)
+        try:
+            future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            return {
+                "connected": False,
+                "tools": 0,
+                "resources": 0,
+                "prompts": 0,
+                "error": f"MCP server '{name}' reconnect timed out",
+            }
+        except Exception as exc:
+            return {"connected": False, "tools": 0, "resources": 0, "prompts": 0, "error": str(exc)}
+
+        return {
+            "connected": name in self._sessions,
+            "tools": len(self._per_server_tools.get(name, [])),
+            "resources": len(self._per_server_resources.get(name, [])),
+            "prompts": len(self._per_server_prompts.get(name, [])),
+            "error": "",
+        }
+
     def remove_server_sync(self, name: str, timeout: int = 15) -> bool:
         """Disconnect and remove an MCP server at runtime (blocks the calling thread).
 
@@ -1285,8 +1237,6 @@ class MCPClientManager:
                 self._supports_prompt_list_changed.pop(name, None)
                 self._last_error.pop(name, None)
                 self._last_notification_refresh.pop(name, None)
-                self._refresh_failures.pop(name, None)
-                self._refresh_backoff_until.pop(name, None)
                 self._cb_clear(name)
                 # Rebuild merged state (serialized with notification handlers)
                 self._rebuild_tools()
@@ -1312,8 +1262,6 @@ class MCPClientManager:
             self._supports_prompt_list_changed.pop(name, None)
             self._last_error.pop(name, None)
             self._last_notification_refresh.pop(name, None)
-            self._refresh_failures.pop(name, None)
-            self._refresh_backoff_until.pop(name, None)
             self._cb_clear(name)
             self._rebuild_tools()
             self._rebuild_resources()
@@ -1527,6 +1475,21 @@ class MCPClientManager:
         if session is None:
             self._cb_record_failure(server_name)
             raise RuntimeError(f"MCP server '{server_name}' reconnect produced no session")
+
+        # Schedule catalog refresh on the loop without blocking the caller.
+        # The reconnected session is valid for the imminent dispatch; catalog
+        # drift will be reconciled on the loop in the background.
+        def _schedule_refresh() -> None:
+            try:
+                asyncio.create_task(self._refresh_server(server_name))
+            except Exception:
+                log.warning(
+                    "Catalog refresh after reconnect failed for '%s'",
+                    server_name,
+                    exc_info=True,
+                )
+
+        self._loop.call_soon_threadsafe(_schedule_refresh)
         return session
 
     def call_tool_sync(
@@ -1794,7 +1757,6 @@ def load_mcp_config(
 def create_mcp_client(
     config_path: str | None = None,
     *,
-    refresh_interval: float = _DEFAULT_REFRESH_INTERVAL,
     storage: Any = None,
 ) -> MCPClientManager | None:
     """Create and start an MCP client manager.
@@ -1815,7 +1777,7 @@ def create_mcp_client(
     if not servers:
         return None
 
-    mgr = MCPClientManager(servers, refresh_interval=refresh_interval)
+    mgr = MCPClientManager(servers)
     # Mark DB-sourced servers so reconcile_sync won't remove config-file servers
     mgr._db_managed = {name for name in servers if name in db_names}
     mgr.start()

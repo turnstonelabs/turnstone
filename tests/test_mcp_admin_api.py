@@ -20,12 +20,16 @@ if TYPE_CHECKING:
 
 from turnstone.console.server import (
     _collect_mcp_status,
+    _notify_nodes_mcp_reconnect_one,
+    _notify_nodes_mcp_refresh_one,
     _notify_nodes_mcp_reload,
     admin_create_mcp_server,
     admin_delete_mcp_server,
     admin_get_mcp_server,
     admin_import_mcp_config,
     admin_list_mcp_servers,
+    admin_mcp_reconnect_one,
+    admin_mcp_refresh_one,
     admin_mcp_reload,
     admin_update_mcp_server,
 )
@@ -103,6 +107,16 @@ _ROUTES = [
                 methods=["POST"],
             ),
             Route(
+                "/api/admin/mcp-servers/{name}/refresh",
+                admin_mcp_refresh_one,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/admin/mcp-servers/{name}/reconnect",
+                admin_mcp_reconnect_one,
+                methods=["POST"],
+            ),
+            Route(
                 "/api/admin/mcp-servers/{server_id}",
                 admin_get_mcp_server,
             ),
@@ -122,8 +136,12 @@ _ROUTES = [
 
 
 def _routes_with_internal() -> list[Mount]:
-    """Routes including the node-side internal endpoint (lazy-imported)."""
-    from turnstone.server import internal_mcp_reload
+    """Routes including the node-side internal endpoints (lazy-imported)."""
+    from turnstone.server import (
+        internal_mcp_reconnect_one,
+        internal_mcp_refresh_one,
+        internal_mcp_reload,
+    )
 
     return [
         Mount(
@@ -131,6 +149,16 @@ def _routes_with_internal() -> list[Mount]:
             routes=[
                 *_ROUTES[0].routes,  # type: ignore[union-attr]
                 Route("/api/_internal/mcp-reload", internal_mcp_reload, methods=["POST"]),
+                Route(
+                    "/api/_internal/mcp-refresh/{name}",
+                    internal_mcp_refresh_one,
+                    methods=["POST"],
+                ),
+                Route(
+                    "/api/_internal/mcp-reconnect/{name}",
+                    internal_mcp_reconnect_one,
+                    methods=["POST"],
+                ),
             ],
         ),
     ]
@@ -889,3 +917,414 @@ class TestInternalMcpReloadEndpoint:
         assert data["added"] == ["a"]
         assert data["removed"] == ["b"]
         assert data["updated"] == ["c"]
+
+
+# ---------------------------------------------------------------------------
+# _notify_nodes_mcp_refresh_one / _notify_nodes_mcp_reconnect_one
+# ---------------------------------------------------------------------------
+
+
+class TestNotifyNodesMcpRefreshOne:
+    @pytest.mark.anyio
+    async def test_returns_json_on_success(self):
+        client = AsyncMock()
+        client.post.return_value = _mock_resp(200, {"status": "ok"})
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_refresh_one(req, "srv")
+        assert result == {"n1": {"status": "ok"}}
+        # Verify the URL used the safe-encoded name segment
+        call_args = client.post.call_args
+        assert call_args[0][0].endswith("/v1/api/_internal/mcp-refresh/srv")
+
+    @pytest.mark.anyio
+    async def test_skips_nodes_without_url(self):
+        client = AsyncMock()
+        req = _fake_request(
+            {"node_id": "n1", "server_url": ""},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_refresh_one(req, "srv")
+        assert result == {}
+        client.post.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_records_error_on_exception(self):
+        client = AsyncMock()
+        client.post.side_effect = ConnectionError("refused")
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_refresh_one(req, "srv")
+        assert "n1" in result
+        assert "error" in result["n1"]
+        assert "refused" in result["n1"]["error"]
+
+    @pytest.mark.anyio
+    async def test_multiple_nodes_mixed(self):
+        client = AsyncMock()
+        client.post.side_effect = [
+            _mock_resp(200, {"status": "ok"}),
+            TimeoutError("timeout"),
+        ]
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            {"node_id": "n2", "server_url": "http://n2:8000"},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_refresh_one(req, "srv")
+        assert result["n1"] == {"status": "ok"}
+        assert "error" in result["n2"]
+
+    @pytest.mark.anyio
+    async def test_empty_cluster(self):
+        req = _fake_request()
+        result = await _notify_nodes_mcp_refresh_one(req, "srv")
+        assert result == {}
+
+
+class TestNotifyNodesMcpReconnectOne:
+    @pytest.mark.anyio
+    async def test_returns_json_on_success(self):
+        client = AsyncMock()
+        client.post.return_value = _mock_resp(200, {"status": "ok"})
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_reconnect_one(req, "srv")
+        assert result == {"n1": {"status": "ok"}}
+        call_args = client.post.call_args
+        assert call_args[0][0].endswith("/v1/api/_internal/mcp-reconnect/srv")
+
+    @pytest.mark.anyio
+    async def test_skips_nodes_without_url(self):
+        client = AsyncMock()
+        req = _fake_request(
+            {"node_id": "n1", "server_url": ""},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_reconnect_one(req, "srv")
+        assert result == {}
+        client.post.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_records_error_on_exception(self):
+        client = AsyncMock()
+        client.post.side_effect = ConnectionError("refused")
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_reconnect_one(req, "srv")
+        assert "n1" in result
+        assert "error" in result["n1"]
+        assert "refused" in result["n1"]["error"]
+
+    @pytest.mark.anyio
+    async def test_multiple_nodes_mixed(self):
+        client = AsyncMock()
+        client.post.side_effect = [
+            _mock_resp(200, {"status": "ok"}),
+            TimeoutError("timeout"),
+        ]
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            {"node_id": "n2", "server_url": "http://n2:8000"},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_reconnect_one(req, "srv")
+        assert result["n1"] == {"status": "ok"}
+        assert "error" in result["n2"]
+
+    @pytest.mark.anyio
+    async def test_empty_cluster(self):
+        req = _fake_request()
+        result = await _notify_nodes_mcp_reconnect_one(req, "srv")
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# Console refresh / reconnect endpoints
+# ---------------------------------------------------------------------------
+
+
+class TestAdminMcpRefreshOneEndpoint:
+    """HTTP-level tests for the console refresh-one endpoint."""
+
+    def test_refresh_one_success(self, client: TestClient) -> None:
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_action",
+            new_callable=AsyncMock,
+            return_value={"n1": {"status": "ok"}},
+        ) as mock_notify:
+            r = client.post("/v1/api/admin/mcp-servers/srv/refresh")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "ok"
+        assert data["results"] == {"n1": {"status": "ok"}}
+        # The shared helper is called with the action verb.
+        mock_notify.assert_awaited_once()
+        args = mock_notify.await_args.args
+        assert args[1] == "refresh"
+        assert args[2] == "srv"
+
+    def test_refresh_one_permission_denied(self, client_no_perm: TestClient) -> None:
+        r = client_no_perm.post("/v1/api/admin/mcp-servers/srv/refresh")
+        assert r.status_code == 403
+        assert "admin.mcp" in r.json()["error"]
+
+    def test_refresh_one_invalid_name(self, client: TestClient) -> None:
+        # Names with '__' (reserved delimiter) are rejected.
+        r = client.post("/v1/api/admin/mcp-servers/bad__name/refresh")
+        assert r.status_code == 400
+        assert "invalid" in r.json()["error"].lower()
+
+
+class TestAdminMcpReconnectOneEndpoint:
+    """HTTP-level tests for the console reconnect-one endpoint."""
+
+    def test_reconnect_one_success(self, client: TestClient) -> None:
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_action",
+            new_callable=AsyncMock,
+            return_value={"n1": {"status": "ok"}},
+        ) as mock_notify:
+            r = client.post("/v1/api/admin/mcp-servers/srv/reconnect")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "ok"
+        assert data["results"] == {"n1": {"status": "ok"}}
+        mock_notify.assert_awaited_once()
+        args = mock_notify.await_args.args
+        assert args[1] == "reconnect"
+        assert args[2] == "srv"
+
+    def test_reconnect_one_permission_denied(self, client_no_perm: TestClient) -> None:
+        r = client_no_perm.post("/v1/api/admin/mcp-servers/srv/reconnect")
+        assert r.status_code == 403
+        assert "admin.mcp" in r.json()["error"]
+
+    def test_reconnect_one_invalid_name(self, client: TestClient) -> None:
+        r = client.post("/v1/api/admin/mcp-servers/bad__name/reconnect")
+        assert r.status_code == 400
+        assert "invalid" in r.json()["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Node refresh-one endpoint: POST /v1/api/_internal/mcp-refresh/{name}
+# ---------------------------------------------------------------------------
+
+
+class TestInternalMcpRefreshOneEndpoint:
+    """HTTP-level tests for the node-side per-server refresh endpoint."""
+
+    @pytest.fixture()
+    def node_app_factory(self, storage: SQLiteBackend):
+        """Build a TestClient with an MCP client manager on app.state."""
+
+        def _make(mgr: Any) -> TestClient:
+            app = Starlette(
+                routes=_routes_with_internal(),
+                middleware=[Middleware(_InjectAuthMiddleware)],
+            )
+            app.state.auth_storage = storage
+            if mgr is not None:
+                app.state.mcp_client = mgr
+            return TestClient(app, raise_server_exceptions=False)
+
+        return _make
+
+    def test_refresh_one_success(self, node_app_factory) -> None:
+        mgr = MagicMock()
+        mgr.refresh_sync.return_value = None
+        mgr.get_server_status.return_value = {
+            "connected": True,
+            "tools": 3,
+            "resources": 0,
+            "prompts": 1,
+            "error": "",
+            "transport": "stdio",
+            "command": "/usr/bin/secret-stdio",
+            "url": "",
+            "circuit_open": False,
+            "consecutive_failures": 0,
+        }
+        c = node_app_factory(mgr)
+        r = c.post("/v1/api/_internal/mcp-refresh/srv")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "ok"
+        # sec-3: command/url stripped from response.
+        assert "command" not in data["server"]
+        assert "url" not in data["server"]
+        assert data["server"]["tools"] == 3
+        mgr.refresh_sync.assert_called_once_with(server_name="srv")
+
+    def test_refresh_one_no_mcp_client_returns_503(self, node_app_factory) -> None:
+        c = node_app_factory(None)
+        r = c.post("/v1/api/_internal/mcp-refresh/srv")
+        assert r.status_code == 503
+        assert r.json()["status"] == "error"
+
+    def test_refresh_one_raises_returns_500(self, node_app_factory) -> None:
+        mgr = MagicMock()
+        mgr.refresh_sync.side_effect = RuntimeError("internal stdio path /etc/shadow blew up")
+        c = node_app_factory(mgr)
+        r = c.post("/v1/api/_internal/mcp-refresh/srv")
+        assert r.status_code == 500
+        # sec-2: raw exception detail must not leak to the caller.
+        body = r.json()
+        assert body["error"] == "refresh failed"
+        assert "shadow" not in body["error"]
+
+    def test_refresh_one_per_server_error_returns_500(self, node_app_factory) -> None:
+        # q-3 / bug-3: refresh_sync swallows per-server errors into _last_error,
+        # so a 200 from refresh_sync is not enough — get_server_status reports.
+        mgr = MagicMock()
+        mgr.refresh_sync.return_value = None
+        mgr.get_server_status.return_value = {
+            "connected": False,
+            "tools": 0,
+            "resources": 0,
+            "prompts": 0,
+            "error": "Refresh failed: connection refused",
+            "transport": "stdio",
+            "command": "secret",
+            "url": "",
+            "circuit_open": True,
+            "consecutive_failures": 5,
+        }
+        c = node_app_factory(mgr)
+        r = c.post("/v1/api/_internal/mcp-refresh/srv")
+        assert r.status_code == 500
+        data = r.json()
+        assert data["status"] == "error"
+        assert data["error"] == "refresh failed"
+        # Public status echoed but command/url stripped.
+        assert "command" not in data["server"]
+        assert "url" not in data["server"]
+        assert data["server"]["circuit_open"] is True
+
+    def test_refresh_one_invalid_name_returns_400(self, node_app_factory) -> None:
+        # sec-4: name validation symmetric with console side.
+        mgr = MagicMock()
+        c = node_app_factory(mgr)
+        r = c.post("/v1/api/_internal/mcp-refresh/bad__name")
+        assert r.status_code == 400
+        assert "invalid" in r.json()["error"].lower()
+        mgr.refresh_sync.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Node reconnect-one endpoint: POST /v1/api/_internal/mcp-reconnect/{name}
+# ---------------------------------------------------------------------------
+
+
+class TestInternalMcpReconnectOneEndpoint:
+    """HTTP-level tests for the node-side per-server reconnect endpoint."""
+
+    @pytest.fixture()
+    def node_app_factory(self, storage: SQLiteBackend):
+        """Build a TestClient with an MCP client manager on app.state."""
+
+        def _make(mgr: Any) -> TestClient:
+            app = Starlette(
+                routes=_routes_with_internal(),
+                middleware=[Middleware(_InjectAuthMiddleware)],
+            )
+            app.state.auth_storage = storage
+            if mgr is not None:
+                app.state.mcp_client = mgr
+            return TestClient(app, raise_server_exceptions=False)
+
+        return _make
+
+    def test_reconnect_one_success(self, node_app_factory) -> None:
+        mgr = MagicMock()
+        mgr.reconnect_sync.return_value = {
+            "connected": True,
+            "tools": 2,
+            "resources": 0,
+            "prompts": 0,
+            "error": "",
+        }
+        mgr.get_server_status.return_value = {
+            "connected": True,
+            "tools": 2,
+            "resources": 0,
+            "prompts": 0,
+            "error": "",
+            "transport": "stdio",
+            "command": "secret-cmd",
+            "url": "",
+            "circuit_open": False,
+            "consecutive_failures": 0,
+        }
+        c = node_app_factory(mgr)
+        r = c.post("/v1/api/_internal/mcp-reconnect/srv")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "ok"
+        # sec-3: command/url stripped from response.
+        assert "command" not in data["server"]
+        assert "url" not in data["server"]
+        mgr.reconnect_sync.assert_called_once_with("srv")
+
+    def test_reconnect_one_no_mcp_client_returns_503(self, node_app_factory) -> None:
+        c = node_app_factory(None)
+        r = c.post("/v1/api/_internal/mcp-reconnect/srv")
+        assert r.status_code == 503
+
+    def test_reconnect_one_returns_error_dict_500(self, node_app_factory) -> None:
+        mgr = MagicMock()
+        mgr.reconnect_sync.return_value = {
+            "connected": False,
+            "tools": 0,
+            "resources": 0,
+            "prompts": 0,
+            "error": "secret stdio at /etc/shadow timed out",
+        }
+        mgr.get_server_status.return_value = {
+            "connected": False,
+            "tools": 0,
+            "resources": 0,
+            "prompts": 0,
+            "error": "secret stdio at /etc/shadow timed out",
+            "transport": "stdio",
+            "command": "secret",
+            "url": "",
+            "circuit_open": False,
+            "consecutive_failures": 1,
+        }
+        c = node_app_factory(mgr)
+        r = c.post("/v1/api/_internal/mcp-reconnect/srv")
+        assert r.status_code == 500
+        body = r.json()
+        # The top-level `error` is generic; the inner `server.error` echoes
+        # whatever ``get_server_status`` returned (still admin-facing).
+        assert body["error"] == "reconnect failed"
+        assert "command" not in body["server"]
+        assert "url" not in body["server"]
+
+    def test_reconnect_one_raises_returns_500(self, node_app_factory) -> None:
+        mgr = MagicMock()
+        mgr.reconnect_sync.side_effect = RuntimeError("internal stdio /etc/shadow blew up")
+        c = node_app_factory(mgr)
+        r = c.post("/v1/api/_internal/mcp-reconnect/srv")
+        assert r.status_code == 500
+        body = r.json()
+        assert body["error"] == "reconnect failed"
+        assert "shadow" not in body["error"]
+
+    def test_reconnect_one_invalid_name_returns_400(self, node_app_factory) -> None:
+        # sec-4: name validation symmetric with console side.
+        mgr = MagicMock()
+        c = node_app_factory(mgr)
+        r = c.post("/v1/api/_internal/mcp-reconnect/bad__name")
+        assert r.status_code == 400
+        assert "invalid" in r.json()["error"].lower()
+        mgr.reconnect_sync.assert_not_called()

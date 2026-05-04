@@ -2850,6 +2850,91 @@ def internal_mcp_status(request: Request) -> JSONResponse:
     return JSONResponse({"servers": mcp_mgr.get_all_server_status()})
 
 
+_SERVER_STATUS_PUBLIC_KEYS: tuple[str, ...] = (
+    "connected",
+    "tools",
+    "resources",
+    "prompts",
+    "error",
+    "transport",
+    "circuit_open",
+    "consecutive_failures",
+)
+
+
+def _public_server_status(mcp_mgr: Any, name: str) -> dict[str, Any]:
+    """Strip ``command``/``url`` from ``get_server_status`` before returning over the wire.
+
+    The full status dict embeds stdio argv and remote URLs that are
+    admin-only context.  Internal node endpoints surface only the
+    operational fields callers need to reflect to the operator.
+    """
+    full = mcp_mgr.get_server_status(name)
+    return {k: full[k] for k in _SERVER_STATUS_PUBLIC_KEYS if k in full}
+
+
+def internal_mcp_refresh_one(request: Request) -> JSONResponse:
+    """POST /v1/api/_internal/mcp-refresh/{name} — refresh a single MCP server's catalog."""
+    name = request.path_params["name"]
+    if "__" in name:
+        return JSONResponse({"status": "error", "error": "invalid name"}, status_code=400)
+    mcp_mgr = getattr(request.app.state, "mcp_client", None)
+    if mcp_mgr is None:
+        return JSONResponse({"status": "error", "error": "MCP client not running"}, status_code=503)
+
+    try:
+        mcp_mgr.refresh_sync(server_name=name)
+    except Exception as exc:
+        log.warning("internal_mcp_refresh_one failed for %s: %s", name, exc)
+        return JSONResponse({"status": "error", "error": "refresh failed"}, status_code=500)
+
+    # _refresh_all swallows per-server errors into _last_error rather than
+    # raising, so a 200-OK from refresh_sync isn't enough — re-check status
+    # and surface 500 if the refresh actually failed for this server.
+    status = _public_server_status(mcp_mgr, name)
+    if status.get("error"):
+        log.warning(
+            "internal_mcp_refresh_one: refresh reported error for %s: %s", name, status["error"]
+        )
+        return JSONResponse(
+            {"status": "error", "error": "refresh failed", "server": status},
+            status_code=500,
+        )
+    return JSONResponse({"status": "ok", "server": status})
+
+
+def internal_mcp_reconnect_one(request: Request) -> JSONResponse:
+    """POST /v1/api/_internal/mcp-reconnect/{name} — force-reconnect a single MCP server."""
+    name = request.path_params["name"]
+    if "__" in name:
+        return JSONResponse({"status": "error", "error": "invalid name"}, status_code=400)
+    mcp_mgr = getattr(request.app.state, "mcp_client", None)
+    if mcp_mgr is None:
+        return JSONResponse({"status": "error", "error": "MCP client not running"}, status_code=503)
+
+    try:
+        result = mcp_mgr.reconnect_sync(name)
+    except Exception as exc:
+        log.warning("internal_mcp_reconnect_one failed for %s: %s", name, exc)
+        return JSONResponse({"status": "error", "error": "reconnect failed"}, status_code=500)
+
+    if result.get("error"):
+        log.warning(
+            "internal_mcp_reconnect_one: reconnect reported error for %s: %s",
+            name,
+            result.get("error", ""),
+        )
+        return JSONResponse(
+            {
+                "status": "error",
+                "error": "reconnect failed",
+                "server": _public_server_status(mcp_mgr, name),
+            },
+            status_code=500,
+        )
+    return JSONResponse({"status": "ok", "server": _public_server_status(mcp_mgr, name)})
+
+
 # -- internal model management -----------------------------------------------
 
 
@@ -3791,6 +3876,16 @@ def create_app(
                     Route("/api/_internal/mcp-reload", internal_mcp_reload, methods=["POST"]),
                     Route("/api/_internal/mcp-status", internal_mcp_status),
                     Route(
+                        "/api/_internal/mcp-refresh/{name}",
+                        internal_mcp_refresh_one,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/_internal/mcp-reconnect/{name}",
+                        internal_mcp_reconnect_one,
+                        methods=["POST"],
+                    ),
+                    Route(
                         "/api/_internal/model-reload",
                         internal_model_reload,
                         methods=["POST"],
@@ -4052,7 +4147,6 @@ def main() -> None:
     mcp_config_cli = args.mcp_config  # CLI-only (no config.toml for this)
     mcp_client = create_mcp_client(
         mcp_config_cli or config_store.get("mcp.config_path") or None,
-        refresh_interval=config_store.get("mcp.refresh_interval"),
         storage=_get_storage(),
     )
     # Mutable ref so session_factory always sees the latest MCP client,
