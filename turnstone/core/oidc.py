@@ -49,6 +49,22 @@ _ALLOWED_ID_TOKEN_ALGS = [
     "PS512",
 ]
 
+# Well-known IdPs whose discovery documents legitimately reference endpoints on
+# hostnames distinct from the issuer hostname. Keys are issuer hostnames; values
+# are the set of additional endpoint hostnames the issuer is allowed to delegate
+# to. eTLD+1 matching does not work here (e.g. google.com vs googleapis.com),
+# so an explicit allow-map is the only safe option.
+_KNOWN_TRUSTED_ENDPOINT_HOSTS: dict[str, frozenset[str]] = {
+    "accounts.google.com": frozenset(
+        {
+            "accounts.google.com",
+            "oauth2.googleapis.com",
+            "www.googleapis.com",
+            "openidconnect.googleapis.com",
+        }
+    ),
+}
+
 
 # ---------------------------------------------------------------------------
 # Exception
@@ -78,6 +94,7 @@ class OIDCConfig:
     role_map: dict[str, str] = field(default_factory=dict)
     password_enabled: bool = True
     redirect_base: str = ""
+    trusted_endpoint_hosts: tuple[str, ...] = ()
     # Discovered from .well-known/openid-configuration
     authorization_endpoint: str = ""
     token_endpoint: str = ""
@@ -96,6 +113,16 @@ def _parse_role_map(raw: str) -> dict[str, str]:
             if k and v:
                 result[k] = v
     return result
+
+
+def _parse_trusted_endpoint_hosts(raw: str) -> tuple[str, ...]:
+    """Parse a comma-separated host list into a normalised tuple."""
+    hosts: list[str] = []
+    for entry in raw.split(","):
+        host = entry.strip().lower()
+        if host:
+            hosts.append(host)
+    return tuple(hosts)
 
 
 def load_oidc_config() -> OIDCConfig:
@@ -146,6 +173,18 @@ def load_oidc_config() -> OIDCConfig:
         password_enabled = password_raw in ("true", "1", "yes")
     else:
         password_enabled = bool(cfg.get("password_enabled", True))
+
+    trusted_hosts_raw = os.environ.get("TURNSTONE_OIDC_TRUSTED_ENDPOINT_HOSTS", "").strip()
+    if trusted_hosts_raw:
+        trusted_endpoint_hosts = _parse_trusted_endpoint_hosts(trusted_hosts_raw)
+    else:
+        cfg_trusted = cfg.get("trusted_endpoint_hosts", "")
+        if isinstance(cfg_trusted, list):
+            trusted_endpoint_hosts = _parse_trusted_endpoint_hosts(
+                ",".join(str(h) for h in cfg_trusted)
+            )
+        else:
+            trusted_endpoint_hosts = _parse_trusted_endpoint_hosts(str(cfg_trusted))
 
     redirect_base = os.environ.get("TURNSTONE_OIDC_REDIRECT_BASE", "").strip()
     if not redirect_base:
@@ -212,6 +251,7 @@ def load_oidc_config() -> OIDCConfig:
         role_map=role_map,
         password_enabled=password_enabled,
         redirect_base=redirect_base,
+        trusted_endpoint_hosts=trusted_endpoint_hosts,
     )
 
 
@@ -225,6 +265,54 @@ def _is_localhost(hostname: str) -> bool:
     return hostname in ("localhost", "127.0.0.1", "::1") or hostname.endswith(".localhost")
 
 
+def _effective_port(parsed: urllib.parse.ParseResult) -> int | None:
+    """Return the explicit port if set, else the scheme default."""
+    if parsed.port is not None:
+        return parsed.port
+    return {"http": 80, "https": 443}.get(parsed.scheme)
+
+
+def _validate_url_no_ssrf(url: str, *, allow_http: bool) -> urllib.parse.ParseResult:
+    """Run the scheme/userinfo/SSRF checks shared by issuer and discovered URLs.
+
+    Returns the parsed URL on success. Raises :class:`OIDCError` on failure.
+    The ``allow_http`` flag is the only knob: when ``True``, ``http://`` is
+    accepted *if* the hostname is also a localhost form; when ``False``,
+    only ``https://`` is accepted.
+    """
+    parsed = urllib.parse.urlparse(url)
+
+    hostname = parsed.hostname
+    if not hostname:
+        raise OIDCError(f"OIDC URL has no hostname: {url}")
+
+    if parsed.username or parsed.password:
+        raise OIDCError("OIDC URL must not contain embedded credentials (userinfo)")
+
+    if parsed.scheme != "https":
+        if allow_http and parsed.scheme == "http" and _is_localhost(hostname):
+            pass
+        else:
+            raise OIDCError(f"OIDC URL must use HTTPS (got {parsed.scheme}://): {url}")
+
+    try:
+        addr_infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        raise OIDCError(f"OIDC hostname cannot be resolved: {hostname}") from exc
+
+    for _family, _type, _proto, _canonname, sockaddr in addr_infos:
+        try:
+            addr = ipaddress.ip_address(sockaddr[0])
+        except ValueError as exc:
+            raise OIDCError(
+                f"OIDC hostname resolved to invalid IP {sockaddr[0]!r}: {hostname}"
+            ) from exc
+        if not addr.is_global and not _is_localhost(hostname):
+            raise OIDCError(f"OIDC URL resolves to non-public address ({addr}): {url}")
+
+    return parsed
+
+
 def validate_issuer_url(url: str) -> None:
     """Validate an OIDC issuer URL to prevent SSRF.
 
@@ -235,39 +323,65 @@ def validate_issuer_url(url: str) -> None:
 
     Raises :class:`OIDCError` on validation failure.
     """
-    parsed = urllib.parse.urlparse(url)
+    _validate_url_no_ssrf(url, allow_http=True)
 
-    # Require a hostname.
-    hostname = parsed.hostname
-    if not hostname:
-        raise OIDCError(f"OIDC issuer URL has no hostname: {url}")
 
-    # Reject embedded credentials — redact userinfo from error message.
-    if parsed.username or parsed.password:
-        raise OIDCError("OIDC issuer URL must not contain embedded credentials (userinfo)")
+def validate_discovered_endpoint(
+    url: str,
+    issuer_parsed: urllib.parse.ParseResult,
+    *,
+    allow_http: bool,
+    trusted_endpoint_hosts: frozenset[str],
+) -> None:
+    """Validate an endpoint pulled from an IdP discovery document.
 
-    # Require HTTPS (allow HTTP only for localhost development).
-    if parsed.scheme != "https":
-        if parsed.scheme == "http" and _is_localhost(hostname):
-            pass  # Allow http://localhost for dev
-        else:
-            raise OIDCError(f"OIDC issuer URL must use HTTPS (got {parsed.scheme}://): {url}")
+    Applies the same scheme/userinfo/SSRF rules as :func:`validate_issuer_url`,
+    then constrains the host: by default the endpoint must share the issuer's
+    hostname. Strict equality is intentional — a hostile or compromised IdP
+    must not be able to redirect ``token_endpoint`` to a third-party host where
+    ``client_secret`` would leak. Multi-origin IdPs (e.g. Google) are
+    accommodated via :data:`_KNOWN_TRUSTED_ENDPOINT_HOSTS` plus an
+    operator-configurable ``trusted_endpoint_hosts`` list.
 
-    # Resolve hostname and reject non-globally-routable addresses.
-    try:
-        addr_infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
-    except socket.gaierror as exc:
-        raise OIDCError(f"OIDC issuer hostname cannot be resolved: {hostname}") from exc
+    The scheme must match the issuer's scheme, and the *effective* port (with
+    scheme defaults applied) must match — so ``https://host`` and
+    ``https://host:443`` are treated as identical.
 
-    for _family, _type, _proto, _canonname, sockaddr in addr_infos:
-        try:
-            addr = ipaddress.ip_address(sockaddr[0])
-        except ValueError as exc:
-            raise OIDCError(
-                f"OIDC issuer hostname resolved to invalid IP {sockaddr[0]!r}: {hostname}"
-            ) from exc
-        if not addr.is_global and not _is_localhost(hostname):
-            raise OIDCError(f"OIDC issuer URL resolves to non-public address ({addr}): {url}")
+    ``allow_http`` should track whether the *issuer* URL was localhost, so the
+    whole flow is allowed to be HTTP only in dev mode.
+
+    Raises :class:`OIDCError` on validation failure.
+    """
+    parsed = _validate_url_no_ssrf(url, allow_http=allow_http)
+
+    issuer_hostname = (issuer_parsed.hostname or "").lower()
+    endpoint_hostname = (parsed.hostname or "").lower()
+
+    if parsed.scheme != issuer_parsed.scheme:
+        raise OIDCError(
+            f"OIDC discovered endpoint scheme ({parsed.scheme}) "
+            f"does not match issuer ({issuer_parsed.scheme}): {url}"
+        )
+
+    known_trusted = _KNOWN_TRUSTED_ENDPOINT_HOSTS.get(issuer_hostname, frozenset())
+    host_allowed = (
+        endpoint_hostname == issuer_hostname
+        or endpoint_hostname in known_trusted
+        or endpoint_hostname in trusted_endpoint_hosts
+    )
+    if not host_allowed:
+        raise OIDCError(
+            f"OIDC discovered endpoint host ({endpoint_hostname}) "
+            f"does not match issuer ({issuer_hostname}) and is not trusted: {url}"
+        )
+
+    endpoint_port = _effective_port(parsed)
+    issuer_port = _effective_port(issuer_parsed)
+    if endpoint_port != issuer_port:
+        raise OIDCError(
+            f"OIDC discovered endpoint port ({endpoint_port}) "
+            f"does not match issuer ({issuer_port}): {url}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +398,7 @@ async def discover_oidc(config: OIDCConfig) -> OIDCConfig:
         return dataclasses.replace(config, enabled=False)
 
     try:
-        validate_issuer_url(config.issuer)
+        issuer_parsed = _validate_url_no_ssrf(config.issuer, allow_http=True)
     except OIDCError as exc:
         log.warning("OIDC issuer URL rejected: %s", exc)
         return dataclasses.replace(config, enabled=False)
@@ -310,6 +424,41 @@ async def discover_oidc(config: OIDCConfig) -> OIDCConfig:
             config.issuer,
         )
         return dataclasses.replace(config, enabled=False)
+
+    allow_http = _is_localhost(issuer_parsed.hostname or "")
+    trusted_hosts = frozenset(h.lower() for h in config.trusted_endpoint_hosts)
+    required = (
+        ("authorization_endpoint", authorization_endpoint),
+        ("token_endpoint", token_endpoint),
+        ("jwks_uri", jwks_uri),
+    )
+    for name, endpoint_url in required:
+        try:
+            validate_discovered_endpoint(
+                endpoint_url,
+                issuer_parsed,
+                allow_http=allow_http,
+                trusted_endpoint_hosts=trusted_hosts,
+            )
+        except OIDCError as exc:
+            log.warning("OIDC discovered %s rejected (url=%s): %s", name, endpoint_url, exc)
+            return dataclasses.replace(config, enabled=False)
+
+    if userinfo_endpoint:
+        try:
+            validate_discovered_endpoint(
+                userinfo_endpoint,
+                issuer_parsed,
+                allow_http=allow_http,
+                trusted_endpoint_hosts=trusted_hosts,
+            )
+        except OIDCError as exc:
+            log.warning(
+                "OIDC discovered userinfo_endpoint rejected (url=%s): %s",
+                userinfo_endpoint,
+                exc,
+            )
+            return dataclasses.replace(config, enabled=False)
 
     log.info("OIDC discovery complete: %s", config.issuer)
     return dataclasses.replace(
