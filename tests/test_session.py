@@ -1984,13 +1984,6 @@ class TestMetacognitiveBuffers:
         assert session._pending_user_advisories == [("correction", "USER_NUDGE_MARK")]
         assert session._pending_tool_advisories == [("tool_error", "TOOL_NUDGE_MARK")]
 
-    def _patch_caps(self, session, *, supports_tool_advisories: bool):
-        """Force capability flag for advisory-aware tests."""
-        caps = MagicMock()
-        caps.supports_tool_advisories = supports_tool_advisories
-        with patch.object(session, "_get_capabilities", return_value=caps):
-            return caps
-
     def test_collect_advisories_drains_tool_buffer_on_last_result(self, tmp_db):
         """Tool-channel metacog reminders no longer ride the persistent
         advisory list (which would write them into tool content via
@@ -2000,12 +1993,9 @@ class TestMetacognitiveBuffers:
         channel."""
         session = _make_session()
         session._queue_tool_advisory("tool_error", "ALERT")
-        caps = MagicMock()
-        caps.supports_tool_advisories = True
-        with patch.object(session, "_get_capabilities", return_value=caps):
-            persistent, metacog = session._collect_advisories(
-                assessment=None, func_name="bash", is_last_in_batch=True
-            )
+        persistent, metacog = session._collect_advisories(
+            assessment=None, func_name="bash", is_last_in_batch=True
+        )
         # Persistent list is empty (no guard / interjection here);
         # MetacognitiveAdvisory does NOT appear among persistent
         # advisories anymore.
@@ -2017,32 +2007,41 @@ class TestMetacognitiveBuffers:
     def test_collect_advisories_holds_tool_buffer_until_last_result(self, tmp_db):
         session = _make_session()
         session._queue_tool_advisory("repeat", "STOP_REPEATING")
-        caps = MagicMock()
-        caps.supports_tool_advisories = True
-        with patch.object(session, "_get_capabilities", return_value=caps):
-            persistent, metacog = session._collect_advisories(
-                assessment=None, func_name="bash", is_last_in_batch=False
-            )
+        persistent, metacog = session._collect_advisories(
+            assessment=None, func_name="bash", is_last_in_batch=False
+        )
         # Not yet drained — only fires on the last result.
         assert persistent == []
         assert metacog == []
         assert len(session._pending_tool_advisories) == 1
 
-    def test_collect_advisories_drops_tool_buffer_when_caps_unsupported(self, tmp_db):
-        """When the model can't parse advisory tags, drop the metacognitive
-        nudge silently rather than embedding raw XML the model will choke on."""
+    def test_collect_advisories_drains_text_queued_messages_to_persistent(self, tmp_db):
+        """Text-only queued user messages drain into the ``persistent``
+        advisory list as ``UserInterjection`` on the last result of a
+        batch — they ride INSIDE the tool result envelope via
+        ``wrap_tool_result`` rather than becoming a separate user turn
+        appended to ``self.messages`` (which would inject ``user``
+        between ``assistant(tool_calls)`` and ``tool`` and break role
+        validation on Mistral / mistral-common and similar strict
+        templates)."""
+        from turnstone.core.tool_advisory import UserInterjection
+
         session = _make_session()
-        session._queue_tool_advisory("tool_error", "ALERT")
-        caps = MagicMock()
-        caps.supports_tool_advisories = False
-        with patch.object(session, "_get_capabilities", return_value=caps):
-            persistent, metacog = session._collect_advisories(
-                assessment=None, func_name="bash", is_last_in_batch=True
-            )
-        assert persistent == []
+        pre_count = len(session.messages)
+        session.queue_message("hows it going?", queue_msg_id="q1")
+        persistent, metacog = session._collect_advisories(
+            assessment=None, func_name="bash", is_last_in_batch=True
+        )
         assert metacog == []
-        # And the buffer is cleared so no stale nudge sticks around.
-        assert session._pending_tool_advisories == []
+        assert len(persistent) == 1
+        assert isinstance(persistent[0], UserInterjection)
+        assert persistent[0].message == "hows it going?"
+        # Queue drained.
+        assert session._queued_messages == {}
+        # Crucially: NO separate user turn was appended to history —
+        # the message rides inside the tool envelope, preserving the
+        # `assistant(tool_calls) → tool` role sequence on the wire.
+        assert len(session.messages) == pre_count
 
     def test_start_nudge_fires_through_send(self, tmp_db):
         """Pin the +1 count-shift invariant — `start` must still fire on the
@@ -2112,10 +2111,7 @@ class TestMetacognitiveBuffers:
         session = _make_session()
         session.ui = MagicMock()
         session._queue_tool_advisory("tool_error", "alert")
-        caps = MagicMock()
-        caps.supports_tool_advisories = True
-        with patch.object(session, "_get_capabilities", return_value=caps):
-            session._collect_advisories(assessment=None, func_name="bash", is_last_in_batch=True)
+        session._collect_advisories(assessment=None, func_name="bash", is_last_in_batch=True)
         info_lines = [call.args[0] for call in session.ui.on_info.call_args_list if call.args]
         assert not any("metacognition: nudge injected" in line for line in info_lines), (
             f"expected NO legacy ping, got {info_lines!r}"
@@ -2785,6 +2781,74 @@ class TestUserAdvisoryCancelClear:
         ):
             session.send("user input")
         assert session._pending_user_advisories == []
+
+    def test_send_continues_when_messages_queued_during_streaming(self, tmp_db):
+        """A user message queued while the assistant is streaming a
+        non-tool response must trigger another model turn — not orphan
+        in history until the next user send.
+
+        Pre-fix bug: after the no-tool branch ran ``_flush_queued_messages``,
+        the loop ``break``-d unconditionally, leaving the queued user
+        message at the tail of ``self.messages`` with no model response.
+        The next outside ``send()`` would finally pick it up alongside
+        the new message — visible as the "two sends to get one reply"
+        symptom.
+
+        Fix: ``_flush_queued_messages`` returns whether anything drained;
+        the no-tool branch ``continue``-s when it did."""
+        session = _make_session()
+        # Suppress the auto-title daemon thread the no-tool branch
+        # would spawn — irrelevant to this test and would otherwise
+        # call the mocked client from a background thread.
+        session._title_generated = True
+        stream_calls = 0
+
+        def mock_create_stream(msgs):
+            nonlocal stream_calls
+            stream_calls += 1
+            if stream_calls == 1:
+                # Simulate a queued message arriving mid-stream — by the
+                # time the no-tool branch runs ``_flush_queued_messages``,
+                # this item is in the queue waiting to be drained.
+                session.queue_message("late arrival", queue_msg_id="q-late")
+            return iter([])
+
+        with (
+            patch.object(session, "_create_stream_with_retry", side_effect=mock_create_stream),
+            patch.object(
+                session,
+                "_stream_response",
+                return_value={"role": "assistant", "content": "ok"},
+            ),
+            patch.object(session, "_full_messages", return_value=[]),
+            patch.object(session, "_update_token_table"),
+            patch.object(session, "_print_status_line"),
+            patch.object(session, "_emit_state"),
+            patch.object(session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
+        ):
+            session.send("first message")
+
+        # Loop continued: a second stream call happened after the
+        # queued message drained into history.  Pre-fix: 1 call.
+        assert stream_calls == 2, (
+            f"expected loop to continue after drain (2 stream calls); got {stream_calls}"
+        )
+        # The queued message landed in history before the second turn.
+        user_texts: list[str] = []
+        for m in session.messages:
+            if m.get("role") != "user":
+                continue
+            content = m.get("content")
+            if isinstance(content, str):
+                user_texts.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and "text" in part:
+                        user_texts.append(part["text"])
+        assert any("late arrival" in t for t in user_texts), (
+            f"queued message must appear in history; got user texts: {user_texts!r}"
+        )
 
 
 class TestReminderSidechannelIsolation:

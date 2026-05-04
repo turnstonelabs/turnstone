@@ -2475,7 +2475,12 @@ class ChatSession:
                         threading.Thread(target=self._generate_title, daemon=True).start()
                     # Flush any queued messages that weren't injected
                     # (no tool calls → no advisory seam to inject at).
-                    self._flush_queued_messages()
+                    # If anything drained, the model hasn't seen those
+                    # messages yet — keep the loop alive so it gets a
+                    # turn over the extended history rather than
+                    # orphaning them until the next user send.
+                    if self._flush_queued_messages():
+                        continue
                     self._emit_state("idle")
                     # Dispatch any pending watch results (chains into
                     # a new send() within the same worker thread).
@@ -3863,7 +3868,7 @@ class ChatSession:
             )
         return resolved
 
-    def _flush_queued_messages(self) -> None:
+    def _flush_queued_messages(self) -> bool:
         """Drain queued messages.
 
         Items without attachments are combined into a single user turn
@@ -3871,6 +3876,8 @@ class ChatSession:
         poorly.  Items with attachments flush as separate multipart user
         turns (combining text+files across distinct queued sends would
         misrepresent ordering).
+
+        Returns ``True`` when any items drained, ``False`` otherwise.
         """
         from turnstone.core.tool_advisory import PRIORITY_IMPORTANT
 
@@ -3879,7 +3886,7 @@ class ChatSession:
             items = list(self._queued_messages.items())
             self._queued_messages.clear()
         if not items:
-            return
+            return False
 
         # Collapse contiguous attachment-free items into one combined text
         # to preserve the prior behaviour; flush attachment-bearing items
@@ -3905,6 +3912,7 @@ class ChatSession:
             else:
                 text_run.append((cleaned, priority))
         _flush_text_run()
+        return True
 
     def _collect_advisories(
         self,
@@ -3933,20 +3941,6 @@ class ChatSession:
         metacognitive nudges drain on the last result in the batch only.
         """
         from turnstone.core.tool_advisory import GuardAdvisory, UserInterjection
-
-        caps = self._get_capabilities()
-
-        # When the model doesn't support advisory tags, still drain queued
-        # messages so they aren't silently orphaned — flush them as regular
-        # user messages instead. Metacognitive tool advisories (tool_error
-        # / repeat) are dropped silently: the model wouldn't reliably parse
-        # them anyway, and the user-channel nudges still fire on the next
-        # user turn.
-        if not caps.supports_tool_advisories:
-            if is_last_in_batch:
-                self._pending_tool_advisories.clear()
-                self._flush_queued_messages()
-            return [], []
 
         persistent: list[ToolAdvisory] = []
         metacog_reminders: list[dict[str, str]] = []
