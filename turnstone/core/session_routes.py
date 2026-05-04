@@ -2513,7 +2513,7 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
     import uuid
 
     from turnstone.core import session_worker
-    from turnstone.core.session import GenerationCancelled
+    from turnstone.core.session import AttachmentsNotQueueableError, GenerationCancelled
     from turnstone.core.web_helpers import read_json_or_400
 
     async def send(request: Request) -> Response:
@@ -2676,11 +2676,15 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
         queue_outcome: dict[str, Any] = {}
 
         def _enqueue() -> None:
-            cleaned, priority, msg_id = session.queue_message(
-                message,
-                attachment_ids=list(ordered_reserved),
-                queue_msg_id=send_id or None,
-            )
+            try:
+                cleaned, priority, msg_id = session.queue_message(
+                    message,
+                    attachment_ids=list(ordered_reserved),
+                    queue_msg_id=send_id or None,
+                )
+            except AttachmentsNotQueueableError:
+                queue_outcome["rejected"] = "attachments_busy"
+                return
             queue_outcome["cleaned"] = cleaned
             queue_outcome["priority"] = priority
             queue_outcome["msg_id"] = msg_id
@@ -2758,6 +2762,20 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
             return JSONResponse(
                 {
                     "status": "queue_full",
+                    "attached_ids": [],
+                    "dropped_attachment_ids": list(requested_ids),
+                }
+            )
+
+        if queue_outcome.get("rejected") == "attachments_busy":
+            # Attachments can't ride a queued user turn (see
+            # AttachmentsNotQueueableError for the role-ordering reason).
+            # Release reservations and surface to the caller so the
+            # client can hold the file and retry once the worker idles.
+            _release_reservation_on_fail()
+            return JSONResponse(
+                {
+                    "status": "attachments_busy",
                     "attached_ids": [],
                     "dropped_attachment_ids": list(requested_ids),
                 }
@@ -3023,8 +3041,9 @@ def make_dequeue_handler(cfg: SessionEndpointConfig) -> Handler:
     Removes a previously-queued message identified by ``msg_id`` from
     the workstream's pending queue. Returns ``status: removed`` when
     the queue had the entry and ``status: not_found`` otherwise.
-    Reservations attached to the dequeued message are released by
-    ``ChatSession.dequeue_message`` so attachments can be reused.
+    Queued messages don't carry attachments (see
+    :class:`AttachmentsNotQueueableError`), so there's no reservation
+    side-effect to undo here.
     """
     from turnstone.core.web_helpers import read_json_or_400
 
