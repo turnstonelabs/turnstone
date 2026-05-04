@@ -307,14 +307,11 @@ function initLogin() {
   var _oidcParams = new URLSearchParams(window.location.search);
   var _oidcError = _oidcParams.get("oidc_error");
   if (_oidcError) {
-    showLogin();
     history.replaceState({}, "", window.location.pathname);
-    // Defer: showLogin() triggers async status fetch → _switchMode() → _clearError().
-    // Display after that settles.
-    var _pendingOidcError = _oidcError;
-    setTimeout(function () {
-      _showError(_pendingOidcError);
-    }, 300);
+    // showLogin's status-fetch resolves _switchMode (which clears errors)
+    // before we paint the OIDC error, so the message wins the race even on
+    // slow networks.
+    showLogin(undefined, _oidcError);
   } else if (_oidcParams.get("oidc_success")) {
     history.replaceState({}, "", window.location.pathname);
     // Fetch permissions before completing login (cookie is already set)
@@ -487,7 +484,7 @@ function _showError(msg) {
   }
 }
 
-function showLogin(reason) {
+function showLogin(reason, oidcError) {
   var overlay = document.getElementById("login-overlay");
   if (!overlay) return;
   overlay.style.display = "flex";
@@ -498,6 +495,7 @@ function showLogin(reason) {
 
   // Check auth status to determine mode
   var _loginReason = reason;
+  var _oidcError = oidcError;
   fetch("/v1/api/auth/status")
     .then(function (r) {
       return r.json();
@@ -515,10 +513,12 @@ function showLogin(reason) {
         }
       }
       _updateOIDCUI(data);
+      if (_oidcError) _showError(_oidcError);
     })
     .catch(function () {
       // Fallback to login mode
       _switchMode("login");
+      if (_oidcError) _showError(_oidcError);
     });
 
   // Keyboard trap
