@@ -729,10 +729,13 @@ def provision_oidc_user(
 
     Looks up an existing OIDC identity by (issuer, sub).  If found,
     updates ``last_login`` and applies role mapping.  Otherwise creates
-    a new user and OIDC identity record.
+    a new user and OIDC identity record atomically.
 
-    Raises :class:`OIDCError` if user creation fails.
+    Raises :class:`OIDCError` if user creation fails or if a concurrent
+    callback wins the username / identity race.
     """
+    from turnstone.core.storage import StorageConflictError
+
     issuer = config.issuer
     sub = str(claims["sub"])
     email = str(claims.get("email", ""))
@@ -749,12 +752,23 @@ def provision_oidc_user(
             raise OIDCError(f"OIDC identity references missing user: {user_id}")
         return user
 
-    # New user -- derive username
+    # New user -- derive username, then create user + identity atomically.
     username = _derive_username(storage, claims)
     user_id = uuid.uuid4().hex
 
-    storage.create_user(user_id, username, display_name, OIDC_PASSWORD_SENTINEL)
-    storage.create_oidc_identity(issuer, sub, user_id, email)
+    try:
+        storage.create_oidc_user(
+            user_id,
+            username,
+            display_name,
+            OIDC_PASSWORD_SENTINEL,
+            issuer,
+            sub,
+            email,
+        )
+    except StorageConflictError as exc:
+        raise OIDCError(f"OIDC provisioning failed: {exc}") from exc
+
     apply_role_mapping(storage, user_id, claims, config)
 
     # Ensure new OIDC users have at least a default role so they can

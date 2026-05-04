@@ -1187,15 +1187,14 @@ class TestProvisionOIDCUser:
         assert user["username"] == "alice"
         storage.update_oidc_identity_login.assert_called_once()
         # Should not create a new user
-        storage.create_user.assert_not_called()
-        storage.create_oidc_identity.assert_not_called()
+        storage.create_oidc_user.assert_not_called()
 
     def test_provision_oidc_user_new(self):
-        """No identity -> creates user + identity."""
+        """No identity -> creates user + identity atomically."""
         config = _make_config()
         storage = _mock_storage()
 
-        # After create_user, get_user should return the new user
+        # After create_oidc_user, get_user should return the new user
         new_user = {
             "user_id": "u-new",
             "username": "bob",
@@ -1211,12 +1210,14 @@ class TestProvisionOIDCUser:
             user = provision_oidc_user(storage, config, claims)
 
         assert user["username"] == "bob"
-        storage.create_user.assert_called_once()
-        storage.create_oidc_identity.assert_called_once()
-        # Verify create_oidc_identity was called with correct issuer and sub
-        call_args = storage.create_oidc_identity.call_args
-        assert call_args[0][0] == "https://idp.example.com"  # issuer
-        assert call_args[0][1] == "sub-456"  # subject
+        storage.create_oidc_user.assert_called_once()
+        # Positional args: user_id, username, display_name, password_hash, issuer, subject, email
+        call_args = storage.create_oidc_user.call_args
+        assert call_args[0][1] == "bob"
+        assert call_args[0][3] == "!oidc"
+        assert call_args[0][4] == "https://idp.example.com"
+        assert call_args[0][5] == "sub-456"
+        assert call_args[0][6] == "bob@example.com"
 
     def test_provision_oidc_user_username_dedup(self):
         """First username taken -> appends suffix."""
@@ -1240,8 +1241,8 @@ class TestProvisionOIDCUser:
         user = provision_oidc_user(storage, config, claims)
 
         assert user["username"] == "bob2"
-        # create_user should have been called with "bob2" as username
-        call_args = storage.create_user.call_args
+        # create_oidc_user should have been called with "bob2" as username
+        call_args = storage.create_oidc_user.call_args
         assert call_args[0][1] == "bob2"
 
     def test_provision_oidc_user_email_prefix(self):
@@ -1260,8 +1261,7 @@ class TestProvisionOIDCUser:
         claims = {"sub": "sub-abc", "email": "charlie@example.com"}
         provision_oidc_user(storage, config, claims)
 
-        # create_user should have been called with "charlie" (email prefix)
-        call_args = storage.create_user.call_args
+        call_args = storage.create_oidc_user.call_args
         assert call_args[0][1] == "charlie"
 
     def test_provision_oidc_user_missing_user_raises(self):
@@ -1296,8 +1296,40 @@ class TestProvisionOIDCUser:
         claims = {"sub": "sub-noemail"}
         provision_oidc_user(storage, config, claims)
 
-        call_args = storage.create_user.call_args
+        call_args = storage.create_oidc_user.call_args
         assert call_args[0][1] == "user"
+
+    def test_provision_oidc_user_username_conflict_raises(self):
+        """Username TOCTOU -> create_oidc_user raises StorageConflictError;
+        provision_oidc_user wraps it as OIDCError without leaving role rows.
+        """
+        from turnstone.core.storage import StorageConflictError
+
+        config = _make_config()
+        storage = _mock_storage()
+        storage.create_oidc_user.side_effect = StorageConflictError("username already taken: bob")
+
+        claims = {"sub": "sub-race", "preferred_username": "bob", "email": "bob@example.com"}
+        with pytest.raises(OIDCError, match="username already taken"):
+            provision_oidc_user(storage, config, claims)
+
+        storage.assign_role.assert_not_called()
+
+    def test_provision_oidc_user_identity_conflict_raises(self):
+        """Concurrent (issuer, subject) creates -> StorageConflictError -> OIDCError."""
+        from turnstone.core.storage import StorageConflictError
+
+        config = _make_config()
+        storage = _mock_storage()
+        storage.create_oidc_user.side_effect = StorageConflictError(
+            "OIDC identity already linked: (https://idp.example.com, sub-race)"
+        )
+
+        claims = {"sub": "sub-race", "preferred_username": "bob", "email": "bob@example.com"}
+        with pytest.raises(OIDCError, match="OIDC identity already linked"):
+            provision_oidc_user(storage, config, claims)
+
+        storage.assign_role.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

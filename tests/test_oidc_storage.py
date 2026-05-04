@@ -6,6 +6,85 @@ import time
 
 import pytest
 
+from turnstone.core.storage import StorageConflictError
+
+# ---------------------------------------------------------------------------
+# Atomic OIDC user provisioning
+# ---------------------------------------------------------------------------
+
+
+class TestCreateOIDCUser:
+    def test_create_oidc_user_success(self, db):
+        """Both rows present after one atomic call."""
+        db.create_oidc_user(
+            user_id="u-new",
+            username="alice",
+            display_name="Alice",
+            password_hash="!oidc",
+            issuer="https://idp.example.com",
+            subject="sub-1",
+            email="alice@example.com",
+        )
+
+        user = db.get_user("u-new")
+        assert user is not None
+        assert user["username"] == "alice"
+        assert user["password_hash"] == "!oidc"
+
+        identity = db.get_oidc_identity("https://idp.example.com", "sub-1")
+        assert identity is not None
+        assert identity["user_id"] == "u-new"
+        assert identity["email"] == "alice@example.com"
+
+    def test_create_oidc_user_username_conflict_rolls_back(self, db):
+        """Pre-existing username -> StorageConflictError; identity NOT inserted."""
+        db.create_user("u-existing", "alice", "Alice", "$2b$12$hash")
+
+        with pytest.raises(StorageConflictError, match="username"):
+            db.create_oidc_user(
+                user_id="u-new",
+                username="alice",
+                display_name="Alice2",
+                password_hash="!oidc",
+                issuer="https://idp.example.com",
+                subject="sub-1",
+                email="alice2@example.com",
+            )
+
+        # The new user_id row must not exist.
+        assert db.get_user("u-new") is None
+        # The identity row must not exist.
+        assert db.get_oidc_identity("https://idp.example.com", "sub-1") is None
+        # The pre-existing user is untouched.
+        existing = db.get_user("u-existing")
+        assert existing is not None
+        assert existing["password_hash"] == "$2b$12$hash"
+
+    def test_create_oidc_user_identity_conflict_rolls_back(self, db):
+        """Pre-existing (issuer, subject) -> StorageConflictError; user row rolled back."""
+        db.create_user("u-other", "other", "Other", "!oidc")
+        db.create_oidc_identity("https://idp.example.com", "sub-1", "u-other", "other@example.com")
+
+        with pytest.raises(StorageConflictError, match="OIDC identity"):
+            db.create_oidc_user(
+                user_id="u-new",
+                username="bob",
+                display_name="Bob",
+                password_hash="!oidc",
+                issuer="https://idp.example.com",
+                subject="sub-1",
+                email="bob@example.com",
+            )
+
+        # The candidate user row was rolled back.
+        assert db.get_user("u-new") is None
+        assert db.get_user_by_username("bob") is None
+        # The pre-existing identity still points at the original user.
+        identity = db.get_oidc_identity("https://idp.example.com", "sub-1")
+        assert identity is not None
+        assert identity["user_id"] == "u-other"
+
+
 # ---------------------------------------------------------------------------
 # OIDC Identity CRUD
 # ---------------------------------------------------------------------------
