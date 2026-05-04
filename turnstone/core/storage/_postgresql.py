@@ -2105,10 +2105,25 @@ class PostgreSQLBackend:
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
+            # `with_for_update()` takes per-row locks on this user's
+            # `user_roles` rows for the duration of the transaction.
+            # Two concurrent OIDC callbacks for the same `user_id` (e.g.
+            # racing token refreshes with differing claim sets) would
+            # otherwise both read the same baseline under READ COMMITTED
+            # and produce a final role state matching neither caller's
+            # intent. The lock is per-`user_id`, so unrelated user writes
+            # are unaffected.
+            #
+            # Note: FOR UPDATE on an empty result set acquires no locks,
+            # so on a brand-new user with no rows yet, two concurrent
+            # callers can proceed in parallel; their inserts merge via
+            # ON CONFLICT DO NOTHING (final state is the union of the
+            # two desired sets). The next single-caller reconciliation
+            # cycle self-heals.
             existing_rows = conn.execute(
-                sa.select(user_roles.c.role_id, user_roles.c.assigned_by).where(
-                    user_roles.c.user_id == user_id
-                )
+                sa.select(user_roles.c.role_id, user_roles.c.assigned_by)
+                .where(user_roles.c.user_id == user_id)
+                .with_for_update()
             ).fetchall()
             current_oidc: set[str] = {r[0] for r in existing_rows if r[1] == "oidc"}
             # Roles assigned by any other source (admin-ui, oidc-default, etc.)

@@ -550,3 +550,50 @@ class TestReplaceOIDCRoles:
         assert removed == {"role-oidc-old"}
         roles = {r["role_id"]: r["assigned_by"] for r in db.list_user_roles("u1")}
         assert roles == {"role-manual": "admin-ui", "role-default": "oidc-default"}
+
+    def test_replace_oidc_roles_no_op_steady_state(self, db):
+        """Steady-state re-login: claims unchanged, function must short-circuit.
+
+        This pins the contract that drives the SQLite optimistic-read fast
+        path — the common case (token refresh with identical role claims)
+        must not acquire a write lock.
+        """
+        db.create_user("u1", "alice", "Alice", "h")
+        self._seed_role(db, "role-a")
+        self._seed_role(db, "role-b")
+        db.assign_role("u1", "role-a", "oidc")
+        db.assign_role("u1", "role-b", "oidc")
+
+        added, removed = db.replace_oidc_roles("u1", {"role-a", "role-b"})
+
+        assert added == set()
+        assert removed == set()
+        # All rows still oidc-assigned with identical membership.
+        roles = {r["role_id"]: r["assigned_by"] for r in db.list_user_roles("u1")}
+        assert roles == {"role-a": "oidc", "role-b": "oidc"}
+
+    def test_replace_oidc_roles_returns_post_lock_diff(self, db):
+        """Returned (added, removed) reflects the post-lock state, not the optimistic read.
+
+        The SQLite implementation re-reads under the write lock to defend
+        against races; the values returned must come from that re-read so
+        callers (apply_role_mapping audit logs) see the actual transition
+        that hit the table. Steady-state input must collapse to empty
+        sets and leave row timestamps unchanged.
+        """
+        db.create_user("u1", "alice", "Alice", "h")
+        self._seed_role(db, "role-a")
+        db.assign_role("u1", "role-a", "oidc")
+
+        before = db.list_user_roles("u1")
+        assert len(before) == 1
+        original_created = before[0]["assignment_created"]
+
+        added, removed = db.replace_oidc_roles("u1", {"role-a"})
+
+        assert added == set()
+        assert removed == set()
+        # No write occurred — the assignment row's timestamp is untouched.
+        after = db.list_user_roles("u1")
+        assert len(after) == 1
+        assert after[0]["assignment_created"] == original_created
