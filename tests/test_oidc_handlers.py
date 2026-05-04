@@ -635,6 +635,79 @@ class TestOIDCCallback:
 
     @patch("turnstone.core.auth.provision_oidc_user")
     @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
+    def test_callback_uses_pending_audience_not_handler_audience(
+        self,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        storage: SQLiteBackend,
+    ) -> None:
+        """JWT ``aud`` claim must come from the audience stored at /authorize,
+        not the audience the callback handler was invoked with.
+
+        Regression for the cross-service audience-confusion concern: a
+        login flow opened against the server (audience ``"turnstone-server"``)
+        must not be silently re-targeted to ``"turnstone-console"`` when
+        the callback runs through the console's handler wrapper.
+        """
+        import jwt as pyjwt
+
+        # Seed pending state with the SERVER audience.
+        storage.create_oidc_pending_state(
+            "audience-state",
+            "audience-nonce",
+            "audience-verifier",
+            "turnstone-server",
+        )
+        mock_exchange.return_value = {"id_token": "fake.jwt.token"}
+        mock_validate.return_value = {
+            "sub": "user-aud",
+            "email": "u@example.com",
+            "nonce": "audience-nonce",
+        }
+        mock_provision.return_value = {"user_id": "test-admin", "username": "testadmin"}
+
+        # Wire a callback bound to the CONSOLE audience.  After bug-3 the
+        # stored audience must take precedence.
+        async def _console_callback(request: Request) -> Response:
+            return await handle_oidc_callback(request, "turnstone-console")
+
+        jwt_secret = "test-jwt-secret-key-padded-32b!!"
+        app = Starlette(
+            routes=[Mount("/v1", routes=[Route("/api/auth/oidc/callback", _console_callback)])]
+        )
+        app.state.oidc_config = _make_oidc_config()
+        app.state.auth_storage = storage
+        app.state.jwt_secret = jwt_secret
+        app.state.jwks_data = {"keys": []}
+        app.state.login_limiter = None
+        client = TestClient(app, raise_server_exceptions=False)
+
+        resp = client.get(
+            "/v1/api/auth/oidc/callback?code=authcode&state=audience-state",
+            follow_redirects=False,
+        )
+
+        assert resp.status_code == 302
+        assert "oidc_success=1" in resp.headers["location"]
+
+        # Extract the JWT from the Set-Cookie header and decode it.
+        set_cookie = resp.headers["set-cookie"]
+        cookie_kv = set_cookie.split(";", 1)[0]
+        name, _, token = cookie_kv.partition("=")
+        assert name == "turnstone_auth"
+        assert token
+
+        # Decoding without audience verification first to inspect the claim.
+        claims = pyjwt.decode(
+            token, jwt_secret, algorithms=["HS256"], options={"verify_aud": False}
+        )
+        assert claims["aud"] == "turnstone-server"
+        assert claims["aud"] != "turnstone-console"
+
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
     @patch("turnstone.core.auth.fetch_jwks", new_callable=AsyncMock)
     @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
     def test_jwks_refetch_dedup_when_kid_appears(

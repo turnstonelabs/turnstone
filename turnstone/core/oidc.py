@@ -562,6 +562,8 @@ async def fetch_jwks(
     except (httpx.HTTPError, ValueError) as exc:
         # ValueError covers json.JSONDecodeError (subclass).
         raise OIDCError(f"JWKS fetch failed: {exc}") from exc
+    if not isinstance(result, dict):
+        raise OIDCError("JWKS document is not a JSON object")
     if not isinstance(result.get("keys"), list):
         raise OIDCError("JWKS document missing 'keys' array")
     return result
