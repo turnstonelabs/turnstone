@@ -1385,17 +1385,16 @@ async def handle_auth_refresh(request: Request, audience: str) -> Response:
     return response
 
 
-def _build_oidc_redirect_uri(request: Request, oidc_config: OIDCConfig) -> str:
-    """Build the OIDC callback redirect URI.
+def _build_oidc_redirect_uri(oidc_config: OIDCConfig) -> str:
+    """Build the OIDC callback redirect URI from the pinned ``redirect_base``.
 
-    Uses ``redirect_base`` from OIDC config when set (recommended for
-    reverse-proxy deployments), otherwise falls back to the request Host header.
+    ``initialize_oidc_state`` refuses to enable OIDC unless ``redirect_base``
+    is set, so any caller reaching this point may assume it is non-empty.
+    A previous Host-header fallback was removed because a permissive front
+    proxy could let an attacker spoof ``Host`` and mint an authorize URL
+    pointing to an attacker-controlled callback origin.
     """
-    if oidc_config.redirect_base:
-        return f"{oidc_config.redirect_base}/v1/api/auth/oidc/callback"
-    scheme = "https" if is_secure_request(dict(request.headers), request.url.scheme) else "http"
-    host = request.headers.get("host", "localhost")
-    return f"{scheme}://{host}/v1/api/auth/oidc/callback"
+    return f"{oidc_config.redirect_base}/v1/api/auth/oidc/callback"
 
 
 async def handle_oidc_authorize(request: Request, audience: str) -> Response:
@@ -1439,8 +1438,8 @@ async def handle_oidc_authorize(request: Request, audience: str) -> Response:
     # Store pending state in database
     storage.create_oidc_pending_state(state, nonce, code_verifier, audience)
 
-    # Build redirect URI (pinned by TURNSTONE_OIDC_REDIRECT_BASE when set)
-    redirect_uri = _build_oidc_redirect_uri(request, oidc_config)
+    # Build redirect URI (pinned by TURNSTONE_OIDC_REDIRECT_BASE)
+    redirect_uri = _build_oidc_redirect_uri(oidc_config)
 
     url = build_authorize_url(oidc_config, redirect_uri, state, nonce, code_verifier)
     return RedirectResponse(url, status_code=302)
@@ -1493,7 +1492,7 @@ async def handle_oidc_callback(request: Request, audience: str) -> Response:
         return RedirectResponse("/?oidc_error=Login+session+expired", status_code=302)
 
     # Build redirect URI (must match what was sent in authorize)
-    redirect_uri = _build_oidc_redirect_uri(request, oidc_config)
+    redirect_uri = _build_oidc_redirect_uri(oidc_config)
 
     try:
         from turnstone.core.oidc import (

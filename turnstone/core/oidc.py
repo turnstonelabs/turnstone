@@ -538,6 +538,17 @@ async def initialize_oidc_state(app_state: Any) -> None:
         app_state.jwks_data = None
         return
 
+    if not cfg.redirect_base:
+        log.error(
+            "OIDC enabled but TURNSTONE_OIDC_REDIRECT_BASE is unset. "
+            "This is required to prevent Host-header-derived redirect_uri spoofing. "
+            "Set it to your service's externally-visible URL "
+            "(e.g. https://idp.example.com). OIDC will be disabled."
+        )
+        app_state.oidc_config = dataclasses.replace(cfg, enabled=False)
+        app_state.jwks_data = None
+        return
+
     try:
         jwks_data = await fetch_jwks(cfg.jwks_uri)
     except OIDCError:

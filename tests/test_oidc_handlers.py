@@ -52,6 +52,7 @@ def _make_oidc_config(**overrides: Any) -> OIDCConfig:
         "role_claim": "",
         "role_map": {},
         "password_enabled": True,
+        "redirect_base": "https://app.example.com",
         "authorization_endpoint": "https://idp.example.com/authorize",
         "token_endpoint": "https://idp.example.com/token",
         "userinfo_endpoint": "https://idp.example.com/userinfo",
