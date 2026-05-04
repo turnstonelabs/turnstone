@@ -75,6 +75,26 @@ class OIDCError(Exception):
     """Raised when an OIDC operation fails."""
 
 
+class OIDCKeyNotFoundError(OIDCError):
+    """Raised when an ID token's signing key is absent from the cached JWKS.
+
+    Distinguishing this from generic OIDCError lets the callback retry once
+    after re-fetching JWKS (key rotation), without depending on substring
+    matching of the error message.
+    """
+
+
+def _sanitize_log_text(s: str, limit: int) -> str:
+    """Escape control characters and truncate untrusted text for log inclusion.
+
+    Untrusted bytes (e.g. an IdP error body) embedded in log lines must not be
+    able to forge fake log records via CR/LF or hide content via NULs / other
+    control characters. ``unicode_escape`` renders these as visible ``\\r``,
+    ``\\n``, ``\\x00`` etc., and the limit caps the *rendered* length.
+    """
+    return s.encode("unicode_escape").decode("ascii")[:limit]
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -636,10 +656,15 @@ async def exchange_code(
         raise OIDCError(f"Token exchange request failed: {exc}") from exc
 
     if resp.status_code != 200:
-        raise OIDCError(f"Token endpoint returned {resp.status_code}: {resp.text[:500]}")
+        raise OIDCError(
+            f"Token endpoint returned {resp.status_code}: {_sanitize_log_text(resp.text, 500)}"
+        )
 
-    result: dict[str, Any] = resp.json()
-    return result
+    result = resp.json()
+    if not isinstance(result, dict):
+        raise OIDCError("Token endpoint returned non-dict body")
+    typed: dict[str, Any] = result
+    return typed
 
 
 # ---------------------------------------------------------------------------
@@ -696,7 +721,7 @@ def validate_id_token(
                 raise OIDCError(f"Failed to parse signing key: {exc}") from exc
 
     if signing_key is None:
-        raise OIDCError(f"Signing key '{kid}' not found in JWKS")
+        raise OIDCKeyNotFoundError(f"Signing key '{kid}' not found in JWKS")
 
     try:
         claims: dict[str, Any] = jwt.decode(

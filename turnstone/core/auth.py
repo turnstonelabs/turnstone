@@ -1497,6 +1497,7 @@ async def handle_oidc_callback(request: Request, audience: str) -> Response:
     try:
         from turnstone.core.oidc import (
             OIDCError,
+            OIDCKeyNotFoundError,
             exchange_code,
             fetch_jwks,
             provision_oidc_user,
@@ -1506,6 +1507,9 @@ async def handle_oidc_callback(request: Request, audience: str) -> Response:
         # Exchange code for tokens
         code = request.query_params.get("code", "")
         tokens = await exchange_code(oidc_config, code, redirect_uri, pending["code_verifier"])
+        id_token = tokens.get("id_token")
+        if not isinstance(id_token, str) or not id_token:
+            raise OIDCError("Token endpoint response missing id_token")
 
         # Validate ID token against cached JWKS keys (no I/O).
         # On unknown kid, refresh JWKS once (async) for key rotation.
@@ -1522,20 +1526,18 @@ async def handle_oidc_callback(request: Request, audience: str) -> Response:
 
         try:
             id_claims = validate_id_token(
-                tokens["id_token"],
+                id_token,
                 jwks_data,
                 oidc_config,
                 pending["nonce"],
             )
-        except OIDCError as first_err:
-            if "not found in JWKS" not in str(first_err):
-                raise
+        except OIDCKeyNotFoundError:
             # Key rotation: re-fetch JWKS and retry once.
             log.info("JWKS key not found — refreshing for possible key rotation")
             jwks_data = await fetch_jwks(oidc_config.jwks_uri)
             request.app.state.jwks_data = jwks_data
             id_claims = validate_id_token(
-                tokens["id_token"],
+                id_token,
                 jwks_data,
                 oidc_config,
                 pending["nonce"],

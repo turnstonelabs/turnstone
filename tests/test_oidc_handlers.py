@@ -32,7 +32,7 @@ from turnstone.core.auth import (
     handle_oidc_authorize,
     handle_oidc_callback,
 )
-from turnstone.core.oidc import OIDCConfig, OIDCError
+from turnstone.core.oidc import OIDCConfig, OIDCError, OIDCKeyNotFoundError
 from turnstone.core.storage._sqlite import SQLiteBackend
 
 # ---------------------------------------------------------------------------
@@ -430,13 +430,13 @@ class TestOIDCCallback:
         authorize_client: TestClient,
         storage: SQLiteBackend,
     ) -> None:
-        """First validate raises 'kid not found in JWKS', fetch_jwks retried, second validate succeeds."""
+        """First validate raises kid-not-found, fetch_jwks retried, second validate succeeds."""
         self._seed_pending_state(storage)
         mock_exchange.return_value = {"id_token": "fake.jwt.token"}
 
         # First call raises kid-not-found; second call (after JWKS refresh) succeeds
         mock_validate.side_effect = [
-            OIDCError("Signing key 'new-kid' not found in JWKS"),
+            OIDCKeyNotFoundError("Signing key 'new-kid' not found in JWKS"),
             {"sub": "user123", "email": "u@example.com", "nonce": "test-nonce"},
         ]
         mock_fetch_jwks.return_value = {"keys": [{"kid": "new-kid", "kty": "RSA"}]}
@@ -450,6 +450,58 @@ class TestOIDCCallback:
         assert "oidc_success=1" in resp.headers["location"]
         mock_fetch_jwks.assert_called_once()
         assert mock_validate.call_count == 2
+
+    @patch("turnstone.core.oidc.provision_oidc_user")
+    @patch("turnstone.core.oidc.validate_id_token")
+    @patch("turnstone.core.oidc.fetch_jwks", new_callable=AsyncMock)
+    @patch("turnstone.core.oidc.exchange_code", new_callable=AsyncMock)
+    def test_callback_uses_keynotfound_for_jwks_retry(
+        self,
+        mock_exchange: AsyncMock,
+        mock_fetch_jwks: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        authorize_client: TestClient,
+        storage: SQLiteBackend,
+    ) -> None:
+        """Retry path keys off the OIDCKeyNotFoundError type, not message substring."""
+        self._seed_pending_state(storage)
+        mock_exchange.return_value = {"id_token": "fake.jwt.token"}
+
+        # First raises subclass; rephrased message must not affect retry behaviour.
+        mock_validate.side_effect = [
+            OIDCKeyNotFoundError("rotated key absent from cached set"),
+            {"sub": "user123", "email": "u@example.com", "nonce": "test-nonce"},
+        ]
+        mock_fetch_jwks.return_value = {"keys": [{"kid": "new-kid", "kty": "RSA"}]}
+        mock_provision.return_value = {"user_id": "test-admin", "username": "testadmin"}
+
+        resp = authorize_client.get(
+            "/v1/api/auth/oidc/callback?code=authcode&state=valid-state",
+            follow_redirects=False,
+        )
+        assert resp.status_code == 302
+        assert "oidc_success=1" in resp.headers["location"]
+        mock_fetch_jwks.assert_called_once()
+        assert mock_validate.call_count == 2
+
+    @patch("turnstone.core.oidc.exchange_code", new_callable=AsyncMock)
+    def test_callback_returns_authentication_failed_on_missing_id_token(
+        self,
+        mock_exchange: AsyncMock,
+        authorize_client: TestClient,
+        storage: SQLiteBackend,
+    ) -> None:
+        """A token endpoint response without id_token must redirect with auth-failed."""
+        self._seed_pending_state(storage)
+        mock_exchange.return_value = {"access_token": "x"}
+
+        resp = authorize_client.get(
+            "/v1/api/auth/oidc/callback?code=authcode&state=valid-state",
+            follow_redirects=False,
+        )
+        assert resp.status_code == 302
+        assert "oidc_error=Authentication+failed" in resp.headers["location"]
 
     @patch("turnstone.core.oidc.provision_oidc_user")
     @patch("turnstone.core.oidc.validate_id_token")
