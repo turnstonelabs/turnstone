@@ -18,10 +18,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.routing import Mount, Route
 from starlette.testclient import TestClient
 
-if TYPE_CHECKING:
-    from starlette.requests import Request
-    from starlette.responses import Response
-
+from tests.conftest import make_oidc_test_config as _make_oidc_config
 from turnstone.console.server import (
     admin_delete_oidc_identity,
     admin_list_oidc_identities,
@@ -35,32 +32,9 @@ from turnstone.core.auth import (
 from turnstone.core.oidc import OIDCConfig, OIDCError, OIDCKeyNotFoundError
 from turnstone.core.storage._sqlite import SQLiteBackend
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _make_oidc_config(**overrides: Any) -> OIDCConfig:
-    """Build a test OIDCConfig with sensible defaults."""
-    defaults: dict[str, Any] = {
-        "enabled": True,
-        "issuer": "https://idp.example.com",
-        "client_id": "my-client",
-        "client_secret": "my-secret",
-        "scopes": "openid email profile",
-        "provider_name": "TestIDP",
-        "role_claim": "",
-        "role_map": {},
-        "password_enabled": True,
-        "redirect_base": "https://app.example.com",
-        "authorization_endpoint": "https://idp.example.com/authorize",
-        "token_endpoint": "https://idp.example.com/token",
-        "userinfo_endpoint": "https://idp.example.com/userinfo",
-        "jwks_uri": "https://idp.example.com/.well-known/jwks.json",
-    }
-    defaults.update(overrides)
-    return OIDCConfig(**defaults)
-
+if TYPE_CHECKING:
+    from starlette.requests import Request
+    from starlette.responses import Response
 
 # ---------------------------------------------------------------------------
 # Thin handler wrappers — match the pattern used in server.py / console
