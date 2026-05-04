@@ -579,39 +579,47 @@ async def initialize_oidc_state(app_state: Any) -> None:
 
     Reads ``app_state.oidc_config`` (already set to a non-discovered config
     by the lifespan), runs :func:`discover_oidc` and :func:`fetch_jwks`, and
-    writes back the populated ``oidc_config`` plus ``jwks_data``. On any
-    failure the helper guarantees ``oidc_config.enabled is False`` and
-    ``jwks_data is None`` -- the caller does not need defensive logic.
+    writes back the populated ``oidc_config`` plus ``jwks_data``.
 
-    Also installs a long-lived ``httpx.AsyncClient`` at
-    ``app_state.oidc_http_client`` so subsequent OIDC outbound calls can
-    reuse a single connection pool.  Pair with :func:`close_oidc_state`
-    in the lifespan teardown.
+    Post-conditions on ``app_state``:
+
+    - On disable (config flag off, discovery failure, discovery-returned-disabled,
+      missing ``redirect_base``): ``oidc_config.enabled is False``,
+      ``jwks_data is None``, ``oidc_http_client is None``.
+    - On JWKS-prefetch failure with otherwise-valid config: ``oidc_config.enabled``
+      stays ``True`` and ``jwks_data is None`` so the callback's lazy-fetch
+      retry path can recover from a transient IdP failure at startup. The
+      long-lived ``oidc_http_client`` stays open for that retry.
+    - On full success: ``oidc_config`` populated with discovered endpoints,
+      ``jwks_data`` populated, ``oidc_http_client`` open for the runtime
+      callback path. Pair with :func:`close_oidc_state` in lifespan teardown.
     """
     cfg: OIDCConfig = app_state.oidc_config
+    app_state.jwks_refetch_lock = asyncio.Lock()
     if not cfg.enabled:
         app_state.jwks_data = None
         app_state.oidc_http_client = None
-        app_state.jwks_refetch_lock = asyncio.Lock()
         return
 
-    http_client = httpx.AsyncClient(timeout=10.0)
-    app_state.oidc_http_client = http_client
-    app_state.jwks_refetch_lock = asyncio.Lock()
-
-    # Discovery is operator-controlled config; any unexpected failure must
-    # disable OIDC rather than escape and bring down the whole service.
-    try:
-        cfg = await discover_oidc(cfg, client=http_client)
-    except Exception:
-        log.warning("OIDC discovery failed -- OIDC login disabled", exc_info=True)
-        app_state.oidc_config = dataclasses.replace(cfg, enabled=False)
-        app_state.jwks_data = None
-        return
+    # Use a transient client for discovery so the long-lived client is only
+    # installed once we know OIDC will actually be enabled.  The disable
+    # branches below would otherwise leak sockets until shutdown.
+    async with httpx.AsyncClient(timeout=10.0) as transient_client:
+        # Discovery is operator-controlled config; any unexpected failure
+        # must disable OIDC rather than escape and bring down the service.
+        try:
+            cfg = await discover_oidc(cfg, client=transient_client)
+        except Exception:
+            log.warning("OIDC discovery failed -- OIDC login disabled", exc_info=True)
+            app_state.oidc_config = dataclasses.replace(cfg, enabled=False)
+            app_state.jwks_data = None
+            app_state.oidc_http_client = None
+            return
 
     if not cfg.enabled:
         app_state.oidc_config = cfg
         app_state.jwks_data = None
+        app_state.oidc_http_client = None
         return
 
     if not cfg.redirect_base:
@@ -623,13 +631,18 @@ async def initialize_oidc_state(app_state: Any) -> None:
         )
         app_state.oidc_config = dataclasses.replace(cfg, enabled=False)
         app_state.jwks_data = None
+        app_state.oidc_http_client = None
         return
+
+    http_client = httpx.AsyncClient(timeout=10.0)
+    app_state.oidc_http_client = http_client
 
     try:
         jwks_data = await fetch_jwks(cfg.jwks_uri, client=http_client)
     except OIDCError:
         # Keep enabled=True so the callback's lazy-fetch retry path can
-        # recover if the IdP transiently failed during startup.
+        # recover if the IdP transiently failed during startup. The
+        # http_client stays open for that retry.
         log.warning("OIDC JWKS prefetch failed -- will retry on first login", exc_info=True)
         app_state.oidc_config = cfg
         app_state.jwks_data = None

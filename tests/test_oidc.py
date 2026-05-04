@@ -2351,8 +2351,14 @@ class TestCloseOIDCState:
 
 
 class TestLongLivedHTTPClientPassthrough:
-    def test_initialize_passes_client_to_discovery_and_jwks(self):
-        """initialize_oidc_state stashes a client and threads it to outbound calls."""
+    def test_initialize_passes_long_lived_client_to_jwks_only(self):
+        """Discovery uses a transient client; JWKS uses the long-lived one.
+
+        Splitting the two avoids leaking the long-lived client when a
+        disable check (discovery exception, discovery-returned-disabled,
+        missing redirect_base) returns before JWKS prefetch — see the
+        post-condition contract on initialize_oidc_state.
+        """
         cfg = _make_config(redirect_base="https://app.example.com")
         state = types.SimpleNamespace(oidc_config=cfg, jwks_data=None)
 
@@ -2375,5 +2381,39 @@ class TestLongLivedHTTPClientPassthrough:
         assert state.oidc_http_client is not None
         kinds = {kind for kind, _ in seen_clients}
         assert {"discover", "jwks"} <= kinds
-        for _kind, c in seen_clients:
-            assert c is state.oidc_http_client
+
+        jwks_clients = [c for kind, c in seen_clients if kind == "jwks"]
+        assert all(c is state.oidc_http_client for c in jwks_clients)
+        # Discovery client is a separate transient (already closed).
+        discover_clients = [c for kind, c in seen_clients if kind == "discover"]
+        assert all(c is not state.oidc_http_client for c in discover_clients)
+
+    def test_initialize_does_not_leak_client_on_discovery_failure(self):
+        """Discovery exception path must close the transient and leave http_client None."""
+        cfg = _make_config(redirect_base="https://app.example.com")
+        state = types.SimpleNamespace(oidc_config=cfg, jwks_data=None)
+
+        async def _boom(_cfg, *, client=None):
+            raise RuntimeError("boom")
+
+        with patch("turnstone.core.oidc.discover_oidc", side_effect=_boom):
+            asyncio.run(initialize_oidc_state(state))
+
+        assert state.oidc_config.enabled is False
+        assert state.oidc_http_client is None
+        assert state.jwks_data is None
+
+    def test_initialize_does_not_leak_client_on_missing_redirect_base(self):
+        """Missing redirect_base path returns before creating the long-lived client."""
+        cfg = _make_config(redirect_base="")
+        state = types.SimpleNamespace(oidc_config=cfg, jwks_data=None)
+
+        async def _discover(c, *, client=None):
+            return c
+
+        with patch("turnstone.core.oidc.discover_oidc", side_effect=_discover):
+            asyncio.run(initialize_oidc_state(state))
+
+        assert state.oidc_config.enabled is False
+        assert state.oidc_http_client is None
+        assert state.jwks_data is None
