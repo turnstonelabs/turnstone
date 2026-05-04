@@ -1533,7 +1533,10 @@ class TestProxyRewriting:
         click-only menu."""
         from turnstone.console.server import _JS_PROXY_SHIM
 
-        assert "/v1/api/cluster/nodes" in _JS_PROXY_SHIM
+        # limit=1000 matches the collector's hard cap; without it the
+        # picker would silently drop nodes past the 100-default in
+        # clusters with >100 nodes.
+        assert "/v1/api/cluster/nodes?limit=1000" in _JS_PROXY_SHIM
         assert "ui-header" in _JS_PROXY_SHIM
         assert "console-node-pill" in _JS_PROXY_SHIM
         assert "ws-tab-dropdown" in _JS_PROXY_SHIM

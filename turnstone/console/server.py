@@ -193,6 +193,9 @@ _JS_PROXY_SHIM = """\
     pill.setAttribute("aria-haspopup", "menu");
     pill.setAttribute("aria-expanded", "false");
     pill.setAttribute("aria-label", "Switch node, currently " + _nodeId);
+    // title gives sighted users the full id when it ellipsizes
+    // \u2014 see the max-width + text-overflow rules in _CONSOLE_PROXY_STYLE.
+    pill.setAttribute("title", _nodeId);
     pill.appendChild(el("span", "console-node-pill-dot"));
     pill.appendChild(el("span", "console-node-pill-id", _nodeId));
     pill.appendChild(el("span", "console-node-pill-caret", "\u25be"));
@@ -246,10 +249,15 @@ _JS_PROXY_SHIM = """\
       // skips disabled rows (current + unreachable) during arrow-key cycling.
       closeHandler = function(e){
         if (e.type === "keydown"){
-          if (e.key === "Escape" || e.key === "Tab"){
+          if (e.key === "Escape"){
             e.preventDefault();
             closeMenu();
             pill.focus();
+          } else if (e.key === "Tab"){
+            // Per ARIA APG menu pattern: Tab closes the menu AND moves
+            // focus to the next focusable element.  Don't preventDefault —
+            // let the browser do its native Tab traversal.
+            closeMenu();
           } else if (e.key === "ArrowDown" || e.key === "ArrowUp"
                   || e.key === "Home" || e.key === "End"){
             e.preventDefault();
@@ -318,7 +326,10 @@ _JS_PROXY_SHIM = """\
       // Saved original fetch \u2014 the prefix shim above would otherwise
       // rewrite this to /node/{id}/v1/api/cluster/nodes, which the node
       // doesn't serve (it's a console-only endpoint mounted at /v1).
-      _oF.call(window, "/v1/api/cluster/nodes", { credentials: "same-origin" })
+      // limit=1000 requests the collector's hard maximum in one round-trip;
+      // beyond 1000 nodes the picker UI is no longer the right shape (it'd
+      // need a search box) so we don't try to paginate.
+      _oF.call(window, "/v1/api/cluster/nodes?limit=1000", { credentials: "same-origin" })
         .then(function(r){ if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
         .then(function(data){
           loaded = true; loading = false;
@@ -440,6 +451,17 @@ _JS_PROXY_SHIM = """\
 
       menu.replaceChildren(...children);
       positionMenu();
+
+      // First-open path: openMenu()'s deferred focus hook ran before the
+      // async fetch resolved, so it found only the skeleton and left
+      // focus on the pill.  If focus is still on the pill (i.e. the user
+      // didn't navigate away while the skeleton was up), grab it now.
+      if (document.activeElement === pill){
+        var first = menu.querySelector(
+          ".ws-tab-dropdown-item:not([aria-disabled='true'])"
+        );
+        if (first) first.focus();
+      }
     }
 
     pill.addEventListener("click", function(e){
@@ -471,11 +493,14 @@ _CONSOLE_PROXY_STYLE = (
     # --- Trigger pill \u2014 sits at the start of #ui-header (.appbar).
     # Height 24px passes WCAG 2.5.8 (24px min target) and harmonises
     # with .btn (28px) and .appbar-back (~20px) without looking stunted.
+    # max-width caps the pill against pathologically long node ids
+    # (validated up to 256 chars upstream); the id span ellipsizes
+    # inside.  min-width:0 lets it shrink under appbar pressure.
     ".console-node-pill{display:inline-flex;align-items:center;gap:6px;"
-    "height:24px;padding:0 10px;font-family:var(--font-mono);"
-    "font-size:12px;color:var(--fg-dim);background:transparent;"
-    "border:1px solid var(--border-strong);border-radius:var(--radius-sm);"
-    "cursor:pointer;line-height:1;"
+    "height:24px;padding:0 10px;max-width:240px;min-width:0;"
+    "font-family:var(--font-mono);font-size:12px;color:var(--fg-dim);"
+    "background:transparent;border:1px solid var(--border-strong);"
+    "border-radius:var(--radius-sm);cursor:pointer;line-height:1;"
     "transition:background .12s,color .12s}"
     ".console-node-pill:hover{background:var(--bg-highlight);color:var(--fg)}"
     '.console-node-pill[aria-expanded="true"]{background:var(--bg-highlight);'
@@ -485,7 +510,8 @@ _CONSOLE_PROXY_STYLE = (
     ".console-node-pill-dot{width:6px;height:6px;border-radius:50%;"
     "background:var(--green);box-shadow:0 0 4px var(--green-glow);"
     "flex-shrink:0}"
-    ".console-node-pill-id{font-weight:500}"
+    ".console-node-pill-id{font-weight:500;overflow:hidden;"
+    "text-overflow:ellipsis;white-space:nowrap;min-width:0}"
     ".console-node-pill-caret{font-size:10px;color:var(--fg-dim);opacity:.7;"
     "display:inline-block;transition:transform .12s}"
     '.console-node-pill[aria-expanded="true"] .console-node-pill-caret'
