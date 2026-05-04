@@ -130,6 +130,31 @@ def _fake_prompt_dict(
     }
 
 
+@pytest.fixture
+def running_loop_mgr():
+    """Yield a (mgr, loop, thread) triple with a background loop already running.
+
+    Spawns an MCPClientManager with a default config of {"srv": stdio echo}
+    and a fresh asyncio loop driven by a daemon thread.  Tests that need a
+    different config can mutate ``mgr._server_configs`` directly.  The
+    fixture stops the loop and joins the thread on teardown so each test
+    leaves a clean slate.
+    """
+    import threading as _threading
+
+    cfg = {"srv": {"type": "stdio", "command": "echo"}}
+    mgr = MCPClientManager(cfg)
+    loop = asyncio.new_event_loop()
+    thread = _threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    mgr._loop = loop
+    try:
+        yield mgr, loop, thread
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+
+
 # ---------------------------------------------------------------------------
 # Schema conversion
 # ---------------------------------------------------------------------------
@@ -1903,60 +1928,179 @@ class TestNotificationDebounce:
 
 
 # ---------------------------------------------------------------------------
-# Fix 5: Periodic refresh backoff
+# reconnect_sync — operator-driven full reconnect
 # ---------------------------------------------------------------------------
 
 
-class TestPeriodicRefreshBackoff:
-    """Verify periodic refresh backoff and auto-reconnect."""
+class TestReconnectSync:
+    """Verify reconnect_sync tears down old session, clears CB, calls _connect_one."""
 
-    def test_backoff_set_on_failure(self):
+    def test_reconnect_unknown_server_returns_error(self):
         mgr = MCPClientManager({})
-        mgr._refresh_failures["srv"] = 1
-        # Simulate what _periodic_refresh does on failure
-        failures = mgr._refresh_failures.get("srv", 0) + 1
-        mgr._refresh_failures["srv"] = failures
-        backoff = min(mgr._REFRESH_BACKOFF_BASE * (2 ** (failures - 1)), mgr._REFRESH_BACKOFF_MAX)
-        mgr._refresh_backoff_until["srv"] = time.monotonic() + backoff
-        assert mgr._refresh_backoff_until["srv"] > time.monotonic()
-        assert failures == 2
+        result = mgr.reconnect_sync("missing")
+        assert result == {
+            "connected": False,
+            "tools": 0,
+            "resources": 0,
+            "prompts": 0,
+            "error": "unknown server",
+        }
 
-    def test_backoff_doubles(self):
-        mgr = MCPClientManager({})
-        b1 = min(mgr._REFRESH_BACKOFF_BASE * (2**0), mgr._REFRESH_BACKOFF_MAX)
-        b2 = min(mgr._REFRESH_BACKOFF_BASE * (2**1), mgr._REFRESH_BACKOFF_MAX)
-        b3 = min(mgr._REFRESH_BACKOFF_BASE * (2**2), mgr._REFRESH_BACKOFF_MAX)
-        assert b1 == 60
-        assert b2 == 120
-        assert b3 == 240
+    def test_reconnect_clears_circuit_breaker(self, running_loop_mgr):
+        mgr, _loop, _thread = running_loop_mgr
 
-    def test_backoff_capped(self):
-        mgr = MCPClientManager({})
-        b = min(mgr._REFRESH_BACKOFF_BASE * (2**20), mgr._REFRESH_BACKOFF_MAX)
-        assert b == mgr._REFRESH_BACKOFF_MAX
+        async def _fake_connect_one(name: str, _cfg: dict[str, Any]) -> None:
+            mgr._sessions[name] = MagicMock()
 
-    def test_backoff_clears_on_success(self):
-        mgr = MCPClientManager({})
-        mgr._refresh_failures["srv"] = 3
-        mgr._refresh_backoff_until["srv"] = time.monotonic() + 1000
-        # Simulate success
-        mgr._refresh_failures.pop("srv", None)
-        mgr._refresh_backoff_until.pop("srv", None)
-        assert "srv" not in mgr._refresh_failures
-        assert "srv" not in mgr._refresh_backoff_until
-
-    def test_server_status_includes_circuit_info(self):
-        mgr = MCPClientManager({"srv": {"type": "stdio", "command": "echo"}})
-        status = mgr.get_server_status("srv")
-        assert "circuit_open" in status
-        assert "consecutive_failures" in status
-        assert status["circuit_open"] is False
-        assert status["consecutive_failures"] == 0
-
-    def test_server_status_shows_open_circuit(self):
-        mgr = MCPClientManager({"srv": {"type": "stdio", "command": "echo"}})
+        # Pre-trip the breaker
         for _ in range(3):
             mgr._cb_record_failure("srv")
-        status = mgr.get_server_status("srv")
-        assert status["circuit_open"] is True
-        assert status["consecutive_failures"] == 3
+        assert "srv" in mgr._circuit_open_until
+
+        with (
+            patch.object(mgr, "_connect_one", side_effect=_fake_connect_one),
+            patch.object(mgr, "_pre_close_streams", new=AsyncMock()),
+        ):
+            result = mgr.reconnect_sync("srv")
+        assert result["connected"] is True
+        assert result["error"] == ""
+        assert "srv" not in mgr._circuit_open_until
+        assert "srv" not in mgr._consecutive_failures
+
+    def test_reconnect_closes_old_session_then_calls_connect_one(self, running_loop_mgr):
+        mgr, _loop, _thread = running_loop_mgr
+
+        order: list[str] = []
+        old_stack = MagicMock(spec=AsyncExitStack)
+
+        async def _pre_close(name: str) -> None:
+            order.append("pre_close")
+
+        async def _safe_close(stack: Any) -> None:
+            order.append("safe_close")
+            assert stack is old_stack
+
+        async def _connect_one(name: str, _cfg: dict[str, Any]) -> None:
+            order.append("connect_one")
+            mgr._sessions[name] = MagicMock()
+
+        mgr._sessions["srv"] = MagicMock()  # populated old session
+        mgr._per_server_stacks["srv"] = old_stack
+        mgr._server_streams["srv"] = (MagicMock(), MagicMock())
+
+        with (
+            patch.object(mgr, "_pre_close_streams", side_effect=_pre_close),
+            patch.object(mgr, "_safe_close_stack", side_effect=_safe_close),
+            patch.object(mgr, "_connect_one", side_effect=_connect_one),
+        ):
+            result = mgr.reconnect_sync("srv")
+        assert result["connected"] is True
+        assert order == ["pre_close", "safe_close", "connect_one"]
+        assert "srv" not in mgr._per_server_stacks
+
+    def test_reconnect_failure_returns_error_dict(self, running_loop_mgr):
+        mgr, _loop, _thread = running_loop_mgr
+
+        async def _connect_one(name: str, _cfg: dict[str, Any]) -> None:
+            raise RuntimeError("handshake failed")
+
+        with (
+            patch.object(mgr, "_connect_one", side_effect=_connect_one),
+            patch.object(mgr, "_pre_close_streams", new=AsyncMock()),
+        ):
+            result = mgr.reconnect_sync("srv")
+        assert result["connected"] is False
+        assert "handshake failed" in result["error"]
+
+    def test_reconnect_failure_clears_stale_catalog(self, running_loop_mgr):
+        # bug-2: when _connect_one fails mid-reconnect, the per-server
+        # catalog must be dropped so the merged tool/resource/prompt maps
+        # don't keep advertising entries with no live session.
+        mgr, _loop, _thread = running_loop_mgr
+
+        # Seed catalog state from a previous successful connect.
+        mgr._per_server_tools["srv"] = [_fake_openai_tool("mcp__srv__t")]
+        mgr._per_server_resources["srv"] = [_fake_resource_dict(server="srv")]
+        mgr._per_server_prompts["srv"] = [_fake_prompt_dict(server="srv")]
+        mgr._rebuild_tools()
+        mgr._rebuild_resources()
+        mgr._rebuild_prompts()
+
+        async def _connect_one(name: str, _cfg: dict[str, Any]) -> None:
+            raise RuntimeError("handshake failed")
+
+        with (
+            patch.object(mgr, "_connect_one", side_effect=_connect_one),
+            patch.object(mgr, "_pre_close_streams", new=AsyncMock()),
+        ):
+            result = mgr.reconnect_sync("srv")
+        assert result["connected"] is False
+        # Per-server catalog and merged maps should both be empty for srv.
+        assert "srv" not in mgr._per_server_tools
+        assert "srv" not in mgr._per_server_resources
+        assert "srv" not in mgr._per_server_prompts
+        assert "mcp__srv__t" not in mgr._tool_map
+
+
+# ---------------------------------------------------------------------------
+# _cb_auto_reconnect — refresh-on-reconnect
+# ---------------------------------------------------------------------------
+
+
+class TestCBAutoReconnectRefresh:
+    """Verify _cb_auto_reconnect schedules catalog refresh after a successful reconnect.
+
+    The refresh runs as a fire-and-forget background task on the loop so it
+    doesn't block the caller (perf-1).  Tests wait briefly for the scheduled
+    task to run and observe its effect.
+    """
+
+    def test_auto_reconnect_schedules_refresh_server_on_success(self, running_loop_mgr):
+        import threading as _threading
+
+        mgr, _loop, _thread = running_loop_mgr
+
+        new_session = MagicMock()
+        refresh_event = _threading.Event()
+
+        async def _connect_one(name: str, _cfg: dict[str, Any]) -> None:
+            mgr._sessions[name] = new_session
+
+        async def _refresh(name: str) -> tuple[list[str], list[str]]:
+            refresh_event.set()
+            return [], []
+
+        with (
+            patch.object(mgr, "_connect_one", side_effect=_connect_one),
+            patch.object(mgr, "_refresh_server", side_effect=_refresh),
+        ):
+            session = mgr._cb_auto_reconnect("srv")
+            # Wait for the scheduled refresh task to actually run on the loop.
+            assert refresh_event.wait(timeout=5), "refresh task was not scheduled"
+        assert session is new_session
+
+    def test_auto_reconnect_swallows_refresh_failure(self, running_loop_mgr):
+        import threading as _threading
+
+        mgr, _loop, _thread = running_loop_mgr
+
+        new_session = MagicMock()
+        refresh_started = _threading.Event()
+
+        async def _connect_one(name: str, _cfg: dict[str, Any]) -> None:
+            mgr._sessions[name] = new_session
+
+        async def _refresh_failing(name: str) -> tuple[list[str], list[str]]:
+            refresh_started.set()
+            raise RuntimeError("catalog fetch broke")
+
+        with (
+            patch.object(mgr, "_connect_one", side_effect=_connect_one),
+            patch.object(mgr, "_refresh_server", side_effect=_refresh_failing),
+        ):
+            # Must not raise — refresh failures are non-fatal.
+            session = mgr._cb_auto_reconnect("srv")
+            # Background refresh actually started and exception was swallowed
+            # by the task without affecting the synchronous caller.
+            assert refresh_started.wait(timeout=5), "refresh task was not scheduled"
+        assert session is new_session

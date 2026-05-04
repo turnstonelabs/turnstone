@@ -8388,6 +8388,57 @@ async def _notify_nodes_mcp_reload(request: Request) -> dict[str, Any]:
     return {nid: data for nid, data in results if data is not None}
 
 
+async def _notify_nodes_mcp_action(request: Request, action: str, name: str) -> dict[str, Any]:
+    """Tell all nodes to perform a per-server MCP action.
+
+    *action* is the suffix of the internal endpoint — currently
+    ``"refresh"`` or ``"reconnect"``.  Each node is hit at
+    ``/v1/api/_internal/mcp-{action}/{name}``.
+    """
+    collector: ClusterCollector = request.app.state.collector
+    nodes = collector.get_all_nodes()
+    client: httpx.AsyncClient = request.app.state.proxy_client
+    headers = _proxy_auth_headers(request)
+    sem = asyncio.Semaphore(_get_fan_out_limit(request))
+    safe_name = urllib.parse.quote(name, safe="")
+
+    async def _notify(node: dict[str, Any]) -> tuple[str, Any]:
+        node_id = node.get("node_id", "")
+        url = node.get("server_url", "")
+        if not url:
+            return node_id, None
+        async with sem:
+            try:
+                resp = await client.post(
+                    f"{url.rstrip('/')}/v1/api/_internal/mcp-{action}/{safe_name}",
+                    headers=headers,
+                    timeout=30,
+                )
+                return node_id, resp.json()
+            except Exception as exc:
+                log.debug(
+                    "Failed to notify node %s for MCP %s of %s",
+                    node_id,
+                    action,
+                    name,
+                    exc_info=True,
+                )
+                return node_id, {"error": str(exc)}
+
+    results = await asyncio.gather(*[_notify(n) for n in nodes])
+    return {nid: data for nid, data in results if data is not None}
+
+
+async def _notify_nodes_mcp_refresh_one(request: Request, name: str) -> dict[str, Any]:
+    """Tell all nodes to refresh a single MCP server's catalog."""
+    return await _notify_nodes_mcp_action(request, "refresh", name)
+
+
+async def _notify_nodes_mcp_reconnect_one(request: Request, name: str) -> dict[str, Any]:
+    """Tell all nodes to force-reconnect a single MCP server."""
+    return await _notify_nodes_mcp_action(request, "reconnect", name)
+
+
 async def admin_mcp_reload(request: Request) -> JSONResponse:
     """POST /v1/api/admin/mcp-servers/reload — tell nodes to re-read DB."""
     from turnstone.core.auth import require_permission
@@ -8402,6 +8453,57 @@ async def admin_mcp_reload(request: Request) -> JSONResponse:
 
     results = await _notify_nodes_mcp_reload(request)
     return JSONResponse({"status": "ok", "results": results})
+
+
+async def _admin_mcp_action(request: Request, action: str) -> JSONResponse:
+    """Shared body for the per-server MCP admin actions.
+
+    *action* is the verb suffix — ``"refresh"`` or ``"reconnect"``.
+    Auth, name validation, audit, and per-node fan-out are identical
+    across the two; only the audit action string and the notify call
+    vary, both keyed on *action*.
+    """
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.mcp")
+    if err:
+        return err
+
+    name = request.path_params["name"]
+    if "__" in name:
+        return JSONResponse({"error": "invalid server name"}, status_code=400)
+
+    existing = storage.get_mcp_server_by_name(name)
+    target_id = existing.get("id", name) if existing else name
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        f"mcp_server.{action}",
+        "mcp_server",
+        target_id,
+        {"name": name},
+        ip,
+    )
+
+    results = await _notify_nodes_mcp_action(request, action, name)
+    return JSONResponse({"status": "ok", "results": results})
+
+
+async def admin_mcp_refresh_one(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/mcp-servers/{name}/refresh — refresh one server's catalog."""
+    return await _admin_mcp_action(request, "refresh")
+
+
+async def admin_mcp_reconnect_one(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/mcp-servers/{name}/reconnect — force-reconnect one server."""
+    return await _admin_mcp_action(request, "reconnect")
 
 
 async def admin_import_mcp_config(request: Request) -> JSONResponse:
@@ -11196,6 +11298,16 @@ def create_app(
                     Route(
                         "/api/admin/mcp-servers/reload",
                         admin_mcp_reload,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/admin/mcp-servers/{name}/refresh",
+                        admin_mcp_refresh_one,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/admin/mcp-servers/{name}/reconnect",
+                        admin_mcp_reconnect_one,
                         methods=["POST"],
                     ),
                     Route(

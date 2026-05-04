@@ -253,7 +253,7 @@ class "MCPClientManager" as MCPMgr {
     Background asyncio event loop
     bridges async MCP SDK to
     sync ChatSession dispatch.
-    Push + periodic + manual refresh.
+    Push + manual refresh.
     Resources + prompts discovered
     alongside tools at startup.
     --

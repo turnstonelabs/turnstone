@@ -207,6 +207,30 @@ class TestRequiredScope:
         """Only POST is elevated — GET falls through to read."""
         assert required_scope("GET", "/api/_internal/mcp-reload") == "read"
 
+    def test_internal_mcp_refresh_one_needs_approve(self):
+        assert required_scope("POST", "/api/_internal/mcp-refresh/srv") == "approve"
+
+    def test_v1_internal_mcp_refresh_one_needs_approve(self):
+        assert required_scope("POST", "/v1/api/_internal/mcp-refresh/srv") == "approve"
+
+    def test_proxy_internal_mcp_refresh_one_needs_approve(self):
+        assert required_scope("POST", "/node/n1/v1/api/_internal/mcp-refresh/srv") == "approve"
+
+    def test_proxy_no_v1_internal_mcp_refresh_one_needs_approve(self):
+        assert required_scope("POST", "/node/n1/api/_internal/mcp-refresh/srv") == "approve"
+
+    def test_internal_mcp_reconnect_one_needs_approve(self):
+        assert required_scope("POST", "/api/_internal/mcp-reconnect/srv") == "approve"
+
+    def test_v1_internal_mcp_reconnect_one_needs_approve(self):
+        assert required_scope("POST", "/v1/api/_internal/mcp-reconnect/srv") == "approve"
+
+    def test_proxy_internal_mcp_reconnect_one_needs_approve(self):
+        assert required_scope("POST", "/node/n1/v1/api/_internal/mcp-reconnect/srv") == "approve"
+
+    def test_proxy_no_v1_internal_mcp_reconnect_one_needs_approve(self):
+        assert required_scope("POST", "/node/n1/api/_internal/mcp-reconnect/srv") == "approve"
+
     # Workstream sub-resource mutations (parametric paths)
     def test_ws_delete_needs_write(self):
         assert required_scope("POST", "/api/workstreams/abc123/delete") == "write"
