@@ -3215,7 +3215,7 @@ class TestSearchOutputBudget:
         down the (5, 3, 1) ladder before falling through to Tier 3.
         Regression test for the perf-2 → ladder-collapse bug.
         """
-        from turnstone.core.session import _format_search_results
+        from turnstone.core.session import _SEARCH_OUTPUT_BUDGET, _format_search_results
 
         # Tune so K=5 doesn't fit but a smaller K does. ~70 files with
         # ~30 matches each at ~120 chars/line: K=5 emits ~42 KB (over
@@ -3233,8 +3233,6 @@ class TestSearchOutputBudget:
         # 1, 3, or 4), but we DO assert it's a per-file-samples result.
         assert "showing first" in out
         # And that it stayed within budget.
-        from turnstone.core.session import _SEARCH_OUTPUT_BUDGET
-
         assert len(out) <= _SEARCH_OUTPUT_BUDGET
 
 

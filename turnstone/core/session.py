@@ -196,13 +196,9 @@ def _encode_image_data_uri(raw: bytes, mime: str) -> str:
 # Upper bound on total skill content injected into system messages
 _MAX_SKILL_CONTENT: int = 32768
 
-# Maximum length (characters) for the *content portion* of an emitted
-# search result line — i.e. everything after ``path:lineno:``. The path
-# and line-number prefix are intentionally not bounded by this constant
-# (paths can be long but they're informational and grep/rg won't emit
-# pathological values for them). Lines whose content exceeds this cap
-# get re-truncated with ``_SEARCH_TRUNCATION_SUFFIX`` to defend against
-# pathological files (minified blobs, base64 data, etc.).
+# Cap on the *content portion* (text after ``path:lineno:``) of an
+# emitted search result line. Defends the context budget against
+# pathological lines (minified blobs, base64 data, etc.).
 _MAX_SEARCH_LINE_LENGTH: int = 1024
 # Margin over the per-line cap before re-truncating, so backend-supplied
 # preview markers (e.g. ripgrep's ``[... omitted end of long line]``) pass
@@ -349,10 +345,11 @@ def _format_search_results(
 
     Tier 1: full ``path:line:content`` lines, stream-emitted with a running
     cost check that short-circuits as soon as the budget would be exceeded.
-    Tier 2: K samples per file plus an ``…and N more in <path>`` note,
-    stepping K down (5 → 3 → 1) until results fit. This guarantees every
-    file is at least mentioned, which prevents the alphabetic-bias dropout
-    that head+tail truncation produced.
+    Tier 2: K samples per file plus an ``…and N more in <path>`` note. K is
+    seeded from a per-file size estimate, then stepped down through the
+    (5, 3, 1) ladder from the highest rung ≤ the estimate until the
+    emission fits. This guarantees every file is at least mentioned, which
+    prevents the alphabetic-bias dropout that head+tail truncation produced.
     Tier 3 (fallback): per-file counts only, sorted by descending count.
     """
     by_file: dict[str, list[tuple[str, str]]] = {}
@@ -417,10 +414,12 @@ def _format_search_results(
     # estimate. If the chosen K's actual emission doesn't fit (the
     # estimate ignored the header and over-counts compression from
     # shared paths), step down to the next rung instead of jumping
-    # straight to Tier 3.
-    candidates = [k for k in _SEARCH_TIER2_SAMPLE_LADDER if k <= max(estimated_k, 1)]
-    if not candidates:
-        candidates = [_SEARCH_TIER2_SAMPLE_LADDER[-1]]
+    # straight to Tier 3. The ``or [...]`` is defence against future
+    # changes to the ladder constant; with the current (5, 3, 1) it
+    # never fires because ``estimated_k`` is floored at 1 above.
+    candidates = [k for k in _SEARCH_TIER2_SAMPLE_LADDER if k <= estimated_k] or [
+        _SEARCH_TIER2_SAMPLE_LADDER[-1]
+    ]
     for k in candidates:
         header = _tier2_header(k)
         # Budget for header + the "\n\n" separator on return.
@@ -8195,11 +8194,7 @@ class ChatSession:
                 while proc.stderr.read(_SEARCH_DRAIN_CHUNK):
                     pass  # discard tail so the child can finish writing
             except Exception:
-                # Drain is best-effort: the pipe may be closed mid-read
-                # when ``proc.kill()`` lands or the child exits. Raising
-                # here would leak the daemon thread's exception to
-                # stderr without affecting correctness; swallow silently.
-                pass
+                pass  # best-effort: pipe may be torn down by proc.kill()/child exit
 
         drain_thread = threading.Thread(target=_drain_stderr, daemon=True)
         drain_thread.start()
@@ -8219,9 +8214,7 @@ class ChatSession:
             watchdog.cancel()
             drain_thread.join(timeout=_SEARCH_DRAIN_JOIN_TIMEOUT)
             for stream in (proc.stdout, proc.stderr):
-                # ``close()`` can raise if the pipe is already torn down
-                # by ``proc.kill()`` or by the OS; we're in cleanup, so
-                # swallow rather than mask the real return path.
+                # best-effort: pipe may be torn down by proc.kill()/OS
                 with contextlib.suppress(Exception):
                     if stream is not None:
                         stream.close()
