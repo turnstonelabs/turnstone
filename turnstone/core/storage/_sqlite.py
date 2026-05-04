@@ -2238,9 +2238,24 @@ class SQLiteBackend:
     def replace_oidc_roles(
         self, user_id: str, desired_role_ids: set[str]
     ) -> tuple[set[str], set[str]]:
+        # Double-check pattern: the steady-state OIDC re-login (claims
+        # unchanged from the last login) is overwhelmingly the common
+        # case, and SQLite's `BEGIN IMMEDIATE` takes the database-wide
+        # write lock — serialising every unrelated writer in the
+        # process. Acquiring it for a no-op diff is pure waste.
+        #
+        # Phase 1 reads under the default deferred transaction (no
+        # write lock) and bails out cheaply when the diff is empty.
+        # Phase 2 only fires when work is needed: it commits the read
+        # txn, escalates to `BEGIN IMMEDIATE`, and re-reads + re-diffs
+        # under the lock. The re-read is required — between the two
+        # reads any concurrent writer (admin-ui assignment, another
+        # racing OIDC callback) could have changed the row set, and
+        # acting on the optimistic snapshot would clobber that change.
+        # The post-lock diff is what we return so callers see the
+        # actual transition that hit the table.
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
-            conn.execute(sa.text("BEGIN IMMEDIATE"))
             existing_rows = conn.execute(
                 sa.select(user_roles.c.role_id, user_roles.c.assigned_by).where(
                     user_roles.c.user_id == user_id
@@ -2250,6 +2265,27 @@ class SQLiteBackend:
             # Roles assigned by any other source (admin-ui, oidc-default, etc.)
             # are off-limits to OIDC reconciliation per apply_role_mapping's contract.
             blocked: set[str] = {r[0] for r in existing_rows if r[1] != "oidc"}
+
+            effective_desired = desired_role_ids - blocked
+            added = effective_desired - current_oidc
+            removed = current_oidc - effective_desired
+            if not added and not removed:
+                # Steady state: claims unchanged from prior login. Skip
+                # the write lock entirely — this is the perf win.
+                return set(), set()
+
+            # Mutation needed. Release the implicit read txn, acquire
+            # the SQLite write lock, and re-read so the diff reflects
+            # any state change that landed between the two reads.
+            conn.commit()
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            existing_rows = conn.execute(
+                sa.select(user_roles.c.role_id, user_roles.c.assigned_by).where(
+                    user_roles.c.user_id == user_id
+                )
+            ).fetchall()
+            current_oidc = {r[0] for r in existing_rows if r[1] == "oidc"}
+            blocked = {r[0] for r in existing_rows if r[1] != "oidc"}
 
             effective_desired = desired_role_ids - blocked
             added = effective_desired - current_oidc
