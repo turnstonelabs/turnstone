@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from turnstone.core.attachments import Attachment
 from turnstone.core.memory import (
     get_attachment,
@@ -273,149 +275,29 @@ class TestProviderIntegration:
         assert "DO THE THING" in parts[1]["text"]
 
 
-class TestQueuedWithAttachments:
-    """Queued user turns must carry their attachments through to dequeue."""
+class TestQueuedAttachmentsRejected:
+    """Queued user messages can't carry attachments — see
+    :class:`AttachmentsNotQueueableError` for the role-ordering reason
+    (an attachment-bearing queued item would have to be appended as a
+    separate user turn, injecting ``user`` between
+    ``assistant(tool_calls)`` and ``tool``)."""
 
-    def test_queue_message_stores_attachment_ids(self, tmp_db, mock_openai_client):
+    def test_queue_message_rejects_attachments(self, tmp_db, mock_openai_client):
+        from turnstone.core.session import AttachmentsNotQueueableError
+
         s = _make_session(mock_openai_client)
-        # Seed a pending attachment owned by the session user
         save_attachment("a-q1", s._ws_id, "u1", "q.md", "text/markdown", 1, "text", b"q")
-        cleaned, priority, msg_id = s.queue_message("queued text", attachment_ids=["a-q1"])
-        assert cleaned == "queued text"
+        with pytest.raises(AttachmentsNotQueueableError):
+            s.queue_message("queued text", attachment_ids=["a-q1"])
+        # Queue stayed empty — nothing partially committed.
+        assert s._queued_messages == {}
+
+    def test_queue_message_accepts_text_only(self, tmp_db, mock_openai_client):
+        s = _make_session(mock_openai_client)
+        cleaned, priority, msg_id = s.queue_message("plain text")
+        assert cleaned == "plain text"
         with s._queued_lock:
-            entry = s._queued_messages[msg_id]
-        # Entry shape is (cleaned, priority, attachment_ids_tuple)
-        assert entry[0] == "queued text"
-        assert entry[2] == ("a-q1",)
-
-    def test_flush_queued_injects_multipart_user_turn(self, tmp_db, mock_openai_client):
-        from turnstone.core.memory import reserve_attachments
-
-        s = _make_session(mock_openai_client)
-        save_attachment("a-f1", s._ws_id, "u1", "f.md", "text/markdown", 3, "text", b"DAT")
-        _c, _p, msg_id = s.queue_message("please review", attachment_ids=["a-f1"])
-        # Server-side would have reserved before queueing; mirror that
-        # so consume's token match succeeds on flush.
-        reserve_attachments(["a-f1"], msg_id, s._ws_id, "u1")
-        s._flush_queued_messages()
-
-        msgs = s.messages
-        assert len(msgs) == 1
-        msg = msgs[0]
-        assert msg["role"] == "user"
-        # Multipart shape — text + document parts
-        assert isinstance(msg["content"], list)
-        assert msg["content"][0] == {"type": "text", "text": "please review"}
-        doc = msg["content"][1]
-        assert doc["type"] == "document"
-        assert doc["document"]["name"] == "f.md"
-        assert doc["document"]["data"] == "DAT"
-        # And the attachment is now consumed (not pending)
-        assert get_attachment("a-f1")["message_id"] is not None
-        assert list_pending_attachments(s._ws_id, "u1") == []
-
-    def test_flush_mixed_attachment_and_text_items(self, tmp_db, mock_openai_client):
-        # Text-only items should combine into one turn while
-        # attachment-bearing items flush as separate multipart turns.
-        from turnstone.core.memory import reserve_attachments
-
-        s = _make_session(mock_openai_client)
-        save_attachment("a-mx", s._ws_id, "u1", "x.md", "text/markdown", 1, "text", b"x")
-        s.queue_message("first plain")
-        _c, _p, mid = s.queue_message("with file", attachment_ids=["a-mx"])
-        reserve_attachments(["a-mx"], mid, s._ws_id, "u1")
-        s.queue_message("another plain")
-        s._flush_queued_messages()
-
-        # We expect at least two user messages: one combining the plain
-        # items flanking the multipart turn is allowed, but the
-        # multipart turn must remain its own message.
-        user_msgs = [m for m in s.messages if m.get("role") == "user"]
-        multipart = [m for m in user_msgs if isinstance(m["content"], list)]
-        assert len(multipart) == 1
-        assert "with file" in multipart[0]["content"][0]["text"]
-
-    def test_flush_drops_cross_user_attachment_silently(self, tmp_db, mock_openai_client):
-        # A forged attachment_id belonging to another user must not
-        # produce an attached part — dequeue resolution re-scopes.
-        s = _make_session(mock_openai_client, user_id="u1")
-        save_attachment("a-other", s._ws_id, "u2", "other.md", "text/plain", 1, "text", b"o")
-        s.queue_message("hi", attachment_ids=["a-other"])
-        s._flush_queued_messages()
-        # Flushed as plain text-only turn — the forged id was scope-dropped.
-        msgs = s.messages
-        assert len(msgs) == 1
-        assert msgs[0]["content"] == "hi"
-
-
-class TestQueueReservationLifecycle:
-    """session.queue_message + dequeue_message lifecycle with reservations."""
-
-    def test_dequeue_unreserves_attachments(self, tmp_db, mock_openai_client):
-        from turnstone.core.memory import get_attachment, reserve_attachments
-
-        s = _make_session(mock_openai_client)
-        save_attachment("a-deq", s._ws_id, "u1", "x.md", "text/plain", 1, "text", b"x")
-        _cleaned, _priority, msg_id = s.queue_message("queued", attachment_ids=["a-deq"])
-        # Simulate the server reserving after queue_message
-        reserve_attachments(["a-deq"], msg_id, s._ws_id, "u1")
-        assert get_attachment("a-deq")["reserved_for_msg_id"] == msg_id
-
-        # Dequeue (user cancelled the queued send)
-        assert s.dequeue_message(msg_id) is True
-        # Reservation is released — back to pending
-        assert get_attachment("a-deq")["reserved_for_msg_id"] is None
-        assert len(list_pending_attachments(s._ws_id, "u1")) == 1
-
-    def test_flush_consumes_reserved_attachment(self, tmp_db, mock_openai_client):
-        from turnstone.core.memory import get_attachment, reserve_attachments
-
-        s = _make_session(mock_openai_client)
-        save_attachment("a-flush", s._ws_id, "u1", "y.md", "text/plain", 1, "text", b"y")
-        _c, _p, msg_id = s.queue_message("go", attachment_ids=["a-flush"])
-        reserve_attachments(["a-flush"], msg_id, s._ws_id, "u1")
-
-        # Flush — queue drain must accept the reserved-for-this-msg attachment
-        s._flush_queued_messages()
-        row = get_attachment("a-flush")
-        assert row["message_id"] is not None
-        assert row["reserved_for_msg_id"] is None  # cleared on consume
-        # And the in-memory message is multipart with the doc attached
-        assert isinstance(s.messages[-1]["content"], list)
-        assert any(p.get("type") == "document" for p in s.messages[-1]["content"])
-
-    def test_resolve_rejects_reservation_for_other_msg(self, tmp_db, mock_openai_client):
-        from turnstone.core.memory import reserve_attachments
-
-        s = _make_session(mock_openai_client)
-        save_attachment("a-other", s._ws_id, "u1", "z.md", "text/plain", 1, "text", b"z")
-        reserve_attachments(["a-other"], "q-OTHER", s._ws_id, "u1")
-        # allow_reserved_for=None (default) → reserved rows are skipped
-        assert s._resolve_attachment_ids(["a-other"]) == []
-        # allow_reserved_for matches → accepted
-        out = s._resolve_attachment_ids(["a-other"], allow_reserved_for="q-OTHER")
-        assert [a.attachment_id for a in out] == ["a-other"]
-
-
-class TestExplicitAttachmentIdsOrderPreserved:
-    """session._resolve_attachment_ids must honour request order."""
-
-    def test_resolve_preserves_request_order(self, tmp_db, mock_openai_client):
-        s = _make_session(mock_openai_client)
-        # Insert in one order, request in the reverse order — resolver
-        # must reflect the request, not the DB's INSERT order.
-        save_attachment("a-1", s._ws_id, "u1", "first.md", "text/plain", 1, "text", b"1")
-        save_attachment("a-2", s._ws_id, "u1", "second.md", "text/plain", 1, "text", b"2")
-        save_attachment("a-3", s._ws_id, "u1", "third.md", "text/plain", 1, "text", b"3")
-
-        out = s._resolve_attachment_ids(["a-3", "a-1", "a-2"])
-        assert [a.attachment_id for a in out] == ["a-3", "a-1", "a-2"]
-
-    def test_resolve_skips_unknown_and_keeps_order(self, tmp_db, mock_openai_client):
-        s = _make_session(mock_openai_client)
-        save_attachment("a-k", s._ws_id, "u1", "k.md", "text/plain", 1, "text", b"k")
-        out = s._resolve_attachment_ids(["unknown", "a-k", ""])
-        assert [a.attachment_id for a in out] == ["a-k"]
+            assert s._queued_messages[msg_id] == ("plain text", priority)
 
 
 class TestTokenAccounting:

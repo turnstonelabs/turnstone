@@ -22,6 +22,7 @@ from turnstone.core.adapters._ui_cleanup import cleanup_session_ui
 from turnstone.core.child_source import ClusterChildSource
 from turnstone.core.children_registry import ChildrenRegistry
 from turnstone.core.log import get_logger
+from turnstone.core.session import AttachmentsNotQueueableError
 from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamState
 
 if TYPE_CHECKING:
@@ -310,13 +311,34 @@ class CoordinatorAdapter:
                 # logging) above.
 
         def _enqueue() -> None:
-            # ``queue_message`` takes attachment *ids* + ``queue_msg_id``
-            # (which doubles as the cross-table reservation token); the
-            # send_id we hold IS that token. Convert Attachment objects
-            # to id list at enqueue time so the queued turn picks the
-            # files up at dequeue.
+            # Queued user turns can't carry attachments (see
+            # ``AttachmentsNotQueueableError``). The route handler's
+            # _enqueue catches the rejection and surfaces an
+            # ``attachments_busy`` status to the caller; the coord
+            # adapter's caller has no equivalent return channel, so
+            # we mirror the cleanup (release the reservation taken
+            # for ``_send_id``) and let session_worker.send return
+            # False — the only call site today
+            # (``_coord_create_post_install``) hits the spawn branch
+            # on a fresh workstream so the catch is defense-in-depth.
             att_ids = [a.attachment_id for a in _attachments] if _attachments else None
-            session.queue_message(message, attachment_ids=att_ids, queue_msg_id=_send_id)
+            try:
+                session.queue_message(message, attachment_ids=att_ids, queue_msg_id=_send_id)
+            except AttachmentsNotQueueableError:
+                if _attachments and _send_id:
+                    from turnstone.core.memory import (
+                        unreserve_attachments as _unreserve,
+                    )
+
+                    try:
+                        _unreserve(_send_id, ws_ref.id, _user_id)
+                    except Exception:
+                        log.debug(
+                            "coord_adapter.attachment_unreserve_failed ws=%s",
+                            ws_ref.id[:8],
+                            exc_info=True,
+                        )
+                raise
 
         return session_worker.send(
             ws,

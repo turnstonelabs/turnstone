@@ -576,6 +576,19 @@
       this.sendBtn.disabled = !!b && !opts.queueWhileBusy;
     }
 
+    // Paperclip is disabled whenever busy, even in queueWhileBusy mode:
+    // attachments can't ride a queued user turn (would inject a `user`
+    // turn between assistant(tool_calls) and tool — see backend
+    // AttachmentsNotQueueableError).
+    if (this.attachBtn) {
+      this.attachBtn.disabled = !!b;
+      var attachLabel = b
+        ? "Attach files (available once the current turn finishes)"
+        : "Attach files";
+      this.attachBtn.title = attachLabel;
+      this.attachBtn.setAttribute("aria-label", attachLabel);
+    }
+
     // Stop button visibility + label reset — reset every transition so
     // cancelGeneration's transient "Cancelling…" label doesn't stick.
     if (this.stopBtn) {

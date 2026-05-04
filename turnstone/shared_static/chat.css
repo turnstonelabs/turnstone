@@ -354,6 +354,15 @@
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
+.composer-attach:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.composer-attach:disabled:hover {
+  background: transparent;
+  color: var(--fg-dim);
+  border-color: var(--border-strong);
+}
 
 .composer-input {
   flex: 1;

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import uuid
 from unittest.mock import MagicMock
 
 import pytest
@@ -707,22 +708,26 @@ class TestQueuedAttachmentReservation:
         mgr.get.return_value = ws
         return ws, session
 
-    def _queue_with_attachment(self, client, mgr, ws_id: str, filename: str = "q.md"):
+    def _reserve_attachment(self, client, mgr, ws_id: str, filename: str = "q.md"):
+        """Set up a reserved attachment for the busy-worker tests below.
+
+        The queue-with-attachments path was removed (queued user turns
+        can't carry attachments — see ``AttachmentsNotQueueableError``),
+        so the tests reserve directly via ``reserve_attachments`` to
+        produce the same on-disk state without going through the
+        rejected route path.
+        """
+        from turnstone.core.memory import reserve_attachments
+
         aid = _upload(client, ws_id, "userA", filename, b"Q", "text/markdown")
         ws, session = self._wire_busy_ws(mgr, ws_id)
-        resp = client.post(
-            f"/v1/api/workstreams/{ws_id}/send",
-            json={"message": "queued", "attachment_ids": [aid]},
-            headers=_auth("userA"),
-        )
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["status"] == "queued"
-        return aid, body["msg_id"], session
+        msg_id = uuid.uuid4().hex
+        reserve_attachments([aid], msg_id, ws_id, "userA")
+        return aid, msg_id, session
 
     def test_reserved_attachment_hidden_from_pending_listing(self, app_client):
         client, mgr = app_client
-        aid, _mid, _session = self._queue_with_attachment(client, mgr, "ws-A")
+        aid, _mid, _session = self._reserve_attachment(client, mgr, "ws-A")
         resp = client.get("/v1/api/workstreams/ws-A/attachments", headers=_auth("userA"))
         # Reserved attachment is not in the pending listing
         ids = [a["attachment_id"] for a in resp.json()["attachments"]]
@@ -730,7 +735,7 @@ class TestQueuedAttachmentReservation:
 
     def test_reserved_attachment_cannot_be_deleted(self, app_client):
         client, mgr = app_client
-        aid, _mid, _session = self._queue_with_attachment(client, mgr, "ws-A")
+        aid, _mid, _session = self._reserve_attachment(client, mgr, "ws-A")
         resp = client.delete(
             f"/v1/api/workstreams/ws-A/attachments/{aid}",
             headers=_auth("userA"),
@@ -745,7 +750,7 @@ class TestQueuedAttachmentReservation:
 
     def test_reserved_attachment_not_auto_consumed_by_later_send(self, app_client):
         client, mgr = app_client
-        aid, _mid, session = self._queue_with_attachment(client, mgr, "ws-A")
+        aid, _mid, session = self._reserve_attachment(client, mgr, "ws-A")
 
         # Swap the busy worker for an idle one and capture the next
         # session.send call so we can assert on its attachment list.
@@ -781,7 +786,7 @@ class TestQueuedAttachmentReservation:
 
     def test_reserved_attachment_rejected_in_explicit_ids(self, app_client):
         client, mgr = app_client
-        aid, _mid, session = self._queue_with_attachment(client, mgr, "ws-A")
+        aid, _mid, session = self._reserve_attachment(client, mgr, "ws-A")
 
         captured: dict = {}
 
@@ -813,29 +818,26 @@ class TestQueuedAttachmentReservation:
         if atts is not None:
             assert aid not in [a.attachment_id for a in atts]
 
-    def test_dequeue_releases_reservation(self, app_client):
+    def test_send_with_attachments_to_busy_worker_returns_attachments_busy(self, app_client):
+        """An attempt to attach mid-tool-call returns ``attachments_busy``;
+        attachments stay pending so the client can retry once idle."""
         client, mgr = app_client
-        aid, mid, session = self._queue_with_attachment(client, mgr, "ws-A")
-
-        # Cancel the queued message — DELETE /api/send with msg_id
-        resp = client.request(
-            "DELETE",
+        aid = _upload(client, "ws-A", "userA", "x.md", b"X", "text/markdown")
+        self._wire_busy_ws(mgr, "ws-A")
+        resp = client.post(
             "/v1/api/workstreams/ws-A/send",
-            json={"msg_id": mid},
+            json={"message": "with file", "attachment_ids": [aid]},
             headers=_auth("userA"),
         )
         assert resp.status_code == 200
-        assert resp.json().get("status") == "removed"
-
-        # Attachment is back to pending — visible + deletable
+        body = resp.json()
+        assert body["status"] == "attachments_busy"
+        assert body["attached_ids"] == []
+        assert body["dropped_attachment_ids"] == [aid]
+        # Reservation released — attachment is still pending and visible.
         resp = client.get("/v1/api/workstreams/ws-A/attachments", headers=_auth("userA"))
         ids = [a["attachment_id"] for a in resp.json()["attachments"]]
         assert aid in ids
-        resp = client.delete(
-            f"/v1/api/workstreams/ws-A/attachments/{aid}",
-            headers=_auth("userA"),
-        )
-        assert resp.status_code == 200
 
 
 class TestReserveThenDispatchRace:
