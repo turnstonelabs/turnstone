@@ -3010,6 +3010,28 @@ class TestSearchLineTruncation:
         output = _run_exec_search(_make_session(), (stdout, 0, b"", True))
         assert "byte cap" in output or "capped" in output
 
+    def test_search_capped_preserves_nonzero_rc_error(self):
+        """When the byte cap fires AND the child also returned a real
+        error rc (rg's rc=2 = 'matches with errors'), surface the error
+        instead of silently treating it as success. The capped→rc=0
+        normalisation should only apply to the SIGKILL we issued (rc<0).
+        """
+        stdout = b"a/b.py:1:line1\n"
+        output = _run_exec_search(
+            _make_session(),
+            (stdout, 2, b"rg: some/file: Permission denied\n", True),
+        )
+        assert "Permission denied" in output
+
+    def test_search_capped_with_signal_kill_treated_as_success(self):
+        """Capped output with rc<0 (our SIGKILL) flows through as a
+        successful partial result — the capped annotation in the output
+        signals incompleteness."""
+        stdout = b"a/b.py:1:line1\n"
+        output = _run_exec_search(_make_session(), (stdout, -9, b"", True))
+        assert "a/b.py:1:line1" in output
+        assert "byte cap" in output or "capped" in output
+
 
 class TestSearchBackendSelection:
     """Tests for backend detection (rg vs grep) and arg construction."""
@@ -3147,7 +3169,10 @@ class TestSearchOutputBudget:
         assert "more in a.py" in out
         assert "more in b.py" in out
         assert "more in c.py" in out
-        assert len(out) <= _SEARCH_OUTPUT_BUDGET + 512  # small slack for header
+        # Strict: the formatter budgets for header + separator up front,
+        # so the final emission stays at or below ``_SEARCH_OUTPUT_BUDGET``
+        # without needing ``_truncate_output`` as a backstop.
+        assert len(out) <= _SEARCH_OUTPUT_BUDGET
 
     def test_tier3_counts_only_when_too_many_files(self):
         """Thousands of files × matches → degrade to per-file counts."""
@@ -3162,7 +3187,7 @@ class TestSearchOutputBudget:
         out = _format_search_results(records, capped=False)
         assert "Counts only" in out
         assert "path/to/file_0000.py: 50 matches" in out
-        assert len(out) <= _SEARCH_OUTPUT_BUDGET + 512
+        assert len(out) <= _SEARCH_OUTPUT_BUDGET
 
     def test_tier1_preserves_file_order(self):
         """Tier 1 emits files in insertion order (so first-seen file appears first)."""
@@ -3184,6 +3209,33 @@ class TestSearchOutputBudget:
         records = [("foo.py", "1", "match")]
         out = _format_search_results(records, capped=True)
         assert "byte cap" in out or "capped" in out
+
+    def test_tier2_steps_down_ladder_before_falling_to_tier3(self):
+        """When the analytical K is too aggressive, Tier 2 must step
+        down the (5, 3, 1) ladder before falling through to Tier 3.
+        Regression test for the perf-2 → ladder-collapse bug.
+        """
+        from turnstone.core.session import _format_search_results
+
+        # Tune so K=5 doesn't fit but a smaller K does. ~70 files with
+        # ~30 matches each at ~120 chars/line: K=5 emits ~42 KB (over
+        # the 32 KB budget); K=3 emits ~25 KB (fits).
+        records = []
+        line = "x" * 100
+        for f_idx in range(70):
+            for i in range(30):
+                records.append((f"src/file_{f_idx:02}.py", str(i), line))
+        out = _format_search_results(records, capped=False)
+        # Did NOT collapse to Tier 3.
+        assert "Counts only" not in out
+        # Used a smaller-than-5 K — the header reports the chosen K.
+        # We don't assert the exact K (the analytical estimate may pick
+        # 1, 3, or 4), but we DO assert it's a per-file-samples result.
+        assert "showing first" in out
+        # And that it stayed within budget.
+        from turnstone.core.session import _SEARCH_OUTPUT_BUDGET
+
+        assert len(out) <= _SEARCH_OUTPUT_BUDGET
 
 
 class TestSearchCaptureStreaming:

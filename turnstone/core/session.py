@@ -196,8 +196,12 @@ def _encode_image_data_uri(raw: bytes, mime: str) -> str:
 # Upper bound on total skill content injected into system messages
 _MAX_SKILL_CONTENT: int = 32768
 
-# Maximum length (characters) for a single line in search results.
-# Lines longer than this are truncated to prevent context overflow from
+# Maximum length (characters) for the *content portion* of an emitted
+# search result line — i.e. everything after ``path:lineno:``. The path
+# and line-number prefix are intentionally not bounded by this constant
+# (paths can be long but they're informational and grep/rg won't emit
+# pathological values for them). Lines whose content exceeds this cap
+# get re-truncated with ``_SEARCH_TRUNCATION_SUFFIX`` to defend against
 # pathological files (minified blobs, base64 data, etc.).
 _MAX_SEARCH_LINE_LENGTH: int = 1024
 # Margin over the per-line cap before re-truncating, so backend-supplied
@@ -381,57 +385,82 @@ def _format_search_results(
     if not overflow:
         return "\n".join(chunks) + summary
 
-    # Pick K analytically rather than iterating the K=5/3/1 ladder and
-    # rebuilding ``chunks2`` from scratch on each retry. Sample the first
-    # ~32 records for an emitted-line-length estimate, then divide the
-    # budget by ``files * (avg + 1)`` to get a K that should fit in one
-    # pass. Floor at 80 so a corpus of unusually short lines doesn't push
-    # K artificially high (the estimate would underweight the per-line
-    # newline + the trailing "...and N more in <path>" notes). The fit
-    # check is preserved below — the estimate is approximate and Tier 3
-    # remains the safety net.
+    # Tier 2 header is added on return; budget for it up front so the
+    # final emission stays strictly within ``_SEARCH_OUTPUT_BUDGET`` and
+    # ``_truncate_output``'s head+tail strategy never kicks in (that
+    # strategy silently drops middle files alphabetically — exactly the
+    # shape we're trying to avoid for search results).
+    def _tier2_header(k_value: int) -> str:
+        h = (
+            f"({total} matches across {files} files — "
+            f"showing first {k_value}/file. Narrow the query or read_file "
+            f"a specific path for full content.)"
+        )
+        if capped:
+            h += " (raw output capped; counts may underreport.)"
+        return h
+
+    # Sample the first ~32 records for an emitted-line-length estimate,
+    # then seed K from ``budget / (files * avg)`` so we usually skip
+    # ladder rungs that won't fit in one pass. Floor avg at 80 so a
+    # corpus of unusually short lines doesn't push K artificially high
+    # (the estimate would underweight the per-line newline + trailing
+    # "...and N more in <path>" notes). The ladder iteration below is
+    # the safety net — the estimate is approximate.
     sample = records[:32]
     avg = max(
         80,
         sum(len(p) + len(ln) + len(c) + 3 for p, ln, c in sample) // max(1, len(sample)),
     )
     estimated_k = max(1, _SEARCH_OUTPUT_BUDGET // max(1, files * (avg + 1)))
-    k = min(_SEARCH_TIER2_SAMPLE_LADDER[0], estimated_k)
-    chunks2: list[str] = []
-    used2 = 0
-    fit = True
-    for path, matches in by_file.items():
-        head = matches[:k]
-        for lineno, content in head:
-            line = f"{path}:{lineno}:{content}"
-            chunks2.append(line)
-            used2 += len(line) + 1
-        if len(matches) > k:
-            note = f"  ...and {len(matches) - k} more in {path}"
-            chunks2.append(note)
-            used2 += len(note) + 1
-        if used2 > _SEARCH_OUTPUT_BUDGET:
-            fit = False
-            break
-    if fit:
-        header = (
-            f"({total} matches across {files} files — "
-            f"showing first {k}/file. Narrow the query or read_file "
-            f"a specific path for full content.)"
-        )
-        if capped:
-            header += " (raw output capped; counts may underreport.)"
-        return header + "\n\n" + "\n".join(chunks2)
+    # Iterate the ladder starting from the highest rung that's ≤ our
+    # estimate. If the chosen K's actual emission doesn't fit (the
+    # estimate ignored the header and over-counts compression from
+    # shared paths), step down to the next rung instead of jumping
+    # straight to Tier 3.
+    candidates = [k for k in _SEARCH_TIER2_SAMPLE_LADDER if k <= max(estimated_k, 1)]
+    if not candidates:
+        candidates = [_SEARCH_TIER2_SAMPLE_LADDER[-1]]
+    for k in candidates:
+        header = _tier2_header(k)
+        # Budget for header + the "\n\n" separator on return.
+        body_budget = _SEARCH_OUTPUT_BUDGET - len(header) - 2
+        chunks2: list[str] = []
+        used2 = 0
+        fit = True
+        for path, matches in by_file.items():
+            head = matches[:k]
+            for lineno, content in head:
+                line = f"{path}:{lineno}:{content}"
+                chunks2.append(line)
+                used2 += len(line) + 1
+            if len(matches) > k:
+                note = f"  ...and {len(matches) - k} more in {path}"
+                chunks2.append(note)
+                used2 += len(note) + 1
+            if used2 > body_budget:
+                fit = False
+                break
+        if fit:
+            return header + "\n\n" + "\n".join(chunks2)
 
     counts = sorted(by_file.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    tier3_header = (
+        f"({total} matches across {files} files — too many to show inline. "
+        f"Counts only; narrow the query or read_file a specific path.)"
+    )
+    if capped:
+        tier3_header += " (raw output capped; counts may underreport.)"
+    # Budget for header + the "\n\n" separator + the trailing
+    # "(plus N more files)" line so the final emission stays within
+    # ``_SEARCH_OUTPUT_BUDGET`` even when the count list is enormous.
+    tier3_body_budget = _SEARCH_OUTPUT_BUDGET - len(tier3_header) - 2 - _SEARCH_TIER3_TAIL_RESERVE
     body_lines: list[str] = []
     body_used = 0
     shown = 0
     for p, m in counts:
         line = f"{p}: {len(m)} matches"
-        # Reserve room for the "(plus N more files)" tail line so we don't
-        # blow the budget when the count list itself is enormous.
-        if body_used + len(line) + 1 + _SEARCH_TIER3_TAIL_RESERVE > _SEARCH_OUTPUT_BUDGET:
+        if body_used + len(line) + 1 > tier3_body_budget:
             break
         body_lines.append(line)
         body_used += len(line) + 1
@@ -442,13 +471,7 @@ def _format_search_results(
             f"(plus {files - shown} more files with {omitted_matches} matches between them)"
         )
     body = "\n".join(body_lines)
-    header = (
-        f"({total} matches across {files} files — too many to show inline. "
-        f"Counts only; narrow the query or read_file a specific path.)"
-    )
-    if capped:
-        header += " (raw output capped; counts may underreport.)"
-    return header + "\n\n" + body
+    return tier3_header + "\n\n" + body
 
 
 # Memory scopes accepted by the ``memory`` tool's preparer + executor.
@@ -8172,6 +8195,10 @@ class ChatSession:
                 while proc.stderr.read(_SEARCH_DRAIN_CHUNK):
                     pass  # discard tail so the child can finish writing
             except Exception:
+                # Drain is best-effort: the pipe may be closed mid-read
+                # when ``proc.kill()`` lands or the child exits. Raising
+                # here would leak the daemon thread's exception to
+                # stderr without affecting correctness; swallow silently.
                 pass
 
         drain_thread = threading.Thread(target=_drain_stderr, daemon=True)
@@ -8192,11 +8219,12 @@ class ChatSession:
             watchdog.cancel()
             drain_thread.join(timeout=_SEARCH_DRAIN_JOIN_TIMEOUT)
             for stream in (proc.stdout, proc.stderr):
-                try:
+                # ``close()`` can raise if the pipe is already torn down
+                # by ``proc.kill()`` or by the OS; we're in cleanup, so
+                # swallow rather than mask the real return path.
+                with contextlib.suppress(Exception):
                     if stream is not None:
                         stream.close()
-                except Exception:
-                    pass
 
         if timed_out[0]:
             raise subprocess.TimeoutExpired(args, self.tool_timeout)
@@ -8213,9 +8241,14 @@ class ChatSession:
 
             # ripgrep and grep share rc semantics: 0 = matches, 1 = no
             # matches, ≥2 = error. When ``capped`` is True we killed the
-            # child intentionally (byte-cap), so its negative rc is ours
-            # and we should treat the partial output as success.
-            if capped:
+            # child intentionally (byte-cap), so a negative rc is from
+            # our SIGKILL — normalise to 0 so the partial output flows
+            # through. But preserve a non-negative rc: there's a narrow
+            # race where the child can exit naturally between our read
+            # and our kill, and we don't want to silently swallow rg's
+            # rc=2 ("matches found but some files had errors") just
+            # because we also tripped the byte cap.
+            if capped and rc < 0:
                 rc = 0
 
             if rc == 1:
