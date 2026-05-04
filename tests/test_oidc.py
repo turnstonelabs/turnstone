@@ -17,9 +17,12 @@ import pytest
 from turnstone.core.oidc import (
     OIDCConfig,
     OIDCError,
+    OIDCKeyNotFoundError,
+    _sanitize_log_text,
     apply_role_mapping,
     build_authorize_url,
     discover_oidc,
+    exchange_code,
     generate_pkce_pair,
     initialize_oidc_state,
     load_oidc_config,
@@ -1119,6 +1122,24 @@ class TestValidateIDToken:
                 nonce="n",
             )
 
+    def test_validate_id_token_raises_keynotfound_for_unknown_kid(self):
+        """Unknown kid raises the OIDCKeyNotFoundError subclass, not generic OIDCError."""
+        config = _make_config()
+        jwks_data = {"keys": [{"kid": "other-key", "kty": "RSA"}]}
+
+        with (
+            patch("jwt.get_unverified_header", return_value={"kid": "unknown", "alg": "RS256"}),
+            pytest.raises(OIDCKeyNotFoundError) as exc_info,
+        ):
+            validate_id_token(
+                raw_token="bad.token",
+                jwks_data=jwks_data,
+                config=config,
+                nonce="n",
+            )
+        assert isinstance(exc_info.value, OIDCError)
+        assert "not found in JWKS" in str(exc_info.value)
+
     def test_validate_id_token_invalid_jwt(self):
         """Invalid JWT raises OIDCError."""
         config = _make_config()
@@ -1153,6 +1174,93 @@ class TestValidateIDToken:
                 config=config,
                 nonce="n",
             )
+
+
+# ---------------------------------------------------------------------------
+# Token Exchange
+# ---------------------------------------------------------------------------
+
+
+def _mock_async_post_client(mock_post):
+    """Build a patched httpx.AsyncClient context manager that supports POST."""
+
+    class _AsyncCtx:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def post(self, url, data=None):
+            return await mock_post(url, data)
+
+    return _AsyncCtx()
+
+
+class TestExchangeCode:
+    def test_exchange_code_rejects_non_dict_body(self):
+        """A 200 response whose JSON body isn't a JSON object must be rejected."""
+        config = _make_config()
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = [1, 2, 3]
+
+        async def _post(_url, _data):
+            return mock_response
+
+        async def _run():
+            client = _mock_async_post_client(_post)
+            with (
+                patch("httpx.AsyncClient", return_value=client),
+                pytest.raises(OIDCError, match="non-dict body"),
+            ):
+                await exchange_code(config, "code", "https://app.example.com/cb", "verifier")
+
+        asyncio.run(_run())
+
+    def test_exchange_code_error_body_is_sanitized(self):
+        """A 4xx response body containing CR/LF must not appear raw in the error message."""
+        config = _make_config()
+
+        mock_response = MagicMock()
+        mock_response.status_code = 400
+        mock_response.text = "evil\nlog injection\rline"
+
+        async def _post(_url, _data):
+            return mock_response
+
+        async def _run():
+            client = _mock_async_post_client(_post)
+            with (
+                patch("httpx.AsyncClient", return_value=client),
+                pytest.raises(OIDCError) as exc_info,
+            ):
+                await exchange_code(config, "code", "https://app.example.com/cb", "verifier")
+
+            msg = str(exc_info.value)
+            assert "\n" not in msg
+            assert "\r" not in msg
+            assert "evil" in msg
+            assert "log injection" in msg
+
+        asyncio.run(_run())
+
+
+class TestSanitizeLogText:
+    def test_sanitize_log_text_escapes_control_chars(self):
+        """CR/LF, NUL, and tab characters must be escaped, not preserved."""
+        out = _sanitize_log_text("a\r\nb\tc\x00d", 500)
+        assert "\r" not in out
+        assert "\n" not in out
+        assert "\t" not in out
+        assert "\x00" not in out
+        assert "a" in out and "b" in out and "c" in out and "d" in out
+
+    def test_sanitize_log_text_truncates_after_escape(self):
+        """The limit caps the rendered length, including the escape sequences."""
+        out = _sanitize_log_text("\n" * 100, 10)
+        assert len(out) == 10
 
 
 # ---------------------------------------------------------------------------
