@@ -19,9 +19,12 @@ import socket
 import urllib.parse
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 from turnstone.core.log import get_logger
 
@@ -30,6 +33,11 @@ log = get_logger(__name__)
 # Sentinel password hash for OIDC-provisioned users.
 # Not a valid bcrypt hash -- verify_password() always rejects it.
 OIDC_PASSWORD_SENTINEL = "!oidc"
+
+# Lifetime of an OIDC authorization-flow pending-state row. Bounds the window
+# between /authorize and /callback; longer than typical IdP latency, shorter
+# than a stale browser tab.
+OIDC_STATE_TTL_SECONDS = 300
 
 # Sanitisation pattern: only keep safe username characters.
 _USERNAME_SAFE_RE = re.compile(r"[^a-zA-Z0-9._-]")
@@ -103,7 +111,20 @@ def _sanitize_log_text(s: str, limit: int) -> str:
 
 @dataclass(frozen=True)
 class OIDCConfig:
-    """OIDC provider configuration -- immutable after startup."""
+    """OIDC provider configuration -- immutable after startup.
+
+    The dataclass has a two-phase lifecycle:
+
+    Startup-config fields (set by :func:`load_oidc_config`):
+        ``enabled``, ``issuer``, ``client_id``, ``client_secret``, ``scopes``,
+        ``provider_name``, ``role_claim``, ``role_map``, ``password_enabled``,
+        ``redirect_base``, ``trusted_endpoint_hosts``.
+
+    Discovery-derived fields (set by :func:`discover_oidc`; empty before
+    discovery completes):
+        ``authorization_endpoint``, ``token_endpoint``, ``userinfo_endpoint``,
+        ``jwks_uri``.
+    """
 
     enabled: bool = False
     issuer: str = ""
@@ -146,6 +167,22 @@ def _parse_trusted_endpoint_hosts(raw: str) -> tuple[str, ...]:
     return tuple(hosts)
 
 
+def _env_or_cfg_str(env_name: str, cfg: Mapping[str, Any], key: str, default: str = "") -> str:
+    """Resolve a string field: env var (stripped, non-empty) wins, else config, else default."""
+    val = os.environ.get(env_name, "").strip()
+    if not val:
+        val = str(cfg.get(key, default)).strip()
+    return val
+
+
+def _env_or_cfg_bool(env_name: str, cfg: Mapping[str, Any], key: str, default: bool) -> bool:
+    """Resolve a boolean field: env var (stripped) wins when set, else config, else default."""
+    raw = os.environ.get(env_name, "").strip().lower()
+    if raw:
+        return raw in ("true", "1", "yes")
+    return bool(cfg.get(key, default))
+
+
 def load_oidc_config() -> OIDCConfig:
     """Build :class:`OIDCConfig` from env vars with config.toml fallback.
 
@@ -156,30 +193,15 @@ def load_oidc_config() -> OIDCConfig:
 
     cfg = load_config("oidc")
 
-    # Start with config.toml values, then override with env vars.
-    issuer = os.environ.get("TURNSTONE_OIDC_ISSUER", "").strip()
-    if not issuer:
-        issuer = str(cfg.get("issuer", "")).strip()
-
-    client_id = os.environ.get("TURNSTONE_OIDC_CLIENT_ID", "").strip()
-    if not client_id:
-        client_id = str(cfg.get("client_id", "")).strip()
-
-    client_secret = os.environ.get("TURNSTONE_OIDC_CLIENT_SECRET", "").strip()
-    if not client_secret:
-        client_secret = str(cfg.get("client_secret", "")).strip()
-
-    scopes = os.environ.get("TURNSTONE_OIDC_SCOPES", "").strip()
-    if not scopes:
-        scopes = str(cfg.get("scopes", "openid email profile")).strip()
-
-    provider_name = os.environ.get("TURNSTONE_OIDC_PROVIDER_NAME", "").strip()
-    if not provider_name:
-        provider_name = str(cfg.get("provider_name", "SSO")).strip()
-
-    role_claim = os.environ.get("TURNSTONE_OIDC_ROLE_CLAIM", "").strip()
-    if not role_claim:
-        role_claim = str(cfg.get("role_claim", "")).strip()
+    issuer = _env_or_cfg_str("TURNSTONE_OIDC_ISSUER", cfg, "issuer")
+    client_id = _env_or_cfg_str("TURNSTONE_OIDC_CLIENT_ID", cfg, "client_id")
+    client_secret = _env_or_cfg_str("TURNSTONE_OIDC_CLIENT_SECRET", cfg, "client_secret")
+    scopes = _env_or_cfg_str("TURNSTONE_OIDC_SCOPES", cfg, "scopes", "openid email profile")
+    provider_name = _env_or_cfg_str("TURNSTONE_OIDC_PROVIDER_NAME", cfg, "provider_name", "SSO")
+    role_claim = _env_or_cfg_str("TURNSTONE_OIDC_ROLE_CLAIM", cfg, "role_claim")
+    password_enabled = _env_or_cfg_bool(
+        "TURNSTONE_OIDC_PASSWORD_ENABLED", cfg, "password_enabled", True
+    )
 
     # Role map: env var is "admin:builtin-admin,eng:builtin-operator"
     role_map_raw = os.environ.get("TURNSTONE_OIDC_ROLE_MAP", "").strip()
@@ -188,12 +210,6 @@ def load_oidc_config() -> OIDCConfig:
     else:
         cfg_role_map = cfg.get("role_map", {})
         role_map = dict(cfg_role_map) if isinstance(cfg_role_map, dict) else {}
-
-    password_raw = os.environ.get("TURNSTONE_OIDC_PASSWORD_ENABLED", "").strip().lower()
-    if password_raw:
-        password_enabled = password_raw in ("true", "1", "yes")
-    else:
-        password_enabled = bool(cfg.get("password_enabled", True))
 
     trusted_hosts_raw = os.environ.get("TURNSTONE_OIDC_TRUSTED_ENDPOINT_HOSTS", "").strip()
     if trusted_hosts_raw:
@@ -207,10 +223,9 @@ def load_oidc_config() -> OIDCConfig:
         else:
             trusted_endpoint_hosts = _parse_trusted_endpoint_hosts(str(cfg_trusted))
 
-    redirect_base = os.environ.get("TURNSTONE_OIDC_REDIRECT_BASE", "").strip()
-    if not redirect_base:
-        redirect_base = str(cfg.get("redirect_base", "")).strip()
-    redirect_base = redirect_base.rstrip("/")
+    redirect_base = _env_or_cfg_str("TURNSTONE_OIDC_REDIRECT_BASE", cfg, "redirect_base").rstrip(
+        "/"
+    )
     if redirect_base:
         parsed = urllib.parse.urlparse(redirect_base)
         if parsed.scheme not in ("https", "http"):
@@ -443,8 +458,9 @@ async def discover_oidc(
                 resp = await transient.get(url)
                 resp.raise_for_status()
                 doc = resp.json()
-    except Exception as exc:
-        log.warning("OIDC discovery failed for %s: %s", config.issuer, exc)
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        # ValueError covers json.JSONDecodeError (subclass).
+        log.warning("OIDC discovery failed for %s: %s", config.issuer, exc, exc_info=True)
         return dataclasses.replace(config, enabled=False)
 
     if not isinstance(doc, dict):
@@ -531,7 +547,7 @@ async def fetch_jwks(
     A long-lived ``client`` may be supplied to share connection pooling;
     when ``None`` a transient client is used.
 
-    Raises :class:`OIDCError` on network failures or malformed responses.
+    Raises :class:`OIDCError` on HTTP error or malformed JSON.
     """
     try:
         if client is not None:
@@ -543,7 +559,8 @@ async def fetch_jwks(
                 resp = await transient.get(jwks_uri)
                 resp.raise_for_status()
                 result = resp.json()
-    except Exception as exc:
+    except (httpx.HTTPError, ValueError) as exc:
+        # ValueError covers json.JSONDecodeError (subclass).
         raise OIDCError(f"JWKS fetch failed: {exc}") from exc
     if not isinstance(result.get("keys"), list):
         raise OIDCError("JWKS document missing 'keys' array")
@@ -640,12 +657,15 @@ async def close_oidc_state(app_state: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def generate_pkce_pair() -> tuple[str, str]:
-    """Generate a PKCE code_verifier and code_challenge pair."""
-    code_verifier = secrets.token_urlsafe(48)
-    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
-    code_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-    return code_verifier, code_challenge
+def generate_pkce_verifier() -> str:
+    """Generate a PKCE code_verifier.
+
+    The matching code_challenge is recomputed from the verifier inside
+    :func:`build_authorize_url`, so callers that only need the verifier
+    (the value stored in pending state for the callback's token exchange)
+    don't have to discard a separately-returned challenge.
+    """
+    return secrets.token_urlsafe(48)
 
 
 # ---------------------------------------------------------------------------
@@ -859,6 +879,12 @@ def provision_oidc_user(
     # they can access the app.  Skipping the per-row list_user_roles
     # round-trip is safe because nothing else has had a chance to assign
     # a role to this just-created user_id.
+    #
+    # ``assigned_by="oidc-default"`` deliberately differs from the
+    # ``"oidc"`` marker used by claim-driven role mapping: ``apply_role_mapping``
+    # only revokes rows tagged ``"oidc"`` when the corresponding claim
+    # disappears, so the safety-net role survives every subsequent login
+    # regardless of what the IdP sends in the claim.
     if not desired_role_ids and storage.get_role("builtin-viewer") is not None:
         storage.assign_role(user_id, "builtin-viewer", "oidc-default")
 

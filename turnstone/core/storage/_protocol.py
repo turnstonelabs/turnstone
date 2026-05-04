@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
 
 if TYPE_CHECKING:
     from turnstone.core.workstream import WorkstreamKind
@@ -16,6 +16,27 @@ class StorageConflictError(Exception):
     conflicted (e.g. ``"users.username"`` vs ``"oidc_identities.PRIMARY"``)
     when the backend can distinguish them.
     """
+
+
+class OIDCIdentity(TypedDict):
+    """Row shape returned by OIDC identity lookups."""
+
+    issuer: str
+    subject: str
+    user_id: str
+    email: str
+    created: str
+    last_login: str
+
+
+class OIDCPendingState(TypedDict):
+    """Row shape returned when popping a pending OIDC authorization-flow state."""
+
+    state: str
+    nonce: str
+    code_verifier: str
+    audience: str
+    created_at: str
 
 
 @runtime_checkable
@@ -729,7 +750,7 @@ class StorageBackend(Protocol):
         """Link an OIDC subject to a turnstone user. No-op if exists."""
         ...
 
-    def get_oidc_identity(self, issuer: str, subject: str) -> dict[str, str] | None:
+    def get_oidc_identity(self, issuer: str, subject: str) -> OIDCIdentity | None:
         """Lookup turnstone user by OIDC issuer+subject. Returns dict or None."""
         ...
 
@@ -737,7 +758,7 @@ class StorageBackend(Protocol):
         """Update last_login timestamp. Returns True if row existed."""
         ...
 
-    def list_oidc_identities_for_user(self, user_id: str) -> list[dict[str, str]]:
+    def list_oidc_identities_for_user(self, user_id: str) -> list[OIDCIdentity]:
         """List all OIDC identities linked to a turnstone user."""
         ...
 
@@ -755,7 +776,7 @@ class StorageBackend(Protocol):
 
     def pop_oidc_pending_state(
         self, state: str, max_age_seconds: int = 300
-    ) -> dict[str, str] | None:
+    ) -> OIDCPendingState | None:
         """Fetch and delete pending state atomically. Returns None if expired or missing."""
         ...
 

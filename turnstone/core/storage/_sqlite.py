@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 from turnstone.core.log import get_logger
+from turnstone.core.storage._protocol import OIDCIdentity, OIDCPendingState
 from turnstone.core.storage._schema import (
     api_tokens,
     audit_events,
@@ -4077,7 +4078,7 @@ class SQLiteBackend:
             )
             conn.commit()
 
-    def get_oidc_identity(self, issuer: str, subject: str) -> dict[str, str] | None:
+    def get_oidc_identity(self, issuer: str, subject: str) -> OIDCIdentity | None:
 
         with self._conn() as conn:
             row = conn.execute(
@@ -4093,14 +4094,14 @@ class SQLiteBackend:
                 )
             ).fetchone()
             if row:
-                return {
-                    "issuer": row[0],
-                    "subject": row[1],
-                    "user_id": row[2],
-                    "email": row[3],
-                    "created": row[4],
-                    "last_login": row[5],
-                }
+                return OIDCIdentity(
+                    issuer=row[0],
+                    subject=row[1],
+                    user_id=row[2],
+                    email=row[3],
+                    created=row[4],
+                    last_login=row[5],
+                )
             return None
 
     def update_oidc_identity_login(self, issuer: str, subject: str) -> bool:
@@ -4117,7 +4118,7 @@ class SQLiteBackend:
             conn.commit()
             return result.rowcount > 0
 
-    def list_oidc_identities_for_user(self, user_id: str) -> list[dict[str, str]]:
+    def list_oidc_identities_for_user(self, user_id: str) -> list[OIDCIdentity]:
 
         with self._conn() as conn:
             rows = conn.execute(
@@ -4133,14 +4134,14 @@ class SQLiteBackend:
                 .order_by(oidc_identities.c.created.desc())
             ).fetchall()
             return [
-                {
-                    "issuer": r[0],
-                    "subject": r[1],
-                    "user_id": r[2],
-                    "email": r[3],
-                    "created": r[4],
-                    "last_login": r[5],
-                }
+                OIDCIdentity(
+                    issuer=r[0],
+                    subject=r[1],
+                    user_id=r[2],
+                    email=r[3],
+                    created=r[4],
+                    last_login=r[5],
+                )
                 for r in rows
             ]
 
@@ -4177,7 +4178,7 @@ class SQLiteBackend:
 
     def pop_oidc_pending_state(
         self, state: str, max_age_seconds: int = 300
-    ) -> dict[str, str] | None:
+    ) -> OIDCPendingState | None:
 
         cutoff = (datetime.now(UTC) - timedelta(seconds=max_age_seconds)).strftime(
             "%Y-%m-%dT%H:%M:%S"
@@ -4202,13 +4203,13 @@ class SQLiteBackend:
             conn.commit()
             if not row:
                 return None
-            return {
-                "state": row[0],
-                "nonce": row[1],
-                "code_verifier": row[2],
-                "audience": row[3],
-                "created_at": row[4],
-            }
+            return OIDCPendingState(
+                state=row[0],
+                nonce=row[1],
+                code_verifier=row[2],
+                audience=row[3],
+                created_at=row[4],
+            )
 
     def cleanup_expired_oidc_states(self, max_age_seconds: int = 300) -> int:
 

@@ -203,6 +203,19 @@ TURNSTONE_OIDC_ROLE_MAP="admin:builtin-admin,engineering:builtin-operator,viewer
   the user authenticates via OIDC, so new group memberships are picked
   up on the next login.
 
+### `assigned_by` markers
+
+Role assignments record an `assigned_by` value that controls how the
+sync logic treats them. OIDC-driven flows use two distinct markers:
+
+- `oidc` — set by claim-driven role mapping; revoked automatically on
+  the next login when the corresponding claim value is no longer
+  present.
+- `oidc-default` — applied to brand-new OIDC users who have no
+  claim-mapped roles, as a safety net so they still get
+  `builtin-viewer` access on first login. Survives subsequent logins
+  regardless of claim contents and is never revoked by `apply_role_mapping`.
+
 ### Built-in Roles
 
 | Role ID | Permissions |

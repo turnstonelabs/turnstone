@@ -511,6 +511,49 @@ function _toggleOidcPanel(userId, username, rowEl) {
     });
 }
 
+function _buildOidcRow(oid, userId, username) {
+  var shortIssuer = _issuerShortName(oid.issuer || "");
+  var shortSubject =
+    (oid.subject || "").length > 12
+      ? (oid.subject || "").slice(0, 12) + "\u2026"
+      : oid.subject || "";
+  var lastLogin = oid.last_login ? _relativeTime(oid.last_login) : "never";
+  return (
+    '<div class="oidc-identity-row">' +
+    '<span class="oidc-identity-issuer"><span class="scope-badge">' +
+    escapeHtml(shortIssuer) +
+    "</span></span>" +
+    '<span class="oidc-identity-subject" title="' +
+    escapeHtml(oid.subject || "") +
+    '">' +
+    escapeHtml(shortSubject) +
+    "</span>" +
+    '<span class="oidc-identity-email" title="' +
+    escapeHtml(oid.email || "") +
+    '">' +
+    escapeHtml(oid.email || "\u2014") +
+    "</span>" +
+    '<span class="oidc-identity-time">' +
+    escapeHtml(lastLogin) +
+    "</span>" +
+    '<span class="oidc-identity-actions">' +
+    '<button class="admin-btn-danger" aria-label="Unlink ' +
+    escapeHtml(shortIssuer) +
+    " identity " +
+    escapeHtml(shortSubject) +
+    '" data-oidc-issuer="' +
+    escapeHtml(oid.issuer || "") +
+    '" data-oidc-subject="' +
+    escapeHtml(oid.subject || "") +
+    '" data-oidc-username="' +
+    escapeHtml(username) +
+    '" data-oidc-user-id="' +
+    escapeHtml(userId) +
+    '">unlink</button>' +
+    "</span></div>"
+  );
+}
+
 function _renderOidcDetail(panel, identities, userId, username) {
   var body = panel.querySelector(".oidc-detail-body");
   if (!body) return;
@@ -522,46 +565,7 @@ function _renderOidcDetail(panel, identities, userId, username) {
   }
   var html = "";
   for (var i = 0; i < identities.length; i++) {
-    var oid = identities[i];
-    var shortIssuer = _issuerShortName(oid.issuer || "");
-    var shortSubject =
-      (oid.subject || "").length > 12
-        ? (oid.subject || "").slice(0, 12) + "\u2026"
-        : oid.subject || "";
-    var lastLogin = oid.last_login ? _relativeTime(oid.last_login) : "never";
-    html +=
-      '<div class="oidc-identity-row">' +
-      '<span class="oidc-identity-issuer"><span class="scope-badge">' +
-      escapeHtml(shortIssuer) +
-      "</span></span>" +
-      '<span class="oidc-identity-subject" title="' +
-      escapeHtml(oid.subject || "") +
-      '">' +
-      escapeHtml(shortSubject) +
-      "</span>" +
-      '<span class="oidc-identity-email" title="' +
-      escapeHtml(oid.email || "") +
-      '">' +
-      escapeHtml(oid.email || "\u2014") +
-      "</span>" +
-      '<span class="oidc-identity-time">' +
-      escapeHtml(lastLogin) +
-      "</span>" +
-      '<span class="oidc-identity-actions">' +
-      '<button class="admin-btn-danger" aria-label="Unlink ' +
-      escapeHtml(shortIssuer) +
-      " identity " +
-      escapeHtml(shortSubject) +
-      '" data-oidc-issuer="' +
-      escapeHtml(oid.issuer || "") +
-      '" data-oidc-subject="' +
-      escapeHtml(oid.subject || "") +
-      '" data-oidc-username="' +
-      escapeHtml(username) +
-      '" data-oidc-user-id="' +
-      escapeHtml(userId) +
-      '">unlink</button>' +
-      "</span></div>";
+    html += _buildOidcRow(identities[i], userId, username);
   }
   body.innerHTML = html;
   // Update panel height for animation
