@@ -2688,6 +2688,9 @@ function showTabDropdown(chevronEl, wsId) {
   menu.style.top = my + "px";
   _tabDropdown = menu;
 
+  // Keyboard handler is mirrored by the console node-picker shim in
+  // turnstone/console/server.py (search for closeHandler in _JS_PROXY_SHIM).
+  // If you change the keys or filter selector here, change them there.
   _tabDropdownCloseHandler = function (e) {
     if (e.type === "keydown") {
       if (e.key === "Escape" || e.key === "Tab") {

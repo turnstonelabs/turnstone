@@ -1512,11 +1512,59 @@ class TestProxyRewriting:
         assert "window.fetch" in _JS_PROXY_SHIM
         assert "window.EventSource" in _JS_PROXY_SHIM
 
-    def test_console_banner_contains_placeholder(self):
-        from turnstone.console.server import _CONSOLE_BANNER_TEMPLATE
+    def test_js_shim_carries_node_id_placeholder(self):
+        """The picker reads the current node_id from the shim's _nodeId
+        closure variable; the placeholder must be present and substitutable."""
+        from turnstone.console.server import _JS_PROXY_SHIM
 
-        assert "NODE_ID_PLACEHOLDER" in _CONSOLE_BANNER_TEMPLATE
-        assert "Console" in _CONSOLE_BANNER_TEMPLATE
+        assert "NODE_ID_PLACEHOLDER" in _JS_PROXY_SHIM
+        replaced = _JS_PROXY_SHIM.replace("NODE_ID_PLACEHOLDER", "node-a")
+        assert "node-a" in replaced
+        assert "NODE_ID_PLACEHOLDER" not in replaced
+
+    def test_js_shim_includes_picker_pieces(self):
+        """Picker logic ships in the same IIFE as the prefix shim — verify
+        the moving parts are present so a future refactor doesn't silently
+        drop them.  /v1/api/cluster/nodes is the lazy-fetch target;
+        #ui-header is the DOM anchor; console-node-pill is the trigger
+        class; ws-tab-dropdown is the menu shell we share with the
+        workstream chevron menu (style + behaviour parity); ArrowDown is
+        the keyboard-nav primitive that disambiguates this from a plain
+        click-only menu."""
+        from turnstone.console.server import _JS_PROXY_SHIM
+
+        assert "/v1/api/cluster/nodes" in _JS_PROXY_SHIM
+        assert "ui-header" in _JS_PROXY_SHIM
+        assert "console-node-pill" in _JS_PROXY_SHIM
+        assert "ws-tab-dropdown" in _JS_PROXY_SHIM
+        assert "ArrowDown" in _JS_PROXY_SHIM
+        assert "DOMContentLoaded" in _JS_PROXY_SHIM
+
+    def test_proxy_style_drops_banner_styles(self):
+        """The legacy banner CSS classes (.console-banner, .ts-header-back-link
+        offsets, .dashboard-overlay top:32px hack) should be gone — the new
+        picker lives inside #ui-header and doesn't need overlay offsets."""
+        from turnstone.console.server import _CONSOLE_PROXY_STYLE
+
+        assert ".console-banner" not in _CONSOLE_PROXY_STYLE
+        assert "dashboard-overlay" not in _CONSOLE_PROXY_STYLE
+        assert ".console-node-pill" in _CONSOLE_PROXY_STYLE
+        assert ".console-node-menu" in _CONSOLE_PROXY_STYLE
+
+    def test_proxy_style_uses_canonical_degraded_color(self):
+        """Degraded health dot must use --accent (the canonical "needs
+        attention" token used by the cluster-overview node table at
+        console/static/style.css:548) and not --yellow.  Yellow is reserved
+        for the dash-state attention dot, a stronger signal."""
+        from turnstone.console.server import _CONSOLE_PROXY_STYLE
+
+        assert "console-node-menu-item-dot--degraded" in _CONSOLE_PROXY_STYLE
+        # The degraded rule sits on its own line; assert it uses --accent
+        # by checking the CSS substring has --accent and not --yellow.
+        idx = _CONSOLE_PROXY_STYLE.find("console-node-menu-item-dot--degraded")
+        rule = _CONSOLE_PROXY_STYLE[idx : idx + 200]
+        assert "var(--accent)" in rule
+        assert "var(--yellow)" not in rule
 
     def test_html_rewriting_changes_static_paths(self):
         """Simulate the proxy_index rewriting logic."""
@@ -1533,16 +1581,24 @@ class TestProxyRewriting:
         assert 'href="/static/' not in rewritten
         assert 'src="/static/' not in rewritten
 
-    def test_banner_injection_after_body(self):
-        """Simulate the banner injection logic."""
-        from turnstone.console.server import _CONSOLE_BANNER_TEMPLATE
+    def test_shim_injection_after_body(self):
+        """Simulate the proxy shim injection — the shim ships the node-id
+        and prefix as JS literals and renders the picker at runtime, so
+        we assert the substituted JS literals land in the page."""
+        from turnstone.console.server import _CONSOLE_PROXY_STYLE, _JS_PROXY_SHIM
 
         sample_html = "<html><body><div>content</div></body></html>"
-        banner = _CONSOLE_BANNER_TEMPLATE.replace("NODE_ID_PLACEHOLDER", "node-a")
-        result = sample_html.replace("<body>", "<body>" + banner, 1)
-        assert "node-a" in result
-        assert "Console" in result
-        assert result.startswith("<html><body><div")
+        prefix = "/node/node-a"
+        shim_js = _JS_PROXY_SHIM.replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix)).replace(
+            '"NODE_ID_PLACEHOLDER"', json.dumps("node-a")
+        )
+        injection = _CONSOLE_PROXY_STYLE + "<script>" + shim_js + "</script>"
+        result = sample_html.replace("<body>", "<body>" + injection, 1)
+        assert '"node-a"' in result
+        assert '"/node/node-a"' in result
+        assert "PREFIX_PLACEHOLDER" not in result
+        assert "NODE_ID_PLACEHOLDER" not in result
+        assert result.startswith("<html><body><style>")
 
 
 # ---------------------------------------------------------------------------
@@ -1777,17 +1833,15 @@ class TestProxySharedStatic:
     def test_proxy_shim_injected_in_html(self):
         """Verify shim is injected as inline script in proxied HTML."""
 
-        from turnstone.console.server import _CONSOLE_BANNER_TEMPLATE, _JS_PROXY_SHIM
+        from turnstone.console.server import _JS_PROXY_SHIM
 
         sample_html = "<html><body><div>content</div></body></html>"
         prefix = "/node/test-node"
-        banner = _CONSOLE_BANNER_TEMPLATE.replace("NODE_ID_PLACEHOLDER", "test-node")
-        shim = (
-            "<script>"
-            + _JS_PROXY_SHIM.replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix))
-            + "</script>"
+        shim_js = _JS_PROXY_SHIM.replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix)).replace(
+            '"NODE_ID_PLACEHOLDER"', json.dumps("test-node")
         )
-        result = sample_html.replace("<body>", "<body>" + banner + shim, 1)
+        shim = "<script>" + shim_js + "</script>"
+        result = sample_html.replace("<body>", "<body>" + shim, 1)
         assert "<script>" in result
         assert "/node/test-node" in result
         assert "window.fetch" in result
