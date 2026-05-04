@@ -1165,6 +1165,54 @@ class TestValidateIDToken:
                 nonce="n",
             )
 
+    def test_validate_id_token_retry_after_kid_rotation(self):
+        """Sign with a fresh key, miss old JWKS, succeed against rotated JWKS.
+
+        Drives the kid-not-found -> JWKS rotation -> retry path at the
+        ``validate_id_token`` unit level.  Uses real RSA signing so the
+        decoded claims come back through pyjwt rather than from a mock.
+        """
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from jwt.algorithms import RSAAlgorithm
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        priv_pem = key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+
+        new_jwk = RSAAlgorithm.to_jwk(key.public_key(), as_dict=True)
+        new_jwk["kid"] = "new-key"
+        new_jwk["alg"] = "RS256"
+
+        config = _make_config(issuer="https://idp.example.com")
+        token = pyjwt.encode(
+            {
+                "sub": "user1",
+                "aud": config.client_id,
+                "iss": config.issuer,
+                "nonce": "test-nonce",
+            },
+            priv_pem,
+            algorithm="RS256",
+            headers={"kid": "new-key"},
+        )
+
+        # Stale JWKS with an unrelated old key -> kid lookup fails.
+        old_jwks = {
+            "keys": [{"kid": "old-key", "kty": "RSA", "n": "abc", "e": "AQAB"}],
+        }
+        with pytest.raises(OIDCKeyNotFoundError):
+            validate_id_token(token, old_jwks, config, "test-nonce")
+
+        # Rotated JWKS includes the new key -> validation succeeds.
+        new_jwks = {"keys": [new_jwk]}
+        claims = validate_id_token(token, new_jwks, config, "test-nonce")
+        assert claims["sub"] == "user1"
+        assert claims["nonce"] == "test-nonce"
+
 
 # ---------------------------------------------------------------------------
 # Token Exchange
@@ -1233,6 +1281,194 @@ class TestExchangeCode:
             assert "\r" not in msg
             assert "evil" in msg
             assert "log injection" in msg
+
+        asyncio.run(_run())
+
+    def test_exchange_code_4xx_status_in_error(self):
+        """A 4xx response surfaces the status code in the OIDCError message."""
+        config = _make_config()
+
+        mock_response = MagicMock()
+        mock_response.status_code = 400
+        mock_response.text = "invalid_grant"
+
+        async def _post(_url, _data):
+            return mock_response
+
+        async def _run():
+            client = _mock_async_post_client(_post)
+            with (
+                patch("httpx.AsyncClient", return_value=client),
+                pytest.raises(OIDCError, match="returned 400"),
+            ):
+                await exchange_code(config, "code", "https://app.example.com/cb", "verifier")
+
+        asyncio.run(_run())
+
+    def test_exchange_code_5xx_status_in_error(self):
+        """A 5xx response surfaces the status code in the OIDCError message."""
+        config = _make_config()
+
+        mock_response = MagicMock()
+        mock_response.status_code = 500
+        mock_response.text = "internal error"
+
+        async def _post(_url, _data):
+            return mock_response
+
+        async def _run():
+            client = _mock_async_post_client(_post)
+            with (
+                patch("httpx.AsyncClient", return_value=client),
+                pytest.raises(OIDCError, match="returned 500"),
+            ):
+                await exchange_code(config, "code", "https://app.example.com/cb", "verifier")
+
+        asyncio.run(_run())
+
+    def test_exchange_code_network_error_wraps_to_oidc_error(self):
+        """``httpx.RequestError`` from the transport surfaces as ``OIDCError``."""
+        config = _make_config()
+
+        async def _post(_url, _data):
+            raise httpx.ConnectError("connection refused")
+
+        async def _run():
+            client = _mock_async_post_client(_post)
+            with (
+                patch("httpx.AsyncClient", return_value=client),
+                pytest.raises(OIDCError, match="Token exchange request failed"),
+            ):
+                await exchange_code(config, "code", "https://app.example.com/cb", "verifier")
+
+        asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# JWKS Fetch
+# ---------------------------------------------------------------------------
+
+
+def _mock_async_get_client(mock_get):
+    """Build a patched httpx.AsyncClient context manager that supports GET-with-timeout."""
+
+    class _AsyncCtx:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, timeout=None):
+            return await mock_get(url)
+
+    return _AsyncCtx()
+
+
+class TestFetchJWKS:
+    """Coverage for ``fetch_jwks`` failure modes — malformed responses must
+    surface as ``OIDCError`` rather than ``AttributeError``/``KeyError``.
+    """
+
+    def test_fetch_jwks_non_200_raises(self):
+        """Non-2xx response (raise_for_status fires) -> OIDCError."""
+        from turnstone.core.oidc import fetch_jwks
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "404", request=MagicMock(), response=mock_response
+        )
+
+        async def _get(_url):
+            return mock_response
+
+        async def _run():
+            client = _mock_async_get_client(_get)
+            with (
+                patch("httpx.AsyncClient", return_value=client),
+                pytest.raises(OIDCError, match="JWKS fetch failed"),
+            ):
+                await fetch_jwks("https://idp.example.com/jwks")
+
+        asyncio.run(_run())
+
+    def test_fetch_jwks_non_dict_body_raises(self):
+        """Body decoded as a list rather than a JSON object -> OIDCError."""
+        from turnstone.core.oidc import fetch_jwks
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = [1, 2, 3]
+        mock_response.raise_for_status = MagicMock()
+
+        async def _get(_url):
+            return mock_response
+
+        async def _run():
+            client = _mock_async_get_client(_get)
+            with (
+                patch("httpx.AsyncClient", return_value=client),
+                pytest.raises(OIDCError, match="not a JSON object"),
+            ):
+                await fetch_jwks("https://idp.example.com/jwks")
+
+        asyncio.run(_run())
+
+    def test_fetch_jwks_dict_missing_keys_raises(self):
+        """Body is a dict but lacks the ``keys`` array -> OIDCError."""
+        from turnstone.core.oidc import fetch_jwks
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"not_keys": []}
+        mock_response.raise_for_status = MagicMock()
+
+        async def _get(_url):
+            return mock_response
+
+        async def _run():
+            client = _mock_async_get_client(_get)
+            with (
+                patch("httpx.AsyncClient", return_value=client),
+                pytest.raises(OIDCError, match="missing 'keys' array"),
+            ):
+                await fetch_jwks("https://idp.example.com/jwks")
+
+        asyncio.run(_run())
+
+    def test_fetch_jwks_keys_not_a_list_raises(self):
+        """``keys`` present but not a list -> OIDCError (not iterable type)."""
+        from turnstone.core.oidc import fetch_jwks
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"keys": "definitely-not-a-list"}
+        mock_response.raise_for_status = MagicMock()
+
+        async def _get(_url):
+            return mock_response
+
+        async def _run():
+            client = _mock_async_get_client(_get)
+            with (
+                patch("httpx.AsyncClient", return_value=client),
+                pytest.raises(OIDCError, match="missing 'keys' array"),
+            ):
+                await fetch_jwks("https://idp.example.com/jwks")
+
+        asyncio.run(_run())
+
+    def test_fetch_jwks_network_error_raises(self):
+        """``httpx.RequestError`` from the transport -> OIDCError."""
+        from turnstone.core.oidc import fetch_jwks
+
+        async def _get(_url):
+            raise httpx.ConnectError("connection refused")
+
+        async def _run():
+            client = _mock_async_get_client(_get)
+            with (
+                patch("httpx.AsyncClient", return_value=client),
+                pytest.raises(OIDCError, match="JWKS fetch failed"),
+            ):
+                await fetch_jwks("https://idp.example.com/jwks")
 
         asyncio.run(_run())
 
@@ -1429,6 +1665,97 @@ class TestProvisionOIDCUser:
 
 
 # ---------------------------------------------------------------------------
+# Username derivation — UUID-retry fallback tiers
+# ---------------------------------------------------------------------------
+
+
+class TestDeriveUsername:
+    """Tier-3 (UUID-retry) and tier-4 (give-up) coverage for ``_derive_username``.
+
+    Tier 1 (sanitised candidate) and tier 2 (numeric suffix dedup) are
+    already exercised through ``TestProvisionOIDCUser``; these tests
+    drive the post-batch-6 fallback path that runs after every numeric
+    suffix collides.
+    """
+
+    def _claims(self) -> dict[str, str]:
+        return {
+            "sub": "sub-x",
+            "preferred_username": "bob",
+            "email": "bob@example.com",
+        }
+
+    def _all_numeric_candidates_taken(self) -> set[str]:
+        """The full set of tier-1 + tier-2 candidates ``_derive_username`` enumerates."""
+        return {"bob", *(f"bob{n}" for n in range(2, 11))}
+
+    def test_derive_username_falls_into_uuid_retry_when_all_suffixes_taken(self):
+        """All 10 numeric candidates taken -> tier 3 returns a UUID-suffixed username."""
+        config = _make_config()
+        storage = _mock_storage(existing_usernames=self._all_numeric_candidates_taken())
+        # First UUID candidate is free.
+        storage.get_user_by_username.return_value = None
+        new_user = {
+            "user_id": "u-new",
+            "username": "ignored-by-test",
+            "display_name": "Bob",
+            "password_hash": "!oidc",
+        }
+        storage.get_user.return_value = new_user
+
+        provision_oidc_user(storage, config, self._claims())
+
+        # The username actually persisted is the tier-3 UUID candidate.
+        called_with = storage.create_oidc_user.call_args[0][1]
+        assert called_with.startswith("bob")
+        # bob + 32-hex UUID hex == 35 chars total.
+        suffix = called_with[len("bob") :]
+        assert len(suffix) == 32
+        assert all(c in "0123456789abcdef" for c in suffix)
+        # Exactly one tier-3 lookup happened (no retry collision).
+        assert storage.get_user_by_username.call_count == 1
+
+    def test_derive_username_uuid_retry_succeeds_on_second_attempt(self):
+        """First UUID candidate collides; second attempt is free."""
+        config = _make_config()
+        storage = _mock_storage(existing_usernames=self._all_numeric_candidates_taken())
+        # First lookup: collision (existing user); second: free.
+        storage.get_user_by_username.side_effect = [
+            {"user_id": "other", "username": "bob-already-used"},
+            None,
+        ]
+        new_user = {
+            "user_id": "u-new",
+            "username": "ignored-by-test",
+            "display_name": "Bob",
+            "password_hash": "!oidc",
+        }
+        storage.get_user.return_value = new_user
+
+        provision_oidc_user(storage, config, self._claims())
+
+        assert storage.get_user_by_username.call_count == 2
+        # The username persisted is the second UUID candidate.
+        persisted = storage.create_oidc_user.call_args[0][1]
+        assert persisted.startswith("bob")
+        assert len(persisted) == len("bob") + 32
+
+    def test_derive_username_uuid_retry_exhausted_raises(self):
+        """All 3 UUID-retry attempts collide -> OIDCError raised."""
+        config = _make_config()
+        storage = _mock_storage(existing_usernames=self._all_numeric_candidates_taken())
+        # Every UUID candidate hits an existing user.
+        storage.get_user_by_username.return_value = {"user_id": "other", "username": "x"}
+
+        with pytest.raises(OIDCError, match="Failed to generate unique username"):
+            provision_oidc_user(storage, config, self._claims())
+
+        # Tier 3 is bounded to 3 attempts.
+        assert storage.get_user_by_username.call_count == 3
+        storage.create_oidc_user.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Role Mapping
 # ---------------------------------------------------------------------------
 
@@ -1566,6 +1893,35 @@ class TestApplyRoleMapping:
         storage.get_role.return_value = {"role_id": "some-role"}
 
         claims = {"sub": "u1"}  # no "groups" key
+        apply_role_mapping(storage, "u1", claims, config)
+
+        storage.replace_oidc_roles.assert_called_once_with("u1", set())
+
+    def test_apply_role_mapping_int_claim(self):
+        """Numeric claim values stringify before role_map lookup (no crash)."""
+        config = _make_config(
+            role_claim="roles",
+            role_map={"42": "builtin-viewer"},
+        )
+        storage = _mock_storage(role={"role_id": "builtin-viewer", "name": "Viewer"})
+
+        claims = {"sub": "u1", "roles": 42}
+        apply_role_mapping(storage, "u1", claims, config)
+
+        storage.replace_oidc_roles.assert_called_once_with("u1", {"builtin-viewer"})
+
+    def test_apply_role_mapping_dict_claim(self):
+        """Dict claim values stringify but won't reliably hit role_map -> empty set."""
+        config = _make_config(
+            role_claim="roles",
+            role_map={"admin": "builtin-admin"},
+        )
+        storage = _mock_storage()
+
+        # Dict reprs are unstable across runtime versions, so callers cannot
+        # reasonably configure role_map keys to match.  The contract is just
+        # "don't crash".
+        claims = {"sub": "u1", "roles": {"role": "admin"}}
         apply_role_mapping(storage, "u1", claims, config)
 
         storage.replace_oidc_roles.assert_called_once_with("u1", set())
