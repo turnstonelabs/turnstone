@@ -291,9 +291,9 @@ class TestOIDCCallback:
     ) -> None:
         storage.create_oidc_pending_state(state, nonce, code_verifier, audience)
 
-    @patch("turnstone.core.oidc.provision_oidc_user")
-    @patch("turnstone.core.oidc.validate_id_token")
-    @patch("turnstone.core.oidc.exchange_code", new_callable=AsyncMock)
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
     def test_happy_path(
         self,
         mock_exchange: AsyncMock,
@@ -380,7 +380,7 @@ class TestOIDCCallback:
         assert resp.status_code == 302
         assert "Login+session+expired" in resp.headers["location"]
 
-    @patch("turnstone.core.oidc.exchange_code", new_callable=AsyncMock)
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
     def test_code_exchange_failure(
         self,
         mock_exchange: AsyncMock,
@@ -397,8 +397,8 @@ class TestOIDCCallback:
         assert resp.status_code == 302
         assert "Authentication+failed" in resp.headers["location"]
 
-    @patch("turnstone.core.oidc.validate_id_token")
-    @patch("turnstone.core.oidc.exchange_code", new_callable=AsyncMock)
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
     def test_token_validation_failure(
         self,
         mock_exchange: AsyncMock,
@@ -417,10 +417,10 @@ class TestOIDCCallback:
         assert resp.status_code == 302
         assert "Authentication+failed" in resp.headers["location"]
 
-    @patch("turnstone.core.oidc.provision_oidc_user")
-    @patch("turnstone.core.oidc.validate_id_token")
-    @patch("turnstone.core.oidc.fetch_jwks", new_callable=AsyncMock)
-    @patch("turnstone.core.oidc.exchange_code", new_callable=AsyncMock)
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.fetch_jwks", new_callable=AsyncMock)
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
     def test_jwks_key_rotation_retry(
         self,
         mock_exchange: AsyncMock,
@@ -451,10 +451,10 @@ class TestOIDCCallback:
         mock_fetch_jwks.assert_called_once()
         assert mock_validate.call_count == 2
 
-    @patch("turnstone.core.oidc.provision_oidc_user")
-    @patch("turnstone.core.oidc.validate_id_token")
-    @patch("turnstone.core.oidc.fetch_jwks", new_callable=AsyncMock)
-    @patch("turnstone.core.oidc.exchange_code", new_callable=AsyncMock)
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.fetch_jwks", new_callable=AsyncMock)
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
     def test_callback_uses_keynotfound_for_jwks_retry(
         self,
         mock_exchange: AsyncMock,
@@ -485,7 +485,7 @@ class TestOIDCCallback:
         mock_fetch_jwks.assert_called_once()
         assert mock_validate.call_count == 2
 
-    @patch("turnstone.core.oidc.exchange_code", new_callable=AsyncMock)
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
     def test_callback_returns_authentication_failed_on_missing_id_token(
         self,
         mock_exchange: AsyncMock,
@@ -503,9 +503,9 @@ class TestOIDCCallback:
         assert resp.status_code == 302
         assert "oidc_error=Authentication+failed" in resp.headers["location"]
 
-    @patch("turnstone.core.oidc.provision_oidc_user")
-    @patch("turnstone.core.oidc.validate_id_token")
-    @patch("turnstone.core.oidc.exchange_code", new_callable=AsyncMock)
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
     def test_no_users_after_oidc_success_redirects_setup(
         self,
         mock_exchange: AsyncMock,
@@ -560,9 +560,9 @@ class TestOIDCCallback:
         assert "oidc_error" in resp.headers["location"]
         assert "Too+many" in resp.headers["location"]
 
-    @patch("turnstone.core.oidc.provision_oidc_user")
-    @patch("turnstone.core.oidc.validate_id_token")
-    @patch("turnstone.core.oidc.exchange_code", new_callable=AsyncMock)
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
     def test_setup_gate_uses_count_users_not_full_scan(
         self,
         mock_exchange: AsyncMock,
@@ -597,9 +597,9 @@ class TestOIDCCallback:
         count_spy.assert_called_once_with()
         list_spy.assert_not_called()
 
-    @patch("turnstone.core.oidc.provision_oidc_user")
-    @patch("turnstone.core.oidc.validate_id_token")
-    @patch("turnstone.core.oidc.exchange_code", new_callable=AsyncMock)
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
     def test_state_cleanup_is_gated(
         self,
         mock_exchange: AsyncMock,
@@ -633,10 +633,10 @@ class TestOIDCCallback:
 
         assert cleanup_spy.call_count == 1
 
-    @patch("turnstone.core.oidc.provision_oidc_user")
-    @patch("turnstone.core.oidc.validate_id_token")
-    @patch("turnstone.core.oidc.fetch_jwks", new_callable=AsyncMock)
-    @patch("turnstone.core.oidc.exchange_code", new_callable=AsyncMock)
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.fetch_jwks", new_callable=AsyncMock)
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
     def test_jwks_refetch_dedup_when_kid_appears(
         self,
         mock_exchange: AsyncMock,

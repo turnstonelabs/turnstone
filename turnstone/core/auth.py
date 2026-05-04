@@ -36,6 +36,17 @@ if TYPE_CHECKING:
     from turnstone.core.oidc import OIDCConfig
 
 from turnstone.core.log import get_logger
+from turnstone.core.oidc import (
+    OIDC_STATE_TTL_SECONDS,
+    OIDCError,
+    OIDCKeyNotFoundError,
+    build_authorize_url,
+    exchange_code,
+    fetch_jwks,
+    generate_pkce_verifier,
+    provision_oidc_user,
+    validate_id_token,
+)
 
 log = get_logger(__name__)
 
@@ -1430,11 +1441,9 @@ async def handle_oidc_authorize(request: Request, audience: str) -> Response:
             status_code=403,
         )
 
-    from turnstone.core.oidc import build_authorize_url, generate_pkce_pair
-
     state = secrets.token_urlsafe(32)
     nonce = secrets.token_urlsafe(32)
-    code_verifier, _code_challenge = generate_pkce_pair()
+    code_verifier = generate_pkce_verifier()
 
     # Store pending state in database
     await asyncio.to_thread(
@@ -1472,8 +1481,6 @@ async def _refetch_jwks_locked(
     another concurrent caller already refreshed the cache to include *kid*
     we return the existing snapshot without issuing another network call.
     """
-    from turnstone.core.oidc import fetch_jwks
-
     lock = getattr(request.app.state, "jwks_refetch_lock", None)
     if lock is None:
         lock = asyncio.Lock()
@@ -1522,7 +1529,7 @@ async def handle_oidc_callback(request: Request, audience: str) -> Response:
     if now_mono - last_cleanup > _OIDC_STATE_CLEANUP_INTERVAL_S:
         request.app.state.oidc_last_cleanup_monotonic = now_mono
         try:
-            await asyncio.to_thread(storage.cleanup_expired_oidc_states, 300)
+            await asyncio.to_thread(storage.cleanup_expired_oidc_states, OIDC_STATE_TTL_SECONDS)
         except Exception:
             log.debug("OIDC state cleanup failed", exc_info=True)
 
@@ -1539,7 +1546,7 @@ async def handle_oidc_callback(request: Request, audience: str) -> Response:
 
     # Validate state
     state = request.query_params.get("state", "")
-    pending = await asyncio.to_thread(storage.pop_oidc_pending_state, state, 300)
+    pending = await asyncio.to_thread(storage.pop_oidc_pending_state, state, OIDC_STATE_TTL_SECONDS)
     if not pending:
         _record_oidc_failure()
         return RedirectResponse("/?oidc_error=Login+session+expired", status_code=302)
@@ -1548,14 +1555,6 @@ async def handle_oidc_callback(request: Request, audience: str) -> Response:
     redirect_uri = _build_oidc_redirect_uri(oidc_config)
 
     try:
-        from turnstone.core.oidc import (
-            OIDCError,
-            OIDCKeyNotFoundError,
-            exchange_code,
-            provision_oidc_user,
-            validate_id_token,
-        )
-
         # Exchange code for tokens
         code = request.query_params.get("code", "")
         http_client = getattr(request.app.state, "oidc_http_client", None)
@@ -1631,9 +1630,12 @@ async def handle_oidc_callback(request: Request, audience: str) -> Response:
     scopes = _permissions_to_scopes(perms)
     jwt_token = ""
     if jwt_secret:
-        # Use the audience stored during authorize (not the handler param)
-        # to bind the JWT to the service that initiated the flow
-        jwt_audience = pending.get("audience", audience)
+        # Bind the JWT to the audience stored at /authorize so it cannot be
+        # silently re-targeted at the callback's handler-supplied audience.
+        # ``pending["audience"]`` is always present (NOT NULL TEXT column,
+        # filled by create_oidc_pending_state); falling back to *audience*
+        # only matters if the column ever holds an empty string.
+        jwt_audience = pending.get("audience") or audience
         jwt_token = create_jwt(
             user_id=user["user_id"],
             scopes=scopes,

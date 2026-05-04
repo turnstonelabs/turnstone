@@ -24,7 +24,7 @@ from turnstone.core.oidc import (
     build_authorize_url,
     discover_oidc,
     exchange_code,
-    generate_pkce_pair,
+    generate_pkce_verifier,
     initialize_oidc_state,
     load_oidc_config,
     provision_oidc_user,
@@ -941,31 +941,18 @@ class TestBuildOIDCRedirectURI:
 
 
 class TestPKCE:
-    def test_generate_pkce_pair(self):
-        verifier, challenge = generate_pkce_pair()
+    def test_generate_pkce_verifier_shape(self):
+        verifier = generate_pkce_verifier()
 
         # Verifier should be URL-safe base64
         assert isinstance(verifier, str)
         assert len(verifier) > 40  # 48 bytes -> ~64 chars
 
-        # Challenge should be base64url SHA-256 of verifier
-        expected_digest = hashlib.sha256(verifier.encode("ascii")).digest()
-        expected_challenge = base64.urlsafe_b64encode(expected_digest).rstrip(b"=").decode("ascii")
-        assert challenge == expected_challenge
-
-    def test_pkce_challenge_matches_verifier(self):
-        """Manually compute challenge and verify it matches."""
-        verifier, challenge = generate_pkce_pair()
-        digest = hashlib.sha256(verifier.encode("ascii")).digest()
-        manual_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-        assert challenge == manual_challenge
-
-    def test_pkce_pair_uniqueness(self):
-        """Each call should produce a unique pair."""
-        v1, c1 = generate_pkce_pair()
-        v2, c2 = generate_pkce_pair()
+    def test_pkce_verifier_uniqueness(self):
+        """Each call should produce a unique verifier."""
+        v1 = generate_pkce_verifier()
+        v2 = generate_pkce_verifier()
         assert v1 != v2
-        assert c1 != c2
 
 
 # ---------------------------------------------------------------------------
@@ -976,7 +963,7 @@ class TestPKCE:
 class TestBuildAuthorizeURL:
     def test_build_authorize_url_contains_required_params(self):
         config = _make_config()
-        verifier, _ = generate_pkce_pair()
+        verifier = generate_pkce_verifier()
         url = build_authorize_url(
             config=config,
             redirect_uri="https://app.example.com/callback",
@@ -998,7 +985,7 @@ class TestBuildAuthorizeURL:
     def test_build_authorize_url_pkce(self):
         """code_challenge in URL should be correct S256 of the verifier."""
         config = _make_config()
-        verifier, _ = generate_pkce_pair()
+        verifier = generate_pkce_verifier()
 
         url = build_authorize_url(
             config=config,
@@ -1020,7 +1007,7 @@ class TestBuildAuthorizeURL:
 
     def test_build_authorize_url_redirect_uri_encoded(self):
         config = _make_config()
-        verifier, _ = generate_pkce_pair()
+        verifier = generate_pkce_verifier()
         redirect = "https://app.example.com/callback?extra=1"
 
         url = build_authorize_url(
