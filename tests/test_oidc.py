@@ -15,8 +15,8 @@ import httpx
 import jwt as pyjwt
 import pytest
 
+from tests.conftest import make_oidc_test_config as _make_config
 from turnstone.core.oidc import (
-    OIDCConfig,
     OIDCError,
     OIDCKeyNotFoundError,
     _ensure_default_role,
@@ -37,27 +37,6 @@ from turnstone.core.oidc import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _make_config(**overrides) -> OIDCConfig:
-    """Build a test OIDCConfig with sensible defaults."""
-    defaults = {
-        "enabled": True,
-        "issuer": "https://idp.example.com",
-        "client_id": "my-client",
-        "client_secret": "my-secret",
-        "scopes": "openid email profile",
-        "provider_name": "TestIDP",
-        "role_claim": "",
-        "role_map": {},
-        "password_enabled": True,
-        "authorization_endpoint": "https://idp.example.com/authorize",
-        "token_endpoint": "https://idp.example.com/token",
-        "userinfo_endpoint": "https://idp.example.com/userinfo",
-        "jwks_uri": "https://idp.example.com/.well-known/jwks.json",
-    }
-    defaults.update(overrides)
-    return OIDCConfig(**defaults)
 
 
 def _mock_storage(**overrides):
