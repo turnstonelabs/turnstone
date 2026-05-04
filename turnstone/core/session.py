@@ -195,6 +195,11 @@ def _encode_image_data_uri(raw: bytes, mime: str) -> str:
 # Upper bound on total skill content injected into system messages
 _MAX_SKILL_CONTENT: int = 32768
 
+# Maximum length (bytes) for a single line in search results.
+# Lines longer than this are truncated to prevent context overflow from
+# pathological files (minified blobs, base64 data, etc.).
+_MAX_SEARCH_LINE_LENGTH: int = 1024
+
 # Memory scopes accepted by the ``memory`` tool's preparer + executor.
 # Single source of truth — every action validator imports this rather
 # than literal-listing the four values, so adding a fifth scope is a
@@ -7876,7 +7881,7 @@ class ChatSession:
                     "-I",
                     "-E",
                     "-m",
-                    "200",  # max matches per file
+                    "100",  # max matches per file
                     "--color=never",  # no ANSI codes in output
                     # Skip common build/vendor/VCS directories
                     "--exclude-dir=.git",
@@ -7907,6 +7912,21 @@ class ChatSession:
                 output = "(no matches)"
             elif result.returncode > 1:
                 output = result.stderr.strip() or f"grep error (exit {result.returncode})"
+
+            # Truncate individual lines to prevent context overflow from
+            # pathological long lines (minified blobs, base64 data, etc.)
+            if result.returncode == 0 and output:
+                lines = output.splitlines()
+                truncated_lines = []
+                for line in lines:
+                    if len(line) > _MAX_SEARCH_LINE_LENGTH:
+                        truncated_lines.append(
+                            line[:_MAX_SEARCH_LINE_LENGTH]
+                            + f"...[truncated, line length > {_MAX_SEARCH_LINE_LENGTH}]"
+                        )
+                    else:
+                        truncated_lines.append(line)
+                output = "\n".join(truncated_lines)
 
             # Count matches and files BEFORE truncation
             match_count = output.count("\n") + 1 if result.returncode == 0 and output else 0
