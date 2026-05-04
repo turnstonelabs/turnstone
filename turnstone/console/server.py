@@ -4209,31 +4209,10 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     scheduler = getattr(app.state, "scheduler", None)
     if scheduler is not None:
         scheduler.start()
-    # OIDC discovery (if configured)
-    oidc_config = app.state.oidc_config
-    if oidc_config.enabled:
-        from turnstone.core.oidc import discover_oidc
+    from turnstone.core.oidc import initialize_oidc_state
 
-        try:
-            oidc_config = await discover_oidc(oidc_config)
-            app.state.oidc_config = oidc_config
-        except Exception:
-            log.warning("OIDC discovery failed — OIDC login disabled", exc_info=True)
-        if oidc_config.enabled and oidc_config.jwks_uri:
-            try:
-                from turnstone.core.oidc import fetch_jwks
+    await initialize_oidc_state(app.state)
 
-                app.state.jwks_data = await fetch_jwks(oidc_config.jwks_uri)
-                log.info(
-                    "OIDC enabled: %s (%s)",
-                    oidc_config.provider_name,
-                    oidc_config.issuer,
-                )
-            except Exception:
-                log.warning(
-                    "OIDC JWKS prefetch failed — will retry on first login",
-                    exc_info=True,
-                )
     # Register console in service registry so other services can discover it
     console_url = getattr(app.state, "console_url", "")
     _console_heartbeat_task: Any = None

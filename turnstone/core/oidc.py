@@ -413,6 +413,14 @@ async def discover_oidc(config: OIDCConfig) -> OIDCConfig:
         log.warning("OIDC discovery failed for %s: %s", config.issuer, exc)
         return dataclasses.replace(config, enabled=False)
 
+    if not isinstance(doc, dict):
+        log.warning(
+            "OIDC discovery document for %s is not a JSON object (got %s)",
+            config.issuer,
+            type(doc).__name__,
+        )
+        return dataclasses.replace(config, enabled=False)
+
     authorization_endpoint = str(doc.get("authorization_endpoint", ""))
     token_endpoint = str(doc.get("token_endpoint", ""))
     userinfo_endpoint = str(doc.get("userinfo_endpoint", ""))
@@ -494,6 +502,55 @@ async def fetch_jwks(jwks_uri: str) -> dict[str, Any]:
     if not isinstance(result.get("keys"), list):
         raise OIDCError("JWKS document missing 'keys' array")
     return result
+
+
+# ---------------------------------------------------------------------------
+# Lifespan integration
+# ---------------------------------------------------------------------------
+
+
+async def initialize_oidc_state(app_state: Any) -> None:
+    """Run OIDC discovery + JWKS prefetch and stash results on ``app_state``.
+
+    Reads ``app_state.oidc_config`` (already set to a non-discovered config
+    by the lifespan), runs :func:`discover_oidc` and :func:`fetch_jwks`, and
+    writes back the populated ``oidc_config`` plus ``jwks_data``. On any
+    failure the helper guarantees ``oidc_config.enabled is False`` and
+    ``jwks_data is None`` -- the caller does not need defensive logic.
+    """
+    cfg: OIDCConfig = app_state.oidc_config
+    if not cfg.enabled:
+        app_state.jwks_data = None
+        return
+
+    # Discovery is operator-controlled config; any unexpected failure must
+    # disable OIDC rather than escape and bring down the whole service.
+    try:
+        cfg = await discover_oidc(cfg)
+    except Exception:
+        log.warning("OIDC discovery failed -- OIDC login disabled", exc_info=True)
+        app_state.oidc_config = dataclasses.replace(cfg, enabled=False)
+        app_state.jwks_data = None
+        return
+
+    if not cfg.enabled:
+        app_state.oidc_config = cfg
+        app_state.jwks_data = None
+        return
+
+    try:
+        jwks_data = await fetch_jwks(cfg.jwks_uri)
+    except OIDCError:
+        # Keep enabled=True so the callback's lazy-fetch retry path can
+        # recover if the IdP transiently failed during startup.
+        log.warning("OIDC JWKS prefetch failed -- will retry on first login", exc_info=True)
+        app_state.oidc_config = cfg
+        app_state.jwks_data = None
+        return
+
+    app_state.oidc_config = cfg
+    app_state.jwks_data = jwks_data
+    log.info("OIDC enabled: %s (%s)", cfg.provider_name, cfg.issuer)
 
 
 # ---------------------------------------------------------------------------

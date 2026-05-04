@@ -3391,31 +3391,11 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                 log.warning("attachments.orphan_sweep.periodic_failed", exc_info=True)
 
     _orphan_sweep_task = asyncio.create_task(_orphan_sweep_loop())
-    # OIDC discovery (if configured)
-    oidc_config = app.state.oidc_config
-    if oidc_config.enabled:
-        from turnstone.core.oidc import discover_oidc
 
-        try:
-            oidc_config = await discover_oidc(oidc_config)
-            app.state.oidc_config = oidc_config
-        except Exception:
-            log.warning("OIDC discovery failed — OIDC login disabled", exc_info=True)
-        if oidc_config.enabled and oidc_config.jwks_uri:
-            try:
-                from turnstone.core.oidc import fetch_jwks
+    from turnstone.core.oidc import initialize_oidc_state
 
-                app.state.jwks_data = await fetch_jwks(oidc_config.jwks_uri)
-                log.info(
-                    "OIDC enabled: %s (%s)",
-                    oidc_config.provider_name,
-                    oidc_config.issuer,
-                )
-            except Exception:
-                log.warning(
-                    "OIDC JWKS prefetch failed — will retry on first login",
-                    exc_info=True,
-                )
+    await initialize_oidc_state(app.state)
+
     # TLS: start auto-renewal if client was initialized
     tls_client = getattr(app.state, "tls_client", None)
     if tls_client is not None:

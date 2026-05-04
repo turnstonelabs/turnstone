@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import hashlib
+import types
 import urllib.parse
 from unittest.mock import MagicMock, patch
 
@@ -19,6 +21,7 @@ from turnstone.core.oidc import (
     build_authorize_url,
     discover_oidc,
     generate_pkce_pair,
+    initialize_oidc_state,
     load_oidc_config,
     provision_oidc_user,
     validate_discovered_endpoint,
@@ -1588,6 +1591,131 @@ class TestDiscoverOIDC:
             assert result.enabled is False
 
         asyncio.run(_run())
+
+    def test_discover_oidc_handles_non_dict_response(self):
+        """IdP returning a list/null body must not raise AttributeError."""
+        config = _make_config(
+            authorization_endpoint="",
+            token_endpoint="",
+            userinfo_endpoint="",
+            jwks_uri="",
+        )
+
+        for payload in (["not", "a", "dict"], None, "string-body", 42):
+            mock_response = MagicMock()
+            mock_response.json.return_value = payload
+            mock_response.raise_for_status = MagicMock()
+
+            async def _run(resp=mock_response):
+                client = _mock_async_client(lambda url: _async_return(resp))
+                with (
+                    patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
+                    patch("httpx.AsyncClient", return_value=client),
+                ):
+                    return await discover_oidc(config)
+
+            result = asyncio.run(_run())
+            assert result.enabled is False
+
+
+# ---------------------------------------------------------------------------
+# Lifespan integration: initialize_oidc_state
+# ---------------------------------------------------------------------------
+
+
+class TestInitializeOIDCState:
+    def test_initialize_skips_when_disabled(self):
+        """Disabled config: jwks_data set to None, oidc_config unchanged."""
+        cfg = _make_config(enabled=False)
+        state = types.SimpleNamespace(oidc_config=cfg, jwks_data="stale")
+
+        asyncio.run(initialize_oidc_state(state))
+
+        assert state.oidc_config is cfg
+        assert state.jwks_data is None
+
+    def test_initialize_disables_on_discovery_exception(self):
+        """Unexpected exception in discovery -> enabled flipped to False."""
+        cfg = _make_config(
+            authorization_endpoint="",
+            token_endpoint="",
+            jwks_uri="",
+        )
+        state = types.SimpleNamespace(oidc_config=cfg, jwks_data=None)
+
+        async def _boom(_cfg):
+            raise RuntimeError("boom")
+
+        with patch("turnstone.core.oidc.discover_oidc", side_effect=_boom):
+            asyncio.run(initialize_oidc_state(state))
+
+        assert state.oidc_config.enabled is False
+        assert state.jwks_data is None
+
+    def test_initialize_disables_on_discovery_returning_disabled(self):
+        """Discovery returns enabled=False (e.g. SSRF reject) -> propagate."""
+        cfg = _make_config(
+            authorization_endpoint="",
+            token_endpoint="",
+            jwks_uri="",
+        )
+        state = types.SimpleNamespace(oidc_config=cfg, jwks_data=None)
+
+        disabled_cfg = dataclasses.replace(cfg, enabled=False)
+
+        async def _disabled(_cfg):
+            return disabled_cfg
+
+        with patch("turnstone.core.oidc.discover_oidc", side_effect=_disabled):
+            asyncio.run(initialize_oidc_state(state))
+
+        assert state.oidc_config is disabled_cfg
+        assert state.oidc_config.enabled is False
+        assert state.jwks_data is None
+
+    def test_initialize_keeps_enabled_but_no_jwks_on_jwks_failure(self):
+        """JWKS fetch failure preserves enabled=True for lazy retry."""
+        cfg = _make_config()
+        state = types.SimpleNamespace(oidc_config=cfg, jwks_data=None)
+
+        async def _ok(c):
+            return c
+
+        async def _jwks_boom(_uri):
+            raise OIDCError("jwks down")
+
+        with (
+            patch("turnstone.core.oidc.discover_oidc", side_effect=_ok),
+            patch("turnstone.core.oidc.fetch_jwks", side_effect=_jwks_boom),
+        ):
+            asyncio.run(initialize_oidc_state(state))
+
+        assert state.oidc_config.enabled is True
+        assert state.oidc_config is cfg
+        assert state.jwks_data is None
+
+    def test_initialize_success(self):
+        """Both discovery and JWKS prefetch succeed."""
+        cfg = _make_config()
+        state = types.SimpleNamespace(oidc_config=cfg, jwks_data=None)
+
+        jwks = {"keys": [{"kid": "k1", "kty": "RSA"}]}
+
+        async def _ok(c):
+            return c
+
+        async def _jwks(_uri):
+            return jwks
+
+        with (
+            patch("turnstone.core.oidc.discover_oidc", side_effect=_ok),
+            patch("turnstone.core.oidc.fetch_jwks", side_effect=_jwks),
+        ):
+            asyncio.run(initialize_oidc_state(state))
+
+        assert state.oidc_config is cfg
+        assert state.oidc_config.enabled is True
+        assert state.jwks_data == jwks
 
 
 async def _async_return(value):
