@@ -21,6 +21,7 @@ from turnstone.core.oidc import (
     generate_pkce_pair,
     load_oidc_config,
     provision_oidc_user,
+    validate_discovered_endpoint,
     validate_id_token,
     validate_issuer_url,
 )
@@ -293,6 +294,48 @@ class TestLoadOIDCConfig:
 
         assert cfg.redirect_base == "http://localhost:8000"
 
+    def test_load_oidc_config_parses_trusted_endpoint_hosts(self, monkeypatch):
+        """TURNSTONE_OIDC_TRUSTED_ENDPOINT_HOSTS is split, lowercased, and trimmed."""
+        monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.example.com")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "csecret")
+        monkeypatch.setenv(
+            "TURNSTONE_OIDC_TRUSTED_ENDPOINT_HOSTS",
+            "Foo.Example.com, BAR.example.com  ,, ",
+        )
+
+        with patch("turnstone.core.config.load_config", return_value={}):
+            cfg = load_oidc_config()
+
+        assert cfg.trusted_endpoint_hosts == ("foo.example.com", "bar.example.com")
+
+    def test_load_oidc_config_trusted_endpoint_hosts_default_empty(self, monkeypatch):
+        """trusted_endpoint_hosts defaults to () when env var is absent."""
+        monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.example.com")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "csecret")
+        monkeypatch.delenv("TURNSTONE_OIDC_TRUSTED_ENDPOINT_HOSTS", raising=False)
+
+        with patch("turnstone.core.config.load_config", return_value={}):
+            cfg = load_oidc_config()
+
+        assert cfg.trusted_endpoint_hosts == ()
+
+    def test_load_oidc_config_trusted_endpoint_hosts_from_toml_list(self, monkeypatch):
+        """config.toml may provide trusted_endpoint_hosts as a list."""
+        monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.example.com")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "csecret")
+        monkeypatch.delenv("TURNSTONE_OIDC_TRUSTED_ENDPOINT_HOSTS", raising=False)
+
+        with patch(
+            "turnstone.core.config.load_config",
+            return_value={"trusted_endpoint_hosts": ["FOO.example.com", "bar.example.com"]},
+        ):
+            cfg = load_oidc_config()
+
+        assert cfg.trusted_endpoint_hosts == ("foo.example.com", "bar.example.com")
+
 
 # ---------------------------------------------------------------------------
 # SSRF Validation
@@ -446,6 +489,422 @@ class TestValidateIssuerURL:
         async def _run():
             result = await discover_oidc(config)
             assert result.enabled is False
+
+        asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Discovered Endpoint Validation
+# ---------------------------------------------------------------------------
+
+
+class TestValidateDiscoveredEndpoint:
+    """Tests for ``validate_discovered_endpoint`` SSRF + same-origin protection."""
+
+    _PUBLIC_ADDR = [(2, 1, 6, "", ("93.184.216.34", 0))]
+    _PRIVATE_ADDR = [(2, 1, 6, "", ("169.254.169.254", 0))]
+    _LOOPBACK_ADDR = [(2, 1, 6, "", ("127.0.0.1", 0))]
+
+    @staticmethod
+    def _issuer(url: str = "https://idp.example.com") -> urllib.parse.ParseResult:
+        return urllib.parse.urlparse(url)
+
+    def test_valid_same_origin(self):
+        """Same scheme/host/port as issuer passes."""
+        with patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR):
+            validate_discovered_endpoint(
+                "https://idp.example.com/token",
+                self._issuer(),
+                allow_http=False,
+                trusted_endpoint_hosts=frozenset(),
+            )
+
+    def test_rejects_http_when_issuer_is_https(self):
+        """http:// discovered endpoint rejected when issuer is https://."""
+        with (
+            patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
+            pytest.raises(OIDCError, match="must use HTTPS"),
+        ):
+            validate_discovered_endpoint(
+                "http://idp.example.com/token",
+                self._issuer(),
+                allow_http=False,
+                trusted_endpoint_hosts=frozenset(),
+            )
+
+    def test_allows_http_when_issuer_is_localhost(self):
+        """http:// discovered endpoint allowed in dev when issuer is http://localhost."""
+        with patch("socket.getaddrinfo", return_value=self._LOOPBACK_ADDR):
+            validate_discovered_endpoint(
+                "http://localhost:8080/token",
+                self._issuer("http://localhost:8080"),
+                allow_http=True,
+                trusted_endpoint_hosts=frozenset(),
+            )
+
+    def test_rejects_private_ip(self):
+        """Endpoint resolving to a private/link-local IP is rejected."""
+        with (
+            patch("socket.getaddrinfo", return_value=self._PRIVATE_ADDR),
+            pytest.raises(OIDCError, match="non-public address.*169.254.169.254"),
+        ):
+            validate_discovered_endpoint(
+                "https://idp.example.com/token",
+                self._issuer(),
+                allow_http=False,
+                trusted_endpoint_hosts=frozenset(),
+            )
+
+    def test_rejects_embedded_credentials(self):
+        """Endpoint with userinfo (user:pass@host) rejected."""
+        with pytest.raises(OIDCError, match="embedded credentials"):
+            validate_discovered_endpoint(
+                "https://user:pass@idp.example.com/token",
+                self._issuer(),
+                allow_http=False,
+                trusted_endpoint_hosts=frozenset(),
+            )
+
+    def test_rejects_different_host(self):
+        """Endpoint on a different host than the issuer is rejected."""
+        with (
+            patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
+            pytest.raises(OIDCError, match="not trusted"),
+        ):
+            validate_discovered_endpoint(
+                "https://attacker.com/token",
+                self._issuer(),
+                allow_http=False,
+                trusted_endpoint_hosts=frozenset(),
+            )
+
+    def test_rejects_subdomain(self):
+        """Sibling-subdomain endpoint is rejected (strict equality)."""
+        with (
+            patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
+            pytest.raises(OIDCError, match="not trusted"),
+        ):
+            validate_discovered_endpoint(
+                "https://login.idp.example.com/token",
+                self._issuer(),
+                allow_http=False,
+                trusted_endpoint_hosts=frozenset(),
+            )
+
+    def test_rejects_different_port(self):
+        """Endpoint on a different port than the issuer is rejected."""
+        with (
+            patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
+            pytest.raises(OIDCError, match="port.*does not match issuer"),
+        ):
+            validate_discovered_endpoint(
+                "https://idp.example.com:9443/token",
+                self._issuer(),
+                allow_http=False,
+                trusted_endpoint_hosts=frozenset(),
+            )
+
+    def test_rejects_different_scheme(self):
+        """Endpoint scheme must match the issuer's scheme."""
+        with (
+            patch("socket.getaddrinfo", return_value=self._LOOPBACK_ADDR),
+            pytest.raises(OIDCError, match="scheme.*does not match issuer"),
+        ):
+            validate_discovered_endpoint(
+                "https://localhost:8080/token",
+                self._issuer("http://localhost:8080"),
+                allow_http=True,
+                trusted_endpoint_hosts=frozenset(),
+            )
+
+    def test_accepts_google_known_endpoints(self):
+        """Issuer accounts.google.com accepts the four well-known multi-origin hosts."""
+        google_endpoints = (
+            "https://accounts.google.com/o/oauth2/v2/auth",
+            "https://oauth2.googleapis.com/token",
+            "https://www.googleapis.com/oauth2/v3/certs",
+            "https://openidconnect.googleapis.com/v1/userinfo",
+        )
+        with patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR):
+            for endpoint in google_endpoints:
+                validate_discovered_endpoint(
+                    endpoint,
+                    self._issuer("https://accounts.google.com"),
+                    allow_http=False,
+                    trusted_endpoint_hosts=frozenset(),
+                )
+
+    def test_rejects_unknown_host_for_known_issuer(self):
+        """Even with a known issuer, foreign endpoints outside the allow-map are rejected."""
+        with (
+            patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
+            pytest.raises(OIDCError, match="not trusted"),
+        ):
+            validate_discovered_endpoint(
+                "https://attacker.com/token",
+                self._issuer("https://accounts.google.com"),
+                allow_http=False,
+                trusted_endpoint_hosts=frozenset(),
+            )
+
+    def test_accepts_operator_trusted_endpoint_host(self):
+        """Operator-supplied trusted_endpoint_hosts permits cross-host endpoints."""
+        with patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR):
+            validate_discovered_endpoint(
+                "https://idp-token.example.net/token",
+                self._issuer("https://idp.example.com"),
+                allow_http=False,
+                trusted_endpoint_hosts=frozenset({"idp-token.example.net"}),
+            )
+
+    def test_accepts_explicit_default_port_match(self):
+        """Issuer omits :443; endpoint includes :443 explicitly -> still same origin."""
+        with patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR):
+            validate_discovered_endpoint(
+                "https://idp.example.com:443/token",
+                self._issuer("https://idp.example.com"),
+                allow_http=False,
+                trusted_endpoint_hosts=frozenset(),
+            )
+
+    def test_accepts_implicit_default_port_match_reverse(self):
+        """Issuer includes :443; endpoint omits the port -> still same origin."""
+        with patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR):
+            validate_discovered_endpoint(
+                "https://idp.example.com/token",
+                self._issuer("https://idp.example.com:443"),
+                allow_http=False,
+                trusted_endpoint_hosts=frozenset(),
+            )
+
+    def test_discover_rejects_endpoint_on_other_host(self):
+        """discover_oidc returns enabled=False when token_endpoint targets a foreign host."""
+        config = _make_config(
+            authorization_endpoint="",
+            token_endpoint="",
+            userinfo_endpoint="",
+            jwks_uri="",
+        )
+        discovery_doc = {
+            "authorization_endpoint": "https://idp.example.com/authorize",
+            "token_endpoint": "https://attacker.com/token",
+            "userinfo_endpoint": "https://idp.example.com/userinfo",
+            "jwks_uri": "https://idp.example.com/.well-known/jwks.json",
+        }
+        mock_response = MagicMock()
+        mock_response.json.return_value = discovery_doc
+        mock_response.raise_for_status = MagicMock()
+
+        async def _run():
+            client = _mock_async_client(lambda url: _async_return(mock_response))
+            with (
+                patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
+                patch("httpx.AsyncClient", return_value=client),
+            ):
+                result = await discover_oidc(config)
+            assert result.enabled is False
+
+        asyncio.run(_run())
+
+    def test_discover_rejects_foreign_userinfo(self):
+        """A foreign userinfo_endpoint is rejected even when other endpoints are same-origin.
+
+        The required-endpoint loop runs first, so this test pins the userinfo branch's
+        reject path and proves it executes.
+        """
+        config = _make_config(
+            authorization_endpoint="",
+            token_endpoint="",
+            userinfo_endpoint="",
+            jwks_uri="",
+        )
+        discovery_doc = {
+            "authorization_endpoint": "https://idp.example.com/authorize",
+            "token_endpoint": "https://idp.example.com/token",
+            "userinfo_endpoint": "https://attacker.com/userinfo",
+            "jwks_uri": "https://idp.example.com/.well-known/jwks.json",
+        }
+        mock_response = MagicMock()
+        mock_response.json.return_value = discovery_doc
+        mock_response.raise_for_status = MagicMock()
+
+        async def _run():
+            client = _mock_async_client(lambda url: _async_return(mock_response))
+            with (
+                patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
+                patch("httpx.AsyncClient", return_value=client),
+            ):
+                result = await discover_oidc(config)
+            assert result.enabled is False
+
+        asyncio.run(_run())
+
+    def test_discover_accepts_google_multi_origin(self):
+        """discover_oidc accepts Google's legitimate multi-origin discovery doc."""
+        config = _make_config(
+            issuer="https://accounts.google.com",
+            authorization_endpoint="",
+            token_endpoint="",
+            userinfo_endpoint="",
+            jwks_uri="",
+        )
+        discovery_doc = {
+            "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+            "token_endpoint": "https://oauth2.googleapis.com/token",
+            "userinfo_endpoint": "https://openidconnect.googleapis.com/v1/userinfo",
+            "jwks_uri": "https://www.googleapis.com/oauth2/v3/certs",
+        }
+        mock_response = MagicMock()
+        mock_response.json.return_value = discovery_doc
+        mock_response.raise_for_status = MagicMock()
+
+        async def _run():
+            client = _mock_async_client(lambda url: _async_return(mock_response))
+            with (
+                patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
+                patch("httpx.AsyncClient", return_value=client),
+            ):
+                result = await discover_oidc(config)
+            assert result.enabled is True
+            assert result.token_endpoint == "https://oauth2.googleapis.com/token"
+            assert result.jwks_uri == "https://www.googleapis.com/oauth2/v3/certs"
+
+        asyncio.run(_run())
+
+    def test_discover_rejects_http_endpoint(self):
+        """discover_oidc returns enabled=False when an endpoint is http:// in prod."""
+        config = _make_config(
+            authorization_endpoint="",
+            token_endpoint="",
+            userinfo_endpoint="",
+            jwks_uri="",
+        )
+        discovery_doc = {
+            "authorization_endpoint": "https://idp.example.com/authorize",
+            "token_endpoint": "http://idp.example.com/token",
+            "userinfo_endpoint": "https://idp.example.com/userinfo",
+            "jwks_uri": "https://idp.example.com/.well-known/jwks.json",
+        }
+        mock_response = MagicMock()
+        mock_response.json.return_value = discovery_doc
+        mock_response.raise_for_status = MagicMock()
+
+        async def _run():
+            client = _mock_async_client(lambda url: _async_return(mock_response))
+            with (
+                patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
+                patch("httpx.AsyncClient", return_value=client),
+            ):
+                result = await discover_oidc(config)
+            assert result.enabled is False
+
+        asyncio.run(_run())
+
+    def test_discover_rejects_endpoint_resolving_to_private_ip(self):
+        """discover_oidc returns enabled=False when an endpoint host resolves privately.
+
+        DNS may legitimately rotate between the issuer check and the per-endpoint
+        re-resolution; defence-in-depth requires we re-validate each discovered URL.
+        """
+        config = _make_config(
+            authorization_endpoint="",
+            token_endpoint="",
+            userinfo_endpoint="",
+            jwks_uri="",
+        )
+        discovery_doc = {
+            "authorization_endpoint": "https://idp.example.com/authorize",
+            "token_endpoint": "https://idp.example.com/token",
+            "userinfo_endpoint": "https://idp.example.com/userinfo",
+            "jwks_uri": "https://idp.example.com/.well-known/jwks.json",
+        }
+        mock_response = MagicMock()
+        mock_response.json.return_value = discovery_doc
+        mock_response.raise_for_status = MagicMock()
+
+        # Issuer validation passes (public), then DNS rotates so each discovered
+        # endpoint resolves to a link-local address.
+        results = iter(
+            [
+                self._PUBLIC_ADDR,
+                self._PRIVATE_ADDR,
+                self._PRIVATE_ADDR,
+                self._PRIVATE_ADDR,
+                self._PRIVATE_ADDR,
+            ]
+        )
+
+        def _resolve(*_args, **_kwargs):
+            return next(results)
+
+        async def _run():
+            client = _mock_async_client(lambda url: _async_return(mock_response))
+            with (
+                patch("socket.getaddrinfo", side_effect=_resolve),
+                patch("httpx.AsyncClient", return_value=client),
+            ):
+                result = await discover_oidc(config)
+            assert result.enabled is False
+
+        asyncio.run(_run())
+
+    def test_discover_accepts_localhost_http_flow(self):
+        """Localhost issuer with http:// endpoints is accepted in dev mode."""
+        config = _make_config(
+            issuer="http://localhost:8080",
+            authorization_endpoint="",
+            token_endpoint="",
+            userinfo_endpoint="",
+            jwks_uri="",
+        )
+        discovery_doc = {
+            "authorization_endpoint": "http://localhost:8080/authorize",
+            "token_endpoint": "http://localhost:8080/token",
+            "userinfo_endpoint": "http://localhost:8080/userinfo",
+            "jwks_uri": "http://localhost:8080/jwks",
+        }
+        mock_response = MagicMock()
+        mock_response.json.return_value = discovery_doc
+        mock_response.raise_for_status = MagicMock()
+
+        async def _run():
+            client = _mock_async_client(lambda url: _async_return(mock_response))
+            with (
+                patch("socket.getaddrinfo", return_value=self._LOOPBACK_ADDR),
+                patch("httpx.AsyncClient", return_value=client),
+            ):
+                result = await discover_oidc(config)
+            assert result.enabled is True
+            assert result.token_endpoint == "http://localhost:8080/token"
+
+        asyncio.run(_run())
+
+    def test_discover_accepts_empty_userinfo(self):
+        """Empty userinfo_endpoint is allowed (skipped) when other endpoints are valid."""
+        config = _make_config(
+            authorization_endpoint="",
+            token_endpoint="",
+            userinfo_endpoint="",
+            jwks_uri="",
+        )
+        discovery_doc = {
+            "authorization_endpoint": "https://idp.example.com/authorize",
+            "token_endpoint": "https://idp.example.com/token",
+            "jwks_uri": "https://idp.example.com/.well-known/jwks.json",
+        }
+        mock_response = MagicMock()
+        mock_response.json.return_value = discovery_doc
+        mock_response.raise_for_status = MagicMock()
+
+        async def _run():
+            client = _mock_async_client(lambda url: _async_return(mock_response))
+            with (
+                patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
+                patch("httpx.AsyncClient", return_value=client),
+            ):
+                result = await discover_oidc(config)
+            assert result.enabled is True
+            assert result.userinfo_endpoint == ""
 
         asyncio.run(_run())
 
