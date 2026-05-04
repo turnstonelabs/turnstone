@@ -765,6 +765,34 @@ class SkillDiscoverResponse(BaseModel):
     skills: list[SkillDiscoverListing]
 
 
+class ParseSkillRequest(BaseModel):
+    raw: str = Field(
+        min_length=1,
+        max_length=32_768,
+        description=(
+            "Raw SKILL.md text — YAML frontmatter delimited by ``---`` "
+            "followed by the markdown body.  Capped at 32 KiB to match "
+            "``admin_create_skill``'s ``content`` ceiling and to bound "
+            "the synchronous YAML parser's worst-case CPU cost.  The "
+            "handler reuses the Python parser at "
+            "``turnstone.core.skill_parser`` so admin UIs and external "
+            "import paths agree on field extraction."
+        ),
+    )
+
+
+class ParseSkillResponse(BaseModel):
+    name: str
+    description: str
+    content: str
+    tags: list[str] = Field(default_factory=list)
+    author: str = ""
+    version: str = "1.0.0"
+    allowed_tools: list[str] = Field(default_factory=list)
+    license: str = ""
+    compatibility: str = ""
+
+
 class SkillInstallRequest(BaseModel):
     source: str  # "skills.sh" or "github"
     skill_id: str = ""  # for skills.sh

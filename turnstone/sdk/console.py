@@ -38,6 +38,7 @@ from turnstone.api.console_schemas import (
     McpServerDetail,
     NodeDetailResponse,
     OrgInfo,
+    ParseSkillResponse,
     RegistrySearchResponse,
     RoleInfo,
     SettingInfo,
@@ -740,6 +741,15 @@ class AsyncTurnstoneConsole(_BaseClient):
         body: dict[str, Any] = {"name": name, "content": content, **kwargs}
         return await self._request(
             "POST", "/v1/api/admin/skills", json_body=body, response_model=SkillInfo
+        )
+
+    async def parse_skill(self, raw: str) -> ParseSkillResponse:
+        """Parse a SKILL.md document into structured fields without persisting."""
+        return await self._request(
+            "POST",
+            "/v1/api/admin/skills/parse",
+            json_body={"raw": raw},
+            response_model=ParseSkillResponse,
         )
 
     async def get_skill(self, skill_id: str) -> SkillInfo:
@@ -1525,6 +1535,9 @@ class TurnstoneConsole:
 
     def create_skill(self, name: str, content: str, **kwargs: Any) -> SkillInfo:
         return self._runner.run(self._async.create_skill(name, content, **kwargs))
+
+    def parse_skill(self, raw: str) -> ParseSkillResponse:
+        return self._runner.run(self._async.parse_skill(raw))
 
     def get_skill(self, skill_id: str) -> SkillInfo:
         return self._runner.run(self._async.get_skill(skill_id))
