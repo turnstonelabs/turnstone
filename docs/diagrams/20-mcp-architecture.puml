@@ -190,21 +190,25 @@ group Push Notifications (debounced 5s per server)
   MCPMgr -> Storage : sync_prompts_to_storage()
 end
 
-group Periodic Polling (default 4h)
-  MCPMgr -> MCPMgr : _periodic_refresh()
+group Manual Refresh
+  Session -> MCPMgr : refresh_sync()
   note right
-    Only polls capabilities
-    without push support.
-    Staggered per-server.
-    Disconnected servers get
-    reconnect attempts with
-    exponential backoff (60s-1h).
+    /mcp refresh [server] —
+    re-fetches catalog and
+    attempts reconnect for
+    disconnected servers.
   end note
 end
 
-group Manual Refresh
-  Session -> MCPMgr : refresh_sync()
-  note right: /mcp refresh [server]
+group Manual Reconnect
+  Session -> MCPMgr : reconnect_sync(name)
+  note right
+    Operator-driven via the
+    console admin panel —
+    tears down session, clears
+    circuit breaker, runs a
+    fresh handshake.
+  end note
 end
 
 == Policy Evaluation ==

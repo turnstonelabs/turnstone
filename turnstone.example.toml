@@ -117,7 +117,6 @@
 
 [mcp]
 # config_path = ""             # Path to MCP servers config file (JSON)
-# refresh_interval = 14400     # Refresh interval in seconds (default: 4h)
 
 # --- Server (node, console) ---
 

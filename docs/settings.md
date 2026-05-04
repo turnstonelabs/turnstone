@@ -100,7 +100,7 @@ initialization:
 | `tools` | timeout, truncation, agent_max_turns, skip_permissions, search, search_threshold, search_max_results |
 | `server` | workstream_idle_timeout, max_workstreams |
 | `cluster` | node_fan_out_limit, mcp_max_servers |
-| `mcp` | config_path, refresh_interval, registry_url |
+| `mcp` | config_path, registry_url |
 | `ratelimit` | enabled, requests_per_second, burst, trusted_proxies |
 | `health` | backend_probe_interval, backend_probe_timeout, circuit_breaker_threshold, circuit_breaker_cooldown |
 | `judge` | enabled, model, provider, base_url, api_key, confidence_threshold, max_context_ratio, timeout, read_only_tools, output_guard, redact_secrets, cancel_on_approval |

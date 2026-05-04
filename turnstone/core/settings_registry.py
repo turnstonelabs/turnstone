@@ -341,14 +341,6 @@ def _build_registry() -> dict[str, SettingDef]:
             reference_url="https://modelcontextprotocol.io",
         ),
         SettingDef(
-            "mcp.refresh_interval",
-            "int",
-            14400,
-            "MCP resource/prompt refresh interval in seconds (0 = disabled, default 4h)",
-            "mcp",
-            min_value=0,
-        ),
-        SettingDef(
             "mcp.registry_url",
             "str",
             "",
