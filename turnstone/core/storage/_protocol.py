@@ -632,6 +632,24 @@ class StorageBackend(Protocol):
         """Return all users ordered by created DESC."""
         ...
 
+    def count_users(self) -> int:
+        """Return the count of users.
+
+        Cheaper than ``list_users`` when the caller only needs to know
+        whether at least one user exists (e.g. the OIDC handlers'
+        "setup complete?" gate).
+        """
+        ...
+
+    def find_existing_usernames(self, candidates: list[str]) -> set[str]:
+        """Return the subset of *candidates* already present in ``users.username``.
+
+        Single ``WHERE username IN (...)`` query — replaces the
+        per-candidate ``get_user_by_username`` loop on the OIDC
+        username-derivation path.  Empty input returns ``set()``.
+        """
+        ...
+
     def delete_user(self, user_id: str) -> bool:
         """Delete user and cascade-delete all their tokens. Returns True if existed."""
         ...
@@ -988,6 +1006,30 @@ class StorageBackend(Protocol):
 
     def list_user_roles(self, user_id: str) -> list[dict[str, Any]]:
         """List roles assigned to a user (joins user_roles with roles)."""
+        ...
+
+    def replace_oidc_roles(
+        self, user_id: str, desired_role_ids: set[str]
+    ) -> tuple[set[str], set[str]]:
+        """Atomically reconcile ``user_roles`` for OIDC-assigned rows.
+
+        Reads every existing row for ``user_id`` and partitions them by
+        ``assigned_by``:
+        - rows where ``assigned_by == "oidc"`` are the reconciliation set
+        - rows where ``assigned_by != "oidc"`` are *blocked* — manual
+          assignments (``admin-ui``) and the ``oidc-default`` fallback are
+          never touched, and a desired role already held under any
+          non-``"oidc"`` source is dropped from the desired set rather
+          than overwriting it (the table PK is ``(user_id, role_id)``
+          only, so an insert would otherwise PK-conflict).
+        Inserts each role in (``desired_role_ids - blocked``) not already
+        held under ``"oidc"``; deletes each currently-OIDC-held role that
+        is no longer desired.  All inside a single transaction.
+
+        Returns ``(added, removed)`` — the role ids that actually
+        transitioned in each direction so the caller can emit the same
+        per-role audit log lines the per-role loop produced.
+        """
         ...
 
     def get_user_permissions(self, user_id: str) -> set[str]:

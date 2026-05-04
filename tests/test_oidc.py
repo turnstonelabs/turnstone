@@ -8,6 +8,7 @@ import dataclasses
 import hashlib
 import types
 import urllib.parse
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -65,6 +66,8 @@ def _mock_storage(**overrides):
     s.get_user.return_value = overrides.get("user")
     s.get_user_by_username.return_value = overrides.get("user_by_username")
     s.get_role.return_value = overrides.get("role")
+    s.find_existing_usernames.return_value = overrides.get("existing_usernames", set())
+    s.replace_oidc_roles.return_value = overrides.get("replace_oidc_roles", (set(), set()))
     return s
 
 
@@ -1330,13 +1333,8 @@ class TestProvisionOIDCUser:
     def test_provision_oidc_user_username_dedup(self):
         """First username taken -> appends suffix."""
         config = _make_config()
-        storage = _mock_storage()
-
-        # First call: username "bob" exists; second call: "bob2" doesn't exist
-        storage.get_user_by_username.side_effect = [
-            {"user_id": "u-other", "username": "bob"},  # "bob" taken
-            None,  # "bob2" available
-        ]
+        # Bulk lookup reports "bob" already taken; "bob2" is free.
+        storage = _mock_storage(existing_usernames={"bob"})
         new_user = {
             "user_id": "u-new",
             "username": "bob2",
@@ -1352,6 +1350,9 @@ class TestProvisionOIDCUser:
         # create_oidc_user should have been called with "bob2" as username
         call_args = storage.create_oidc_user.call_args
         assert call_args[0][1] == "bob2"
+        # Single bulk query rather than per-candidate get_user_by_username
+        storage.find_existing_usernames.assert_called_once()
+        storage.get_user_by_username.assert_not_called()
 
     def test_provision_oidc_user_email_prefix(self):
         """No preferred_username -> uses email prefix."""
@@ -1457,10 +1458,13 @@ class TestApplyRoleMapping:
         claims = {"sub": "u1", "groups": "admin"}
         apply_role_mapping(storage, "u1", claims, config)
 
-        storage.assign_role.assert_called_once_with("u1", "builtin-admin", "oidc")
+        storage.replace_oidc_roles.assert_called_once_with("u1", {"builtin-admin"})
+        storage.assign_role.assert_not_called()
+        storage.unassign_role.assert_not_called()
+        storage.list_user_roles.assert_not_called()
 
     def test_apply_role_mapping_list_claim(self):
-        """Claim is a list of strings -> maps each."""
+        """Claim is a list of strings -> single replace call."""
         config = _make_config(
             role_claim="roles",
             role_map={"admin": "builtin-admin", "editor": "builtin-operator"},
@@ -1472,7 +1476,9 @@ class TestApplyRoleMapping:
         claims = {"sub": "u1", "roles": ["admin", "editor"]}
         apply_role_mapping(storage, "u1", claims, config)
 
-        assert storage.assign_role.call_count == 2
+        storage.replace_oidc_roles.assert_called_once_with(
+            "u1", {"builtin-admin", "builtin-operator"}
+        )
 
     def test_apply_role_mapping_no_config(self):
         """No role_claim configured -> no-op."""
@@ -1482,10 +1488,10 @@ class TestApplyRoleMapping:
         claims = {"sub": "u1", "roles": "admin"}
         apply_role_mapping(storage, "u1", claims, config)
 
-        storage.assign_role.assert_not_called()
+        storage.replace_oidc_roles.assert_not_called()
 
     def test_apply_role_mapping_unknown_role(self):
-        """Claim maps to nonexistent role -> skipped."""
+        """Claim maps to nonexistent role -> empty replace set."""
         config = _make_config(
             role_claim="groups",
             role_map={"admin": "nonexistent-role"},
@@ -1495,10 +1501,10 @@ class TestApplyRoleMapping:
         claims = {"sub": "u1", "groups": "admin"}
         apply_role_mapping(storage, "u1", claims, config)
 
-        storage.assign_role.assert_not_called()
+        storage.replace_oidc_roles.assert_called_once_with("u1", set())
 
     def test_apply_role_mapping_no_matching_claim_value(self):
-        """Claim value not in role_map -> no assignment."""
+        """Claim value not in role_map -> empty replace set."""
         config = _make_config(
             role_claim="groups",
             role_map={"admin": "builtin-admin"},
@@ -1508,10 +1514,10 @@ class TestApplyRoleMapping:
         claims = {"sub": "u1", "groups": "viewer"}  # "viewer" not in role_map
         apply_role_mapping(storage, "u1", claims, config)
 
-        storage.assign_role.assert_not_called()
+        storage.replace_oidc_roles.assert_called_once_with("u1", set())
 
     def test_apply_role_mapping_claim_missing(self):
-        """Claim key not present in claims -> no-op."""
+        """Claim key not present in claims -> empty replace set."""
         config = _make_config(
             role_claim="groups",
             role_map={"admin": "builtin-admin"},
@@ -1521,7 +1527,7 @@ class TestApplyRoleMapping:
         claims = {"sub": "u1"}  # no "groups" key
         apply_role_mapping(storage, "u1", claims, config)
 
-        storage.assign_role.assert_not_called()
+        storage.replace_oidc_roles.assert_called_once_with("u1", set())
 
     def test_apply_role_mapping_no_role_map(self):
         """role_claim set but role_map empty -> no-op (early return)."""
@@ -1531,66 +1537,51 @@ class TestApplyRoleMapping:
         claims = {"sub": "u1", "groups": "admin"}
         apply_role_mapping(storage, "u1", claims, config)
 
-        storage.assign_role.assert_not_called()
+        storage.replace_oidc_roles.assert_not_called()
 
-    def test_apply_role_mapping_revokes_stale_oidc_roles(self):
-        """Roles previously assigned by OIDC but no longer in claims are revoked."""
+    def test_apply_role_mapping_revokes_stale_oidc_roles(self, caplog):
+        """Roles previously assigned by OIDC but no longer in claims are revoked.
+
+        Storage owns the diff via ``replace_oidc_roles``; ``apply_role_mapping``
+        only logs the returned ``(added, removed)`` sets.  Manual roles are
+        invisible to ``apply_role_mapping`` post-perf-3 — protection now lives
+        in the storage layer's ``WHERE assigned_by = 'oidc'`` filter.
+        """
         config = _make_config(
             role_claim="groups",
             role_map={"admin": "builtin-admin", "eng": "builtin-operator"},
         )
-        storage = _mock_storage()
+        storage = _mock_storage(
+            replace_oidc_roles=({"builtin-operator"}, {"builtin-admin"}),
+        )
         storage.get_role.return_value = {"role_id": "some-role"}
-        # User currently has admin (via OIDC) and a manual role
-        storage.list_user_roles.return_value = [
-            {"role_id": "builtin-admin", "assigned_by": "oidc"},
-            {"role_id": "custom-role", "assigned_by": "admin-ui"},
-        ]
 
         # IdP now only says "eng", not "admin"
         claims = {"sub": "u1", "groups": ["eng"]}
-        apply_role_mapping(storage, "u1", claims, config)
+        with caplog.at_level("INFO", logger="turnstone.core.oidc"):
+            apply_role_mapping(storage, "u1", claims, config)
 
-        # builtin-admin should be revoked (OIDC-assigned, no longer in claims)
-        storage.unassign_role.assert_called_once_with("u1", "builtin-admin")
-        # custom-role should NOT be revoked (not assigned by OIDC)
-
-    def test_apply_role_mapping_preserves_manual_roles(self):
-        """Manually assigned roles are never revoked by OIDC sync."""
-        config = _make_config(
-            role_claim="groups",
-            role_map={"admin": "builtin-admin"},
+        storage.replace_oidc_roles.assert_called_once_with("u1", {"builtin-operator"})
+        assert any(
+            "Revoked role" in record.getMessage() and "builtin-admin" in record.getMessage()
+            for record in caplog.records
         )
-        storage = _mock_storage()
-        storage.get_role.return_value = {"role_id": "some-role"}
-        storage.list_user_roles.return_value = [
-            {"role_id": "builtin-admin", "assigned_by": "admin-ui"},
-        ]
-
-        # Claims have no groups at all
-        claims = {"sub": "u1"}
-        apply_role_mapping(storage, "u1", claims, config)
-
-        # Manual admin role must NOT be revoked
-        storage.unassign_role.assert_not_called()
 
     def test_apply_role_mapping_revokes_all_oidc_roles_when_claim_absent(self):
-        """When the claim is absent from the token, all OIDC-assigned roles are revoked."""
+        """Empty desired set propagates to storage (diff happens server-side)."""
         config = _make_config(
             role_claim="groups",
             role_map={"admin": "builtin-admin"},
         )
-        storage = _mock_storage()
+        storage = _mock_storage(
+            replace_oidc_roles=(set(), {"builtin-admin", "builtin-operator"}),
+        )
         storage.get_role.return_value = {"role_id": "some-role"}
-        storage.list_user_roles.return_value = [
-            {"role_id": "builtin-admin", "assigned_by": "oidc"},
-            {"role_id": "builtin-operator", "assigned_by": "oidc"},
-        ]
 
         claims = {"sub": "u1"}  # no "groups" key
         apply_role_mapping(storage, "u1", claims, config)
 
-        assert storage.unassign_role.call_count == 2
+        storage.replace_oidc_roles.assert_called_once_with("u1", set())
 
 
 # ---------------------------------------------------------------------------
@@ -1774,7 +1765,7 @@ class TestInitializeOIDCState:
 
         disabled_cfg = dataclasses.replace(cfg, enabled=False)
 
-        async def _disabled(_cfg):
+        async def _disabled(_cfg, *, client=None):
             return disabled_cfg
 
         with patch("turnstone.core.oidc.discover_oidc", side_effect=_disabled):
@@ -1789,10 +1780,10 @@ class TestInitializeOIDCState:
         cfg = _make_config(redirect_base="")
         state = types.SimpleNamespace(oidc_config=cfg, jwks_data=None)
 
-        async def _ok(c):
+        async def _ok(c, *, client=None):
             return c
 
-        async def _jwks_unexpected(_uri):
+        async def _jwks_unexpected(_uri, *, client=None):
             raise AssertionError("fetch_jwks must not be called when redirect_base is empty")
 
         with (
@@ -1811,10 +1802,10 @@ class TestInitializeOIDCState:
         cfg = _make_config(redirect_base="https://app.example.com")
         state = types.SimpleNamespace(oidc_config=cfg, jwks_data=None)
 
-        async def _ok(c):
+        async def _ok(c, *, client=None):
             return c
 
-        async def _jwks_boom(_uri):
+        async def _jwks_boom(_uri, *, client=None):
             raise OIDCError("jwks down")
 
         with (
@@ -1834,10 +1825,10 @@ class TestInitializeOIDCState:
 
         jwks = {"keys": [{"kid": "k1", "kty": "RSA"}]}
 
-        async def _ok(c):
+        async def _ok(c, *, client=None):
             return c
 
-        async def _jwks(_uri):
+        async def _jwks(_uri, *, client=None):
             return jwks
 
         with (
@@ -1849,8 +1840,62 @@ class TestInitializeOIDCState:
         assert state.oidc_config is cfg
         assert state.oidc_config.enabled is True
         assert state.jwks_data == jwks
+        assert state.oidc_http_client is not None
 
 
 async def _async_return(value):
     """Helper: return a value from an async function."""
     return value
+
+
+class TestCloseOIDCState:
+    def test_close_when_never_initialised(self):
+        """close_oidc_state on bare state must not raise."""
+        from turnstone.core.oidc import close_oidc_state
+
+        state = types.SimpleNamespace()
+        asyncio.run(close_oidc_state(state))
+
+    def test_close_releases_long_lived_client(self):
+        """The long-lived client installed by initialize_oidc_state is aclosed."""
+        from turnstone.core.oidc import close_oidc_state
+
+        client = MagicMock()
+
+        async def _aclose():
+            client.aclose_called = True
+
+        client.aclose = _aclose
+        state = types.SimpleNamespace(oidc_http_client=client)
+        asyncio.run(close_oidc_state(state))
+        assert getattr(client, "aclose_called", False) is True
+        assert state.oidc_http_client is None
+
+
+class TestLongLivedHTTPClientPassthrough:
+    def test_initialize_passes_client_to_discovery_and_jwks(self):
+        """initialize_oidc_state stashes a client and threads it to outbound calls."""
+        cfg = _make_config(redirect_base="https://app.example.com")
+        state = types.SimpleNamespace(oidc_config=cfg, jwks_data=None)
+
+        seen_clients: list[Any] = []
+
+        async def _discover(c, *, client=None):
+            seen_clients.append(("discover", client))
+            return c
+
+        async def _jwks(_uri, *, client=None):
+            seen_clients.append(("jwks", client))
+            return {"keys": [{"kid": "k1"}]}
+
+        with (
+            patch("turnstone.core.oidc.discover_oidc", side_effect=_discover),
+            patch("turnstone.core.oidc.fetch_jwks", side_effect=_jwks),
+        ):
+            asyncio.run(initialize_oidc_state(state))
+
+        assert state.oidc_http_client is not None
+        kinds = {kind for kind, _ in seen_clients}
+        assert {"discover", "jwks"} <= kinds
+        for _kind, c in seen_clients:
+            assert c is state.oidc_http_client

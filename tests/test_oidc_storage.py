@@ -383,3 +383,170 @@ class TestOIDCPendingState:
                 .where(oidc_pending_states.c.state == "state-cleanup")
             ).scalar()
             assert count == 0
+
+
+# ---------------------------------------------------------------------------
+# count_users / find_existing_usernames
+# ---------------------------------------------------------------------------
+
+
+class TestCountUsers:
+    def test_count_users_empty(self, db):
+        assert db.count_users() == 0
+
+    def test_count_users_after_inserts(self, db):
+        db.create_user("u1", "alice", "Alice", "h1")
+        db.create_user("u2", "bob", "Bob", "h2")
+        db.create_user("u3", "carol", "Carol", "h3")
+        assert db.count_users() == 3
+
+
+class TestFindExistingUsernames:
+    def test_empty_input_returns_empty_set(self, db):
+        db.create_user("u1", "alice", "Alice", "h1")
+        assert db.find_existing_usernames([]) == set()
+
+    def test_returns_subset_present_in_db(self, db):
+        db.create_user("u1", "alice", "Alice", "h1")
+        db.create_user("u2", "bob", "Bob", "h2")
+
+        existing = db.find_existing_usernames(["alice", "bob", "carol", "dave"])
+        assert existing == {"alice", "bob"}
+
+    def test_no_matches_returns_empty_set(self, db):
+        db.create_user("u1", "alice", "Alice", "h1")
+        assert db.find_existing_usernames(["bob", "carol"]) == set()
+
+
+# ---------------------------------------------------------------------------
+# replace_oidc_roles
+# ---------------------------------------------------------------------------
+
+
+class TestReplaceOIDCRoles:
+    def _seed_role(self, db, role_id):
+        db.create_role(role_id, role_id, role_id, "perm.read", False, "")
+
+    def test_inserts_added_roles(self, db):
+        db.create_user("u1", "alice", "Alice", "h")
+        self._seed_role(db, "role-a")
+        self._seed_role(db, "role-b")
+
+        added, removed = db.replace_oidc_roles("u1", {"role-a", "role-b"})
+
+        assert added == {"role-a", "role-b"}
+        assert removed == set()
+        roles = {r["role_id"] for r in db.list_user_roles("u1")}
+        assert roles == {"role-a", "role-b"}
+
+    def test_removes_stale_oidc_roles(self, db):
+        db.create_user("u1", "alice", "Alice", "h")
+        self._seed_role(db, "role-a")
+        self._seed_role(db, "role-b")
+        db.assign_role("u1", "role-a", "oidc")
+        db.assign_role("u1", "role-b", "oidc")
+
+        added, removed = db.replace_oidc_roles("u1", {"role-a"})
+
+        assert added == set()
+        assert removed == {"role-b"}
+        roles = {r["role_id"] for r in db.list_user_roles("u1")}
+        assert roles == {"role-a"}
+
+    def test_preserves_non_oidc_roles(self, db):
+        """Manually-assigned and oidc-default rows are NOT touched."""
+        db.create_user("u1", "alice", "Alice", "h")
+        self._seed_role(db, "role-manual")
+        self._seed_role(db, "role-default")
+        self._seed_role(db, "role-oidc-old")
+        db.assign_role("u1", "role-manual", "admin-ui")
+        db.assign_role("u1", "role-default", "oidc-default")
+        db.assign_role("u1", "role-oidc-old", "oidc")
+
+        added, removed = db.replace_oidc_roles("u1", set())
+
+        # Only the oidc-assigned row was diffed
+        assert added == set()
+        assert removed == {"role-oidc-old"}
+
+        roles = {r["role_id"]: r["assigned_by"] for r in db.list_user_roles("u1")}
+        assert roles == {
+            "role-manual": "admin-ui",
+            "role-default": "oidc-default",
+        }
+
+    def test_no_op_when_desired_matches_current(self, db):
+        db.create_user("u1", "alice", "Alice", "h")
+        self._seed_role(db, "role-a")
+        db.assign_role("u1", "role-a", "oidc")
+
+        added, removed = db.replace_oidc_roles("u1", {"role-a"})
+
+        assert added == set()
+        assert removed == set()
+        assert {r["role_id"] for r in db.list_user_roles("u1")} == {"role-a"}
+
+    def test_empty_user_no_oidc_history(self, db):
+        db.create_user("u1", "alice", "Alice", "h")
+
+        added, removed = db.replace_oidc_roles("u1", set())
+
+        assert added == set()
+        assert removed == set()
+
+    def test_desired_role_blocked_by_admin_ui_assignment(self, db):
+        """Desired role already held via admin-ui: untouched, no PK conflict."""
+        db.create_user("u1", "alice", "Alice", "h")
+        self._seed_role(db, "role-a")
+        db.assign_role("u1", "role-a", "admin-ui")
+
+        added, removed = db.replace_oidc_roles("u1", {"role-a"})
+
+        assert added == set()
+        assert removed == set()
+        roles = {r["role_id"]: r["assigned_by"] for r in db.list_user_roles("u1")}
+        assert roles == {"role-a": "admin-ui"}
+
+    def test_desired_role_blocked_by_oidc_default_assignment(self, db):
+        """Desired role already held via oidc-default fallback: untouched."""
+        db.create_user("u1", "alice", "Alice", "h")
+        self._seed_role(db, "role-a")
+        db.assign_role("u1", "role-a", "oidc-default")
+
+        added, removed = db.replace_oidc_roles("u1", {"role-a"})
+
+        assert added == set()
+        assert removed == set()
+        roles = {r["role_id"]: r["assigned_by"] for r in db.list_user_roles("u1")}
+        assert roles == {"role-a": "oidc-default"}
+
+    def test_desired_role_added_alongside_blocked_role(self, db):
+        """Mixed case: one desired role is blocked (admin-ui), the other inserts cleanly."""
+        db.create_user("u1", "alice", "Alice", "h")
+        self._seed_role(db, "role-a")
+        self._seed_role(db, "role-b")
+        db.assign_role("u1", "role-a", "admin-ui")
+
+        added, removed = db.replace_oidc_roles("u1", {"role-a", "role-b"})
+
+        assert added == {"role-b"}
+        assert removed == set()
+        roles = {r["role_id"]: r["assigned_by"] for r in db.list_user_roles("u1")}
+        assert roles == {"role-a": "admin-ui", "role-b": "oidc"}
+
+    def test_revoke_only_oidc_assigned_roles(self, db):
+        """OIDC-assigned roles get revoked when not in desired; admin-ui rows survive."""
+        db.create_user("u1", "alice", "Alice", "h")
+        self._seed_role(db, "role-manual")
+        self._seed_role(db, "role-oidc-old")
+        self._seed_role(db, "role-default")
+        db.assign_role("u1", "role-manual", "admin-ui")
+        db.assign_role("u1", "role-oidc-old", "oidc")
+        db.assign_role("u1", "role-default", "oidc-default")
+
+        added, removed = db.replace_oidc_roles("u1", set())
+
+        assert added == set()
+        assert removed == {"role-oidc-old"}
+        roles = {r["role_id"]: r["assigned_by"] for r in db.list_user_roles("u1")}
+        assert roles == {"role-manual": "admin-ui", "role-default": "oidc-default"}
