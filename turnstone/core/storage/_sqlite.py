@@ -1309,6 +1309,20 @@ class SQLiteBackend:
                 for r in rows
             ]
 
+    def count_users(self) -> int:
+        with self._conn() as conn:
+            n = conn.execute(sa.select(sa.func.count()).select_from(users)).scalar()
+            return int(n or 0)
+
+    def find_existing_usernames(self, candidates: list[str]) -> set[str]:
+        if not candidates:
+            return set()
+        with self._conn() as conn:
+            rows = conn.execute(
+                sa.select(users.c.username).where(users.c.username.in_(candidates))
+            ).fetchall()
+            return {r[0] for r in rows}
+
     def delete_user(self, user_id: str) -> bool:
 
         with self._conn() as conn:
@@ -2219,6 +2233,50 @@ class SQLiteBackend:
                 .where(user_roles.c.user_id == user_id)
             ).fetchall()
             return [_row_to_dict(r, "builtin") for r in rows]
+
+    def replace_oidc_roles(
+        self, user_id: str, desired_role_ids: set[str]
+    ) -> tuple[set[str], set[str]]:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            existing_rows = conn.execute(
+                sa.select(user_roles.c.role_id, user_roles.c.assigned_by).where(
+                    user_roles.c.user_id == user_id
+                )
+            ).fetchall()
+            current_oidc: set[str] = {r[0] for r in existing_rows if r[1] == "oidc"}
+            # Roles assigned by any other source (admin-ui, oidc-default, etc.)
+            # are off-limits to OIDC reconciliation per apply_role_mapping's contract.
+            blocked: set[str] = {r[0] for r in existing_rows if r[1] != "oidc"}
+
+            effective_desired = desired_role_ids - blocked
+            added = effective_desired - current_oidc
+            removed = current_oidc - effective_desired
+
+            if added:
+                conn.execute(
+                    sa.insert(user_roles).prefix_with("OR IGNORE"),
+                    [
+                        {
+                            "user_id": user_id,
+                            "role_id": role_id,
+                            "assigned_by": "oidc",
+                            "created": now,
+                        }
+                        for role_id in added
+                    ],
+                )
+            if removed:
+                conn.execute(
+                    sa.delete(user_roles).where(
+                        (user_roles.c.user_id == user_id)
+                        & (user_roles.c.assigned_by == "oidc")
+                        & (user_roles.c.role_id.in_(removed))
+                    )
+                )
+            conn.commit()
+            return added, removed
 
     def get_user_permissions(self, user_id: str) -> set[str]:
         with self._conn() as conn:

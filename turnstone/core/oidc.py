@@ -7,6 +7,7 @@ event loop.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import dataclasses
 import hashlib
@@ -409,10 +410,18 @@ def validate_discovered_endpoint(
 # ---------------------------------------------------------------------------
 
 
-async def discover_oidc(config: OIDCConfig) -> OIDCConfig:
+async def discover_oidc(
+    config: OIDCConfig,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> OIDCConfig:
     """Fetch OIDC discovery document and return updated config with endpoints.
 
     On failure, logs a warning and returns config with ``enabled=False``.
+
+    A long-lived ``client`` may be supplied to amortise TLS / connection
+    setup across calls; when ``None`` a transient client is used (the
+    legacy shape, kept so tests don't need lifecycle management).
     """
     if not config.issuer:
         return dataclasses.replace(config, enabled=False)
@@ -425,10 +434,15 @@ async def discover_oidc(config: OIDCConfig) -> OIDCConfig:
 
     url = config.issuer.rstrip("/") + "/.well-known/openid-configuration"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url)
+        if client is not None:
+            resp = await client.get(url, timeout=10.0)
             resp.raise_for_status()
             doc = resp.json()
+        else:
+            async with httpx.AsyncClient(timeout=10.0) as transient:
+                resp = await transient.get(url)
+                resp.raise_for_status()
+                doc = resp.json()
     except Exception as exc:
         log.warning("OIDC discovery failed for %s: %s", config.issuer, exc)
         return dataclasses.replace(config, enabled=False)
@@ -503,20 +517,32 @@ async def discover_oidc(config: OIDCConfig) -> OIDCConfig:
 # ---------------------------------------------------------------------------
 
 
-async def fetch_jwks(jwks_uri: str) -> dict[str, Any]:
+async def fetch_jwks(
+    jwks_uri: str,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
     """Fetch the JWKS key set from the IdP.
 
     Returns the parsed JSON document (``{"keys": [...]}``) .  Called during
     startup discovery and on-demand when an unknown ``kid`` is encountered
     (key rotation).  Uses ``httpx.AsyncClient`` — never blocks the event loop.
 
+    A long-lived ``client`` may be supplied to share connection pooling;
+    when ``None`` a transient client is used.
+
     Raises :class:`OIDCError` on network failures or malformed responses.
     """
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(jwks_uri)
+        if client is not None:
+            resp = await client.get(jwks_uri, timeout=10.0)
             resp.raise_for_status()
             result: dict[str, Any] = resp.json()
+        else:
+            async with httpx.AsyncClient(timeout=10.0) as transient:
+                resp = await transient.get(jwks_uri)
+                resp.raise_for_status()
+                result = resp.json()
     except Exception as exc:
         raise OIDCError(f"JWKS fetch failed: {exc}") from exc
     if not isinstance(result.get("keys"), list):
@@ -537,16 +563,27 @@ async def initialize_oidc_state(app_state: Any) -> None:
     writes back the populated ``oidc_config`` plus ``jwks_data``. On any
     failure the helper guarantees ``oidc_config.enabled is False`` and
     ``jwks_data is None`` -- the caller does not need defensive logic.
+
+    Also installs a long-lived ``httpx.AsyncClient`` at
+    ``app_state.oidc_http_client`` so subsequent OIDC outbound calls can
+    reuse a single connection pool.  Pair with :func:`close_oidc_state`
+    in the lifespan teardown.
     """
     cfg: OIDCConfig = app_state.oidc_config
     if not cfg.enabled:
         app_state.jwks_data = None
+        app_state.oidc_http_client = None
+        app_state.jwks_refetch_lock = asyncio.Lock()
         return
+
+    http_client = httpx.AsyncClient(timeout=10.0)
+    app_state.oidc_http_client = http_client
+    app_state.jwks_refetch_lock = asyncio.Lock()
 
     # Discovery is operator-controlled config; any unexpected failure must
     # disable OIDC rather than escape and bring down the whole service.
     try:
-        cfg = await discover_oidc(cfg)
+        cfg = await discover_oidc(cfg, client=http_client)
     except Exception:
         log.warning("OIDC discovery failed -- OIDC login disabled", exc_info=True)
         app_state.oidc_config = dataclasses.replace(cfg, enabled=False)
@@ -570,7 +607,7 @@ async def initialize_oidc_state(app_state: Any) -> None:
         return
 
     try:
-        jwks_data = await fetch_jwks(cfg.jwks_uri)
+        jwks_data = await fetch_jwks(cfg.jwks_uri, client=http_client)
     except OIDCError:
         # Keep enabled=True so the callback's lazy-fetch retry path can
         # recover if the IdP transiently failed during startup.
@@ -582,6 +619,20 @@ async def initialize_oidc_state(app_state: Any) -> None:
     app_state.oidc_config = cfg
     app_state.jwks_data = jwks_data
     log.info("OIDC enabled: %s (%s)", cfg.provider_name, cfg.issuer)
+
+
+async def close_oidc_state(app_state: Any) -> None:
+    """Close the long-lived OIDC HTTP client installed by :func:`initialize_oidc_state`.
+
+    Safe to call when OIDC was never enabled — does nothing.
+    """
+    client = getattr(app_state, "oidc_http_client", None)
+    if client is not None:
+        try:
+            await client.aclose()
+        except Exception:
+            log.debug("OIDC http client close failed", exc_info=True)
+        app_state.oidc_http_client = None
 
 
 # ---------------------------------------------------------------------------
@@ -636,8 +687,13 @@ async def exchange_code(
     code: str,
     redirect_uri: str,
     code_verifier: str,
+    *,
+    client: httpx.AsyncClient | None = None,
 ) -> dict[str, Any]:
     """Exchange authorization code for tokens at the token endpoint.
+
+    A long-lived ``client`` may be supplied; when ``None`` a transient
+    client is used.
 
     Raises :class:`OIDCError` on non-200 response.
     """
@@ -650,8 +706,11 @@ async def exchange_code(
         "code_verifier": code_verifier,
     }
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(config.token_endpoint, data=data)
+        if client is not None:
+            resp = await client.post(config.token_endpoint, data=data, timeout=10.0)
+        else:
+            async with httpx.AsyncClient(timeout=10.0) as transient:
+                resp = await transient.post(config.token_endpoint, data=data)
     except Exception as exc:
         raise OIDCError(f"Token exchange request failed: {exc}") from exc
 
@@ -794,12 +853,13 @@ def provision_oidc_user(
     except StorageConflictError as exc:
         raise OIDCError(f"OIDC provisioning failed: {exc}") from exc
 
-    apply_role_mapping(storage, user_id, claims, config)
+    desired_role_ids = apply_role_mapping(storage, user_id, claims, config)
 
-    # Ensure new OIDC users have at least a default role so they can
-    # access the application.  builtin-viewer grants read-only access.
-    user_roles = storage.list_user_roles(user_id)
-    if not user_roles and storage.get_role("builtin-viewer") is not None:
+    # Fresh user with no IdP-mapped roles: fall back to builtin-viewer so
+    # they can access the app.  Skipping the per-row list_user_roles
+    # round-trip is safe because nothing else has had a chance to assign
+    # a role to this just-created user_id.
+    if not desired_role_ids and storage.get_role("builtin-viewer") is not None:
         storage.assign_role(user_id, "builtin-viewer", "oidc-default")
 
     created_user: dict[str, str] | None = storage.get_user(user_id)
@@ -826,14 +886,13 @@ def _derive_username(storage: Any, claims: dict[str, Any]) -> str:
     if not sanitised:
         sanitised = "user"
 
-    # Check validity and uniqueness.
-    if is_valid_username(sanitised) and storage.get_user_by_username(sanitised) is None:
-        return sanitised
-
-    # Deduplicate: append suffix.
-    for suffix in range(2, 11):
-        candidate = f"{sanitised[:60]}{suffix}"
-        if is_valid_username(candidate) and storage.get_user_by_username(candidate) is None:
+    # Build the full set of bounded candidates (base + 2..10 suffixes), strip
+    # invalid forms, then ask storage which ones are already taken in one query.
+    candidates = [sanitised, *(f"{sanitised[:60]}{n}" for n in range(2, 11))]
+    valid_candidates = [c for c in candidates if is_valid_username(c)]
+    existing = storage.find_existing_usernames(valid_candidates)
+    for candidate in valid_candidates:
+        if candidate not in existing:
             return candidate
 
     # Last resort: full UUID suffix with validation + uniqueness check.
@@ -856,18 +915,22 @@ def apply_role_mapping(
     user_id: str,
     claims: dict[str, Any],
     config: OIDCConfig,
-) -> None:
-    """Sync Turnstone roles from OIDC claims.
+) -> set[str]:
+    """Sync Turnstone roles from OIDC claims.  Returns desired role id set.
 
     If ``config.role_claim`` is set, reads the corresponding claim value,
     normalises it to a list, and maps each value via ``config.role_map``
     to a Turnstone role ID.  Roles assigned by OIDC on previous logins
     that are no longer present in the claims are revoked (IdP demotions
-    propagate).  Roles assigned manually or by other sources are never
-    touched.
+    propagate).  Roles assigned manually or by other sources (including
+    the ``oidc-default`` builtin-viewer fallback) are never touched.
+
+    The returned ``desired_role_ids`` lets the caller decide whether to
+    apply the new-user fallback role without a second ``list_user_roles``
+    round-trip.
     """
     if not config.role_claim or not config.role_map:
-        return
+        return set()
 
     claim_value = claims.get(config.role_claim)
 
@@ -888,16 +951,10 @@ def apply_role_mapping(
         if role_id and storage.get_role(role_id) is not None:
             desired_role_ids.add(role_id)
 
-    # Add new roles from claims.
-    for role_id in desired_role_ids:
-        storage.assign_role(user_id, role_id, "oidc")
+    added, removed = storage.replace_oidc_roles(user_id, desired_role_ids)
+    for role_id in added:
         log.debug("Assigned role %s to user %s via OIDC claim", role_id, user_id)
+    for role_id in removed:
+        log.info("Revoked role %s from user %s (removed from IdP claims)", role_id, user_id)
 
-    # Revoke OIDC-assigned roles no longer present in claims.
-    current_roles = storage.list_user_roles(user_id)
-    for role in current_roles:
-        if role.get("assigned_by") == "oidc" and role["role_id"] not in desired_role_ids:
-            storage.unassign_role(user_id, role["role_id"])
-            log.info(
-                "Revoked role %s from user %s (removed from IdP claims)", role["role_id"], user_id
-            )
+    return desired_role_ids

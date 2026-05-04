@@ -15,6 +15,7 @@ always accessible without authentication.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -1420,10 +1421,10 @@ async def handle_oidc_authorize(request: Request, audience: str) -> Response:
 
     # Require setup to be complete before allowing OIDC login
     try:
-        users = storage.list_users()
+        users_count = await asyncio.to_thread(storage.count_users)
     except Exception:
         return JSONResponse({"error": "Storage unavailable"}, status_code=503)
-    if not users:
+    if users_count == 0:
         return JSONResponse(
             {"error": "Initial setup required before OIDC login"},
             status_code=403,
@@ -1436,13 +1437,59 @@ async def handle_oidc_authorize(request: Request, audience: str) -> Response:
     code_verifier, _code_challenge = generate_pkce_pair()
 
     # Store pending state in database
-    storage.create_oidc_pending_state(state, nonce, code_verifier, audience)
+    await asyncio.to_thread(
+        storage.create_oidc_pending_state, state, nonce, code_verifier, audience
+    )
 
     # Build redirect URI (pinned by TURNSTONE_OIDC_REDIRECT_BASE)
     redirect_uri = _build_oidc_redirect_uri(oidc_config)
 
     url = build_authorize_url(oidc_config, redirect_uri, state, nonce, code_verifier)
     return RedirectResponse(url, status_code=302)
+
+
+_OIDC_STATE_CLEANUP_INTERVAL_S = 60.0
+
+
+def _resolve_kid(jwks: dict[str, Any] | None, kid: str | None) -> bool:
+    """Return True iff *jwks* contains the supplied *kid* (or has a single key when kid is None)."""
+    if jwks is None:
+        return False
+    keys = jwks.get("keys", [])
+    if not isinstance(keys, list):
+        return False
+    if kid is None:
+        return len(keys) == 1
+    return any(isinstance(k, dict) and k.get("kid") == kid for k in keys)
+
+
+async def _refetch_jwks_locked(
+    request: Request, jwks_uri: str, kid: str | None
+) -> dict[str, Any] | None:
+    """Acquire the per-app JWKS refetch lock, re-check the cache, and refetch on miss.
+
+    Returns the JWKS dict on success or ``None`` if the fetch failed.  When
+    another concurrent caller already refreshed the cache to include *kid*
+    we return the existing snapshot without issuing another network call.
+    """
+    from turnstone.core.oidc import fetch_jwks
+
+    lock = getattr(request.app.state, "jwks_refetch_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        request.app.state.jwks_refetch_lock = lock
+    http_client = getattr(request.app.state, "oidc_http_client", None)
+    async with lock:
+        cached: dict[str, Any] | None = getattr(request.app.state, "jwks_data", None)
+        if _resolve_kid(cached, kid):
+            return cached
+        try:
+            fresh = await fetch_jwks(jwks_uri, client=http_client)
+        except Exception:
+            log.warning("JWKS fetch failed from %s", jwks_uri, exc_info=True)
+            return None
+        request.app.state.jwks_data = fresh
+        return fresh
 
 
 async def handle_oidc_callback(request: Request, audience: str) -> Response:
@@ -1467,11 +1514,17 @@ async def handle_oidc_callback(request: Request, audience: str) -> Response:
         if not ip_ok:
             return RedirectResponse("/?oidc_error=Too+many+login+attempts", status_code=302)
 
-    # Lazy cleanup of expired pending states
-    try:
-        storage.cleanup_expired_oidc_states(300)
-    except Exception:
-        log.debug("OIDC state cleanup failed", exc_info=True)
+    # Lazy cleanup of expired pending states — gated to once per
+    # _OIDC_STATE_CLEANUP_INTERVAL_S so a high-rate callback path
+    # doesn't fire a full DELETE per login.
+    last_cleanup = getattr(request.app.state, "oidc_last_cleanup_monotonic", 0.0)
+    now_mono = time.monotonic()
+    if now_mono - last_cleanup > _OIDC_STATE_CLEANUP_INTERVAL_S:
+        request.app.state.oidc_last_cleanup_monotonic = now_mono
+        try:
+            await asyncio.to_thread(storage.cleanup_expired_oidc_states, 300)
+        except Exception:
+            log.debug("OIDC state cleanup failed", exc_info=True)
 
     def _record_oidc_failure() -> None:
         if login_limiter is not None:
@@ -1486,7 +1539,7 @@ async def handle_oidc_callback(request: Request, audience: str) -> Response:
 
     # Validate state
     state = request.query_params.get("state", "")
-    pending = storage.pop_oidc_pending_state(state, max_age_seconds=300)
+    pending = await asyncio.to_thread(storage.pop_oidc_pending_state, state, 300)
     if not pending:
         _record_oidc_failure()
         return RedirectResponse("/?oidc_error=Login+session+expired", status_code=302)
@@ -1499,14 +1552,20 @@ async def handle_oidc_callback(request: Request, audience: str) -> Response:
             OIDCError,
             OIDCKeyNotFoundError,
             exchange_code,
-            fetch_jwks,
             provision_oidc_user,
             validate_id_token,
         )
 
         # Exchange code for tokens
         code = request.query_params.get("code", "")
-        tokens = await exchange_code(oidc_config, code, redirect_uri, pending["code_verifier"])
+        http_client = getattr(request.app.state, "oidc_http_client", None)
+        tokens = await exchange_code(
+            oidc_config,
+            code,
+            redirect_uri,
+            pending["code_verifier"],
+            client=http_client,
+        )
         id_token = tokens.get("id_token")
         if not isinstance(id_token, str) or not id_token:
             raise OIDCError("Token endpoint response missing id_token")
@@ -1515,12 +1574,10 @@ async def handle_oidc_callback(request: Request, audience: str) -> Response:
         # On unknown kid, refresh JWKS once (async) for key rotation.
         jwks_data: dict[str, Any] | None = getattr(request.app.state, "jwks_data", None)
         if jwks_data is None and oidc_config.jwks_uri:
-            # Lazy fetch: JWKS may have failed at startup but IdP recovered
-            try:
-                jwks_data = await fetch_jwks(oidc_config.jwks_uri)
-                request.app.state.jwks_data = jwks_data
-            except OIDCError:
-                log.warning("JWKS fetch failed from %s", oidc_config.jwks_uri, exc_info=True)
+            # Lazy fetch: JWKS may have failed at startup but IdP recovered.
+            # Coalesced via the per-app refetch lock so concurrent callbacks
+            # don't fan out N parallel JWKS GETs.
+            jwks_data = await _refetch_jwks_locked(request, oidc_config.jwks_uri, kid=None)
         if jwks_data is None:
             return RedirectResponse("/?oidc_error=OIDC+temporarily+unavailable", status_code=302)
 
@@ -1532,10 +1589,18 @@ async def handle_oidc_callback(request: Request, audience: str) -> Response:
                 pending["nonce"],
             )
         except OIDCKeyNotFoundError:
-            # Key rotation: re-fetch JWKS and retry once.
+            # Key rotation: re-fetch JWKS once (coalesced) and retry.
+            import jwt as _jwt
+
+            try:
+                _kid = _jwt.get_unverified_header(id_token).get("kid")
+            except Exception:
+                _kid = None
             log.info("JWKS key not found — refreshing for possible key rotation")
-            jwks_data = await fetch_jwks(oidc_config.jwks_uri)
-            request.app.state.jwks_data = jwks_data
+            refreshed = await _refetch_jwks_locked(request, oidc_config.jwks_uri, kid=_kid)
+            if refreshed is None:
+                raise
+            jwks_data = refreshed
             id_claims = validate_id_token(
                 id_token,
                 jwks_data,
@@ -1544,12 +1609,13 @@ async def handle_oidc_callback(request: Request, audience: str) -> Response:
             )
 
         # Verify setup is complete
-        users = storage.list_users()
-        if not users:
+        users_count = await asyncio.to_thread(storage.count_users)
+        if users_count == 0:
             return RedirectResponse("/?oidc_error=Initial+setup+required", status_code=302)
 
-        # Provision or match user
-        user = provision_oidc_user(storage, oidc_config, id_claims)
+        # Provision or match user (chains apply_role_mapping +
+        # potentially a write to user_roles — wrap as a unit).
+        user = await asyncio.to_thread(provision_oidc_user, storage, oidc_config, id_claims)
 
     except OIDCError as exc:
         log.warning("OIDC callback failed: %s", exc)
@@ -1561,7 +1627,7 @@ async def handle_oidc_callback(request: Request, audience: str) -> Response:
         return RedirectResponse("/?oidc_error=Authentication+failed", status_code=302)
 
     # Load permissions and issue Turnstone JWT
-    perms = _load_user_permissions(storage, user["user_id"])
+    perms = await asyncio.to_thread(_load_user_permissions, storage, user["user_id"])
     scopes = _permissions_to_scopes(perms)
     jwt_token = ""
     if jwt_secret:
