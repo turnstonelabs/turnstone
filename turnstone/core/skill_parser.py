@@ -202,7 +202,7 @@ def parse_skill_md(raw: str, *, lenient: bool = False) -> ParsedSkill | None:
     raw_desc = meta.get("description")
     description = str(raw_desc).strip() if raw_desc is not None else ""
     if not description and body:
-        first_line = body.split("\n")[0].strip()
+        first_line = body.split("\n", 1)[0].strip()
         # Skip markdown headings
         if first_line.startswith("#"):
             first_line = first_line.lstrip("# ").strip()

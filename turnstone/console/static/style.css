@@ -908,11 +908,14 @@
 }
 
 /* ==========================================================================
-   Toast override — position above cluster status bar
+   Toast override — position above cluster status bar AND above admin modal
+   overlays (which sit at z-index 600).  Without this, toasts fired while a
+   modal is open — e.g. paste-to-fill on the Create Skill modal — render
+   behind the dimmed backdrop and never reach the user.
    ========================================================================== */
 #toast {
   bottom: 56px;
-  z-index: 200;
+  z-index: 700;
   color: var(--fg-bright);
   border-color: var(--border-strong);
 }
@@ -1907,6 +1910,23 @@ h3.skill-spec-heading {
   font-weight: 400;
   font-size: 10px;
   opacity: 1;
+}
+
+/* Tip line above the Skill Content textarea announcing the paste-to-fill
+   affordance.  Sized to match the dim hint on the heading rather than the
+   default body text, so it doesn't out-shout the rest of the modal. */
+.skill-paste-hint {
+  font-size: 11px;
+  color: var(--fg-dim);
+  margin: -2px 0 6px;
+  line-height: 1.5;
+}
+.skill-paste-hint code {
+  font-size: 10.5px;
+  padding: 0 4px;
+  background: var(--code-bg);
+  border-radius: 2px;
+  color: var(--fg);
 }
 
 .skill-spec-section-content {

@@ -3094,17 +3094,33 @@
               <h3 class="skill-spec-heading">
                 Skill Content
                 <span class="label-hint"
-                  >system message &mdash; {{model}}, {{ws_id}},
-                  {{node_id}}</span
+                  >available: {{model}}, {{ws_id}}, {{node_id}}</span
                 >
               </h3>
+              <div
+                class="skill-paste-hint"
+                id="ctm-paste-hint"
+                aria-live="polite"
+              >
+                <span class="skill-paste-hint-rest">
+                  Tip: paste a SKILL.md (with <code>---</code> frontmatter) to
+                  auto-fill the form.
+                </span>
+                <span
+                  class="skill-paste-hint-busy"
+                  style="display: none"
+                >
+                  Parsing SKILL.md&hellip;
+                </span>
+              </div>
               <textarea
                 id="ctm-content"
                 class="skill-content-area"
+                aria-describedby="ctm-paste-hint"
                 placeholder="You are a code reviewer using {{model}}..."
               ></textarea>
               <div class="skill-vars-row">
-                <span class="skill-vars-label">Variables</span>
+                <span class="skill-vars-label">Used</span>
                 <div
                   id="ctm-variables"
                   class="skill-vars-display label-hint"
@@ -3379,12 +3395,12 @@
               <h3 class="skill-spec-heading">
                 Skill Content
                 <span class="label-hint"
-                  >{{model}}, {{ws_id}}, {{node_id}}</span
+                  >available: {{model}}, {{ws_id}}, {{node_id}}</span
                 >
               </h3>
               <textarea id="etm-content" class="skill-content-area"></textarea>
               <div class="skill-vars-row">
-                <span class="skill-vars-label">Variables</span>
+                <span class="skill-vars-label">Used</span>
                 <div
                   id="etm-variables"
                   class="skill-vars-display label-hint"

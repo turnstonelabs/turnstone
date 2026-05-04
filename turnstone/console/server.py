@@ -6975,6 +6975,80 @@ def _get_discovery_url(request: Request) -> str:
     return DEFAULT_DISCOVERY_URL
 
 
+# Authoritative cap on ``raw`` itself — code points, matching the Pydantic
+# ``max_length`` on ``ParseSkillRequest.raw`` and the ``content[:32768]``
+# truncation in ``admin_create_skill``.
+_PARSE_SKILL_MAX_CHARS = 32_768
+
+# Generous coarse Content-Length pre-check.  The HTTP body carries the JSON
+# wrapper (``{"raw":"..."}`` + escaping) plus any UTF-8 multi-byte expansion,
+# so a legitimate max-length ``raw`` produces a body well above the char cap
+# — rejecting at exactly 32 KiB would 413 valid near-max requests.  This
+# threshold only needs to refuse obviously oversized payloads before
+# ``request.json()`` buffers them; the per-string ``len(raw)`` check below
+# is the authoritative limit.
+_PARSE_SKILL_MAX_BODY_BYTES = _PARSE_SKILL_MAX_CHARS * 4
+
+
+async def admin_parse_skill(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/skills/parse — parse SKILL.md frontmatter + body.
+
+    Used by the admin UI's create/edit skill modals: when a user pastes a
+    full SKILL.md document, the frontend posts the raw text here and uses
+    the returned fields to populate the form, then drops the body into
+    the content textarea.  Reusing the Python parser keeps admin imports
+    and external skill installs in lockstep on edge cases (Hermes/nested
+    metadata layouts, malformed-YAML recovery, length caps).
+
+    Hardening: size cap + threadpool offload guard against deeply-nested
+    YAML; alias amplification is not a concern with ``safe_load``.
+    """
+    from turnstone.core.auth import require_permission
+    from turnstone.core.skill_parser import parse_skill_md
+    from turnstone.core.web_helpers import read_json_or_400
+
+    err = require_permission(request, "admin.skills")
+    if err:
+        return err
+
+    # Reject oversized bodies before buffering — protects worker memory from
+    # an admin token spraying multi-GB JSON.  Threshold is generous enough
+    # to admit a max-length ``raw`` plus its JSON wrapper and escaping; the
+    # per-string check below enforces the exact 32 KiB rule.
+    cl = request.headers.get("content-length")
+    if cl and cl.isdigit() and int(cl) > _PARSE_SKILL_MAX_BODY_BYTES:
+        return JSONResponse({"error": "request body too large"}, status_code=413)
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    raw = body.get("raw")
+    if not isinstance(raw, str) or not raw.strip():
+        return JSONResponse({"error": "raw is required"}, status_code=400)
+    if len(raw) > _PARSE_SKILL_MAX_CHARS:
+        return JSONResponse({"error": "raw exceeds 32 KiB"}, status_code=413)
+
+    try:
+        parsed = await asyncio.to_thread(parse_skill_md, raw)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    return JSONResponse(
+        {
+            "name": parsed.name,
+            "description": parsed.description,
+            "content": parsed.content,
+            "tags": list(parsed.tags),
+            "author": parsed.author,
+            "version": parsed.version,
+            "allowed_tools": list(parsed.allowed_tools),
+            "license": parsed.license,
+            "compatibility": parsed.compatibility,
+        }
+    )
+
+
 async def admin_skill_discover(request: Request) -> JSONResponse:
     """GET /v1/api/admin/skills/discover — search external skill registries."""
     from turnstone.core.auth import require_permission
@@ -11034,6 +11108,11 @@ def create_app(
                     Route(
                         "/api/admin/skills/install",
                         admin_skill_install,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/admin/skills/parse",
+                        admin_parse_skill,
                         methods=["POST"],
                     ),
                     # Governance: Skills
