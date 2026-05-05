@@ -14,6 +14,9 @@ both coroutines return the same access_token.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -26,6 +29,60 @@ from tests.conftest import make_mcp_token_cipher
 from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.mcp_oauth import get_user_access_token
 from turnstone.core.storage._sqlite import SQLiteBackend
+
+# Generous CI ceiling — cancel/drain is sub-millisecond on a healthy loop.
+_CANCEL_WAIT_S = 5.0
+
+
+class _ObservableLockCm:
+    """Class-based context manager whose ``__exit__`` is observable.
+
+    Used by :class:`TestPgRefreshLock` cancellation tests instead of
+    ``@contextlib.contextmanager`` so the test can distinguish:
+
+      * an explicit ``cm.__exit__(None, None, None)`` call from the drain
+        coroutine (records ``(None, None, None)`` in :attr:`exit_calls`)
+      * ``GeneratorExit`` thrown by the cm's generator finalizer during
+        garbage collection (records ``(GeneratorExit, ...)``)
+
+    Class-based ``__exit__`` runs only when called explicitly — generator
+    finalization doesn't go through it — so an empty ``exit_calls`` is
+    proof the drain didn't run, not just that GC didn't fire.
+    """
+
+    def __init__(
+        self,
+        *,
+        enter_started: threading.Event | None = None,
+        enter_release: threading.Event | None = None,
+        enter_raises: BaseException | None = None,
+    ) -> None:
+        self.enter_thread: int | None = None
+        self.exit_thread: int | None = None
+        self.exit_calls: list[tuple[Any, Any, Any]] = []
+        self._enter_started = enter_started
+        self._enter_release = enter_release
+        self._enter_raises = enter_raises
+
+    def __enter__(self) -> None:
+        self.enter_thread = threading.get_ident()
+        if self._enter_started is not None:
+            self._enter_started.set()
+        if self._enter_release is not None:
+            self._enter_release.wait(timeout=_CANCEL_WAIT_S)
+        if self._enter_raises is not None:
+            raise self._enter_raises
+        return None
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: Any,
+    ) -> None:
+        self.exit_thread = threading.get_ident()
+        self.exit_calls.append((exc_type, exc, tb))
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -638,6 +695,195 @@ class TestAdvisoryLock:
         with cm as value:
             assert value is None
         assert isinstance(cm, _contextlib.nullcontext)
+
+
+# ---------------------------------------------------------------------------
+# _PgRefreshLock executor topology — independent of advisory-lock semantics
+# ---------------------------------------------------------------------------
+
+
+class TestPgRefreshLock:
+    """Topology of the ``_PgRefreshLock`` async wrapper itself.
+
+    These tests patch ``acquire_advisory_lock_sync`` with a fake context
+    manager and assert behaviour of the per-instance executor, the
+    cancellation-safety drain, and other lifecycle properties — not the
+    advisory-lock semantics under it (those live in ``TestAdvisoryLock``).
+    """
+
+    def test_pg_refresh_lock_per_key_concurrency(self, storage: SQLiteBackend) -> None:
+        """Two ``_PgRefreshLock`` instances with different keys must enter in parallel.
+
+        Regression for the global single-worker executor shape: if every
+        instance shared one ``ThreadPoolExecutor(max_workers=1)``, the
+        second instance's ``__aenter__`` would queue behind the first
+        even though the advisory keys are unrelated, so a single slow
+        ``pg_try_advisory_xact_lock`` spin would block every other
+        refresh on the node. Per-instance executors keep enter/exit on
+        the same thread (psycopg2 thread-affinity) without globally
+        serializing the spin loop.
+        """
+        from turnstone.core.mcp_oauth import _PgRefreshLock
+
+        in_flight = 0
+        max_in_flight = 0
+        counter_lock = threading.Lock()
+        enter_hold_s = 0.1
+
+        @contextlib.contextmanager
+        def _slow_lock_cm(_key_text: str = "") -> Any:
+            nonlocal in_flight, max_in_flight
+            with counter_lock:
+                in_flight += 1
+                max_in_flight = max(max_in_flight, in_flight)
+            try:
+                # Block INSIDE __enter__, before the yield, so concurrent
+                # callers overlap on this stretch of the call.
+                time.sleep(enter_hold_s)
+                yield
+            finally:
+                with counter_lock:
+                    in_flight -= 1
+
+        with patch.object(storage, "acquire_advisory_lock_sync", side_effect=_slow_lock_cm):
+
+            async def _hold(key: str) -> None:
+                async with _PgRefreshLock(storage, key):
+                    pass
+
+            async def _two_concurrent() -> None:
+                await asyncio.gather(_hold("key-a"), _hold("key-b"))
+
+            asyncio.run(_two_concurrent())
+
+        assert max_in_flight == 2, (
+            "_PgRefreshLock instances serialized through a shared executor: "
+            f"max_in_flight={max_in_flight}; expected 2 with per-instance executors."
+        )
+
+    def _run_cancel_scenario(
+        self,
+        storage: SQLiteBackend,
+        *,
+        enter_raises: BaseException | None = None,
+    ) -> _ObservableLockCm:
+        """Run the cancellation scenario shared by both cancellation tests.
+
+        Patches ``acquire_advisory_lock_sync`` with a factory that returns
+        a fresh :class:`_ObservableLockCm`, starts a ``_PgRefreshLock``
+        acquire on a task, waits for the worker to enter ``cm.__enter__``,
+        cancels the task, then releases the worker to either succeed
+        (default) or raise (``enter_raises``). Awaits in-flight drain
+        tasks via :data:`_pg_refresh_drain_tasks` so callers can inspect
+        the cm deterministically.
+
+        Test integrity:
+        * Class-based cm — drain's explicit ``__exit__(None, None, None)``
+          is recorded as a real method call, distinguishable from
+          ``GeneratorExit`` thrown by GC of a generator-based cm.
+        * Strong ref via ``created_cms`` — keeps the cm alive past the
+          test's awaits, so a no-op drain genuinely fails the assertion
+          rather than papering over via GC finalization timing.
+        * Deterministic drain wait via :data:`_pg_refresh_drain_tasks` —
+          no fixed-duration sleeps.
+
+        Returns the single cm the factory created.
+        """
+        from turnstone.core.mcp_oauth import _pg_refresh_drain_tasks, _PgRefreshLock
+
+        enter_started = threading.Event()
+        enter_release = threading.Event()
+        created_cms: list[_ObservableLockCm] = []
+
+        def _factory(_key_text: str) -> _ObservableLockCm:
+            cm = _ObservableLockCm(
+                enter_started=enter_started,
+                enter_release=enter_release,
+                enter_raises=enter_raises,
+            )
+            created_cms.append(cm)
+            return cm
+
+        with patch.object(storage, "acquire_advisory_lock_sync", side_effect=_factory):
+
+            async def _run() -> None:
+                lock = _PgRefreshLock(storage, "key-cancel")
+
+                async def _attempt() -> None:
+                    async with lock:
+                        pass  # body never runs — we cancel before it does
+
+                task = asyncio.create_task(_attempt())
+                # Wait until the worker is inside cm.__enter__.
+                await asyncio.to_thread(enter_started.wait, _CANCEL_WAIT_S)
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+                    await task
+                # Release the worker — succeed (default) or raise
+                # (``enter_raises`` set via factory closure).
+                enter_release.set()
+                # Wait deterministically for any in-flight drain task.
+                drains = list(_pg_refresh_drain_tasks)
+                if drains:
+                    await asyncio.gather(*drains, return_exceptions=True)
+
+            asyncio.run(_run())
+
+        assert len(created_cms) == 1, (
+            f"factory was called {len(created_cms)} times — expected exactly 1"
+        )
+        return created_cms[0]
+
+    def test_pg_refresh_lock_cancellation_releases_on_same_thread(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """Cancelling ``__aenter__`` mid-acquire MUST release on the same thread.
+
+        Regression for: cancellation between submit and the worker
+        completing ``cm.__enter__`` would otherwise leave an acquired
+        Postgres advisory lock + open transaction whose paired
+        ``cm.__exit__`` runs on a non-deterministic GC thread —
+        violating psycopg2's connection thread-affinity (the very
+        invariant the per-instance executor was introduced to enforce).
+        The fire-and-forget drain coroutine waits for the worker to
+        settle (via a fresh ``asyncio.wrap_future`` of the underlying
+        ``concurrent.futures.Future``, NOT a re-await of the cancelled
+        asyncio wrapper) and runs ``cm.__exit__`` on the same executor.
+        """
+        cm = self._run_cancel_scenario(storage)
+        assert cm.exit_calls, (
+            "drain did NOT call cm.__exit__ — orphan Postgres lock + open transaction"
+        )
+        # Drain calls __exit__(None, None, None); GC GeneratorExit would
+        # have args (GeneratorExit, ..., ...). Distinguish.
+        assert cm.exit_calls == [(None, None, None)], (
+            f"cm.__exit__ called with {cm.exit_calls[0]} — expected "
+            "(None, None, None) from drain. A non-(None,None,None) call would "
+            "indicate the drain came in via GeneratorExit / GC instead of an "
+            "explicit drain invocation."
+        )
+        assert cm.exit_thread == cm.enter_thread, (
+            f"cm.__exit__ ran on thread {cm.exit_thread} but cm.__enter__ on "
+            f"{cm.enter_thread} — psycopg2 thread-affinity violated"
+        )
+
+    def test_pg_refresh_lock_cancellation_no_lock_no_orphan(self, storage: SQLiteBackend) -> None:
+        """If ``cm.__enter__`` raised, the drain must NOT call ``cm.__exit__``.
+
+        The drain pairs only with successful acquires. If the worker
+        raised (e.g., ``TimeoutError`` from the spin loop), there is no
+        transaction to commit — calling ``__exit__`` on an unentered cm
+        would itself raise.
+        """
+        cm = self._run_cancel_scenario(
+            storage,
+            enter_raises=TimeoutError("simulated spin-loop timeout"),
+        )
+        assert not cm.exit_calls, (
+            "drain incorrectly called cm.__exit__ on an unentered cm "
+            f"(calls: {cm.exit_calls}). Would attempt to commit a transaction "
+            "that never began."
+        )
 
 
 # ---------------------------------------------------------------------------
