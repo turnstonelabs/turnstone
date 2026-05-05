@@ -1,9 +1,8 @@
-"""Add OAuth-MCP schema (Phase 2).
+"""Add OAuth-MCP schema.
 
 Adds two new tables (``mcp_user_tokens``, ``mcp_oauth_pending``) and
 eight new columns on ``mcp_servers`` to support per-(user, server)
-OAuth 2.1 + PKCE authorization for MCP servers.  See
-``docs/design/oauth-mcp.md`` §5.1 / §5.2.
+OAuth 2.1 + PKCE authorization for MCP servers.
 
 Existing rows continue working: every new column is either nullable or
 defaults to ``'static'`` (the existing behavior).  After the new

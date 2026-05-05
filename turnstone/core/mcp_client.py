@@ -78,11 +78,11 @@ def _mcp_to_openai(server_name: str, tool: Any) -> dict[str, Any]:
 class StaticServerState:
     """Per-server state for auth_type ∈ {none, static}. Name-keyed only.
 
-    Phase 5 introduces PoolEntryState as the (user, server)-keyed sibling
-    for auth_type=oauth_user. Together with the typed map declarations
-    (dict[str, StaticServerState] vs dict[tuple[str, str], PoolEntryState]),
-    this makes accidental cross-keying lookups easier to catch in review
-    and rejected by mypy.
+    The upcoming per-user pool integration introduces PoolEntryState as
+    the (user, server)-keyed sibling for auth_type=oauth_user. Together
+    with the typed map declarations (dict[str, StaticServerState] vs
+    dict[tuple[str, str], PoolEntryState]), this makes accidental
+    cross-keying lookups easier to catch in review and rejected by mypy.
     """
 
     name: str
@@ -103,10 +103,10 @@ class StaticServerState:
 class PoolEntryState:
     """Per-(user, server) state for auth_type = oauth_user.
 
-    Defined for Phase 5 use; not instantiated anywhere in Phase 0.
-    open_lock has no default — RFC §2.0 invariant 2 forbids allocating an
-    asyncio.Lock outside the mcp-loop. Phase 5 allocates lazily inside
-    connect coroutines.
+    Defined for use by the upcoming per-user pool integration; currently
+    no production caller. open_lock has no default — the mcp-loop
+    invariant forbids allocating an asyncio.Lock outside the mcp-loop;
+    the pool integration allocates lazily inside connect coroutines.
     """
 
     key: tuple[str, str]  # (user_id, server_name)
@@ -143,8 +143,9 @@ class MCPClientManager:
 
         # Per-server state for auth_type ∈ {none, static}.  Each entry holds
         # session/stack/streams/catalog/capability flags for one name-keyed
-        # connection.  Phase 5 introduces a sibling pool-entry map for
-        # auth_type=oauth_user; static entries always live here.
+        # connection.  The upcoming per-user pool integration introduces a
+        # sibling pool-entry map for auth_type=oauth_user; static entries
+        # always live here.
         self._static_servers: dict[str, StaticServerState] = {}
 
         self._tools: list[dict[str, Any]] = []
@@ -318,8 +319,9 @@ class MCPClientManager:
         Pre-closing unblocks anyio transport tasks stuck on zero-buffer
         ``send()`` calls, preventing the CPU busy-loop from SDK #2147.
 
-        Parameter is ``str`` today; Phase 5 widens to ``str | tuple[str, str]``
-        once ``PoolEntryState`` is wired.
+        Parameter is ``str`` today; the upcoming per-user pool
+        integration widens it to ``str | tuple[str, str]`` once
+        ``PoolEntryState`` is wired.
         """
         state = self._static_servers.get(key)
         if state is None or state.streams is None:
@@ -336,8 +338,9 @@ class MCPClientManager:
         Fails fast when the server is unreachable, avoiding the anyio
         cancel-scope orphan bug that causes 100% CPU spin.
 
-        Parameter is ``str`` today; Phase 5 widens to ``str | tuple[str, str]``
-        once ``PoolEntryState`` is wired.
+        Parameter is ``str`` today; the upcoming per-user pool
+        integration widens it to ``str | tuple[str, str]`` once
+        ``PoolEntryState`` is wired.
         """
         from urllib.parse import urlparse
 
@@ -1764,9 +1767,18 @@ class MCPClientManager:
 
 
 def _db_servers_to_config(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Convert mcp_servers DB rows to the config dict format."""
+    """Convert mcp_servers DB rows to the config dict format.
+
+    Skips ``auth_type='oauth_user'`` rows: they need per-user bearer
+    tokens fetched at dispatch time via the OAuth flow, so auto-connecting
+    them at startup with empty headers fails handshake and trips the
+    circuit breaker. The upcoming per-user pool integration brings them
+    online lazily once a user has consented.
+    """
     result: dict[str, dict[str, Any]] = {}
     for row in rows:
+        if row.get("auth_type") == "oauth_user":
+            continue
         name = row["name"]
         cfg: dict[str, Any] = {"type": row["transport"]}
         if row["transport"] == "stdio":

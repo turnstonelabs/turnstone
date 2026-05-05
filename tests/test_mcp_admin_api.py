@@ -355,9 +355,9 @@ class TestCreateMcpServer:
         assert "name" in r.json()["error"].lower()
 
     def test_admin_create_oauth_server(self, client):
-        """Phase 3: admin can POST a server with auth_type=oauth_user;
-        the seven OAuth text fields round-trip via GET and the plaintext
-        client secret is encrypted-at-rest via the dedicated writer."""
+        """Admin can POST a server with auth_type=oauth_user; the seven
+        OAuth text fields round-trip via GET and the plaintext client
+        secret is encrypted-at-rest via the dedicated writer."""
         r = client.post(
             "/v1/api/admin/mcp-servers",
             json={
@@ -381,7 +381,7 @@ class TestCreateMcpServer:
         assert data["oauth_audience"] == "https://mcp.example.com"
         assert data["oauth_registration_mode"] == "preregistered"
         assert data["oauth_authorization_server_url"] == "https://auth.example.com"
-        # Phase 3: ciphertext is persisted; the response masks it to "***".
+        # Ciphertext is persisted; the response masks it to "***".
         assert data["oauth_client_secret_ct"] == "***"
 
     def test_admin_create_oauth_server_without_token_store_returns_503(self, client_no_token_store):
@@ -537,8 +537,8 @@ class TestUpdateMcpServer:
         assert "transport" in r.json()["error"].lower()
 
     def test_admin_update_auth_type_static_to_oauth(self, client):
-        """Phase 2: an existing static row can be flipped to oauth_user
-        with OAuth fields supplied alongside."""
+        """An existing static row can be flipped to oauth_user with
+        OAuth fields supplied alongside."""
         created = _create_server(
             client,
             name="flip-to-oauth",

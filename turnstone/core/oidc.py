@@ -11,11 +11,9 @@ import asyncio
 import base64
 import dataclasses
 import hashlib
-import ipaddress
 import os
 import re
 import secrets
-import socket
 import urllib.parse
 import uuid
 from dataclasses import dataclass, field
@@ -27,6 +25,17 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 from turnstone.core.log import get_logger
+from turnstone.core.oauth_ssrf import (
+    KNOWN_TRUSTED_OAUTH_ENDPOINT_HOSTS,
+    OAuthSSRFError,
+    is_localhost,
+)
+from turnstone.core.oauth_ssrf import (
+    validate_discovered_endpoint as _ssrf_validate_discovered_endpoint,
+)
+from turnstone.core.oauth_ssrf import (
+    validate_url_no_ssrf as _ssrf_validate_url_no_ssrf,
+)
 
 log = get_logger(__name__)
 
@@ -58,21 +67,9 @@ _ALLOWED_ID_TOKEN_ALGS = [
     "PS512",
 ]
 
-# Well-known IdPs whose discovery documents legitimately reference endpoints on
-# hostnames distinct from the issuer hostname. Keys are issuer hostnames; values
-# are the set of additional endpoint hostnames the issuer is allowed to delegate
-# to. eTLD+1 matching does not work here (e.g. google.com vs googleapis.com),
-# so an explicit allow-map is the only safe option.
-_KNOWN_TRUSTED_ENDPOINT_HOSTS: dict[str, frozenset[str]] = {
-    "accounts.google.com": frozenset(
-        {
-            "accounts.google.com",
-            "oauth2.googleapis.com",
-            "www.googleapis.com",
-            "openidconnect.googleapis.com",
-        }
-    ),
-}
+# Re-export the shared trusted-host map under the legacy OIDC name so existing
+# callers / tests continue to work without churn.
+_KNOWN_TRUSTED_ENDPOINT_HOSTS = KNOWN_TRUSTED_OAUTH_ENDPOINT_HOSTS
 
 
 # ---------------------------------------------------------------------------
@@ -94,14 +91,10 @@ class OIDCKeyNotFoundError(OIDCError):
 
 
 def _sanitize_log_text(s: str, limit: int) -> str:
-    """Escape control characters and truncate untrusted text for log inclusion.
+    """Legacy alias for the shared :func:`oauth_ssrf.sanitize_log_text`."""
+    from turnstone.core.oauth_ssrf import sanitize_log_text
 
-    Untrusted bytes (e.g. an IdP error body) embedded in log lines must not be
-    able to forge fake log records via CR/LF or hide content via NULs / other
-    control characters. ``unicode_escape`` renders these as visible ``\\r``,
-    ``\\n``, ``\\x00`` etc., and the limit caps the *rendered* length.
-    """
-    return s.encode("unicode_escape").decode("ascii")[:limit]
+    return sanitize_log_text(s, limit)
 
 
 # ---------------------------------------------------------------------------
@@ -293,60 +286,19 @@ def load_oidc_config() -> OIDCConfig:
 
 # ---------------------------------------------------------------------------
 # SSRF validation
+#
+# The actual checks live in :mod:`turnstone.core.oauth_ssrf` so the MCP OAuth
+# flow can reuse them. The wrappers below preserve OIDC's public API by
+# converting :class:`OAuthSSRFError` to :class:`OIDCError`.
 # ---------------------------------------------------------------------------
 
 
-def _is_localhost(hostname: str) -> bool:
-    """Return True if *hostname* refers to the loopback interface."""
-    return hostname in ("localhost", "127.0.0.1", "::1") or hostname.endswith(".localhost")
-
-
-def _effective_port(parsed: urllib.parse.ParseResult) -> int | None:
-    """Return the explicit port if set, else the scheme default."""
-    if parsed.port is not None:
-        return parsed.port
-    return {"http": 80, "https": 443}.get(parsed.scheme)
-
-
 def _validate_url_no_ssrf(url: str, *, allow_http: bool) -> urllib.parse.ParseResult:
-    """Run the scheme/userinfo/SSRF checks shared by issuer and discovered URLs.
-
-    Returns the parsed URL on success. Raises :class:`OIDCError` on failure.
-    The ``allow_http`` flag is the only knob: when ``True``, ``http://`` is
-    accepted *if* the hostname is also a localhost form; when ``False``,
-    only ``https://`` is accepted.
-    """
-    parsed = urllib.parse.urlparse(url)
-
-    hostname = parsed.hostname
-    if not hostname:
-        raise OIDCError(f"OIDC URL has no hostname: {url}")
-
-    if parsed.username or parsed.password:
-        raise OIDCError("OIDC URL must not contain embedded credentials (userinfo)")
-
-    if parsed.scheme != "https":
-        if allow_http and parsed.scheme == "http" and _is_localhost(hostname):
-            pass
-        else:
-            raise OIDCError(f"OIDC URL must use HTTPS (got {parsed.scheme}://): {url}")
-
+    """OIDC-flavoured wrapper around :func:`oauth_ssrf.validate_url_no_ssrf`."""
     try:
-        addr_infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
-    except socket.gaierror as exc:
-        raise OIDCError(f"OIDC hostname cannot be resolved: {hostname}") from exc
-
-    for _family, _type, _proto, _canonname, sockaddr in addr_infos:
-        try:
-            addr = ipaddress.ip_address(sockaddr[0])
-        except ValueError as exc:
-            raise OIDCError(
-                f"OIDC hostname resolved to invalid IP {sockaddr[0]!r}: {hostname}"
-            ) from exc
-        if not addr.is_global and not _is_localhost(hostname):
-            raise OIDCError(f"OIDC URL resolves to non-public address ({addr}): {url}")
-
-    return parsed
+        return _ssrf_validate_url_no_ssrf(url, allow_http=allow_http)
+    except OAuthSSRFError as exc:
+        raise OIDCError(str(exc)) from exc
 
 
 def validate_issuer_url(url: str) -> None:
@@ -388,36 +340,15 @@ def validate_discovered_endpoint(
 
     Raises :class:`OIDCError` on validation failure.
     """
-    parsed = _validate_url_no_ssrf(url, allow_http=allow_http)
-
-    issuer_hostname = (issuer_parsed.hostname or "").lower()
-    endpoint_hostname = (parsed.hostname or "").lower()
-
-    if parsed.scheme != issuer_parsed.scheme:
-        raise OIDCError(
-            f"OIDC discovered endpoint scheme ({parsed.scheme}) "
-            f"does not match issuer ({issuer_parsed.scheme}): {url}"
+    try:
+        _ssrf_validate_discovered_endpoint(
+            url,
+            issuer_parsed,
+            allow_http=allow_http,
+            trusted_endpoint_hosts=trusted_endpoint_hosts,
         )
-
-    known_trusted = _KNOWN_TRUSTED_ENDPOINT_HOSTS.get(issuer_hostname, frozenset())
-    host_allowed = (
-        endpoint_hostname == issuer_hostname
-        or endpoint_hostname in known_trusted
-        or endpoint_hostname in trusted_endpoint_hosts
-    )
-    if not host_allowed:
-        raise OIDCError(
-            f"OIDC discovered endpoint host ({endpoint_hostname}) "
-            f"does not match issuer ({issuer_hostname}) and is not trusted: {url}"
-        )
-
-    endpoint_port = _effective_port(parsed)
-    issuer_port = _effective_port(issuer_parsed)
-    if endpoint_port != issuer_port:
-        raise OIDCError(
-            f"OIDC discovered endpoint port ({endpoint_port}) "
-            f"does not match issuer ({issuer_port}): {url}"
-        )
+    except OAuthSSRFError as exc:
+        raise OIDCError(str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -483,7 +414,7 @@ async def discover_oidc(
         )
         return dataclasses.replace(config, enabled=False)
 
-    allow_http = _is_localhost(issuer_parsed.hostname or "")
+    allow_http = is_localhost(issuer_parsed.hostname or "")
     trusted_hosts = frozenset(h.lower() for h in config.trusted_endpoint_hosts)
     required = (
         ("authorization_endpoint", authorization_endpoint),

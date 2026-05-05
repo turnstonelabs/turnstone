@@ -13,7 +13,12 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 from turnstone.core.log import get_logger
-from turnstone.core.storage._protocol import MCPUserToken, OIDCIdentity, OIDCPendingState
+from turnstone.core.storage._protocol import (
+    MCPOAuthPendingState,
+    MCPUserToken,
+    OIDCIdentity,
+    OIDCPendingState,
+)
 from turnstone.core.storage._schema import (
     api_tokens,
     audit_events,
@@ -22,6 +27,7 @@ from turnstone.core.storage._schema import (
     conversations,
     heuristic_rules,
     intent_verdicts,
+    mcp_oauth_pending,
     mcp_servers,
     mcp_user_tokens,
     metadata,
@@ -1332,6 +1338,8 @@ class SQLiteBackend:
             conn.execute(sa.delete(channel_users).where(channel_users.c.user_id == user_id))
             conn.execute(sa.delete(api_tokens).where(api_tokens.c.user_id == user_id))
             conn.execute(sa.delete(oidc_identities).where(oidc_identities.c.user_id == user_id))
+            conn.execute(sa.delete(mcp_user_tokens).where(mcp_user_tokens.c.user_id == user_id))
+            conn.execute(sa.delete(mcp_oauth_pending).where(mcp_oauth_pending.c.user_id == user_id))
             result = conn.execute(sa.delete(users).where(users.c.user_id == user_id))
             conn.commit()
             return result.rowcount > 0
@@ -4082,6 +4090,104 @@ class SQLiteBackend:
             )
             conn.commit()
             return result.rowcount > 0
+
+    def delete_mcp_oauth_rows_by_server_name(self, server_name: str) -> int:
+        """Purge user tokens + pending OAuth state for *server_name*."""
+        with self._conn() as conn:
+            tokens_result = conn.execute(
+                sa.delete(mcp_user_tokens).where(mcp_user_tokens.c.server_name == server_name)
+            )
+            pending_result = conn.execute(
+                sa.delete(mcp_oauth_pending).where(mcp_oauth_pending.c.server_name == server_name)
+            )
+            conn.commit()
+            return int(tokens_result.rowcount or 0) + int(pending_result.rowcount or 0)
+
+    def get_mcp_oauth_client_secret_ct(self, server_id: str) -> bytes | None:
+        """Return the encrypted OAuth client secret column or None."""
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(mcp_servers.c.oauth_client_secret_ct).where(
+                    mcp_servers.c.server_id == server_id
+                )
+            ).fetchone()
+            if row is None or row[0] is None:
+                return None
+            return bytes(row[0])
+
+    # -- MCP OAuth pending state (per-(user, server) flow) ---------------------
+
+    def create_mcp_oauth_pending_state(
+        self,
+        state: str,
+        user_id: str,
+        server_name: str,
+        code_verifier: str,
+        return_url: str,
+    ) -> None:
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            conn.execute(
+                sa.insert(mcp_oauth_pending),
+                {
+                    "state": state,
+                    "user_id": user_id,
+                    "server_name": server_name,
+                    "code_verifier": code_verifier,
+                    "return_url": return_url,
+                    "created_at": now,
+                },
+            )
+            conn.commit()
+
+    def pop_mcp_oauth_pending_state(
+        self, state: str, max_age_seconds: int = 600
+    ) -> MCPOAuthPendingState | None:
+
+        cutoff = (datetime.now(UTC) - timedelta(seconds=max_age_seconds)).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+        with self._conn() as conn:
+            # Acquire write lock before SELECT to prevent TOCTOU race
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            row = conn.execute(
+                sa.select(
+                    mcp_oauth_pending.c.state,
+                    mcp_oauth_pending.c.user_id,
+                    mcp_oauth_pending.c.server_name,
+                    mcp_oauth_pending.c.code_verifier,
+                    mcp_oauth_pending.c.return_url,
+                    mcp_oauth_pending.c.created_at,
+                ).where(
+                    (mcp_oauth_pending.c.state == state) & (mcp_oauth_pending.c.created_at > cutoff)
+                )
+            ).fetchone()
+            # Always delete the row (whether valid, expired, or missing is fine)
+            conn.execute(sa.delete(mcp_oauth_pending).where(mcp_oauth_pending.c.state == state))
+            conn.commit()
+            if not row:
+                return None
+            return MCPOAuthPendingState(
+                state=row[0],
+                user_id=row[1],
+                server_name=row[2],
+                code_verifier=row[3],
+                return_url=row[4],
+                created_at=row[5],
+            )
+
+    def cleanup_expired_mcp_oauth_pending_states(self, max_age_seconds: int = 600) -> int:
+
+        cutoff = (datetime.now(UTC) - timedelta(seconds=max_age_seconds)).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.delete(mcp_oauth_pending).where(mcp_oauth_pending.c.created_at < cutoff)
+            )
+            conn.commit()
+            return result.rowcount
 
     # -- Model definitions -----------------------------------------------------
 
