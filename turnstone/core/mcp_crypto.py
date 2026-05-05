@@ -473,7 +473,8 @@ def initialize_mcp_crypto_state(app_state: object, *, node_id: str = "") -> None
     if oauth_user_count > 0 and cipher_cfg is None:
         log.error(
             "mcp.oauth: %d server(s) configured with auth_type='oauth_user' but no "
-            "[security] mcp_token_encryption_key in config.toml. Generate a key with: "
+            "[security] mcp_token_encryption_keys (rotation list) or "
+            "mcp_token_encryption_key (single) in config.toml. Generate a key with: "
             "python -c 'from cryptography.fernet import Fernet; "
             "print(Fernet.generate_key().decode())' "
             "and add it to your config.toml.",
