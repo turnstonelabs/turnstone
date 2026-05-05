@@ -4213,6 +4213,15 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
 
     await initialize_oidc_state(app.state)
 
+    # MCP-OAuth token-at-rest encryption — fail-loud on misconfiguration
+    # when any mcp_servers row has auth_type='oauth_user'.  See
+    # docs/design/oauth-mcp.md §5.3.  The console acts as the cluster
+    # admin surface and is the canonical writer for OAuth client secrets,
+    # so it needs the cipher even when no node currently dispatches.
+    from turnstone.core.mcp_crypto import initialize_mcp_crypto_state
+
+    initialize_mcp_crypto_state(app.state, node_id="console")
+
     # Register console in service registry so other services can discover it
     console_url = getattr(app.state, "console_url", "")
     _console_heartbeat_task: Any = None
@@ -4476,6 +4485,9 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     from turnstone.core.oidc import close_oidc_state
 
     await close_oidc_state(app.state)
+    from turnstone.core.mcp_crypto import close_mcp_crypto_state
+
+    close_mcp_crypto_state(app.state)
     app.state.collector.stop()
     audit_exec_shutdown = getattr(app.state, "audit_executor", None)
     if audit_exec_shutdown is not None:
@@ -8011,6 +8023,124 @@ def _get_mcp_max_servers(request: Request) -> int:
     return _MCP_MAX_SERVERS
 
 
+def _audit_oauth_client_secret_set(
+    storage: Any,
+    actor_id: str,
+    server_id: str,
+    *,
+    cleared: bool,
+    cipher: Any,
+    ip: str,
+) -> None:
+    """Emit ``mcp_server.oauth.client_secret_set`` after a write.
+
+    ``cleared=True`` means the operator cleared the secret (empty input);
+    ``cleared=False`` means a new secret was stored.  ``cipher`` carries
+    the active key fingerprint so audit consumers can correlate decrypt
+    failures with the key in use at write time.
+    """
+    from turnstone.core.audit import record_audit
+
+    fingerprints = getattr(cipher, "key_fingerprints", ()) if cipher is not None else ()
+    detail: dict[str, Any] = {"server_id": server_id, "cleared": cleared}
+    if fingerprints:
+        detail["key_fingerprint"] = fingerprints[0]
+    record_audit(
+        storage,
+        actor_id,
+        "mcp_server.oauth.client_secret_set",
+        "mcp_server",
+        server_id,
+        detail,
+        ip,
+    )
+
+
+_OAUTH_TOKEN_STORE_503_MSG = (
+    "OAuth-MCP encryption key not configured. Set "
+    "[security] mcp_token_encryption_key (or mcp_token_encryption_keys "
+    "for rotation) in config.toml and restart."
+)
+
+
+def _require_token_store_for_oauth_secret(
+    request: Request, body: dict[str, Any], *, auth_type: str
+) -> JSONResponse | None:
+    """Pre-mutation gate for the OAuth client-secret write path.
+
+    Returns a 503 ``JSONResponse`` when ``oauth_client_secret`` is in
+    ``body`` and ``auth_type == 'oauth_user'`` but the cluster has no
+    Fernet key configured.  Returns ``None`` otherwise (caller proceeds).
+
+    A second 400 is returned when the body field is present but not a
+    string or null — the caller should not need to re-validate it.
+
+    Used to fail-fast before ``storage.create_mcp_server`` /
+    ``storage.update_mcp_server`` so a 503 never leaves a partially
+    written row behind.
+    """
+    if "oauth_client_secret" not in body or auth_type != "oauth_user":
+        return None
+    secret_input = body.get("oauth_client_secret")
+    if secret_input is not None and not isinstance(secret_input, str):
+        return JSONResponse(
+            {"error": "oauth_client_secret must be a string or null"},
+            status_code=400,
+        )
+    if getattr(request.app.state, "mcp_token_store", None) is None:
+        return JSONResponse({"error": _OAUTH_TOKEN_STORE_503_MSG}, status_code=503)
+    return None
+
+
+def _apply_oauth_client_secret(
+    request: Request,
+    *,
+    server_id: str,
+    body: dict[str, Any],
+    auth_type: str,
+    audit_uid: str,
+    storage: Any,
+    ip: str,
+) -> tuple[bool | None, JSONResponse | None]:
+    """Encrypt + persist the operator-supplied client secret.
+
+    ``oauth_client_secret`` is read from ``body``; ``None`` / empty string
+    clears the column.  No-op when the field is absent or ``auth_type``
+    is not ``oauth_user`` — ``(None, None)`` is returned in that case.
+
+    On success returns ``(True, None)`` for a set or ``(False, None)``
+    for a clear.  Returns ``(None, error_response)`` only when the body
+    field has the wrong JSON type or the token store is unavailable
+    (callers must invoke ``_require_token_store_for_oauth_secret`` BEFORE
+    the storage write to avoid a partial-write hazard; this helper
+    re-checks defensively in case lifespan state changed mid-request).
+    """
+    if "oauth_client_secret" not in body or auth_type != "oauth_user":
+        return None, None
+    secret_input = body.get("oauth_client_secret")
+    if secret_input is not None and not isinstance(secret_input, str):
+        return None, JSONResponse(
+            {"error": "oauth_client_secret must be a string or null"},
+            status_code=400,
+        )
+    token_store = getattr(request.app.state, "mcp_token_store", None)
+    if token_store is None:
+        return None, JSONResponse({"error": _OAUTH_TOKEN_STORE_503_MSG}, status_code=503)
+    secret_text = (secret_input or "").strip()
+    secret_value: str | None = secret_text or None
+    token_store.set_oauth_client_secret(server_id, secret_value)
+    cleared = secret_value is None
+    _audit_oauth_client_secret_set(
+        storage,
+        audit_uid,
+        server_id,
+        cleared=cleared,
+        cipher=token_store.cipher,
+        ip=ip,
+    )
+    return (not cleared), None
+
+
 def _mask_mcp_secrets(server: dict[str, Any], reveal: bool = False) -> dict[str, Any]:
     """Mask secret fields on an MCP server response dict.
 
@@ -8224,6 +8354,12 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
             status_code=409,
         )
 
+    # bug-1 / sec-1: validate token-store availability and JSON shape BEFORE
+    # any storage mutation so a missing key leaves no orphan oauth_user row.
+    err_resp = _require_token_store_for_oauth_secret(request, body, auth_type=auth_type)
+    if err_resp is not None:
+        return err_resp
+
     server_id = uuid.uuid4().hex
     audit_uid, ip = _audit_context(request)
 
@@ -8253,9 +8389,25 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
         ),
     )
 
+    # Encrypt + persist the operator-supplied client secret via the dedicated
+    # writer.  Pre-checked above; the helper re-checks defensively.
+    secret_set_state, err_resp = _apply_oauth_client_secret(
+        request,
+        server_id=server_id,
+        body=body,
+        auth_type=auth_type,
+        audit_uid=audit_uid,
+        storage=storage,
+        ip=ip,
+    )
+    if err_resp is not None:
+        return err_resp
+
     audit_detail: dict[str, Any] = {"name": name, "auth_type": auth_type}
     if "oauth_client_secret" in body:
         audit_detail["oauth_client_secret"] = "(redacted)"
+        if secret_set_state is not None:
+            audit_detail["oauth_client_secret_set"] = secret_set_state
     record_audit(
         storage,
         audit_uid,
@@ -8389,7 +8541,12 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     # columns so a stale client_id / audience can't leak back if the
     # row is later flipped to a different oauth_user provider.
     # ``oauth_client_secret_ct`` is owned by a dedicated write path
-    # (not the generic update); its clear-on-change lives there.
+    # (not the generic update); the matching clear-on-transition is
+    # applied below via ``token_store.set_oauth_client_secret(..., None)``
+    # (or a direct storage call when no encryption key is configured).
+    transitioning_away_from_oauth_user = (
+        updates.get("auth_type") in {"static", "none"} and existing.get("auth_type") == "oauth_user"
+    )
     if updates.get("auth_type") and updates["auth_type"] != "oauth_user":
         updates.update(
             {
@@ -8402,16 +8559,71 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
             }
         )
 
+    # bug-2 / sec-1: validate token-store availability and JSON shape BEFORE
+    # ``storage.update_mcp_server`` so a missing key doesn't leave partial
+    # column changes persisted.
+    auth_type_now = updates.get("auth_type", existing.get("auth_type", "static"))
+    err_resp = _require_token_store_for_oauth_secret(request, body, auth_type=auth_type_now)
+    if err_resp is not None:
+        return err_resp
+
     if updates:
         storage.update_mcp_server(server_id, **updates)
 
     audit_uid, ip = _audit_context(request)
+
+    # sec-2: when the row is leaving ``oauth_user``, also clear the encrypted
+    # client secret column.  Operators expect "disable OAuth" to revoke
+    # credentials; leaving stale ciphertext that resurfaces if the row is
+    # flipped back is surprising and a footgun.
+    if transitioning_away_from_oauth_user:
+        token_store = getattr(request.app.state, "mcp_token_store", None)
+        if token_store is not None:
+            token_store.set_oauth_client_secret(server_id, None)
+            _audit_oauth_client_secret_set(
+                storage,
+                audit_uid,
+                server_id,
+                cleared=True,
+                cipher=token_store.cipher,
+                ip=ip,
+            )
+        else:
+            # No encryption key configured — clear the column directly so the
+            # operator's mental model holds.  No cipher fingerprint to audit.
+            storage.set_mcp_oauth_client_secret_ct(server_id, None)
+            _audit_oauth_client_secret_set(
+                storage,
+                audit_uid,
+                server_id,
+                cleared=True,
+                cipher=None,
+                ip=ip,
+            )
+
+    # Encrypt + persist the operator-supplied client secret via the dedicated
+    # writer.  Skip when the post-update auth_type is not oauth_user (the
+    # generic update above also clears OAuth columns in that case).
+    secret_set_state, err_resp = _apply_oauth_client_secret(
+        request,
+        server_id=server_id,
+        body=body,
+        auth_type=auth_type_now,
+        audit_uid=audit_uid,
+        storage=storage,
+        ip=ip,
+    )
+    if err_resp is not None:
+        return err_resp
+
     audit_detail = dict(updates)
     for _secret_key in ("env", "headers"):
         if _secret_key in audit_detail:
             audit_detail[_secret_key] = "(updated)"
     if "oauth_client_secret" in body:
         audit_detail["oauth_client_secret"] = "(redacted)"
+        if secret_set_state is not None:
+            audit_detail["oauth_client_secret_set"] = secret_set_state
     record_audit(
         storage,
         audit_uid,
