@@ -39,6 +39,38 @@ class OIDCPendingState(TypedDict):
     created_at: str
 
 
+class MCPUserToken(TypedDict):
+    """Row shape returned by per-(user, MCP server) OAuth token lookups.
+
+    See ``docs/design/oauth-mcp.md`` §5.1.  ``access_token_ct`` and
+    ``refresh_token_ct`` are Fernet ciphertext blobs; the storage layer
+    returns them verbatim and ``MCPTokenStore`` (Phase 3) handles
+    encrypt/decrypt.
+    """
+
+    user_id: str
+    server_name: str
+    access_token_ct: bytes
+    refresh_token_ct: bytes | None
+    expires_at: str | None
+    scopes: str | None
+    as_issuer: str
+    audience: str
+    created: str
+    last_refreshed: str | None
+
+
+class MCPOAuthPendingState(TypedDict):
+    """Row shape returned when popping a pending MCP OAuth flow state."""
+
+    state: str
+    user_id: str
+    server_name: str
+    code_verifier: str
+    return_url: str
+    created_at: str
+
+
 @runtime_checkable
 class StorageBackend(Protocol):
     """Protocol that every storage backend adapter must implement.
@@ -1585,6 +1617,14 @@ class StorageBackend(Protocol):
         registry_name: str | None = None,
         registry_version: str = "",
         registry_meta: str = "{}",
+        auth_type: str = "static",
+        oauth_client_id: str | None = None,
+        oauth_client_secret_ct: bytes | None = None,
+        oauth_scopes: str | None = None,
+        oauth_audience: str | None = None,
+        oauth_registration_mode: str | None = None,
+        oauth_authorization_server_url: str | None = None,
+        oauth_as_issuer_cached: str | None = None,
     ) -> None:
         """Create an MCP server definition. No-op if server_id already exists."""
         ...

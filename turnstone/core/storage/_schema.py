@@ -607,6 +607,19 @@ mcp_servers = sa.Table(
     sa.Column("registry_name", sa.Text, nullable=True),
     sa.Column("registry_version", sa.Text, nullable=False, server_default=""),
     sa.Column("registry_meta", sa.Text, nullable=False, server_default="{}"),
+    # Per-(user, server) OAuth 2.1 — see docs/design/oauth-mcp.md §5.2.
+    # `auth_type` is one of: 'none', 'static', 'oauth_user'.  The other
+    # `oauth_*` columns are NULL when auth_type != 'oauth_user'.
+    # `oauth_client_secret_ct` is Fernet ciphertext; never decrypted on
+    # the read path (write-only field, masked as "***" in responses).
+    sa.Column("auth_type", sa.Text, nullable=False, server_default="static"),
+    sa.Column("oauth_client_id", sa.Text, nullable=True),
+    sa.Column("oauth_client_secret_ct", sa.LargeBinary, nullable=True),
+    sa.Column("oauth_scopes", sa.Text, nullable=True),
+    sa.Column("oauth_audience", sa.Text, nullable=True),
+    sa.Column("oauth_registration_mode", sa.Text, nullable=True),
+    sa.Column("oauth_authorization_server_url", sa.Text, nullable=True),
+    sa.Column("oauth_as_issuer_cached", sa.Text, nullable=True),
     sa.Column("created", sa.Text, nullable=False),
     sa.Column("updated", sa.Text, nullable=False),
 )
@@ -692,6 +705,41 @@ oidc_pending_states = sa.Table(
     sa.Column("audience", sa.Text, nullable=False),
     sa.Column("created_at", sa.Text, nullable=False),
 )
+
+# ---------------------------------------------------------------------------
+# MCP per-(user, server) OAuth tokens and pending authorization-flow state.
+# See docs/design/oauth-mcp.md §5.1.  No FKs at the schema level (matches
+# `oidc_*` tables; tests avoid orphan rows via fixtures).
+# ---------------------------------------------------------------------------
+
+mcp_user_tokens = sa.Table(
+    "mcp_user_tokens",
+    metadata,
+    sa.Column("user_id", sa.Text, nullable=False),
+    sa.Column("server_name", sa.Text, nullable=False),
+    sa.Column("access_token_ct", sa.LargeBinary, nullable=False),
+    sa.Column("refresh_token_ct", sa.LargeBinary, nullable=True),
+    sa.Column("expires_at", sa.Text, nullable=True),
+    sa.Column("scopes", sa.Text, nullable=True),
+    sa.Column("as_issuer", sa.Text, nullable=False),
+    sa.Column("audience", sa.Text, nullable=False),
+    sa.Column("created", sa.Text, nullable=False),
+    sa.Column("last_refreshed", sa.Text, nullable=True),
+    sa.PrimaryKeyConstraint("user_id", "server_name"),
+)
+
+mcp_oauth_pending = sa.Table(
+    "mcp_oauth_pending",
+    metadata,
+    sa.Column("state", sa.Text, primary_key=True),
+    sa.Column("user_id", sa.Text, nullable=False),
+    sa.Column("server_name", sa.Text, nullable=False),
+    sa.Column("code_verifier", sa.Text, nullable=False),
+    sa.Column("return_url", sa.Text, nullable=False),
+    sa.Column("created_at", sa.Text, nullable=False),
+)
+
+sa.Index("idx_mcp_pending_created", mcp_oauth_pending.c.created_at)
 
 # ── TLS / ACME (lacme integration) ──────────────────────────────────────────
 

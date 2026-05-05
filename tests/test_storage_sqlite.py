@@ -939,6 +939,64 @@ class TestTouchWorkstream:
         backend.touch_workstream("nonexistent")  # must not raise
 
 
+# -- MCP OAuth columns ---------------------------------------------------------
+
+
+class TestMcpServerOauthColumns:
+    def test_mcp_servers_oauth_columns_round_trip(self, backend: Any) -> None:
+        """An oauth_user row round-trips through create -> get with all
+        seven OAuth text columns intact."""
+        sid = "oauth-srv-1"
+        backend.create_mcp_server(
+            server_id=sid,
+            name="oauth-srv",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+            auth_type="oauth_user",
+            oauth_client_id="cli_abc123",
+            oauth_scopes="openid profile",
+            oauth_audience="https://mcp.example.com",
+            oauth_registration_mode="preregistered",
+            oauth_authorization_server_url="https://auth.example.com",
+            oauth_as_issuer_cached="https://auth.example.com",
+        )
+        s = backend.get_mcp_server(sid)
+        assert s is not None
+        assert s["auth_type"] == "oauth_user"
+        assert s["oauth_client_id"] == "cli_abc123"
+        assert s["oauth_scopes"] == "openid profile"
+        assert s["oauth_audience"] == "https://mcp.example.com"
+        assert s["oauth_registration_mode"] == "preregistered"
+        assert s["oauth_authorization_server_url"] == "https://auth.example.com"
+        assert s["oauth_as_issuer_cached"] == "https://auth.example.com"
+        # Phase 2 leaves the ciphertext slot NULL even when other oauth
+        # fields are populated; Phase 3 wires the encryption write path.
+        assert s["oauth_client_secret_ct"] is None
+
+    def test_update_auth_type_static_to_oauth(self, backend: Any) -> None:
+        sid = "oauth-srv-2"
+        backend.create_mcp_server(
+            server_id=sid,
+            name="static-then-oauth",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+        )
+        assert backend.get_mcp_server(sid)["auth_type"] == "static"
+
+        ok = backend.update_mcp_server(
+            sid,
+            auth_type="oauth_user",
+            oauth_client_id="cli_after",
+            oauth_audience="https://mcp.example.com",
+        )
+        assert ok is True
+        s = backend.get_mcp_server(sid)
+        assert s is not None
+        assert s["auth_type"] == "oauth_user"
+        assert s["oauth_client_id"] == "cli_after"
+        assert s["oauth_audience"] == "https://mcp.example.com"
+
+
 # -- Lifecycle -----------------------------------------------------------------
 
 
