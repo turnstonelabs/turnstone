@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import uuid
 from typing import TYPE_CHECKING, Any
@@ -169,6 +170,25 @@ def storage(tmp_path):
     return SQLiteBackend(str(tmp_path / "test.db"))
 
 
+def _install_token_store(app, storage) -> None:
+    """Install an MCPTokenStore on ``app.state`` for tests that exercise
+    the OAuth client-secret write path.  Uses a deterministic test key."""
+    from cryptography.fernet import Fernet
+
+    from turnstone.core.mcp_crypto import (
+        MCPTokenCipher,
+        MCPTokenCipherConfig,
+        MCPTokenStore,
+    )
+
+    raw_key = base64.urlsafe_b64decode(Fernet.generate_key())
+    cipher = MCPTokenCipher(MCPTokenCipherConfig(keys=(raw_key,)))
+    app.state.mcp_token_cipher = cipher
+    app.state.mcp_token_store = MCPTokenStore(
+        storage, cipher, node_id="test", audit_storage=storage
+    )
+
+
 @pytest.fixture
 def client(storage):
     """TestClient wired to console admin MCP endpoints with full permissions."""
@@ -177,6 +197,7 @@ def client(storage):
         middleware=[Middleware(_InjectAuthMiddleware)],
     )
     app.state.auth_storage = storage
+    _install_token_store(app, storage)
     return TestClient(app)
 
 
@@ -188,6 +209,20 @@ def client_no_perm(storage):
         middleware=[Middleware(_InjectAuthNoMcpMiddleware)],
     )
     app.state.auth_storage = storage
+    _install_token_store(app, storage)
+    return TestClient(app)
+
+
+@pytest.fixture
+def client_no_token_store(storage):
+    """TestClient WITHOUT MCPTokenStore — the 503 path for OAuth secret writes."""
+    app = Starlette(
+        routes=_ROUTES,
+        middleware=[Middleware(_InjectAuthMiddleware)],
+    )
+    app.state.auth_storage = storage
+    app.state.mcp_token_store = None
+    app.state.mcp_token_cipher = None
     return TestClient(app)
 
 
@@ -320,8 +355,9 @@ class TestCreateMcpServer:
         assert "name" in r.json()["error"].lower()
 
     def test_admin_create_oauth_server(self, client):
-        """Phase 2: admin can POST a server with auth_type=oauth_user
-        and the seven OAuth text fields round-trip via GET."""
+        """Phase 3: admin can POST a server with auth_type=oauth_user;
+        the seven OAuth text fields round-trip via GET and the plaintext
+        client secret is encrypted-at-rest via the dedicated writer."""
         r = client.post(
             "/v1/api/admin/mcp-servers",
             json={
@@ -330,7 +366,7 @@ class TestCreateMcpServer:
                 "url": "https://mcp.example.com/sse",
                 "auth_type": "oauth_user",
                 "oauth_client_id": "cli_abc",
-                "oauth_client_secret": "should-be-discarded",
+                "oauth_client_secret": "secret-value",
                 "oauth_scopes": "openid profile",
                 "oauth_audience": "https://mcp.example.com",
                 "oauth_registration_mode": "preregistered",
@@ -345,9 +381,65 @@ class TestCreateMcpServer:
         assert data["oauth_audience"] == "https://mcp.example.com"
         assert data["oauth_registration_mode"] == "preregistered"
         assert data["oauth_authorization_server_url"] == "https://auth.example.com"
-        # Phase 2 discards the plaintext secret — ciphertext stays NULL,
-        # masked to None in the response.
-        assert data["oauth_client_secret_ct"] is None
+        # Phase 3: ciphertext is persisted; the response masks it to "***".
+        assert data["oauth_client_secret_ct"] == "***"
+
+    def test_admin_create_oauth_server_without_token_store_returns_503(self, client_no_token_store):
+        """When MCPTokenStore is unconfigured (no Fernet key), the admin
+        form returns 503 with an operator-actionable hint rather than
+        silently dropping the secret."""
+        r = client_no_token_store.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "oauth-srv",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_abc",
+                "oauth_client_secret": "secret-value",
+            },
+        )
+        assert r.status_code == 503, r.text
+        assert "mcp_token_encryption_key" in r.json()["error"]
+
+    def test_admin_create_oauth_server_503_does_not_create_orphan_row(
+        self, client_no_token_store, storage
+    ):
+        """bug-1: a 503 from the token-store gate must not leave an orphan
+        ``oauth_user`` row behind.  The validation is pre-mutation."""
+        r = client_no_token_store.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "would-be-orphan",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_abc",
+                "oauth_client_secret": "secret-value",
+            },
+        )
+        assert r.status_code == 503
+        # No row was created — the storage write was gated on the token store.
+        assert storage.get_mcp_server_by_name("would-be-orphan") is None
+        assert storage.list_mcp_servers() == []
+
+    def test_admin_create_oauth_server_rejects_non_string_secret(self, client):
+        """bug-3: ``oauth_client_secret`` must be a string or null in JSON.
+        A boolean / number / list payload should 400 cleanly, not be coerced
+        via ``str(...)``."""
+        for bad in (False, 0, [], {}):
+            r = client.post(
+                "/v1/api/admin/mcp-servers",
+                json={
+                    "name": f"bad-secret-{type(bad).__name__}",
+                    "transport": "streamable-http",
+                    "url": "https://mcp.example.com/sse",
+                    "auth_type": "oauth_user",
+                    "oauth_client_secret": bad,
+                },
+            )
+            assert r.status_code == 400, f"payload={bad!r} got {r.status_code}: {r.text}"
+            assert "oauth_client_secret" in r.json()["error"]
 
     def test_create_invalid_auth_type(self, client):
         r = client.post(
@@ -567,6 +659,131 @@ class TestUpdateMcpServer:
         assert data["auth_type"] == "none"
         assert data["oauth_client_id"] is None
         assert data["oauth_audience"] is None
+
+    def test_admin_update_oauth_server_503_does_not_partial_write(
+        self, client_no_token_store, storage
+    ):
+        """bug-2: a 503 from the token-store gate during PUT must leave the
+        existing row unchanged — no partial column rewrites persist."""
+        # Seed a static row directly via storage so no token store is needed.
+        storage.create_mcp_server(
+            server_id="srv-pre",
+            name="pre-existing",
+            transport="streamable-http",
+            url="https://orig.example.com/sse",
+            auth_type="static",
+        )
+        before = storage.get_mcp_server("srv-pre")
+        assert before is not None
+
+        # Try to flip to oauth_user with a secret while token store is None.
+        r = client_no_token_store.put(
+            "/v1/api/admin/mcp-servers/srv-pre",
+            json={
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_partial",
+                "oauth_client_secret": "would-be-written",
+                "url": "https://changed.example.com/sse",
+            },
+        )
+        assert r.status_code == 503, r.text
+
+        # Row must be unchanged — no partial column rewrites.
+        after = storage.get_mcp_server("srv-pre")
+        assert after is not None
+        assert after["auth_type"] == "static"
+        assert after["url"] == "https://orig.example.com/sse"
+        assert after.get("oauth_client_id") in (None, "")
+
+    def test_admin_update_rejects_non_string_secret(self, client):
+        """bug-3 (update path): non-string ``oauth_client_secret`` -> 400."""
+        # Seed an oauth_user row.
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "oauth-update-bad-secret",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli",
+            },
+        )
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+
+        for bad in (False, 0, [], {}):
+            r = client.put(
+                f"/v1/api/admin/mcp-servers/{sid}",
+                json={"oauth_client_secret": bad},
+            )
+            assert r.status_code == 400, f"payload={bad!r} got {r.status_code}: {r.text}"
+            assert "oauth_client_secret" in r.json()["error"]
+
+    def test_auth_type_transition_clears_oauth_client_secret_ct(self, client, storage):
+        """sec-2: flipping auth_type from oauth_user away (to static or none)
+        must clear the encrypted client secret column.  Otherwise the stale
+        ciphertext would resurface if the row were flipped back."""
+        # Seed an oauth_user row WITH a client secret persisted.
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "transition-clears-secret",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_xx",
+                "oauth_client_secret": "stays-until-transition",
+            },
+        )
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        # Confirm the ciphertext column is populated before the transition.
+        seeded = storage.get_mcp_server(sid)
+        assert seeded is not None
+        assert seeded.get("oauth_client_secret_ct") is not None
+
+        # Flip to static — column must be cleared.
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "static"},
+        )
+        assert r.status_code == 200, r.text
+        cleared = storage.get_mcp_server(sid)
+        assert cleared is not None
+        assert cleared["auth_type"] == "static"
+        assert cleared.get("oauth_client_secret_ct") is None
+
+    def test_auth_type_transition_clears_secret_without_token_store(
+        self, client_no_token_store, storage
+    ):
+        """sec-2: when no encryption key is configured the transition still
+        clears the column via a direct storage call — the operator's
+        mental model holds even with the cipher disabled at runtime."""
+        # Seed an oauth_user row with raw ciphertext bytes via storage so the
+        # transition has something to clear.
+        storage.create_mcp_server(
+            server_id="srv-direct-clear",
+            name="direct-clear",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+            auth_type="oauth_user",
+            oauth_client_id="cli_direct",
+        )
+        # Plant ciphertext via the dedicated writer (no cipher needed).
+        storage.set_mcp_oauth_client_secret_ct("srv-direct-clear", b"opaque-bytes")
+        seeded = storage.get_mcp_server("srv-direct-clear")
+        assert seeded is not None
+        assert seeded.get("oauth_client_secret_ct") is not None
+
+        r = client_no_token_store.put(
+            "/v1/api/admin/mcp-servers/srv-direct-clear",
+            json={"auth_type": "none"},
+        )
+        assert r.status_code == 200, r.text
+        cleared = storage.get_mcp_server("srv-direct-clear")
+        assert cleared is not None
+        assert cleared["auth_type"] == "none"
+        assert cleared.get("oauth_client_secret_ct") is None
 
 
 # ---------------------------------------------------------------------------

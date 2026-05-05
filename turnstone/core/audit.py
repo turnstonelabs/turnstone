@@ -34,6 +34,15 @@ Action-name conventions (non-exhaustive — grep
                         ``prompt_policy``, ``setting``, ``token``,
                         ``conversation``, ``memory``, ``org``.
 
+    mcp_server.oauth.*  OAuth-MCP delegated authorization events
+                        (``mcp_server.oauth.client_secret_set`` from
+                        admin handlers when the operator stores or
+                        clears a per-server OAuth client secret;
+                        ``mcp_server.oauth.token_decrypt_failure`` from
+                        ``MCPTokenStore.get_user_token`` when no
+                        installed key can decrypt a stored token).
+                        See ``docs/design/oauth-mcp.md`` §5.3.
+
 When adding a new namespace, prefer extending an existing prefix over
 inventing a synonym (e.g. ``mcp_server.refresh`` rather than
 ``mcp.refresh`` — ``mcp_server.*`` is already the established prefix).

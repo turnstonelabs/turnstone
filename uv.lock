@@ -2538,6 +2538,7 @@ source = { editable = "." }
 dependencies = [
     { name = "alembic" },
     { name = "bcrypt" },
+    { name = "cryptography" },
     { name = "httpx" },
     { name = "httpx-sse" },
     { name = "mcp" },
@@ -2616,6 +2617,7 @@ requires-dist = [
     { name = "bcrypt", specifier = ">=4.0" },
     { name = "croniter", marker = "extra == 'console'", specifier = ">=3.0" },
     { name = "croniter", marker = "extra == 'test'", specifier = ">=3.0" },
+    { name = "cryptography", specifier = ">=42" },
     { name = "ddgs", marker = "extra == 'ddg'", specifier = ">=9.0" },
     { name = "discord-py", marker = "extra == 'discord'", specifier = ">=2.4" },
     { name = "httpx", specifier = ">=0.28" },

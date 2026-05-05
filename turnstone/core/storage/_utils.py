@@ -153,6 +153,11 @@ SKILL_MUTABLE = frozenset(
     }
 )
 STRUCTURED_MEMORY_MUTABLE = frozenset({"content", "description", "type"})
+# ``oauth_client_secret_ct`` is intentionally absent from this set.  It has
+# its own dedicated writer (``StorageBackend.set_mcp_oauth_client_secret_ct``)
+# so the encrypt/None-to-clear semantics — owned by
+# :class:`turnstone.core.mcp_crypto.MCPTokenStore` — live in one place and
+# the generic ``update_mcp_server`` cannot accept a raw ciphertext blob.
 MCP_SERVER_MUTABLE = frozenset(
     {
         "name",
