@@ -3677,6 +3677,114 @@
             placeholder="Authorization: Bearer ..."
           ></textarea>
         </div>
+        <fieldset
+          id="mcp-auth-section"
+          style="
+            border: 1px solid var(--border);
+            padding: 10px 12px;
+            margin-top: 12px;
+          "
+        >
+          <legend style="font-size: 12px; padding: 0 6px">
+            Multitenant Authorization
+          </legend>
+          <label
+            style="display: block; margin: 4px 0; font-weight: 400; font-size: 13px"
+          >
+            <input
+              type="radio"
+              name="mcp-auth-type"
+              id="mcp-auth-none"
+              value="none"
+              onchange="toggleMcpAuthFields()"
+              style="margin-right: 6px"
+            />No authorization
+          </label>
+          <label
+            style="display: block; margin: 4px 0; font-weight: 400; font-size: 13px"
+          >
+            <input
+              type="radio"
+              name="mcp-auth-type"
+              id="mcp-auth-static"
+              value="static"
+              onchange="toggleMcpAuthFields()"
+              checked
+              style="margin-right: 6px"
+            />Static headers (single shared identity)
+          </label>
+          <label
+            style="display: block; margin: 4px 0; font-weight: 400; font-size: 13px"
+          >
+            <input
+              type="radio"
+              name="mcp-auth-type"
+              id="mcp-auth-oauth"
+              value="oauth_user"
+              onchange="toggleMcpAuthFields()"
+              style="margin-right: 6px"
+            />Per-user OAuth 2.1 (recommended)
+          </label>
+          <div id="mcp-oauth-fields" style="display: none; margin-top: 8px">
+            <label for="mcp-oauth-as-url"
+              >Authorization Server URL
+              <span style="font-weight: 400; text-transform: none"
+                >(optional — override discovery when MCP server URL is not the
+                OAuth issuer)</span
+              ></label
+            >
+            <input
+              type="text"
+              id="mcp-oauth-as-url"
+              placeholder="https://auth.example.com"
+            />
+            <label for="mcp-oauth-registration">Client Registration</label>
+            <select id="mcp-oauth-registration">
+              <option value="preregistered">preregistered</option>
+              <option value="dcr">dcr (Dynamic Client Registration)</option>
+            </select>
+            <label for="mcp-oauth-client-id">Client ID</label>
+            <input
+              type="text"
+              id="mcp-oauth-client-id"
+              placeholder="(operator-issued client_id)"
+            />
+            <label for="mcp-oauth-client-secret"
+              >Client Secret
+              <span style="font-weight: 400; text-transform: none"
+                >(write-only, never displayed)</span
+              ></label
+            >
+            <input
+              type="password"
+              id="mcp-oauth-client-secret"
+              placeholder="***"
+              autocomplete="off"
+            />
+            <label for="mcp-oauth-scopes"
+              >Scopes
+              <span style="font-weight: 400; text-transform: none"
+                >(space-separated)</span
+              ></label
+            >
+            <input
+              type="text"
+              id="mcp-oauth-scopes"
+              placeholder="openid profile"
+            />
+            <label for="mcp-oauth-audience"
+              >Audience
+              <span style="font-weight: 400; text-transform: none"
+                >(auto-populated from URL)</span
+              ></label
+            >
+            <input
+              type="text"
+              id="mcp-oauth-audience"
+              placeholder="https://mcp.example.com"
+            />
+          </div>
+        </fieldset>
         <div style="display: flex; gap: 20px; margin-top: 14px">
           <label style="margin: 0; font-size: 12px; color: var(--fg-dim)"
             ><input

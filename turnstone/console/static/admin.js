@@ -3465,6 +3465,46 @@ function toggleMcpTransport() {
     v === "stdio" ? "" : "none";
   document.getElementById("mcp-http-fields").style.display =
     v === "streamable-http" ? "" : "none";
+  // Re-evaluate auth-field visibility because the headers row lives
+  // inside mcp-http-fields and gets toggled there.
+  toggleMcpAuthFields();
+}
+
+function _selectedMcpAuthType() {
+  var radios = document.getElementsByName("mcp-auth-type");
+  for (var i = 0; i < radios.length; i++) {
+    if (radios[i].checked) return radios[i].value;
+  }
+  return "static";
+}
+
+function toggleMcpAuthFields() {
+  var authType = _selectedMcpAuthType();
+  var oauthDiv = document.getElementById("mcp-oauth-fields");
+  if (oauthDiv) {
+    oauthDiv.style.display = authType === "oauth_user" ? "" : "none";
+  }
+  // The "Headers" textarea (inside mcp-http-fields) is only meaningful
+  // for static auth; hide it for 'none' / 'oauth_user' so operators
+  // don't accidentally configure stale credentials.
+  var headersInput = document.getElementById("mcp-headers");
+  if (headersInput) {
+    var headersLabel = document.querySelector('label[for="mcp-headers"]');
+    var show = authType === "static";
+    headersInput.style.display = show ? "" : "none";
+    if (headersLabel) headersLabel.style.display = show ? "" : "none";
+  }
+}
+
+function _wireMcpAudienceAutofill() {
+  // Idempotent — only attach the listener once per page lifetime.
+  var urlInput = document.getElementById("mcp-url");
+  if (!urlInput || urlInput.dataset.audAutofill === "1") return;
+  urlInput.dataset.audAutofill = "1";
+  urlInput.addEventListener("blur", function () {
+    var aud = document.getElementById("mcp-oauth-audience");
+    if (aud && !aud.value.trim()) aud.value = urlInput.value.trim();
+  });
 }
 
 function showCreateMcpModal() {
@@ -3483,8 +3523,20 @@ function showCreateMcpModal() {
   document.getElementById("mcp-headers").value = "";
   document.getElementById("mcp-auto-approve").checked = false;
   document.getElementById("mcp-enabled").checked = true;
+  // Reset auth radios + OAuth subfields to the 'static' default.
+  document.getElementById("mcp-auth-static").checked = true;
+  document.getElementById("mcp-auth-none").checked = false;
+  document.getElementById("mcp-auth-oauth").checked = false;
+  document.getElementById("mcp-oauth-as-url").value = "";
+  document.getElementById("mcp-oauth-registration").value = "preregistered";
+  document.getElementById("mcp-oauth-client-id").value = "";
+  document.getElementById("mcp-oauth-client-secret").value = "";
+  document.getElementById("mcp-oauth-scopes").value = "";
+  document.getElementById("mcp-oauth-audience").value = "";
   document.getElementById("mcp-create-error").style.display = "none";
   toggleMcpTransport();
+  toggleMcpAuthFields();
+  _wireMcpAudienceAutofill();
   document.getElementById("mcp-name").focus();
   _mcpCreateTrap = _installTrap("mcp-create-overlay", "mcp-create-box");
 }
@@ -3535,7 +3587,25 @@ function showEditMcpModal(serverId) {
       document.getElementById("mcp-auto-approve").checked =
         s.auto_approve || false;
       document.getElementById("mcp-enabled").checked = s.enabled !== false;
+      var authType = s.auth_type || "static";
+      document.getElementById("mcp-auth-none").checked = authType === "none";
+      document.getElementById("mcp-auth-static").checked =
+        authType === "static";
+      document.getElementById("mcp-auth-oauth").checked =
+        authType === "oauth_user";
+      document.getElementById("mcp-oauth-as-url").value =
+        s.oauth_authorization_server_url || "";
+      document.getElementById("mcp-oauth-registration").value =
+        s.oauth_registration_mode || "preregistered";
+      document.getElementById("mcp-oauth-client-id").value =
+        s.oauth_client_id || "";
+      // Secret field always blank — write-only, never read back.
+      document.getElementById("mcp-oauth-client-secret").value = "";
+      document.getElementById("mcp-oauth-scopes").value = s.oauth_scopes || "";
+      document.getElementById("mcp-oauth-audience").value =
+        s.oauth_audience || "";
       toggleMcpTransport();
+      toggleMcpAuthFields();
     })
     .catch(function () {
       showToast("Failed to load server details");
@@ -3557,11 +3627,13 @@ function _parseMcpForm() {
     return { error: "Name must match [a-zA-Z0-9._-]+" };
   if (name.indexOf("__") >= 0) return { error: "Name must not contain '__'" };
 
+  var authType = _selectedMcpAuthType();
   var payload = {
     name: name,
     transport: transport,
     auto_approve: document.getElementById("mcp-auto-approve").checked,
     enabled: document.getElementById("mcp-enabled").checked,
+    auth_type: authType,
   };
 
   if (transport === "stdio") {
@@ -3587,19 +3659,46 @@ function _parseMcpForm() {
     payload.env = envObj;
   } else {
     payload.url = document.getElementById("mcp-url").value.trim();
-    var hdrText = document.getElementById("mcp-headers").value.trim();
-    var hdrObj = {};
-    if (hdrText) {
-      hdrText.split("\n").forEach(function (line) {
-        var colon = line.indexOf(":");
-        if (colon > 0)
-          hdrObj[line.substring(0, colon).trim()] = line
-            .substring(colon + 1)
-            .trim();
-      });
+    if (authType === "static") {
+      var hdrText = document.getElementById("mcp-headers").value.trim();
+      var hdrObj = {};
+      if (hdrText) {
+        hdrText.split("\n").forEach(function (line) {
+          var colon = line.indexOf(":");
+          if (colon > 0)
+            hdrObj[line.substring(0, colon).trim()] = line
+              .substring(colon + 1)
+              .trim();
+        });
+      }
+      payload.headers = hdrObj;
+    } else {
+      // 'none' / 'oauth_user' — clear server-side static headers state.
+      payload.headers = {};
     }
-    payload.headers = hdrObj;
   }
+
+  if (authType === "oauth_user") {
+    payload.oauth_authorization_server_url = document
+      .getElementById("mcp-oauth-as-url")
+      .value.trim();
+    payload.oauth_registration_mode = document.getElementById(
+      "mcp-oauth-registration",
+    ).value;
+    payload.oauth_client_id = document
+      .getElementById("mcp-oauth-client-id")
+      .value.trim();
+    payload.oauth_scopes = document
+      .getElementById("mcp-oauth-scopes")
+      .value.trim();
+    payload.oauth_audience = document
+      .getElementById("mcp-oauth-audience")
+      .value.trim();
+    var secret = document.getElementById("mcp-oauth-client-secret").value;
+    // Submit only when the operator typed a value; redacted in audit log.
+    if (secret) payload.oauth_client_secret = secret;
+  }
+
   return payload;
 }
 
