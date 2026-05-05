@@ -23,15 +23,14 @@ import json
 import random
 import threading
 import time
+import urllib.parse
 import uuid
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
-if TYPE_CHECKING:
-    from collections.abc import Callable
-
+import httpx
 import mcp.types as mcp_types
 from mcp import ClientSession, McpError, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -39,8 +38,47 @@ from mcp.client.streamable_http import streamablehttp_client
 
 from turnstone.core.config import load_config
 from turnstone.core.log import get_logger
+from turnstone.core.mcp_oauth import (
+    TokenLookupResult,
+    get_user_access_token_classified,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 log = get_logger("turnstone.mcp")
+
+
+# ---------------------------------------------------------------------------
+# Transport URL hygiene (per-user OAuth bearer transmission)
+# ---------------------------------------------------------------------------
+
+
+_LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def _validate_oauth_user_url(url: str) -> None:
+    """Reject MCP server URLs that would transmit a bearer token in plaintext.
+
+    Pool dispatch attaches the per-user OAuth bearer to the
+    ``Authorization`` header; ``http://`` URLs would leak it in transit.
+    Only the exact loopback hostnames in ``_LOOPBACK_HOSTS`` are exempt;
+    a ``*.localhost`` suffix bypass is intentionally NOT honored because
+    RFC 6761 localhost-zone resolution is configuration-dependent
+    (custom resolvers, hosts file, split-horizon DNS, Docker overlays
+    can map ``foo.localhost`` to non-loopback IPs and silently break
+    the bearer-confidentiality guarantee).
+    """
+    parsed = urllib.parse.urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    if scheme == "https":
+        return
+    hostname = (parsed.hostname or "").lower()
+    if scheme == "http" and hostname in _LOOPBACK_HOSTS:
+        return
+    raise ValueError(
+        "MCP servers with auth_type='oauth_user' must use https:// (loopback http:// excepted)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -103,10 +141,14 @@ class StaticServerState:
 class PoolEntryState:
     """Per-(user, server) state for auth_type = oauth_user.
 
-    Defined for use by the upcoming per-user pool integration; currently
-    no production caller. open_lock has no default — the mcp-loop
-    invariant forbids allocating an asyncio.Lock outside the mcp-loop;
-    the pool integration allocates lazily inside connect coroutines.
+    open_lock has no default — the mcp-loop invariant forbids allocating
+    an asyncio.Lock outside the mcp-loop; the pool integration allocates
+    lazily inside connect coroutines.
+
+    ``in_flight`` is a dispatch counter used by the eviction interlock:
+    eviction skips entries with ``in_flight > 0`` so a long-running
+    ``call_tool`` can release ``open_lock`` while still pinning the
+    entry's session against teardown.
     """
 
     key: tuple[str, str]  # (user_id, server_name)
@@ -114,10 +156,14 @@ class PoolEntryState:
     session: Any | None = None
     stack: AsyncExitStack | None = None
     streams: tuple[Any, Any] | None = None
-    tools: list[dict[str, Any]] = field(default_factory=list)
-    resources: list[dict[str, Any]] = field(default_factory=list)
-    prompts: list[dict[str, Any]] = field(default_factory=list)
+    # Catalog state — populated when Phase 6 wires per-user discovery in;
+    # left ``None`` here so 200-entry pools don't retain 600 empty list
+    # objects.
+    tools: list[dict[str, Any]] | None = None
+    resources: list[dict[str, Any]] | None = None
+    prompts: list[dict[str, Any]] | None = None
     last_used: float = 0.0
+    in_flight: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +195,11 @@ class MCPClientManager:
         self._static_servers: dict[str, StaticServerState] = {}
 
         self._tools: list[dict[str, Any]] = []
-        # prefixed_name -> (server_name, original_tool_name)
+        # prefixed_name -> (server_name, original_tool_name).
+        # ``_db_servers_to_config`` strips ``oauth_user`` rows on the way
+        # into ``_static_servers``, so any tool that landed in ``_tool_map``
+        # is by construction static-path; ``_resolve_pool_target`` uses
+        # presence-in-map (not the auth_type column) to short-circuit.
         self._tool_map: dict[str, tuple[str, str]] = {}
         self._connected = threading.Event()
         self._error: str | None = None
@@ -192,6 +242,34 @@ class MCPClientManager:
         # Notification debounce (per-server)
         self._last_notification_refresh: dict[str, float] = {}
 
+        # Per-(user, server) state for auth_type=oauth_user. Loop-bound:
+        # mutated only on the mcp-loop. Sync threads interact via
+        # ``asyncio.run_coroutine_threadsafe``.
+        self._user_pool_entries: dict[tuple[str, str], PoolEntryState] = {}
+        # LRU tracking: monotonic last-access timestamp per pool key.
+        self._user_pool_last_used: dict[tuple[str, str], float] = {}
+        # Per-key lock guarding open / dispatch / close. Allocated lazily
+        # inside ``_ensure_pool_entry`` (which runs only on the mcp-loop)
+        # so each ``asyncio.Lock`` binds to the correct loop on first use.
+        self._user_pool_locks: dict[tuple[str, str], asyncio.Lock] = {}
+
+        # Pool tuning (read at construction; falls back to defaults).
+        mcp_cfg = load_config("mcp")
+        self._user_pool_idle_ttl_s = float(mcp_cfg.get("user_session_idle_ttl_seconds", 600))
+        self._user_pool_lru_max = int(mcp_cfg.get("user_session_lru_max", 200))
+
+        # OAuth integration. ``set_app_state`` wires app_state in after the
+        # lifespan has built the token store / OAuth helpers; pool dispatch
+        # asserts non-None when it actually runs, so static-only callers
+        # never hit it.
+        self._app_state: Any = None
+
+        # Idle-eviction task handle. Scheduled lazily on the mcp-loop the
+        # first time a pool entry is created (start() runs before pool
+        # rows exist, so deferring keeps the task count at zero in
+        # static-only deployments).
+        self._user_pool_eviction_task: asyncio.Task[None] | None = None
+
     def _ensure_static_state(self, name: str) -> StaticServerState:
         """Get or create the StaticServerState for ``name``.
 
@@ -203,6 +281,40 @@ class MCPClientManager:
             state = StaticServerState(name=name)
             self._static_servers[name] = state
         return state
+
+    async def _ensure_pool_entry(self, key: tuple[str, str]) -> PoolEntryState:
+        """Get or create the PoolEntryState for ``(user_id, server_name)``.
+
+        MUST run on the mcp-loop — the lazily-allocated ``asyncio.Lock``
+        binds to whatever loop is current at construction, and the pool
+        dispatch path relies on every per-key lock being bound to
+        ``self._loop``.
+        """
+        entry = self._user_pool_entries.get(key)
+        if entry is None:
+            lock = self._user_pool_locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._user_pool_locks[key] = lock
+            entry = PoolEntryState(key=key, open_lock=lock)
+            self._user_pool_entries[key] = entry
+            # First pool entry — start the idle-eviction loop. Deferred
+            # until the first pool key materializes so static-only
+            # deployments never spawn the task.
+            if self._user_pool_eviction_task is None:
+                self._user_pool_eviction_task = asyncio.create_task(self._user_pool_eviction_loop())
+        return entry
+
+    def set_app_state(self, app_state: Any) -> None:
+        """Wire the OAuth ``app.state`` into the manager.
+
+        Called from the lifespan after ``initialize_mcp_crypto_state`` and
+        ``initialize_mcp_oauth_state`` have populated the token store,
+        OAuth HTTP client, metadata cache, and refresh-lock map. Required
+        before any ``auth_type='oauth_user'`` dispatch; static-only
+        deployments may leave it unset.
+        """
+        self._app_state = app_state
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -248,6 +360,13 @@ class MCPClientManager:
 
     # Notification debounce
     _NOTIFICATION_DEBOUNCE = 5.0  # seconds between refreshes per server
+
+    # Pool eviction loop tick interval (per-iteration sleep, seconds).
+    _POOL_EVICTION_TICK_S = 30.0
+
+    # Best-effort lock acquire timeout for the eviction pass; eviction must
+    # never block on a contested per-key lock so the next tick retries.
+    _POOL_EVICTION_LOCK_ACQUIRE_TIMEOUT_S = 0.05
 
     # -- circuit breaker (per-server) -----------------------------------------
 
@@ -313,16 +432,26 @@ class MCPClientManager:
 
     # -- safe transport helpers ------------------------------------------------
 
-    async def _pre_close_streams(self, key: str) -> None:
+    async def _pre_close_streams(self, key: str | tuple[str, str]) -> None:
         """Close MCP transport streams before stack teardown.
 
         Pre-closing unblocks anyio transport tasks stuck on zero-buffer
         ``send()`` calls, preventing the CPU busy-loop from SDK #2147.
 
-        Parameter is ``str`` today; the upcoming per-user pool
-        integration widens it to ``str | tuple[str, str]`` once
-        ``PoolEntryState`` is wired.
+        Accepts either a static server name (``str``) or a pool key
+        (``(user_id, server_name)`` tuple). The two paths share this
+        helper but address different state maps.
         """
+        if isinstance(key, tuple):
+            entry = self._user_pool_entries.get(key)
+            if entry is None or entry.streams is None:
+                return
+            streams = entry.streams
+            entry.streams = None  # take-and-clear pattern
+            for s in streams:
+                with contextlib.suppress(Exception):
+                    await s.aclose()
+            return
         state = self._static_servers.get(key)
         if state is None or state.streams is None:
             return
@@ -332,26 +461,26 @@ class MCPClientManager:
             with contextlib.suppress(Exception):
                 await s.aclose()
 
-    async def _tcp_probe(self, key: str, url: str) -> None:
+    async def _tcp_probe(self, key: str | tuple[str, str], url: str) -> None:
         """Fast TCP connect check before entering the MCP transport context.
 
         Fails fast when the server is unreachable, avoiding the anyio
         cancel-scope orphan bug that causes 100% CPU spin.
 
-        Parameter is ``str`` today; the upcoming per-user pool
-        integration widens it to ``str | tuple[str, str]`` once
-        ``PoolEntryState`` is wired.
+        Accepts either a static server name or a pool key; only the error
+        message differs (the probe itself is keyless).
         """
         from urllib.parse import urlparse
 
+        label = f"{key[1]}@{key[0]}" if isinstance(key, tuple) else key
         parsed = urlparse(url)
         host = parsed.hostname
         if not host:
-            raise ConnectionError(f"MCP server '{key}' has invalid URL (no hostname): {url}")
+            raise ConnectionError(f"MCP server '{label}' has invalid URL (no hostname): {url}")
         try:
             port = parsed.port or (443 if parsed.scheme == "https" else 80)
         except ValueError:
-            raise ConnectionError(f"MCP server '{key}' has invalid port in URL: {url}") from None
+            raise ConnectionError(f"MCP server '{label}' has invalid port in URL: {url}") from None
         try:
             _, writer = await asyncio.wait_for(
                 asyncio.open_connection(host, port),
@@ -361,7 +490,7 @@ class MCPClientManager:
             await writer.wait_closed()
         except (TimeoutError, OSError) as exc:
             raise ConnectionError(
-                f"MCP server '{key}' unreachable at {host}:{port}: {exc}"
+                f"MCP server '{label}' unreachable at {host}:{port}: {exc}"
             ) from None
 
     @staticmethod
@@ -377,6 +506,20 @@ class MCPClientManager:
             await asyncio.wait_for(stack.aclose(), timeout=5)
         except (Exception, asyncio.CancelledError):
             log.debug("Error closing AsyncExitStack; ignoring", exc_info=True)
+
+    async def _safe_teardown_on_connect_failure(
+        self, key: str | tuple[str, str], stack: AsyncExitStack
+    ) -> None:
+        """Pre-close streams + close the stack on a connect-time failure.
+
+        Shared by ``_connect_one`` (static) and ``_connect_one_pool``
+        (per-(user, server)) — both raise from inside the stream-enter /
+        session-init try blocks, and both must drain the anyio
+        zero-buffer ``send()`` calls before closing the stack to avoid
+        the SDK #2147 CPU busy-loop.
+        """
+        await self._pre_close_streams(key)
+        await self._safe_close_stack(stack)
 
     async def _connect_one(self, name: str, cfg: dict[str, Any]) -> None:
         """Connect to a single MCP server and discover its tools."""
@@ -447,23 +590,19 @@ class MCPClientManager:
             # (shutdown), re-raise so we don't block teardown.
             task = asyncio.current_task()
             if task is not None and task.cancelling():
-                await self._pre_close_streams(name)
-                await self._safe_close_stack(stack)
+                await self._safe_teardown_on_connect_failure(name, stack)
                 raise
             log.warning("MCP server '%s' connection failed (anyio cancel)", name)
-            await self._pre_close_streams(name)
-            await self._safe_close_stack(stack)
+            await self._safe_teardown_on_connect_failure(name, stack)
             raise TimeoutError(f"Connection failed for '{name}'") from None
         except TimeoutError:
             log.warning(
                 "MCP server '%s' connection timed out after %ds", name, self._CONNECT_TIMEOUT
             )
-            await self._pre_close_streams(name)
-            await self._safe_close_stack(stack)
+            await self._safe_teardown_on_connect_failure(name, stack)
             raise TimeoutError(f"Connection timed out after {self._CONNECT_TIMEOUT}s") from None
         except Exception:
-            await self._pre_close_streams(name)
-            await self._safe_close_stack(stack)
+            await self._safe_teardown_on_connect_failure(name, stack)
             raise
 
         # Register notification handler — dispatches tool, resource, and
@@ -509,8 +648,7 @@ class MCPClientManager:
                 ClientSession(read, write, message_handler=_on_notification)  # type: ignore[arg-type]
             )
         except Exception:
-            await self._pre_close_streams(name)
-            await self._safe_close_stack(stack)
+            await self._safe_teardown_on_connect_failure(name, stack)
             raise
 
         state.stack = stack
@@ -520,21 +658,17 @@ class MCPClientManager:
             state.stack = None
             task = asyncio.current_task()
             if task is not None and task.cancelling():
-                await self._pre_close_streams(name)
-                await self._safe_close_stack(stack)
+                await self._safe_teardown_on_connect_failure(name, stack)
                 raise
-            await self._pre_close_streams(name)
-            await self._safe_close_stack(stack)
+            await self._safe_teardown_on_connect_failure(name, stack)
             raise TimeoutError(f"MCP handshake failed for '{name}'") from None
         except TimeoutError:
             state.stack = None
-            await self._pre_close_streams(name)
-            await self._safe_close_stack(stack)
+            await self._safe_teardown_on_connect_failure(name, stack)
             raise TimeoutError(f"MCP handshake timed out after {self._CONNECT_TIMEOUT}s") from None
         except Exception:
             state.stack = None
-            await self._pre_close_streams(name)
-            await self._safe_close_stack(stack)
+            await self._safe_teardown_on_connect_failure(name, stack)
             raise
         state.session = session
 
@@ -646,6 +780,262 @@ class MCPClientManager:
         # Connection succeeded — clear any previous error
         self._last_error.pop(name, None)
 
+    async def _connect_one_pool(
+        self,
+        key: tuple[str, str],
+        cfg: dict[str, Any],
+        access_token: str,
+    ) -> PoolEntryState:
+        """Connect a single per-(user, server) pool entry.
+
+        Mirror of :meth:`_connect_one` for ``auth_type='oauth_user'``,
+        with three differences:
+
+        * Streamable-HTTP transport only — pool servers are remote.
+        * ``Authorization: Bearer {access_token}`` injected into headers
+          alongside any operator-supplied static headers.
+        * No catalog discovery (tools / resources / prompts) and no
+          notification handler — those land in Phase 6 once per-user
+          catalog state is in place.
+
+        MUST run on the mcp-loop. Caller holds ``entry.open_lock``.
+        """
+        user_id, server_name = key
+        if "__" in server_name:
+            raise RuntimeError(
+                f"MCP server name '{server_name}' contains '__' (reserved delimiter)"
+            )
+
+        entry = await self._ensure_pool_entry(key)
+
+        # Tear down any stale session/stack the same way ``_connect_one``
+        # does (cf. PR #296 invariant 5 for the static path).
+        if entry.session is not None or entry.stack is not None:
+            entry.session = None
+            await self._pre_close_streams(key)
+            old_stack = entry.stack
+            entry.stack = None
+            if old_stack is not None:
+                await self._safe_close_stack(old_stack)
+
+        url = cfg.get("url")
+        if not url or cfg.get("type") not in ("http", "streamable-http"):
+            raise RuntimeError(
+                f"MCP server '{server_name}' requires streamable-http transport for "
+                f"auth_type=oauth_user (got transport={cfg.get('type')!r})"
+            )
+
+        # Defense-in-depth: reject http:// (non-loopback) before the bearer
+        # is attached. _dispatch_pool already screens this at the structured-
+        # error boundary; this catch is for any callers that bypass it.
+        _validate_oauth_user_url(url)
+
+        # Merge operator-supplied headers with the per-user bearer.
+        headers: dict[str, str] = dict(cfg.get("headers") or {})
+        headers["Authorization"] = f"Bearer {access_token}"
+
+        stack = AsyncExitStack()
+        await stack.__aenter__()
+        try:
+            await self._tcp_probe(key, url)
+            read, write, _ = await asyncio.wait_for(
+                stack.enter_async_context(streamablehttp_client(url=url, headers=headers)),
+                timeout=self._CONNECT_TIMEOUT,
+            )
+            entry.streams = (read, write)
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                await self._safe_teardown_on_connect_failure(key, stack)
+                raise
+            log.warning(
+                "MCP pool connect failed (anyio cancel) user=%s server=%s", user_id, server_name
+            )
+            await self._safe_teardown_on_connect_failure(key, stack)
+            raise TimeoutError(f"Pool connection failed for '{server_name}'") from None
+        except TimeoutError:
+            log.warning(
+                "MCP pool connect timed out after %ds user=%s server=%s",
+                self._CONNECT_TIMEOUT,
+                user_id,
+                server_name,
+            )
+            await self._safe_teardown_on_connect_failure(key, stack)
+            raise TimeoutError(
+                f"Pool connection timed out after {self._CONNECT_TIMEOUT}s"
+            ) from None
+        except Exception:
+            await self._safe_teardown_on_connect_failure(key, stack)
+            raise
+
+        try:
+            session = await stack.enter_async_context(ClientSession(read, write))
+        except Exception:
+            await self._safe_teardown_on_connect_failure(key, stack)
+            raise
+
+        entry.stack = stack
+        try:
+            await asyncio.wait_for(session.initialize(), timeout=self._CONNECT_TIMEOUT)
+        except asyncio.CancelledError:
+            entry.stack = None
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                await self._safe_teardown_on_connect_failure(key, stack)
+                raise
+            await self._safe_teardown_on_connect_failure(key, stack)
+            raise TimeoutError(f"Pool handshake failed for '{server_name}'") from None
+        except TimeoutError:
+            entry.stack = None
+            await self._safe_teardown_on_connect_failure(key, stack)
+            raise TimeoutError(f"Pool handshake timed out after {self._CONNECT_TIMEOUT}s") from None
+        except Exception:
+            entry.stack = None
+            await self._safe_teardown_on_connect_failure(key, stack)
+            raise
+        entry.session = session
+        entry.last_used = time.monotonic()
+        self._user_pool_last_used[key] = entry.last_used
+        return entry
+
+    # -- pool eviction --------------------------------------------------------
+
+    async def _user_pool_eviction_loop(self) -> None:
+        """Long-running coroutine — periodically evicts idle pool entries.
+
+        Note: the loop wakes on a fixed tick rather than a condition
+        variable. Event-driven evictions would be more efficient on
+        large idle pools but add complexity (tracking per-entry
+        deadlines + a wakeup ``asyncio.Event``); at the design cap of
+        200 entries the unconditional 30 s wake is negligible.
+        """
+        while True:
+            try:
+                await asyncio.sleep(self._POOL_EVICTION_TICK_S)
+                await self._evict_idle_pool_entries()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                log.warning("MCP pool eviction iteration failed", exc_info=True)
+
+    async def _evict_idle_pool_entries(self) -> None:
+        """Evict pool entries past the idle TTL or above the LRU cap.
+
+        Skips any key whose ``open_lock`` is currently held or whose
+        ``in_flight`` counter is non-zero — eviction never blocks on a
+        contested lock or an active dispatch; the next tick retries.
+        """
+        if not self._user_pool_entries:
+            return
+        now = time.monotonic()
+        ttl = self._user_pool_idle_ttl_s
+
+        # First pass: TTL-based eviction. Run closes in parallel so a tick
+        # that needs to evict many entries doesn't block on serial teardowns.
+        ttl_targets: list[tuple[str, str]] = []
+        for key, entry in list(self._user_pool_entries.items()):
+            last = self._user_pool_last_used.get(key, entry.last_used)
+            if (now - last) >= ttl:
+                ttl_targets.append(key)
+        if ttl_targets:
+            await asyncio.gather(
+                *(self._close_pool_entry_if_idle(k) for k in ttl_targets),
+                return_exceptions=True,
+            )
+
+        # Second pass: LRU cap. Iterate the canonical entry map (not the
+        # last_used view) so brand-new entries that were created via
+        # ``_ensure_pool_entry`` but haven't dispatched yet are still
+        # eviction-eligible.
+        if len(self._user_pool_entries) <= self._user_pool_lru_max:
+            return
+        ordered = sorted(
+            self._user_pool_entries.items(),
+            key=lambda kv: self._user_pool_last_used.get(kv[0], kv[1].last_used),
+        )
+        # Compute the eviction batch up front; we re-check the cap after
+        # each close (in-flight skips can leave us still over).
+        for key, _entry in ordered:
+            if len(self._user_pool_entries) <= self._user_pool_lru_max:
+                break
+            await self._close_pool_entry_if_idle(key)
+
+    async def _close_pool_entry_if_idle(self, key: tuple[str, str]) -> None:
+        """Close ``key`` iff its open_lock is uncontested AND in_flight==0.
+
+        Best-effort: a contested lock or an active dispatch causes the
+        function to return without mutation; the next eviction tick
+        retries.
+        """
+        entry = self._user_pool_entries.get(key)
+        if entry is None:
+            return
+        # In-flight dispatchers may have released ``open_lock`` after the
+        # connect/reuse window (see ``_dispatch_pool_with_entry``); the
+        # ``in_flight`` counter is the source of truth for whether the
+        # session is currently being used.
+        if entry.in_flight > 0:
+            return
+        lock = entry.open_lock
+        if lock.locked():
+            return
+        try:
+            await asyncio.wait_for(
+                lock.acquire(), timeout=self._POOL_EVICTION_LOCK_ACQUIRE_TIMEOUT_S
+            )
+        except (TimeoutError, asyncio.CancelledError):
+            return
+        try:
+            entry = self._user_pool_entries.get(key)
+            if entry is None:
+                return
+            # Re-check in_flight under the lock — a dispatcher may have
+            # bumped the counter between our pre-acquire skip check and
+            # the lock acquisition.
+            if entry.in_flight > 0:
+                return
+            entry.session = None
+            await self._pre_close_streams(key)
+            stack = entry.stack
+            entry.stack = None
+            if stack is not None:
+                await self._safe_close_stack(stack)
+            self._user_pool_entries.pop(key, None)
+            self._user_pool_last_used.pop(key, None)
+        finally:
+            lock.release()
+        # Drop the now-orphaned lock so the dict doesn't grow without
+        # bound across the process lifetime. A new key will reallocate.
+        self._user_pool_locks.pop(key, None)
+
+    # -- failure classification (pool dispatch) ------------------------------
+
+    def _classify_failure(
+        self, exc: BaseException
+    ) -> Literal["transport", "auth", "protocol", "other"]:
+        """Classify a dispatch-time exception for circuit-breaker gating.
+
+        Only ``transport`` failures trip the per-server breaker. Auth
+        failures (401/403) are pool-entry-only — they never affect the
+        breaker. Protocol errors (``McpError``) come from a healthy
+        connection that rejected the request.
+
+        ``auth`` is detected via :class:`httpx.HTTPStatusError` since the
+        streamable-http transport surfaces upstream HTTP errors through
+        ``response.raise_for_status()``. ``McpError`` payloads do not
+        carry a clean status code; bare ``McpError`` therefore stays
+        ``protocol``.
+        """
+        if isinstance(exc, httpx.HTTPStatusError):
+            status = exc.response.status_code
+            if status in (401, 403):
+                return "auth"
+        if isinstance(exc, McpError):
+            return "protocol"
+        if isinstance(exc, BrokenPipeError | ConnectionResetError | EOFError | TimeoutError):
+            return "transport"
+        return "other"
+
     # -- tool refresh --------------------------------------------------------
 
     def _rebuild_tools(self) -> None:
@@ -653,6 +1043,13 @@ class MCPClientManager:
 
         Uses copy-on-write: builds new objects, then assigns atomically.
         Concurrent readers see either the old or new snapshot — both valid.
+
+        Every entry sourced from ``_static_servers`` is, by construction,
+        NOT ``auth_type='oauth_user'`` — :func:`_db_servers_to_config`
+        strips oauth_user rows on the way in. Phase 5 pool catalogs do
+        not contribute to ``_tool_map``; pool tools become reachable
+        via ``_tool_map`` only when Phase 7 (catalog scoping) lands
+        per-user catalogs.
         """
         new_tools: list[dict[str, Any]] = []
         new_map: dict[str, tuple[str, str]] = {}
@@ -1113,6 +1510,32 @@ class MCPClientManager:
 
     def shutdown(self) -> None:
         """Close all MCP sessions and stop the background loop."""
+        # Cancel the pool eviction task, then close all pool entries
+        # before tearing down static-path state. Both run on the
+        # mcp-loop so dispatcher coroutines can't race them.
+        if self._loop and (self._user_pool_eviction_task is not None or self._user_pool_entries):
+
+            async def _close_all_pool() -> None:
+                if self._user_pool_eviction_task is not None:
+                    self._user_pool_eviction_task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await self._user_pool_eviction_task
+                    self._user_pool_eviction_task = None
+                for key in list(self._user_pool_entries):
+                    await self._pre_close_streams(key)
+                    entry = self._user_pool_entries.get(key)
+                    if entry is not None and entry.stack is not None:
+                        await self._safe_close_stack(entry.stack)
+                self._user_pool_entries.clear()
+                self._user_pool_last_used.clear()
+                self._user_pool_locks.clear()
+
+            future = asyncio.run_coroutine_threadsafe(_close_all_pool(), self._loop)
+            try:
+                future.result(timeout=10)
+            except Exception:
+                log.debug("Error closing MCP pool sessions", exc_info=True)
+
         # Close all per-server stacks (transports + sessions)
         if self._loop and self._static_servers:
 
@@ -1162,6 +1585,13 @@ class MCPClientManager:
         self._circuit_open_until.clear()
         self._circuit_trip_count.clear()
         self._last_notification_refresh.clear()
+        # Pool state already cleared above when the loop was alive; this
+        # makes shutdown idempotent if the loop exited before pool state
+        # could be wound down (e.g., manager constructed but never started).
+        self._user_pool_entries.clear()
+        self._user_pool_last_used.clear()
+        self._user_pool_locks.clear()
+        self._user_pool_eviction_task = None
 
         log.info("MCP client shut down")
 
@@ -1480,7 +1910,17 @@ class MCPClientManager:
         return len(self._prompts)
 
     def is_mcp_tool(self, func_name: str) -> bool:
-        """Check whether *func_name* belongs to an MCP server."""
+        """Check whether *func_name* belongs to an MCP server.
+
+        Phase 5 caveat: only static-path tools (``auth_type ∈ {none,
+        static}``) populate ``_tool_map``; pool tools become reachable
+        via this method only when Phase 7 (catalog scoping) lands
+        per-user catalogs. Until then, pool dispatch is reachable from
+        production callers like ``ChatSession._exec_mcp_tool`` only when
+        the LLM produces a ``mcp__{server}__{tool}`` name that bypasses
+        ``is_mcp_tool``-style gating, or via direct ``call_tool_sync``
+        with a known prefixed name (the path the new pool tests use).
+        """
         return func_name in self._tool_map
 
     def is_mcp_prompt(self, name: str) -> bool:
@@ -1572,6 +2012,8 @@ class MCPClientManager:
         self,
         func_name: str,
         arguments: dict[str, Any],
+        *,
+        user_id: str | None = None,
         timeout: int = 120,
     ) -> str:
         """Execute an MCP tool call synchronously (blocks the calling thread).
@@ -1579,11 +2021,37 @@ class MCPClientManager:
         Dispatches an async ``tools/call`` to the background event loop and
         waits for the result.  Includes circuit-breaker gating and automatic
         reconnection for servers recovering from failure.
+
+        When ``user_id`` is supplied AND the resolved server's ``auth_type``
+        is ``oauth_user``, dispatch goes through the per-(user, server)
+        pool. Otherwise the call takes the byte-identical static path.
         """
         mapping = self._tool_map.get(func_name)
-        if mapping is None:
+        server_name: str | None = None
+        original_name: str | None = None
+        if mapping is not None:
+            server_name, original_name = mapping
+
+        # Pool dispatch is gated on (a) caller passing user_id and
+        # (b) the server row being auth_type=oauth_user. The Phase 5
+        # tool-map only carries static-path entries; pool catalogs land
+        # in Phase 7. Consequently, in Phase 5 a pool dispatch reaches
+        # this branch only when the caller supplied func_name as
+        # ``mcp__{server}__{tool}`` and we resolve auth_type via storage.
+        if user_id and self._app_state is not None and self._storage is not None:
+            pool_target = self._resolve_pool_target(func_name, server_name, original_name)
+            if pool_target is not None:
+                return self._dispatch_pool_sync(
+                    user_id=user_id,
+                    server_name=pool_target[0],
+                    original_name=pool_target[1],
+                    arguments=arguments,
+                    server_row=pool_target[2],
+                    timeout=timeout,
+                )
+
+        if mapping is None or server_name is None or original_name is None:
             raise ValueError(f"Unknown MCP tool: {func_name}")
-        server_name, original_name = mapping
 
         self._cb_gate(server_name)
 
@@ -1607,7 +2075,7 @@ class MCPClientManager:
             # rejected the request — only transport errors trip the breaker.
             if not isinstance(exc, McpError):
                 self._cb_record_failure(server_name)
-            if isinstance(exc, (BrokenPipeError, ConnectionResetError, EOFError)):
+            if isinstance(exc, BrokenPipeError | ConnectionResetError | EOFError):
                 # Evict the session only — leave stack/streams behind so the
                 # stale-session-and-stack guard in _connect_one cleans them up
                 # on the next connect attempt.
@@ -1617,22 +2085,247 @@ class MCPClientManager:
             raise
 
         self._cb_record_success(server_name)
+        return _decode_tool_result(result)
 
-        # Extract text from the content array
-        texts: list[str] = []
-        for item in result.content:
-            if hasattr(item, "text"):
-                texts.append(item.text)
-            elif hasattr(item, "data"):
-                mime = getattr(item, "mimeType", "binary")
-                texts.append(f"[{mime} data, {len(item.data)} bytes]")
-            else:
-                texts.append(str(item))
+    # -- pool dispatch -------------------------------------------------------
 
-        output = "\n".join(texts) if texts else "(no output)"
-        if getattr(result, "isError", False):
-            output = f"Error: {output}"
-        return output
+    def _resolve_pool_target(
+        self,
+        func_name: str,
+        static_server: str | None,
+        static_original: str | None,
+    ) -> tuple[str, str, dict[str, Any]] | None:
+        """Resolve ``(server_name, original_name, server_row)`` for pool dispatch.
+
+        Returns ``None`` when the call should fall through to the static
+        path. Phase 5: pool catalogs do not contribute to ``_tool_map``,
+        so a pool tool is invoked by passing the prefixed name
+        ``mcp__{server}__{tool}`` directly. ``mcp_servers.auth_type``
+        confirms pool eligibility.
+
+        Presence in ``_tool_map`` (signalled by non-None ``static_server``
+        / ``static_original`` from the caller's lookup) is sufficient
+        to short-circuit without a DB hop: ``_db_servers_to_config``
+        strips ``oauth_user`` rows on the way into ``_static_servers``,
+        so any name that landed in ``_tool_map`` is by construction
+        static-path. The resolved row is threaded back to the caller so
+        ``_dispatch_pool`` avoids a duplicate ``get_mcp_server_by_name``
+        round-trip.
+        """
+        if static_server is not None and static_original is not None:
+            return None
+        if not func_name.startswith("mcp__") or func_name.count("__") < 2:
+            return None
+        # Parse ``mcp__{server}__{rest}`` — server may itself be empty
+        # (rejected during admin), original may contain ``__``.
+        _, server_name, original = func_name.split("__", 2)
+        if not server_name or not original:
+            return None
+        row = self._lookup_server_row(server_name)
+        if row is None or row.get("auth_type") != "oauth_user":
+            return None
+        return server_name, original, row
+
+    def _lookup_server_row(self, server_name: str) -> dict[str, Any] | None:
+        """Return the ``mcp_servers`` row for *server_name*, or None."""
+        if self._storage is None:
+            return None
+        try:
+            row: dict[str, Any] | None = self._storage.get_mcp_server_by_name(server_name)
+        except Exception:
+            log.debug("mcp_pool.server_lookup_failed", exc_info=True)
+            return None
+        return row
+
+    def _dispatch_pool_sync(
+        self,
+        *,
+        user_id: str,
+        server_name: str,
+        original_name: str,
+        arguments: dict[str, Any],
+        server_row: dict[str, Any],
+        timeout: int,
+    ) -> str:
+        """Synchronous wrapper for pool dispatch.
+
+        Bridges sync caller → mcp-loop coroutine → result. Returns either
+        the tool output string or a structured-error JSON string when
+        token state forces the call to fail cleanly without raising
+        (consent required, key mismatch, etc.). ``server_row`` is the
+        row already resolved by ``_resolve_pool_target`` and is reused
+        verbatim by ``_dispatch_pool`` to skip a duplicate DB hop.
+        """
+        assert self._loop is not None
+        future = asyncio.run_coroutine_threadsafe(
+            self._dispatch_pool(
+                user_id=user_id,
+                server_name=server_name,
+                original_name=original_name,
+                arguments=arguments,
+                server_row=server_row,
+            ),
+            self._loop,
+        )
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            self._cb_record_failure(server_name)
+            raise TimeoutError(f"MCP tool call timed out after {timeout}s") from None
+
+    async def _dispatch_pool(
+        self,
+        *,
+        user_id: str,
+        server_name: str,
+        original_name: str,
+        arguments: dict[str, Any],
+        server_row: dict[str, Any],
+    ) -> str:
+        """Pool-side coroutine: resolve token, connect-or-reuse, dispatch.
+
+        Returns either the textualized tool output or a structured-error
+        JSON string when token state precludes dispatch. ``server_row``
+        is supplied by ``_resolve_pool_target`` so this path doesn't
+        re-issue the ``mcp_servers`` lookup; it's also pre-validated to
+        have ``auth_type='oauth_user'``.
+        """
+        if self._app_state is None:
+            raise RuntimeError("Pool dispatch requires set_app_state() to have been called")
+
+        # Token-side errors (missing / decrypt / refresh-failed) bypass
+        # the breaker entirely — the server itself is healthy. The breaker
+        # gate runs only AFTER we have a usable access token; that way a
+        # spurious cooldown-expired probe never lands here without ending
+        # in either a real success or a real transport failure.
+        lookup: TokenLookupResult = await get_user_access_token_classified(
+            app_state=self._app_state, user_id=user_id, server_name=server_name
+        )
+        if lookup.kind == "missing":
+            return _structured_error(
+                code="mcp_consent_required",
+                server=server_name,
+                detail="No token for user. Consent flow required.",
+            )
+        if lookup.kind == "decrypt_failure":
+            return _structured_error(
+                code="mcp_token_undecryptable_key_unknown",
+                server=server_name,
+                detail=(
+                    "Stored token cannot be decrypted by any installed encryption key. "
+                    "Operator action required."
+                ),
+            )
+        if lookup.kind == "refresh_failed":
+            # ``mcp_server.oauth.token_revoked`` audit was already emitted
+            # by ``get_user_access_token_classified`` when it deleted the
+            # row; no second audit needed here.
+            return _structured_error(
+                code="mcp_consent_required",
+                server=server_name,
+                detail="Refresh token rejected. Re-consent required.",
+            )
+        # kind == "token"
+        access_token = lookup.token or ""
+        if not access_token:
+            return _structured_error(
+                code="mcp_consent_required",
+                server=server_name,
+                detail="No token for user. Consent flow required.",
+            )
+
+        # URL hygiene — pool dispatch transmits the per-user bearer; reject
+        # plaintext schemes before they reach _connect_one_pool.
+        url = str(server_row.get("url") or "")
+        try:
+            _validate_oauth_user_url(url)
+        except ValueError as exc:
+            log.warning(
+                "mcp_pool.url_insecure server=%s scheme=%s",
+                server_name,
+                urllib.parse.urlparse(url).scheme,
+            )
+            return _structured_error(
+                code="mcp_oauth_url_insecure",
+                server=server_name,
+                detail=str(exc),
+            )
+
+        self._cb_gate(server_name)
+
+        cfg = _pool_cfg_from_row(server_row)
+        key = (user_id, server_name)
+        entry = await self._ensure_pool_entry(key)
+
+        try:
+            result = await self._dispatch_pool_with_entry(
+                entry=entry,
+                key=key,
+                cfg=cfg,
+                access_token=access_token,
+                original_name=original_name,
+                arguments=arguments,
+            )
+        except BaseException as exc:
+            classification = self._classify_failure(exc)
+            if classification == "auth":
+                # 401/403 from the upstream — pool-entry-only, never
+                # affects the breaker. Drop the cached session so the
+                # next dispatch re-authenticates with a fresh token.
+                evict = self._user_pool_entries.get(key)
+                if evict is not None:
+                    evict.session = None
+                log.debug("mcp_pool.auth_failure", exc_info=exc)
+                raise
+            if classification == "transport":
+                self._cb_record_failure(server_name)
+                evict = self._user_pool_entries.get(key)
+                if evict is not None:
+                    evict.session = None
+                log.debug("mcp_pool.transport_failure", exc_info=exc)
+                raise
+            # protocol / other — don't trip the breaker.
+            raise
+
+        self._cb_record_success(server_name)
+        return result
+
+    async def _dispatch_pool_with_entry(
+        self,
+        *,
+        entry: PoolEntryState,
+        key: tuple[str, str],
+        cfg: dict[str, Any],
+        access_token: str,
+        original_name: str,
+        arguments: dict[str, Any],
+    ) -> str:
+        """Acquire ``entry.open_lock`` only across connect-or-reuse, then dispatch.
+
+        Releasing ``open_lock`` before ``call_tool`` lets two concurrent
+        tool calls from the SAME user against the SAME server multiplex
+        on a shared :class:`mcp.ClientSession` (request_id-correlated by
+        the SDK). The eviction interlock now uses ``entry.in_flight``:
+        eviction skips entries with in-flight calls so a long-running
+        ``call_tool`` can't have its session yanked mid-await.
+        """
+        async with entry.open_lock:
+            entry.last_used = time.monotonic()
+            self._user_pool_last_used[key] = entry.last_used
+            session = entry.session
+            if session is None:
+                # Lazy connect — also covers post-eviction recovery.
+                fresh = await self._connect_one_pool(key, cfg, access_token)
+                session = fresh.session
+                if session is None:
+                    raise RuntimeError(f"Pool connect for {key!r} produced no session")
+            entry.in_flight += 1
+        try:
+            result = await session.call_tool(original_name, arguments)
+        finally:
+            entry.in_flight -= 1
+        return _decode_tool_result(result)
 
     # -- resource read -------------------------------------------------------
 
@@ -1759,6 +2452,88 @@ class MCPClientManager:
             text = content.text if hasattr(content, "text") else str(content)
             messages.append({"role": msg.role, "content": text})
         return messages
+
+
+# ---------------------------------------------------------------------------
+# Pool helpers (module-level)
+# ---------------------------------------------------------------------------
+
+
+def _decode_tool_result(result: Any) -> str:
+    """Render an MCP ``tools/call`` result into the string the agent sees.
+
+    Walks ``result.content`` collecting text parts and labelling binary
+    parts; an ``isError`` result is prefixed with ``Error: `` so the
+    LLM can narrate the failure. Shared by the static and pool dispatch
+    paths.
+    """
+    texts: list[str] = []
+    for item in result.content:
+        if hasattr(item, "text"):
+            texts.append(item.text)
+        elif hasattr(item, "data"):
+            mime = getattr(item, "mimeType", "binary")
+            texts.append(f"[{mime} data, {len(item.data)} bytes]")
+        else:
+            texts.append(str(item))
+    output = "\n".join(texts) if texts else "(no output)"
+    if getattr(result, "isError", False):
+        output = f"Error: {output}"
+    return output
+
+
+def _structured_error(*, code: str, server: str, detail: str) -> str:
+    """Encode a pool-dispatch failure as a JSON string.
+
+    Returned to the agent through ``_exec_mcp_tool`` so the LLM can
+    narrate "tool unavailable, consent required" rather than crashing
+    the workstream. Schema mirrors RFC §6 (consent UX) plus the
+    decrypt-failure code introduced in RFC §5.3.
+
+    Operator-actionable encryption-key fingerprints are intentionally
+    NOT included in this payload: they are already captured server-side
+    via :meth:`MCPTokenStore._audit_decrypt_failure`, and exposing them
+    to the LLM (and through it to the model provider) would be
+    unnecessary disclosure.
+    """
+    payload: dict[str, Any] = {
+        "error": {
+            "code": code,
+            "server": server,
+            "detail": detail,
+        }
+    }
+    return json.dumps(payload)
+
+
+def _pool_cfg_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Build a streamable-http MCP-client cfg from an ``mcp_servers`` row.
+
+    Pool servers are required to be HTTP-transport (auth_type=oauth_user
+    has no meaningful stdio encoding). Operator-supplied static headers
+    are merged with the per-user bearer at connect time.
+    """
+    cfg: dict[str, Any] = {
+        "type": row.get("transport") or "streamable-http",
+        "url": row.get("url") or "",
+    }
+    headers_raw = row.get("headers")
+    parsed_headers: dict[str, str] = {}
+    if isinstance(headers_raw, dict):
+        for k, v in headers_raw.items():
+            if isinstance(k, str) and isinstance(v, str):
+                parsed_headers[k] = v
+    elif isinstance(headers_raw, str) and headers_raw:
+        try:
+            decoded = json.loads(headers_raw)
+        except (json.JSONDecodeError, TypeError):
+            decoded = {}
+        if isinstance(decoded, dict):
+            for k, v in decoded.items():
+                if isinstance(k, str) and isinstance(v, str):
+                    parsed_headers[k] = v
+    cfg["headers"] = parsed_headers
+    return cfg
 
 
 # ---------------------------------------------------------------------------

@@ -10,27 +10,29 @@ acceptable audience values is the resolved
 (Auth0) that issue tokens with ``aud=oauth_audience`` rather than the
 canonical resource URL.
 
-Multi-node refresh contention: this module currently relies on an
-``asyncio.Lock`` keyed by ``(user_id, server_name)`` for in-process
-serialization. This is correct for SQLite single-node deployments but
-NOT sufficient for multi-node setups. A later iteration wraps the
-multi-node case in a postgres advisory lock — see the note in
-:func:`get_user_access_token`.
+Multi-node refresh contention: :func:`get_user_access_token` and the
+classified variant :func:`get_user_access_token_classified` serialize
+the read-current → exchange-at-AS → write-new sequence at two layers
+— an outer Postgres advisory lock (cluster-wide) wraps an inner
+``asyncio.Lock`` (intra-process). The advisory lock is no-op on SQLite
+single-node deployments via :meth:`StorageBackend.acquire_advisory_lock_sync`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
+import contextlib
 import hashlib
 import json
 import re
 import secrets
 import time
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 
@@ -904,11 +906,12 @@ def _parse_iso_to_utc(value: str) -> datetime | None:
 def _refresh_lock_for(app_state: Any, user_id: str, server_name: str) -> asyncio.Lock:
     """Return the shared refresh lock for ``(user_id, server_name)``.
 
-    Multi-node correctness note: this in-process ``asyncio.Lock`` is
-    sufficient for SQLite single-node deployments; multi-node Postgres
-    deployments need a postgres advisory lock keyed on
-    ``hashtext('mcp_refresh:' || user_id || ':' || server_name)`` so
-    concurrent nodes don't double-refresh.
+    This in-process ``asyncio.Lock`` provides intra-process
+    serialization. Cluster-wide serialization is layered on top via the
+    Postgres advisory lock acquired by
+    :func:`_acquire_pg_refresh_lock`; both are taken together by
+    :func:`get_user_access_token` so concurrent nodes don't
+    double-refresh.
     """
     locks = getattr(app_state, "mcp_oauth_refresh_locks", None)
     if locks is None:
@@ -936,6 +939,90 @@ def _drop_refresh_lock(app_state: Any, user_id: str, server_name: str) -> None:
     locks.pop((user_id, server_name), None)
 
 
+def _refresh_advisory_key(user_id: str, server_name: str) -> str:
+    """Return the advisory-lock key for ``(user_id, server_name)``.
+
+    Hashed via ``pg_advisory_xact_lock(hashtext(...))`` at the storage
+    layer; the textual form is what the storage helper hashes, so the
+    callers don't need to know about the digest.
+    """
+    return f"mcp_refresh:{user_id}:{server_name}"
+
+
+async def _acquire_pg_refresh_lock(
+    storage: StorageBackend, user_id: str, server_name: str
+) -> contextlib.AbstractAsyncContextManager[None]:
+    """Async context manager that serializes the refresh body across nodes.
+
+    On Postgres, holds ``pg_advisory_xact_lock(hashtext(...))`` for the
+    duration of the body via :meth:`StorageBackend.acquire_advisory_lock_sync`.
+    On SQLite, the storage helper returns ``nullcontext`` and this is
+    effectively a no-op — single-node deployments rely on the
+    in-process ``asyncio.Lock`` for serialization.
+
+    The blocking SQLAlchemy hops inside the storage context manager are
+    routed through ``asyncio.to_thread`` so the mcp-loop stays
+    responsive.
+    """
+    return _PgRefreshLock(storage, _refresh_advisory_key(user_id, server_name))
+
+
+_PG_REFRESH_LOCK_EXECUTOR: concurrent.futures.ThreadPoolExecutor | None = None
+
+
+def _pg_refresh_lock_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """Return the single-worker executor used for advisory-lock acquire/release.
+
+    bug-5: ``__aenter__`` and ``__aexit__`` previously dispatched onto
+    the default ``asyncio.to_thread`` executor, so the SQLAlchemy
+    connection captured by ``acquire_advisory_lock_sync`` could have its
+    transaction begun on one worker thread and committed/rolled back on
+    another. Pinning to a single-worker executor guarantees enter and
+    exit run on the same thread, satisfying psycopg2's "connection
+    transactions are thread-affine" expectation.
+    """
+    global _PG_REFRESH_LOCK_EXECUTOR
+    if _PG_REFRESH_LOCK_EXECUTOR is None:
+        _PG_REFRESH_LOCK_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mcp-pg-refresh-lock"
+        )
+    return _PG_REFRESH_LOCK_EXECUTOR
+
+
+class _PgRefreshLock(contextlib.AbstractAsyncContextManager[None]):
+    """Async wrapper around :meth:`StorageBackend.acquire_advisory_lock_sync`."""
+
+    def __init__(self, storage: StorageBackend, key_text: str) -> None:
+        self._storage = storage
+        self._key_text = key_text
+        self._sync_cm: contextlib.AbstractContextManager[None] | None = None
+
+    async def __aenter__(self) -> None:
+        # Single-worker executor pins enter and exit to the same thread —
+        # see ``_pg_refresh_lock_executor`` for the rationale.
+        cm = self._storage.acquire_advisory_lock_sync(self._key_text)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(_pg_refresh_lock_executor(), cm.__enter__)
+        self._sync_cm = cm
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: Any,
+    ) -> None:
+        cm = self._sync_cm
+        if cm is None:
+            return
+        self._sync_cm = None
+        loop = asyncio.get_running_loop()
+
+        def _exit() -> None:
+            cm.__exit__(exc_type, exc, tb)
+
+        await loop.run_in_executor(_pg_refresh_lock_executor(), _exit)
+
+
 def _dcr_lock_for(app_state: Any, server_id: str) -> asyncio.Lock:
     """Return the per-server DCR registration lock.
 
@@ -958,6 +1045,24 @@ def _dcr_lock_for(app_state: Any, server_id: str) -> asyncio.Lock:
     return lock
 
 
+@dataclass(frozen=True)
+class TokenLookupResult:
+    """Tagged result of :func:`get_user_access_token_classified`.
+
+    Lets the dispatch state machine distinguish "row missing" from
+    "row present but undecryptable" from "row present but refresh
+    rejected" — three states that the ``Optional[str]``-returning
+    :func:`get_user_access_token` collapses to ``None``. The
+    distinction matters because they map to different user-facing
+    errors (RFC §5.3 forbids emitting ``mcp_consent_required`` on a
+    decrypt failure).
+    """
+
+    kind: Literal["token", "missing", "decrypt_failure", "refresh_failed"] = "missing"
+    token: str | None = None
+    decrypt_fingerprints: tuple[str, ...] = field(default_factory=tuple)
+
+
 async def get_user_access_token(*, app_state: Any, user_id: str, server_name: str) -> str | None:
     """Return a valid plaintext access token, refreshing if needed.
 
@@ -968,81 +1073,110 @@ async def get_user_access_token(*, app_state: Any, user_id: str, server_name: st
         ``mcp_consent_required``)
       - the cipher / token store is not configured
 
-    Multi-node correctness note: the refresh path is serialized via the
-    in-process ``asyncio.Lock`` returned by :func:`_refresh_lock_for`. A
-    multi-node deployment running against Postgres needs that same
-    serialization across nodes via ``pg_advisory_lock`` keyed on
-    ``hashtext('mcp_refresh:' || user_id || ':' || server_name)`` so
-    concurrent nodes don't double-refresh.
+    Implemented as a thin wrapper around
+    :func:`get_user_access_token_classified`: every non-``token`` result
+    collapses back to ``None`` to preserve the legacy contract.
+    """
+    result = await get_user_access_token_classified(
+        app_state=app_state, user_id=user_id, server_name=server_name
+    )
+    if result.kind == "token":
+        return result.token
+    return None
+
+
+async def get_user_access_token_classified(
+    *, app_state: Any, user_id: str, server_name: str
+) -> TokenLookupResult:
+    """Tagged token lookup with refresh-on-expiry.
+
+    Walks the §1.5 / RFC §6 state machine and returns a tagged result so
+    the dispatcher can map each failure mode to the right user-facing
+    error.
+
+    Multi-node correctness: the refresh path is serialized at two
+    layers — an outer Postgres advisory lock acquired via
+    :meth:`StorageBackend.acquire_advisory_lock_sync` (cluster-wide;
+    no-op on SQLite) and an inner ``asyncio.Lock`` from
+    :func:`_refresh_lock_for` (intra-process). Order matters: the
+    cluster lock is taken first so cross-node contention serializes at
+    the database, then the asyncio lock is essentially uncontested
+    because at most one waiter is allowed past the cluster lock at a
+    time. The re-read inside the asyncio lock collapses both windows.
     """
     token_store: MCPTokenStore | None = getattr(app_state, "mcp_token_store", None)
     if token_store is None:
         log.debug("mcp_server.oauth.token_store_unconfigured")
-        return None
+        return TokenLookupResult(kind="missing")
 
     try:
         plain = await asyncio.to_thread(token_store.get_user_token, user_id, server_name)
-    except MCPTokenDecryptError:
-        # No installed key can decrypt the row (e.g. operator dropped
-        # the prior key after rotation). Falling through to None forces
-        # the caller to re-consent rather than crashing the dispatch.
+    except MCPTokenDecryptError as exc:
         log.warning(
-            "mcp_server.oauth.token_decrypt_failed_falling_through",
+            "mcp_server.oauth.token_decrypt_failed_classified",
             user_id=user_id,
             server_name=server_name,
             exc_info=True,
         )
-        return None
+        return TokenLookupResult(
+            kind="decrypt_failure",
+            decrypt_fingerprints=tuple(exc.key_fingerprints_attempted),
+        )
     if plain is None:
-        return None
+        return TokenLookupResult(kind="missing")
 
-    # Fast path — non-expired access token.
     expires_at = plain.get("expires_at")
     if not _token_needs_refresh(expires_at):
-        return plain["access_token"]
+        return TokenLookupResult(kind="token", token=plain["access_token"])
+
+    storage = _get_storage(app_state)
+    if storage is None:
+        return TokenLookupResult(kind="missing")
+
+    # bug-6: load server_row BEFORE the no-refresh-token branch so the
+    # pre-lock audit event carries the immutable server_id rather than
+    # falling back to a name-keyed lookup that races admin renames.
+    server_row = await asyncio.to_thread(storage.get_mcp_server_by_name, server_name)
+    if server_row is None:
+        return TokenLookupResult(kind="missing")
+    server_id_for_audit = str(server_row.get("server_id") or "")
 
     refresh_value = plain.get("refresh_token")
     if not refresh_value:
-        # Expired access token, no refresh token — revoke + force re-consent.
         await asyncio.to_thread(token_store.delete_user_token, user_id, server_name)
         _drop_refresh_lock(app_state, user_id, server_name)
         await _audit_event(
             app_state,
+            server_id=server_id_for_audit,
             user_id=user_id,
             action="mcp_server.oauth.token_revoked",
             server_name=server_name,
             detail={"reason": "expired_no_refresh"},
         )
-        return None
-
-    storage = _get_storage(app_state)
-    if storage is None:
-        return None
-
-    server_row = await asyncio.to_thread(storage.get_mcp_server_by_name, server_name)
-    if server_row is None:
-        return None
-    server_id_for_audit = str(server_row.get("server_id") or "")
+        return TokenLookupResult(kind="refresh_failed")
 
     lock = _refresh_lock_for(app_state, user_id, server_name)
-    async with lock:
-        # Re-read after lock — another caller may have refreshed already.
+    pg_lock = await _acquire_pg_refresh_lock(storage, user_id, server_name)
+    async with pg_lock, lock:
         try:
             plain2 = await asyncio.to_thread(token_store.get_user_token, user_id, server_name)
-        except MCPTokenDecryptError:
+        except MCPTokenDecryptError as exc:
             log.warning(
-                "mcp_server.oauth.token_decrypt_failed_falling_through",
+                "mcp_server.oauth.token_decrypt_failed_classified",
                 user_id=user_id,
                 server_name=server_name,
                 exc_info=True,
             )
             _drop_refresh_lock(app_state, user_id, server_name)
-            return None
+            return TokenLookupResult(
+                kind="decrypt_failure",
+                decrypt_fingerprints=tuple(exc.key_fingerprints_attempted),
+            )
         if plain2 is None:
-            return None
+            return TokenLookupResult(kind="missing")
         expires_at2 = plain2.get("expires_at")
         if not _token_needs_refresh(expires_at2):
-            return plain2["access_token"]
+            return TokenLookupResult(kind="token", token=plain2["access_token"])
         refresh_value2 = plain2.get("refresh_token")
         if not refresh_value2:
             await asyncio.to_thread(token_store.delete_user_token, user_id, server_name)
@@ -1054,14 +1188,11 @@ async def get_user_access_token(*, app_state: Any, user_id: str, server_name: st
                 server_name=server_name,
                 detail={"reason": "expired_no_refresh"},
             )
-            # Drop the lock entry AFTER we exit the ``async with`` block —
-            # we still hold ``lock`` here, so dropping the dict reference
-            # only matters for the next caller.
             _drop_refresh_lock(app_state, user_id, server_name)
-            return None
+            return TokenLookupResult(kind="refresh_failed")
 
         try:
-            new_access, new_refresh, new_expires_at = await _refresh_and_persist(
+            new_access, _new_refresh, _new_expires_at = await _refresh_and_persist(
                 app_state=app_state,
                 storage=storage,
                 token_store=token_store,
@@ -1082,10 +1213,8 @@ async def get_user_access_token(*, app_state: Any, user_id: str, server_name: st
                 detail={"reason": "refresh_failed"},
             )
             _drop_refresh_lock(app_state, user_id, server_name)
-            return None
-        _ = new_refresh
-        _ = new_expires_at
-        return new_access
+            return TokenLookupResult(kind="refresh_failed")
+        return TokenLookupResult(kind="token", token=new_access)
 
 
 def _token_needs_refresh(expires_at: str | None) -> bool:
@@ -2009,12 +2138,14 @@ __all__ = [
     "MCPOAuthRefreshFailed",
     "MCP_OAUTH_DISCOVERY_CACHE_TTL_SECONDS",
     "MCP_OAUTH_STATE_TTL_SECONDS",
+    "TokenLookupResult",
     "build_authorize_url",
     "close_mcp_oauth_state",
     "create_pending_state",
     "discover_authorization_server",
     "generate_pkce_pair",
     "get_user_access_token",
+    "get_user_access_token_classified",
     "handle_mcp_oauth_authorize",
     "handle_mcp_oauth_callback",
     "initialize_mcp_oauth_state",

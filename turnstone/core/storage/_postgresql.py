@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -4746,6 +4747,76 @@ class PostgreSQLBackend:
             )
             conn.commit()
             return result.rowcount > 0
+
+    # -- Cross-node serialization ----------------------------------------------
+
+    _ADVISORY_LOCK_TRY_INTERVAL_S = 0.05
+    _ADVISORY_LOCK_TRY_TIMEOUT_S = 30.0
+
+    def acquire_advisory_lock_sync(self, key_text: str) -> contextlib.AbstractContextManager[None]:
+        """Take a Postgres advisory lock keyed on ``hashtext(key_text)``.
+
+        perf-4: previous implementation called ``pg_advisory_xact_lock``
+        and held its connection for the full ``with`` body, so a burst
+        of concurrent waiters (e.g. 50 user-token refreshes hitting the
+        AS within a clock-skew window) starved the small SQLAlchemy
+        engine pool — every waiting backend held one of the 5 max
+        connections.
+
+        New shape: spin on ``pg_try_advisory_xact_lock`` with a fresh
+        connection per probe. Waiters return the connection to the pool
+        between attempts; only the actual lock holder keeps a connection
+        for the body. The lock auto-releases on transaction end.
+        """
+        engine = self._engine
+        try_interval = self._ADVISORY_LOCK_TRY_INTERVAL_S
+        try_timeout = self._ADVISORY_LOCK_TRY_TIMEOUT_S
+
+        @contextlib.contextmanager
+        def _ctx() -> Iterator[None]:
+            deadline = time.monotonic() + try_timeout
+            while True:
+                conn = engine.connect()
+                trans: Any = None
+                try:
+                    trans = conn.begin()
+                    acquired_row = conn.execute(
+                        sa.text("SELECT pg_try_advisory_xact_lock(hashtext(:k))"),
+                        {"k": key_text},
+                    ).scalar()
+                    if acquired_row:
+                        try:
+                            yield
+                        finally:
+                            # COMMIT releases the xact-scoped lock; if it
+                            # raises (e.g., transaction rolled back by a
+                            # network blip mid-body), the outer except
+                            # below does a best-effort rollback so the
+                            # lock isn't left held when conn returns to
+                            # the pool.
+                            if trans.is_active:
+                                trans.commit()
+                        return
+                    # Didn't acquire — release tx, fall through to backoff.
+                    trans.rollback()
+                except BaseException:
+                    # Any failure in begin / execute / yield / commit —
+                    # ensure the transaction is closed before the
+                    # outer finally returns the connection to the pool.
+                    if trans is not None and trans.is_active:
+                        with contextlib.suppress(Exception):
+                            trans.rollback()
+                    raise
+                finally:
+                    conn.close()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"pg_try_advisory_xact_lock timed out after {try_timeout:.1f}s "
+                        f"for key={key_text!r}"
+                    )
+                time.sleep(try_interval)
+
+        return _ctx()
 
     # -- Lifecycle -------------------------------------------------------------
 
