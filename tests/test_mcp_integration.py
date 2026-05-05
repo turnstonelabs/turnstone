@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from tests.conftest import _seed_static_state
 from turnstone.core.mcp_client import MCPClientManager
 from turnstone.core.storage._sqlite import SQLiteBackend
 
@@ -109,13 +110,15 @@ class TestFullLifecycleResourcesPrompts:
 
     def test_rebuild_resources_produces_merged_state(self, mgr: MCPClientManager) -> None:
         """_rebuild_resources merges per-server resources into a unified list."""
-        mgr._per_server_resources["alpha"] = [
-            _make_resource("file:///a.txt", "a", "alpha"),
-            _make_resource("file:///b.txt", "b", "alpha"),
-        ]
-        mgr._per_server_resources["beta"] = [
-            _make_resource("file:///c.txt", "c", "beta"),
-        ]
+        _seed_static_state(
+            mgr,
+            "alpha",
+            resources=[
+                _make_resource("file:///a.txt", "a", "alpha"),
+                _make_resource("file:///b.txt", "b", "alpha"),
+            ],
+        )
+        _seed_static_state(mgr, "beta", resources=[_make_resource("file:///c.txt", "c", "beta")])
 
         mgr._rebuild_resources()
 
@@ -130,13 +133,19 @@ class TestFullLifecycleResourcesPrompts:
 
     def test_rebuild_prompts_produces_merged_state(self, mgr: MCPClientManager) -> None:
         """_rebuild_prompts merges per-server prompts into a unified list."""
-        mgr._per_server_prompts["alpha"] = [
-            _make_prompt("mcp__alpha__greet", "greet", "alpha", "Say hello"),
-        ]
-        mgr._per_server_prompts["beta"] = [
-            _make_prompt("mcp__beta__summarize", "summarize", "beta", "Summarize text"),
-            _make_prompt("mcp__beta__translate", "translate", "beta", "Translate text"),
-        ]
+        _seed_static_state(
+            mgr,
+            "alpha",
+            prompts=[_make_prompt("mcp__alpha__greet", "greet", "alpha", "Say hello")],
+        )
+        _seed_static_state(
+            mgr,
+            "beta",
+            prompts=[
+                _make_prompt("mcp__beta__summarize", "summarize", "beta", "Summarize text"),
+                _make_prompt("mcp__beta__translate", "translate", "beta", "Translate text"),
+            ],
+        )
 
         mgr._rebuild_prompts()
 
@@ -164,10 +173,12 @@ class TestFullLifecycleResourcesPrompts:
         try:
             # Populate session and resource map
             session = _make_mock_session()
-            mgr._sessions["alpha"] = session
-            mgr._per_server_resources["alpha"] = [
-                _make_resource("file:///readme.md", "readme", "alpha"),
-            ]
+            _seed_static_state(
+                mgr,
+                "alpha",
+                session=session,
+                resources=[_make_resource("file:///readme.md", "readme", "alpha")],
+            )
             mgr._rebuild_resources()
 
             result = mgr.read_resource_sync("file:///readme.md", timeout=5)
@@ -194,18 +205,22 @@ class TestFullLifecycleResourcesPrompts:
 
         try:
             session = _make_mock_session()
-            mgr._sessions["alpha"] = session
             # Register a template resource (no concrete resources)
-            mgr._per_server_resources["alpha"] = [
-                {
-                    "uri": "db://tables/{table}/rows/{id}",
-                    "name": "row",
-                    "description": "Fetch a row",
-                    "mimeType": "application/json",
-                    "server": "alpha",
-                    "template": True,
-                },
-            ]
+            _seed_static_state(
+                mgr,
+                "alpha",
+                session=session,
+                resources=[
+                    {
+                        "uri": "db://tables/{table}/rows/{id}",
+                        "name": "row",
+                        "description": "Fetch a row",
+                        "mimeType": "application/json",
+                        "server": "alpha",
+                        "template": True,
+                    },
+                ],
+            )
             mgr._rebuild_resources()
 
             # Template should not be in _resource_map
@@ -230,10 +245,12 @@ class TestFullLifecycleResourcesPrompts:
 
         try:
             session = _make_mock_session()
-            mgr._sessions["alpha"] = session
-            mgr._per_server_prompts["alpha"] = [
-                _make_prompt("mcp__alpha__greet", "greet", "alpha", "Say hello"),
-            ]
+            _seed_static_state(
+                mgr,
+                "alpha",
+                session=session,
+                prompts=[_make_prompt("mcp__alpha__greet", "greet", "alpha", "Say hello")],
+            )
             mgr._rebuild_prompts()
 
             messages = mgr.get_prompt_sync(
@@ -314,40 +331,42 @@ class TestFullLifecycleResourcesPrompts:
     def test_shutdown_clears_all_state(self, mgr: MCPClientManager) -> None:
         """shutdown() clears sessions, tools, resources, prompts, and listeners."""
         # Populate state
-        mgr._sessions["alpha"] = MagicMock()
-        mgr._per_server_tools["alpha"] = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "mcp__alpha__search",
-                    "description": "Search",
-                    "parameters": {},
+        _seed_static_state(
+            mgr,
+            "alpha",
+            session=MagicMock(),
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__alpha__search",
+                        "description": "Search",
+                        "parameters": {},
+                    },
+                }
+            ],
+            resources=[
+                _make_resource("file:///a.txt", "a", "alpha"),
+                {
+                    "uri": "db://tables/{table}",
+                    "name": "table",
+                    "description": "",
+                    "mimeType": "",
+                    "server": "alpha",
+                    "template": True,
                 },
-            }
-        ]
+            ],
+            prompts=[_make_prompt("mcp__alpha__greet", "greet", "alpha")],
+        )
         mgr._rebuild_tools()
-        mgr._per_server_resources["alpha"] = [
-            _make_resource("file:///a.txt", "a", "alpha"),
-            {
-                "uri": "db://tables/{table}",
-                "name": "table",
-                "description": "",
-                "mimeType": "",
-                "server": "alpha",
-                "template": True,
-            },
-        ]
         mgr._rebuild_resources()
-        mgr._per_server_prompts["alpha"] = [
-            _make_prompt("mcp__alpha__greet", "greet", "alpha"),
-        ]
         mgr._rebuild_prompts()
         mgr._listeners.append(lambda: None)
         mgr._resource_listeners.append(lambda: None)
         mgr._prompt_listeners.append(lambda: None)
 
         # Verify populated
-        assert len(mgr._sessions) == 1
+        assert len(mgr._static_servers) == 1
         assert len(mgr._tools) == 1
         assert len(mgr._resources) == 2  # 1 concrete + 1 template
         assert len(mgr._template_prefixes) == 1
@@ -355,7 +374,7 @@ class TestFullLifecycleResourcesPrompts:
 
         mgr.shutdown()
 
-        assert len(mgr._sessions) == 0
+        assert len(mgr._static_servers) == 0
         assert len(mgr._tools) == 0
         assert len(mgr._tool_map) == 0
         assert len(mgr._resources) == 0
@@ -376,19 +395,15 @@ class TestFullLifecycleResourcesPrompts:
         mgr.add_resource_listener(lambda: resource_fired.append(1))
         mgr.add_prompt_listener(lambda: prompt_fired.append(1))
 
-        mgr._per_server_tools["alpha"] = []
+        _seed_static_state(mgr, "alpha", tools=[])
         mgr._rebuild_tools()
         assert len(tool_fired) == 1
 
-        mgr._per_server_resources["alpha"] = [
-            _make_resource("file:///x.txt", "x", "alpha"),
-        ]
+        _seed_static_state(mgr, "alpha", resources=[_make_resource("file:///x.txt", "x", "alpha")])
         mgr._rebuild_resources()
         assert len(resource_fired) == 1
 
-        mgr._per_server_prompts["alpha"] = [
-            _make_prompt("mcp__alpha__p1", "p1", "alpha"),
-        ]
+        _seed_static_state(mgr, "alpha", prompts=[_make_prompt("mcp__alpha__p1", "p1", "alpha")])
         mgr._rebuild_prompts()
         assert len(prompt_fired) == 1
 

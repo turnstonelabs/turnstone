@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from tests.conftest import _seed_static_state
 from turnstone.core.mcp_client import MCPClientManager
 
 # ---------------------------------------------------------------------------
@@ -105,14 +106,18 @@ class TestRemoveServerSync:
         """remove_server_sync cleans up all per-server state dicts."""
         mgr = MCPClientManager({"test": {"command": "echo"}})
         # Simulate state as if the server was connected
-        mgr._per_server_tools["test"] = [_fake_openai_tool()]
-        mgr._per_server_resources["test"] = [_fake_resource_dict()]
-        mgr._per_server_prompts["test"] = [_fake_prompt_dict()]
-        mgr._supports_list_changed["test"] = True
-        mgr._supports_resources["test"] = True
-        mgr._supports_resource_list_changed["test"] = True
-        mgr._supports_prompts["test"] = True
-        mgr._supports_prompt_list_changed["test"] = True
+        _seed_static_state(
+            mgr,
+            "test",
+            tools=[_fake_openai_tool()],
+            resources=[_fake_resource_dict()],
+            prompts=[_fake_prompt_dict()],
+            supports_list_changed=True,
+            supports_resources=True,
+            supports_resource_list_changed=True,
+            supports_prompts=True,
+            supports_prompt_list_changed=True,
+        )
         mgr._rebuild_tools()
         mgr._rebuild_resources()
         mgr._rebuild_prompts()
@@ -127,14 +132,7 @@ class TestRemoveServerSync:
         assert len(mgr.get_tools()) == 0
         assert mgr.resource_count == 0
         assert mgr.prompt_count == 0
-        assert "test" not in mgr._per_server_tools
-        assert "test" not in mgr._per_server_resources
-        assert "test" not in mgr._per_server_prompts
-        assert "test" not in mgr._supports_list_changed
-        assert "test" not in mgr._supports_resources
-        assert "test" not in mgr._supports_resource_list_changed
-        assert "test" not in mgr._supports_prompts
-        assert "test" not in mgr._supports_prompt_list_changed
+        assert "test" not in mgr._static_servers
 
     def test_removes_config_to_prevent_reconnect(self) -> None:
         """remove_server_sync removes from _server_configs to prevent reconnect."""
@@ -146,8 +144,8 @@ class TestRemoveServerSync:
     def test_preserves_other_servers(self) -> None:
         """Removing one server does not affect another server's state."""
         mgr = MCPClientManager({"srv_a": {}, "srv_b": {}})
-        mgr._per_server_tools["srv_a"] = [_fake_openai_tool("mcp__srv_a__foo")]
-        mgr._per_server_tools["srv_b"] = [_fake_openai_tool("mcp__srv_b__bar")]
+        _seed_static_state(mgr, "srv_a", tools=[_fake_openai_tool("mcp__srv_a__foo")])
+        _seed_static_state(mgr, "srv_b", tools=[_fake_openai_tool("mcp__srv_b__bar")])
         mgr._rebuild_tools()
 
         assert len(mgr.get_tools()) == 2
@@ -179,13 +177,17 @@ class TestGetServerStatus:
         """Status of a connected server reports correct tool/resource/prompt counts."""
         mgr = MCPClientManager({"test": {}})
         # Simulate connected state
-        mgr._sessions["test"] = object()  # any truthy value
-        mgr._per_server_tools["test"] = [
-            _fake_openai_tool("mcp__test__a"),
-            _fake_openai_tool("mcp__test__b"),
-        ]
-        mgr._per_server_resources["test"] = [_fake_resource_dict()]
-        mgr._per_server_prompts["test"] = [_fake_prompt_dict()]
+        _seed_static_state(
+            mgr,
+            "test",
+            session=object(),  # any truthy value
+            tools=[
+                _fake_openai_tool("mcp__test__a"),
+                _fake_openai_tool("mcp__test__b"),
+            ],
+            resources=[_fake_resource_dict()],
+            prompts=[_fake_prompt_dict()],
+        )
 
         status = mgr.get_server_status("test")
         assert status["connected"] is True
@@ -225,8 +227,7 @@ class TestGetAllServerStatus:
     def test_mixed_connected_and_disconnected(self) -> None:
         """Status correctly reflects a mix of connected and disconnected servers."""
         mgr = MCPClientManager({"up": {}, "down": {}})
-        mgr._sessions["up"] = object()
-        mgr._per_server_tools["up"] = [_fake_openai_tool("mcp__up__x")]
+        _seed_static_state(mgr, "up", session=object(), tools=[_fake_openai_tool("mcp__up__x")])
 
         statuses = mgr.get_all_server_status()
         assert statuses["up"]["connected"] is True
