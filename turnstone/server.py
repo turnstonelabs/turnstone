@@ -2702,6 +2702,20 @@ async def oidc_callback(request: Request) -> Response:
     return await handle_oidc_callback(request, JWT_AUD_SERVER)
 
 
+async def mcp_oauth_authorize(request: Request) -> Response:
+    """GET /v1/api/mcp/oauth/start — begin per-(user, server) OAuth flow."""
+    from turnstone.core.mcp_oauth import handle_mcp_oauth_authorize
+
+    return await handle_mcp_oauth_authorize(request)
+
+
+async def mcp_oauth_callback(request: Request) -> Response:
+    """GET /v1/api/mcp/oauth/callback — AS-redirected OAuth callback."""
+    from turnstone.core.mcp_oauth import handle_mcp_oauth_callback
+
+    return await handle_mcp_oauth_callback(request)
+
+
 def list_interface_settings(request: Request) -> JSONResponse:
     """GET /v1/api/admin/settings — return interface settings from ConfigStore.
 
@@ -3482,11 +3496,16 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     await initialize_oidc_state(app.state)
 
     # MCP-OAuth token-at-rest encryption — fail-loud on misconfiguration
-    # when any mcp_servers row has auth_type='oauth_user'.  See
-    # docs/design/oauth-mcp.md §5.3.
+    # when any mcp_servers row has auth_type='oauth_user'.
     from turnstone.core.mcp_crypto import initialize_mcp_crypto_state
 
     initialize_mcp_crypto_state(app.state, node_id=getattr(app.state, "node_id", ""))
+
+    # Per-(user, server) OAuth flow state — long-lived HTTP client +
+    # in-process refresh lock + metadata cache.
+    from turnstone.core.mcp_oauth import initialize_mcp_oauth_state
+
+    await initialize_mcp_oauth_state(app.state)
 
     # TLS: start auto-renewal if client was initialized
     tls_client = getattr(app.state, "tls_client", None)
@@ -3635,12 +3654,19 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         app.state.mcp_client.shutdown()
     if app.state.registry:
         app.state.registry.shutdown()
-    from turnstone.core.oidc import close_oidc_state
+    # Close in reverse order of initialization (mcp_oauth → mcp_crypto →
+    # oidc). The OAuth flow holds a long-lived httpx.AsyncClient that
+    # depends on no later-initialised state, but reversing init order
+    # is the conventional LIFO discipline.
+    from turnstone.core.mcp_oauth import close_mcp_oauth_state
 
-    await close_oidc_state(app.state)
+    await close_mcp_oauth_state(app.state)
     from turnstone.core.mcp_crypto import close_mcp_crypto_state
 
     close_mcp_crypto_state(app.state)
+    from turnstone.core.oidc import close_oidc_state
+
+    await close_oidc_state(app.state)
     app.state.sse_executor.shutdown(wait=True, cancel_futures=True)
 
 
@@ -3876,6 +3902,8 @@ def create_app(
                     Route("/api/auth/refresh", auth_refresh, methods=["POST"]),
                     Route("/api/auth/oidc/authorize", oidc_authorize),
                     Route("/api/auth/oidc/callback", oidc_callback),
+                    Route("/api/mcp/oauth/start", mcp_oauth_authorize),
+                    Route("/api/mcp/oauth/callback", mcp_oauth_callback),
                     Route("/api/admin/settings", list_interface_settings),
                     Route(
                         "/api/admin/settings/{key:path}",

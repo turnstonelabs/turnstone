@@ -15,6 +15,7 @@ import pytest
 from tests.conftest import _seed_static_state
 from turnstone.core.mcp_client import (
     MCPClientManager,
+    _db_servers_to_config,
     _mcp_to_openai,
     load_mcp_config,
 )
@@ -259,6 +260,61 @@ class TestLoadMcpConfig:
         with patch("turnstone.core.mcp_client.load_config", return_value={}):
             result = load_mcp_config(str(config_file))
         assert result == {}
+
+
+class TestDBServersToConfig:
+    """``_db_servers_to_config`` shapes DB rows for the MCP client."""
+
+    def test_static_streamable_http_row_passes_through(self) -> None:
+        rows = [
+            {
+                "name": "static-srv",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com",
+                "headers": '{"Authorization": "Bearer token"}',
+                "auth_type": "static",
+            }
+        ]
+        result = _db_servers_to_config(rows)
+        assert "static-srv" in result
+        assert result["static-srv"]["url"] == "https://mcp.example.com"
+        assert result["static-srv"]["headers"] == {"Authorization": "Bearer token"}
+
+    def test_db_servers_to_config_skips_oauth_user_rows(self) -> None:
+        """Rows with auth_type=oauth_user must be invisible to the static
+        auto-connect path.
+
+        Auto-connecting these with empty headers fails the AS check and
+        trips the circuit breaker on startup. Per-user OAuth servers
+        come online lazily once the user has consented.
+        """
+        rows = [
+            {
+                "name": "static-srv",
+                "transport": "streamable-http",
+                "url": "https://static.example.com",
+                "headers": "{}",
+                "auth_type": "static",
+            },
+            {
+                "name": "oauth-srv",
+                "transport": "streamable-http",
+                "url": "https://oauth.example.com",
+                "headers": "{}",
+                "auth_type": "oauth_user",
+            },
+            {
+                "name": "stdio-srv",
+                "transport": "stdio",
+                "command": "echo",
+                "args": "[]",
+                "env": "{}",
+                "auth_type": "none",
+            },
+        ]
+        result = _db_servers_to_config(rows)
+        assert set(result) == {"static-srv", "stdio-srv"}
+        assert "oauth-srv" not in result
 
 
 # ---------------------------------------------------------------------------

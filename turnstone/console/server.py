@@ -1621,6 +1621,20 @@ async def oidc_callback(request: Request) -> Response:
     return await handle_oidc_callback(request, JWT_AUD_CONSOLE)
 
 
+async def mcp_oauth_authorize(request: Request) -> Response:
+    """GET /v1/api/mcp/oauth/start — begin per-(user, server) OAuth flow."""
+    from turnstone.core.mcp_oauth import handle_mcp_oauth_authorize
+
+    return await handle_mcp_oauth_authorize(request)
+
+
+async def mcp_oauth_callback(request: Request) -> Response:
+    """GET /v1/api/mcp/oauth/callback — AS-redirected OAuth callback."""
+    from turnstone.core.mcp_oauth import handle_mcp_oauth_callback
+
+    return await handle_mcp_oauth_callback(request)
+
+
 # ---------------------------------------------------------------------------
 # Route handlers — available models (lightweight, no admin permission)
 # ---------------------------------------------------------------------------
@@ -4214,13 +4228,19 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     await initialize_oidc_state(app.state)
 
     # MCP-OAuth token-at-rest encryption — fail-loud on misconfiguration
-    # when any mcp_servers row has auth_type='oauth_user'.  See
-    # docs/design/oauth-mcp.md §5.3.  The console acts as the cluster
-    # admin surface and is the canonical writer for OAuth client secrets,
-    # so it needs the cipher even when no node currently dispatches.
+    # when any mcp_servers row has auth_type='oauth_user'.  The console
+    # acts as the cluster admin surface and is the canonical writer for
+    # OAuth client secrets, so it needs the cipher even when no node
+    # currently dispatches.
     from turnstone.core.mcp_crypto import initialize_mcp_crypto_state
 
     initialize_mcp_crypto_state(app.state, node_id="console")
+
+    # Per-(user, server) OAuth flow state — long-lived HTTP client +
+    # in-process refresh lock + metadata cache.
+    from turnstone.core.mcp_oauth import initialize_mcp_oauth_state
+
+    await initialize_mcp_oauth_state(app.state)
 
     # Register console in service registry so other services can discover it
     console_url = getattr(app.state, "console_url", "")
@@ -4482,12 +4502,17 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         log.debug("console.coord_ui_refs_reset_failed", exc_info=True)
     await app.state.proxy_sse_client.aclose()
     await app.state.proxy_client.aclose()
-    from turnstone.core.oidc import close_oidc_state
+    # Close in reverse order of initialization (mcp_oauth → mcp_crypto →
+    # oidc) per LIFO teardown discipline.
+    from turnstone.core.mcp_oauth import close_mcp_oauth_state
 
-    await close_oidc_state(app.state)
+    await close_mcp_oauth_state(app.state)
     from turnstone.core.mcp_crypto import close_mcp_crypto_state
 
     close_mcp_crypto_state(app.state)
+    from turnstone.core.oidc import close_oidc_state
+
+    await close_oidc_state(app.state)
     app.state.collector.stop()
     audit_exec_shutdown = getattr(app.state, "audit_executor", None)
     if audit_exec_shutdown is not None:
@@ -8123,6 +8148,14 @@ def _apply_oauth_client_secret(
             {"error": "oauth_client_secret must be a string or null"},
             status_code=400,
         )
+    # Cap plaintext at 1024 chars — defends against pathological input
+    # blowing up the Fernet ciphertext column. Real OAuth client secrets
+    # from production AS implementations are well under 256 chars.
+    if isinstance(secret_input, str) and len(secret_input) > 1024:
+        return None, JSONResponse(
+            {"error": "oauth_client_secret must be 1024 characters or fewer"},
+            status_code=400,
+        )
     token_store = getattr(request.app.state, "mcp_token_store", None)
     if token_store is None:
         return None, JSONResponse({"error": _OAUTH_TOKEN_STORE_503_MSG}, status_code=503)
@@ -8547,6 +8580,11 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     transitioning_away_from_oauth_user = (
         updates.get("auth_type") in {"static", "none"} and existing.get("auth_type") == "oauth_user"
     )
+    # Renaming an oauth_user row needs the same per-user-token purge as
+    # delete: the tokens are keyed on the OLD ``server_name`` and a row
+    # later created with that old name (with attacker-controlled URL)
+    # would otherwise silently rebind them.
+    name_changing = "name" in updates and existing.get("name", "") != updates["name"]
     if updates.get("auth_type") and updates["auth_type"] != "oauth_user":
         updates.update(
             {
@@ -8571,6 +8609,22 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
         storage.update_mcp_server(server_id, **updates)
 
     audit_uid, ip = _audit_context(request)
+
+    # Purge per-user tokens + pending OAuth states keyed on the OLD
+    # name on rename, or on ``oauth_user → static/none`` transition.
+    # Both cases would otherwise leave tokens orphaned-and-rebindable
+    # because the OAuth tables key on the mutable ``server_name``.
+    if name_changing or transitioning_away_from_oauth_user:
+        purge_target = existing.get("name", "")
+        if purge_target:
+            try:
+                storage.delete_mcp_oauth_rows_by_server_name(purge_target)
+            except Exception:
+                log.warning(
+                    "admin.mcp.purge_oauth_rows_failed server_id=%s",
+                    server_id,
+                    exc_info=True,
+                )
 
     # sec-2: when the row is leaving ``oauth_user``, also clear the encrypted
     # client secret column.  Operators expect "disable OAuth" to revoke
@@ -8656,6 +8710,24 @@ async def admin_delete_mcp_server(request: Request) -> JSONResponse:
     if existing is None:
         return JSONResponse({"error": "MCP server not found"}, status_code=404)
 
+    # Purge per-user tokens + pending OAuth states keyed on this name
+    # before the row goes away. The OAuth tables are keyed on the
+    # mutable ``server_name``; without this purge, a future server with
+    # the same name (and an attacker-controlled URL) would silently
+    # rebind those tokens. A future schema migration will replace this
+    # with a server_id FK + ON DELETE CASCADE; until then, explicit
+    # purge is the only safe path.
+    existing_name = existing.get("name", "")
+    if existing_name:
+        try:
+            storage.delete_mcp_oauth_rows_by_server_name(existing_name)
+        except Exception:
+            log.warning(
+                "admin.mcp.purge_oauth_rows_failed server_id=%s",
+                server_id,
+                exc_info=True,
+            )
+
     storage.delete_mcp_server(server_id)
 
     audit_uid, ip = _audit_context(request)
@@ -8665,7 +8737,7 @@ async def admin_delete_mcp_server(request: Request) -> JSONResponse:
         "mcp_server.delete",
         "mcp_server",
         server_id,
-        {"name": existing.get("name", "")},
+        {"name": existing_name},
         ip,
     )
 
@@ -8792,7 +8864,7 @@ async def _admin_mcp_action(request: Request, action: str) -> JSONResponse:
         return JSONResponse({"error": "invalid server name"}, status_code=400)
 
     existing = storage.get_mcp_server_by_name(name)
-    target_id = existing.get("id", name) if existing else name
+    target_id = existing.get("server_id", name) if existing else name
 
     audit_uid, ip = _audit_context(request)
     record_audit(
@@ -11438,6 +11510,8 @@ def create_app(
                     Route("/api/auth/refresh", auth_refresh, methods=["POST"]),
                     Route("/api/auth/oidc/authorize", oidc_authorize),
                     Route("/api/auth/oidc/callback", oidc_callback),
+                    Route("/api/mcp/oauth/start", mcp_oauth_authorize),
+                    Route("/api/mcp/oauth/callback", mcp_oauth_callback),
                     Route("/api/admin/users", admin_list_users),
                     Route("/api/admin/users", admin_create_user, methods=["POST"]),
                     Route("/api/admin/users/{user_id}", admin_delete_user, methods=["DELETE"]),

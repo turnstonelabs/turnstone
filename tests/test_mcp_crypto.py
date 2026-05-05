@@ -1,7 +1,6 @@
 """Tests for ``turnstone.core.mcp_crypto`` cipher + config loading.
 
-Covers Phase 3 of the OAuth-MCP RFC: token-at-rest encryption.
-See ``docs/design/oauth-mcp.md`` §5.3.
+Covers token-at-rest encryption for OAuth-MCP.
 """
 
 from __future__ import annotations

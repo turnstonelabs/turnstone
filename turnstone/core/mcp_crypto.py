@@ -1,4 +1,4 @@
-"""Token-at-rest encryption for OAuth-MCP. See docs/design/oauth-mcp.md §5.3.
+"""Token-at-rest encryption for OAuth-MCP.
 
 Uses cryptography.fernet (AES-128-CBC + HMAC-SHA256, 256-bit total key
 material, encrypt-then-MAC). Single-key chosen for v1; rotation supported
@@ -342,10 +342,9 @@ class MCPTokenStore:
         ``refresh_token=None`` CLEARS the column — it does NOT preserve
         the existing value.  Per RFC 6749 §6, an authorization server MAY
         omit ``refresh_token`` from the refresh response; in that case
-        the caller (the OAuth flow that lands in a future phase) MUST
-        pre-resolve whether to keep the existing refresh token or drop
-        it before invoking this method.  This API has no
-        "leave unchanged" sentinel.
+        the OAuth-flow caller MUST pre-resolve whether to keep the
+        existing refresh token or drop it before invoking this method.
+        This API has no "leave unchanged" sentinel.
         """
         access_ct = self._cipher.encrypt(access_token.encode("utf-8"))
         refresh_ct = self._cipher.encrypt(refresh_token.encode("utf-8")) if refresh_token else None
@@ -376,21 +375,46 @@ class MCPTokenStore:
         secret_ct = self._cipher.encrypt(plaintext_secret.encode("utf-8"))
         return self._storage.set_mcp_oauth_client_secret_ct(server_id, secret_ct)
 
+    def get_oauth_client_secret(self, server_id: str) -> str | None:
+        """Decrypt and return the per-server OAuth client secret, or None.
+
+        Returns ``None`` when the row is missing or the column is NULL.
+        Raises :class:`MCPTokenDecryptError` on key mismatch — the caller
+        decides whether to treat that as a missing-secret case (e.g. log +
+        prompt re-consent) or surface as a configuration failure.
+        """
+        secret_ct = self._storage.get_mcp_oauth_client_secret_ct(server_id)
+        if secret_ct is None:
+            return None
+        return self._cipher.decrypt(secret_ct).decode("utf-8")
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
     def _audit_decrypt_failure(self, server_name: str, fingerprints: tuple[str, ...]) -> None:
-        """Best-effort audit emit on decrypt failure (no-op when unconfigured)."""
+        """Best-effort audit emit on decrypt failure (no-op when unconfigured).
+
+        Uses ``server_id`` (PK UUID) as ``resource_id`` so admin-driven
+        server renames don't break event correlation. Falls back to
+        ``server_name`` when the lookup misses.
+        """
         if self._audit_storage is None:
             return
+        resource_id = server_name
+        try:
+            row = self._audit_storage.get_mcp_server_by_name(server_name)
+        except Exception:
+            row = None
+        if row is not None:
+            resource_id = str(row.get("server_id") or server_name)
         try:
             record_audit(
                 self._audit_storage,
                 user_id="",
                 action="mcp_server.oauth.token_decrypt_failure",
                 resource_type="mcp_server",
-                resource_id=server_name,
+                resource_id=resource_id,
                 detail={
                     "server_name": server_name,
                     "key_fingerprints_attempted": list(fingerprints),
@@ -399,7 +423,7 @@ class MCPTokenStore:
             )
         except Exception:
             log.warning(
-                "mcp.oauth.audit_emit_failed",
+                "mcp_server.oauth.audit_emit_failed",
                 action="token_decrypt_failure",
                 server_name=server_name,
                 exc_info=True,
@@ -438,7 +462,7 @@ def initialize_mcp_crypto_state(app_state: object, *, node_id: str = "") -> None
     try:
         cipher_cfg = load_mcp_token_cipher_config()
     except MCPTokenKeyConfigError as exc:
-        log.error("mcp.oauth.key_config_invalid: %s", exc)
+        log.error("mcp_server.oauth.key_config_invalid: %s", exc)
         raise SystemExit(1) from exc
 
     storage = get_storage()
@@ -462,7 +486,7 @@ def initialize_mcp_crypto_state(app_state: object, *, node_id: str = "") -> None
         # exercised; install None sentinels so callers can fast-path.
         app_state.mcp_token_cipher = None  # type: ignore[attr-defined]
         app_state.mcp_token_store = None  # type: ignore[attr-defined]
-        log.debug("mcp.oauth.disabled (no key configured, no oauth_user rows)")
+        log.debug("mcp_server.oauth.disabled (no key configured, no oauth_user rows)")
         return
 
     cipher = MCPTokenCipher(cipher_cfg)
@@ -474,7 +498,7 @@ def initialize_mcp_crypto_state(app_state: object, *, node_id: str = "") -> None
         audit_storage=storage,
     )
     log.info(
-        "mcp.oauth.cipher_installed",
+        "mcp_server.oauth.cipher_installed",
         keys=len(cipher.key_fingerprints),
         active_fp=cipher.key_fingerprints[0],
     )

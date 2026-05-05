@@ -42,10 +42,9 @@ class OIDCPendingState(TypedDict):
 class MCPUserToken(TypedDict):
     """Row shape returned by per-(user, MCP server) OAuth token lookups.
 
-    See ``docs/design/oauth-mcp.md`` §5.1.  ``access_token_ct`` and
-    ``refresh_token_ct`` are Fernet ciphertext blobs; the storage layer
-    returns them verbatim and ``MCPTokenStore`` (Phase 3) handles
-    encrypt/decrypt.
+    ``access_token_ct`` and ``refresh_token_ct`` are Fernet ciphertext
+    blobs; the storage layer returns them verbatim and ``MCPTokenStore``
+    handles encrypt/decrypt.
     """
 
     user_id: str
@@ -1706,6 +1705,57 @@ class StorageBackend(Protocol):
 
     def delete_mcp_user_token(self, user_id: str, server_name: str) -> bool:
         """Delete the per-(user, server) token row. Returns True if existed."""
+        ...
+
+    def delete_mcp_oauth_rows_by_server_name(self, server_name: str) -> int:
+        """Purge per-(user, server) tokens and pending OAuth states for *server_name*.
+
+        Used when the operator renames or deletes an MCP server row to
+        prevent old user tokens from rebinding to a freshly-created
+        server with the same ``name``. Returns the total number of rows
+        deleted across both tables.
+
+        Both ``mcp_user_tokens`` and ``mcp_oauth_pending`` are keyed on
+        the mutable ``server_name`` rather than the immutable
+        ``server_id``; until those tables migrate to a server_id FK with
+        ON DELETE CASCADE (a future schema migration), explicit purge on
+        rename/delete is the only safe path.
+        """
+        ...
+
+    def get_mcp_oauth_client_secret_ct(self, server_id: str) -> bytes | None:
+        """Return the encrypted OAuth client secret column or None.
+
+        Mirror of :meth:`set_mcp_oauth_client_secret_ct` for the read path.
+        Returns ``None`` when the row does not exist or the column is NULL.
+        """
+        ...
+
+    # -- MCP OAuth pending state (per-(user, server) flow) ---------------------
+
+    def create_mcp_oauth_pending_state(
+        self,
+        state: str,
+        user_id: str,
+        server_name: str,
+        code_verifier: str,
+        return_url: str,
+    ) -> None:
+        """Insert a pending MCP OAuth flow row for callback validation."""
+        ...
+
+    def pop_mcp_oauth_pending_state(
+        self, state: str, max_age_seconds: int = 600
+    ) -> MCPOAuthPendingState | None:
+        """Atomically fetch+delete a pending MCP OAuth row.
+
+        Returns ``None`` when the row is missing or older than
+        ``max_age_seconds``.
+        """
+        ...
+
+    def cleanup_expired_mcp_oauth_pending_states(self, max_age_seconds: int = 600) -> int:
+        """Bulk-delete expired pending MCP OAuth rows. Returns count deleted."""
         ...
 
     # -- Model definitions -----------------------------------------------------

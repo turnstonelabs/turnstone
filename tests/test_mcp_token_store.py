@@ -251,3 +251,36 @@ class TestDecryptFailureInvariant:
         events = backend.list_audit_events(limit=10)
         actions = {ev.get("action") for ev in events}
         assert "mcp_server.oauth.token_decrypt_failure" in actions
+
+
+# ---------------------------------------------------------------------------
+# Client-secret reader — q-9
+# ---------------------------------------------------------------------------
+
+
+class TestClientSecretReader:
+    def test_get_oauth_client_secret_returns_none_when_row_absent(self, backend) -> None:
+        store, _ = _make_store(backend)
+        assert store.get_oauth_client_secret("does-not-exist") is None
+
+    def test_get_oauth_client_secret_returns_none_when_column_null(self, backend) -> None:
+        store, _ = _make_store(backend)
+        server_id = _seed_server(backend)
+        # No set_oauth_client_secret call — column stays NULL.
+        assert store.get_oauth_client_secret(server_id) is None
+
+    def test_get_oauth_client_secret_round_trip(self, backend) -> None:
+        store, _ = _make_store(backend)
+        server_id = _seed_server(backend)
+        store.set_oauth_client_secret(server_id, "shhh-its-secret")
+        assert store.get_oauth_client_secret(server_id) == "shhh-its-secret"
+
+    def test_get_oauth_client_secret_raises_on_key_mismatch(self, backend) -> None:
+        store_a, _ = _make_store(backend)
+        server_id = _seed_server(backend)
+        store_a.set_oauth_client_secret(server_id, "secret-under-key-a")
+
+        # Cipher B has a different key — decrypt fails loudly.
+        store_b, _ = _make_store(backend)
+        with pytest.raises(MCPTokenDecryptError):
+            store_b.get_oauth_client_secret(server_id)
