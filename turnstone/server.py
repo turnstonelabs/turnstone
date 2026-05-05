@@ -3481,6 +3481,13 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
 
     await initialize_oidc_state(app.state)
 
+    # MCP-OAuth token-at-rest encryption — fail-loud on misconfiguration
+    # when any mcp_servers row has auth_type='oauth_user'.  See
+    # docs/design/oauth-mcp.md §5.3.
+    from turnstone.core.mcp_crypto import initialize_mcp_crypto_state
+
+    initialize_mcp_crypto_state(app.state, node_id=getattr(app.state, "node_id", ""))
+
     # TLS: start auto-renewal if client was initialized
     tls_client = getattr(app.state, "tls_client", None)
     if tls_client is not None:
@@ -3631,6 +3638,9 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     from turnstone.core.oidc import close_oidc_state
 
     await close_oidc_state(app.state)
+    from turnstone.core.mcp_crypto import close_mcp_crypto_state
+
+    close_mcp_crypto_state(app.state)
     app.state.sse_executor.shutdown(wait=True, cancel_futures=True)
 
 

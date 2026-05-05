@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 from turnstone.core.log import get_logger
-from turnstone.core.storage._protocol import OIDCIdentity, OIDCPendingState
+from turnstone.core.storage._protocol import MCPUserToken, OIDCIdentity, OIDCPendingState
 from turnstone.core.storage._schema import (
     api_tokens,
     audit_events,
@@ -23,6 +23,7 @@ from turnstone.core.storage._schema import (
     heuristic_rules,
     intent_verdicts,
     mcp_servers,
+    mcp_user_tokens,
     metadata,
     model_definitions,
     oidc_identities,
@@ -3956,6 +3957,128 @@ class SQLiteBackend:
         with self._conn() as conn:
             result = conn.execute(
                 sa.delete(mcp_servers).where(mcp_servers.c.server_id == server_id)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    # -- MCP OAuth: client-secret + per-(user, server) tokens ------------------
+
+    def set_mcp_oauth_client_secret_ct(self, server_id: str, secret_ct: bytes | None) -> bool:
+        """Update only the encrypted OAuth client-secret column.
+
+        Returns True when a row was updated. ``None`` clears the column.
+        Bypasses ``MCP_SERVER_MUTABLE`` deliberately.
+        """
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.update(mcp_servers)
+                .where(mcp_servers.c.server_id == server_id)
+                .values(oauth_client_secret_ct=secret_ct, updated=now)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def create_mcp_user_token(
+        self,
+        user_id: str,
+        server_name: str,
+        *,
+        access_token_ct: bytes,
+        refresh_token_ct: bytes | None,
+        expires_at: str | None,
+        scopes: str | None,
+        as_issuer: str,
+        audience: str,
+    ) -> None:
+        """Insert a new per-(user, server) token row. No-op on conflict."""
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            conn.execute(
+                sa.insert(mcp_user_tokens).prefix_with("OR IGNORE"),
+                {
+                    "user_id": user_id,
+                    "server_name": server_name,
+                    "access_token_ct": access_token_ct,
+                    "refresh_token_ct": refresh_token_ct,
+                    "expires_at": expires_at,
+                    "scopes": scopes,
+                    "as_issuer": as_issuer,
+                    "audience": audience,
+                    "created": now,
+                    "last_refreshed": None,
+                },
+            )
+            conn.commit()
+
+    def get_mcp_user_token(self, user_id: str, server_name: str) -> MCPUserToken | None:
+        """Return the per-(user, server) token row or None."""
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(mcp_user_tokens).where(
+                    (mcp_user_tokens.c.user_id == user_id)
+                    & (mcp_user_tokens.c.server_name == server_name)
+                )
+            ).fetchone()
+            if row is None:
+                return None
+            m = row._mapping
+            return MCPUserToken(
+                user_id=m["user_id"],
+                server_name=m["server_name"],
+                access_token_ct=bytes(m["access_token_ct"]),
+                refresh_token_ct=(
+                    bytes(m["refresh_token_ct"]) if m["refresh_token_ct"] is not None else None
+                ),
+                expires_at=m["expires_at"],
+                scopes=m["scopes"],
+                as_issuer=m["as_issuer"],
+                audience=m["audience"],
+                created=m["created"],
+                last_refreshed=m["last_refreshed"],
+            )
+
+    def update_mcp_user_token_after_refresh(
+        self,
+        user_id: str,
+        server_name: str,
+        *,
+        access_token_ct: bytes,
+        refresh_token_ct: bytes | None,
+        expires_at: str | None,
+    ) -> bool:
+        """Rewrite token columns + ``last_refreshed`` after an AS refresh.
+
+        Preserves columns this method does not rewrite (``scopes``,
+        ``as_issuer``, ``audience``, ``created``). Returns True when a
+        row was updated.
+        """
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.update(mcp_user_tokens)
+                .where(
+                    (mcp_user_tokens.c.user_id == user_id)
+                    & (mcp_user_tokens.c.server_name == server_name)
+                )
+                .values(
+                    access_token_ct=access_token_ct,
+                    refresh_token_ct=refresh_token_ct,
+                    expires_at=expires_at,
+                    last_refreshed=now,
+                )
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def delete_mcp_user_token(self, user_id: str, server_name: str) -> bool:
+        """Delete the per-(user, server) token row. Returns True if existed."""
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.delete(mcp_user_tokens).where(
+                    (mcp_user_tokens.c.user_id == user_id)
+                    & (mcp_user_tokens.c.server_name == server_name)
+                )
             )
             conn.commit()
             return result.rowcount > 0

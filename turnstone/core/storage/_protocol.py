@@ -1653,6 +1653,61 @@ class StorageBackend(Protocol):
         """Delete an MCP server definition. Returns True if existed."""
         ...
 
+    # -- MCP OAuth: client-secret + per-(user, server) tokens ------------------
+    #
+    # ``oauth_client_secret_ct`` is intentionally absent from
+    # ``MCP_SERVER_MUTABLE`` (see ``_utils.py``).  It has its own dedicated
+    # writer so the encrypt/None-to-clear semantics live in one place — see
+    # ``set_mcp_oauth_client_secret_ct`` below.
+
+    def set_mcp_oauth_client_secret_ct(self, server_id: str, secret_ct: bytes | None) -> bool:
+        """Update only the encrypted OAuth client-secret column.
+
+        Returns True when a row was updated. ``None`` clears the column.
+        Bypasses ``MCP_SERVER_MUTABLE`` deliberately.
+        """
+        ...
+
+    def create_mcp_user_token(
+        self,
+        user_id: str,
+        server_name: str,
+        *,
+        access_token_ct: bytes,
+        refresh_token_ct: bytes | None,
+        expires_at: str | None,
+        scopes: str | None,
+        as_issuer: str,
+        audience: str,
+    ) -> None:
+        """Insert a new per-(user, server) token row. No-op on conflict."""
+        ...
+
+    def get_mcp_user_token(self, user_id: str, server_name: str) -> MCPUserToken | None:
+        """Return the per-(user, server) token row or None."""
+        ...
+
+    def update_mcp_user_token_after_refresh(
+        self,
+        user_id: str,
+        server_name: str,
+        *,
+        access_token_ct: bytes,
+        refresh_token_ct: bytes | None,
+        expires_at: str | None,
+    ) -> bool:
+        """Rewrite token columns + ``last_refreshed`` after an AS refresh.
+
+        Preserves columns this method does not rewrite (``scopes``,
+        ``as_issuer``, ``audience``, ``created``). Returns True when a
+        row was updated.
+        """
+        ...
+
+    def delete_mcp_user_token(self, user_id: str, server_name: str) -> bool:
+        """Delete the per-(user, server) token row. Returns True if existed."""
+        ...
+
     # -- Model definitions -----------------------------------------------------
 
     def create_model_definition(

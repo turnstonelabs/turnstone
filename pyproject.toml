@@ -35,6 +35,7 @@ dependencies = [
     "structlog>=24.1",
     "PyJWT>=2.8",
     "bcrypt>=4.0",
+    "cryptography>=42",
     "python-frontmatter>=1.0",
 ]
 
