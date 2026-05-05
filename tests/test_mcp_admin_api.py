@@ -142,6 +142,7 @@ def _routes_with_internal() -> list[Mount]:
         internal_mcp_reconnect_one,
         internal_mcp_refresh_one,
         internal_mcp_reload,
+        internal_mcp_status,
     )
 
     return [
@@ -150,6 +151,7 @@ def _routes_with_internal() -> list[Mount]:
             routes=[
                 *_ROUTES[0].routes,  # type: ignore[union-attr]
                 Route("/api/_internal/mcp-reload", internal_mcp_reload, methods=["POST"]),
+                Route("/api/_internal/mcp-status", internal_mcp_status),
                 Route(
                     "/api/_internal/mcp-refresh/{name}",
                     internal_mcp_refresh_one,
@@ -1712,3 +1714,93 @@ class TestInternalMcpReconnectOneEndpoint:
         assert r.status_code == 400
         assert "invalid" in r.json()["error"].lower()
         mgr.reconnect_sync.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Node fan-out status endpoint: GET /v1/api/_internal/mcp-status
+# ---------------------------------------------------------------------------
+
+
+class TestInternalMcpStatusEndpoint:
+    """HTTP-level tests for the node-side aggregate status endpoint.
+
+    The endpoint falls through to ``read`` scope (a deliberate choice
+    so dashboards can render status indicators for non-admin
+    operators). Because of that, the response must strip ``command``
+    (stdio argv) and ``url`` (remote MCP endpoint) — both admin-only
+    context — before it leaves the process.
+    """
+
+    @pytest.fixture()
+    def node_app_factory(self, storage: SQLiteBackend):
+        def _make(mgr: Any) -> TestClient:
+            app = Starlette(
+                routes=_routes_with_internal(),
+                middleware=[Middleware(_InjectAuthMiddleware)],
+            )
+            app.state.auth_storage = storage
+            if mgr is not None:
+                app.state.mcp_client = mgr
+            return TestClient(app, raise_server_exceptions=False)
+
+        return _make
+
+    def test_status_strips_command_url_and_error(self, node_app_factory) -> None:
+        mgr = MagicMock()
+        mgr.get_all_server_status.return_value = {
+            "srv-stdio": {
+                "connected": False,
+                "tools": 0,
+                "resources": 0,
+                "prompts": 0,
+                # Error text would carry the binary path even after
+                # ``command`` is stripped — read scope must not see it.
+                "error": "FileNotFoundError: [Errno 2] No such file or "
+                "directory: '/usr/local/bin/secret-mcp-bin'",
+                "transport": "stdio",
+                "command": ["/usr/local/bin/secret-mcp-bin", "--token", "abc"],
+                "url": "",
+                "circuit_open": True,
+                "consecutive_failures": 5,
+            },
+            "srv-http": {
+                "connected": True,
+                "tools": 1,
+                "resources": 1,
+                "prompts": 0,
+                "error": "",
+                "transport": "streamable-http",
+                "command": "",
+                "url": "https://internal-mcp.example/mcp",
+                "circuit_open": False,
+                "consecutive_failures": 0,
+            },
+        }
+        c = node_app_factory(mgr)
+        r = c.get("/v1/api/_internal/mcp-status")
+        assert r.status_code == 200
+        servers = r.json()["servers"]
+        assert set(servers) == {"srv-stdio", "srv-http"}
+        for entry in servers.values():
+            assert "command" not in entry
+            assert "url" not in entry
+            # ``error`` text is replaced by ``has_error`` boolean so a
+            # FileNotFoundError binary path or httpx URL cannot leak
+            # through verbose exception messages at read scope.
+            assert "error" not in entry
+            assert "has_error" in entry
+        # Coarse error indicator preserved.
+        assert servers["srv-stdio"]["has_error"] is True
+        assert servers["srv-http"]["has_error"] is False
+        # Operational fields preserved.
+        assert servers["srv-http"]["tools"] == 1
+        assert servers["srv-http"]["transport"] == "streamable-http"
+        assert servers["srv-stdio"]["circuit_open"] is True
+        # No leaked binary path anywhere in the rendered response.
+        assert "secret-mcp-bin" not in r.text
+
+    def test_status_no_mcp_client_returns_empty_servers(self, node_app_factory) -> None:
+        c = node_app_factory(None)
+        r = c.get("/v1/api/_internal/mcp-status")
+        assert r.status_code == 200
+        assert r.json() == {"servers": {}}

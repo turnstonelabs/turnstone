@@ -26,7 +26,6 @@ if TYPE_CHECKING:
 
 from turnstone.core.log import get_logger
 from turnstone.core.oauth_ssrf import (
-    KNOWN_TRUSTED_OAUTH_ENDPOINT_HOSTS,
     OAuthSSRFError,
     is_localhost,
 )
@@ -66,11 +65,6 @@ _ALLOWED_ID_TOKEN_ALGS = [
     "PS384",
     "PS512",
 ]
-
-# Re-export the shared trusted-host map under the legacy OIDC name so existing
-# callers / tests continue to work without churn.
-_KNOWN_TRUSTED_ENDPOINT_HOSTS = KNOWN_TRUSTED_OAUTH_ENDPOINT_HOSTS
-
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -328,8 +322,8 @@ def validate_discovered_endpoint(
     hostname. Strict equality is intentional — a hostile or compromised IdP
     must not be able to redirect ``token_endpoint`` to a third-party host where
     ``client_secret`` would leak. Multi-origin IdPs (e.g. Google) are
-    accommodated via :data:`_KNOWN_TRUSTED_ENDPOINT_HOSTS` plus an
-    operator-configurable ``trusted_endpoint_hosts`` list.
+    accommodated via :data:`turnstone.core.oauth_ssrf.KNOWN_TRUSTED_OAUTH_ENDPOINT_HOSTS`
+    plus an operator-configurable ``trusted_endpoint_hosts`` list.
 
     The scheme must match the issuer's scheme, and the *effective* port (with
     scheme defaults applied) must match — so ``https://host`` and

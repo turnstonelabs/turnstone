@@ -2855,15 +2855,6 @@ def internal_mcp_reload(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", **result})
 
 
-def internal_mcp_status(request: Request) -> JSONResponse:
-    """GET /v1/api/_internal/mcp-status — return MCP server status."""
-    mcp_mgr = getattr(request.app.state, "mcp_client", None)
-    if mcp_mgr is None:
-        return JSONResponse({"servers": {}})
-
-    return JSONResponse({"servers": mcp_mgr.get_all_server_status()})
-
-
 _SERVER_STATUS_PUBLIC_KEYS: tuple[str, ...] = (
     "connected",
     "tools",
@@ -2875,16 +2866,69 @@ _SERVER_STATUS_PUBLIC_KEYS: tuple[str, ...] = (
     "consecutive_failures",
 )
 
+_READ_STATUS_PUBLIC_KEYS: tuple[str, ...] = tuple(
+    k for k in _SERVER_STATUS_PUBLIC_KEYS if k != "error"
+)
+
+
+def _strip_server_status(full: dict[str, Any]) -> dict[str, Any]:
+    """Project a status dict to the approve-scope public-safe key set.
+
+    The full status dict embeds ``command`` (stdio argv) and ``url``
+    (remote MCP endpoint) which are admin-only context. Approve-scoped
+    callers (refresh/reconnect) get the verbose ``error`` text so an
+    operator triaging a failure sees the underlying exception.
+
+    Read-scope callers must use :func:`_strip_server_status_for_read`
+    instead — error strings can carry stdio binary paths
+    (``FileNotFoundError: ... '/usr/local/bin/...'``) or internal MCP
+    URLs (``httpx.ConnectError: ... 'https://internal/...'``) and
+    those are equivalent to leaking ``command``/``url``.
+    """
+    return {k: full[k] for k in _SERVER_STATUS_PUBLIC_KEYS if k in full}
+
+
+def _strip_server_status_for_read(full: dict[str, Any]) -> dict[str, Any]:
+    """Project a status dict for read-scope callers.
+
+    Drops the verbose ``error`` text and replaces it with a coarse
+    ``has_error: bool`` so dashboards can light up a failure indicator
+    without leaking the underlying exception detail.
+    """
+    out = {k: full[k] for k in _READ_STATUS_PUBLIC_KEYS if k in full}
+    out["has_error"] = bool(full.get("error"))
+    return out
+
 
 def _public_server_status(mcp_mgr: Any, name: str) -> dict[str, Any]:
-    """Strip ``command``/``url`` from ``get_server_status`` before returning over the wire.
+    """Strip ``command``/``url`` from ``get_server_status`` before returning over the wire."""
+    return _strip_server_status(mcp_mgr.get_server_status(name))
 
-    The full status dict embeds stdio argv and remote URLs that are
-    admin-only context.  Internal node endpoints surface only the
-    operational fields callers need to reflect to the operator.
+
+def internal_mcp_status(request: Request) -> JSONResponse:
+    """GET /v1/api/_internal/mcp-status — return MCP server status.
+
+    Read-scoped. The full set of configured MCP server names is
+    enumerated to any caller with ``read`` scope: that is the
+    intentional trust boundary so dashboards can render per-server
+    indicators without admin scope. Verbose ``error`` text is dropped
+    in favour of ``has_error`` (see :func:`_strip_server_status_for_read`)
+    because error strings can carry stdio binary paths or internal
+    MCP URLs. Per-server error detail and ``command``/``url`` remain
+    on the approve-scoped ``mcp-refresh``/``mcp-reconnect`` endpoints.
     """
-    full = mcp_mgr.get_server_status(name)
-    return {k: full[k] for k in _SERVER_STATUS_PUBLIC_KEYS if k in full}
+    mcp_mgr = getattr(request.app.state, "mcp_client", None)
+    if mcp_mgr is None:
+        return JSONResponse({"servers": {}})
+
+    return JSONResponse(
+        {
+            "servers": {
+                name: _strip_server_status_for_read(status)
+                for name, status in mcp_mgr.get_all_server_status().items()
+            }
+        }
+    )
 
 
 def internal_mcp_refresh_one(request: Request) -> JSONResponse:
