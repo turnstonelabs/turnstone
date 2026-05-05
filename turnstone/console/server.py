@@ -8040,6 +8040,26 @@ def _parse_auth_type(body: dict[str, Any]) -> tuple[str | None, JSONResponse | N
     return auth_type, None
 
 
+def _enforce_oauth_user_https(auth_type: str, url: str | None) -> JSONResponse | None:
+    """Reject oauth_user MCP server URLs that aren't https (or loopback http).
+
+    Belt-and-braces with :func:`turnstone.core.mcp_client._validate_oauth_user_url`
+    so a misconfigured row never persists. Returns the error response or
+    ``None`` when the input is acceptable.
+    """
+    if auth_type != "oauth_user":
+        return None
+    if not url:
+        return None  # presence checked elsewhere; this helper only checks scheme
+    from turnstone.core.mcp_client import _validate_oauth_user_url
+
+    try:
+        _validate_oauth_user_url(url)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return None
+
+
 def _get_mcp_max_servers(request: Request) -> int:
     """Read cluster.mcp_max_servers via ConfigStore (validated + cached)."""
     config_store = getattr(request.app.state, "config_store", None)
@@ -8371,6 +8391,11 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
     # Helper returns None when key is absent — fall back to the default.
     auth_type = auth_type_value if auth_type_value is not None else "static"
 
+    # sec-1: oauth_user must use https:// (loopback http allowed for dev).
+    err_resp = _enforce_oauth_user_https(auth_type, str(body.get("url", "")).strip())
+    if err_resp is not None:
+        return err_resp
+
     # Check max servers
     existing = storage.list_mcp_servers()
     max_servers = _get_mcp_max_servers(request)
@@ -8585,6 +8610,17 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     # later created with that old name (with attacker-controlled URL)
     # would otherwise silently rebind them.
     name_changing = "name" in updates and existing.get("name", "") != updates["name"]
+    # URL change on an oauth_user row needs the same purge: bearer tokens
+    # are bound (via OAuth resource / audience) to the URL active at
+    # consent time, so sending them to a new URL is a token-binding
+    # violation. A compromised admin who flips the URL to an attacker
+    # endpoint would otherwise replay every user's bearer there silently.
+    # Re-consent forces fresh token issuance bound to the new resource.
+    url_changing = (
+        existing.get("auth_type") == "oauth_user"
+        and "url" in updates
+        and existing.get("url", "") != updates["url"]
+    )
     if updates.get("auth_type") and updates["auth_type"] != "oauth_user":
         updates.update(
             {
@@ -8605,16 +8641,25 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     if err_resp is not None:
         return err_resp
 
+    # sec-1: enforce https:// for the post-update url+auth_type combination,
+    # using the new url if present in updates, else the existing row's url.
+    url_now = updates.get("url", existing.get("url", ""))
+    err_resp = _enforce_oauth_user_https(auth_type_now, url_now)
+    if err_resp is not None:
+        return err_resp
+
     if updates:
         storage.update_mcp_server(server_id, **updates)
 
     audit_uid, ip = _audit_context(request)
 
     # Purge per-user tokens + pending OAuth states keyed on the OLD
-    # name on rename, or on ``oauth_user → static/none`` transition.
-    # Both cases would otherwise leave tokens orphaned-and-rebindable
-    # because the OAuth tables key on the mutable ``server_name``.
-    if name_changing or transitioning_away_from_oauth_user:
+    # name on rename, on ``oauth_user → static/none`` transition, or
+    # on URL change for an oauth_user row. All three cases would
+    # otherwise leave tokens orphaned-and-rebindable because the OAuth
+    # tables key on the mutable ``server_name`` and tokens are bound
+    # to the URL active at consent time.
+    if name_changing or transitioning_away_from_oauth_user or url_changing:
         purge_target = existing.get("name", "")
         if purge_target:
             try:

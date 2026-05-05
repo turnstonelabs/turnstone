@@ -4890,6 +4890,13 @@ class SQLiteBackend:
             conn.commit()
             return result.rowcount > 0
 
+    # -- Cross-node serialization ----------------------------------------------
+
+    def acquire_advisory_lock_sync(self, key_text: str) -> contextlib.AbstractContextManager[None]:
+        """SQLite is single-node — in-process ``asyncio.Lock`` suffices."""
+        del key_text  # silenced: signature parity with the Postgres impl
+        return contextlib.nullcontext()
+
     # -- Lifecycle -------------------------------------------------------------
 
     def close(self) -> None:
