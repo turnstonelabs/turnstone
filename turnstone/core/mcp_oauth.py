@@ -1463,9 +1463,25 @@ async def _register_dynamic_client_if_needed(
         return client_id, None
 
 
-def _validate_return_url(return_url: str, request: Request) -> str | None:
-    """Ensure ``return_url`` is same-origin with the request. Returns sanitised URL or None."""
+def _validate_return_url(return_url: str, redirect_base: str) -> str | None:
+    """Ensure ``return_url`` is same-origin with the configured *redirect_base*.
+
+    Pinning to ``redirect_base`` (rather than ``request.url``) is the
+    same defense as :func:`_resolve_redirect_base`: a permissive front
+    proxy can let an attacker spoof ``Host`` and pass a same-origin
+    check derived from the request, turning the callback into an open
+    redirect. The OIDC module pinned this in PR #476.
+
+    Backslashes and protocol-relative ``//`` prefixes are rejected up
+    front: WHATWG-conformant browsers normalise ``\\`` to ``/``, so a
+    path-only value like ``/\\evil.example/foo`` becomes the
+    protocol-relative ``//evil.example/foo`` after the 302 — slipping
+    past ``urlparse`` (which leaves the backslash inside ``path``) and
+    re-introducing the open redirect.
+    """
     if not return_url:
+        return None
+    if "\\" in return_url or return_url.startswith("//"):
         return None
     parsed = urllib.parse.urlparse(return_url)
     # Allow path-only return URLs.
@@ -1473,10 +1489,24 @@ def _validate_return_url(return_url: str, request: Request) -> str | None:
         if parsed.path.startswith("/"):
             return return_url
         return None
-    request_origin = (request.url.scheme, request.url.netloc)
-    if (parsed.scheme, parsed.netloc) != request_origin:
+    base = urllib.parse.urlparse(redirect_base)
+    if _origin_tuple(parsed) != _origin_tuple(base):
         return None
     return return_url
+
+
+def _origin_tuple(parsed: urllib.parse.ParseResult) -> tuple[str, str, int | None]:
+    """Canonicalise (scheme, host, port) for same-origin comparison.
+
+    Lowercases scheme and hostname, and collapses the scheme's default
+    port — so ``https://Host`` matches ``https://host:443`` instead of
+    silently failing the same-origin check on a cosmetic difference.
+    """
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    default_port = {"https": 443, "http": 80}.get(scheme)
+    port = parsed.port if parsed.port is not None else default_port
+    return (scheme, host, port)
 
 
 def _apply_security_headers(response: Response) -> Response:
@@ -1531,7 +1561,9 @@ async def _handle_mcp_oauth_authorize_inner(request: Request) -> Response:
     if not server_name:
         return JSONResponse({"error": "Missing 'server' query parameter"}, status_code=400)
 
-    return_url = _validate_return_url(request.query_params.get("return_url", "").strip(), request)
+    return_url = _validate_return_url(
+        request.query_params.get("return_url", "").strip(), redirect_base
+    )
     if return_url is None:
         # Fall back to root — operators often hit /start without a hint.
         return_url = "/"

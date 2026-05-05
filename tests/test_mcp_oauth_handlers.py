@@ -27,6 +27,7 @@ from tests.conftest import make_mcp_token_cipher
 from turnstone.core.auth import AuthResult
 from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.mcp_oauth import (
+    _validate_return_url,
     handle_mcp_oauth_authorize,
     handle_mcp_oauth_callback,
 )
@@ -868,3 +869,73 @@ class TestCallbackErrorPopsPendingState:
         )
         assert replay.status_code == 302
         assert "session+expired" in replay.headers["location"]
+
+
+# ---------------------------------------------------------------------------
+# return_url same-origin pinning (Host-header injection defense)
+# ---------------------------------------------------------------------------
+
+
+class TestValidateReturnUrl:
+    """Direct unit tests for ``_validate_return_url``.
+
+    The validator pins ``return_url`` against the configured
+    ``redirect_base`` rather than the request Host header, so a
+    permissive front proxy cannot turn the OAuth callback into an
+    open redirect via spoofed ``Host``.
+    """
+
+    REDIRECT_BASE = "https://app.example.com"
+
+    def test_empty_returns_none(self) -> None:
+        assert _validate_return_url("", self.REDIRECT_BASE) is None
+
+    def test_relative_path_passes(self) -> None:
+        assert _validate_return_url("/admin/mcp", self.REDIRECT_BASE) == "/admin/mcp"
+
+    def test_non_root_relative_rejected(self) -> None:
+        assert _validate_return_url("admin/mcp", self.REDIRECT_BASE) is None
+
+    def test_same_origin_absolute_passes(self) -> None:
+        same_origin = "https://app.example.com/admin/mcp"
+        assert _validate_return_url(same_origin, self.REDIRECT_BASE) == same_origin
+
+    def test_cross_origin_absolute_rejected(self) -> None:
+        # Even when the request arrives with ``Host: attacker.example``
+        # and ``return_url`` matches that host, pinning to the
+        # configured redirect_base catches the open-redirect attempt.
+        assert _validate_return_url("https://attacker.example/cb", self.REDIRECT_BASE) is None
+
+    def test_scheme_mismatch_rejected(self) -> None:
+        assert _validate_return_url("http://app.example.com/admin", self.REDIRECT_BASE) is None
+
+    def test_backslash_in_path_rejected(self) -> None:
+        # WHATWG-conformant browsers normalise ``\`` to ``/``, so
+        # ``/\evil.example/foo`` becomes the protocol-relative
+        # ``//evil.example/foo`` after the 302 — must be rejected up
+        # front because urlparse leaves the backslash inside ``path``
+        # and the path-only branch would otherwise return it verbatim.
+        assert _validate_return_url("/\\evil.example/foo", self.REDIRECT_BASE) is None
+        # Trailing-position backslash still rejected (defense-in-depth).
+        assert _validate_return_url("/admin\\..", self.REDIRECT_BASE) is None
+
+    def test_protocol_relative_rejected(self) -> None:
+        # ``//evil.example/foo`` would urlparse to netloc=evil.example
+        # and fail the cross-origin check anyway, but the early
+        # ``startswith("//")`` reject is defense-in-depth.
+        assert _validate_return_url("//evil.example/foo", self.REDIRECT_BASE) is None
+
+    def test_same_origin_with_default_port_passes(self) -> None:
+        # Operator may legitimately type ``:443`` even though
+        # ``redirect_base`` was configured without it.
+        url = "https://app.example.com:443/admin"
+        assert _validate_return_url(url, self.REDIRECT_BASE) == url
+
+    def test_same_origin_with_uppercase_host_passes(self) -> None:
+        url = "https://App.Example.COM/admin"
+        assert _validate_return_url(url, self.REDIRECT_BASE) == url
+
+    def test_explicit_port_mismatch_rejected(self) -> None:
+        assert (
+            _validate_return_url("https://app.example.com:8443/admin", self.REDIRECT_BASE) is None
+        )

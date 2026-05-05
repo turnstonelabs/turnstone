@@ -7,6 +7,7 @@ MCP server rows.
 
 from __future__ import annotations
 
+import re
 import types
 
 import pytest
@@ -90,8 +91,12 @@ class TestInitializeMcpCryptoState:
         ):
             initialize_mcp_crypto_state(state, node_id="n1")
         assert exc_info.value.code == 1
-        # Operator-actionable error message names the missing config key.
-        assert any("mcp_token_encryption_key" in record.message for record in caplog.records)
+        # Operator-actionable error message names BOTH supported config-key
+        # forms so an operator using the rotation list (plural) is not
+        # misled into thinking only the singular form is valid.
+        messages = " ".join(record.message for record in caplog.records)
+        assert "mcp_token_encryption_keys" in messages
+        assert re.search(r"mcp_token_encryption_key(?!s)", messages) is not None
 
     def test_startup_aborts_with_invalid_key(
         self, backend, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
