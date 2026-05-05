@@ -1951,14 +1951,19 @@ class StorageBackend(Protocol):
     def acquire_advisory_lock_sync(self, key_text: str) -> AbstractContextManager[None]:
         """Acquire a backend-specific advisory lock for the duration of the context.
 
-        PostgreSQL: takes ``pg_advisory_xact_lock(hashtext(key_text))``
-        inside a fresh transaction so the lock auto-releases on commit /
-        rollback. SQLite: returns ``contextlib.nullcontext`` (single-node
-        deployments rely on in-process ``asyncio.Lock`` for serialization).
+        PostgreSQL: spins on ``pg_try_advisory_xact_lock(hashtext(key_text))``
+        with a short backoff between attempts. Each probe runs in a fresh
+        transaction, and waiting probes return their connection to the pool
+        between attempts; only the actual lock holder retains a connection
+        for the body. The lock auto-releases on transaction end (commit /
+        rollback). Raises ``TimeoutError`` if no probe succeeds within the
+        backend-defined deadline. SQLite: returns ``contextlib.nullcontext``
+        (single-node deployments rely on in-process ``asyncio.Lock`` for
+        serialization).
 
         Caller is expected to wrap the resulting context manager in
-        ``asyncio.to_thread`` when invoking from an async context — the
-        underlying SQLAlchemy hops are blocking.
+        ``asyncio.to_thread`` (or a dedicated executor) when invoking from
+        an async context — the underlying SQLAlchemy hops are blocking.
         """
         ...
 

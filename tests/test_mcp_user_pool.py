@@ -856,7 +856,7 @@ class TestConcurrentDispatch:
         _run_on_loop(loop, _seed_entry())
 
         results: list[str] = []
-        errors: list[BaseException] = []
+        errors: list[Exception] = []
 
         def _dispatch() -> None:
             try:
@@ -868,7 +868,7 @@ class TestConcurrentDispatch:
                         timeout=5,
                     )
                 )
-            except BaseException as exc:  # pragma: no cover — diagnostic only
+            except Exception as exc:  # pragma: no cover — diagnostic only
                 errors.append(exc)
 
         t1 = threading.Thread(target=_dispatch)
