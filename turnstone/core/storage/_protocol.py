@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
 
 if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
+
     from turnstone.core.workstream import WorkstreamKind
 
 
@@ -1942,6 +1944,22 @@ class StorageBackend(Protocol):
 
     def delete_tls_cert(self, domain: str) -> bool:
         """Delete a certificate by domain. Returns True if existed."""
+        ...
+
+    # -- Cross-node serialization ----------------------------------------------
+
+    def acquire_advisory_lock_sync(self, key_text: str) -> AbstractContextManager[None]:
+        """Acquire a backend-specific advisory lock for the duration of the context.
+
+        PostgreSQL: takes ``pg_advisory_xact_lock(hashtext(key_text))``
+        inside a fresh transaction so the lock auto-releases on commit /
+        rollback. SQLite: returns ``contextlib.nullcontext`` (single-node
+        deployments rely on in-process ``asyncio.Lock`` for serialization).
+
+        Caller is expected to wrap the resulting context manager in
+        ``asyncio.to_thread`` when invoking from an async context — the
+        underlying SQLAlchemy hops are blocking.
+        """
         ...
 
     # -- Lifecycle -------------------------------------------------------------

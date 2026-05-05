@@ -456,6 +456,42 @@ class TestCreateMcpServer:
         assert r.status_code == 400
         assert "auth_type" in r.json()["error"].lower()
 
+    def test_admin_create_oauth_user_rejects_http(self, client, storage):
+        """sec-1: an oauth_user row with a plaintext (non-loopback) URL
+        must 400 — pool dispatch would transmit the per-user bearer in
+        the clear."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "insecure-oauth",
+                "transport": "streamable-http",
+                "url": "http://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_abc",
+                "oauth_client_secret": "secret-value",
+            },
+        )
+        assert r.status_code == 400, r.text
+        assert "https://" in r.json()["error"]
+        # No partial row was persisted.
+        assert storage.get_mcp_server_by_name("insecure-oauth") is None
+
+    def test_admin_create_oauth_user_accepts_loopback_http(self, client):
+        """``http://localhost`` and ``http://127.0.0.1`` must remain
+        usable for dev/test convenience."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "dev-oauth",
+                "transport": "streamable-http",
+                "url": "http://127.0.0.1:9000/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_abc",
+                "oauth_client_secret": "secret-value",
+            },
+        )
+        assert r.status_code == 200, r.text
+
 
 # ---------------------------------------------------------------------------
 # Get single
@@ -540,12 +576,13 @@ class TestUpdateMcpServer:
 
     def test_admin_update_auth_type_static_to_oauth(self, client):
         """An existing static row can be flipped to oauth_user with
-        OAuth fields supplied alongside."""
+        OAuth fields supplied alongside. The row must already use
+        https:// — sec-1 enforces this on update too."""
         created = _create_server(
             client,
             name="flip-to-oauth",
             transport="streamable-http",
-            url="http://mcp.example.com/sse",
+            url="https://mcp.example.com/sse",
         )
         sid = created["server_id"]
         assert created["auth_type"] == "static"
@@ -565,6 +602,101 @@ class TestUpdateMcpServer:
         assert data["oauth_client_id"] == "cli_xyz"
         assert data["oauth_audience"] == "https://mcp.example.com"
         assert data["oauth_registration_mode"] == "dcr"
+
+    def test_admin_update_oauth_url_to_http_rejected(self, client):
+        """sec-1: flipping the URL on an existing oauth_user row to
+        plaintext http must 400."""
+        # Create with proper https.
+        r0 = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "oauth-flip-url",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_abc",
+                "oauth_client_secret": "secret-value",
+            },
+        )
+        assert r0.status_code == 200, r0.text
+        sid = r0.json()["server_id"]
+
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"url": "http://insecure.example.com/sse"},
+        )
+        assert r.status_code == 400, r.text
+        assert "https://" in r.json()["error"]
+
+    def test_admin_update_oauth_url_change_purges_user_tokens(self, client, storage):
+        """sec-1 (pre-push): URL change on an oauth_user row must purge
+        per-user tokens. Bearer tokens are bound (via OAuth resource /
+        audience) to the URL active at consent time; sending them to a
+        new URL is a token-binding violation. A compromised admin who
+        flips the URL to an attacker endpoint would otherwise replay
+        every user's bearer there silently. Re-consent must be forced.
+        """
+        import sqlalchemy as sa
+
+        from turnstone.core.storage._schema import mcp_user_tokens
+
+        # Seed an oauth_user row at URL_A.
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "url-change-purge",
+                "transport": "streamable-http",
+                "url": "https://orig.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_seed",
+            },
+        )
+        assert r.status_code == 200, r.text
+
+        # Plant a per-user token row keyed on the server name.
+        with storage._engine.connect() as conn:
+            conn.execute(
+                sa.insert(mcp_user_tokens),
+                {
+                    "user_id": "u1",
+                    "server_name": "url-change-purge",
+                    "access_token_ct": b"\x00ciphertext-a",
+                    "refresh_token_ct": b"\x00ciphertext-r",
+                    "expires_at": "2026-12-31T00:00:00",
+                    "scopes": "openid",
+                    "as_issuer": "https://auth.orig.example.com",
+                    "audience": "https://orig.example.com",
+                    "created": "2026-05-04T11:00:00",
+                    "last_refreshed": None,
+                },
+            )
+            conn.commit()
+            count_before = conn.execute(
+                sa.select(sa.func.count())
+                .select_from(mcp_user_tokens)
+                .where(mcp_user_tokens.c.server_name == "url-change-purge")
+            ).scalar()
+        assert count_before == 1
+
+        # Flip the URL to a different (still https) endpoint.
+        sid = r.json()["server_id"]
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"url": "https://new.example.com/sse"},
+        )
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["url"] == "https://new.example.com/sse"
+
+        # Token rows keyed on the OLD server name must be gone — the new
+        # URL is a different OAuth resource, so the bearer is no longer
+        # valid there. Force re-consent.
+        with storage._engine.connect() as conn:
+            count_after = conn.execute(
+                sa.select(sa.func.count())
+                .select_from(mcp_user_tokens)
+                .where(mcp_user_tokens.c.server_name == "url-change-purge")
+            ).scalar()
+        assert count_after == 0, "URL change must purge per-user tokens"
 
     def test_update_invalid_auth_type(self, client):
         created = _create_server(client, name="bad-auth-update")

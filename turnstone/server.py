@@ -2845,6 +2845,7 @@ def internal_mcp_reload(request: Request) -> JSONResponse:
         mcp_mgr = MCPClientManager({})
         mcp_mgr.start()
         mcp_mgr.set_storage(storage)
+        mcp_mgr.set_app_state(request.app.state)
         request.app.state.mcp_client = mcp_mgr
         # Update shared ref so session_factory sees the new client
         mcp_ref = getattr(request.app.state, "mcp_ref", None)
@@ -4606,6 +4607,7 @@ def main() -> None:
         if mcp_tools:
             log.info("MCP tools: %d from %d server(s)", len(mcp_tools), mcp_client.server_count)
         mcp_client.set_storage(get_storage())
+        mcp_client.set_app_state(app.state)
     log.info(
         "Health tracking: failure_threshold=%s",
         config_store.get("health.failure_threshold"),

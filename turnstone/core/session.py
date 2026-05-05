@@ -7632,7 +7632,12 @@ class ChatSession:
         assert self._mcp_client is not None
         mcp_error = False
         try:
-            output = self._mcp_client.call_tool_sync(func_name, args, timeout=self.tool_timeout)
+            output = self._mcp_client.call_tool_sync(
+                func_name,
+                args,
+                user_id=self._user_id or None,
+                timeout=self.tool_timeout,
+            )
         except TimeoutError:
             output = f"MCP tool timed out after {self.tool_timeout}s"
             mcp_error = True

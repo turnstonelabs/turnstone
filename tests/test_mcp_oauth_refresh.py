@@ -578,3 +578,191 @@ class TestExpiresInParsing:
         assert _expires_at_from_response({"expires_in": True}) is None
         assert _expires_at_from_response({"expires_in": 0}) is None
         assert _expires_at_from_response({"expires_in": -5}) is None
+
+
+# ---------------------------------------------------------------------------
+# Multi-node refresh lock — advisory lock plumbing
+# ---------------------------------------------------------------------------
+
+
+class TestAdvisoryLock:
+    """The refresh path must take the storage advisory lock as the OUTER
+    serialization layer (cluster-wide), with the in-process asyncio.Lock
+    as the inner layer. SQLite returns ``nullcontext`` so single-node
+    deployments are untouched.
+    """
+
+    def test_advisory_lock_acquired_during_refresh(self, storage: SQLiteBackend) -> None:
+        """The storage advisory lock must be acquired when refresh runs."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(
+            return_value=_mk_response(
+                200,
+                {
+                    "access_token": "access-NEW",
+                    "refresh_token": "refresh-NEW",
+                    "expires_in": 3600,
+                },
+            )
+        )
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        keys_seen: list[str] = []
+        original = storage.acquire_advisory_lock_sync
+
+        def _spy(key: str):  # type: ignore[no-untyped-def]
+            keys_seen.append(key)
+            return original(key)
+
+        with patch.object(storage, "acquire_advisory_lock_sync", side_effect=_spy):
+
+            async def _run():
+                with _public_addr_patch():
+                    return await get_user_access_token(
+                        app_state=state, user_id="user-1", server_name="srv-oauth"
+                    )
+
+            asyncio.run(_run())
+
+        assert keys_seen == ["mcp_refresh:user-1:srv-oauth"]
+
+    def test_advisory_lock_is_noop_on_sqlite(self, storage: SQLiteBackend) -> None:
+        """The SQLite backend's advisory lock is a ``nullcontext`` no-op."""
+        import contextlib as _contextlib
+
+        cm = storage.acquire_advisory_lock_sync("mcp_refresh:any:any")
+        # ``nullcontext`` returns this exact object from __enter__.
+        with cm as value:
+            assert value is None
+        assert isinstance(cm, _contextlib.nullcontext)
+
+
+# ---------------------------------------------------------------------------
+# get_user_access_token_classified — tagged-result variant
+# ---------------------------------------------------------------------------
+
+
+class TestClassifiedGetter:
+    """The classified getter distinguishes ``missing`` vs ``decrypt_failure``
+    vs ``refresh_failed`` vs ``token`` so the dispatcher can map each to
+    the right user-facing error.
+    """
+
+    def test_returns_token_on_happy_path(self, storage: SQLiteBackend) -> None:
+        from turnstone.core.mcp_oauth import get_user_access_token_classified
+
+        _seed_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=3600)
+
+        async def _run():
+            return await get_user_access_token_classified(
+                app_state=state, user_id="user-1", server_name="srv-oauth"
+            )
+
+        result = asyncio.run(_run())
+        assert result.kind == "token"
+        assert result.token == "access-aaa"
+
+    def test_missing_token_returns_missing(self, storage: SQLiteBackend) -> None:
+        from turnstone.core.mcp_oauth import get_user_access_token_classified
+
+        _seed_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        state = _make_app_state(storage, http_client=client)
+
+        async def _run():
+            return await get_user_access_token_classified(
+                app_state=state, user_id="user-1", server_name="srv-oauth"
+            )
+
+        result = asyncio.run(_run())
+        assert result.kind == "missing"
+
+    def test_decrypt_failure_returns_decrypt_failure(self, storage: SQLiteBackend) -> None:
+        """A key-mismatch must NOT collapse to ``missing``.
+
+        RFC §5.3 — the dispatcher MUST distinguish "row missing" from
+        "row present but undecryptable" so it can avoid emitting fake
+        ``mcp_consent_required`` events on every operator misconfig.
+        """
+        from turnstone.core.mcp_crypto import MCPTokenDecryptError
+        from turnstone.core.mcp_oauth import get_user_access_token_classified
+
+        _seed_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=3600)
+
+        def _raise_decrypt(*args, **kwargs):
+            raise MCPTokenDecryptError(
+                "no installed key can decrypt",
+                key_fingerprints_attempted=("aabbccdd",),
+            )
+
+        state.mcp_token_store.get_user_token = _raise_decrypt
+
+        async def _run():
+            return await get_user_access_token_classified(
+                app_state=state, user_id="user-1", server_name="srv-oauth"
+            )
+
+        result = asyncio.run(_run())
+        assert result.kind == "decrypt_failure"
+        assert result.decrypt_fingerprints == ("aabbccdd",)
+
+    def test_refresh_failure_returns_refresh_failed(self, storage: SQLiteBackend) -> None:
+        from turnstone.core.mcp_oauth import get_user_access_token_classified
+
+        _seed_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(return_value=_mk_response(400, {"error": "invalid_grant"}))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        async def _run():
+            with _public_addr_patch():
+                return await get_user_access_token_classified(
+                    app_state=state, user_id="user-1", server_name="srv-oauth"
+                )
+
+        result = asyncio.run(_run())
+        assert result.kind == "refresh_failed"
+        # Row was deleted (re-consent path).
+        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is None
+
+    def test_no_refresh_token_returns_refresh_failed(self, storage: SQLiteBackend) -> None:
+        from turnstone.core.mcp_oauth import get_user_access_token_classified
+
+        _seed_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000, refresh=None)
+
+        async def _run():
+            return await get_user_access_token_classified(
+                app_state=state, user_id="user-1", server_name="srv-oauth"
+            )
+
+        result = asyncio.run(_run())
+        assert result.kind == "refresh_failed"
+
+    def test_classified_does_not_break_legacy_helper(self, storage: SQLiteBackend) -> None:
+        """The legacy ``get_user_access_token`` keeps its ``str | None`` contract."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=3600)
+
+        async def _run():
+            return await get_user_access_token(
+                app_state=state, user_id="user-1", server_name="srv-oauth"
+            )
+
+        token = asyncio.run(_run())
+        assert token == "access-aaa"

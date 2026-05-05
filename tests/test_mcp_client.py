@@ -577,7 +577,7 @@ class TestSessionIntegration:
         assert call_id == "call_789"
         assert output == "result text"
         mock_mcp.call_tool_sync.assert_called_once_with(
-            "mcp__test__search", {"query": "hello"}, timeout=30
+            "mcp__test__search", {"query": "hello"}, user_id=None, timeout=30
         )
 
     def test_exec_mcp_tool_error(self, tmp_db):
