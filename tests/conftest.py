@@ -7,7 +7,26 @@ from unittest.mock import MagicMock
 import pytest
 
 if TYPE_CHECKING:
+    from turnstone.core.mcp_client import MCPClientManager, StaticServerState
     from turnstone.core.oidc import OIDCConfig
+
+
+def _seed_static_state(mgr: MCPClientManager, name: str, **overrides: Any) -> StaticServerState:
+    """Get-or-create a ``StaticServerState`` on ``mgr`` and apply ``overrides``.
+
+    Shared across MCP test files so the helper stays in one place. Imported
+    where needed; ``StaticServerState`` is constructed lazily so non-MCP
+    tests don't pay the import cost.
+    """
+    from turnstone.core.mcp_client import StaticServerState
+
+    state = mgr._static_servers.get(name)
+    if state is None:
+        state = StaticServerState(name=name)
+        mgr._static_servers[name] = state
+    for k, v in overrides.items():
+        setattr(state, k, v)
+    return state
 
 
 def make_oidc_test_config(**overrides: Any) -> OIDCConfig:
