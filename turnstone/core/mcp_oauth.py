@@ -967,43 +967,120 @@ async def _acquire_pg_refresh_lock(
     return _PgRefreshLock(storage, _refresh_advisory_key(user_id, server_name))
 
 
-_PG_REFRESH_LOCK_EXECUTOR: concurrent.futures.ThreadPoolExecutor | None = None
+# Strong refs to in-flight drain tasks. asyncio holds tasks via a WeakSet,
+# so a fire-and-forget ``loop.create_task(...)`` whose handle isn't stored
+# can be GC'd before the worker settles — exactly the cleanup we rely on.
+# Tasks register here on creation and discard themselves on completion via
+# ``add_done_callback``.
+_pg_refresh_drain_tasks: set[asyncio.Task[None]] = set()
 
 
-def _pg_refresh_lock_executor() -> concurrent.futures.ThreadPoolExecutor:
-    """Return the single-worker executor used for advisory-lock acquire/release.
+async def _drain_orphan_pg_lock(
+    loop: asyncio.AbstractEventLoop,
+    executor: concurrent.futures.ThreadPoolExecutor,
+    cm: contextlib.AbstractContextManager[None],
+    cf_fut: concurrent.futures.Future[Any],
+) -> None:
+    """Best-effort cleanup of a ``_PgRefreshLock`` whose ``__aenter__`` raised.
 
-    bug-5: ``__aenter__`` and ``__aexit__`` previously dispatched onto
-    the default ``asyncio.to_thread`` executor, so the SQLAlchemy
-    connection captured by ``acquire_advisory_lock_sync`` could have its
-    transaction begun on one worker thread and committed/rolled back on
-    another. Pinning to a single-worker executor guarantees enter and
-    exit run on the same thread, satisfying psycopg2's "connection
-    transactions are thread-affine" expectation.
+    The worker thread that ran ``cm.__enter__`` may complete *after* the
+    awaiter has propagated an exception (typically a cancellation). If
+    it ultimately acquired the Postgres advisory lock, the paired
+    ``cm.__exit__`` MUST run on the same executor (same OS thread) so
+    the connection-bound transaction commits / rolls back on the thread
+    that began it — psycopg2 connections are thread-affine. On loop or
+    process shutdown, the engine's ``dispose()`` is the backstop.
+
+    The ``cf_fut`` parameter is the *underlying* ``concurrent.futures.Future``
+    — NOT the asyncio wrapper that ``__aenter__`` was awaiting. That asyncio
+    wrapper is in CANCELLED state once the awaiter was cancelled, and
+    re-awaiting a CANCELLED future raises ``CancelledError`` immediately
+    instead of waiting for the worker. A fresh ``asyncio.wrap_future(cf_fut)``
+    creates a new asyncio Future tied only to the worker's outcome, so the
+    drain genuinely waits for the worker to settle.
     """
-    global _PG_REFRESH_LOCK_EXECUTOR
-    if _PG_REFRESH_LOCK_EXECUTOR is None:
-        _PG_REFRESH_LOCK_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="mcp-pg-refresh-lock"
-        )
-    return _PG_REFRESH_LOCK_EXECUTOR
+    try:
+        try:
+            await asyncio.wrap_future(cf_fut, loop=loop)
+        except Exception:
+            # ``cm.__enter__`` raised on the worker — nothing acquired,
+            # nothing to release. ``CancelledError`` is intentionally NOT
+            # caught: if the drain task itself is cancelled (loop
+            # shutdown), it should record as cancelled rather than be
+            # silently logged as 'completed normally with no acquire'.
+            # The lock then leaks to ``Engine.dispose()`` cleanup, which
+            # is the documented backstop.
+            return
+        try:
+            await loop.run_in_executor(executor, lambda: cm.__exit__(None, None, None))
+        except Exception:
+            # Same rationale as above for ``CancelledError``: don't
+            # mask drain-task cancellation as 'drain_exit_failed'.
+            log.warning(
+                "mcp_server.oauth.pg_refresh_lock_drain_exit_failed",
+                exc_info=True,
+            )
+    finally:
+        executor.shutdown(wait=False)
 
 
 class _PgRefreshLock(contextlib.AbstractAsyncContextManager[None]):
-    """Async wrapper around :meth:`StorageBackend.acquire_advisory_lock_sync`."""
+    """Async wrapper around :meth:`StorageBackend.acquire_advisory_lock_sync`.
+
+    psycopg2 connection transactions are thread-affine, so for a given
+    lock instance ``__enter__`` (which begins the transaction) and
+    ``__exit__`` (which commits / rolls back) MUST run on the same OS
+    thread. Each instance allocates a private single-worker
+    ``ThreadPoolExecutor`` to satisfy that constraint. A module-global
+    single-worker executor would also satisfy thread-affinity, but at
+    the cost of serializing every advisory-lock acquire on the node
+    behind one thread — different ``(user, server)`` keys would queue
+    against each other through the spin loop's 30s timeout window.
+    Per-instance executors keep the affinity guarantee while letting
+    unrelated refreshes spin on ``pg_try_advisory_xact_lock`` in
+    parallel.
+
+    Cancellation between submit and the worker completing
+    ``cm.__enter__`` is handled by ``_drain_orphan_pg_lock``: ``__aenter__``
+    submits via ``executor.submit`` directly so it holds the
+    ``concurrent.futures.Future``, then awaits a fresh
+    ``asyncio.wrap_future`` of it. If the awaiter is cancelled, only the
+    asyncio wrapper goes to CANCELLED state — the underlying worker
+    continues. The drain wraps ``cf_fut`` again (fresh) and so genuinely
+    waits for the worker to settle, then runs ``cm.__exit__`` on the same
+    executor when the lock did get acquired.
+    """
 
     def __init__(self, storage: StorageBackend, key_text: str) -> None:
         self._storage = storage
         self._key_text = key_text
         self._sync_cm: contextlib.AbstractContextManager[None] | None = None
+        self._executor: concurrent.futures.ThreadPoolExecutor | None = None
 
     async def __aenter__(self) -> None:
-        # Single-worker executor pins enter and exit to the same thread —
-        # see ``_pg_refresh_lock_executor`` for the rationale.
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mcp-pg-refresh-lock"
+        )
         cm = self._storage.acquire_advisory_lock_sync(self._key_text)
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(_pg_refresh_lock_executor(), cm.__enter__)
+        # Submit directly to keep a handle on the underlying
+        # ``concurrent.futures.Future``. Each ``asyncio.wrap_future`` here
+        # and inside the drain creates an *independent* asyncio Future
+        # tied to the same worker outcome, so cancellation of one wrapper
+        # doesn't poison the other.
+        cf_fut: concurrent.futures.Future[Any] = executor.submit(cm.__enter__)
+        try:
+            await asyncio.wrap_future(cf_fut, loop=loop)
+        except BaseException:
+            drain = loop.create_task(
+                _drain_orphan_pg_lock(loop, executor, cm, cf_fut),
+                name="mcp-pg-refresh-lock-drain",
+            )
+            _pg_refresh_drain_tasks.add(drain)
+            drain.add_done_callback(_pg_refresh_drain_tasks.discard)
+            raise
         self._sync_cm = cm
+        self._executor = executor
 
     async def __aexit__(
         self,
@@ -1012,15 +1089,29 @@ class _PgRefreshLock(contextlib.AbstractAsyncContextManager[None]):
         tb: Any,
     ) -> None:
         cm = self._sync_cm
-        if cm is None:
-            return
+        executor = self._executor
         self._sync_cm = None
+        self._executor = None
+        if cm is None or executor is None:
+            return
         loop = asyncio.get_running_loop()
 
         def _exit() -> None:
             cm.__exit__(exc_type, exc, tb)
 
-        await loop.run_in_executor(_pg_refresh_lock_executor(), _exit)
+        # No drain analogue here — unlike ``__aenter__``, cancellation
+        # mid-await doesn't strand the lock. ``loop.run_in_executor``
+        # submits ``_exit`` synchronously before yielding, so the worker
+        # already has the work; cancelling our await doesn't cancel the
+        # worker. The cm's ``__exit__`` runs to completion on the same
+        # thread that ran ``__enter__`` (psycopg2 thread-affinity
+        # preserved), commits or rolls back the transaction, and
+        # releases the advisory lock. ``shutdown(wait=False)`` lets the
+        # worker finish without blocking; the executor is then GC'd.
+        try:
+            await loop.run_in_executor(executor, _exit)
+        finally:
+            executor.shutdown(wait=False)
 
 
 def _dcr_lock_for(app_state: Any, server_id: str) -> asyncio.Lock:
@@ -1095,14 +1186,16 @@ async def get_user_access_token_classified(
     error.
 
     Multi-node correctness: the refresh path is serialized at two
-    layers — an outer Postgres advisory lock acquired via
+    layers — an outer ``asyncio.Lock`` from :func:`_refresh_lock_for`
+    (intra-process) and an inner Postgres advisory lock acquired via
     :meth:`StorageBackend.acquire_advisory_lock_sync` (cluster-wide;
-    no-op on SQLite) and an inner ``asyncio.Lock`` from
-    :func:`_refresh_lock_for` (intra-process). Order matters: the
-    cluster lock is taken first so cross-node contention serializes at
-    the database, then the asyncio lock is essentially uncontested
-    because at most one waiter is allowed past the cluster lock at a
-    time. The re-read inside the asyncio lock collapses both windows.
+    no-op on SQLite). Order matters: the in-process lock is taken
+    first so concurrent same-key callers on this node collapse to a
+    single waiter at the cluster lock — this also collapses N
+    per-instance ``ThreadPoolExecutor`` allocations down to one. The
+    surviving local caller then serializes against other nodes via
+    the cluster lock. The re-read inside the locked block collapses
+    both contention windows.
     """
     token_store: MCPTokenStore | None = getattr(app_state, "mcp_token_store", None)
     if token_store is None:
@@ -1157,7 +1250,11 @@ async def get_user_access_token_classified(
 
     lock = _refresh_lock_for(app_state, user_id, server_name)
     pg_lock = await _acquire_pg_refresh_lock(storage, user_id, server_name)
-    async with pg_lock, lock:
+    # In-process lock outside the cross-node lock so concurrent same-key
+    # callers serialize on the asyncio.Lock BEFORE allocating the
+    # pg_lock's per-instance executor / spin loop. N concurrent callers
+    # for one key collapse to one executor allocation.
+    async with lock, pg_lock:
         try:
             plain2 = await asyncio.to_thread(token_store.get_user_token, user_id, server_name)
         except MCPTokenDecryptError as exc:
