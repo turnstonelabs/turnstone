@@ -167,6 +167,13 @@ MCP_SERVER_MUTABLE = frozenset(
         "registry_name",
         "registry_version",
         "registry_meta",
+        "auth_type",
+        "oauth_client_id",
+        "oauth_scopes",
+        "oauth_audience",
+        "oauth_registration_mode",
+        "oauth_authorization_server_url",
+        "oauth_as_issuer_cached",
     }
 )
 MODEL_DEFINITION_MUTABLE = frozenset(

@@ -674,6 +674,16 @@ class McpServerInfo(BaseModel):
     registry_name: str | None = None
     registry_version: str = ""
     registry_meta: str = "{}"
+    auth_type: str = "static"
+    oauth_client_id: str | None = None
+    oauth_scopes: str | None = None
+    oauth_audience: str | None = None
+    oauth_registration_mode: str | None = None
+    oauth_authorization_server_url: str | None = None
+    oauth_as_issuer_cached: str | None = None
+    # Fernet ciphertext; never decrypted on the read path.  Responses
+    # carry the masked ``"***"`` sentinel via ``_mask_mcp_secrets``.
+    oauth_client_secret_ct: str | None = None
     created: str
     updated: str
 
@@ -704,6 +714,16 @@ class CreateMcpServerRequest(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
     auto_approve: bool = False
     enabled: bool = True
+    # OAuth-MCP: one of 'none' | 'static' | 'oauth_user'.
+    # ``oauth_client_secret`` is plaintext input; never persisted,
+    # redacted in audit log.
+    auth_type: str = "static"
+    oauth_client_id: str | None = None
+    oauth_client_secret: str | None = None
+    oauth_scopes: str | None = None
+    oauth_audience: str | None = None
+    oauth_registration_mode: str | None = None
+    oauth_authorization_server_url: str | None = None
 
 
 class UpdateMcpServerRequest(BaseModel):
@@ -716,6 +736,13 @@ class UpdateMcpServerRequest(BaseModel):
     env: dict[str, str] | None = None
     auto_approve: bool | None = None
     enabled: bool | None = None
+    auth_type: str | None = None
+    oauth_client_id: str | None = None
+    oauth_client_secret: str | None = None
+    oauth_scopes: str | None = None
+    oauth_audience: str | None = None
+    oauth_registration_mode: str | None = None
+    oauth_authorization_server_url: str | None = None
 
 
 class ListMcpServersResponse(BaseModel):

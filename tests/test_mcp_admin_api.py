@@ -319,6 +319,49 @@ class TestCreateMcpServer:
         assert r.status_code == 400
         assert "name" in r.json()["error"].lower()
 
+    def test_admin_create_oauth_server(self, client):
+        """Phase 2: admin can POST a server with auth_type=oauth_user
+        and the seven OAuth text fields round-trip via GET."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "oauth-srv",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_abc",
+                "oauth_client_secret": "should-be-discarded",
+                "oauth_scopes": "openid profile",
+                "oauth_audience": "https://mcp.example.com",
+                "oauth_registration_mode": "preregistered",
+                "oauth_authorization_server_url": "https://auth.example.com",
+            },
+        )
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["auth_type"] == "oauth_user"
+        assert data["oauth_client_id"] == "cli_abc"
+        assert data["oauth_scopes"] == "openid profile"
+        assert data["oauth_audience"] == "https://mcp.example.com"
+        assert data["oauth_registration_mode"] == "preregistered"
+        assert data["oauth_authorization_server_url"] == "https://auth.example.com"
+        # Phase 2 discards the plaintext secret — ciphertext stays NULL,
+        # masked to None in the response.
+        assert data["oauth_client_secret_ct"] is None
+
+    def test_create_invalid_auth_type(self, client):
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "bad-auth",
+                "transport": "stdio",
+                "command": "x",
+                "auth_type": "magic",
+            },
+        )
+        assert r.status_code == 400
+        assert "auth_type" in r.json()["error"].lower()
+
 
 # ---------------------------------------------------------------------------
 # Get single
@@ -400,6 +443,130 @@ class TestUpdateMcpServer:
         )
         assert r.status_code == 400
         assert "transport" in r.json()["error"].lower()
+
+    def test_admin_update_auth_type_static_to_oauth(self, client):
+        """Phase 2: an existing static row can be flipped to oauth_user
+        with OAuth fields supplied alongside."""
+        created = _create_server(
+            client,
+            name="flip-to-oauth",
+            transport="streamable-http",
+            url="http://mcp.example.com/sse",
+        )
+        sid = created["server_id"]
+        assert created["auth_type"] == "static"
+
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_xyz",
+                "oauth_audience": "https://mcp.example.com",
+                "oauth_registration_mode": "dcr",
+            },
+        )
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["auth_type"] == "oauth_user"
+        assert data["oauth_client_id"] == "cli_xyz"
+        assert data["oauth_audience"] == "https://mcp.example.com"
+        assert data["oauth_registration_mode"] == "dcr"
+
+    def test_update_invalid_auth_type(self, client):
+        created = _create_server(client, name="bad-auth-update")
+        sid = created["server_id"]
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "wat"},
+        )
+        assert r.status_code == 400
+        assert "auth_type" in r.json()["error"].lower()
+
+    def test_update_empty_auth_type_rejected(self, client):
+        """Empty-string auth_type is rejected (no silent coercion to 'static')."""
+        created = _create_server(client, name="empty-auth-update")
+        sid = created["server_id"]
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": ""},
+        )
+        assert r.status_code == 400
+        assert "auth_type" in r.json()["error"].lower()
+
+    def test_create_empty_auth_type_rejected(self, client):
+        """Empty-string auth_type on create is rejected too."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "empty-auth-create",
+                "transport": "stdio",
+                "command": "x",
+                "auth_type": "",
+            },
+        )
+        assert r.status_code == 400
+        assert "auth_type" in r.json()["error"].lower()
+
+    def test_update_auth_type_oauth_to_static_clears_oauth_fields(self, client):
+        """Flipping auth_type away from oauth_user clears the oauth_* text
+        columns so a stale client_id / audience can't leak back."""
+        # Seed an oauth_user row with all fields populated.
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "flip-away",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_seed",
+                "oauth_scopes": "openid",
+                "oauth_audience": "https://mcp.example.com",
+                "oauth_registration_mode": "preregistered",
+                "oauth_authorization_server_url": "https://auth.example.com",
+            },
+        )
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+
+        # Flip to static — server should clear all oauth_* text fields.
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "static"},
+        )
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["auth_type"] == "static"
+        assert data["oauth_client_id"] is None
+        assert data["oauth_scopes"] is None
+        assert data["oauth_audience"] is None
+        assert data["oauth_registration_mode"] is None
+        assert data["oauth_authorization_server_url"] is None
+
+    def test_update_auth_type_oauth_to_none_clears_oauth_fields(self, client):
+        """Same clear behavior when flipping to 'none'."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "flip-to-none",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_seed2",
+                "oauth_audience": "https://mcp.example.com",
+            },
+        )
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "none"},
+        )
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["auth_type"] == "none"
+        assert data["oauth_client_id"] is None
+        assert data["oauth_audience"] is None
 
 
 # ---------------------------------------------------------------------------

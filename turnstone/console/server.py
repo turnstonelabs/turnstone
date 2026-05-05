@@ -7965,6 +7965,42 @@ async def admin_registry_install(request: Request) -> JSONResponse:
 
 _MCP_NAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 _MCP_MAX_SERVERS = 200  # fallback; prefer cluster.mcp_max_servers from storage
+_MCP_AUTH_TYPES = frozenset({"none", "static", "oauth_user"})
+
+
+def _clean_oauth_text(value: Any, *, max_length: int = 512) -> str | None:
+    """Normalize an admin form OAuth text field — empty string -> None.
+
+    Caps the input to ``max_length`` characters to bound DB row size on
+    the admin.mcp write path.  Pass a larger ``max_length`` (e.g. 2048)
+    for URL fields where the default would otherwise truncate valid
+    long URLs.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text[:max_length]
+
+
+def _parse_auth_type(body: dict[str, Any]) -> tuple[str | None, JSONResponse | None]:
+    """Validate ``auth_type`` from a request body.
+
+    Returns ``(value, None)`` for a valid value, ``(None, error)`` for
+    a present-but-invalid value (caller returns ``error``), or
+    ``(None, None)`` when ``auth_type`` is absent (caller skips the
+    update / falls back to a default).
+    """
+    if "auth_type" not in body:
+        return None, None
+    auth_type = str(body["auth_type"]).strip()
+    if auth_type not in _MCP_AUTH_TYPES:
+        return None, JSONResponse(
+            {"error": "auth_type must be 'none', 'static', or 'oauth_user'"},
+            status_code=400,
+        )
+    return auth_type, None
 
 
 def _get_mcp_max_servers(request: Request) -> int:
@@ -7976,10 +8012,20 @@ def _get_mcp_max_servers(request: Request) -> int:
 
 
 def _mask_mcp_secrets(server: dict[str, Any], reveal: bool = False) -> dict[str, Any]:
-    """Replace env/headers values with '***' unless reveal is True."""
-    if reveal:
-        return server
+    """Mask secret fields on an MCP server response dict.
+
+    ``env`` and ``headers`` are masked only when ``reveal`` is False.
+    ``oauth_client_secret_ct`` is always masked regardless of ``reveal``
+    — it's a write-only field (the admin form accepts plaintext but
+    the response just signals presence-or-absence as ``"***"`` /
+    ``None``).
+    """
     s = dict(server)
+    # OAuth client secret ciphertext is write-only at every read path.
+    raw_secret = s.get("oauth_client_secret_ct")
+    s["oauth_client_secret_ct"] = "***" if raw_secret is not None else None
+    if reveal:
+        return s
     if s.get("env") and s["env"] != "{}":
         try:
             env_dict = json.loads(s["env"]) if isinstance(s["env"], str) else s["env"]
@@ -8100,6 +8146,7 @@ async def admin_list_mcp_servers(request: Request) -> JSONResponse:
                 "auto_approve": False,
                 "enabled": True,
                 "created_by": "",
+                "auth_type": "static",
                 "created": "",
                 "updated": "",
                 "source": "config",
@@ -8155,6 +8202,12 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
             {"error": "url is required for streamable-http transport"}, status_code=400
         )
 
+    auth_type_value, err_resp = _parse_auth_type(body)
+    if err_resp is not None:
+        return err_resp
+    # Helper returns None when key is absent — fall back to the default.
+    auth_type = auth_type_value if auth_type_value is not None else "static"
+
     # Check max servers
     existing = storage.list_mcp_servers()
     max_servers = _get_mcp_max_servers(request)
@@ -8190,15 +8243,26 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
         auto_approve=bool(body.get("auto_approve", False)),
         enabled=bool(body.get("enabled", True)),
         created_by=audit_uid,
+        auth_type=auth_type,
+        oauth_client_id=_clean_oauth_text(body.get("oauth_client_id")),
+        oauth_scopes=_clean_oauth_text(body.get("oauth_scopes")),
+        oauth_audience=_clean_oauth_text(body.get("oauth_audience"), max_length=2048),
+        oauth_registration_mode=_clean_oauth_text(body.get("oauth_registration_mode")),
+        oauth_authorization_server_url=_clean_oauth_text(
+            body.get("oauth_authorization_server_url"), max_length=2048
+        ),
     )
 
+    audit_detail: dict[str, Any] = {"name": name, "auth_type": auth_type}
+    if "oauth_client_secret" in body:
+        audit_detail["oauth_client_secret"] = "(redacted)"
     record_audit(
         storage,
         audit_uid,
         "mcp_server.create",
         "mcp_server",
         server_id,
-        {"name": name},
+        audit_detail,
         ip,
     )
 
@@ -8302,6 +8366,41 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
         updates["auto_approve"] = bool(body["auto_approve"])
     if "enabled" in body:
         updates["enabled"] = bool(body["enabled"])
+    auth_type_value, err_resp = _parse_auth_type(body)
+    if err_resp is not None:
+        return err_resp
+    if auth_type_value is not None:
+        updates["auth_type"] = auth_type_value
+    for _oauth_key in (
+        "oauth_client_id",
+        "oauth_scopes",
+        "oauth_registration_mode",
+    ):
+        if _oauth_key in body:
+            updates[_oauth_key] = _clean_oauth_text(body[_oauth_key])
+    for _oauth_url_key in (
+        "oauth_audience",
+        "oauth_authorization_server_url",
+    ):
+        if _oauth_url_key in body:
+            updates[_oauth_url_key] = _clean_oauth_text(body[_oauth_url_key], max_length=2048)
+
+    # When auth_type is changed away from oauth_user, clear the OAuth
+    # columns so a stale client_id / audience can't leak back if the
+    # row is later flipped to a different oauth_user provider.
+    # ``oauth_client_secret_ct`` is owned by a dedicated write path
+    # (not the generic update); its clear-on-change lives there.
+    if updates.get("auth_type") and updates["auth_type"] != "oauth_user":
+        updates.update(
+            {
+                "oauth_client_id": None,
+                "oauth_scopes": None,
+                "oauth_audience": None,
+                "oauth_registration_mode": None,
+                "oauth_authorization_server_url": None,
+                "oauth_as_issuer_cached": None,
+            }
+        )
 
     if updates:
         storage.update_mcp_server(server_id, **updates)
@@ -8311,6 +8410,8 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     for _secret_key in ("env", "headers"):
         if _secret_key in audit_detail:
             audit_detail[_secret_key] = "(updated)"
+    if "oauth_client_secret" in body:
+        audit_detail["oauth_client_secret"] = "(redacted)"
     record_audit(
         storage,
         audit_uid,
