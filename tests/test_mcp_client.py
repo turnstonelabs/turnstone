@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tests.conftest import _seed_static_state
 from turnstone.core.mcp_client import (
     MCPClientManager,
     _mcp_to_openai,
@@ -319,8 +320,8 @@ class TestMCPClientManager:
 
     def test_server_count(self):
         mgr = MCPClientManager({})
-        mgr._sessions["a"] = MagicMock()
-        mgr._sessions["b"] = MagicMock()
+        _seed_static_state(mgr, "a", session=MagicMock())
+        _seed_static_state(mgr, "b", session=MagicMock())
         assert mgr.server_count == 2
 
     def test_call_tool_sync_unknown_tool(self):
@@ -557,7 +558,7 @@ class TestServerNameValidation:
                 mgr._exit_stack = stack
                 await mgr._connect_one("my__bad", {"command": "echo"})
             # Should not have connected
-            assert "my__bad" not in mgr._sessions
+            assert "my__bad" not in mgr._static_servers
             assert mgr.get_tools() == []
 
         asyncio.run(_run())
@@ -585,10 +586,8 @@ class TestCreateMcpClient:
 class TestRebuildTools:
     def test_rebuild_from_per_server(self):
         mgr = MCPClientManager({})
-        mgr._per_server_tools = {
-            "github": [_fake_openai_tool("mcp__github__search")],
-            "slack": [_fake_openai_tool("mcp__slack__send")],
-        }
+        _seed_static_state(mgr, "github", tools=[_fake_openai_tool("mcp__github__search")])
+        _seed_static_state(mgr, "slack", tools=[_fake_openai_tool("mcp__slack__send")])
         mgr._rebuild_tools()
         assert len(mgr._tools) == 2
         names = {t["function"]["name"] for t in mgr._tools}
@@ -598,18 +597,18 @@ class TestRebuildTools:
 
     def test_rebuild_copy_on_write(self):
         mgr = MCPClientManager({})
-        mgr._per_server_tools = {"a": [_fake_openai_tool("mcp__a__x")]}
+        _seed_static_state(mgr, "a", tools=[_fake_openai_tool("mcp__a__x")])
         mgr._rebuild_tools()
         old_tools = mgr._tools
         old_map = mgr._tool_map
-        mgr._per_server_tools["b"] = [_fake_openai_tool("mcp__b__y")]
+        _seed_static_state(mgr, "b", tools=[_fake_openai_tool("mcp__b__y")])
         mgr._rebuild_tools()
         assert mgr._tools is not old_tools
         assert mgr._tool_map is not old_map
 
     def test_rebuild_empty(self):
         mgr = MCPClientManager({})
-        mgr._per_server_tools = {}
+        mgr._static_servers = {}
         mgr._rebuild_tools()
         assert mgr._tools == []
         assert mgr._tool_map == {}
@@ -621,8 +620,7 @@ class TestRefreshServer:
         mgr: MCPClientManager, server_name: str, mock_session: MagicMock
     ) -> None:
         """Add empty list_resources/list_prompts mocks so _refresh_server works."""
-        mgr._supports_resources[server_name] = True
-        mgr._supports_prompts[server_name] = True
+        _seed_static_state(mgr, server_name, supports_resources=True, supports_prompts=True)
         empty_res = MagicMock()
         empty_res.resources = []
         mock_session.list_resources = AsyncMock(return_value=empty_res)
@@ -644,8 +642,12 @@ class TestRefreshServer:
             ]
             mock_session.list_tools = AsyncMock(return_value=mock_result)
             self._add_empty_resource_prompt_mocks(mgr, "github", mock_session)
-            mgr._sessions["github"] = mock_session
-            mgr._per_server_tools["github"] = [_fake_openai_tool("mcp__github__search")]
+            _seed_static_state(
+                mgr,
+                "github",
+                session=mock_session,
+                tools=[_fake_openai_tool("mcp__github__search")],
+            )
             mgr._rebuild_tools()
 
             added, removed = await mgr._refresh_server("github")
@@ -663,8 +665,12 @@ class TestRefreshServer:
             mock_result.tools = []  # all tools removed
             mock_session.list_tools = AsyncMock(return_value=mock_result)
             self._add_empty_resource_prompt_mocks(mgr, "github", mock_session)
-            mgr._sessions["github"] = mock_session
-            mgr._per_server_tools["github"] = [_fake_openai_tool("mcp__github__search")]
+            _seed_static_state(
+                mgr,
+                "github",
+                session=mock_session,
+                tools=[_fake_openai_tool("mcp__github__search")],
+            )
             mgr._rebuild_tools()
 
             added, removed = await mgr._refresh_server("github")
@@ -682,8 +688,12 @@ class TestRefreshServer:
             mock_result.tools = [_fake_mcp_tool("search")]
             mock_session.list_tools = AsyncMock(return_value=mock_result)
             self._add_empty_resource_prompt_mocks(mgr, "github", mock_session)
-            mgr._sessions["github"] = mock_session
-            mgr._per_server_tools["github"] = [_fake_openai_tool("mcp__github__search")]
+            _seed_static_state(
+                mgr,
+                "github",
+                session=mock_session,
+                tools=[_fake_openai_tool("mcp__github__search")],
+            )
             mgr._rebuild_tools()
 
             added, removed = await mgr._refresh_server("github")
@@ -706,7 +716,7 @@ class TestListeners:
         mgr = MCPClientManager({})
         calls: list[int] = []
         mgr.add_listener(lambda: calls.append(1))
-        mgr._per_server_tools = {"a": [_fake_openai_tool("mcp__a__x")]}
+        _seed_static_state(mgr, "a", tools=[_fake_openai_tool("mcp__a__x")])
         mgr._rebuild_tools()
         assert len(calls) == 1
 
@@ -903,12 +913,14 @@ class TestMCPResources:
     def test_resource_discovery(self):
         """Mock list_resources() returning 2 resources, verify get_resources()."""
         mgr = MCPClientManager({})
-        mgr._per_server_resources = {
-            "fs": [
+        _seed_static_state(
+            mgr,
+            "fs",
+            resources=[
                 _fake_resource_dict("file:///a.txt", "a", "File A", "text/plain", "fs"),
                 _fake_resource_dict("file:///b.txt", "b", "File B", "text/plain", "fs"),
             ],
-        }
+        )
         mgr._rebuild_resources()
         resources = mgr.get_resources()
         assert len(resources) == 2
@@ -919,22 +931,18 @@ class TestMCPResources:
     def test_rebuild_resources_copy_on_write(self):
         """Verify mutation safety — get_resources() returns independent copy."""
         mgr = MCPClientManager({})
-        mgr._per_server_resources = {
-            "a": [_fake_resource_dict("file:///x", "x", "", "", "a")],
-        }
+        _seed_static_state(mgr, "a", resources=[_fake_resource_dict("file:///x", "x", "", "", "a")])
         mgr._rebuild_resources()
         old_resources = mgr._resources
         old_map = mgr._resource_map
-        mgr._per_server_resources["b"] = [_fake_resource_dict("file:///y", "y", "", "", "b")]
+        _seed_static_state(mgr, "b", resources=[_fake_resource_dict("file:///y", "y", "", "", "b")])
         mgr._rebuild_resources()
         assert mgr._resources is not old_resources
         assert mgr._resource_map is not old_map
 
     def test_get_resources_returns_copy(self):
         mgr = MCPClientManager({})
-        mgr._per_server_resources = {
-            "a": [_fake_resource_dict("file:///x", "x", "", "", "a")],
-        }
+        _seed_static_state(mgr, "a", resources=[_fake_resource_dict("file:///x", "x", "", "", "a")])
         mgr._rebuild_resources()
         resources = mgr.get_resources()
         assert len(resources) == 1
@@ -946,7 +954,7 @@ class TestMCPResources:
         mgr = MCPClientManager({})
         mgr._resource_map = {"file:///readme": ("fs", "file:///readme")}
         mock_session = MagicMock()
-        mgr._sessions["fs"] = mock_session
+        _seed_static_state(mgr, "fs", session=mock_session)
         mgr._loop = asyncio.new_event_loop()
 
         # Mock the read_resource result
@@ -974,7 +982,7 @@ class TestMCPResources:
         mgr = MCPClientManager({})
         mgr._resource_map = {"file:///img.png": ("fs", "file:///img.png")}
         mock_session = MagicMock()
-        mgr._sessions["fs"] = mock_session
+        _seed_static_state(mgr, "fs", session=mock_session)
         mgr._loop = asyncio.new_event_loop()
 
         blob_content = MagicMock(spec=["blob"])
@@ -1011,7 +1019,7 @@ class TestMCPResources:
         mgr = MCPClientManager({})
         mgr._resource_map = {"file:///x": ("fs", "file:///x")}
         mock_session = MagicMock()
-        mgr._sessions["fs"] = mock_session
+        _seed_static_state(mgr, "fs", session=mock_session)
         mgr._loop = asyncio.new_event_loop()
 
         async def _slow_read(_uri: str) -> None:
@@ -1036,7 +1044,7 @@ class TestMCPResources:
         mgr = MCPClientManager({})
         calls: list[int] = []
         mgr.add_resource_listener(lambda: calls.append(1))
-        mgr._per_server_resources = {"a": [_fake_resource_dict()]}
+        _seed_static_state(mgr, "a", resources=[_fake_resource_dict()])
         mgr._rebuild_resources()
         assert len(calls) == 1
 
@@ -1060,13 +1068,13 @@ class TestMCPResources:
         async def _run() -> None:
             mgr = MCPClientManager({})
             mock_session = MagicMock()
-            mgr._sessions["fs"] = mock_session
-            mgr._supports_resources["fs"] = True
-
-            # Initial state
-            mgr._per_server_resources["fs"] = [
-                _fake_resource_dict("file:///old", server="fs"),
-            ]
+            _seed_static_state(
+                mgr,
+                "fs",
+                session=mock_session,
+                supports_resources=True,
+                resources=[_fake_resource_dict("file:///old", server="fs")],
+            )
             mgr._rebuild_resources()
             assert len(mgr.get_resources()) == 1
 
@@ -1088,17 +1096,19 @@ class TestMCPResources:
 
     def test_rebuild_resources_empty(self):
         mgr = MCPClientManager({})
-        mgr._per_server_resources = {}
+        mgr._static_servers = {}
         mgr._rebuild_resources()
         assert mgr._resources == []
         assert mgr._resource_map == {}
 
     def test_rebuild_resources_multi_server(self):
         mgr = MCPClientManager({})
-        mgr._per_server_resources = {
-            "fs": [_fake_resource_dict("file:///a", server="fs")],
-            "db": [_fake_resource_dict("db://table", name="table", server="db")],
-        }
+        _seed_static_state(mgr, "fs", resources=[_fake_resource_dict("file:///a", server="fs")])
+        _seed_static_state(
+            mgr,
+            "db",
+            resources=[_fake_resource_dict("db://table", name="table", server="db")],
+        )
         mgr._rebuild_resources()
         assert len(mgr._resources) == 2
         assert mgr._resource_map["file:///a"] == ("fs", "file:///a")
@@ -1107,8 +1117,10 @@ class TestMCPResources:
     def test_template_prefix_matching(self):
         """Expanded URI matches template by prefix."""
         mgr = MCPClientManager({})
-        mgr._per_server_resources = {
-            "db": [
+        _seed_static_state(
+            mgr,
+            "db",
+            resources=[
                 {
                     "uri": "db://tables/{table}/rows/{id}",
                     "name": "row",
@@ -1118,7 +1130,7 @@ class TestMCPResources:
                     "template": True,
                 },
             ],
-        }
+        )
         mgr._rebuild_resources()
         # Template should not be in resource_map
         assert "db://tables/{table}/rows/{id}" not in mgr._resource_map
@@ -1134,8 +1146,10 @@ class TestMCPResources:
         mgr = MCPClientManager({})
         # Use templates with genuinely different prefix lengths:
         # "db://data/" (6 chars after scheme) vs "db://data/tables/" (13 chars after scheme)
-        mgr._per_server_resources = {
-            "short": [
+        _seed_static_state(
+            mgr,
+            "short",
+            resources=[
                 {
                     "uri": "db://data/{collection}",
                     "name": "collection",
@@ -1145,7 +1159,11 @@ class TestMCPResources:
                     "template": True,
                 },
             ],
-            "long": [
+        )
+        _seed_static_state(
+            mgr,
+            "long",
+            resources=[
                 {
                     "uri": "db://data/tables/{table}",
                     "name": "table",
@@ -1155,7 +1173,7 @@ class TestMCPResources:
                     "template": True,
                 },
             ],
-        }
+        )
         mgr._rebuild_resources()
         # "db://data/tables/users" matches both prefixes ("db://data/" and
         # "db://data/tables/") — the longer one should win
@@ -1172,8 +1190,10 @@ class TestMCPResources:
     def test_template_no_match_raises(self):
         """Completely unrelated URI still raises ValueError."""
         mgr = MCPClientManager({})
-        mgr._per_server_resources = {
-            "db": [
+        _seed_static_state(
+            mgr,
+            "db",
+            resources=[
                 {
                     "uri": "db://tables/{table}",
                     "name": "table",
@@ -1183,7 +1203,7 @@ class TestMCPResources:
                     "template": True,
                 },
             ],
-        }
+        )
         mgr._rebuild_resources()
         assert mgr._match_template("file:///something") is None
         with pytest.raises(ValueError, match="Unknown MCP resource"):
@@ -1192,8 +1212,10 @@ class TestMCPResources:
     def test_read_resource_sync_with_template_uri(self):
         """End-to-end: template discovered, expanded URI dispatched to correct server."""
         mgr = MCPClientManager({})
-        mgr._per_server_resources = {
-            "db": [
+        _seed_static_state(
+            mgr,
+            "db",
+            resources=[
                 {
                     "uri": "db://tables/{table}/rows/{id}",
                     "name": "row",
@@ -1203,11 +1225,11 @@ class TestMCPResources:
                     "template": True,
                 },
             ],
-        }
+        )
         mgr._rebuild_resources()
 
         mock_session = MagicMock()
-        mgr._sessions["db"] = mock_session
+        _seed_static_state(mgr, "db", session=mock_session)
         mgr._loop = asyncio.new_event_loop()
 
         text_content = MagicMock(spec=["text"])
@@ -1239,12 +1261,14 @@ class TestMCPPrompts:
     def test_prompt_discovery(self):
         """Mock list_prompts(), verify get_prompts() with correct prefixed names."""
         mgr = MCPClientManager({})
-        mgr._per_server_prompts = {
-            "tmpl": [
+        _seed_static_state(
+            mgr,
+            "tmpl",
+            prompts=[
                 _fake_prompt_dict("mcp__tmpl__code_review", "code_review", "tmpl"),
                 _fake_prompt_dict("mcp__tmpl__summarize", "summarize", "tmpl"),
             ],
-        }
+        )
         mgr._rebuild_prompts()
         prompts = mgr.get_prompts()
         assert len(prompts) == 2
@@ -1257,22 +1281,18 @@ class TestMCPPrompts:
     def test_rebuild_prompts_copy_on_write(self):
         """Verify mutation safety."""
         mgr = MCPClientManager({})
-        mgr._per_server_prompts = {
-            "a": [_fake_prompt_dict("mcp__a__p1", "p1", "a")],
-        }
+        _seed_static_state(mgr, "a", prompts=[_fake_prompt_dict("mcp__a__p1", "p1", "a")])
         mgr._rebuild_prompts()
         old_prompts = mgr._prompts
         old_map = mgr._prompt_map
-        mgr._per_server_prompts["b"] = [_fake_prompt_dict("mcp__b__p2", "p2", "b")]
+        _seed_static_state(mgr, "b", prompts=[_fake_prompt_dict("mcp__b__p2", "p2", "b")])
         mgr._rebuild_prompts()
         assert mgr._prompts is not old_prompts
         assert mgr._prompt_map is not old_map
 
     def test_get_prompts_returns_copy(self):
         mgr = MCPClientManager({})
-        mgr._per_server_prompts = {
-            "a": [_fake_prompt_dict("mcp__a__p1", "p1", "a")],
-        }
+        _seed_static_state(mgr, "a", prompts=[_fake_prompt_dict("mcp__a__p1", "p1", "a")])
         mgr._rebuild_prompts()
         prompts = mgr.get_prompts()
         assert len(prompts) == 1
@@ -1284,7 +1304,7 @@ class TestMCPPrompts:
         mgr = MCPClientManager({})
         mgr._prompt_map = {"mcp__tmpl__review": ("tmpl", "review")}
         mock_session = MagicMock()
-        mgr._sessions["tmpl"] = mock_session
+        _seed_static_state(mgr, "tmpl", session=mock_session)
         mgr._loop = asyncio.new_event_loop()
 
         # Build mock PromptMessage
@@ -1335,7 +1355,7 @@ class TestMCPPrompts:
         mgr = MCPClientManager({})
         mgr._prompt_map = {"mcp__tmpl__slow": ("tmpl", "slow")}
         mock_session = MagicMock()
-        mgr._sessions["tmpl"] = mock_session
+        _seed_static_state(mgr, "tmpl", session=mock_session)
         mgr._loop = asyncio.new_event_loop()
 
         async def _slow_prompt(_name: str, *, arguments: dict[str, str] | None = None) -> None:
@@ -1360,7 +1380,7 @@ class TestMCPPrompts:
         mgr = MCPClientManager({})
         calls: list[int] = []
         mgr.add_prompt_listener(lambda: calls.append(1))
-        mgr._per_server_prompts = {"a": [_fake_prompt_dict()]}
+        _seed_static_state(mgr, "a", prompts=[_fake_prompt_dict()])
         mgr._rebuild_prompts()
         assert len(calls) == 1
 
@@ -1391,13 +1411,13 @@ class TestMCPPrompts:
         async def _run() -> None:
             mgr = MCPClientManager({})
             mock_session = MagicMock()
-            mgr._sessions["tmpl"] = mock_session
-            mgr._supports_prompts["tmpl"] = True
-
-            # Initial state
-            mgr._per_server_prompts["tmpl"] = [
-                _fake_prompt_dict("mcp__tmpl__old", "old", "tmpl"),
-            ]
+            _seed_static_state(
+                mgr,
+                "tmpl",
+                session=mock_session,
+                supports_prompts=True,
+                prompts=[_fake_prompt_dict("mcp__tmpl__old", "old", "tmpl")],
+            )
             mgr._rebuild_prompts()
             assert len(mgr.get_prompts()) == 1
 
@@ -1417,17 +1437,15 @@ class TestMCPPrompts:
 
     def test_rebuild_prompts_empty(self):
         mgr = MCPClientManager({})
-        mgr._per_server_prompts = {}
+        mgr._static_servers = {}
         mgr._rebuild_prompts()
         assert mgr._prompts == []
         assert mgr._prompt_map == {}
 
     def test_rebuild_prompts_multi_server(self):
         mgr = MCPClientManager({})
-        mgr._per_server_prompts = {
-            "a": [_fake_prompt_dict("mcp__a__p1", "p1", "a")],
-            "b": [_fake_prompt_dict("mcp__b__p2", "p2", "b")],
-        }
+        _seed_static_state(mgr, "a", prompts=[_fake_prompt_dict("mcp__a__p1", "p1", "a")])
+        _seed_static_state(mgr, "b", prompts=[_fake_prompt_dict("mcp__b__p2", "p2", "b")])
         mgr._rebuild_prompts()
         assert len(mgr._prompts) == 2
         assert mgr._prompt_map["mcp__a__p1"] == ("a", "p1")
@@ -1442,9 +1460,9 @@ class TestMCPPrompts:
 class TestShutdownCleanup:
     def test_shutdown_clears_resources_and_prompts(self):
         mgr = MCPClientManager({})
-        mgr._per_server_resources = {"a": [_fake_resource_dict()]}
+        _seed_static_state(mgr, "a", resources=[_fake_resource_dict()])
         mgr._rebuild_resources()
-        mgr._per_server_prompts = {"a": [_fake_prompt_dict()]}
+        _seed_static_state(mgr, "a", prompts=[_fake_prompt_dict()])
         mgr._rebuild_prompts()
         assert mgr.get_resources() != []
         assert mgr.get_prompts() != []
@@ -1528,8 +1546,9 @@ class TestConnectOneUnreachable:
         mgr._loop.run_until_complete(_run())
         mgr._loop.close()
 
-        # Server should NOT be in sessions (connection failed)
-        assert "bad-server" not in mgr._sessions
+        # Server should NOT have a live session (connection failed)
+        bad_state = mgr._static_servers.get("bad-server")
+        assert bad_state is None or bad_state.session is None
 
     def test_connect_all_continues_after_unreachable_server(self):
         """_connect_all logs error and continues to next server."""
@@ -1543,7 +1562,8 @@ class TestConnectOneUnreachable:
         loop.run_until_complete(mgr._connect_all())
         loop.close()
 
-        assert "bad" not in mgr._sessions
+        bad_state = mgr._static_servers.get("bad")
+        assert bad_state is None or bad_state.session is None
         assert "bad" in mgr._last_error
 
 
@@ -1598,7 +1618,7 @@ class TestFutureCancellation:
         mock_session.call_tool = MagicMock(return_value="sentinel")
         mock_session.read_resource = MagicMock(return_value="sentinel")
         mock_session.get_prompt = MagicMock(return_value="sentinel")
-        mgr._sessions["test"] = mock_session
+        _seed_static_state(mgr, "test", session=mock_session)
         mgr._loop = MagicMock()
         mgr._tool_map["mcp__test__search"] = ("test", "search")
         mgr._resource_map["file:///a.txt"] = ("test", "file:///a.txt")
@@ -1766,7 +1786,7 @@ class TestCircuitBreaker:
         mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
         mock_session = MagicMock()
         mock_session.call_tool = MagicMock(return_value="sentinel")
-        mgr._sessions["test"] = mock_session
+        _seed_static_state(mgr, "test", session=mock_session)
         mgr._loop = MagicMock()
         mgr._tool_map["mcp__test__ping"] = ("test", "ping")
         mock_future = MagicMock()
@@ -1782,7 +1802,7 @@ class TestCircuitBreaker:
         mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
         mock_session = MagicMock()
         mock_session.call_tool = MagicMock(return_value="sentinel")
-        mgr._sessions["test"] = mock_session
+        _seed_static_state(mgr, "test", session=mock_session)
         mgr._loop = MagicMock()
         mgr._tool_map["mcp__test__ping"] = ("test", "ping")
         # Pre-set a failure
@@ -1800,7 +1820,10 @@ class TestCircuitBreaker:
         mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
         mock_session = MagicMock()
         mock_session.call_tool = MagicMock(return_value="sentinel")
-        mgr._sessions["test"] = mock_session
+        # Seed both session and stack so the test can verify stack survives.
+        old_stack = MagicMock()
+        old_streams = (MagicMock(), MagicMock())
+        _seed_static_state(mgr, "test", session=mock_session, stack=old_stack, streams=old_streams)
         mgr._loop = MagicMock()
         mgr._tool_map["mcp__test__ping"] = ("test", "ping")
         mock_future = MagicMock()
@@ -1810,7 +1833,12 @@ class TestCircuitBreaker:
             pytest.raises(BrokenPipeError),
         ):
             mgr.call_tool_sync("mcp__test__ping", {}, timeout=5)
-        assert "test" not in mgr._sessions
+        # Session evicted, but stack/streams remain for the stale-and-stack
+        # guard in _connect_one to clean up on next reconnect attempt.
+        state = mgr._static_servers["test"]
+        assert state.session is None
+        assert state.stack is old_stack
+        assert state.streams is old_streams
 
     def test_independent_circuits_per_server(self):
         mgr = MCPClientManager({})
@@ -1829,7 +1857,7 @@ class TestCircuitBreaker:
         mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
         mock_session = MagicMock()
         mock_session.call_tool = MagicMock(return_value="sentinel")
-        mgr._sessions["test"] = mock_session
+        _seed_static_state(mgr, "test", session=mock_session)
         mgr._loop = MagicMock()
         mgr._tool_map["mcp__test__ping"] = ("test", "ping")
         mock_future = MagicMock()
@@ -1855,7 +1883,7 @@ class TestSafeTransportStreams:
         mgr = MCPClientManager({})
         stream_a = MagicMock()
         stream_b = MagicMock()
-        mgr._server_streams["srv"] = (stream_a, stream_b)
+        _seed_static_state(mgr, "srv", streams=(stream_a, stream_b))
 
         async def _run():
             await mgr._pre_close_streams("srv")
@@ -1863,7 +1891,8 @@ class TestSafeTransportStreams:
         asyncio.run(_run())
         stream_a.aclose.assert_called_once()
         stream_b.aclose.assert_called_once()
-        assert "srv" not in mgr._server_streams
+        # Streams cleared, but the state entry itself can remain.
+        assert mgr._static_servers["srv"].streams is None
 
     def test_pre_close_streams_ignores_missing(self):
         mgr = MCPClientManager({})
@@ -1878,7 +1907,7 @@ class TestSafeTransportStreams:
         stream_a = MagicMock()
         stream_a.aclose.side_effect = RuntimeError("boom")
         stream_b = MagicMock()
-        mgr._server_streams["srv"] = (stream_a, stream_b)
+        _seed_static_state(mgr, "srv", streams=(stream_a, stream_b))
 
         async def _run():
             await mgr._pre_close_streams("srv")
@@ -1888,9 +1917,9 @@ class TestSafeTransportStreams:
 
     def test_shutdown_clears_stream_refs(self):
         mgr = MCPClientManager({})
-        mgr._server_streams["srv"] = (MagicMock(), MagicMock())
+        _seed_static_state(mgr, "srv", streams=(MagicMock(), MagicMock()))
         mgr.shutdown()
-        assert len(mgr._server_streams) == 0
+        assert len(mgr._static_servers) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1950,7 +1979,7 @@ class TestReconnectSync:
         mgr, _loop, _thread = running_loop_mgr
 
         async def _fake_connect_one(name: str, _cfg: dict[str, Any]) -> None:
-            mgr._sessions[name] = MagicMock()
+            _seed_static_state(mgr, name, session=MagicMock())
 
         # Pre-trip the breaker
         for _ in range(3):
@@ -1982,11 +2011,16 @@ class TestReconnectSync:
 
         async def _connect_one(name: str, _cfg: dict[str, Any]) -> None:
             order.append("connect_one")
-            mgr._sessions[name] = MagicMock()
+            _seed_static_state(mgr, name, session=MagicMock())
 
-        mgr._sessions["srv"] = MagicMock()  # populated old session
-        mgr._per_server_stacks["srv"] = old_stack
-        mgr._server_streams["srv"] = (MagicMock(), MagicMock())
+        # Seed the old session/stack/streams that the guard should clear.
+        _seed_static_state(
+            mgr,
+            "srv",
+            session=MagicMock(),
+            stack=old_stack,
+            streams=(MagicMock(), MagicMock()),
+        )
 
         with (
             patch.object(mgr, "_pre_close_streams", side_effect=_pre_close),
@@ -1996,7 +2030,8 @@ class TestReconnectSync:
             result = mgr.reconnect_sync("srv")
         assert result["connected"] is True
         assert order == ["pre_close", "safe_close", "connect_one"]
-        assert "srv" not in mgr._per_server_stacks
+        # The old stack reference should have been cleared from state.
+        assert mgr._static_servers["srv"].stack is not old_stack
 
     def test_reconnect_failure_returns_error_dict(self, running_loop_mgr):
         mgr, _loop, _thread = running_loop_mgr
@@ -2019,9 +2054,13 @@ class TestReconnectSync:
         mgr, _loop, _thread = running_loop_mgr
 
         # Seed catalog state from a previous successful connect.
-        mgr._per_server_tools["srv"] = [_fake_openai_tool("mcp__srv__t")]
-        mgr._per_server_resources["srv"] = [_fake_resource_dict(server="srv")]
-        mgr._per_server_prompts["srv"] = [_fake_prompt_dict(server="srv")]
+        _seed_static_state(
+            mgr,
+            "srv",
+            tools=[_fake_openai_tool("mcp__srv__t")],
+            resources=[_fake_resource_dict(server="srv")],
+            prompts=[_fake_prompt_dict(server="srv")],
+        )
         mgr._rebuild_tools()
         mgr._rebuild_resources()
         mgr._rebuild_prompts()
@@ -2035,11 +2074,52 @@ class TestReconnectSync:
         ):
             result = mgr.reconnect_sync("srv")
         assert result["connected"] is False
-        # Per-server catalog and merged maps should both be empty for srv.
-        assert "srv" not in mgr._per_server_tools
-        assert "srv" not in mgr._per_server_resources
-        assert "srv" not in mgr._per_server_prompts
+        # Per-server catalog should be cleared and merged maps drained.
+        srv_state = mgr._static_servers.get("srv")
+        assert srv_state is not None
+        assert srv_state.tools == []
+        assert srv_state.resources == []
+        assert srv_state.prompts == []
         assert "mcp__srv__t" not in mgr._tool_map
+
+    def test_reconnect_preserves_static_state_identity(self, running_loop_mgr):
+        # q-3: PR #296 invariant 5 — _static_servers[name] must be the SAME
+        # object across a connect → transient-failure → reconnect cycle.
+        # Guards against future refactors that pop-and-repopulate the entry,
+        # which would invalidate any references held by concurrent readers.
+        mgr, _loop, _thread = running_loop_mgr
+
+        # First connect: seed an initial entry as if _connect_one succeeded.
+        async def _first_connect(name: str, _cfg: dict[str, Any]) -> None:
+            _seed_static_state(mgr, name, session=MagicMock())
+
+        with (
+            patch.object(mgr, "_connect_one", side_effect=_first_connect),
+            patch.object(mgr, "_pre_close_streams", new=AsyncMock()),
+        ):
+            mgr.reconnect_sync("srv")
+
+        state_before = mgr._static_servers["srv"]
+        id_before = id(state_before)
+
+        # Simulate a transient transport failure: evict the session (as
+        # call_tool_sync would on BrokenPipeError) but keep the entry.
+        state_before.session = None
+
+        # Reconnect.
+        async def _reconnect(name: str, _cfg: dict[str, Any]) -> None:
+            _seed_static_state(mgr, name, session=MagicMock())
+
+        with (
+            patch.object(mgr, "_connect_one", side_effect=_reconnect),
+            patch.object(mgr, "_pre_close_streams", new=AsyncMock()),
+        ):
+            result = mgr.reconnect_sync("srv")
+        assert result["connected"] is True
+
+        state_after = mgr._static_servers["srv"]
+        assert id(state_after) == id_before
+        assert state_after is state_before
 
 
 # ---------------------------------------------------------------------------
@@ -2064,7 +2144,7 @@ class TestCBAutoReconnectRefresh:
         refresh_event = _threading.Event()
 
         async def _connect_one(name: str, _cfg: dict[str, Any]) -> None:
-            mgr._sessions[name] = new_session
+            _seed_static_state(mgr, name, session=new_session)
 
         async def _refresh(name: str) -> tuple[list[str], list[str]]:
             refresh_event.set()
@@ -2088,7 +2168,7 @@ class TestCBAutoReconnectRefresh:
         refresh_started = _threading.Event()
 
         async def _connect_one(name: str, _cfg: dict[str, Any]) -> None:
-            mgr._sessions[name] = new_session
+            _seed_static_state(mgr, name, session=new_session)
 
         async def _refresh_failing(name: str) -> tuple[list[str], list[str]]:
             refresh_started.set()

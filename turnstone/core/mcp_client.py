@@ -25,6 +25,7 @@ import threading
 import time
 import uuid
 from contextlib import AsyncExitStack
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -69,6 +70,57 @@ def _mcp_to_openai(server_name: str, tool: Any) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Per-server state containers
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class StaticServerState:
+    """Per-server state for auth_type ∈ {none, static}. Name-keyed only.
+
+    Phase 5 introduces PoolEntryState as the (user, server)-keyed sibling
+    for auth_type=oauth_user. Together with the typed map declarations
+    (dict[str, StaticServerState] vs dict[tuple[str, str], PoolEntryState]),
+    this makes accidental cross-keying lookups easier to catch in review
+    and rejected by mypy.
+    """
+
+    name: str
+    session: Any | None = None
+    stack: AsyncExitStack | None = None
+    streams: tuple[Any, Any] | None = None
+    tools: list[dict[str, Any]] = field(default_factory=list)
+    resources: list[dict[str, Any]] = field(default_factory=list)
+    prompts: list[dict[str, Any]] = field(default_factory=list)
+    supports_list_changed: bool = False
+    supports_resources: bool = False
+    supports_prompts: bool = False
+    supports_resource_list_changed: bool = False
+    supports_prompt_list_changed: bool = False
+
+
+@dataclass
+class PoolEntryState:
+    """Per-(user, server) state for auth_type = oauth_user.
+
+    Defined for Phase 5 use; not instantiated anywhere in Phase 0.
+    open_lock has no default — RFC §2.0 invariant 2 forbids allocating an
+    asyncio.Lock outside the mcp-loop. Phase 5 allocates lazily inside
+    connect coroutines.
+    """
+
+    key: tuple[str, str]  # (user_id, server_name)
+    open_lock: asyncio.Lock
+    session: Any | None = None
+    stack: AsyncExitStack | None = None
+    streams: tuple[Any, Any] | None = None
+    tools: list[dict[str, Any]] = field(default_factory=list)
+    resources: list[dict[str, Any]] = field(default_factory=list)
+    prompts: list[dict[str, Any]] = field(default_factory=list)
+    last_used: float = 0.0
+
+
+# ---------------------------------------------------------------------------
 # Client manager
 # ---------------------------------------------------------------------------
 
@@ -88,9 +140,13 @@ class MCPClientManager:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._exit_stack: AsyncExitStack | None = None
-        self._per_server_stacks: dict[str, AsyncExitStack] = {}
 
-        self._sessions: dict[str, Any] = {}
+        # Per-server state for auth_type ∈ {none, static}.  Each entry holds
+        # session/stack/streams/catalog/capability flags for one name-keyed
+        # connection.  Phase 5 introduces a sibling pool-entry map for
+        # auth_type=oauth_user; static entries always live here.
+        self._static_servers: dict[str, StaticServerState] = {}
+
         self._tools: list[dict[str, Any]] = []
         # prefixed_name -> (server_name, original_tool_name)
         self._tool_map: dict[str, tuple[str, str]] = {}
@@ -104,30 +160,19 @@ class MCPClientManager:
         self._last_error: dict[str, str] = {}
         self._MAX_ERROR_LEN = 256
 
-        # Per-server tool storage for surgical refresh
-        self._per_server_tools: dict[str, list[dict[str, Any]]] = {}
-        # Tracks which servers support push notifications
-        self._supports_list_changed: dict[str, bool] = {}
-
         # Listener infrastructure (tool-change callbacks for ChatSession)
         self._listeners: list[Callable[[], None]] = []
         self._listeners_lock = threading.Lock()
 
-        # Resources — parallel to tools
-        self._per_server_resources: dict[str, list[dict[str, Any]]] = {}
+        # Merged resource catalog
         self._resources: list[dict[str, Any]] = []
         self._resource_map: dict[str, tuple[str, str]] = {}  # uri → (server, uri)
-        self._supports_resources: dict[str, bool] = {}  # server has resources capability
-        self._supports_resource_list_changed: dict[str, bool] = {}
         self._resource_listeners: list[Callable[[], None]] = []
         self._resource_listeners_lock = threading.Lock()
 
-        # Prompts — parallel to tools
-        self._per_server_prompts: dict[str, list[dict[str, Any]]] = {}
+        # Merged prompt catalog
         self._prompts: list[dict[str, Any]] = []
         self._prompt_map: dict[str, tuple[str, str]] = {}  # prefixed → (server, original)
-        self._supports_prompts: dict[str, bool] = {}  # server has prompts capability
-        self._supports_prompt_list_changed: dict[str, bool] = {}
         self._prompt_listeners: list[Callable[[], None]] = []
         self._prompt_listeners_lock = threading.Lock()
 
@@ -143,12 +188,20 @@ class MCPClientManager:
         self._circuit_open_until: dict[str, float] = {}  # monotonic timestamp
         self._circuit_trip_count: dict[str, int] = {}  # backoff exponent
 
-        # Safe transport stream refs (pre-close before stack teardown to avoid
-        # the anyio cancel-scope CPU busy-loop — MCP SDK #2147)
-        self._server_streams: dict[str, tuple[Any, Any]] = {}
-
         # Notification debounce (per-server)
         self._last_notification_refresh: dict[str, float] = {}
+
+    def _ensure_static_state(self, name: str) -> StaticServerState:
+        """Get or create the StaticServerState for ``name``.
+
+        Returns an empty state on first access; subsequent fields are populated
+        as connect proceeds.
+        """
+        state = self._static_servers.get(name)
+        if state is None:
+            state = StaticServerState(name=name)
+            self._static_servers[name] = state
+        return state
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -259,34 +312,43 @@ class MCPClientManager:
 
     # -- safe transport helpers ------------------------------------------------
 
-    async def _pre_close_streams(self, name: str) -> None:
+    async def _pre_close_streams(self, key: str) -> None:
         """Close MCP transport streams before stack teardown.
 
         Pre-closing unblocks anyio transport tasks stuck on zero-buffer
         ``send()`` calls, preventing the CPU busy-loop from SDK #2147.
-        """
-        streams = self._server_streams.pop(name, None)
-        if streams:
-            for s in streams:
-                with contextlib.suppress(Exception):
-                    await s.aclose()
 
-    async def _tcp_probe(self, name: str, url: str) -> None:
+        Parameter is ``str`` today; Phase 5 widens to ``str | tuple[str, str]``
+        once ``PoolEntryState`` is wired.
+        """
+        state = self._static_servers.get(key)
+        if state is None or state.streams is None:
+            return
+        streams = state.streams
+        state.streams = None  # take-and-clear pattern
+        for s in streams:
+            with contextlib.suppress(Exception):
+                await s.aclose()
+
+    async def _tcp_probe(self, key: str, url: str) -> None:
         """Fast TCP connect check before entering the MCP transport context.
 
         Fails fast when the server is unreachable, avoiding the anyio
         cancel-scope orphan bug that causes 100% CPU spin.
+
+        Parameter is ``str`` today; Phase 5 widens to ``str | tuple[str, str]``
+        once ``PoolEntryState`` is wired.
         """
         from urllib.parse import urlparse
 
         parsed = urlparse(url)
         host = parsed.hostname
         if not host:
-            raise ConnectionError(f"MCP server '{name}' has invalid URL (no hostname): {url}")
+            raise ConnectionError(f"MCP server '{key}' has invalid URL (no hostname): {url}")
         try:
             port = parsed.port or (443 if parsed.scheme == "https" else 80)
         except ValueError:
-            raise ConnectionError(f"MCP server '{name}' has invalid port in URL: {url}") from None
+            raise ConnectionError(f"MCP server '{key}' has invalid port in URL: {url}") from None
         try:
             _, writer = await asyncio.wait_for(
                 asyncio.open_connection(host, port),
@@ -296,7 +358,7 @@ class MCPClientManager:
             await writer.wait_closed()
         except (TimeoutError, OSError) as exc:
             raise ConnectionError(
-                f"MCP server '{name}' unreachable at {host}:{port}: {exc}"
+                f"MCP server '{key}' unreachable at {host}:{port}: {exc}"
             ) from None
 
     @staticmethod
@@ -319,14 +381,21 @@ class MCPClientManager:
             log.error("MCP server name '%s' contains '__' (reserved delimiter), skipping", name)
             return
 
+        # Operate on a single state object throughout: get-or-create up front
+        # so the stale-entry guard and the post-handshake field assignments
+        # touch the same instance (PR #296 invariant 5: identity stability).
+        state = self._ensure_static_state(name)
+
         # Guard: tear down stale session/stack so we don't leak.  Checks both
-        # _sessions and _per_server_stacks because transport errors in the sync
-        # dispatch methods evict the session but leave the stack behind.
-        if name in self._sessions or name in self._per_server_stacks:
-            self._sessions.pop(name, None)
+        # session and stack because transport errors in the sync dispatch
+        # methods evict the session but leave the stack behind.  On a brand
+        # new entry both fields are None, so this branch is skipped.
+        if state.session is not None or state.stack is not None:
+            state.session = None
             await self._pre_close_streams(name)
-            old_stack = self._per_server_stacks.pop(name, None)
-            if old_stack:
+            old_stack = state.stack
+            state.stack = None
+            if old_stack is not None:
                 await self._safe_close_stack(old_stack)
 
         # Per-server exit stack for clean per-server lifecycle management
@@ -351,7 +420,7 @@ class MCPClientManager:
                 )
                 # Stash stream refs so _pre_close_streams can unblock anyio
                 # transport tasks before the cancel scope fires (SDK #2147).
-                self._server_streams[name] = (read, write)
+                state.streams = (read, write)
             else:
                 # Default: stdio transport
                 command = cfg.get("command", "")
@@ -368,7 +437,7 @@ class MCPClientManager:
                     env=env,
                 )
                 read, write = await stack.enter_async_context(stdio_client(params))
-                self._server_streams[name] = (read, write)
+                state.streams = (read, write)
         except asyncio.CancelledError:
             # Stray CancelledError from broken anyio cancel scope -- treat as
             # connection failure.  But if the task is genuinely being cancelled
@@ -441,11 +510,11 @@ class MCPClientManager:
             await self._safe_close_stack(stack)
             raise
 
-        self._per_server_stacks[name] = stack
+        state.stack = stack
         try:
             await asyncio.wait_for(session.initialize(), timeout=self._CONNECT_TIMEOUT)
         except asyncio.CancelledError:
-            self._per_server_stacks.pop(name, None)
+            state.stack = None
             task = asyncio.current_task()
             if task is not None and task.cancelling():
                 await self._pre_close_streams(name)
@@ -455,32 +524,30 @@ class MCPClientManager:
             await self._safe_close_stack(stack)
             raise TimeoutError(f"MCP handshake failed for '{name}'") from None
         except TimeoutError:
-            self._per_server_stacks.pop(name, None)
+            state.stack = None
             await self._pre_close_streams(name)
             await self._safe_close_stack(stack)
             raise TimeoutError(f"MCP handshake timed out after {self._CONNECT_TIMEOUT}s") from None
         except Exception:
-            self._per_server_stacks.pop(name, None)
+            state.stack = None
             await self._pre_close_streams(name)
             await self._safe_close_stack(stack)
             raise
-        self._sessions[name] = session
+        state.session = session
 
         # Check push notification support for each capability
         caps = session.get_server_capabilities()
 
         tools_cap = getattr(caps, "tools", None) if caps else None
-        self._supports_list_changed[name] = bool(getattr(tools_cap, "listChanged", False))
+        state.supports_list_changed = bool(getattr(tools_cap, "listChanged", False))
 
         resources_cap = getattr(caps, "resources", None) if caps else None
-        self._supports_resources[name] = resources_cap is not None
-        self._supports_resource_list_changed[name] = bool(
-            getattr(resources_cap, "listChanged", False)
-        )
+        state.supports_resources = resources_cap is not None
+        state.supports_resource_list_changed = bool(getattr(resources_cap, "listChanged", False))
 
         prompts_cap = getattr(caps, "prompts", None) if caps else None
-        self._supports_prompts[name] = prompts_cap is not None
-        self._supports_prompt_list_changed[name] = bool(getattr(prompts_cap, "listChanged", False))
+        state.supports_prompts = prompts_cap is not None
+        state.supports_prompt_list_changed = bool(getattr(prompts_cap, "listChanged", False))
 
         # Discover tools
         result = await session.list_tools()
@@ -488,7 +555,7 @@ class MCPClientManager:
         for tool in result.tools:
             server_tools.append(_mcp_to_openai(name, tool))
 
-        self._per_server_tools[name] = server_tools
+        state.tools = server_tools
         self._rebuild_tools()
 
         # Discover resources
@@ -521,7 +588,7 @@ class MCPClientManager:
                     }
                 )
             resource_count = len(server_resources)
-            self._per_server_resources[name] = server_resources
+            state.resources = server_resources
             self._rebuild_resources()
 
         # Discover prompts
@@ -547,15 +614,15 @@ class MCPClientManager:
                     }
                 )
             prompt_count = len(server_prompts)
-            self._per_server_prompts[name] = server_prompts
+            state.prompts = server_prompts
             self._rebuild_prompts()
 
         push_parts: list[str] = []
-        if self._supports_list_changed[name]:
+        if state.supports_list_changed:
             push_parts.append("tools")
-        if self._supports_resource_list_changed[name]:
+        if state.supports_resource_list_changed:
             push_parts.append("resources")
-        if self._supports_prompt_list_changed[name]:
+        if state.supports_prompt_list_changed:
             push_parts.append("prompts")
         push_status = f" (push: {','.join(push_parts)})" if push_parts else ""
         log.info(
@@ -586,8 +653,8 @@ class MCPClientManager:
         """
         new_tools: list[dict[str, Any]] = []
         new_map: dict[str, tuple[str, str]] = {}
-        for srv_name, srv_tools in self._per_server_tools.items():
-            for tool in srv_tools:
+        for srv_name, srv_state in self._static_servers.items():
+            for tool in srv_state.tools:
                 prefixed: str = tool["function"]["name"]
                 new_tools.append(tool)
                 # Extract original name from the mcp__server__original pattern
@@ -599,17 +666,21 @@ class MCPClientManager:
 
     async def _refresh_server_tools(self, name: str) -> tuple[list[str], list[str]]:
         """Re-fetch tools for one server.  Returns ``(added, removed)`` names."""
-        session = self._sessions.get(name)
-        if session is None:
+        state = self._static_servers.get(name)
+        if state is None or state.session is None:
             raise RuntimeError(f"MCP server '{name}' is not connected")
+        # Capture session locally — a concurrent transport-error eviction in
+        # call_tool_sync can clear state.session; reads after an await would
+        # raise AttributeError without this snapshot.
+        session = state.session
 
-        old_names = {t["function"]["name"] for t in self._per_server_tools.get(name, [])}
+        old_names = {t["function"]["name"] for t in state.tools}
 
         result = await session.list_tools()
         server_tools = [_mcp_to_openai(name, tool) for tool in result.tools]
         new_names = {t["function"]["name"] for t in server_tools}
 
-        self._per_server_tools[name] = server_tools
+        state.tools = server_tools
         self._rebuild_tools()
 
         added = sorted(new_names - old_names)
@@ -651,16 +722,18 @@ class MCPClientManager:
 
         for name in targets:
             try:
-                if name not in self._sessions:
+                state = self._static_servers.get(name)
+                if state is None or state.session is None:
                     # Attempt reconnect
                     cfg = self._server_configs.get(name)
                     if cfg:
                         log.info("Reconnecting MCP server '%s'", name)
                         await self._connect_one(name, cfg)
                         self._cb_record_success(name)
-                        new_names = [
-                            t["function"]["name"] for t in self._per_server_tools.get(name, [])
-                        ]
+                        post = self._static_servers.get(name)
+                        new_names = (
+                            [t["function"]["name"] for t in post.tools] if post is not None else []
+                        )
                         results[name] = (new_names, [])
                     continue
                 added, removed = await self._refresh_server(name)
@@ -703,8 +776,8 @@ class MCPClientManager:
         """
         new_resources: list[dict[str, Any]] = []
         new_map: dict[str, tuple[str, str]] = {}
-        for srv_name, srv_resources in self._per_server_resources.items():
-            for res in srv_resources:
+        for srv_name, srv_state in self._static_servers.items():
+            for res in srv_state.resources:
                 uri: str = res["uri"]
                 new_resources.append(res)
                 if res.get("template"):
@@ -719,8 +792,8 @@ class MCPClientManager:
                 new_map[uri] = (srv_name, uri)
         # Build template prefix map for URI expansion fallback
         new_prefixes: dict[str, tuple[str, str]] = {}
-        for srv_name, srv_resources in self._per_server_resources.items():
-            for res in srv_resources:
+        for srv_name, srv_state in self._static_servers.items():
+            for res in srv_state.resources:
                 if res.get("template"):
                     tmpl_uri = res["uri"]
                     brace = tmpl_uri.find("{")
@@ -755,11 +828,15 @@ class MCPClientManager:
 
     async def _refresh_server_resources(self, name: str) -> None:
         """Re-fetch resources for one server."""
-        if not self._supports_resources.get(name, False):
+        state = self._static_servers.get(name)
+        if state is None or not state.supports_resources:
             return
-        session = self._sessions.get(name)
-        if session is None:
+        if state.session is None:
             return
+        # Capture session locally — a concurrent transport-error eviction in
+        # call_tool_sync can clear state.session between awaits, which would
+        # turn the second list_resource_templates() call into AttributeError.
+        session = state.session
 
         server_resources: list[dict[str, Any]] = []
         res_result = await session.list_resources()
@@ -786,7 +863,7 @@ class MCPClientManager:
                 }
             )
 
-        self._per_server_resources[name] = server_resources
+        state.resources = server_resources
         self._rebuild_resources()
 
     # -- prompt refresh ------------------------------------------------------
@@ -798,8 +875,8 @@ class MCPClientManager:
         """
         new_prompts: list[dict[str, Any]] = []
         new_map: dict[str, tuple[str, str]] = {}
-        for srv_name, srv_prompts in self._per_server_prompts.items():
-            for prompt in srv_prompts:
+        for srv_name, srv_state in self._static_servers.items():
+            for prompt in srv_state.prompts:
                 prefixed: str = prompt["name"]
                 new_prompts.append(prompt)
                 new_map[prefixed] = (srv_name, prompt["original_name"])
@@ -809,11 +886,15 @@ class MCPClientManager:
 
     async def _refresh_server_prompts(self, name: str) -> None:
         """Re-fetch prompts for one server."""
-        if not self._supports_prompts.get(name, False):
+        state = self._static_servers.get(name)
+        if state is None or not state.supports_prompts:
             return
-        session = self._sessions.get(name)
-        if session is None:
+        if state.session is None:
             return
+        # Capture session locally — see _refresh_server_resources for the
+        # concurrent-eviction race this guards against. Single-await today,
+        # multi-await tomorrow; consistent capture-once idiom.
+        session = state.session
 
         server_prompts: list[dict[str, Any]] = []
         prompt_result = await session.list_prompts()
@@ -835,7 +916,7 @@ class MCPClientManager:
                 }
             )
 
-        self._per_server_prompts[name] = server_prompts
+        state.prompts = server_prompts
         self._rebuild_prompts()
 
         # Sync discovered prompts into governance storage
@@ -1030,14 +1111,15 @@ class MCPClientManager:
     def shutdown(self) -> None:
         """Close all MCP sessions and stop the background loop."""
         # Close all per-server stacks (transports + sessions)
-        if self._loop and self._per_server_stacks:
+        if self._loop and self._static_servers:
 
             async def _close_all_stacks() -> None:
                 # Pre-close streams to prevent anyio CPU busy-loop during teardown
-                for srv_name in list(self._server_streams):
+                for srv_name in list(self._static_servers):
                     await self._pre_close_streams(srv_name)
-                for stack in self._per_server_stacks.values():
-                    await self._safe_close_stack(stack)
+                for srv_state in self._static_servers.values():
+                    if srv_state.stack is not None:
+                        await self._safe_close_stack(srv_state.stack)
 
             future = asyncio.run_coroutine_threadsafe(_close_all_stacks(), self._loop)
             try:
@@ -1059,24 +1141,15 @@ class MCPClientManager:
             self._thread.join(timeout=5)
 
         # Clear all state
-        self._sessions.clear()
-        self._per_server_stacks.clear()
+        self._static_servers.clear()
         self._db_managed.clear()
         self._tools = []
         self._tool_map = {}
-        self._per_server_tools.clear()
-        self._supports_list_changed.clear()
         self._resources = []
         self._resource_map = {}
         self._template_prefixes = {}
-        self._per_server_resources.clear()
-        self._supports_resources.clear()
-        self._supports_resource_list_changed.clear()
         self._prompts = []
         self._prompt_map = {}
-        self._per_server_prompts.clear()
-        self._supports_prompts.clear()
-        self._supports_prompt_list_changed.clear()
         # Clear listener lists to release callback references
         self._listeners.clear()
         self._resource_listeners.clear()
@@ -1085,7 +1158,6 @@ class MCPClientManager:
         self._consecutive_failures.clear()
         self._circuit_open_until.clear()
         self._circuit_trip_count.clear()
-        self._server_streams.clear()
         self._last_notification_refresh.clear()
 
         log.info("MCP client shut down")
@@ -1125,11 +1197,12 @@ class MCPClientManager:
             self._server_configs.pop(name, None)
             return {"connected": False, "tools": 0, "resources": 0, "prompts": 0, "error": str(exc)}
 
+        state = self._static_servers.get(name)
         return {
-            "connected": name in self._sessions,
-            "tools": len(self._per_server_tools.get(name, [])),
-            "resources": len(self._per_server_resources.get(name, [])),
-            "prompts": len(self._per_server_prompts.get(name, [])),
+            "connected": state is not None and state.session is not None,
+            "tools": len(state.tools) if state else 0,
+            "resources": len(state.resources) if state else 0,
+            "prompts": len(state.prompts) if state else 0,
             "error": "",
         }
 
@@ -1162,20 +1235,25 @@ class MCPClientManager:
 
         async def _reconnect() -> None:
             self._cb_clear(name)
-            self._sessions.pop(name, None)
-            await self._pre_close_streams(name)
-            stack = self._per_server_stacks.pop(name, None)
-            if stack is not None:
-                await self._safe_close_stack(stack)
+            state = self._static_servers.get(name)
+            if state is not None:
+                state.session = None
+                await self._pre_close_streams(name)
+                old_stack = state.stack
+                state.stack = None
+                if old_stack is not None:
+                    await self._safe_close_stack(old_stack)
             try:
                 await self._connect_one(name, cfg)
             except Exception:
                 # Connect failed mid-reconnect — drop the stale per-server
                 # catalog so the merged tool/resource/prompt maps don't keep
                 # advertising entries with no live session behind them.
-                self._per_server_tools.pop(name, None)
-                self._per_server_resources.pop(name, None)
-                self._per_server_prompts.pop(name, None)
+                fail_state = self._static_servers.get(name)
+                if fail_state is not None:
+                    fail_state.tools = []
+                    fail_state.resources = []
+                    fail_state.prompts = []
                 self._rebuild_tools()
                 self._rebuild_resources()
                 self._rebuild_prompts()
@@ -1196,11 +1274,12 @@ class MCPClientManager:
         except Exception as exc:
             return {"connected": False, "tools": 0, "resources": 0, "prompts": 0, "error": str(exc)}
 
+        state = self._static_servers.get(name)
         return {
-            "connected": name in self._sessions,
-            "tools": len(self._per_server_tools.get(name, [])),
-            "resources": len(self._per_server_resources.get(name, [])),
-            "prompts": len(self._per_server_prompts.get(name, [])),
+            "connected": state is not None and state.session is not None,
+            "tools": len(state.tools) if state else 0,
+            "resources": len(state.resources) if state else 0,
+            "prompts": len(state.prompts) if state else 0,
             "error": "",
         }
 
@@ -1212,7 +1291,8 @@ class MCPClientManager:
 
         Returns True if the server was connected and successfully removed.
         """
-        was_connected = name in self._sessions
+        existing = self._static_servers.get(name)
+        was_connected = existing is not None and existing.session is not None
 
         # Remove from config to prevent reconnection
         self._server_configs.pop(name, None)
@@ -1221,20 +1301,16 @@ class MCPClientManager:
 
             async def _remove() -> None:
                 # Close session + transport via per-server stack
-                self._sessions.pop(name, None)
-                await self._pre_close_streams(name)
-                stack = self._per_server_stacks.pop(name, None)
-                if stack is not None:
-                    await self._safe_close_stack(stack)
+                state = self._static_servers.get(name)
+                if state is not None:
+                    state.session = None
+                    await self._pre_close_streams(name)
+                    stack = state.stack
+                    state.stack = None
+                    if stack is not None:
+                        await self._safe_close_stack(stack)
                 # Clean up per-server state (on the event loop thread)
-                self._per_server_tools.pop(name, None)
-                self._per_server_resources.pop(name, None)
-                self._per_server_prompts.pop(name, None)
-                self._supports_list_changed.pop(name, None)
-                self._supports_resources.pop(name, None)
-                self._supports_resource_list_changed.pop(name, None)
-                self._supports_prompts.pop(name, None)
-                self._supports_prompt_list_changed.pop(name, None)
+                self._static_servers.pop(name, None)
                 self._last_error.pop(name, None)
                 self._last_notification_refresh.pop(name, None)
                 self._cb_clear(name)
@@ -1250,16 +1326,7 @@ class MCPClientManager:
                 log.warning("Error removing MCP server '%s'", name, exc_info=True)
         else:
             # No event loop (tests / pre-start) — mutate directly
-            self._sessions.pop(name, None)
-            self._server_streams.pop(name, None)
-            self._per_server_tools.pop(name, None)
-            self._per_server_resources.pop(name, None)
-            self._per_server_prompts.pop(name, None)
-            self._supports_list_changed.pop(name, None)
-            self._supports_resources.pop(name, None)
-            self._supports_resource_list_changed.pop(name, None)
-            self._supports_prompts.pop(name, None)
-            self._supports_prompt_list_changed.pop(name, None)
+            self._static_servers.pop(name, None)
             self._last_error.pop(name, None)
             self._last_notification_refresh.pop(name, None)
             self._cb_clear(name)
@@ -1283,16 +1350,21 @@ class MCPClientManager:
 
     def get_server_status(self, name: str) -> dict[str, Any]:
         """Return live status for a single server, including config details."""
-        connected = name in self._sessions
+        state = self._static_servers.get(name)
+        connected = state is not None and state.session is not None
         cfg = self._server_configs.get(name, {})
         transport = cfg.get("type", "stdio")
         cb_deadline = self._circuit_open_until.get(name)
         cb_open = cb_deadline is not None and time.monotonic() < cb_deadline
+        # Inline predicate (instead of reusing ``connected``) so mypy narrows
+        # ``state`` for the attribute reads — a separate boolean wouldn't.
         return {
             "connected": connected,
-            "tools": len(self._per_server_tools.get(name, [])) if connected else 0,
-            "resources": len(self._per_server_resources.get(name, [])) if connected else 0,
-            "prompts": len(self._per_server_prompts.get(name, [])) if connected else 0,
+            "tools": len(state.tools) if state is not None and state.session is not None else 0,
+            "resources": (
+                len(state.resources) if state is not None and state.session is not None else 0
+            ),
+            "prompts": len(state.prompts) if state is not None and state.session is not None else 0,
             "error": self._last_error.get(name, ""),
             "transport": transport,
             "command": cfg.get("command", "") if transport == "stdio" else "",
@@ -1414,7 +1486,7 @@ class MCPClientManager:
 
     @property
     def server_count(self) -> int:
-        return len(self._sessions)
+        return sum(1 for s in self._static_servers.values() if s.session is not None)
 
     @property
     def error_count(self) -> int:
@@ -1471,7 +1543,8 @@ class MCPClientManager:
         except Exception as exc:
             self._cb_record_failure(server_name)
             raise RuntimeError(f"MCP server '{server_name}' reconnect failed: {exc}") from None
-        session = self._sessions.get(server_name)
+        state = self._static_servers.get(server_name)
+        session = state.session if state is not None else None
         if session is None:
             self._cb_record_failure(server_name)
             raise RuntimeError(f"MCP server '{server_name}' reconnect produced no session")
@@ -1511,7 +1584,8 @@ class MCPClientManager:
 
         self._cb_gate(server_name)
 
-        session = self._sessions.get(server_name)
+        state = self._static_servers.get(server_name)
+        session = state.session if state is not None else None
         if session is None:
             session = self._cb_auto_reconnect(server_name)
         assert self._loop is not None
@@ -1531,7 +1605,12 @@ class MCPClientManager:
             if not isinstance(exc, McpError):
                 self._cb_record_failure(server_name)
             if isinstance(exc, (BrokenPipeError, ConnectionResetError, EOFError)):
-                self._sessions.pop(server_name, None)
+                # Evict the session only — leave stack/streams behind so the
+                # stale-session-and-stack guard in _connect_one cleans them up
+                # on the next connect attempt.
+                evict = self._static_servers.get(server_name)
+                if evict is not None:
+                    evict.session = None
             raise
 
         self._cb_record_success(server_name)
@@ -1586,7 +1665,8 @@ class MCPClientManager:
 
         self._cb_gate(server_name)
 
-        session = self._sessions.get(server_name)
+        state = self._static_servers.get(server_name)
+        session = state.session if state is not None else None
         if session is None:
             session = self._cb_auto_reconnect(server_name)
         assert self._loop is not None
@@ -1602,7 +1682,12 @@ class MCPClientManager:
             if not isinstance(exc, McpError):
                 self._cb_record_failure(server_name)
             if isinstance(exc, (BrokenPipeError, ConnectionResetError, EOFError)):
-                self._sessions.pop(server_name, None)
+                # Evict the session only — leave stack/streams behind so the
+                # stale-session-and-stack guard in _connect_one cleans them up
+                # on the next connect attempt.
+                evict = self._static_servers.get(server_name)
+                if evict is not None:
+                    evict.session = None
             raise
 
         self._cb_record_success(server_name)
@@ -1636,7 +1721,8 @@ class MCPClientManager:
 
         self._cb_gate(server_name)
 
-        session = self._sessions.get(server_name)
+        state = self._static_servers.get(server_name)
+        session = state.session if state is not None else None
         if session is None:
             session = self._cb_auto_reconnect(server_name)
         assert self._loop is not None
@@ -1654,7 +1740,12 @@ class MCPClientManager:
             if not isinstance(exc, McpError):
                 self._cb_record_failure(server_name)
             if isinstance(exc, (BrokenPipeError, ConnectionResetError, EOFError)):
-                self._sessions.pop(server_name, None)
+                # Evict the session only — leave stack/streams behind so the
+                # stale-session-and-stack guard in _connect_one cleans them up
+                # on the next connect attempt.
+                evict = self._static_servers.get(server_name)
+                if evict is not None:
+                    evict.session = None
             raise
 
         self._cb_record_success(server_name)
