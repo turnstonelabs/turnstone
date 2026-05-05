@@ -8,7 +8,25 @@ import pytest
 
 if TYPE_CHECKING:
     from turnstone.core.mcp_client import MCPClientManager, StaticServerState
+    from turnstone.core.mcp_crypto import MCPTokenCipher
     from turnstone.core.oidc import OIDCConfig
+
+
+def make_mcp_token_cipher() -> MCPTokenCipher:
+    """Build a single-key MCP token cipher for tests.
+
+    Used by test files that need to exercise ``MCPTokenStore`` round-
+    trips without the lifespan-side configuration loader; centralised
+    here so the key/material defaults stay aligned across files.
+    """
+    import base64
+
+    from cryptography.fernet import Fernet
+
+    from turnstone.core.mcp_crypto import MCPTokenCipher, MCPTokenCipherConfig
+
+    raw = base64.urlsafe_b64decode(Fernet.generate_key())
+    return MCPTokenCipher(MCPTokenCipherConfig(keys=(raw,)))
 
 
 def _seed_static_state(mgr: MCPClientManager, name: str, **overrides: Any) -> StaticServerState:

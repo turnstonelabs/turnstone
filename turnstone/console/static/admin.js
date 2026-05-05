@@ -3323,6 +3323,12 @@ function _renderMcpServers(items) {
       '<button class="admin-btn-action" data-mcp-reconnect="' +
       escapeHtml(s.name) +
       '">reconnect</button>';
+    if (s.auth_type === "oauth_user") {
+      actionBtns +=
+        '<button class="admin-btn-action" data-mcp-oauth-connect="' +
+        escapeHtml(s.name) +
+        '">connect</button>';
+    }
     var actions = isConfig
       ? actionBtns
       : actionBtns +
@@ -3429,6 +3435,19 @@ function _renderMcpServers(items) {
         .catch(function () {
           showToast("Failed to reconnect " + name);
         });
+    });
+  });
+  el.querySelectorAll("[data-mcp-oauth-connect]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var name = this.getAttribute("data-mcp-oauth-connect");
+      // Open the OAuth /start endpoint in a new window so the redirect
+      // chain (AS → callback → return_url) doesn't displace the admin UI.
+      var url =
+        "/v1/api/mcp/oauth/start?server=" +
+        encodeURIComponent(name) +
+        "&return_url=" +
+        encodeURIComponent(window.location.href);
+      window.open(url, "_blank", "noopener");
     });
   });
   el.querySelectorAll("[data-mcp-delete]").forEach(function (btn) {

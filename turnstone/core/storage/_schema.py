@@ -607,7 +607,7 @@ mcp_servers = sa.Table(
     sa.Column("registry_name", sa.Text, nullable=True),
     sa.Column("registry_version", sa.Text, nullable=False, server_default=""),
     sa.Column("registry_meta", sa.Text, nullable=False, server_default="{}"),
-    # Per-(user, server) OAuth 2.1 — see docs/design/oauth-mcp.md §5.2.
+    # Per-(user, server) OAuth 2.1 columns.
     # `auth_type` is one of: 'none', 'static', 'oauth_user'.  The other
     # `oauth_*` columns are NULL when auth_type != 'oauth_user'.
     # `oauth_client_secret_ct` is Fernet ciphertext; never decrypted on
@@ -708,8 +708,8 @@ oidc_pending_states = sa.Table(
 
 # ---------------------------------------------------------------------------
 # MCP per-(user, server) OAuth tokens and pending authorization-flow state.
-# See docs/design/oauth-mcp.md §5.1.  No FKs at the schema level (matches
-# `oidc_*` tables; tests avoid orphan rows via fixtures).
+# No FKs at the schema level (matches `oidc_*` tables; tests avoid orphan
+# rows via fixtures).
 # ---------------------------------------------------------------------------
 
 mcp_user_tokens = sa.Table(

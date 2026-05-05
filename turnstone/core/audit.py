@@ -40,8 +40,17 @@ Action-name conventions (non-exhaustive — grep
                         clears a per-server OAuth client secret;
                         ``mcp_server.oauth.token_decrypt_failure`` from
                         ``MCPTokenStore.get_user_token`` when no
-                        installed key can decrypt a stored token).
-                        See ``docs/design/oauth-mcp.md`` §5.3.
+                        installed key can decrypt a stored token;
+                        ``mcp_server.oauth.consent_started`` /
+                        ``.consent_completed`` / ``.consent_failed`` for
+                        the per-user authorization-flow handlers;
+                        ``mcp_server.oauth.token_refreshed`` /
+                        ``.token_revoked`` from
+                        ``get_user_access_token`` when the
+                        refresh-grant exchange runs;
+                        ``mcp_server.oauth.dcr_registered`` when a
+                        client_id was provisioned dynamically against
+                        an AS that exposes ``registration_endpoint``).
 
 When adding a new namespace, prefer extending an existing prefix over
 inventing a synonym (e.g. ``mcp_server.refresh`` rather than
