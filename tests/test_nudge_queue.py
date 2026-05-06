@@ -128,6 +128,61 @@ class TestDropOldestByType:
         assert q.drop_oldest_by_type("target") is True
         assert q.pending() == [("target", "2"), ("target", "3")]
 
+    def test_drop_oldest_by_type_channel_filter(self):
+        """With ``channel`` set, drop walks only that channel.  Pairs with
+        :meth:`count_by_type(..., channel=...)` so producer-side soft caps
+        operate on a consistent entry set.
+        """
+        q = NudgeQueue()
+        q.enqueue("target", "user-1", "user")
+        q.enqueue("target", "any-1", "any")
+        q.enqueue("target", "any-2", "any")
+        # Drop the oldest "any"-channel target — leaves the user one
+        # untouched even though it's earlier in insertion order.
+        assert q.drop_oldest_by_type("target", channel="any") is True
+        assert q.pending() == [
+            ("target", "user-1"),
+            ("target", "any-2"),
+        ]
+        # And a channel with no matches returns False without touching
+        # the queue.
+        assert q.drop_oldest_by_type("target", channel="tool") is False
+        assert q.pending() == [
+            ("target", "user-1"),
+            ("target", "any-2"),
+        ]
+
+
+class TestCountByType:
+    def test_count_by_type_no_channel(self):
+        """Count across all channels with ``channel=None``."""
+        q = NudgeQueue()
+        q.enqueue("target", "1", "user")
+        q.enqueue("other", "x", "any")
+        q.enqueue("target", "2", "any")
+        q.enqueue("target", "3", "tool")
+        assert q.count_by_type("target") == 3
+        assert q.count_by_type("other") == 1
+        assert q.count_by_type("missing") == 0
+
+    def test_count_by_type_with_channel_filter(self):
+        """Filter narrows the count to one channel — used by producer-side
+        soft caps that pair with ``drop_oldest_by_type(..., channel=...)``.
+        """
+        q = NudgeQueue()
+        q.enqueue("target", "u-1", "user")
+        q.enqueue("target", "a-1", "any")
+        q.enqueue("target", "a-2", "any")
+        q.enqueue("target", "t-1", "tool")
+        assert q.count_by_type("target", channel="any") == 2
+        assert q.count_by_type("target", channel="user") == 1
+        assert q.count_by_type("target", channel="tool") == 1
+
+    def test_count_by_type_empty_queue(self):
+        q = NudgeQueue()
+        assert q.count_by_type("anything") == 0
+        assert q.count_by_type("anything", channel="any") == 0
+
 
 class TestPending:
     def test_pending_no_filter_returns_all_in_order(self):
