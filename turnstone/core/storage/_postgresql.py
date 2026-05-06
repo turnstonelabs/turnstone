@@ -1695,6 +1695,16 @@ class PostgreSQLBackend:
                 return None
             return dict(row._mapping)
 
+    def is_watch_active(self, watch_id: str) -> bool:
+
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(watches.c.active).where(watches.c.watch_id == watch_id)
+            ).fetchone()
+            if row is None:
+                return False
+            return bool(row[0])
+
     def list_watches_for_ws(self, ws_id: str) -> list[dict[str, Any]]:
 
         with self._conn() as conn:

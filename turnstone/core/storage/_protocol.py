@@ -928,6 +928,16 @@ class StorageBackend(Protocol):
         """Return watch dict or None."""
         ...
 
+    def is_watch_active(self, watch_id: str) -> bool:
+        """Return True iff the watch exists and its ``active`` flag is set.
+
+        Single-column read for hot paths that only need the active flag
+        (e.g. the watch-dispatch ``valid_until`` predicate) without
+        paying for the full row marshal that ``get_watch`` does.
+        Returns ``False`` if the watch row is missing.
+        """
+        ...
+
     def list_watches_for_ws(self, ws_id: str) -> list[dict[str, Any]]:
         """Return active watches for a workstream, ordered by created DESC."""
         ...

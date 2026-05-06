@@ -1392,7 +1392,7 @@ class ChatSession:
             :data:`_WATCH_QUEUE_SOFT_CAP` + drop-oldest-on-saturation,
             standing in for the deleted ``_watch_pending`` maxsize bound.
           - a ``valid_until`` predicate that re-checks
-            ``storage.get_watch(watch_id)["active"]`` at drain time so a
+            ``storage.is_watch_active(watch_id)`` at drain time so a
             cancelled watch's last splat doesn't ride out a future wake.
           - producer-side :func:`sanitize_payload` over the whole
             formatted message so steering-vector / control-char payloads
@@ -1427,15 +1427,13 @@ class ChatSession:
                 # Re-checked at drain time outside the queue lock — if
                 # the watch was cancelled between fire and drain, the
                 # entry gets dropped silently rather than splicing a
-                # stale result onto the user's next turn.
+                # stale result onto the user's next turn.  Single-column
+                # ``is_watch_active`` avoids the full-row marshal of
+                # ``get_watch`` on this hot path.
                 try:
-                    storage = get_storage()
-                    row = storage.get_watch(bound_watch_id)
+                    return get_storage().is_watch_active(bound_watch_id)
                 except Exception:
                     return False
-                if row is None:
-                    return False
-                return bool(row.get("active", False))
 
             nudge_queue.enqueue("watch_triggered", sanitized, "any", valid_until=_still_active)
 
