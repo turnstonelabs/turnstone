@@ -35,11 +35,21 @@ import mcp.types as mcp_types
 from mcp import ClientSession, McpError, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client
+from mcp.shared._httpx_utils import (
+    MCP_DEFAULT_SSE_READ_TIMEOUT,
+    MCP_DEFAULT_TIMEOUT,
+    McpHttpClientFactory,
+)
 
 from turnstone.core.config import load_config
 from turnstone.core.log import get_logger
+from turnstone.core.mcp_http_parsers import (
+    parse_www_authenticate_error,
+    parse_www_authenticate_scope,
+)
 from turnstone.core.mcp_oauth import (
     TokenLookupResult,
+    emit_insufficient_scope_audit,
     get_user_access_token_classified,
 )
 
@@ -79,6 +89,116 @@ def _validate_oauth_user_url(url: str) -> None:
     raise ValueError(
         "MCP servers with auth_type='oauth_user' must use https:// (loopback http:// excepted)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Pool dispatch auth introspection (response-hook carrier)
+# ---------------------------------------------------------------------------
+#
+# The MCP SDK's ``streamable_http`` transport raises
+# :class:`httpx.HTTPStatusError` inside ``_handle_post_request`` and the
+# enclosing ``post_writer`` swallows it (``mcp/client/streamable_http.py``
+# logger.exception path). The dispatcher then sees only
+# ``McpError(CONNECTION_CLOSED)`` with no status / headers preserved.
+# To recover the upstream 401/403 we plug into the SDK's documented
+# extension point — ``streamablehttp_client(httpx_client_factory=...)``
+# — and pass a factory that builds the ``httpx.AsyncClient`` with a
+# response hook. The hook fires after headers arrive but BEFORE
+# ``raise_for_status()`` runs, so the carrier is populated before the
+# SDK swallow.
+#
+# Forward-compat: ``streamablehttp_client`` is ``@deprecated`` in SDK
+# 1.27 in favour of ``streamable_http_client(http_client=...)`` which
+# accepts a pre-built client. The same factory pattern translates
+# 1:1 against the new entry point when we migrate.
+
+
+# Defensive cap on the number of scopes we report in
+# ``mcp_insufficient_scope`` audit/error payloads. Real ASes return
+# single-digit scope counts; the cap stops a malicious upstream from
+# bloating either surface via a thousand-token ``scope=`` value.
+_MAX_INSUFFICIENT_SCOPE_REPORTED = 32
+
+
+@dataclass
+class _AuthCapture:
+    """Carrier populated by the response hook on 4xx upstream responses."""
+
+    status: int | None = None
+    www_authenticate: str | None = None
+
+
+class _PoolDispatchRetryRequested(BaseException):  # noqa: N818
+    """Module-private signal: the auth_401 branch wants the sync caller to retry.
+
+    Inherits :class:`BaseException` (not ``Exception``) so that nothing in
+    the SDK / anyio path accidentally swallows it inside an ``except
+    Exception`` block. ``_dispatch_pool_sync`` is the only caller that
+    catches it and the only handler that re-issues the dispatch on a
+    fresh ``asyncio.Task`` via ``run_coroutine_threadsafe``.
+    """
+
+
+def _make_capturing_http_factory(capture: _AuthCapture) -> McpHttpClientFactory:
+    """Return an ``httpx`` factory that records 4xx auth signals into ``capture``.
+
+    The hook is ``async`` because :class:`httpx.AsyncClient` invokes
+    response hooks via ``await hook(response)`` — a sync function would
+    return ``None`` and ``await None`` raises ``TypeError`` inside the
+    SDK's :meth:`client.stream` call. Even though our work is purely
+    synchronous (read ``status_code`` and a header), the contract
+    requires an awaitable. The first attempt's hook would still
+    populate the carrier (the body runs before the ``await``), but the
+    ``TypeError`` poisons the SDK's anyio TaskGroup teardown so the
+    next ``streamablehttp_client(...)`` invocation surfaces a stray
+    ``CancelledError`` from inside its own scope. Empirically verified
+    via a minimal repro: a sync hook breaks back-to-back connects in
+    the same process; the async form does not.
+    """
+
+    async def _hook(response: httpx.Response) -> None:
+        # Only record on auth-relevant statuses to keep the carrier
+        # focused. ``capture`` is mutated in place; the dispatcher
+        # consults it after ``call_tool`` returns/raises. No I/O, no
+        # other awaits — the hook stays cancellation-safe.
+        #
+        # Use ``get_list(...)[0]`` rather than ``get(...)`` so a
+        # malicious upstream that emits multiple ``WWW-Authenticate``
+        # headers cannot inject auth-params into the parser via the
+        # comma-joined value httpx returns from ``get(...)``. Repeated
+        # headers join with ``, `` which the RFC 7235 tokenizer would
+        # otherwise consume as a continuation of the first challenge,
+        # silently folding attacker scopes into the parsed dict. We
+        # discard every challenge after the first; defence-in-depth
+        # mirror lives in ``parse_www_authenticate_bearer``.
+        status = response.status_code
+        if status in (401, 403):
+            capture.status = status
+            headers = response.headers.get_list("www-authenticate")
+            capture.www_authenticate = headers[0] if headers else None
+
+    def _factory(
+        headers: dict[str, str] | None = None,
+        timeout: httpx.Timeout | None = None,
+        auth: httpx.Auth | None = None,
+    ) -> httpx.AsyncClient:
+        kwargs: dict[str, Any] = {
+            "follow_redirects": True,
+            "event_hooks": {"response": [_hook]},
+        }
+        if timeout is None:
+            kwargs["timeout"] = httpx.Timeout(
+                MCP_DEFAULT_TIMEOUT, read=MCP_DEFAULT_SSE_READ_TIMEOUT
+            )
+        else:
+            kwargs["timeout"] = timeout
+        if headers is not None:
+            kwargs["headers"] = headers
+        if auth is not None:
+            kwargs["auth"] = auth
+        return httpx.AsyncClient(**kwargs)
+
+    return _factory
 
 
 # ---------------------------------------------------------------------------
@@ -156,9 +276,9 @@ class PoolEntryState:
     session: Any | None = None
     stack: AsyncExitStack | None = None
     streams: tuple[Any, Any] | None = None
-    # Catalog state — populated when Phase 6 wires per-user discovery in;
-    # left ``None`` here so 200-entry pools don't retain 600 empty list
-    # objects.
+    # Catalog state — populated lazily once per-user discovery wires
+    # in; left ``None`` here so 200-entry pools don't retain 600 empty
+    # list objects.
     tools: list[dict[str, Any]] | None = None
     resources: list[dict[str, Any]] | None = None
     prompts: list[dict[str, Any]] | None = None
@@ -501,10 +621,27 @@ class MCPClientManager:
         errors could mask the original exception.  CancelledError is caught
         explicitly because it is the primary failure mode (stray cancel from
         broken anyio scope) and is BaseException, not Exception.
+
+        ``BaseExceptionGroup`` is also caught: anyio's TaskGroup wraps any
+        unhandled task exception (e.g., the SDK's
+        ``HTTPStatusError`` raised inside ``post_writer``'s
+        ``tg.start_soon(handle_request_async)`` after a 401/403)
+        into a ``BaseExceptionGroup`` on ``__aexit__``. Without this catch
+        the auth-retry path's eager teardown would propagate the SDK's
+        own collected fallout.
+
+        The 5s ``asyncio.wait_for`` is a deliberate guard against
+        ``aclose()`` hanging on a broken stack (e.g., a never-completing
+        anyio task during teardown). The auth_401 retry runs on a
+        fresh :class:`asyncio.Task` scheduled via
+        :func:`asyncio.run_coroutine_threadsafe` (see
+        :meth:`_dispatch_pool_sync`), so this helper is never invoked
+        from inside an active cancellation context — ``wait_for``'s
+        own cancellation observation does not abort the aclose early.
         """
         try:
             await asyncio.wait_for(stack.aclose(), timeout=5)
-        except (Exception, asyncio.CancelledError):
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup):
             log.debug("Error closing AsyncExitStack; ignoring", exc_info=True)
 
     async def _safe_teardown_on_connect_failure(
@@ -785,6 +922,8 @@ class MCPClientManager:
         key: tuple[str, str],
         cfg: dict[str, Any],
         access_token: str,
+        *,
+        auth_capture: _AuthCapture | None = None,
     ) -> PoolEntryState:
         """Connect a single per-(user, server) pool entry.
 
@@ -795,8 +934,17 @@ class MCPClientManager:
         * ``Authorization: Bearer {access_token}`` injected into headers
           alongside any operator-supplied static headers.
         * No catalog discovery (tools / resources / prompts) and no
-          notification handler — those land in Phase 6 once per-user
-          catalog state is in place.
+          notification handler — those land later once per-user catalog
+          state is in place.
+
+        When ``auth_capture`` is supplied, the underlying ``httpx``
+        client is built via a factory whose response hook records 401/403
+        status + ``WWW-Authenticate`` into the carrier, recovering the
+        upstream auth signal that the SDK's ``post_writer`` would
+        otherwise swallow. Static-path callers
+        (:meth:`_connect_one`) MUST NOT pass this — the static path
+        must remain byte-identical, which means the SDK's default
+        ``create_mcp_http_client`` factory.
 
         MUST run on the mcp-loop. Caller holds ``entry.open_lock``.
         """
@@ -834,12 +982,16 @@ class MCPClientManager:
         headers: dict[str, str] = dict(cfg.get("headers") or {})
         headers["Authorization"] = f"Bearer {access_token}"
 
+        client_kwargs: dict[str, Any] = {"url": url, "headers": headers}
+        if auth_capture is not None:
+            client_kwargs["httpx_client_factory"] = _make_capturing_http_factory(auth_capture)
+
         stack = AsyncExitStack()
         await stack.__aenter__()
         try:
             await self._tcp_probe(key, url)
             read, write, _ = await asyncio.wait_for(
-                stack.enter_async_context(streamablehttp_client(url=url, headers=headers)),
+                stack.enter_async_context(streamablehttp_client(**client_kwargs)),
                 timeout=self._CONNECT_TIMEOUT,
             )
             entry.streams = (read, write)
@@ -1011,8 +1163,11 @@ class MCPClientManager:
     # -- failure classification (pool dispatch) ------------------------------
 
     def _classify_failure(
-        self, exc: BaseException
-    ) -> Literal["transport", "auth", "protocol", "other"]:
+        self,
+        exc: BaseException,
+        *,
+        capture: _AuthCapture | None = None,
+    ) -> Literal["transport", "auth_401", "auth_403", "protocol", "other"]:
         """Classify a dispatch-time exception for circuit-breaker gating.
 
         Only ``transport`` failures trip the per-server breaker. Auth
@@ -1020,16 +1175,24 @@ class MCPClientManager:
         breaker. Protocol errors (``McpError``) come from a healthy
         connection that rejected the request.
 
-        ``auth`` is detected via :class:`httpx.HTTPStatusError` since the
-        streamable-http transport surfaces upstream HTTP errors through
-        ``response.raise_for_status()``. ``McpError`` payloads do not
-        carry a clean status code; bare ``McpError`` therefore stays
-        ``protocol``.
+        Auth detection prefers ``capture.status`` (response-hook
+        introspection — the SDK swallows :class:`httpx.HTTPStatusError`
+        in its ``post_writer`` so the carrier is the only signal that
+        reaches us in production). The ``HTTPStatusError`` fallback is
+        defense-in-depth for the non-SDK refresh path
+        (:func:`turnstone.core.mcp_oauth._refresh_and_persist`) where
+        ``httpx`` errors propagate directly.
         """
+        if capture is not None and capture.status == 401:
+            return "auth_401"
+        if capture is not None and capture.status == 403:
+            return "auth_403"
         if isinstance(exc, httpx.HTTPStatusError):
             status = exc.response.status_code
-            if status in (401, 403):
-                return "auth"
+            if status == 401:
+                return "auth_401"
+            if status == 403:
+                return "auth_403"
         if isinstance(exc, McpError):
             return "protocol"
         if isinstance(exc, BrokenPipeError | ConnectionResetError | EOFError | TimeoutError):
@@ -1046,10 +1209,9 @@ class MCPClientManager:
 
         Every entry sourced from ``_static_servers`` is, by construction,
         NOT ``auth_type='oauth_user'`` — :func:`_db_servers_to_config`
-        strips oauth_user rows on the way in. Phase 5 pool catalogs do
-        not contribute to ``_tool_map``; pool tools become reachable
-        via ``_tool_map`` only when Phase 7 (catalog scoping) lands
-        per-user catalogs.
+        strips oauth_user rows on the way in. Pool catalogs do not
+        contribute to ``_tool_map`` today; pool tools become reachable
+        via ``_tool_map`` only once per-user catalog scoping lands.
         """
         new_tools: list[dict[str, Any]] = []
         new_map: dict[str, tuple[str, str]] = {}
@@ -1912,14 +2074,14 @@ class MCPClientManager:
     def is_mcp_tool(self, func_name: str) -> bool:
         """Check whether *func_name* belongs to an MCP server.
 
-        Phase 5 caveat: only static-path tools (``auth_type ∈ {none,
-        static}``) populate ``_tool_map``; pool tools become reachable
-        via this method only when Phase 7 (catalog scoping) lands
-        per-user catalogs. Until then, pool dispatch is reachable from
-        production callers like ``ChatSession._exec_mcp_tool`` only when
-        the LLM produces a ``mcp__{server}__{tool}`` name that bypasses
-        ``is_mcp_tool``-style gating, or via direct ``call_tool_sync``
-        with a known prefixed name (the path the new pool tests use).
+        Caveat: only static-path tools (``auth_type ∈ {none, static}``)
+        populate ``_tool_map``; pool tools become reachable via this
+        method only once per-user catalog scoping lands. Until then,
+        pool dispatch is reachable from production callers like
+        ``ChatSession._exec_mcp_tool`` only when the LLM produces a
+        ``mcp__{server}__{tool}`` name that bypasses ``is_mcp_tool``-
+        style gating, or via direct ``call_tool_sync`` with a known
+        prefixed name (the path the new pool tests use).
         """
         return func_name in self._tool_map
 
@@ -2025,6 +2187,17 @@ class MCPClientManager:
         When ``user_id`` is supplied AND the resolved server's ``auth_type``
         is ``oauth_user``, dispatch goes through the per-(user, server)
         pool. Otherwise the call takes the byte-identical static path.
+
+        Pool-path 401/403 handling: the SDK's ``post_writer`` swallows
+        ``httpx.HTTPStatusError``; we recover the upstream auth signal
+        via a response-hook carrier on the per-dispatch
+        ``httpx.AsyncClient``. A 401 triggers one refresh-and-retry
+        with ``force_refresh=True``; persistent 401 emits
+        ``mcp_consent_required``. A 403 with
+        ``WWW-Authenticate: error="insufficient_scope"`` emits
+        ``mcp_insufficient_scope`` with the parsed scope set. Other
+        403s emit ``mcp_tool_call_forbidden``. Auth failures NEVER
+        trip the per-server breaker.
         """
         mapping = self._tool_map.get(func_name)
         server_name: str | None = None
@@ -2033,10 +2206,10 @@ class MCPClientManager:
             server_name, original_name = mapping
 
         # Pool dispatch is gated on (a) caller passing user_id and
-        # (b) the server row being auth_type=oauth_user. The Phase 5
-        # tool-map only carries static-path entries; pool catalogs land
-        # in Phase 7. Consequently, in Phase 5 a pool dispatch reaches
-        # this branch only when the caller supplied func_name as
+        # (b) the server row being auth_type=oauth_user. The current
+        # tool-map only carries static-path entries; pool catalogs are
+        # not merged in. Consequently, a pool dispatch reaches this
+        # branch only when the caller supplied func_name as
         # ``mcp__{server}__{tool}`` and we resolve auth_type via storage.
         if user_id and self._app_state is not None and self._storage is not None:
             pool_target = self._resolve_pool_target(func_name, server_name, original_name)
@@ -2098,7 +2271,7 @@ class MCPClientManager:
         """Resolve ``(server_name, original_name, server_row)`` for pool dispatch.
 
         Returns ``None`` when the call should fall through to the static
-        path. Phase 5: pool catalogs do not contribute to ``_tool_map``,
+        path. Pool catalogs do not contribute to ``_tool_map`` today,
         so a pool tool is invoked by passing the prefixed name
         ``mcp__{server}__{tool}`` directly. ``mcp_servers.auth_type``
         confirms pool eligibility.
@@ -2155,10 +2328,86 @@ class MCPClientManager:
         (consent required, key mismatch, etc.). ``server_row`` is the
         row already resolved by ``_resolve_pool_target`` and is reused
         verbatim by ``_dispatch_pool`` to skip a duplicate DB hop.
+
+        Retry-on-401: the 401 branch in :meth:`_dispatch_pool` raises
+        :class:`_PoolDispatchRetryRequested` after refreshing the
+        bearer. Catching the signal HERE — at the sync boundary — means
+        the retry is scheduled via a fresh
+        :func:`asyncio.run_coroutine_threadsafe` call, which runs the
+        retry coroutine in a brand-new :class:`asyncio.Task` with no
+        inherited anyio cancel-scope state from the prior connect's
+        ``streamablehttp_client`` TaskGroup. An in-task retry inherits
+        that scope state across :meth:`asyncio.Task.uncancel` and
+        ``loop.create_task`` and surfaces ``CancelledError`` from inside
+        the retry's own anyio scope. The retry-count ceiling is one;
+        callers see consent_required if both attempts 401.
+
+        The ``timeout`` is a wall-clock budget across both attempts —
+        the retry's ``future.result`` window is reduced by however long
+        the first attempt consumed before raising
+        :class:`_PoolDispatchRetryRequested`. Without this, a slow
+        first attempt followed by a stuck retry could double the
+        caller-observed timeout.
+        """
+        assert self._loop is not None
+        start = time.monotonic()
+        try:
+            return self._run_pool_dispatch_attempt(
+                retry_count=0,
+                timeout=timeout,
+                original_timeout=timeout,
+                user_id=user_id,
+                server_name=server_name,
+                original_name=original_name,
+                arguments=arguments,
+                server_row=server_row,
+            )
+        except _PoolDispatchRetryRequested:
+            # auth_401: refresh already happened on the prior task;
+            # re-issue on a fresh task so the retry's anyio scope
+            # state is independent of the prior connect's TaskGroup
+            # teardown.
+            remaining = max(1, int(timeout - (time.monotonic() - start)))
+            return self._run_pool_dispatch_attempt(
+                retry_count=1,
+                timeout=remaining,
+                original_timeout=timeout,
+                user_id=user_id,
+                server_name=server_name,
+                original_name=original_name,
+                arguments=arguments,
+                server_row=server_row,
+            )
+
+    def _run_pool_dispatch_attempt(
+        self,
+        *,
+        retry_count: int,
+        timeout: int,
+        original_timeout: int,
+        user_id: str,
+        server_name: str,
+        original_name: str,
+        arguments: dict[str, Any],
+        server_row: dict[str, Any],
+    ) -> str:
+        """Schedule one ``_dispatch_pool`` attempt and wait for the result.
+
+        Split out of :meth:`_dispatch_pool_sync` so the two retry
+        attempts share scheduling + timeout-bookkeeping without
+        re-introducing the ``for retry_count in (0, 1)`` loop (which
+        gave both attempts the full ``timeout`` and required an
+        unreachable ``RuntimeError`` fallback).
+
+        ``original_timeout`` is the wall-clock budget the caller
+        requested; ``timeout`` is what's left for this specific
+        attempt. The ``TimeoutError`` message reports the original so
+        callers see the budget they set, not the trimmed window.
         """
         assert self._loop is not None
         future = asyncio.run_coroutine_threadsafe(
             self._dispatch_pool(
+                retry_count=retry_count,
                 user_id=user_id,
                 server_name=server_name,
                 original_name=original_name,
@@ -2172,7 +2421,7 @@ class MCPClientManager:
         except concurrent.futures.TimeoutError:
             future.cancel()
             self._cb_record_failure(server_name)
-            raise TimeoutError(f"MCP tool call timed out after {timeout}s") from None
+            raise TimeoutError(f"MCP tool call timed out after {original_timeout}s") from None
 
     async def _dispatch_pool(
         self,
@@ -2182,6 +2431,7 @@ class MCPClientManager:
         original_name: str,
         arguments: dict[str, Any],
         server_row: dict[str, Any],
+        retry_count: int = 0,
     ) -> str:
         """Pool-side coroutine: resolve token, connect-or-reuse, dispatch.
 
@@ -2190,6 +2440,18 @@ class MCPClientManager:
         is supplied by ``_resolve_pool_target`` so this path doesn't
         re-issue the ``mcp_servers`` lookup; it's also pre-validated to
         have ``auth_type='oauth_user'``.
+
+        ``retry_count`` is supplied by :meth:`_dispatch_pool_sync` and
+        bounds the auth_401 refresh-and-retry to one re-issue. The first
+        attempt (``retry_count == 0``) refreshes the token via
+        ``force_refresh=True`` and raises
+        :class:`_PoolDispatchRetryRequested` so the sync caller schedules
+        the retry on a fresh :class:`asyncio.Task` (an in-task retry
+        inherits anyio cancel-scope state from the prior connect's
+        TaskGroup teardown and surfaces ``CancelledError`` from inside
+        the retry's own anyio scope; the cross-task hop avoids that).
+        At the ceiling (``retry_count == 1``) the auth_401 branch emits
+        ``mcp_consent_required`` instead.
         """
         if self._app_state is None:
             raise RuntimeError("Pool dispatch requires set_app_state() to have been called")
@@ -2199,8 +2461,17 @@ class MCPClientManager:
         # gate runs only AFTER we have a usable access token; that way a
         # spurious cooldown-expired probe never lands here without ending
         # in either a real success or a real transport failure.
+        #
+        # ``retry_count >= 1`` forces the AS round-trip: the previous
+        # attempt's auth_401 branch evicted the session and signalled
+        # this retry; the local cached token is the one the AS just
+        # rejected, so reading it back without ``force_refresh=True``
+        # would re-attempt with the same (rejected) bearer.
         lookup: TokenLookupResult = await get_user_access_token_classified(
-            app_state=self._app_state, user_id=user_id, server_name=server_name
+            app_state=self._app_state,
+            user_id=user_id,
+            server_name=server_name,
+            force_refresh=retry_count > 0,
         )
         if lookup.kind == "missing":
             return _structured_error(
@@ -2258,6 +2529,13 @@ class MCPClientManager:
         key = (user_id, server_name)
         entry = await self._ensure_pool_entry(key)
 
+        # First attempt — fresh capture per dispatch so a prior
+        # dispatch's 401 cannot leak into this one's classification.
+        # Even though ``open_lock`` is held across ``call_tool``,
+        # allocating per-call (rather than per-entry) protects against
+        # future concurrent-multiplex regressions if the lock scope
+        # ever shrinks.
+        capture = _AuthCapture()
         try:
             result = await self._dispatch_pool_with_entry(
                 entry=entry,
@@ -2266,23 +2544,48 @@ class MCPClientManager:
                 access_token=access_token,
                 original_name=original_name,
                 arguments=arguments,
+                auth_capture=capture,
             )
         except BaseException as exc:
-            classification = self._classify_failure(exc)
-            if classification == "auth":
-                # 401/403 from the upstream — pool-entry-only, never
-                # affects the breaker. Drop the cached session so the
-                # next dispatch re-authenticates with a fresh token.
-                evict = self._user_pool_entries.get(key)
-                if evict is not None:
-                    evict.session = None
-                log.debug("mcp_pool.auth_failure", exc_info=exc)
-                raise
+            classification = self._classify_failure(exc, capture=capture)
+            if classification == "auth_401":
+                self._evict_session(key)
+                if retry_count == 0:
+                    # 401 on the initial attempt: signal the sync caller
+                    # to re-issue on a fresh :class:`asyncio.Task`. The
+                    # retry's :meth:`_dispatch_pool` invocation runs the
+                    # token lookup with ``force_refresh=True`` (the
+                    # ``retry_count > 0`` branch above), guaranteeing
+                    # the bearer attached to the retry's connect is
+                    # different from the one the AS just rejected. The
+                    # cross-task hop avoids the in-task anyio
+                    # cancel-scope inheritance that surfaces a
+                    # ``CancelledError`` from inside the retry's own
+                    # ``streamablehttp_client`` TaskGroup — see
+                    # :meth:`_dispatch_pool_sync` for the architectural
+                    # rationale.
+                    log.debug("mcp_pool.auth_401_initial", exc_info=exc)
+                    raise _PoolDispatchRetryRequested from None
+                # retry_count == 1 — refreshed bearer also rejected;
+                # emit consent_required so the user/operator re-grants.
+                log.debug("mcp_pool.auth_401_retry_failed", exc_info=exc)
+                return _structured_error(
+                    code="mcp_consent_required",
+                    server=server_name,
+                    detail="Refreshed token still rejected. Re-consent required.",
+                )
+            if classification == "auth_403":
+                self._evict_session(key)
+                log.debug("mcp_pool.auth_403", exc_info=exc)
+                return await self._handle_auth_403(
+                    user_id=user_id,
+                    server_name=server_name,
+                    server_row=server_row,
+                    capture=capture,
+                )
             if classification == "transport":
                 self._cb_record_failure(server_name)
-                evict = self._user_pool_entries.get(key)
-                if evict is not None:
-                    evict.session = None
+                self._evict_session(key)
                 log.debug("mcp_pool.transport_failure", exc_info=exc)
                 raise
             # protocol / other — don't trip the breaker.
@@ -2290,6 +2593,63 @@ class MCPClientManager:
 
         self._cb_record_success(server_name)
         return result
+
+    def _evict_session(self, key: tuple[str, str]) -> None:
+        """Drop the cached session on a pool entry. Stack/streams left for reconnect.
+
+        Auth/transport branches both call this — the next connect's
+        ``_connect_one_pool`` tears down the stale stack lazily via the
+        stale-entry guard at the top of the method. Closing eagerly
+        from here is incorrect under cancellation: ``stack.aclose()``
+        must run inside the same anyio scope it was entered in, which
+        the next connect arranges.
+        """
+        evict = self._user_pool_entries.get(key)
+        if evict is not None:
+            evict.session = None
+
+    async def _handle_auth_403(
+        self,
+        *,
+        user_id: str,
+        server_name: str,
+        server_row: dict[str, Any],
+        capture: _AuthCapture,
+    ) -> str:
+        """Map a 403 + WWW-Authenticate into a structured error.
+
+        ``error="insufficient_scope"`` becomes ``mcp_insufficient_scope``
+        with the parsed ``scope=...`` set so the dashboard renderer
+        can construct an authorize URL with the union of original +
+        new scopes — re-consenting with the original scopes alone
+        would loop because the AS would re-issue the same insufficient
+        token. Other 403s become a generic ``mcp_tool_call_forbidden``
+        with no retry; the user lacks permission and a step-up
+        wouldn't help.
+        """
+        header = capture.www_authenticate or ""
+        error_token = parse_www_authenticate_error(header)
+        if error_token == "insufficient_scope":
+            scopes = parse_www_authenticate_scope(header)
+            scopes = scopes[:_MAX_INSUFFICIENT_SCOPE_REPORTED]
+            await emit_insufficient_scope_audit(
+                app_state=self._app_state,
+                user_id=user_id,
+                server_name=server_name,
+                server_row=server_row,
+                scopes=scopes,
+            )
+            return _structured_error(
+                code="mcp_insufficient_scope",
+                server=server_name,
+                detail=("Tool requires elevated scopes. Re-consent flow with new scopes required."),
+                scopes_required=list(scopes),
+            )
+        return _structured_error(
+            code="mcp_tool_call_forbidden",
+            server=server_name,
+            detail="Tool call forbidden by upstream policy.",
+        )
 
     async def _dispatch_pool_with_entry(
         self,
@@ -2300,15 +2660,23 @@ class MCPClientManager:
         access_token: str,
         original_name: str,
         arguments: dict[str, Any],
+        auth_capture: _AuthCapture,
     ) -> str:
-        """Acquire ``entry.open_lock`` only across connect-or-reuse, then dispatch.
+        """Hold ``entry.open_lock`` across connect-or-reuse AND ``call_tool``.
 
-        Releasing ``open_lock`` before ``call_tool`` lets two concurrent
-        tool calls from the SAME user against the SAME server multiplex
-        on a shared :class:`mcp.ClientSession` (request_id-correlated by
-        the SDK). The eviction interlock now uses ``entry.in_flight``:
-        eviction skips entries with in-flight calls so a long-running
-        ``call_tool`` can't have its session yanked mid-await.
+        Lock held across ``call_tool`` because the per-dispatch
+        ``_AuthCapture`` is keyed off the httpx event hook; releasing
+        would let a concurrent same-(user, server) dispatch overwrite
+        the carrier mid-flight, attributing one caller's auth failure
+        to another. Holding the lock serialises same-(user, server)
+        calls — acceptable because that contention scenario is rare
+        in practice (ChatSession dispatches sequentially and per-
+        (user, server) parallelism is not a production requirement).
+
+        ``entry.in_flight`` accounting is preserved for the eviction
+        interlock — it's belt-and-braces here since ``open_lock.locked()``
+        already signals "do not evict", but the in-flight counter
+        remains the source of truth for :meth:`_close_pool_entry_if_idle`.
         """
         async with entry.open_lock:
             entry.last_used = time.monotonic()
@@ -2316,15 +2684,17 @@ class MCPClientManager:
             session = entry.session
             if session is None:
                 # Lazy connect — also covers post-eviction recovery.
-                fresh = await self._connect_one_pool(key, cfg, access_token)
+                fresh = await self._connect_one_pool(
+                    key, cfg, access_token, auth_capture=auth_capture
+                )
                 session = fresh.session
                 if session is None:
                     raise RuntimeError(f"Pool connect for {key!r} produced no session")
             entry.in_flight += 1
-        try:
-            result = await session.call_tool(original_name, arguments)
-        finally:
-            entry.in_flight -= 1
+            try:
+                result = await session.call_tool(original_name, arguments)
+            finally:
+                entry.in_flight -= 1
         return _decode_tool_result(result)
 
     # -- resource read -------------------------------------------------------
@@ -2482,13 +2852,24 @@ def _decode_tool_result(result: Any) -> str:
     return output
 
 
-def _structured_error(*, code: str, server: str, detail: str) -> str:
+def _structured_error(
+    *,
+    code: str,
+    server: str,
+    detail: str,
+    scopes_required: list[str] | None = None,
+) -> str:
     """Encode a pool-dispatch failure as a JSON string.
 
     Returned to the agent through ``_exec_mcp_tool`` so the LLM can
     narrate "tool unavailable, consent required" rather than crashing
-    the workstream. Schema mirrors RFC §6 (consent UX) plus the
-    decrypt-failure code introduced in RFC §5.3.
+    the workstream. Schema covers ``mcp_consent_required``,
+    decrypt-failure (``mcp_token_undecryptable_key_unknown``), and the
+    ``mcp_insufficient_scope`` step-up shape.
+
+    ``scopes_required`` is omitted from the payload when ``None`` —
+    the dashboard renderer keys on its presence to construct an
+    authorize URL with the union of original + new scopes.
 
     Operator-actionable encryption-key fingerprints are intentionally
     NOT included in this payload: they are already captured server-side
@@ -2496,14 +2877,14 @@ def _structured_error(*, code: str, server: str, detail: str) -> str:
     to the LLM (and through it to the model provider) would be
     unnecessary disclosure.
     """
-    payload: dict[str, Any] = {
-        "error": {
-            "code": code,
-            "server": server,
-            "detail": detail,
-        }
+    err: dict[str, Any] = {
+        "code": code,
+        "server": server,
+        "detail": detail,
     }
-    return json.dumps(payload)
+    if scopes_required is not None:
+        err["scopes_required"] = scopes_required
+    return json.dumps({"error": err})
 
 
 def _pool_cfg_from_row(row: dict[str, Any]) -> dict[str, Any]:

@@ -26,7 +26,6 @@ import concurrent.futures
 import contextlib
 import hashlib
 import json
-import re
 import secrets
 import time
 import urllib.parse
@@ -39,6 +38,7 @@ import httpx
 from turnstone.core.audit import record_audit
 from turnstone.core.log import get_logger
 from turnstone.core.mcp_crypto import MCPTokenDecryptError
+from turnstone.core.mcp_http_parsers import parse_www_authenticate_bearer
 from turnstone.core.oauth_ssrf import (
     OAuthSSRFError,
     sanitize_log_text,
@@ -127,53 +127,19 @@ class ASMetadata:
 # ---------------------------------------------------------------------------
 
 
-_PRM_RESOURCE_METADATA_KEY_RE = re.compile(
-    r"resource_metadata\s*=\s*",
-    re.IGNORECASE,
-)
-
-
-def _parse_quoted_string(text: str, start: int) -> tuple[str, int] | None:
-    """Parse an RFC 7230 ``quoted-string`` starting at ``text[start]``.
-
-    Returns ``(value, end_index)`` where ``end_index`` is the index just
-    past the closing quote, or ``None`` if the input is malformed (no
-    opening quote, unterminated string).
-
-    Handles ``\\"`` and ``\\\\`` escapes per RFC 7230 §3.2.6 — the prior
-    naive ``([^"]+)`` regex truncated the URL at the first unescaped quote
-    and silently dropped backslash escapes from the value.
-    """
-    if start >= len(text) or text[start] != '"':
-        return None
-    out: list[str] = []
-    i = start + 1
-    while i < len(text):
-        ch = text[i]
-        if ch == "\\" and i + 1 < len(text):
-            out.append(text[i + 1])
-            i += 2
-            continue
-        if ch == '"':
-            return "".join(out), i + 1
-        out.append(ch)
-        i += 1
-    return None
-
-
 def _parse_prm_url_from_www_authenticate(header: str) -> str | None:
     """Extract ``resource_metadata`` URL from a ``WWW-Authenticate: Bearer`` header.
 
     Returns the URL string or ``None`` when the header lacks the param,
-    is malformed, or terminates the quoted-string prematurely.
+    is malformed, or terminates the quoted-string prematurely. Delegates
+    to :func:`parse_www_authenticate_bearer` so quoted-string handling
+    (RFC 7230 §3.2.6 backslash escapes) and the multi-challenge
+    defence-in-depth guard live in one place.
     """
     if not header:
         return None
-    for match in _PRM_RESOURCE_METADATA_KEY_RE.finditer(header):
-        parsed = _parse_quoted_string(header, match.end())
-        if parsed is not None:
-            return parsed[0]
-    return None
+    params = parse_www_authenticate_bearer(header)
+    return params.get("resource_metadata") or None
 
 
 async def _fetch_prm_issuer(
@@ -1145,8 +1111,8 @@ class TokenLookupResult:
     rejected" — three states that the ``Optional[str]``-returning
     :func:`get_user_access_token` collapses to ``None``. The
     distinction matters because they map to different user-facing
-    errors (RFC §5.3 forbids emitting ``mcp_consent_required`` on a
-    decrypt failure).
+    errors — emitting ``mcp_consent_required`` on a decrypt failure
+    would be wrong (the user can't fix it; only an operator can).
     """
 
     kind: Literal["token", "missing", "decrypt_failure", "refresh_failed"] = "missing"
@@ -1177,11 +1143,12 @@ async def get_user_access_token(*, app_state: Any, user_id: str, server_name: st
 
 
 async def get_user_access_token_classified(
-    *, app_state: Any, user_id: str, server_name: str
+    *, app_state: Any, user_id: str, server_name: str, force_refresh: bool = False
 ) -> TokenLookupResult:
     """Tagged token lookup with refresh-on-expiry.
 
-    Walks the §1.5 / RFC §6 state machine and returns a tagged result so
+    Walks the token-lookup state machine (token / missing /
+    decrypt_failure / refresh_failed) and returns a tagged result so
     the dispatcher can map each failure mode to the right user-facing
     error.
 
@@ -1196,11 +1163,27 @@ async def get_user_access_token_classified(
     surviving local caller then serializes against other nodes via
     the cluster lock. The re-read inside the locked block collapses
     both contention windows.
+
+    ``force_refresh=True`` bypasses the local freshness check and
+    forces an AS round-trip — used by the dispatch path when the
+    upstream AS rejected a token our cache still considered fresh
+    (e.g., AS-side revocation). Concurrent ``force_refresh=True``
+    callers still collapse to one round-trip via the dual-layer lock:
+    the second caller sees ``last_refreshed > t_lock_request_started``
+    and reuses the freshly-refreshed token.
     """
     token_store: MCPTokenStore | None = getattr(app_state, "mcp_token_store", None)
     if token_store is None:
         log.debug("mcp_server.oauth.token_store_unconfigured")
         return TokenLookupResult(kind="missing")
+
+    # Captured BEFORE we acquire any lock so the inside-lock guard can
+    # tell whether another caller refreshed under contention. Truncated
+    # to seconds because ``last_refreshed`` storage has second-precision
+    # ISO8601 — comparing microsecond-precision against second-precision
+    # would race when the refresh and the contention occur in the same
+    # wall-clock second.
+    t_lock_request_started = datetime.now(UTC).replace(microsecond=0)
 
     try:
         plain = await asyncio.to_thread(token_store.get_user_token, user_id, server_name)
@@ -1219,7 +1202,7 @@ async def get_user_access_token_classified(
         return TokenLookupResult(kind="missing")
 
     expires_at = plain.get("expires_at")
-    if not _token_needs_refresh(expires_at):
+    if not force_refresh and not _token_needs_refresh(expires_at):
         return TokenLookupResult(kind="token", token=plain["access_token"])
 
     storage = _get_storage(app_state)
@@ -1272,8 +1255,20 @@ async def get_user_access_token_classified(
         if plain2 is None:
             return TokenLookupResult(kind="missing")
         expires_at2 = plain2.get("expires_at")
+        # Reuse the freshly-refreshed token under two conditions:
+        #  1. ``force_refresh=False`` and the cached token is still fresh
+        #     (existing fast path).
+        #  2. ``force_refresh=True`` BUT another same-key caller already
+        #     refreshed under contention since we started waiting for the
+        #     lock. ``last_refreshed`` is the storage-side replacement
+        #     timestamp; if it advanced past ``t_lock_request_started``,
+        #     we lost the race and should reuse rather than refresh again.
         if not _token_needs_refresh(expires_at2):
-            return TokenLookupResult(kind="token", token=plain2["access_token"])
+            if not force_refresh:
+                return TokenLookupResult(kind="token", token=plain2["access_token"])
+            last_refreshed = _parse_iso_to_utc(plain2.get("last_refreshed") or "")
+            if last_refreshed is not None and last_refreshed >= t_lock_request_started:
+                return TokenLookupResult(kind="token", token=plain2["access_token"])
         refresh_value2 = plain2.get("refresh_token")
         if not refresh_value2:
             await asyncio.to_thread(token_store.delete_user_token, user_id, server_name)
@@ -1413,7 +1408,7 @@ async def _refresh_and_persist(
     if not isinstance(new_access, str) or not new_access:
         raise MCPOAuthRefreshFailed("refresh response missing access_token")
 
-    # RFC 6749 §6 — the AS MAY omit ``refresh_token`` from the refresh
+    # RFC 6749 section 6 — the AS MAY omit ``refresh_token`` from the refresh
     # response. Most production ASes (Google, default Auth0, default
     # Okta) do not rotate the refresh token; clearing the column on
     # every refresh would force the user to re-consent every hour.
@@ -1531,6 +1526,35 @@ async def _audit_event(
         )
     except Exception:
         log.debug("mcp_server.oauth.audit_emit_failed", action=action, exc_info=True)
+
+
+async def emit_insufficient_scope_audit(
+    *,
+    app_state: Any,
+    user_id: str,
+    server_name: str,
+    server_row: dict[str, Any],
+    scopes: tuple[str, ...],
+) -> None:
+    """Emit ``mcp_server.oauth.insufficient_scope_emitted`` audit event.
+
+    Best-effort: :func:`_audit_event` already swallows storage / write
+    failures internally so audit emission never breaks dispatch.
+    Operators tracking step-up patterns consume this via the standard
+    audit log. Called by the pool dispatcher after classifying a 403
+    ``WWW-Authenticate: error="insufficient_scope"``.
+    """
+    if app_state is None:
+        return
+    server_id = str(server_row.get("server_id") or "") if server_row else ""
+    await _audit_event(
+        app_state,
+        server_id=server_id,
+        user_id=user_id,
+        action="mcp_server.oauth.insufficient_scope_emitted",
+        server_name=server_name,
+        detail={"scopes_required": list(scopes)},
+    )
 
 
 # ---------------------------------------------------------------------------
