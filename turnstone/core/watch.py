@@ -195,6 +195,48 @@ def format_watch_message(
     return "\n".join(lines)
 
 
+def build_watch_reminder(
+    name: str,
+    command: str,
+    output: str,
+    poll_count: int,
+    max_polls: int,
+    elapsed_secs: float,
+    stop_on: str | None,
+    is_final: bool,
+    reason: str,
+) -> dict[str, Any]:
+    """Build a structured ``watch_triggered`` reminder dict.
+
+    Returns a dict with ``{type, text, watch_name, command, poll_count,
+    max_polls, is_final}`` so the frontend can render a structured
+    ``.msg.watch-result`` card with command preview + poll counter
+    instead of a plain advisory bubble.  The ``text`` field is the
+    formatted body (same content :func:`format_watch_message` produces)
+    so compaction / channel adapters / ``_apply_reminders_for_provider``
+    keep seeing the human-readable shell output as before.
+    """
+    return {
+        "type": "watch_triggered",
+        "text": format_watch_message(
+            name=name,
+            command=command,
+            output=output,
+            poll_count=poll_count,
+            max_polls=max_polls,
+            elapsed_secs=elapsed_secs,
+            stop_on=stop_on,
+            is_final=is_final,
+            reason=reason,
+        ),
+        "watch_name": name,
+        "command": command,
+        "poll_count": poll_count,
+        "max_polls": max_polls,
+        "is_final": is_final,
+    }
+
+
 def format_interval(secs: float) -> str:
     """Human-readable duration (e.g. ``'5m'``, ``'1h30m'``)."""
     if secs < 60:
@@ -227,7 +269,7 @@ class WatchRunner:
         *,
         check_interval: float = 15.0,
         tool_timeout: float = 30.0,
-        restore_fn: Callable[[str], Callable[[str, str], None] | None] | None = None,
+        restore_fn: Callable[[str], Callable[[dict[str, Any], str], None] | None] | None = None,
     ) -> None:
         self._storage = storage
         self._node_id = node_id
@@ -235,7 +277,7 @@ class WatchRunner:
         self._tool_timeout = tool_timeout
         self._restore_fn = restore_fn
 
-        self._dispatch_fns: dict[str, Callable[[str, str], None]] = {}
+        self._dispatch_fns: dict[str, Callable[[dict[str, Any], str], None]] = {}
         self._dispatch_lock = threading.Lock()
 
         self._stop_event = threading.Event()
@@ -260,14 +302,17 @@ class WatchRunner:
 
     # -- Dispatch function registry ------------------------------------------
 
-    def set_dispatch_fn(self, ws_id: str, fn: Callable[[str, str], None]) -> None:
+    def set_dispatch_fn(self, ws_id: str, fn: Callable[[dict[str, Any], str], None]) -> None:
         """Register a per-workstream dispatch fn.
 
-        The fn signature is ``(message, watch_id)`` — the runner passes
+        The fn signature is ``(reminder, watch_id)`` — the runner passes
         the originating ``watch_id`` so dispatch closures can capture
         per-watch metadata (e.g. a ``valid_until`` predicate that
         re-checks ``storage.is_watch_active(watch_id)`` before
-        delivering a stale entry).
+        delivering a stale entry).  ``reminder`` is the structured dict
+        returned by :func:`build_watch_reminder` — ``text`` carries the
+        formatted body, the remaining fields ride as queue-entry
+        metadata so the frontend can render a ``.msg.watch-result`` card.
         """
         with self._dispatch_lock:
             self._dispatch_fns[ws_id] = fn
@@ -276,7 +321,7 @@ class WatchRunner:
         with self._dispatch_lock:
             self._dispatch_fns.pop(ws_id, None)
 
-    def get_dispatch_fn(self, ws_id: str) -> Callable[[str, str], None] | None:
+    def get_dispatch_fn(self, ws_id: str) -> Callable[[dict[str, Any], str], None] | None:
         """Public accessor for the registered dispatch fn (used by
         server-side restore paths to thread the closure through
         ``WatchRunner.restore_fn`` after the workstream is rehydrated).
@@ -388,7 +433,7 @@ class WatchRunner:
                 except (ValueError, TypeError):
                     pass  # elapsed stays 0.0
 
-            message = format_watch_message(
+            reminder = build_watch_reminder(
                 name=watch_row["name"],
                 command=command,
                 output=output,
@@ -399,7 +444,7 @@ class WatchRunner:
                 is_final=is_final,
                 reason=reason,
             )
-            self._dispatch_result(ws_id, message, watch_id)
+            self._dispatch_result(ws_id, reminder, watch_id)
 
         log.debug(
             "watch_runner.polled",
@@ -434,14 +479,20 @@ class WatchRunner:
         except Exception as exc:
             return f"[command failed: {exc}]", -1
 
-    def _dispatch_result(self, ws_id: str, message: str, watch_id: str) -> None:
-        """Deliver a watch result to the owning workstream."""
+    def _dispatch_result(self, ws_id: str, reminder: dict[str, Any], watch_id: str) -> None:
+        """Deliver a watch result to the owning workstream.
+
+        ``reminder`` is the structured dict produced by
+        :func:`build_watch_reminder` — ``text`` is the formatted body
+        (matched by the dispatch closure's :func:`sanitize_payload`
+        pass) and the optional fields ride as queue-entry metadata.
+        """
         with self._dispatch_lock:
             fn = self._dispatch_fns.get(ws_id)
 
         if fn is not None:
             try:
-                fn(message, watch_id)
+                fn(reminder, watch_id)
                 return
             except Exception:
                 log.exception("watch_runner.dispatch_error", extra={"ws_id": ws_id})
@@ -451,7 +502,7 @@ class WatchRunner:
             try:
                 restored_fn = self._restore_fn(ws_id)
                 if restored_fn is not None:
-                    restored_fn(message, watch_id)
+                    restored_fn(reminder, watch_id)
                     return
             except Exception:
                 log.exception("watch_runner.restore_error", extra={"ws_id": ws_id})
