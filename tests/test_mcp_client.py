@@ -397,6 +397,217 @@ class TestMCPClientManager:
         mgr = MCPClientManager({})
         mgr.shutdown()  # should be a no-op
 
+    # -- Phase 7: per-user catalog scoping ---------------------------------
+
+    def test_is_mcp_tool_user_id_default_none_unchanged(self):
+        """Sanity: default ``user_id=None`` answers static-only.
+
+        The legacy single-arg call still works, and unknown names still
+        return False — Phase 7 adds an optional keyword without
+        rewriting the static-path semantics.
+        """
+        mgr = MCPClientManager({})
+        mgr._tool_map["mcp__static__list"] = ("static", "list")
+        # Legacy single-arg call still works.
+        assert mgr.is_mcp_tool("mcp__static__list") is True
+        assert mgr.is_mcp_tool("mcp__static__list", user_id=None) is True
+        assert mgr.is_mcp_tool("nonexistent") is False
+        assert mgr.is_mcp_tool("nonexistent", user_id=None) is False
+
+    def test_is_mcp_tool_user_keyed_pool_tool(self):
+        """A name visible only via ``_user_tool_map`` resolves only for
+        the matching ``user_id``.
+
+        Verifies the new branch: ``_tool_map`` miss + ``user_id`` hit.
+        """
+        mgr = MCPClientManager({})
+        mgr._user_tool_map["user-1"] = {
+            "mcp__pool-srv__do": ("pool-srv", "do"),
+        }
+        # Visible to user-1.
+        assert mgr.is_mcp_tool("mcp__pool-srv__do", user_id="user-1") is True
+        # Invisible to None caller (admin / web-search backend resolution).
+        assert mgr.is_mcp_tool("mcp__pool-srv__do", user_id=None) is False
+        # Invisible to a different user.
+        assert mgr.is_mcp_tool("mcp__pool-srv__do", user_id="user-2") is False
+
+    def test_is_mcp_tool_static_wins_for_any_user(self):
+        """Static-path tools are visible regardless of ``user_id`` —
+        the merged view is ``static ∪ user-pool``."""
+        mgr = MCPClientManager({})
+        mgr._tool_map["mcp__static__list"] = ("static", "list")
+        # Even for an unknown user, a static tool is still reachable —
+        # static-path is process-global.
+        assert mgr.is_mcp_tool("mcp__static__list", user_id="user-1") is True
+        assert mgr.is_mcp_tool("mcp__static__list", user_id="anybody") is True
+
+    def test_get_tools_user_id_none_returns_static_only(self):
+        """``get_tools(user_id=None)`` returns the global static catalog.
+
+        Pool tools are NEVER included in the default-arg view — that's
+        the legacy contract every pre-Phase-7 caller relies on.
+        """
+        mgr = MCPClientManager({})
+        mgr._tools = [_fake_openai_tool("mcp__static__list")]
+        # Seed a pool entry that should NOT appear in the default view.
+        from turnstone.core.mcp_client import PoolEntryState
+
+        entry = PoolEntryState(key=("user-1", "pool-srv"), open_lock=MagicMock())
+        entry.tools = [_fake_openai_tool("mcp__pool-srv__do")]
+        mgr._user_pool_entries[("user-1", "pool-srv")] = entry
+
+        tools = mgr.get_tools()
+        names = [t["function"]["name"] for t in tools]
+        assert names == ["mcp__static__list"]
+
+    def test_get_tools_user_id_merges_pool(self):
+        """``get_tools(user_id='user-1')`` merges static + that user's pool tools.
+
+        Other users' pool entries MUST NOT leak into the result —
+        privacy / RBAC invariant.
+        """
+        from turnstone.core.mcp_client import PoolEntryState
+
+        mgr = MCPClientManager({})
+        mgr._tools = [_fake_openai_tool("mcp__static__list")]
+        e1 = PoolEntryState(key=("user-1", "pool-srv"), open_lock=MagicMock())
+        e1.tools = [_fake_openai_tool("mcp__pool-srv__do")]
+        e2 = PoolEntryState(key=("user-2", "pool-srv"), open_lock=MagicMock())
+        e2.tools = [_fake_openai_tool("mcp__pool-srv__other")]
+        mgr._user_pool_entries[("user-1", "pool-srv")] = e1
+        mgr._user_pool_entries[("user-2", "pool-srv")] = e2
+        # Production invariant: ``_connect_one_pool`` /
+        # ``_refresh_pool_server_tools`` / ``_evict_session`` /
+        # ``_close_pool_entry_if_idle`` all call ``_rebuild_user_tool_map``
+        # immediately after mutating ``_user_pool_entries``. Tests that
+        # seed pool entries directly must mirror that invariant —
+        # ``get_tools(user_id=...)`` reads from the ``_user_tools``
+        # snapshot (built by ``_rebuild_user_tool_map``), never iterating
+        # ``_user_pool_entries`` directly.
+        mgr._rebuild_user_tool_map("user-1")
+        mgr._rebuild_user_tool_map("user-2")
+
+        u1_names = [t["function"]["name"] for t in mgr.get_tools(user_id="user-1")]
+        assert sorted(u1_names) == ["mcp__pool-srv__do", "mcp__static__list"]
+
+        u2_names = [t["function"]["name"] for t in mgr.get_tools(user_id="user-2")]
+        assert sorted(u2_names) == ["mcp__pool-srv__other", "mcp__static__list"]
+
+        # Default still global-only — unaffected by either user's entries.
+        default_names = [t["function"]["name"] for t in mgr.get_tools()]
+        assert default_names == ["mcp__static__list"]
+
+    def test_get_tools_user_id_returns_copies(self):
+        """Mirror existing ``test_get_tools_returns_copy``: caller mutation
+        of the returned list MUST NOT affect the manager's catalog."""
+        from turnstone.core.mcp_client import PoolEntryState
+
+        mgr = MCPClientManager({})
+        mgr._tools = [_fake_openai_tool("mcp__static__a")]
+        entry = PoolEntryState(key=("user-1", "pool-srv"), open_lock=MagicMock())
+        entry.tools = [_fake_openai_tool("mcp__pool-srv__b")]
+        mgr._user_pool_entries[("user-1", "pool-srv")] = entry
+        # See note in ``test_get_tools_user_id_merges_pool``.
+        mgr._rebuild_user_tool_map("user-1")
+
+        tools = mgr.get_tools(user_id="user-1")
+        assert len(tools) == 2
+        tools.clear()
+        # Re-fetch — original catalog unchanged.
+        assert len(mgr.get_tools(user_id="user-1")) == 2
+
+    def test_get_tools_user_with_none_tools_skipped(self):
+        """A pool entry that hasn't completed discovery (``entry.tools is None``)
+        contributes no tools — the merged view skips it cleanly."""
+        from turnstone.core.mcp_client import PoolEntryState
+
+        mgr = MCPClientManager({})
+        mgr._tools = [_fake_openai_tool("mcp__static__a")]
+        # Brand-new pool entry, discovery not yet run.
+        entry = PoolEntryState(key=("user-1", "pool-srv"), open_lock=MagicMock())
+        assert entry.tools is None
+        mgr._user_pool_entries[("user-1", "pool-srv")] = entry
+        # Rebuild observes ``entry.tools is None`` and skips this entry.
+        mgr._rebuild_user_tool_map("user-1")
+
+        names = [t["function"]["name"] for t in mgr.get_tools(user_id="user-1")]
+        assert names == ["mcp__static__a"]
+
+    def test_rebuild_user_tool_map_populates(self):
+        """``_rebuild_user_tool_map`` materializes the per-user index from
+        pool entries owned by that user."""
+        from turnstone.core.mcp_client import PoolEntryState
+
+        mgr = MCPClientManager({})
+        entry = PoolEntryState(key=("user-1", "pool-srv"), open_lock=MagicMock())
+        entry.tools = [_fake_openai_tool("mcp__pool-srv__do")]
+        mgr._user_pool_entries[("user-1", "pool-srv")] = entry
+
+        mgr._rebuild_user_tool_map("user-1")
+        assert mgr._user_tool_map["user-1"] == {"mcp__pool-srv__do": ("pool-srv", "do")}
+        # Sibling _user_tools cache (bug-1 fix) MUST be populated alongside
+        # the map — otherwise get_tools(user_id="user-1") would silently
+        # return the static-only view despite is_mcp_tool returning True.
+        assert mgr._user_tools["user-1"] == [_fake_openai_tool("mcp__pool-srv__do")]
+
+    def test_rebuild_user_tool_map_drops_empty_user(self):
+        """Rebuilding for a user with no pool entries removes the key
+        rather than retaining an empty-dict sentinel."""
+        from turnstone.core.mcp_client import PoolEntryState
+
+        mgr = MCPClientManager({})
+        entry = PoolEntryState(key=("user-1", "pool-srv"), open_lock=MagicMock())
+        entry.tools = [_fake_openai_tool("mcp__pool-srv__do")]
+        mgr._user_pool_entries[("user-1", "pool-srv")] = entry
+        mgr._rebuild_user_tool_map("user-1")
+        assert "user-1" in mgr._user_tool_map
+        assert "user-1" in mgr._user_tools
+
+        # Drop the entry, rebuild — user_id key should be removed from BOTH
+        # the map and the sibling tool list (bug-1 fix). A drop in only one
+        # would leave get_tools and is_mcp_tool out of sync.
+        mgr._user_pool_entries.clear()
+        mgr._rebuild_user_tool_map("user-1")
+        assert "user-1" not in mgr._user_tool_map
+        assert "user-1" not in mgr._user_tools
+
+    def test_rebuild_user_tool_map_isolates_users(self):
+        """Rebuilding for ``user-1`` MUST NOT touch ``user-2``'s entry."""
+        from turnstone.core.mcp_client import PoolEntryState
+
+        mgr = MCPClientManager({})
+        e1 = PoolEntryState(key=("user-1", "pool-srv"), open_lock=MagicMock())
+        e1.tools = [_fake_openai_tool("mcp__pool-srv__one")]
+        e2 = PoolEntryState(key=("user-2", "pool-srv"), open_lock=MagicMock())
+        e2.tools = [_fake_openai_tool("mcp__pool-srv__two")]
+        mgr._user_pool_entries[("user-1", "pool-srv")] = e1
+        mgr._user_pool_entries[("user-2", "pool-srv")] = e2
+
+        mgr._rebuild_user_tool_map("user-1")
+        mgr._rebuild_user_tool_map("user-2")
+        assert mgr._user_tool_map["user-1"] == {"mcp__pool-srv__one": ("pool-srv", "one")}
+        assert mgr._user_tool_map["user-2"] == {"mcp__pool-srv__two": ("pool-srv", "two")}
+
+        # Clear user-1's entry only; rebuild user-1; user-2 must remain.
+        mgr._user_pool_entries.pop(("user-1", "pool-srv"))
+        mgr._rebuild_user_tool_map("user-1")
+        assert "user-1" not in mgr._user_tool_map
+        assert mgr._user_tool_map["user-2"] == {"mcp__pool-srv__two": ("pool-srv", "two")}
+
+    def test_rebuild_user_tool_map_does_not_touch_static(self):
+        """Invariant 1: per-user rebuild must NOT mutate ``_tool_map``."""
+        from turnstone.core.mcp_client import PoolEntryState
+
+        mgr = MCPClientManager({})
+        mgr._tool_map["mcp__static__list"] = ("static", "list")
+        entry = PoolEntryState(key=("user-1", "pool-srv"), open_lock=MagicMock())
+        entry.tools = [_fake_openai_tool("mcp__pool-srv__do")]
+        mgr._user_pool_entries[("user-1", "pool-srv")] = entry
+
+        before = dict(mgr._tool_map)
+        mgr._rebuild_user_tool_map("user-1")
+        assert mgr._tool_map == before
+
 
 # ---------------------------------------------------------------------------
 # Session integration (mock MCP client)
@@ -597,6 +808,84 @@ class TestSessionIntegration:
         assert "MCP tool error" in output
         assert "server crashed" in output
 
+    # -- Phase 7: per-user catalog scoping ---------------------------------
+
+    def test_session_passes_user_id_to_get_tools(self, tmp_db):
+        """ChatSession threads its ``user_id`` into ``get_tools`` so the
+        merged static + pool view is scoped to the session's user."""
+        mock_mcp = MagicMock()
+        mock_mcp.get_tools.return_value = [_fake_openai_tool()]
+        self._make_session(mcp_client=mock_mcp, user_id="user-7")
+        mock_mcp.get_tools.assert_called_with(user_id="user-7")
+
+    def test_session_get_tools_empty_user_id_passes_none(self, tmp_db):
+        """Sentinel ``user_id=""`` (CLI / service / unknown) collapses to
+        ``user_id=None`` so the static-only view is returned."""
+        mock_mcp = MagicMock()
+        mock_mcp.get_tools.return_value = [_fake_openai_tool()]
+        self._make_session(mcp_client=mock_mcp, user_id="")
+        mock_mcp.get_tools.assert_called_with(user_id=None)
+
+    def test_session_passes_user_id_to_add_listener(self, tmp_db):
+        """ChatSession registers its tool-change listener under its own
+        ``user_id`` so pool-only changes for OTHER users do not fire it."""
+        mock_mcp = MagicMock()
+        mock_mcp.get_tools.return_value = [_fake_openai_tool()]
+        self._make_session(mcp_client=mock_mcp, user_id="user-7")
+        # ``add_listener`` was called with ``user_id="user-7"``.
+        listener_calls = mock_mcp.add_listener.call_args_list
+        assert listener_calls, "ChatSession did not register a tool listener"
+        first_call = listener_calls[0]
+        assert first_call.kwargs.get("user_id") == "user-7"
+
+    def test_session_close_removes_listener_with_same_user_id(self, tmp_db):
+        """R4 critical: register and remove MUST agree on ``user_id`` —
+        the listener identity is ``(user_id, callback)``."""
+        mock_mcp = MagicMock()
+        mock_mcp.get_tools.return_value = [_fake_openai_tool()]
+        session = self._make_session(mcp_client=mock_mcp, user_id="user-7")
+
+        session.close()
+        # ``remove_listener`` must be called with the same ``user_id``.
+        remove_calls = mock_mcp.remove_listener.call_args_list
+        assert remove_calls, "ChatSession.close did not unregister a tool listener"
+        first_remove = remove_calls[0]
+        assert first_remove.kwargs.get("user_id") == "user-7"
+        # And the callback identity must match what was registered.
+        registered_cb = mock_mcp.add_listener.call_args_list[0].args[0]
+        removed_cb = first_remove.args[0]
+        assert registered_cb is removed_cb
+
+    def test_session_unknown_tool_lists_user_scoped_catalog(self, tmp_db):
+        """The "Unknown tool" error message lists tools the session can
+        actually invoke — drawn from the merged user-scoped catalog,
+        not the manager's private static-only ``_tool_map``."""
+        mock_mcp = MagicMock()
+        # Pretend the user's merged view contains a static + pool entry.
+        mock_mcp.get_tools.return_value = [
+            _fake_openai_tool("mcp__static__list"),
+            _fake_openai_tool("mcp__pool-srv__do"),
+        ]
+        mock_mcp.is_mcp_tool.return_value = False
+        session = self._make_session(mcp_client=mock_mcp, user_id="user-7")
+        # Reset the call counter so we observe only the _prepare_tool call.
+        mock_mcp.get_tools.reset_mock()
+
+        tc = {
+            "id": "call_unknown",
+            "function": {"name": "no_such_tool", "arguments": "{}"},
+        }
+        prepared = session._prepare_tool(tc)
+        assert "error" in prepared
+        # The error mentions both static and pool tools — proves we're
+        # consulting the merged catalog rather than ``_tool_map``.
+        assert "mcp__static__list" in prepared["error"]
+        assert "mcp__pool-srv__do" in prepared["error"]
+        # And the catalog request was scoped to this session's user.
+        assert any(
+            call.kwargs.get("user_id") == "user-7" for call in mock_mcp.get_tools.call_args_list
+        )
+
 
 # ---------------------------------------------------------------------------
 # Server name validation
@@ -793,6 +1082,75 @@ class TestListeners:
         mgr = MCPClientManager({})
         mgr.add_listener(lambda: 1 / 0)  # will raise ZeroDivisionError
         mgr._rebuild_tools()  # should not raise
+
+    # -- Phase 7: user-keyed listener fan-out ------------------------------
+
+    def test_add_listener_records_user_id(self):
+        """``add_listener`` stores ``(user_id, callback)`` tuples — the
+        listener identity carries the user_id."""
+        mgr = MCPClientManager({})
+        cb_admin = lambda: None  # noqa: E731
+        cb_user = lambda: None  # noqa: E731
+        mgr.add_listener(cb_admin)  # default: user_id=None (admin)
+        mgr.add_listener(cb_user, user_id="user-1")
+        assert (None, cb_admin) in mgr._listeners
+        assert ("user-1", cb_user) in mgr._listeners
+
+    def test_remove_listener_requires_matching_user_id(self):
+        """Removing with a different ``user_id`` must NOT remove the
+        original registration — listener identity is the pair."""
+        mgr = MCPClientManager({})
+        calls: list[int] = []
+        cb = lambda: calls.append(1)  # noqa: E731
+        mgr.add_listener(cb, user_id="user-1")
+
+        # Try to remove with the wrong user_id — should be a no-op.
+        mgr.remove_listener(cb, user_id="user-2")
+        # The user-1 listener should still be live.
+        mgr._notify_user_tool_listeners("user-1")
+        assert calls == [1]
+
+        # Now remove with the right user_id.
+        mgr.remove_listener(cb, user_id="user-1")
+        mgr._notify_user_tool_listeners("user-1")
+        assert calls == [1]  # not invoked again
+
+    def test_static_change_fires_all_listeners(self):
+        """``_rebuild_tools`` (static-path change) fires ALL registered
+        listeners — admin + every user. RFC §3.3."""
+        mgr = MCPClientManager({})
+        admin_calls: list[int] = []
+        u1_calls: list[int] = []
+        u2_calls: list[int] = []
+        mgr.add_listener(lambda: admin_calls.append(1))
+        mgr.add_listener(lambda: u1_calls.append(1), user_id="user-1")
+        mgr.add_listener(lambda: u2_calls.append(1), user_id="user-2")
+        _seed_static_state(mgr, "a", tools=[_fake_openai_tool("mcp__a__x")])
+        mgr._rebuild_tools()
+        assert admin_calls == [1]
+        assert u1_calls == [1]
+        assert u2_calls == [1]
+
+    def test_user_tool_listeners_only_fire_for_matching_user(self):
+        """``_notify_user_tool_listeners('user-1')`` fires admin (None)
+        and user-1 listeners; user-2's listener is silent."""
+        mgr = MCPClientManager({})
+        admin_calls: list[int] = []
+        u1_calls: list[int] = []
+        u2_calls: list[int] = []
+        mgr.add_listener(lambda: admin_calls.append(1))
+        mgr.add_listener(lambda: u1_calls.append(1), user_id="user-1")
+        mgr.add_listener(lambda: u2_calls.append(1), user_id="user-2")
+
+        mgr._notify_user_tool_listeners("user-1")
+        assert admin_calls == [1]
+        assert u1_calls == [1]
+        assert u2_calls == []
+
+        mgr._notify_user_tool_listeners("user-2")
+        assert admin_calls == [1, 1]
+        assert u1_calls == [1]
+        assert u2_calls == [1]
 
 
 class TestServerNames:

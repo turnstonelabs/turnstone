@@ -173,3 +173,50 @@ class TestResolveClient:
     def test_unknown_backend_returns_none(self):
         client = resolve_web_search_client("typo_backend", tavily_key="key")
         assert client is None
+
+    def test_resolve_web_search_client_rejects_oauth_user_backend(self):
+        """A web_search backend pointing at an ``auth_type=oauth_user``
+        MCP server MUST be rejected at boot — per-node web_search
+        cannot carry per-user tokens, so resolving the backend would
+        guarantee a 401-on-call instead of a clean disablement.
+
+        Phase 7 invariant 8 corollary: pool tools are user-scoped;
+        every entry point that lacks per-user identity (web_search
+        boot resolver, eval harness, CLI default) MUST refuse them
+        rather than silently produce a broken client.
+
+        Verified by reverting the ``server_auth_type(...) == 'oauth_user'``
+        guard in ``resolve_web_search_client``: the resolver returns
+        an ``MCPSearchClient`` whose ``call_tool_sync`` would surface
+        a 401 / consent_required structured error on every search.
+        """
+        mcp = MagicMock()
+        mcp.is_mcp_tool.return_value = True  # name resolves
+        mcp.server_auth_type.return_value = "oauth_user"
+        client = resolve_web_search_client(
+            "mcp:oauth-search:search", tavily_key=None, mcp_client=mcp
+        )
+        assert client is None, (
+            "oauth_user-backed web_search backend resolved to a non-None client; "
+            "boot-time guard missing or regressed."
+        )
+        # Per-turn callers must read from the in-memory cache, never
+        # the SQL helper — perf regression guard.
+        mcp.server_auth_type.assert_called_with("oauth-search")
+        assert not mcp._lookup_server_row.called, (
+            "resolver issued a SQL roundtrip via _lookup_server_row; "
+            "per-turn web_search backend resolution must use the "
+            "in-memory server_auth_type accessor."
+        )
+
+    def test_resolve_web_search_client_accepts_static_backend(self):
+        """Static-path (``auth_type=none`` or ``static``) MCP backends
+        still resolve cleanly — the new guard ONLY rejects oauth_user.
+        """
+        mcp = MagicMock()
+        mcp.is_mcp_tool.return_value = True
+        mcp.server_auth_type.return_value = None
+        client = resolve_web_search_client(
+            "mcp:static-search:search", tavily_key=None, mcp_client=mcp
+        )
+        assert isinstance(client, MCPSearchClient)

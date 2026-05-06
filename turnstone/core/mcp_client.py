@@ -119,6 +119,16 @@ def _validate_oauth_user_url(url: str) -> None:
 # bloating either surface via a thousand-token ``scope=`` value.
 _MAX_INSUFFICIENT_SCOPE_REPORTED = 32
 
+# Defensive cap on the number of tools we accept from any single MCP
+# server's ``tools/list`` response. Real servers expose at most a few
+# dozen tools; a misconfigured or hostile upstream returning thousands
+# would amplify both memory (one OpenAI tool dict per entry) and
+# downstream BM25 reindex cost. Mirrors the ``_MAX_ERROR_LEN`` /
+# ``_MAX_INSUFFICIENT_SCOPE_REPORTED`` defensive ceilings: we truncate
+# rather than reject so partial visibility beats zero visibility, and
+# emit a warning so operators can investigate.
+_MAX_TOOLS_PER_SERVER = 1000
+
 
 @dataclass
 class _AuthCapture:
@@ -247,6 +257,25 @@ def _mcp_to_openai(server_name: str, tool: Any) -> dict[str, Any]:
     }
 
 
+def _cap_server_tools(server_name: str, tools: list[Any]) -> list[Any]:
+    """Apply ``_MAX_TOOLS_PER_SERVER`` cap with operator-visible warning.
+
+    Identity for inputs at or below the cap (no copy); slice + warn on
+    overflow. Caller is responsible for converting the returned list to
+    the OpenAI shape via :func:`_mcp_to_openai`.
+    """
+    if len(tools) <= _MAX_TOOLS_PER_SERVER:
+        return tools
+    log.warning(
+        "MCP server '%s' returned %d tools — truncating to %d "
+        "(_MAX_TOOLS_PER_SERVER cap). Misconfigured or hostile upstream?",
+        server_name,
+        len(tools),
+        _MAX_TOOLS_PER_SERVER,
+    )
+    return tools[:_MAX_TOOLS_PER_SERVER]
+
+
 # ---------------------------------------------------------------------------
 # Per-server state containers
 # ---------------------------------------------------------------------------
@@ -366,8 +395,12 @@ class MCPClientManager:
         self._last_error: dict[str, str] = {}
         self._MAX_ERROR_LEN = 256
 
-        # Listener infrastructure (tool-change callbacks for ChatSession)
-        self._listeners: list[Callable[[], None]] = []
+        # Listener infrastructure (tool-change callbacks for ChatSession).
+        # Each entry is ``(user_id, callback)``: ``user_id=None`` is the
+        # admin / global listener (fires on every tool-change), a string
+        # ``user_id`` fires only on changes scoped to that user OR on
+        # global static-path changes. RFC §3.3.
+        self._listeners: list[tuple[str | None, Callable[[], None]]] = []
         self._listeners_lock = threading.Lock()
 
         # Merged resource catalog
@@ -408,6 +441,31 @@ class MCPClientManager:
         # so each ``asyncio.Lock`` binds to the correct loop on first use.
         self._user_pool_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
+        # Per-(user, server) catalog state. Tools live on
+        # ``PoolEntryState.tools`` (the dataclass already carries the
+        # field — it's populated lazily by per-user discovery on first
+        # connect). ``_user_tool_map`` is the per-user prefixed-name
+        # index, mirroring static ``_tool_map``: outer key is ``user_id``,
+        # inner is ``prefixed_name → (server_name, original_name)``.
+        # Resource/prompt mirrors are deferred to Phase 7b — Phase 7
+        # only lights up the tool path needed for invariant 8.
+        self._user_tool_map: dict[str, dict[str, tuple[str, str]]] = {}
+        # Per-user merged tool list (one snapshot per user_id), updated
+        # atomically alongside ``_user_tool_map`` in
+        # ``_rebuild_user_tool_map``. ``get_tools(user_id=...)`` reads
+        # this via a single dict-get (atomic under GIL) so sync-thread
+        # callers (ChatSession) never iterate ``_user_pool_entries``
+        # concurrently with the mcp-loop's mutations of the same dict
+        # (insert in ``_ensure_pool_entry`` / pop in
+        # ``_close_pool_entry_if_idle`` / ``_evict_session``).
+        self._user_tools: dict[str, list[dict[str, Any]]] = {}
+
+        # Notification debounce for pool sessions, keyed ``(user_id, server)``.
+        # Mirrors ``_last_notification_refresh`` (static) but per-pool-key
+        # so a noisy server in one user's pool doesn't suppress a refresh
+        # in another user's pool of the same server.
+        self._last_pool_notification_refresh: dict[tuple[str, str], float] = {}
+
         # Pool tuning (read at construction; falls back to defaults).
         mcp_cfg = load_config("mcp")
         self._user_pool_idle_ttl_s = float(mcp_cfg.get("user_session_idle_ttl_seconds", 600))
@@ -418,6 +476,15 @@ class MCPClientManager:
         # asserts non-None when it actually runs, so static-only callers
         # never hit it.
         self._app_state: Any = None
+
+        # In-memory cache of server names whose ``auth_type='oauth_user'``.
+        # ``_db_servers_to_config`` strips oauth_user rows on the way into
+        # ``_server_configs``, so neither that dict nor ``_static_servers``
+        # carries auth_type. This set is populated alongside ``reconcile_sync``
+        # / ``set_oauth_user_servers`` so per-turn callers (web_search
+        # backend resolution) can answer "is this server pool-backed?"
+        # without a SQL roundtrip.
+        self._oauth_user_server_names: set[str] = set()
 
         # Idle-eviction task handle. Scheduled lazily on the mcp-loop the
         # first time a pool entry is created (start() runs before pool
@@ -866,9 +933,8 @@ class MCPClientManager:
 
         # Discover tools
         result = await session.list_tools()
-        server_tools: list[dict[str, Any]] = []
-        for tool in result.tools:
-            server_tools.append(_mcp_to_openai(name, tool))
+        capped = _cap_server_tools(name, result.tools)
+        server_tools: list[dict[str, Any]] = [_mcp_to_openai(name, tool) for tool in capped]
 
         state.tools = server_tools
         self._rebuild_tools()
@@ -975,9 +1041,12 @@ class MCPClientManager:
         * Streamable-HTTP transport only — pool servers are remote.
         * ``Authorization: Bearer {access_token}`` injected into headers
           alongside any operator-supplied static headers.
-        * No catalog discovery (tools / resources / prompts) and no
-          notification handler — those land later once per-user catalog
-          state is in place.
+        * Tool catalog discovery runs after ``initialize()``; the
+          notification handler is bound to ``(user_id, server_name)`` so
+          push-driven ``tools/list_changed`` updates only refresh the
+          owning user's catalog (the static refresher must NEVER fire
+          from a pool session — it would clobber static-path state).
+          Resource / prompt discovery is deferred to Phase 7b.
 
         When ``auth_capture`` is supplied, the underlying ``httpx``
         client is built via a factory whose response hook records 401/403
@@ -1064,8 +1133,66 @@ class MCPClientManager:
             await self._safe_teardown_on_connect_failure(key, stack)
             raise
 
+        # Pool-scoped notification handler — bound to ``(user_id,
+        # server_name)`` via closure so a push-driven
+        # ``tools/list_changed`` only refreshes THIS user's catalog,
+        # never the static path's. Calling the static
+        # ``_refresh_server_tools(server_name)`` from a pool session
+        # would mutate ``_static_servers[server_name].tools`` and
+        # ``_tool_map`` — breaking invariant 1 (static-path
+        # byte-identical) and broadcasting one user's tool view to all
+        # other sessions. Phase 7 ToolListChangedNotification only;
+        # resource / prompt branches log + skip until Phase 7b adds
+        # ``_refresh_pool_server_resources`` / ``_refresh_pool_server_prompts``.
+        async def _on_pool_notification(
+            msg: Any,  # RequestResponder | ServerNotification | Exception
+        ) -> None:
+            if not isinstance(msg, mcp_types.ServerNotification):
+                return
+            root = msg.root
+            now = time.monotonic()
+            last = self._last_pool_notification_refresh.get(key, 0.0)
+            if now - last < self._NOTIFICATION_DEBOUNCE:
+                log.debug(
+                    "Debouncing pool notification user=%s server=%s (%.1fs since last refresh)",
+                    user_id,
+                    server_name,
+                    now - last,
+                )
+                return
+            try:
+                if isinstance(root, mcp_types.ToolListChangedNotification):
+                    log.info(
+                        "Received tools/list_changed from pool user=%s server=%s",
+                        user_id,
+                        server_name,
+                    )
+                    self._last_pool_notification_refresh[key] = now
+                    await self._refresh_pool_server_tools(key)
+                elif isinstance(root, mcp_types.ResourceListChangedNotification):
+                    log.debug(
+                        "pool resources/list_changed (deferred to Phase 7b) user=%s server=%s",
+                        user_id,
+                        server_name,
+                    )
+                elif isinstance(root, mcp_types.PromptListChangedNotification):
+                    log.debug(
+                        "pool prompts/list_changed (deferred to Phase 7b) user=%s server=%s",
+                        user_id,
+                        server_name,
+                    )
+            except Exception:
+                log.warning(
+                    "Pool refresh after notification failed user=%s server=%s",
+                    user_id,
+                    server_name,
+                    exc_info=True,
+                )
+
         try:
-            session = await stack.enter_async_context(ClientSession(read, write))
+            session = await stack.enter_async_context(
+                ClientSession(read, write, message_handler=_on_pool_notification)  # type: ignore[arg-type]
+            )
         except Exception:
             await self._safe_teardown_on_connect_failure(key, stack)
             raise
@@ -1089,9 +1216,70 @@ class MCPClientManager:
             entry.stack = None
             await self._safe_teardown_on_connect_failure(key, stack)
             raise
+
+        # Discover this user's tool catalog. R6 verified: a 401 here
+        # propagates through anyio TaskGroup unwinding (raises an
+        # ``ExceptionGroup`` from the surrounding ``streamablehttp_client``
+        # context) — plain ``await`` under ``asyncio.timeout`` is
+        # sufficient. The carrier-race shape used by
+        # ``_dispatch_pool_with_entry`` defends a different scenario
+        # (reused-session 401 from inside a SECOND dispatch) that
+        # doesn't apply to first-connect discovery. Resource / prompt
+        # discovery deferred to Phase 7b.
+        #
+        # Why ``asyncio.timeout``, not ``asyncio.wait_for``: per
+        # ``feedback_asyncio_timeout_vs_wait_for.md`` and the f6a3b66
+        # fix, Python 3.11's ``asyncio.wait_for`` wraps the inner
+        # coroutine in a fresh task. When the SDK's ``streamablehttp_client``
+        # TaskGroup unwinds (e.g. on a 401), ``aclose`` on the surrounding
+        # anyio scope runs from a different task than entered it →
+        # ``RuntimeError("Attempted to exit cancel scope in a different
+        # task")``. ``asyncio.timeout`` runs the inner coroutine in the
+        # current task and is the safe shape for any await that may
+        # traverse anyio cleanup.
+        try:
+            async with asyncio.timeout(self._CONNECT_TIMEOUT):
+                tools_result = await session.list_tools()
+        except asyncio.CancelledError:
+            entry.stack = None
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                await self._safe_teardown_on_connect_failure(key, stack)
+                raise
+            await self._safe_teardown_on_connect_failure(key, stack)
+            raise TimeoutError(f"Pool discovery failed for '{server_name}'") from None
+        except TimeoutError:
+            entry.stack = None
+            await self._safe_teardown_on_connect_failure(key, stack)
+            raise TimeoutError(f"Pool discovery timed out after {self._CONNECT_TIMEOUT}s") from None
+        except Exception:
+            entry.stack = None
+            await self._safe_teardown_on_connect_failure(key, stack)
+            raise
+
+        capped_tools = _cap_server_tools(server_name, tools_result.tools)
+        entry.tools = [_mcp_to_openai(server_name, tool) for tool in capped_tools]
+        # Publish session readiness BEFORE catalog visibility.
+        # ``_rebuild_user_tool_map`` makes ``is_mcp_tool(name, user_id=U)``
+        # return True for the discovered names; if catalog visibility
+        # preceded ``entry.session`` assignment, a sync-thread reader
+        # racing with this coroutine could observe a tool whose backing
+        # entry has ``session=None``. Defence-in-depth — dispatch
+        # re-fetches its own token through ``get_user_access_token_classified``
+        # and lazy-reconnects on session=None — but ordering catches the
+        # race at the source rather than relying on the dispatch-time
+        # recovery path.
         entry.session = session
         entry.last_used = time.monotonic()
         self._user_pool_last_used[key] = entry.last_used
+
+        # Loop-only mutation; sync-thread readers observe the new tool
+        # list atomically via the per-user dict-get on ``_user_tools``.
+        self._rebuild_user_tool_map(user_id)
+        # Wake user-keyed AND admin (None) listeners; per-user fan-out
+        # ensures another user's session never observes this user's
+        # tool change.
+        self._notify_user_tool_listeners(user_id)
         return entry
 
     # -- pool eviction --------------------------------------------------------
@@ -1181,6 +1369,7 @@ class MCPClientManager:
             )
         except (TimeoutError, asyncio.CancelledError):
             return
+        evicted = False
         try:
             entry = self._user_pool_entries.get(key)
             if entry is None:
@@ -1198,11 +1387,27 @@ class MCPClientManager:
                 await self._safe_close_stack(stack)
             self._user_pool_entries.pop(key, None)
             self._user_pool_last_used.pop(key, None)
+            # Mirror ``_evict_session``'s catalog cleanup: dropping the
+            # entry without rebuilding ``_user_tool_map`` would leave
+            # ``is_mcp_tool`` returning True for tools whose backing
+            # pool is gone, and ChatSession's ``_tools`` would never
+            # rebuild because no listener fires.
+            self._last_pool_notification_refresh.pop(key, None)
+            user_id, _server_name = key
+            self._rebuild_user_tool_map(user_id)
+            self._notify_user_tool_listeners(user_id)
+            evicted = True
         finally:
             lock.release()
         # Drop the now-orphaned lock so the dict doesn't grow without
-        # bound across the process lifetime. A new key will reallocate.
-        self._user_pool_locks.pop(key, None)
+        # bound across the process lifetime — but ONLY on the success
+        # path. The early-return branches (entry already removed by a
+        # racing path, or in_flight > 0) leave the lock in place: an
+        # in-flight dispatcher needs the same lock object on its next
+        # acquire, and a key whose entry races a concurrent eviction
+        # will be re-allocated by ``_ensure_pool_entry`` next time.
+        if evicted:
+            self._user_pool_locks.pop(key, None)
 
     # -- failure classification (pool dispatch) ------------------------------
 
@@ -1270,6 +1475,52 @@ class MCPClientManager:
         self._tool_map = new_map
         self._notify_listeners()
 
+    def _rebuild_user_tool_map(self, user_id: str) -> None:
+        """Rebuild the per-user prefixed-name index from pool entries.
+
+        Mirrors :meth:`_rebuild_tools` for one user's pool entries:
+        scan ``_user_pool_entries`` for keys whose first element matches
+        ``user_id``, materialize a fresh ``prefixed_name → (server, original)``
+        dict and a parallel tool-list, assign each to its dict in
+        ``_user_tool_map`` and ``_user_tools`` respectively. Each
+        per-key write is individually atomic under the GIL; the two
+        writes happen back-to-back on the mcp-loop with no awaits
+        between them, so a sync-thread reader cannot interleave at the
+        Python statement level — but the cross-dict write is not a
+        single atomic operation. In practice the window is sub-microsecond
+        and the listener fan-out (which fires AFTER both writes
+        complete) is the trigger for any session-side rebuild that
+        might re-read both dicts.
+
+        ``_tool_map`` (the static index) is NEVER mutated here, so
+        invariant 1 (static path byte-identical) is preserved.
+
+        Empty rebuilds drop the user_id key from BOTH dicts so an idle
+        user with no pool entries doesn't retain permanent empty-list
+        sentinels.
+
+        MUST run on the mcp-loop. The pool dict scan here cannot race
+        with sync-thread reads because sync threads never touch
+        ``_user_pool_entries``; they read ``_user_tools`` instead.
+        """
+        new_map: dict[str, tuple[str, str]] = {}
+        new_tools: list[dict[str, Any]] = []
+        for (uid, _server_name), entry in self._user_pool_entries.items():
+            if uid != user_id or entry.tools is None:
+                continue
+            for tool in entry.tools:
+                prefixed: str = tool["function"]["name"]
+                # Extract original name from the mcp__server__original pattern.
+                original = prefixed.split("__", 2)[2] if prefixed.count("__") >= 2 else prefixed
+                new_map[prefixed] = (_server_name, original)
+                new_tools.append(tool)
+        if new_map:
+            self._user_tool_map[user_id] = new_map
+            self._user_tools[user_id] = new_tools
+        else:
+            self._user_tool_map.pop(user_id, None)
+            self._user_tools.pop(user_id, None)
+
     async def _refresh_server_tools(self, name: str) -> tuple[list[str], list[str]]:
         """Re-fetch tools for one server.  Returns ``(added, removed)`` names."""
         state = self._static_servers.get(name)
@@ -1283,7 +1534,8 @@ class MCPClientManager:
         old_names = {t["function"]["name"] for t in state.tools}
 
         result = await session.list_tools()
-        server_tools = [_mcp_to_openai(name, tool) for tool in result.tools]
+        capped = _cap_server_tools(name, result.tools)
+        server_tools = [_mcp_to_openai(name, tool) for tool in capped]
         new_names = {t["function"]["name"] for t in server_tools}
 
         state.tools = server_tools
@@ -1295,6 +1547,51 @@ class MCPClientManager:
             log.info(
                 "Refreshed MCP server '%s': +%d/-%d tool(s)",
                 name,
+                len(added),
+                len(removed),
+            )
+        return added, removed
+
+    async def _refresh_pool_server_tools(self, key: tuple[str, str]) -> tuple[list[str], list[str]]:
+        """Re-fetch tools for one pool entry.  Returns ``(added, removed)`` names.
+
+        Mirror of :meth:`_refresh_server_tools` for the pool path:
+        targets a single ``(user_id, server_name)`` entry, mutates ONLY
+        ``entry.tools`` + the per-user index, fires the user-scoped
+        listener fan-out. Static-path catalogs are NEVER touched, so
+        invariant 1 (static path byte-identical) is preserved.
+
+        MUST run on the mcp-loop. Caller does not need to hold
+        ``open_lock`` — ``_refresh_pool_server_tools`` is invoked from
+        the pool session's notification handler, which already runs in
+        the SDK's receive task on the loop.
+        """
+        entry = self._user_pool_entries.get(key)
+        if entry is None or entry.session is None:
+            raise RuntimeError(f"Pool entry {key!r} is not connected")
+        # Snapshot session locally — a concurrent transport-error
+        # eviction can clear ``entry.session`` after our reads, so a
+        # post-await ``entry.session.<...>`` call would raise
+        # ``AttributeError``. Mirrors the static path's pattern.
+        session = entry.session
+        user_id, server_name = key
+        old_names = {t["function"]["name"] for t in (entry.tools or [])}
+        result = await session.list_tools()
+        capped = _cap_server_tools(server_name, result.tools)
+        server_tools = [_mcp_to_openai(server_name, tool) for tool in capped]
+        new_names = {t["function"]["name"] for t in server_tools}
+        entry.tools = server_tools
+        self._rebuild_user_tool_map(user_id)
+        # Fire user-keyed AND admin (None) listeners. Other users'
+        # listeners do NOT see this change — the pool catalog is private.
+        self._notify_user_tool_listeners(user_id)
+        added = sorted(new_names - old_names)
+        removed = sorted(old_names - new_names)
+        if added or removed:
+            log.info(
+                "Refreshed pool MCP server user=%s server=%s: +%d/-%d tool(s)",
+                user_id,
+                server_name,
                 len(added),
                 len(removed),
             )
@@ -1533,20 +1830,52 @@ class MCPClientManager:
 
     # -- listener infrastructure ---------------------------------------------
 
-    def add_listener(self, callback: Callable[[], None]) -> None:
-        """Register a callback invoked when the tool list changes."""
-        with self._listeners_lock:
-            self._listeners.append(callback)
+    def add_listener(self, callback: Callable[[], None], *, user_id: str | None = None) -> None:
+        """Register a callback invoked when the tool list changes.
 
-    def remove_listener(self, callback: Callable[[], None]) -> None:
-        """Unregister a tool-change callback."""
+        ``user_id=None`` (default) registers a global / admin listener
+        that fires on every tool-change (static or pool). A string
+        ``user_id`` scopes the listener: it fires on global static-path
+        changes AND on pool changes for that user only — never on
+        another user's pool change. RFC §3.3.
+        """
+        with self._listeners_lock:
+            self._listeners.append((user_id, callback))
+
+    def remove_listener(self, callback: Callable[[], None], *, user_id: str | None = None) -> None:
+        """Unregister a tool-change callback.
+
+        ``user_id`` MUST match the value used at registration; the
+        ``(user_id, callback)`` pair is the listener identity.
+        """
         with self._listeners_lock, contextlib.suppress(ValueError):
-            self._listeners.remove(callback)
+            self._listeners.remove((user_id, callback))
 
     def _notify_listeners(self) -> None:
-        """Invoke all registered tool-change listeners."""
+        """Static-path tool change — fires ALL registered listeners.
+
+        The static catalog is a process-wide concern: a static-server
+        notification (or reconcile) updates ``_tool_map`` which every
+        user-scoped session relies on, so the fan-out is unconditional.
+        """
         with self._listeners_lock:
             listeners = list(self._listeners)
+        for _uid, cb in listeners:
+            try:
+                cb()
+            except Exception:
+                log.warning("Tool-change listener raised", exc_info=True)
+
+    def _notify_user_tool_listeners(self, user_id: str) -> None:
+        """Pool-entry tool change — fires only listeners that should see it.
+
+        A pool catalog change touches one user's view; firing every
+        registered listener would broadcast that user's tool set to
+        unrelated sessions. Scoped fan-out targets the matching
+        ``user_id`` AND admin (``None``) listeners. RFC §3.3.
+        """
+        with self._listeners_lock:
+            listeners = [cb for uid, cb in self._listeners if uid == user_id or uid is None]
         for cb in listeners:
             try:
                 cb()
@@ -1807,6 +2136,16 @@ class MCPClientManager:
         """Connect a new MCP server at runtime (blocks the calling thread).
 
         Returns status dict with keys: connected, tools, resources, prompts, error.
+
+        Note on ``_oauth_user_server_names``: this method does NOT update
+        the oauth_user-name cache. ``_db_servers_to_config`` strips
+        ``auth_type='oauth_user'`` rows before this method is reached, so
+        production callers (only :meth:`reconcile_sync`) never pass an
+        oauth_user cfg here — the cache is rebuilt wholesale by
+        ``reconcile_sync`` at the top of every reconcile, which is the
+        canonical update point. Direct test callers passing an oauth_user
+        cfg would leave the cache stale; route through ``reconcile_sync``
+        instead.
         """
         if "__" in name:
             return {
@@ -1929,6 +2268,17 @@ class MCPClientManager:
         with notification handlers and refresh tasks.
 
         Returns True if the server was connected and successfully removed.
+
+        Note on ``_oauth_user_server_names``: this method does NOT discard
+        ``name`` from the oauth_user-name cache. The cache is the source of
+        truth for "this server exists in the DB as oauth_user", not "this
+        server is connected on the static path" — those are separate
+        concerns. A static→oauth_user transition during reconcile_sync
+        keeps ``name`` in the cache (the new identity) AND calls this
+        method to drop the old static-path connection; discarding here
+        would silently make web_search resolve to a now-pool-only server.
+        The cache is updated only by :meth:`reconcile_sync`'s wholesale
+        rebuild at line 2340.
         """
         existing = self._static_servers.get(name)
         was_connected = existing is not None and existing.session is not None
@@ -2039,6 +2389,14 @@ class MCPClientManager:
             log.warning("reconcile_sync: failed to read mcp_servers table", exc_info=True)
             return {"added": [], "removed": [], "updated": []}
 
+        # Refresh the in-memory oauth_user name cache from the rows we
+        # just read — feeds :meth:`server_auth_type` so callers (e.g.
+        # ``web_search.resolve_web_search_client``) avoid a per-turn SQL
+        # roundtrip.
+        self._oauth_user_server_names = {
+            row["name"] for row in rows if row.get("auth_type") == "oauth_user"
+        }
+
         desired = _db_servers_to_config(rows)
         desired_names = set(desired)
 
@@ -2093,9 +2451,29 @@ class MCPClientManager:
 
     # -- query methods -------------------------------------------------------
 
-    def get_tools(self) -> list[dict[str, Any]]:
-        """Return MCP tools in OpenAI function-calling format."""
-        return [dict(t) for t in self._tools]
+    def get_tools(self, user_id: str | None = None) -> list[dict[str, Any]]:
+        """Return MCP tools in OpenAI function-calling format.
+
+        ``user_id=None`` returns the global static-path catalog only —
+        the legacy behaviour every pre-Phase-7 caller relies on. A
+        string ``user_id`` returns the merged view: static catalog
+        followed by that user's cached pool tools, read from
+        ``_user_tools`` (a single dict-get, atomic under GIL). The
+        list snapshot is materialised on the mcp-loop by
+        :meth:`_rebuild_user_tool_map` and replaced atomically — sync
+        threads never iterate ``_user_pool_entries`` directly, so the
+        mcp-loop is free to insert/pop entries concurrently.
+        Callers that don't carry a session-bound user (boot-time
+        logging, web_search backend resolution) MUST use the default.
+
+        Returned dicts are shallow-copied; nested objects are shared
+        with the manager's catalog, mirroring the pre-Phase-7 contract.
+        """
+        base = [dict(t) for t in self._tools]
+        if user_id is None:
+            return base
+        base.extend(dict(t) for t in self._user_tools.get(user_id, []))
+        return base
 
     def get_resources(self) -> list[dict[str, Any]]:
         """Return discovered MCP resources (shallow-copied dicts)."""
@@ -2115,23 +2493,46 @@ class MCPClientManager:
         """Number of discovered prompts (no allocation)."""
         return len(self._prompts)
 
-    def is_mcp_tool(self, func_name: str) -> bool:
+    def is_mcp_tool(self, func_name: str, *, user_id: str | None = None) -> bool:
         """Check whether *func_name* belongs to an MCP server.
 
-        Caveat: only static-path tools (``auth_type ∈ {none, static}``)
-        populate ``_tool_map``; pool tools become reachable via this
-        method only once per-user catalog scoping lands. Until then,
-        pool dispatch is reachable from production callers like
-        ``ChatSession._exec_mcp_tool`` only when the LLM produces a
-        ``mcp__{server}__{tool}`` name that bypasses ``is_mcp_tool``-
-        style gating, or via direct ``call_tool_sync`` with a known
-        prefixed name (the path the new pool tests use).
+        ``user_id=None`` (default) asks "is this a static-path tool?" —
+        the answer is process-global. Boot-time and per-node callers
+        (e.g. ``resolve_web_search_client``) MUST use the default
+        because they don't carry a session-bound user identity.
+
+        A string ``user_id`` extends the lookup to that user's pool
+        catalog: returns ``True`` if ``func_name`` is in either the
+        static map OR the user's per-user tool map. Pool tools become
+        reachable via this gate ONLY once a session-bound caller
+        threads its ``user_id`` through; CLI sessions default
+        ``user_id=""`` and so cannot see pool tools — documented
+        limitation.
         """
-        return func_name in self._tool_map
+        if func_name in self._tool_map:
+            return True
+        if user_id is None:
+            return False
+        user_map = self._user_tool_map.get(user_id)
+        return user_map is not None and func_name in user_map
 
     def is_mcp_prompt(self, name: str) -> bool:
         """Check whether *name* is a known MCP prompt."""
         return name in self._prompt_map
+
+    def server_auth_type(self, server_name: str) -> str | None:
+        """Return ``'oauth_user'`` for pool-backed servers, else ``None``.
+
+        In-memory accessor for the per-turn callers that need to
+        distinguish pool-backed servers from static-path ones without a
+        SQL roundtrip. ``None`` means "either static-path or unknown" —
+        the boot-time / per-node web_search resolver only uses this as
+        a defence-in-depth gate, so a missing-cache miss is safe (the
+        outer ``is_mcp_tool`` check already proves the server is in
+        ``_tool_map``, which by construction excludes oauth_user).
+        Populated by ``reconcile_sync`` and ``create_mcp_client``.
+        """
+        return "oauth_user" if server_name in self._oauth_user_server_names else None
 
     @property
     def server_count(self) -> int:
@@ -2605,11 +3006,28 @@ class MCPClientManager:
                     # ``streamablehttp_client`` TaskGroup — see
                     # :meth:`_dispatch_pool_sync` for the architectural
                     # rationale.
-                    log.debug("mcp_pool.auth_401_initial", exc_info=exc)
+                    #
+                    # exc_info=False: the underlying httpx exception
+                    # carries ``request.headers["authorization"]`` with
+                    # the rejected bearer; standard tracebacks don't
+                    # render locals but Sentry / faulthandler hooks
+                    # capture frame state. Structured fields below
+                    # provide the diagnostic signal without the secret.
+                    log.debug(
+                        "mcp_pool.auth_401_initial server=%s user=%s exc=%s",
+                        server_name,
+                        user_id,
+                        type(exc).__name__,
+                    )
                     raise _PoolDispatchRetryRequested from None
                 # retry_count == 1 — refreshed bearer also rejected;
                 # emit consent_required so the user/operator re-grants.
-                log.debug("mcp_pool.auth_401_retry_failed", exc_info=exc)
+                log.debug(
+                    "mcp_pool.auth_401_retry_failed server=%s user=%s exc=%s",
+                    server_name,
+                    user_id,
+                    type(exc).__name__,
+                )
                 return _structured_error(
                     code="mcp_consent_required",
                     server=server_name,
@@ -2617,7 +3035,12 @@ class MCPClientManager:
                 )
             if classification == "auth_403":
                 self._evict_session(key)
-                log.debug("mcp_pool.auth_403", exc_info=exc)
+                log.debug(
+                    "mcp_pool.auth_403 server=%s user=%s exc=%s",
+                    server_name,
+                    user_id,
+                    type(exc).__name__,
+                )
                 return await self._handle_auth_403(
                     user_id=user_id,
                     server_name=server_name,
@@ -2627,7 +3050,15 @@ class MCPClientManager:
             if classification == "transport":
                 self._cb_record_failure(server_name)
                 self._evict_session(key)
-                log.debug("mcp_pool.transport_failure", exc_info=exc)
+                # See auth_401 branch for why exc_info=False — pool
+                # dispatch errors all share the same request object
+                # whose headers carry the bearer.
+                log.debug(
+                    "mcp_pool.transport_failure server=%s user=%s exc=%s",
+                    server_name,
+                    user_id,
+                    type(exc).__name__,
+                )
                 raise
             # protocol / other — don't trip the breaker.
             raise
@@ -2636,18 +3067,40 @@ class MCPClientManager:
         return result
 
     def _evict_session(self, key: tuple[str, str]) -> None:
-        """Drop the cached session on a pool entry. Stack/streams left for reconnect.
+        """Drop the cached session AND catalog on a pool entry.
 
-        Auth/transport branches both call this — the next connect's
-        ``_connect_one_pool`` tears down the stale stack lazily via the
-        stale-entry guard at the top of the method. Closing eagerly
-        from here is incorrect under cancellation: ``stack.aclose()``
-        must run inside the same anyio scope it was entered in, which
-        the next connect arranges.
+        Stack/streams left for reconnect. Auth/transport branches both
+        call this — the next connect's ``_connect_one_pool`` tears
+        down the stale stack lazily via the stale-entry guard at the
+        top of the method. Closing eagerly from here is incorrect
+        under cancellation: ``stack.aclose()`` must run inside the
+        same anyio scope it was entered in, which the next connect
+        arranges.
+
+        Catalog cleanup (Phase 7): clearing ``entry.tools`` here
+        ensures an evicted-then-not-yet-reconnected entry contributes
+        no stale entries to ``_user_tool_map``. Without this,
+        ``is_mcp_tool(name, user_id=user_id)`` could return True for a
+        name whose backing pool is gone, then ``_resolve_pool_target``
+        would dispatch into a session-less entry and the next call
+        would surface as a generic transport error instead of a
+        clean reconnect path.
         """
         evict = self._user_pool_entries.get(key)
         if evict is not None:
             evict.session = None
+            evict.tools = None
+            # Prune the debounce stamp in lockstep with the entry — the
+            # dict grows otherwise (slow leak) across (user, server)
+            # churn. Mirrors the cleanup in ``_close_pool_entry_if_idle``.
+            self._last_pool_notification_refresh.pop(key, None)
+            user_id, _server_name = key
+            self._rebuild_user_tool_map(user_id)
+            # Wake the user's session so its merged tool list shrinks
+            # back to static-only until the next connect populates the
+            # entry. Admin (None) listeners also fire — operator
+            # tooling tracking pool catalog state observes the drop.
+            self._notify_user_tool_listeners(user_id)
 
     async def _handle_auth_403(
         self,
@@ -3129,11 +3582,15 @@ def create_mcp_client(
     """
     # Check DB first to know which servers are DB-managed
     db_names: set[str] = set()
+    oauth_user_names: set[str] = set()
     if storage is not None:
         try:
             rows = storage.list_mcp_servers(enabled_only=True)
             if rows:
                 db_names = {r["name"] for r in rows}
+                # Cache oauth_user names so per-turn callers (web_search
+                # backend resolution) can answer auth_type without SQL.
+                oauth_user_names = {r["name"] for r in rows if r.get("auth_type") == "oauth_user"}
         except Exception:
             log.warning("Failed to load DB-managed MCP servers", exc_info=True)
 
@@ -3144,5 +3601,6 @@ def create_mcp_client(
     mgr = MCPClientManager(servers)
     # Mark DB-sourced servers so reconcile_sync won't remove config-file servers
     mgr._db_managed = {name for name in servers if name in db_names}
+    mgr._oauth_user_server_names = oauth_user_names
     mgr.start()
     return mgr

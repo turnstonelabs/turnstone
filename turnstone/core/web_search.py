@@ -168,7 +168,27 @@ def resolve_web_search_client(
         if len(parts) == 3 and mcp_client is not None:
             _, server, tool = parts
             prefixed = f"mcp__{server}__{tool}"
+            # Boot-time gate: ``is_mcp_tool`` without ``user_id`` returns
+            # True only for static-path catalogs. Pool-backed
+            # (``auth_type=oauth_user``) servers are NEVER reachable via
+            # the per-node web_search client because the boot-time
+            # resolver has no per-user identity to attach a bearer to —
+            # the resolved client would be shared across requests, but
+            # the bearer can't be (RFC §3, invariant 8 corollary).
             if mcp_client.is_mcp_tool(prefixed):
+                # Defence-in-depth: even if a future change widens
+                # ``_tool_map`` to include oauth_user names by accident,
+                # refuse the backend explicitly. ``server_auth_type``
+                # is an in-memory accessor — this resolver is invoked
+                # per LLM turn, so a SQL hop here would amplify token
+                # cost on every chat round.
+                if mcp_client.server_auth_type(server) == "oauth_user":
+                    log.warning(
+                        "web_search_backend %r points at oauth_user MCP server; "
+                        "per-node web search cannot use per-user tokens — disabling",
+                        backend,
+                    )
+                    return None
                 return MCPSearchClient(mcp_client, prefixed, timeout=timeout)
         return None
 
