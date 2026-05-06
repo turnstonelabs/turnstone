@@ -712,7 +712,24 @@ class ChatSession:
         self.debug = False
         self.auto_approve = False
         self._node_id = node_id
+        # ``user_id`` is the authenticated principal's UUID for HTTP-borne
+        # sessions (server, console) and the empty string ``""`` for CLI
+        # / eval / unauthenticated callers. The empty string is a SENTINEL
+        # that collapses to ``None`` for MCPClientManager's optional
+        # ``user_id`` arguments (cached once below as ``_mcp_user_id``),
+        # which short-circuits per-user OAuth pool lookup → CLI / eval
+        # sessions cannot use ``auth_type=oauth_user`` MCP servers
+        # (no per-request user identity to attach a bearer to). End
+        # users running such servers must pre-link via the web UI;
+        # static-path MCP servers continue to work in all session
+        # contexts.
         self._user_id = user_id
+        # ``_user_id`` is set once here and never reassigned, so we
+        # compute the MCP-API form (empty-string-to-None collapse) once
+        # rather than re-asserting the invariant at each call site.
+        # Listener identity, catalog merge, and dispatch all consume
+        # this through ``_mcp_user_id``.
+        self._mcp_user_id: str | None = user_id or None
         self._username = username
         self._client_type = client_type
         self._config_store = config_store
@@ -841,13 +858,15 @@ class ChatSession:
             self._task_tools = []
             self._agent_tools = []
         elif mcp_client:
-            mcp_tools = mcp_client.get_tools()
+            mcp_tools = mcp_client.get_tools(user_id=self._mcp_user_id)
             self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)
             self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
             self._agent_tools = merge_mcp_tools(AGENT_TOOLS, mcp_tools)
-            # Register for tool-change notifications from MCP servers
+            # Register for tool-change notifications from MCP servers.
+            # ``user_id`` is the listener identity component — pool-only
+            # changes for OTHER users must not fire this callback.
             self._mcp_refresh_cb = self._on_mcp_tools_changed
-            mcp_client.add_listener(self._mcp_refresh_cb)
+            mcp_client.add_listener(self._mcp_refresh_cb, user_id=self._mcp_user_id)
             # Register for resource-change notifications
             self._mcp_resource_cb = self._on_mcp_resources_changed
             mcp_client.add_resource_listener(self._mcp_resource_cb)
@@ -1203,7 +1222,11 @@ class ChatSession:
         # is fixed at COORDINATOR_TOOLS.  Ignore MCP server changes.
         if self._kind == WorkstreamKind.COORDINATOR:
             return
-        mcp_tools = self._mcp_client.get_tools()
+        # Phase 7: pass session-bound user_id so the merged tool list
+        # includes this user's pool catalog. The static path is included
+        # by ``get_tools`` regardless; ``user_id=None`` would silently
+        # drop pool tools that the LLM is allowed to call.
+        mcp_tools = self._mcp_client.get_tools(user_id=self._mcp_user_id)
         self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)
         self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
         self._agent_tools = merge_mcp_tools(AGENT_TOOLS, mcp_tools)
@@ -1369,7 +1392,11 @@ class ChatSession:
         if self._judge_cancel_event is not None:
             self._judge_cancel_event.set()
         if self._mcp_client and self._mcp_refresh_cb:
-            self._mcp_client.remove_listener(self._mcp_refresh_cb)
+            # ``user_id`` MUST match the value used at registration —
+            # the listener identity is ``(user_id, callback)``, not
+            # callback alone. ``self._user_id`` is set once in
+            # ``__init__`` and never mutated, so identity is stable.
+            self._mcp_client.remove_listener(self._mcp_refresh_cb, user_id=self._mcp_user_id)
             self._mcp_refresh_cb = None
         if self._mcp_client and self._mcp_resource_cb:
             self._mcp_client.remove_resource_listener(self._mcp_resource_cb)
@@ -4725,13 +4752,24 @@ class ChatSession:
         }
         preparer = preparers.get(func_name)
         if not preparer:
-            # Check if this is an MCP tool
-            if self._mcp_client and self._mcp_client.is_mcp_tool(func_name):
+            # Check if this is an MCP tool. Phase 7: pass session-bound
+            # ``user_id`` so per-user pool tools become reachable here —
+            # without this kwarg the gate stays static-only and pool
+            # dispatch is structurally unreachable from
+            # ``ChatSession._prepare_tool`` (RFC §3, invariant 8).
+            if self._mcp_client and self._mcp_client.is_mcp_tool(
+                func_name, user_id=self._mcp_user_id
+            ):
                 return self._prepare_mcp_tool(call_id, func_name, args)
             self.ui.on_error(f"Model called unknown tool: {func_name!r}")
             available = list(preparers)
             if self._mcp_client:
-                available.extend(sorted(self._mcp_client._tool_map))
+                available.extend(
+                    sorted(
+                        t["function"]["name"]
+                        for t in self._mcp_client.get_tools(user_id=self._mcp_user_id)
+                    )
+                )
             return {
                 "call_id": call_id,
                 "func_name": func_name,
@@ -7782,7 +7820,7 @@ class ChatSession:
             output = self._mcp_client.call_tool_sync(
                 func_name,
                 args,
-                user_id=self._user_id or None,
+                user_id=self._mcp_user_id,
                 timeout=self.tool_timeout,
             )
         except TimeoutError:
@@ -10148,7 +10186,11 @@ class ChatSession:
             elif arg and arg.split()[0] == "refresh":
                 self._handle_mcp_refresh(arg)
             else:
-                tools = self._mcp_client.get_tools()
+                # Phase 7: pass session-bound user_id so the /mcp listing
+                # surfaces this user's pool tools alongside the static
+                # catalog. Resource / prompt query stays user_id-less
+                # (deferred to Phase 7b).
+                tools = self._mcp_client.get_tools(user_id=self._mcp_user_id)
                 resources = self._mcp_client.get_resources()
                 prompts = self._mcp_client.get_prompts()
                 mcp_lines = []
