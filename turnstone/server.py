@@ -4456,11 +4456,6 @@ def main() -> None:
             if ws.session:
                 ws.session.resume(ws_id)
                 ws.session.set_watch_runner(_watch_runner)
-                # Use the public accessor instead of reaching into
-                # ``_dispatch_fns``: ``set_watch_runner`` registered the
-                # closure under the rehydrated workstream's id, which
-                # may differ from the original ``ws_id`` we restored
-                # against — look it up by the new id explicitly.
                 return _watch_runner.get_dispatch_fn(ws.session._ws_id)
         except RuntimeError:
             log.warning("watch_restore: cannot restore ws %s (all slots active)", ws_id)
