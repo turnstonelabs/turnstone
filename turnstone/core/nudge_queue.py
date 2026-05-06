@@ -99,14 +99,23 @@ class NudgeQueue:
         with self._lock:
             if not self._items:
                 return []
-            kept: deque[_Entry] = deque()
-            candidates: list[_Entry] = []
-            for entry in self._items:
-                if entry.channel in channels:
-                    candidates.append(entry)
-                else:
-                    kept.append(entry)
-            self._items = kept
+            # Fast path: every entry matches → swap deque rather than
+            # walk + partition + per-entry append.  This is the common
+            # case in practice since the chat loop's drain seams use
+            # ``USER_DRAIN`` / ``TOOL_DRAIN`` (channel + "any") and
+            # most queues hold only one channel's entries at a time.
+            if all(entry.channel in channels for entry in self._items):
+                candidates: list[_Entry] = list(self._items)
+                self._items = deque()
+            else:
+                kept: deque[_Entry] = deque()
+                candidates = []
+                for entry in self._items:
+                    if entry.channel in channels:
+                        candidates.append(entry)
+                    else:
+                        kept.append(entry)
+                self._items = kept
         # Predicates evaluate outside the lock — they may do storage
         # I/O or other work that shouldn't block other producers /
         # the drain consumer's other queues.

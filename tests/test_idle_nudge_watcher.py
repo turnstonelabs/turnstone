@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 import pytest
 
-from turnstone.core.metacognition import IdleNudgeWatcher
+from turnstone.core.idle_nudge_watcher import IdleNudgeWatcher
 from turnstone.core.nudge_queue import NudgeQueue
 from turnstone.core.workstream import WorkstreamState
 

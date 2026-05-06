@@ -30,7 +30,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tests.test_session_manager import FakeStorage
-from turnstone.core.metacognition import IdleNudgeWatcher
+from turnstone.core.idle_nudge_watcher import IdleNudgeWatcher
 from turnstone.core.session import ChatSession
 from turnstone.core.session_manager import SessionManager
 from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamState
@@ -90,8 +90,8 @@ class _BuildRealSessionAdapter:
     that production ``WebUI`` / coord adapters expose.
     """
 
-    def __init__(self) -> None:
-        self.kind = WorkstreamKind.INTERACTIVE
+    def __init__(self, kind: WorkstreamKind = WorkstreamKind.INTERACTIVE) -> None:
+        self.kind = kind
         self.events: list[str] = []
         self.cleaned_up: list[str] = []
 
@@ -270,3 +270,116 @@ def test_idle_event_with_empty_queue_does_not_dispatch_wake(real_mgr, tmp_db):
             assert mock_send.call_count == 0, "wake must not dispatch for an empty queue"
     finally:
         watcher.shutdown()
+
+
+@pytest.fixture
+def coord_mgr() -> tuple[SessionManager, _BuildRealSessionAdapter, FakeStorage]:
+    """Real coord-side SessionManager with the adapter's kind set to
+    COORDINATOR.  Same shape as ``real_mgr`` but for the coord half of
+    the lifespan.  No StateWriter wired so subscriber dispatch fires
+    synchronously on the test thread.
+    """
+    adapter = _BuildRealSessionAdapter(kind=WorkstreamKind.COORDINATOR)
+    storage = FakeStorage()
+    mgr = SessionManager(
+        adapter,
+        storage=storage,
+        max_active=5,
+        event_emitter=adapter,
+    )
+    return mgr, adapter, storage
+
+
+def test_coord_idle_with_active_children_emits_envelope_via_real_managers(coord_mgr, tmp_db):
+    """Full coord-path integration test (matches design doc §7.4).
+
+    Drives the production install order — ``CoordinatorIdleObserver``
+    registered FIRST, then ``IdleNudgeWatcher`` — and asserts the
+    full chain: observer enqueues on IDLE → watcher peeks → wake
+    spawns a worker → ``deliver_wake_nudge_from_queue`` drains and
+    runs the synthetic empty-user turn → reminder envelope reaches
+    the synthesized user message via the side-channel.
+
+    The boundary-crossing path tested here mirrors what
+    ``console/server.py``'s lifespan does at production startup; if
+    the install order is ever reversed, this test fails.
+    """
+    from turnstone.console.coordinator_idle_observer import CoordinatorIdleObserver
+    from turnstone.core.workstream import WorkstreamKind as _Kind
+
+    mgr, adapter, storage = coord_mgr
+    # Observer FIRST, then watcher.  Same order as
+    # ``console/server.py:4435-4443`` — production correctness depends
+    # on subscribers firing in registration order on the same IDLE.
+    observer = CoordinatorIdleObserver(mgr, storage)
+    observer.start()
+    watcher = IdleNudgeWatcher(mgr)
+    watcher.start()
+
+    try:
+        coord = mgr.create(user_id="u1", name="parent-coord", skill=None)
+        assert coord.session is not None
+
+        # Two interactive children of the coord, both running.  Use
+        # the storage's register_workstream API so the rows match
+        # production shape (the observer queries via list_workstreams).
+        storage.register_workstream(
+            "child-a",
+            user_id="u1",
+            name="research-pricing",
+            kind=_Kind.INTERACTIVE,
+            parent_ws_id=coord.id,
+            state="running",
+        )
+        storage.register_workstream(
+            "child-b",
+            user_id="u1",
+            name="draft-rfc",
+            kind=_Kind.INTERACTIVE,
+            parent_ws_id=coord.id,
+            state="thinking",
+        )
+
+        # Pretend the coord has already had a real conversation so
+        # ``should_nudge``'s message_count > 1 gate passes.
+        coord.session.messages.append({"role": "user", "content": "spawn 2"})
+        coord.session.messages.append({"role": "assistant", "content": "ok"})
+
+        with (
+            patch.object(coord.session, "_create_stream_with_retry", return_value=iter([])),
+            patch.object(
+                coord.session,
+                "_stream_response",
+                return_value={"role": "assistant", "content": "ack"},
+            ),
+            patch.object(coord.session, "_full_messages", return_value=[]),
+            patch.object(coord.session, "_update_token_table"),
+            patch.object(coord.session, "_print_status_line"),
+            patch.object(coord.session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
+        ):
+            coord.session._title_generated = True
+            mgr.set_state(coord.id, WorkstreamState.IDLE)
+            _wait_for_worker_done(coord)
+
+        # Queue drained — the wake delivered the observer's enqueue.
+        assert len(coord.session._nudge_queue) == 0
+        # The synthetic empty-user turn landed with a reminder containing
+        # both children.
+        user_msgs = [m for m in coord.session.messages if m.get("role") == "user"]
+        # Two real msgs (user + assistant context above) plus the wake.
+        wake_msg = user_msgs[-1]
+        assert wake_msg["content"] == ""
+        assert wake_msg.get("_source") == "system_nudge"
+        reminders = wake_msg.get("_reminders") or []
+        assert len(reminders) == 1
+        assert reminders[0]["type"] == "idle_children"
+        text = reminders[0]["text"]
+        assert "research-pricing" in text
+        assert "draft-rfc" in text
+        assert "child-a" in text
+        assert "child-b" in text
+        assert "wait_for_workstream" in text
+    finally:
+        watcher.shutdown()
+        observer.shutdown()
