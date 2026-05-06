@@ -87,6 +87,7 @@ from turnstone.core.metacognition import (
     detect_completion,
     detect_correction,
     format_nudge,
+    sanitize_payload,
     should_nudge,
 )
 from turnstone.core.nudge_queue import TOOL_DRAIN, USER_DRAIN, NudgeQueue
@@ -533,6 +534,20 @@ _RESOURCE_PATH_RE = re.compile(
 _TEMPLATE_VAR_RE = re.compile(r"\{\{(\w+)\}\}")
 
 
+# Soft cap on ``"watch_triggered"`` entries in the per-session NudgeQueue.
+# The pull-model path batches N watch fires into ONE envelope splice on
+# the next drain seam (vs N successive ``send`` turns under the old
+# ``_dispatch_pending_watch`` chain), so a per-call recursion cap is no
+# longer the bound on unbounded accumulation — but a runaway noisy watch
+# should still not pile up unbounded entries.  50 = 10x the prior
+# ``_watch_pending`` ``maxsize=20``, applied producer-side via
+# :meth:`NudgeQueue.drop_oldest_by_type` so other nudge producers
+# (idle_children, advisories) stay unaffected.  Drop policy is
+# drop-OLDEST: a drowning watch is most useful with its latest output,
+# not its earliest.
+_WATCH_QUEUE_SOFT_CAP = 50
+
+
 def _without_tool(tools: list[dict[str, Any]], name: str) -> list[dict[str, Any]]:
     """Return *tools* with the named tool removed."""
     return [t for t in tools if t.get("function", {}).get("name") != name]
@@ -769,8 +784,6 @@ class ChatSession:
         self._notify_count = 0
         # Watch support: server-level runner injected via set_watch_runner()
         self._watch_runner: Any = None  # WatchRunner | None
-        self._watch_pending: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=20)
-        self._watch_dispatch_depth = 0
         # Metacognitive nudges: ephemeral prompts for proactive memory use.
         # One ``NudgeQueue`` per session; producers tag each entry with a
         # channel and consumers drain by filter:
@@ -1363,29 +1376,74 @@ class ChatSession:
         else:
             self._tool_search = None
 
-    def set_watch_runner(self, runner: Any, dispatch_fn: Any = None) -> None:
-        """Inject the server-level WatchRunner (called after workstream setup).
+    def set_watch_runner(self, runner: Any) -> None:
+        """Inject the server-level WatchRunner and register a dispatch fn
+        that routes watch results onto this session's NudgeQueue.
 
-        If *dispatch_fn* is provided (the server passes one that can start
-        worker threads), it is registered directly.  Otherwise a simple
-        enqueue fallback is used — suitable only when ``send()`` is already
-        active (Path A).
+        The dispatch closure is the post-#482 unified path: each watch
+        fire enqueues a ``"watch_triggered"`` entry on ``"any"`` channel,
+        and the existing drain seams (USER_DRAIN, TOOL_DRAIN,
+        ``IdleNudgeWatcher`` IDLE wake) splice it into a
+        ``<system-reminder>`` envelope at the wire boundary — uniform
+        with every other metacog nudge.
+
+        The closure carries:
+          - a soft cap on per-session ``"watch_triggered"`` depth via
+            :data:`_WATCH_QUEUE_SOFT_CAP` + drop-oldest-on-saturation,
+            standing in for the deleted ``_watch_pending`` maxsize bound.
+          - a ``valid_until`` predicate that re-checks
+            ``storage.get_watch(watch_id)["active"]`` at drain time so a
+            cancelled watch's last splat doesn't ride out a future wake.
+          - producer-side :func:`sanitize_payload` over the whole
+            formatted message so steering-vector / control-char payloads
+            sourced from arbitrary shell output can't tamper with the
+            envelope at interpolation time.
         """
         self._watch_runner = runner
-        if dispatch_fn is not None:
-            runner.set_dispatch_fn(self._ws_id, dispatch_fn)
-        else:
-            pending = self._watch_pending
+        nudge_queue = self._nudge_queue
+        ws_id = self._ws_id
 
-            def _enqueue(msg: str) -> None:
+        def _dispatch(msg: str, watch_id: str) -> None:
+            sanitized = sanitize_payload(msg)
+            if not sanitized:
+                # All control chars / empty after strip — silently drop.
+                return
+            # Soft cap: count current "watch_triggered" entries; if at
+            # cap, surgically drop the oldest before enqueueing the new
+            # one.  Drop-oldest matches model-facing intent (latest
+            # output is most useful) and replaces the prior pre-switchover
+            # drop-on-full behaviour of ``_watch_pending``.
+            existing = sum(
+                1
+                for nudge_type, _text in nudge_queue.pending(channel="any")
+                if nudge_type == "watch_triggered"
+            )
+            if existing >= _WATCH_QUEUE_SOFT_CAP:
+                nudge_queue.drop_oldest_by_type("watch_triggered")
+                log.warning(
+                    "watch_dispatch.queue_full ws=%s cap=%d dropped_oldest=True",
+                    ws_id,
+                    _WATCH_QUEUE_SOFT_CAP,
+                )
+            bound_watch_id = watch_id
+
+            def _still_active() -> bool:
+                # Re-checked at drain time outside the queue lock — if
+                # the watch was cancelled between fire and drain, the
+                # entry gets dropped silently rather than splicing a
+                # stale result onto the user's next turn.
                 try:
-                    pending.put_nowait({"message": msg})
-                except queue.Full:
-                    log.warning(
-                        "Watch pending queue full, dropping result for ws_id=%s", self._ws_id
-                    )
+                    storage = get_storage()
+                    row = storage.get_watch(bound_watch_id)
+                except Exception:
+                    return False
+                if row is None:
+                    return False
+                return bool(row.get("active", False))
 
-            runner.set_dispatch_fn(self._ws_id, _enqueue)
+            nudge_queue.enqueue("watch_triggered", sanitized, "any", valid_until=_still_active)
+
+        runner.set_dispatch_fn(self._ws_id, _dispatch)
 
     def close(self) -> None:
         """Release resources (listener registrations, etc.)."""
@@ -2841,9 +2899,6 @@ class ChatSession:
                     if self._flush_queued_messages():
                         continue
                     self._emit_state("idle")
-                    # Dispatch any pending watch results (chains into
-                    # a new send() within the same worker thread).
-                    self._dispatch_pending_watch(self._watch_dispatch_depth)
                     break
 
                 # Execute tool calls (potentially in parallel)
@@ -9599,43 +9654,6 @@ class ChatSession:
         )
         self._report_tool_result(call_id, "watch", msg)
         return call_id, msg
-
-    _MAX_WATCH_CHAIN = 5  # max consecutive watch dispatches per worker thread
-
-    def _dispatch_pending_watch(self, depth: int = 0) -> None:
-        """Dispatch one pending watch result as a new send() turn.
-
-        Each ``send()`` chains back here on IDLE, so multiple queued results
-        are processed sequentially.  Depth is capped to prevent unbounded
-        stack growth.
-
-        Clears ``_wake_source_tag`` for the duration of the recursive
-        ``send`` so the watch turn is processed as a normal user turn:
-        ``_check_metacognitive_nudge`` runs against the watch message,
-        ``_append_user_turn`` does NOT stamp ``_source = "system_nudge"``
-        on the watch user-message, and ``_queue_*_advisory`` calls
-        during the watch's tool execution are not suppressed.  Without
-        this, a watch chained off a wake-driven send inherits the
-        wake-source guards inappropriately — the watch is its own
-        separate event from the wake.
-        """
-        if depth >= self._MAX_WATCH_CHAIN:
-            self._watch_dispatch_depth = 0
-            return
-        try:
-            result = self._watch_pending.get_nowait()
-        except queue.Empty:
-            self._watch_dispatch_depth = 0  # chain ended — reset for next user turn
-            return
-        message = result.get("message", "")
-        if message:
-            self._watch_dispatch_depth = depth + 1
-            saved_wake_tag = self._wake_source_tag
-            self._wake_source_tag = ""
-            try:
-                self.send(message)
-            finally:
-                self._wake_source_tag = saved_wake_tag
 
     def _exec_write_file(self, item: dict[str, Any]) -> tuple[str, str]:
         """Write content to a file, creating parent directories as needed."""
