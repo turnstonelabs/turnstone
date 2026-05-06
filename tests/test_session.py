@@ -3145,6 +3145,55 @@ class TestDeliverWakeNudge:
         # Cleanup so the test doesn't bleed state into subsequent tests.
         _ = original_send
 
+    def test_flushed_user_msg_during_wake_does_not_inherit_source_tag(self, tmp_db):
+        """A real user message queued via ``queue_message`` while a wake
+        send is in flight, then drained by ``_flush_queued_messages`` at
+        the IDLE seam, must NOT be stamped ``_source = "system_nudge"``.
+
+        Pre-fix bug: ``_append_user_turn`` stamped ``_source`` whenever
+        ``_wake_source_tag`` was set, but the tag stays set throughout
+        the wake's chat loop — including the moment ``_flush_queued_messages``
+        funnels a real user-queued message back through
+        ``_append_user_turn``.  Result: real user input mis-attributed
+        to the system in audit / replay metadata.
+
+        Fix: ``_append_user_turn`` only stamps when ``from_wake=True``
+        is passed explicitly (the wake's synthesized first turn);
+        ``_flush_queued_messages``'s default-False call leaves the tag
+        unset on the flushed message.
+        """
+        session = _make_session()
+        session._title_generated = True
+        session._nudge_queue.enqueue("idle_children", "kids", "any")
+        # Queue a real user message that will be flushed at the IDLE seam.
+        session.queue_message("real user input", queue_msg_id="q-1")
+
+        with (
+            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
+            patch.object(
+                session,
+                "_stream_response",
+                return_value={"role": "assistant", "content": "ok"},
+            ),
+            patch.object(session, "_full_messages", return_value=[]),
+            patch.object(session, "_update_token_table"),
+            patch.object(session, "_print_status_line"),
+            patch.object(session, "_emit_state"),
+            patch.object(session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
+        ):
+            session.deliver_wake_nudge_from_queue()
+
+        user_msgs = [m for m in session.messages if m.get("role") == "user"]
+        # Two user messages: the wake's synthetic empty turn (with
+        # _source) AND the flushed real user input (without _source).
+        wake_msg = next(m for m in user_msgs if m.get("content") == "")
+        flushed_msg = next(
+            m for m in user_msgs if m.get("content") and "real user input" in m["content"]
+        )
+        assert wake_msg.get("_source") == "system_nudge"
+        assert flushed_msg.get("_source") is None
+
     def test_exception_marks_appended_reminders_delivered(self, tmp_db):
         """Post-retry stream failure: the just-appended user message's
         ``_reminders`` must be flagged delivered so the next real user

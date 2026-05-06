@@ -2495,6 +2495,8 @@ class ChatSession:
         user_input: str,
         attachments: list[Attachment] | tuple[Attachment, ...],
         send_id: str | None = None,
+        *,
+        from_wake: bool = False,
     ) -> int:
         """Append a user turn (plain or multipart) and persist it.
 
@@ -2557,13 +2559,18 @@ class ChatSession:
             user_content = user_input
 
         user_msg: dict[str, Any] = {"role": "user", "content": user_content}
-        if self._wake_source_tag:
+        if from_wake and self._wake_source_tag:
             # Sibling tag for audit / replay: the synthetic empty user
             # message emitted by ``deliver_wake_nudge_from_queue`` is
             # marked so UI can render it distinctly (or hide it) and
             # log consumers can tell self-prompted turns from real
             # user input.  Stripped at the sanitize boundary by the
-            # leading-underscore filter.
+            # leading-underscore filter.  ``from_wake`` is required
+            # explicitly because :meth:`_flush_queued_messages` also
+            # calls this method during a wake's chat loop — those
+            # messages are real user input that happens to be
+            # delivered while a wake is in flight, NOT synthetic, so
+            # they must not inherit the wake tag.
             user_msg["_source"] = self._wake_source_tag
         if attachments:
             # Sibling metadata so live history replay has the same shape
@@ -2595,6 +2602,15 @@ class ChatSession:
         # consume are two separate transactions; a crash between them
         # leaves pending rows that the UI's chip rehydration can still
         # surface so the user can clear or resend them.
+        #
+        # Skip the persist for the wake's synthesized empty turn — the
+        # row would carry no content (the system-reminder lives on the
+        # ``_reminders`` sibling, stripped before persist) and the
+        # ``_source`` audit tag isn't column-backed.  Replays can
+        # re-derive the wake event from the conversation flow without
+        # this empty row.
+        if from_wake and not user_input and not attachments:
+            return 0
         message_id = save_message(self._ws_id, "user", user_input)
         if attachments and message_id:
             mark_attachments_consumed(
@@ -2613,6 +2629,8 @@ class ChatSession:
         user_input: str,
         attachments: list[Attachment] | None = None,
         send_id: str | None = None,
+        *,
+        from_wake: bool = False,
     ) -> None:
         """Send user input and handle the response loop (including tool calls).
 
@@ -2662,7 +2680,7 @@ class ChatSession:
         if nudge:
             self._queue_user_advisory(*nudge)
 
-        self._append_user_turn(user_input, attachments or (), send_id=send_id)
+        self._append_user_turn(user_input, attachments or (), send_id=send_id, from_wake=from_wake)
 
         try:
             while True:
@@ -5917,7 +5935,7 @@ class ChatSession:
         Drains the queue inline (running every entry's ``valid_until``
         predicate) BEFORE synthesizing the empty user turn — bails if
         no entry survives the predicate check.  Without this, the
-        watcher's ``has_pending`` peek can succeed on entries whose
+        watcher's ``len(queue)`` peek can succeed on entries whose
         predicate later drops them inside
         ``_attach_pending_user_reminders``'s drain, leaving us
         synthesizing an empty user turn with no reminder context (and
@@ -5935,7 +5953,7 @@ class ChatSession:
             {"type": nudge_type, "text": text} for nudge_type, text in items
         ]
         try:
-            self.send("")
+            self.send("", from_wake=True)
         except Exception:
             for msg in self.messages[pre_len:]:
                 if msg.get("_reminders"):

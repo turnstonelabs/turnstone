@@ -4432,7 +4432,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                 from turnstone.console.coordinator_idle_observer import (
                     CoordinatorIdleObserver,
                 )
-                from turnstone.core.metacognition import install_idle_nudge_watcher
+                from turnstone.core.idle_nudge_watcher import install_idle_nudge_watcher
 
                 coord_idle_observer = CoordinatorIdleObserver(coord_mgr, storage)
                 coord_idle_observer.start()
@@ -4492,7 +4492,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         await tls_mgr.stop_renewal()
     if scheduler is not None:
         scheduler.stop()
-    from turnstone.core.metacognition import shutdown_idle_nudge_watchers
+    from turnstone.core.idle_nudge_watcher import shutdown_idle_nudge_watchers
 
     shutdown_idle_nudge_watchers(app)
     coord_idle_observer_shutdown = getattr(app.state, "coord_idle_observer", None)
