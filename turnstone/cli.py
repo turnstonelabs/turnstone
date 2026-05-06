@@ -312,7 +312,7 @@ class TerminalUI(SessionUI):
         sys.stdout.write(f"{RED}{message}{RESET}\n")
         sys.stdout.flush()
 
-    def _print_reminder(self, reminders: list[dict[str, str]]) -> None:
+    def _print_reminder(self, reminders: list[dict[str, Any]]) -> None:
         """Render a metacognitive reminder list as ``[metacognition · type] text``
         lines in the terminal — the CLI's equivalent of the web UI's
         yellow themed bubble.  Used by both ``on_user_reminder`` and
@@ -326,10 +326,10 @@ class TerminalUI(SessionUI):
             sys.stdout.write(f"{YELLOW}[{label}]{RESET} {text}\n")
         sys.stdout.flush()
 
-    def on_user_reminder(self, reminders: list[dict[str, str]]) -> None:
+    def on_user_reminder(self, reminders: list[dict[str, Any]]) -> None:
         self._print_reminder(reminders)
 
-    def on_tool_reminder(self, reminders: list[dict[str, str]], tool_call_id: str) -> None:
+    def on_tool_reminder(self, reminders: list[dict[str, Any]], tool_call_id: str) -> None:
         # tool_call_id ignored — the CLI anchors by output sequence
         # (the line lands directly after the tool result that
         # triggered the batch's reminder).
