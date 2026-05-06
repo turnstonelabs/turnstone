@@ -17,7 +17,9 @@ class TestEnqueueDrain:
         q.enqueue("c", "3", "any")
         # Drain everything regardless of channel — preserves insertion order.
         out = q.drain({"user", "tool", "any"})
-        assert out == [("a", "1"), ("b", "2"), ("c", "3")]
+        # Drain returns ``(nudge_type, text, metadata)``; producers
+        # without ``metadata`` see ``None`` in the third slot.
+        assert out == [("a", "1", None), ("b", "2", None), ("c", "3", None)]
         assert len(q) == 0
 
     def test_drain_filter_keeps_non_matching(self):
@@ -26,22 +28,22 @@ class TestEnqueueDrain:
         q.enqueue("b", "y", "tool")
         # Drain only user → tool entry stays.
         out = q.drain(USER_DRAIN)
-        assert out == [("a", "x")]
+        assert out == [("a", "x", None)]
         assert len(q) == 1
         # Now drain tool — gets the remaining entry.
         out = q.drain(TOOL_DRAIN)
-        assert out == [("b", "y")]
+        assert out == [("b", "y", None)]
         assert len(q) == 0
 
     def test_any_channel_drains_on_either_seam(self):
         q = NudgeQueue()
         q.enqueue("c", "z", "any")
         # User-seam drain pulls "any".
-        assert q.drain(USER_DRAIN) == [("c", "z")]
+        assert q.drain(USER_DRAIN) == [("c", "z", None)]
         assert len(q) == 0
         # Re-enqueue and prove tool-seam also drains "any".
         q.enqueue("d", "w", "any")
-        assert q.drain(TOOL_DRAIN) == [("d", "w")]
+        assert q.drain(TOOL_DRAIN) == [("d", "w", None)]
         assert len(q) == 0
 
     def test_drain_empty_filter_no_op(self):
@@ -65,9 +67,9 @@ class TestEnqueueDrain:
         q.enqueue("c", "3", "user")
         q.enqueue("d", "4", "tool")
         # Drain user — should get "a" then "c" in order; "b","d" stay.
-        assert q.drain({"user"}) == [("a", "1"), ("c", "3")]
+        assert q.drain({"user"}) == [("a", "1", None), ("c", "3", None)]
         # Tool drain follows insertion order on remaining.
-        assert q.drain({"tool"}) == [("b", "2"), ("d", "4")]
+        assert q.drain({"tool"}) == [("b", "2", None), ("d", "4", None)]
 
 
 class TestLenAndClear:
@@ -279,6 +281,70 @@ class TestPending:
         assert len(q) == 2
 
 
+class TestMetadata:
+    """Producer-supplied ``metadata`` rides alongside ``(type, text)`` on
+    drain.  Today only ``watch_triggered`` populates it; the wire shape
+    accommodates future producers (e.g. structured tool_error context)
+    without another schema bump.
+    """
+
+    def test_drain_returns_metadata_when_set(self):
+        q = NudgeQueue()
+        meta = {"watch_name": "w1", "command": "ls", "poll_count": 2}
+        q.enqueue("watch_triggered", "$ ls\nfile.txt", "any", metadata=meta)
+        out = q.drain({"any"})
+        assert out == [("watch_triggered", "$ ls\nfile.txt", meta)]
+
+    def test_drain_returns_none_when_metadata_unset(self):
+        q = NudgeQueue()
+        q.enqueue("idle_children", "kids", "any")  # no metadata kwarg
+        out = q.drain({"any"})
+        assert out == [("idle_children", "kids", None)]
+
+    def test_pending_with_metadata_projects_third_field(self):
+        q = NudgeQueue()
+        q.enqueue("a", "1", "user")
+        q.enqueue("watch_triggered", "out", "any", metadata={"watch_name": "w"})
+        snapshot = q.pending_with_metadata()
+        assert snapshot == [
+            ("a", "1", None),
+            ("watch_triggered", "out", {"watch_name": "w"}),
+        ]
+        # ``pending`` (without metadata) keeps the legacy 2-tuple shape.
+        assert q.pending() == [("a", "1"), ("watch_triggered", "out")]
+
+    def test_metadata_survives_partial_drain(self):
+        """A ``user``-channel drain leaves an unaffected ``tool``-channel
+        entry — its metadata must still be present on the next drain."""
+        q = NudgeQueue()
+        q.enqueue("user_thing", "u", "user")
+        q.enqueue("watch_triggered", "w-out", "tool", metadata={"watch_name": "w1"})
+        # User drain doesn't touch the tool entry.
+        assert q.drain({"user"}) == [("user_thing", "u", None)]
+        # Tool drain still has the metadata.
+        assert q.drain({"tool"}) == [
+            ("watch_triggered", "w-out", {"watch_name": "w1"}),
+        ]
+
+    def test_metadata_with_valid_until_predicate(self):
+        """Metadata + ``valid_until`` co-exist on the same entry; the
+        predicate gate runs as before, and on a True result the metadata
+        rides the drained tuple.
+        """
+        q = NudgeQueue()
+        q.enqueue(
+            "watch_triggered",
+            "w-out",
+            "any",
+            valid_until=lambda: True,
+            metadata={"watch_name": "w1", "is_final": True},
+        )
+        out = q.drain({"any"})
+        assert out == [
+            ("watch_triggered", "w-out", {"watch_name": "w1", "is_final": True}),
+        ]
+
+
 class TestHasPending:
     def test_has_pending_returns_false_on_empty_queue(self):
         q = NudgeQueue()
@@ -343,7 +409,7 @@ class TestValidUntil:
         q = NudgeQueue()
         q.enqueue("a", "1", "any", valid_until=lambda: True)
         out = q.drain({"any"})
-        assert out == [("a", "1")]
+        assert out == [("a", "1", None)]
 
     def test_valid_until_false_drops_silently(self):
         q = NudgeQueue()
@@ -386,7 +452,7 @@ class TestValidUntil:
         # Outer's predicate ran outside the lock, enqueued "inner";
         # outer's True return delivered "outer".  "inner" was enqueued
         # AFTER the partition snapshot, so it stays in the queue.
-        assert out == [("outer", "1")]
+        assert out == [("outer", "1", None)]
         assert q.pending() == [("inner", "from-predicate")]
 
     def test_valid_until_only_evaluated_for_matching_channel(self):
@@ -412,7 +478,7 @@ class TestValidUntil:
         # No predicate → entry behaves identically to pre-PR-3 entries.
         q = NudgeQueue()
         q.enqueue("a", "1", "any")  # no valid_until kwarg
-        assert q.drain({"any"}) == [("a", "1")]
+        assert q.drain({"any"}) == [("a", "1", None)]
 
 
 class TestConcurrency:
@@ -444,7 +510,11 @@ class TestConcurrency:
                 drained = q.drain({"user"})
                 if drained:
                     with observed_lock:
-                        observed.extend(drained)
+                        # Drop the trailing ``metadata`` slot — every
+                        # entry here was enqueued without metadata, so
+                        # the comparison set / count matches the produced
+                        # ``(type, text)`` shape.
+                        observed.extend((nt, txt) for nt, txt, _meta in drained)
 
         consumer = threading.Thread(target=consume, daemon=True)
         consumer.start()

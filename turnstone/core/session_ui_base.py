@@ -1319,7 +1319,7 @@ class SessionUIBase:
     def on_error(self, message: str) -> None:
         self._enqueue({"type": "error", "message": message})
 
-    def on_user_reminder(self, reminders: list[dict[str, str]]) -> None:
+    def on_user_reminder(self, reminders: list[dict[str, Any]]) -> None:
         """Surface a metacognitive user-channel nudge as its own UI
         element.
 
@@ -1334,7 +1334,7 @@ class SessionUIBase:
         """
         self._enqueue({"type": "user_reminder", "reminders": reminders})
 
-    def on_tool_reminder(self, reminders: list[dict[str, str]], tool_call_id: str) -> None:
+    def on_tool_reminder(self, reminders: list[dict[str, Any]], tool_call_id: str) -> None:
         """Surface a metacognitive tool-channel nudge (``tool_error`` /
         ``repeat``) as its own UI element below the tool result that
         triggered it.

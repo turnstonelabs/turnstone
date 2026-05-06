@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import threading
 from collections import deque
-from typing import TYPE_CHECKING, Literal, NamedTuple
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -49,6 +49,16 @@ class _Entry(NamedTuple):
     text: str
     channel: Channel
     valid_until: Callable[[], bool] | None = None
+    # Producer-supplied optional fields that ride alongside ``text`` when
+    # drained — used by ``watch_triggered`` to carry ``watch_name`` /
+    # ``command`` / ``poll_count`` / ``max_polls`` / ``is_final`` into the
+    # rendered reminder dict so the frontend can render a structured
+    # ``.msg.watch-result`` card instead of a plain advisory bubble.
+    # Other producers leave it ``None`` and consumers see only
+    # ``{type, text}``.  Atomicity guarantee: text + metadata land on the
+    # same enqueue call, so a concurrent drain can't observe text without
+    # the matching metadata.
+    metadata: dict[str, Any] | None = None
 
 
 class NudgeQueue:
@@ -65,6 +75,7 @@ class NudgeQueue:
         channel: Channel,
         *,
         valid_until: Callable[[], bool] | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         """Append a nudge.  ``channel`` MUST be in :data:`_VALID_CHANNELS`.
 
@@ -79,17 +90,27 @@ class NudgeQueue:
         stale).  The predicate is called outside the queue lock so
         producers can do non-trivial work (e.g. re-querying storage
         for active children) without blocking other producers.
+
+        ``metadata`` carries optional producer-specific fields that
+        drain returns alongside ``(nudge_type, text)``.  ``watch_triggered``
+        uses it for ``watch_name`` / ``command`` / ``poll_count`` /
+        ``max_polls`` / ``is_final`` so the frontend can render a
+        structured card; other producers leave it ``None``.
         """
         if channel not in _VALID_CHANNELS:
             raise ValueError(f"channel={channel!r}; expected one of {sorted(_VALID_CHANNELS)}")
         with self._lock:
-            self._items.append(_Entry(nudge_type, text, channel, valid_until))
+            self._items.append(_Entry(nudge_type, text, channel, valid_until, metadata))
 
-    def drain(self, channels: frozenset[str] | set[str]) -> list[tuple[str, str]]:
+    def drain(
+        self, channels: frozenset[str] | set[str]
+    ) -> list[tuple[str, str, dict[str, Any] | None]]:
         """Drain entries whose channel is in ``channels``.
 
         Entries with non-matching channels stay in the queue, in order.
-        Returns ``(nudge_type, text)`` tuples in insertion order.
+        Returns ``(nudge_type, text, metadata)`` tuples in insertion
+        order; ``metadata`` is the producer-supplied dict (or ``None``
+        when unset).
 
         Entries with a ``valid_until`` predicate get re-checked outside
         the queue lock; falsy / raising predicates drop the entry
@@ -119,14 +140,14 @@ class NudgeQueue:
         # Predicates evaluate outside the lock — they may do storage
         # I/O or other work that shouldn't block other producers /
         # the drain consumer's other queues.
-        out: list[tuple[str, str]] = []
+        out: list[tuple[str, str, dict[str, Any] | None]] = []
         for entry in candidates:
             if entry.valid_until is None:
-                out.append((entry.nudge_type, entry.text))
+                out.append((entry.nudge_type, entry.text, entry.metadata))
                 continue
             try:
                 if entry.valid_until():
-                    out.append((entry.nudge_type, entry.text))
+                    out.append((entry.nudge_type, entry.text, entry.metadata))
             except Exception:
                 # Predicate raising is treated as "no longer valid" —
                 # drop silently rather than letting one bad predicate
@@ -227,11 +248,30 @@ class NudgeQueue:
         code that wants to *consume* entries should call :meth:`drain`
         instead — pending entries are by definition unconsumed and
         will redraw at the next matching seam.
+
+        ``metadata`` is intentionally NOT projected here — tests that
+        need to assert producer-specific fields call
+        :meth:`pending_with_metadata` (or :meth:`drain` directly).
         """
         with self._lock:
             if channel is None:
                 return [(e.nudge_type, e.text) for e in self._items]
             return [(e.nudge_type, e.text) for e in self._items if e.channel == channel]
+
+    def pending_with_metadata(
+        self, channel: Channel | None = None
+    ) -> list[tuple[str, str, dict[str, Any] | None]]:
+        """Non-mutating snapshot including each entry's ``metadata``.
+
+        Used by tests / introspection paths that need to assert
+        producer-specific optional fields (e.g. the watch dispatcher's
+        ``watch_name`` / ``command`` / ``poll_count`` payload).  Production
+        consumers should still call :meth:`drain`.
+        """
+        with self._lock:
+            if channel is None:
+                return [(e.nudge_type, e.text, e.metadata) for e in self._items]
+            return [(e.nudge_type, e.text, e.metadata) for e in self._items if e.channel == channel]
 
     def has_pending(self, channels: frozenset[str] | set[str]) -> bool:
         """Short-circuiting existence check.
