@@ -2692,15 +2692,26 @@ class ChatSession:
         # leaves pending rows that the UI's chip rehydration can still
         # surface so the user can clear or resend them.
         #
-        # Skip the persist for the wake's synthesized empty turn — the
-        # row would carry no content (the system-reminder lives on the
-        # ``_reminders`` sibling, stripped before persist) and the
-        # ``_source`` audit tag isn't column-backed.  Replays can
-        # re-derive the wake event from the conversation flow without
-        # this empty row.
-        if from_wake and not user_input and not attachments:
-            return 0
-        message_id = save_message(self._ws_id, "user", user_input)
+        # The wake's synthesised empty turn DOES persist now: the
+        # ``_source`` and ``_reminders`` columns mirror the in-memory
+        # side-channels so a tab reconnecting via /history sees the
+        # same system-nudge marker + reminder bubbles the originating
+        # tab rendered live.  Without persistence, multi-tab / multi-
+        # device replay shows the assistant's response with no
+        # preceding context — the wake event looks like it came out of
+        # nowhere.
+        source = user_msg.get("_source")
+        reminders_payload = user_msg.get("_reminders")
+        reminders_json = (
+            json.dumps(reminders_payload, separators=(",", ":")) if reminders_payload else None
+        )
+        message_id = save_message(
+            self._ws_id,
+            "user",
+            user_input,
+            source=source if isinstance(source, str) and source else None,
+            reminders=reminders_json,
+        )
         if attachments and message_id:
             mark_attachments_consumed(
                 [a.attachment_id for a in attachments],
@@ -3027,12 +3038,23 @@ class ChatSession:
                         )[:TOOL_RESULT_STORAGE_CAP]
                     else:
                         store_text = raw_output[:TOOL_RESULT_STORAGE_CAP]
+                    # Mirror the user-channel persistence: tool-channel
+                    # reminders (``tool_error`` / ``repeat``) ride the same
+                    # ``_reminders`` JSON column so a tab reconnecting via
+                    # /history sees the below-the-tool bubble the
+                    # originating tab rendered live.
+                    tool_reminders_json = (
+                        json.dumps(metacog_reminders, separators=(",", ":"))
+                        if metacog_reminders
+                        else None
+                    )
                     save_message(
                         self._ws_id,
                         "tool",
                         store_text,
                         _tname,
                         tool_call_id=tc_id,
+                        reminders=tool_reminders_json,
                     )
                 # Inject user feedback from approval prompt (e.g. "y, use full path")
                 if user_feedback:

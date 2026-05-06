@@ -289,9 +289,12 @@ def reconstruct_messages(
 ) -> list[dict[str, Any]]:
     """Reconstruct OpenAI message format from stored conversation rows.
 
-    Each *row* is a 7-tuple ``(id, role, content, tool_name,
-    tool_call_id, provider_data, tool_calls_json)``, ordered
-    chronologically by row id.
+    Each *row* is a 9-tuple ``(id, role, content, tool_name,
+    tool_call_id, provider_data, tool_calls_json, source,
+    reminders_json)``, ordered chronologically by row id.  The trailing
+    two columns mirror the ``_source`` / ``_reminders`` in-memory side
+    channels so multi-tab / multi-device replay sees the same bubble
+    shape the originating tab saw live.
 
     When ``attachments_by_msg`` is provided, any user row whose id has
     attachments is rebuilt with multipart list content (text +
@@ -299,7 +302,17 @@ def reconstruct_messages(
     """
     messages: list[dict[str, Any]] = []
     for row in rows:
-        row_id, role, content, _tool_name, tc_id, provider_data, tool_calls_json = row
+        (
+            row_id,
+            role,
+            content,
+            _tool_name,
+            tc_id,
+            provider_data,
+            tool_calls_json,
+            source,
+            reminders_json,
+        ) = row
 
         if role == "user":
             parts: list[dict[str, Any]] = []
@@ -325,9 +338,17 @@ def reconstruct_messages(
                 umsg: dict[str, Any] = {"role": "user", "content": user_content}
                 if meta:
                     umsg["_attachments_meta"] = meta
-                messages.append(umsg)
             else:
-                messages.append({"role": "user", "content": content or ""})
+                umsg = {"role": "user", "content": content or ""}
+            if source:
+                umsg["_source"] = str(source)
+            if reminders_json:
+                # Mirrors the ``provider_data`` / ``tool_calls`` JSON
+                # decode pattern below: malformed JSON in the column is
+                # swallowed silently rather than aborting load.
+                with contextlib.suppress(json.JSONDecodeError, TypeError):
+                    umsg["_reminders"] = json.loads(reminders_json)
+            messages.append(umsg)
 
         elif role == "assistant":
             msg: dict[str, Any] = {"role": "assistant", "content": content or ""}
@@ -340,13 +361,18 @@ def reconstruct_messages(
             messages.append(msg)
 
         elif role == "tool":
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tc_id or "",
-                    "content": content or "",
-                }
-            )
+            tmsg: dict[str, Any] = {
+                "role": "tool",
+                "tool_call_id": tc_id or "",
+                "content": content or "",
+            }
+            if reminders_json:
+                # Tool-channel reminders (``tool_error`` / ``repeat``)
+                # ride the same column so replay shows the same below-
+                # the-tool bubble the originating tab rendered live.
+                with contextlib.suppress(json.JSONDecodeError, TypeError):
+                    tmsg["_reminders"] = json.loads(reminders_json)
+            messages.append(tmsg)
 
     # Repair: strip trailing incomplete tool call turns
     while messages:

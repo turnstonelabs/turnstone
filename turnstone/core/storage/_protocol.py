@@ -115,12 +115,20 @@ class StorageBackend(Protocol):
         tool_call_id: str | None = None,
         provider_data: str | None = None,
         tool_calls: str | None = None,
+        source: str | None = None,
+        reminders: str | None = None,
     ) -> int:
         """Log a message to the conversations table.
 
         Returns the inserted row's ``id`` (autoincrement PK).  Callers
         that need to link side tables (e.g. ``workstream_attachments``)
         use this to associate the row after save.
+
+        ``source`` is the persisted twin of the in-memory ``_source``
+        side-channel (today only ``"system_nudge"`` for wake-driven
+        empty user turns).  ``reminders`` is a JSON-encoded list mirroring
+        ``_reminders``; both are NULL for the common case where a
+        message carries no metacog payload.
         """
         ...
 
@@ -130,8 +138,8 @@ class StorageBackend(Protocol):
         Each dict must include ``ws_id``, ``role``, and ``content``
         (which may be ``None`` for assistant messages with only tool_calls).
         Optional keys: ``tool_name``, ``tool_call_id``, ``provider_data``,
-        ``tool_calls``.  Timestamp and workstream
-        updated-at are handled internally.
+        ``tool_calls``, ``source``, ``reminders``.  Timestamp and
+        workstream updated-at are handled internally.
         """
         ...
 
