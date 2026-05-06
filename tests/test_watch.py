@@ -450,13 +450,13 @@ class TestWatchRunner:
         runner.set_dispatch_fn("ws-1", fn1)
         runner.set_dispatch_fn("ws-2", fn2)
 
-        runner._dispatch_result("ws-1", "msg1")
-        fn1.assert_called_once_with("msg1")
+        runner._dispatch_result("ws-1", "msg1", "watch-a")
+        fn1.assert_called_once_with("msg1", "watch-a")
         fn2.assert_not_called()
 
         runner.remove_dispatch_fn("ws-1")
         # After removal, dispatch should try restore_fn
-        runner._dispatch_result("ws-1", "msg2")
+        runner._dispatch_result("ws-1", "msg2", "watch-b")
         fn1.assert_called_once()  # still just the one call
 
     def test_restore_fn_called_for_evicted(self):
@@ -464,9 +464,24 @@ class TestWatchRunner:
         restore_fn = MagicMock(return_value=restored_fn)
         runner = self._make_runner(restore_fn=restore_fn)
 
-        runner._dispatch_result("ws-evicted", "hello")
+        runner._dispatch_result("ws-evicted", "hello", "watch-x")
         restore_fn.assert_called_once_with("ws-evicted")
-        restored_fn.assert_called_once_with("hello")
+        restored_fn.assert_called_once_with("hello", "watch-x")
+
+    def test_get_dispatch_fn_returns_registered_fn(self):
+        """``get_dispatch_fn`` is the public accessor used by the
+        server-side restore path to retrieve the per-ws closure that
+        ``set_watch_runner`` constructed during workstream rehydrate.
+        """
+        runner = self._make_runner()
+        fn = MagicMock()
+        runner.set_dispatch_fn("ws-1", fn)
+        assert runner.get_dispatch_fn("ws-1") is fn
+        # Unknown ws → None.
+        assert runner.get_dispatch_fn("ws-missing") is None
+        # After removal → None.
+        runner.remove_dispatch_fn("ws-1")
+        assert runner.get_dispatch_fn("ws-1") is None
 
     def test_run_command_success(self):
         runner = self._make_runner()

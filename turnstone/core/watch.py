@@ -227,7 +227,7 @@ class WatchRunner:
         *,
         check_interval: float = 15.0,
         tool_timeout: float = 30.0,
-        restore_fn: Callable[[str], Callable[[str], None] | None] | None = None,
+        restore_fn: Callable[[str], Callable[[str, str], None] | None] | None = None,
     ) -> None:
         self._storage = storage
         self._node_id = node_id
@@ -235,7 +235,7 @@ class WatchRunner:
         self._tool_timeout = tool_timeout
         self._restore_fn = restore_fn
 
-        self._dispatch_fns: dict[str, Callable[[str], None]] = {}
+        self._dispatch_fns: dict[str, Callable[[str, str], None]] = {}
         self._dispatch_lock = threading.Lock()
 
         self._stop_event = threading.Event()
@@ -260,13 +260,30 @@ class WatchRunner:
 
     # -- Dispatch function registry ------------------------------------------
 
-    def set_dispatch_fn(self, ws_id: str, fn: Callable[[str], None]) -> None:
+    def set_dispatch_fn(self, ws_id: str, fn: Callable[[str, str], None]) -> None:
+        """Register a per-workstream dispatch fn.
+
+        The fn signature is ``(message, watch_id)`` — the runner passes
+        the originating ``watch_id`` so dispatch closures can capture
+        per-watch metadata (e.g. a ``valid_until`` predicate that
+        re-checks ``storage.get_watch(watch_id)["active"]`` before
+        delivering a stale entry).
+        """
         with self._dispatch_lock:
             self._dispatch_fns[ws_id] = fn
 
     def remove_dispatch_fn(self, ws_id: str) -> None:
         with self._dispatch_lock:
             self._dispatch_fns.pop(ws_id, None)
+
+    def get_dispatch_fn(self, ws_id: str) -> Callable[[str, str], None] | None:
+        """Public accessor for the registered dispatch fn (used by
+        server-side restore paths to thread the closure through
+        ``WatchRunner.restore_fn`` after the workstream is rehydrated).
+        Returns ``None`` if no dispatch fn is registered for ``ws_id``.
+        """
+        with self._dispatch_lock:
+            return self._dispatch_fns.get(ws_id)
 
     # -- Main loop -----------------------------------------------------------
 
@@ -382,7 +399,7 @@ class WatchRunner:
                 is_final=is_final,
                 reason=reason,
             )
-            self._dispatch_result(ws_id, message)
+            self._dispatch_result(ws_id, message, watch_id)
 
         log.debug(
             "watch_runner.polled",
@@ -417,14 +434,14 @@ class WatchRunner:
         except Exception as exc:
             return f"[command failed: {exc}]", -1
 
-    def _dispatch_result(self, ws_id: str, message: str) -> None:
+    def _dispatch_result(self, ws_id: str, message: str, watch_id: str) -> None:
         """Deliver a watch result to the owning workstream."""
         with self._dispatch_lock:
             fn = self._dispatch_fns.get(ws_id)
 
         if fn is not None:
             try:
-                fn(message)
+                fn(message, watch_id)
                 return
             except Exception:
                 log.exception("watch_runner.dispatch_error", extra={"ws_id": ws_id})
@@ -434,7 +451,7 @@ class WatchRunner:
             try:
                 restored_fn = self._restore_fn(ws_id)
                 if restored_fn is not None:
-                    restored_fn(message)
+                    restored_fn(message, watch_id)
                     return
             except Exception:
                 log.exception("watch_runner.restore_error", extra={"ws_id": ws_id})
