@@ -163,6 +163,28 @@ class FakeAdapter:
             return [e for e in self.events if e.kind == kind]
 
 
+class _FakeRowMapping:
+    """SQLAlchemy-Row-like wrapper exposing ``_mapping`` over a ``_Row``.
+
+    The real backends return ``Row`` objects with a ``_mapping`` attribute;
+    consumers (e.g. ``CoordinatorIdleObserver._active_children``) prefer
+    ``row._mapping[<col>]`` access.  This shim mirrors that contract so
+    fakes are interchangeable with real Rows in tests.
+    """
+
+    def __init__(self, row: _Row) -> None:
+        self._mapping = {
+            "ws_id": row.ws_id,
+            "user_id": row.user_id,
+            "name": row.name,
+            "kind": row.kind,
+            "state": row.state,
+            "parent_ws_id": row.parent_ws_id,
+            "updated": row.updated,
+            "node_id": row.node_id,
+        }
+
+
 @dataclass
 class _Row:
     ws_id: str
@@ -299,6 +321,47 @@ class FakeStorage:
                 "state": row.state,
                 "parent_ws_id": row.parent_ws_id,
             }
+
+    def list_workstreams(
+        self,
+        node_id: str | None = None,
+        limit: int = 100,
+        *,
+        parent_ws_id: str | None = None,
+        kind: WorkstreamKind | str | None = None,
+        user_id: str | None = None,
+    ) -> list[Any]:
+        kind_str = kind.value if isinstance(kind, WorkstreamKind) else kind
+        with self.lock:
+            matched: list[_FakeRowMapping] = []
+            for row in self.rows.values():
+                if parent_ws_id is not None and row.parent_ws_id != parent_ws_id:
+                    continue
+                if kind_str is not None and row.kind != kind_str:
+                    continue
+                if user_id is not None and row.user_id != user_id:
+                    continue
+                matched.append(_FakeRowMapping(row))
+            # Order by updated DESC so the consumer's LIMIT semantics match
+            # production (storage backends order this way).
+            matched.sort(key=lambda r: r._mapping["updated"], reverse=True)
+            return matched[:limit]
+
+    def count_workstreams_by_state(
+        self,
+        *,
+        parent_ws_id: str | None = None,
+        user_id: str | None = None,
+    ) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        with self.lock:
+            for row in self.rows.values():
+                if parent_ws_id is not None and row.parent_ws_id != parent_ws_id:
+                    continue
+                if user_id is not None and row.user_id != user_id:
+                    continue
+                counts[row.state] = counts.get(row.state, 0) + 1
+        return counts
 
     def delete_workstream(self, ws_id: str) -> None:
         with self.lock:

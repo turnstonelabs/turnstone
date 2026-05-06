@@ -1,25 +1,19 @@
 """Metacognitive prompting — situational nudges for proactive memory use.
 
-Also hosts :class:`IdleNudgeWatcher`, the wake-trigger that converts a
-workstream's transition to ``WorkstreamState.IDLE`` into a synthetic
-empty-user-turn ``send`` whenever the session has any-channel nudges
-queued (typically the ``idle_children`` nudge enqueued by the
-coordinator-side observer).  Race analysis lives on
-:class:`IdleNudgeWatcher` itself.
+Static nudge text templates (``NUDGE_*``), detection heuristics
+(``detect_correction``, ``detect_completion``), the :class:`RepeatDetector`
+streak counter, and the cooldown-aware :func:`should_nudge` /
+:func:`format_nudge` / :func:`format_idle_children_nudge` helpers.
+
+The wake-trigger lifecycle (``IdleNudgeWatcher`` plus the
+``install_idle_nudge_watcher`` / ``shutdown_idle_nudge_watchers``
+lifespan helpers) lives in :mod:`turnstone.core.idle_nudge_watcher`.
 """
 
 from __future__ import annotations
 
-import contextlib
 import re
 import time
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
-
-    from turnstone.core.session_manager import SessionManager
-    from turnstone.core.workstream import WorkstreamState
 
 # Default cooldown (s) between nudges of the same type.  Production
 # paths pass ``cooldown_secs`` explicitly from
@@ -148,7 +142,24 @@ NUDGE_IDLE_CHILDREN_HEADER = (
 )
 
 
-_NAME_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+# ASCII control chars + Unicode steering vectors (bidi-override,
+# zero-width, line/paragraph separators, BOM, tag chars).  Treated
+# uniformly as control chars and replaced with a space; angle-bracket
+# tag-breakers are stripped separately below.  Defense-in-depth today
+# (self-injection within one user's tenant — children inherit parent
+# ``user_id``); becomes load-bearing the moment a producer ingests
+# names from a different boundary (a future watch trigger consuming
+# external webhook bodies into ``ws.name``, etc).
+_NAME_CONTROL_CHARS = re.compile(
+    r"[\x00-\x1f\x7f"  # ASCII control + DEL
+    r"​-‏"  # zero-width / LRM / RLM
+    r"‪-‮"  # bidi overrides
+    r"⁦-⁩"  # bidi isolates
+    r"  "  # line / paragraph separator
+    r"﻿"  # BOM
+    r"]"
+    r"|[\U000e0000-\U000e007f]"  # Unicode tag chars (separate range above BMP)
+)
 _NAME_TAG_BREAKERS = re.compile(r"[<>]")
 
 
@@ -158,8 +169,9 @@ def _sanitize_child_name(name: str) -> str:
     The wire-boundary :func:`escape_wrapper_tags` only protects the
     ``<system-reminder>`` and ``<tool_output>`` envelopes; other
     angle-bracketed markers (``</thinking>``, ``<answer>``,
-    ``<artifact>``, …) and control chars can still steer some models.
-    Strip both before interpolation — self-injection only today
+    ``<artifact>``, …) and Unicode steering vectors (RTL override,
+    zero-width chars, tag chars) can still steer some models.  Strip
+    both classes before interpolation — self-injection only today
     (children inherit parent ``user_id``), but the cost is one
     ``re.sub`` per child.
     """
@@ -294,6 +306,26 @@ def detect_completion(message: str) -> bool:
     return any(p.search(message) for p in _WEAK_COMPLETION)
 
 
+def _cooldown_allows(
+    nudge_type: str,
+    state: dict[str, float],
+    *,
+    cooldown_secs: int = _COOLDOWN_SECS,
+) -> bool:
+    """Read-only cooldown peek — does NOT record a fire timestamp.
+
+    Use this as a cheap pre-gate before expensive work (storage queries,
+    message walks).  The follow-up :func:`should_nudge` call re-checks
+    cooldown AND records the timestamp atomically.  A producer that
+    races between this peek and ``should_nudge`` would just lose the
+    fire to the other producer — benign.
+    """
+    last = state.get(nudge_type)
+    if last is None:
+        return True
+    return time.monotonic() - last >= cooldown_secs
+
+
 def should_nudge(
     nudge_type: str,
     state: dict[str, float],
@@ -329,121 +361,3 @@ def should_nudge(
 def format_nudge(nudge_type: str) -> str:
     """Return the nudge text for the given type."""
     return _NUDGE_MAP.get(nudge_type, "")
-
-
-class IdleNudgeWatcher:
-    """Convert a workstream IDLE transition into a wake send when the
-    session has queued nudges.
-
-    Subscribes to :meth:`SessionManager.subscribe_to_state` and listens
-    for ``WorkstreamState.IDLE``.  If the workstream's
-    :class:`NudgeQueue` is non-empty, dispatches via
-    ``session_worker.send`` with a no-op ``enqueue`` callback.
-
-    **Race semantics.**  ``session_worker.send`` decides atomically
-    under ``ws._lock`` whether a worker thread already owns the
-    workstream.  Three outcomes:
-
-    * No worker → spawn a new daemon that calls
-      :meth:`ChatSession.deliver_wake_nudge_from_queue` (the wake
-      drains its own queue and runs the synthetic empty-user turn).
-    * Worker running → call our ``enqueue`` lambda, which is a no-op.
-      The wake is silently dropped; the queued nudge stays in
-      ``NudgeQueue`` and the in-flight worker picks it up at its next
-      user-message-attach or tool-result seam (whichever fires first
-      for the entry's channel).  This is the load-bearing fallback —
-      we never spawn a competing worker.
-    * Workstream gone (``ws is None``) or session not built
-      (``ws.session is None``) → bail.
-
-    **Subscription order matters.**  When a workstream-kind-specific
-    observer (e.g. ``CoordinatorIdleObserver`` in PR 3) needs to
-    *enqueue* a nudge on the same IDLE event before this watcher
-    *peeks* the queue, the observer must register first so that
-    ``SessionManager.set_state``'s subscriber loop fires it earlier in
-    the same synchronous fan-out.
-
-    **Kind-agnostic.**  Fires for any workstream regardless of
-    :class:`WorkstreamKind`.  Producers decide what to enqueue.
-    """
-
-    def __init__(self, manager: SessionManager) -> None:
-        self._manager = manager
-        self._callback: Callable[[str, WorkstreamState], None] | None = None
-
-    def start(self) -> None:
-        """Idempotent — registering twice is a no-op."""
-        if self._callback is not None:
-            return
-        # Local import to avoid a circular import at module load time
-        # (session_manager imports from session, which already pulls
-        # metacognition, so a top-level import here would cycle).
-        from turnstone.core.workstream import WorkstreamState
-
-        def _on_state(ws_id: str, state: WorkstreamState) -> None:
-            if state is not WorkstreamState.IDLE:
-                return
-            ws = self._manager.get(ws_id)
-            if ws is None or ws.session is None:
-                return
-            session = ws.session
-            if len(session._nudge_queue) == 0:
-                return
-            from turnstone.core import session_worker
-
-            session_worker.send(
-                ws,
-                enqueue=lambda: None,
-                run=session.deliver_wake_nudge_from_queue,
-                thread_name=f"wake-nudge-{ws.id[:8]}",
-            )
-
-        self._callback = _on_state
-        self._manager.subscribe_to_state(_on_state)
-
-    def shutdown(self) -> None:
-        """Unsubscribe; idempotent."""
-        cb = self._callback
-        if cb is None:
-            return
-        with contextlib.suppress(Exception):
-            self._manager.unsubscribe_from_state(cb)
-        self._callback = None
-
-
-_APP_STATE_ATTR = "_idle_nudge_watchers"
-
-
-def install_idle_nudge_watcher(app: Any, manager: SessionManager) -> IdleNudgeWatcher:
-    """Construct + start an :class:`IdleNudgeWatcher` and register it
-    for lifespan teardown via :func:`shutdown_idle_nudge_watchers`.
-
-    Multiple watchers may be installed against different
-    :class:`SessionManager` instances on the same ``app`` (e.g. the
-    interactive manager + the coord manager on a multi-kind host).
-    All of them get torn down by a single
-    :func:`shutdown_idle_nudge_watchers` call.
-
-    Returns the watcher so the caller can run additional setup
-    against the same manager — but the typical site doesn't need
-    the return value.
-    """
-    watcher = IdleNudgeWatcher(manager)
-    watcher.start()
-    watchers: list[IdleNudgeWatcher] = getattr(app.state, _APP_STATE_ATTR, [])
-    if not watchers:
-        # First watcher on this app — initialise the list.  Avoids
-        # mutating a default arg or sharing the list across apps.
-        setattr(app.state, _APP_STATE_ATTR, watchers)
-    watchers.append(watcher)
-    return watcher
-
-
-def shutdown_idle_nudge_watchers(app: Any) -> None:
-    """Shut down every watcher installed via
-    :func:`install_idle_nudge_watcher`.  No-op if none.
-    """
-    watchers: list[IdleNudgeWatcher] = getattr(app.state, _APP_STATE_ATTR, [])
-    for watcher in watchers:
-        watcher.shutdown()
-    watchers.clear()
