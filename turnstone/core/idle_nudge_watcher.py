@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from turnstone.core import session_worker
 from turnstone.core.log import get_logger
+from turnstone.core.nudge_queue import USER_DRAIN
 from turnstone.core.workstream import WorkstreamState
 
 if TYPE_CHECKING:
@@ -32,8 +33,14 @@ class IdleNudgeWatcher:
 
     Subscribes to :meth:`SessionManager.subscribe_to_state` and listens
     for ``WorkstreamState.IDLE``.  If the workstream's
-    :class:`NudgeQueue` is non-empty, dispatches via
-    ``session_worker.send`` with a no-op ``enqueue`` callback.
+    :class:`NudgeQueue` has any drainable entry for the wake's drain
+    filter (``USER_DRAIN`` — channels ``"user"`` or ``"any"``),
+    dispatches via ``session_worker.send`` with a no-op ``enqueue``
+    callback.  Tool-only entries don't fire the wake — they belong to
+    the next tool-result seam, not a synthetic empty user turn —
+    otherwise every IDLE event with a queued tool advisory would spawn
+    a wake daemon that immediately no-ops at
+    ``deliver_wake_nudge_from_queue``'s drain guard.
 
     **Race semantics.**  ``session_worker.send`` decides atomically
     under ``ws._lock`` whether a worker thread already owns the
@@ -78,7 +85,7 @@ class IdleNudgeWatcher:
             if ws is None or ws.session is None:
                 return
             session = ws.session
-            if len(session._nudge_queue) == 0:
+            if not session._nudge_queue.has_pending(USER_DRAIN):
                 return
             session_worker.send(
                 ws,
