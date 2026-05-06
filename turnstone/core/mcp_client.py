@@ -665,17 +665,23 @@ class MCPClientManager:
         the auth-retry path's eager teardown would propagate the SDK's
         own collected fallout.
 
-        The 5s ``asyncio.wait_for`` is a deliberate guard against
-        ``aclose()`` hanging on a broken stack (e.g., a never-completing
-        anyio task during teardown). The auth_401 retry runs on a
-        fresh :class:`asyncio.Task` scheduled via
-        :func:`asyncio.run_coroutine_threadsafe` (see
-        :meth:`_dispatch_pool_sync`), so this helper is never invoked
-        from inside an active cancellation context — ``wait_for``'s
-        own cancellation observation does not abort the aclose early.
+        The 5s timeout uses ``asyncio.timeout`` (NOT ``asyncio.wait_for``)
+        because Python 3.11's ``asyncio.wait_for`` wraps its inner
+        coroutine in a fresh :class:`asyncio.Task`. When that fresh
+        task runs ``stack.aclose()``, it tries to exit anyio cancel
+        scopes that were entered in the CALLING task — anyio rejects
+        the cross-task scope-exit with
+        ``RuntimeError('Attempted to exit cancel scope in a different
+        task than it was entered in')`` and the aclose fails.
+        ``asyncio.timeout`` runs the inner code in the current task
+        (matches Python 3.12+'s ``wait_for`` rewrite), preserving
+        scope-exit identity. The 5s bound stays as protection against
+        ``aclose()`` hanging on a broken stack (a never-completing
+        anyio task during teardown).
         """
         try:
-            await asyncio.wait_for(stack.aclose(), timeout=5)
+            async with asyncio.timeout(5):
+                await stack.aclose()
         except (Exception, asyncio.CancelledError, BaseExceptionGroup):
             log.debug("Error closing AsyncExitStack; ignoring", exc_info=True)
 
@@ -2765,16 +2771,14 @@ class MCPClientManager:
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                 finally:
-                    # Cancel-and-await: matches the codebase's standard
-                    # cancel pattern (cf. shutdown helper). Awaiting
-                    # cancelled tasks here pins the broken session's
-                    # streams against the auth_401 retry's
+                    # Cancel-and-await both losers. Awaiting cancelled
+                    # tasks here pins the broken session's streams
+                    # against the auth_401 retry's
                     # ``_safe_close_stack`` teardown — without it the
                     # cancelled ``call_task`` could keep touching the
                     # SDK's stream state concurrently with the new
-                    # ``_connect_one_pool``'s aclose, racing exactly
-                    # the way the rest of this fix was written to
-                    # avoid. ``BaseException`` covers both the
+                    # ``_connect_one_pool``'s aclose.
+                    # ``BaseException`` covers both the
                     # ``CancelledError`` we asked for and any
                     # ``BaseExceptionGroup`` the SDK's anyio
                     # TaskGroup may wrap on teardown.
