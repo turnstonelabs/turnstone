@@ -243,19 +243,6 @@ class TestValidUntil:
         # Predicate ran once with the dispatched watch_id.
         assert is_active_calls == ["watch-1"]
 
-    def test_valid_until_drops_when_watch_missing(self, tmp_db, monkeypatch):
-        session = _make_session_for_dispatch()
-        _runner, dispatch = _register_runner(session)
-
-        # Missing-row case collapses to the same False return shape under
-        # the ``is_watch_active`` API — pinned separately to make the
-        # missing-vs-inactive intent explicit at the call site.
-        patch_session_storage(monkeypatch, active=False)
-
-        dispatch("body", "watch-1")
-        out = session._nudge_queue.drain({"any"})
-        assert out == []
-
     def test_valid_until_drops_when_storage_raises(self, tmp_db, monkeypatch):
         """The closure's broad-except in the predicate translates a
         storage-layer exception to ``False`` so the drain doesn't
@@ -310,18 +297,14 @@ class TestConcurrency:
         # behaviour, not storage round-trips.
         patch_session_storage(monkeypatch, active=True)
 
-        n_threads = 2
         per_thread = 100
+        labels = ("a", "b")
 
         def fire(label: str) -> None:
             for i in range(per_thread):
                 dispatch(f"{label}-{i}", f"watch-{label}")
 
-        threads = [
-            threading.Thread(target=fire, args=("a",), daemon=True),
-            threading.Thread(target=fire, args=("b",), daemon=True),
-        ]
-        assert len(threads) == n_threads
+        threads = [threading.Thread(target=fire, args=(label,), daemon=True) for label in labels]
         for t in threads:
             t.start()
         for t in threads:
@@ -329,16 +312,12 @@ class TestConcurrency:
         for t in threads:
             assert not t.is_alive(), "dispatch thread did not finish in time"
 
-        # Two threads × 100 dispatches → at most 200 entries; the cap
-        # bounds the actual count; no exception was raised across the
-        # 3-acquisition window per dispatch.
+        # The non-atomic count-then-drop window admits at most one "slip"
+        # per concurrent thread above the cap (each thread can observe a
+        # sub-cap count and append before another thread's drop runs).
         depth = len(session._nudge_queue)
-        assert depth <= n_threads * per_thread
-        # The non-atomic count-then-drop window admits at most one
-        # "slip" per concurrent thread above the cap (each thread can
-        # observe a sub-cap count and append before another thread's
-        # drop runs).  Bound the slack to N_THREADS, not 2 * per_thread.
-        assert depth <= _WATCH_QUEUE_SOFT_CAP + n_threads
+        assert depth <= len(threads) * per_thread
+        assert depth <= _WATCH_QUEUE_SOFT_CAP + len(threads)
 
 
 # ---------------------------------------------------------------------------
