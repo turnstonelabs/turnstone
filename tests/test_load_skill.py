@@ -420,8 +420,9 @@ class TestSkillCatalogDisclosure:
         session.system_messages = []
         session._agent_system_messages = []
         session.reasoning_effort = "medium"
-        session._pending_tool_advisories = []
-        session._pending_user_advisories = []
+        from turnstone.core.nudge_queue import NudgeQueue
+
+        session._nudge_queue = NudgeQueue()
         session._tool_search = None
         session._mcp_client = None
         session._notify_on_complete = "{}"
