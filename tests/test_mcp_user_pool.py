@@ -517,23 +517,29 @@ class TestClassifyFailure:
         mgr = MCPClientManager({})
         assert mgr._classify_failure(ValueError("nope")) == "other"
 
-    def test_http_401_classified_as_auth(self) -> None:
+    def test_http_401_classified_as_auth_401(self) -> None:
+        """Defense-in-depth: ``HTTPStatusError`` classification still works
+        even though Phase 6 normally consults the carrier instead.
+
+        Phase 6 split ``"auth"`` into ``"auth_401"`` / ``"auth_403"``
+        so the dispatcher can refresh-and-retry only on 401.
+        """
         import httpx
 
         mgr = MCPClientManager({})
         req = httpx.Request("POST", "https://mcp.example.com/sse")
         resp = httpx.Response(401, request=req)
         exc = httpx.HTTPStatusError("unauthorized", request=req, response=resp)
-        assert mgr._classify_failure(exc) == "auth"
+        assert mgr._classify_failure(exc) == "auth_401"
 
-    def test_http_403_classified_as_auth(self) -> None:
+    def test_http_403_classified_as_auth_403(self) -> None:
         import httpx
 
         mgr = MCPClientManager({})
         req = httpx.Request("POST", "https://mcp.example.com/sse")
         resp = httpx.Response(403, request=req)
         exc = httpx.HTTPStatusError("forbidden", request=req, response=resp)
-        assert mgr._classify_failure(exc) == "auth"
+        assert mgr._classify_failure(exc) == "auth_403"
 
     def test_http_500_not_classified_as_auth(self) -> None:
         import httpx
@@ -576,37 +582,6 @@ class TestDispatchFailureWiring:
             entry.session = sess
 
         _run_on_loop(loop, _seed())
-
-    def test_dispatch_pool_401_does_not_trip_breaker(
-        self, running_loop_mgr, storage: SQLiteBackend
-    ) -> None:
-        import httpx
-
-        mgr, loop, _ = running_loop_mgr
-        cipher = make_mcp_token_cipher()
-        _seed_oauth_server(storage, name="pool-srv")
-        _seed_user_token(storage, cipher)
-        self._wire_pool(mgr, storage, cipher)
-
-        req = httpx.Request("POST", "https://mcp.example.com/sse")
-        resp = httpx.Response(401, request=req)
-        self._seed_connected_session(
-            mgr, loop, httpx.HTTPStatusError("unauthorized", request=req, response=resp)
-        )
-
-        with pytest.raises(httpx.HTTPStatusError):
-            mgr.call_tool_sync(
-                "mcp__pool-srv__do_thing",
-                {},
-                user_id="user-1",
-                timeout=5,
-            )
-        # Auth failure must NOT tick the per-server breaker.
-        assert mgr._consecutive_failures.get("pool-srv", 0) == 0
-        # But the pool entry's session must be cleared so the next call
-        # re-authenticates with a fresh bearer.
-        entry = mgr._user_pool_entries[("user-1", "pool-srv")]
-        assert entry.session is None
 
     def test_dispatch_pool_transport_failure_trips_breaker(
         self, running_loop_mgr, storage: SQLiteBackend
@@ -811,11 +786,27 @@ class TestLruInterlock:
 
 
 class TestConcurrentDispatch:
-    def test_pool_concurrent_dispatch_to_same_user_server_is_concurrent(
+    def test_pool_concurrent_dispatch_to_same_user_server_is_serialized(
         self, running_loop_mgr, storage: SQLiteBackend
     ) -> None:
-        """Two tool calls on the SAME (user, server) must overlap in flight,
-        not serialize on ``open_lock``."""
+        """Phase 6: two tool calls on the SAME (user, server) MUST serialize
+        on ``open_lock`` so the auth-introspection carrier never crosses
+        between concurrent dispatches.
+
+        Phase 5 perf-1 released ``open_lock`` before ``call_tool`` so two
+        concurrent same-key calls multiplexed on a shared
+        ``ClientSession``. Phase 6 reverts that for the auth-aware path
+        because the per-dispatch ``_AuthCapture`` is keyed off the
+        ``httpx.AsyncClient`` event hook — releasing the lock would let
+        a concurrent dispatch overwrite the carrier mid-flight,
+        attributing one caller's 401 to another (a security bug).
+
+        Verified by reverting ``_dispatch_pool_with_entry`` to the
+        Phase 5 shape (release ``open_lock`` before ``call_tool`` —
+        i.e. move the ``in_flight += 1`` / ``call_tool`` / decrement
+        block out of the ``async with`` body) and confirming this test
+        observes ``max_concurrency == 2``.
+        """
         mgr, loop, _ = running_loop_mgr
         cipher = make_mcp_token_cipher()
         _seed_oauth_server(storage, name="pool-srv")
@@ -834,7 +825,8 @@ class TestConcurrentDispatch:
                 in_flight += 1
                 observed_max_concurrency = max(observed_max_concurrency, in_flight)
             try:
-                # Hold a moment so concurrent calls overlap.
+                # Hold a moment so concurrent calls would overlap if
+                # they weren't serialized on ``open_lock``.
                 await asyncio.sleep(0.1)
                 content = MagicMock()
                 content.text = "ok"
@@ -880,9 +872,9 @@ class TestConcurrentDispatch:
 
         assert errors == []
         assert results == ["ok", "ok"]
-        # Both dispatches were in flight at the same time — open_lock did
-        # not serialize them.
-        assert observed_max_concurrency == 2
+        # ``open_lock`` held across ``call_tool`` — the second dispatch
+        # waits for the first to release before entering call_tool.
+        assert observed_max_concurrency == 1
 
 
 # ---------------------------------------------------------------------------
