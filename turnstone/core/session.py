@@ -1406,8 +1406,18 @@ class ChatSession:
         nudge_queue = self._nudge_queue
         ws_id = self._ws_id
 
-        def _dispatch(msg: str, watch_id: str) -> None:
-            sanitized = sanitize_payload(msg)
+        def _dispatch(reminder: dict[str, Any], watch_id: str) -> None:
+            # ``reminder`` is the structured dict produced by
+            # :func:`build_watch_reminder`.  ``text`` carries the
+            # formatted body — sanitised here over the full string so
+            # steering-vector / control-char payloads sourced from
+            # arbitrary shell output can't tamper with the envelope at
+            # interpolation time.  The remaining fields ride as the
+            # queue entry's ``metadata`` so the frontend can render a
+            # ``.msg.watch-result`` card with command preview + poll
+            # counter.
+            text = reminder.get("text", "") if isinstance(reminder, dict) else ""
+            sanitized = sanitize_payload(text)
             if not sanitized:
                 # All control chars / empty after strip — silently drop.
                 return
@@ -1433,7 +1443,18 @@ class ChatSession:
                 except Exception:
                     return False
 
-            nudge_queue.enqueue("watch_triggered", sanitized, "any", valid_until=_still_active)
+            metadata = {
+                k: reminder[k]
+                for k in ("watch_name", "command", "poll_count", "max_polls", "is_final")
+                if isinstance(reminder, dict) and k in reminder
+            }
+            nudge_queue.enqueue(
+                "watch_triggered",
+                sanitized,
+                "any",
+                valid_until=_still_active,
+                metadata=metadata or None,
+            )
 
         runner.set_dispatch_fn(self._ws_id, _dispatch)
 
