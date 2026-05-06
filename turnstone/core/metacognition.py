@@ -118,11 +118,15 @@ _NUDGE_MAP: dict[str, str] = {
     "start": NUDGE_START,
     "tool_error": NUDGE_TOOL_ERROR,
     "repeat": NUDGE_REPEAT,
-    # idle_children carries no static body — :func:`format_idle_children_nudge`
-    # produces the per-fire text from the active-children snapshot.  Empty
-    # string here keeps :func:`format_nudge` round-tripping honestly while
-    # still letting :func:`should_nudge` recognise the type.
+    # idle_children and watch_triggered carry no static body — the
+    # per-fire text comes from a producer (``format_idle_children_nudge``
+    # for the former, ``format_watch_message`` + ``sanitize_payload``
+    # in the watch dispatch closure for the latter).  Empty string
+    # here keeps :func:`format_nudge` round-tripping honestly while
+    # still letting :func:`should_nudge` and ``_NUDGE_MAP``-as-registry
+    # consumers recognise the type.
     "idle_children": "",
+    "watch_triggered": "",
 }
 
 
@@ -147,11 +151,19 @@ NUDGE_IDLE_CHILDREN_HEADER = (
 # uniformly as control chars and replaced with a space; angle-bracket
 # tag-breakers are stripped separately below.  Defense-in-depth today
 # (self-injection within one user's tenant — children inherit parent
-# ``user_id``); becomes load-bearing the moment a producer ingests
-# names from a different boundary (a future watch trigger consuming
-# external webhook bodies into ``ws.name``, etc).
-_NAME_CONTROL_CHARS = re.compile(
-    r"[\x00-\x1f\x7f"  # ASCII control + DEL
+# ``user_id`` and watch commands are user-supplied), but becomes
+# load-bearing the moment a producer ingests payloads from a different
+# trust boundary (a future watch trigger consuming external webhook
+# bodies, etc).
+#
+# TAB / LF / CR (``\x09``/``\x0a``/``\x0d``) are intentionally
+# **excluded** from the strip set: watch payloads carry multi-line
+# shell output whose layout is part of the signal the model needs to
+# interpret.  Stripping LF/CR would collapse multi-line output to one
+# line — this gap is closed here so the shared sanitiser is safe to
+# apply to the whole formatted watch message.
+_PAYLOAD_CONTROL_CHARS = re.compile(
+    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f"  # ASCII control (skip \t\n\r) + DEL
     r"​-‏"  # zero-width / LRM / RLM
     r"‪-‮"  # bidi overrides
     r"⁦-⁩"  # bidi isolates
@@ -160,11 +172,16 @@ _NAME_CONTROL_CHARS = re.compile(
     r"]"
     r"|[\U000e0000-\U000e007f]"  # Unicode tag chars (separate range above BMP)
 )
-_NAME_TAG_BREAKERS = re.compile(r"[<>]")
+_PAYLOAD_TAG_BREAKERS = re.compile(r"[<>]")
 
 
-def _sanitize_child_name(name: str) -> str:
-    """Neutralize prompt-structural markers in user-controlled child names.
+def sanitize_payload(text: str) -> str:
+    """Neutralize prompt-structural markers in user-controlled nudge payloads.
+
+    Used by both producers whose payloads are sourced from user input:
+    workstream names rendered into the ``idle_children`` nudge body,
+    and ``format_watch_message`` output rendered into the
+    ``watch_triggered`` nudge body.
 
     The wire-boundary :func:`escape_wrapper_tags` only protects the
     ``<system-reminder>`` and ``<tool_output>`` envelopes; other
@@ -172,13 +189,16 @@ def _sanitize_child_name(name: str) -> str:
     ``<artifact>``, …) and Unicode steering vectors (RTL override,
     zero-width chars, tag chars) can still steer some models.  Strip
     both classes before interpolation — self-injection only today
-    (children inherit parent ``user_id``), but the cost is one
-    ``re.sub`` per child.
+    (child workstreams inherit parent ``user_id`` and watch commands
+    are user-supplied), but the cost is one ``re.sub`` per payload.
+
+    TAB / LF / CR are preserved (see ``_PAYLOAD_CONTROL_CHARS``) so
+    multi-line shell output in watch payloads keeps its line structure.
     """
-    if not name:
+    if not text:
         return ""
-    cleaned = _NAME_CONTROL_CHARS.sub(" ", name)
-    cleaned = _NAME_TAG_BREAKERS.sub("", cleaned)
+    cleaned = _PAYLOAD_CONTROL_CHARS.sub(" ", text)
+    cleaned = _PAYLOAD_TAG_BREAKERS.sub("", cleaned)
     return cleaned.strip()
 
 
@@ -192,7 +212,7 @@ def format_idle_children_nudge(children: list[dict[str, str]]) -> str:
     at the wire boundary.
 
     User-controlled ``name`` strings get sanitized via
-    :func:`_sanitize_child_name` before interpolation so a workstream
+    :func:`sanitize_payload` before interpolation so a workstream
     named ``</thinking>...`` can't steer the model's reasoning
     channels through the rendered body.
 
@@ -208,7 +228,7 @@ def format_idle_children_nudge(children: list[dict[str, str]]) -> str:
     shown = children[:NUDGE_IDLE_CHILDREN_DISPLAY_CAP]
     for c in shown:
         ws_id = c.get("ws_id", "")
-        name = _sanitize_child_name(c.get("name", "")) or "(unnamed)"
+        name = sanitize_payload(c.get("name", "")) or "(unnamed)"
         state = c.get("state", "?")
         lines.append(f"  - {ws_id[:8]} ({state}): {name}")
     overflow = len(children) - len(shown)
