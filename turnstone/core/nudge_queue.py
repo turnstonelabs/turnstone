@@ -172,13 +172,9 @@ class NudgeQueue:
         With ``channel=None`` searches across all channels; with a specific
         channel filters to that channel only.  Returns ``True`` if an
         entry was dropped, ``False`` if no matching entry was found.
-        Used by producers with a soft cap on their own type's queue depth
-        (e.g. the watch dispatcher's drop-oldest policy when
-        ``"watch_triggered"`` saturates) — atomic under the queue lock
-        so the count snapshot + drop pair can't interleave with a
-        concurrent enqueue from the same producer.  Pass the same
-        ``channel`` to both :meth:`count_by_type` and this method so
-        both halves agree on the entry set being capped.
+        The call itself is atomic under the queue lock; producers that
+        need an atomic count-and-drop pair (no interleave with concurrent
+        drains) should use :meth:`cap_at_or_drop_oldest` instead.
         """
         with self._lock:
             for i, entry in enumerate(self._items):
@@ -189,6 +185,38 @@ class NudgeQueue:
                 del self._items[i]
                 return True
         return False
+
+    def cap_at_or_drop_oldest(
+        self,
+        nudge_type: str,
+        max_depth: int,
+        channel: Channel | None = None,
+    ) -> bool:
+        """If queued ``nudge_type`` entries reach ``max_depth``, drop the
+        earliest matching entry — under a single lock acquisition so a
+        concurrent drain can't slip between the count and the drop.
+
+        Returns ``True`` iff a drop happened.  Producers with a per-type
+        soft cap call this on the enqueue path; ``max_depth <= 0`` is a
+        defensive no-op returning ``False``.
+        """
+        if max_depth <= 0:
+            return False
+        with self._lock:
+            oldest_index = -1
+            count = 0
+            for i, entry in enumerate(self._items):
+                if entry.nudge_type != nudge_type:
+                    continue
+                if channel is not None and entry.channel != channel:
+                    continue
+                if oldest_index == -1:
+                    oldest_index = i
+                count += 1
+                if count >= max_depth:
+                    del self._items[oldest_index]
+                    return True
+            return False
 
     def pending(self, channel: Channel | None = None) -> list[tuple[str, str]]:
         """Non-mutating snapshot for tests / introspection.

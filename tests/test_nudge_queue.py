@@ -153,6 +153,71 @@ class TestDropOldestByType:
         ]
 
 
+class TestCapAtOrDropOldest:
+    def test_below_cap_no_drop(self):
+        q = NudgeQueue()
+        for i in range(3):
+            q.enqueue("target", f"t-{i}", "any")
+        # 3 entries, cap=5 → no drop.
+        assert q.cap_at_or_drop_oldest("target", 5, channel="any") is False
+        assert q.count_by_type("target") == 3
+
+    def test_at_cap_drops_oldest(self):
+        q = NudgeQueue()
+        for i in range(5):
+            q.enqueue("target", f"t-{i}", "any")
+        # 5 entries, cap=5 → drop the oldest ("t-0"), leaving 4.
+        assert q.cap_at_or_drop_oldest("target", 5, channel="any") is True
+        remaining = q.pending()
+        assert ("target", "t-0") not in remaining
+        assert len(remaining) == 4
+        assert remaining[0] == ("target", "t-1")  # FIFO drop-oldest preserved
+
+    def test_above_cap_drops_only_one(self):
+        q = NudgeQueue()
+        for i in range(7):
+            q.enqueue("target", f"t-{i}", "any")
+        # 7 entries, cap=5 → drop only ONE per call (soft-cap regulates over time).
+        assert q.cap_at_or_drop_oldest("target", 5, channel="any") is True
+        assert q.count_by_type("target") == 6
+
+    def test_channel_filter_respected(self):
+        q = NudgeQueue()
+        for i in range(3):
+            q.enqueue("target", f"any-{i}", "any")
+        for i in range(3):
+            q.enqueue("target", f"user-{i}", "user")
+        # 3 "any"-channel entries; cap=3 on channel="any" → drop oldest "any" only.
+        assert q.cap_at_or_drop_oldest("target", 3, channel="any") is True
+        # User-channel entries untouched.
+        assert q.count_by_type("target", channel="user") == 3
+        assert q.count_by_type("target", channel="any") == 2
+
+    def test_other_types_ignored(self):
+        q = NudgeQueue()
+        for i in range(5):
+            q.enqueue("other", f"o-{i}", "any")
+        q.enqueue("target", "t-0", "any")
+        # Only one "target" entry; cap=1 on "target" → drop it.  "other"
+        # entries are untouched even though queue holds 6 total.
+        assert q.cap_at_or_drop_oldest("target", 1, channel="any") is True
+        assert q.count_by_type("target") == 0
+        assert q.count_by_type("other") == 5
+
+    def test_zero_or_negative_cap_no_op(self):
+        q = NudgeQueue()
+        q.enqueue("target", "t-0", "any")
+        assert q.cap_at_or_drop_oldest("target", 0, channel="any") is False
+        assert q.cap_at_or_drop_oldest("target", -1, channel="any") is False
+        assert q.count_by_type("target") == 1
+
+    def test_no_match_returns_false(self):
+        q = NudgeQueue()
+        q.enqueue("other", "o-0", "any")
+        assert q.cap_at_or_drop_oldest("target", 1, channel="any") is False
+        assert q.count_by_type("other") == 1
+
+
 class TestCountByType:
     def test_count_by_type_no_channel(self):
         """Count across all channels with ``channel=None``."""
