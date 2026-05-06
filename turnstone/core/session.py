@@ -591,8 +591,8 @@ class SessionUI(Protocol):
     def on_plan_review(self, content: str) -> str: ...
     def on_info(self, message: str) -> None: ...
     def on_error(self, message: str) -> None: ...
-    def on_user_reminder(self, reminders: list[dict[str, str]]) -> None: ...
-    def on_tool_reminder(self, reminders: list[dict[str, str]], tool_call_id: str) -> None: ...
+    def on_user_reminder(self, reminders: list[dict[str, Any]]) -> None: ...
+    def on_tool_reminder(self, reminders: list[dict[str, Any]], tool_call_id: str) -> None: ...
     def on_state_change(self, state: str) -> None: ...
     def on_rename(self, name: str) -> None: ...
     def on_intent_verdict(self, verdict: dict[str, Any]) -> None:
@@ -813,7 +813,7 @@ class ChatSession:
         # — handed to ``_attach_pending_user_reminders`` so the synthesized
         # send doesn't re-drain (and so we can bail out before send when
         # every entry's ``valid_until`` predicate dropped its item).
-        self._wake_drained_reminders: list[dict[str, str]] | None = None
+        self._wake_drained_reminders: list[dict[str, Any]] | None = None
         # User message queue: messages sent while model is executing.
         # OrderedDict preserves FIFO order and supports O(1) removal by ID.
         # Queued user turns never carry attachments — see
@@ -4288,7 +4288,7 @@ class ChatSession:
         assessment: OutputAssessment | None,
         func_name: str,
         is_last_in_batch: bool,
-    ) -> tuple[list[ToolAdvisory], list[dict[str, str]]]:
+    ) -> tuple[list[ToolAdvisory], list[dict[str, Any]]]:
         """Gather advisories to attach to a tool result message.
 
         Returns ``(persistent, metacog_reminders)``:
@@ -4297,10 +4297,12 @@ class ChatSession:
           inside the tool-result envelope via ``wrap_tool_result``.
           These are conversation history and must persist in
           ``self.messages``.
-        - ``metacog_reminders`` — list of ``{"type", "text"}`` dicts for
-          ``tool_error`` / ``repeat`` nudges that the caller attaches to
-          the tool message dict's ``_reminders`` side-channel.  Like
-          user-channel reminders, they are spliced into ``content`` only
+        - ``metacog_reminders`` — list of ``{"type", "text", ...optional}``
+          dicts for ``tool_error`` / ``repeat`` nudges that the caller
+          attaches to the tool message dict's ``_reminders`` side-channel.
+          The optional fields ride from the producer's ``metadata`` dict
+          (today only ``watch_triggered`` populates it).  Like user-
+          channel reminders, the dicts are spliced into ``content`` only
           at the wire boundary by ``_apply_reminders_for_provider`` and
           surfaced separately on the UI as a themed bubble below the
           tool result.
@@ -4312,7 +4314,7 @@ class ChatSession:
         from turnstone.core.tool_advisory import GuardAdvisory, UserInterjection
 
         persistent: list[ToolAdvisory] = []
-        metacog_reminders: list[dict[str, str]] = []
+        metacog_reminders: list[dict[str, Any]] = []
 
         # Output guard advisory — persists with the tool result.
         if assessment is not None:
@@ -4326,7 +4328,11 @@ class ChatSession:
         # and rides the wire only via the transient-copy splice.
         if is_last_in_batch:
             drained = self._nudge_queue.drain(TOOL_DRAIN)
-            metacog_reminders.extend({"type": nt, "text": text} for nt, text in drained)
+            for nt, text, meta in drained:
+                entry: dict[str, Any] = {"type": nt, "text": text}
+                if meta:
+                    entry.update(meta)
+                metacog_reminders.append(entry)
 
         # Drain queued user messages on the last result in the batch.
         # Items are always text-only (attachments rejected at
@@ -5995,7 +6001,12 @@ class ChatSession:
             items = self._nudge_queue.drain(USER_DRAIN)
             if not items:
                 return
-            reminders = [{"type": nudge_type, "text": text} for nudge_type, text in items]
+            reminders = []
+            for nudge_type, text, meta in items:
+                entry: dict[str, Any] = {"type": nudge_type, "text": text}
+                if meta:
+                    entry.update(meta)
+                reminders.append(entry)
         if not reminders:
             return
         user_msg["_reminders"] = reminders
@@ -6068,9 +6079,13 @@ class ChatSession:
             return
         pre_len = len(self.messages)
         self._wake_source_tag = "system_nudge"
-        self._wake_drained_reminders = [
-            {"type": nudge_type, "text": text} for nudge_type, text in items
-        ]
+        wake_reminders: list[dict[str, Any]] = []
+        for nudge_type, text, meta in items:
+            entry: dict[str, Any] = {"type": nudge_type, "text": text}
+            if meta:
+                entry.update(meta)
+            wake_reminders.append(entry)
+        self._wake_drained_reminders = wake_reminders
         try:
             self.send("", from_wake=True)
         except Exception:

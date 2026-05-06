@@ -139,10 +139,10 @@ class NullUI:
     def on_error(self, message: str) -> None:
         pass
 
-    def on_user_reminder(self, reminders: list[dict[str, str]]) -> None:
+    def on_user_reminder(self, reminders: list[dict[str, Any]]) -> None:
         pass
 
-    def on_tool_reminder(self, reminders: list[dict[str, str]], tool_call_id: str) -> None:
+    def on_tool_reminder(self, reminders: list[dict[str, Any]], tool_call_id: str) -> None:
         pass
 
     def on_state_change(self, state: str) -> None:
