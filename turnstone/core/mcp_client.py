@@ -139,7 +139,21 @@ class _PoolDispatchRetryRequested(BaseException):  # noqa: N818
     """
 
 
-def _make_capturing_http_factory(capture: _AuthCapture) -> McpHttpClientFactory:
+class _CarrierAuthSignal(Exception):  # noqa: N818
+    """Internal signal raised when the response hook captures a 4xx mid-call.
+
+    Raised from ``_dispatch_pool_with_entry`` when the carrier's fired
+    event wins the race against ``session.call_tool``. The dispatcher's
+    ``_classify_failure(exc, capture=...)`` resolves the actual auth
+    class (``auth_401`` / ``auth_403``) from the carrier's ``status``,
+    so this exception is just a structural placeholder — it never
+    surfaces to callers.
+    """
+
+
+def _make_capturing_http_factory(
+    capture: _AuthCapture, fired_event: asyncio.Event | None = None
+) -> McpHttpClientFactory:
     """Return an ``httpx`` factory that records 4xx auth signals into ``capture``.
 
     The hook is ``async`` because :class:`httpx.AsyncClient` invokes
@@ -176,6 +190,12 @@ def _make_capturing_http_factory(capture: _AuthCapture) -> McpHttpClientFactory:
             capture.status = status
             headers = response.headers.get_list("www-authenticate")
             capture.www_authenticate = headers[0] if headers else None
+            if fired_event is not None:
+                # Wakes the dispatcher's race in ``_dispatch_pool_with_entry``.
+                # See the docstring on _CarrierAuthSignal for why call_tool
+                # cannot be relied on to propagate the failure on a reused
+                # session.
+                fired_event.set()
 
     def _factory(
         headers: dict[str, str] | None = None,
@@ -269,6 +289,14 @@ class PoolEntryState:
     eviction skips entries with ``in_flight > 0`` so a long-running
     ``call_tool`` can release ``open_lock`` while still pinning the
     entry's session against teardown.
+
+    ``auth_capture`` is bound once at first connect (passed to the
+    httpx response hook factory); the hook closes over this object for
+    the life of the underlying ``httpx.AsyncClient``. Each dispatch
+    resets the carrier's fields under ``open_lock`` before
+    ``call_tool`` and reads them after — a per-dispatch carrier would
+    fail silently on session reuse because the hook is bound at
+    connect time, not per dispatch.
     """
 
     key: tuple[str, str]  # (user_id, server_name)
@@ -284,6 +312,13 @@ class PoolEntryState:
     prompts: list[dict[str, Any]] | None = None
     last_used: float = 0.0
     in_flight: int = 0
+    auth_capture: _AuthCapture = field(default_factory=_AuthCapture)
+    # Set by the response hook when the carrier captures a 4xx; awaited
+    # by ``_dispatch_pool_with_entry``'s race against ``call_tool``.
+    # Must be allocated on the mcp-loop (per :class:`asyncio.Event`'s
+    # loop-binding contract); ``_ensure_pool_entry`` runs on the loop
+    # so the dataclass default_factory is safe.
+    auth_fired_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 # ---------------------------------------------------------------------------
@@ -924,6 +959,7 @@ class MCPClientManager:
         access_token: str,
         *,
         auth_capture: _AuthCapture | None = None,
+        auth_fired_event: asyncio.Event | None = None,
     ) -> PoolEntryState:
         """Connect a single per-(user, server) pool entry.
 
@@ -984,7 +1020,9 @@ class MCPClientManager:
 
         client_kwargs: dict[str, Any] = {"url": url, "headers": headers}
         if auth_capture is not None:
-            client_kwargs["httpx_client_factory"] = _make_capturing_http_factory(auth_capture)
+            client_kwargs["httpx_client_factory"] = _make_capturing_http_factory(
+                auth_capture, fired_event=auth_fired_event
+            )
 
         stack = AsyncExitStack()
         await stack.__aenter__()
@@ -2190,9 +2228,10 @@ class MCPClientManager:
 
         Pool-path 401/403 handling: the SDK's ``post_writer`` swallows
         ``httpx.HTTPStatusError``; we recover the upstream auth signal
-        via a response-hook carrier on the per-dispatch
-        ``httpx.AsyncClient``. A 401 triggers one refresh-and-retry
-        with ``force_refresh=True``; persistent 401 emits
+        via a response-hook carrier owned by the pool entry (bound to
+        the entry's persistent ``httpx.AsyncClient`` at first connect;
+        see ``PoolEntryState.auth_capture``). A 401 triggers one
+        refresh-and-retry with ``force_refresh=True``; persistent 401 emits
         ``mcp_consent_required``. A 403 with
         ``WWW-Authenticate: error="insufficient_scope"`` emits
         ``mcp_insufficient_scope`` with the parsed scope set. Other
@@ -2529,13 +2568,10 @@ class MCPClientManager:
         key = (user_id, server_name)
         entry = await self._ensure_pool_entry(key)
 
-        # First attempt — fresh capture per dispatch so a prior
-        # dispatch's 401 cannot leak into this one's classification.
-        # Even though ``open_lock`` is held across ``call_tool``,
-        # allocating per-call (rather than per-entry) protects against
-        # future concurrent-multiplex regressions if the lock scope
-        # ever shrinks.
-        capture = _AuthCapture()
+        # See PoolEntryState.auth_capture for why the carrier is
+        # entry-owned; _dispatch_pool_with_entry resets it under
+        # open_lock before call_tool, we read it after.
+        capture = entry.auth_capture
         try:
             result = await self._dispatch_pool_with_entry(
                 entry=entry,
@@ -2544,7 +2580,6 @@ class MCPClientManager:
                 access_token=access_token,
                 original_name=original_name,
                 arguments=arguments,
-                auth_capture=capture,
             )
         except BaseException as exc:
             classification = self._classify_failure(exc, capture=capture)
@@ -2660,18 +2695,22 @@ class MCPClientManager:
         access_token: str,
         original_name: str,
         arguments: dict[str, Any],
-        auth_capture: _AuthCapture,
     ) -> str:
         """Hold ``entry.open_lock`` across connect-or-reuse AND ``call_tool``.
 
-        Lock held across ``call_tool`` because the per-dispatch
+        Lock held across ``call_tool`` because the entry's
         ``_AuthCapture`` is keyed off the httpx event hook; releasing
-        would let a concurrent same-(user, server) dispatch overwrite
-        the carrier mid-flight, attributing one caller's auth failure
-        to another. Holding the lock serialises same-(user, server)
-        calls — acceptable because that contention scenario is rare
-        in practice (ChatSession dispatches sequentially and per-
-        (user, server) parallelism is not a production requirement).
+        the lock would let a concurrent same-(user, server) dispatch
+        overwrite the carrier mid-flight and attribute one caller's
+        auth failure to another. Holding the lock serialises
+        same-(user, server) calls — acceptable because that contention
+        scenario is rare in practice (ChatSession dispatches
+        sequentially and per-(user, server) parallelism is not a
+        production requirement).
+
+        Reset of ``entry.auth_capture`` and ``entry.auth_fired_event``
+        happens under the lock before ``call_tool`` — see
+        :class:`PoolEntryState` for why the carrier is entry-owned.
 
         ``entry.in_flight`` accounting is preserved for the eviction
         interlock — it's belt-and-braces here since ``open_lock.locked()``
@@ -2681,18 +2720,80 @@ class MCPClientManager:
         async with entry.open_lock:
             entry.last_used = time.monotonic()
             self._user_pool_last_used[key] = entry.last_used
+            entry.auth_capture.status = None
+            entry.auth_capture.www_authenticate = None
+            entry.auth_fired_event.clear()
             session = entry.session
             if session is None:
                 # Lazy connect — also covers post-eviction recovery.
                 fresh = await self._connect_one_pool(
-                    key, cfg, access_token, auth_capture=auth_capture
+                    key,
+                    cfg,
+                    access_token,
+                    auth_capture=entry.auth_capture,
+                    auth_fired_event=entry.auth_fired_event,
                 )
                 session = fresh.session
                 if session is None:
                     raise RuntimeError(f"Pool connect for {key!r} produced no session")
             entry.in_flight += 1
             try:
-                result = await session.call_tool(original_name, arguments)
+                # Race ``call_tool`` against the carrier's fired event.
+                # Without this race, an upstream 4xx on a REUSED session
+                # never propagates back through ``call_tool``: the SDK's
+                # ``_receive_loop`` is in BaseSession's TaskGroup, nested
+                # inside ``streamablehttp_client``'s TaskGroup. When
+                # the spawned ``handle_request_async`` task raises
+                # ``HTTPStatusError``, the outer TaskGroup cancels
+                # ``_receive_loop`` mid-finally, before it can deliver
+                # ``CONNECTION_CLOSED`` to the response stream's waiting
+                # receiver. anyio's ``send_nowait`` skips waiters with
+                # pending cancellation; here the dispatcher's task has
+                # NO pending cancellation (it was created by a fresh
+                # ``run_coroutine_threadsafe`` and is not in the
+                # streamablehttp_client cancel-scope chain), so the
+                # send delivers but the receiver never wakes — the
+                # waiter's Event is set on a stale state. Result: a
+                # forever-hung ``response_stream_reader.receive()``.
+                # The carrier-fired event lets us short-circuit before
+                # the SDK's hang manifests.
+                call_task = asyncio.create_task(session.call_tool(original_name, arguments))
+                fired_task = asyncio.create_task(entry.auth_fired_event.wait())
+                try:
+                    done, pending = await asyncio.wait(
+                        {call_task, fired_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    # Cancel-and-await: matches the codebase's standard
+                    # cancel pattern (cf. shutdown helper). Awaiting
+                    # cancelled tasks here pins the broken session's
+                    # streams against the auth_401 retry's
+                    # ``_safe_close_stack`` teardown — without it the
+                    # cancelled ``call_task`` could keep touching the
+                    # SDK's stream state concurrently with the new
+                    # ``_connect_one_pool``'s aclose, racing exactly
+                    # the way the rest of this fix was written to
+                    # avoid. ``BaseException`` covers both the
+                    # ``CancelledError`` we asked for and any
+                    # ``BaseExceptionGroup`` the SDK's anyio
+                    # TaskGroup may wrap on teardown.
+                    for task in (call_task, fired_task):
+                        if not task.done():
+                            task.cancel()
+                    for task in (call_task, fired_task):
+                        with contextlib.suppress(BaseException):
+                            await task
+                if call_task in done:
+                    result = call_task.result()
+                else:
+                    # Hook captured 4xx before call_tool returned. The
+                    # SDK won't propagate the failure through
+                    # call_tool, so eagerly tear down the session and
+                    # raise a sentinel that the dispatcher's
+                    # ``_classify_failure`` will resolve via the
+                    # carrier (which holds the captured status).
+                    raise _CarrierAuthSignal()
             finally:
                 entry.in_flight -= 1
         return _decode_tool_result(result)
