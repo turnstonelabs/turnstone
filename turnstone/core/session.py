@@ -1408,11 +1408,7 @@ class ChatSession:
             if not sanitized:
                 # All control chars / empty after strip — silently drop.
                 return
-            # Soft cap: count current "watch_triggered" entries; if at
-            # cap, surgically drop the oldest before enqueueing the new
-            # one.  Drop-oldest matches model-facing intent (latest
-            # output is most useful) and replaces the prior pre-switchover
-            # drop-on-full behaviour of ``_watch_pending``.
+            # Soft cap drops oldest — latest output is most useful.
             existing = nudge_queue.count_by_type("watch_triggered", channel="any")
             if existing >= _WATCH_QUEUE_SOFT_CAP:
                 nudge_queue.drop_oldest_by_type("watch_triggered", channel="any")
@@ -1421,7 +1417,6 @@ class ChatSession:
                     ws_id,
                     _WATCH_QUEUE_SOFT_CAP,
                 )
-            bound_watch_id = watch_id
 
             def _still_active() -> bool:
                 # Re-checked at drain time outside the queue lock — if
@@ -1431,7 +1426,7 @@ class ChatSession:
                 # ``is_watch_active`` avoids the full-row marshal of
                 # ``get_watch`` on this hot path.
                 try:
-                    return get_storage().is_watch_active(bound_watch_id)
+                    return get_storage().is_watch_active(watch_id)
                 except Exception:
                     return False
 
