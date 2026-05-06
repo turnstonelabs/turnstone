@@ -1413,13 +1413,9 @@ class ChatSession:
             # one.  Drop-oldest matches model-facing intent (latest
             # output is most useful) and replaces the prior pre-switchover
             # drop-on-full behaviour of ``_watch_pending``.
-            existing = sum(
-                1
-                for nudge_type, _text in nudge_queue.pending(channel="any")
-                if nudge_type == "watch_triggered"
-            )
+            existing = nudge_queue.count_by_type("watch_triggered", channel="any")
             if existing >= _WATCH_QUEUE_SOFT_CAP:
-                nudge_queue.drop_oldest_by_type("watch_triggered")
+                nudge_queue.drop_oldest_by_type("watch_triggered", channel="any")
                 log.warning(
                     "watch_dispatch.queue_full ws=%s cap=%d dropped_oldest=True",
                     ws_id,

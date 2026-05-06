@@ -146,21 +146,48 @@ class NudgeQueue:
             self._items.clear()
             return n
 
-    def drop_oldest_by_type(self, nudge_type: str) -> bool:
+    def count_by_type(self, nudge_type: str, channel: Channel | None = None) -> int:
+        """Return the number of queued entries matching ``nudge_type``.
+
+        With ``channel=None`` counts across all channels; with a specific
+        channel filters to that channel only.  Walks ``_items`` once
+        under the lock without materialising tuples — cheaper than
+        ``len(pending(channel=...))`` for callers that only need the
+        count (e.g. the watch dispatcher's soft-cap pre-check).
+        Producer-side soft caps that pair this with
+        :meth:`drop_oldest_by_type` should pass the same ``channel`` to
+        both halves so the count snapshot and the drop walk over the
+        same entry set.
+        """
+        with self._lock:
+            if channel is None:
+                return sum(1 for e in self._items if e.nudge_type == nudge_type)
+            return sum(
+                1 for e in self._items if e.nudge_type == nudge_type and e.channel == channel
+            )
+
+    def drop_oldest_by_type(self, nudge_type: str, channel: Channel | None = None) -> bool:
         """Remove the earliest-enqueued entry whose type matches ``nudge_type``.
 
-        Returns ``True`` if an entry was dropped, ``False`` if no matching
-        entry was found.  Used by producers with a soft cap on their own
-        type's queue depth (e.g. the watch dispatcher's drop-oldest policy
-        when ``"watch_triggered"`` saturates) — atomic under the queue
-        lock so the count snapshot + drop pair can't interleave with a
-        concurrent enqueue from the same producer.
+        With ``channel=None`` searches across all channels; with a specific
+        channel filters to that channel only.  Returns ``True`` if an
+        entry was dropped, ``False`` if no matching entry was found.
+        Used by producers with a soft cap on their own type's queue depth
+        (e.g. the watch dispatcher's drop-oldest policy when
+        ``"watch_triggered"`` saturates) — atomic under the queue lock
+        so the count snapshot + drop pair can't interleave with a
+        concurrent enqueue from the same producer.  Pass the same
+        ``channel`` to both :meth:`count_by_type` and this method so
+        both halves agree on the entry set being capped.
         """
         with self._lock:
             for i, entry in enumerate(self._items):
-                if entry.nudge_type == nudge_type:
-                    del self._items[i]
-                    return True
+                if entry.nudge_type != nudge_type:
+                    continue
+                if channel is not None and entry.channel != channel:
+                    continue
+                del self._items[i]
+                return True
         return False
 
     def pending(self, channel: Channel | None = None) -> list[tuple[str, str]]:
