@@ -5237,6 +5237,16 @@ class ChatSession:
                 "needs_approval": False,
                 "error": "Error: no page name provided",
             }
+        section = (args.get("section") or "").strip()
+        # Accept the canonical "name(section)" notation that the model often
+        # emits (e.g. printf(3), open(2), perlfunc(3pm)) \u2014 the parens are
+        # otherwise rejected by the page-name sanitizer below. An explicit
+        # ``section`` arg, if provided, takes precedence over the parsed one.
+        m = re.match(r"^([a-zA-Z0-9._-]+)\(([1-9][a-z]*)\)$", page)
+        if m:
+            page = m.group(1)
+            if not section:
+                section = m.group(2)
         # Sanitize: only allow alphanumeric, dash, underscore, dot
         if not re.match(r"^[a-zA-Z0-9._-]+$", page):
             return {
@@ -5247,8 +5257,7 @@ class ChatSession:
                 "needs_approval": False,
                 "error": f"Error: invalid page name {page!r}",
             }
-        section = (args.get("section") or "").strip()
-        if section and not re.match(r"^[1-9][a-z]?$", section):
+        if section and not re.match(r"^[1-9][a-z]*$", section):
             section = ""
         label = f"{page}({section})" if section else page
         preview = f"    {DIM}{label}{RESET}"

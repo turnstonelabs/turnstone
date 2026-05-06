@@ -532,6 +532,81 @@ class TestAgentModelOverride:
 
 
 # ---------------------------------------------------------------------------
+# man tool
+# ---------------------------------------------------------------------------
+
+
+class TestPrepareMan:
+    """``ChatSession._prepare_man`` argument parsing."""
+
+    def test_plain_page(self, tmp_db) -> None:
+        session = _make_session()
+        item = session._prepare_man("c1", {"page": "grep"})
+        assert "error" not in item
+        assert item["page"] == "grep"
+        assert item["section"] == ""
+
+    def test_explicit_section_arg(self, tmp_db) -> None:
+        session = _make_session()
+        item = session._prepare_man("c1", {"page": "printf", "section": "3"})
+        assert "error" not in item
+        assert item["page"] == "printf"
+        assert item["section"] == "3"
+
+    def test_parenthesized_section_in_page(self, tmp_db) -> None:
+        # Models commonly emit canonical man-page notation; we should
+        # parse the section out instead of rejecting the call.
+        session = _make_session()
+        item = session._prepare_man("c1", {"page": "printf(3)"})
+        assert "error" not in item
+        assert item["page"] == "printf"
+        assert item["section"] == "3"
+        assert "printf(3)" in item["header"]
+
+    def test_parenthesized_section_with_letter_suffix(self, tmp_db) -> None:
+        session = _make_session()
+        item = session._prepare_man("c1", {"page": "perlfunc(3pm)"})
+        assert "error" not in item
+        assert item["page"] == "perlfunc"
+        assert item["section"] == "3pm"
+
+    def test_explicit_section_arg_wins_over_parsed(self, tmp_db) -> None:
+        session = _make_session()
+        item = session._prepare_man("c1", {"page": "open(2)", "section": "3"})
+        assert "error" not in item
+        assert item["page"] == "open"
+        assert item["section"] == "3"
+
+    def test_invalid_section_in_parens_falls_through_to_error(self, tmp_db) -> None:
+        # Parens that don't match the section pattern aren't parsed away,
+        # so the page-name sanitizer rejects the literal string.
+        session = _make_session()
+        item = session._prepare_man("c1", {"page": "grep(bogus)"})
+        assert "error" in item
+        assert "invalid page name" in item["error"]
+
+    def test_empty_page(self, tmp_db) -> None:
+        session = _make_session()
+        item = session._prepare_man("c1", {"page": ""})
+        assert "error" in item
+        assert "no page name" in item["error"]
+
+    def test_parsed_section_reaches_subprocess_argv(self, tmp_db) -> None:
+        # End-to-end check that page="printf(3)" produces the right
+        # ``man`` argv — guards against future drift between
+        # ``_prepare_man``'s output keys and ``_exec_man``'s reads.
+        session = _make_session()
+        item = session._prepare_man("c1", {"page": "printf(3)"})
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="MAN PAGE TEXT", stderr=""
+        )
+        with patch("subprocess.run", return_value=completed) as mock_run:
+            session._exec_man(item)
+        argv = mock_run.call_args_list[0].args[0]
+        assert argv == ["man", "3", "printf"]
+
+
+# ---------------------------------------------------------------------------
 # Plan validation
 # ---------------------------------------------------------------------------
 
