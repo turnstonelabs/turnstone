@@ -188,3 +188,84 @@ def test_three_back_to_back_watch_fires_drain_into_one_turn(tmp_db, monkeypatch)
     # And there's exactly ONE assistant turn (not three).
     assistant_turns = [m for m in session.messages if m.get("role") == "assistant"]
     assert len(assistant_turns) == 1
+
+
+def test_watch_dispatch_through_restore_fn_lands_on_rehydrated_session(tmp_db, monkeypatch):
+    """Cover the production ``_watch_restore_fn`` closure surface.
+
+    Path under test:
+      WatchRunner._dispatch_result(ws_id, msg, watch_id)
+        no dispatch fn registered (original session evicted)
+        restore_fn(ws_id) constructs a fresh ChatSession,
+            calls session.resume(ws_id) to adopt the original ws_id,
+            re-registers the dispatch closure via session.set_watch_runner,
+            returns runner.get_dispatch_fn(session._ws_id)
+        runner invokes the returned fn with (msg, watch_id)
+        watch payload lands on the rehydrated session's NudgeQueue
+
+    Construction inside ``server.py``'s ``_watch_restore_fn`` is the new
+    contract surface introduced by the switchover; this test pins that
+    contract so a future refactor of the closure (e.g. swapping
+    ``manager.create + session.resume`` for ``manager.open``) doesn't
+    silently break the watch-restore pipeline.
+    """
+    from turnstone.core import session as session_mod
+
+    monkeypatch.setattr(session_mod, "get_storage", lambda: _stub_storage(active=True))
+
+    # Stage 1 — build the original session and persist a message so
+    # ``session.resume`` finds the ws_id in storage.
+    original = _make_session()
+    original_ws_id = original._ws_id
+    # Persist a stub user message so ``load_messages(original_ws_id)``
+    # returns something non-empty (resume short-circuits on empty).
+    session_mod.save_message(original_ws_id, "user", "kickoff message")
+
+    # Stage 2 — runner with NO dispatch fn registered (simulates the
+    # original session being evicted between watch fire and dispatch).
+    # The restore_fn captures *which* fresh ChatSession got built so the
+    # test can assert the queue landed on it (not on the original).
+    rehydrated_holder: dict[str, ChatSession] = {}
+
+    def _restore_fn(ws_id: str) -> Any:
+        """Mirror the production ``_watch_restore_fn`` closure shape:
+        construct a fresh session, resume the persisted ws_id (so the
+        new session adopts the original ws_id), wire the dispatch
+        closure, return the dispatch fn.
+        """
+        new_session = _make_session()
+        ok = new_session.resume(ws_id)
+        assert ok, "resume should succeed against a non-empty message log"
+        new_session.set_watch_runner(runner)
+        rehydrated_holder["session"] = new_session
+        return runner.get_dispatch_fn(new_session._ws_id)
+
+    runner = WatchRunner(
+        storage=_stub_storage(active=True),
+        node_id="test-node",
+        restore_fn=_restore_fn,
+    )
+
+    # Sanity: no dispatch fn registered yet for the original ws_id.
+    assert runner.get_dispatch_fn(original_ws_id) is None
+
+    # Stage 3 — fire a watch result.  ``_dispatch_result`` should fall
+    # through to the restore branch.
+    runner._dispatch_result(original_ws_id, "post-restore body", "watch-1")
+
+    # The restore fn ran exactly once and produced a fresh session that
+    # adopted the original ws_id.
+    assert "session" in rehydrated_holder, "restore_fn was not invoked"
+    rehydrated = rehydrated_holder["session"]
+    assert rehydrated is not original
+    assert rehydrated._ws_id == original_ws_id
+
+    # The watch payload landed on the rehydrated session's queue, not on
+    # the (now-evicted) original session's queue.
+    assert len(rehydrated._nudge_queue) == 1
+    assert rehydrated._nudge_queue.pending(channel="any") == [
+        ("watch_triggered", "post-restore body")
+    ]
+    # Original session's queue stays empty — the dispatch did NOT
+    # accidentally route back to it.
+    assert len(original._nudge_queue) == 0
