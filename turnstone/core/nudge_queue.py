@@ -166,9 +166,11 @@ class NudgeQueue:
 
         Returns ``True`` as soon as a queued entry's channel matches
         ``channels``.  Cheaper than :meth:`pending` for callers that
-        only need a boolean (e.g. the wake-path defense in
-        :meth:`ChatSession.deliver_wake_nudge_from_queue`) — no list
-        allocation, lock released on first match.
+        only need a boolean — used by
+        :class:`turnstone.core.idle_nudge_watcher.IdleNudgeWatcher` to
+        gate wake dispatch on whether ``USER_DRAIN`` would actually
+        deliver anything before paying the worker-thread spawn.  No
+        list allocation, lock released on first match.
         """
         with self._lock:
             return any(e.channel in channels for e in self._items)

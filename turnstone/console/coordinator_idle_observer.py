@@ -4,7 +4,7 @@ Subscribes to a coordinator-side :class:`SessionManager`'s state events.
 When a coord transitions to :class:`WorkstreamState.IDLE` while still
 having active interactive children, enqueues an ``idle_children`` nudge
 on the coord's :class:`NudgeQueue`.  The
-:class:`turnstone.core.metacognition.IdleNudgeWatcher` (registered
+:class:`turnstone.core.idle_nudge_watcher.IdleNudgeWatcher` (registered
 *after* this observer in the lifespan, so subscriber-order has the
 observer fire first on the same IDLE event) then peeks the queue and
 dispatches the wake send.
