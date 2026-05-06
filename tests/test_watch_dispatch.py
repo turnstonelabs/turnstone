@@ -69,6 +69,19 @@ def _register_runner(session: ChatSession) -> tuple[Any, Any]:
     return runner, captured["fn"]
 
 
+def _reminder(text: str, **extra: Any) -> dict[str, Any]:
+    """Build a structured ``watch_triggered`` reminder dict for tests.
+
+    Mirrors the shape produced by :func:`turnstone.core.watch.build_watch_reminder`
+    — ``text`` is the formatted body, optional fields ride alongside.
+    Tests that don't care about the optional fields can call with
+    ``text`` only.
+    """
+    out: dict[str, Any] = {"type": "watch_triggered", "text": text}
+    out.update(extra)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Enqueue shape
 # ---------------------------------------------------------------------------
@@ -83,7 +96,7 @@ class TestEnqueueShape:
         session = _make_session_for_dispatch()
         _runner, dispatch = _register_runner(session)
 
-        dispatch("watch fired body", "watch-1")
+        dispatch(_reminder("watch fired body"), "watch-1")
 
         # One entry, "watch_triggered" type, on "any" channel.
         assert len(session._nudge_queue) == 1
@@ -114,7 +127,7 @@ class TestSanitisation:
         # Build a payload with: BEL (\x07), zero-width space (U+200B),
         # bidi RTL override (U+202E), and angle-bracket tag breakers.
         raw = "before\x07middle​after‮more<thinking>tail"
-        dispatch(raw, "watch-1")
+        dispatch(_reminder(raw), "watch-1")
 
         pending = session._nudge_queue.pending(channel="any")
         assert len(pending) == 1
@@ -136,7 +149,7 @@ class TestSanitisation:
         session = _make_session_for_dispatch()
         _runner, dispatch = _register_runner(session)
 
-        dispatch("line1\nline2\n\tindented\n\rline3", "watch-1")
+        dispatch(_reminder("line1\nline2\n\tindented\n\rline3"), "watch-1")
 
         pending = session._nudge_queue.pending(channel="any")
         assert len(pending) == 1
@@ -151,7 +164,7 @@ class TestSanitisation:
         _runner, dispatch = _register_runner(session)
 
         # All-control + DEL + zero-width — strips to empty.
-        dispatch("\x07\x0b\x7f​", "watch-1")
+        dispatch(_reminder("\x07\x0b\x7f​"), "watch-1")
 
         assert len(session._nudge_queue) == 0
 
@@ -174,11 +187,11 @@ class TestSoftCap:
         # Pre-fill at the cap.  Each entry has a unique body so we can
         # tell which one(s) survived a drop.
         for i in range(_WATCH_QUEUE_SOFT_CAP):
-            dispatch(f"body-{i}", "watch-1")
+            dispatch(_reminder(f"body-{i}"), "watch-1")
         assert len(session._nudge_queue) == _WATCH_QUEUE_SOFT_CAP
 
         with caplog.at_level("WARNING"):
-            dispatch("overflow", "watch-1")
+            dispatch(_reminder("overflow"), "watch-1")
 
         # Total stays at cap (one dropped, one added).
         assert len(session._nudge_queue) == _WATCH_QUEUE_SOFT_CAP
@@ -205,9 +218,9 @@ class TestSoftCap:
 
         # Saturate watches up to cap (queue holds cap+2 total).
         for i in range(_WATCH_QUEUE_SOFT_CAP):
-            dispatch(f"body-{i}", "watch-1")
+            dispatch(_reminder(f"body-{i}"), "watch-1")
         # One more triggers drop-oldest of a "watch_triggered" entry.
-        dispatch("overflow", "watch-1")
+        dispatch(_reminder("overflow"), "watch-1")
 
         # Both idle_children entries survived — no collateral eviction.
         idle_bodies = [
@@ -236,7 +249,7 @@ class TestValidUntil:
         # Storage stub returns False at drain time.
         is_active_calls = patch_session_storage(monkeypatch, active=False)
 
-        dispatch("body", "watch-1")
+        dispatch(_reminder("body"), "watch-1")
         # Drain fires the predicate; entry should NOT be delivered.
         out = session._nudge_queue.drain({"any"})
         assert out == []
@@ -254,7 +267,7 @@ class TestValidUntil:
 
         patch_session_storage(monkeypatch, raise_on_is_active=True)
 
-        dispatch("body", "watch-bound-id")
+        dispatch(_reminder("body"), "watch-bound-id")
         out = session._nudge_queue.drain({"any"})
         assert out == []
 
@@ -267,7 +280,7 @@ class TestValidUntil:
 
         patch_session_storage(monkeypatch, active=True)
 
-        dispatch("body", "watch-1")
+        dispatch(_reminder("body"), "watch-1")
         out = session._nudge_queue.drain({"any"})
         assert len(out) == 1
         assert out[0][0] == "watch_triggered"
@@ -302,7 +315,7 @@ class TestConcurrency:
 
         def fire(label: str) -> None:
             for i in range(per_thread):
-                dispatch(f"{label}-{i}", f"watch-{label}")
+                dispatch(_reminder(f"{label}-{i}"), f"watch-{label}")
 
         threads = [threading.Thread(target=fire, args=(label,), daemon=True) for label in labels]
         for t in threads:
@@ -333,6 +346,64 @@ def test_dispatch_no_op_for_empty_payloads(tmp_db, payload: str):
     session = _make_session_for_dispatch()
     _runner, dispatch = _register_runner(session)
 
-    dispatch(payload, "watch-1")
+    dispatch(_reminder(payload), "watch-1")
 
     assert len(session._nudge_queue) == 0
+
+
+# ---------------------------------------------------------------------------
+# Metadata propagation
+# ---------------------------------------------------------------------------
+
+
+class TestMetadataPropagation:
+    """Step 7 of the watch-card UX plan: the dispatch closure pulls
+    optional fields out of the structured ``reminder`` dict and
+    attaches them to the queue entry's ``metadata``.  Drain seams later
+    merge ``metadata`` into the rendered reminder dict so the frontend
+    can display a structured ``.msg.watch-result`` card.
+    """
+
+    def test_dispatch_attaches_watch_metadata_on_enqueue(self, tmp_db):
+        session = _make_session_for_dispatch()
+        _runner, dispatch = _register_runner(session)
+
+        reminder = _reminder(
+            "$ ls\nfile.txt",
+            watch_name="my-watch",
+            command="ls",
+            poll_count=2,
+            max_polls=100,
+            is_final=False,
+        )
+        dispatch(reminder, "watch-1")
+
+        # Snapshot via ``pending_with_metadata`` to inspect the full
+        # entry shape.  Exactly one entry, with the optional fields
+        # carried verbatim onto ``metadata``.
+        snapshot = session._nudge_queue.pending_with_metadata(channel="any")
+        assert len(snapshot) == 1
+        nt, _text, meta = snapshot[0]
+        assert nt == "watch_triggered"
+        assert meta == {
+            "watch_name": "my-watch",
+            "command": "ls",
+            "poll_count": 2,
+            "max_polls": 100,
+            "is_final": False,
+        }
+
+    def test_dispatch_omits_metadata_when_optional_fields_missing(self, tmp_db):
+        """A bare ``{type, text}`` reminder produces an entry with no
+        metadata — the closure builds an empty dict, sees nothing to
+        carry, and falls through to ``metadata=None``.
+        """
+        session = _make_session_for_dispatch()
+        _runner, dispatch = _register_runner(session)
+
+        dispatch(_reminder("just a body"), "watch-1")
+
+        snapshot = session._nudge_queue.pending_with_metadata(channel="any")
+        assert len(snapshot) == 1
+        _nt, _text, meta = snapshot[0]
+        assert meta is None

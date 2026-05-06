@@ -83,7 +83,11 @@ def test_watch_fires_then_user_send_drains_envelope(tmp_db, monkeypatch):
     session.set_watch_runner(runner)
 
     # 1. Fire a watch result synchronously.
-    runner._dispatch_result(session._ws_id, "watch payload body", "watch-1")
+    runner._dispatch_result(
+        session._ws_id,
+        {"type": "watch_triggered", "text": "watch payload body"},
+        "watch-1",
+    )
 
     # 2. The queue holds one entry on the "any" channel.
     assert len(session._nudge_queue) == 1
@@ -143,9 +147,15 @@ def test_three_back_to_back_watch_fires_drain_into_one_turn(tmp_db, monkeypatch)
     runner = WatchRunner(storage=MagicMock(), node_id="test-node")
     session.set_watch_runner(runner)
 
-    runner._dispatch_result(session._ws_id, "fire one", "watch-1")
-    runner._dispatch_result(session._ws_id, "fire two", "watch-1")
-    runner._dispatch_result(session._ws_id, "fire three", "watch-1")
+    runner._dispatch_result(
+        session._ws_id, {"type": "watch_triggered", "text": "fire one"}, "watch-1"
+    )
+    runner._dispatch_result(
+        session._ws_id, {"type": "watch_triggered", "text": "fire two"}, "watch-1"
+    )
+    runner._dispatch_result(
+        session._ws_id, {"type": "watch_triggered", "text": "fire three"}, "watch-1"
+    )
     assert len(session._nudge_queue) == 3
 
     with (
@@ -238,8 +248,13 @@ def test_watch_dispatch_through_restore_fn_lands_on_rehydrated_session(tmp_db, m
     assert runner.get_dispatch_fn(original_ws_id) is None
 
     # Stage 3 — fire a watch result.  ``_dispatch_result`` should fall
-    # through to the restore branch.
-    runner._dispatch_result(original_ws_id, "post-restore body", "watch-1")
+    # through to the restore branch.  Post-Step-7 dispatch surface uses
+    # a structured reminder dict.
+    runner._dispatch_result(
+        original_ws_id,
+        {"type": "watch_triggered", "text": "post-restore body"},
+        "watch-1",
+    )
 
     # The restore fn ran exactly once and produced a fresh session that
     # adopted the original ws_id.

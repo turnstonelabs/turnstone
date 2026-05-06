@@ -9,6 +9,7 @@ import pytest
 
 from turnstone.core.watch import (
     WatchRunner,
+    build_watch_reminder,
     evaluate_condition,
     format_interval,
     format_watch_message,
@@ -302,6 +303,62 @@ class TestFormatWatchMessage:
 
 
 # ---------------------------------------------------------------------------
+# build_watch_reminder
+# ---------------------------------------------------------------------------
+
+
+class TestBuildWatchReminder:
+    """The structured-reminder builder lifts ``format_watch_message``'s
+    args into a dict the dispatch closure can pass to
+    ``WatchRunner._dispatch_result``.  ``text`` matches the formatter's
+    output verbatim (so compaction / channel adapters / wire splice
+    keep their behaviour), and the optional fields ride alongside for
+    the frontend's ``.msg.watch-result`` card.
+    """
+
+    def test_emits_text_body_and_fields(self):
+        kwargs = dict(
+            name="pr-review",
+            command="gh pr view --json state",
+            output='{"state": "MERGED"}',
+            poll_count=5,
+            max_polls=100,
+            elapsed_secs=1500,
+            stop_on='data["state"] == "MERGED"',
+            is_final=True,
+            reason='condition met: data["state"] == "MERGED"',
+        )
+        reminder = build_watch_reminder(**kwargs)
+        # Round-trip with format_watch_message — text is the same body
+        # the wire splice + channel adapters have always seen.
+        assert reminder["text"] == format_watch_message(**kwargs)
+        # Optional fields ride alongside.
+        assert reminder["type"] == "watch_triggered"
+        assert reminder["watch_name"] == "pr-review"
+        assert reminder["command"] == "gh pr view --json state"
+        assert reminder["poll_count"] == 5
+        assert reminder["max_polls"] == 100
+        assert reminder["is_final"] is True
+
+    def test_non_final_carries_is_final_false(self):
+        reminder = build_watch_reminder(
+            name="deploy",
+            command="curl -s http://localhost/health",
+            output="ok",
+            poll_count=3,
+            max_polls=50,
+            elapsed_secs=90,
+            stop_on=None,
+            is_final=False,
+            reason="",
+        )
+        assert reminder["is_final"] is False
+        assert reminder["poll_count"] == 3
+        # No "auto-cancelled" body for non-final fires.
+        assert "auto-cancelled" not in reminder["text"].lower()
+
+
+# ---------------------------------------------------------------------------
 # WatchRunner
 # ---------------------------------------------------------------------------
 
@@ -450,13 +507,17 @@ class TestWatchRunner:
         runner.set_dispatch_fn("ws-1", fn1)
         runner.set_dispatch_fn("ws-2", fn2)
 
-        runner._dispatch_result("ws-1", "msg1", "watch-a")
-        fn1.assert_called_once_with("msg1", "watch-a")
+        # Post-Step-7 dispatch surface: ``_dispatch_result`` takes a
+        # structured reminder dict, not a bare string.
+        reminder1 = {"type": "watch_triggered", "text": "msg1"}
+        runner._dispatch_result("ws-1", reminder1, "watch-a")
+        fn1.assert_called_once_with(reminder1, "watch-a")
         fn2.assert_not_called()
 
         runner.remove_dispatch_fn("ws-1")
         # After removal, dispatch should try restore_fn
-        runner._dispatch_result("ws-1", "msg2", "watch-b")
+        reminder2 = {"type": "watch_triggered", "text": "msg2"}
+        runner._dispatch_result("ws-1", reminder2, "watch-b")
         fn1.assert_called_once()  # still just the one call
 
     def test_restore_fn_called_for_evicted(self):
@@ -464,9 +525,10 @@ class TestWatchRunner:
         restore_fn = MagicMock(return_value=restored_fn)
         runner = self._make_runner(restore_fn=restore_fn)
 
-        runner._dispatch_result("ws-evicted", "hello", "watch-x")
+        reminder = {"type": "watch_triggered", "text": "hello"}
+        runner._dispatch_result("ws-evicted", reminder, "watch-x")
         restore_fn.assert_called_once_with("ws-evicted")
-        restored_fn.assert_called_once_with("hello", "watch-x")
+        restored_fn.assert_called_once_with(reminder, "watch-x")
 
     def test_get_dispatch_fn_returns_registered_fn(self):
         """``get_dispatch_fn`` is the public accessor used by the
