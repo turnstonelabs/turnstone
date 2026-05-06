@@ -49,12 +49,12 @@ from turnstone.core.mcp_http_parsers import (
 )
 from turnstone.core.mcp_oauth import (
     TokenLookupResult,
-    emit_insufficient_scope_audit,
+    emit_oauth_failure_audit,
     get_user_access_token_classified,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Awaitable, Callable
 
 log = get_logger("turnstone.mcp")
 
@@ -128,6 +128,18 @@ _MAX_INSUFFICIENT_SCOPE_REPORTED = 32
 # rather than reject so partial visibility beats zero visibility, and
 # emit a warning so operators can investigate.
 _MAX_TOOLS_PER_SERVER = 1000
+
+# Defensive caps mirroring ``_MAX_TOOLS_PER_SERVER`` for the resource and
+# prompt list paths discovered in :meth:`MCPClientManager._connect_one_pool`
+# (RFC §3.2 for resources, §3.3 for prompts). Real MCP servers expose at
+# most a few dozen of each; a
+# hostile or misconfigured upstream returning thousands would amplify
+# memory (one dict per entry) plus downstream rendering cost. Truncate
+# rather than reject so partial visibility beats zero visibility, and
+# emit a warning so operators can investigate.
+_MAX_RESOURCES_PER_SERVER = 1000
+_MAX_RESOURCE_TEMPLATES_PER_SERVER = 1000
+_MAX_PROMPTS_PER_SERVER = 1000
 
 
 @dataclass
@@ -276,6 +288,62 @@ def _cap_server_tools(server_name: str, tools: list[Any]) -> list[Any]:
     return tools[:_MAX_TOOLS_PER_SERVER]
 
 
+def _cap_server_resources(server_name: str, resources: list[Any]) -> list[Any]:
+    """Apply ``_MAX_RESOURCES_PER_SERVER`` cap with operator-visible warning.
+
+    Identity for inputs at or below the cap (no copy); slice + warn on
+    overflow. Mirrors :func:`_cap_server_tools` for the resource list path.
+    """
+    if len(resources) <= _MAX_RESOURCES_PER_SERVER:
+        return resources
+    log.warning(
+        "MCP server '%s' returned %d resources — truncating to %d "
+        "(_MAX_RESOURCES_PER_SERVER cap). Misconfigured or hostile upstream?",
+        server_name,
+        len(resources),
+        _MAX_RESOURCES_PER_SERVER,
+    )
+    return resources[:_MAX_RESOURCES_PER_SERVER]
+
+
+def _cap_server_resource_templates(server_name: str, templates: list[Any]) -> list[Any]:
+    """Apply ``_MAX_RESOURCE_TEMPLATES_PER_SERVER`` cap with operator-visible warning.
+
+    Identity for inputs at or below the cap (no copy); slice + warn on
+    overflow. Mirrors :func:`_cap_server_resources` for the resource
+    template list path (RFC §3.2 templates are a separate catalog from
+    concrete resources but share the per-server amplification risk).
+    """
+    if len(templates) <= _MAX_RESOURCE_TEMPLATES_PER_SERVER:
+        return templates
+    log.warning(
+        "MCP server '%s' returned %d resource templates — truncating to %d "
+        "(_MAX_RESOURCE_TEMPLATES_PER_SERVER cap). Misconfigured or hostile upstream?",
+        server_name,
+        len(templates),
+        _MAX_RESOURCE_TEMPLATES_PER_SERVER,
+    )
+    return templates[:_MAX_RESOURCE_TEMPLATES_PER_SERVER]
+
+
+def _cap_server_prompts(server_name: str, prompts: list[Any]) -> list[Any]:
+    """Apply ``_MAX_PROMPTS_PER_SERVER`` cap with operator-visible warning.
+
+    Identity for inputs at or below the cap (no copy); slice + warn on
+    overflow. Mirrors :func:`_cap_server_tools` for the prompt list path.
+    """
+    if len(prompts) <= _MAX_PROMPTS_PER_SERVER:
+        return prompts
+    log.warning(
+        "MCP server '%s' returned %d prompts — truncating to %d "
+        "(_MAX_PROMPTS_PER_SERVER cap). Misconfigured or hostile upstream?",
+        server_name,
+        len(prompts),
+        _MAX_PROMPTS_PER_SERVER,
+    )
+    return prompts[:_MAX_PROMPTS_PER_SERVER]
+
+
 # ---------------------------------------------------------------------------
 # Per-server state containers
 # ---------------------------------------------------------------------------
@@ -348,6 +416,17 @@ class PoolEntryState:
     # loop-binding contract); ``_ensure_pool_entry`` runs on the loop
     # so the dataclass default_factory is safe.
     auth_fired_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # Capability flags mirror ``StaticServerState`` so the pool path can
+    # gate resource / prompt discovery the same way (RFC §3.2). Tools
+    # are always discovered, so no ``supports_tools`` flag is needed —
+    # but ``listChanged`` for tools is also implicit (the notification
+    # handler is always registered). Resources and prompts get explicit
+    # presence flags because we skip discovery entirely when the
+    # capability is absent.
+    supports_resources: bool = False
+    supports_prompts: bool = False
+    supports_resource_list_changed: bool = False
+    supports_prompt_list_changed: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -406,13 +485,19 @@ class MCPClientManager:
         # Merged resource catalog
         self._resources: list[dict[str, Any]] = []
         self._resource_map: dict[str, tuple[str, str]] = {}  # uri → (server, uri)
-        self._resource_listeners: list[Callable[[], None]] = []
+        # Phase 7b: each entry is ``(user_id, callback)`` mirroring the
+        # tool-listener shape (RFC §3.3) — ``user_id=None`` is the admin
+        # / global listener (fires on every change), a string ``user_id``
+        # fires only on changes scoped to that user OR on global static
+        # changes.
+        self._resource_listeners: list[tuple[str | None, Callable[[], None]]] = []
         self._resource_listeners_lock = threading.Lock()
 
         # Merged prompt catalog
         self._prompts: list[dict[str, Any]] = []
         self._prompt_map: dict[str, tuple[str, str]] = {}  # prefixed → (server, original)
-        self._prompt_listeners: list[Callable[[], None]] = []
+        # Phase 7b: see ``_resource_listeners`` for the tuple shape rationale.
+        self._prompt_listeners: list[tuple[str | None, Callable[[], None]]] = []
         self._prompt_listeners_lock = threading.Lock()
 
         # Template prefix → (server_name, full_template_uri) for URI expansion
@@ -447,8 +532,7 @@ class MCPClientManager:
         # connect). ``_user_tool_map`` is the per-user prefixed-name
         # index, mirroring static ``_tool_map``: outer key is ``user_id``,
         # inner is ``prefixed_name → (server_name, original_name)``.
-        # Resource/prompt mirrors are deferred to Phase 7b — Phase 7
-        # only lights up the tool path needed for invariant 8.
+        # Phase 7b lights up the resource/prompt sibling dicts below.
         self._user_tool_map: dict[str, dict[str, tuple[str, str]]] = {}
         # Per-user merged tool list (one snapshot per user_id), updated
         # atomically alongside ``_user_tool_map`` in
@@ -459,6 +543,26 @@ class MCPClientManager:
         # (insert in ``_ensure_pool_entry`` / pop in
         # ``_close_pool_entry_if_idle`` / ``_evict_session``).
         self._user_tools: dict[str, list[dict[str, Any]]] = {}
+
+        # Per-user resource catalog. Mirrors ``_user_tool_map`` /
+        # ``_user_tools``: outer key is ``user_id``, inner is
+        # ``uri → (server_name, uri)``. Loop-only writes via
+        # :meth:`_rebuild_user_resource_map`; sync-thread reads via a
+        # single dict-get on ``_user_resources`` (atomic under GIL).
+        # RFC §3.2 — Phase 7b lights this up.
+        self._user_resource_map: dict[str, dict[str, tuple[str, str]]] = {}
+        self._user_resources: dict[str, list[dict[str, Any]]] = {}
+        # Per-user template-prefix index for resource URI expansion.
+        # ``_user_template_prefixes[user_id][prefix] = (server, full_template_uri)``.
+        # Used by :meth:`_match_template`'s per-user-first lookup branch
+        # (scope decision 0.1).
+        self._user_template_prefixes: dict[str, dict[str, tuple[str, str]]] = {}
+
+        # Per-user prompt catalog. Mirrors ``_user_tool_map`` /
+        # ``_user_tools`` for prompts: outer key is ``user_id``, inner
+        # is ``prefixed_name → (server_name, original_name)``.
+        self._user_prompt_map: dict[str, dict[str, tuple[str, str]]] = {}
+        self._user_prompts: dict[str, list[dict[str, Any]]] = {}
 
         # Notification debounce for pool sessions, keyed ``(user_id, server)``.
         # Mirrors ``_last_notification_refresh`` (static) but per-pool-key
@@ -1041,12 +1145,13 @@ class MCPClientManager:
         * Streamable-HTTP transport only — pool servers are remote.
         * ``Authorization: Bearer {access_token}`` injected into headers
           alongside any operator-supplied static headers.
-        * Tool catalog discovery runs after ``initialize()``; the
-          notification handler is bound to ``(user_id, server_name)`` so
-          push-driven ``tools/list_changed`` updates only refresh the
-          owning user's catalog (the static refresher must NEVER fire
-          from a pool session — it would clobber static-path state).
-          Resource / prompt discovery is deferred to Phase 7b.
+        * Tool / resource / prompt catalog discovery runs after
+          ``initialize()`` (RFC §3.2 — discovery covers all three
+          catalogs, capability-gated). The notification handler is
+          bound to ``(user_id, server_name)`` so push-driven
+          ``*/list_changed`` updates only refresh the owning user's
+          catalog (the static refreshers must NEVER fire from a pool
+          session — they would clobber static-path state).
 
         When ``auth_capture`` is supplied, the underlying ``httpx``
         client is built via a factory whose response hook records 401/403
@@ -1141,9 +1246,10 @@ class MCPClientManager:
         # would mutate ``_static_servers[server_name].tools`` and
         # ``_tool_map`` — breaking invariant 1 (static-path
         # byte-identical) and broadcasting one user's tool view to all
-        # other sessions. Phase 7 ToolListChangedNotification only;
-        # resource / prompt branches log + skip until Phase 7b adds
-        # ``_refresh_pool_server_resources`` / ``_refresh_pool_server_prompts``.
+        # other sessions. Phase 7 wired tool list-changed; Phase 7b
+        # extends the same shape to resources and prompts via
+        # ``_refresh_pool_server_resources`` /
+        # ``_refresh_pool_server_prompts``.
         async def _on_pool_notification(
             msg: Any,  # RequestResponder | ServerNotification | Exception
         ) -> None:
@@ -1170,17 +1276,21 @@ class MCPClientManager:
                     self._last_pool_notification_refresh[key] = now
                     await self._refresh_pool_server_tools(key)
                 elif isinstance(root, mcp_types.ResourceListChangedNotification):
-                    log.debug(
-                        "pool resources/list_changed (deferred to Phase 7b) user=%s server=%s",
+                    log.info(
+                        "Received resources/list_changed from pool user=%s server=%s",
                         user_id,
                         server_name,
                     )
+                    self._last_pool_notification_refresh[key] = now
+                    await self._refresh_pool_server_resources(key)
                 elif isinstance(root, mcp_types.PromptListChangedNotification):
-                    log.debug(
-                        "pool prompts/list_changed (deferred to Phase 7b) user=%s server=%s",
+                    log.info(
+                        "Received prompts/list_changed from pool user=%s server=%s",
                         user_id,
                         server_name,
                     )
+                    self._last_pool_notification_refresh[key] = now
+                    await self._refresh_pool_server_prompts(key)
             except Exception as exc:
                 # Structured fields only — ``exc_info=True`` would
                 # serialize the chained ``httpx.Request`` whose headers
@@ -1231,6 +1341,19 @@ class MCPClientManager:
             await self._safe_teardown_on_connect_failure(key, stack)
             raise
 
+        # Capability fetch — mirror the static path at mcp_client.py:920-932.
+        # Per RFC §3.2 the pool path now discovers resources & prompts too,
+        # capability-gated so a server that doesn't implement them stays
+        # cheap (no extra round-trips). Capabilities are populated by the
+        # initialize roundtrip and immutable thereafter (R13).
+        caps = session.get_server_capabilities()
+        resources_cap = getattr(caps, "resources", None) if caps else None
+        prompts_cap = getattr(caps, "prompts", None) if caps else None
+        entry.supports_resources = resources_cap is not None
+        entry.supports_resource_list_changed = bool(getattr(resources_cap, "listChanged", False))
+        entry.supports_prompts = prompts_cap is not None
+        entry.supports_prompt_list_changed = bool(getattr(prompts_cap, "listChanged", False))
+
         # Discover this user's tool catalog. R6 verified: a 401 here
         # propagates through anyio TaskGroup unwinding (raises an
         # ``ExceptionGroup`` from the surrounding ``streamablehttp_client``
@@ -1238,8 +1361,7 @@ class MCPClientManager:
         # sufficient. The carrier-race shape used by
         # ``_dispatch_pool_with_entry`` defends a different scenario
         # (reused-session 401 from inside a SECOND dispatch) that
-        # doesn't apply to first-connect discovery. Resource / prompt
-        # discovery deferred to Phase 7b.
+        # doesn't apply to first-connect discovery.
         #
         # Why ``asyncio.timeout``, not ``asyncio.wait_for``: per
         # ``feedback_asyncio_timeout_vs_wait_for.md`` and the f6a3b66
@@ -1250,7 +1372,10 @@ class MCPClientManager:
         # ``RuntimeError("Attempted to exit cancel scope in a different
         # task")``. ``asyncio.timeout`` runs the inner coroutine in the
         # current task and is the safe shape for any await that may
-        # traverse anyio cleanup.
+        # traverse anyio cleanup. R6 (Phase 7b) verified the same hazard
+        # applies to ``list_resources`` / ``list_resource_templates`` /
+        # ``list_prompts`` — they all traverse the same
+        # ``mcp/shared/session.py:240-314`` send_request infrastructure.
         try:
             async with asyncio.timeout(self._CONNECT_TIMEOUT):
                 tools_result = await session.list_tools()
@@ -1273,6 +1398,108 @@ class MCPClientManager:
 
         capped_tools = _cap_server_tools(server_name, tools_result.tools)
         entry.tools = [_mcp_to_openai(server_name, tool) for tool in capped_tools]
+
+        # Phase 7b — discover resources (capability-gated). Same anyio /
+        # ``asyncio.timeout`` invariant as the tool discovery above (R1).
+        server_resources: list[dict[str, Any]] = []
+        if resources_cap is not None:
+            try:
+                async with asyncio.timeout(self._CONNECT_TIMEOUT):
+                    # 1-RTT (gather) instead of 2 sequential RTTs — both
+                    # calls share the same timeout budget and target
+                    # disjoint catalogs (resources vs. templates), so
+                    # ordering is irrelevant.
+                    res_result, tmpl_result = await asyncio.gather(
+                        session.list_resources(),
+                        session.list_resource_templates(),
+                    )
+            except asyncio.CancelledError:
+                entry.stack = None
+                task = asyncio.current_task()
+                if task is not None and task.cancelling():
+                    await self._safe_teardown_on_connect_failure(key, stack)
+                    raise
+                await self._safe_teardown_on_connect_failure(key, stack)
+                raise TimeoutError(f"Pool resource discovery failed for '{server_name}'") from None
+            except TimeoutError:
+                entry.stack = None
+                await self._safe_teardown_on_connect_failure(key, stack)
+                raise TimeoutError(
+                    f"Pool resource discovery timed out after {self._CONNECT_TIMEOUT}s"
+                ) from None
+            except Exception:
+                entry.stack = None
+                await self._safe_teardown_on_connect_failure(key, stack)
+                raise
+
+            for r in _cap_server_resources(server_name, res_result.resources):
+                server_resources.append(
+                    {
+                        "uri": str(r.uri),
+                        "name": r.name or "",
+                        "description": r.description or "",
+                        "mimeType": r.mimeType or "",
+                        "server": server_name,
+                    }
+                )
+            for t in _cap_server_resource_templates(server_name, tmpl_result.resourceTemplates):
+                server_resources.append(
+                    {
+                        "uri": str(t.uriTemplate),
+                        "name": t.name or "",
+                        "description": t.description or "",
+                        "mimeType": t.mimeType or "",
+                        "server": server_name,
+                        "template": True,
+                    }
+                )
+
+        # Phase 7b — discover prompts (capability-gated).
+        server_prompts: list[dict[str, Any]] = []
+        if prompts_cap is not None:
+            try:
+                async with asyncio.timeout(self._CONNECT_TIMEOUT):
+                    prompt_result = await session.list_prompts()
+            except asyncio.CancelledError:
+                entry.stack = None
+                task = asyncio.current_task()
+                if task is not None and task.cancelling():
+                    await self._safe_teardown_on_connect_failure(key, stack)
+                    raise
+                await self._safe_teardown_on_connect_failure(key, stack)
+                raise TimeoutError(f"Pool prompt discovery failed for '{server_name}'") from None
+            except TimeoutError:
+                entry.stack = None
+                await self._safe_teardown_on_connect_failure(key, stack)
+                raise TimeoutError(
+                    f"Pool prompt discovery timed out after {self._CONNECT_TIMEOUT}s"
+                ) from None
+            except Exception:
+                entry.stack = None
+                await self._safe_teardown_on_connect_failure(key, stack)
+                raise
+
+            for p in _cap_server_prompts(server_name, prompt_result.prompts):
+                server_prompts.append(
+                    {
+                        "name": f"mcp__{server_name}__{p.name}",
+                        "original_name": p.name,
+                        "server": server_name,
+                        "description": p.description or "",
+                        "arguments": [
+                            {
+                                "name": a.name,
+                                "description": a.description or "",
+                                "required": a.required or False,
+                            }
+                            for a in (p.arguments or [])
+                        ],
+                    }
+                )
+
+        entry.resources = server_resources if resources_cap is not None else None
+        entry.prompts = server_prompts if prompts_cap is not None else None
+
         # Publish session readiness BEFORE catalog visibility.
         # ``_rebuild_user_tool_map`` makes ``is_mcp_tool(name, user_id=U)``
         # return True for the discovered names; if catalog visibility
@@ -1282,18 +1509,24 @@ class MCPClientManager:
         # re-fetches its own token through ``get_user_access_token_classified``
         # and lazy-reconnects on session=None — but ordering catches the
         # race at the source rather than relying on the dispatch-time
-        # recovery path.
+        # recovery path. Same ordering invariant covers resources/prompts
+        # (R16).
         entry.session = session
         entry.last_used = time.monotonic()
         self._user_pool_last_used[key] = entry.last_used
 
-        # Loop-only mutation; sync-thread readers observe the new tool
-        # list atomically via the per-user dict-get on ``_user_tools``.
+        # Loop-only mutation; sync-thread readers observe the new
+        # catalog atomically via per-user dict-gets on ``_user_tools`` /
+        # ``_user_resources`` / ``_user_prompts``.
         self._rebuild_user_tool_map(user_id)
+        self._rebuild_user_resource_map(user_id)
+        self._rebuild_user_prompt_map(user_id)
         # Wake user-keyed AND admin (None) listeners; per-user fan-out
         # ensures another user's session never observes this user's
-        # tool change.
+        # catalog change.
         self._notify_user_tool_listeners(user_id)
+        self._notify_user_resource_listeners(user_id)
+        self._notify_user_prompt_listeners(user_id)
         return entry
 
     # -- pool eviction --------------------------------------------------------
@@ -1402,14 +1635,19 @@ class MCPClientManager:
             self._user_pool_entries.pop(key, None)
             self._user_pool_last_used.pop(key, None)
             # Mirror ``_evict_session``'s catalog cleanup: dropping the
-            # entry without rebuilding ``_user_tool_map`` would leave
-            # ``is_mcp_tool`` returning True for tools whose backing
-            # pool is gone, and ChatSession's ``_tools`` would never
-            # rebuild because no listener fires.
+            # entry without rebuilding the per-user catalogs would leave
+            # ``is_mcp_tool`` / per-user resource & prompt maps returning
+            # stale entries whose backing pool is gone, and ChatSession's
+            # tool / resource / prompt lists would never rebuild because
+            # no listener fires.
             self._last_pool_notification_refresh.pop(key, None)
             user_id, _server_name = key
             self._rebuild_user_tool_map(user_id)
+            self._rebuild_user_resource_map(user_id)
+            self._rebuild_user_prompt_map(user_id)
             self._notify_user_tool_listeners(user_id)
+            self._notify_user_resource_listeners(user_id)
+            self._notify_user_prompt_listeners(user_id)
             evicted = True
         finally:
             lock.release()
@@ -1535,6 +1773,118 @@ class MCPClientManager:
             self._user_tool_map.pop(user_id, None)
             self._user_tools.pop(user_id, None)
 
+    def _rebuild_user_resource_map(self, user_id: str) -> None:
+        """Rebuild the per-user resource index from pool entries.
+
+        Mirrors :meth:`_rebuild_user_tool_map` for resources (RFC §3.2):
+        scan ``_user_pool_entries`` for keys whose first element matches
+        ``user_id``, materialize a fresh ``uri → (server, uri)`` dict, a
+        parallel resource list, AND a parallel template-prefix dict,
+        and assign each atomically.
+
+        URI collisions across pool servers within a single user's pool
+        follow the same "later wins, log warning" policy as the static
+        :meth:`_rebuild_resources` (mcp_client.py:1689-1744). Empty
+        rebuilds drop the user_id key from all three dicts so idle
+        users don't retain empty-list sentinels.
+
+        ``_resource_map`` / ``_template_prefixes`` (the static indices)
+        are NEVER mutated here, preserving invariant 1.
+
+        MUST run on the mcp-loop. The two writes (``_user_resource_map``,
+        ``_user_resources``, ``_user_template_prefixes``) happen
+        back-to-back with no awaits between them so a sync-thread reader
+        cannot observe a torn state.
+        """
+        new_map: dict[str, tuple[str, str]] = {}
+        new_resources: list[dict[str, Any]] = []
+        new_prefixes: dict[str, tuple[str, str]] = {}
+        for (uid, server_name), entry in self._user_pool_entries.items():
+            if uid != user_id or entry.resources is None:
+                continue
+            for res in entry.resources:
+                if res.get("template"):
+                    tmpl_uri: str = res["uri"]
+                    brace = tmpl_uri.find("{")
+                    prefix = tmpl_uri[:brace] if brace >= 0 else tmpl_uri
+                    if prefix:
+                        if prefix in new_prefixes:
+                            existing_srv, existing_tmpl = new_prefixes[prefix]
+                            if len(tmpl_uri) > len(existing_tmpl):
+                                log.warning(
+                                    "Pool template prefix collision: '%s' from '%s' overrides "
+                                    "'%s' (keeping more specific template) user=%s",
+                                    prefix,
+                                    server_name,
+                                    existing_srv,
+                                    user_id,
+                                )
+                                new_prefixes[prefix] = (server_name, tmpl_uri)
+                            else:
+                                log.warning(
+                                    "Pool template prefix collision: '%s' from '%s' ignored in "
+                                    "favor of '%s' (keeping more specific template) user=%s",
+                                    prefix,
+                                    server_name,
+                                    existing_srv,
+                                    user_id,
+                                )
+                        else:
+                            new_prefixes[prefix] = (server_name, tmpl_uri)
+                    new_resources.append(res)
+                    continue
+                uri: str = res["uri"]
+                if uri in new_map:
+                    log.warning(
+                        "Pool resource URI collision: '%s' from '%s' overrides '%s' user=%s",
+                        uri,
+                        server_name,
+                        new_map[uri][0],
+                        user_id,
+                    )
+                new_map[uri] = (server_name, uri)
+                new_resources.append(res)
+        if new_map or new_resources or new_prefixes:
+            self._user_resource_map[user_id] = new_map
+            self._user_resources[user_id] = new_resources
+            self._user_template_prefixes[user_id] = new_prefixes
+        else:
+            self._user_resource_map.pop(user_id, None)
+            self._user_resources.pop(user_id, None)
+            self._user_template_prefixes.pop(user_id, None)
+
+    def _rebuild_user_prompt_map(self, user_id: str) -> None:
+        """Rebuild the per-user prompt index from pool entries.
+
+        Mirrors :meth:`_rebuild_user_tool_map` for prompts (RFC §3.3):
+        scan ``_user_pool_entries`` for keys whose first element matches
+        ``user_id``, materialize a fresh
+        ``prefixed_name → (server, original_name)`` dict and a parallel
+        prompt list, and assign each atomically.
+
+        ``_prompt_map`` (the static index) is NEVER mutated here,
+        preserving invariant 1.
+
+        Empty rebuilds drop the user_id key from BOTH dicts.
+
+        MUST run on the mcp-loop.
+        """
+        new_map: dict[str, tuple[str, str]] = {}
+        new_prompts: list[dict[str, Any]] = []
+        for (uid, _server_name), entry in self._user_pool_entries.items():
+            if uid != user_id or entry.prompts is None:
+                continue
+            for prompt in entry.prompts:
+                prefixed: str = prompt["name"]
+                new_map[prefixed] = (prompt["server"], prompt["original_name"])
+                new_prompts.append(prompt)
+        if new_map:
+            self._user_prompt_map[user_id] = new_map
+            self._user_prompts[user_id] = new_prompts
+        else:
+            self._user_prompt_map.pop(user_id, None)
+            self._user_prompts.pop(user_id, None)
+
     async def _refresh_server_tools(self, name: str) -> tuple[list[str], list[str]]:
         """Re-fetch tools for one server.  Returns ``(added, removed)`` names."""
         state = self._static_servers.get(name)
@@ -1604,6 +1954,138 @@ class MCPClientManager:
         if added or removed:
             log.info(
                 "Refreshed pool MCP server user=%s server=%s: +%d/-%d tool(s)",
+                user_id,
+                server_name,
+                len(added),
+                len(removed),
+            )
+        return added, removed
+
+    async def _refresh_pool_server_resources(
+        self, key: tuple[str, str]
+    ) -> tuple[list[str], list[str]]:
+        """Re-fetch resources for one pool entry. Returns ``(added, removed)`` URIs.
+
+        Mirror of :meth:`_refresh_pool_server_tools` for the resource
+        path (RFC §3.2). Skips when ``supports_resources`` is False so
+        a server that no longer advertises resources doesn't trigger
+        a list call. ``asyncio.timeout`` is mandatory — see R6.
+
+        MUST run on the mcp-loop. Caller does not need to hold
+        ``open_lock``; this is invoked from the pool notification
+        handler running on the SDK's receive task.
+        """
+        entry = self._user_pool_entries.get(key)
+        if entry is None or entry.session is None or not entry.supports_resources:
+            return [], []
+        session = entry.session
+        user_id, server_name = key
+        old_uris = {r["uri"] for r in (entry.resources or []) if not r.get("template")}
+
+        async with asyncio.timeout(self._CONNECT_TIMEOUT):
+            # 1-RTT (gather) instead of 2 sequential RTTs — both calls
+            # share the same timeout budget and target disjoint catalogs
+            # (resources vs. templates), so ordering is irrelevant.
+            res_result, tmpl_result = await asyncio.gather(
+                session.list_resources(),
+                session.list_resource_templates(),
+            )
+
+        server_resources: list[dict[str, Any]] = []
+        for r in _cap_server_resources(server_name, res_result.resources):
+            server_resources.append(
+                {
+                    "uri": str(r.uri),
+                    "name": r.name or "",
+                    "description": r.description or "",
+                    "mimeType": r.mimeType or "",
+                    "server": server_name,
+                }
+            )
+        for t in _cap_server_resource_templates(server_name, tmpl_result.resourceTemplates):
+            server_resources.append(
+                {
+                    "uri": str(t.uriTemplate),
+                    "name": t.name or "",
+                    "description": t.description or "",
+                    "mimeType": t.mimeType or "",
+                    "server": server_name,
+                    "template": True,
+                }
+            )
+
+        new_uris = {r["uri"] for r in server_resources if not r.get("template")}
+        entry.resources = server_resources
+        self._rebuild_user_resource_map(user_id)
+        # Fire user-keyed AND admin (None) listeners. Other users'
+        # listeners do NOT see this change — the pool catalog is private.
+        self._notify_user_resource_listeners(user_id)
+
+        added = sorted(new_uris - old_uris)
+        removed = sorted(old_uris - new_uris)
+        if added or removed:
+            log.info(
+                "Refreshed pool MCP server user=%s server=%s: +%d/-%d resource(s)",
+                user_id,
+                server_name,
+                len(added),
+                len(removed),
+            )
+        return added, removed
+
+    async def _refresh_pool_server_prompts(
+        self, key: tuple[str, str]
+    ) -> tuple[list[str], list[str]]:
+        """Re-fetch prompts for one pool entry. Returns ``(added, removed)`` names.
+
+        Mirror of :meth:`_refresh_pool_server_tools` for the prompt
+        path (RFC §3.3). Skips when ``supports_prompts`` is False so a
+        server that no longer advertises prompts doesn't trigger a list
+        call. ``asyncio.timeout`` is mandatory — see R6.
+
+        MUST run on the mcp-loop. Caller does not need to hold
+        ``open_lock``; this is invoked from the pool notification
+        handler running on the SDK's receive task.
+        """
+        entry = self._user_pool_entries.get(key)
+        if entry is None or entry.session is None or not entry.supports_prompts:
+            return [], []
+        session = entry.session
+        user_id, server_name = key
+        old_names = {p["name"] for p in (entry.prompts or [])}
+
+        async with asyncio.timeout(self._CONNECT_TIMEOUT):
+            prompt_result = await session.list_prompts()
+
+        server_prompts: list[dict[str, Any]] = []
+        for p in _cap_server_prompts(server_name, prompt_result.prompts):
+            server_prompts.append(
+                {
+                    "name": f"mcp__{server_name}__{p.name}",
+                    "original_name": p.name,
+                    "server": server_name,
+                    "description": p.description or "",
+                    "arguments": [
+                        {
+                            "name": a.name,
+                            "description": a.description or "",
+                            "required": a.required or False,
+                        }
+                        for a in (p.arguments or [])
+                    ],
+                }
+            )
+
+        new_names = {p["name"] for p in server_prompts}
+        entry.prompts = server_prompts
+        self._rebuild_user_prompt_map(user_id)
+        self._notify_user_prompt_listeners(user_id)
+
+        added = sorted(new_names - old_names)
+        removed = sorted(old_names - new_names)
+        if added or removed:
+            log.info(
+                "Refreshed pool MCP server user=%s server=%s: +%d/-%d prompt(s)",
                 user_id,
                 server_name,
                 len(added),
@@ -1896,40 +2378,110 @@ class MCPClientManager:
             except Exception:
                 log.warning("Tool-change listener raised", exc_info=True)
 
-    def add_resource_listener(self, callback: Callable[[], None]) -> None:
-        """Register a callback invoked when the resource list changes."""
-        with self._resource_listeners_lock:
-            self._resource_listeners.append(callback)
+    def add_resource_listener(
+        self, callback: Callable[[], None], *, user_id: str | None = None
+    ) -> None:
+        """Register a callback invoked when the resource list changes.
 
-    def remove_resource_listener(self, callback: Callable[[], None]) -> None:
-        """Unregister a resource-change callback."""
+        ``user_id=None`` (default) registers a global / admin listener
+        that fires on every resource-change (static or pool). A string
+        ``user_id`` scopes the listener: it fires on global static-path
+        changes AND on pool changes for that user only — never on
+        another user's pool change. RFC §3.3.
+        """
+        with self._resource_listeners_lock:
+            self._resource_listeners.append((user_id, callback))
+
+    def remove_resource_listener(
+        self, callback: Callable[[], None], *, user_id: str | None = None
+    ) -> None:
+        """Unregister a resource-change callback.
+
+        ``user_id`` MUST match the value used at registration; the
+        ``(user_id, callback)`` pair is the listener identity.
+        """
         with self._resource_listeners_lock, contextlib.suppress(ValueError):
-            self._resource_listeners.remove(callback)
+            self._resource_listeners.remove((user_id, callback))
 
     def _notify_resource_listeners(self) -> None:
-        """Invoke all registered resource-change listeners."""
+        """Static-path resource change — fires ALL registered listeners.
+
+        Mirrors ``_notify_listeners`` for tools (RFC §3.3): the static
+        catalog is process-wide so the fan-out is unconditional.
+        """
         with self._resource_listeners_lock:
             listeners = list(self._resource_listeners)
+        for _uid, cb in listeners:
+            try:
+                cb()
+            except Exception:
+                log.warning("Resource-change listener raised", exc_info=True)
+
+    def _notify_user_resource_listeners(self, user_id: str) -> None:
+        """Pool-entry resource change — fires only listeners that should see it.
+
+        Scoped fan-out targets the matching ``user_id`` AND admin
+        (``None``) listeners. Mirrors ``_notify_user_tool_listeners``.
+        RFC §3.3.
+        """
+        with self._resource_listeners_lock:
+            listeners = [
+                cb for uid, cb in self._resource_listeners if uid == user_id or uid is None
+            ]
         for cb in listeners:
             try:
                 cb()
             except Exception:
                 log.warning("Resource-change listener raised", exc_info=True)
 
-    def add_prompt_listener(self, callback: Callable[[], None]) -> None:
-        """Register a callback invoked when the prompt list changes."""
-        with self._prompt_listeners_lock:
-            self._prompt_listeners.append(callback)
+    def add_prompt_listener(
+        self, callback: Callable[[], None], *, user_id: str | None = None
+    ) -> None:
+        """Register a callback invoked when the prompt list changes.
 
-    def remove_prompt_listener(self, callback: Callable[[], None]) -> None:
-        """Unregister a prompt-change callback."""
+        ``user_id=None`` (default) registers a global / admin listener
+        that fires on every prompt-change (static or pool). A string
+        ``user_id`` scopes the listener: it fires on global static-path
+        changes AND on pool changes for that user only — never on
+        another user's pool change. RFC §3.3.
+        """
+        with self._prompt_listeners_lock:
+            self._prompt_listeners.append((user_id, callback))
+
+    def remove_prompt_listener(
+        self, callback: Callable[[], None], *, user_id: str | None = None
+    ) -> None:
+        """Unregister a prompt-change callback.
+
+        ``user_id`` MUST match the value used at registration; the
+        ``(user_id, callback)`` pair is the listener identity.
+        """
         with self._prompt_listeners_lock, contextlib.suppress(ValueError):
-            self._prompt_listeners.remove(callback)
+            self._prompt_listeners.remove((user_id, callback))
 
     def _notify_prompt_listeners(self) -> None:
-        """Invoke all registered prompt-change listeners."""
+        """Static-path prompt change — fires ALL registered listeners.
+
+        Mirrors ``_notify_listeners`` for tools (RFC §3.3): the static
+        catalog is process-wide so the fan-out is unconditional.
+        """
         with self._prompt_listeners_lock:
             listeners = list(self._prompt_listeners)
+        for _uid, cb in listeners:
+            try:
+                cb()
+            except Exception:
+                log.warning("Prompt-change listener raised", exc_info=True)
+
+    def _notify_user_prompt_listeners(self, user_id: str) -> None:
+        """Pool-entry prompt change — fires only listeners that should see it.
+
+        Scoped fan-out targets the matching ``user_id`` AND admin
+        (``None``) listeners. Mirrors ``_notify_user_tool_listeners``.
+        RFC §3.3.
+        """
+        with self._prompt_listeners_lock:
+            listeners = [cb for uid, cb in self._prompt_listeners if uid == user_id or uid is None]
         for cb in listeners:
             try:
                 cb()
@@ -2140,6 +2692,14 @@ class MCPClientManager:
         self._user_pool_entries.clear()
         self._user_pool_last_used.clear()
         self._user_pool_locks.clear()
+        self._user_tool_map.clear()
+        self._user_tools.clear()
+        # Phase 7b — per-user resource / prompt catalogs.
+        self._user_resource_map.clear()
+        self._user_resources.clear()
+        self._user_template_prefixes.clear()
+        self._user_prompt_map.clear()
+        self._user_prompts.clear()
         self._user_pool_eviction_task = None
 
         log.info("MCP client shut down")
@@ -2489,23 +3049,83 @@ class MCPClientManager:
         base.extend(dict(t) for t in self._user_tools.get(user_id, []))
         return base
 
-    def get_resources(self) -> list[dict[str, Any]]:
-        """Return discovered MCP resources (shallow-copied dicts)."""
-        return [dict(r) for r in self._resources]
+    def get_resources(self, user_id: str | None = None) -> list[dict[str, Any]]:
+        """Return discovered MCP resources (shallow-copied dicts).
 
-    def get_prompts(self) -> list[dict[str, Any]]:
-        """Return discovered MCP prompts (shallow-copied dicts)."""
-        return [dict(p) for p in self._prompts]
+        ``user_id=None`` returns the global static-path catalog only —
+        the legacy behaviour every pre-Phase-7b caller relies on. A
+        string ``user_id`` returns the merged view: per-user pool
+        resources first (per scope decision 0.1 — per-user-first
+        ordering), then the static catalog. Reads ``_user_resources``
+        via a single dict-get (atomic under GIL).
+
+        Returned dicts are shallow-copied; nested objects are shared
+        with the manager's catalog, mirroring the pre-Phase-7b contract.
+        """
+        if user_id is None:
+            return [dict(r) for r in self._resources]
+        merged: list[dict[str, Any]] = [dict(r) for r in self._user_resources.get(user_id, [])]
+        merged.extend(dict(r) for r in self._resources)
+        return merged
+
+    def get_prompts(self, user_id: str | None = None) -> list[dict[str, Any]]:
+        """Return discovered MCP prompts (shallow-copied dicts).
+
+        ``user_id=None`` returns the global static-path catalog only.
+        A string ``user_id`` returns the merged view: per-user pool
+        prompts first (scope decision 0.1), then static.
+        """
+        if user_id is None:
+            return [dict(p) for p in self._prompts]
+        merged: list[dict[str, Any]] = [dict(p) for p in self._user_prompts.get(user_id, [])]
+        merged.extend(dict(p) for p in self._prompts)
+        return merged
 
     @property
     def resource_count(self) -> int:
-        """Number of discovered resources (no allocation)."""
+        """Number of discovered static resources (no allocation).
+
+        Process-global by design — admin endpoints rely on this contract.
+        Use :meth:`resource_count_for_user` for the per-user count that
+        includes the user's pool resources.
+        """
         return len(self._resources)
 
     @property
     def prompt_count(self) -> int:
-        """Number of discovered prompts (no allocation)."""
+        """Number of discovered static prompts (no allocation).
+
+        Process-global by design — admin endpoints rely on this contract.
+        Use :meth:`prompt_count_for_user` for the per-user count that
+        includes the user's pool prompts.
+        """
         return len(self._prompts)
+
+    def resource_count_for_user(self, user_id: str | None = None) -> int:
+        """Return ``len(static) + len(user_pool)`` resources.
+
+        ``user_id=None`` returns the static-only count (matches the
+        ``resource_count`` property). A string ``user_id`` adds that
+        user's pool resources. Used by ChatSession's ``read_resource``
+        tool gating so a pool-only user still sees the tool when
+        their pool has resources but the static catalog is empty
+        (scope decision 0.2).
+        """
+        base = len(self._resources)
+        if user_id is None:
+            return base
+        return base + len(self._user_resources.get(user_id, []))
+
+    def prompt_count_for_user(self, user_id: str | None = None) -> int:
+        """Return ``len(static) + len(user_pool)`` prompts.
+
+        See :meth:`resource_count_for_user` — same shape, prompts
+        instead of resources.
+        """
+        base = len(self._prompts)
+        if user_id is None:
+            return base
+        return base + len(self._user_prompts.get(user_id, []))
 
     def is_mcp_tool(self, func_name: str, *, user_id: str | None = None) -> bool:
         """Check whether *func_name* belongs to an MCP server.
@@ -2530,9 +3150,23 @@ class MCPClientManager:
         user_map = self._user_tool_map.get(user_id)
         return user_map is not None and func_name in user_map
 
-    def is_mcp_prompt(self, name: str) -> bool:
-        """Check whether *name* is a known MCP prompt."""
-        return name in self._prompt_map
+    def is_mcp_prompt(self, name: str, *, user_id: str | None = None) -> bool:
+        """Check whether *name* is a known MCP prompt.
+
+        ``user_id=None`` (default) asks "is this a static-path prompt?" —
+        the answer is process-global. A string ``user_id`` extends the
+        lookup to that user's pool catalog: returns ``True`` if ``name``
+        is in either the static map OR the user's per-user prompt map.
+        Mirrors :meth:`is_mcp_tool` (scope decision 0.1, per-user-first
+        is moot for prompts because their prefixed names are
+        per-server-disjoint by construction).
+        """
+        if name in self._prompt_map:
+            return True
+        if user_id is None:
+            return False
+        user_map = self._user_prompt_map.get(user_id)
+        return user_map is not None and name in user_map
 
     def server_auth_type(self, server_name: str) -> str | None:
         """Return ``'oauth_user'`` for pool-backed servers, else ``None``.
@@ -2770,6 +3404,69 @@ class MCPClientManager:
             return None
         return row
 
+    def _resolve_pool_target_resource(
+        self, uri: str, user_id: str
+    ) -> tuple[str, str, dict[str, Any]] | None:
+        """Resolve ``(server_name, uri, server_row)`` for pool resource reads.
+
+        Per scope decision 0.1: per-user-first resolution. Consults the
+        user's ``_user_resource_map`` first, then the user's
+        ``_user_template_prefixes`` (longest-prefix match). Returns
+        ``None`` when the URI doesn't match a pool entry — the caller
+        falls through to the static path.
+
+        Pool eligibility is gated on ``server_row.auth_type ==
+        'oauth_user'``: a per-user map entry that points at a static-
+        path server is treated as a miss (the static path will pick it
+        up). Defence-in-depth — _user_resource_map is populated only
+        from pool entries, so this case shouldn't occur in practice.
+        """
+        user_map = self._user_resource_map.get(user_id) or {}
+        mapping = user_map.get(uri)
+        if mapping is None:
+            # Try per-user templates (longest-prefix wins within scope).
+            best: tuple[str, str] | None = None
+            best_len = 0
+            for prefix, prefix_mapping in (self._user_template_prefixes.get(user_id) or {}).items():
+                if uri.startswith(prefix) and len(prefix) > best_len:
+                    best = prefix_mapping
+                    best_len = len(prefix)
+            if best is None:
+                return None
+            server_name = best[0]
+        else:
+            server_name = mapping[0]
+        row = self._lookup_server_row(server_name)
+        if row is None or row.get("auth_type") != "oauth_user":
+            return None
+        return server_name, uri, row
+
+    def _resolve_pool_target_prompt(
+        self,
+        prefixed_name: str,
+        static_server: str | None,
+        static_original: str | None,
+    ) -> tuple[str, str, dict[str, Any]] | None:
+        """Resolve ``(server_name, original_name, server_row)`` for pool prompts.
+
+        Mirror of :meth:`_resolve_pool_target` for prompts: prompts
+        carry the ``mcp__{server}__{name}`` prefix shape so the same
+        parsing applies. Presence in static ``_prompt_map`` (signalled
+        by non-None ``static_server`` / ``static_original``) short-
+        circuits to None — the static path owns that name.
+        """
+        if static_server is not None and static_original is not None:
+            return None
+        if not prefixed_name.startswith("mcp__") or prefixed_name.count("__") < 2:
+            return None
+        _, server_name, original = prefixed_name.split("__", 2)
+        if not server_name or not original:
+            return None
+        row = self._lookup_server_row(server_name)
+        if row is None or row.get("auth_type") != "oauth_user":
+            return None
+        return server_name, original, row
+
     def _dispatch_pool_sync(
         self,
         *,
@@ -2882,6 +3579,174 @@ class MCPClientManager:
             future.cancel()
             self._cb_record_failure(server_name)
             raise TimeoutError(f"MCP tool call timed out after {original_timeout}s") from None
+
+    def _dispatch_pool_resource_sync(
+        self,
+        *,
+        user_id: str,
+        server_name: str,
+        uri: str,
+        server_row: dict[str, Any],
+        timeout: int,
+    ) -> str:
+        """Synchronous wrapper for pool resource read.
+
+        Mirrors :meth:`_dispatch_pool_sync` for the resource path.
+        Returns either the resource body or a structured-error JSON
+        string when token state precludes the call.
+
+        Retry-on-401 follows the same fresh-task scheduling pattern
+        as the tool path — the dispatcher coroutine raises
+        :class:`_PoolDispatchRetryRequested` after refreshing the
+        bearer; we re-issue on a brand-new task so the retry's anyio
+        cancel-scope state is independent of the prior connect's
+        TaskGroup teardown.
+        """
+        assert self._loop is not None
+        start = time.monotonic()
+        try:
+            return self._run_pool_dispatch_resource_attempt(
+                retry_count=0,
+                timeout=timeout,
+                original_timeout=timeout,
+                user_id=user_id,
+                server_name=server_name,
+                uri=uri,
+                server_row=server_row,
+            )
+        except _PoolDispatchRetryRequested:
+            remaining = max(1, int(timeout - (time.monotonic() - start)))
+            return self._run_pool_dispatch_resource_attempt(
+                retry_count=1,
+                timeout=remaining,
+                original_timeout=timeout,
+                user_id=user_id,
+                server_name=server_name,
+                uri=uri,
+                server_row=server_row,
+            )
+
+    def _run_pool_dispatch_resource_attempt(
+        self,
+        *,
+        retry_count: int,
+        timeout: int,
+        original_timeout: int,
+        user_id: str,
+        server_name: str,
+        uri: str,
+        server_row: dict[str, Any],
+    ) -> str:
+        """Schedule one resource dispatch attempt; same shape as
+        :meth:`_run_pool_dispatch_attempt` for tools."""
+        assert self._loop is not None
+        future = asyncio.run_coroutine_threadsafe(
+            self._dispatch_pool_resource(
+                retry_count=retry_count,
+                user_id=user_id,
+                server_name=server_name,
+                uri=uri,
+                server_row=server_row,
+            ),
+            self._loop,
+        )
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            self._cb_record_failure(server_name)
+            raise TimeoutError(f"MCP resource read timed out after {original_timeout}s") from None
+
+    def _dispatch_pool_prompt_sync(
+        self,
+        *,
+        user_id: str,
+        server_name: str,
+        original_name: str,
+        arguments: dict[str, str] | None,
+        server_row: dict[str, Any],
+        timeout: int,
+    ) -> list[dict[str, Any]]:
+        """Synchronous wrapper for pool prompt invocation.
+
+        Mirrors :meth:`_dispatch_pool_sync` for the prompt path. The
+        async dispatcher returns either a list of expanded messages OR
+        a structured-error JSON string (the failure path); to keep the
+        return shape consistent with the static path
+        (:meth:`get_prompt_sync`), errors are surfaced via
+        :class:`RuntimeError` so the agent-loop's existing
+        ``except Exception`` block at the call site renders the
+        structured-error message. Embedding the JSON in a single-element
+        message list would pollute the prompt protocol — open question 1
+        in the plan.
+        """
+        assert self._loop is not None
+        start = time.monotonic()
+        try:
+            result = self._run_pool_dispatch_prompt_attempt(
+                retry_count=0,
+                timeout=timeout,
+                original_timeout=timeout,
+                user_id=user_id,
+                server_name=server_name,
+                original_name=original_name,
+                arguments=arguments,
+                server_row=server_row,
+            )
+        except _PoolDispatchRetryRequested:
+            remaining = max(1, int(timeout - (time.monotonic() - start)))
+            result = self._run_pool_dispatch_prompt_attempt(
+                retry_count=1,
+                timeout=remaining,
+                original_timeout=timeout,
+                user_id=user_id,
+                server_name=server_name,
+                original_name=original_name,
+                arguments=arguments,
+                server_row=server_row,
+            )
+        if isinstance(result, str):
+            # Structured-error path — surface as RuntimeError so the
+            # agent-loop renders the JSON via its except-Exception
+            # handler.
+            raise RuntimeError(result)
+        return result
+
+    def _run_pool_dispatch_prompt_attempt(
+        self,
+        *,
+        retry_count: int,
+        timeout: int,
+        original_timeout: int,
+        user_id: str,
+        server_name: str,
+        original_name: str,
+        arguments: dict[str, str] | None,
+        server_row: dict[str, Any],
+    ) -> list[dict[str, Any]] | str:
+        """Schedule one prompt dispatch attempt; returns either decoded
+        messages or a structured-error string. Mirror of
+        :meth:`_run_pool_dispatch_attempt` for prompts."""
+        assert self._loop is not None
+        future = asyncio.run_coroutine_threadsafe(
+            self._dispatch_pool_prompt(
+                retry_count=retry_count,
+                user_id=user_id,
+                server_name=server_name,
+                original_name=original_name,
+                arguments=arguments,
+                server_row=server_row,
+            ),
+            self._loop,
+        )
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            self._cb_record_failure(server_name)
+            raise TimeoutError(
+                f"MCP prompt retrieval timed out after {original_timeout}s"
+            ) from None
 
     async def _dispatch_pool(
         self,
@@ -3080,6 +3945,290 @@ class MCPClientManager:
         self._cb_record_success(server_name)
         return result
 
+    async def _dispatch_pool_resource(
+        self,
+        *,
+        user_id: str,
+        server_name: str,
+        uri: str,
+        server_row: dict[str, Any],
+        retry_count: int = 0,
+    ) -> str:
+        """Pool-side coroutine for resource reads (RFC §3.2).
+
+        Mirror of :meth:`_dispatch_pool` for the resource path. Returns
+        either the textualized resource content or a structured-error
+        JSON string. Reuses the same token-classify, breaker-gate,
+        URL-hygiene, carrier-race, classification and retry plumbing
+        as the tool dispatcher; only the SDK call differs.
+        """
+        if self._app_state is None:
+            raise RuntimeError("Pool dispatch requires set_app_state() to have been called")
+
+        lookup: TokenLookupResult = await get_user_access_token_classified(
+            app_state=self._app_state,
+            user_id=user_id,
+            server_name=server_name,
+            force_refresh=retry_count > 0,
+        )
+        if lookup.kind == "missing":
+            return _structured_error(
+                code="mcp_consent_required",
+                server=server_name,
+                detail="No token for user. Consent flow required.",
+            )
+        if lookup.kind == "decrypt_failure":
+            return _structured_error(
+                code="mcp_token_undecryptable_key_unknown",
+                server=server_name,
+                detail=(
+                    "Stored token cannot be decrypted by any installed encryption key. "
+                    "Operator action required."
+                ),
+            )
+        if lookup.kind == "refresh_failed":
+            return _structured_error(
+                code="mcp_consent_required",
+                server=server_name,
+                detail="Refresh token rejected. Re-consent required.",
+            )
+        access_token = lookup.token or ""
+        if not access_token:
+            return _structured_error(
+                code="mcp_consent_required",
+                server=server_name,
+                detail="No token for user. Consent flow required.",
+            )
+
+        url = str(server_row.get("url") or "")
+        try:
+            _validate_oauth_user_url(url)
+        except ValueError as exc:
+            log.warning(
+                "mcp_pool.url_insecure server=%s scheme=%s",
+                server_name,
+                urllib.parse.urlparse(url).scheme,
+            )
+            return _structured_error(
+                code="mcp_oauth_url_insecure",
+                server=server_name,
+                detail=str(exc),
+            )
+
+        self._cb_gate(server_name)
+
+        cfg = _pool_cfg_from_row(server_row)
+        key = (user_id, server_name)
+        entry = await self._ensure_pool_entry(key)
+        capture = entry.auth_capture
+        try:
+            sdk_result = await self._dispatch_pool_with_entry_call(
+                entry=entry,
+                key=key,
+                cfg=cfg,
+                access_token=access_token,
+                sdk_call=lambda s: s.read_resource(uri),
+            )
+        except BaseException as exc:
+            classification = self._classify_failure(exc, capture=capture)
+            if classification == "auth_401":
+                self._evict_session(key)
+                if retry_count == 0:
+                    log.debug(
+                        "mcp_pool.auth_401_initial_resource server=%s user=%s exc=%s",
+                        server_name,
+                        user_id,
+                        type(exc).__name__,
+                    )
+                    raise _PoolDispatchRetryRequested from None
+                log.debug(
+                    "mcp_pool.auth_401_retry_failed_resource server=%s user=%s exc=%s",
+                    server_name,
+                    user_id,
+                    type(exc).__name__,
+                )
+                return _structured_error(
+                    code="mcp_consent_required",
+                    server=server_name,
+                    detail="Refreshed token still rejected. Re-consent required.",
+                )
+            if classification == "auth_403":
+                self._evict_session(key)
+                log.debug(
+                    "mcp_pool.auth_403_resource server=%s user=%s exc=%s",
+                    server_name,
+                    user_id,
+                    type(exc).__name__,
+                )
+                return await self._handle_auth_403(
+                    user_id=user_id,
+                    server_name=server_name,
+                    server_row=server_row,
+                    capture=capture,
+                    kind="resource",
+                )
+            if classification == "transport":
+                self._cb_record_failure(server_name)
+                self._evict_session(key)
+                log.debug(
+                    "mcp_pool.transport_failure_resource server=%s user=%s exc=%s",
+                    server_name,
+                    user_id,
+                    type(exc).__name__,
+                )
+                raise
+            raise
+
+        self._cb_record_success(server_name)
+        return _decode_resource_result(sdk_result)
+
+    async def _dispatch_pool_prompt(
+        self,
+        *,
+        user_id: str,
+        server_name: str,
+        original_name: str,
+        arguments: dict[str, str] | None,
+        server_row: dict[str, Any],
+        retry_count: int = 0,
+    ) -> list[dict[str, Any]] | str:
+        """Pool-side coroutine for prompt invocation (RFC §3.3).
+
+        Mirror of :meth:`_dispatch_pool_resource` for the prompt path.
+        Returns either the decoded list of expanded messages or a
+        structured-error JSON string. Reuses the same token-classify,
+        breaker-gate, URL-hygiene, carrier-race, classification and
+        retry plumbing as the tool / resource dispatchers; only the SDK
+        call differs.
+
+        The dual return type (``list[dict[str, Any]] | str``) is shaped
+        for the sync wrapper at :meth:`_dispatch_pool_prompt_sync` —
+        it surfaces the structured-error string via
+        :class:`RuntimeError` so the agent-loop's ``except Exception``
+        block at the call site renders the JSON. Embedding error JSON
+        in a single-element message list would pollute the prompt
+        protocol (open question 1, plan §5).
+        """
+        if self._app_state is None:
+            raise RuntimeError("Pool dispatch requires set_app_state() to have been called")
+
+        lookup: TokenLookupResult = await get_user_access_token_classified(
+            app_state=self._app_state,
+            user_id=user_id,
+            server_name=server_name,
+            force_refresh=retry_count > 0,
+        )
+        if lookup.kind == "missing":
+            return _structured_error(
+                code="mcp_consent_required",
+                server=server_name,
+                detail="No token for user. Consent flow required.",
+            )
+        if lookup.kind == "decrypt_failure":
+            return _structured_error(
+                code="mcp_token_undecryptable_key_unknown",
+                server=server_name,
+                detail=(
+                    "Stored token cannot be decrypted by any installed encryption key. "
+                    "Operator action required."
+                ),
+            )
+        if lookup.kind == "refresh_failed":
+            return _structured_error(
+                code="mcp_consent_required",
+                server=server_name,
+                detail="Refresh token rejected. Re-consent required.",
+            )
+        access_token = lookup.token or ""
+        if not access_token:
+            return _structured_error(
+                code="mcp_consent_required",
+                server=server_name,
+                detail="No token for user. Consent flow required.",
+            )
+
+        url = str(server_row.get("url") or "")
+        try:
+            _validate_oauth_user_url(url)
+        except ValueError as exc:
+            log.warning(
+                "mcp_pool.url_insecure server=%s scheme=%s",
+                server_name,
+                urllib.parse.urlparse(url).scheme,
+            )
+            return _structured_error(
+                code="mcp_oauth_url_insecure",
+                server=server_name,
+                detail=str(exc),
+            )
+
+        self._cb_gate(server_name)
+
+        cfg = _pool_cfg_from_row(server_row)
+        key = (user_id, server_name)
+        entry = await self._ensure_pool_entry(key)
+        capture = entry.auth_capture
+        try:
+            sdk_result = await self._dispatch_pool_with_entry_call(
+                entry=entry,
+                key=key,
+                cfg=cfg,
+                access_token=access_token,
+                sdk_call=lambda s: s.get_prompt(original_name, arguments=arguments),
+            )
+        except BaseException as exc:
+            classification = self._classify_failure(exc, capture=capture)
+            if classification == "auth_401":
+                self._evict_session(key)
+                if retry_count == 0:
+                    log.debug(
+                        "mcp_pool.auth_401_initial_prompt server=%s user=%s exc=%s",
+                        server_name,
+                        user_id,
+                        type(exc).__name__,
+                    )
+                    raise _PoolDispatchRetryRequested from None
+                log.debug(
+                    "mcp_pool.auth_401_retry_failed_prompt server=%s user=%s exc=%s",
+                    server_name,
+                    user_id,
+                    type(exc).__name__,
+                )
+                return _structured_error(
+                    code="mcp_consent_required",
+                    server=server_name,
+                    detail="Refreshed token still rejected. Re-consent required.",
+                )
+            if classification == "auth_403":
+                self._evict_session(key)
+                log.debug(
+                    "mcp_pool.auth_403_prompt server=%s user=%s exc=%s",
+                    server_name,
+                    user_id,
+                    type(exc).__name__,
+                )
+                return await self._handle_auth_403(
+                    user_id=user_id,
+                    server_name=server_name,
+                    server_row=server_row,
+                    capture=capture,
+                    kind="prompt",
+                )
+            if classification == "transport":
+                self._cb_record_failure(server_name)
+                self._evict_session(key)
+                log.debug(
+                    "mcp_pool.transport_failure_prompt server=%s user=%s exc=%s",
+                    server_name,
+                    user_id,
+                    type(exc).__name__,
+                )
+                raise
+            raise
+
+        self._cb_record_success(server_name)
+        return _decode_prompt_result(sdk_result)
+
     def _evict_session(self, key: tuple[str, str]) -> None:
         """Drop the cached session AND catalog on a pool entry.
 
@@ -3091,30 +4240,39 @@ class MCPClientManager:
         same anyio scope it was entered in, which the next connect
         arranges.
 
-        Catalog cleanup (Phase 7): clearing ``entry.tools`` here
-        ensures an evicted-then-not-yet-reconnected entry contributes
-        no stale entries to ``_user_tool_map``. Without this,
-        ``is_mcp_tool(name, user_id=user_id)`` could return True for a
-        name whose backing pool is gone, then ``_resolve_pool_target``
-        would dispatch into a session-less entry and the next call
-        would surface as a generic transport error instead of a
-        clean reconnect path.
+        Catalog cleanup (Phase 7 / 7b): clearing ``entry.tools`` /
+        ``entry.resources`` / ``entry.prompts`` here ensures an
+        evicted-then-not-yet-reconnected entry contributes no stale
+        entries to ``_user_tool_map`` / ``_user_resource_map`` /
+        ``_user_prompt_map``. Without this, ``is_mcp_tool`` /
+        ``is_mcp_prompt`` / pool resource resolution could return True
+        for names whose backing pool is gone, then the resolver would
+        dispatch into a session-less entry and the next call would
+        surface as a generic transport error instead of a clean
+        reconnect path.
         """
         evict = self._user_pool_entries.get(key)
         if evict is not None:
             evict.session = None
             evict.tools = None
+            evict.resources = None
+            evict.prompts = None
             # Prune the debounce stamp in lockstep with the entry — the
             # dict grows otherwise (slow leak) across (user, server)
             # churn. Mirrors the cleanup in ``_close_pool_entry_if_idle``.
             self._last_pool_notification_refresh.pop(key, None)
             user_id, _server_name = key
             self._rebuild_user_tool_map(user_id)
-            # Wake the user's session so its merged tool list shrinks
-            # back to static-only until the next connect populates the
-            # entry. Admin (None) listeners also fire — operator
-            # tooling tracking pool catalog state observes the drop.
+            self._rebuild_user_resource_map(user_id)
+            self._rebuild_user_prompt_map(user_id)
+            # Wake the user's session so its merged tool / resource /
+            # prompt lists shrink back to static-only until the next
+            # connect populates the entry. Admin (None) listeners also
+            # fire — operator tooling tracking pool catalog state
+            # observes the drop.
             self._notify_user_tool_listeners(user_id)
+            self._notify_user_resource_listeners(user_id)
+            self._notify_user_prompt_listeners(user_id)
 
     async def _handle_auth_403(
         self,
@@ -3123,6 +4281,7 @@ class MCPClientManager:
         server_name: str,
         server_row: dict[str, Any],
         capture: _AuthCapture,
+        kind: Literal["tool", "resource", "prompt"] = "tool",
     ) -> str:
         """Map a 403 + WWW-Authenticate into a structured error.
 
@@ -3131,32 +4290,64 @@ class MCPClientManager:
         can construct an authorize URL with the union of original +
         new scopes — re-consenting with the original scopes alone
         would loop because the AS would re-issue the same insufficient
-        token. Other 403s become a generic ``mcp_tool_call_forbidden``
-        with no retry; the user lacks permission and a step-up
-        wouldn't help.
+        token. Other 403s become a generic per-operation forbidden
+        code (``mcp_tool_call_forbidden`` / ``mcp_resource_read_forbidden``
+        / ``mcp_prompt_get_forbidden``) so the dashboard renderer can
+        special-case the message. The user lacks permission and a
+        step-up wouldn't help; no retry.
+
+        Both branches now emit an audit event via
+        :func:`emit_oauth_failure_audit` carrying the ``kind`` and
+        resolved error ``code`` so operators can distinguish tool-call
+        vs resource-read vs prompt-get 403s for the same
+        ``(user, server)`` and detect cross-tenant probing of generic
+        forbidden surfaces.
         """
         header = capture.www_authenticate or ""
         error_token = parse_www_authenticate_error(header)
         if error_token == "insufficient_scope":
             scopes = parse_www_authenticate_scope(header)
             scopes = scopes[:_MAX_INSUFFICIENT_SCOPE_REPORTED]
-            await emit_insufficient_scope_audit(
+            await emit_oauth_failure_audit(
                 app_state=self._app_state,
                 user_id=user_id,
                 server_name=server_name,
                 server_row=server_row,
+                kind=kind,
+                code="mcp_insufficient_scope",
                 scopes=scopes,
             )
             return _structured_error(
                 code="mcp_insufficient_scope",
                 server=server_name,
-                detail=("Tool requires elevated scopes. Re-consent flow with new scopes required."),
+                detail=(
+                    f"{kind.capitalize()} requires elevated scopes. "
+                    "Re-consent flow with new scopes required."
+                ),
                 scopes_required=list(scopes),
             )
+        forbidden_code = {
+            "tool": "mcp_tool_call_forbidden",
+            "resource": "mcp_resource_read_forbidden",
+            "prompt": "mcp_prompt_get_forbidden",
+        }[kind]
+        forbidden_detail = {
+            "tool": "Tool call forbidden by upstream policy.",
+            "resource": "Resource read forbidden by upstream policy.",
+            "prompt": "Prompt invocation forbidden by upstream policy.",
+        }[kind]
+        await emit_oauth_failure_audit(
+            app_state=self._app_state,
+            user_id=user_id,
+            server_name=server_name,
+            server_row=server_row,
+            kind=kind,
+            code=forbidden_code,
+        )
         return _structured_error(
-            code="mcp_tool_call_forbidden",
+            code=forbidden_code,
             server=server_name,
-            detail="Tool call forbidden by upstream policy.",
+            detail=forbidden_detail,
         )
 
     async def _dispatch_pool_with_entry(
@@ -3171,24 +4362,67 @@ class MCPClientManager:
     ) -> str:
         """Hold ``entry.open_lock`` across connect-or-reuse AND ``call_tool``.
 
-        Lock held across ``call_tool`` because the entry's
+        Thin wrapper over :meth:`_dispatch_pool_with_entry_call` —
+        passes a closure that invokes ``session.call_tool`` and
+        decodes the SDK result. See the helper for the carrier-race
+        rationale (which Phase 7 verified for the tool path; Phase 7b
+        reuses the same shape for resources & prompts).
+
+        **Why this wrapper exists** (revisited under Phase 7b pre-push
+        review): the autouse fixture
+        ``tests/test_mcp_pool_auth_introspection.py::_install_capture_intercept``
+        monkeypatches this method to stash ``entry.auth_capture`` on
+        ``mgr._test_active_capture`` for downstream call_tool stubs.
+        Inlining the wrapper would require redirecting the monkeypatch
+        to ``_dispatch_pool_with_entry_call`` (different kwargs shape)
+        and re-validating every test that depends on the interception.
+        Keeping the wrapper preserves a stable interception point on
+        the codebase's hottest correctness path.
+        """
+        result = await self._dispatch_pool_with_entry_call(
+            entry=entry,
+            key=key,
+            cfg=cfg,
+            access_token=access_token,
+            sdk_call=lambda s: s.call_tool(original_name, arguments),
+        )
+        return _decode_tool_result(result)
+
+    async def _dispatch_pool_with_entry_call(
+        self,
+        *,
+        entry: PoolEntryState,
+        key: tuple[str, str],
+        cfg: dict[str, Any],
+        access_token: str,
+        sdk_call: Callable[[Any], Awaitable[Any]],
+    ) -> Any:
+        """Hold ``entry.open_lock`` across connect-or-reuse AND ``sdk_call``.
+
+        Generalisation of the Phase 7 ``_dispatch_pool_with_entry``
+        machinery (RFC §3.2): ``sdk_call`` is a closure that takes the
+        SDK ``ClientSession`` and returns an awaitable. The dispatcher
+        passes ``lambda s: s.call_tool(name, args)`` for tools,
+        ``lambda s: s.read_resource(uri)`` for resources, and
+        ``lambda s: s.get_prompt(name, arguments=args)`` for prompts.
+
+        Lock held across the SDK call because the entry's
         ``_AuthCapture`` is keyed off the httpx event hook; releasing
         the lock would let a concurrent same-(user, server) dispatch
         overwrite the carrier mid-flight and attribute one caller's
         auth failure to another. Holding the lock serialises
         same-(user, server) calls — acceptable because that contention
-        scenario is rare in practice (ChatSession dispatches
-        sequentially and per-(user, server) parallelism is not a
-        production requirement).
+        scenario is rare in practice.
 
         Reset of ``entry.auth_capture`` and ``entry.auth_fired_event``
-        happens under the lock before ``call_tool`` — see
+        happens under the lock before the SDK call — see
         :class:`PoolEntryState` for why the carrier is entry-owned.
 
         ``entry.in_flight`` accounting is preserved for the eviction
-        interlock — it's belt-and-braces here since ``open_lock.locked()``
+        interlock — belt-and-braces since ``open_lock.locked()``
         already signals "do not evict", but the in-flight counter
-        remains the source of truth for :meth:`_close_pool_entry_if_idle`.
+        remains the source of truth for
+        :meth:`_close_pool_entry_if_idle`.
         """
         async with entry.open_lock:
             entry.last_used = time.monotonic()
@@ -3211,9 +4445,9 @@ class MCPClientManager:
                     raise RuntimeError(f"Pool connect for {key!r} produced no session")
             entry.in_flight += 1
             try:
-                # Race ``call_tool`` against the carrier's fired event.
+                # Race ``sdk_call`` against the carrier's fired event.
                 # Without this race, an upstream 4xx on a REUSED session
-                # never propagates back through ``call_tool``: the SDK's
+                # never propagates back through the SDK call: the SDK's
                 # ``_receive_loop`` is in BaseSession's TaskGroup, nested
                 # inside ``streamablehttp_client``'s TaskGroup. When
                 # the spawned ``handle_request_async`` task raises
@@ -3230,10 +4464,13 @@ class MCPClientManager:
                 # forever-hung ``response_stream_reader.receive()``.
                 # The carrier-fired event lets us short-circuit before
                 # the SDK's hang manifests.
-                call_task = asyncio.create_task(session.call_tool(original_name, arguments))
+                async def _await_sdk_call() -> Any:
+                    return await sdk_call(session)
+
+                call_task: asyncio.Task[Any] = asyncio.create_task(_await_sdk_call())
                 fired_task = asyncio.create_task(entry.auth_fired_event.wait())
                 try:
-                    done, pending = await asyncio.wait(
+                    done, _pending = await asyncio.wait(
                         {call_task, fired_task},
                         return_when=asyncio.FIRST_COMPLETED,
                     )
@@ -3256,48 +4493,91 @@ class MCPClientManager:
                         with contextlib.suppress(BaseException):
                             await task
                 if call_task in done:
-                    result = call_task.result()
-                else:
-                    # Hook captured 4xx before call_tool returned. The
-                    # SDK won't propagate the failure through
-                    # call_tool, so eagerly tear down the session and
-                    # raise a sentinel that the dispatcher's
-                    # ``_classify_failure`` will resolve via the
-                    # carrier (which holds the captured status).
-                    raise _CarrierAuthSignal()
+                    return call_task.result()
+                # Hook captured 4xx before the SDK call returned. The
+                # SDK won't propagate the failure through the call, so
+                # eagerly tear down the session and raise a sentinel
+                # that the dispatcher's ``_classify_failure`` will
+                # resolve via the carrier (which holds the captured
+                # status).
+                raise _CarrierAuthSignal()
             finally:
                 entry.in_flight -= 1
-        return _decode_tool_result(result)
 
     # -- resource read -------------------------------------------------------
 
-    def _match_template(self, uri: str) -> tuple[str, str] | None:
+    def _match_template(self, uri: str, *, user_id: str | None = None) -> tuple[str, str] | None:
         """Find the longest matching template prefix for an expanded URI.
 
         Returns ``(server_name, template_uri)`` or *None* if no match.
-        The match uses the longest static prefix stored in
-        ``_template_prefixes`` (the portion of each template URI before
-        the first ``{``), with simple ``startswith`` matching.
+        Uses ``startswith`` longest-prefix matching.
+
+        Per scope decision 0.1, when ``user_id is not None`` the
+        per-user template index is consulted FIRST; static templates
+        only run as a fallback. This keeps a user's own scoped templates
+        authoritative within their namespace and avoids surprising
+        static→pool fallthrough that would attach a per-user bearer
+        to a server the operator believed was the same name.
         """
         best: tuple[str, str] | None = None
         best_len = 0
+        if user_id is not None:
+            for prefix, mapping in (self._user_template_prefixes.get(user_id) or {}).items():
+                if uri.startswith(prefix) and len(prefix) > best_len:
+                    best = mapping
+                    best_len = len(prefix)
+            if best is not None:
+                return best
         for prefix, mapping in self._template_prefixes.items():
             if uri.startswith(prefix) and len(prefix) > best_len:
                 best = mapping
                 best_len = len(prefix)
         return best
 
-    def read_resource_sync(self, uri: str, timeout: int = 120) -> str:
+    def read_resource_sync(
+        self, uri: str, *, user_id: str | None = None, timeout: int = 120
+    ) -> str:
         """Read a resource by URI synchronously (blocks the calling thread).
 
         Returns text content for ``TextResourceContents``, or base64 data
         for ``BlobResourceContents``.
+
+        When ``user_id`` is supplied AND the URI resolves to a pool
+        entry (per scope decision 0.1, per-user-first), dispatch goes
+        through the per-(user, server) pool with the same 401 / 403 /
+        consent-required handling as :meth:`call_tool_sync`. Otherwise
+        the call takes the byte-identical static path (invariant 1).
         """
+        # Phase 7b — per-user-first pool dispatch.
+        if user_id and self._app_state is not None and self._storage is not None:
+            pool_target = self._resolve_pool_target_resource(uri, user_id)
+            if pool_target is not None:
+                return self._dispatch_pool_resource_sync(
+                    user_id=user_id,
+                    server_name=pool_target[0],
+                    uri=pool_target[1],
+                    server_row=pool_target[2],
+                    timeout=timeout,
+                )
+
         mapping = self._resource_map.get(uri)
         if mapping is None:
             # Fall back to template prefix matching for expanded URIs
             mapping = self._match_template(uri)
         if mapping is None:
+            # Per-user resources whose static lookup misses fall through here
+            # only when the user has no pool entry for the server. A pool
+            # entry exists in ``_user_resource_map`` only AFTER discovery; the
+            # pool resolver tried it above and returned None (no oauth_user
+            # row).
+            if (
+                user_id is not None
+                and (self._user_resource_map.get(user_id) or {}).get(uri) is not None
+            ):
+                # Per-user map carries this URI but the resolver could not
+                # match it to an oauth_user server row; this is an internal
+                # inconsistency.
+                raise ValueError(f"Unknown MCP resource: {uri} (per-user map / DB mismatch)")
             raise ValueError(f"Unknown MCP resource: {uri}")
         server_name, _ = mapping
 
@@ -3329,16 +4609,7 @@ class MCPClientManager:
             raise
 
         self._cb_record_success(server_name)
-
-        parts: list[str] = []
-        for item in result.contents:
-            if hasattr(item, "text"):
-                parts.append(item.text)
-            elif hasattr(item, "blob"):
-                parts.append(item.blob)
-            else:
-                parts.append(str(item))
-        return "\n".join(parts) if parts else "(empty resource)"
+        return _decode_resource_result(result)
 
     # -- prompt invocation ---------------------------------------------------
 
@@ -3346,16 +4617,67 @@ class MCPClientManager:
         self,
         prefixed_name: str,
         arguments: dict[str, str] | None = None,
+        *,
+        user_id: str | None = None,
         timeout: int = 30,
     ) -> list[dict[str, Any]]:
         """Invoke an MCP prompt synchronously and return expanded messages.
 
         Returns a list of ``{role: str, content: str}`` dicts.
+
+        When ``user_id`` is supplied AND ``prefixed_name`` resolves to a
+        pool entry, dispatch goes through the per-(user, server) pool
+        with the same 401 / 403 / consent-required handling as
+        :meth:`call_tool_sync`. Otherwise the call takes the byte-
+        identical static path (invariant 1).
+
+        Pool error path: structured-error responses (consent required,
+        decrypt failure, insufficient scope, etc.) are surfaced via
+        :class:`RuntimeError` so the agent-loop's existing
+        ``except Exception`` block at the call site renders the error
+        message. The return type stays ``list[dict[str, Any]]`` because
+        embedding error JSON in a single-element message list would
+        pollute the prompt protocol.
         """
-        mapping = self._prompt_map.get(prefixed_name)
-        if mapping is None:
+        # Phase 7b — pool dispatch (per-user-first, scope decision 0.1).
+        static_mapping = self._prompt_map.get(prefixed_name)
+        static_server: str | None = None
+        static_original: str | None = None
+        if static_mapping is not None:
+            static_server, static_original = static_mapping
+
+        if user_id and self._app_state is not None and self._storage is not None:
+            pool_target = self._resolve_pool_target_prompt(
+                prefixed_name, static_server, static_original
+            )
+            if pool_target is not None:
+                return self._dispatch_pool_prompt_sync(
+                    user_id=user_id,
+                    server_name=pool_target[0],
+                    original_name=pool_target[1],
+                    arguments=arguments,
+                    server_row=pool_target[2],
+                    timeout=timeout,
+                )
+
+        if static_mapping is None:
+            # Per-user prompts whose static lookup misses fall through here
+            # only when the user has no pool entry for the server. A pool
+            # entry exists in ``_user_prompt_map`` only AFTER discovery; the
+            # pool resolver tried it above and returned None (no oauth_user
+            # row).
+            if (
+                user_id is not None
+                and (self._user_prompt_map.get(user_id) or {}).get(prefixed_name) is not None
+            ):
+                # Per-user map carries this prefixed name but the resolver
+                # could not match it to an oauth_user server row; this is
+                # an internal inconsistency.
+                raise ValueError(
+                    f"Unknown MCP prompt: {prefixed_name} (per-user map / DB mismatch)"
+                )
             raise ValueError(f"Unknown MCP prompt: {prefixed_name}")
-        server_name, original_name = mapping
+        server_name, original_name = static_mapping
 
         self._cb_gate(server_name)
 
@@ -3387,13 +4709,7 @@ class MCPClientManager:
             raise
 
         self._cb_record_success(server_name)
-
-        messages: list[dict[str, Any]] = []
-        for msg in result.messages:
-            content = msg.content
-            text = content.text if hasattr(content, "text") else str(content)
-            messages.append({"role": msg.role, "content": text})
-        return messages
+        return _decode_prompt_result(result)
 
 
 # ---------------------------------------------------------------------------
@@ -3422,6 +4738,36 @@ def _decode_tool_result(result: Any) -> str:
     if getattr(result, "isError", False):
         output = f"Error: {output}"
     return output
+
+
+def _decode_resource_result(result: Any) -> str:
+    """Render an MCP ``resources/read`` result into the string the agent sees.
+
+    Walks ``result.contents`` collecting text parts (TextResourceContents)
+    and base64 data (BlobResourceContents). Shared by the static and pool
+    resource-read paths.
+    """
+    parts: list[str] = []
+    for item in result.contents:
+        if hasattr(item, "text"):
+            parts.append(item.text)
+        elif hasattr(item, "blob"):
+            parts.append(item.blob)
+        else:
+            parts.append(str(item))
+    return "\n".join(parts) if parts else "(empty resource)"
+
+
+def _decode_prompt_result(result: Any) -> list[dict[str, Any]]:
+    """Render an MCP ``prompts/get`` result into the list-of-messages
+    the agent sees. Shared by the static and pool prompt-get paths.
+    """
+    messages: list[dict[str, Any]] = []
+    for msg in result.messages:
+        content = msg.content
+        text = content.text if hasattr(content, "text") else str(content)
+        messages.append({"role": msg.role, "content": text})
+    return messages
 
 
 def _structured_error(

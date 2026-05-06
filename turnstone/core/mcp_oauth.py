@@ -1528,21 +1528,34 @@ async def _audit_event(
         log.debug("mcp_server.oauth.audit_emit_failed", action=action, exc_info=True)
 
 
-async def emit_insufficient_scope_audit(
+async def emit_oauth_failure_audit(
     *,
     app_state: Any,
     user_id: str,
     server_name: str,
     server_row: dict[str, Any],
-    scopes: tuple[str, ...],
+    kind: str,
+    code: str,
+    scopes: tuple[str, ...] = (),
 ) -> None:
     """Emit ``mcp_server.oauth.insufficient_scope_emitted`` audit event.
 
     Best-effort: :func:`_audit_event` already swallows storage / write
     failures internally so audit emission never breaks dispatch.
-    Operators tracking step-up patterns consume this via the standard
-    audit log. Called by the pool dispatcher after classifying a 403
-    ``WWW-Authenticate: error="insufficient_scope"``.
+    Operators tracking step-up patterns and forbidden-policy hits
+    consume this via the standard audit log. Called by the pool
+    dispatcher after classifying a 403 — both
+    ``WWW-Authenticate: error="insufficient_scope"`` and the generic
+    forbidden branch route here so cross-tenant probing leaves an
+    audit trail (Phase 7 left the generic 403 branch silent; Phase 7b
+    closes that gap).
+
+    The ``kind`` ("tool" / "resource" / "prompt") and ``code``
+    (``mcp_insufficient_scope`` / ``mcp_tool_call_forbidden`` /
+    ``mcp_resource_read_forbidden`` / ``mcp_prompt_get_forbidden``)
+    fields land in the audit detail so operators can distinguish
+    tool-call vs resource-read vs prompt-get 403s for the same
+    ``(user, server)``.
     """
     if app_state is None:
         return
@@ -1553,7 +1566,7 @@ async def emit_insufficient_scope_audit(
         user_id=user_id,
         action="mcp_server.oauth.insufficient_scope_emitted",
         server_name=server_name,
-        detail={"scopes_required": list(scopes)},
+        detail={"scopes_required": list(scopes), "kind": kind, "code": code},
     )
 
 

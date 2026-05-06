@@ -199,10 +199,17 @@ class TestLazyConnect:
 
         fake_session = MagicMock()
         fake_session.initialize = AsyncMock(return_value=None)
-        # Phase 7: ``_connect_one_pool`` discovers the user's tool
-        # catalog after ``initialize()`` returns. This stub returns a
-        # zero-tool result so the test can keep its narrow focus on
-        # the bearer-injection contract.
+        # Phase 7b: ``_connect_one_pool`` discovers tools, resources,
+        # and prompts after ``initialize()`` returns (resources/prompts
+        # capability-gated). The capability stub returns a tools-only
+        # advertisement so the test can keep its narrow focus on the
+        # bearer-injection contract; resources/prompts paths are
+        # exercised by the real-transport tests in
+        # ``tests/test_mcp_user_catalog.py``.
+        fake_caps = MagicMock()
+        fake_caps.resources = None
+        fake_caps.prompts = None
+        fake_session.get_server_capabilities = MagicMock(return_value=fake_caps)
         fake_session.list_tools = AsyncMock(return_value=MagicMock(tools=[]))
 
         def _stream_factory(*, url: str, headers: dict[str, str]) -> _AsyncCM:

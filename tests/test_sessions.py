@@ -914,8 +914,11 @@ class TestMCPToolGating:
         """read_resource excluded when MCP client has no resources."""
         mcp_client = MagicMock()
         mcp_client.get_tools.return_value = []
-        mcp_client.resource_count = 0
-        mcp_client.prompt_count = 2
+        # Phase 7b: gating uses ``*_count_for_user`` so the test mocks
+        # the per-user variant (the property remains for static-only
+        # admin paths). Returning 0 / 2 mirrors the prior contract.
+        mcp_client.resource_count_for_user.return_value = 0
+        mcp_client.prompt_count_for_user.return_value = 2
 
         session = ChatSession(
             client=mock_openai_client,
@@ -937,8 +940,8 @@ class TestMCPToolGating:
         """use_prompt excluded when MCP client has no prompts."""
         mcp_client = MagicMock()
         mcp_client.get_tools.return_value = []
-        mcp_client.resource_count = 3
-        mcp_client.prompt_count = 0
+        mcp_client.resource_count_for_user.return_value = 3
+        mcp_client.prompt_count_for_user.return_value = 0
 
         session = ChatSession(
             client=mock_openai_client,
@@ -960,8 +963,8 @@ class TestMCPToolGating:
         """Both tools present when MCP client has resources and prompts."""
         mcp_client = MagicMock()
         mcp_client.get_tools.return_value = []
-        mcp_client.resource_count = 1
-        mcp_client.prompt_count = 1
+        mcp_client.resource_count_for_user.return_value = 1
+        mcp_client.prompt_count_for_user.return_value = 1
 
         session = ChatSession(
             client=mock_openai_client,
@@ -983,8 +986,8 @@ class TestMCPToolGating:
         """Gating applies even when tool_search is active (client-side path)."""
         mcp_client = MagicMock()
         mcp_client.get_tools.return_value = []
-        mcp_client.resource_count = 0
-        mcp_client.prompt_count = 0
+        mcp_client.resource_count_for_user.return_value = 0
+        mcp_client.prompt_count_for_user.return_value = 0
 
         session = ChatSession(
             client=mock_openai_client,
@@ -1012,8 +1015,8 @@ class TestMCPToolGating:
 
         mcp_client = MagicMock()
         mcp_client.get_tools.return_value = []
-        mcp_client.resource_count = 0
-        mcp_client.prompt_count = 0
+        mcp_client.resource_count_for_user.return_value = 0
+        mcp_client.prompt_count_for_user.return_value = 0
 
         session = ChatSession(
             client=mock_openai_client,
@@ -1034,3 +1037,42 @@ class TestMCPToolGating:
         names = [t.get("function", {}).get("name") for t in tools]
         assert "read_resource" not in names
         assert "use_prompt" not in names
+
+    def test_pool_only_user_keeps_read_resource_and_use_prompt(self, tmp_db, mock_openai_client):
+        """Phase 7b canary: a pool-only user (static catalog empty) still
+        sees ``read_resource`` and ``use_prompt`` because the gating
+        consults ``*_count_for_user`` (scope decision 0.2).
+
+        Drives ``resource_count = prompt_count = 0`` (the static-only
+        properties are zero) but ``*_count_for_user(uid) > 0`` because
+        the user has pool entries; the tools must remain visible.
+        """
+        mcp_client = MagicMock()
+        mcp_client.get_tools.return_value = []
+        # Static catalog is empty; admin-style legacy properties say 0.
+        mcp_client.resource_count = 0
+        mcp_client.prompt_count = 0
+        # Per-user variant reports the user's pool entries.
+        mcp_client.resource_count_for_user.return_value = 2
+        mcp_client.prompt_count_for_user.return_value = 1
+
+        session = ChatSession(
+            client=mock_openai_client,
+            model="local-model",
+            ui=MagicMock(),
+            instructions=None,
+            temperature=0.5,
+            max_tokens=1000,
+            tool_timeout=10,
+            mcp_client=mcp_client,
+            user_id="pool-only-user",
+        )
+
+        tools = session._get_active_tools()
+        names = [t.get("function", {}).get("name") for t in tools]
+        assert "read_resource" in names
+        assert "use_prompt" in names
+        # Verify the per-user gate was actually consulted with the
+        # session's ``user_id`` (sanity-check on the wiring).
+        mcp_client.resource_count_for_user.assert_any_call("pool-only-user")
+        mcp_client.prompt_count_for_user.assert_any_call("pool-only-user")
