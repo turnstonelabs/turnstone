@@ -3112,39 +3112,6 @@ class TestDeliverWakeNudge:
         # _reminders payload, not re-queued.)
         assert all(t != "correction" for t, _ in _user_pending(session))
 
-    def test_dispatch_pending_watch_clears_wake_tag_during_recursive_send(self, tmp_db):
-        """Watch turns chained off a wake send via ``_dispatch_pending_watch``
-        must run as normal user turns — not inherit the wake's
-        ``_wake_source_tag``.
-
-        Without this, a watch chained off a wake send would (a) skip
-        ``_check_metacognitive_nudge`` on the watch's actual user
-        text, (b) stamp ``_source = "system_nudge"`` on the watch's
-        user message, and (c) suppress denial / repeat / tool_error
-        nudges during the watch's tool dispatch.  All wrong — the
-        watch is a separate event.
-        """
-        session = _make_session()
-        session._wake_source_tag = "system_nudge"  # simulate wake context
-        session._watch_pending.put_nowait({"message": "watch fired"})
-        observed_tag: list[str] = []
-
-        original_send = session.send
-
-        def capture_tag_during_send(msg, *args, **kwargs):
-            observed_tag.append(session._wake_source_tag)
-            # Don't actually run the chat loop — just capture.
-
-        with patch.object(session, "send", side_effect=capture_tag_during_send):
-            session._dispatch_pending_watch(depth=0)
-
-        # The recursive send saw an empty tag, not "system_nudge".
-        assert observed_tag == [""]
-        # Tag is restored after the recursive send completes.
-        assert session._wake_source_tag == "system_nudge"
-        # Cleanup so the test doesn't bleed state into subsequent tests.
-        _ = original_send
-
     def test_flushed_user_msg_during_wake_does_not_inherit_source_tag(self, tmp_db):
         """A real user message queued via ``queue_message`` while a wake
         send is in flight, then drained by ``_flush_queued_messages`` at

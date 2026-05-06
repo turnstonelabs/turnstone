@@ -44,7 +44,6 @@ from starlette.staticfiles import StaticFiles
 from turnstone import __version__
 from turnstone.api.docs import make_docs_handler, make_openapi_handler
 from turnstone.api.server_spec import build_server_spec
-from turnstone.core import session_worker
 from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
 from turnstone.core.auth import (
     DENY_EMPTY_SUB,
@@ -1380,55 +1379,6 @@ async def metrics_endpoint(request: Request) -> Response:
     return Response(content, media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
-def _make_watch_dispatch(ws: Workstream, session: ChatSession, ui: Any) -> Any:
-    """Create a dispatch function for watch results on a workstream.
-
-    Handles both busy (enqueue into ``session._watch_pending`` for drain at IDLE)
-    and idle (spawn a worker thread) cases via the shared
-    :func:`turnstone.core.session_worker.send` dispatcher. The shared
-    dispatcher's ``_worker_running`` gate keeps watches and the path-keyed
-    send endpoint from racing into parallel workers on the same ChatSession.
-    """
-    pending = session._watch_pending
-
-    def dispatch(msg: str) -> None:
-        def _enq() -> None:
-            # Watches don't pump through ChatSession.queue_message; instead
-            # they drop into the IDLE-drain pending queue. Swallow Full
-            # locally — drop-on-full is the long-standing watch behavior
-            # (no 429 surface).
-            try:
-                pending.put_nowait({"message": msg})
-            except queue.Full:
-                log.warning(
-                    "Watch pending queue full, dropping result for ws %s",
-                    ws.id,
-                )
-
-        def _run() -> None:
-            me = threading.current_thread()
-            try:
-                session.send(msg)
-            except GenerationCancelled:
-                if ws.worker_thread is me and ui:
-                    ui.on_stream_end()
-                    ui.on_state_change("idle")
-            except Exception as exc:
-                if ws.worker_thread is me and ui:
-                    ui.on_error(f"Watch error: {exc}")
-                    ui.on_stream_end()
-                    ui.on_state_change("error")
-
-        session_worker.send(
-            ws,
-            enqueue=_enq,
-            run=_run,
-            thread_name=f"watch-worker-{ws.id[:8]}",
-        )
-
-    return dispatch
-
-
 async def plan_feedback(request: Request) -> JSONResponse:
     """POST /v1/api/plan — respond to a plan review."""
     from turnstone.core.web_helpers import read_json_or_400
@@ -1996,7 +1946,7 @@ async def _interactive_create_post_install(
         ws.ui.auto_approve = True
     runner = getattr(request.app.state, "watch_runner", None)
     if runner and ws.session:
-        ws.session.set_watch_runner(runner, dispatch_fn=_make_watch_dispatch(ws, ws.session, ws.ui))
+        ws.session.set_watch_runner(runner)
     gq: queue.Queue[dict[str, Any]] = request.app.state.global_queue
     # Emit ``ws_created`` on the global queue for SSE consumers
     # (console). Held until past attachment validation in the
@@ -4492,10 +4442,10 @@ def main() -> None:
     def _watch_restore_fn(ws_id: str) -> Any:
         """Restore an evicted workstream so a watch can deliver results.
 
-        Returns a callable that starts a worker thread to send() the watch
-        result.  Unlike the normal dispatch path (which enqueues for IDLE
-        drain), the restored workstream has no active send() loop, so we
-        must start a worker thread directly — same pattern as send_message().
+        Returns the per-ws dispatch closure ``set_watch_runner`` registered
+        on the rehydrated session, so ``WatchRunner._dispatch_result`` can
+        re-deliver the current message into the rehydrated workstream's
+        :class:`NudgeQueue` without a second pass through ``restore_fn``.
         """
         try:
             ws = manager.create(user_id="", name="watch-restore")
@@ -4505,9 +4455,13 @@ def main() -> None:
                 ws.ui.auto_approve = True
             if ws.session:
                 ws.session.resume(ws_id)
-                dispatch_fn = _make_watch_dispatch(ws, ws.session, ws.ui)
-                ws.session.set_watch_runner(_watch_runner, dispatch_fn=dispatch_fn)
-                return dispatch_fn
+                ws.session.set_watch_runner(_watch_runner)
+                # Use the public accessor instead of reaching into
+                # ``_dispatch_fns``: ``set_watch_runner`` registered the
+                # closure under the rehydrated workstream's id, which
+                # may differ from the original ``ws_id`` we restored
+                # against — look it up by the new id explicitly.
+                return _watch_runner.get_dispatch_fn(ws.session._ws_id)
         except RuntimeError:
             log.warning("watch_restore: cannot restore ws %s (all slots active)", ws_id)
         return None
@@ -4536,9 +4490,7 @@ def main() -> None:
         if args.skip_permissions or config_store.get("tools.skip_permissions"):
             ws.ui.auto_approve = True
         assert ws.session is not None
-        ws.session.set_watch_runner(
-            _watch_runner, dispatch_fn=_make_watch_dispatch(ws, ws.session, ws.ui)
-        )
+        ws.session.set_watch_runner(_watch_runner)
         if not ws.session.resume(target_id):
             log.error("Workstream '%s' has no messages.", args.resume)
             sys.exit(1)
