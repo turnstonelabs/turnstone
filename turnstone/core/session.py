@@ -880,12 +880,16 @@ class ChatSession:
             # changes for OTHER users must not fire this callback.
             self._mcp_refresh_cb = self._on_mcp_tools_changed
             mcp_client.add_listener(self._mcp_refresh_cb, user_id=self._mcp_user_id)
-            # Register for resource-change notifications
+            # Register for resource-change notifications.
+            # ``user_id`` scopes the listener so pool-only resource
+            # changes for OTHER users do not wake this session.
             self._mcp_resource_cb = self._on_mcp_resources_changed
-            mcp_client.add_resource_listener(self._mcp_resource_cb)
-            # Register for prompt-change notifications
+            mcp_client.add_resource_listener(self._mcp_resource_cb, user_id=self._mcp_user_id)
+            # Register for prompt-change notifications.
+            # ``user_id`` scopes the listener so pool-only prompt changes
+            # for OTHER users do not wake this session.
             self._mcp_prompt_cb = self._on_mcp_prompts_changed
-            mcp_client.add_prompt_listener(self._mcp_prompt_cb)
+            mcp_client.add_prompt_listener(self._mcp_prompt_cb, user_id=self._mcp_user_id)
         else:
             self._tools = INTERACTIVE_TOOLS
             self._task_tools = TASK_AGENT_TOOLS
@@ -1445,10 +1449,15 @@ class ChatSession:
             self._mcp_client.remove_listener(self._mcp_refresh_cb, user_id=self._mcp_user_id)
             self._mcp_refresh_cb = None
         if self._mcp_client and self._mcp_resource_cb:
-            self._mcp_client.remove_resource_listener(self._mcp_resource_cb)
+            # ``user_id`` MUST mirror the value passed at registration —
+            # the listener identity is ``(user_id, callback)`` and an
+            # unscoped removal would leave the registration in place.
+            self._mcp_client.remove_resource_listener(
+                self._mcp_resource_cb, user_id=self._mcp_user_id
+            )
             self._mcp_resource_cb = None
         if self._mcp_client and self._mcp_prompt_cb:
-            self._mcp_client.remove_prompt_listener(self._mcp_prompt_cb)
+            self._mcp_client.remove_prompt_listener(self._mcp_prompt_cb, user_id=self._mcp_user_id)
             self._mcp_prompt_cb = None
         if self._watch_runner:
             self._watch_runner.remove_dispatch_fn(self._ws_id)
@@ -1915,7 +1924,9 @@ class ChatSession:
                 )
         # MCP resource catalog (lets the model know what's available for read_resource)
         if self._mcp_client:
-            all_resources = self._mcp_client.get_resources()
+            # Per-user merge: pool entries for ``self._mcp_user_id`` are
+            # included; other users' pool resources are not.
+            all_resources = self._mcp_client.get_resources(user_id=self._mcp_user_id)
             concrete = [r for r in all_resources if not r.get("template")]
             templates = [r for r in all_resources if r.get("template")]
             if concrete or templates:
@@ -1940,7 +1951,9 @@ class ChatSession:
                 dev_parts.append("\n".join(lines))
         # MCP prompt catalog (lets the model know what's available for use_prompt)
         if self._mcp_client:
-            prompts = self._mcp_client.get_prompts()
+            # Per-user merge: pool entries for ``self._mcp_user_id`` are
+            # included; other users' pool prompts are not.
+            prompts = self._mcp_client.get_prompts(user_id=self._mcp_user_id)
             if prompts:
                 lines = ["<mcp-prompts>"]
                 for p in prompts[:30]:
@@ -2329,10 +2342,13 @@ class ChatSession:
         if not caps.supports_web_search and not self._resolve_search_client():
             tools = _without_tool(tools, "web_search")
 
-        # Gate MCP tools: only include when relevant MCP servers are connected
-        if not self._mcp_client or not self._mcp_client.resource_count:
+        # Gate MCP tools: only include when relevant MCP servers are
+        # connected. Per-user variants (scope decision 0.2) keep the
+        # tool visible for a pool-only user even when the static catalog
+        # is empty.
+        if not self._mcp_client or not self._mcp_client.resource_count_for_user(self._mcp_user_id):
             tools = _without_tool(tools, "read_resource")
-        if not self._mcp_client or not self._mcp_client.prompt_count:
+        if not self._mcp_client or not self._mcp_client.prompt_count_for_user(self._mcp_user_id):
             tools = _without_tool(tools, "use_prompt")
 
         return tools
@@ -7941,14 +7957,21 @@ class ChatSession:
         assert self._mcp_client is not None
         mcp_error = False
         try:
-            output = self._mcp_client.read_resource_sync(uri, timeout=self.tool_timeout)
+            # Per-user pool dispatch (Phase 7b): when ``user_id`` is set
+            # and the URI resolves to an oauth_user pool entry, the read
+            # goes through the per-(user, server) pool with token /
+            # 401 / 403 / consent-required handling. Otherwise the
+            # static path runs byte-identical (invariant 1).
+            output = self._mcp_client.read_resource_sync(
+                uri, user_id=self._mcp_user_id, timeout=self.tool_timeout
+            )
         except TimeoutError:
             output = f"MCP resource read timed out after {self.tool_timeout}s"
             mcp_error = True
             self.ui.on_error(output)
-        except Exception:
+        except Exception as e:
             log.warning("MCP resource read failed for %s", uri, exc_info=True)
-            output = "MCP resource error: failed to read resource"
+            output = f"MCP resource error: {e}"
             mcp_error = True
             self.ui.on_error(output)
 
@@ -7977,7 +8000,7 @@ class ChatSession:
                 "needs_approval": False,
                 "error": "No MCP servers configured",
             }
-        if not self._mcp_client.is_mcp_prompt(name):
+        if not self._mcp_client.is_mcp_prompt(name, user_id=self._mcp_user_id):
             return {
                 "call_id": call_id,
                 "func_name": "use_prompt",
@@ -8023,17 +8046,25 @@ class ChatSession:
         assert self._mcp_client is not None
         mcp_error = False
         try:
+            # Per-user pool dispatch (Phase 7b): structured-error
+            # responses (consent required, decrypt failure, insufficient
+            # scope, etc.) surface here as ``RuntimeError`` carrying the
+            # JSON payload — caught by the broad ``except Exception``
+            # below so the agent renders the error message.
             messages = self._mcp_client.get_prompt_sync(
-                name, arguments or None, timeout=self.tool_timeout
+                name,
+                arguments or None,
+                user_id=self._mcp_user_id,
+                timeout=self.tool_timeout,
             )
             output = "\n\n".join(f"[{m['role']}]: {m['content']}" for m in messages)
         except TimeoutError:
             output = f"MCP prompt timed out after {self.tool_timeout}s"
             mcp_error = True
             self.ui.on_error(output)
-        except Exception:
+        except Exception as e:
             log.warning("MCP prompt invocation failed for %s", name, exc_info=True)
-            output = "MCP prompt error: failed to invoke prompt"
+            output = f"MCP prompt error: {e}"
             mcp_error = True
             self.ui.on_error(output)
 
@@ -10192,13 +10223,12 @@ class ChatSession:
             elif arg and arg.split()[0] == "refresh":
                 self._handle_mcp_refresh(arg)
             else:
-                # Phase 7: pass session-bound user_id so the /mcp listing
-                # surfaces this user's pool tools alongside the static
-                # catalog. Resource / prompt query stays user_id-less
-                # (deferred to Phase 7b).
+                # Phase 7 + 7b: pass session-bound user_id so the /mcp
+                # listing surfaces this user's pool tools, resources,
+                # and prompts alongside the static catalog.
                 tools = self._mcp_client.get_tools(user_id=self._mcp_user_id)
-                resources = self._mcp_client.get_resources()
-                prompts = self._mcp_client.get_prompts()
+                resources = self._mcp_client.get_resources(user_id=self._mcp_user_id)
+                prompts = self._mcp_client.get_prompts(user_id=self._mcp_user_id)
                 mcp_lines = []
                 if tools:
                     mcp_lines.append(f"MCP tools ({len(tools)}):")
