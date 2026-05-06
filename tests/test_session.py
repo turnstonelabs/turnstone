@@ -2888,6 +2888,215 @@ class TestUserAdvisoryCancelClear:
         )
 
 
+class TestDeliverWakeNudge:
+    """:meth:`ChatSession.deliver_wake_nudge_from_queue` — synthesizes
+    an empty-user-turn ``send`` so any-channel queued nudges drain via
+    the existing ``_attach_pending_user_reminders`` side-channel and
+    splice into wire content via ``_apply_reminders_for_provider``.
+    """
+
+    def test_no_op_when_queue_has_no_drainable_entries(self, tmp_db):
+        session = _make_session()
+        # Queue has only a tool-channel entry — wake's user-seam drain
+        # won't match.  Bail before synthesizing an empty user turn.
+        session._queue_tool_advisory("tool_error", "stale")
+        before_len = len(session.messages)
+        with patch.object(session, "_create_stream_with_retry") as stream:
+            session.deliver_wake_nudge_from_queue()
+        # No send → no message appended → stream untouched.
+        assert len(session.messages) == before_len
+        assert stream.call_count == 0
+        # Tool entry still queued (would orphan in production today; the
+        # bail just protects against the empty-envelope failure mode).
+        assert _tool_pending(session) == [("tool_error", "stale")]
+        # Wake tag never set.
+        assert session._wake_source_tag == ""
+
+    def test_no_op_when_queue_is_empty(self, tmp_db):
+        session = _make_session()
+        before_len = len(session.messages)
+        with patch.object(session, "_create_stream_with_retry") as stream:
+            session.deliver_wake_nudge_from_queue()
+        assert len(session.messages) == before_len
+        assert stream.call_count == 0
+        assert session._wake_source_tag == ""
+
+    def test_drains_any_channel_onto_synthetic_empty_user_turn(self, tmp_db):
+        """Any-channel entries (the future ``idle_children`` shape) drain
+        at the synthesized user seam.  The empty content + spliced
+        ``_reminders`` is what reaches the provider via
+        ``_apply_reminders_for_provider``.
+        """
+        session = _make_session()
+        session._title_generated = True  # suppress auto-title thread
+        session._nudge_queue.enqueue("idle_children", "your kids", "any")
+        with (
+            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
+            patch.object(
+                session,
+                "_stream_response",
+                return_value={"role": "assistant", "content": "ok"},
+            ),
+            patch.object(session, "_full_messages", return_value=[]),
+            patch.object(session, "_update_token_table"),
+            patch.object(session, "_print_status_line"),
+            patch.object(session, "_emit_state"),
+            patch.object(session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
+        ):
+            session.deliver_wake_nudge_from_queue()
+        # Queue drained.
+        assert _user_pending(session) == []
+        # Empty-content user message was appended with the reminder side-channel.
+        user_msgs = [m for m in session.messages if m.get("role") == "user"]
+        assert user_msgs, "wake should append a synthetic user message"
+        wake_msg = user_msgs[-1]
+        assert wake_msg["content"] == ""
+        assert wake_msg["_reminders"] == [{"type": "idle_children", "text": "your kids"}]
+
+    def test_marks_source_tag_on_synthesized_user_msg(self, tmp_db):
+        session = _make_session()
+        session._title_generated = True
+        session._queue_user_advisory("denial", "leftover")
+        with (
+            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
+            patch.object(
+                session,
+                "_stream_response",
+                return_value={"role": "assistant", "content": "ok"},
+            ),
+            patch.object(session, "_full_messages", return_value=[]),
+            patch.object(session, "_update_token_table"),
+            patch.object(session, "_print_status_line"),
+            patch.object(session, "_emit_state"),
+            patch.object(session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
+        ):
+            session.deliver_wake_nudge_from_queue()
+        user_msgs = [m for m in session.messages if m.get("role") == "user"]
+        wake_msg = user_msgs[-1]
+        assert wake_msg.get("_source") == "system_nudge"
+
+    def test_clears_wake_tag_after_success(self, tmp_db):
+        session = _make_session()
+        session._title_generated = True
+        session._queue_user_advisory("denial", "x")
+        with (
+            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
+            patch.object(
+                session,
+                "_stream_response",
+                return_value={"role": "assistant", "content": "ok"},
+            ),
+            patch.object(session, "_full_messages", return_value=[]),
+            patch.object(session, "_update_token_table"),
+            patch.object(session, "_print_status_line"),
+            patch.object(session, "_emit_state"),
+            patch.object(session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
+        ):
+            session.deliver_wake_nudge_from_queue()
+        # `finally` block resets the tag; production code outside the
+        # wake send sees the field empty and behaves normally.
+        assert session._wake_source_tag == ""
+
+    def test_skips_metacog_check_on_synthetic_send(self, tmp_db):
+        """Wake-channel content with regex-matching trigger words must
+        NOT re-fire correction / completion nudges on top of the
+        envelope.  The ``_wake_source_tag`` guard at the top of
+        ``_check_metacognitive_nudge`` covers this; verify by enqueuing
+        text that *would* trigger ``detect_correction`` (contains
+        "don't") and asserting no fresh ``correction`` entry lands in
+        the queue post-wake.
+        """
+        session = _make_session()
+        session._title_generated = True
+        # NUDGE_DENIAL contains "don't modify that file" — would match
+        # the strong-correction `\bdon'?t\b` pattern if re-detected.
+        session._queue_user_advisory("denial", "don't do that next time")
+        # Force enough memory + message context that should_nudge would
+        # otherwise fire a fresh correction nudge.
+        session.messages.append({"role": "user", "content": "earlier"})
+        with (
+            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
+            patch.object(
+                session,
+                "_stream_response",
+                return_value={"role": "assistant", "content": "ok"},
+            ),
+            patch.object(session, "_full_messages", return_value=[]),
+            patch.object(session, "_update_token_table"),
+            patch.object(session, "_print_status_line"),
+            patch.object(session, "_emit_state"),
+            patch.object(session, "_visible_memory_count", return_value=10),
+            patch("turnstone.core.session.save_message"),
+        ):
+            session.deliver_wake_nudge_from_queue()
+        # No fresh correction entry was enqueued during the wake send.
+        # (The original `denial` entry was drained as the wake's
+        # _reminders payload, not re-queued.)
+        assert all(t != "correction" for t, _ in _user_pending(session))
+
+    def test_dispatch_pending_watch_clears_wake_tag_during_recursive_send(self, tmp_db):
+        """Watch turns chained off a wake send via ``_dispatch_pending_watch``
+        must run as normal user turns — not inherit the wake's
+        ``_wake_source_tag``.
+
+        Without this, a watch chained off a wake send would (a) skip
+        ``_check_metacognitive_nudge`` on the watch's actual user
+        text, (b) stamp ``_source = "system_nudge"`` on the watch's
+        user message, and (c) suppress denial / repeat / tool_error
+        nudges during the watch's tool dispatch.  All wrong — the
+        watch is a separate event.
+        """
+        session = _make_session()
+        session._wake_source_tag = "system_nudge"  # simulate wake context
+        session._watch_pending.put_nowait({"message": "watch fired"})
+        observed_tag: list[str] = []
+
+        original_send = session.send
+
+        def capture_tag_during_send(msg, *args, **kwargs):
+            observed_tag.append(session._wake_source_tag)
+            # Don't actually run the chat loop — just capture.
+
+        with patch.object(session, "send", side_effect=capture_tag_during_send):
+            session._dispatch_pending_watch(depth=0)
+
+        # The recursive send saw an empty tag, not "system_nudge".
+        assert observed_tag == [""]
+        # Tag is restored after the recursive send completes.
+        assert session._wake_source_tag == "system_nudge"
+        # Cleanup so the test doesn't bleed state into subsequent tests.
+        _ = original_send
+
+    def test_exception_marks_appended_reminders_delivered(self, tmp_db):
+        """Post-retry stream failure: the just-appended user message's
+        ``_reminders`` must be flagged delivered so the next real user
+        turn doesn't re-render the same envelope.
+        """
+        session = _make_session()
+        session._queue_user_advisory("denial", "leftover")
+        with (
+            patch.object(session, "_visible_memory_count", return_value=0),
+            patch.object(
+                session,
+                "_create_stream_with_retry",
+                side_effect=RuntimeError("boom"),
+            ),
+            contextlib.suppress(RuntimeError),
+        ):
+            session.deliver_wake_nudge_from_queue()
+        # Synthetic user message landed; reminders flagged delivered so
+        # _apply_reminders_for_provider's next pass skips them.
+        user_msgs = [m for m in session.messages if m.get("role") == "user"]
+        wake_msg = user_msgs[-1]
+        assert wake_msg.get("_reminders") is not None
+        assert wake_msg.get("_reminders_delivered") is True
+        # Wake tag cleared even on exception (finally block).
+        assert session._wake_source_tag == ""
+
+
 class TestReminderSidechannelIsolation:
     """The side-channel design's load-bearing guarantee: any reader of
     ``self.messages`` that goes through ``content`` cannot see reminders.

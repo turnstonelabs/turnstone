@@ -106,3 +106,15 @@ class NudgeQueue:
             if channel is None:
                 return [(e.nudge_type, e.text) for e in self._items]
             return [(e.nudge_type, e.text) for e in self._items if e.channel == channel]
+
+    def has_pending(self, channels: frozenset[str] | set[str]) -> bool:
+        """Short-circuiting existence check.
+
+        Returns ``True`` as soon as a queued entry's channel matches
+        ``channels``.  Cheaper than :meth:`pending` for callers that
+        only need a boolean (e.g. the wake-path defense in
+        :meth:`ChatSession.deliver_wake_nudge_from_queue`) — no list
+        allocation, lock released on first match.
+        """
+        with self._lock:
+            return any(e.channel in channels for e in self._items)

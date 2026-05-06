@@ -770,6 +770,15 @@ class ChatSession:
         # ``should_nudge`` gating.
         self._metacog_state: dict[str, float] = {}
         self._nudge_queue = NudgeQueue()
+        # Wake-trigger plumbing: ``deliver_wake_nudge_from_queue`` sets
+        # this tag while sending a synthetic empty user turn so that
+        # ``_check_metacognitive_nudge`` and the ``_queue_*_advisory``
+        # producers short-circuit (the wake's reminder text contains
+        # trigger words like "don't" that would otherwise re-fire
+        # correction nudges on top of the envelope) and so the
+        # synthesized user message gets stamped ``_source`` for
+        # audit / replay distinction.
+        self._wake_source_tag: str = ""
         # User message queue: messages sent while model is executing.
         # OrderedDict preserves FIFO order and supports O(1) removal by ID.
         # Queued user turns never carry attachments — see
@@ -2543,6 +2552,14 @@ class ChatSession:
             user_content = user_input
 
         user_msg: dict[str, Any] = {"role": "user", "content": user_content}
+        if self._wake_source_tag:
+            # Sibling tag for audit / replay: the synthetic empty user
+            # message emitted by ``deliver_wake_nudge_from_queue`` is
+            # marked so UI can render it distinctly (or hide it) and
+            # log consumers can tell self-prompted turns from real
+            # user input.  Stripped at the sanitize boundary by the
+            # leading-underscore filter.
+            user_msg["_source"] = self._wake_source_tag
         if attachments:
             # Sibling metadata so live history replay has the same shape
             # as reloaded-from-DB (filenames are not recoverable from an
@@ -5723,6 +5740,13 @@ class ChatSession:
 
         Returns ``(nudge_type, nudge_text)`` or ``None``.
         """
+        # Wake-channel guard: don't re-detect nudges on the synthetic
+        # empty input emitted by ``deliver_wake_nudge_from_queue``.
+        # Belt-and-braces with the "" → no-match short-circuit in
+        # ``detect_correction`` / ``detect_completion`` since future
+        # text changes shouldn't be load-bearing for correctness.
+        if self._wake_source_tag:
+            return None
         if not self._mem_cfg.nudges:
             return None
         mem_count = self._visible_memory_count()
@@ -5765,7 +5789,16 @@ class ChatSession:
         message dict's ``_reminders`` side-channel.  Used for nudges
         that respond to user behaviour: ``correction``, ``denial``,
         ``resume``, ``start``, ``completion``.
+
+        No-ops while the session is inside a wake-driven turn
+        (``_wake_source_tag`` set) so model behaviour during the wake
+        send (e.g. denying a tool the wake suggested, hitting a
+        repeat / tool_error) doesn't queue a nudge that would land on
+        top of the wake's own envelope or on the user's next real
+        turn referencing a context the user never saw.
         """
+        if self._wake_source_tag:
+            return
         self._nudge_queue.enqueue(nudge_type, text, "user")
 
     def _attach_pending_user_reminders(self, user_msg: dict[str, Any]) -> None:
@@ -5817,8 +5850,67 @@ class ChatSession:
         user interjections; ``wrap_tool_result`` then renders it inside
         the tool-result envelope. Used for nudges that respond to model
         behaviour at a tool boundary: ``tool_error``, ``repeat``.
+
+        No-ops while the session is inside a wake-driven turn (see
+        ``_queue_user_advisory`` for the rationale).
         """
+        if self._wake_source_tag:
+            return
         self._nudge_queue.enqueue(nudge_type, text, "tool")
+
+    def deliver_wake_nudge_from_queue(self) -> None:
+        """Drive a synthetic empty user turn so any-channel nudges drain.
+
+        The standard side-channel pipeline does the rendering: the
+        ``send("")`` we trigger lands at ``_append_user_turn`` which
+        attaches drained reminders onto the empty user message via
+        ``_attach_pending_user_reminders``.  ``_apply_reminders_for_provider``
+        then splices the rendered ``<system-reminder>`` block onto the
+        trailing edge of the empty content — wire content becomes the
+        envelope alone, providers accept it as a normal user turn.
+        See foundation §F4 of the design doc.
+
+        ``_wake_source_tag`` is set for the duration of the synthetic
+        send so:
+
+        * ``_check_metacognitive_nudge`` short-circuits (no
+          recursive correction / completion detection on the
+          envelope text)
+        * ``_queue_user_advisory`` / ``_queue_tool_advisory`` short-
+          circuit if model behaviour during the wake (e.g. a denied
+          tool call) would otherwise queue a fresh nudge on top of
+          the wake itself
+        * ``_append_user_turn`` stamps ``_source = "system_nudge"``
+          on the synthesized user message for audit / replay parity
+
+        On post-retry stream failure the just-attached ``_reminders``
+        get marked delivered before the exception propagates, so a
+        stale envelope doesn't re-fire on the user's next real turn —
+        operator intervention is required for the underlying failure
+        anyway and a haunted nudge would be noise.
+
+        Bails early if nothing in the queue would drain at the user
+        seam (only stale ``"tool"``-channel entries, say): without
+        the guard we'd synthesize an empty-content user turn whose
+        ``<system-reminder>`` envelope is empty and which providers
+        reject for missing content.  The :class:`IdleNudgeWatcher`
+        peeks total queue length and may dispatch us for a tool-only
+        queue; this defense covers that race plus any future direct
+        caller.
+        """
+        if not self._nudge_queue.has_pending(USER_DRAIN):
+            return
+        pre_len = len(self.messages)
+        self._wake_source_tag = "system_nudge"
+        try:
+            self.send("")
+        except Exception:
+            for msg in self.messages[pre_len:]:
+                if msg.get("_reminders"):
+                    msg["_reminders_delivered"] = True
+            raise
+        finally:
+            self._wake_source_tag = ""
 
     def _apply_post_execute_advisories(
         self,
@@ -9427,6 +9519,16 @@ class ChatSession:
         Each ``send()`` chains back here on IDLE, so multiple queued results
         are processed sequentially.  Depth is capped to prevent unbounded
         stack growth.
+
+        Clears ``_wake_source_tag`` for the duration of the recursive
+        ``send`` so the watch turn is processed as a normal user turn:
+        ``_check_metacognitive_nudge`` runs against the watch message,
+        ``_append_user_turn`` does NOT stamp ``_source = "system_nudge"``
+        on the watch user-message, and ``_queue_*_advisory`` calls
+        during the watch's tool execution are not suppressed.  Without
+        this, a watch chained off a wake-driven send inherits the
+        wake-source guards inappropriately — the watch is its own
+        separate event from the wake.
         """
         if depth >= self._MAX_WATCH_CHAIN:
             self._watch_dispatch_depth = 0
@@ -9439,7 +9541,12 @@ class ChatSession:
         message = result.get("message", "")
         if message:
             self._watch_dispatch_depth = depth + 1
-            self.send(message)
+            saved_wake_tag = self._wake_source_tag
+            self._wake_source_tag = ""
+            try:
+                self.send(message)
+            finally:
+                self._wake_source_tag = saved_wake_tag
 
     def _exec_write_file(self, item: dict[str, Any]) -> tuple[str, str]:
         """Write content to a file, creating parent directories as needed."""
