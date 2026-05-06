@@ -4424,6 +4424,15 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                 ConsoleCoordinatorUI._console_metrics = app.state.console_metrics
                 app.state.coord_mgr = coord_mgr
                 app.state.coord_adapter = coord_adapter
+                # Idle wake-trigger for coords.  Subscribes to coord IDLE
+                # transitions and dispatches a synthetic empty-user-turn
+                # send when the coord's NudgeQueue is non-empty.  PR 3
+                # registers the CoordinatorIdleObserver BEFORE this so
+                # subscriber fire order on the same IDLE event has the
+                # observer enqueueing first, then this watcher peeking.
+                from turnstone.core.metacognition import install_idle_nudge_watcher
+
+                install_idle_nudge_watcher(app, coord_mgr)
                 # Wire the cluster-event subscription so the coordinator's
                 # SSE stream fans out filtered child_ws_* events.  Safe to
                 # call even when the collector has no nodes yet — the
@@ -4475,6 +4484,9 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         await tls_mgr.stop_renewal()
     if scheduler is not None:
         scheduler.stop()
+    from turnstone.core.metacognition import shutdown_idle_nudge_watchers
+
+    shutdown_idle_nudge_watchers(app)
     coord_adapter_shutdown = getattr(app.state, "coord_adapter", None)
     if coord_adapter_shutdown is not None:
         try:

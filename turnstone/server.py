@@ -3683,6 +3683,9 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         await tls_client.stop_renewal()
     if app.state.watch_runner:
         app.state.watch_runner.stop()
+    from turnstone.core.metacognition import shutdown_idle_nudge_watchers
+
+    shutdown_idle_nudge_watchers(app)
     # Drain + stop the buffered state-writer. shutdown() joins a
     # daemon thread and runs synchronous DB writes; offload to a
     # worker thread so we don't block the lifespan event loop and
@@ -3988,6 +3991,14 @@ def create_app(
     )
     app.state.workstreams = workstreams
     app.state.state_writer = state_writer
+    # Idle-driven wake trigger: dispatches a synthetic empty-user-turn
+    # send when an interactive workstream goes IDLE with queued nudges.
+    # Feature-inert until a producer enqueues against the interactive
+    # SessionManager (PR 4 watch switchover); installed here for
+    # symmetry with the coord-side install in console/server.py.
+    from turnstone.core.metacognition import install_idle_nudge_watcher
+
+    install_idle_nudge_watcher(app, workstreams)
     app.state.global_queue = global_queue
     app.state.global_listeners = global_listeners
     app.state.global_listeners_lock = global_listeners_lock

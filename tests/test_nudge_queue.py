@@ -126,6 +126,44 @@ class TestPending:
         assert len(q) == 2
 
 
+class TestHasPending:
+    def test_has_pending_returns_false_on_empty_queue(self):
+        q = NudgeQueue()
+        assert q.has_pending({"user", "any"}) is False
+        assert q.has_pending({"tool"}) is False
+
+    def test_has_pending_short_circuits_on_first_match(self):
+        q = NudgeQueue()
+        q.enqueue("a", "1", "tool")
+        q.enqueue("b", "2", "user")
+        # First entry doesn't match, second does — true after walking 2.
+        assert q.has_pending({"user"}) is True
+
+    def test_has_pending_returns_false_when_no_match(self):
+        q = NudgeQueue()
+        q.enqueue("a", "1", "tool")
+        q.enqueue("b", "2", "tool")
+        assert q.has_pending({"user", "any"}) is False
+
+    def test_has_pending_matches_any_channel(self):
+        q = NudgeQueue()
+        q.enqueue("a", "1", "any")
+        # USER_DRAIN-shaped filter pulls "any" entries.
+        assert q.has_pending(USER_DRAIN) is True
+        # TOOL_DRAIN-shaped filter also pulls "any" entries.
+        assert q.has_pending(TOOL_DRAIN) is True
+
+    def test_has_pending_does_not_mutate(self):
+        q = NudgeQueue()
+        q.enqueue("a", "1", "user")
+        q.enqueue("b", "2", "tool")
+        before = q.pending()
+        q.has_pending({"user"})
+        q.has_pending({"tool"})
+        q.has_pending(set())
+        assert q.pending() == before
+
+
 class TestValidation:
     def test_invalid_channel_raises(self):
         q = NudgeQueue()
