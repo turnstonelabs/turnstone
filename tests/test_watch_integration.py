@@ -56,12 +56,12 @@ def _make_session() -> ChatSession:
 
 def _stub_storage(active: bool = True) -> Any:
     """Minimal storage stub providing the surface the dispatch closure
-    touches — ``get_watch`` for the ``valid_until`` predicate.
+    touches — ``is_watch_active`` for the ``valid_until`` predicate.
     """
 
     class _S:
-        def get_watch(self, watch_id: str) -> dict[str, Any]:
-            return {"watch_id": watch_id, "active": active}
+        def is_watch_active(self, watch_id: str) -> bool:
+            return active
 
     return _S()
 

@@ -266,7 +266,7 @@ class WatchRunner:
         The fn signature is ``(message, watch_id)`` — the runner passes
         the originating ``watch_id`` so dispatch closures can capture
         per-watch metadata (e.g. a ``valid_until`` predicate that
-        re-checks ``storage.get_watch(watch_id)["active"]`` before
+        re-checks ``storage.is_watch_active(watch_id)`` before
         delivering a stale entry).
         """
         with self._dispatch_lock:

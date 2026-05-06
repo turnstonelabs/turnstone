@@ -68,11 +68,6 @@ def _register_runner(session: ChatSession) -> tuple[Any, Any]:
     return runner, captured["fn"]
 
 
-def _watch_row(active: bool = True, watch_id: str = "watch-1") -> dict[str, Any]:
-    """Minimal storage row shape ``valid_until`` predicates re-check."""
-    return {"watch_id": watch_id, "active": active}
-
-
 # ---------------------------------------------------------------------------
 # Enqueue shape
 # ---------------------------------------------------------------------------
@@ -239,13 +234,13 @@ class TestValidUntil:
 
         from turnstone.core import session as session_mod
 
-        # Storage stub returns active=False at drain time.
-        get_calls: list[str] = []
+        # Storage stub returns False at drain time.
+        is_active_calls: list[str] = []
 
         class _StubStorage:
-            def get_watch(self, watch_id: str) -> dict[str, Any] | None:
-                get_calls.append(watch_id)
-                return _watch_row(active=False, watch_id=watch_id)
+            def is_watch_active(self, watch_id: str) -> bool:
+                is_active_calls.append(watch_id)
+                return False
 
         monkeypatch.setattr(session_mod, "get_storage", lambda: _StubStorage())
 
@@ -254,7 +249,7 @@ class TestValidUntil:
         out = session._nudge_queue.drain({"any"})
         assert out == []
         # Predicate ran once.
-        assert get_calls == ["watch-1"]
+        assert is_active_calls == ["watch-1"]
 
     def test_valid_until_drops_when_watch_missing(self, tmp_db, monkeypatch):
         session = _make_session_for_dispatch()
@@ -263,8 +258,8 @@ class TestValidUntil:
         from turnstone.core import session as session_mod
 
         class _StubStorage:
-            def get_watch(self, watch_id: str) -> dict[str, Any] | None:
-                return None  # row gone (deleted)
+            def is_watch_active(self, watch_id: str) -> bool:
+                return False  # row gone (deleted)
 
         monkeypatch.setattr(session_mod, "get_storage", lambda: _StubStorage())
 
@@ -284,7 +279,7 @@ class TestValidUntil:
         from turnstone.core import session as session_mod
 
         class _BoomStorage:
-            def get_watch(self, watch_id: str) -> dict[str, Any] | None:
+            def is_watch_active(self, watch_id: str) -> bool:
                 raise RuntimeError("storage down")
 
         monkeypatch.setattr(session_mod, "get_storage", lambda: _BoomStorage())
@@ -303,8 +298,8 @@ class TestValidUntil:
         from turnstone.core import session as session_mod
 
         class _StubStorage:
-            def get_watch(self, watch_id: str) -> dict[str, Any] | None:
-                return _watch_row(active=True, watch_id=watch_id)
+            def is_watch_active(self, watch_id: str) -> bool:
+                return True
 
         monkeypatch.setattr(session_mod, "get_storage", lambda: _StubStorage())
 
@@ -339,8 +334,8 @@ class TestConcurrency:
         from turnstone.core import session as session_mod
 
         class _ActiveStorage:
-            def get_watch(self, watch_id: str) -> dict[str, Any]:
-                return _watch_row(active=True, watch_id=watch_id)
+            def is_watch_active(self, watch_id: str) -> bool:
+                return True
 
         monkeypatch.setattr(session_mod, "get_storage", lambda: _ActiveStorage())
 
