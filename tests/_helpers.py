@@ -34,19 +34,9 @@ def patch_session_storage(
     active: bool = True,
     raise_on_is_active: bool = False,
 ) -> list[str]:
-    """Replace ``turnstone.core.session.get_storage`` with a minimal stub
-    that exposes ``is_watch_active`` — the only storage surface the watch
-    dispatch closure's ``valid_until`` predicate touches.
-
-    Returns the list of ``watch_id``s the predicate was called with so
-    callers can assert on call shape.  Use ``raise_on_is_active=True`` to
-    pin the broad-except branch in the predicate.
-
-    Tests that need a more elaborate storage stub (call tracking on
-    multiple methods, return-shape variations beyond the active flag)
-    should keep an inline class — this helper covers the common
-    ``set up an active/inactive/boom storage stub`` shape that
-    accumulated 7 near-duplicate ``monkeypatch.setattr`` sites.
+    """Patch ``session.get_storage`` to a stub whose ``is_watch_active``
+    returns *active* (or raises if *raise_on_is_active*).  Returns the
+    list of ``watch_id``s the predicate was called with.
     """
     from turnstone.core import session as session_mod
 
