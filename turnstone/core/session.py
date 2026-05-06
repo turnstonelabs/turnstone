@@ -1408,9 +1408,9 @@ class ChatSession:
                 # All control chars / empty after strip — silently drop.
                 return
             # Soft cap drops oldest — latest output is most useful.
-            existing = nudge_queue.count_by_type("watch_triggered", channel="any")
-            if existing >= _WATCH_QUEUE_SOFT_CAP:
-                nudge_queue.drop_oldest_by_type("watch_triggered", channel="any")
+            if nudge_queue.cap_at_or_drop_oldest(
+                "watch_triggered", _WATCH_QUEUE_SOFT_CAP, channel="any"
+            ):
                 log.warning(
                     "watch_dispatch.queue_full ws=%s cap=%d dropped_oldest=True",
                     ws_id,
