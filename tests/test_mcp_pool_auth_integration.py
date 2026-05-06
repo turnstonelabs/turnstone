@@ -716,3 +716,130 @@ def test_integration_static_path_unaffected(
     assert state_after.session is not session_before, (
         "Reconnect did not actually replace the session"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 28: pool reuse — 401 on a SECOND dispatch (carrier owned by entry)
+# ---------------------------------------------------------------------------
+
+
+def test_integration_pool_reuse_401_refresh_and_retry_succeeds(
+    upstream: Any, running_loop_mgr: Any, storage: SQLiteBackend
+) -> None:
+    """Reused pool sessions still capture 401 correctly.
+
+    Dispatch 1 hits a passthrough upstream (200) and populates
+    ``entry.session``. Dispatch 2 reuses that session — no fresh
+    connect, so a per-dispatch ``_AuthCapture`` would never reach
+    the httpx response hook (the hook closes over the carrier passed
+    at first connect, which lives on the entry). A correctly-wired
+    entry-owned carrier is the only shape that lets dispatch 2's 401
+    surface to the dispatcher.
+
+    Two independent production bugs gate this test passing; both must
+    hold for reused-session 401 recovery to work end-to-end:
+
+    1. The carrier must live on the pool entry (not per-dispatch) so
+       the response hook bound at first connect writes to the same
+       object the dispatcher reads across reuse. Verified by reverting
+       ``PoolEntryState.auth_capture`` to a per-dispatch
+       ``_AuthCapture()`` allocation: the carrier-fired event never
+       reaches the dispatcher and the test times out.
+
+    2. The dispatcher must race ``call_tool`` against the carrier's
+       fired event. The SDK's ``_receive_loop`` runs in BaseSession's
+       TaskGroup nested inside ``streamablehttp_client``'s TaskGroup;
+       when an upstream 4xx fires, the outer TaskGroup cancels
+       ``_receive_loop`` mid-finally before it can deliver
+       ``CONNECTION_CLOSED`` to the response stream's waiting
+       receiver. anyio's ``send_nowait`` skips waiters with pending
+       cancellation — but our dispatch task (created via
+       ``run_coroutine_threadsafe`` for the reused-session case) has
+       NO pending cancellation, so the send delivers but the receiver
+       never wakes (the waiter's Event is set on stale state). Result:
+       a forever-hung ``response_stream_reader.receive()``. Verified
+       by reverting the ``asyncio.wait({call_task, fired_task})``
+       race in ``_dispatch_pool_with_entry`` to a bare ``await
+       session.call_tool(...)``: the test times out.
+
+    This test is the structural gate against the per-dispatch carrier
+    pattern: it looks right in code review and passes single-dispatch
+    integration tests, but breaks silently on session reuse — and the
+    SDK-level hang the carrier fix exposes silently strands the
+    dispatcher even when the carrier is correct.
+    """
+    url, behaviour = upstream
+    behaviour["mode"] = "never"  # passthrough — dispatch 1 succeeds
+
+    mgr, _loop, _ = running_loop_mgr
+    cipher = make_mcp_token_cipher()
+    _seed_oauth_server(storage, name="pool-srv", url=url)
+    _seed_user_token(storage, cipher)
+    mgr.set_storage(storage)
+    mgr.set_app_state(_make_app_state(storage, cipher=cipher))
+
+    async def _fake_classified(**kwargs: Any) -> TokenLookupResult:
+        if kwargs.get("force_refresh"):
+            return TokenLookupResult(kind="token", token="refreshed-bearer")
+        return TokenLookupResult(kind="token", token="access-aaa")
+
+    with patch(
+        "turnstone.core.mcp_client.get_user_access_token_classified",
+        side_effect=_fake_classified,
+    ):
+        # Dispatch 1: passthrough success. Establishes the pooled session.
+        result1 = mgr.call_tool_sync(
+            "mcp__pool-srv__echo", {"payload": "first"}, user_id="user-1", timeout=15
+        )
+        assert "echoed:first" in result1
+
+        entry = mgr._user_pool_entries[("user-1", "pool-srv")]
+        session_after_first = entry.session
+        assert session_after_first is not None, (
+            "test setup: dispatch 1 did not populate entry.session; "
+            "subsequent dispatch will not exercise the reuse path"
+        )
+
+        # Reconfigure upstream to 401 once on the next call. Reset the
+        # auth-headers log so we can count dispatch-2's POSTs cleanly.
+        behaviour["post_auth_headers"] = []
+        behaviour["mode"] = "once_401"
+        behaviour["_fired"] = False
+
+        # Dispatch 2: same (user, server). The hook from dispatch 1's
+        # connect is still bound to entry.auth_capture. The 401 fires;
+        # the dispatcher's auth_401 path triggers refresh-and-retry.
+        result2 = mgr.call_tool_sync(
+            "mcp__pool-srv__echo", {"payload": "second"}, user_id="user-1", timeout=15
+        )
+
+    assert "echoed:second" in result2, (
+        f"reused-session 401 retry did not succeed. result: {result2!r}. "
+        "If this is JSON with mcp_consent_required, the dispatcher "
+        "fell through to consent_required emission; if a generic "
+        "tool error, the carrier was empty (auth branch unreachable)."
+    )
+    assert mgr._consecutive_failures.get("pool-srv", 0) == 0, (
+        "auth failures must not trip the per-server breaker"
+    )
+
+    # Dispatch 2 produces multiple POSTs: the original 401 with the
+    # rejected bearer, then the retry's full connect handshake
+    # (initialize + notifications/initialized + tools/list) followed by
+    # the actual tools/call — all under the refreshed bearer. The retry
+    # reconnects because the auth_401 handler evicted the broken session.
+    post_headers = behaviour.get("post_auth_headers", [])
+    assert len(post_headers) >= 2, (
+        f"expected >=2 POSTs after dispatch 2 (401 + retry); "
+        f"got {len(post_headers)}: {post_headers}"
+    )
+    # First POST is the original bearer that got 401'd.
+    assert post_headers[0] == "Bearer access-aaa", (
+        f"first POST was {post_headers[0]!r}; expected the original bearer"
+    )
+    # Every subsequent POST carries the refreshed bearer (the retry
+    # ran with force_refresh=True and reconnected with the new token).
+    refreshed = post_headers[1:]
+    assert all(h == "Bearer refreshed-bearer" for h in refreshed), (
+        f"retry POSTs carried unexpected bearer(s); observed: {post_headers}"
+    )

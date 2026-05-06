@@ -177,25 +177,37 @@ class TestClassifyFailureWithCapture:
 
 
 # ---------------------------------------------------------------------------
-# Tests 9-10: carrier per-dispatch isolation + hook only fires on 4xx
+# Tests 9-10: carrier field-reset isolation + hook only fires on 4xx
 # ---------------------------------------------------------------------------
 
 
 class TestCarrierLifecycle:
     def test_capture_resets_per_dispatch(self, running_loop_mgr, storage: SQLiteBackend) -> None:
-        """Each ``_dispatch_pool`` allocates a fresh ``_AuthCapture`` so a
-        prior dispatch's 401 cannot leak into the next dispatch.
+        """The carrier's fields are reset before each ``call_tool`` so a
+        prior dispatch's 401 cannot leak into the next dispatch's
+        classification.
 
-        The autouse ``_install_capture_intercept`` fixture stashes the
-        per-dispatch carrier on the manager. Two consecutive dispatches
-        must observe DIFFERENT carrier identities — if the dispatcher
-        reused one capture, the second dispatch would see the same
-        ``id()``.
+        The carrier is owned by the pool entry (the httpx response hook
+        closes over ``entry.auth_capture`` at first connect; a per-
+        dispatch carrier would never reach the hook on a reused
+        session). Object identity is
+        therefore expected to be the SAME across dispatches; what
+        matters is that the FIELDS are reset under ``open_lock``
+        before ``call_tool`` runs.
 
-        Verified by reverting ``_dispatch_pool`` to allocate
-        ``_AuthCapture`` once (e.g., set it on ``self._shared_capture``
-        in ``__init__`` and reuse) and confirming this test fails
-        because the two dispatches observe the same carrier identity.
+        Test shape:
+        1. Dispatch 1's stub ``call_tool`` populates the carrier with a
+           401 + WWW-Authenticate.
+        2. Dispatch 2's stub ``call_tool`` records the carrier's state
+           as observed AT CALL ENTRY — before this stub writes anything.
+        3. Assert the recorded state is reset (status=None,
+           www_authenticate=None) — proves dispatch 1's payload did
+           not leak.
+
+        Verified by reverting ``_dispatch_pool_with_entry`` to remove
+        the two reset assignments under ``open_lock`` and confirming
+        this test fails because dispatch 2 observes dispatch 1's
+        leaked 401.
         """
         from unittest.mock import patch
 
@@ -208,12 +220,21 @@ class TestCarrierLifecycle:
         mgr.set_storage(storage)
         mgr.set_app_state(_make_app_state(storage, cipher=cipher))
 
-        observed_capture_ids: list[int] = []
+        # Dispatch 1's stub leaves a 401 on the carrier; dispatch 2's
+        # stub records carrier state at entry.
+        observed_states: list[tuple[int | None, str | None]] = []
+        call_index = [0]
 
         async def _call_tool(name: str, args: dict[str, Any]) -> Any:
             cap = getattr(mgr, "_test_active_capture", None)
-            if cap is not None:
-                observed_capture_ids.append(id(cap))
+            assert cap is not None, "test setup error: capture not stashed"
+            observed_states.append((cap.status, cap.www_authenticate))
+            if call_index[0] == 0:
+                # Simulate dispatch 1 seeing a 401 — leak this into
+                # the carrier so dispatch 2 must explicitly reset.
+                cap.status = 401
+                cap.www_authenticate = 'Bearer error="invalid_token"'
+            call_index[0] += 1
             content = MagicMock()
             content.text = "ok"
             res = MagicMock()
@@ -239,10 +260,17 @@ class TestCarrierLifecycle:
             mgr.call_tool_sync("mcp__pool-srv__do_thing", {}, user_id="user-1", timeout=5)
             mgr.call_tool_sync("mcp__pool-srv__do_thing", {}, user_id="user-1", timeout=5)
 
-        assert len(observed_capture_ids) == 2
-        assert observed_capture_ids[0] != observed_capture_ids[1], (
-            "Both dispatches saw the same _AuthCapture object; the dispatcher "
-            "is reusing the carrier across calls instead of allocating fresh."
+        assert len(observed_states) == 2
+        # Dispatch 1 saw the freshly-constructed carrier (None/None) —
+        # initial state from PoolEntryState's default_factory.
+        assert observed_states[0] == (None, None), (
+            f"dispatch 1 saw stale carrier state: {observed_states[0]}"
+        )
+        # Dispatch 2 must observe the reset — dispatch 1's leaked 401
+        # is gone.
+        assert observed_states[1] == (None, None), (
+            f"dispatch 2 leaked dispatch 1's state: {observed_states[1]}; "
+            "_dispatch_pool_with_entry's reset of entry.auth_capture is broken"
         )
 
     def test_capture_dataclass_isolated_when_constructed_separately(self) -> None:
@@ -257,7 +285,7 @@ class TestCarrierLifecycle:
         cap_b.status = 403
         assert cap_a.status == 401
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_response_hook_captures_4xx_only(self) -> None:
         """Hook records on 401 and 403 only; 200/201/202/500 are ignored.
 
@@ -310,7 +338,7 @@ class TestCarrierLifecycle:
 
 
 class TestForceRefresh:
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_force_refresh_bypasses_token_freshness_check(
         self, storage: SQLiteBackend
     ) -> None:
@@ -358,7 +386,7 @@ class TestForceRefresh:
             assert forced.kind == "token"
             assert forced.token == "refreshed-token"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_force_refresh_collapses_concurrent_callers_via_lock(
         self, storage: SQLiteBackend
     ) -> None:
@@ -439,7 +467,7 @@ class TestForceRefresh:
             f"observed {call_count} round-trips."
         )
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_force_refresh_goes_through_pg_refresh_lock_path(
         self, storage: SQLiteBackend
     ) -> None:
@@ -543,6 +571,7 @@ class TestDispatcherAuthFlows:
             access_token: str,
             *,
             auth_capture: Any = None,
+            auth_fired_event: Any = None,
         ) -> Any:
             entry = await self_inner._ensure_pool_entry(key)
             sess = MagicMock()
@@ -586,20 +615,13 @@ class TestDispatcherAuthFlows:
                 return TokenLookupResult(kind="token", token="refreshed-bearer")
             return TokenLookupResult(kind="token", token="access-aaa")
 
-        # The first call_tool populates the carrier with 401; the
-        # second call_tool returns success.
+        # The first call_tool populates the entry-owned carrier with
+        # 401 (via _populate_active_capture, simulating what the
+        # production response hook would record); the second call_tool
+        # returns success.
         async def _call_tool(name: str, args: dict[str, Any]) -> Any:
             nonlocal call_count
             call_count += 1
-            # Find the calling _dispatch_pool's capture by walking the
-            # most recently allocated entry session — the test bridges
-            # via the dispatch path, so we mutate the per-dispatch
-            # carrier directly via the patched factory's hook semantics.
-            # Easier: use a sentinel exception that the dispatcher's
-            # capture pre-populates via the hook test path. But for
-            # the dispatcher unit test we drive the carrier through
-            # an exception-injection that ALSO populates the captured
-            # carrier — see the test fixtures below.
             if call_count == 1:
                 # Simulate the SDK swallow path: carrier was populated
                 # by the hook, but the exception that surfaces is a
@@ -905,6 +927,7 @@ class TestBreakerInvariant:
             access_token: str,
             *,
             auth_capture: Any = None,
+            auth_fired_event: Any = None,
         ) -> Any:
             entry = await self_inner._ensure_pool_entry(key)
             sess = MagicMock()
@@ -1225,34 +1248,30 @@ class TestRetryTimeoutBudget:
 # ---------------------------------------------------------------------------
 # Test helpers — bridge the test stand-in for the real httpx event hook.
 #
-# The dispatcher allocates a fresh ``_AuthCapture`` per dispatch and threads
-# it into ``_dispatch_pool_with_entry`` via the ``auth_capture`` kwarg. To
-# unit-test the dispatcher's reaction without a real upstream, the fake
-# ``call_tool`` populates the carrier directly via this helper, simulating
-# what the production response hook would do.
+# The dispatcher consults ``entry.auth_capture`` (carrier owned by the pool
+# entry, persisted across dispatches; the production response hook closes
+# over it at first connect). To unit-test the dispatcher's reaction without
+# a real upstream, the fake ``call_tool`` populates that carrier directly
+# via this helper, simulating what the production response hook would do.
 # ---------------------------------------------------------------------------
 
 
 def _populate_active_capture(mgr: MCPClientManager, *, status: int, header: str) -> None:
-    """Mutate the per-dispatch ``_AuthCapture`` stashed on the manager
+    """Mutate the entry-owned ``_AuthCapture`` stashed on the manager
     by the autouse ``_install_capture_intercept`` fixture.
 
     Used by stub ``call_tool`` implementations to simulate what the
     production response hook would record on a 4xx upstream response.
     Raises ``RuntimeError`` if invoked outside the autouse fixture's
-    intercept window — the carrier is per-dispatch, not per-test, so
-    it only exists while a dispatch is in flight.
+    intercept window — the helper only resolves the carrier while a
+    dispatch is in flight.
     """
     capture = getattr(mgr, "_test_active_capture", None)
     if capture is None:
-        # Allocate a fresh sentinel that the dispatcher's auth-classification
-        # branch will see. The fake call_tool mutates THIS object; the
-        # dispatcher consults its own per-dispatch capture, but since we
-        # also patch _classify_failure to consult the test sentinel...
         raise RuntimeError(
             "test setup error: _populate_active_capture called before "
-            "_install_capture_intercept; the dispatcher's per-dispatch "
-            "_AuthCapture isn't observable from this stub."
+            "_install_capture_intercept; the entry's _AuthCapture isn't "
+            "observable from this stub."
         )
     capture.status = status
     capture.www_authenticate = header
@@ -1261,7 +1280,7 @@ def _populate_active_capture(mgr: MCPClientManager, *, status: int, header: str)
 @pytest.fixture(autouse=True)
 def _install_capture_intercept(monkeypatch: pytest.MonkeyPatch) -> None:
     """Wrap ``_dispatch_pool_with_entry`` so the test's fake ``call_tool``
-    can populate the per-dispatch ``_AuthCapture`` via ``mgr._test_active_capture``.
+    can populate the entry-owned ``_AuthCapture`` via ``mgr._test_active_capture``.
 
     The wrap is a no-op for tests that don't call ``_populate_active_capture``;
     they simply never read the attribute. Dispatcher-asserting tests rely
@@ -1273,8 +1292,12 @@ def _install_capture_intercept(monkeypatch: pytest.MonkeyPatch) -> None:
     original = mcp_client_mod.MCPClientManager._dispatch_pool_with_entry
 
     async def _wrapped(self: MCPClientManager, **kwargs: Any) -> str:
-        # Stash the carrier so the test's call_tool stub can populate it.
-        self._test_active_capture = kwargs.get("auth_capture")  # type: ignore[attr-defined]
+        # Stash the entry's persistent carrier so the test's call_tool
+        # stub can populate it.
+        entry = kwargs.get("entry")
+        self._test_active_capture = (  # type: ignore[attr-defined]
+            entry.auth_capture if entry is not None else None
+        )
         try:
             return await original(self, **kwargs)
         finally:
