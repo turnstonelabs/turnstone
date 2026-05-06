@@ -72,6 +72,20 @@ class TestWatchCRUD:
         assert db.delete_watch("nope") is False
 
 
+class TestIsWatchActive:
+    def test_active_row_returns_true(self, db):
+        db.create_watch(**_make_watch_kwargs())
+        assert db.is_watch_active("watch_001") is True
+
+    def test_inactive_row_returns_false(self, db):
+        db.create_watch(**_make_watch_kwargs())
+        db.update_watch("watch_001", active=False)
+        assert db.is_watch_active("watch_001") is False
+
+    def test_missing_row_returns_false(self, db):
+        assert db.is_watch_active("nope") is False
+
+
 class TestWatchListQueries:
     def test_list_for_ws(self, db):
         db.create_watch(**_make_watch_kwargs(watch_id="w1", ws_id="ws-1", name="a"))
