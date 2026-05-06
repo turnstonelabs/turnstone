@@ -199,6 +199,11 @@ class TestLazyConnect:
 
         fake_session = MagicMock()
         fake_session.initialize = AsyncMock(return_value=None)
+        # Phase 7: ``_connect_one_pool`` discovers the user's tool
+        # catalog after ``initialize()`` returns. This stub returns a
+        # zero-tool result so the test can keep its narrow focus on
+        # the bearer-injection contract.
+        fake_session.list_tools = AsyncMock(return_value=MagicMock(tools=[]))
 
         def _stream_factory(*, url: str, headers: dict[str, str]) -> _AsyncCM:
             observed_kwargs["url"] = url
