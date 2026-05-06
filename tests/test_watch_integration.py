@@ -27,6 +27,7 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+from tests._helpers import patch_session_storage
 from turnstone.core.session import ChatSession
 from turnstone.core.watch import WatchRunner
 
@@ -54,18 +55,6 @@ def _make_session() -> ChatSession:
     )
 
 
-def _stub_storage(active: bool = True) -> Any:
-    """Minimal storage stub providing the surface the dispatch closure
-    touches — ``is_watch_active`` for the ``valid_until`` predicate.
-    """
-
-    class _S:
-        def is_watch_active(self, watch_id: str) -> bool:
-            return active
-
-    return _S()
-
-
 def test_watch_fires_then_user_send_drains_envelope(tmp_db, monkeypatch):
     """Pin the cross-PR concern that watch text reaches the model via
     the unified ``<system-reminder>`` envelope path:
@@ -82,15 +71,15 @@ def test_watch_fires_then_user_send_drains_envelope(tmp_db, monkeypatch):
 
     # Bypass the storage-touching predicate — we want to assert the
     # envelope splice, not exercise a fresh sqlite watch row.
-    from turnstone.core import session as session_mod
-
-    monkeypatch.setattr(session_mod, "get_storage", lambda: _stub_storage(active=True))
+    patch_session_storage(monkeypatch, active=True)
 
     # Real WatchRunner; we don't ``start()`` the daemon thread (that
     # would race with the test's deterministic order).  Direct call
     # to ``_dispatch_result`` exercises the same dispatch path the
-    # daemon would invoke.
-    runner = WatchRunner(storage=_stub_storage(active=True), node_id="test-node")
+    # daemon would invoke.  Runner-side ``storage`` is unused on this
+    # path (only the polling loop touches it); a MagicMock placeholder
+    # keeps the constructor signature happy.
+    runner = WatchRunner(storage=MagicMock(), node_id="test-node")
     session.set_watch_runner(runner)
 
     # 1. Fire a watch result synchronously.
@@ -148,11 +137,10 @@ def test_three_back_to_back_watch_fires_drain_into_one_turn(tmp_db, monkeypatch)
     the old per-fire-turn shape.
     """
     session = _make_session()
-    from turnstone.core import session as session_mod
 
-    monkeypatch.setattr(session_mod, "get_storage", lambda: _stub_storage(active=True))
+    patch_session_storage(monkeypatch, active=True)
 
-    runner = WatchRunner(storage=_stub_storage(active=True), node_id="test-node")
+    runner = WatchRunner(storage=MagicMock(), node_id="test-node")
     session.set_watch_runner(runner)
 
     runner._dispatch_result(session._ws_id, "fire one", "watch-1")
@@ -211,7 +199,7 @@ def test_watch_dispatch_through_restore_fn_lands_on_rehydrated_session(tmp_db, m
     """
     from turnstone.core import session as session_mod
 
-    monkeypatch.setattr(session_mod, "get_storage", lambda: _stub_storage(active=True))
+    patch_session_storage(monkeypatch, active=True)
 
     # Stage 1 — build the original session and persist a message so
     # ``session.resume`` finds the ws_id in storage.
@@ -241,7 +229,7 @@ def test_watch_dispatch_through_restore_fn_lands_on_rehydrated_session(tmp_db, m
         return runner.get_dispatch_fn(new_session._ws_id)
 
     runner = WatchRunner(
-        storage=_stub_storage(active=True),
+        storage=MagicMock(),
         node_id="test-node",
         restore_fn=_restore_fn,
     )
