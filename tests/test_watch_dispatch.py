@@ -21,6 +21,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tests._helpers import patch_session_storage
 from turnstone.core.session import _WATCH_QUEUE_SOFT_CAP, ChatSession
 
 
@@ -232,36 +233,24 @@ class TestValidUntil:
         session = _make_session_for_dispatch()
         _runner, dispatch = _register_runner(session)
 
-        from turnstone.core import session as session_mod
-
         # Storage stub returns False at drain time.
-        is_active_calls: list[str] = []
-
-        class _StubStorage:
-            def is_watch_active(self, watch_id: str) -> bool:
-                is_active_calls.append(watch_id)
-                return False
-
-        monkeypatch.setattr(session_mod, "get_storage", lambda: _StubStorage())
+        is_active_calls = patch_session_storage(monkeypatch, active=False)
 
         dispatch("body", "watch-1")
         # Drain fires the predicate; entry should NOT be delivered.
         out = session._nudge_queue.drain({"any"})
         assert out == []
-        # Predicate ran once.
+        # Predicate ran once with the dispatched watch_id.
         assert is_active_calls == ["watch-1"]
 
     def test_valid_until_drops_when_watch_missing(self, tmp_db, monkeypatch):
         session = _make_session_for_dispatch()
         _runner, dispatch = _register_runner(session)
 
-        from turnstone.core import session as session_mod
-
-        class _StubStorage:
-            def is_watch_active(self, watch_id: str) -> bool:
-                return False  # row gone (deleted)
-
-        monkeypatch.setattr(session_mod, "get_storage", lambda: _StubStorage())
+        # Missing-row case collapses to the same False return shape under
+        # the ``is_watch_active`` API — pinned separately to make the
+        # missing-vs-inactive intent explicit at the call site.
+        patch_session_storage(monkeypatch, active=False)
 
         dispatch("body", "watch-1")
         out = session._nudge_queue.drain({"any"})
@@ -276,13 +265,7 @@ class TestValidUntil:
         session = _make_session_for_dispatch()
         _runner, dispatch = _register_runner(session)
 
-        from turnstone.core import session as session_mod
-
-        class _BoomStorage:
-            def is_watch_active(self, watch_id: str) -> bool:
-                raise RuntimeError("storage down")
-
-        monkeypatch.setattr(session_mod, "get_storage", lambda: _BoomStorage())
+        patch_session_storage(monkeypatch, raise_on_is_active=True)
 
         dispatch("body", "watch-bound-id")
         out = session._nudge_queue.drain({"any"})
@@ -295,13 +278,7 @@ class TestValidUntil:
         session = _make_session_for_dispatch()
         _runner, dispatch = _register_runner(session)
 
-        from turnstone.core import session as session_mod
-
-        class _StubStorage:
-            def is_watch_active(self, watch_id: str) -> bool:
-                return True
-
-        monkeypatch.setattr(session_mod, "get_storage", lambda: _StubStorage())
+        patch_session_storage(monkeypatch, active=True)
 
         dispatch("body", "watch-1")
         out = session._nudge_queue.drain({"any"})
@@ -331,14 +308,9 @@ class TestConcurrency:
 
         # Bypass the storage-touching valid_until predicate: count cap
         # behaviour, not storage round-trips.
-        from turnstone.core import session as session_mod
+        patch_session_storage(monkeypatch, active=True)
 
-        class _ActiveStorage:
-            def is_watch_active(self, watch_id: str) -> bool:
-                return True
-
-        monkeypatch.setattr(session_mod, "get_storage", lambda: _ActiveStorage())
-
+        n_threads = 2
         per_thread = 100
 
         def fire(label: str) -> None:
@@ -349,6 +321,7 @@ class TestConcurrency:
             threading.Thread(target=fire, args=("a",), daemon=True),
             threading.Thread(target=fire, args=("b",), daemon=True),
         ]
+        assert len(threads) == n_threads
         for t in threads:
             t.start()
         for t in threads:
@@ -360,10 +333,12 @@ class TestConcurrency:
         # bounds the actual count; no exception was raised across the
         # 3-acquisition window per dispatch.
         depth = len(session._nudge_queue)
-        assert depth <= 2 * per_thread
-        # The non-atomic count-then-drop window allows the queue to
-        # transiently go slightly above cap.  Bound the slack:
-        assert depth <= _WATCH_QUEUE_SOFT_CAP + 2 * per_thread
+        assert depth <= n_threads * per_thread
+        # The non-atomic count-then-drop window admits at most one
+        # "slip" per concurrent thread above the cap (each thread can
+        # observe a sub-cap count and append before another thread's
+        # drop runs).  Bound the slack to N_THREADS, not 2 * per_thread.
+        assert depth <= _WATCH_QUEUE_SOFT_CAP + n_threads
 
 
 # ---------------------------------------------------------------------------

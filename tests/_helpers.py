@@ -26,3 +26,38 @@ def make_chat_session(**overrides: Any) -> Any:
     }
     defaults.update(overrides)
     return ChatSession(**defaults)
+
+
+def patch_session_storage(
+    monkeypatch: Any,
+    *,
+    active: bool = True,
+    raise_on_is_active: bool = False,
+) -> list[str]:
+    """Replace ``turnstone.core.session.get_storage`` with a minimal stub
+    that exposes ``is_watch_active`` — the only storage surface the watch
+    dispatch closure's ``valid_until`` predicate touches.
+
+    Returns the list of ``watch_id``s the predicate was called with so
+    callers can assert on call shape.  Use ``raise_on_is_active=True`` to
+    pin the broad-except branch in the predicate.
+
+    Tests that need a more elaborate storage stub (call tracking on
+    multiple methods, return-shape variations beyond the active flag)
+    should keep an inline class — this helper covers the common
+    ``set up an active/inactive/boom storage stub`` shape that
+    accumulated 7 near-duplicate ``monkeypatch.setattr`` sites.
+    """
+    from turnstone.core import session as session_mod
+
+    calls: list[str] = []
+
+    class _Stub:
+        def is_watch_active(self, watch_id: str) -> bool:
+            calls.append(watch_id)
+            if raise_on_is_active:
+                raise RuntimeError("storage down")
+            return active
+
+    monkeypatch.setattr(session_mod, "get_storage", lambda: _Stub())
+    return calls
