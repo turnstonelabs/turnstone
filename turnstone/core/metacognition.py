@@ -124,7 +124,91 @@ _NUDGE_MAP: dict[str, str] = {
     "start": NUDGE_START,
     "tool_error": NUDGE_TOOL_ERROR,
     "repeat": NUDGE_REPEAT,
+    # idle_children carries no static body — :func:`format_idle_children_nudge`
+    # produces the per-fire text from the active-children snapshot.  Empty
+    # string here keeps :func:`format_nudge` round-tripping honestly while
+    # still letting :func:`should_nudge` recognise the type.
+    "idle_children": "",
 }
+
+
+# Display cap for the ``idle_children`` body — list at most this many
+# children inline, append "...and N more" overflow line beyond that.
+NUDGE_IDLE_CHILDREN_DISPLAY_CAP = 6
+
+# Suggested ``wait_for_workstream(ws_ids=[...])`` cap — matches
+# ``WAIT_MAX_WS_IDS`` in :mod:`turnstone.core.coordinator_client` so the
+# emitted suggestion is callable as-is.
+NUDGE_IDLE_CHILDREN_WAIT_CAP = 32
+
+NUDGE_IDLE_CHILDREN_HEADER = (
+    "You went idle but still have active child workstreams.  Either "
+    "continue the user's work or block on the listed children "
+    "explicitly:"
+)
+
+
+_NAME_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+_NAME_TAG_BREAKERS = re.compile(r"[<>]")
+
+
+def _sanitize_child_name(name: str) -> str:
+    """Neutralize prompt-structural markers in user-controlled child names.
+
+    The wire-boundary :func:`escape_wrapper_tags` only protects the
+    ``<system-reminder>`` and ``<tool_output>`` envelopes; other
+    angle-bracketed markers (``</thinking>``, ``<answer>``,
+    ``<artifact>``, …) and control chars can still steer some models.
+    Strip both before interpolation — self-injection only today
+    (children inherit parent ``user_id``), but the cost is one
+    ``re.sub`` per child.
+    """
+    if not name:
+        return ""
+    cleaned = _NAME_CONTROL_CHARS.sub(" ", name)
+    cleaned = _NAME_TAG_BREAKERS.sub("", cleaned)
+    return cleaned.strip()
+
+
+def format_idle_children_nudge(children: list[dict[str, str]]) -> str:
+    """Render the ``idle_children`` reminder body.
+
+    *children* is a list of dicts with ``ws_id``, ``name``, ``state``
+    keys — the row-mapping shape coordinator-side storage exposes.
+    Returns raw text *without* the ``<system-reminder>`` envelope; the
+    side-channel :func:`_apply_reminders_for_provider` splice wraps it
+    at the wire boundary.
+
+    User-controlled ``name`` strings get sanitized via
+    :func:`_sanitize_child_name` before interpolation so a workstream
+    named ``</thinking>...`` can't steer the model's reasoning
+    channels through the rendered body.
+
+    Display caps at :data:`NUDGE_IDLE_CHILDREN_DISPLAY_CAP` with an
+    overflow line; the trailing ``wait_for_workstream`` suggestion's
+    ``ws_ids`` list caps at :data:`NUDGE_IDLE_CHILDREN_WAIT_CAP`.
+    Empty input returns the empty string so callers can short-circuit
+    on ``if not text: return``.
+    """
+    if not children:
+        return ""
+    lines = [NUDGE_IDLE_CHILDREN_HEADER, ""]
+    shown = children[:NUDGE_IDLE_CHILDREN_DISPLAY_CAP]
+    for c in shown:
+        ws_id = c.get("ws_id", "")
+        name = _sanitize_child_name(c.get("name", "")) or "(unnamed)"
+        state = c.get("state", "?")
+        lines.append(f"  - {ws_id[:8]} ({state}): {name}")
+    overflow = len(children) - len(shown)
+    if overflow > 0:
+        lines.append(f"  ...and {overflow} more")
+    lines.append("")
+    wait_ids = [c.get("ws_id", "") for c in children[:NUDGE_IDLE_CHILDREN_WAIT_CAP]]
+    lines.append(
+        f'To block on them: wait_for_workstream(ws_ids={wait_ids!r}, mode="any", timeout=120).'
+    )
+    return "\n".join(lines)
+
 
 # ---------------------------------------------------------------------------
 # Detection heuristics — strong/weak tiers

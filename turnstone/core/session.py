@@ -779,6 +779,11 @@ class ChatSession:
         # synthesized user message gets stamped ``_source`` for
         # audit / replay distinction.
         self._wake_source_tag: str = ""
+        # Reminders pre-drained by ``deliver_wake_nudge_from_queue``
+        # — handed to ``_attach_pending_user_reminders`` so the synthesized
+        # send doesn't re-drain (and so we can bail out before send when
+        # every entry's ``valid_until`` predicate dropped its item).
+        self._wake_drained_reminders: list[dict[str, str]] | None = None
         # User message queue: messages sent while model is executing.
         # OrderedDict preserves FIFO order and supports O(1) removal by ID.
         # Queued user turns never carry attachments — see
@@ -5822,6 +5827,12 @@ class ChatSession:
         ``_provider_content``); ``sanitize_messages`` strips it before
         the wire on its own pass.
 
+        When ``deliver_wake_nudge_from_queue`` is the caller, it has
+        already drained the queue and stashed the reminders on
+        ``self._wake_drained_reminders``; we use that list directly
+        rather than draining again (the predicate-aware drain runs
+        once, in deliver_wake_nudge_from_queue).
+
         Also fires the live ``on_user_reminder`` UI hook so any open
         SSE consumers (other browser tabs, CLI mirrors, eventual
         channel adapters) can render the reminder bubble in lockstep
@@ -5831,11 +5842,16 @@ class ChatSession:
         not abort the user's send (which would otherwise drop both the
         user message and the queued nudges).
         """
-        items = self._nudge_queue.drain(USER_DRAIN)
-        if not items:
+        if self._wake_drained_reminders is not None:
+            reminders = self._wake_drained_reminders
+            self._wake_drained_reminders = None  # consume — only delivered once
+        else:
+            items = self._nudge_queue.drain(USER_DRAIN)
+            if not items:
+                return
+            reminders = [{"type": nudge_type, "text": text} for nudge_type, text in items]
+        if not reminders:
             return
-
-        reminders = [{"type": nudge_type, "text": text} for nudge_type, text in items]
         user_msg["_reminders"] = reminders
 
         try:
@@ -5889,19 +5905,26 @@ class ChatSession:
         operator intervention is required for the underlying failure
         anyway and a haunted nudge would be noise.
 
-        Bails early if nothing in the queue would drain at the user
-        seam (only stale ``"tool"``-channel entries, say): without
-        the guard we'd synthesize an empty-content user turn whose
-        ``<system-reminder>`` envelope is empty and which providers
-        reject for missing content.  The :class:`IdleNudgeWatcher`
-        peeks total queue length and may dispatch us for a tool-only
-        queue; this defense covers that race plus any future direct
-        caller.
+        Drains the queue inline (running every entry's ``valid_until``
+        predicate) BEFORE synthesizing the empty user turn — bails if
+        no entry survives the predicate check.  Without this, the
+        watcher's ``has_pending`` peek can succeed on entries whose
+        predicate later drops them inside
+        ``_attach_pending_user_reminders``'s drain, leaving us
+        synthesizing an empty user turn with no reminder context (and
+        risking provider rejection of empty user content).  The
+        drained items get handed to ``_attach_pending_user_reminders``
+        via ``_wake_drained_reminders`` instead of re-draining the
+        queue from inside ``send``.
         """
-        if not self._nudge_queue.has_pending(USER_DRAIN):
+        items = self._nudge_queue.drain(USER_DRAIN)
+        if not items:
             return
         pre_len = len(self.messages)
         self._wake_source_tag = "system_nudge"
+        self._wake_drained_reminders = [
+            {"type": nudge_type, "text": text} for nudge_type, text in items
+        ]
         try:
             self.send("")
         except Exception:
@@ -5911,6 +5934,7 @@ class ChatSession:
             raise
         finally:
             self._wake_source_tag = ""
+            self._wake_drained_reminders = None
 
     def _apply_post_execute_advisories(
         self,

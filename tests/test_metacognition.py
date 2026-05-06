@@ -4,6 +4,8 @@ from turnstone.core.metacognition import (
     NUDGE_COMPLETION,
     NUDGE_CORRECTION,
     NUDGE_DENIAL,
+    NUDGE_IDLE_CHILDREN_DISPLAY_CAP,
+    NUDGE_IDLE_CHILDREN_WAIT_CAP,
     NUDGE_REPEAT,
     NUDGE_RESUME,
     NUDGE_START,
@@ -11,6 +13,7 @@ from turnstone.core.metacognition import (
     RepeatDetector,
     detect_completion,
     detect_correction,
+    format_idle_children_nudge,
     format_nudge,
     should_nudge,
 )
@@ -376,3 +379,94 @@ class TestRepeatDetector:
     def test_threshold_one_fires_immediately(self):
         det = RepeatDetector(threshold=1)
         assert det.record("a") is True
+
+
+class TestFormatIdleChildrenNudge:
+    """``format_idle_children_nudge`` renders the wake-driven idle_children
+    body — no ``<system-reminder>`` envelope (the side-channel splice
+    wraps it at the wire boundary).
+    """
+
+    def test_empty_list_returns_empty_string(self):
+        # Caller short-circuits on `if not text: return` — so empty
+        # input MUST produce empty output, not a header-only stub.
+        assert format_idle_children_nudge([]) == ""
+
+    def test_single_child_renders(self):
+        children = [{"ws_id": "ws-abc12345", "name": "research-task", "state": "running"}]
+        text = format_idle_children_nudge(children)
+        assert "ws-abc12" in text  # short-id form (8 chars)
+        assert "research-task" in text
+        assert "running" in text
+        assert "wait_for_workstream" in text
+        assert "ws-abc12345" in text  # full id appears in the suggestion's ws_ids list
+
+    def test_under_display_cap_no_overflow_line(self):
+        children = [
+            {"ws_id": f"ws-{i:08d}", "name": f"task-{i}", "state": "running"} for i in range(3)
+        ]
+        text = format_idle_children_nudge(children)
+        assert "...and" not in text
+        for i in range(3):
+            assert f"task-{i}" in text
+
+    def test_over_display_cap_renders_overflow_line(self):
+        n = NUDGE_IDLE_CHILDREN_DISPLAY_CAP + 4
+        children = [
+            {"ws_id": f"ws-{i:08d}", "name": f"task-{i}", "state": "thinking"} for i in range(n)
+        ]
+        text = format_idle_children_nudge(children)
+        assert f"...and {n - NUDGE_IDLE_CHILDREN_DISPLAY_CAP} more" in text
+        # First N children are inline; later ones are folded into "...and N more".
+        for i in range(NUDGE_IDLE_CHILDREN_DISPLAY_CAP):
+            assert f"task-{i}" in text
+        for i in range(NUDGE_IDLE_CHILDREN_DISPLAY_CAP, n):
+            # Names beyond the display cap aren't visible; only counted.
+            assert f"task-{i}" not in text
+
+    def test_over_wait_cap_truncates_suggestion_ws_ids(self):
+        n = NUDGE_IDLE_CHILDREN_WAIT_CAP + 5
+        children = [
+            {"ws_id": f"ws-{i:08d}", "name": f"task-{i}", "state": "running"} for i in range(n)
+        ]
+        text = format_idle_children_nudge(children)
+        # The first WAIT_CAP ids appear in the suggestion; later ones don't.
+        first_in_suggestion = f"ws-{NUDGE_IDLE_CHILDREN_WAIT_CAP - 1:08d}"
+        first_excluded = f"ws-{NUDGE_IDLE_CHILDREN_WAIT_CAP:08d}"
+        assert first_in_suggestion in text
+        assert first_excluded not in text
+
+    def test_unnamed_child_falls_back(self):
+        children = [{"ws_id": "ws-deadbeef", "name": "", "state": "attention"}]
+        text = format_idle_children_nudge(children)
+        assert "(unnamed)" in text
+        assert "attention" in text
+
+    def test_missing_state_renders_question_mark(self):
+        children = [{"ws_id": "ws-12345678", "name": "x"}]
+        text = format_idle_children_nudge(children)
+        # Defensive default — exotic state keys / partial dicts shouldn't crash.
+        assert "?" in text
+
+    def test_no_system_reminder_envelope(self):
+        # The side-channel ``_apply_reminders_for_provider`` splice
+        # adds ``<system-reminder>`` at the wire boundary; the formatter
+        # MUST NOT wrap, or the model would see a doubled envelope.
+        text = format_idle_children_nudge([{"ws_id": "ws-x", "name": "y", "state": "running"}])
+        assert "<system-reminder>" not in text
+        assert "</system-reminder>" not in text
+
+    def test_format_nudge_returns_empty_for_idle_children(self):
+        # The static map's idle_children entry is the empty string by
+        # design — format_idle_children_nudge produces the real body.
+        assert format_nudge("idle_children") == ""
+
+    def test_should_nudge_recognises_idle_children_type(self, monkeypatch):
+        # Type registration in ``_NUDGE_MAP`` makes ``should_nudge``
+        # recognise it for cooldown gating; without the entry it would
+        # silently return False on every call.
+        state: dict[str, float] = {}
+        # message_count > 1 to clear the first-message gate.
+        assert should_nudge("idle_children", state, message_count=4, memory_count=0) is True
+        # Cooldown set on success → second immediate call returns False.
+        assert should_nudge("idle_children", state, message_count=5, memory_count=0) is False
