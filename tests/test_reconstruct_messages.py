@@ -15,9 +15,26 @@ def _row(
     tc_id=None,
     pdata=None,
     tool_calls=None,
+    source=None,
+    reminders=None,
 ):
-    """Build a 7-element conversation row tuple (id, role, ...)."""
-    return (next(_row_ids), role, content, tool_name, tc_id, pdata, tool_calls)
+    """Build a 9-element conversation row tuple (id, role, ...).
+
+    Trailing ``source`` / ``reminders`` mirror the persisted twins of
+    the in-memory ``_source`` / ``_reminders`` side-channels added in
+    migration 050.
+    """
+    return (
+        next(_row_ids),
+        role,
+        content,
+        tool_name,
+        tc_id,
+        pdata,
+        tool_calls,
+        source,
+        reminders,
+    )
 
 
 class TestAssistantWithToolCalls:

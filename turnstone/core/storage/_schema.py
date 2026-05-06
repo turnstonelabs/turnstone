@@ -38,6 +38,14 @@ conversations = sa.Table(
     sa.Column("tool_call_id", sa.Text),
     sa.Column("provider_data", sa.Text),
     sa.Column("tool_calls", sa.Text),
+    # Sibling-key columns mirroring the in-memory ``_source`` /
+    # ``_reminders`` side-channels.  ``_source`` audits which producer
+    # synthesised the row (today only ``"system_nudge"`` for wake-driven
+    # empty user turns); ``_reminders`` stores the JSON-encoded reminder
+    # list ``[{type, text, ...optional}]`` so multi-tab / multi-device
+    # replay sees the same bubble shape the originating tab saw live.
+    sa.Column("_source", sa.Text),
+    sa.Column("_reminders", sa.Text),
 )
 
 sa.Index("idx_conversations_timestamp", conversations.c.timestamp)

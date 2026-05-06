@@ -41,11 +41,18 @@ def save_message(
     tool_call_id: str | None = None,
     provider_data: str | None = None,
     tool_calls: str | None = None,
+    source: str | None = None,
+    reminders: str | None = None,
 ) -> int:
     """Log a message to the conversations table.
 
     Returns the inserted row id, or ``0`` on failure (preserving the
     module's no-raise contract).
+
+    ``source`` / ``reminders`` mirror the in-memory ``_source`` /
+    ``_reminders`` side-channels (``reminders`` JSON-encoded).  Both
+    default to ``None`` for the common case where no metacog payload
+    rides the row.
     """
     try:
         return get_storage().save_message(
@@ -56,6 +63,8 @@ def save_message(
             tool_call_id,
             provider_data,
             tool_calls=tool_calls,
+            source=source,
+            reminders=reminders,
         )
     except Exception:
         log.warning("Failed to save message for ws=%s role=%s", ws_id, role, exc_info=True)
