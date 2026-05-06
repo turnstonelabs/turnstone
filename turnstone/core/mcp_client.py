@@ -1181,12 +1181,19 @@ class MCPClientManager:
                         user_id,
                         server_name,
                     )
-            except Exception:
+            except Exception as exc:
+                # Structured fields only — ``exc_info=True`` would
+                # serialize the chained ``httpx.Request`` whose headers
+                # carry ``Authorization: Bearer <token>``. Sentry /
+                # faulthandler-style integrations capture that frame
+                # and the bearer would land in error tracking.
+                # Mirrors the dispatch-path log scrubbing applied in
+                # the sec-1 round-1 fix.
                 log.warning(
-                    "Pool refresh after notification failed user=%s server=%s",
+                    "Pool refresh after notification failed user=%s server=%s exc=%s",
                     user_id,
                     server_name,
-                    exc_info=True,
+                    type(exc).__name__,
                 )
 
         try:
@@ -1198,8 +1205,15 @@ class MCPClientManager:
             raise
 
         entry.stack = stack
+        # ``asyncio.timeout`` (NOT ``asyncio.wait_for``) — same anyio /
+        # Python 3.11 reasoning as the discovery call below: ``wait_for``
+        # wraps the inner coroutine in a fresh task, and a 401-during-
+        # handshake that triggers ``streamablehttp_client``'s anyio
+        # TaskGroup to unwind would surface a cross-task cancel-scope
+        # exit. ``asyncio.timeout`` keeps the await in the current task.
         try:
-            await asyncio.wait_for(session.initialize(), timeout=self._CONNECT_TIMEOUT)
+            async with asyncio.timeout(self._CONNECT_TIMEOUT):
+                await session.initialize()
         except asyncio.CancelledError:
             entry.stack = None
             task = asyncio.current_task()
@@ -1505,14 +1519,14 @@ class MCPClientManager:
         """
         new_map: dict[str, tuple[str, str]] = {}
         new_tools: list[dict[str, Any]] = []
-        for (uid, _server_name), entry in self._user_pool_entries.items():
+        for (uid, server_name), entry in self._user_pool_entries.items():
             if uid != user_id or entry.tools is None:
                 continue
             for tool in entry.tools:
                 prefixed: str = tool["function"]["name"]
                 # Extract original name from the mcp__server__original pattern.
                 original = prefixed.split("__", 2)[2] if prefixed.count("__") >= 2 else prefixed
-                new_map[prefixed] = (_server_name, original)
+                new_map[prefixed] = (server_name, original)
                 new_tools.append(tool)
         if new_map:
             self._user_tool_map[user_id] = new_map
