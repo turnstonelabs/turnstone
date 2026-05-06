@@ -156,12 +156,28 @@ NUDGE_IDLE_CHILDREN_HEADER = (
 # trust boundary (a future watch trigger consuming external webhook
 # bodies, etc).
 #
-# TAB / LF / CR (``\x09``/``\x0a``/``\x0d``) are intentionally
-# **excluded** from the strip set: watch payloads carry multi-line
-# shell output whose layout is part of the signal the model needs to
-# interpret.  Stripping LF/CR would collapse multi-line output to one
-# line — this gap is closed here so the shared sanitiser is safe to
-# apply to the whole formatted watch message.
+# Two classes, picked at the call site by the caller's structural
+# requirements:
+#   * :data:`_NAME_CONTROL_CHARS` — STRICT: also strips TAB/LF/CR.
+#     Used by :func:`sanitize_name` for single-line user-controlled
+#     fields (workstream ``name`` rendered as bullet items by
+#     :func:`format_idle_children_nudge` — a name with ``\n`` in it
+#     would otherwise break the bullet's one-line structure and let
+#     a malicious child name forge sibling rows).
+#   * :data:`_PAYLOAD_CONTROL_CHARS` — PERMISSIVE: preserves TAB/LF/CR.
+#     Used by :func:`sanitize_payload` for multi-line payloads where
+#     line layout is part of the signal (watch shell output —
+#     stripping LF/CR would collapse multi-line output to one line).
+_NAME_CONTROL_CHARS = re.compile(
+    r"[\x00-\x1f\x7f"  # ASCII control (incl. \t\n\r) + DEL
+    r"​-‏"  # zero-width / LRM / RLM
+    r"‪-‮"  # bidi overrides
+    r"⁦-⁩"  # bidi isolates
+    r"  "  # line / paragraph separator
+    r"﻿"  # BOM
+    r"]"
+    r"|[\U000e0000-\U000e007f]"  # Unicode tag chars (separate range above BMP)
+)
 _PAYLOAD_CONTROL_CHARS = re.compile(
     r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f"  # ASCII control (skip \t\n\r) + DEL
     r"​-‏"  # zero-width / LRM / RLM
@@ -175,12 +191,27 @@ _PAYLOAD_CONTROL_CHARS = re.compile(
 _PAYLOAD_TAG_BREAKERS = re.compile(r"[<>]")
 
 
-def sanitize_payload(text: str) -> str:
-    """Neutralize prompt-structural markers in user-controlled nudge payloads.
+def sanitize_name(text: str) -> str:
+    """Strict sanitiser for single-line user-controlled name fields.
 
-    Used by both producers whose payloads are sourced from user input:
-    workstream names rendered into the ``idle_children`` nudge body,
-    and ``format_watch_message`` output rendered into the
+    Strips ASCII control chars **including** TAB/LF/CR plus Unicode
+    steering vectors and angle-bracket tag breakers.  Use for fields
+    rendered as a single bullet item / label where embedded newlines
+    would break the surrounding structure (workstream ``name`` in
+    :func:`format_idle_children_nudge`, where a ``\\n`` in the name
+    would otherwise forge a fake sibling bullet).
+    """
+    if not text:
+        return ""
+    cleaned = _NAME_CONTROL_CHARS.sub(" ", text)
+    cleaned = _PAYLOAD_TAG_BREAKERS.sub("", cleaned)
+    return cleaned.strip()
+
+
+def sanitize_payload(text: str) -> str:
+    """Permissive sanitiser for multi-line user-controlled nudge payloads.
+
+    Used by ``format_watch_message`` output rendered into the
     ``watch_triggered`` nudge body.
 
     The wire-boundary :func:`escape_wrapper_tags` only protects the
@@ -189,11 +220,13 @@ def sanitize_payload(text: str) -> str:
     ``<artifact>``, …) and Unicode steering vectors (RTL override,
     zero-width chars, tag chars) can still steer some models.  Strip
     both classes before interpolation — self-injection only today
-    (child workstreams inherit parent ``user_id`` and watch commands
-    are user-supplied), but the cost is one ``re.sub`` per payload.
+    (watch commands are user-supplied), but the cost is one ``re.sub``
+    per payload.
 
     TAB / LF / CR are preserved (see ``_PAYLOAD_CONTROL_CHARS``) so
     multi-line shell output in watch payloads keeps its line structure.
+    For single-line name fields where newlines would break surrounding
+    structure, use :func:`sanitize_name` instead.
     """
     if not text:
         return ""
@@ -212,9 +245,10 @@ def format_idle_children_nudge(children: list[dict[str, str]]) -> str:
     at the wire boundary.
 
     User-controlled ``name`` strings get sanitized via
-    :func:`sanitize_payload` before interpolation so a workstream
+    :func:`sanitize_name` before interpolation so a workstream
     named ``</thinking>...`` can't steer the model's reasoning
-    channels through the rendered body.
+    channels through the rendered body, and an embedded ``\\n`` in
+    a name can't forge a fake sibling bullet.
 
     Display caps at :data:`NUDGE_IDLE_CHILDREN_DISPLAY_CAP` with an
     overflow line; the trailing ``wait_for_workstream`` suggestion's
@@ -228,7 +262,7 @@ def format_idle_children_nudge(children: list[dict[str, str]]) -> str:
     shown = children[:NUDGE_IDLE_CHILDREN_DISPLAY_CAP]
     for c in shown:
         ws_id = c.get("ws_id", "")
-        name = sanitize_payload(c.get("name", "")) or "(unnamed)"
+        name = sanitize_name(c.get("name", "")) or "(unnamed)"
         state = c.get("state", "?")
         lines.append(f"  - {ws_id[:8]} ({state}): {name}")
     overflow = len(children) - len(shown)
