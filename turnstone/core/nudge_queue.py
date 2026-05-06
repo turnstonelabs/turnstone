@@ -146,6 +146,23 @@ class NudgeQueue:
             self._items.clear()
             return n
 
+    def drop_oldest_by_type(self, nudge_type: str) -> bool:
+        """Remove the earliest-enqueued entry whose type matches ``nudge_type``.
+
+        Returns ``True`` if an entry was dropped, ``False`` if no matching
+        entry was found.  Used by producers with a soft cap on their own
+        type's queue depth (e.g. the watch dispatcher's drop-oldest policy
+        when ``"watch_triggered"`` saturates) — atomic under the queue
+        lock so the count snapshot + drop pair can't interleave with a
+        concurrent enqueue from the same producer.
+        """
+        with self._lock:
+            for i, entry in enumerate(self._items):
+                if entry.nudge_type == nudge_type:
+                    del self._items[i]
+                    return True
+        return False
+
     def pending(self, channel: Channel | None = None) -> list[tuple[str, str]]:
         """Non-mutating snapshot for tests / introspection.
 

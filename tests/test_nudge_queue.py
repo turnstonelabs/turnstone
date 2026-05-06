@@ -96,6 +96,39 @@ class TestLenAndClear:
         assert q.clear() == 0
 
 
+class TestDropOldestByType:
+    def test_drop_oldest_by_type_removes_earliest_match(self):
+        """Drop the FIRST entry of the matching type; later matches stay."""
+        q = NudgeQueue()
+        q.enqueue("other", "first", "any")
+        q.enqueue("target", "older", "any")
+        q.enqueue("target", "newer", "any")
+        # "older" is the earliest target — drop it.
+        assert q.drop_oldest_by_type("target") is True
+        assert q.pending() == [("other", "first"), ("target", "newer")]
+
+    def test_drop_oldest_by_type_no_match_returns_false(self):
+        """Empty queue and unmatched-type cases both return False."""
+        q = NudgeQueue()
+        # Empty.
+        assert q.drop_oldest_by_type("target") is False
+        # Non-matching items only.
+        q.enqueue("other", "1", "any")
+        q.enqueue("other", "2", "tool")
+        assert q.drop_oldest_by_type("target") is False
+        # Queue is unaffected.
+        assert q.pending() == [("other", "1"), ("other", "2")]
+
+    def test_drop_oldest_by_type_only_drops_one(self):
+        """Multiple matching entries → only the first is removed."""
+        q = NudgeQueue()
+        q.enqueue("target", "1", "any")
+        q.enqueue("target", "2", "any")
+        q.enqueue("target", "3", "any")
+        assert q.drop_oldest_by_type("target") is True
+        assert q.pending() == [("target", "2"), ("target", "3")]
+
+
 class TestPending:
     def test_pending_no_filter_returns_all_in_order(self):
         q = NudgeQueue()
