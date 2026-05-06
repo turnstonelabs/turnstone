@@ -168,25 +168,20 @@ NUDGE_IDLE_CHILDREN_HEADER = (
 #     Used by :func:`sanitize_payload` for multi-line payloads where
 #     line layout is part of the signal (watch shell output —
 #     stripping LF/CR would collapse multi-line output to one line).
-_NAME_CONTROL_CHARS = re.compile(
-    r"[\x00-\x1f\x7f"  # ASCII control (incl. \t\n\r) + DEL
-    r"​-‏"  # zero-width / LRM / RLM
-    r"‪-‮"  # bidi overrides
-    r"⁦-⁩"  # bidi isolates
-    r"  "  # line / paragraph separator
-    r"﻿"  # BOM
+_CONTROL_CHARS_TAIL = (
+    r"\u200b-\u200f"  # zero-width / LRM / RLM
+    r"\u202a-\u202e"  # bidi overrides
+    r"\u2066-\u2069"  # bidi isolates
+    r"\u2028\u2029"  # line / paragraph separator
+    r"\ufeff"  # BOM
     r"]"
     r"|[\U000e0000-\U000e007f]"  # Unicode tag chars (separate range above BMP)
 )
+_NAME_CONTROL_CHARS = re.compile(
+    r"[\x00-\x1f\x7f" + _CONTROL_CHARS_TAIL  # ASCII control (incl. \t\n\r) + DEL
+)
 _PAYLOAD_CONTROL_CHARS = re.compile(
-    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f"  # ASCII control (skip \t\n\r) + DEL
-    r"​-‏"  # zero-width / LRM / RLM
-    r"‪-‮"  # bidi overrides
-    r"⁦-⁩"  # bidi isolates
-    r"  "  # line / paragraph separator
-    r"﻿"  # BOM
-    r"]"
-    r"|[\U000e0000-\U000e007f]"  # Unicode tag chars (separate range above BMP)
+    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f" + _CONTROL_CHARS_TAIL  # ASCII control (skip \t\n\r) + DEL
 )
 _PAYLOAD_TAG_BREAKERS = re.compile(r"[<>]")
 

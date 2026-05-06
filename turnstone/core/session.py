@@ -1389,8 +1389,7 @@ class ChatSession:
 
         The closure carries:
           - a soft cap on per-session ``"watch_triggered"`` depth via
-            :data:`_WATCH_QUEUE_SOFT_CAP` + drop-oldest-on-saturation,
-            standing in for the deleted ``_watch_pending`` maxsize bound.
+            :data:`_WATCH_QUEUE_SOFT_CAP` + drop-oldest-on-saturation.
           - a ``valid_until`` predicate that re-checks
             ``storage.is_watch_active(watch_id)`` at drain time so a
             cancelled watch's last splat doesn't ride out a future wake.
