@@ -470,3 +470,49 @@ class TestFormatIdleChildrenNudge:
         assert should_nudge("idle_children", state, message_count=4, memory_count=0) is True
         # Cooldown set on success → second immediate call returns False.
         assert should_nudge("idle_children", state, message_count=5, memory_count=0) is False
+
+
+class TestSanitizePayload:
+    """Shared sanitiser used by ``idle_children`` and ``watch_triggered``
+    producers.  Strips ASCII control chars (except TAB/LF/CR), Unicode
+    steering vectors (bidi, zero-width, BOM, tag chars), and angle-bracket
+    tag breakers — keeps everything else intact.
+    """
+
+    def test_empty_input_returns_empty(self):
+        from turnstone.core.metacognition import sanitize_payload
+
+        assert sanitize_payload("") == ""
+
+    def test_strips_ascii_control_chars(self):
+        """``\\x00``-``\\x1f`` minus TAB/LF/CR plus ``\\x7f`` (DEL) become spaces."""
+        from turnstone.core.metacognition import sanitize_payload
+
+        # BEL (0x07), VT (0x0b), FF (0x0c) — all in strip set.
+        assert sanitize_payload("a\x07b\x0bc\x0cd") == "a b c d"
+        # DEL (0x7f).
+        assert sanitize_payload("a\x7fb") == "a b"
+
+    def test_preserves_tab_lf_cr(self):
+        """TAB / LF / CR are intentionally preserved so multi-line shell
+        output keeps its line structure when sanitised as a watch payload.
+        """
+        from turnstone.core.metacognition import sanitize_payload
+
+        # Newlines kept; only the leading + trailing strip happens.
+        out = sanitize_payload("line1\nline2\n\tindented\rline3")
+        assert out == "line1\nline2\n\tindented\rline3"
+
+    def test_strips_bidi_and_zero_width(self):
+        from turnstone.core.metacognition import sanitize_payload
+
+        # U+202E RIGHT-TO-LEFT OVERRIDE; U+200B ZERO WIDTH SPACE.
+        assert sanitize_payload("a‮b​c") == "a b c"
+
+    def test_strips_angle_bracket_tag_breakers(self):
+        from turnstone.core.metacognition import sanitize_payload
+
+        # "<" / ">" go away entirely (not replaced with space) so a name
+        # like "</thinking>" doesn't leave a hole the model can read as
+        # a structural marker.
+        assert sanitize_payload("a</thinking>b") == "a/thinkingb"
