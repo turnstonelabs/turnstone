@@ -86,6 +86,21 @@ def _make_session(
     return ChatSession(**defaults)
 
 
+def _user_pending(session) -> list[tuple[str, str]]:
+    """Return user-channel queued nudges as ``(type, text)`` tuples.
+
+    Replaces direct introspection of the legacy
+    ``_pending_user_advisories`` list with a non-mutating
+    :meth:`NudgeQueue.pending` lookup filtered to the user channel.
+    """
+    return session._nudge_queue.pending("user")
+
+
+def _tool_pending(session) -> list[tuple[str, str]]:
+    """Return tool-channel queued nudges as ``(type, text)`` tuples."""
+    return session._nudge_queue.pending("tool")
+
+
 def _run_exec_search(session, capture_return):
     """Patch ``_search_capture`` to ``capture_return`` and run ``_exec_search``.
 
@@ -1993,13 +2008,13 @@ class TestMetacognitiveBuffers:
 
     def test_pending_buffers_initialised_empty(self, tmp_db):
         session = _make_session()
-        assert session._pending_user_advisories == []
-        assert session._pending_tool_advisories == []
+        assert _user_pending(session) == []
+        assert _tool_pending(session) == []
 
     def test_queue_user_advisory_stashes(self, tmp_db):
         session = _make_session()
         session._queue_user_advisory("correction", "watch your step")
-        assert session._pending_user_advisories == [("correction", "watch your step")]
+        assert _user_pending(session) == [("correction", "watch your step")]
 
     def test_queue_tool_advisory_stashes_tuple(self, tmp_db):
         session = _make_session()
@@ -2008,7 +2023,7 @@ class TestMetacognitiveBuffers:
         # constructs MetacognitiveAdvisory at drain time inside
         # _collect_advisories so wrap_tool_result sees a proper advisory
         # while readers of the buffer don't have to unbox.
-        assert session._pending_tool_advisories == [("tool_error", "check memories")]
+        assert _tool_pending(session) == [("tool_error", "check memories")]
 
     def test_attach_writes_reminders_sidechannel_for_string_content(self, tmp_db):
         session = _make_session()
@@ -2023,7 +2038,7 @@ class TestMetacognitiveBuffers:
         assert msg["content"] == "hello there"
         assert "<system-reminder>" not in msg["content"]
         assert msg["_reminders"] == [{"type": "correction", "text": "ALERT_TEXT"}]
-        assert session._pending_user_advisories == []
+        assert _user_pending(session) == []
 
     def test_attach_writes_reminders_sidechannel_for_list_content(self, tmp_db):
         session = _make_session()
@@ -2065,7 +2080,7 @@ class TestMetacognitiveBuffers:
             {"type": "correction", "text": "SECOND"},
         ]
         # Both nudges drained.
-        assert session._pending_user_advisories == []
+        assert _user_pending(session) == []
 
     def test_init_system_messages_no_longer_renders_nudges(self, tmp_db):
         """System message must not include nudge text even with both buffers populated."""
@@ -2078,8 +2093,8 @@ class TestMetacognitiveBuffers:
         assert "TOOL_NUDGE_MARK" not in joined
         # And the buffers are not drained by system rebuild — they wait
         # for their respective drain points (next user turn / tool batch).
-        assert session._pending_user_advisories == [("correction", "USER_NUDGE_MARK")]
-        assert session._pending_tool_advisories == [("tool_error", "TOOL_NUDGE_MARK")]
+        assert _user_pending(session) == [("correction", "USER_NUDGE_MARK")]
+        assert _tool_pending(session) == [("tool_error", "TOOL_NUDGE_MARK")]
 
     def test_collect_advisories_drains_tool_buffer_on_last_result(self, tmp_db):
         """Tool-channel metacog reminders no longer ride the persistent
@@ -2099,7 +2114,7 @@ class TestMetacognitiveBuffers:
         assert persistent == []
         assert metacog == [{"type": "tool_error", "text": "ALERT"}]
         # Buffer drained.
-        assert session._pending_tool_advisories == []
+        assert _tool_pending(session) == []
 
     def test_collect_advisories_holds_tool_buffer_until_last_result(self, tmp_db):
         session = _make_session()
@@ -2110,7 +2125,7 @@ class TestMetacognitiveBuffers:
         # Not yet drained — only fires on the last result.
         assert persistent == []
         assert metacog == []
-        assert len(session._pending_tool_advisories) == 1
+        assert len(_tool_pending(session)) == 1
 
     def test_collect_advisories_drains_text_queued_messages_to_persistent(self, tmp_db):
         """Text-only queued user messages drain into the ``persistent``
@@ -2183,7 +2198,7 @@ class TestMetacognitiveBuffers:
             "saved memories from prior sessions" in r.get("text", "") for r in reminders
         )  # NUDGE_START body
         # And the buffer drained.
-        assert session._pending_user_advisories == []
+        assert _user_pending(session) == []
 
     def test_attach_does_not_emit_visibility_ping(self, tmp_db):
         """The themed reminder bubble (via ``on_user_reminder``) is now
@@ -2245,7 +2260,7 @@ class TestMetacognitiveBuffers:
         # Side-channel write completed despite the hook raising.
         assert msg["_reminders"] == [{"type": "correction", "text": "watch out"}]
         # Buffer drained.
-        assert session._pending_user_advisories == []
+        assert _user_pending(session) == []
 
     def test_cancel_handler_clears_tool_advisory_buffer(self, tmp_db):
         """A tool_error/repeat advisory queued before a cancel must not
@@ -2265,7 +2280,7 @@ class TestMetacognitiveBuffers:
             session.send("user input")
 
         # Buffer cleared by the cancel handler — no leak into next send().
-        assert session._pending_tool_advisories == []
+        assert _tool_pending(session) == []
 
 
 class TestApplyPostExecuteAdvisories:
@@ -2304,10 +2319,10 @@ class TestApplyPostExecuteAdvisories:
             if i < 2:
                 # Streak below threshold — no inline warning, no advisory yet.
                 assert results[0][1] == "file contents"
-                assert all(t != "repeat" for t, _ in session._pending_tool_advisories)
+                assert all(t != "repeat" for t, _ in _tool_pending(session))
             else:
                 assert "⚠ Warning: this is an identical repeat" in results[0][1]
-        assert any(t == "repeat" for t, _ in session._pending_tool_advisories)
+        assert any(t == "repeat" for t, _ in _tool_pending(session))
 
     def test_errored_calls_count_toward_streak(self, tmp_db):
         """Regression: when metacog was split out of the system message,
@@ -2324,7 +2339,7 @@ class TestApplyPostExecuteAdvisories:
                     [self._tc(tc_id, "bash", '{"command": "ls /missing"}')],
                     [(tc_id, "ls: cannot access /missing")],
                 )
-        assert any(t == "repeat" for t, _ in session._pending_tool_advisories)
+        assert any(t == "repeat" for t, _ in _tool_pending(session))
 
     def test_intervening_different_sig_resets_streak(self, tmp_db):
         """Streak semantics: [A, A, B, A] does NOT fire — B breaks the run."""
@@ -2343,7 +2358,7 @@ class TestApplyPostExecuteAdvisories:
                     [self._tc(tc_id, name, args)],
                     [(tc_id, "ok")],
                 )
-        assert all(t != "repeat" for t, _ in session._pending_tool_advisories)
+        assert all(t != "repeat" for t, _ in _tool_pending(session))
 
     def test_intervening_different_call_resets_streak(self, tmp_db):
         """Streak detection is consecutive-only: any intervening call
@@ -2373,7 +2388,7 @@ class TestApplyPostExecuteAdvisories:
                     [self._tc(tc_id, "read_file", '{"path": "x"}')],
                     [(tc_id, "contents")],
                 )
-        assert all(t != "repeat" for t, _ in session._pending_tool_advisories)
+        assert all(t != "repeat" for t, _ in _tool_pending(session))
 
     def test_sequential_bash_same_command_fires_repeat(self, tmp_db):
         """Regression: small local models flaking out and looping on the
@@ -2397,7 +2412,7 @@ class TestApplyPostExecuteAdvisories:
                     [self._tc(tc_id, "bash", '{"command": "echo test"}')],
                     [(tc_id, "test\n")],
                 )
-        assert any(t == "repeat" for t, _ in session._pending_tool_advisories)
+        assert any(t == "repeat" for t, _ in _tool_pending(session))
 
     def test_sequential_bash_failures_fire_repeat(self, tmp_db):
         """Same shape as the success case, but with each call setting
@@ -2415,7 +2430,7 @@ class TestApplyPostExecuteAdvisories:
                     [self._tc(tc_id, "bash", '{"command": "ls /missing"}')],
                     [(tc_id, "ls: cannot access /missing")],
                 )
-        assert any(t == "repeat" for t, _ in session._pending_tool_advisories)
+        assert any(t == "repeat" for t, _ in _tool_pending(session))
 
     def test_json_output_tracked_but_not_inline_warned(self, tmp_db):
         """MCP-shape JSON outputs are tracked toward the streak but the
@@ -2434,7 +2449,7 @@ class TestApplyPostExecuteAdvisories:
                 if i == 2:
                     # JSON content untouched even though streak fired.
                     assert results[0][1] == json_out
-        assert any(t == "repeat" for t, _ in session._pending_tool_advisories)
+        assert any(t == "repeat" for t, _ in _tool_pending(session))
 
     def test_tool_error_nudge_fires_when_memories_exist(self, tmp_db):
         session = _make_session()
@@ -2446,7 +2461,7 @@ class TestApplyPostExecuteAdvisories:
                 [self._tc(tc_id, "bash", '{"command": "false"}')],
                 [(tc_id, "command failed")],
             )
-        assert any(t == "tool_error" for t, _ in session._pending_tool_advisories)
+        assert any(t == "tool_error" for t, _ in _tool_pending(session))
 
     def test_tool_error_nudge_skipped_with_zero_memories(self, tmp_db):
         """Without memories the tool_error nudge has nothing useful to point
@@ -2460,7 +2475,7 @@ class TestApplyPostExecuteAdvisories:
                 [self._tc(tc_id, "bash", '{"command": "false"}')],
                 [(tc_id, "command failed")],
             )
-        assert all(t != "tool_error" for t, _ in session._pending_tool_advisories)
+        assert all(t != "tool_error" for t, _ in _tool_pending(session))
 
     def test_no_legacy_repeat_info_line_on_streak_fire(self, tmp_db):
         """The legacy gray ``[repeat: tool() called with same arguments]``
@@ -2827,10 +2842,10 @@ class TestUpdateTokenTableMsgsParam:
 
 class TestUserAdvisoryCancelClear:
     """Pre-existing bug surfaced by the side-channel audit — cancel
-    handlers cleared ``_pending_tool_advisories`` but not the user-channel
-    buffer, so a queued user-channel nudge from a cancelled batch leaked
-    into the next user turn.  Stage 1 fix lives at the three cancel
-    branches inside ``send``.
+    handlers cleared the tool channel but not the user-channel buffer,
+    so a queued user-channel nudge from a cancelled batch leaked into
+    the next user turn.  Stage 1 fix lives at the three cancel branches
+    inside ``send`` (now via the unified :class:`NudgeQueue.clear`).
     """
 
     def test_generation_cancelled_clears_user_advisory_buffer(self, tmp_db):
@@ -2847,7 +2862,7 @@ class TestUserAdvisoryCancelClear:
             ),
         ):
             session.send("user input")
-        assert session._pending_user_advisories == []
+        assert _user_pending(session) == []
 
     def test_keyboard_interrupt_clears_user_advisory_buffer(self, tmp_db):
         session = _make_session()
@@ -2862,7 +2877,7 @@ class TestUserAdvisoryCancelClear:
             contextlib.suppress(KeyboardInterrupt),
         ):
             session.send("user input")
-        assert session._pending_user_advisories == []
+        assert _user_pending(session) == []
 
     def test_unexpected_exception_clears_user_advisory_buffer(self, tmp_db):
         session = _make_session()
@@ -2877,7 +2892,7 @@ class TestUserAdvisoryCancelClear:
             contextlib.suppress(RuntimeError),
         ):
             session.send("user input")
-        assert session._pending_user_advisories == []
+        assert _user_pending(session) == []
 
     def test_send_continues_when_messages_queued_during_streaming(self, tmp_db):
         """A user message queued while the assistant is streaming a

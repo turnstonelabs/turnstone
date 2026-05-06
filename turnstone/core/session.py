@@ -89,6 +89,7 @@ from turnstone.core.metacognition import (
     format_nudge,
     should_nudge,
 )
+from turnstone.core.nudge_queue import TOOL_DRAIN, USER_DRAIN, NudgeQueue
 from turnstone.core.providers import create_provider
 from turnstone.core.safety import is_command_blocked, sanitize_command
 from turnstone.core.sandbox import execute_math_sandboxed
@@ -754,19 +755,21 @@ class ChatSession:
         self._watch_pending: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=20)
         self._watch_dispatch_depth = 0
         # Metacognitive nudges: ephemeral prompts for proactive memory use.
-        # Two buffers, one per delivery channel — the system message no
-        # longer carries nudges, so neither buffer triggers a system-prefix
-        # rebuild (and therefore neither busts the prompt cache):
-        #   - tool advisories drain into the next tool-result envelope via
-        #     _collect_advisories (alongside GuardAdvisory / UserInterjection)
-        #   - user advisories splice as <system-reminder> blocks at the
-        #     end of the next user message in _append_user_turn
-        # Both store ``(nudge_type, text)`` so readers don't have to track
-        # which channel boxes its payload — the tool channel constructs
-        # ``MetacognitiveAdvisory`` at drain time inside _collect_advisories.
+        # One ``NudgeQueue`` per session; producers tag each entry with a
+        # channel and consumers drain by filter:
+        #   - "user" entries drain at the next user-message seam via
+        #     ``_attach_pending_user_reminders`` and splice as
+        #     <system-reminder> blocks
+        #   - "tool" entries drain at the next tool-result batch via
+        #     ``_collect_advisories`` (alongside GuardAdvisory and
+        #     UserInterjection)
+        #   - "any" entries drain at whichever seam fires first; used for
+        #     wake-trigger-driven nudges that should not pin to a
+        #     specific seam
+        # Cooldown timestamps live separately in ``_metacog_state`` for
+        # ``should_nudge`` gating.
         self._metacog_state: dict[str, float] = {}
-        self._pending_tool_advisories: list[tuple[str, str]] = []  # (type, text)
-        self._pending_user_advisories: list[tuple[str, str]] = []  # (type, text)
+        self._nudge_queue = NudgeQueue()
         # User message queue: messages sent while model is executing.
         # OrderedDict preserves FIFO order and supports O(1) removal by ID.
         # Queued user turns never carry attachments — see
@@ -2993,18 +2996,17 @@ class ChatSession:
             raise
 
     def _drain_pending_advisories(self) -> None:
-        """Drop both advisory channels' pending buffers.
+        """Drop every pending nudge regardless of channel.
 
-        Both channels are scoped to the current generation: tool-channel
-        nudges (``tool_error``, ``repeat``) queued earlier in this batch
-        and user-channel nudges (``correction``, ``denial``, …) queued
-        during ``_check_metacognitive_nudge`` but not yet drained.  When
-        a generation is abandoned (cancel, KeyboardInterrupt, unexpected
-        exception) both must drop so they don't bleed into the next
-        send's tool loop or next user turn.
+        Tool-channel nudges (``tool_error``, ``repeat``) queued earlier
+        in this batch and user-channel nudges (``correction``,
+        ``denial``, …) queued during ``_check_metacognitive_nudge`` but
+        not yet drained share the same per-session :class:`NudgeQueue`.
+        When a generation is abandoned (cancel, KeyboardInterrupt,
+        unexpected exception) the entire queue drops so nothing bleeds
+        into the next send's tool loop or next user turn.
         """
-        self._pending_tool_advisories.clear()
-        self._pending_user_advisories.clear()
+        self._nudge_queue.clear()
 
     def _synthesize_cancelled_results(self, reason: str) -> None:
         """Synthesize tool_result messages for orphaned tool_calls after cancel.
@@ -4174,9 +4176,8 @@ class ChatSession:
         # Lands on the tool message dict's ``_reminders`` side-channel
         # (caller's responsibility) so it stays out of persisted content
         # and rides the wire only via the transient-copy splice.
-        if is_last_in_batch and self._pending_tool_advisories:
-            drained = list(self._pending_tool_advisories)
-            self._pending_tool_advisories.clear()
+        if is_last_in_batch:
+            drained = self._nudge_queue.drain(TOOL_DRAIN)
             metacog_reminders.extend({"type": nt, "text": text} for nt, text in drained)
 
         # Drain queued user messages on the last result in the batch.
@@ -5769,16 +5770,20 @@ class ChatSession:
     def _queue_user_advisory(self, nudge_type: str, text: str) -> None:
         """Queue a metacognitive nudge for the next user turn.
 
-        Drains in ``_append_user_turn`` onto the user message dict's
-        ``_reminders`` side-channel.  Used for nudges that respond to
-        user behaviour: ``correction``, ``denial``, ``resume``,
-        ``start``, ``completion``.
+        Drains in ``_attach_pending_user_reminders`` onto the user
+        message dict's ``_reminders`` side-channel.  Used for nudges
+        that respond to user behaviour: ``correction``, ``denial``,
+        ``resume``, ``start``, ``completion``.
         """
-        self._pending_user_advisories.append((nudge_type, text))
+        self._nudge_queue.enqueue(nudge_type, text, "user")
 
     def _attach_pending_user_reminders(self, user_msg: dict[str, Any]) -> None:
-        """Drain ``_pending_user_advisories`` onto *user_msg*'s ``_reminders``
-        sibling key (a side-channel, never inside ``content``).
+        """Drain user-channel nudges from :class:`NudgeQueue` onto
+        *user_msg*'s ``_reminders`` sibling key (a side-channel, never
+        inside ``content``).
+
+        Drains entries whose ``channel`` is in ``{"user", "any"}``;
+        ``"tool"`` entries stay queued for the next tool-result batch.
 
         Mutates *user_msg* in place — the caller appends it after.  The
         rendered ``<system-reminder>`` envelope is built later in
@@ -5802,11 +5807,9 @@ class ChatSession:
         not abort the user's send (which would otherwise drop both the
         user message and the queued nudges).
         """
-        if not self._pending_user_advisories:
+        items = self._nudge_queue.drain(USER_DRAIN)
+        if not items:
             return
-
-        items = list(self._pending_user_advisories)
-        self._pending_user_advisories.clear()
 
         reminders = [{"type": nudge_type, "text": text} for nudge_type, text in items]
         user_msg["_reminders"] = reminders
@@ -5824,7 +5827,7 @@ class ChatSession:
         the tool-result envelope. Used for nudges that respond to model
         behaviour at a tool boundary: ``tool_error``, ``repeat``.
         """
-        self._pending_tool_advisories.append((nudge_type, text))
+        self._nudge_queue.enqueue(nudge_type, text, "tool")
 
     def _apply_post_execute_advisories(
         self,
@@ -5835,8 +5838,9 @@ class ChatSession:
 
         Mutates *results* in place when an identical-repeat warning is
         appended to a tool's text output.  Updates ``self._repeat_detector``,
-        ``self._pending_tool_advisories``, and ``self._metacog_state``
-        (cooldown timestamp via ``should_nudge``).  The operator-visible
+        ``self._nudge_queue`` (via ``_queue_tool_advisory``), and
+        ``self._metacog_state`` (cooldown timestamp via ``should_nudge``).
+        The operator-visible
         signal is the themed ``tool_reminder`` bubble below the tool
         block — emitted by the per-result loop downstream when the
         drained metacog reminders attach to the tool message dict's
