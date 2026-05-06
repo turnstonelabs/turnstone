@@ -3187,6 +3187,72 @@ class TestDeliverWakeNudge:
         # Wake tag cleared even on exception (finally block).
         assert session._wake_source_tag == ""
 
+    def test_wake_row_persists_with_source_column(self, tmp_db):
+        """The wake's synthesised empty user turn now persists with
+        ``_source = "system_nudge"`` (post-#484 the skip at
+        ``session.py:2685-2686`` is dropped).  Without persistence,
+        a second tab connecting via /history would see the assistant
+        turn with no preceding wake context.
+        """
+        from turnstone.core.storage import get_storage
+
+        session = _make_session()
+        session._title_generated = True
+        session._queue_user_advisory("denial", "leftover")
+        with (
+            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
+            patch.object(
+                session,
+                "_stream_response",
+                return_value={"role": "assistant", "content": "ok"},
+            ),
+            patch.object(session, "_full_messages", return_value=[]),
+            patch.object(session, "_update_token_table"),
+            patch.object(session, "_print_status_line"),
+            patch.object(session, "_emit_state"),
+            patch.object(session, "_visible_memory_count", return_value=0),
+        ):
+            session.deliver_wake_nudge_from_queue()
+        rows = get_storage().load_messages(session._ws_id)
+        wake_rows = [
+            r for r in rows if r.get("role") == "user" and r.get("_source") == "system_nudge"
+        ]
+        assert len(wake_rows) == 1
+        assert wake_rows[0]["content"] == ""
+
+    def test_user_reminder_persists_with_widened_payload(self, tmp_db):
+        """User-channel reminders attached to the wake's synthetic
+        empty turn round-trip through storage including their full
+        payload (the ``denial`` text here; later steps add optional
+        fields like ``watch_name`` for ``watch_triggered``).
+        """
+        from turnstone.core.storage import get_storage
+
+        session = _make_session()
+        session._title_generated = True
+        session._queue_user_advisory("denial", "do not do that")
+        with (
+            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
+            patch.object(
+                session,
+                "_stream_response",
+                return_value={"role": "assistant", "content": "ok"},
+            ),
+            patch.object(session, "_full_messages", return_value=[]),
+            patch.object(session, "_update_token_table"),
+            patch.object(session, "_print_status_line"),
+            patch.object(session, "_emit_state"),
+            patch.object(session, "_visible_memory_count", return_value=0),
+        ):
+            session.deliver_wake_nudge_from_queue()
+        rows = get_storage().load_messages(session._ws_id)
+        wake_rows = [
+            r for r in rows if r.get("role") == "user" and r.get("_source") == "system_nudge"
+        ]
+        assert len(wake_rows) == 1
+        reminders = wake_rows[0].get("_reminders")
+        assert reminders == [{"type": "denial", "text": "do not do that"}]
+
 
 class TestReminderSidechannelIsolation:
     """The side-channel design's load-bearing guarantee: any reader of

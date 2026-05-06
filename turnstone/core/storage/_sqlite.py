@@ -218,6 +218,8 @@ class SQLiteBackend:
         tool_call_id: str | None = None,
         provider_data: str | None = None,
         tool_calls: str | None = None,
+        source: str | None = None,
+        reminders: str | None = None,
     ) -> int:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         content = sanitize_text(content)
@@ -234,6 +236,8 @@ class SQLiteBackend:
                     "tool_call_id": tool_call_id,
                     "provider_data": provider_data,
                     "tool_calls": tool_calls,
+                    "_source": source,
+                    "_reminders": reminders,
                 },
             )
             if result.lastrowid is None:
@@ -277,6 +281,8 @@ class SQLiteBackend:
                     "tool_call_id": row.get("tool_call_id"),
                     "provider_data": sanitize_text(row.get("provider_data")),
                     "tool_calls": row.get("tool_calls"),
+                    "_source": row.get("source"),
+                    "_reminders": row.get("reminders"),
                 }
             )
         with self._conn() as conn:
@@ -312,6 +318,8 @@ class SQLiteBackend:
                         conversations.c.tool_call_id,
                         conversations.c.provider_data,
                         conversations.c.tool_calls,
+                        conversations.c._source,
+                        conversations.c._reminders,
                     )
                     .where(conversations.c.ws_id == ws_id)
                     .order_by(conversations.c.id.desc())
@@ -328,6 +336,8 @@ class SQLiteBackend:
                         conversations.c.tool_call_id,
                         conversations.c.provider_data,
                         conversations.c.tool_calls,
+                        conversations.c._source,
+                        conversations.c._reminders,
                     )
                     .where(conversations.c.ws_id == ws_id)
                     .order_by(conversations.c.id)
