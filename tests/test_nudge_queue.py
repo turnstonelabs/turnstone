@@ -181,6 +181,87 @@ class TestValidation:
             q.enqueue("a", "1")  # type: ignore[call-arg]
 
 
+class TestValidUntil:
+    """``valid_until`` predicate: drain re-checks freshness; falsy /
+    raising predicates drop the entry without delivery.
+    """
+
+    def test_valid_until_true_delivers(self):
+        q = NudgeQueue()
+        q.enqueue("a", "1", "any", valid_until=lambda: True)
+        out = q.drain({"any"})
+        assert out == [("a", "1")]
+
+    def test_valid_until_false_drops_silently(self):
+        q = NudgeQueue()
+        q.enqueue("a", "1", "any", valid_until=lambda: False)
+        out = q.drain({"any"})
+        assert out == []
+        # Already removed from queue (drain partition removes BEFORE
+        # predicate check — falsy doesn't return to queue).
+        assert len(q) == 0
+
+    def test_valid_until_exception_drops_silently(self):
+        q = NudgeQueue()
+
+        def boom() -> bool:
+            raise RuntimeError("predicate crash")
+
+        q.enqueue("a", "1", "any", valid_until=boom)
+        out = q.drain({"any"})
+        assert out == []
+        # Crash-on-predicate is treated as "no longer valid" — drop, not propagate.
+        assert len(q) == 0
+
+    def test_valid_until_evaluated_outside_lock(self):
+        """The predicate may do non-trivial work (e.g. storage I/O)
+        without blocking other producers.  Verify the predicate runs
+        outside the queue's internal lock by enqueueing from inside
+        the predicate — would deadlock if the lock was still held.
+        """
+        q = NudgeQueue()
+
+        def reentrant() -> bool:
+            # If the lock is held during predicate eval, this enqueue
+            # would block forever (RLock would let it through, but the
+            # queue uses a plain Lock).
+            q.enqueue("inner", "from-predicate", "any", valid_until=lambda: True)
+            return True
+
+        q.enqueue("outer", "1", "any", valid_until=reentrant)
+        out = q.drain({"any"})
+        # Outer's predicate ran outside the lock, enqueued "inner";
+        # outer's True return delivered "outer".  "inner" was enqueued
+        # AFTER the partition snapshot, so it stays in the queue.
+        assert out == [("outer", "1")]
+        assert q.pending() == [("inner", "from-predicate")]
+
+    def test_valid_until_only_evaluated_for_matching_channel(self):
+        """A non-matching entry's predicate must NOT fire — that would
+        be wasted work (or worse, a side-effecting predicate would run
+        when the entry is supposed to stay queued).
+        """
+        q = NudgeQueue()
+        calls = []
+
+        def track() -> bool:
+            calls.append(1)
+            return True
+
+        # Tool-channel entry; we drain user-channel.  Predicate must not run.
+        q.enqueue("a", "1", "tool", valid_until=track)
+        q.drain({"user", "any"})
+        assert calls == []
+        # Entry stays queued.
+        assert q.pending("tool") == [("a", "1")]
+
+    def test_valid_until_default_none_always_delivers(self):
+        # No predicate → entry behaves identically to pre-PR-3 entries.
+        q = NudgeQueue()
+        q.enqueue("a", "1", "any")  # no valid_until kwarg
+        assert q.drain({"any"}) == [("a", "1")]
+
+
 class TestConcurrency:
     def test_concurrent_enqueue_drain_no_loss(self):
         """16 producer threads × 64 nudges = 1024 total; one consumer

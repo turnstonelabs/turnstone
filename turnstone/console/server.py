@@ -4424,14 +4424,22 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                 ConsoleCoordinatorUI._console_metrics = app.state.console_metrics
                 app.state.coord_mgr = coord_mgr
                 app.state.coord_adapter = coord_adapter
-                # Idle wake-trigger for coords.  Subscribes to coord IDLE
-                # transitions and dispatches a synthetic empty-user-turn
-                # send when the coord's NudgeQueue is non-empty.  PR 3
-                # registers the CoordinatorIdleObserver BEFORE this so
-                # subscriber fire order on the same IDLE event has the
-                # observer enqueueing first, then this watcher peeking.
+                # Coord-side observer: when a coord goes IDLE with active
+                # children still running, enqueues an idle_children
+                # nudge.  MUST register BEFORE the IdleNudgeWatcher so
+                # subscriber-fire order on the same IDLE event has the
+                # observer enqueueing first, then the watcher peeking.
+                from turnstone.console.coordinator_idle_observer import (
+                    CoordinatorIdleObserver,
+                )
                 from turnstone.core.metacognition import install_idle_nudge_watcher
 
+                coord_idle_observer = CoordinatorIdleObserver(coord_mgr, storage)
+                coord_idle_observer.start()
+                app.state.coord_idle_observer = coord_idle_observer
+                # Idle wake-trigger for coords.  Subscribes to coord IDLE
+                # transitions and dispatches a synthetic empty-user-turn
+                # send when the coord's NudgeQueue is non-empty.
                 install_idle_nudge_watcher(app, coord_mgr)
                 # Wire the cluster-event subscription so the coordinator's
                 # SSE stream fans out filtered child_ws_* events.  Safe to
@@ -4487,6 +4495,12 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     from turnstone.core.metacognition import shutdown_idle_nudge_watchers
 
     shutdown_idle_nudge_watchers(app)
+    coord_idle_observer_shutdown = getattr(app.state, "coord_idle_observer", None)
+    if coord_idle_observer_shutdown is not None:
+        try:
+            coord_idle_observer_shutdown.shutdown()
+        except Exception:
+            log.debug("console.coord_idle_observer_shutdown_failed", exc_info=True)
     coord_adapter_shutdown = getattr(app.state, "coord_adapter", None)
     if coord_adapter_shutdown is not None:
         try:
