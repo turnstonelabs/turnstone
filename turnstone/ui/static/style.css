@@ -1655,9 +1655,7 @@ body {
 .ts-approval-tool[data-func-name="memory"] ~ .media-embed,
 .ts-approval-tool[data-func-name="recall"] ~ .media-embed,
 .ts-approval-tool[data-func-name="memory"] ~ .output-warning,
-.ts-approval-tool[data-func-name="recall"] ~ .output-warning,
-.ts-approval-tool[data-func-name="memory"] ~ .tool-output-truncated,
-.ts-approval-tool[data-func-name="recall"] ~ .tool-output-truncated {
+.ts-approval-tool[data-func-name="recall"] ~ .output-warning {
   opacity: 0.55;
   transition: opacity 120ms ease-out;
 }
@@ -1665,8 +1663,8 @@ body {
    subtree.  Without :focus-within on the siblings, a keyboard user
    tabbing into a link or collapsible toggle inside .tool-output
    sees the content remain dimmed — a11y regression.  Cover the
-   warning + truncation pills too so they fully reveal alongside
-   the result they decorate. */
+   warning pill too so it fully reveals alongside the result it
+   decorates. */
 .ts-approval-tool[data-func-name="memory"] ~ .tool-output:hover,
 .ts-approval-tool[data-func-name="recall"] ~ .tool-output:hover,
 .ts-approval-tool[data-func-name="memory"] ~ .tool-output:focus-within,
@@ -1678,29 +1676,8 @@ body {
 .ts-approval-tool[data-func-name="memory"] ~ .output-warning:hover,
 .ts-approval-tool[data-func-name="recall"] ~ .output-warning:hover,
 .ts-approval-tool[data-func-name="memory"] ~ .output-warning:focus-within,
-.ts-approval-tool[data-func-name="recall"] ~ .output-warning:focus-within,
-.ts-approval-tool[data-func-name="memory"] ~ .tool-output-truncated:hover,
-.ts-approval-tool[data-func-name="recall"] ~ .tool-output-truncated:hover,
-.ts-approval-tool[data-func-name="memory"] ~ .tool-output-truncated:focus-within,
-.ts-approval-tool[data-func-name="recall"] ~ .tool-output-truncated:focus-within {
+.ts-approval-tool[data-func-name="recall"] ~ .output-warning:focus-within {
   opacity: 1;
-}
-/* Truncation indicator — the persisted tool result is clamped at
-   2000 chars per row in storage; surface that on replay so users
-   know they're seeing a clipped view rather than the full output
-   the live session saw.  Aligns with .output-warning's left gutter
-   (margin-left: 16px) and uses transparent background + dim border
-   so it reads as quiet metadata rather than a foreign element. */
-.tool-output-truncated {
-  display: inline-block;
-  margin-top: 4px;
-  margin-left: 16px;
-  padding: 1px 6px;
-  font-size: 10px;
-  color: var(--fg-dim);
-  background: transparent;
-  border-radius: 3px;
-  border: 1px solid var(--fg-dim);
 }
 /* .ts-approval (chat.css) stacks its children with flex gap, so a
    border-top on the body would float above a strip of container

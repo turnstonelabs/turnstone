@@ -45,7 +45,6 @@ from turnstone.core.attachments import (
 )
 from turnstone.core.config import get_tavily_key
 from turnstone.core.edit import find_occurrences, pick_nearest
-from turnstone.core.history_decoration import TOOL_RESULT_STORAGE_CAP
 from turnstone.core.log import get_logger
 from turnstone.core.memory import (
     count_structured_memories,
@@ -555,10 +554,9 @@ _WATCH_QUEUE_SOFT_CAP = 50
 # producers (a watch streaming unbounded shell output, a corruption-class
 # steering payload).  The in-memory side-channel keeps the full body —
 # only the persisted JSON is clamped — so the live splice and UI render
-# see the same shape.  Mirrors ``TOOL_RESULT_STORAGE_CAP`` on tool
-# result rows.  Cap is in UTF-8 bytes so non-ASCII payloads (CJK, emoji)
-# can't blow the byte ceiling 4x by living entirely under the codepoint
-# count.
+# see the same shape.  Cap is in UTF-8 bytes so non-ASCII payloads
+# (CJK, emoji) can't blow the byte ceiling 4x by living entirely under
+# the codepoint count.
 REMINDER_TEXT_STORAGE_CAP = 8192
 
 
@@ -2255,7 +2253,21 @@ class ChatSession:
             copy = dict(msg)
             content = copy.get("content")
             if isinstance(content, str):
-                copy["content"] = escape_wrapper_tags(content) + block
+                # Tool messages whose content already carries a
+                # ``<tool_output>`` envelope (queued-message advisories
+                # via ``wrap_tool_result``, output_guard findings) must
+                # not be re-escaped — the wrapper has already escaped
+                # the raw body, and re-escaping would entity-encode the
+                # envelope's literal ``<tool_output>`` and
+                # ``<system-reminder>`` tags so the model sees
+                # ``&lt;tool_output&gt;...`` instead of a parseable
+                # envelope.  Append the metacog block as a trailing
+                # ``<system-reminder>`` (same shape ``wrap_tool_result``
+                # produces when stacking multiple advisories).
+                if content.startswith("<tool_output>\n"):
+                    copy["content"] = content + block
+                else:
+                    copy["content"] = escape_wrapper_tags(content) + block
             elif isinstance(content, list):
                 # Shallow-copy the parts list and any text parts we'll
                 # mutate so the original list/dicts in self.messages stay
@@ -2268,7 +2280,21 @@ class ChatSession:
                     p for p in new_parts if isinstance(p, dict) and p.get("type") == "text"
                 ]
                 for part in text_parts:
-                    part["text"] = escape_wrapper_tags(part.get("text", ""))
+                    text = part.get("text", "")
+                    # Skip escape on text parts that already carry a
+                    # ``<tool_output>`` envelope — those are produced by
+                    # ``wrap_tool_result`` (Seam 1 splice for list-typed
+                    # tool output appends the envelope as its own text
+                    # part).  The wrapper has already escaped the inner
+                    # body; re-escaping here would entity-encode the
+                    # envelope's literal ``<tool_output>`` and
+                    # ``<system-reminder>`` tags so the model sees
+                    # ``&lt;tool_output&gt;...`` instead of a parseable
+                    # envelope.  Mirrors the string-branch detection
+                    # above.
+                    if text.startswith("<tool_output>\n"):
+                        continue
+                    part["text"] = escape_wrapper_tags(text)
                 if text_parts:
                     text_parts[-1]["text"] = text_parts[-1]["text"] + block
                 else:
@@ -3067,23 +3093,20 @@ class ChatSession:
                         budget = self._remaining_token_budget()
                         output = self._truncate_output(output, remaining_budget_tokens=budget)
 
-                    # Capture raw output for DB storage before advisory wrapping
-                    raw_output = output
-
-                    # Advisory injection: persistent advisories (output
-                    # guard findings) wrap into the tool-result envelope
-                    # and stay in self.messages.  Metacognitive
-                    # tool-channel reminders (tool_error / repeat) ride
-                    # a side-channel — never inside content — so the
-                    # model sees the splice only at the wire boundary
-                    # via _apply_reminders_for_provider, while UI/replay
+                    # Advisory injection: persistent advisories — output
+                    # guard findings AND queued user messages (Seam 1)
+                    # — wrap into the tool-result envelope and stay in
+                    # self.messages.  Metacognitive tool-channel
+                    # reminders (tool_error / repeat) ride a side-
+                    # channel — never inside content — so the model
+                    # sees the splice only at the wire boundary via
+                    # _apply_reminders_for_provider, while UI/replay
                     # surfaces them as a themed bubble below the tool
-                    # result.  Queued user messages drain via
-                    # ``_flush_queued_messages`` AFTER this loop, so
-                    # they no longer ride the persistent-advisory path.
+                    # result.
                     persistent_advisories, metacog_reminders = self._collect_advisories(
                         assessment, _tc_names.get(tc_id, ""), _ri == _last_idx
                     )
+                    raw_output = output
                     if isinstance(output, str):
                         output = wrap_tool_result(output, persistent_advisories)
                     elif isinstance(output, list) and persistent_advisories:
@@ -3129,20 +3152,44 @@ class ChatSession:
                         tok_est = max(1, int(len(output) / self._chars_per_token))
                     self._msg_tokens.append(tok_est)
 
-                    # Log tool result.  Use raw_output (pre-advisory-wrap)
-                    # so the DB stores clean tool output without ephemeral
-                    # advisory XML.  memory/recall persist alongside every
-                    # other tool: replays show the full audit trail, and
-                    # output already passes through _truncate_output above
-                    # so size is bounded by the same budget every other
-                    # tool uses.
+                    # Log tool result.  Store the WRAPPED output so the
+                    # persisted row matches ``self.messages[i]['content']``
+                    # exactly — when ``persistent_advisories`` is empty
+                    # ``wrap_tool_result`` no-ops and the row carries
+                    # bare text, when non-empty the row carries the
+                    # ``<tool_output>`` envelope so replay's
+                    # ``decorate_history_messages`` can extract the
+                    # advisory back out.  Size is already bounded by
+                    # ``_truncate_output`` above (per-turn context
+                    # budget); no second cap needed.
+                    #
+                    # List-typed output (image / structured MCP results)
+                    # has no native string projection, so we rebuild the
+                    # envelope from the joined PRE-wrap text parts plus
+                    # the same advisories.  Joining the POST-wrap parts
+                    # would put the original raw text first and the
+                    # already-wrapped advisory text second, producing a
+                    # ``<raw> <tool_output>...`` shape that
+                    # ``extract_advisories_from_tool_envelope``'s
+                    # ``startswith("<tool_output>\n")`` prefix check
+                    # rejects on replay — the raw envelope XML would
+                    # leak into the rendered tool bubble.  Round-trip
+                    # works because ``wrap_tool_result(text, [])``
+                    # returns ``text`` unchanged when there are no
+                    # advisories.
                     _tname = _tc_names.get(tc_id, "")
                     if isinstance(raw_output, list):
-                        store_text = " ".join(
-                            p.get("text", "") for p in raw_output if p.get("type") == "text"
-                        )[:TOOL_RESULT_STORAGE_CAP]
+                        raw_text = " ".join(
+                            p.get("text", "")
+                            for p in raw_output
+                            if isinstance(p, dict) and p.get("type") == "text"
+                        )
+                        store_text: str = wrap_tool_result(raw_text, persistent_advisories)
                     else:
-                        store_text = raw_output[:TOOL_RESULT_STORAGE_CAP]
+                        # ``raw_output`` was a string, so the post-wrap
+                        # ``output`` is also a string (envelope or raw).
+                        assert isinstance(output, str)
+                        store_text = output
                     # Mirror the user-channel persistence: tool-channel
                     # reminders (``tool_error`` / ``repeat``) ride the same
                     # ``_reminders`` JSON column so a tab reconnecting via
@@ -3157,23 +3204,17 @@ class ChatSession:
                         tool_call_id=tc_id,
                         reminders=tool_reminders_json,
                     )
-                # Inject user feedback from approval prompt (e.g. "y, use full path")
-                if user_feedback:
-                    self.messages.append({"role": "user", "content": user_feedback})
-                    self._msg_tokens.append(max(1, int(len(user_feedback) / self._chars_per_token)))
-
-                # Drain queued user messages as a separate user turn
-                # AFTER the assistant→tool batch is complete.  The
-                # role sequence becomes assistant(tool_calls) → tool …
-                # tool → user, which is valid for strict providers
-                # (Mistral, Anthropic) and gives the user a real DB
-                # row that survives reconnect.  Pre-fix the queued
-                # messages rode inside the tool envelope as
-                # ``UserInterjection`` advisories — visible to the
-                # model on the same turn, but with no persisted user
-                # row, so the optimistic queued bubble vanished on
-                # page reload (and on cross-tab replay).
-                self._flush_queued_messages()
+                # Fold ``user_feedback`` (text typed alongside an approval,
+                # e.g. "y, use full path") and any queued messages that
+                # raced past Seam 1's drain into a single trailing user
+                # row.  Seam 2 in the queued-message architecture: the
+                # safety net for items that landed in ``_queued_messages``
+                # *after* ``_collect_advisories`` ran for the last result
+                # but *before* ``_execute_tools`` returned.  Common case
+                # (no feedback, queue empty) no-ops; coexistence case
+                # produces one user turn with feedback as the prefix
+                # joined to queued items by ``\n\n``.
+                self._flush_queued_messages(prefix=user_feedback or "")
 
                 # Mid-turn compaction: prevent context overflow during long
                 # tool chains.  Uses local estimates since _last_usage reflects
@@ -4375,7 +4416,7 @@ class ChatSession:
             popped = self._queued_messages.pop(msg_id, None)
         return popped is not None
 
-    def _flush_queued_messages(self) -> bool:
+    def _flush_queued_messages(self, prefix: str = "") -> bool:
         """Drain queued messages into a single combined user turn.
 
         Queued items are always text-only (attachments are rejected at
@@ -4383,19 +4424,54 @@ class ChatSession:
         so a single combined turn avoids back-to-back user messages
         that some models handle poorly.
 
-        Returns ``True`` when any items drained, ``False`` otherwise.
+        ``prefix`` (when non-empty) is the ``user_feedback`` string from
+        the post-tool-batch path: text the user typed alongside an
+        approval prompt (e.g. "y, use full path").  Folding it into
+        the same flush keeps the role sequence to exactly one trailing
+        user row whether feedback alone, queued items alone, or both
+        are present.  When both are present the rendered content is
+        ``prefix + "\\n\\n" + "\\n\\n".join(parts)``.
+
+        Returns ``True`` when any user row was appended (prefix or
+        items), ``False`` when both were empty.
         """
         from turnstone.core.tool_advisory import PRIORITY_IMPORTANT
 
         with self._queued_lock:
             items = list(self._queued_messages.values())
             self._queued_messages.clear()
-        if not items:
+        if not items and not prefix:
             return False
 
         parts = [f"[IMPORTANT] {msg}" if pri == PRIORITY_IMPORTANT else msg for msg, pri in items]
-        self._append_user_turn("\n\n".join(parts), ())
+        if prefix and parts:
+            content = prefix + "\n\n" + "\n\n".join(parts)
+        elif prefix:
+            content = prefix
+        else:
+            content = "\n\n".join(parts)
+        self._append_user_turn(content, ())
         return True
+
+    def _drain_queued_messages_to_advisories(self) -> list[ToolAdvisory]:
+        """Drain ``_queued_messages`` into ``UserInterjection`` advisories.
+
+        Mirrors the swap-and-clear pattern in
+        :meth:`_flush_queued_messages` but produces wire-bound
+        ``UserInterjection`` instances rather than appending a user
+        turn — the splice path used by Seam 1 (queued message rides
+        inside the last tool-result envelope of a batch).  Held under
+        ``_queued_lock`` to keep the read+clear atomic against a
+        concurrent ``queue_message`` from the SSE worker.
+        """
+        from turnstone.core.tool_advisory import UserInterjection
+
+        with self._queued_lock:
+            queued_items = list(self._queued_messages.values())
+            self._queued_messages.clear()
+        return [
+            UserInterjection(message=text, priority=priority) for text, priority in queued_items
+        ]
 
     def _collect_advisories(
         self,
@@ -4407,9 +4483,10 @@ class ChatSession:
 
         Returns ``(persistent, metacog_reminders)``:
 
-        - ``persistent`` — guard findings that ride inside the
-          tool-result envelope via ``wrap_tool_result``.  These are
-          conversation history and must persist in ``self.messages``.
+        - ``persistent`` — guard findings and queued user messages
+          (Seam 1) that ride inside the tool-result envelope via
+          ``wrap_tool_result``.  These are conversation history and
+          must persist in ``self.messages``.
         - ``metacog_reminders`` — list of ``{"type", "text", ...optional}``
           dicts for ``tool_error`` / ``repeat`` nudges that the caller
           attaches to the tool message dict's ``_reminders`` side-channel.
@@ -4420,19 +4497,21 @@ class ChatSession:
           surfaced separately on the UI as a themed bubble below the
           tool result.
 
-        Queued user messages are NOT drained here — they're appended
-        as a separate user turn after the batch completes (see
-        ``_flush_queued_messages`` invocations in ``send``).  The prior
-        UserInterjection splice into ``wrap_tool_result`` left no DB
-        row for the queued message, so it vanished on reconnect (the
-        tool result content carried the text inside a transient
-        ``<system-reminder>`` envelope).  Appending after the batch
-        keeps the assistant → tool sequence intact for strict providers
-        (Mistral) while persisting a real user row for replay parity.
+        Queued user messages drain into a :class:`UserInterjection`
+        advisory on the LAST result of a batch — Seam 1 in the
+        queued-message architecture.  The wrapped envelope persists
+        on the tool row; replay extracts it back out via
+        :func:`history_decoration.decorate_history_messages` and the
+        wire layer ships it as ``advisories`` so the UI renders a
+        proper user bubble after the tool block.  Cancel / exception /
+        no-tool-call paths drain the queue as a real user row instead
+        (Seams 2 and 3), since there is no envelope to splice into.
 
         Both lists are empty when no advisories apply (common case).
-        Guard advisories attach per-result; metacognitive nudges drain
-        on the last result in the batch only.
+        Guard advisories attach per-result; queued messages and
+        metacognitive nudges drain on the last result in the batch
+        only — single splice envelope per batch, no duplication
+        across N tool results.
         """
         from turnstone.core.tool_advisory import GuardAdvisory
 
@@ -4443,13 +4522,24 @@ class ChatSession:
         if assessment is not None:
             persistent.append(GuardAdvisory(assessment=assessment, func_name=func_name))
 
-        # Metacognitive tool-channel drain — fires once per batch on the
-        # last result.  Queued by _queue_tool_advisory from the
-        # tool_error / repeat detection paths just before this loop.
-        # Lands on the tool message dict's ``_reminders`` side-channel
-        # (caller's responsibility) so it stays out of persisted content
-        # and rides the wire only via the transient-copy splice.
+        # Last-result-in-batch drain seams: queued user messages (Seam 1)
+        # and tool-channel metacog nudges (tool_error / repeat).  Both
+        # fire once per batch so a parallel fan-out doesn't paint the
+        # same advisory N times.  Queue-drain is delegated to a named
+        # helper so the swap-and-clear pattern lives next to
+        # ``_flush_queued_messages``'s identical pattern, and the
+        # side-effect is documented at the call site rather than buried
+        # mid-function.
         if is_last_in_batch:
+            persistent.extend(self._drain_queued_messages_to_advisories())
+
+            # Metacognitive tool-channel drain.  Queued by
+            # ``_queue_tool_advisory`` from the tool_error / repeat
+            # detection paths just before this loop.  Lands on the
+            # tool message dict's ``_reminders`` side-channel
+            # (caller's responsibility) so it stays out of persisted
+            # content and rides the wire only via the transient-copy
+            # splice.
             drained = self._nudge_queue.drain(TOOL_DRAIN)
             for nt, text, meta in drained:
                 entry: dict[str, Any] = {"type": nt, "text": text}

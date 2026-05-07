@@ -53,10 +53,10 @@ from turnstone.core.auth import (
     jwt_version_slot,
 )
 from turnstone.core.history_decoration import (
-    TOOL_RESULT_STORAGE_CAP,
+    decorate_tool_call as _decorate_tool_call,
 )
 from turnstone.core.history_decoration import (
-    decorate_tool_call as _decorate_tool_call,
+    extract_advisories_from_tool_envelope,
 )
 from turnstone.core.history_decoration import (
     load_verdict_indexes as _load_verdict_indexes,
@@ -587,15 +587,60 @@ def _build_history(
             result_call_id = msg.get("tool_call_id")
             if result_call_id:
                 entry["tool_call_id"] = str(result_call_id)
-            # Tool results are clamped to TOOL_RESULT_STORAGE_CAP
-            # chars per row at storage time (session.py).  Surface
-            # that on replay so the user knows the visible output is
-            # a clipped view of what the live session saw, rather
-            # than the full result.  Reference the shared constant
-            # rather than a literal so the UI pill logic can't
-            # silently desync if the cap ever changes.
-            if isinstance(content, str) and len(content) >= TOOL_RESULT_STORAGE_CAP:
-                entry["truncated"] = True
+            # Extract advisories from a wrapped ``<tool_output>`` envelope
+            # (Seam 1 queued-message splice).  ``session.messages`` never
+            # carries an ``advisories`` key on its own — only
+            # ``decorate_history_messages`` mutates dicts to add it for
+            # the REST ``/history`` path, and the SSE replay surface
+            # bypasses that decoration entirely.  Calling the same
+            # idempotent extraction helper here pins both surfaces to
+            # the same wire shape: cleaned content + extracted advisories
+            # ride as a user bubble after the tool block.  No-ops cleanly
+            # for plain (unwrapped) content.
+            extracted_advisories: list[dict[str, str]] = []
+            if isinstance(content, str):
+                try:
+                    extracted = extract_advisories_from_tool_envelope(content)
+                except Exception:
+                    extracted = None
+                if extracted is not None:
+                    cleaned, extracted_advisories = extracted
+                    content = cleaned
+                    entry["content"] = cleaned
+            elif isinstance(content, list):
+                # List-typed tool output (image / structured MCP
+                # results) carries any Seam 1 splice as an appended
+                # text part produced by ``wrap_tool_result("", ...)``
+                # — the inner cleaned content is empty by construction,
+                # so the part exists only to carry advisories.  Walk
+                # the parts, extract advisories from any wrap
+                # envelope, and drop those parts from the projected
+                # list.  Without this, the JS replay would render the
+                # raw envelope as a text bubble inside the tool block
+                # AND fail to render the queued message as a user
+                # bubble (no ``advisories`` array).
+                new_parts: list[Any] = []
+                changed = False
+                for part in content:
+                    text = (
+                        part.get("text")
+                        if isinstance(part, dict) and part.get("type") == "text"
+                        else None
+                    )
+                    if isinstance(text, str) and text.startswith("<tool_output>\n"):
+                        try:
+                            extracted = extract_advisories_from_tool_envelope(text)
+                        except Exception:
+                            extracted = None
+                        if extracted is not None:
+                            _cleaned_text, advisories_from_part = extracted
+                            extracted_advisories.extend(advisories_from_part)
+                            changed = True
+                            continue
+                    new_parts.append(part)
+                if changed:
+                    content = new_parts
+                    entry["content"] = new_parts
             if isinstance(content, str):
                 if content.startswith("Denied by user") or content.startswith("Blocked"):
                     entry["denied"] = True
@@ -612,6 +657,33 @@ def _build_history(
                     or content.startswith("MCP prompt error")
                 ):
                     entry["is_error"] = True
+            # Surface advisories on the wire so the JS replay can render
+            # them as user bubbles after the tool block.  Project on a
+            # known set of keys — narrows the blast radius if a future
+            # producer stuffs sensitive fields into the dict.  Mirrors
+            # the ``reminders`` filter above for the same reason.  The
+            # extracted-from-envelope list is the production-realistic
+            # source: ``decorate_history_messages`` populates the
+            # ``advisories`` key only on the REST ``/history`` path, but
+            # ``session.messages`` (the SSE-replay source) never has it.
+            if extracted_advisories:
+                clean_advisories: list[dict[str, Any]] = []
+                for a in extracted_advisories:
+                    if not isinstance(a, dict):
+                        continue
+                    atype = str(a.get("type") or "")
+                    atext = str(a.get("text") or "")
+                    if not atype or not atext:
+                        continue
+                    clean_advisories.append(
+                        {
+                            "type": atype,
+                            "text": atext,
+                            "priority": str(a.get("priority") or "notice"),
+                        }
+                    )
+                if clean_advisories:
+                    entry["advisories"] = clean_advisories
         history.append(entry)
 
     # Propagate denial from tool results to their parent assistant entry.

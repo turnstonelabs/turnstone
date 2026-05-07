@@ -1292,8 +1292,8 @@ Pane.prototype.replayHistory = function (messages) {
         // bug where calling resultTarget.after(node) twice put the
         // second node BETWEEN resultTarget and the first (the second
         // .after call was always relative to the same anchor).
-        // Resulting order with all three present:
-        //   [tool div][output][truncation pill][output-warning]
+        // Resulting order with all present:
+        //   [tool div][output][output-warning]
         var insertCursor = resultTarget;
         var insertChained = function (node) {
           if (insertCursor) {
@@ -1315,17 +1315,6 @@ Pane.prototype.replayHistory = function (messages) {
               makeCollapsible(out);
             }
             insertChained(out);
-          }
-          // Truncation pill — server marks this when the stored row
-          // hit the 2000-char cap.  Live tool_result events carry full
-          // output so they don't need the indicator.
-          if (msg.truncated) {
-            var pill = document.createElement("span");
-            pill.className = "tool-output-truncated";
-            pill.textContent = "… truncated in storage";
-            pill.title =
-              "The full tool output was sent to the model live; only the first 10000 characters are persisted to the conversation row.";
-            insertChained(pill);
           }
         }
         if (isToolError && !lastToolBlock.classList.contains("denied")) {
@@ -1353,6 +1342,20 @@ Pane.prototype.replayHistory = function (messages) {
       if (Array.isArray(msg.reminders) && msg.reminders.length) {
         this.addToolReminder(msg.reminders, "");
       }
+      // Queued user messages spliced into the last tool-result envelope
+      // (Seam 1) replay as proper user bubbles after the tool block.
+      // ``decorate_history_messages`` extracts the user_interjection
+      // advisory from the persisted envelope and the wire layer projects
+      // it onto ``msg.advisories``; rendering through ``addUserMessage``
+      // matches the live shape a Seam 2/3 message would produce.  The
+      // walk/filter is shared via ``replayAdvisoriesAfterTool`` in
+      // ``shared/utils.js`` so coord and interactive can never drift on
+      // advisory-shape filtering.
+      var self = this;
+      replayAdvisoriesAfterTool(msg.advisories, function (text) {
+        self.addUserMessage(text, null);
+        lastToolBlock = null;
+      });
     }
   }
   // Flush any output_assessments left in the map — these correspond

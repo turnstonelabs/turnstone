@@ -70,3 +70,22 @@ function cssEscape(s) {
   }
   return str.replace(/["\\]/g, "\\$&");
 }
+
+// Replay the ``advisories`` array attached to a tool history message.
+// Queued user messages spliced into the last tool-result envelope of
+// a batch (Seam 1) persist on the tool DB row as a wrapped
+// ``<tool_output>`` envelope; the wire layer projects them onto
+// ``msg.advisories``.  Both interactive's ``replayHistory`` and the
+// coord history loop walk the array, filter on ``user_interjection``,
+// and route ``adv.text`` through their own renderer (interactive uses
+// ``addUserMessage``; coord uses ``appendUserMessageWithAttachments``).
+// This shared helper centralises the walk + filter so a future
+// advisory shape change lands once.
+function replayAdvisoriesAfterTool(advisories, renderUserText) {
+  if (!Array.isArray(advisories) || !advisories.length) return;
+  for (var ai = 0; ai < advisories.length; ai++) {
+    var adv = advisories[ai];
+    if (!adv || adv.type !== "user_interjection") continue;
+    renderUserText(adv.text || "");
+  }
+}

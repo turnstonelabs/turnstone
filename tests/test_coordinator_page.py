@@ -302,3 +302,43 @@ def test_coordinator_js_handle_child_state_no_longer_reads_sse_pending_approval_
         "cycles) — without this, the second bulk-poll after an SSE "
         "transition silently clobbers."
     )
+
+
+def test_coord_history_renders_user_interjection_advisory_after_tool_block():
+    """Queued user messages spliced into the last tool-result envelope
+    of a batch (Seam 1) persist on the tool DB row as a wrapped
+    ``<tool_output>`` envelope.  ``decorate_history_messages`` extracts
+    the advisory back out and the wire layer projects it onto
+    ``m.advisories``; the coord history loop must invoke the shared
+    ``replayAdvisoriesAfterTool`` helper (defined in
+    ``shared/utils.js``) so each ``user_interjection`` renders through
+    ``appendUserMessageWithAttachments`` and the bubble looks identical
+    to a Seam 2/3 user row.
+
+    This test pins the call site so a refactor that drops the helper
+    invocation regresses the queued-during-batch replay shape silently.
+    Mirrors ``test_app_js.py``'s same-shape pin on interactive's
+    ``replayHistory``."""
+    import re
+    from pathlib import Path
+
+    coord_js = Path(__file__).resolve().parent.parent / (
+        "turnstone/console/static/coordinator/coordinator.js"
+    )
+    body = coord_js.read_text(encoding="utf-8")
+
+    assert "replayAdvisoriesAfterTool(m.advisories" in body, (
+        "Coord history loop must invoke replayAdvisoriesAfterTool with "
+        "m.advisories so queued messages spliced into the tool envelope "
+        "render as user bubbles after the tool block."
+    )
+    # The renderer callback routes through appendUserMessageWithAttachments
+    # so the bubble matches a normal user-row replay.
+    assert re.search(
+        r"appendUserMessageWithAttachments\(\s*text",
+        body,
+    ), (
+        "Coord history loop's renderer callback must route the extracted "
+        "advisory text through appendUserMessageWithAttachments so the "
+        "rendered bubble matches a normal user-row replay."
+    )

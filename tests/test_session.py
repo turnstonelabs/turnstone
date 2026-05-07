@@ -86,6 +86,48 @@ def _make_session(
     return ChatSession(**defaults)
 
 
+@contextlib.contextmanager
+def _send_with_mocks(session, responses, mock_execute, **extra_patches):
+    """Stand up the mock context that the queued-message ``send()`` tests share.
+
+    Six tests in ``TestMetacognitiveBuffers`` previously inlined the
+    same nine ``patch.object`` / ``patch`` declarations.  Extracting
+    the ctxmgr keeps each test focused on its scenario (responses +
+    execute behaviour + assertions) rather than re-asserting the
+    common mock surface.
+
+    Yields the ``save_message`` MagicMock so callers that need to
+    assert on persistence can ``... as save_msg`` over the helper.
+    Extra per-test patches (e.g. wrapping ``_collect_advisories``) ride
+    via ``**extra_patches`` — keyword name maps to attribute on the
+    session, value is the ``side_effect`` to inject.
+    """
+    from unittest.mock import patch as _patch
+
+    def mock_stream(_msgs):
+        return iter([])
+
+    def mock_response(_stream, _gen):
+        return responses.pop(0)
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            _patch.object(session, "_create_stream_with_retry", side_effect=mock_stream)
+        )
+        stack.enter_context(_patch.object(session, "_stream_response", side_effect=mock_response))
+        stack.enter_context(_patch.object(session, "_execute_tools", side_effect=mock_execute))
+        for attr, side_effect in extra_patches.items():
+            stack.enter_context(_patch.object(session, attr, side_effect=side_effect))
+        stack.enter_context(_patch.object(session, "_full_messages", return_value=[]))
+        stack.enter_context(_patch.object(session, "_update_token_table"))
+        stack.enter_context(_patch.object(session, "_print_status_line"))
+        stack.enter_context(_patch.object(session, "_emit_state"))
+        stack.enter_context(_patch.object(session, "_visible_memory_count", return_value=0))
+        stack.enter_context(_patch.object(session, "_apply_post_execute_advisories"))
+        save_msg = stack.enter_context(_patch("turnstone.core.session.save_message"))
+        yield save_msg
+
+
 def _user_pending(session) -> list[tuple[str, str]]:
     """Return user-channel queued nudges as ``(type, text)`` tuples.
 
@@ -2127,50 +2169,73 @@ class TestMetacognitiveBuffers:
         assert metacog == []
         assert len(_tool_pending(session)) == 1
 
-    def test_collect_advisories_does_not_drain_queued_messages(self, tmp_db):
-        """Queued user messages are NOT drained inside the tool result
-        envelope — they're appended as a separate user turn after the
-        full batch completes (see the ``_flush_queued_messages`` call
-        in ``send`` after the tool-result loop).  The pre-fix shape
-        wrapped them as ``UserInterjection`` advisories that rode
-        inside ``wrap_tool_result``; the model saw them inline but no
-        user row landed in storage, so the optimistic queued bubble
-        vanished on page reload (and on cross-tab replay).
+    def test_collect_advisories_drains_queued_messages_on_last_result(self, tmp_db):
+        """Queued user messages drain into a ``UserInterjection``
+        persistent advisory on the LAST result of a batch (Seam 1 in
+        the queued-message architecture).  The wrapped tool-result
+        envelope persists on the tool row; replay extracts the
+        advisory back via ``decorate_history_messages``.
 
-        Persistent + metacog drains still happen here for the output
-        guard finding and tool-channel nudges; only the queued-message
-        drain moved out.
+        Splice-on-last-result mirrors the metacognitive tool-channel
+        drain — single envelope per batch, no duplication across N
+        tool results.  The queue is cleared so the next-turn flow
+        doesn't double-deliver.
         """
+        from turnstone.core.tool_advisory import UserInterjection
+
         session = _make_session()
         pre_count = len(session.messages)
         session.queue_message("hows it going?", queue_msg_id="q1")
         persistent, metacog = session._collect_advisories(
             assessment=None, func_name="bash", is_last_in_batch=True
         )
-        # Neither list carries the queued message anymore.
         assert metacog == []
-        assert persistent == []
-        # Queue still holds the message — it'll drain via
-        # ``_flush_queued_messages`` after the tool batch finishes.
-        assert "q1" in session._queued_messages
-        # No separate user turn appended yet (that happens post-batch).
+        assert len(persistent) == 1
+        adv = persistent[0]
+        assert isinstance(adv, UserInterjection)
+        assert adv.message == "hows it going?"
+        assert adv.priority == "notice"
+        # Queue cleared by the drain.
+        assert session._queued_messages == {}
+        # No separate user turn appended (the splice rides inside the
+        # tool envelope and persists via the wrapped DB row).
         assert len(session.messages) == pre_count
 
-    def test_queued_message_persists_as_user_row_after_tool_batch(self, tmp_db):
-        """A queued message arriving during a tool batch lands in
-        ``self.messages`` as a separate user turn after the batch
-        completes — and gets persisted to storage so a reconnect /
-        page-reload sees the bubble survive.
+    def test_collect_advisories_does_not_drain_queued_when_not_last(self, tmp_db):
+        """Mid-batch results must NOT splice the queued message — the
+        drain is bound to the last result so a parallel fan-out doesn't
+        paint the same advisory N times.  Queue stays intact until the
+        last result fires (or until cancel/exception/no-tool-call paths
+        flush it as Seams 2/3)."""
+        session = _make_session()
+        session.queue_message("hows it going?", queue_msg_id="q1")
+        persistent, metacog = session._collect_advisories(
+            assessment=None, func_name="bash", is_last_in_batch=False
+        )
+        assert persistent == []
+        assert metacog == []
+        # Queue intact — the next call (with is_last_in_batch=True)
+        # will drain it.
+        assert "q1" in session._queued_messages
 
-        Pre-fix shape wrapped the queue into ``wrap_tool_result``'s
-        ``<system-reminder>`` envelope; the model saw the text but no
-        user row was written, so reconnecting tabs lost the bubble.
+    def test_queued_message_persists_as_user_row_after_tool_batch(self, tmp_db):
+        """A queued message arriving during a tool batch rides as a
+        ``UserInterjection`` advisory spliced into the LAST tool result
+        envelope (Seam 1).  The wrapped ``<tool_output>`` envelope
+        persists on the tool DB row; replay's
+        ``decorate_history_messages`` extracts the advisory back as a
+        wire-shape user bubble that survives reconnect / page reload.
+
+        Asserts:
+        - Last tool message in ``session.messages`` carries the
+          ``<system-reminder>`` envelope containing the queued text.
+        - No extra user row landed between the tool batch and the next
+          assistant (role sequence stays ``assistant -> tool``).
+        - ``save_message`` was called for the tool row with the
+          WRAPPED envelope as its content (DB↔memory symmetry).
+        - Queue cleared post-batch.
         """
         session = _make_session()
-        # Two-iteration stream: first call returns tool_calls (drives
-        # the batch path); second call has a queued message arriving
-        # in between (the post-batch drain seam).  Third call returns
-        # no tool_calls, ending the loop.
         responses = [
             {
                 "role": "assistant",
@@ -2185,59 +2250,400 @@ class TestMetacognitiveBuffers:
             },
             {"role": "assistant", "content": "ack"},
         ]
-        stream_idx = 0
-
-        def mock_stream(_msgs):
-            nonlocal stream_idx
-            stream_idx += 1
-            return iter([])
-
-        def mock_response(_stream, _gen):
-            return responses.pop(0)
 
         def mock_execute(_tool_calls):
+            # Queue arrives DURING the tool batch — Seam 1 fires on
+            # the last result of the batch.
             session.queue_message("typed during tool", queue_msg_id="q1")
             return [("call_x", "ok")], None
 
-        with (
-            patch.object(session, "_create_stream_with_retry", side_effect=mock_stream),
-            patch.object(session, "_stream_response", side_effect=mock_response),
-            patch.object(session, "_execute_tools", side_effect=mock_execute),
-            patch.object(session, "_full_messages", return_value=[]),
-            patch.object(session, "_update_token_table"),
-            patch.object(session, "_print_status_line"),
-            patch.object(session, "_emit_state"),
-            patch.object(session, "_visible_memory_count", return_value=0),
-            patch.object(session, "_apply_post_execute_advisories"),
-            patch("turnstone.core.session.save_message") as save_msg,
+        with _send_with_mocks(session, responses, mock_execute) as save_msg:
+            session._title_generated = True
+            session.send("first")
+
+        # Role sequence: user(first) -> assistant(tool_calls) ->
+        # tool(call_x with envelope) -> assistant(ack).  No extra
+        # trailing user row from a post-batch flush — Seam 1 splice
+        # is the only delivery path for the queued text.
+        roles = [m.get("role") for m in session.messages]
+        assert roles == ["user", "assistant", "tool", "assistant"], (
+            f"expected user->assistant->tool->assistant, got {roles!r}"
+        )
+        # Last tool message carries the spliced advisory.
+        tool_msg = session.messages[2]
+        tool_content = tool_msg["content"]
+        assert isinstance(tool_content, str)
+        assert "<system-reminder>" in tool_content
+        assert "typed during tool" in tool_content
+        assert tool_content.startswith("<tool_output>\n")
+        # The DB save for the tool row carried the WRAPPED envelope —
+        # storage matches in-memory shape, so replay extraction is
+        # complete and lossless.
+        tool_saves = [
+            c for c in save_msg.call_args_list if len(c.args) >= 3 and c.args[1] == "tool"
+        ]
+        assert len(tool_saves) == 1
+        saved_text = tool_saves[0].args[2]
+        assert "<system-reminder>" in saved_text
+        assert "typed during tool" in saved_text
+        # Queue empty after drain.
+        assert session._queued_messages == {}
+
+    def test_user_feedback_only_creates_single_user_row_via_flush(self, tmp_db):
+        """When ``_execute_tools`` returns a non-empty ``user_feedback``
+        and the queue is empty, the post-batch flush still produces
+        exactly one trailing user row (the feedback alone).  Seam 2 in
+        the queued-message architecture: flush absorbs the feedback as
+        a prefix-only call."""
+        session = _make_session()
+        responses = [
+            {
+                "role": "assistant",
+                "content": "calling",
+                "tool_calls": [
+                    {
+                        "id": "call_x",
+                        "type": "function",
+                        "function": {"name": "echo", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "ack"},
+        ]
+
+        def mock_execute(_tool_calls):
+            return [("call_x", "ok")], "y, use full path"
+
+        with _send_with_mocks(session, responses, mock_execute) as save_msg:
+            session._title_generated = True
+            session.send("first")
+
+        roles = [m.get("role") for m in session.messages]
+        # Single trailing user row carrying the feedback before the
+        # final assistant ack.
+        assert roles == ["user", "assistant", "tool", "user", "assistant"], (
+            f"expected feedback-as-user-row sequence, got {roles!r}"
+        )
+        assert session.messages[3]["content"] == "y, use full path"
+        # Persisted via _append_user_turn -> save_message("user", ...).
+        user_saves = [
+            c for c in save_msg.call_args_list if len(c.args) >= 3 and c.args[1] == "user"
+        ]
+        assert any(c.args[2] == "y, use full path" for c in user_saves), (
+            f"feedback must persist as a user row; saw: {user_saves!r}"
+        )
+
+    def test_user_feedback_and_queued_coexistence_single_row_with_prefix(self, tmp_db):
+        """Seam 1 + Seam 2 coexistence — a queued message that lands
+        AFTER ``_collect_advisories`` already drained the queue for
+        the last tool result (Seam 1 closed) but BEFORE
+        ``_flush_queued_messages`` ran (Seam 2).  In production this
+        race is operator-typing during the approval prompt narrowly
+        crossing the boundary; here we simulate it by wrapping
+        ``_collect_advisories`` with a pass-through that queues a
+        new message AFTER the original returned.
+
+        The queued text rides Seam 2's flush as the suffix of a
+        single trailing user row, with ``user_feedback`` as the
+        prefix.  Crucially: NO back-to-back user rows (the strict-
+        template hazard the prefix-merge logic was added to fix).
+        Reverting the prefix-merge in ``_flush_queued_messages``
+        breaks this test."""
+        session = _make_session()
+        responses = [
+            {
+                "role": "assistant",
+                "content": "calling",
+                "tool_calls": [
+                    {
+                        "id": "call_x",
+                        "type": "function",
+                        "function": {"name": "echo", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "ack"},
+        ]
+
+        def mock_execute(_tool_calls):
+            return [("call_x", "ok")], "y, use full path"
+
+        # Wrap _collect_advisories so we can queue a message AFTER
+        # the original ran (Seam 1 already closed for this batch).
+        # The next stop in the call chain is _flush_queued_messages
+        # — which is Seam 2 and must fold the late arrival in
+        # alongside user_feedback.
+        original_collect = session._collect_advisories
+
+        def collect_then_queue_late(*args, **kwargs):
+            persistent, metacog = original_collect(*args, **kwargs)
+            # Only queue once, AFTER the last-in-batch drain ran so
+            # the queue is genuinely empty when we fill it.
+            if kwargs.get("is_last_in_batch") or (len(args) >= 3 and args[2]):
+                session.queue_message("late arrival", queue_msg_id="q-late")
+            return persistent, metacog
+
+        with _send_with_mocks(
+            session,
+            responses,
+            mock_execute,
+            _collect_advisories=collect_then_queue_late,
         ):
             session._title_generated = True
             session.send("first")
 
-        # The queued user message landed in self.messages as a user
-        # turn after the tool result.
         roles = [m.get("role") for m in session.messages]
-        # Expect: user(first) → assistant(tool_calls) → tool(call_x)
-        # → user(typed during tool) → assistant(ack)
-        assert roles[-2] == "user", f"expected user before final assistant, got {roles!r}"
-        assert "typed during tool" in str(session.messages[-2].get("content", ""))
-        # And persisted: at least one save_message call carried "user"
-        # role with the queued text.
-        user_saves = [
-            c for c in save_msg.call_args_list if len(c.args) >= 3 and c.args[1] == "user"
-        ]
-        assert any("typed during tool" in str(c.args[2]) for c in user_saves), (
-            f"queued message must be persisted as a user row; saw: {user_saves!r}"
+        # NO back-to-back user rows.  Pre-fix the user_feedback
+        # appended a separate user row and the queue drained another:
+        # roles == [..., "user", "user", ...] which broke strict
+        # vLLM-template providers (Mistral / Llama).
+        for i in range(1, len(roles)):
+            assert not (roles[i] == "user" and roles[i - 1] == "user"), (
+                f"back-to-back user rows at idx {i - 1}/{i} in {roles!r}"
+            )
+        # Single trailing user row containing prefix + queued.
+        assert roles == ["user", "assistant", "tool", "user", "assistant"], (
+            f"expected single-trailing-user shape, got {roles!r}"
         )
-        # Queue is empty after drain.
+        flushed_content = session.messages[3]["content"]
+        # The two pieces are joined by the canonical separator.
+        assert flushed_content == "y, use full path\n\nlate arrival"
+        # Queue cleared.
         assert session._queued_messages == {}
-        # Two model turns: one for the tool-call iteration, one for the
-        # follow-up after the post-batch flush appended the queued user
-        # row.  Without the second stream the model would never see /
-        # respond to the queued message — pinning this guards against a
-        # future regression where the post-batch flush runs but the
-        # send-loop short-circuits before the next iteration.
-        assert stream_idx == 2, f"expected 2 stream calls (tool-iter + follow-up), got {stream_idx}"
+
+    def test_flush_queued_messages_with_prefix_only(self, tmp_db):
+        """Empty queue + non-empty prefix produces one user row
+        carrying the prefix verbatim.  Returns True so the caller
+        knows a turn was appended."""
+        session = _make_session()
+        pre_count = len(session.messages)
+        appended = session._flush_queued_messages(prefix="hello")
+        assert appended is True
+        assert len(session.messages) == pre_count + 1
+        last = session.messages[-1]
+        assert last["role"] == "user"
+        assert last["content"] == "hello"
+
+    def test_flush_queued_messages_with_prefix_and_items(self, tmp_db):
+        """Both prefix and queued items produce ONE user row joining
+        prefix + items with the canonical ``\\n\\n`` separator.  Queue
+        is cleared on drain so a re-entry doesn't double-deliver."""
+        session = _make_session()
+        session.queue_message("a", queue_msg_id="q-a")
+        session.queue_message("b", queue_msg_id="q-b")
+        appended = session._flush_queued_messages(prefix="approve")
+        assert appended is True
+        last = session.messages[-1]
+        assert last["role"] == "user"
+        assert last["content"] == "approve\n\na\n\nb"
+        assert session._queued_messages == {}
+
+    def test_tool_db_row_stores_wrapped_output_when_advisories_present(self, tmp_db):
+        """A tool row whose batch produced a ``UserInterjection``
+        advisory persists the WRAPPED envelope to storage, not the
+        bare raw output.  Symmetry between
+        ``self.messages[i]['content']`` and the DB row is what makes
+        replay's envelope-extraction lossless."""
+        session = _make_session()
+        responses = [
+            {
+                "role": "assistant",
+                "content": "calling",
+                "tool_calls": [
+                    {
+                        "id": "call_x",
+                        "type": "function",
+                        "function": {"name": "echo", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "ack"},
+        ]
+
+        def mock_execute(_tool_calls):
+            session.queue_message("during", queue_msg_id="q-d")
+            return [("call_x", "raw output")], None
+
+        with _send_with_mocks(session, responses, mock_execute) as save_msg:
+            session._title_generated = True
+            session.send("first")
+
+        tool_saves = [
+            c for c in save_msg.call_args_list if len(c.args) >= 3 and c.args[1] == "tool"
+        ]
+        assert len(tool_saves) == 1
+        saved_text = tool_saves[0].args[2]
+        assert saved_text.startswith("<tool_output>\n")
+        assert "<system-reminder>" in saved_text
+        assert "during" in saved_text
+        # And the raw text is still inside the envelope.
+        assert "raw output" in saved_text
+
+    def test_tool_db_row_stores_raw_output_when_no_advisories(self, tmp_db):
+        """When ``_collect_advisories`` returns empty (no guard
+        finding, no queued message), ``wrap_tool_result`` no-ops and
+        the DB row gets the bare raw output — symmetry with
+        ``self.messages[i]['content']`` is preserved without forcing
+        every tool through the envelope path."""
+        session = _make_session()
+        responses = [
+            {
+                "role": "assistant",
+                "content": "calling",
+                "tool_calls": [
+                    {
+                        "id": "call_x",
+                        "type": "function",
+                        "function": {"name": "echo", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "ack"},
+        ]
+
+        def mock_execute(_tool_calls):
+            return [("call_x", "raw output")], None
+
+        with _send_with_mocks(session, responses, mock_execute) as save_msg:
+            session._title_generated = True
+            session.send("first")
+
+        tool_saves = [
+            c for c in save_msg.call_args_list if len(c.args) >= 3 and c.args[1] == "tool"
+        ]
+        assert len(tool_saves) == 1
+        saved_text = tool_saves[0].args[2]
+        # Bare raw output — no envelope at all.
+        assert saved_text == "raw output"
+        assert "<tool_output>" not in saved_text
+        assert "<system-reminder>" not in saved_text
+
+    def test_tool_db_row_stores_wrapped_output_for_list_content(self, tmp_db):
+        """Image / structured tool output (list-typed) projects to a
+        proper envelope-anchored-at-start string in the TEXT column —
+        ``wrap_tool_result(joined_raw_text, advisories)`` rebuilds the
+        envelope from the PRE-wrap text parts so the saved row starts
+        with ``<tool_output>\\n``.  The previous join-of-post-wrap-parts
+        produced a ``<raw> <tool_output>...`` shape that
+        ``extract_advisories_from_tool_envelope``'s ``startswith``
+        prefix check rejected on replay.  Replacing ``raw_output`` with
+        ``output`` (the post-wrap list) in the persistence projection
+        breaks this test."""
+        session = _make_session()
+        responses = [
+            {
+                "role": "assistant",
+                "content": "calling",
+                "tool_calls": [
+                    {
+                        "id": "call_x",
+                        "type": "function",
+                        "function": {"name": "view_image", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "ack"},
+        ]
+
+        def mock_execute(_tool_calls):
+            session.queue_message("about that image", queue_msg_id="q-i")
+            return [
+                (
+                    "call_x",
+                    [
+                        {"type": "text", "text": "raw text part"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,xxx"}},
+                    ],
+                )
+            ], None
+
+        with _send_with_mocks(session, responses, mock_execute) as save_msg:
+            session._title_generated = True
+            session.send("first")
+
+        tool_saves = [
+            c for c in save_msg.call_args_list if len(c.args) >= 3 and c.args[1] == "tool"
+        ]
+        assert len(tool_saves) == 1
+        saved_text = tool_saves[0].args[2]
+        # Envelope anchored at the start so replay's ``startswith``
+        # prefix check matches and extracts the advisory cleanly.
+        assert saved_text.startswith("<tool_output>\n")
+        assert "raw text part" in saved_text
+        assert "<system-reminder>" in saved_text
+        assert "about that image" in saved_text
+
+    def test_tool_db_row_round_trips_list_output_with_advisories(self, tmp_db):
+        """Round-trip the persistence projection for list-typed output:
+        the saved string must extract back to the original raw text
+        plus the user_interjection advisory — same contract the string
+        case satisfies via the symmetry between
+        ``self.messages[i]['content']`` and the DB row.
+
+        Replacing the persistence projection's
+        ``wrap_tool_result(raw_text, persistent_advisories)`` with the
+        previous join-of-post-wrap-parts shape produces a string that
+        does NOT start with ``<tool_output>\\n``;
+        ``extract_advisories_from_tool_envelope`` returns ``None`` and
+        the raw envelope XML leaks into the rendered tool bubble on
+        replay.  This test fails in that broken-shape branch."""
+        from turnstone.core.history_decoration import (
+            extract_advisories_from_tool_envelope,
+        )
+
+        session = _make_session()
+        responses = [
+            {
+                "role": "assistant",
+                "content": "calling",
+                "tool_calls": [
+                    {
+                        "id": "call_x",
+                        "type": "function",
+                        "function": {"name": "view_image", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "ack"},
+        ]
+
+        def mock_execute(_tool_calls):
+            session.queue_message("inspect the histogram", queue_msg_id="q-i")
+            return [
+                (
+                    "call_x",
+                    [
+                        {"type": "text", "text": "the chart shows X"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,xxx"}},
+                    ],
+                )
+            ], None
+
+        with _send_with_mocks(session, responses, mock_execute) as save_msg:
+            session._title_generated = True
+            session.send("first")
+
+        tool_saves = [
+            c for c in save_msg.call_args_list if len(c.args) >= 3 and c.args[1] == "tool"
+        ]
+        assert len(tool_saves) == 1
+        saved_text = tool_saves[0].args[2]
+        # Saved row is anchored on the envelope prefix replay's
+        # extractor checks for.
+        assert saved_text.startswith("<tool_output>\n")
+        # And the extractor recovers the cleaned text + the queued-
+        # message advisory it carried.
+        result = extract_advisories_from_tool_envelope(saved_text)
+        assert result is not None
+        cleaned, advisories = result
+        assert cleaned == "the chart shows X"
+        assert advisories == [
+            {
+                "type": "user_interjection",
+                "text": "inspect the histogram",
+                "priority": "notice",
+            }
+        ]
 
     def test_start_nudge_fires_through_send(self, tmp_db):
         """Pin the +1 count-shift invariant — `start` must still fire on the
@@ -2821,6 +3227,112 @@ class TestApplyRemindersForProvider:
         }
         session._apply_reminders_for_provider([msg])
         assert msg["_reminders"] == [{"type": "correction", "text": "WATCH"}]
+
+    def test_apply_reminders_preserves_existing_wrapper_envelope(self, tmp_db):
+        """A tool message whose ``content`` already carries a
+        ``<tool_output>`` envelope (queued-message ``UserInterjection``
+        spliced via ``wrap_tool_result`` on Seam 1, or a pre-existing
+        output_guard advisory) must not be entity-encoded by the
+        provider splice — the wrapper has already escaped the raw body
+        and re-escaping would turn the envelope's literal
+        ``<tool_output>`` and ``<system-reminder>`` tags into
+        ``&lt;tool_output&gt;...`` so the model sees mangled text
+        instead of a parseable envelope.
+
+        Removing the ``content.startswith("<tool_output>\\n")``
+        wrapper-detection branch in ``_apply_reminders_for_provider``
+        (so the splice always re-escapes) breaks this test."""
+        from turnstone.core.tool_advisory import UserInterjection, wrap_tool_result
+
+        session = _make_session()
+        wrapped = wrap_tool_result(
+            "raw body",
+            [UserInterjection(message="check logs", priority="notice")],
+        )
+        msg = {
+            "role": "tool",
+            "tool_call_id": "call_a",
+            "content": wrapped,
+            "_reminders": [{"type": "tool_error", "text": "retry suggestion"}],
+        }
+        out = session._apply_reminders_for_provider([msg])
+        wire = out[0]["content"]
+        assert isinstance(wire, str)
+        # Envelope still anchored at the start — replay's prefix check
+        # would still match this projection.
+        assert wire.startswith("<tool_output>\n")
+        # The original envelope's literal tags survive (NOT entity-
+        # encoded).  ``<system-reminder>`` should appear at least
+        # twice: once for the queued-message advisory inside the
+        # original envelope, once for the freshly appended tool_error
+        # block.
+        assert wire.count("<system-reminder>") >= 2
+        assert wire.count("</system-reminder>") >= 2
+        # The wrapper's literal tags must NOT have been entity-encoded
+        # by escape_wrapper_tags.
+        assert "&lt;tool_output&gt;" not in wire
+        assert "&lt;system-reminder&gt;" not in wire
+        # Both the original advisory body and the appended reminder
+        # text are present.
+        assert "check logs" in wire
+        assert "retry suggestion" in wire
+
+    def test_apply_reminders_preserves_wrapper_envelope_in_list_text_part(self, tmp_db):
+        """Parallel of the string-content case for list-typed tool
+        output (image / structured MCP results).  The Seam 1 splice
+        for list content appends the wrap envelope as a separate
+        text part (see ``session.py`` tool-result loop where
+        ``wrap_tool_result("", advisories)`` lands as
+        ``{"type": "text", "text": <envelope>}``).  When the same
+        message also carries ``_reminders``, the per-text-part
+        ``escape_wrapper_tags`` loop in ``_apply_reminders_for_provider``
+        must skip parts whose text already starts with
+        ``<tool_output>\\n`` — re-escaping would mangle the
+        envelope's literal tags so the model sees opaque entity-
+        encoded text instead of a parseable envelope.
+
+        Removing the ``text.startswith("<tool_output>\\n")`` skip in
+        the list-branch escape loop breaks this test."""
+        from turnstone.core.tool_advisory import UserInterjection, wrap_tool_result
+
+        session = _make_session()
+        wrap_text = wrap_tool_result(
+            "",
+            [UserInterjection(message="check logs", priority="notice")],
+        )
+        msg = {
+            "role": "tool",
+            "tool_call_id": "call_a",
+            "content": [
+                {"type": "text", "text": "the chart shows X"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,xxx"}},
+                {"type": "text", "text": wrap_text},
+            ],
+            "_reminders": [{"type": "tool_error", "text": "retry suggestion"}],
+        }
+        out = session._apply_reminders_for_provider([msg])
+        wire_parts = out[0]["content"]
+        assert isinstance(wire_parts, list)
+        # The wrap text-part must survive intact — its literal
+        # ``<tool_output>`` and ``<system-reminder>`` tags are
+        # not entity-encoded.
+        wrap_part_text = next(
+            p["text"]
+            for p in wire_parts
+            if isinstance(p, dict)
+            and p.get("type") == "text"
+            and p.get("text", "").startswith("<tool_output>\n")
+        )
+        assert "&lt;tool_output&gt;" not in wrap_part_text
+        assert "&lt;system-reminder&gt;" not in wrap_part_text
+        assert "check logs" in wrap_part_text
+        # The non-envelope text part WAS escape-walked (it contains
+        # no wrapper-tag literals so the escape is a no-op, but the
+        # appended reminder block lands here per the existing
+        # contract).
+        last_text = wire_parts[-1]
+        assert isinstance(last_text, dict) and last_text.get("type") == "text"
+        assert "retry suggestion" in last_text.get("text", "")
 
 
 class TestMarkRemindersDelivered:
