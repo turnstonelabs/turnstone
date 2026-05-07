@@ -4198,13 +4198,19 @@ def _bootstrap_coord_subsystem(
     # Pre-compute config-derived integers BEFORE any thread starts so a
     # missing / non-numeric setting raises here rather than after
     # ``StateWriter.start()`` has spawned a daemon we can't easily roll
-    # back on the runtime-bootstrap retry path.
+    # back.
     max_active = int(config_store.get("coordinator.max_active"))
     try:
         idle_minutes = int(config_store.get("server.workstream_idle_timeout"))
     except Exception:
         idle_minutes = 0
 
+    # Build phase: construct everything as locals.  No ``app.state``
+    # writes here so a concurrent dashboard request running through
+    # :func:`_require_coord_mgr` cannot observe a partially-wired
+    # subsystem (``coord_mgr`` set without ``coord_registry`` would
+    # otherwise surface a misleading "Restart the console" 503 during
+    # the bootstrap window).
     coord_factory = build_console_session_factory(
         registry=coord_registry,
         config_store=config_store,
@@ -4217,14 +4223,6 @@ def _bootstrap_coord_subsystem(
         session_factory=coord_factory,
     )
     coord_state_writer = StateWriter(storage)
-    coord_state_writer.start()
-    # Stamp the StateWriter immediately after start so a failure between
-    # here and the final commit (e.g. SessionManager validation) leaves
-    # the daemon thread reachable from ``app.state`` for
-    # :func:`_teardown_partial_coord_subsystem` to shut down on the
-    # runtime-bootstrap retry path.  Without this, every retry would
-    # leak a fresh state-writer thread.
-    app.state.coord_state_writer = coord_state_writer
     coord_mgr = SessionManager(
         coord_adapter,
         storage=storage,
@@ -4244,8 +4242,94 @@ def _bootstrap_coord_subsystem(
     # ``_rebuild_children_registry`` / ``send`` / fan-out dispatch can
     # call ``mgr.get(ws_id)``.
     coord_adapter.attach(coord_mgr)
-    app.state.coord_mgr = coord_mgr
+    coord_idle_observer = CoordinatorIdleObserver(coord_mgr, storage)
+    cleanup_thread: threading.Thread | None = None
+
+    # Side-effect phase: start threads + register subscriptions.  Any
+    # failure here rolls back via locally-held handles BEFORE the
+    # exception propagates — no dangling daemons, no stale class attrs
+    # on ``ConsoleCoordinatorUI``, no leftover watchers in
+    # ``app.state._idle_nudge_watchers``.
+    try:
+        coord_state_writer.start()
+        # Coord-side observer: when a coord goes IDLE with active
+        # children still running, enqueues an idle_children nudge.
+        # MUST register BEFORE the IdleNudgeWatcher so subscriber-fire
+        # order on the same IDLE event has the observer enqueueing
+        # first, then the watcher peeking.
+        coord_idle_observer.start()
+        # Idle wake-trigger for coords.  Subscribes to coord IDLE
+        # transitions and dispatches a synthetic empty-user-turn send
+        # when the coord's NudgeQueue is non-empty.
+        install_idle_nudge_watcher(app, coord_mgr)
+        # Wire the cluster-event subscription so the coordinator's SSE
+        # stream fans out filtered child_ws_* events.  Safe to call
+        # even when the collector has no nodes yet — the subscription
+        # just sits idle until the first node event.  Inner failure
+        # only loses fan-out (a degraded-but-functional state); we
+        # log + continue rather than abort the whole bootstrap.
+        try:
+            coord_adapter.start_child_event_fanout(app.state.collector)
+        except Exception:
+            log.warning("console.coordinator_child_fanout_init_failed", exc_info=True)
+        # Idle cleanup: closes loaded-but-stale coords AND DB orphans
+        # left behind by prior console processes.  The thread runs an
+        # initial sweep on entry (no synchronous lifespan call needed
+        # — see ``_coord_idle_cleanup_thread``) so cold-start cleanup
+        # doesn't block startup.  Reuses the regular-server
+        # ``server.workstream_idle_timeout`` setting — same cadence
+        # makes sense for both kinds and avoids a redundant config
+        # knob.
+        if idle_minutes > 0:
+            timeout_sec = float(idle_minutes * 60)
+            cleanup_thread = threading.Thread(
+                target=_coord_idle_cleanup_thread,
+                args=(coord_mgr, timeout_sec),
+                name="coord-idle-cleanup",
+                daemon=True,
+            )
+            cleanup_thread.start()
+    except Exception:
+        # Roll back partial side-effects from locals (no app.state
+        # writes have happened yet, so the cleanup is local-ref-driven).
+        # Each shutdown is independently try-wrapped so one failure
+        # doesn't block the next; the whole rollback is best-effort.
+        from turnstone.core.idle_nudge_watcher import shutdown_idle_nudge_watchers
+
+        try:
+            coord_state_writer.shutdown(timeout=2.0)
+        except Exception:
+            log.warning("console.coord_bootstrap_rollback_state_writer_failed", exc_info=True)
+        try:
+            coord_idle_observer.shutdown()
+        except Exception:
+            log.warning("console.coord_bootstrap_rollback_idle_observer_failed", exc_info=True)
+        try:
+            coord_adapter.shutdown()
+        except Exception:
+            log.warning("console.coord_bootstrap_rollback_adapter_failed", exc_info=True)
+        try:
+            shutdown_idle_nudge_watchers(app)
+        except Exception:
+            log.warning("console.coord_bootstrap_rollback_idle_nudge_failed", exc_info=True)
+        # cleanup_thread is the last side-effect started; if it ran
+        # successfully, the surrounding try block had already exited
+        # successfully — so a partial-failure path will not have a
+        # cleanup_thread to roll back.  No-op for symmetry.
+        raise
+
+    # Atomic commit phase: stamp ``app.state`` and class attrs.  Order
+    # matters — :func:`_require_coord_mgr` reads ``coord_mgr`` first
+    # and only then reads ``coord_registry``, so ``coord_registry``
+    # MUST land BEFORE ``coord_mgr``.  Under CPython's GIL each
+    # individual ``setattr`` is atomic and ordering is preserved, so
+    # any concurrent reader observing a populated ``coord_mgr`` is
+    # guaranteed to see all the prior commits including the registry.
+    app.state.coord_state_writer = coord_state_writer
     app.state.coord_adapter = coord_adapter
+    app.state.coord_idle_observer = coord_idle_observer
+    if cleanup_thread is not None:
+        app.state.coord_idle_cleanup_thread = cleanup_thread
     # Shared refs so ConsoleCoordinatorUI.on_state_change flows state
     # transitions through the unified manager, on_rename fans out to
     # the cluster dashboard, and _record_judge_metric /
@@ -4254,68 +4338,69 @@ def _bootstrap_coord_subsystem(
     ConsoleCoordinatorUI._coord_mgr = coord_mgr
     ConsoleCoordinatorUI._collector = app.state.collector
     ConsoleCoordinatorUI._console_metrics = app.state.console_metrics
-    # Coord-side observer: when a coord goes IDLE with active children
-    # still running, enqueues an idle_children nudge.  MUST register
-    # BEFORE the IdleNudgeWatcher so subscriber-fire order on the same
-    # IDLE event has the observer enqueueing first, then the watcher
-    # peeking.
-    coord_idle_observer = CoordinatorIdleObserver(coord_mgr, storage)
-    coord_idle_observer.start()
-    app.state.coord_idle_observer = coord_idle_observer
-    # Idle wake-trigger for coords.  Subscribes to coord IDLE
-    # transitions and dispatches a synthetic empty-user-turn send when
-    # the coord's NudgeQueue is non-empty.
-    install_idle_nudge_watcher(app, coord_mgr)
-    # Wire the cluster-event subscription so the coordinator's SSE
-    # stream fans out filtered child_ws_* events.  Safe to call even
-    # when the collector has no nodes yet — the subscription just sits
-    # idle until the first node event.
-    try:
-        coord_adapter.start_child_event_fanout(app.state.collector)
-    except Exception:
-        log.warning("console.coordinator_child_fanout_init_failed", exc_info=True)
-    # Idle cleanup: closes loaded-but-stale coords AND DB orphans left
-    # behind by prior console processes.  The thread runs an initial
-    # sweep on entry (no synchronous lifespan call needed — see
-    # ``_coord_idle_cleanup_thread``) so cold-start cleanup doesn't
-    # block startup.  Reuses the regular-server
-    # ``server.workstream_idle_timeout`` setting — the same cadence
-    # makes sense for both kinds and avoids a redundant config knob.
-    if idle_minutes > 0:
-        timeout_sec = float(idle_minutes * 60)
-        cleanup_thread = threading.Thread(
-            target=_coord_idle_cleanup_thread,
-            args=(coord_mgr, timeout_sec),
-            name="coord-idle-cleanup",
-            daemon=True,
-        )
-        cleanup_thread.start()
-        app.state.coord_idle_cleanup_thread = cleanup_thread
-    # Final commit: stamp the registry + clear any stale boot-time error
-    # message under the same logical step.  Callers can rely on the
-    # invariant that ``coord_registry`` is set iff ``coord_mgr`` is set,
-    # so a failed bootstrap leaves the same coherent fresh-install state
-    # the lifespan path produces on a registry-load failure.
     app.state.coord_registry = coord_registry
     app.state.coord_registry_error = ""
+    # Final commit — every reader gates on ``coord_mgr is not None``,
+    # so this assignment is the "subsystem ready" signal.
+    app.state.coord_mgr = coord_mgr
     log.info(
         "console.coordinator_mgr_ready max_active=%s",
         max_active,
     )
 
 
+def _load_and_bootstrap_coord_subsystem(app: Starlette, storage: Any, config_store: Any) -> None:
+    """Synchronous lifespan-startup entry point: load the model
+    registry from storage, run :func:`_bootstrap_coord_subsystem` on
+    success, fall back to recording the load error on
+    ``app.state.coord_registry_error`` when the DB has no model rows.
+
+    Wraps the full startup-time bootstrap path so the lifespan can
+    offload it to ``asyncio.to_thread`` — every shutdown call inside
+    the rollback path (notably :meth:`StateWriter.shutdown`, which
+    joins a daemon thread + runs sync DB writes for up to 2 seconds)
+    runs on a worker thread instead of blocking the event loop while
+    the console is still coming up.
+    """
+    from turnstone.core.model_registry import load_model_registry
+
+    try:
+        try:
+            coord_registry = load_model_registry(storage=storage)
+        except ValueError as exc:
+            # No model rows configured.  Endpoint returns 503 with the
+            # error text so admin sees remediation in the UI; the
+            # operator can recover at runtime by adding a model in the
+            # admin panel (see :func:`_maybe_bootstrap_coord_subsystem`).
+            app.state.coord_registry_error = str(exc)
+            return
+        _bootstrap_coord_subsystem(app, storage, config_store, coord_registry)
+    except Exception:
+        log.warning("console.coordinator_init_failed", exc_info=True)
+        # ``_bootstrap_coord_subsystem`` rolls back its own partial
+        # side-effects from locals before re-raising, so this helper
+        # is normally redundant — kept as defence-in-depth in case
+        # future code drift leaves anything stamped on ``app.state``
+        # despite the local-rollback contract.
+        _teardown_partial_coord_subsystem(app)
+
+
 def _teardown_partial_coord_subsystem(app: Any) -> None:
     """Best-effort cleanup of any handles partially stamped on
-    ``app.state`` by a failed :func:`_bootstrap_coord_subsystem` run.
+    ``app.state`` (and the ``ConsoleCoordinatorUI`` class attrs).
 
-    Called from the runtime-bootstrap path's failure branch so a
-    subsequent CRUD retry doesn't spawn a duplicate ``StateWriter``
-    daemon or re-subscribe an observer that was already wired up.
-    Resets ``coord_mgr`` / ``coord_adapter`` / ``coord_registry`` to
-    ``None`` so :func:`_require_coord_mgr` keeps returning 503 with the
-    builder-failure remediation message until the operator retries.
+    Defense-in-depth fallback used by the runtime-bootstrap and
+    lifespan-startup error paths.  ``_bootstrap_coord_subsystem`` rolls
+    back its own partial side-effects from locals before re-raising,
+    so this helper is normally a near-no-op — it exists to catch any
+    state that future code drift might leave on ``app.state`` despite
+    the local-rollback contract, and to ensure ``ConsoleCoordinatorUI``
+    class attrs aren't left pointing at a half-built subsystem (the
+    normal lifespan teardown clears them too, line ~4629).
+
     Idempotent — safe to call when nothing is partially built.
     """
+    from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
     from turnstone.core.idle_nudge_watcher import shutdown_idle_nudge_watchers
 
     state = app.state
@@ -4360,6 +4445,13 @@ def _teardown_partial_coord_subsystem(app: Any) -> None:
     # a partial failure can't have started one.  Clear the attr defensively
     # against future code-shape drift.
     state.coord_idle_cleanup_thread = None
+    # Match the lifespan shutdown's cleanup of these class-level refs
+    # (server.py ~line 4629) so a failed bootstrap doesn't leave stale
+    # process-global pointers at a half-built coord_mgr / collector /
+    # console_metrics that the next bootstrap would never reset.
+    ConsoleCoordinatorUI._coord_mgr = None
+    ConsoleCoordinatorUI._collector = None
+    ConsoleCoordinatorUI._console_metrics = None
 
 
 @asynccontextmanager
@@ -4556,31 +4648,12 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     app.state.coord_registry = None
     app.state.coord_registry_error = ""
     if storage and config_store:
-        try:
-            from turnstone.core.model_registry import load_model_registry
-
-            try:
-                coord_registry = load_model_registry(storage=storage)
-            except ValueError as exc:
-                # No model rows configured.  Endpoint returns 503 with
-                # the error text so admin sees remediation in the UI.
-                app.state.coord_registry_error = str(exc)
-                coord_registry = None
-
-            if coord_registry is not None:
-                # ``_bootstrap_coord_subsystem`` stamps ``coord_registry``
-                # on app.state itself as the final commit step, so a
-                # build failure leaves both ``coord_registry`` and
-                # ``coord_mgr`` ``None`` — the same coherent fresh-install
-                # state a registry-load failure produces above.
-                _bootstrap_coord_subsystem(app, storage, config_store, coord_registry)
-        except Exception:
-            log.warning("console.coordinator_init_failed", exc_info=True)
-            # The bootstrap may have partially stamped handles on
-            # app.state before the failure; tear them down so a daemon
-            # doesn't outlive a console process that gave up on
-            # initialising the coord subsystem.
-            _teardown_partial_coord_subsystem(app)
+        # Run the whole load-and-bootstrap synchronously on a worker
+        # thread so a slow ``StateWriter.shutdown(timeout=2.0)`` on the
+        # rollback path can't block the console event loop during
+        # startup.  Mirrors the runtime CRUD-triggered path's
+        # ``asyncio.to_thread`` invocation.
+        await asyncio.to_thread(_load_and_bootstrap_coord_subsystem, app, storage, config_store)
 
     yield
     # Shutdown
