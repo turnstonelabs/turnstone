@@ -105,6 +105,35 @@ class TestRemindersRoundtrip:
         assert len(tool_msgs) == 1
         assert tool_msgs[0].get("_reminders") == payload
 
+    def test_nul_bytes_stripped_from_source_and_reminders(self, backend):
+        """NUL bytes must be stripped at the storage layer.
+
+        Producers (``sanitize_payload`` on the watch dispatch path,
+        constants for non-watch nudges) already strip NUL today so
+        nothing in production reaches this clamp — but the layer is
+        the tripwire if a future producer forgets, mirroring how
+        ``content`` and ``provider_data`` are sanitized.  PostgreSQL
+        TEXT columns reject NUL outright, so the sanitization is also
+        a hard correctness invariant on that backend.
+
+        ``json.dumps`` already escapes NUL inside string values to
+        ``\\u0000`` so a real NUL byte can't enter ``_reminders`` via
+        the normal encode path — the test feeds a raw NUL directly to
+        cover the bypass case (a future producer that hand-builds the
+        column string).
+        """
+        backend.register_workstream("s1")
+        backend.save_message(
+            "s1",
+            "user",
+            "",
+            source="system_nudge\x00",
+            reminders='[{"type":"watch_triggered","text":"ok\x00bad"}]',
+        )
+        msgs = backend.load_messages("s1")
+        assert msgs[0].get("_source") == "system_nudge"
+        assert msgs[0].get("_reminders") == [{"type": "watch_triggered", "text": "okbad"}]
+
     def test_malformed_reminders_json_does_not_crash_load(self, backend):
         """A garbage string in the column must not abort the whole
         load — mirrors the ``provider_data`` JSON-decode-suppress
