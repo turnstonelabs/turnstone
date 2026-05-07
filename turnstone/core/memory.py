@@ -79,10 +79,15 @@ def save_messages_bulk(rows: list[dict[str, Any]]) -> None:
         log.warning("Failed to bulk-save %d messages", len(rows), exc_info=True)
 
 
-def load_messages(ws_id: str) -> list[dict[str, Any]]:
-    """Load messages for a workstream and reconstruct OpenAI message format."""
+def load_messages(ws_id: str, *, limit: int | None = None) -> list[dict[str, Any]]:
+    """Load messages for a workstream and reconstruct OpenAI message format.
+
+    *limit* tail-loads the most recent N rows when set; the storage
+    backend already accepts the kwarg.  Used by callers that don't
+    need the full transcript (e.g. browsing a long-running coord).
+    """
     try:
-        return get_storage().load_messages(ws_id)
+        return get_storage().load_messages(ws_id, limit=limit)
     except Exception:
         log.warning("Failed to load messages for ws=%s", ws_id, exc_info=True)
         return []
