@@ -109,6 +109,7 @@ from turnstone.core.tools import (
     TASK_AUTO_TOOLS,
     merge_mcp_tools,
 )
+from turnstone.core.watch import WATCH_REMINDER_OPTIONAL_KEYS
 from turnstone.core.web import check_ssrf, strip_html
 from turnstone.core.workstream import WorkstreamKind
 from turnstone.prompts import ClientType, SessionContext, compose_system_message
@@ -1456,14 +1457,12 @@ class ChatSession:
                 except Exception:
                     return False
 
-            from turnstone.core.watch import _WATCH_REMINDER_OPTIONAL_KEYS
-
             def _maybe_sanitize(v: Any) -> Any:
                 return sanitize_payload(v) if isinstance(v, str) else v
 
             metadata = {
                 k: _maybe_sanitize(reminder[k])
-                for k in _WATCH_REMINDER_OPTIONAL_KEYS
+                for k in WATCH_REMINDER_OPTIONAL_KEYS
                 if k in reminder
             }
             nudge_queue.enqueue(

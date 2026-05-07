@@ -195,7 +195,7 @@ def format_watch_message(
     return "\n".join(lines)
 
 
-_WATCH_REMINDER_OPTIONAL_KEYS = (
+WATCH_REMINDER_OPTIONAL_KEYS = (
     "watch_name",
     "command",
     "poll_count",
