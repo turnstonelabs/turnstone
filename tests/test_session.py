@@ -3311,6 +3311,57 @@ class TestReminderSidechannelIsolation:
         assert extracted_user == "first message body"
         assert "SECRET_NUDGE_TEXT" not in extracted_user
 
+    def test_resume_does_not_re_splice_persisted_reminders(self, tmp_db):
+        """Persisted reminders survive ``load_messages`` but the
+        in-memory ``_reminders_delivered`` flag does not (it's
+        session-scoped — the post-stream hook flips it after each
+        successful provider call, and persistence skips
+        leading-underscore siblings).  Without a re-splice guard at
+        resume time, ``_apply_reminders_for_provider`` would walk every
+        loaded message, see ``_reminders`` set + ``_reminders_delivered``
+        falsy, and splice every historical ``<system-reminder>`` envelope
+        onto the wire on the very next user turn — leaking each
+        reminder a second time, the turn after it had already advised.
+        """
+        from turnstone.core.memory import register_workstream, save_message
+
+        # Stage a workstream with a persisted user-channel reminder.
+        # Direct save_message so we control the exact reminders payload
+        # without driving a real send().
+        register_workstream("resume_no_resplice")
+        save_message("resume_no_resplice", "user", "first turn", source="system_nudge")
+        save_message(
+            "resume_no_resplice",
+            "user",
+            "second turn",
+            reminders=json.dumps(
+                [{"type": "denial", "text": "HISTORICAL_REMINDER_BODY"}],
+                separators=(",", ":"),
+            ),
+        )
+        save_message("resume_no_resplice", "assistant", "ok")
+
+        # Resume into a fresh session.
+        session = _make_session()
+        assert session.resume("resume_no_resplice") is True
+
+        # Sanity: the historical reminder is on the loaded message dict.
+        loaded_user = next(
+            m for m in session.messages if m.get("role") == "user" and m.get("_reminders")
+        )
+        assert loaded_user["_reminders"] == [{"type": "denial", "text": "HISTORICAL_REMINDER_BODY"}]
+
+        # Append a new live user turn (no reminders) and run the wire
+        # transform.  The output must NOT carry the historical reminder
+        # body — every loaded message that had _reminders should already
+        # be flagged delivered, so _apply_reminders_for_provider skips
+        # them on the pass-through path.
+        session.messages.append({"role": "user", "content": "live new turn"})
+        wire = session._apply_reminders_for_provider(session.messages)
+        rendered = "\n".join(m["content"] for m in wire if isinstance(m.get("content"), str))
+        assert "HISTORICAL_REMINDER_BODY" not in rendered
+        assert "<system-reminder>" not in rendered
+
 
 class TestSessionUIBaseUserReminderHook:
     """``on_user_reminder`` enqueues a ``user_reminder`` SSE event with
