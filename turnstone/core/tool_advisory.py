@@ -23,6 +23,22 @@ PRIORITY_IMPORTANT: Final = "important"
 PRIORITY_NOTICE: Final = "notice"
 
 
+# UserInterjection preamble strings — shared between the producer
+# (``UserInterjection.render``) and the replay parser
+# (``history_decoration._classify_advisory``).  Keeping them in one
+# place ensures the parser and producer can never drift on the exact
+# wording the parser uses to disambiguate priority.  Marker is the
+# fixed substring that separates the preamble from the user's body.
+_USER_INTERJECTION_NOTICE_PREAMBLE: Final = (
+    "The user sent additional context while you were working. "
+    "Incorporate if relevant, otherwise continue."
+)
+_USER_INTERJECTION_IMPORTANT_PREAMBLE: Final = (
+    "The user sent a message while you were working. You MUST address this before continuing."
+)
+_USER_INTERJECTION_BODY_MARKER: Final = "\n\nUser message: "
+
+
 # -- Protocol -----------------------------------------------------------------
 
 
@@ -68,14 +84,16 @@ class GuardAdvisory:
 class UserInterjection:
     """Advisory for a message the user sent while the model was executing.
 
-    Currently no production producer — pre-PR-#487 the queued-message
-    drain in ``_collect_advisories`` instantiated this and rode it
-    through ``wrap_tool_result``.  PR #487 dropped the splice and now
-    drains queued messages as a real user turn after the tool batch.
-    Class + tests retained pending the back-to-back-user role-ordering
-    decision (see review finding bug-1) — one viable fix path resumes
-    the splice for the ``user_feedback`` + queue-drain coexistence
-    case, in which case this advisory shape stays load-bearing.
+    Produced by ``ChatSession._collect_advisories`` on the LAST tool
+    result of a batch when ``_queued_messages`` is non-empty (Seam 1 in
+    the queued-message architecture).  Splicing inside the tool-result
+    envelope keeps the role sequence ``assistant -> tool`` intact for
+    strict-template providers and delivers the user's text on the
+    same turn as the tool batch.  The persisted DB row is the wrapped
+    envelope — replay extracts the advisory back out via
+    :func:`history_decoration.decorate_history_messages` and renders
+    it as a proper user bubble in the wire/UI layer, so the queued
+    message survives reconnect / page reload.
     """
 
     message: str
@@ -87,16 +105,10 @@ class UserInterjection:
 
     def render(self) -> str:
         if self.priority == PRIORITY_IMPORTANT:
-            preamble = (
-                "The user sent a message while you were working. "
-                "You MUST address this before continuing."
-            )
+            preamble = _USER_INTERJECTION_IMPORTANT_PREAMBLE
         else:
-            preamble = (
-                "The user sent additional context while you were working. "
-                "Incorporate if relevant, otherwise continue."
-            )
-        return f"{preamble}\n\nUser message: {self.message}"
+            preamble = _USER_INTERJECTION_NOTICE_PREAMBLE
+        return f"{preamble}{_USER_INTERJECTION_BODY_MARKER}{self.message}"
 
 
 @dataclass(frozen=True)
@@ -132,9 +144,24 @@ def escape_wrapper_tags(text: str) -> str:
     cannot fabricate or close one of the wrapper blocks. Use this on any
     untrusted content that is glued next to a wrapper tag — tool output,
     user message bodies, and (defense-in-depth) advisory render output.
+
+    Round-trip symmetry with :func:`history_decoration._entity_decode_wrapper_tags`
+    requires escaping ``&`` first.  Otherwise a tool output that contains
+    the literal string ``&lt;tool_output&gt;`` (e.g. documentation
+    describing the wrapper format) would round-trip to the bare
+    ``<tool_output>`` tag, fabricating an envelope the wrapper layer
+    never produced.  The short-circuit on ``"<" not in text and "&" not
+    in text`` covers the common case where neither wrapper tag nor any
+    pre-existing entity is present — most tool outputs.
     """
+    if "<" not in text and "&" not in text:
+        return text
+    # Encode ``&`` first so a pre-existing literal like ``&lt;tool_output&gt;``
+    # in the source text becomes ``&amp;lt;tool_output&amp;gt;`` and
+    # cannot collide with our wrapper-tag escape strings.
     return (
-        text.replace("</tool_output>", "&lt;/tool_output&gt;")
+        text.replace("&", "&amp;")
+        .replace("</tool_output>", "&lt;/tool_output&gt;")
         .replace("<tool_output>", "&lt;tool_output&gt;")
         .replace("<system-reminder>", "&lt;system-reminder&gt;")
         .replace("</system-reminder>", "&lt;/system-reminder&gt;")

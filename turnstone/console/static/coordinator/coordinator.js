@@ -949,10 +949,6 @@
     if (!row) return;
     const existing = row.querySelector(".coord-tool-row-result");
     if (existing) existing.remove();
-    // Re-fires (cancel + rerun, error + retry) clear any prior
-    // truncation pill so it doesn't stack on the new result.
-    const existingTrunc = row.querySelector(".coord-tool-truncated");
-    if (existingTrunc) existingTrunc.remove();
     if (isError) {
       row.classList.add("error");
       // Lift the row's error onto the enclosing batch so the left
@@ -1008,19 +1004,6 @@
     body.textContent = pretty;
     block.appendChild(body);
     row.appendChild(block);
-    // Storage-truncation indicator — sibling pill (not text inside
-    // the result body) so renderers / parsers / copy-as-text paths
-    // see the unmodified output.  Same convention as interactive's
-    // .tool-output-truncated; styled by .coord-tool-truncated in
-    // coordinator.css.
-    if (opts && opts.truncated) {
-      const pill = document.createElement("span");
-      pill.className = "coord-tool-truncated";
-      pill.textContent = "… truncated in storage";
-      pill.title =
-        "Full tool output was sent to the model live; only the first 10000 characters are persisted to the conversation row.";
-      row.appendChild(pill);
-    }
   }
 
   function _makeActionButton(label, role, kbdHint, ariaLabel) {
@@ -4088,20 +4071,27 @@
           const toolName =
             (callId && toolNameByCallId.get(callId)) || m.tool_name || "tool";
           const isError = callOutcomes.get(callId) === "error";
-          // Storage truncation surfaces as a sibling pill next to
-          // the result (see _appendResultToRow's opts.truncated
-          // branch) rather than as text inside the result body — a
-          // future "best-effort JSON repair" pass would otherwise
-          // need to strip a marker string before parsing.
-          appendToolResult(toolName, callId, content || "", isError, {
-            truncated: !!m.truncated,
-          });
+          appendToolResult(toolName, callId, content || "", isError);
           // Tool-channel metacog reminders ride the same _reminders
           // side-channel as the user channel; surface as a themed
           // bubble below the .coord-tool-batch construct.
           if (Array.isArray(m.reminders) && m.reminders.length) {
             appendToolReminderLive(m.reminders, callId);
           }
+          // Queued user messages spliced into the last tool-result
+          // envelope of a batch (Seam 1) replay as proper user bubbles
+          // after the tool block.  ``decorate_history_messages``
+          // extracts the user_interjection advisory from the persisted
+          // envelope and the wire layer projects it onto
+          // ``m.advisories``; rendering through
+          // ``appendUserMessageWithAttachments`` matches the live shape
+          // a Seam 2/3 message would produce.  The walk/filter is
+          // shared via ``replayAdvisoriesAfterTool`` in
+          // ``shared/utils.js`` so coord and interactive can never drift
+          // on advisory-shape filtering.
+          replayAdvisoriesAfterTool(m.advisories, function (text) {
+            appendUserMessageWithAttachments(text, [], { label: "user" });
+          });
         } else if (role === "assistant") {
           // Render content BEFORE the tool batch so DOM order matches
           // chronological order (the model emits text first, then

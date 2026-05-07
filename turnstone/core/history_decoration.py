@@ -22,23 +22,13 @@ import json
 from typing import Any
 
 from turnstone.core.log import get_logger
+from turnstone.core.tool_advisory import (
+    _USER_INTERJECTION_BODY_MARKER,
+    _USER_INTERJECTION_IMPORTANT_PREAMBLE,
+    _USER_INTERJECTION_NOTICE_PREAMBLE,
+)
 
 log = get_logger(__name__)
-
-# Tool results are clamped at this length per row at storage time
-# (see ``session.py``'s ``store_text = raw_output[:TOOL_RESULT_STORAGE_CAP]``).
-# Keeping the constant here lets the truncation flag detection in
-# ``decorate_history_messages`` stay in sync without a magic number
-# duplicated across server.py / session.py.
-#
-# Raised from 2000 → 10000 because a 2000-char clip routinely cut
-# the body of a single grep / file read mid-line, leaving the
-# historical record useless for retrospective debugging.  FTS5
-# index + row size grow proportionally; the per-tool upper bound is
-# still bounded upstream by ``_truncate_output``'s context-budget
-# clamp (so a single huge result can't blow past the live context
-# window).
-TOOL_RESULT_STORAGE_CAP = 10000
 
 
 def load_verdict_indexes(
@@ -174,6 +164,103 @@ def decorate_tool_call(
             tc["output_assessment"] = assessment
 
 
+def _entity_decode_wrapper_tags(text: str) -> str:
+    """Reverse :func:`tool_advisory.escape_wrapper_tags` on extraction.
+
+    The wrap layer escapes the four wrapper-tag forms to HTML entities
+    so embedded user / advisory text cannot fabricate or close an
+    envelope.  When the replay decorator pulls advisories back out of
+    the persisted envelope, the inner text needs to be returned to its
+    literal form for UI rendering.
+
+    Decodes ``&amp;`` last so a tool output that contains the literal
+    string ``&lt;tool_output&gt;`` round-trips identically to its
+    source: encode produces ``&amp;lt;tool_output&amp;gt;`` (no
+    collision with wrapper-tag escapes), decode walks the wrapper
+    escapes first, then strips the ``&amp;`` sentinel back to ``&``.
+    The short-circuit on ``"&" not in text`` covers the common case
+    where no escaped entities are present.
+    """
+    if "&" not in text:
+        return text
+    return (
+        text.replace("&lt;/tool_output&gt;", "</tool_output>")
+        .replace("&lt;tool_output&gt;", "<tool_output>")
+        .replace("&lt;system-reminder&gt;", "<system-reminder>")
+        .replace("&lt;/system-reminder&gt;", "</system-reminder>")
+        .replace("&amp;", "&")
+    )
+
+
+def _classify_advisory(render_text: str) -> dict[str, str] | None:
+    """Map a ``<system-reminder>`` body back to a wire-shape advisory.
+
+    Returns a dict with ``type`` / ``text`` / optional ``priority`` for
+    advisory shapes the UI knows how to render, or ``None`` to suppress
+    the advisory entirely (output-guard findings already render via the
+    ``output_assessment`` audit-table decoration; doubling them would
+    paint two warning bubbles).  Unknown advisory shapes fall through
+    to ``None`` rather than rendering an opaque envelope blob.
+    """
+    if render_text.startswith("Output guard:"):
+        return None
+    if _USER_INTERJECTION_BODY_MARKER in render_text:
+        # UserInterjection is the only producer that uses this marker.
+        # The preamble disambiguates priority: "important" gets the
+        # MUST-address framing, "notice" gets the incorporate-if-relevant
+        # framing.  The body sits after the marker.  Preamble + marker
+        # constants are imported from ``tool_advisory`` so the parser
+        # and producer can never drift on wording.
+        if render_text.startswith(_USER_INTERJECTION_IMPORTANT_PREAMBLE):
+            priority = "important"
+        elif render_text.startswith(_USER_INTERJECTION_NOTICE_PREAMBLE):
+            priority = "notice"
+        else:
+            # Marker present but preamble drifted — still render as a
+            # notice rather than dropping the user's text.
+            priority = "notice"
+        body = render_text.split(_USER_INTERJECTION_BODY_MARKER, 1)[1]
+        return {"type": "user_interjection", "text": body, "priority": priority}
+    return None
+
+
+def extract_advisories_from_tool_envelope(
+    content: str,
+) -> tuple[str, list[dict[str, str]]] | None:
+    """Strip a ``<tool_output>`` envelope and return ``(clean, advisories)``.
+
+    Returns ``None`` when *content* doesn't look like a wrapped tool
+    result — caller should leave the message unchanged.  When the
+    envelope parses but no advisories survive classification (e.g.
+    only an output_guard advisory rode along), returns the cleaned
+    output with an empty advisories list — the caller still needs to
+    strip the envelope from the rendered content.
+    """
+    if not content.startswith("<tool_output>\n"):
+        return None
+    close = content.find("\n</tool_output>")
+    if close == -1:
+        return None
+    inner = content[len("<tool_output>\n") : close]
+    rest = content[close + len("\n</tool_output>") :]
+    advisories: list[dict[str, str]] = []
+    cursor = 0
+    while True:
+        open_idx = rest.find("<system-reminder>\n", cursor)
+        if open_idx == -1:
+            break
+        close_idx = rest.find("\n</system-reminder>", open_idx)
+        if close_idx == -1:
+            break
+        body = rest[open_idx + len("<system-reminder>\n") : close_idx]
+        decoded = _entity_decode_wrapper_tags(body)
+        classified = _classify_advisory(decoded)
+        if classified is not None:
+            advisories.append(classified)
+        cursor = close_idx + len("\n</system-reminder>")
+    return _entity_decode_wrapper_tags(inner), advisories
+
+
 def decorate_history_messages(
     messages: list[dict[str, Any]],
     verdicts_by_call_id: dict[str, dict[str, Any]],
@@ -184,8 +271,12 @@ def decorate_history_messages(
     Used by the ``/history`` REST endpoint after ``load_messages``
     returns.  For each assistant message with ``tool_calls``, runs
     :func:`decorate_tool_call` on every entry.  For each tool message
-    whose content hits the storage cap, sets ``truncated: True`` so
-    the client can render the "… truncated in storage" pill.
+    whose ``content`` carries a ``<tool_output>`` envelope (queued
+    user message spliced via :class:`UserInterjection` during a tool
+    batch), strips the envelope, restores literal wrapper tags inside
+    the body, and surfaces the extracted advisories on
+    ``msg["advisories"]`` so the wire layer can replay them as user
+    bubbles after the tool result.
 
     Pure transform — no I/O.  Async callers should pre-load the
     indexes via :func:`load_verdict_indexes` (in ``to_thread``) and
@@ -201,5 +292,18 @@ def decorate_history_messages(
                         decorate_tool_call(tc, verdicts_by_call_id, assessments_by_call_id)
         elif role == "tool":
             content = msg.get("content")
-            if isinstance(content, str) and len(content) >= TOOL_RESULT_STORAGE_CAP:
-                msg["truncated"] = True
+            if not isinstance(content, str):
+                continue
+            try:
+                extracted = extract_advisories_from_tool_envelope(content)
+            except Exception:
+                # Defensive — on any unexpected parse failure leave the
+                # message untouched rather than crashing the replay.
+                log.debug("advisory extraction failed; leaving content intact", exc_info=True)
+                continue
+            if extracted is None:
+                continue
+            cleaned, advisories = extracted
+            msg["content"] = cleaned
+            if advisories:
+                msg["advisories"] = advisories

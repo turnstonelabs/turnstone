@@ -2287,7 +2287,14 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
                 )
 
                 indexes = await asyncio.to_thread(load_verdict_indexes, ws_id)
-                decorate_history_messages(messages, indexes[0], indexes[1])
+                # Pure transform but iterates every message and every
+                # tool_call dict — for a long workstream the pass takes
+                # tens of milliseconds and would otherwise block the
+                # event loop's hot path on the request handler.
+                # ``decorate_history_messages`` is thread-safe (no
+                # shared mutable state beyond the per-call message
+                # list) so the off-loop hop is free.
+                await asyncio.to_thread(decorate_history_messages, messages, indexes[0], indexes[1])
             except Exception:
                 # Operationally interesting: a persistent decoration
                 # failure (missing migration, driver mismatch, schema
