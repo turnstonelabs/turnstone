@@ -492,7 +492,9 @@
       appendReminderBubble(reminders, marker);
       return;
     }
-    const userMsgs = messagesEl.querySelectorAll(".msg.user");
+    const userMsgs = messagesEl.querySelectorAll(
+      ".msg.user:not(.system-nudge)",
+    );
     const anchor = userMsgs.length ? userMsgs[userMsgs.length - 1] : null;
     appendReminderBubble(reminders, anchor);
   }

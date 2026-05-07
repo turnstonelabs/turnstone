@@ -753,6 +753,8 @@ function _buildWatchResultBubble(r) {
 function _buildDefaultReminderBubble(r) {
   var el = document.createElement("div");
   el.className = "msg user-reminder";
+  var body = document.createElement("div");
+  body.className = "msg-body";
   var labelEl = document.createElement("span");
   labelEl.className = "msg-user-reminder-label";
   labelEl.textContent =
@@ -760,8 +762,9 @@ function _buildDefaultReminderBubble(r) {
   var textEl = document.createElement("span");
   textEl.className = "msg-user-reminder-text";
   textEl.textContent = r.text || "";
-  el.appendChild(labelEl);
-  el.appendChild(textEl);
+  body.appendChild(labelEl);
+  body.appendChild(textEl);
+  el.appendChild(body);
   return el;
 }
 
@@ -803,7 +806,9 @@ Pane.prototype.addUserReminder = function (reminders, source) {
   if (source === "system_nudge") {
     anchor = this.addSystemNudgeMarker();
   } else {
-    var userBubbles = this.messagesEl.querySelectorAll(".msg.user");
+    var userBubbles = this.messagesEl.querySelectorAll(
+      ".msg.user:not(.system-nudge)",
+    );
     anchor = userBubbles.length ? userBubbles[userBubbles.length - 1] : null;
   }
   for (var i = 0; i < reminders.length; i++) {
