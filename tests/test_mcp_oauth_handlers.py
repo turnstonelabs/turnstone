@@ -391,7 +391,7 @@ class TestAuthorize:
         app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
         client = TestClient(app, raise_server_exceptions=False)
 
-        # 33 tokens — one over the cap (``_MAX_INSUFFICIENT_SCOPE_REPORTED = 32``).
+        # 33 tokens — one over the cap (``MAX_INSUFFICIENT_SCOPE_REPORTED = 32``).
         scopes = "%20".join(f"s{i}" for i in range(33))
         with _public_addr_patch():
             resp = client.get(

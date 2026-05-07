@@ -399,13 +399,14 @@ def test_integration_401_with_refresh_failure_emits_consent_required(
             return TokenLookupResult(kind="refresh_failed")
         return TokenLookupResult(kind="token", token="access-aaa")
 
-    with patch(
-        "turnstone.core.mcp_client.get_user_access_token_classified",
-        side_effect=_fake_classified,
-    ), pytest.raises(RuntimeError) as exc_info:
-        mgr.call_tool_sync(
-            "mcp__pool-srv__echo", {"payload": "x"}, user_id="user-1", timeout=15
-        )
+    with (
+        patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            side_effect=_fake_classified,
+        ),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
+        mgr.call_tool_sync("mcp__pool-srv__echo", {"payload": "x"}, user_id="user-1", timeout=15)
 
     # Structured-error envelopes flow back via ``RuntimeError(json_str)``
     # so the session-layer ``except Exception`` handler routes the
@@ -444,13 +445,14 @@ def test_integration_403_insufficient_scope_emits_structured_error(
     async def _fake_classified(**_kwargs: Any) -> TokenLookupResult:
         return TokenLookupResult(kind="token", token="access-aaa")
 
-    with patch(
-        "turnstone.core.mcp_client.get_user_access_token_classified",
-        side_effect=_fake_classified,
-    ), pytest.raises(RuntimeError) as exc_info:
-        mgr.call_tool_sync(
-            "mcp__pool-srv__echo", {"payload": "x"}, user_id="user-1", timeout=15
-        )
+    with (
+        patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            side_effect=_fake_classified,
+        ),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
+        mgr.call_tool_sync("mcp__pool-srv__echo", {"payload": "x"}, user_id="user-1", timeout=15)
 
     payload = json.loads(str(exc_info.value))
     assert payload["error"]["code"] == "mcp_insufficient_scope"
@@ -489,13 +491,14 @@ def test_integration_403_no_insufficient_scope_emits_generic_forbidden(
     async def _fake_classified(**_kwargs: Any) -> TokenLookupResult:
         return TokenLookupResult(kind="token", token="access-aaa")
 
-    with patch(
-        "turnstone.core.mcp_client.get_user_access_token_classified",
-        side_effect=_fake_classified,
-    ), pytest.raises(RuntimeError) as exc_info:
-        mgr.call_tool_sync(
-            "mcp__pool-srv__echo", {"payload": "x"}, user_id="user-1", timeout=15
-        )
+    with (
+        patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            side_effect=_fake_classified,
+        ),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
+        mgr.call_tool_sync("mcp__pool-srv__echo", {"payload": "x"}, user_id="user-1", timeout=15)
 
     payload = json.loads(str(exc_info.value))
     assert payload["error"]["code"] == "mcp_tool_call_forbidden"
@@ -563,13 +566,14 @@ def test_integration_403_multi_www_authenticate_drops_injected_scopes(
     async def _fake_classified(**_kwargs: Any) -> TokenLookupResult:
         return TokenLookupResult(kind="token", token="access-aaa")
 
-    with patch(
-        "turnstone.core.mcp_client.get_user_access_token_classified",
-        side_effect=_fake_classified,
-    ), pytest.raises(RuntimeError) as exc_info:
-        mgr.call_tool_sync(
-            "mcp__pool-srv__echo", {"payload": "x"}, user_id="user-1", timeout=15
-        )
+    with (
+        patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            side_effect=_fake_classified,
+        ),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
+        mgr.call_tool_sync("mcp__pool-srv__echo", {"payload": "x"}, user_id="user-1", timeout=15)
 
     payload = json.loads(str(exc_info.value))
     assert payload["error"]["code"] == "mcp_insufficient_scope", (
@@ -615,13 +619,14 @@ def test_integration_401_retry_ceiling(
             return TokenLookupResult(kind="token", token=f"refreshed-{refresh_count}")
         return TokenLookupResult(kind="token", token="access-aaa")
 
-    with patch(
-        "turnstone.core.mcp_client.get_user_access_token_classified",
-        side_effect=_fake_classified,
-    ), pytest.raises(RuntimeError) as exc_info:
-        mgr.call_tool_sync(
-            "mcp__pool-srv__echo", {"payload": "x"}, user_id="user-1", timeout=15
-        )
+    with (
+        patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            side_effect=_fake_classified,
+        ),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
+        mgr.call_tool_sync("mcp__pool-srv__echo", {"payload": "x"}, user_id="user-1", timeout=15)
 
     payload = json.loads(str(exc_info.value))
     assert payload["error"]["code"] == "mcp_consent_required"

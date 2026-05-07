@@ -44,6 +44,7 @@ from mcp.shared._httpx_utils import (
 from turnstone.core.config import load_config
 from turnstone.core.log import get_logger
 from turnstone.core.mcp_http_parsers import (
+    MAX_INSUFFICIENT_SCOPE_REPORTED,
     parse_www_authenticate_error,
     parse_www_authenticate_scope,
 )
@@ -113,18 +114,12 @@ def _validate_oauth_user_url(url: str) -> None:
 # 1:1 against the new entry point when we migrate.
 
 
-# Defensive cap on the number of scopes we report in
-# ``mcp_insufficient_scope`` audit/error payloads. Real ASes return
-# single-digit scope counts; the cap stops a malicious upstream from
-# bloating either surface via a thousand-token ``scope=`` value.
-_MAX_INSUFFICIENT_SCOPE_REPORTED = 32
-
 # Defensive cap on the number of tools we accept from any single MCP
 # server's ``tools/list`` response. Real servers expose at most a few
 # dozen tools; a misconfigured or hostile upstream returning thousands
 # would amplify both memory (one OpenAI tool dict per entry) and
 # downstream BM25 reindex cost. Mirrors the ``_MAX_ERROR_LEN`` /
-# ``_MAX_INSUFFICIENT_SCOPE_REPORTED`` defensive ceilings: we truncate
+# ``MAX_INSUFFICIENT_SCOPE_REPORTED`` defensive ceilings: we truncate
 # rather than reject so partial visibility beats zero visibility, and
 # emit a warning so operators can investigate.
 _MAX_TOOLS_PER_SERVER = 1000
@@ -907,6 +902,14 @@ class MCPClientManager:
                 # orphaned cancel-scope tasks spinning at 100% CPU.
                 await self._tcp_probe(name, cfg["url"])
 
+                # ``wait_for`` retained — the static path is byte-identical
+                # (invariant 1) and its narrow connect-once / no-eviction-then-
+                # reuse pattern doesn't trigger the cross-task scope-exit that
+                # f6a3b66 fixed for ``_safe_close_stack`` and that the pool
+                # path's ``_connect_one_pool`` migrated at line 1206 below.
+                # Migrating here would change the static path's bytes; reverting
+                # 1206 to match would re-introduce the pool-path flake. Pin both
+                # directions.
                 read, write, _ = await asyncio.wait_for(
                     stack.enter_async_context(
                         streamablehttp_client(url=cfg["url"], headers=cfg.get("headers"))
@@ -1002,6 +1005,8 @@ class MCPClientManager:
 
         state.stack = stack
         try:
+            # ``wait_for`` retained — see line 905 for the static-path
+            # exemption from the pool-path migration (invariant 1 byte-identical).
             await asyncio.wait_for(session.initialize(), timeout=self._CONNECT_TIMEOUT)
         except asyncio.CancelledError:
             state.stack = None
@@ -1208,10 +1213,38 @@ class MCPClientManager:
         await stack.__aenter__()
         try:
             await self._tcp_probe(key, url)
-            read, write, _ = await asyncio.wait_for(
-                stack.enter_async_context(streamablehttp_client(**client_kwargs)),
-                timeout=self._CONNECT_TIMEOUT,
-            )
+            # ``asyncio.timeout`` (NOT ``asyncio.wait_for``) — same anyio /
+            # Python 3.11 reasoning as ``session.initialize`` below and
+            # the ``_safe_close_stack`` fix in f6a3b66. ``wait_for``
+            # wraps the inner coroutine in a fresh :class:`asyncio.Task`
+            # which enters ``streamablehttp_client``'s anyio cancel
+            # scopes. When that fresh task completes (connect succeeded)
+            # its scopes are recorded on the stack but the entering
+            # task is dead; the eventual ``stack.aclose()`` during
+            # eviction (or auth_401 retry) tries to exit those scopes
+            # from a different task and anyio raises
+            # ``RuntimeError('Attempted to exit cancel scope in a
+            # different task...')`` — the same cross-task hazard
+            # f6a3b66 fixed at the close side.
+            #
+            # Surfacing: ``test_integration_pool_reuse_401_refresh_and_retry_succeeds``
+            # times out (non-deterministically) on Python 3.11 /
+            # resource-constrained CI when reverted — the wedged anyio
+            # state from dispatch 1's fresh-task connect blocks the
+            # auth_401 retry's stack teardown + reconnect within the
+            # 15s call budget. The test is the symptom, NOT a structural
+            # gate (its docstring at tests/test_mcp_pool_auth_integration.py:806-836
+            # asserts carrier-on-entry + race-against-fired-event, neither
+            # of which exercises this scope-ownership invariant). The
+            # structural argument is ``_safe_close_stack`` at line 834-846
+            # plus invariant 18 (``asyncio.timeout`` not ``asyncio.wait_for``
+            # for any SDK / AS / pool-loop await crossing anyio scopes).
+            # Reverting and finding the test green on a fast machine
+            # does NOT validate the revert.
+            async with asyncio.timeout(self._CONNECT_TIMEOUT):
+                read, write, _ = await stack.enter_async_context(
+                    streamablehttp_client(**client_kwargs)
+                )
             entry.streams = (read, write)
         except asyncio.CancelledError:
             task = asyncio.current_task()
@@ -4342,7 +4375,7 @@ class MCPClientManager:
         error_token = parse_www_authenticate_error(header)
         if error_token == "insufficient_scope":
             scopes = parse_www_authenticate_scope(header)
-            scopes = scopes[:_MAX_INSUFFICIENT_SCOPE_REPORTED]
+            scopes = scopes[:MAX_INSUFFICIENT_SCOPE_REPORTED]
             await emit_oauth_failure_audit(
                 app_state=self._app_state,
                 user_id=user_id,
