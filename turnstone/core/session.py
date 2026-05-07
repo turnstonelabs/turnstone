@@ -152,14 +152,16 @@ class AttachmentsNotQueueableError(Exception):
     """Raised by ``ChatSession.queue_message`` when called with non-empty
     ``attachment_ids``.
 
-    Queued messages are injected at the next tool-result advisory seam
-    where they ride inside the tool envelope as text-only
-    ``UserInterjection`` advisories.  Attachments can't ride that path
-    (advisories don't carry image / file blocks), so an attachment-
-    bearing queued item would have to be appended as a separate
-    ``user`` turn — which would inject ``user`` between
-    ``assistant(tool_calls)`` and ``tool``, a role sequence strict
-    providers (Mistral, Anthropic) reject.
+    Queued messages drain via ``_flush_queued_messages`` after the tool
+    batch completes, joining all queued items into a single text-only
+    user turn (see the ``"\\n\\n".join(parts)`` shape).  That join can't
+    carry image / file blocks, so an attachment-bearing queued item
+    would either be silently dropped or force a per-item separate user
+    turn — the latter would inject extra ``user`` rows between the tool
+    batch and the next assistant turn, expanding the strict-template
+    role-ordering surface (Mistral / Anthropic) that the post-batch
+    drain already balances.  Rejecting attachments at queue time keeps
+    the single-combined-turn invariant intact.
 
     Callers surface this to the user as "wait for the current turn
     before attaching".
@@ -838,8 +840,7 @@ class ChatSession:
         #     ``_attach_pending_user_reminders`` and splice as
         #     <system-reminder> blocks
         #   - "tool" entries drain at the next tool-result batch via
-        #     ``_collect_advisories`` (alongside GuardAdvisory and
-        #     UserInterjection)
+        #     ``_collect_advisories`` (alongside ``GuardAdvisory``)
         #   - "any" entries drain at whichever seam fires first; used for
         #     wake-trigger-driven nudges that should not pin to a
         #     specific seam
@@ -3070,15 +3071,16 @@ class ChatSession:
                     raw_output = output
 
                     # Advisory injection: persistent advisories (output
-                    # guard findings, queued user interjections) wrap
-                    # into the tool-result envelope and stay in
-                    # self.messages.  Metacognitive tool-channel
-                    # reminders (tool_error / repeat) ride a side-channel
-                    # — never inside content — so the model sees the
-                    # splice only at the wire boundary via
-                    # _apply_reminders_for_provider, while UI/replay
+                    # guard findings) wrap into the tool-result envelope
+                    # and stay in self.messages.  Metacognitive
+                    # tool-channel reminders (tool_error / repeat) ride
+                    # a side-channel — never inside content — so the
+                    # model sees the splice only at the wire boundary
+                    # via _apply_reminders_for_provider, while UI/replay
                     # surfaces them as a themed bubble below the tool
-                    # result.
+                    # result.  Queued user messages drain via
+                    # ``_flush_queued_messages`` AFTER this loop, so
+                    # they no longer ride the persistent-advisory path.
                     persistent_advisories, metacog_reminders = self._collect_advisories(
                         assessment, _tc_names.get(tc_id, ""), _ri == _last_idx
                     )
@@ -6135,10 +6137,11 @@ class ChatSession:
     def _queue_tool_advisory(self, nudge_type: str, text: str) -> None:
         """Queue a metacognitive nudge for the next tool-result batch.
 
-        Drains in ``_collect_advisories`` alongside guard findings and
-        user interjections; ``wrap_tool_result`` then renders it inside
-        the tool-result envelope. Used for nudges that respond to model
-        behaviour at a tool boundary: ``tool_error``, ``repeat``.
+        Drains in ``_collect_advisories`` alongside guard findings, then
+        rides the tool message dict's ``_reminders`` side-channel —
+        spliced into wire content only at the provider boundary by
+        ``_apply_reminders_for_provider``.  Used for nudges that respond
+        to model behaviour at a tool boundary: ``tool_error``, ``repeat``.
 
         No-ops while the session is inside a wake-driven turn (see
         ``_queue_user_advisory`` for the rationale).
@@ -6287,9 +6290,9 @@ class ChatSession:
                 self._queue_tool_advisory("repeat", format_nudge("repeat"))
 
         # Tool-error nudge — queued so the MetacognitiveAdvisory rides
-        # the same _collect_advisories drain pass as guard findings and
-        # user interjections.  Cooldown gating in should_nudge keeps
-        # this to one nudge per batch even with many failing tools.
+        # the same _collect_advisories drain pass as guard findings.
+        # Cooldown gating in should_nudge keeps this to one nudge per
+        # batch even with many failing tools.
         if (
             self._mem_cfg.nudges
             and any(self._tool_error_flags.get(tc_id) for tc_id, _ in results)
