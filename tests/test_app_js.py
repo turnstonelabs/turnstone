@@ -169,6 +169,66 @@ def test_replay_history_renders_persisted_verdict_badge() -> None:
     )
 
 
+def test_shared_utils_defines_replay_advisories_after_tool() -> None:
+    """The shared ``replayAdvisoriesAfterTool`` helper in
+    ``shared_static/utils.js`` is the single source of advisory-walk +
+    type-filter logic for both ``app.js`` (interactive) and
+    ``coordinator.js`` (coord).  A refactor that drops the helper
+    breaks both surfaces, so guard its definition + filter shape here.
+    """
+    utils_js = Path(__file__).resolve().parent.parent / "turnstone/shared_static/utils.js"
+    body = utils_js.read_text(encoding="utf-8")
+    assert "function replayAdvisoriesAfterTool" in body, (
+        "shared/utils.js must define replayAdvisoriesAfterTool — "
+        "interactive and coord both invoke it."
+    )
+    # The type filter — ``adv.type !== 'user_interjection'`` — must
+    # remain in the helper so a future advisory shape (output_guard,
+    # metacognitive nudge, etc.) doesn't silently render as a user
+    # bubble.
+    assert 'adv.type !== "user_interjection"' in body, (
+        "replayAdvisoriesAfterTool must filter by advisory type so a "
+        "future non-user_interjection advisory shape doesn't silently "
+        "render as a user bubble."
+    )
+
+
+def test_replay_renders_user_interjection_advisory_after_tool_block() -> None:
+    """Queued user messages spliced into the last tool-result envelope
+    of a batch (Seam 1) persist on the tool DB row as a wrapped
+    ``<tool_output>`` envelope.  ``decorate_history_messages`` extracts
+    the advisory back out and the wire layer projects it onto
+    ``msg.advisories``; ``replayHistory`` must invoke the shared
+    ``replayAdvisoriesAfterTool`` helper (defined in
+    ``shared/utils.js``) so each ``user_interjection`` renders through
+    ``addUserMessage`` and the bubble looks identical to a Seam 2/3
+    user row.
+
+    This test pins the call site so a refactor that drops the helper
+    invocation regresses the queued-during-batch replay shape
+    silently."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    start = body.index("Pane.prototype.replayHistory = function")
+    end = body.index("Pane.prototype._attachRetryToLastAssistant", start)
+    fn = body[start:end]
+    # The replay loop must invoke the shared helper, passing
+    # ``msg.advisories`` and a renderer that routes through
+    # ``addUserMessage``.  The helper itself filters on
+    # ``adv.type !== "user_interjection"``; that branch lives in
+    # ``shared/utils.js`` (test_shared_utils_js or runtime smoke covers
+    # the helper's body).
+    assert "replayAdvisoriesAfterTool(msg.advisories" in fn, (
+        "replayHistory must invoke replayAdvisoriesAfterTool with "
+        "msg.advisories so queued messages spliced into the tool "
+        "envelope render as user bubbles after the tool block."
+    )
+    assert "addUserMessage(text" in fn, (
+        "replayHistory's renderer callback must route the extracted "
+        "advisory text through addUserMessage so the rendered bubble "
+        "matches a normal user-row replay."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Phase 8 — Chunk D: MCP error embed + settings panel UX
 # ---------------------------------------------------------------------------

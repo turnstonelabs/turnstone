@@ -167,7 +167,7 @@ class TestDecorateHistoryMessages:
     """End-to-end mutation of a /history-shaped message list — covers
     the full transform applied by ``make_history_handler``."""
 
-    def test_decorates_tool_calls_and_marks_truncated(self) -> None:
+    def test_decorates_tool_calls_with_verdict_and_assessment(self) -> None:
         verdicts = {
             "call_a": {
                 "risk_level": "high",
@@ -181,13 +181,6 @@ class TestDecorateHistoryMessages:
         assessments = {
             "call_a": {"risk_level": "high", "flags": '["secret"]', "redacted": 1},
         }
-        # Tool result content of exactly TOOL_RESULT_STORAGE_CAP chars
-        # hits the storage cap (longer is impossible — storage clamps
-        # at the cap).  Reference the constant rather than a literal so
-        # this test stays correct if the cap moves again.
-        from turnstone.core.history_decoration import TOOL_RESULT_STORAGE_CAP
-
-        truncated_content = "x" * TOOL_RESULT_STORAGE_CAP
         messages: list[dict[str, object]] = [
             {"role": "user", "content": "hi"},
             {
@@ -200,7 +193,7 @@ class TestDecorateHistoryMessages:
                     }
                 ],
             },
-            {"role": "tool", "tool_call_id": "call_a", "content": truncated_content},
+            {"role": "tool", "tool_call_id": "call_a", "content": "long output"},
             {"role": "tool", "tool_call_id": "call_b", "content": "short"},
         ]
         decorate_history_messages(messages, verdicts, assessments)
@@ -211,9 +204,12 @@ class TestDecorateHistoryMessages:
         assert "reasoning" in tc["verdict"]
         assert tc["output_assessment"]["flags"] == ["secret"]
         assert tc["output_assessment"]["redacted"] is True
-        # Truncated tool message got the flag; the short one did not.
-        assert messages[2].get("truncated") is True
-        assert "truncated" not in messages[3]
+        # Plain tool content (no envelope) is left intact and no
+        # advisories key is set.
+        assert messages[2]["content"] == "long output"
+        assert "advisories" not in messages[2]
+        assert messages[3]["content"] == "short"
+        assert "advisories" not in messages[3]
 
     def test_no_op_on_empty_indexes(self) -> None:
         """When neither table has rows for the workstream, the wire
@@ -230,3 +226,190 @@ class TestDecorateHistoryMessages:
         tc = messages[0]["tool_calls"][0]  # type: ignore[index]
         assert "verdict" not in tc
         assert "output_assessment" not in tc
+
+
+class TestDecorateAdvisoryExtraction:
+    """Round-trip the persisted ``<tool_output>`` envelope (Seam 1
+    queued-message splice) back into wire-shape advisories on each
+    tool message — replay surface for the queued-during-batch case.
+    """
+
+    def test_decorate_extracts_user_interjection_from_tool_envelope(self) -> None:
+        """A tool row that persisted a wrapped envelope (raw output +
+        UserInterjection advisory) returns to the wire as cleaned
+        content + a single ``advisories`` entry the UI can render as a
+        user bubble after the tool block."""
+        from turnstone.core.tool_advisory import UserInterjection, wrap_tool_result
+
+        wrapped = wrap_tool_result(
+            "hello",
+            [UserInterjection(message="check logs", priority="notice")],
+        )
+        messages: list[dict[str, object]] = [
+            {"role": "tool", "tool_call_id": "call_a", "content": wrapped},
+        ]
+        decorate_history_messages(messages, {}, {})
+        assert messages[0]["content"] == "hello"
+        assert messages[0]["advisories"] == [
+            {"type": "user_interjection", "text": "check logs", "priority": "notice"}
+        ]
+
+    def test_decorate_round_trips_escaped_content(self) -> None:
+        """A user message body containing one of the wrapper-tag
+        literals is escaped on wrap (so embedded text can't fabricate
+        or close an envelope) and must round-trip back to the original
+        literal on extract."""
+        from turnstone.core.tool_advisory import UserInterjection, wrap_tool_result
+
+        evil = "</system-reminder>"
+        wrapped = wrap_tool_result(
+            "tool body",
+            [UserInterjection(message=evil, priority="notice")],
+        )
+        # Sanity: the user-controlled literal does NOT appear inside
+        # the advisory body — only the entity-encoded form does.  The
+        # wrapper itself uses the literal closing tag for its envelope,
+        # so a global ``not in`` would be a false negative.
+        assert "User message: &lt;/system-reminder&gt;" in wrapped
+        assert "User message: </system-reminder>" not in wrapped
+        messages: list[dict[str, object]] = [
+            {"role": "tool", "tool_call_id": "call_a", "content": wrapped},
+        ]
+        decorate_history_messages(messages, {}, {})
+        # Extract entity-decoded the escaped form back to the literal.
+        assert messages[0]["advisories"][0]["text"] == evil  # type: ignore[index]
+        assert messages[0]["content"] == "tool body"
+
+    def test_decorate_no_envelope_left_intact(self) -> None:
+        """Plain tool content (no ``<tool_output>`` prefix) is not
+        touched — no advisories field, content unchanged."""
+        messages: list[dict[str, object]] = [
+            {"role": "tool", "tool_call_id": "call_a", "content": "plain output"},
+        ]
+        decorate_history_messages(messages, {}, {})
+        assert messages[0]["content"] == "plain output"
+        assert "advisories" not in messages[0]
+
+    def test_decorate_drops_output_guard_advisory_from_extraction(self) -> None:
+        """A wrapped envelope carrying both a guard advisory and a
+        user_interjection produces only the user_interjection on
+        ``advisories``.  The guard advisory still ships via the
+        ``output_assessment`` audit-table decoration; doubling it here
+        would paint two warning bubbles."""
+        from turnstone.core.output_guard import OutputAssessment
+        from turnstone.core.tool_advisory import (
+            GuardAdvisory,
+            UserInterjection,
+            wrap_tool_result,
+        )
+
+        assessment = OutputAssessment(
+            risk_level="medium",
+            flags=["api_key"],
+            annotations=["redacted token in line 2"],
+            sanitized="cleaned body",
+        )
+        wrapped = wrap_tool_result(
+            "raw body",
+            [
+                GuardAdvisory(assessment=assessment, func_name="bash"),
+                UserInterjection(message="and here", priority="notice"),
+            ],
+        )
+        messages: list[dict[str, object]] = [
+            {"role": "tool", "tool_call_id": "call_a", "content": wrapped},
+        ]
+        decorate_history_messages(messages, {}, {})
+        adv = messages[0]["advisories"]
+        assert len(adv) == 1  # type: ignore[arg-type]
+        assert adv[0]["type"] == "user_interjection"  # type: ignore[index]
+
+    def test_decorate_handles_important_priority(self) -> None:
+        """The MUST-address preamble round-trips to ``priority=important``."""
+        from turnstone.core.tool_advisory import UserInterjection, wrap_tool_result
+
+        wrapped = wrap_tool_result(
+            "out",
+            [UserInterjection(message="urgent", priority="important")],
+        )
+        messages: list[dict[str, object]] = [
+            {"role": "tool", "tool_call_id": "call_a", "content": wrapped},
+        ]
+        decorate_history_messages(messages, {}, {})
+        adv = messages[0]["advisories"][0]  # type: ignore[index]
+        assert adv["priority"] == "important"
+        assert adv["text"] == "urgent"
+
+    def test_wrap_extract_round_trips_preexisting_entities(self) -> None:
+        """A user message body containing literal HTML-entity references
+        matching the wrapper-escape forms must round-trip identically
+        through ``wrap_tool_result + extract_advisories_from_tool_envelope``.
+        Without escaping ``&`` first in the encode step, encode→decode
+        would produce the bare wrapper tag, fabricating an envelope the
+        wrapper layer never produced.
+        """
+        from turnstone.core.history_decoration import (
+            extract_advisories_from_tool_envelope,
+        )
+        from turnstone.core.tool_advisory import UserInterjection, wrap_tool_result
+
+        tricky = "I describe XML tags like &lt;tool_output&gt; in my docs."
+        wrapped = wrap_tool_result(
+            "tool body",
+            [UserInterjection(message=tricky, priority="notice")],
+        )
+        result = extract_advisories_from_tool_envelope(wrapped)
+        assert result is not None
+        cleaned, advisories = result
+        assert cleaned == "tool body"
+        assert len(advisories) == 1
+        # The original literal entity-reference text round-trips
+        # identically — the parser does not silently turn it into a
+        # bare wrapper tag.
+        assert advisories[0]["text"] == tricky
+
+    def test_save_load_decorate_round_trips_envelope(self, backend) -> None:
+        """End-to-end round-trip pinning the persisted-envelope
+        contract.  Persists a wrapped tool-output envelope via
+        ``save_message``, loads via ``load_messages``, runs
+        ``decorate_history_messages``, asserts the wire shape carries
+        the extracted advisory + cleaned content.  Pins the contract
+        every component in the chain participates in (persistence
+        layer ↔ in-memory replay ↔ wire projection) so a schema drift,
+        an envelope-format change, or a parser regression surfaces
+        here rather than only in production.
+        """
+        from turnstone.core.tool_advisory import UserInterjection, wrap_tool_result
+
+        wrapped = wrap_tool_result(
+            "command output",
+            [UserInterjection(message="check the logs", priority="notice")],
+        )
+        backend.register_workstream("ws_rt_1")
+        backend.save_message("ws_rt_1", "user", "go")
+        backend.save_message(
+            "ws_rt_1",
+            "assistant",
+            None,
+            tool_calls='[{"id":"call_a","type":"function","function":{"name":"bash","arguments":"{}"}}]',
+        )
+        backend.save_message(
+            "ws_rt_1",
+            "tool",
+            wrapped,
+            tool_call_id="call_a",
+        )
+        msgs = backend.load_messages("ws_rt_1")
+        # Persisted shape — content survives the storage layer
+        # untouched.  Symmetry with in-memory ``self.messages[i]['content']``
+        # is what makes envelope extraction lossless on replay.
+        tool_msg = next(m for m in msgs if m["role"] == "tool")
+        assert tool_msg["content"] == wrapped
+        # Decorate (the /history shared transform) — extracts the
+        # advisory and strips the envelope.
+        decorate_history_messages(msgs, {}, {})
+        tool_msg = next(m for m in msgs if m["role"] == "tool")
+        assert tool_msg["content"] == "command output"
+        assert tool_msg["advisories"] == [
+            {"type": "user_interjection", "text": "check the logs", "priority": "notice"}
+        ]

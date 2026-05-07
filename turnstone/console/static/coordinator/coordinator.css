@@ -439,25 +439,6 @@
   font-size: 10px;
 }
 
-/* Storage-truncation indicator — same convention as the interactive
-   UI's `.tool-output-truncated` pill (transparent bg, dim border,
-   small font) so the operator reads the affordance the same way on
-   both surfaces.  Sibling node next to .coord-tool-row-result rather
-   than text-in-content so a future "best-effort JSON repair" pass
-   on the result body doesn't have to strip a marker string. */
-.coord-tool-truncated {
-  display: inline-block;
-  margin-top: 4px;
-  margin-left: 6px;
-  padding: 1px 6px;
-  font-size: 10px;
-  font-family: var(--font-mono);
-  color: var(--ink-3);
-  background: transparent;
-  border: 1px solid var(--ink-3);
-  border-radius: 3px;
-}
-
 /* memory/recall calls are background metadata — the audit trail is
    useful but they crowd the tree on workstreams with heavy memory
    usage.  Dim the row by default; full opacity on hover so they

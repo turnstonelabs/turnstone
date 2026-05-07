@@ -1031,6 +1031,188 @@ class TestBuildHistoryReminderPropagation:
         assert history[0]["content"] == content
 
 
+class TestBuildHistoryAdvisoryRoundTrip:
+    """``_build_history`` must round-trip the persisted
+    ``<tool_output>`` envelope (Seam 1 queued-message splice) to
+    cleaned content + a wire-shape ``advisories`` array.
+
+    Production realism note: ``session.messages`` never carries an
+    ``advisories`` key — only ``decorate_history_messages`` mutates
+    dicts to add it for the REST ``/history`` path, and the SSE replay
+    surface bypasses that decoration entirely.  The earlier
+    ``TestBuildHistoryAdvisoryPropagation`` class pre-populated
+    ``advisories`` directly on the session messages, which tested a
+    passthrough that doesn't exist in production — the SSE replay code
+    path silently dropped queued messages despite the green tests.
+    These round-trip tests exercise the production shape (wrapped
+    envelope on the tool row's ``content``) so a regression in the
+    inline ``extract_advisories_from_tool_envelope`` call inside
+    ``_build_history`` surfaces here.
+    """
+
+    def _session_with_messages(self, messages: list[dict]) -> MagicMock:
+        session = MagicMock()
+        session.messages = messages
+        return session
+
+    def test_build_history_round_trips_envelope_to_advisories(self):
+        """The production-realistic shape: a tool row whose ``content``
+        is the wrapped ``<tool_output>`` envelope (no ``advisories``
+        key set — that's the bug-1 footprint).  ``_build_history``
+        must extract the advisory back out and ship it on the wire as
+        cleaned content + ``advisories``.
+
+        Reverting the inline ``extract_advisories_from_tool_envelope``
+        call in ``server._build_history``'s tool-message branch breaks
+        this test.
+        """
+        from turnstone.core.tool_advisory import UserInterjection, wrap_tool_result
+        from turnstone.server import _build_history
+
+        wrapped = wrap_tool_result(
+            "tool body",
+            [UserInterjection(message="check logs", priority="notice")],
+        )
+        session = self._session_with_messages(
+            [
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_a",
+                    "content": wrapped,
+                }
+            ]
+        )
+        history = _build_history(session)
+        # Cleaned content rides on the wire — envelope stripped.
+        assert history[0]["content"] == "tool body"
+        # Advisory survives as a wire-shape entry the JS can render
+        # as a user bubble after the tool block.
+        assert history[0]["advisories"] == [
+            {"type": "user_interjection", "text": "check logs", "priority": "notice"}
+        ]
+
+    def test_build_history_round_trips_important_priority(self):
+        """The ``important`` priority preamble round-trips — pin both
+        the priority detection in the parser and the projection through
+        to the wire shape."""
+        from turnstone.core.tool_advisory import UserInterjection, wrap_tool_result
+        from turnstone.server import _build_history
+
+        wrapped = wrap_tool_result(
+            "out",
+            [UserInterjection(message="urgent", priority="important")],
+        )
+        session = self._session_with_messages(
+            [{"role": "tool", "tool_call_id": "call_a", "content": wrapped}]
+        )
+        history = _build_history(session)
+        assert history[0]["content"] == "out"
+        assert history[0]["advisories"] == [
+            {"type": "user_interjection", "text": "urgent", "priority": "important"}
+        ]
+
+    def test_build_history_no_envelope_passes_through_unchanged(self):
+        """Plain tool content (no ``<tool_output>`` prefix) — no
+        advisories field, content unchanged."""
+        from turnstone.server import _build_history
+
+        session = self._session_with_messages(
+            [{"role": "tool", "tool_call_id": "call_a", "content": "plain output"}]
+        )
+        history = _build_history(session)
+        assert history[0]["content"] == "plain output"
+        assert "advisories" not in history[0]
+
+    def test_build_history_round_trip_through_full_decoration_chain(self):
+        """End-to-end pin: persist a wrapped envelope into ``messages``,
+        run the full decoration chain (``decorate_history_messages``
+        followed by ``_build_history``), assert the wire shape carries
+        the advisory.  This pins the contract every component in the
+        chain participates in — REST ``/history`` callers go through
+        ``decorate_history_messages``, and SSE replay goes through
+        ``_build_history`` — both must produce the same wire shape.
+        """
+        from turnstone.core.history_decoration import decorate_history_messages
+        from turnstone.core.tool_advisory import UserInterjection, wrap_tool_result
+        from turnstone.server import _build_history
+
+        wrapped = wrap_tool_result(
+            "raw",
+            [UserInterjection(message="hi", priority="notice")],
+        )
+        # Decorate first — REST /history shape.
+        rest_messages: list[dict] = [{"role": "tool", "tool_call_id": "call_a", "content": wrapped}]
+        decorate_history_messages(rest_messages, {}, {})
+        # And separately drive _build_history with a fresh undecorated
+        # message — SSE replay shape.
+        session = self._session_with_messages(
+            [{"role": "tool", "tool_call_id": "call_a", "content": wrapped}]
+        )
+        sse_history = _build_history(session)
+        # Both surfaces produce the same advisory + cleaned content.
+        assert rest_messages[0]["content"] == "raw"
+        assert rest_messages[0]["advisories"] == [
+            {"type": "user_interjection", "text": "hi", "priority": "notice"}
+        ]
+        assert sse_history[0]["content"] == "raw"
+        assert sse_history[0]["advisories"] == [
+            {"type": "user_interjection", "text": "hi", "priority": "notice"}
+        ]
+
+    def test_build_history_extracts_advisories_from_list_content_text_part(self):
+        """List-typed tool output (image / structured MCP results)
+        with a Seam 1 splice carries the wrap envelope as a separate
+        text part (``session.py``'s tool-result loop appends
+        ``{"type": "text", "text": wrap_tool_result("", advisories)}``
+        when ``output`` is a list).  ``_build_history`` must walk the
+        list parts, extract advisories from any wrap-envelope text
+        part, and DROP that text part from the projected list — the
+        cleaned inner content is empty by construction, and leaving
+        the part would cause the JS replay to render the literal
+        envelope text as a chunk inside the tool block AND fail to
+        render the queued message as a user bubble.
+
+        Removing the list-content branch in ``_build_history``'s tool-
+        message advisory extraction breaks this test.
+        """
+        from turnstone.core.tool_advisory import UserInterjection, wrap_tool_result
+        from turnstone.server import _build_history
+
+        wrap_text = wrap_tool_result(
+            "",
+            [UserInterjection(message="inspect histogram", priority="notice")],
+        )
+        list_content = [
+            {"type": "text", "text": "the chart shows X"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,xxx"}},
+            {"type": "text", "text": wrap_text},
+        ]
+        session = self._session_with_messages(
+            [{"role": "tool", "tool_call_id": "call_a", "content": list_content}]
+        )
+        history = _build_history(session)
+        # Wire-shape content keeps the original text + image parts but
+        # has the wrap text-part dropped.
+        wire_content = history[0]["content"]
+        assert isinstance(wire_content, list)
+        assert len(wire_content) == 2
+        assert wire_content[0] == {"type": "text", "text": "the chart shows X"}
+        assert wire_content[1] == {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,xxx"},
+        }
+        # Advisory rides on the wire so JS replay renders the user
+        # bubble after the tool block — same contract as the string-
+        # content path.
+        assert history[0]["advisories"] == [
+            {
+                "type": "user_interjection",
+                "text": "inspect histogram",
+                "priority": "notice",
+            }
+        ]
+
+
 class TestDetailInteractive:
     """Interactive parity for the lifted ``GET /v1/api/workstreams/{ws_id}``.
 

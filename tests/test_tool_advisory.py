@@ -7,6 +7,7 @@ from turnstone.core.tool_advisory import (
     GuardAdvisory,
     MetacognitiveAdvisory,
     UserInterjection,
+    escape_wrapper_tags,
     parse_priority,
     render_system_reminder,
     wrap_tool_result,
@@ -222,6 +223,63 @@ class TestMetacognitiveAdvisory:
         result = wrap_tool_result("tool output", [adv])
         assert "<system-reminder>" in result
         assert "don't repeat tool calls" in result
+
+
+class TestEscapeWrapperTags:
+    """``escape_wrapper_tags`` must round-trip through
+    ``_entity_decode_wrapper_tags`` for any input — not just text that
+    happens to contain only wrapper tags.
+    """
+
+    def test_short_circuit_passes_through_plain_text(self) -> None:
+        """No ``<`` and no ``&`` — ``escape_wrapper_tags`` must avoid
+        the four ``replace`` chains.  Common case for most tool outputs;
+        the short-circuit keeps wrap_tool_result's overhead near zero."""
+        text = "plain text without any markup"
+        assert escape_wrapper_tags(text) == text
+
+    def test_escape_wrapper_tags_round_trips_preexisting_entities(self) -> None:
+        """Asymmetry guard — a tool output that happens to contain the
+        literal string ``&lt;tool_output&gt;`` (e.g. documentation
+        describing the wrapper format) must round-trip identically.
+        Without escaping ``&`` first, encode→decode would produce the
+        bare ``<tool_output>`` tag, fabricating an envelope the wrapper
+        layer never produced."""
+        from turnstone.core.history_decoration import _entity_decode_wrapper_tags
+
+        text = "I describe XML tags like &lt;tool_output&gt; in my docs."
+        encoded = escape_wrapper_tags(text)
+        # Sanity: the original literal got escaped to a sentinel form
+        # that can't collide with our wrapper-tag escapes.
+        assert "&amp;lt;tool_output&amp;gt;" in encoded
+        assert "&lt;tool_output&gt;" not in encoded
+        # Round-trip back to the literal source.
+        assert _entity_decode_wrapper_tags(encoded) == text
+
+    def test_escape_wrapper_tags_round_trips_real_wrapper_tag(self) -> None:
+        """A literal ``<tool_output>`` in source text round-trips back
+        correctly — encoding produces ``&lt;tool_output&gt;`` (no
+        ``&amp;`` prefix because there was no pre-existing entity), and
+        decoding restores the literal."""
+        from turnstone.core.history_decoration import _entity_decode_wrapper_tags
+
+        text = "Here is a literal <tool_output> tag in my doc."
+        encoded = escape_wrapper_tags(text)
+        assert "<tool_output>" not in encoded
+        assert "&lt;tool_output&gt;" in encoded
+        assert _entity_decode_wrapper_tags(encoded) == text
+
+    def test_escape_wrapper_tags_round_trips_mixed_content(self) -> None:
+        """Mixed: literal wrapper tags AND pre-existing entity
+        references — both round-trip."""
+        from turnstone.core.history_decoration import _entity_decode_wrapper_tags
+
+        text = (
+            "Mixed: literal <tool_output> next to escaped &lt;system-reminder&gt; "
+            "and a stray &amp; on its own."
+        )
+        encoded = escape_wrapper_tags(text)
+        assert _entity_decode_wrapper_tags(encoded) == text
 
 
 class TestRenderSystemReminder:
