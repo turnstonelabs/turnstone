@@ -23,6 +23,12 @@ returns a normalised ``{key.lower(): value}`` dict. The thin extraction
 wrappers (``parse_www_authenticate_scope`` / ``parse_www_authenticate_error``)
 preserve the original return shapes so call sites only need to swap the
 import.
+
+Also hosts ``MAX_INSUFFICIENT_SCOPE_REPORTED`` — the shared defensive cap
+on scope-list lengths consumed by both the WWW-Authenticate parser
+(``mcp_client``) and the ``/v1/api/mcp/oauth/start?scopes=`` step-up
+handler (``mcp_oauth``). Living here avoids one module importing a
+private name from the other.
 """
 
 from __future__ import annotations
@@ -183,6 +189,18 @@ def parse_www_authenticate_bearer(header: str) -> dict[str, str]:
             value = header[val_start:i]
             out.setdefault(key, value)
     return out
+
+
+# Defensive cap on the number of scopes reported in
+# ``mcp_insufficient_scope`` audit/error payloads and accepted from the
+# ``/v1/api/mcp/oauth/start?scopes=`` step-up query param. Real ASes
+# return single-digit scope counts; the cap stops a malicious upstream
+# (or buggy client) from bloating either surface via a thousand-token
+# scope list. Lives here so the WWW-Authenticate parser (consumer:
+# ``mcp_client``) and the ``/start`` handler (consumer: ``mcp_oauth``)
+# share a single source of truth without one importing a private name
+# from the other.
+MAX_INSUFFICIENT_SCOPE_REPORTED = 32
 
 
 def is_valid_scope_token(token: str) -> bool:

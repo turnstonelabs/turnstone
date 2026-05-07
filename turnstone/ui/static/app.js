@@ -5162,8 +5162,14 @@ function _refreshConsentBadge() {
   if (!btn) return;
   var existing = btn.querySelector(".settings-consent-badge");
   var n = _pendingConsentServers.size;
+  // Keep the visible badge and the accessible name in lockstep so screen-
+  // reader users get the same pending-consent signal that sighted users
+  // get from the red dot. The badge itself stays aria-hidden because the
+  // count is already reflected in the button's aria-label/title.
   if (n === 0) {
     if (existing) existing.remove();
+    btn.setAttribute("aria-label", "MCP server connections");
+    btn.setAttribute("title", "MCP server connections");
     return;
   }
   if (!existing) {
@@ -5173,6 +5179,14 @@ function _refreshConsentBadge() {
     btn.appendChild(existing);
   }
   existing.textContent = String(n);
+  var label =
+    "MCP server connections (" +
+    n +
+    " pending consent" +
+    (n === 1 ? "" : "s") +
+    ")";
+  btn.setAttribute("aria-label", label);
+  btn.setAttribute("title", label);
 }
 
 /**
@@ -5824,6 +5838,16 @@ function openSettingsPanel() {
 }
 
 function closeSettingsPanel() {
+  // If the nested revoke confirmation is still up, tear it down first
+  // — otherwise hiding the parent panel would leave an orphan modal
+  // overlay floating with its own keydown trap still attached. The
+  // Escape-key path inside the parent's keydown trap defers to the
+  // inner trap; this branch is the close-button path that doesn't go
+  // through that trap.
+  var inner = document.getElementById("revoke-mcp-overlay");
+  if (inner && inner.style.display !== "none") {
+    cancelRevokeMcp();
+  }
   var overlay = document.getElementById("settings-overlay");
   if (overlay) overlay.style.display = "none";
   if (_settingsTrap) {
