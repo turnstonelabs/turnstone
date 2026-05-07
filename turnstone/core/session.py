@@ -1728,6 +1728,21 @@ class ChatSession:
         if not fork:
             self._ws_id = ws_id
         self.messages = messages
+        # Persisted reminders ride the ``_reminders`` side-channel but
+        # carry no in-memory ``_reminders_delivered`` flag (the flag is
+        # session-scoped — set by ``_mark_reminders_delivered`` after
+        # each successful provider stream, never persisted).  Without
+        # this re-splice guard, the very next user turn after resume
+        # would walk the loaded history and re-render every historical
+        # ``<system-reminder>`` block onto the wire — leaking each one a
+        # second time, the turn after it had already advised.  Mirror
+        # the post-stream hook here: every loaded message that carries
+        # reminders has already been delivered (it survived to disk),
+        # so flag it accordingly so ``_apply_reminders_for_provider``
+        # short-circuits on the pass-through path.
+        for msg in self.messages:
+            if msg.get("_reminders"):
+                msg["_reminders_delivered"] = True
         self._read_files.clear()
         self._repeat_detector.clear()
         self._last_usage = None
