@@ -311,6 +311,117 @@ class TestAuthorize:
         assert pending is not None
         assert pending["return_url"] == "/"
 
+    def test_authorize_scope_param_unioned_with_configured_scopes(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        token_store = _make_token_store(storage)
+        http_client_mock.get.return_value = _mk_response(200, _good_as_metadata_doc())
+
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        with _public_addr_patch():
+            resp = client.get(
+                "/v1/api/mcp/oauth/start?server=srv-oauth&scopes=email%20admin",
+                follow_redirects=False,
+            )
+
+        assert resp.status_code == 302
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(resp.headers["location"]).query)
+        # Configured = "openid profile"; requested = "email admin".
+        # Union sorted alphabetically.
+        scope_param = params["scope"][0]
+        assert sorted(scope_param.split(" ")) == ["admin", "email", "openid", "profile"]
+
+    def test_authorize_scope_param_dedupe_and_sort(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        token_store = _make_token_store(storage)
+        http_client_mock.get.return_value = _mk_response(200, _good_as_metadata_doc())
+
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        # Caller passes scopes that overlap with the configured set + an
+        # extra. Ordering is intentionally unsorted to exercise the
+        # deterministic-sort property.
+        with _public_addr_patch():
+            resp = client.get(
+                "/v1/api/mcp/oauth/start?server=srv-oauth"
+                "&scopes=zzz%20openid%20aaa%20openid%20profile",
+                follow_redirects=False,
+            )
+
+        assert resp.status_code == 302
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(resp.headers["location"]).query)
+        # Sorted, deduped union.
+        assert params["scope"][0] == "aaa openid profile zzz"
+
+    def test_authorize_scope_param_rejects_invalid_token(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        token_store = _make_token_store(storage)
+        http_client_mock.get.return_value = _mk_response(200, _good_as_metadata_doc())
+
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        # CR/LF, NUL, backslash, and double-quote each individually fail
+        # the RFC 6749 §3.3 scope-token grammar; ``request.query_params``
+        # already URL-decodes so we send the encoded form.
+        for hostile in ("a%0Db", "a%0Ab", "a%00b", 'a"b', "a\\b"):
+            with _public_addr_patch():
+                resp = client.get(
+                    f"/v1/api/mcp/oauth/start?server=srv-oauth&scopes={hostile}",
+                    follow_redirects=False,
+                )
+            assert resp.status_code == 400, f"hostile={hostile!r} got {resp.status_code}"
+            assert resp.json() == {"error": "Invalid scope token"}
+
+    def test_authorize_scope_param_rejects_over_cap(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        token_store = _make_token_store(storage)
+        http_client_mock.get.return_value = _mk_response(200, _good_as_metadata_doc())
+
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        # 33 tokens — one over the cap (``_MAX_INSUFFICIENT_SCOPE_REPORTED = 32``).
+        scopes = "%20".join(f"s{i}" for i in range(33))
+        with _public_addr_patch():
+            resp = client.get(
+                f"/v1/api/mcp/oauth/start?server=srv-oauth&scopes={scopes}",
+                follow_redirects=False,
+            )
+        assert resp.status_code == 400
+        assert resp.json() == {"error": "Invalid scope token"}
+
+    def test_authorize_no_scope_param_passes_configured_scope_unchanged(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        # Static-path invariant: when no ``scopes`` query param is passed,
+        # the AS sees the configured scope string verbatim (not run
+        # through sort/dedup). Configured = "openid profile" → AS
+        # receives "openid profile" in the same order.
+        _seed_oauth_user_server(storage)
+        token_store = _make_token_store(storage)
+        http_client_mock.get.return_value = _mk_response(200, _good_as_metadata_doc())
+
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        with _public_addr_patch():
+            resp = client.get("/v1/api/mcp/oauth/start?server=srv-oauth", follow_redirects=False)
+
+        assert resp.status_code == 302
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(resp.headers["location"]).query)
+        assert params["scope"] == ["openid profile"]
+
 
 # ---------------------------------------------------------------------------
 # /callback

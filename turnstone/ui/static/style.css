@@ -3155,3 +3155,246 @@ audio.media-player {
 .ts-verdict-glow--review .ts-approval-btn--deny {
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--warn) 25%, transparent);
 }
+
+/* ==========================================================================
+   MCP error embed (consent / scope / forbidden / operator)
+   ========================================================================== */
+.mcp-error-card {
+  border-top: 1px solid var(--border);
+  background: var(--code-bg);
+  padding: 12px;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 12px;
+  align-items: start;
+  font-family: var(--font-ui);
+  font-size: 13px;
+}
+.mcp-error-icon {
+  font-size: 20px;
+  line-height: 1;
+  color: var(--accent);
+}
+.mcp-error-card.mcp-error-forbidden .mcp-error-icon,
+.mcp-error-card.mcp-error-operator .mcp-error-icon {
+  color: var(--red);
+}
+.mcp-error-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.mcp-error-title {
+  font-weight: 600;
+  color: var(--fg);
+}
+.mcp-error-detail {
+  color: var(--fg-dim);
+}
+.mcp-error-server,
+.mcp-error-scopes {
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+.mcp-error-server code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--fg);
+}
+.mcp-scope-pill {
+  display: inline-block;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 2px 8px;
+  margin-right: 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg);
+}
+.mcp-error-action-btn {
+  margin-top: 6px;
+  padding: 6px 12px;
+  background: var(--accent);
+  color: var(--bg);
+  border: none;
+  border-radius: 4px;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  align-self: start;
+}
+.mcp-error-action-btn:hover {
+  filter: brightness(1.1);
+}
+.mcp-error-card details {
+  grid-column: 1 / -1;
+  margin-top: 6px;
+}
+.mcp-error-card details summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--fg-dim);
+  padding: 4px 0;
+}
+.mcp-error-card details pre {
+  margin: 4px 0 0 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-dim);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* ==========================================================================
+   Settings: MCP server connections
+   ========================================================================== */
+#settings-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+#settings-box {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  width: min(720px, 90vw);
+  max-height: 80vh;
+  overflow-y: auto;
+  font-family: var(--font-ui);
+}
+#settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+}
+#settings-header h3 {
+  margin: 0;
+  font-size: 16px;
+  color: var(--fg);
+}
+#settings-close-btn {
+  background: transparent;
+  border: none;
+  color: var(--fg-dim);
+  font-size: 18px;
+  cursor: pointer;
+  padding: 4px 8px;
+}
+#settings-body {
+  padding: 16px 20px;
+}
+#settings-mcp-loading,
+#settings-mcp-empty {
+  color: var(--fg-dim);
+  font-size: 13px;
+  padding: 12px 0;
+}
+#settings-mcp-error {
+  color: var(--red);
+  font-size: 13px;
+  padding: 12px 0;
+}
+#settings-mcp-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+#settings-mcp-table th {
+  text-align: left;
+  padding: 6px 8px;
+  font-weight: 500;
+  color: var(--fg-dim);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+#settings-mcp-table td {
+  padding: 8px 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg);
+  vertical-align: middle;
+}
+.settings-revoke-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--red);
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  cursor: pointer;
+}
+.settings-revoke-btn:hover {
+  background: rgba(255, 0, 0, 0.05);
+}
+.settings-consent-badge {
+  display: inline-block;
+  margin-left: 4px;
+  background: var(--red);
+  color: var(--bg);
+  border-radius: 8px;
+  font-size: 10px;
+  padding: 1px 5px;
+  vertical-align: top;
+  font-weight: 600;
+  line-height: 1.4;
+  font-family: var(--font-ui);
+}
+
+/* Revoke confirmation modal — uses the existing delete-ws pattern */
+#revoke-mcp-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1001;
+}
+#revoke-mcp-box {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 20px;
+  width: min(420px, 90vw);
+  font-family: var(--font-ui);
+}
+#revoke-mcp-box h3 {
+  margin: 0 0 12px 0;
+  font-size: 16px;
+  color: var(--fg);
+}
+#revoke-mcp-message {
+  font-size: 13px;
+  color: var(--fg-dim);
+  margin: 0 0 16px 0;
+}
+#revoke-mcp-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+#revoke-mcp-buttons button {
+  padding: 6px 14px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--fg);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  cursor: pointer;
+}
+#revoke-mcp-buttons button.danger {
+  background: var(--red);
+  color: var(--bg);
+  border-color: var(--red);
+}

@@ -360,10 +360,10 @@ def test_resource_read_persistent_401_emits_consent_required(
     with patch(
         "turnstone.core.mcp_client.get_user_access_token_classified",
         side_effect=_fake_classified,
-    ):
-        result = mgr.read_resource_sync("res://hello", user_id="user-1", timeout=15)
+    ), pytest.raises(RuntimeError) as exc_info:
+        mgr.read_resource_sync("res://hello", user_id="user-1", timeout=15)
 
-    payload = json.loads(result)
+    payload = json.loads(str(exc_info.value))
     assert payload["error"]["code"] == "mcp_consent_required"
     assert payload["error"]["server"] == "pool-srv"
     assert mgr._consecutive_failures.get("pool-srv", 0) == 0
@@ -395,10 +395,10 @@ def test_resource_read_403_insufficient_scope_emits_structured_error(
     with patch(
         "turnstone.core.mcp_client.get_user_access_token_classified",
         side_effect=_fake_classified,
-    ):
-        result = mgr.read_resource_sync("res://hello", user_id="user-1", timeout=15)
+    ), pytest.raises(RuntimeError) as exc_info:
+        mgr.read_resource_sync("res://hello", user_id="user-1", timeout=15)
 
-    payload = json.loads(result)
+    payload = json.loads(str(exc_info.value))
     assert payload["error"]["code"] == "mcp_insufficient_scope"
     assert payload["error"]["scopes_required"] == ["files:read"]
     post_headers = behaviour.get("post_auth_headers", [])
@@ -433,10 +433,10 @@ def test_resource_read_403_generic_forbidden(
     with patch(
         "turnstone.core.mcp_client.get_user_access_token_classified",
         side_effect=_fake_classified,
-    ):
-        result = mgr.read_resource_sync("res://hello", user_id="user-1", timeout=15)
+    ), pytest.raises(RuntimeError) as exc_info:
+        mgr.read_resource_sync("res://hello", user_id="user-1", timeout=15)
 
-    payload = json.loads(result)
+    payload = json.loads(str(exc_info.value))
     # Per the kind="resource" wiring of `_handle_auth_403`, the
     # operation-specific code surfaces here rather than the tool path's
     # generic mcp_tool_call_forbidden.
@@ -479,9 +479,9 @@ def test_resource_read_breaker_unaffected_by_auth_failures(
         with patch(
             "turnstone.core.mcp_client.get_user_access_token_classified",
             side_effect=_fake_classified,
-        ):
-            result = mgr.read_resource_sync("res://hello", user_id="user-1", timeout=15)
-        payload = json.loads(result)
+        ), pytest.raises(RuntimeError) as exc_info:
+            mgr.read_resource_sync("res://hello", user_id="user-1", timeout=15)
+        payload = json.loads(str(exc_info.value))
         assert payload["error"]["code"] == "mcp_consent_required"
         assert mgr._consecutive_failures.get("pool-srv", 0) == 0
 
@@ -508,10 +508,10 @@ def test_resource_read_missing_token_emits_consent_required(
     with patch(
         "turnstone.core.mcp_client.get_user_access_token_classified",
         side_effect=_fake_classified,
-    ):
-        result = mgr.read_resource_sync("res://hello", user_id="user-1", timeout=10)
+    ), pytest.raises(RuntimeError) as exc_info:
+        mgr.read_resource_sync("res://hello", user_id="user-1", timeout=10)
 
-    payload = json.loads(result)
+    payload = json.loads(str(exc_info.value))
     assert payload["error"]["code"] == "mcp_consent_required"
 
 
@@ -532,10 +532,10 @@ def test_resource_read_decrypt_failure_emits_token_undecryptable(
     with patch(
         "turnstone.core.mcp_client.get_user_access_token_classified",
         side_effect=_fake_classified,
-    ):
-        result = mgr.read_resource_sync("res://hello", user_id="user-1", timeout=10)
+    ), pytest.raises(RuntimeError) as exc_info:
+        mgr.read_resource_sync("res://hello", user_id="user-1", timeout=10)
 
-    payload = json.loads(result)
+    payload = json.loads(str(exc_info.value))
     assert payload["error"]["code"] == "mcp_token_undecryptable_key_unknown"
 
 
@@ -559,10 +559,10 @@ def test_resource_read_http_url_emits_url_insecure(
     with patch(
         "turnstone.core.mcp_client.get_user_access_token_classified",
         side_effect=_fake_classified,
-    ):
-        result = mgr.read_resource_sync("res://hello", user_id="user-1", timeout=5)
+    ), pytest.raises(RuntimeError) as exc_info:
+        mgr.read_resource_sync("res://hello", user_id="user-1", timeout=5)
 
-    payload = json.loads(result)
+    payload = json.loads(str(exc_info.value))
     assert payload["error"]["code"] == "mcp_oauth_url_insecure"
 
 

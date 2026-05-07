@@ -2689,6 +2689,20 @@ async def mcp_oauth_callback(request: Request) -> Response:
     return await handle_mcp_oauth_callback(request)
 
 
+async def mcp_oauth_list_connections(request: Request) -> Response:
+    """GET /v1/api/mcp/oauth/connections — list this user's MCP server consents."""
+    from turnstone.core.mcp_oauth import handle_mcp_oauth_list_connections
+
+    return await handle_mcp_oauth_list_connections(request)
+
+
+async def mcp_oauth_revoke_connection(request: Request) -> Response:
+    """DELETE /v1/api/mcp/oauth/connections/{server_name} — revoke a consent."""
+    from turnstone.core.mcp_oauth import handle_mcp_oauth_revoke_connection
+
+    return await handle_mcp_oauth_revoke_connection(request)
+
+
 def list_interface_settings(request: Request) -> JSONResponse:
     """GET /v1/api/admin/settings — return interface settings from ConfigStore.
 
@@ -3925,6 +3939,12 @@ def create_app(
                     Route("/api/auth/oidc/callback", oidc_callback),
                     Route("/api/mcp/oauth/start", mcp_oauth_authorize),
                     Route("/api/mcp/oauth/callback", mcp_oauth_callback),
+                    Route("/api/mcp/oauth/connections", mcp_oauth_list_connections),
+                    Route(
+                        "/api/mcp/oauth/connections/{server_name}",
+                        mcp_oauth_revoke_connection,
+                        methods=["DELETE"],
+                    ),
                     Route("/api/admin/settings", list_interface_settings),
                     Route(
                         "/api/admin/settings/{key:path}",

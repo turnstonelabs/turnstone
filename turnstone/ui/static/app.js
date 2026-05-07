@@ -1751,6 +1751,22 @@ Pane.prototype.appendToolOutput = function (callId, name, output, isError) {
     }
   }
 
+  // Detect structured MCP error envelope and render an interactive
+  // consent / re-consent / forbidden / operator card.  The existing
+  // ✗ error badge from appendToolErrorBadge still fires below.
+  if (isError) {
+    var mcpErr = tryParseMcpError(stripped);
+    if (mcpErr) {
+      if (parentBlock && !parentBlock.classList.contains("denied")) {
+        parentBlock.classList.add("error");
+        appendToolErrorBadge(parentBlock);
+      }
+      target.after(buildMcpErrorEmbed(mcpErr, stripped));
+      this.scrollToBottom();
+      return;
+    }
+  }
+
   var out = renderToolOutput(stripped, isError);
 
   // Mark the parent approval block as errored
@@ -5120,6 +5136,210 @@ function buildMediaResultsList(results, totalCount) {
   return container;
 }
 
+// ===========================================================================
+//  12b. MCP error embed (consent / scope / forbidden / operator)
+// ===========================================================================
+
+// Module-level set of servers with an unresolved consent prompt; drives the
+// gear-icon badge so the user has a stable signal that re-consent is pending
+// after the inline card scrolls out of view.
+var _pendingConsentServers = new Set();
+
+function _onConsentDetected(server) {
+  if (typeof server === "string" && server) {
+    _pendingConsentServers.add(server);
+    _refreshConsentBadge();
+  }
+}
+
+function _clearConsentBadge() {
+  _pendingConsentServers.clear();
+  _refreshConsentBadge();
+}
+
+function _refreshConsentBadge() {
+  var btn = document.getElementById("settings-btn");
+  if (!btn) return;
+  var existing = btn.querySelector(".settings-consent-badge");
+  var n = _pendingConsentServers.size;
+  if (n === 0) {
+    if (existing) existing.remove();
+    return;
+  }
+  if (!existing) {
+    existing = document.createElement("span");
+    existing.className = "settings-consent-badge";
+    existing.setAttribute("aria-hidden", "true");
+    btn.appendChild(existing);
+  }
+  existing.textContent = String(n);
+}
+
+/**
+ * Detect a structured MCP error envelope.  Returns the inner ``error``
+ * object on shape match, null otherwise.  Recognised codes:
+ *   - mcp_consent_required (carries optional consent_url + scopes_required)
+ *   - mcp_insufficient_scope (carries consent_url + scopes_required)
+ *   - mcp_tool_call_forbidden / mcp_resource_read_forbidden / mcp_prompt_get_forbidden
+ *   - mcp_token_undecryptable_key_unknown (operator action)
+ *   - mcp_oauth_url_insecure (operator action)
+ */
+function tryParseMcpError(text) {
+  try {
+    var obj = JSON.parse(text);
+  } catch (e) {
+    return null;
+  }
+  if (!obj || typeof obj !== "object") return null;
+  var err = obj.error;
+  if (!err || typeof err !== "object") return null;
+  if (typeof err.code !== "string" || err.code.indexOf("mcp_") !== 0)
+    return null;
+  return err;
+}
+
+function _mcpErrorCategory(code) {
+  if (code === "mcp_consent_required" || code === "mcp_insufficient_scope") {
+    return "actionable";
+  }
+  if (
+    code === "mcp_token_undecryptable_key_unknown" ||
+    code === "mcp_oauth_url_insecure"
+  ) {
+    return "operator";
+  }
+  // Default for any other mcp_*_forbidden / unrecognised mcp_ code.
+  return "forbidden";
+}
+
+function _mcpErrorTitle(err) {
+  switch (err.code) {
+    case "mcp_consent_required":
+      return "Consent required";
+    case "mcp_insufficient_scope":
+      return "Re-consent required (insufficient scope)";
+    case "mcp_token_undecryptable_key_unknown":
+    case "mcp_oauth_url_insecure":
+      return "Operator action required";
+    default:
+      return "Forbidden";
+  }
+}
+
+/**
+ * Render the action card for an MCP error envelope.  Mirrors the
+ * media-embed pattern: visible card on top, collapsible raw JSON below.
+ */
+function buildMcpErrorEmbed(err, rawJson) {
+  var category = _mcpErrorCategory(err.code);
+  var wrapper = document.createElement("div");
+  wrapper.className = "mcp-error-card mcp-error-" + category;
+
+  var icon = document.createElement("div");
+  icon.className = "mcp-error-icon";
+  icon.setAttribute("aria-hidden", "true");
+  icon.textContent = "⚠";
+  wrapper.appendChild(icon);
+
+  var body = document.createElement("div");
+  body.className = "mcp-error-body";
+
+  var title = document.createElement("div");
+  title.className = "mcp-error-title";
+  title.textContent = _mcpErrorTitle(err);
+  body.appendChild(title);
+
+  if (err.detail) {
+    var detail = document.createElement("div");
+    detail.className = "mcp-error-detail";
+    detail.textContent = String(err.detail);
+    body.appendChild(detail);
+  }
+
+  if (err.server) {
+    var serverLine = document.createElement("div");
+    serverLine.className = "mcp-error-server";
+    serverLine.appendChild(document.createTextNode("server: "));
+    var serverCode = document.createElement("code");
+    serverCode.textContent = String(err.server);
+    serverLine.appendChild(serverCode);
+    body.appendChild(serverLine);
+  }
+
+  if (Array.isArray(err.scopes_required) && err.scopes_required.length) {
+    var scopesLine = document.createElement("div");
+    scopesLine.className = "mcp-error-scopes";
+    scopesLine.appendChild(document.createTextNode("scopes: "));
+    for (var i = 0; i < err.scopes_required.length; i++) {
+      var pill = document.createElement("span");
+      pill.className = "mcp-scope-pill";
+      pill.textContent = String(err.scopes_required[i]);
+      scopesLine.appendChild(pill);
+    }
+    body.appendChild(scopesLine);
+  }
+
+  if (category === "actionable") {
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "mcp-error-action-btn";
+    var serverLabel = err.server ? String(err.server) : "server";
+    btn.textContent =
+      err.code === "mcp_insufficient_scope"
+        ? "Re-consent with new scopes →"
+        : "Connect to " + serverLabel + " →";
+    btn.setAttribute(
+      "aria-label",
+      err.code === "mcp_insufficient_scope"
+        ? "Re-consent with new scopes for " + serverLabel
+        : "Connect to " + serverLabel,
+    );
+    btn.addEventListener("click", function () {
+      var consentUrl = err.consent_url;
+      if (!consentUrl || typeof consentUrl !== "string") {
+        // Defensive: should always be present per the dispatcher.  If a
+        // path forgets to include it the user can still connect via the
+        // Settings panel (gear icon).
+        showToast("No consent URL available; open Settings to connect.");
+        return;
+      }
+      // Defence-in-depth: reject anything that isn't path-relative to
+      // the dispatcher's known prefix. ``_build_consent_url`` always
+      // emits ``/v1/api/mcp/oauth/start?...`` — a non-prefix value
+      // would indicate a future producer drift or a compromised
+      // dispatcher, and ``window.open("javascript:...")`` would be
+      // catastrophic. Never rely on the producer-side guarantee alone.
+      if (!consentUrl.startsWith("/v1/api/mcp/oauth/start")) {
+        showToast("Invalid consent URL");
+        return;
+      }
+      var sep = consentUrl.indexOf("?") >= 0 ? "&" : "?";
+      var url =
+        consentUrl +
+        sep +
+        "return_url=" +
+        encodeURIComponent(window.location.href);
+      window.open(url, "_blank", "noopener");
+    });
+    body.appendChild(btn);
+    _onConsentDetected(err.server);
+  }
+
+  wrapper.appendChild(body);
+
+  var details = document.createElement("details");
+  var summary = document.createElement("summary");
+  summary.textContent = "raw payload";
+  details.appendChild(summary);
+  var pre = document.createElement("pre");
+  pre.className = "tool-output";
+  pre.textContent = _tryPrettyJson(rawJson) || _redactApiKeys(rawJson);
+  details.appendChild(pre);
+  wrapper.appendChild(details);
+
+  return wrapper;
+}
+
 // ---------------------------------------------------------------------------
 //  HLS lazy-loader (follows the mermaid.js lazy-load pattern in
 //  /shared/renderer.js)
@@ -5551,6 +5771,265 @@ document
   }
 })();
 
+// ===========================================================================
+//  15. MCP server connections settings panel
+// ===========================================================================
+
+var _pendingRevokeServer = null;
+var _settingsTrap = null;
+var _revokeMcpTrap = null;
+var _settingsReturnFocus = null;
+
+function openSettingsPanel() {
+  var overlay = document.getElementById("settings-overlay");
+  if (!overlay) return;
+  _settingsReturnFocus = document.activeElement;
+  overlay.style.display = "flex";
+
+  if (_settingsTrap) document.removeEventListener("keydown", _settingsTrap);
+  _settingsTrap = function (e) {
+    if (e.key === "Escape") {
+      // If the nested revoke confirmation is open, let its own trap
+      // handle Escape — closing inner-first matches the delete-ws flow.
+      var inner = document.getElementById("revoke-mcp-overlay");
+      if (inner && inner.style.display !== "none") return;
+      e.preventDefault();
+      closeSettingsPanel();
+      return;
+    }
+    if (e.key === "Tab") {
+      var box = document.getElementById("settings-box");
+      if (!box) return;
+      var focusable = box.querySelectorAll(
+        "button, [href], input, select, textarea, [tabindex]:not([tabindex='-1'])",
+      );
+      if (!focusable.length) return;
+      var first = focusable[0];
+      var last = focusable[focusable.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+  };
+  document.addEventListener("keydown", _settingsTrap);
+
+  loadMcpConnections();
+
+  var closeBtn = document.getElementById("settings-close-btn");
+  if (closeBtn) closeBtn.focus();
+}
+
+function closeSettingsPanel() {
+  var overlay = document.getElementById("settings-overlay");
+  if (overlay) overlay.style.display = "none";
+  if (_settingsTrap) {
+    document.removeEventListener("keydown", _settingsTrap);
+    _settingsTrap = null;
+  }
+  if (
+    _settingsReturnFocus &&
+    typeof _settingsReturnFocus.focus === "function"
+  ) {
+    try {
+      _settingsReturnFocus.focus();
+    } catch (_) {}
+  }
+  _settingsReturnFocus = null;
+}
+
+function loadMcpConnections() {
+  var loadingEl = document.getElementById("settings-mcp-loading");
+  var emptyEl = document.getElementById("settings-mcp-empty");
+  var tableEl = document.getElementById("settings-mcp-table");
+  var errorEl = document.getElementById("settings-mcp-error");
+  if (!loadingEl || !emptyEl || !tableEl || !errorEl) return;
+  loadingEl.style.display = "";
+  emptyEl.style.display = "none";
+  tableEl.style.display = "none";
+  errorEl.style.display = "none";
+
+  authFetch("/v1/api/mcp/oauth/connections")
+    .then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    })
+    .then(function (data) {
+      loadingEl.style.display = "none";
+      var connections =
+        data && Array.isArray(data.connections) ? data.connections : [];
+      renderMcpConnections(connections);
+      // Clear AFTER the table renders so the badge reflects "user has
+      // seen current state" rather than "user opened the panel" — a
+      // failed fetch keeps the pending-consent signal until the user
+      // gets confirmation that consents are in fact reachable.
+      _clearConsentBadge();
+    })
+    .catch(function (err) {
+      loadingEl.style.display = "none";
+      errorEl.style.display = "";
+      errorEl.textContent = "Failed to load connections: " + err.message;
+    });
+}
+
+function _clearChildren(node) {
+  while (node && node.firstChild) node.removeChild(node.firstChild);
+}
+
+function renderMcpConnections(list) {
+  var emptyEl = document.getElementById("settings-mcp-empty");
+  var tableEl = document.getElementById("settings-mcp-table");
+  var tbody = document.getElementById("settings-mcp-tbody");
+  if (!emptyEl || !tableEl || !tbody) return;
+  if (!list.length) {
+    tableEl.style.display = "none";
+    emptyEl.style.display = "";
+    return;
+  }
+  emptyEl.style.display = "none";
+  tableEl.style.display = "";
+  _clearChildren(tbody);
+  for (var i = 0; i < list.length; i++) {
+    var conn = list[i];
+    var tr = document.createElement("tr");
+
+    var serverTd = document.createElement("td");
+    serverTd.textContent = conn.server_name || "";
+    tr.appendChild(serverTd);
+
+    var scopesTd = document.createElement("td");
+    scopesTd.textContent = conn.scopes || "(none)";
+    tr.appendChild(scopesTd);
+
+    var createdTd = document.createElement("td");
+    createdTd.textContent = _formatRelativeTimestamp(conn.created);
+    createdTd.title = conn.created || "";
+    tr.appendChild(createdTd);
+
+    var refreshedTd = document.createElement("td");
+    if (conn.last_refreshed) {
+      refreshedTd.textContent = _formatRelativeTimestamp(conn.last_refreshed);
+      refreshedTd.title = conn.last_refreshed;
+    } else {
+      refreshedTd.textContent = "—";
+    }
+    tr.appendChild(refreshedTd);
+
+    var actionTd = document.createElement("td");
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "settings-revoke-btn";
+    btn.textContent = "Revoke";
+    var serverNameForRevoke = conn.server_name || "";
+    btn.setAttribute(
+      "aria-label",
+      "Revoke connection to " + serverNameForRevoke,
+    );
+    (function (name) {
+      btn.addEventListener("click", function () {
+        promptRevokeMcp(name);
+      });
+    })(serverNameForRevoke);
+    actionTd.appendChild(btn);
+    tr.appendChild(actionTd);
+
+    tbody.appendChild(tr);
+  }
+}
+
+function promptRevokeMcp(server) {
+  if (!server) return;
+  _pendingRevokeServer = server;
+  var msg = document.getElementById("revoke-mcp-message");
+  var overlay = document.getElementById("revoke-mcp-overlay");
+  if (msg) {
+    msg.textContent =
+      "Disconnect " +
+      server +
+      "? Tools that need this server will require re-consent.";
+  }
+  if (overlay) overlay.style.display = "flex";
+
+  if (_revokeMcpTrap) document.removeEventListener("keydown", _revokeMcpTrap);
+  _revokeMcpTrap = function (e) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      cancelRevokeMcp();
+      return;
+    }
+    if (e.key === "Tab") {
+      var box = document.getElementById("revoke-mcp-box");
+      if (!box) return;
+      var focusable = box.querySelectorAll("button");
+      if (!focusable.length) return;
+      var first = focusable[0];
+      var last = focusable[focusable.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+  };
+  document.addEventListener("keydown", _revokeMcpTrap);
+
+  var cancelBtn = overlay ? overlay.querySelector("button:not(.danger)") : null;
+  if (cancelBtn) cancelBtn.focus();
+}
+
+function cancelRevokeMcp() {
+  _pendingRevokeServer = null;
+  var overlay = document.getElementById("revoke-mcp-overlay");
+  if (overlay) overlay.style.display = "none";
+  if (_revokeMcpTrap) {
+    document.removeEventListener("keydown", _revokeMcpTrap);
+    _revokeMcpTrap = null;
+  }
+}
+
+function confirmRevokeMcp() {
+  var server = _pendingRevokeServer;
+  if (!server) {
+    cancelRevokeMcp();
+    return;
+  }
+  authFetch("/v1/api/mcp/oauth/connections/" + encodeURIComponent(server), {
+    method: "DELETE",
+  })
+    .then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      cancelRevokeMcp();
+      showToast("Disconnected " + server);
+      loadMcpConnections();
+    })
+    .catch(function (err) {
+      cancelRevokeMcp();
+      showToast("Failed to revoke: " + err.message);
+    });
+}
+
+function _formatRelativeTimestamp(iso) {
+  if (!iso) return "—";
+  try {
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return iso;
+    var now = new Date();
+    var diffMs = now.getTime() - d.getTime();
+    var sec = Math.round(diffMs / 1000);
+    if (sec < 60) return "just now";
+    if (sec < 3600) return Math.round(sec / 60) + "m ago";
+    if (sec < 86400) return Math.round(sec / 3600) + "h ago";
+    return Math.round(sec / 86400) + "d ago";
+  } catch (e) {
+    return iso;
+  }
+}
+
 document.addEventListener("keydown", function (e) {
   // Defer to modal's own keydown handler when any modal is open
   var modalIds = [
@@ -5558,6 +6037,8 @@ document.addEventListener("keydown", function (e) {
     "edit-title-overlay",
     "delete-ws-overlay",
     "ws-delete-overlay",
+    "settings-overlay",
+    "revoke-mcp-overlay",
   ];
   for (var mi = 0; mi < modalIds.length; mi++) {
     var modal = document.getElementById(modalIds[mi]);
@@ -5749,7 +6230,7 @@ document.addEventListener("keydown", function (e) {
 });
 
 // ===========================================================================
-//  15. Init
+//  16. Init
 // ===========================================================================
 
 function initWorkstreams() {

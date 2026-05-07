@@ -41,6 +41,16 @@
         >
           &#9790;
         </button>
+        <button
+          id="settings-btn"
+          class="header-btn btn"
+          type="button"
+          onclick="openSettingsPanel()"
+          aria-label="MCP server connections"
+          title="MCP server connections"
+        >
+          &#9881;
+        </button>
       </span>
     </div>
 
@@ -355,6 +365,74 @@
           <button type="button" onclick="cancelDeleteWs()">Cancel</button>
           <button type="button" class="danger" onclick="executeDeleteWs()">
             Delete
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Settings: MCP server connections -->
+    <div
+      id="settings-overlay"
+      style="display: none"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="settings-heading"
+    >
+      <div id="settings-box">
+        <div id="settings-header">
+          <h3 id="settings-heading">MCP server connections</h3>
+          <button
+            type="button"
+            id="settings-close-btn"
+            onclick="closeSettingsPanel()"
+            aria-label="Close settings"
+          >
+            &#10005;
+          </button>
+        </div>
+        <div id="settings-body">
+          <div id="settings-mcp-loading" style="display: none">Loading...</div>
+          <div id="settings-mcp-empty" style="display: none">
+            No MCP server consents yet. Tools that need OAuth will show a
+            "Connect" button when used.
+          </div>
+          <table id="settings-mcp-table" style="display: none">
+            <thead>
+              <tr>
+                <th>Server</th>
+                <th>Scopes</th>
+                <th>Issued</th>
+                <th>Last refreshed</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="settings-mcp-tbody"></tbody>
+          </table>
+          <div
+            id="settings-mcp-error"
+            role="alert"
+            aria-live="polite"
+            style="display: none"
+          ></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Revoke confirmation modal (matches delete-ws pattern) -->
+    <div
+      id="revoke-mcp-overlay"
+      style="display: none"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="revoke-mcp-heading"
+    >
+      <div id="revoke-mcp-box">
+        <h3 id="revoke-mcp-heading">Revoke connection?</h3>
+        <p id="revoke-mcp-message"></p>
+        <div id="revoke-mcp-buttons">
+          <button type="button" onclick="cancelRevokeMcp()">Cancel</button>
+          <button type="button" class="danger" onclick="confirmRevokeMcp()">
+            Revoke
           </button>
         </div>
       </div>

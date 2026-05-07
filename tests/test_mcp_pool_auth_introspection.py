@@ -683,18 +683,21 @@ class TestDispatcherAuthFlows:
 
         self._seed_pool_entry_with_call_tool(mgr, loop, _call_tool)
 
-        with patch(
-            "turnstone.core.mcp_client.get_user_access_token_classified",
-            side_effect=_fake_classified,
+        with (
+            patch(
+                "turnstone.core.mcp_client.get_user_access_token_classified",
+                side_effect=_fake_classified,
+            ),
+            pytest.raises(RuntimeError) as exc_info,
         ):
-            result = mgr.call_tool_sync(
+            mgr.call_tool_sync(
                 "mcp__pool-srv__do_thing",
                 {},
                 user_id="user-1",
                 timeout=5,
             )
 
-        payload = json.loads(result)
+        payload = json.loads(str(exc_info.value))
         assert payload["error"]["code"] == "mcp_consent_required"
         assert payload["error"]["server"] == "pool-srv"
         assert mgr._consecutive_failures.get("pool-srv", 0) == 0
@@ -742,18 +745,21 @@ class TestDispatcherAuthFlows:
 
         self._seed_pool_entry_with_call_tool(mgr, loop, _call_tool)
 
-        with patch(
-            "turnstone.core.mcp_client.get_user_access_token_classified",
-            side_effect=_fake_classified,
+        with (
+            patch(
+                "turnstone.core.mcp_client.get_user_access_token_classified",
+                side_effect=_fake_classified,
+            ),
+            pytest.raises(RuntimeError) as exc_info,
         ):
-            result = mgr.call_tool_sync(
+            mgr.call_tool_sync(
                 "mcp__pool-srv__do_thing",
                 {},
                 user_id="user-1",
                 timeout=5,
             )
 
-        payload = json.loads(result)
+        payload = json.loads(str(exc_info.value))
         assert payload["error"]["code"] == "mcp_consent_required"
         # Exactly TWO calls: initial + retry. No recursion.
         assert call_count == 2, (
@@ -794,18 +800,21 @@ class TestDispatcherAuthFlows:
 
         self._seed_pool_entry_with_call_tool(mgr, loop, _call_tool)
 
-        with patch(
-            "turnstone.core.mcp_client.get_user_access_token_classified",
-            side_effect=_fake_classified,
+        with (
+            patch(
+                "turnstone.core.mcp_client.get_user_access_token_classified",
+                side_effect=_fake_classified,
+            ),
+            pytest.raises(RuntimeError) as exc_info,
         ):
-            result = mgr.call_tool_sync(
+            mgr.call_tool_sync(
                 "mcp__pool-srv__do_thing",
                 {},
                 user_id="user-1",
                 timeout=5,
             )
 
-        payload = json.loads(result)
+        payload = json.loads(str(exc_info.value))
         assert payload["error"]["code"] == "mcp_insufficient_scope"
         assert payload["error"]["scopes_required"] == ["files:write", "mail:send"]
         assert call_count == 1, "403 must NOT trigger a retry"
@@ -836,18 +845,21 @@ class TestDispatcherAuthFlows:
 
         self._seed_pool_entry_with_call_tool(mgr, loop, _call_tool)
 
-        with patch(
-            "turnstone.core.mcp_client.get_user_access_token_classified",
-            side_effect=_fake_classified,
+        with (
+            patch(
+                "turnstone.core.mcp_client.get_user_access_token_classified",
+                side_effect=_fake_classified,
+            ),
+            pytest.raises(RuntimeError) as exc_info,
         ):
-            result = mgr.call_tool_sync(
+            mgr.call_tool_sync(
                 "mcp__pool-srv__do_thing",
                 {},
                 user_id="user-1",
                 timeout=5,
             )
 
-        payload = json.loads(result)
+        payload = json.loads(str(exc_info.value))
         assert payload["error"]["code"] == "mcp_tool_call_forbidden"
         assert "scopes_required" not in payload["error"]
 
@@ -947,14 +959,15 @@ class TestBreakerInvariant:
         assert result_401_retry == "ok"
         assert mgr._consecutive_failures.get("pool-srv", 0) == 0
 
-        with patch(
-            "turnstone.core.mcp_client.get_user_access_token_classified",
-            side_effect=_fake_classified,
+        with (
+            patch(
+                "turnstone.core.mcp_client.get_user_access_token_classified",
+                side_effect=_fake_classified,
+            ),
+            pytest.raises(RuntimeError) as exc_info,
         ):
-            result_403 = mgr.call_tool_sync(
-                "mcp__pool-srv__do_thing", {}, user_id="user-1", timeout=5
-            )
-        payload = json.loads(result_403)
+            mgr.call_tool_sync("mcp__pool-srv__do_thing", {}, user_id="user-1", timeout=5)
+        payload = json.loads(str(exc_info.value))
         assert payload["error"]["code"] == "mcp_insufficient_scope"
         # STILL zero after the 403 cycle.
         assert mgr._consecutive_failures.get("pool-srv", 0) == 0
@@ -1308,6 +1321,219 @@ def _install_capture_intercept(monkeypatch: pytest.MonkeyPatch) -> None:
         "_dispatch_pool_with_entry",
         _wrapped,
     )
+
+
+# ---------------------------------------------------------------------------
+# bug-1 — pool dispatchers RAISE on structured-error envelopes
+#
+# Pre-fix, ``_dispatch_pool`` and ``_dispatch_pool_resource`` returned
+# ``_structured_error(...)`` JSON in the success-shape return slot, which
+# the public ``call_tool_sync`` / ``read_resource_sync`` then forwarded
+# verbatim. ``ChatSession._exec_mcp_tool`` /  ``_exec_read_resource``
+# saw a successful return, called ``_report_tool_result(..., is_error=False)``,
+# and the dashboard's ``appendToolOutput`` short-circuited
+# ``tryParseMcpError`` because that gate fires only inside the
+# ``isError`` branch. The interactive consent card NEVER rendered.
+#
+# The fix wraps the dispatcher's final return: when the result is a
+# structured-error envelope (``_is_structured_error``), the sync
+# wrapper raises ``RuntimeError(json_str)``. The agent-loop's
+# ``except Exception`` branch then calls ``_format_mcp_dispatch_error``
+# which preserves the JSON on the structured-error path, and
+# ``_report_tool_result(..., is_error=True)`` fires — the dashboard's
+# tryParseMcpError gate opens and the card renders.
+#
+# These tests pin the contract at the public API. Each parametrized
+# case mocks ``_dispatch_pool*`` to RETURN (not raise) the structured
+# error string and asserts ``call_tool_sync`` / ``read_resource_sync``
+# / ``get_prompt_sync`` raise ``RuntimeError`` carrying the JSON.
+# ---------------------------------------------------------------------------
+
+
+_BUG1_STRUCTURED_ERROR_CODES = (
+    "mcp_consent_required",
+    "mcp_insufficient_scope",
+    "mcp_tool_call_forbidden",
+    "mcp_token_undecryptable_key_unknown",
+    "mcp_oauth_url_insecure",
+)
+
+
+def _make_structured_error_json(code: str, *, server: str = "pool-srv") -> str:
+    payload: dict[str, Any] = {
+        "error": {
+            "code": code,
+            "server": server,
+            "detail": f"test-fixture-{code}",
+        }
+    }
+    if code == "mcp_insufficient_scope":
+        payload["error"]["scopes_required"] = ["files:write"]
+        payload["error"]["consent_url"] = (
+            "/v1/api/mcp/oauth/start?server=pool-srv&scopes=files%3Awrite"
+        )
+    elif code == "mcp_consent_required":
+        payload["error"]["consent_url"] = "/v1/api/mcp/oauth/start?server=pool-srv"
+    return json.dumps(payload)
+
+
+@pytest.mark.parametrize("code", _BUG1_STRUCTURED_ERROR_CODES)
+def test_call_tool_sync_raises_on_structured_error_envelope(
+    code: str, running_loop_mgr, storage: SQLiteBackend
+) -> None:
+    """End-to-end regression for the consent-card non-rendering bug.
+
+    Mocks ``_dispatch_pool`` to RETURN the structured-error JSON in the
+    success slot (the pre-fix production shape). The public
+    ``call_tool_sync`` MUST raise ``RuntimeError`` carrying the JSON
+    so the session-layer ``except Exception`` handler runs and
+    ``_report_tool_result(..., is_error=True)`` fires.
+    """
+    mgr, _loop, _ = running_loop_mgr
+    cipher = make_mcp_token_cipher()
+    _seed_oauth_server(storage, name="pool-srv")
+    _seed_user_token(storage, cipher)
+    mgr.set_storage(storage)
+    mgr.set_app_state(_make_app_state(storage, cipher=cipher))
+
+    json_payload = _make_structured_error_json(code)
+
+    async def _fake_dispatch_pool(**_kwargs: Any) -> str:
+        return json_payload
+
+    mgr._dispatch_pool = _fake_dispatch_pool  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError) as exc_info:
+        mgr.call_tool_sync("mcp__pool-srv__do_thing", {}, user_id="user-1", timeout=5)
+
+    # The exception text MUST be the structured-error JSON byte-for-byte
+    # (so ``_format_mcp_dispatch_error`` recognises the envelope and
+    # surfaces it intact to the dashboard).
+    assert str(exc_info.value) == json_payload
+    decoded = json.loads(str(exc_info.value))
+    assert decoded["error"]["code"] == code
+
+
+@pytest.mark.parametrize("code", _BUG1_STRUCTURED_ERROR_CODES)
+def test_read_resource_sync_raises_on_structured_error_envelope(
+    code: str, running_loop_mgr, storage: SQLiteBackend
+) -> None:
+    """Mirror of the tool path's bug-1 regression for resource reads."""
+    mgr, loop, _ = running_loop_mgr
+    cipher = make_mcp_token_cipher()
+    _seed_oauth_server(storage, name="pool-srv")
+    _seed_user_token(storage, cipher)
+    mgr.set_storage(storage)
+    mgr.set_app_state(_make_app_state(storage, cipher=cipher))
+
+    # Seed the resource map so the resolver finds ``res://hello`` and
+    # routes through ``_dispatch_pool_resource_sync``.
+    async def _seed() -> None:
+        entry = await mgr._ensure_pool_entry(("user-1", "pool-srv"))
+        entry.resources = [
+            {
+                "uri": "res://hello",
+                "name": "",
+                "description": "",
+                "mimeType": "",
+                "server": "pool-srv",
+            }
+        ]
+        mgr._rebuild_user_resource_map("user-1")
+
+    asyncio.run_coroutine_threadsafe(_seed(), loop).result(timeout=5)
+
+    json_payload = _make_structured_error_json(code)
+
+    async def _fake_dispatch_pool_resource(**_kwargs: Any) -> str:
+        return json_payload
+
+    mgr._dispatch_pool_resource = _fake_dispatch_pool_resource  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError) as exc_info:
+        mgr.read_resource_sync("res://hello", user_id="user-1", timeout=5)
+
+    assert str(exc_info.value) == json_payload
+    decoded = json.loads(str(exc_info.value))
+    assert decoded["error"]["code"] == code
+
+
+@pytest.mark.parametrize("code", _BUG1_STRUCTURED_ERROR_CODES)
+def test_get_prompt_sync_raises_on_structured_error_envelope(
+    code: str, running_loop_mgr, storage: SQLiteBackend
+) -> None:
+    """Mirror of the tool path's bug-1 regression for prompt invocation.
+
+    The prompt path already converted the structured-error string to a
+    ``RuntimeError`` via the ``isinstance(result, str)`` check in
+    ``_dispatch_pool_prompt_sync`` (success type is ``list[dict]`` so a
+    str return is unambiguously the failure path). This test pins the
+    behaviour at the public API so the contract stays uniform across
+    tool / resource / prompt dispatchers post-bug-1.
+    """
+    mgr, loop, _ = running_loop_mgr
+    cipher = make_mcp_token_cipher()
+    _seed_oauth_server(storage, name="pool-srv")
+    _seed_user_token(storage, cipher)
+    mgr.set_storage(storage)
+    mgr.set_app_state(_make_app_state(storage, cipher=cipher))
+
+    async def _seed() -> None:
+        entry = await mgr._ensure_pool_entry(("user-1", "pool-srv"))
+        entry.prompts = [
+            {
+                "name": "mcp__pool-srv__greet",
+                "original_name": "greet",
+                "server": "pool-srv",
+                "description": "",
+                "arguments": [],
+            }
+        ]
+        mgr._rebuild_user_prompt_map("user-1")
+
+    asyncio.run_coroutine_threadsafe(_seed(), loop).result(timeout=5)
+
+    json_payload = _make_structured_error_json(code)
+
+    async def _fake_dispatch_pool_prompt(**_kwargs: Any) -> str:
+        return json_payload
+
+    mgr._dispatch_pool_prompt = _fake_dispatch_pool_prompt  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError) as exc_info:
+        mgr.get_prompt_sync("mcp__pool-srv__greet", {}, user_id="user-1", timeout=5)
+
+    assert str(exc_info.value) == json_payload
+    decoded = json.loads(str(exc_info.value))
+    assert decoded["error"]["code"] == code
+
+
+def test_call_tool_sync_does_not_wrap_non_structured_string(
+    running_loop_mgr, storage: SQLiteBackend
+) -> None:
+    """A success-shape return whose payload merely happens to start with
+    ``{"error":...`` but lacks an ``mcp_*`` code MUST flow back to the
+    caller as a string, not a raised RuntimeError. This is the bug-1
+    fix's defensive gate: only structured-error envelopes are wrapped.
+    """
+    mgr, _loop, _ = running_loop_mgr
+    cipher = make_mcp_token_cipher()
+    _seed_oauth_server(storage, name="pool-srv")
+    _seed_user_token(storage, cipher)
+    mgr.set_storage(storage)
+    mgr.set_app_state(_make_app_state(storage, cipher=cipher))
+
+    # Tool output that happens to look JSON-ish but isn't a Phase 7b
+    # ``_structured_error`` envelope. Must round-trip as a plain string.
+    payload = json.dumps({"error": {"code": "tool_specific_failure", "msg": "x"}})
+
+    async def _fake_dispatch_pool(**_kwargs: Any) -> str:
+        return payload
+
+    mgr._dispatch_pool = _fake_dispatch_pool  # type: ignore[method-assign]
+
+    result = mgr.call_tool_sync("mcp__pool-srv__do_thing", {}, user_id="user-1", timeout=5)
+    assert result == payload
 
 
 # Suppress unused-import warning for AsyncMock.

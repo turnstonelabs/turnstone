@@ -412,6 +412,7 @@ class TestMetadataCache:
             authorization_endpoint="https://as.example.com/authorize",
             token_endpoint="https://as.example.com/token",
             registration_endpoint=None,
+            revocation_endpoint=None,
             jwks_uri=None,
             code_challenge_methods_supported=("S256",),
             token_endpoint_auth_methods_supported=(),
@@ -544,3 +545,82 @@ class TestCachedIssuerSSRFRevalidation:
             if c.kwargs.get("oauth_as_issuer_cached") is None
         ]
         assert clear_calls, "cached_issuer should have been cleared"
+
+
+# ---------------------------------------------------------------------------
+# revocation_endpoint parsing (RFC 8414)
+# ---------------------------------------------------------------------------
+
+
+class TestASMetadataRevocationEndpoint:
+    def test_as_metadata_parses_revocation_endpoint(self) -> None:
+        doc = _good_as_metadata_doc()
+        doc["revocation_endpoint"] = "https://as.example.com/revoke"
+
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, doc))
+        storage = _mk_storage_mock()
+
+        async def _run() -> ASMetadata:
+            with _public_addr_patch():
+                return await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url="https://mcp.example.com/sse",
+                    override_url="https://as.example.com",
+                    cached_issuer=None,
+                    http_client=client,
+                    storage=storage,
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                )
+
+        meta = asyncio.run(_run())
+        assert meta.revocation_endpoint == "https://as.example.com/revoke"
+
+    def test_as_metadata_revocation_endpoint_absent(self) -> None:
+        doc = _good_as_metadata_doc()
+        doc.pop("revocation_endpoint", None)
+
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, doc))
+        storage = _mk_storage_mock()
+
+        async def _run() -> ASMetadata:
+            with _public_addr_patch():
+                return await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url="https://mcp.example.com/sse",
+                    override_url="https://as.example.com",
+                    cached_issuer=None,
+                    http_client=client,
+                    storage=storage,
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                )
+
+        meta = asyncio.run(_run())
+        assert meta.revocation_endpoint is None
+
+    def test_as_metadata_revocation_endpoint_rejected_when_cross_origin(self) -> None:
+        doc = _good_as_metadata_doc()
+        doc["revocation_endpoint"] = "https://attacker.example.com/revoke"
+
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, doc))
+        storage = _mk_storage_mock()
+
+        async def _run() -> ASMetadata:
+            with _public_addr_patch():
+                return await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url="https://mcp.example.com/sse",
+                    override_url="https://as.example.com",
+                    cached_issuer=None,
+                    http_client=client,
+                    storage=storage,
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                )
+
+        with pytest.raises(MCPOAuthDiscoveryError, match="revocation_endpoint"):
+            asyncio.run(_run())
