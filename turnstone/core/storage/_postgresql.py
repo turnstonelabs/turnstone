@@ -184,6 +184,8 @@ class PostgreSQLBackend:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         content = sanitize_text(content)
         provider_data = sanitize_text(provider_data)
+        source = sanitize_text(source)
+        reminders = sanitize_text(reminders)
         with self._conn() as conn:
             result = conn.execute(
                 sa.insert(conversations)
@@ -227,8 +229,8 @@ class PostgreSQLBackend:
                     "tool_call_id": row.get("tool_call_id"),
                     "provider_data": sanitize_text(row.get("provider_data")),
                     "tool_calls": row.get("tool_calls"),
-                    "_source": row.get("source"),
-                    "_reminders": row.get("reminders"),
+                    "_source": sanitize_text(row.get("source")),
+                    "_reminders": sanitize_text(row.get("reminders")),
                 }
             )
         with self._conn() as conn:
