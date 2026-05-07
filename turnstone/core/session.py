@@ -1398,7 +1398,7 @@ class ChatSession:
         """Inject the server-level WatchRunner and register a dispatch fn
         that routes watch results onto this session's NudgeQueue.
 
-        The dispatch closure is the post-#482 unified path: each watch
+        The dispatch closure is the unified pull-model path: each watch
         fire enqueues a ``"watch_triggered"`` entry on ``"any"`` channel,
         and the existing drain seams (USER_DRAIN, TOOL_DRAIN,
         ``IdleNudgeWatcher`` IDLE wake) splice it into a
@@ -1457,10 +1457,15 @@ class ChatSession:
                 except Exception:
                     return False
 
+            from turnstone.core.watch import _WATCH_REMINDER_OPTIONAL_KEYS
+
+            def _maybe_sanitize(v: Any) -> Any:
+                return sanitize_payload(v) if isinstance(v, str) else v
+
             metadata = {
-                k: reminder[k]
-                for k in ("watch_name", "command", "poll_count", "max_polls", "is_final")
-                if isinstance(reminder, dict) and k in reminder
+                k: _maybe_sanitize(reminder[k])
+                for k in _WATCH_REMINDER_OPTIONAL_KEYS
+                if k in reminder
             }
             nudge_queue.enqueue(
                 "watch_triggered",

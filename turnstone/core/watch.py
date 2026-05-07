@@ -195,6 +195,15 @@ def format_watch_message(
     return "\n".join(lines)
 
 
+_WATCH_REMINDER_OPTIONAL_KEYS = (
+    "watch_name",
+    "command",
+    "poll_count",
+    "max_polls",
+    "is_final",
+)
+
+
 def build_watch_reminder(
     name: str,
     command: str,

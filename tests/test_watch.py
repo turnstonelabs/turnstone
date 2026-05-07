@@ -507,8 +507,8 @@ class TestWatchRunner:
         runner.set_dispatch_fn("ws-1", fn1)
         runner.set_dispatch_fn("ws-2", fn2)
 
-        # Post-Step-7 dispatch surface: ``_dispatch_result`` takes a
-        # structured reminder dict, not a bare string.
+        # ``_dispatch_result`` takes a structured reminder dict, not a
+        # bare string.
         reminder1 = {"type": "watch_triggered", "text": "msg1"}
         runner._dispatch_result("ws-1", reminder1, "watch-a")
         fn1.assert_called_once_with(reminder1, "watch-a")

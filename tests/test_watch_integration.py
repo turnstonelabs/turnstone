@@ -248,8 +248,8 @@ def test_watch_dispatch_through_restore_fn_lands_on_rehydrated_session(tmp_db, m
     assert runner.get_dispatch_fn(original_ws_id) is None
 
     # Stage 3 — fire a watch result.  ``_dispatch_result`` should fall
-    # through to the restore branch.  Post-Step-7 dispatch surface uses
-    # a structured reminder dict.
+    # through to the restore branch.  The dispatch surface takes a
+    # structured reminder dict.
     runner._dispatch_result(
         original_ws_id,
         {"type": "watch_triggered", "text": "post-restore body"},

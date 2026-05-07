@@ -3191,11 +3191,10 @@ class TestDeliverWakeNudge:
         assert session._wake_source_tag == ""
 
     def test_wake_row_persists_with_source_column(self, tmp_db):
-        """The wake's synthesised empty user turn now persists with
-        ``_source = "system_nudge"`` (post-#484 the skip at
-        ``session.py:2685-2686`` is dropped).  Without persistence,
-        a second tab connecting via /history would see the assistant
-        turn with no preceding wake context.
+        """The wake's synthesised empty user turn persists with
+        ``_source = "system_nudge"``.  Without persistence, a second
+        tab connecting via /history would see the assistant turn with
+        no preceding wake context.
         """
         from turnstone.core.storage import get_storage
 
