@@ -2771,15 +2771,6 @@ class ChatSession:
                 }
                 for a in attachments
             ]
-        # Metacognitive user-channel drain: any nudges queued via
-        # _queue_user_advisory (correction/start/completion from this
-        # turn, denial from the previous tool batch, resume from
-        # rehydrate) attach to the user message dict's ``_reminders``
-        # side-channel — content stays clean.  The wire-side splice
-        # happens later in _apply_reminders_for_provider against a
-        # transient copy.  The DB row stores ``user_input`` only (line
-        # below) so reminders stay in-memory only and don't persist
-        # across reloads.
         self._attach_pending_user_reminders(user_msg)
         self.messages.append(user_msg)
         self._msg_tokens.append(max(1, int(self._msg_char_count(user_msg) / self._chars_per_token)))
