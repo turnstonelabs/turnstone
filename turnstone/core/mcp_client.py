@@ -2387,7 +2387,7 @@ class MCPClientManager:
         that fires on every resource-change (static or pool). A string
         ``user_id`` scopes the listener: it fires on global static-path
         changes AND on pool changes for that user only — never on
-        another user's pool change. RFC §3.3.
+        another user's pool change. RFC §3.2 (resources).
         """
         with self._resource_listeners_lock:
             self._resource_listeners.append((user_id, callback))
@@ -2406,8 +2406,8 @@ class MCPClientManager:
     def _notify_resource_listeners(self) -> None:
         """Static-path resource change — fires ALL registered listeners.
 
-        Mirrors ``_notify_listeners`` for tools (RFC §3.3): the static
-        catalog is process-wide so the fan-out is unconditional.
+        Mirrors ``_notify_listeners`` for tools: the static catalog is
+        process-wide so the fan-out is unconditional. RFC §3.2 (resources).
         """
         with self._resource_listeners_lock:
             listeners = list(self._resource_listeners)
@@ -2422,7 +2422,7 @@ class MCPClientManager:
 
         Scoped fan-out targets the matching ``user_id`` AND admin
         (``None``) listeners. Mirrors ``_notify_user_tool_listeners``.
-        RFC §3.3.
+        RFC §3.2 (resources).
         """
         with self._resource_listeners_lock:
             listeners = [
@@ -2462,8 +2462,8 @@ class MCPClientManager:
     def _notify_prompt_listeners(self) -> None:
         """Static-path prompt change — fires ALL registered listeners.
 
-        Mirrors ``_notify_listeners`` for tools (RFC §3.3): the static
-        catalog is process-wide so the fan-out is unconditional.
+        Mirrors ``_notify_listeners`` for tools: the static catalog is
+        process-wide so the fan-out is unconditional. RFC §3.3 (prompts).
         """
         with self._prompt_listeners_lock:
             listeners = list(self._prompt_listeners)
@@ -2478,7 +2478,7 @@ class MCPClientManager:
 
         Scoped fan-out targets the matching ``user_id`` AND admin
         (``None``) listeners. Mirrors ``_notify_user_tool_listeners``.
-        RFC §3.3.
+        RFC §3.3 (prompts).
         """
         with self._prompt_listeners_lock:
             listeners = [cb for uid, cb in self._prompt_listeners if uid == user_id or uid is None]

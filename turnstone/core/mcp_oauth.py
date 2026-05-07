@@ -1538,7 +1538,16 @@ async def emit_oauth_failure_audit(
     code: str,
     scopes: tuple[str, ...] = (),
 ) -> None:
-    """Emit ``mcp_server.oauth.insufficient_scope_emitted`` audit event.
+    """Emit an ``mcp_server.oauth.*_emitted`` audit event for a 403 classification.
+
+    The audit ``action`` is selected from ``code`` so downstream
+    alerting / analytics can filter on a label that matches reality:
+
+    - ``mcp_insufficient_scope`` →
+      ``mcp_server.oauth.insufficient_scope_emitted``
+    - ``mcp_tool_call_forbidden`` / ``mcp_resource_read_forbidden`` /
+      ``mcp_prompt_get_forbidden`` →
+      ``mcp_server.oauth.forbidden_emitted``
 
     Best-effort: :func:`_audit_event` already swallows storage / write
     failures internally so audit emission never breaks dispatch.
@@ -1550,21 +1559,24 @@ async def emit_oauth_failure_audit(
     audit trail (Phase 7 left the generic 403 branch silent; Phase 7b
     closes that gap).
 
-    The ``kind`` ("tool" / "resource" / "prompt") and ``code``
-    (``mcp_insufficient_scope`` / ``mcp_tool_call_forbidden`` /
-    ``mcp_resource_read_forbidden`` / ``mcp_prompt_get_forbidden``)
-    fields land in the audit detail so operators can distinguish
-    tool-call vs resource-read vs prompt-get 403s for the same
-    ``(user, server)``.
+    The ``kind`` ("tool" / "resource" / "prompt") and ``code`` fields
+    land in the audit detail so operators can distinguish tool-call vs
+    resource-read vs prompt-get 403s for the same ``(user, server)``
+    even within a single ``action`` bucket.
     """
     if app_state is None:
         return
     server_id = str(server_row.get("server_id") or "") if server_row else ""
+    action = (
+        "mcp_server.oauth.insufficient_scope_emitted"
+        if code == "mcp_insufficient_scope"
+        else "mcp_server.oauth.forbidden_emitted"
+    )
     await _audit_event(
         app_state,
         server_id=server_id,
         user_id=user_id,
-        action="mcp_server.oauth.insufficient_scope_emitted",
+        action=action,
         server_name=server_name,
         detail={"scopes_required": list(scopes), "kind": kind, "code": code},
     )
