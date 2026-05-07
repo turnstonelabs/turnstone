@@ -2127,33 +2127,110 @@ class TestMetacognitiveBuffers:
         assert metacog == []
         assert len(_tool_pending(session)) == 1
 
-    def test_collect_advisories_drains_text_queued_messages_to_persistent(self, tmp_db):
-        """Text-only queued user messages drain into the ``persistent``
-        advisory list as ``UserInterjection`` on the last result of a
-        batch — they ride INSIDE the tool result envelope via
-        ``wrap_tool_result`` rather than becoming a separate user turn
-        appended to ``self.messages`` (which would inject ``user``
-        between ``assistant(tool_calls)`` and ``tool`` and break role
-        validation on Mistral / mistral-common and similar strict
-        templates)."""
-        from turnstone.core.tool_advisory import UserInterjection
+    def test_collect_advisories_does_not_drain_queued_messages(self, tmp_db):
+        """Queued user messages are NOT drained inside the tool result
+        envelope — they're appended as a separate user turn after the
+        full batch completes (see the ``_flush_queued_messages`` call
+        in ``send`` after the tool-result loop).  The pre-fix shape
+        wrapped them as ``UserInterjection`` advisories that rode
+        inside ``wrap_tool_result``; the model saw them inline but no
+        user row landed in storage, so the optimistic queued bubble
+        vanished on page reload (and on cross-tab replay).
 
+        Persistent + metacog drains still happen here for the output
+        guard finding and tool-channel nudges; only the queued-message
+        drain moved out.
+        """
         session = _make_session()
         pre_count = len(session.messages)
         session.queue_message("hows it going?", queue_msg_id="q1")
         persistent, metacog = session._collect_advisories(
             assessment=None, func_name="bash", is_last_in_batch=True
         )
+        # Neither list carries the queued message anymore.
         assert metacog == []
-        assert len(persistent) == 1
-        assert isinstance(persistent[0], UserInterjection)
-        assert persistent[0].message == "hows it going?"
-        # Queue drained.
-        assert session._queued_messages == {}
-        # Crucially: NO separate user turn was appended to history —
-        # the message rides inside the tool envelope, preserving the
-        # `assistant(tool_calls) → tool` role sequence on the wire.
+        assert persistent == []
+        # Queue still holds the message — it'll drain via
+        # ``_flush_queued_messages`` after the tool batch finishes.
+        assert "q1" in session._queued_messages
+        # No separate user turn appended yet (that happens post-batch).
         assert len(session.messages) == pre_count
+
+    def test_queued_message_persists_as_user_row_after_tool_batch(self, tmp_db):
+        """A queued message arriving during a tool batch lands in
+        ``self.messages`` as a separate user turn after the batch
+        completes — and gets persisted to storage so a reconnect /
+        page-reload sees the bubble survive.
+
+        Pre-fix shape wrapped the queue into ``wrap_tool_result``'s
+        ``<system-reminder>`` envelope; the model saw the text but no
+        user row was written, so reconnecting tabs lost the bubble.
+        """
+        session = _make_session()
+        # Two-iteration stream: first call returns tool_calls (drives
+        # the batch path); second call has a queued message arriving
+        # in between (the post-batch drain seam).  Third call returns
+        # no tool_calls, ending the loop.
+        responses = [
+            {
+                "role": "assistant",
+                "content": "calling",
+                "tool_calls": [
+                    {
+                        "id": "call_x",
+                        "type": "function",
+                        "function": {"name": "echo", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "ack"},
+        ]
+        stream_idx = 0
+
+        def mock_stream(_msgs):
+            nonlocal stream_idx
+            stream_idx += 1
+            return iter([])
+
+        def mock_response(_stream, _gen):
+            return responses.pop(0)
+
+        def mock_execute(_tool_calls):
+            session.queue_message("typed during tool", queue_msg_id="q1")
+            return [("call_x", "ok")], None
+
+        with (
+            patch.object(session, "_create_stream_with_retry", side_effect=mock_stream),
+            patch.object(session, "_stream_response", side_effect=mock_response),
+            patch.object(session, "_execute_tools", side_effect=mock_execute),
+            patch.object(session, "_full_messages", return_value=[]),
+            patch.object(session, "_update_token_table"),
+            patch.object(session, "_print_status_line"),
+            patch.object(session, "_emit_state"),
+            patch.object(session, "_visible_memory_count", return_value=0),
+            patch.object(session, "_apply_post_execute_advisories"),
+            patch("turnstone.core.session.save_message") as save_msg,
+        ):
+            session._title_generated = True
+            session.send("first")
+
+        # The queued user message landed in self.messages as a user
+        # turn after the tool result.
+        roles = [m.get("role") for m in session.messages]
+        # Expect: user(first) → assistant(tool_calls) → tool(call_x)
+        # → user(typed during tool) → assistant(ack)
+        assert roles[-2] == "user", f"expected user before final assistant, got {roles!r}"
+        assert "typed during tool" in str(session.messages[-2].get("content", ""))
+        # And persisted: at least one save_message call carried "user"
+        # role with the queued text.
+        user_saves = [
+            c for c in save_msg.call_args_list if len(c.args) >= 3 and c.args[1] == "user"
+        ]
+        assert any("typed during tool" in str(c.args[2]) for c in user_saves), (
+            f"queued message must be persisted as a user row; saw: {user_saves!r}"
+        )
+        # Queue is empty after drain.
+        assert session._queued_messages == {}
 
     def test_start_nudge_fires_through_send(self, tmp_db):
         """Pin the +1 count-shift invariant — `start` must still fire on the

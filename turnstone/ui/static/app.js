@@ -1158,7 +1158,14 @@ Pane.prototype.replayHistory = function (messages) {
       // the tool-result message in the NEXT iteration anchors via
       // lastToolBlock, which the tool-block branch sets last — so
       // content must run first to avoid clobbering that anchor.
-      if (msg.content) {
+      //
+      // Whitespace-only content (e.g. "\n\n" from a reasoning-parser
+      // model that strips <think>…</think> and leaves only trailing
+      // newlines before the tool call) is treated as empty — the
+      // live stream never accumulated a visible bubble for it, so
+      // surfacing one on replay would be a phantom card that diverges
+      // from what the originating tab saw.
+      if (msg.content && msg.content.trim()) {
         var el = document.createElement("div");
         el.className = "msg assistant";
         var bodyEl = document.createElement("div");

@@ -3160,6 +3160,19 @@ class ChatSession:
                     self.messages.append({"role": "user", "content": user_feedback})
                     self._msg_tokens.append(max(1, int(len(user_feedback) / self._chars_per_token)))
 
+                # Drain queued user messages as a separate user turn
+                # AFTER the assistant→tool batch is complete.  The
+                # role sequence becomes assistant(tool_calls) → tool …
+                # tool → user, which is valid for strict providers
+                # (Mistral, Anthropic) and gives the user a real DB
+                # row that survives reconnect.  Pre-fix the queued
+                # messages rode inside the tool envelope as
+                # ``UserInterjection`` advisories — visible to the
+                # model on the same turn, but with no persisted user
+                # row, so the optimistic queued bubble vanished on
+                # page reload (and on cross-tab replay).
+                self._flush_queued_messages()
+
                 # Mid-turn compaction: prevent context overflow during long
                 # tool chains.  Uses local estimates since _last_usage reflects
                 # the previous API call, not the tool results just appended.
@@ -4392,10 +4405,9 @@ class ChatSession:
 
         Returns ``(persistent, metacog_reminders)``:
 
-        - ``persistent`` — guard findings + user interjections that ride
-          inside the tool-result envelope via ``wrap_tool_result``.
-          These are conversation history and must persist in
-          ``self.messages``.
+        - ``persistent`` — guard findings that ride inside the
+          tool-result envelope via ``wrap_tool_result``.  These are
+          conversation history and must persist in ``self.messages``.
         - ``metacog_reminders`` — list of ``{"type", "text", ...optional}``
           dicts for ``tool_error`` / ``repeat`` nudges that the caller
           attaches to the tool message dict's ``_reminders`` side-channel.
@@ -4406,11 +4418,21 @@ class ChatSession:
           surfaced separately on the UI as a themed bubble below the
           tool result.
 
+        Queued user messages are NOT drained here — they're appended
+        as a separate user turn after the batch completes (see
+        ``_flush_queued_messages`` invocations in ``send``).  The prior
+        UserInterjection splice into ``wrap_tool_result`` left no DB
+        row for the queued message, so it vanished on reconnect (the
+        tool result content carried the text inside a transient
+        ``<system-reminder>`` envelope).  Appending after the batch
+        keeps the assistant → tool sequence intact for strict providers
+        (Mistral) while persisting a real user row for replay parity.
+
         Both lists are empty when no advisories apply (common case).
-        Guard advisories attach per-result; user messages and
-        metacognitive nudges drain on the last result in the batch only.
+        Guard advisories attach per-result; metacognitive nudges drain
+        on the last result in the batch only.
         """
-        from turnstone.core.tool_advisory import GuardAdvisory, UserInterjection
+        from turnstone.core.tool_advisory import GuardAdvisory
 
         persistent: list[ToolAdvisory] = []
         metacog_reminders: list[dict[str, Any]] = []
@@ -4432,18 +4454,6 @@ class ChatSession:
                 if meta:
                     entry.update(meta)
                 metacog_reminders.append(entry)
-
-        # Drain queued user messages on the last result in the batch.
-        # Items are always text-only (attachments rejected at
-        # queue_message time), so they ride inside the tool envelope
-        # as text advisories — preserves the assistant→tool role
-        # sequence on the wire.
-        if is_last_in_batch:
-            with self._queued_lock:
-                items = list(self._queued_messages.values())
-                self._queued_messages.clear()
-            for msg, priority in items:
-                persistent.append(UserInterjection(message=msg, priority=priority))
 
         return persistent, metacog_reminders
 
