@@ -547,16 +547,15 @@ _TEMPLATE_VAR_RE = re.compile(r"\{\{(\w+)\}\}")
 # not its earliest.
 _WATCH_QUEUE_SOFT_CAP = 50
 
-# Per-reminder ``text`` field clamp at storage time.  The conversations
-# row's ``_reminders`` JSON column persists every metacog nudge a tab
-# rendered live so reconnecting tabs see the same bubbles, but a single
-# pathological producer — a watch streaming unbounded shell output, a
-# corrupted steering payload — should not blow the row width or the
-# FTS5 index.  8 KiB matches ``docs/design/watch-card-ux-briefing.md``'s
-# spec for the reminder body.  Mirrors ``TOOL_RESULT_STORAGE_CAP`` on
-# tool result rows; the in-memory side-channel keeps the full body so
-# the live splice and UI render see the same shape, only the persisted
-# JSON is clamped.
+# Per-reminder ``text`` field clamp on the persisted ``_reminders``
+# JSON column.  Bounds row width and the FTS5 index against pathological
+# producers (a watch streaming unbounded shell output, a corruption-class
+# steering payload).  The in-memory side-channel keeps the full body —
+# only the persisted JSON is clamped — so the live splice and UI render
+# see the same shape.  Mirrors ``TOOL_RESULT_STORAGE_CAP`` on tool
+# result rows.  Cap is in UTF-8 bytes so non-ASCII payloads (CJK, emoji)
+# can't blow the byte ceiling 4x by living entirely under the codepoint
+# count.
 REMINDER_TEXT_STORAGE_CAP = 8192
 
 
@@ -2139,14 +2138,12 @@ class ChatSession:
         feed the result straight into ``save_message(..., reminders=...)``
         without a separate empty check.
 
-        **Per-reminder text cap.**  Each entry's ``text`` field is
-        clamped to :data:`REMINDER_TEXT_STORAGE_CAP` characters before
-        encoding so a single rogue producer (a watch streaming an
-        unbounded shell command, a corruption-class steering payload)
-        can't blow the conversations row width or the FTS5 index.  The
-        in-memory dict on the message side-channel keeps the full body
-        — only the persisted JSON is clamped.  Mirrors
-        ``TOOL_RESULT_STORAGE_CAP``'s row-level clamp on tool results.
+        Each entry's ``text`` field is clamped to
+        :data:`REMINDER_TEXT_STORAGE_CAP` UTF-8 bytes before encoding;
+        the in-memory dict keeps the full body so the live splice and
+        UI render see the same shape, only the persisted JSON is
+        clamped.  Byte-clamping (rather than codepoint-clamping) keeps
+        the row-width / FTS5-index bound tight for non-ASCII payloads.
         """
         if not reminders:
             return None
@@ -2155,12 +2152,16 @@ class ChatSession:
             if not isinstance(r, dict):
                 continue
             text = r.get("text")
-            if isinstance(text, str) and len(text) > REMINDER_TEXT_STORAGE_CAP:
-                clamped = dict(r)
-                clamped["text"] = text[:REMINDER_TEXT_STORAGE_CAP]
-                capped.append(clamped)
-            else:
-                capped.append(r)
+            if isinstance(text, str):
+                encoded = text.encode("utf-8")
+                if len(encoded) > REMINDER_TEXT_STORAGE_CAP:
+                    clamped = dict(r)
+                    clamped["text"] = encoded[:REMINDER_TEXT_STORAGE_CAP].decode(
+                        "utf-8", errors="ignore"
+                    )
+                    capped.append(clamped)
+                    continue
+            capped.append(r)
         if not capped:
             return None
         return json.dumps(capped, separators=(",", ":"))
