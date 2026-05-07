@@ -22,6 +22,8 @@ to lock in:
 
 from __future__ import annotations
 
+import threading
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -33,6 +35,7 @@ from starlette.testclient import TestClient
 
 from tests._coord_test_helpers import _AuthMiddleware
 from turnstone.console.server import (
+    _maybe_bootstrap_coord_subsystem,
     _refresh_coord_registry,
     admin_create_model_definition,
     admin_delete_model_definition,
@@ -41,6 +44,29 @@ from turnstone.console.server import (
 )
 from turnstone.core.model_registry import ModelConfig, ModelRegistry
 from turnstone.core.storage._sqlite import SQLiteBackend
+
+
+def _bootstrap_app(**overrides: Any) -> Any:
+    """Build a fake ``app`` with the ``state`` attrs the bootstrap helper
+    inspects.  Defaults match a freshly-installed console (no coord
+    subsystem yet) with all required prereqs (collector, console_metrics,
+    config_store) populated as MagicMocks.  Tests pass overrides to
+    suppress individual prereqs or pre-set ``coord_mgr`` etc.
+    """
+    state_kwargs: dict[str, Any] = {
+        "coord_mgr": None,
+        "coord_adapter": None,
+        "coord_registry": None,
+        "coord_registry_error": "",
+        "coord_state_writer": None,
+        "coord_idle_observer": None,
+        "config_store": MagicMock(),
+        "collector": MagicMock(),
+        "console_metrics": MagicMock(),
+    }
+    state_kwargs.update(overrides)
+    return SimpleNamespace(state=SimpleNamespace(**state_kwargs))
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -213,6 +239,367 @@ def test_helper_preserves_registry_when_no_enabled_rows(storage: SQLiteBackend) 
     assert state.coord_registry.get_config("local").model == "cached-model"
 
 
+# ---------------------------------------------------------------------------
+# First-row bootstrap tests — ``_maybe_bootstrap_coord_subsystem`` semantics.
+# A console booted with no model rows leaves coord_mgr = None; the operator
+# adding the first row at runtime must promote the subsystem to ready
+# without a console restart.
+# ---------------------------------------------------------------------------
+
+
+def test_bootstrap_noop_when_coord_mgr_already_built(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Idempotent fast-path — already-bootstrapped subsystem must not
+    re-stand-up a second SessionManager / StateWriter pair."""
+    from turnstone.console import server as server_module
+
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    app = _bootstrap_app(coord_mgr=MagicMock())  # subsystem already built
+
+    calls: list[Any] = []
+    monkeypatch.setattr(
+        server_module,
+        "_bootstrap_coord_subsystem",
+        lambda *a, **kw: calls.append(a),
+    )
+    _maybe_bootstrap_coord_subsystem(app, storage)
+    assert calls == []
+
+
+@pytest.mark.parametrize("missing_attr", ["config_store", "collector", "console_metrics"])
+def test_bootstrap_noop_when_prerequisites_missing(
+    storage: SQLiteBackend,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_attr: str,
+) -> None:
+    """Each strictly-required ``app.state`` attr (config_store, collector,
+    console_metrics) must individually short-circuit the bootstrap to a
+    no-op — partial init / test harnesses don't have the full set, and a
+    CRUD write that already landed mustn't 500 on a missing prereq."""
+    from turnstone.console import server as server_module
+
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    app = _bootstrap_app(**{missing_attr: None})
+    calls: list[Any] = []
+    monkeypatch.setattr(
+        server_module,
+        "_bootstrap_coord_subsystem",
+        lambda *a, **kw: calls.append(a),
+    )
+    _maybe_bootstrap_coord_subsystem(app, storage)
+    assert calls == []
+    assert app.state.coord_mgr is None
+
+
+def test_bootstrap_records_error_when_no_rows(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All rows disabled (or none seeded) — load_model_registry raises
+    ValueError.  Helper records the message on app.state so the
+    coord-endpoint 503 surfaces a current diagnosis instead of a stale
+    one from boot."""
+    from turnstone.console import server as server_module
+
+    app = _bootstrap_app()
+    calls: list[Any] = []
+    monkeypatch.setattr(
+        server_module,
+        "_bootstrap_coord_subsystem",
+        lambda *a, **kw: calls.append(a),
+    )
+    _maybe_bootstrap_coord_subsystem(app, storage)
+    assert calls == []
+    assert "No model definitions found" in app.state.coord_registry_error
+
+
+def test_bootstrap_calls_subsystem_builder_on_first_row(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row exists ⇒ helper loads the registry, hands it to the
+    subsystem builder, and the builder stamps it on app.state.  Mirrors
+    the post-build invariant the real ``_bootstrap_coord_subsystem``
+    establishes (coord_registry set iff coord_mgr set) so the stale
+    boot-time error string clears as part of the same commit step."""
+    from turnstone.console import server as server_module
+
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    app = _bootstrap_app(coord_registry_error="stale boot-time message")
+    captured: dict[str, Any] = {}
+
+    def _fake_build(app_arg: Any, _storage: Any, _cfg: Any, registry_arg: Any) -> None:
+        captured["app"] = app_arg
+        captured["registry"] = registry_arg
+        # Simulate the real builder's final commit step: stamp registry
+        # + clear stale error + set coord_mgr atomically.
+        app_arg.state.coord_registry = registry_arg
+        app_arg.state.coord_registry_error = ""
+        app_arg.state.coord_mgr = MagicMock()
+
+    monkeypatch.setattr(server_module, "_bootstrap_coord_subsystem", _fake_build)
+    _maybe_bootstrap_coord_subsystem(app, storage)
+    assert captured["app"] is app
+    assert captured["registry"].has_alias("local")
+    assert app.state.coord_registry is captured["registry"]
+    assert app.state.coord_registry_error == ""
+
+
+def test_bootstrap_replaces_stale_error_on_builder_failure(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A builder failure after a successful registry load must not leave
+    the stale "no model definitions" message on app.state — that
+    diagnosis is demonstrably wrong (rows ARE present, the build failed
+    for a different reason).  Replacement message must surface the
+    actual exception type so operators can correlate with logs."""
+    from turnstone.console import server as server_module
+
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    app = _bootstrap_app(
+        coord_registry_error=(
+            "No model definitions found. Provide --model, configure [models.*] "
+            "in config.toml, or add model definitions in the admin panel."
+        )
+    )
+
+    def _boom(*_a: Any, **_kw: Any) -> None:
+        raise RuntimeError("simulated builder failure")
+
+    monkeypatch.setattr(server_module, "_bootstrap_coord_subsystem", _boom)
+    _maybe_bootstrap_coord_subsystem(app, storage)  # must not raise
+    assert app.state.coord_mgr is None
+    # Stale "no models" message replaced.
+    assert "No model definitions found" not in app.state.coord_registry_error
+    # New message mentions the actual failure class so the 503 banner
+    # gives operators something actionable beyond "look at logs".
+    assert "RuntimeError" in app.state.coord_registry_error
+    assert "failed to initialise" in app.state.coord_registry_error
+
+
+def test_bootstrap_tears_down_partial_state_on_builder_failure(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the builder partially stamps handles on app.state and then
+    raises, the helper must call the teardown path so a subsequent
+    retry doesn't leak a StateWriter daemon / observer subscription."""
+    from turnstone.console import server as server_module
+
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    app = _bootstrap_app()
+
+    state_writer = MagicMock()
+    idle_observer = MagicMock()
+    coord_adapter = MagicMock()
+
+    def _partial_then_boom(app_arg: Any, *_a: Any, **_kw: Any) -> None:
+        # Mirror the real builder's stamp-immediately-after-start order:
+        # StateWriter spawned + stamped before SessionManager validates.
+        app_arg.state.coord_state_writer = state_writer
+        app_arg.state.coord_idle_observer = idle_observer
+        app_arg.state.coord_adapter = coord_adapter
+        raise RuntimeError("simulated mid-build failure")
+
+    monkeypatch.setattr(server_module, "_bootstrap_coord_subsystem", _partial_then_boom)
+    _maybe_bootstrap_coord_subsystem(app, storage)
+    # Teardown ran for each partially-stamped handle.
+    state_writer.shutdown.assert_called_once()
+    idle_observer.shutdown.assert_called_once()
+    coord_adapter.shutdown.assert_called_once()
+    # And the app.state slots are reset so a retry sees a clean field.
+    assert app.state.coord_state_writer is None
+    assert app.state.coord_idle_observer is None
+    assert app.state.coord_adapter is None
+    assert app.state.coord_mgr is None
+    assert app.state.coord_registry is None
+
+
+def test_real_bootstrap_stands_up_subsystem_end_to_end(
+    storage: SQLiteBackend,
+) -> None:
+    """End-to-end: the real ``_bootstrap_coord_subsystem`` constructs a
+    working ``SessionManager`` against a real ``ConfigStore`` + real
+    ``ClusterCollector`` when an operator adds the first model row to
+    a freshly-installed console.
+
+    This is the test that reproduces the user-reported bug — without it,
+    all the bootstrap helper-level tests can pass even if the real
+    builder never actually completes (the helper-level tests
+    monkeypatch the builder out).  Asserts the post-bootstrap invariant
+    that ``_require_coord_mgr`` relies on: ``coord_mgr`` is a real
+    SessionManager and ``coord_registry_error`` has been cleared.
+    """
+    from turnstone.console import server as server_module
+    from turnstone.console.collector import ClusterCollector
+    from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
+    from turnstone.console.metrics import ConsoleMetrics
+    from turnstone.core.config_store import ConfigStore
+    from turnstone.core.session_manager import SessionManager
+
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    config_store = ConfigStore(storage)
+    # Disable the idle-cleanup daemon for this test — it has no
+    # stop_event hook in the bootstrap (the loop runs until process
+    # termination) so leaving the default 120-minute timeout would
+    # leak a daemon thread across every test run.
+    config_store.set("server.workstream_idle_timeout", 0)
+    # ClusterCollector is constructed but NOT started — start() spawns
+    # network discovery + SSE manager threads we don't need for this
+    # test.  ensure_console_pseudo_node() (called by the bootstrap via
+    # start_child_event_fanout) operates on the in-memory snapshot map
+    # without requiring the discovery loop to be live.
+    collector = ClusterCollector(storage=storage)
+    # Snapshot ConsoleCoordinatorUI's class attrs so the test can
+    # restore them on teardown — the bootstrap mutates them and they
+    # persist across tests at process scope.
+    saved_coord_mgr = ConsoleCoordinatorUI._coord_mgr
+    saved_collector = ConsoleCoordinatorUI._collector
+    saved_metrics = ConsoleCoordinatorUI._console_metrics
+
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            coord_mgr=None,
+            coord_adapter=None,
+            coord_registry=None,
+            coord_registry_error=(
+                "No model definitions found. Provide --model, configure [models.*] "
+                "in config.toml, or add model definitions in the admin panel."
+            ),
+            coord_state_writer=None,
+            coord_idle_observer=None,
+            config_store=config_store,
+            collector=collector,
+            console_metrics=ConsoleMetrics(),
+            jwt_secret="x" * 32,
+            console_url="http://127.0.0.1:8001",
+        )
+    )
+
+    try:
+        _maybe_bootstrap_coord_subsystem(app, storage)
+        # The real builder ran and produced a working SessionManager.
+        assert isinstance(app.state.coord_mgr, SessionManager)
+        assert app.state.coord_adapter is not None
+        # Registry stamped with the seeded alias.
+        assert app.state.coord_registry is not None
+        assert app.state.coord_registry.has_alias("local")
+        # Stale boot-time error string cleared as part of the commit.
+        assert app.state.coord_registry_error == ""
+        # StateWriter daemon is alive — it's the load-bearing async
+        # persistence layer for SessionManager state transitions.
+        assert app.state.coord_state_writer is not None
+        # Class-level wiring on ConsoleCoordinatorUI is the path
+        # on_state_change / on_rename use to fan out to the dashboard.
+        assert ConsoleCoordinatorUI._coord_mgr is app.state.coord_mgr
+        assert ConsoleCoordinatorUI._collector is collector
+    finally:
+        # Tear down threads + subscriptions spawned by the bootstrap.
+        # ``_teardown_partial_coord_subsystem`` does the same work the
+        # runtime-bootstrap failure path does, so reusing it here also
+        # exercises that helper end-to-end.
+        server_module._teardown_partial_coord_subsystem(app)
+        # Restore ConsoleCoordinatorUI class attrs so other tests in
+        # the suite see them as they were before this test ran.
+        ConsoleCoordinatorUI._coord_mgr = saved_coord_mgr
+        ConsoleCoordinatorUI._collector = saved_collector
+        ConsoleCoordinatorUI._console_metrics = saved_metrics
+
+
+def test_bootstrap_lock_serialises_concurrent_calls(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two simultaneous CRUD writes both seeing ``coord_mgr is None``
+    must serialise via ``_COORD_BOOTSTRAP_LOCK`` and the second caller
+    must observe the post-build state on its inside-the-lock re-check —
+    so the builder runs exactly once.  Without the lock + double-check,
+    both threads enter the build and stamp duplicate SessionManager /
+    StateWriter / observer triples on app.state.
+
+    The synchronisation is deterministic, not wall-clock-based: an
+    instrumented lock wrapper signals when a second acquirer arrives,
+    so the test fails fast and reproducibly on slow CI rather than
+    relying on a sleep long enough to "probably" let thread 2 reach
+    the lock — a dependence the previous version was rightly criticised
+    for.
+    """
+    from turnstone.console import server as server_module
+
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    app = _bootstrap_app()
+    build_count = 0
+    count_lock = threading.Lock()
+    in_build = threading.Event()
+    release_build = threading.Event()
+
+    def _slow_build(app_arg: Any, *_a: Any, **_kw: Any) -> None:
+        nonlocal build_count
+        with count_lock:
+            build_count += 1
+            is_first = build_count == 1
+        if is_first:
+            # Hold inside the build so the second thread is forced to
+            # queue at the lock — without the lock it would race ahead
+            # and increment build_count to 2.
+            in_build.set()
+            release_build.wait(timeout=2.0)
+        # Mirror the real builder's commit step.
+        app_arg.state.coord_mgr = MagicMock()
+        app_arg.state.coord_registry = MagicMock()
+
+    monkeypatch.setattr(server_module, "_bootstrap_coord_subsystem", _slow_build)
+
+    # Instrumented wrapper: delegates to a real ``threading.Lock`` so
+    # the production ``with _COORD_BOOTSTRAP_LOCK:`` block keeps doing
+    # genuine serialisation work, but counts arrivals so the main
+    # thread can wait deterministically until thread 2 is at the lock
+    # before releasing thread 1.  If the production code drops the
+    # ``with`` block entirely, the wrapper is never entered, the
+    # arrival event never fires, and the assertion below times out
+    # with a clear error rather than the subtler false-pass a sleep
+    # would allow.
+    real_lock = threading.Lock()
+    arrivals_lock = threading.Lock()
+    arrivals = 0
+    second_waiter_arrived = threading.Event()
+
+    class _InstrumentedLock:
+        def __enter__(self) -> Any:
+            nonlocal arrivals
+            with arrivals_lock:
+                arrivals += 1
+                arrival_index = arrivals
+            if arrival_index >= 2:
+                second_waiter_arrived.set()
+            real_lock.acquire()
+            return self
+
+        def __exit__(self, *_exc: Any) -> None:
+            real_lock.release()
+
+    monkeypatch.setattr(server_module, "_COORD_BOOTSTRAP_LOCK", _InstrumentedLock())
+
+    def _run() -> None:
+        _maybe_bootstrap_coord_subsystem(app, storage)
+
+    t1 = threading.Thread(target=_run, name="bootstrap-thread-1")
+    t2 = threading.Thread(target=_run, name="bootstrap-thread-2")
+    t1.start()
+    assert in_build.wait(timeout=2.0), "thread 1 never entered the builder"
+    t2.start()
+    # Deterministic: block here until thread 2 has reached the lock
+    # (or the wait times out, signalling the lock was bypassed entirely).
+    assert second_waiter_arrived.wait(timeout=2.0), (
+        "thread 2 never reached the lock — concurrency was not exercised, "
+        "production code may be skipping the lock"
+    )
+    release_build.set()
+    t1.join(timeout=5.0)
+    t2.join(timeout=5.0)
+    assert not t1.is_alive() and not t2.is_alive()
+    assert build_count == 1, (
+        f"builder ran {build_count} times — lock failed to serialise concurrent calls"
+    )
+
+
 def test_helper_preserves_registry_on_reload_validation_error(
     storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -307,6 +694,79 @@ def test_create_endpoint_refreshes_registry(storage: SQLiteBackend) -> None:
     assert resp.status_code == 200, resp.text
     assert registry.has_alias("fast")
     assert registry.get_config("fast").model == "fast-model"
+
+
+def test_create_endpoint_bootstraps_subsystem_on_fresh_install(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """User-visible regression: a console booted with no model rows leaves
+    coord_mgr unbuilt; the operator adding their first model via the
+    admin panel must promote the subsystem to ready (no console restart).
+    Before the fix, ``_refresh_coord_registry`` short-circuited on
+    ``coord_registry is None`` and the dashboard's 503 banner persisted
+    until the user restarted.
+    """
+    from turnstone.console import server as server_module
+
+    # Fresh-install state: registry=None, coord_mgr=None, boot-time
+    # error string set by the lifespan's ValueError catch.  Build the
+    # app explicitly so the test can inspect ``app.state`` after the
+    # request completes (TestClient's ``.app`` attribute is typed as
+    # ASGIApp, which loses the ``.state`` accessor).
+    app = Starlette(
+        routes=[
+            Route(
+                "/v1/api/admin/model-definitions",
+                admin_create_model_definition,
+                methods=["POST"],
+            ),
+        ],
+        middleware=[Middleware(_AuthMiddleware)],
+    )
+    app.state.auth_storage = storage
+    app.state.coord_registry = None
+    app.state.coord_mgr = None
+    app.state.coord_registry_error = (
+        "No model definitions found. Provide --model, configure [models.*] "
+        "in config.toml, or add model definitions in the admin panel."
+    )
+    app.state.collector = MagicMock()
+    app.state.collector.get_all_nodes.return_value = []
+    app.state.config_store = MagicMock()
+    app.state.console_metrics = MagicMock()
+    client = TestClient(app)
+    client.headers.update({"X-Test-User": "admin", "X-Test-Perms": "admin.models"})
+
+    captured: dict[str, Any] = {}
+
+    def _fake_build(app_arg: Any, _storage: Any, _cfg: Any, registry_arg: Any) -> None:
+        captured["registry"] = registry_arg
+        # Mirror the real builder's commit step so the post-call asserts
+        # see the same invariant a successful real bootstrap establishes.
+        app_arg.state.coord_registry = registry_arg
+        app_arg.state.coord_registry_error = ""
+        app_arg.state.coord_mgr = MagicMock()
+
+    monkeypatch.setattr(server_module, "_bootstrap_coord_subsystem", _fake_build)
+
+    resp = client.post(
+        "/v1/api/admin/model-definitions",
+        json={
+            "alias": "first",
+            "model": "first-model",
+            "provider": "openai-compatible",
+            "base_url": "http://localhost:9000/v1",
+            "api_key": "sk-x",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    # Bootstrap fired with a registry holding the just-added alias.
+    assert "registry" in captured and captured["registry"].has_alias("first")
+    # coord_mgr is now non-None (bootstrap completed) and the stale
+    # boot-time error message has been cleared so subsequent 503s
+    # don't lie about current state.
+    assert app.state.coord_mgr is not None
+    assert app.state.coord_registry_error == ""
 
 
 def test_update_endpoint_refreshes_registry(storage: SQLiteBackend) -> None:
