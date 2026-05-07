@@ -139,7 +139,7 @@ class NullUI:
     def on_error(self, message: str) -> None:
         pass
 
-    def on_user_reminder(self, reminders: list[dict[str, Any]]) -> None:
+    def on_user_reminder(self, reminders: list[dict[str, Any]], source: str | None = None) -> None:
         pass
 
     def on_tool_reminder(self, reminders: list[dict[str, Any]], tool_call_id: str) -> None:

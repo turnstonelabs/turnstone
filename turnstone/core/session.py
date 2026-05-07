@@ -591,7 +591,9 @@ class SessionUI(Protocol):
     def on_plan_review(self, content: str) -> str: ...
     def on_info(self, message: str) -> None: ...
     def on_error(self, message: str) -> None: ...
-    def on_user_reminder(self, reminders: list[dict[str, Any]]) -> None: ...
+    def on_user_reminder(
+        self, reminders: list[dict[str, Any]], source: str | None = None
+    ) -> None: ...
     def on_tool_reminder(self, reminders: list[dict[str, Any]], tool_call_id: str) -> None: ...
     def on_state_change(self, state: str) -> None: ...
     def on_rename(self, name: str) -> None: ...
@@ -6032,8 +6034,15 @@ class ChatSession:
             return
         user_msg["_reminders"] = reminders
 
+        # Forward ``_source`` (today only ``"system_nudge"`` for wake
+        # turns) so non-originating SSE consumers can render the thin
+        # ``.msg.user.system-nudge`` marker before the reminder bubble.
+        # Without it, a non-originating tab anchors the bubble below
+        # whichever stale prior user message exists.
+        source_tag = user_msg.get("_source")
+        source_arg: str | None = source_tag if isinstance(source_tag, str) and source_tag else None
         try:
-            self.ui.on_user_reminder(reminders)
+            self.ui.on_user_reminder(reminders, source=source_arg)
         except Exception:
             log.warning("ui.on_user_reminder failed; reminder still attached", exc_info=True)
 

@@ -50,7 +50,7 @@ class NullUI:
     def on_error(self, message):
         pass
 
-    def on_user_reminder(self, reminders):
+    def on_user_reminder(self, reminders, source=None):
         pass
 
     def on_tool_reminder(self, reminders, tool_call_id):
@@ -2240,10 +2240,13 @@ class TestMetacognitiveBuffers:
         msg = {"role": "user", "content": "noted"}
         session._attach_pending_user_reminders(msg)
         # on_user_reminder called with the same shape as _build_history
-        # surfaces — list of {type, text} dicts.
+        # surfaces — list of {type, text} dicts.  ``source`` rides as
+        # a kwarg (None for non-wake correction nudges); inspect via
+        # ``call_args.args`` for the positional reminders payload only.
         assert session.ui.on_user_reminder.call_count == 1
-        (reminders_arg,) = session.ui.on_user_reminder.call_args.args
+        reminders_arg = session.ui.on_user_reminder.call_args.args[0]
         assert reminders_arg == [{"type": "correction", "text": "watch out"}]
+        assert session.ui.on_user_reminder.call_args.kwargs.get("source") is None
 
     def test_attach_swallows_on_user_reminder_failure(self, tmp_db):
         """A UI hook implementation that raises (queue full, unexpected
@@ -3328,7 +3331,35 @@ class TestSessionUIBaseUserReminderHook:
         ui = _RecordingUI()
         reminders = [{"type": "correction", "text": "watch out"}]
         ui.on_user_reminder(reminders)
+        # ``source`` omitted from the payload when not provided —
+        # absent vs. None on the wire should mean the same thing.
         assert ui.events == [{"type": "user_reminder", "reminders": reminders}]
+
+    def test_on_user_reminder_carries_source_when_set(self):
+        """Wake-driven reminders fire with ``source="system_nudge"`` so
+        non-originating SSE consumers can render the thin
+        ``.msg.user.system-nudge`` marker before the reminder bubble.
+        """
+        from turnstone.core.session_ui_base import SessionUIBase
+
+        class _RecordingUI(SessionUIBase):
+            def __init__(self) -> None:
+                super().__init__()
+                self.events: list[dict] = []
+
+            def _enqueue(self, data: dict) -> None:  # type: ignore[override]
+                self.events.append(data)
+
+        ui = _RecordingUI()
+        reminders = [{"type": "idle_children", "text": "kids"}]
+        ui.on_user_reminder(reminders, source="system_nudge")
+        assert ui.events == [
+            {
+                "type": "user_reminder",
+                "reminders": reminders,
+                "source": "system_nudge",
+            }
+        ]
 
 
 class TestSessionUIBaseToolReminderHook:
