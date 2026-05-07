@@ -14,6 +14,13 @@ at save time) and any preceding tab's reminder bubbles missing as well.
   ``{type, text, ...optional}``.  Empty / missing column means no
   reminders for that row.
 
+**SQLite upgrade cost.**  Alembic env.py runs migrations with
+``render_as_batch=True``, which on SQLite implements ``add_column`` by
+recreating the table.  Two ``add_column`` calls = two full-table
+copies on first deployment after upgrade.  For installs with months
+of chat history (millions of rows) the migration takes seconds to
+minutes.  PostgreSQL is unaffected (metadata-only ALTER).
+
 Revision ID: 050
 Revises: 049
 Create Date: 2026-05-06
