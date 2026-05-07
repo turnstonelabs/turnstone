@@ -915,6 +915,73 @@
   margin-right: 6px;
   text-transform: lowercase;
 }
+/* Newline preservation for every metacog reminder bubble.
+   `.msg.user-reminder` sets `white-space: pre-wrap` on the outer
+   element but the shared `.msg-body` rule below explicitly resets to
+   `normal` for markdown-friendly spacing.  Restoring `pre-wrap` for
+   the reminder body keeps multi-line shell output (watch_triggered)
+   and bulleted lists (idle_children) readable instead of collapsing
+   newlines into single spaces. */
+.msg.user-reminder .msg-body {
+  white-space: pre-wrap;
+}
+
+/* Watch-result card — full-width structured rendering for the
+   `watch_triggered` reminder type.  First-pass functional treatment
+   (no bespoke design polish yet) — the goal is making 50-line
+   `gh pr view` shell output legible inside the chat flow rather than
+   buried in a small advisory bubble. */
+.msg.watch-result {
+  border-left-color: var(--cyan);
+  background: var(--panel);
+  padding: 8px 12px;
+  margin: 6px 0;
+  width: 100%;
+}
+.msg.watch-result .msg-watch-header {
+  color: var(--cyan);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  margin-bottom: 4px;
+  text-transform: lowercase;
+}
+.msg.watch-result .msg-watch-cmd {
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+.msg.watch-result .msg-watch-body {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  margin: 0;
+  white-space: pre-wrap;
+  /* Shell output can be wide (URLs, JSON, file lists) — break inside
+     long words so the off-canvas mobile drawer doesn't blow horizontal
+     layout.  R7 in the plan's risk register. */
+  word-break: break-word;
+}
+.msg.watch-result .msg-watch-footer {
+  color: var(--ink-3);
+  font-size: 11px;
+  margin-top: 6px;
+}
+
+/* System-nudge marker — visible-but-thin replacement for the wake's
+   synthetic empty user turn.  Rendered above wake-driven reminder
+   bubbles so they anchor to a real DOM element instead of falling
+   below an old user message (the §3.4 misalignment in the briefing).
+   Today only `_source = "system_nudge"` triggers it; future producers
+   can add their own thin marker via the same pattern. */
+.msg.user.system-nudge {
+  border-left-color: var(--yellow);
+  color: var(--ink-3);
+  font-size: 11px;
+  padding: 2px 10px;
+  background: transparent;
+  text-transform: lowercase;
+}
 .msg.assistant {
   border-left-color: var(--hair-2);
 }

@@ -1319,7 +1319,7 @@ class SessionUIBase:
     def on_error(self, message: str) -> None:
         self._enqueue({"type": "error", "message": message})
 
-    def on_user_reminder(self, reminders: list[dict[str, Any]]) -> None:
+    def on_user_reminder(self, reminders: list[dict[str, Any]], source: str | None = None) -> None:
         """Surface a metacognitive user-channel nudge as its own UI
         element.
 
@@ -1331,8 +1331,16 @@ class SessionUIBase:
         originating tab.  The history-replay path surfaces the same
         shape via ``_build_history`` so a tab reconnecting later
         renders the same bubble.
+
+        ``source`` mirrors the user-message dict's ``_source`` field
+        (today only ``"system_nudge"`` for wake-driven reminders).  The
+        frontend uses it to render the thin ``.msg.user.system-nudge``
+        marker before anchoring the reminder bubbles below it.
         """
-        self._enqueue({"type": "user_reminder", "reminders": reminders})
+        evt: dict[str, Any] = {"type": "user_reminder", "reminders": reminders}
+        if source:
+            evt["source"] = source
+        self._enqueue(evt)
 
     def on_tool_reminder(self, reminders: list[dict[str, Any]], tool_call_id: str) -> None:
         """Surface a metacognitive tool-channel nudge (``tool_error`` /

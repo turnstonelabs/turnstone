@@ -64,8 +64,8 @@ class _FakeUI:
     def on_state_change(self, state: str) -> None:
         self.events.append(("state", state))
 
-    def on_user_reminder(self, reminders: Any) -> None:
-        self.events.append(("user_reminder", reminders))
+    def on_user_reminder(self, reminders: Any, source: str | None = None) -> None:
+        self.events.append(("user_reminder", reminders, source))
 
     def on_error(self, message: str) -> None:
         pass
