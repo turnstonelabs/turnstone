@@ -1744,18 +1744,10 @@ class ChatSession:
         if not fork:
             self._ws_id = ws_id
         self.messages = messages
-        # Persisted reminders ride the ``_reminders`` side-channel but
-        # carry no in-memory ``_reminders_delivered`` flag (the flag is
-        # session-scoped — set by ``_mark_reminders_delivered`` after
-        # each successful provider stream, never persisted).  Without
-        # this re-splice guard, the very next user turn after resume
-        # would walk the loaded history and re-render every historical
-        # ``<system-reminder>`` block onto the wire — leaking each one a
-        # second time, the turn after it had already advised.  Mirror
-        # the post-stream hook here: every loaded message that carries
-        # reminders has already been delivered (it survived to disk),
-        # so flag it accordingly so ``_apply_reminders_for_provider``
-        # short-circuits on the pass-through path.
+        # Loaded reminders are already delivered — the flag is
+        # session-scoped and not persisted, so without this guard the
+        # next user turn would re-splice every historical reminder onto
+        # the wire.
         for msg in self.messages:
             if msg.get("_reminders"):
                 msg["_reminders_delivered"] = True
@@ -1855,14 +1847,6 @@ class ChatSession:
                     pd_str = json.dumps(pd) if pd and not isinstance(pd, str) else pd
                 except (TypeError, ValueError):
                     pd_str = None
-                # Carry the persisted side-channels (``_source`` /
-                # ``_reminders``) onto the fork's rows.  Both backends'
-                # ``save_messages_bulk`` accept them post-migration 050;
-                # without them, a fork dropped every wake marker and
-                # every reminder bubble that survived to disk on the
-                # source workstream — the resumed fork's transcript
-                # would then look like the assistant turn answered out
-                # of nowhere.
                 src = msg.get("_source")
                 bulk_rows.append(
                     {
@@ -2786,14 +2770,9 @@ class ChatSession:
         # leaves pending rows that the UI's chip rehydration can still
         # surface so the user can clear or resend them.
         #
-        # The wake's synthesised empty turn DOES persist now: the
-        # ``_source`` and ``_reminders`` columns mirror the in-memory
-        # side-channels so a tab reconnecting via /history sees the
-        # same system-nudge marker + reminder bubbles the originating
-        # tab rendered live.  Without persistence, multi-tab / multi-
-        # device replay shows the assistant's response with no
-        # preceding context — the wake event looks like it came out of
-        # nowhere.
+        # The wake's synthesised empty turn carries ``_source`` /
+        # ``_reminders`` onto the row so reconnecting tabs render the
+        # marker + bubbles instead of an unanchored assistant reply.
         source = user_msg.get("_source")
         reminders_payload = user_msg.get("_reminders")
         reminders_json = self._encode_reminders(reminders_payload)
