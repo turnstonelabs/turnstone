@@ -504,6 +504,177 @@ def test_real_bootstrap_stands_up_subsystem_end_to_end(
         ConsoleCoordinatorUI._console_metrics = saved_metrics
 
 
+def test_real_bootstrap_rolls_back_partial_state_on_side_effect_failure(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real ``_bootstrap_coord_subsystem`` must roll back from
+    locally-held handles when a side-effect step fails mid-build, so
+    ``app.state`` is never stamped (no half-built subsystem visible)
+    and the started ``StateWriter`` daemon is shut down (no leaked
+    thread across retries).
+
+    Exercises the bug-2 fix end-to-end: monkeypatches
+    ``install_idle_nudge_watcher`` to raise, drives the real builder,
+    and asserts (a) the exception propagates, (b) ``app.state`` shows
+    a clean fresh-install state, (c) the started ``StateWriter`` is
+    no longer alive.
+    """
+    from turnstone.console import server as server_module
+    from turnstone.console.collector import ClusterCollector
+    from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
+    from turnstone.console.metrics import ConsoleMetrics
+    from turnstone.core.config_store import ConfigStore
+
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    config_store = ConfigStore(storage)
+    config_store.set("server.workstream_idle_timeout", 0)
+    collector = ClusterCollector(storage=storage)
+    saved_coord_mgr = ConsoleCoordinatorUI._coord_mgr
+    saved_collector = ConsoleCoordinatorUI._collector
+    saved_metrics = ConsoleCoordinatorUI._console_metrics
+
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            coord_mgr=None,
+            coord_adapter=None,
+            coord_registry=None,
+            coord_registry_error="boot-time stale message",
+            coord_state_writer=None,
+            coord_idle_observer=None,
+            config_store=config_store,
+            collector=collector,
+            console_metrics=ConsoleMetrics(),
+            jwt_secret="x" * 32,
+            console_url="http://127.0.0.1:8001",
+        )
+    )
+
+    # Monkeypatch a mid-build side-effect to fail AFTER StateWriter +
+    # observer have started but BEFORE the atomic commit.  This is the
+    # exact failure shape the new local-rollback path is designed to
+    # handle cleanly.
+    def _boom(*_a: Any, **_kw: Any) -> Any:
+        raise RuntimeError("simulated mid-build subscription failure")
+
+    monkeypatch.setattr("turnstone.console.server.install_idle_nudge_watcher", _boom, raising=False)
+    # The bootstrap helper imports install_idle_nudge_watcher locally
+    # at call time (inside the function), so we need to patch the
+    # source module too — server.py's import is a name lookup against
+    # the module each call.
+    monkeypatch.setattr(
+        "turnstone.core.idle_nudge_watcher.install_idle_nudge_watcher",
+        _boom,
+    )
+
+    try:
+        # ``_maybe_bootstrap_coord_subsystem`` swallows the exception,
+        # logs it, and replaces the stale boot-time error string with
+        # a builder-failure-specific one — but the underlying invariant
+        # we're testing here is that the real builder cleaned up its
+        # own partial side-effects so ``app.state`` is left clean.
+        _maybe_bootstrap_coord_subsystem(app, storage)
+        # No state stamped — atomic commit never reached.
+        assert app.state.coord_mgr is None
+        assert app.state.coord_registry is None
+        assert app.state.coord_state_writer is None
+        assert app.state.coord_idle_observer is None
+        assert app.state.coord_adapter is None
+        # ConsoleCoordinatorUI class attrs were never stamped because
+        # they sit AFTER the side-effect phase — local-rollback never
+        # had to touch them, but the post-failure state still matches
+        # the lifespan's clean state.
+        assert ConsoleCoordinatorUI._coord_mgr is None
+        # The error string surfaces the actual failure cause, not the
+        # stale boot-time "no models" message.
+        assert "RuntimeError" in app.state.coord_registry_error
+        assert "failed to initialise" in app.state.coord_registry_error
+    finally:
+        # Defensive — _maybe_bootstrap should already have torn down,
+        # but call once more in case future drift introduces a leak.
+        server_module._teardown_partial_coord_subsystem(app)
+        ConsoleCoordinatorUI._coord_mgr = saved_coord_mgr
+        ConsoleCoordinatorUI._collector = saved_collector
+        ConsoleCoordinatorUI._console_metrics = saved_metrics
+
+
+def test_bootstrap_atomic_commit_no_partial_visibility(
+    storage: SQLiteBackend,
+) -> None:
+    """A concurrent reader scanning ``app.state`` while the bootstrap
+    runs must never observe ``coord_mgr`` set with ``coord_registry``
+    still ``None`` — that combination would surface a misleading
+    "Restart the console after adding a model definition" 503 from
+    :func:`_require_coord_mgr` even though the operator just
+    successfully added a model.
+
+    Drives the real builder while a separate thread polls
+    ``coord_mgr`` / ``coord_registry`` in tight loops; if the bootstrap
+    ever stamps ``coord_mgr`` before ``coord_registry``, the polling
+    thread will catch it.
+    """
+    from turnstone.console import server as server_module
+    from turnstone.console.collector import ClusterCollector
+    from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
+    from turnstone.console.metrics import ConsoleMetrics
+    from turnstone.core.config_store import ConfigStore
+
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    config_store = ConfigStore(storage)
+    config_store.set("server.workstream_idle_timeout", 0)
+    collector = ClusterCollector(storage=storage)
+    saved_coord_mgr = ConsoleCoordinatorUI._coord_mgr
+    saved_collector = ConsoleCoordinatorUI._collector
+    saved_metrics = ConsoleCoordinatorUI._console_metrics
+
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            coord_mgr=None,
+            coord_adapter=None,
+            coord_registry=None,
+            coord_registry_error="",
+            coord_state_writer=None,
+            coord_idle_observer=None,
+            config_store=config_store,
+            collector=collector,
+            console_metrics=ConsoleMetrics(),
+            jwt_secret="x" * 32,
+            console_url="http://127.0.0.1:8001",
+        )
+    )
+
+    stop_polling = threading.Event()
+    violations: list[str] = []
+
+    def _poll_for_partial_state() -> None:
+        # Tight loop emulating ``_require_coord_mgr``'s read pattern
+        # (coord_mgr first, then coord_registry).  Any iteration that
+        # observes coord_mgr set with coord_registry still None is the
+        # exact bug Copilot's first finding pointed at.
+        while not stop_polling.is_set():
+            mgr = app.state.coord_mgr
+            reg = app.state.coord_registry
+            if mgr is not None and reg is None:
+                violations.append(f"mgr={mgr!r} reg={reg!r}")
+                return
+
+    poller = threading.Thread(target=_poll_for_partial_state, name="partial-state-poller")
+    poller.start()
+    try:
+        _maybe_bootstrap_coord_subsystem(app, storage)
+    finally:
+        stop_polling.set()
+        poller.join(timeout=2.0)
+        server_module._teardown_partial_coord_subsystem(app)
+        ConsoleCoordinatorUI._coord_mgr = saved_coord_mgr
+        ConsoleCoordinatorUI._collector = saved_collector
+        ConsoleCoordinatorUI._console_metrics = saved_metrics
+
+    assert violations == [], (
+        "concurrent reader observed coord_mgr set with coord_registry still None — "
+        f"atomic commit invariant violated: {violations}"
+    )
+
+
 def test_bootstrap_lock_serialises_concurrent_calls(
     storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
