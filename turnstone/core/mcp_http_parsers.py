@@ -185,6 +185,25 @@ def parse_www_authenticate_bearer(header: str) -> dict[str, str]:
     return out
 
 
+def is_valid_scope_token(token: str) -> bool:
+    """Return True iff ``token`` is a valid RFC 6749 §3.3 ``scope-token``.
+
+    The grammar restricts scope tokens to visible ASCII (``0x21..0x7E``)
+    excluding ``"`` (``0x22``) and ``\\`` (``0x5C``). The empty string
+    is rejected — a zero-length token has no semantic meaning in the
+    space-separated scope list.
+
+    Used by the WWW-Authenticate parser to filter AS-supplied scope
+    sets, and by ``/v1/api/mcp/oauth/start`` to reject caller-supplied
+    scope query params that could smuggle CR/LF/tab/control bytes
+    through the AS round-trip into downstream log or notification
+    paths.
+    """
+    if not token:
+        return False
+    return all(0x21 <= ord(c) <= 0x7E and c not in ('"', "\\") for c in token)
+
+
 def parse_www_authenticate_scope(header: str) -> tuple[str, ...]:
     """Return the ``scope=...`` value as a tuple of individual scopes.
 
@@ -194,21 +213,17 @@ def parse_www_authenticate_scope(header: str) -> tuple[str, ...]:
 
     Each token is validated against the RFC 6749 §3.3 ``scope-token``
     grammar (visible ASCII ``0x21..0x7E`` excluding ``"`` and ``\\``)
-    so that a malicious or buggy AS cannot smuggle CR/LF/tab/control
-    bytes through a future log or notification path. Today scopes are
-    JSON-encoded everywhere downstream so no concrete exploit exists,
-    but the validation is cheap and forecloses regressions in
-    structured-error rendering.
+    via :func:`is_valid_scope_token` so that a malicious or buggy AS
+    cannot smuggle CR/LF/tab/control bytes through a future log or
+    notification path. Today scopes are JSON-encoded everywhere
+    downstream so no concrete exploit exists, but the validation is
+    cheap and forecloses regressions in structured-error rendering.
     """
     params = parse_www_authenticate_bearer(header)
     value = params.get("scope")
     if not value:
         return ()
-    return tuple(
-        s
-        for s in value.split(" ")
-        if s and all(0x21 <= ord(c) <= 0x7E and c not in '"\\' for c in s)
-    )
+    return tuple(s for s in value.split(" ") if is_valid_scope_token(s))
 
 
 def parse_www_authenticate_error(header: str) -> str | None:

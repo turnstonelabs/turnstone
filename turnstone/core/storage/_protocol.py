@@ -61,6 +61,25 @@ class MCPUserToken(TypedDict):
     last_refreshed: str | None
 
 
+class MCPUserTokenMetadataRow(TypedDict):
+    """Non-secret projection of ``mcp_user_tokens`` for the settings UI.
+
+    Excludes ``access_token_ct`` and ``refresh_token_ct`` so the
+    storage layer never materialises ciphertext for list queries that
+    only need metadata. ``MCPTokenStore.list_user_token_metadata``
+    re-types these rows as ``MCPUserTokenMetadata`` (same field shape).
+    """
+
+    user_id: str
+    server_name: str
+    expires_at: str | None
+    scopes: str | None
+    as_issuer: str
+    audience: str
+    created: str
+    last_refreshed: str | None
+
+
 class MCPOAuthPendingState(TypedDict):
     """Row shape returned when popping a pending MCP OAuth flow state."""
 
@@ -1725,6 +1744,18 @@ class StorageBackend(Protocol):
 
     def delete_mcp_user_token(self, user_id: str, server_name: str) -> bool:
         """Delete the per-(user, server) token row. Returns True if existed."""
+        ...
+
+    def list_mcp_user_token_metadata_by_user(self, user_id: str) -> list[MCPUserTokenMetadataRow]:
+        """Return non-secret metadata for every token row owned by ``user_id``,
+        ordered by ``created`` ASC.
+
+        Empty list when the user has no rows. Ciphertext columns are
+        intentionally NOT loaded — the projection runs at the SQL boundary
+        so the LargeBinary blobs never cross the wire for the list-view
+        path. ``MCPTokenStore`` re-types the rows as
+        ``MCPUserTokenMetadata`` (same field shape) for the settings UI.
+        """
         ...
 
     def delete_mcp_oauth_rows_by_server_name(self, server_name: str) -> int:

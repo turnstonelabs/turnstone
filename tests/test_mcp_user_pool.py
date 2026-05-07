@@ -390,13 +390,14 @@ class TestDispatchStateMachine:
         _seed_oauth_server(storage, name="pool-srv")
         self._wire_pool(mgr, storage, cipher)
 
-        result = mgr.call_tool_sync(
-            "mcp__pool-srv__do_thing",
-            {},
-            user_id="user-1",
-            timeout=5,
-        )
-        payload = json.loads(result)
+        with pytest.raises(RuntimeError) as exc_info:
+            mgr.call_tool_sync(
+                "mcp__pool-srv__do_thing",
+                {},
+                user_id="user-1",
+                timeout=5,
+            )
+        payload = json.loads(str(exc_info.value))
         assert payload["error"]["code"] == "mcp_consent_required"
         assert payload["error"]["server"] == "pool-srv"
 
@@ -419,13 +420,14 @@ class TestDispatchStateMachine:
 
         state.mcp_token_store.get_user_token = _raise
 
-        result = mgr.call_tool_sync(
-            "mcp__pool-srv__do_thing",
-            {},
-            user_id="user-1",
-            timeout=5,
-        )
-        payload = json.loads(result)
+        with pytest.raises(RuntimeError) as exc_info:
+            mgr.call_tool_sync(
+                "mcp__pool-srv__do_thing",
+                {},
+                user_id="user-1",
+                timeout=5,
+            )
+        payload = json.loads(str(exc_info.value))
         assert payload["error"]["code"] == "mcp_token_undecryptable_key_unknown"
         # Operator fingerprints stay server-side (audit log + structured log);
         # the agent-facing payload must NOT carry them onward to the LLM
@@ -454,13 +456,14 @@ class TestDispatchStateMachine:
             audience="https://mcp.example.com",
         )
 
-        result = mgr.call_tool_sync(
-            "mcp__pool-srv__do_thing",
-            {},
-            user_id="user-1",
-            timeout=5,
-        )
-        payload = json.loads(result)
+        with pytest.raises(RuntimeError) as exc_info:
+            mgr.call_tool_sync(
+                "mcp__pool-srv__do_thing",
+                {},
+                user_id="user-1",
+                timeout=5,
+            )
+        payload = json.loads(str(exc_info.value))
         assert payload["error"]["code"] == "mcp_consent_required"
 
     def test_token_present_dispatches_to_session(
@@ -634,13 +637,14 @@ class TestHttpsEnforcement:
         state = _make_app_state(storage, cipher=cipher)
         mgr.set_app_state(state)
 
-        result = mgr.call_tool_sync(
-            "mcp__pool-srv__do_thing",
-            {},
-            user_id="user-1",
-            timeout=5,
-        )
-        payload = json.loads(result)
+        with pytest.raises(RuntimeError) as exc_info:
+            mgr.call_tool_sync(
+                "mcp__pool-srv__do_thing",
+                {},
+                user_id="user-1",
+                timeout=5,
+            )
+        payload = json.loads(str(exc_info.value))
         assert payload["error"]["code"] == "mcp_oauth_url_insecure"
         assert payload["error"]["server"] == "pool-srv"
 

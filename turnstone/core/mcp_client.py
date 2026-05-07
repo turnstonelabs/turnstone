@@ -3505,11 +3505,23 @@ class MCPClientManager:
         :class:`_PoolDispatchRetryRequested`. Without this, a slow
         first attempt followed by a stuck retry could double the
         caller-observed timeout.
+
+        Structured-error returns (``mcp_consent_required`` /
+        ``mcp_insufficient_scope`` / ``mcp_token_undecryptable_key_unknown``
+        / ...) flow back from ``_dispatch_pool`` as a JSON string in the
+        success-shape return slot. The session-layer ``_exec_mcp_tool``
+        path keys on ``except Exception`` to render the dashboard's
+        consent card — so we surface that JSON via ``RuntimeError`` here
+        to drive the same path uniformly across tool / resource / prompt
+        dispatchers. The wrap is gated on
+        :func:`_is_structured_error` so a tool whose successful
+        output happens to start with ``{"error":...`` is unaffected;
+        only envelopes carrying an ``mcp_*`` code are converted.
         """
         assert self._loop is not None
         start = time.monotonic()
         try:
-            return self._run_pool_dispatch_attempt(
+            result = self._run_pool_dispatch_attempt(
                 retry_count=0,
                 timeout=timeout,
                 original_timeout=timeout,
@@ -3525,7 +3537,7 @@ class MCPClientManager:
             # state is independent of the prior connect's TaskGroup
             # teardown.
             remaining = max(1, int(timeout - (time.monotonic() - start)))
-            return self._run_pool_dispatch_attempt(
+            result = self._run_pool_dispatch_attempt(
                 retry_count=1,
                 timeout=remaining,
                 original_timeout=timeout,
@@ -3535,6 +3547,9 @@ class MCPClientManager:
                 arguments=arguments,
                 server_row=server_row,
             )
+        if _is_structured_error(result):
+            raise RuntimeError(result)
+        return result
 
     def _run_pool_dispatch_attempt(
         self,
@@ -3601,11 +3616,16 @@ class MCPClientManager:
         bearer; we re-issue on a brand-new task so the retry's anyio
         cancel-scope state is independent of the prior connect's
         TaskGroup teardown.
+
+        Structured-error returns are surfaced via ``RuntimeError`` —
+        see :meth:`_dispatch_pool_sync` for the rationale; this keeps
+        the agent-loop's ``except Exception`` handling uniform across
+        tool and resource dispatchers.
         """
         assert self._loop is not None
         start = time.monotonic()
         try:
-            return self._run_pool_dispatch_resource_attempt(
+            result = self._run_pool_dispatch_resource_attempt(
                 retry_count=0,
                 timeout=timeout,
                 original_timeout=timeout,
@@ -3616,7 +3636,7 @@ class MCPClientManager:
             )
         except _PoolDispatchRetryRequested:
             remaining = max(1, int(timeout - (time.monotonic() - start)))
-            return self._run_pool_dispatch_resource_attempt(
+            result = self._run_pool_dispatch_resource_attempt(
                 retry_count=1,
                 timeout=remaining,
                 original_timeout=timeout,
@@ -3625,6 +3645,9 @@ class MCPClientManager:
                 uri=uri,
                 server_row=server_row,
             )
+        if _is_structured_error(result):
+            raise RuntimeError(result)
+        return result
 
     def _run_pool_dispatch_resource_attempt(
         self,
@@ -3803,6 +3826,7 @@ class MCPClientManager:
                 code="mcp_consent_required",
                 server=server_name,
                 detail="No token for user. Consent flow required.",
+                consent_url=_build_consent_url(server_row),
             )
         if lookup.kind == "decrypt_failure":
             return _structured_error(
@@ -3821,6 +3845,7 @@ class MCPClientManager:
                 code="mcp_consent_required",
                 server=server_name,
                 detail="Refresh token rejected. Re-consent required.",
+                consent_url=_build_consent_url(server_row),
             )
         # kind == "token"
         access_token = lookup.token or ""
@@ -3829,6 +3854,7 @@ class MCPClientManager:
                 code="mcp_consent_required",
                 server=server_name,
                 detail="No token for user. Consent flow required.",
+                consent_url=_build_consent_url(server_row),
             )
 
         # URL hygiene — pool dispatch transmits the per-user bearer; reject
@@ -3911,6 +3937,7 @@ class MCPClientManager:
                     code="mcp_consent_required",
                     server=server_name,
                     detail="Refreshed token still rejected. Re-consent required.",
+                    consent_url=_build_consent_url(server_row),
                 )
             if classification == "auth_403":
                 self._evict_session(key)
@@ -3976,6 +4003,7 @@ class MCPClientManager:
                 code="mcp_consent_required",
                 server=server_name,
                 detail="No token for user. Consent flow required.",
+                consent_url=_build_consent_url(server_row),
             )
         if lookup.kind == "decrypt_failure":
             return _structured_error(
@@ -3991,6 +4019,7 @@ class MCPClientManager:
                 code="mcp_consent_required",
                 server=server_name,
                 detail="Refresh token rejected. Re-consent required.",
+                consent_url=_build_consent_url(server_row),
             )
         access_token = lookup.token or ""
         if not access_token:
@@ -3998,6 +4027,7 @@ class MCPClientManager:
                 code="mcp_consent_required",
                 server=server_name,
                 detail="No token for user. Consent flow required.",
+                consent_url=_build_consent_url(server_row),
             )
 
         url = str(server_row.get("url") or "")
@@ -4051,6 +4081,7 @@ class MCPClientManager:
                     code="mcp_consent_required",
                     server=server_name,
                     detail="Refreshed token still rejected. Re-consent required.",
+                    consent_url=_build_consent_url(server_row),
                 )
             if classification == "auth_403":
                 self._evict_session(key)
@@ -4123,6 +4154,7 @@ class MCPClientManager:
                 code="mcp_consent_required",
                 server=server_name,
                 detail="No token for user. Consent flow required.",
+                consent_url=_build_consent_url(server_row),
             )
         if lookup.kind == "decrypt_failure":
             return _structured_error(
@@ -4138,6 +4170,7 @@ class MCPClientManager:
                 code="mcp_consent_required",
                 server=server_name,
                 detail="Refresh token rejected. Re-consent required.",
+                consent_url=_build_consent_url(server_row),
             )
         access_token = lookup.token or ""
         if not access_token:
@@ -4145,6 +4178,7 @@ class MCPClientManager:
                 code="mcp_consent_required",
                 server=server_name,
                 detail="No token for user. Consent flow required.",
+                consent_url=_build_consent_url(server_row),
             )
 
         url = str(server_row.get("url") or "")
@@ -4198,6 +4232,7 @@ class MCPClientManager:
                     code="mcp_consent_required",
                     server=server_name,
                     detail="Refreshed token still rejected. Re-consent required.",
+                    consent_url=_build_consent_url(server_row),
                 )
             if classification == "auth_403":
                 self._evict_session(key)
@@ -4325,6 +4360,7 @@ class MCPClientManager:
                     "Re-consent flow with new scopes required."
                 ),
                 scopes_required=list(scopes),
+                consent_url=_build_consent_url(server_row, scopes_required=list(scopes)),
             )
         forbidden_code = {
             "tool": "mcp_tool_call_forbidden",
@@ -4711,6 +4747,34 @@ class MCPClientManager:
         self._cb_record_success(server_name)
         return _decode_prompt_result(result)
 
+    def evict_user_session(self, user_id: str, server_name: str) -> None:
+        """Drop the cached pool session for ``(user_id, server_name)``.
+
+        Sync entry point for callers (e.g. the OAuth revoke handler)
+        that mutate token state from outside the mcp-loop and need the
+        next dispatch to reconnect with fresh credentials. Idempotent —
+        a missing key is a silent no-op. Fire-and-forget: schedules
+        :meth:`_evict_session` on the mcp-loop and returns immediately
+        without waiting for the future. Best-effort: a closed loop or
+        scheduling failure logs at info level; never raises.
+        """
+        if self._loop is None:
+            return
+        key = (user_id, server_name)
+
+        async def _do_evict() -> None:
+            self._evict_session(key)
+
+        try:
+            asyncio.run_coroutine_threadsafe(_do_evict(), self._loop)
+        except RuntimeError as exc:
+            log.info(
+                "mcp_pool.evict_user_session_failed server=%s user=%s error=%s",
+                server_name,
+                user_id,
+                type(exc).__name__,
+            )
+
 
 # ---------------------------------------------------------------------------
 # Pool helpers (module-level)
@@ -4776,6 +4840,7 @@ def _structured_error(
     server: str,
     detail: str,
     scopes_required: list[str] | None = None,
+    consent_url: str | None = None,
 ) -> str:
     """Encode a pool-dispatch failure as a JSON string.
 
@@ -4788,6 +4853,13 @@ def _structured_error(
     ``scopes_required`` is omitted from the payload when ``None`` —
     the dashboard renderer keys on its presence to construct an
     authorize URL with the union of original + new scopes.
+
+    ``consent_url`` is omitted when ``None``. When present it carries a
+    relative ``/v1/api/mcp/oauth/start?...`` path the dashboard can
+    open in a popup. Only emitted for user-actionable codes
+    (``mcp_consent_required``, ``mcp_insufficient_scope``); operator-
+    actionable codes (key-unknown, URL-insecure, generic forbidden)
+    intentionally omit it because re-consent doesn't help.
 
     Operator-actionable encryption-key fingerprints are intentionally
     NOT included in this payload: they are already captured server-side
@@ -4802,7 +4874,64 @@ def _structured_error(
     }
     if scopes_required is not None:
         err["scopes_required"] = scopes_required
+    if consent_url is not None:
+        err["consent_url"] = consent_url
     return json.dumps({"error": err})
+
+
+def _is_structured_error(result: str) -> bool:
+    """Return True if *result* parses as a :func:`_structured_error` envelope.
+
+    Used by :meth:`MCPClientManager._dispatch_pool_sync` /
+    :meth:`MCPClientManager._dispatch_pool_resource_sync` to convert the
+    dispatcher's success-shape return into a raised ``RuntimeError``, so
+    the session-layer ``except`` branch fires uniformly across tool /
+    resource / prompt dispatchers. The prompt path uses an
+    ``isinstance(result, str)`` hack that doesn't generalize because
+    tools and resources return ``str`` on success too.
+    """
+    if not isinstance(result, str) or not result.startswith('{"error":'):
+        return False
+    try:
+        decoded = json.loads(result)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(decoded, dict):
+        return False
+    err = decoded.get("error")
+    if not isinstance(err, dict):
+        return False
+    code = err.get("code")
+    return isinstance(code, str) and code.startswith("mcp_")
+
+
+def _build_consent_url(
+    server_row: dict[str, Any],
+    *,
+    scopes_required: list[str] | None = None,
+) -> str | None:
+    """Build a consent URL the dashboard can open in a popup.
+
+    Returns ``None`` when ``server_row`` is not configured for
+    ``auth_type=oauth_user`` (defensive — a structured error for a
+    static-auth server should not advertise a consent flow).
+
+    The ``return_url`` query param is intentionally not baked in: the
+    dashboard JS appends ``window.location.href`` at click time,
+    matching the existing admin.js connect-button pattern. The scope
+    set is passed through so the step-up flow can union with the
+    server's configured scopes server-side at /start.
+    """
+    if server_row.get("auth_type") != "oauth_user":
+        return None
+    server_name = str(server_row.get("name") or "")
+    if not server_name:
+        return None
+    qs = "server=" + urllib.parse.quote(server_name, safe="")
+    if scopes_required:
+        scopes_str = " ".join(scopes_required)
+        qs += "&scopes=" + urllib.parse.quote(scopes_str, safe="")
+    return f"/v1/api/mcp/oauth/start?{qs}"
 
 
 def _pool_cfg_from_row(row: dict[str, Any]) -> dict[str, Any]:

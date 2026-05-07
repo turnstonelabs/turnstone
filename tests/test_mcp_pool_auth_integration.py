@@ -402,14 +402,21 @@ def test_integration_401_with_refresh_failure_emits_consent_required(
     with patch(
         "turnstone.core.mcp_client.get_user_access_token_classified",
         side_effect=_fake_classified,
-    ):
-        result = mgr.call_tool_sync(
+    ), pytest.raises(RuntimeError) as exc_info:
+        mgr.call_tool_sync(
             "mcp__pool-srv__echo", {"payload": "x"}, user_id="user-1", timeout=15
         )
 
-    payload = json.loads(result)
+    # Structured-error envelopes flow back via ``RuntimeError(json_str)``
+    # so the session-layer ``except Exception`` handler routes the
+    # consent card uniformly across tool / resource / prompt dispatchers.
+    payload = json.loads(str(exc_info.value))
     assert payload["error"]["code"] == "mcp_consent_required"
     assert payload["error"]["server"] == "pool-srv"
+    # Phase 8 — consent_url surfaces a /start URL the dashboard can open
+    # in a popup. URL-encoded server name; no scopes baked in (the AS
+    # picks up the configured scopes server-side at /start).
+    assert payload["error"]["consent_url"] == "/v1/api/mcp/oauth/start?server=pool-srv"
     assert mgr._consecutive_failures.get("pool-srv", 0) == 0
 
 
@@ -440,14 +447,19 @@ def test_integration_403_insufficient_scope_emits_structured_error(
     with patch(
         "turnstone.core.mcp_client.get_user_access_token_classified",
         side_effect=_fake_classified,
-    ):
-        result = mgr.call_tool_sync(
+    ), pytest.raises(RuntimeError) as exc_info:
+        mgr.call_tool_sync(
             "mcp__pool-srv__echo", {"payload": "x"}, user_id="user-1", timeout=15
         )
 
-    payload = json.loads(result)
+    payload = json.loads(str(exc_info.value))
     assert payload["error"]["code"] == "mcp_insufficient_scope"
     assert payload["error"]["scopes_required"] == ["files:write", "mail:send"]
+    # Phase 8 — consent_url carries the step-up scopes URL-encoded so the
+    # dashboard can union them with the configured set at /start.
+    assert payload["error"]["consent_url"] == (
+        "/v1/api/mcp/oauth/start?server=pool-srv&scopes=files%3Awrite%20mail%3Asend"
+    )
     # No retry — exactly ONE POST attempted before the structured error.
     post_headers = behaviour.get("post_auth_headers", [])
     assert len(post_headers) == 1, (
@@ -480,12 +492,12 @@ def test_integration_403_no_insufficient_scope_emits_generic_forbidden(
     with patch(
         "turnstone.core.mcp_client.get_user_access_token_classified",
         side_effect=_fake_classified,
-    ):
-        result = mgr.call_tool_sync(
+    ), pytest.raises(RuntimeError) as exc_info:
+        mgr.call_tool_sync(
             "mcp__pool-srv__echo", {"payload": "x"}, user_id="user-1", timeout=15
         )
 
-    payload = json.loads(result)
+    payload = json.loads(str(exc_info.value))
     assert payload["error"]["code"] == "mcp_tool_call_forbidden"
     assert "scopes_required" not in payload["error"]
     post_headers = behaviour.get("post_auth_headers", [])
@@ -554,12 +566,12 @@ def test_integration_403_multi_www_authenticate_drops_injected_scopes(
     with patch(
         "turnstone.core.mcp_client.get_user_access_token_classified",
         side_effect=_fake_classified,
-    ):
-        result = mgr.call_tool_sync(
+    ), pytest.raises(RuntimeError) as exc_info:
+        mgr.call_tool_sync(
             "mcp__pool-srv__echo", {"payload": "x"}, user_id="user-1", timeout=15
         )
 
-    payload = json.loads(result)
+    payload = json.loads(str(exc_info.value))
     assert payload["error"]["code"] == "mcp_insufficient_scope", (
         f"expected mcp_insufficient_scope; got {payload!r}"
     )
@@ -606,12 +618,12 @@ def test_integration_401_retry_ceiling(
     with patch(
         "turnstone.core.mcp_client.get_user_access_token_classified",
         side_effect=_fake_classified,
-    ):
-        result = mgr.call_tool_sync(
+    ), pytest.raises(RuntimeError) as exc_info:
+        mgr.call_tool_sync(
             "mcp__pool-srv__echo", {"payload": "x"}, user_id="user-1", timeout=15
         )
 
-    payload = json.loads(result)
+    payload = json.loads(str(exc_info.value))
     assert payload["error"]["code"] == "mcp_consent_required"
     # Exactly ONE refresh round-trip.
     assert refresh_count == 1, f"expected exactly 1 refresh round-trip; got {refresh_count}"
@@ -654,10 +666,11 @@ def test_integration_breaker_unaffected_by_auth_failures(
         side_effect=_fake_classified,
     ):
         for _ in range(50):
-            result = mgr.call_tool_sync(
-                "mcp__pool-srv__echo", {"payload": "x"}, user_id="user-1", timeout=15
-            )
-            payload = json.loads(result)
+            with pytest.raises(RuntimeError) as exc_info:
+                mgr.call_tool_sync(
+                    "mcp__pool-srv__echo", {"payload": "x"}, user_id="user-1", timeout=15
+                )
+            payload = json.loads(str(exc_info.value))
             assert payload["error"]["code"] == "mcp_consent_required"
             assert mgr._consecutive_failures.get("pool-srv", 0) == 0
 
@@ -716,6 +729,55 @@ def test_integration_static_path_unaffected(
     assert state_after.session is not session_before, (
         "Reconnect did not actually replace the session"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 27b: static dispatch unaffected by Phase 8 consent_url kwarg
+# ---------------------------------------------------------------------------
+
+
+def test_static_dispatch_unaffected_by_consent_url_kwarg(
+    upstream: Any, running_loop_mgr: Any, storage: SQLiteBackend
+) -> None:
+    """Static-auth tool dispatch must be byte-identical post-Phase 8.
+
+    The Phase 8 changes only ADD a ``consent_url`` kwarg to
+    ``_structured_error`` invocations on the pool path. Static dispatch
+    must not pick up the field — there's no consent flow for
+    ``auth_type='none'`` / ``'static'`` servers, and exposing one would
+    confuse the dashboard renderer. Asserts a successful tool result is
+    a plain string with no JSON envelope and no ``consent_url`` substring.
+    """
+    url, behaviour = upstream
+    behaviour["mode"] = "never"  # passthrough — succeeds
+
+    mgr, loop, _ = running_loop_mgr
+    cfg = {"type": "streamable-http", "url": url}
+
+    async def _connect_static() -> None:
+        await mgr._connect_one("static-srv", cfg)
+
+    fut = asyncio.run_coroutine_threadsafe(_connect_static(), loop)
+    fut.result(timeout=15)
+
+    # Drive call_tool_sync without a user_id — the static path is taken.
+    result = mgr.call_tool_sync("mcp__static-srv__echo", {"payload": "static-x"}, timeout=15)
+
+    # Static path returns the FastMCP fixture's echo string.
+    assert "echoed:static-x" in result
+    # No JSON envelope leaked through; specifically no consent_url field.
+    assert "consent_url" not in result, (
+        f"Static-auth tool dispatch surfaced a consent_url; result: {result!r}"
+    )
+    # Defensive: result is not a JSON-encoded structured error.
+    try:
+        parsed = json.loads(result)
+    except (json.JSONDecodeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict):
+        assert "error" not in parsed, (
+            f"Static-auth dispatch returned a structured-error envelope; got {parsed!r}"
+        )
 
 
 # ---------------------------------------------------------------------------

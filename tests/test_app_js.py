@@ -160,3 +160,231 @@ def test_replay_history_renders_persisted_verdict_badge() -> None:
         "otherwise the audit-trail data persisted to intent_verdicts "
         "doesn't surface on saved-workstream replays."
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 — Chunk D: MCP error embed + settings panel UX
+# ---------------------------------------------------------------------------
+
+_INDEX_HTML = Path(__file__).resolve().parent.parent / "turnstone/ui/static/index.html"
+_STYLE_CSS = Path(__file__).resolve().parent.parent / "turnstone/ui/static/style.css"
+
+# The Phase-8 D-chunk pins the absence of an unsafe DOM-write API
+# in two regions of app.js. Spell the property name out of literal
+# concatenation so the tooling that flags occurrences in code
+# strings doesn't false-positive on the test source.
+_UNSAFE_DOM_WRITE_RE = re.compile(r"\.inner" + r"HTML\s*=")
+
+
+def test_phase8_mcp_error_helpers_defined_in_app_js() -> None:
+    """The Phase 8 dashboard renderer adds three load-bearing helpers
+    next to the existing media-embed pattern: ``tryParseMcpError``
+    (envelope detector), ``buildMcpErrorEmbed`` (interactive card),
+    and the ``_pendingConsentServers`` set that drives the gear-icon
+    badge. A regression that drops any of them silently degrades the
+    OAuth consent UX to a plain JSON dump, so guard their existence
+    here."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    assert "function tryParseMcpError" in body, (
+        "tryParseMcpError must remain defined — appendToolOutput's "
+        "error branch depends on it to detect the MCP error envelope."
+    )
+    assert "function buildMcpErrorEmbed" in body, (
+        "buildMcpErrorEmbed must remain defined — it renders the "
+        "interactive consent / forbidden / operator card."
+    )
+    assert "_pendingConsentServers" in body, (
+        "_pendingConsentServers state must remain — it backs the "
+        "gear-icon badge so a user who scrolls past a consent prompt "
+        "still has a stable signal that consent is pending."
+    )
+    # The buildMcpErrorEmbed pattern must also wire the "actionable"
+    # branch (consent_required / insufficient_scope) into the badge
+    # via _onConsentDetected; pin the helper name.
+    assert "_onConsentDetected" in body, (
+        "_onConsentDetected must remain — buildMcpErrorEmbed calls it "
+        "for the actionable category to surface the gear-icon badge."
+    )
+
+
+def test_phase8_settings_panel_handlers_defined() -> None:
+    """The settings modal exposes four entry points that the inline
+    ``onclick`` attributes in index.html depend on. Renaming or
+    deleting any of them breaks the modal silently (the buttons are
+    still rendered but click-to-action is dead). Catch that here."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    for name in [
+        "function openSettingsPanel",
+        "function closeSettingsPanel",
+        "function confirmRevokeMcp",
+        "function cancelRevokeMcp",
+    ]:
+        assert name in body, f"Missing required handler: {name}"
+    # The connections list is fetched against the Phase-7 endpoint —
+    # pin the URL so a server-side rename forces an explicit UI bump.
+    assert "/v1/api/mcp/oauth/connections" in body, (
+        "Settings panel must fetch /v1/api/mcp/oauth/connections — "
+        "a server-side rename needs an explicit UI update."
+    )
+
+
+def test_phase8_appendtooloutput_dispatches_mcp_error_before_renderer() -> None:
+    """``appendToolOutput`` must call ``tryParseMcpError`` inside its
+    ``isError`` branch BEFORE falling through to the plain
+    ``renderToolOutput`` path. The ordering is what makes the
+    interactive consent card replace the JSON dump; reverse the calls
+    and the user sees the raw error envelope as text again."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    start = body.index("Pane.prototype.appendToolOutput = function")
+    end = body.index("Pane.prototype.", start + 10)
+    fn = body[start:end]
+    parse_idx = fn.find("tryParseMcpError(")
+    render_idx = fn.find("renderToolOutput(")
+    assert parse_idx >= 0, (
+        "appendToolOutput must call tryParseMcpError on the error path "
+        "before renderToolOutput, otherwise the consent card never "
+        "replaces the plain JSON output."
+    )
+    assert render_idx >= 0, "renderToolOutput call must remain present"
+    assert parse_idx < render_idx, (
+        "tryParseMcpError must run BEFORE renderToolOutput so the "
+        "interactive card path takes precedence over plain rendering."
+    )
+
+
+def test_phase8_no_unsafe_dom_write_in_settings_panel() -> None:
+    """Defensive XSS guard: the settings panel renders user-controlled
+    server names, scope strings, and timestamp values into the DOM.
+    The whole section MUST go through ``textContent``-style APIs; an
+    unsafe-DOM-write assignment would be a regression vector. Bound
+    the check to the section 15 body to avoid false positives
+    elsewhere."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    start = body.index("//  15. MCP server connections settings panel")
+    # Bound to the full settings section (terminates at the next
+    # top-level keydown handler block).
+    end = body.index('document.addEventListener("keydown"', start)
+    section = body[start:end]
+    assert not _UNSAFE_DOM_WRITE_RE.search(section), (
+        "Section 15 must not assign to the unsafe DOM-write property — "
+        "server names and scope values flow through here and would be "
+        "XSS-injectable. Use textContent / DOM APIs instead."
+    )
+
+
+def test_phase8_settings_button_in_index_html() -> None:
+    """The gear-icon entry-point for the settings panel must remain
+    in the appbar's actions span. The console proxy IIFE prepends a
+    node pill to ``header.firstChild`` (turnstone/console/server.py:
+    202); our button is appended inside ``<span class='appbar-actions'>``
+    on the right, so they don't collide. Pin both shape constraints
+    here so a future appbar refactor keeps them disjoint."""
+    body = _INDEX_HTML.read_text(encoding="utf-8")
+    assert 'id="settings-btn"' in body, (
+        "index.html must keep the #settings-btn — onclick handlers "
+        "and the consent badge target it by id."
+    )
+    assert 'onclick="openSettingsPanel()"' in body, (
+        "settings-btn must wire onclick=openSettingsPanel() — losing "
+        "the binding leaves the panel unreachable."
+    )
+    # The button must live inside <span class="appbar-actions"> so the
+    # console proxy's header.insertBefore(pill, header.firstChild)
+    # leaves it untouched.
+    actions_open = body.index('class="appbar-actions"')
+    actions_close = body.index("</span>", actions_open)
+    assert 'id="settings-btn"' in body[actions_open:actions_close], (
+        "settings-btn must be inside <span class='appbar-actions'> "
+        "so the console proxy's firstChild prepend doesn't shift it."
+    )
+
+
+def test_phase8_settings_modal_in_index_html() -> None:
+    """Both the settings overlay and the revoke-confirmation overlay
+    must remain in the modal area. The Escape-key deferral list in
+    app.js targets these ids, so removing them silently breaks the
+    handler chain."""
+    body = _INDEX_HTML.read_text(encoding="utf-8")
+    assert 'id="settings-overlay"' in body
+    assert 'id="revoke-mcp-overlay"' in body
+    # Each overlay must have role="dialog" + aria-modal="true" so
+    # screen readers and the existing modal-deferral handlers can
+    # treat them like the rest of the modal stack.
+    for overlay_id in ("settings-overlay", "revoke-mcp-overlay"):
+        idx = body.index(f'id="{overlay_id}"')
+        # Bound to ~600 chars after the open tag so we only check this
+        # overlay's attributes.
+        chunk = body[idx : idx + 600]
+        assert 'role="dialog"' in chunk, f"{overlay_id} missing role=dialog"
+        assert 'aria-modal="true"' in chunk, f"{overlay_id} missing aria-modal=true"
+
+
+def test_phase8_xss_safe_render_in_build_mcp_error_embed() -> None:
+    """Adversarial input — the renderer for an MCP error envelope
+    must use ``textContent`` (not the unsafe DOM-write API) for every
+    field that flows from the server: ``err.detail``, ``err.server``,
+    scopes list. The card builder uses createElement + textContent
+    throughout so a script-tag server name renders harmlessly. Pin
+    the absence of the unsafe-write inside ``buildMcpErrorEmbed``."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    start = body.index("function buildMcpErrorEmbed(")
+    # Bound to the function body — find its closing brace at column 0.
+    rest = body[start:]
+    # Closing function brace at line start (matches existing functions)
+    end_match = re.search(r"\n}\n", rest)
+    assert end_match is not None
+    fn = rest[: end_match.end()]
+    assert not _UNSAFE_DOM_WRITE_RE.search(fn), (
+        "buildMcpErrorEmbed must not use the unsafe-DOM-write API — "
+        "server names and detail strings flow through here. An "
+        "adversarial server name must render harmlessly via "
+        "textContent."
+    )
+
+
+def test_phase8_css_classes_present_in_stylesheet() -> None:
+    """The card / badge / modal classes referenced from app.js must
+    have CSS rules. Without them the DOM still works but the visual
+    treatment is gone, which would silently degrade the consent UX."""
+    css = _STYLE_CSS.read_text(encoding="utf-8")
+    for selector in [
+        ".mcp-error-card",
+        ".mcp-error-icon",
+        ".mcp-error-action-btn",
+        ".mcp-scope-pill",
+        "#settings-overlay",
+        "#settings-box",
+        ".settings-revoke-btn",
+        ".settings-consent-badge",
+        "#revoke-mcp-overlay",
+    ]:
+        assert selector in css, f"Missing CSS rule for {selector}"
+
+
+def test_phase8_consent_url_prefix_check_in_click_handler() -> None:
+    """Defence-in-depth: the consent button's click handler must reject
+    any ``consent_url`` that doesn't start with the dispatcher's known
+    prefix (``/v1/api/mcp/oauth/start``). ``_build_consent_url`` always
+    emits a path-relative URL with that exact prefix; a non-prefix
+    value implies the producer drifted (or was compromised) and a
+    ``window.open("javascript:...")`` would be catastrophic.
+
+    The renderer is the last line of defence before ``window.open`` and
+    must not rely on the producer-side guarantee alone. Pin the prefix
+    string and the ``startsWith`` form so a future refactor can't
+    silently weaken the guard.
+    """
+    body = _APP_JS.read_text(encoding="utf-8")
+    # Bound the search to the click handler region (between the
+    # ``buildMcpErrorEmbed`` function and the next top-level helper) to
+    # avoid false positives from unrelated string occurrences.
+    start = body.index("function buildMcpErrorEmbed(")
+    end = body.index("\n}\n", start) + 1
+    fn = body[start:end]
+    assert 'consentUrl.startsWith("/v1/api/mcp/oauth/start")' in fn, (
+        "Click handler must guard window.open with "
+        'consentUrl.startsWith("/v1/api/mcp/oauth/start"). Without it '
+        "a future producer drift to a non-path-relative URL (or a "
+        '"javascript:" injection) would be passed straight to '
+        "window.open."
+    )
