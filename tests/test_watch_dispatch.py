@@ -1,8 +1,8 @@
 """Tests for the watch dispatch closure built inside ``set_watch_runner``.
 
 The closure routes watch results onto the per-session :class:`NudgeQueue`
-under the unified pull-model surface (post-#482).  Each test focuses on
-one assertion: enqueue shape, sanitisation, soft-cap drop-oldest,
+under the unified pull-model surface.  Each test focuses on one
+assertion: enqueue shape, sanitisation, soft-cap drop-oldest,
 ``valid_until`` predicate, and concurrent-enqueue safety.
 
 Tests in this file replace the pre-switchover suite that pinned the
@@ -357,11 +357,11 @@ def test_dispatch_no_op_for_empty_payloads(tmp_db, payload: str):
 
 
 class TestMetadataPropagation:
-    """Step 7 of the watch-card UX plan: the dispatch closure pulls
-    optional fields out of the structured ``reminder`` dict and
-    attaches them to the queue entry's ``metadata``.  Drain seams later
-    merge ``metadata`` into the rendered reminder dict so the frontend
-    can display a structured ``.msg.watch-result`` card.
+    """The dispatch closure pulls optional fields out of the structured
+    ``reminder`` dict and attaches them to the queue entry's
+    ``metadata``.  Drain seams later merge ``metadata`` into the
+    rendered reminder dict so the frontend can display a structured
+    ``.msg.watch-result`` card.
     """
 
     def test_dispatch_attaches_watch_metadata_on_enqueue(self, tmp_db):

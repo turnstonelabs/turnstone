@@ -329,7 +329,6 @@ class TerminalUI(SessionUI):
     def on_user_reminder(self, reminders: list[dict[str, Any]], source: str | None = None) -> None:
         # ``source`` ignored — the CLI doesn't render a wake marker
         # (terminal output is anchored by sequence, not anchor element).
-        del source
         self._print_reminder(reminders)
 
     def on_tool_reminder(self, reminders: list[dict[str, Any]], tool_call_id: str) -> None:

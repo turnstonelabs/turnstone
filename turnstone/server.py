@@ -92,6 +92,7 @@ from turnstone.core.session_ui_base import (
     fire_judge_verdict_metric,
 )
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
+from turnstone.core.watch import _WATCH_REMINDER_OPTIONAL_KEYS
 from turnstone.core.web_helpers import version_html as _version_html
 from turnstone.core.workstream import (
     Workstream,
@@ -549,14 +550,7 @@ def _build_history(
                 if not rtype and not rtext:
                     continue
                 clean: dict[str, Any] = {"type": rtype, "text": rtext}
-                # Preserve watch-card optional fields verbatim.
-                for opt_key in (
-                    "watch_name",
-                    "command",
-                    "poll_count",
-                    "max_polls",
-                    "is_final",
-                ):
+                for opt_key in _WATCH_REMINDER_OPTIONAL_KEYS:
                     if opt_key in r:
                         clean[opt_key] = r[opt_key]
                 clean_reminders.append(clean)
