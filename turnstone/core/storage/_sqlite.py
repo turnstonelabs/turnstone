@@ -16,6 +16,7 @@ from turnstone.core.log import get_logger
 from turnstone.core.storage._protocol import (
     MCPOAuthPendingState,
     MCPUserToken,
+    MCPUserTokenMetadataRow,
     OIDCIdentity,
     OIDCPendingState,
 )
@@ -4112,6 +4113,45 @@ class SQLiteBackend:
             )
             conn.commit()
             return result.rowcount > 0
+
+    def list_mcp_user_token_metadata_by_user(self, user_id: str) -> list[MCPUserTokenMetadataRow]:
+        """Return non-secret metadata rows for ``user_id``, ordered by ``created`` ASC.
+
+        Projects metadata columns at the SQL boundary so ciphertext
+        blobs (``access_token_ct`` / ``refresh_token_ct``) never cross
+        the wire on the settings-list path.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                sa.select(
+                    mcp_user_tokens.c.user_id,
+                    mcp_user_tokens.c.server_name,
+                    mcp_user_tokens.c.expires_at,
+                    mcp_user_tokens.c.scopes,
+                    mcp_user_tokens.c.as_issuer,
+                    mcp_user_tokens.c.audience,
+                    mcp_user_tokens.c.created,
+                    mcp_user_tokens.c.last_refreshed,
+                )
+                .where(mcp_user_tokens.c.user_id == user_id)
+                .order_by(mcp_user_tokens.c.created)
+            ).fetchall()
+            out: list[MCPUserTokenMetadataRow] = []
+            for row in rows:
+                m = row._mapping
+                out.append(
+                    MCPUserTokenMetadataRow(
+                        user_id=m["user_id"],
+                        server_name=m["server_name"],
+                        expires_at=m["expires_at"],
+                        scopes=m["scopes"],
+                        as_issuer=m["as_issuer"],
+                        audience=m["audience"],
+                        created=m["created"],
+                        last_refreshed=m["last_refreshed"],
+                    )
+                )
+            return out
 
     def delete_mcp_oauth_rows_by_server_name(self, server_name: str) -> int:
         """Purge user tokens + pending OAuth state for *server_name*."""

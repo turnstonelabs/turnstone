@@ -38,7 +38,10 @@ import httpx
 from turnstone.core.audit import record_audit
 from turnstone.core.log import get_logger
 from turnstone.core.mcp_crypto import MCPTokenDecryptError
-from turnstone.core.mcp_http_parsers import parse_www_authenticate_bearer
+from turnstone.core.mcp_http_parsers import (
+    is_valid_scope_token,
+    parse_www_authenticate_bearer,
+)
 from turnstone.core.oauth_ssrf import (
     OAuthSSRFError,
     sanitize_log_text,
@@ -117,6 +120,7 @@ class ASMetadata:
     authorization_endpoint: str
     token_endpoint: str
     registration_endpoint: str | None
+    revocation_endpoint: str | None
     jwks_uri: str | None
     code_challenge_methods_supported: tuple[str, ...]
     token_endpoint_auth_methods_supported: tuple[str, ...]
@@ -270,6 +274,10 @@ async def _fetch_as_metadata(
     registration_endpoint = (
         str(registration_endpoint_raw) if isinstance(registration_endpoint_raw, str) else None
     )
+    revocation_endpoint_raw = doc.get("revocation_endpoint")
+    revocation_endpoint = (
+        str(revocation_endpoint_raw) if isinstance(revocation_endpoint_raw, str) else None
+    )
     jwks_uri_raw = doc.get("jwks_uri")
     jwks_uri = str(jwks_uri_raw) if isinstance(jwks_uri_raw, str) else None
 
@@ -292,18 +300,21 @@ async def _fetch_as_metadata(
         except OAuthSSRFError as exc:
             raise MCPOAuthDiscoveryError(f"AS {name} rejected (url={endpoint_url}): {exc}") from exc
 
-    if registration_endpoint:
+    for opt_name, opt_url in (
+        ("registration_endpoint", registration_endpoint),
+        ("revocation_endpoint", revocation_endpoint),
+    ):
+        if not opt_url:
+            continue
         try:
             await validate_discovered_endpoint_async(
-                registration_endpoint,
+                opt_url,
                 issuer_parsed,
                 allow_http=allow_http,
                 trusted_endpoint_hosts=trusted_hosts,
             )
         except OAuthSSRFError as exc:
-            raise MCPOAuthDiscoveryError(
-                f"AS registration_endpoint rejected (url={registration_endpoint}): {exc}"
-            ) from exc
+            raise MCPOAuthDiscoveryError(f"AS {opt_name} rejected (url={opt_url}): {exc}") from exc
 
     code_methods_raw = doc.get("code_challenge_methods_supported", [])
     if not isinstance(code_methods_raw, list):
@@ -324,6 +335,7 @@ async def _fetch_as_metadata(
         authorization_endpoint=authorization_endpoint,
         token_endpoint=token_endpoint,
         registration_endpoint=registration_endpoint,
+        revocation_endpoint=revocation_endpoint,
         jwks_uri=jwks_uri,
         code_challenge_methods_supported=code_methods,
         token_endpoint_auth_methods_supported=auth_methods,
@@ -770,6 +782,75 @@ async def refresh_token(
     if not isinstance(doc, dict):
         raise MCPOAuthRefreshFailed("refresh body is not a JSON object")
     return doc
+
+
+async def revoke_token_at_as(
+    *,
+    as_metadata: ASMetadata,
+    http_client: httpx.AsyncClient,
+    refresh_token: str,
+    client_id: str,
+    client_secret: str | None,
+    timeout_seconds: float = _DEFAULT_HTTP_TIMEOUT,
+) -> None:
+    """Best-effort RFC 7009 token revocation.
+
+    Posts ``token=<refresh_token>&token_type_hint=refresh_token`` plus
+    client credentials to ``as_metadata.revocation_endpoint``. This is
+    fire-and-don't-care — the helper logs the outcome and never raises,
+    so callers can fold it into a teardown path without try/except.
+
+    When the AS metadata document carries no ``revocation_endpoint``
+    (RFC 8414 makes it optional), the helper logs and returns. The
+    timeout is enforced via ``asyncio.timeout`` (NOT ``asyncio.wait_for``)
+    to avoid the Python 3.11 anyio cancel-scope hazard on cleanup paths.
+    """
+    if as_metadata.revocation_endpoint is None:
+        log.info(
+            "mcp_server.oauth.revocation_unsupported",
+            as_issuer=as_metadata.issuer,
+        )
+        return
+
+    data: dict[str, str] = {
+        "token": refresh_token,
+        "token_type_hint": "refresh_token",
+        "client_id": client_id,
+    }
+    if client_secret:
+        data["client_secret"] = client_secret
+
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            resp = await http_client.post(
+                as_metadata.revocation_endpoint,
+                data=data,
+            )
+    except Exception as exc:
+        # NOTE: never use ``exc_info=True`` here — chained ``__context__``
+        # may carry an ``httpx.Request`` whose ``Authorization`` header
+        # holds a bearer. Structured fields with ``type(exc).__name__``
+        # only.
+        log.info(
+            "mcp_server.oauth.revocation_failed",
+            as_issuer=as_metadata.issuer,
+            error=type(exc).__name__,
+        )
+        return
+
+    if 200 <= resp.status_code < 300:
+        log.info(
+            "mcp_server.oauth.revocation_succeeded",
+            as_issuer=as_metadata.issuer,
+            status=resp.status_code,
+        )
+        return
+
+    log.info(
+        "mcp_server.oauth.revocation_failed",
+        as_issuer=as_metadata.issuer,
+        status=resp.status_code,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1843,6 +1924,31 @@ async def _handle_mcp_oauth_authorize_inner(request: Request) -> Response:
         # Fall back to root — operators often hit /start without a hint.
         return_url = "/"
 
+    # Optional ``scopes`` query param — caller-supplied step-up scopes.
+    # Validated against the RFC 6749 §3.3 grammar so a malicious or buggy
+    # client can't smuggle CR/LF/tab/control bytes through the AS round-
+    # trip into downstream log or notification paths. The cap matches
+    # the per-call ceiling used in the WWW-Authenticate parser
+    # (``mcp_client._MAX_INSUFFICIENT_SCOPE_REPORTED``); over-capped
+    # input is rejected loudly so callers don't silently lose state.
+    #
+    # Splitting on a single space (NOT ``str.split()``) is intentional:
+    # Python's whitespace split would silently strip embedded CR/LF/tab,
+    # masking hostile input that the grammar predicate is supposed to
+    # catch.
+    requested_scopes_raw = request.query_params.get("scopes", "")
+    requested_scopes: list[str] = []
+    if requested_scopes_raw:
+        from turnstone.core.mcp_client import _MAX_INSUFFICIENT_SCOPE_REPORTED
+
+        candidates = [tok for tok in requested_scopes_raw.split(" ") if tok]
+        if len(candidates) > _MAX_INSUFFICIENT_SCOPE_REPORTED:
+            return JSONResponse({"error": "Invalid scope token"}, status_code=400)
+        for tok in candidates:
+            if not is_valid_scope_token(tok):
+                return JSONResponse({"error": "Invalid scope token"}, status_code=400)
+        requested_scopes = candidates
+
     storage = _get_storage(request.app.state)
     if storage is None:
         return JSONResponse({"error": "Storage unavailable"}, status_code=503)
@@ -1930,7 +2036,16 @@ async def _handle_mcp_oauth_authorize_inner(request: Request) -> Response:
     )
 
     audience = server_row.get("oauth_audience") or server_url
-    scopes = server_row.get("oauth_scopes") or ""
+    configured_scopes = str(server_row.get("oauth_scopes") or "")
+    if requested_scopes:
+        # Union: configured scopes + caller-supplied step-up scopes, deduped
+        # and sorted so the AS sees a stable string regardless of caller
+        # ordering (cache-key stability, deterministic audit detail).
+        merged = set(configured_scopes.split()) | set(requested_scopes)
+        merged.discard("")
+        scopes = " ".join(sorted(merged))
+    else:
+        scopes = configured_scopes
     url = build_authorize_url(
         as_metadata=as_metadata,
         client_id=client_id,
@@ -2238,6 +2353,271 @@ async def _handle_mcp_oauth_callback_inner(request: Request) -> Response:
     return RedirectResponse(pending["return_url"] or "/", status_code=302)
 
 
+async def handle_mcp_oauth_list_connections(request: Request) -> Response:
+    """``GET /v1/api/mcp/oauth/connections``.
+
+    Lists the authenticated user's MCP server consents. Returns the
+    non-secret projection (no access/refresh ciphertext) so the
+    settings UI can render a connections list without ever pulling
+    decrypt material out of storage.
+    """
+    return _apply_security_headers(await _handle_mcp_oauth_list_connections_inner(request))
+
+
+async def _handle_mcp_oauth_list_connections_inner(request: Request) -> Response:
+    from starlette.responses import JSONResponse
+
+    token_store = getattr(request.app.state, "mcp_token_store", None)
+    if token_store is None:
+        return _no_token_store_response("connections")
+
+    user_id = _require_user_id(request)
+    if user_id is None:
+        return JSONResponse({"error": "Authentication required"}, status_code=401)
+
+    rows = await asyncio.to_thread(token_store.list_user_token_metadata, user_id)
+    return JSONResponse({"connections": list(rows)})
+
+
+async def handle_mcp_oauth_revoke_connection(request: Request) -> Response:
+    """``DELETE /v1/api/mcp/oauth/connections/{server_name}``.
+
+    Best-effort RFC 7009 upstream revoke followed by the authoritative
+    local delete. Cross-user attempts return 404 with the same body
+    shape as a never-existed row to avoid leaking tenant existence.
+    Pool sessions for the (user, server) pair are evicted so any
+    in-flight dispatch reconnects with a fresh token at next call.
+    """
+    return _apply_security_headers(await _handle_mcp_oauth_revoke_connection_inner(request))
+
+
+# Strong refs to in-flight upstream-revoke tasks. asyncio holds tasks via
+# a WeakSet; a fire-and-forget ``loop.create_task`` whose handle isn't
+# stored can be GC'd before the AS round-trip completes. Tasks register
+# here on creation and discard themselves on completion via
+# ``add_done_callback`` — same pattern as ``_pg_refresh_drain_tasks``.
+_revoke_upstream_tasks: set[asyncio.Task[None]] = set()
+
+# Soft cap on concurrent in-flight upstream revokes. A coordinated mass
+# revoke (admin sweep, scripted cleanup, compromised account) could pile
+# up arbitrarily many tasks each pinning storage / token_store / server_row
+# / refresh-token plaintext until the AS round-trip completes (~30s
+# worst case). When the set is full, the local delete still runs and
+# the audit row records ``upstream_revoke_outcome="shed_by_cap"``; the
+# operator can re-run revokes against any straggling AS-side tokens once
+# the queue drains.
+_REVOKE_UPSTREAM_TASKS_MAX = 256
+
+
+async def _attempt_upstream_revoke(
+    *,
+    http_client: httpx.AsyncClient,
+    metadata_cache: dict[str, Any] | None,
+    storage: StorageBackend,
+    token_store: MCPTokenStore,
+    server_name: str,
+    server_row: dict[str, Any],
+    server_id_for_audit: str,
+    refresh_token: str,
+) -> None:
+    """Best-effort RFC 7009 upstream revoke for ``user_revoked`` flow.
+
+    Designed to be fired from :func:`asyncio.create_task` so the caller's
+    204 isn't gated on the AS round-trip — the local delete is
+    authoritative for this deployment, and the AS-side state is best-
+    effort. Never raises. Each terminal state emits a structured log so
+    operators can audit AS-side outcomes without parsing exception text:
+    ``revoke_token_at_as`` logs ``revocation_succeeded`` /
+    ``revocation_failed`` / ``revocation_unsupported`` on its branches;
+    discovery failures emit ``upstream_revoke_discovery_failed``; an
+    unexpected exception in the outer block emits
+    ``upstream_revoke_failed``.
+
+    The outer ``try/except Exception`` is load-bearing: this helper is
+    fired as a background task whose handle goes into ``_revoke_upstream_tasks``
+    with a ``set.discard`` done-callback that does NOT consume
+    ``task.exception()``. An unhandled exception here would surface as
+    ``Task exception was never retrieved`` from asyncio's default handler.
+    Catching at the outer boundary keeps the helper's contract honest.
+    Bearer-leak invariant: ``exc_info=True`` is forbidden on this path —
+    the chained ``__context__`` may carry an ``httpx.Request`` whose
+    ``Authorization`` header holds the per-user bearer.
+    """
+    try:
+        try:
+            as_metadata = await discover_authorization_server(
+                server_name=server_name,
+                server_url=str(server_row.get("url") or ""),
+                override_url=server_row.get("oauth_authorization_server_url") or None,
+                cached_issuer=server_row.get("oauth_as_issuer_cached") or None,
+                http_client=http_client,
+                storage=storage,
+                server_id=server_id_for_audit,
+                trusted_hosts=frozenset(),
+                metadata_cache=metadata_cache,
+            )
+        except MCPOAuthDiscoveryError as exc:
+            log.info(
+                "mcp_server.oauth.upstream_revoke_discovery_failed",
+                server_name=server_name,
+                error=type(exc).__name__,
+            )
+            return
+        # When the AS doesn't advertise a revocation_endpoint,
+        # ``revoke_token_at_as`` itself logs ``revocation_unsupported``
+        # and returns — no need for a redundant gate here. Letting the
+        # call through keeps the observability story uniform.
+        client_id = str(server_row.get("oauth_client_id") or "")
+        client_secret: str | None = None
+        if server_id_for_audit:
+            client_secret_ct = await asyncio.to_thread(
+                storage.get_mcp_oauth_client_secret_ct, server_id_for_audit
+            )
+            if client_secret_ct is not None:
+                try:
+                    client_secret = token_store.cipher.decrypt(client_secret_ct).decode("utf-8")
+                except MCPTokenDecryptError:
+                    client_secret = None
+        # ``revoke_token_at_as`` never raises and never logs ``exc_info=True``;
+        # the AS round-trip is fire-and-don't-care from the caller's vantage.
+        await revoke_token_at_as(
+            as_metadata=as_metadata,
+            http_client=http_client,
+            refresh_token=refresh_token,
+            client_id=client_id,
+            client_secret=client_secret,
+        )
+    except Exception as exc:
+        log.info(
+            "mcp_server.oauth.upstream_revoke_failed",
+            server_name=server_name,
+            error=type(exc).__name__,
+        )
+
+
+async def _handle_mcp_oauth_revoke_connection_inner(request: Request) -> Response:
+    from starlette.responses import JSONResponse, Response
+
+    token_store = getattr(request.app.state, "mcp_token_store", None)
+    if token_store is None:
+        return _no_token_store_response("revoke_connection")
+
+    user_id = _require_user_id(request)
+    if user_id is None:
+        return JSONResponse({"error": "Authentication required"}, status_code=401)
+
+    server_name = request.path_params.get("server_name", "").strip()
+    if not server_name:
+        return JSONResponse({"error": "Missing server_name"}, status_code=400)
+
+    storage = _get_storage(request.app.state)
+    if storage is None:
+        return JSONResponse({"error": "Storage unavailable"}, status_code=503)
+
+    # Decrypt is best-effort: we can't perform an upstream revoke without
+    # the plaintext refresh token, but the local delete is authoritative
+    # so the consent is invalidated either way. Decrypt failure here is
+    # not a hard error — the operator can still revoke locally.
+    plain: Any = None
+    try:
+        plain = await asyncio.to_thread(token_store.get_user_token, user_id, server_name)
+    except MCPTokenDecryptError:
+        plain = None
+
+    # Distinguish "row missing" from "decrypt failed" — a missing row
+    # surfaces as 404 (with the same shape used for cross-user attempts
+    # so existence is not leaked across tenants).
+    if plain is None:
+        storage_row = await asyncio.to_thread(storage.get_mcp_user_token, user_id, server_name)
+        if storage_row is None:
+            return JSONResponse({"error": "No such connection"}, status_code=404)
+
+    server_row = await asyncio.to_thread(storage.get_mcp_server_by_name, server_name)
+    server_id_for_audit = ""
+    if server_row is not None:
+        server_id_for_audit = str(server_row.get("server_id") or "")
+
+    # Local delete — authoritative. Even if the upstream revoke fails or
+    # is unsupported, the consent is invalidated for this deployment.
+    # Run BEFORE the AS round-trip so the user-visible 204 isn't gated
+    # on a slow / unreachable AS.
+    await asyncio.to_thread(token_store.delete_user_token, user_id, server_name)
+    _drop_refresh_lock(request.app.state, user_id, server_name)
+
+    # Best-effort pool eviction so any in-flight session backed by the
+    # now-deleted row is closed before the next dispatch.
+    mcp_client = getattr(request.app.state, "mcp_client", None)
+    if mcp_client is not None and hasattr(mcp_client, "evict_user_session"):
+        try:
+            mcp_client.evict_user_session(user_id, server_name)
+        except Exception as exc:
+            # Best-effort: a closed loop or transient scheduling error
+            # must not block the user-visible 204. Type name only — the
+            # exception's chain may carry token-bearing context.
+            log.info(
+                "mcp_server.oauth.evict_user_session_failed",
+                user_id=user_id,
+                server_name=server_name,
+                error=type(exc).__name__,
+            )
+
+    # Schedule the upstream RFC 7009 revoke as a fire-and-forget task so
+    # the response isn't gated on the AS round-trip. ``upstream_revoke_outcome``
+    # is the categorical audit field — operators can distinguish the
+    # four terminal states (scheduled, no_refresh_token, no_http_client,
+    # shed_by_cap) without parsing log streams.
+    refresh_token_for_revoke: str | None = plain.get("refresh_token") if plain is not None else None
+    if not refresh_token_for_revoke or server_row is None:
+        upstream_revoke_outcome = "no_refresh_token"
+    else:
+        http_client = getattr(request.app.state, "mcp_oauth_http_client", None)
+        if http_client is None:
+            upstream_revoke_outcome = "no_http_client"
+        elif len(_revoke_upstream_tasks) >= _REVOKE_UPSTREAM_TASKS_MAX:
+            # Soft-cap shed: the local delete already ran (authoritative);
+            # surface the dropped attempt in the audit detail so an
+            # operator can re-run revokes once the queue drains.
+            log.info(
+                "mcp_server.oauth.upstream_revoke_shed",
+                server_name=server_name,
+                in_flight=len(_revoke_upstream_tasks),
+                cap=_REVOKE_UPSTREAM_TASKS_MAX,
+            )
+            upstream_revoke_outcome = "shed_by_cap"
+        else:
+            metadata_cache = getattr(request.app.state, "mcp_oauth_metadata_cache", None)
+            task = asyncio.create_task(
+                _attempt_upstream_revoke(
+                    http_client=http_client,
+                    metadata_cache=metadata_cache,
+                    storage=storage,
+                    token_store=token_store,
+                    server_name=server_name,
+                    server_row=server_row,
+                    server_id_for_audit=server_id_for_audit,
+                    refresh_token=refresh_token_for_revoke,
+                ),
+                name="mcp-oauth-upstream-revoke",
+            )
+            _revoke_upstream_tasks.add(task)
+            task.add_done_callback(_revoke_upstream_tasks.discard)
+            upstream_revoke_outcome = "scheduled"
+
+    await _audit_event(
+        request.app.state,
+        server_id=server_id_for_audit,
+        user_id=user_id,
+        action="mcp_server.oauth.token_revoked",
+        server_name=server_name,
+        detail={
+            "reason": "user_revoked",
+            "upstream_revoke_outcome": upstream_revoke_outcome,
+        },
+    )
+
+    return Response(status_code=204)
+
+
 # ---------------------------------------------------------------------------
 # Lifespan integration
 # ---------------------------------------------------------------------------
@@ -2294,6 +2674,9 @@ __all__ = [
     "get_user_access_token_classified",
     "handle_mcp_oauth_authorize",
     "handle_mcp_oauth_callback",
+    "handle_mcp_oauth_list_connections",
+    "handle_mcp_oauth_revoke_connection",
     "initialize_mcp_oauth_state",
     "pop_pending_state",
+    "revoke_token_at_as",
 ]

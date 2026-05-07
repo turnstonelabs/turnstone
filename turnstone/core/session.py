@@ -619,6 +619,39 @@ class SessionUI(Protocol):
 
 
 # ---------------------------------------------------------------------------
+# MCP dispatch helpers
+# ---------------------------------------------------------------------------
+
+
+def _format_mcp_dispatch_error(prefix: str, exc: Exception) -> str:
+    """Preserve structured-error JSON when the dispatcher signals via ``RuntimeError(json_str)``.
+
+    The pool dispatcher raises ``RuntimeError(json_str)`` with a
+    :func:`turnstone.core.mcp_client._structured_error` payload (e.g.
+    ``mcp_consent_required``, ``mcp_insufficient_scope``) when the
+    failure has a user-actionable remedy. The dashboard renderer keys
+    on this shape; surrounding it with ``f"{prefix}: {exc}"`` would
+    make the JSON un-parseable. Non-structured exceptions are still
+    rendered with the prefix so the agent has a human-readable label.
+
+    Shared by :meth:`ChatSession._exec_mcp_tool`,
+    :meth:`ChatSession._exec_read_resource`, and
+    :meth:`ChatSession._exec_use_prompt` — placed at module scope so
+    no single exec site can claim ownership.
+    """
+    text = str(exc)
+    try:
+        decoded = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return f"{prefix}: {exc}"
+    if isinstance(decoded, dict) and isinstance(decoded.get("error"), dict):
+        code = decoded["error"].get("code")
+        if isinstance(code, str) and code.startswith("mcp_"):
+            return text
+    return f"{prefix}: {exc}"
+
+
+# ---------------------------------------------------------------------------
 # Notify auth helper (module-level, lazy-init)
 # ---------------------------------------------------------------------------
 
@@ -7997,7 +8030,7 @@ class ChatSession:
             mcp_error = True
             self.ui.on_error(output)
         except Exception as e:
-            output = f"MCP tool error: {e}"
+            output = _format_mcp_dispatch_error("MCP tool error", e)
             mcp_error = True
             self.ui.on_error(output)
 
@@ -8080,8 +8113,12 @@ class ChatSession:
             mcp_error = True
             self.ui.on_error(output)
         except Exception as e:
-            log.warning("MCP resource read failed for %s", uri, exc_info=True)
-            output = f"MCP resource error: {e}"
+            # exc_info=True would let chained ``__context__`` carry an
+            # ``httpx.Request`` whose ``Authorization`` header holds the
+            # per-user bearer (Phase 7b pool dispatch path). Use
+            # structured fields with ``type(e).__name__`` only.
+            log.warning("mcp.resource_read_failed", uri=uri, error=type(e).__name__)
+            output = _format_mcp_dispatch_error("MCP resource error", e)
             mcp_error = True
             self.ui.on_error(output)
 
@@ -8173,8 +8210,10 @@ class ChatSession:
             mcp_error = True
             self.ui.on_error(output)
         except Exception as e:
-            log.warning("MCP prompt invocation failed for %s", name, exc_info=True)
-            output = f"MCP prompt error: {e}"
+            # See ``_exec_read_resource`` for the no-``exc_info`` rationale —
+            # bearer-leak via chained ``httpx.Request`` __context__.
+            log.warning("mcp.prompt_invoke_failed", name=name, error=type(e).__name__)
+            output = _format_mcp_dispatch_error("MCP prompt error", e)
             mcp_error = True
             self.ui.on_error(output)
 

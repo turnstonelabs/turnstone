@@ -90,6 +90,24 @@ class MCPUserTokenPlain(TypedDict):
     last_refreshed: str | None
 
 
+class MCPUserTokenMetadata(TypedDict):
+    """Non-secret subset of ``MCPUserToken`` for the settings UI.
+
+    Token ciphertext is intentionally absent: a list view never needs
+    the access/refresh secrets, and decrypt happens only at MCP-call
+    time.
+    """
+
+    user_id: str
+    server_name: str
+    expires_at: str | None
+    scopes: str | None
+    as_issuer: str
+    audience: str
+    created: str
+    last_refreshed: str | None
+
+
 # ---------------------------------------------------------------------------
 # Config dataclass + loader
 # ---------------------------------------------------------------------------
@@ -360,6 +378,30 @@ class MCPTokenStore:
         """Delete the user-token row. Returns True if existed."""
         return self._storage.delete_mcp_user_token(user_id, server_name)
 
+    def list_user_token_metadata(self, user_id: str) -> list[MCPUserTokenMetadata]:
+        """Return non-secret metadata for every token row owned by ``user_id``.
+
+        Storage layer projects the metadata columns at the SQL boundary
+        (``list_mcp_user_token_metadata_by_user``) so ciphertext blobs
+        never cross the wire on this list-view path. Rows arrive in
+        ``created`` ASC order. Decrypt is intentionally skipped — the
+        list view has no need for the secret material.
+        """
+        rows = self._storage.list_mcp_user_token_metadata_by_user(user_id)
+        return [
+            MCPUserTokenMetadata(
+                user_id=row["user_id"],
+                server_name=row["server_name"],
+                expires_at=row["expires_at"],
+                scopes=row["scopes"],
+                as_issuer=row["as_issuer"],
+                audience=row["audience"],
+                created=row["created"],
+                last_refreshed=row["last_refreshed"],
+            )
+            for row in rows
+        ]
+
     def set_oauth_client_secret(self, server_id: str, plaintext_secret: str | None) -> bool:
         """Encrypt plaintext and persist via the dedicated storage writer.
 
@@ -529,6 +571,7 @@ __all__ = [
     "MCPTokenDecryptError",
     "MCPTokenKeyConfigError",
     "MCPTokenStore",
+    "MCPUserTokenMetadata",
     "MCPUserTokenPlain",
     "close_mcp_crypto_state",
     "initialize_mcp_crypto_state",
