@@ -3362,6 +3362,62 @@ class TestReminderSidechannelIsolation:
         assert "HISTORICAL_REMINDER_BODY" not in rendered
         assert "<system-reminder>" not in rendered
 
+    def test_fork_preserves_source_and_reminders(self, tmp_db):
+        """``ChatSession.resume(..., fork=True)`` bulk-inserts the source
+        workstream's messages into the fork's own ws_id.  The bulk-row
+        builder must carry the persisted side-channels (``_source`` /
+        ``_reminders``) — both backends' ``save_messages_bulk`` accept
+        them post-migration 050.  Dropping them was the original bug:
+        the fork's resumed transcript lost every wake marker and every
+        reminder bubble that survived to disk on the source, so the
+        resumed transcript looked like the assistant turn answered out
+        of nowhere.
+        """
+        from turnstone.core.memory import register_workstream, save_message
+
+        # Stage a source workstream with both a wake row (``_source =
+        # system_nudge``) and a reminders-bearing row.
+        register_workstream("fork_source")
+        save_message("fork_source", "user", "real turn")
+        save_message("fork_source", "user", "", source="system_nudge")
+        save_message(
+            "fork_source",
+            "user",
+            "advised turn",
+            reminders=json.dumps(
+                [{"type": "denial", "text": "FORKED_REMINDER_BODY"}],
+                separators=(",", ":"),
+            ),
+        )
+        save_message("fork_source", "assistant", "ok")
+
+        # Fork into a fresh session — keeps its own ws_id, copies the
+        # messages.  Then resume the fork (no fork=True) into a second
+        # fresh session and assert the side-channels round-tripped.
+        forking_session = _make_session()
+        fork_ws_id = forking_session._ws_id
+        assert forking_session.resume("fork_source", fork=True) is True
+
+        resumed_fork = _make_session()
+        assert resumed_fork.resume(fork_ws_id) is True
+
+        # Wake row's ``_source`` survived.
+        wake_msgs = [
+            m
+            for m in resumed_fork.messages
+            if m.get("role") == "user" and m.get("_source") == "system_nudge"
+        ]
+        assert len(wake_msgs) == 1
+        assert wake_msgs[0].get("content") == ""
+
+        # Reminders survived.
+        advised_msg = next(
+            m
+            for m in resumed_fork.messages
+            if m.get("role") == "user" and m.get("content") == "advised turn"
+        )
+        assert advised_msg.get("_reminders") == [{"type": "denial", "text": "FORKED_REMINDER_BODY"}]
+
 
 class TestSessionUIBaseUserReminderHook:
     """``on_user_reminder`` enqueues a ``user_reminder`` SSE event with
