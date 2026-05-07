@@ -568,17 +568,20 @@ Pane.prototype.handleEvent = function (evt) {
       // insertAdjacentElement('afterend', el) call drops the bubble
       // immediately below.
       //
-      // Multi-tab caveat: the server emits no user_message SSE event
-      // today, so a non-originating tab open on the same workstream
+      // Wake-driven reminders (``evt.source === "system_nudge"``)
+      // render the thin .msg.user.system-nudge marker first and
+      // anchor below it, so non-originating tabs see the same shape
+      // the originating tab does.
+      //
+      // Multi-tab caveat (non-wake): the server emits no user_message
+      // SSE event for real user input today, so a non-originating tab
       // sees the reminder without a paired user-message render — the
       // anchor falls on a stale prior user bubble, mis-positioning
-      // the reminder.  The next /history reload corrects it (the
-      // entry["reminders"] propagation in _build_history is
-      // anchor-stable because replayHistory runs addUserMessage first
-      // for every turn).  Acceptable cost for stage 1; closing the
-      // gap is a follow-up that adds a user_message SSE event.
+      // the reminder.  The next /history reload corrects it.
+      // Acceptable cost for stage 1; closing the gap is a follow-up
+      // that adds a user_message SSE event.
       if (Array.isArray(evt.reminders) && evt.reminders.length) {
-        this.addUserReminder(evt.reminders);
+        this.addUserReminder(evt.reminders, evt.source || "");
       }
       break;
 
@@ -707,7 +710,78 @@ Pane.prototype.removeThinkingIndicator = function () {
   if (el) el.remove();
 };
 
-Pane.prototype.addUserReminder = function (reminders) {
+// Build a structured ``.msg.watch-result`` card for a
+// ``watch_triggered`` reminder — full-width treatment with command
+// preview header + shell output body + poll counter footer.  Mirrors
+// the coordinator pane's buildWatchResultBubble; first-pass functional
+// rendering only.  All text goes through textContent so shell output
+// containing angle brackets / scripts / steering bytes renders inertly.
+function _buildWatchResultBubble(r) {
+  var el = document.createElement("div");
+  el.className = "msg watch-result";
+  el.setAttribute("role", "article");
+  el.setAttribute("data-ts-role", "watch");
+  el.setAttribute("aria-label", "watch");
+  var header = document.createElement("div");
+  header.className = "msg-watch-header";
+  header.textContent =
+    "watch" + (r.watch_name ? " · " + String(r.watch_name) : "");
+  el.appendChild(header);
+  if (r.command) {
+    var cmd = document.createElement("div");
+    cmd.className = "msg-watch-cmd";
+    cmd.textContent = "$ " + String(r.command);
+    el.appendChild(cmd);
+  }
+  var body = document.createElement("pre");
+  body.className = "msg-watch-body";
+  body.textContent = r.text || "";
+  el.appendChild(body);
+  if (r.poll_count != null && r.max_polls != null) {
+    var footer = document.createElement("div");
+    footer.className = "msg-watch-footer";
+    var finalSuffix = r.is_final ? " · final" : "";
+    footer.textContent =
+      "poll " + String(r.poll_count) + "/" + String(r.max_polls) + finalSuffix;
+    el.appendChild(footer);
+  }
+  return el;
+}
+
+// Default ``.msg.user-reminder`` bubble — yellow themed advisory used
+// for every metacog nudge other than ``watch_triggered``.
+function _buildDefaultReminderBubble(r) {
+  var el = document.createElement("div");
+  el.className = "msg user-reminder";
+  var labelEl = document.createElement("span");
+  labelEl.className = "msg-user-reminder-label";
+  labelEl.textContent =
+    "metacognition" + (r.type ? " · " + String(r.type) : "");
+  var textEl = document.createElement("span");
+  textEl.className = "msg-user-reminder-text";
+  textEl.textContent = r.text || "";
+  el.appendChild(labelEl);
+  el.appendChild(textEl);
+  return el;
+}
+
+Pane.prototype.addSystemNudgeMarker = function () {
+  // Thin .msg.user.system-nudge marker rendered as the anchor for
+  // wake-driven reminder bubbles.  Replaces the previously-invisible
+  // synthetic empty user turn with a visible-but-subtle DOM element so
+  // the bubble below it lands in the right place even when the wake
+  // fires long after the user's last real message.
+  this.removeEmptyState();
+  var el = document.createElement("div");
+  el.className = "msg user system-nudge";
+  el.setAttribute("data-source", "system_nudge");
+  el.setAttribute("aria-label", "system nudge");
+  el.textContent = "system nudge";
+  this.messagesEl.appendChild(el);
+  return el;
+};
+
+Pane.prototype.addUserReminder = function (reminders, source) {
   // Render each metacognitive reminder as its own bubble immediately
   // BELOW the user message it advises — semantically the reminder is
   // a hint to the model right before the assistant turn.  Always
@@ -719,22 +793,25 @@ Pane.prototype.addUserReminder = function (reminders) {
   // exists at all (e.g. a non-originating tab receiving a reminder
   // before any user turn has rendered) we append; the next /history
   // reload corrects any anchor anomaly.
+  //
+  // ``source === "system_nudge"`` is the wake-driven case: render
+  // a thin .msg.user.system-nudge marker first and anchor below it.
+  // ``watch_triggered`` reminders branch off into a structured
+  // .msg.watch-result card.
   this.removeEmptyState();
-  var userBubbles = this.messagesEl.querySelectorAll(".msg.user");
-  var anchor = userBubbles.length ? userBubbles[userBubbles.length - 1] : null;
+  var anchor;
+  if (source === "system_nudge") {
+    anchor = this.addSystemNudgeMarker();
+  } else {
+    var userBubbles = this.messagesEl.querySelectorAll(".msg.user");
+    anchor = userBubbles.length ? userBubbles[userBubbles.length - 1] : null;
+  }
   for (var i = 0; i < reminders.length; i++) {
     var r = reminders[i] || {};
-    var el = document.createElement("div");
-    el.className = "msg user-reminder";
-    var labelEl = document.createElement("span");
-    labelEl.className = "msg-user-reminder-label";
-    labelEl.textContent =
-      "metacognition" + (r.type ? " · " + String(r.type) : "");
-    var textEl = document.createElement("span");
-    textEl.className = "msg-user-reminder-text";
-    textEl.textContent = r.text || "";
-    el.appendChild(labelEl);
-    el.appendChild(textEl);
+    var el =
+      r.type === "watch_triggered"
+        ? _buildWatchResultBubble(r)
+        : _buildDefaultReminderBubble(r);
     if (anchor) {
       anchor.insertAdjacentElement("afterend", el);
       // Anchor advances so multiple reminders stack below the user
@@ -757,7 +834,9 @@ Pane.prototype.addToolReminder = function (reminders, toolCallId) {
   // to "last .ts-approval block in messagesEl", which is correct
   // because messages render in order — the assistant block carrying
   // the tool batch is always the most recent approval block by the
-  // time we hit the tool message that owns the reminder.
+  // time we hit the tool message that owns the reminder.  Tool-channel
+  // reminders also branch on r.type so a watch_triggered drained at
+  // the tool seam (channel="any") renders the structured card.
   this.removeEmptyState();
   var anchor = null;
   if (toolCallId) {
@@ -775,19 +854,10 @@ Pane.prototype.addToolReminder = function (reminders, toolCallId) {
   }
   for (var i = 0; i < reminders.length; i++) {
     var r = reminders[i] || {};
-    var el = document.createElement("div");
-    // Same .msg.user-reminder class — visual treatment is shared
-    // across user and tool channels (both are metacog nudges).
-    el.className = "msg user-reminder";
-    var labelEl = document.createElement("span");
-    labelEl.className = "msg-user-reminder-label";
-    labelEl.textContent =
-      "metacognition" + (r.type ? " · " + String(r.type) : "");
-    var textEl = document.createElement("span");
-    textEl.className = "msg-user-reminder-text";
-    textEl.textContent = r.text || "";
-    el.appendChild(labelEl);
-    el.appendChild(textEl);
+    var el =
+      r.type === "watch_triggered"
+        ? _buildWatchResultBubble(r)
+        : _buildDefaultReminderBubble(r);
     if (anchor) {
       anchor.insertAdjacentElement("afterend", el);
       anchor = el;
@@ -1053,6 +1123,17 @@ Pane.prototype.replayHistory = function (messages) {
   for (var i = 0; i < messages.length; i++) {
     var msg = messages[i];
     if (msg.role === "user") {
+      if (msg.source === "system_nudge") {
+        // Wake-driven empty user turn: render the thin marker
+        // (replaces the previously-skipped synthetic empty bubble)
+        // and anchor reminder bubbles below it.
+        this.addUserReminder(
+          Array.isArray(msg.reminders) ? msg.reminders : [],
+          "system_nudge",
+        );
+        lastToolBlock = null;
+        continue;
+      }
       // addUserMessage first so addUserReminder's "anchor to most
       // recent .msg.user" lookup finds THIS message's bubble (not the
       // previous user message's, which would associate the reminder

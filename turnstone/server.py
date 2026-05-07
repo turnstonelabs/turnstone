@@ -515,22 +515,51 @@ def _build_history(
         entry = {"role": msg["role"], "content": content}
         if attachments_meta:
             entry["attachments"] = attachments_meta
+        # Surface the ``_source`` side-channel so the frontend can apply
+        # the ``.msg.user.system-nudge`` class on history replay (today
+        # only the wake-driven empty user turn carries ``"system_nudge"``).
+        # Persisted via the conversations._source column added in
+        # migration 050; legacy rows without the column lack the key
+        # entirely.
+        if msg.get("_source"):
+            entry["source"] = str(msg["_source"])
         # Surface the ``_reminders`` side-channel so a tab reconnecting
         # via /history renders the same metacognitive nudge bubble the
         # originating tab saw live (user-channel reminders via
         # ``user_reminder`` SSE; tool-channel via ``tool_reminder``).
-        # Reminders are in-memory only (not persisted to DB), so this
-        # only fires for the originating session.
+        # Persisted via the conversations._reminders column added in
+        # migration 050 — multi-tab / multi-device tabs reconnecting
+        # later see the same shape now, not just the originating tab.
         reminders = msg.get("_reminders")
         if isinstance(reminders, list):
             # Filter first so an all-malformed _reminders doesn't set the
             # field to []; absent vs. empty-list should mean the same
-            # thing on the wire.
-            clean_reminders = [
-                {"type": str(r.get("type") or ""), "text": str(r.get("text") or "")}
-                for r in reminders
-                if isinstance(r, dict)
-            ]
+            # thing on the wire.  Project on a known set of keys —
+            # narrows the blast radius if a future producer accidentally
+            # stuffs sensitive fields into the dict.  ``watch_triggered``
+            # carries the structured watch-card fields (watch_name,
+            # command, poll_count, max_polls, is_final) and other
+            # producers leave them unset.
+            clean_reminders: list[dict[str, Any]] = []
+            for r in reminders:
+                if not isinstance(r, dict):
+                    continue
+                rtype = str(r.get("type") or "")
+                rtext = str(r.get("text") or "")
+                if not rtype and not rtext:
+                    continue
+                clean: dict[str, Any] = {"type": rtype, "text": rtext}
+                # Preserve watch-card optional fields verbatim.
+                for opt_key in (
+                    "watch_name",
+                    "command",
+                    "poll_count",
+                    "max_polls",
+                    "is_final",
+                ):
+                    if opt_key in r:
+                        clean[opt_key] = r[opt_key]
+                clean_reminders.append(clean)
             if clean_reminders:
                 entry["reminders"] = clean_reminders
         if msg.get("tool_calls"):

@@ -368,34 +368,89 @@
     return el;
   }
 
+  // Build a structured ``.msg.watch-result`` card for a
+  // ``watch_triggered`` reminder — full-width treatment with
+  // command preview header + shell output body + poll counter footer.
+  // First-pass functional rendering; bespoke design polish lives in a
+  // future workstream.  All text goes through ``textContent`` so shell
+  // output containing angle brackets / scripts / steering bytes
+  // renders inertly.
+  function buildWatchResultBubble(r) {
+    const el = document.createElement("div");
+    el.className = "msg watch-result";
+    el.setAttribute("role", "article");
+    el.setAttribute("data-ts-role", "watch");
+    el.setAttribute("aria-label", "watch");
+    const header = document.createElement("div");
+    header.className = "msg-watch-header";
+    header.textContent =
+      "watch" + (r.watch_name ? " · " + String(r.watch_name) : "");
+    el.appendChild(header);
+    if (r.command) {
+      const cmd = document.createElement("div");
+      cmd.className = "msg-watch-cmd";
+      cmd.textContent = "$ " + String(r.command);
+      el.appendChild(cmd);
+    }
+    const body = document.createElement("pre");
+    body.className = "msg-watch-body";
+    body.textContent = r.text || "";
+    el.appendChild(body);
+    if (r.poll_count != null && r.max_polls != null) {
+      const footer = document.createElement("div");
+      footer.className = "msg-watch-footer";
+      const finalSuffix = r.is_final ? " · final" : "";
+      footer.textContent =
+        "poll " +
+        String(r.poll_count) +
+        "/" +
+        String(r.max_polls) +
+        finalSuffix;
+      el.appendChild(footer);
+    }
+    return el;
+  }
+
+  // Default ``.msg.user-reminder`` bubble — yellow themed advisory used
+  // for every metacog nudge other than ``watch_triggered``.
+  function buildDefaultReminderBubble(r) {
+    const el = document.createElement("div");
+    el.className = "msg user-reminder";
+    el.setAttribute("role", "article");
+    el.setAttribute("data-ts-role", "metacognition");
+    el.setAttribute("aria-label", "metacognition");
+    const body = document.createElement("div");
+    body.className = "msg-body";
+    const labelEl = document.createElement("span");
+    labelEl.className = "msg-user-reminder-label";
+    labelEl.textContent =
+      "metacognition" + (r.type ? " · " + String(r.type) : "");
+    const textEl = document.createElement("span");
+    textEl.className = "msg-user-reminder-text";
+    textEl.textContent = r.text || "";
+    body.appendChild(labelEl);
+    body.appendChild(textEl);
+    el.appendChild(body);
+    return el;
+  }
+
   // Metacognitive reminder bubble (user-channel correction / denial /
   // resume / start / completion AND tool-channel tool_error / repeat).
   // Mirrors Pane.prototype.addUserReminder / addToolReminder in the
   // interactive UI — yellow themed bubble slotted directly below the
-  // message it advises.  ``anchor`` is the DOM element to anchor below;
-  // when null, append at the bottom of messagesEl.
+  // message it advises.  ``watch_triggered`` reminders branch off into
+  // the structured ``.msg.watch-result`` card.  ``anchor`` is the DOM
+  // element to anchor below; when null, append at the bottom of
+  // messagesEl.
   function appendReminderBubble(reminders, anchor) {
     if (!Array.isArray(reminders) || !reminders.length) return;
     let cursor = anchor;
     for (let i = 0; i < reminders.length; i++) {
       const r = reminders[i] || {};
-      const el = document.createElement("div");
-      el.className = "msg user-reminder";
-      el.setAttribute("role", "article");
-      el.setAttribute("data-ts-role", "metacognition");
-      el.setAttribute("aria-label", "metacognition");
-      const body = document.createElement("div");
-      body.className = "msg-body";
-      const labelEl = document.createElement("span");
-      labelEl.className = "msg-user-reminder-label";
-      labelEl.textContent =
-        "metacognition" + (r.type ? " · " + String(r.type) : "");
-      const textEl = document.createElement("span");
-      textEl.className = "msg-user-reminder-text";
-      textEl.textContent = r.text || "";
-      body.appendChild(labelEl);
-      body.appendChild(textEl);
-      el.appendChild(body);
+      const el =
+        r.type === "watch_triggered"
+          ? buildWatchResultBubble(r)
+          : buildDefaultReminderBubble(r);
       if (cursor) {
         cursor.insertAdjacentElement("afterend", el);
         cursor = el;
@@ -406,11 +461,37 @@
     _scheduleScroll();
   }
 
+  // Thin ``.msg.user.system-nudge`` marker rendered as the anchor for
+  // wake-driven reminder bubbles.  Replaces the previously-invisible
+  // synthetic empty user turn with a visible-but-subtle DOM element so
+  // the bubble below it lands in the right place even when the wake
+  // fires long after the user's last real message.
+  function appendSystemNudgeMarker() {
+    const el = document.createElement("div");
+    el.className = "msg user system-nudge";
+    el.setAttribute("data-source", "system_nudge");
+    el.setAttribute("aria-label", "system nudge");
+    el.textContent = "system nudge";
+    messagesEl.appendChild(el);
+    return el;
+  }
+
   // Live SSE for user-channel reminders — anchors below the most
   // recent user message.  On a non-originating tab there may be no
   // user message rendered yet; we append and the next /history reload
   // corrects.  (Same caveat as the interactive UI; tracked there.)
-  function appendUserReminderLive(reminders) {
+  //
+  // ``source`` widens the live SSE event to carry the wake's
+  // ``"system_nudge"`` tag so the marker renders on every connected
+  // tab — without this, only the originating tab (which sees the
+  // synthesised empty user turn live) would render the wake bubble in
+  // the right place.
+  function appendUserReminderLive(reminders, source) {
+    if (source === "system_nudge") {
+      const marker = appendSystemNudgeMarker();
+      appendReminderBubble(reminders, marker);
+      return;
+    }
     const userMsgs = messagesEl.querySelectorAll(".msg.user");
     const anchor = userMsgs.length ? userMsgs[userMsgs.length - 1] : null;
     appendReminderBubble(reminders, anchor);
@@ -2028,9 +2109,11 @@
       case "user_reminder":
         // Metacognitive user-channel nudge — render below the most
         // recent user message as a yellow themed bubble.  Same shape
-        // as the interactive UI's case.
+        // as the interactive UI's case.  When ``source === "system_nudge"``
+        // (wake-driven), render the thin .msg.user.system-nudge
+        // marker first so the bubble anchors below it.
         if (Array.isArray(ev.reminders) && ev.reminders.length) {
-          appendUserReminderLive(ev.reminders);
+          appendUserReminderLive(ev.reminders, ev.source || "");
         }
         break;
       case "tool_reminder":
@@ -4053,6 +4136,17 @@
           // text when the message carried attachments — even when the
           // text portion is empty (image-only sends).
           if (role === "user") {
+            const isSystemNudge = m.source === "system_nudge";
+            if (isSystemNudge) {
+              // Wake-driven empty user turn: render the thin marker
+              // (replaces the previously-skipped synthetic empty
+              // bubble) and anchor reminder bubbles below it.
+              const marker = appendSystemNudgeMarker();
+              if (Array.isArray(m.reminders) && m.reminders.length) {
+                appendReminderBubble(m.reminders, marker);
+              }
+              return;
+            }
             if (!content && userAttachments.length === 0) return;
             appendUserMessageWithAttachments(content, userAttachments, {
               label: role,
