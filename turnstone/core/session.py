@@ -547,6 +547,18 @@ _TEMPLATE_VAR_RE = re.compile(r"\{\{(\w+)\}\}")
 # not its earliest.
 _WATCH_QUEUE_SOFT_CAP = 50
 
+# Per-reminder ``text`` field clamp at storage time.  The conversations
+# row's ``_reminders`` JSON column persists every metacog nudge a tab
+# rendered live so reconnecting tabs see the same bubbles, but a single
+# pathological producer — a watch streaming unbounded shell output, a
+# corrupted steering payload — should not blow the row width or the
+# FTS5 index.  8 KiB matches ``docs/design/watch-card-ux-briefing.md``'s
+# spec for the reminder body.  Mirrors ``TOOL_RESULT_STORAGE_CAP`` on
+# tool result rows; the in-memory side-channel keeps the full body so
+# the live splice and UI render see the same shape, only the persisted
+# JSON is clamped.
+REMINDER_TEXT_STORAGE_CAP = 8192
+
 
 def _without_tool(tools: list[dict[str, Any]], name: str) -> list[dict[str, Any]]:
     """Return *tools* with the named tool removed."""
@@ -1839,6 +1851,15 @@ class ChatSession:
                     pd_str = json.dumps(pd) if pd and not isinstance(pd, str) else pd
                 except (TypeError, ValueError):
                     pd_str = None
+                # Carry the persisted side-channels (``_source`` /
+                # ``_reminders``) onto the fork's rows.  Both backends'
+                # ``save_messages_bulk`` accept them post-migration 050;
+                # without them, a fork dropped every wake marker and
+                # every reminder bubble that survived to disk on the
+                # source workstream — the resumed fork's transcript
+                # would then look like the assistant turn answered out
+                # of nowhere.
+                src = msg.get("_source")
                 bulk_rows.append(
                     {
                         "ws_id": self._ws_id,
@@ -1848,6 +1869,8 @@ class ChatSession:
                         "tool_call_id": msg.get("tool_call_id"),
                         "tool_calls": tc_json,
                         "provider_data": pd_str,
+                        "source": src if isinstance(src, str) and src else None,
+                        "reminders": self._encode_reminders(msg.get("_reminders")),
                     }
                 )
             save_messages_bulk(bulk_rows)
@@ -2100,6 +2123,42 @@ class ChatSession:
     def _full_messages(self) -> list[dict[str, Any]]:
         """System messages + conversation history."""
         return self.system_messages + self.messages
+
+    @staticmethod
+    def _encode_reminders(
+        reminders: list[dict[str, Any]] | None,
+    ) -> str | None:
+        """JSON-encode a ``_reminders`` list for the storage column.
+
+        Returns ``None`` when *reminders* is empty / falsy so callers can
+        feed the result straight into ``save_message(..., reminders=...)``
+        without a separate empty check.
+
+        **Per-reminder text cap.**  Each entry's ``text`` field is
+        clamped to :data:`REMINDER_TEXT_STORAGE_CAP` characters before
+        encoding so a single rogue producer (a watch streaming an
+        unbounded shell command, a corruption-class steering payload)
+        can't blow the conversations row width or the FTS5 index.  The
+        in-memory dict on the message side-channel keeps the full body
+        — only the persisted JSON is clamped.  Mirrors
+        ``TOOL_RESULT_STORAGE_CAP``'s row-level clamp on tool results.
+        """
+        if not reminders:
+            return None
+        capped: list[dict[str, Any]] = []
+        for r in reminders:
+            if not isinstance(r, dict):
+                continue
+            text = r.get("text")
+            if isinstance(text, str) and len(text) > REMINDER_TEXT_STORAGE_CAP:
+                clamped = dict(r)
+                clamped["text"] = text[:REMINDER_TEXT_STORAGE_CAP]
+                capped.append(clamped)
+            else:
+                capped.append(r)
+        if not capped:
+            return None
+        return json.dumps(capped, separators=(",", ":"))
 
     def _apply_reminders_for_provider(
         self,
@@ -2740,9 +2799,7 @@ class ChatSession:
         # nowhere.
         source = user_msg.get("_source")
         reminders_payload = user_msg.get("_reminders")
-        reminders_json = (
-            json.dumps(reminders_payload, separators=(",", ":")) if reminders_payload else None
-        )
+        reminders_json = self._encode_reminders(reminders_payload)
         message_id = save_message(
             self._ws_id,
             "user",
@@ -3081,11 +3138,7 @@ class ChatSession:
                     # ``_reminders`` JSON column so a tab reconnecting via
                     # /history sees the below-the-tool bubble the
                     # originating tab rendered live.
-                    tool_reminders_json = (
-                        json.dumps(metacog_reminders, separators=(",", ":"))
-                        if metacog_reminders
-                        else None
-                    )
+                    tool_reminders_json = self._encode_reminders(metacog_reminders)
                     save_message(
                         self._ws_id,
                         "tool",
