@@ -124,7 +124,14 @@ def test_replay_history_renders_content_before_tool_block() -> None:
     asst_start = fn.index('msg.role === "assistant"')
     asst_end = fn.index('msg.role === "tool"', asst_start)
     asst = fn[asst_start:asst_end]
-    content_idx = asst.index("if (msg.content)")
+    # ``if (msg.content && msg.content.trim())`` guards against a
+    # whitespace-only content row (Qwen-style "\n\n" left over after a
+    # reasoning-parser model strips ``<think>…</think>`` and emits
+    # nothing else before the tool call).  Pre-trim guard, those rows
+    # rendered as a visible-but-empty ``.msg.assistant`` card on
+    # replay.  Match the substring up to ``msg.content`` so the test
+    # tolerates either guard shape without locking the trim() in.
+    content_idx = asst.index("if (msg.content")
     tool_calls_idx = asst.index("if (msg.tool_calls && msg.tool_calls.length)")
     assert content_idx < tool_calls_idx, (
         "replayHistory must render msg.content BEFORE msg.tool_calls "

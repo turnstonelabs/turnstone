@@ -3924,111 +3924,107 @@
         callOutcomes.set(m.tool_call_id, outcome);
       });
 
+      // Render an assistant turn's tool_calls as a single batch
+      // construct.  Synthesises one batch per assistant turn so a
+      // parallel fan-out (tool_calls.length ≥ 2) reads as one cohesive
+      // dispatch, matching how live SSE renders the same flow via
+      // approve_request / tool_info.  Resolved when every call_id has
+      // a matching tool result; otherwise --running (see the
+      // resolvedCallIds rationale above).  SSE upgrades --running in
+      // place when it knows more.
+      function renderAssistantToolBatch(m) {
+        const items = m.tool_calls.map((tc) => {
+          const fn = (tc && tc.function) || {};
+          const name = String(fn.name || "tool");
+          const callId = String((tc && tc.id) || "");
+          const argsRaw = String(fn.arguments || "");
+          let parsedArgs = null;
+          try {
+            parsedArgs = JSON.parse(argsRaw || "{}");
+          } catch (_) {
+            /* malformed — fall back to raw string in preview */
+          }
+          if (callId) toolNameByCallId.set(callId, name);
+          const item = synthesizeHistoricalToolCall(
+            name,
+            callId,
+            parsedArgs,
+            argsRaw,
+          );
+          // Server attaches the persisted intent_verdict to each
+          // tc on /history (newest-wins per call_id; LLM upgrade
+          // beats heuristic when both exist).  Stamp on the item
+          // under the field name the render path already consumes
+          // (judge_verdict for LLM tier, heuristic_verdict
+          // otherwise) so the verdict pill paints on history rows
+          // without a render-path fork.  Also seed the
+          // judgeVerdicts cache so a later live SSE event for the
+          // same call_id reads "already painted" and skips the
+          // rebuild.
+          if (tc && tc.verdict) {
+            if (tc.verdict.tier === "llm") {
+              item.judge_verdict = tc.verdict;
+            } else {
+              item.heuristic_verdict = tc.verdict;
+            }
+            if (callId) _cacheJudgeVerdict(callId, tc.verdict);
+          }
+          // Output-guard finding — surface as the same
+          // "[output guard] ..." chat line the live handler emits
+          // (case "output_warning" above).  Stamp on the item so
+          // the post-batch loop below can read + emit; rendering
+          // anchored next to the call gives the operator the same
+          // adjacency they'd see live.
+          if (tc && tc.output_assessment) {
+            item.output_assessment = tc.output_assessment;
+          }
+          // needs_approval is unknown at replay time (the
+          // assistant.tool_calls history payload doesn't persist
+          // the bit).  Leave it unset; the upgrade-in-place path
+          // refreshes per-row state via _refreshRowStatus from the
+          // authoritative SSE item when approve_request /
+          // tool_info actually arrives, so we never tag the wrong
+          // row as needing approval.
+          return item;
+        });
+        // Classify the batch as a whole:
+        //   - any call_id without an outcome at all → orphan,
+        //     render as --running (SSE will upgrade in place)
+        //   - any call_id outcome === "denied" → resolved-denied
+        //   - else → resolved-approved (a runtime error doesn't
+        //     change the approval verdict; the per-row .error class
+        //     comes from the tool_result branch below)
+        const outcomes = items.map((it) =>
+          it.call_id ? callOutcomes.get(it.call_id) : "ok",
+        );
+        const allResolved = outcomes.every((o) => o !== undefined);
+        if (!allResolved) {
+          appendToolBatch(items, { running: true });
+        } else if (outcomes.some((o) => o === "denied")) {
+          appendToolBatch(items, { resolved: { approved: false } });
+        } else {
+          appendToolBatch(items, { resolved: { approved: true } });
+        }
+        // Output-guard findings — render each one as a chip
+        // anchored to the .coord-tool-row that tripped the guard
+        // rather than a generic "[output guard]" chat line.
+        // Anchored placement preserves per-call adjacency on
+        // multi-tool batches (live + replay) and the chip's
+        // severity styling makes the visual weight match the
+        // verdict pill on the same row.
+        for (let oi = 0; oi < items.length; oi++) {
+          const oa = items[oi].output_assessment;
+          if (!oa || !oa.risk_level || oa.risk_level === "none") continue;
+          const cid = items[oi].call_id || "";
+          if (!cid) continue;
+          const entry = toolRows.get(cid);
+          if (!entry || !entry.row) continue;
+          _attachOutputWarningChip(entry.row, oa);
+        }
+      }
+
       (hist.messages || []).forEach((m) => {
         const role = m.role || "tool";
-
-        // Assistant tool_calls — synthesize one batch construct per
-        // assistant turn so a parallel fan-out (tool_calls.length ≥ 2)
-        // reads as one cohesive dispatch, matching how live SSE
-        // renders the same flow via approve_request / tool_info.
-        // Resolved when every call_id has a matching tool result;
-        // otherwise --running (see the resolvedCallIds rationale
-        // above).  SSE upgrades --running in place when it knows
-        // more.
-        if (
-          role === "assistant" &&
-          Array.isArray(m.tool_calls) &&
-          m.tool_calls.length
-        ) {
-          const items = m.tool_calls.map((tc) => {
-            const fn = (tc && tc.function) || {};
-            const name = String(fn.name || "tool");
-            const callId = String((tc && tc.id) || "");
-            const argsRaw = String(fn.arguments || "");
-            let parsedArgs = null;
-            try {
-              parsedArgs = JSON.parse(argsRaw || "{}");
-            } catch (_) {
-              /* malformed — fall back to raw string in preview */
-            }
-            if (callId) toolNameByCallId.set(callId, name);
-            const item = synthesizeHistoricalToolCall(
-              name,
-              callId,
-              parsedArgs,
-              argsRaw,
-            );
-            // Server attaches the persisted intent_verdict to each
-            // tc on /history (newest-wins per call_id; LLM upgrade
-            // beats heuristic when both exist).  Stamp on the item
-            // under the field name the render path already consumes
-            // (judge_verdict for LLM tier, heuristic_verdict
-            // otherwise) so the verdict pill paints on history rows
-            // without a render-path fork.  Also seed the
-            // judgeVerdicts cache so a later live SSE event for the
-            // same call_id reads "already painted" and skips the
-            // rebuild.
-            if (tc && tc.verdict) {
-              if (tc.verdict.tier === "llm") {
-                item.judge_verdict = tc.verdict;
-              } else {
-                item.heuristic_verdict = tc.verdict;
-              }
-              if (callId) _cacheJudgeVerdict(callId, tc.verdict);
-            }
-            // Output-guard finding — surface as the same
-            // "[output guard] ..." chat line the live handler emits
-            // (case "output_warning" above).  Stamp on the item so
-            // the post-batch loop below can read + emit; rendering
-            // anchored next to the call gives the operator the same
-            // adjacency they'd see live.
-            if (tc && tc.output_assessment) {
-              item.output_assessment = tc.output_assessment;
-            }
-            // needs_approval is unknown at replay time (the
-            // assistant.tool_calls history payload doesn't persist
-            // the bit).  Leave it unset; the upgrade-in-place path
-            // refreshes per-row state via _refreshRowStatus from the
-            // authoritative SSE item when approve_request /
-            // tool_info actually arrives, so we never tag the wrong
-            // row as needing approval.
-            return item;
-          });
-          // Classify the batch as a whole:
-          //   - any call_id without an outcome at all → orphan,
-          //     render as --running (SSE will upgrade in place)
-          //   - any call_id outcome === "denied" → resolved-denied
-          //   - else → resolved-approved (a runtime error doesn't
-          //     change the approval verdict; the per-row .error class
-          //     comes from the tool_result branch below)
-          const outcomes = items.map((it) =>
-            it.call_id ? callOutcomes.get(it.call_id) : "ok",
-          );
-          const allResolved = outcomes.every((o) => o !== undefined);
-          if (!allResolved) {
-            appendToolBatch(items, { running: true });
-          } else if (outcomes.some((o) => o === "denied")) {
-            appendToolBatch(items, { resolved: { approved: false } });
-          } else {
-            appendToolBatch(items, { resolved: { approved: true } });
-          }
-          // Output-guard findings — render each one as a chip
-          // anchored to the .coord-tool-row that tripped the guard
-          // rather than a generic "[output guard]" chat line.
-          // Anchored placement preserves per-call adjacency on
-          // multi-tool batches (live + replay) and the chip's
-          // severity styling makes the visual weight match the
-          // verdict pill on the same row.
-          for (let oi = 0; oi < items.length; oi++) {
-            const oa = items[oi].output_assessment;
-            if (!oa || !oa.risk_level || oa.risk_level === "none") continue;
-            const cid = items[oi].call_id || "";
-            if (!cid) continue;
-            const entry = toolRows.get(cid);
-            if (!entry || !entry.row) continue;
-            _attachOutputWarningChip(entry.row, oa);
-          }
-        }
 
         // User messages with attachments arrive as multipart list
         // content (text + image_url/document parts) and may carry an
@@ -4107,27 +4103,43 @@
             appendToolReminderLive(m.reminders, callId);
           }
         } else if (role === "assistant") {
-          // Empty content with tool_calls only means the assistant
-          // turn was just tool dispatch — the synthesized tool-call
-          // rows above already cover it; skip the empty bubble.
-          if (!content) return;
-          // Run assistant content through the markdown pipeline
-          // (renderMarkdown + post-render hljs / mermaid / KaTeX) so a
-          // reconnect / page-reload renders the same way a live stream
-          // does.  appendText would only escape and dump the raw text —
-          // markdown tables, code fences, math, and links would all
-          // render as literal characters.
-          const el = appendMsg(role, "", { label: role });
-          const body = el.querySelector(".msg-body");
-          if (body && typeof streamingRenderFinalize === "function") {
-            try {
-              streamingRenderFinalize(body, content);
-            } catch (e) {
-              console.warn("coordinator history render failed", e);
+          // Render content BEFORE the tool batch so DOM order matches
+          // chronological order (the model emits text first, then
+          // dispatches tools).  Whitespace-only content (e.g. "\n\n"
+          // from a reasoning-parser model that strips <think>…</think>
+          // and leaves only trailing newlines before the tool call) is
+          // treated as empty — without the .trim() guard it would
+          // render a visible-but-empty .msg.assistant card on replay,
+          // which the live stream never showed (the live path didn't
+          // accumulate the trailing whitespace as a visible bubble).
+          if (content && content.trim()) {
+            // Run assistant content through the markdown pipeline
+            // (renderMarkdown + post-render hljs / mermaid / KaTeX) so
+            // a reconnect / page-reload renders the same way a live
+            // stream does.  appendText would only escape and dump the
+            // raw text — markdown tables, code fences, math, and links
+            // would all render as literal characters.
+            const el = appendMsg(role, "", { label: role });
+            const body = el.querySelector(".msg-body");
+            if (body && typeof streamingRenderFinalize === "function") {
+              try {
+                streamingRenderFinalize(body, content);
+              } catch (e) {
+                console.warn("coordinator history render failed", e);
+                body.textContent = content;
+              }
+            } else if (body) {
               body.textContent = content;
             }
-          } else if (body) {
-            body.textContent = content;
+          }
+          // Tool batch comes after the content card so the DOM matches
+          // the chronological order the model emitted (text → dispatch).
+          // Hoisting this out of the role-agnostic top of the loop —
+          // the prior shape rendered tool_calls before the assistant
+          // text that announced them, putting parallel batches
+          // visually above their narrating message on rehydrate.
+          if (Array.isArray(m.tool_calls) && m.tool_calls.length) {
+            renderAssistantToolBatch(m);
           }
         } else {
           // user / reasoning / system / other roles render as plain
