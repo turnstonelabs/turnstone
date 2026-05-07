@@ -66,7 +66,17 @@ class GuardAdvisory:
 
 @dataclass(frozen=True)
 class UserInterjection:
-    """Advisory for a message the user sent while the model was executing."""
+    """Advisory for a message the user sent while the model was executing.
+
+    Currently no production producer — pre-PR-#487 the queued-message
+    drain in ``_collect_advisories`` instantiated this and rode it
+    through ``wrap_tool_result``.  PR #487 dropped the splice and now
+    drains queued messages as a real user turn after the tool batch.
+    Class + tests retained pending the back-to-back-user role-ordering
+    decision (see review finding bug-1) — one viable fix path resumes
+    the splice for the ``user_feedback`` + queue-drain coexistence
+    case, in which case this advisory shape stays load-bearing.
+    """
 
     message: str
     priority: str = PRIORITY_NOTICE

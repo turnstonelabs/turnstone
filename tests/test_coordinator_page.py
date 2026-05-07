@@ -167,6 +167,28 @@ def test_coordinator_js_exposes_inline_approval_helpers():
     # direction.
     assert "function appendUserMessageWithAttachments" in body
     assert "msg-user-attach" in body
+    # PR #487 — whitespace-only assistant content (Qwen3 with vLLM
+    # ``--reasoning-parser`` strips ``<think>…</think>`` and emits only
+    # ``"\n\n"`` as content before a tool call) must be skipped on
+    # history replay or the empty ``.msg.assistant`` card surfaces as
+    # a phantom row.  The literal substring ``content.trim()`` is the
+    # single-line guard the rendering branch uses; a refactor that
+    # drops the trim() (e.g. simplifies to ``if (!content)``) silently
+    # regresses the phantom-card fix on the multi-node coord path.
+    # Mirrors ``test_app_js.py``'s same-shape pin on ``app.js``.
+    assert "content.trim()" in body
+    # PR #487 — coord history replay must render the assistant content
+    # card BEFORE the tool batch, not after, so DOM order matches the
+    # chronological order the model emitted (text → dispatch → results).
+    # Pre-fix the tool_calls branch sat at the role-agnostic top of the
+    # loop and rendered ahead of the assistant text that announced the
+    # batch, putting parallel fan-outs visually above their narrating
+    # message.  The fix hoisted the synthesis into ``renderAssistantToolBatch``
+    # called from inside the assistant branch AFTER the content card —
+    # asserting the helper name lets a refactor that re-inlines or
+    # renames it surface here instead of via manual reload testing.
+    assert "function renderAssistantToolBatch" in body
+    assert "renderAssistantToolBatch(m)" in body
 
 
 def test_coordinator_js_handle_child_state_no_longer_reads_sse_pending_approval_detail():

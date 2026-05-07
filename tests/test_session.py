@@ -2231,6 +2231,13 @@ class TestMetacognitiveBuffers:
         )
         # Queue is empty after drain.
         assert session._queued_messages == {}
+        # Two model turns: one for the tool-call iteration, one for the
+        # follow-up after the post-batch flush appended the queued user
+        # row.  Without the second stream the model would never see /
+        # respond to the queued message — pinning this guards against a
+        # future regression where the post-batch flush runs but the
+        # send-loop short-circuits before the next iteration.
+        assert stream_idx == 2, f"expected 2 stream calls (tool-iter + follow-up), got {stream_idx}"
 
     def test_start_nudge_fires_through_send(self, tmp_db):
         """Pin the +1 count-shift invariant — `start` must still fire on the
