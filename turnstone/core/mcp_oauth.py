@@ -39,6 +39,7 @@ from turnstone.core.audit import record_audit
 from turnstone.core.log import get_logger
 from turnstone.core.mcp_crypto import MCPTokenDecryptError
 from turnstone.core.mcp_http_parsers import (
+    MAX_INSUFFICIENT_SCOPE_REPORTED,
     is_valid_scope_token,
     parse_www_authenticate_bearer,
 )
@@ -1928,9 +1929,10 @@ async def _handle_mcp_oauth_authorize_inner(request: Request) -> Response:
     # Validated against the RFC 6749 §3.3 grammar so a malicious or buggy
     # client can't smuggle CR/LF/tab/control bytes through the AS round-
     # trip into downstream log or notification paths. The cap matches
-    # the per-call ceiling used in the WWW-Authenticate parser
-    # (``mcp_client._MAX_INSUFFICIENT_SCOPE_REPORTED``); over-capped
-    # input is rejected loudly so callers don't silently lose state.
+    # the per-call ceiling used in the WWW-Authenticate parser via the
+    # shared ``MAX_INSUFFICIENT_SCOPE_REPORTED`` constant in
+    # ``mcp_http_parsers``; over-capped input is rejected loudly so
+    # callers don't silently lose state.
     #
     # Splitting on a single space (NOT ``str.split()``) is intentional:
     # Python's whitespace split would silently strip embedded CR/LF/tab,
@@ -1939,10 +1941,8 @@ async def _handle_mcp_oauth_authorize_inner(request: Request) -> Response:
     requested_scopes_raw = request.query_params.get("scopes", "")
     requested_scopes: list[str] = []
     if requested_scopes_raw:
-        from turnstone.core.mcp_client import _MAX_INSUFFICIENT_SCOPE_REPORTED
-
         candidates = [tok for tok in requested_scopes_raw.split(" ") if tok]
-        if len(candidates) > _MAX_INSUFFICIENT_SCOPE_REPORTED:
+        if len(candidates) > MAX_INSUFFICIENT_SCOPE_REPORTED:
             return JSONResponse({"error": "Invalid scope token"}, status_code=400)
         for tok in candidates:
             if not is_valid_scope_token(tok):

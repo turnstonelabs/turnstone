@@ -357,10 +357,13 @@ def test_resource_read_persistent_401_emits_consent_required(
             return TokenLookupResult(kind="token", token="refreshed-bearer")
         return TokenLookupResult(kind="token", token="access-aaa")
 
-    with patch(
-        "turnstone.core.mcp_client.get_user_access_token_classified",
-        side_effect=_fake_classified,
-    ), pytest.raises(RuntimeError) as exc_info:
+    with (
+        patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            side_effect=_fake_classified,
+        ),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
         mgr.read_resource_sync("res://hello", user_id="user-1", timeout=15)
 
     payload = json.loads(str(exc_info.value))
@@ -392,10 +395,13 @@ def test_resource_read_403_insufficient_scope_emits_structured_error(
     async def _fake_classified(**_kwargs: Any) -> TokenLookupResult:
         return TokenLookupResult(kind="token", token="access-aaa")
 
-    with patch(
-        "turnstone.core.mcp_client.get_user_access_token_classified",
-        side_effect=_fake_classified,
-    ), pytest.raises(RuntimeError) as exc_info:
+    with (
+        patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            side_effect=_fake_classified,
+        ),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
         mgr.read_resource_sync("res://hello", user_id="user-1", timeout=15)
 
     payload = json.loads(str(exc_info.value))
@@ -430,10 +436,13 @@ def test_resource_read_403_generic_forbidden(
     async def _fake_classified(**_kwargs: Any) -> TokenLookupResult:
         return TokenLookupResult(kind="token", token="access-aaa")
 
-    with patch(
-        "turnstone.core.mcp_client.get_user_access_token_classified",
-        side_effect=_fake_classified,
-    ), pytest.raises(RuntimeError) as exc_info:
+    with (
+        patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            side_effect=_fake_classified,
+        ),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
         mgr.read_resource_sync("res://hello", user_id="user-1", timeout=15)
 
     payload = json.loads(str(exc_info.value))
@@ -476,10 +485,13 @@ def test_resource_read_breaker_unaffected_by_auth_failures(
     # repopulates this; the test simulates that out-of-band.
     for _ in range(10):
         _seed_pool_resource_map(mgr, "user-1", "pool-srv", "res://hello")
-        with patch(
-            "turnstone.core.mcp_client.get_user_access_token_classified",
-            side_effect=_fake_classified,
-        ), pytest.raises(RuntimeError) as exc_info:
+        with (
+            patch(
+                "turnstone.core.mcp_client.get_user_access_token_classified",
+                side_effect=_fake_classified,
+            ),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
             mgr.read_resource_sync("res://hello", user_id="user-1", timeout=15)
         payload = json.loads(str(exc_info.value))
         assert payload["error"]["code"] == "mcp_consent_required"
@@ -505,10 +517,13 @@ def test_resource_read_missing_token_emits_consent_required(
     async def _fake_classified(**_kwargs: Any) -> TokenLookupResult:
         return TokenLookupResult(kind="missing")
 
-    with patch(
-        "turnstone.core.mcp_client.get_user_access_token_classified",
-        side_effect=_fake_classified,
-    ), pytest.raises(RuntimeError) as exc_info:
+    with (
+        patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            side_effect=_fake_classified,
+        ),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
         mgr.read_resource_sync("res://hello", user_id="user-1", timeout=10)
 
     payload = json.loads(str(exc_info.value))
@@ -529,10 +544,13 @@ def test_resource_read_decrypt_failure_emits_token_undecryptable(
     async def _fake_classified(**_kwargs: Any) -> TokenLookupResult:
         return TokenLookupResult(kind="decrypt_failure")
 
-    with patch(
-        "turnstone.core.mcp_client.get_user_access_token_classified",
-        side_effect=_fake_classified,
-    ), pytest.raises(RuntimeError) as exc_info:
+    with (
+        patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            side_effect=_fake_classified,
+        ),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
         mgr.read_resource_sync("res://hello", user_id="user-1", timeout=10)
 
     payload = json.loads(str(exc_info.value))
@@ -556,10 +574,13 @@ def test_resource_read_http_url_emits_url_insecure(
     async def _fake_classified(**_kwargs: Any) -> TokenLookupResult:
         return TokenLookupResult(kind="token", token="access-aaa")
 
-    with patch(
-        "turnstone.core.mcp_client.get_user_access_token_classified",
-        side_effect=_fake_classified,
-    ), pytest.raises(RuntimeError) as exc_info:
+    with (
+        patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            side_effect=_fake_classified,
+        ),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
         mgr.read_resource_sync("res://hello", user_id="user-1", timeout=5)
 
     payload = json.loads(str(exc_info.value))

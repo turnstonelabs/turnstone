@@ -165,9 +165,10 @@ class TestExecReadResourceDispatchError:
             "call_id": "rc_1",
             "resource_uri": "https://example.com/r",
         }
-        # The exec site logs ``log.warning(... exc_info=True)`` on failure.
-        # Patch the logger so the test doesn't emit noise to the captured
-        # stderr — assertions don't depend on log output.
+        # The exec site emits a ``log.warning`` (no ``exc_info`` — bearer-leak
+        # invariant) on failure. Patch the logger so the test doesn't emit
+        # noise to the captured stderr — assertions don't depend on log
+        # output.
         with patch("turnstone.core.session.log"):
             session._exec_read_resource(item)
 
