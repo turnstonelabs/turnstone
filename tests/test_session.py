@@ -3362,15 +3362,11 @@ class TestReminderSidechannelIsolation:
         assert "<system-reminder>" not in rendered
 
     def test_fork_preserves_source_and_reminders(self, tmp_db):
-        """``ChatSession.resume(..., fork=True)`` bulk-inserts the source
-        workstream's messages into the fork's own ws_id.  The bulk-row
-        builder must carry the persisted side-channels (``_source`` /
-        ``_reminders``) — both backends' ``save_messages_bulk`` accept
-        them post-migration 050.  Dropping them was the original bug:
-        the fork's resumed transcript lost every wake marker and every
-        reminder bubble that survived to disk on the source, so the
-        resumed transcript looked like the assistant turn answered out
-        of nowhere.
+        """A forked workstream's resumed transcript carries both wake
+        markers (``_source = "system_nudge"``) and reminder bubbles
+        (``_reminders``).  The bulk-row builder threads the side-channels
+        onto every fork row so reconnecting tabs see the same shape the
+        source workstream's originating tab rendered live.
         """
         from turnstone.core.memory import register_workstream, save_message
 
