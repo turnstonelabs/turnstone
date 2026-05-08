@@ -1010,7 +1010,7 @@
                 <div
                   id="create-hr-error"
                   role="alert"
-                  aria-live="assertive"
+                  aria-live="assertive" aria-atomic="true"
                 ></div>
                 <label for="hr-name">Name</label>
                 <input
@@ -1124,7 +1124,7 @@
                 <div
                   id="create-ogp-error"
                   role="alert"
-                  aria-live="assertive"
+                  aria-live="assertive" aria-atomic="true"
                 ></div>
                 <label for="ogp-name">Name</label>
                 <input
@@ -1245,7 +1245,7 @@
                 <div
                   id="edit-hr-error"
                   role="alert"
-                  aria-live="assertive"
+                  aria-live="assertive" aria-atomic="true"
                 ></div>
                 <input id="ehr-id" type="hidden" />
                 <input id="ehr-builtin" type="hidden" />
@@ -1349,7 +1349,7 @@
                 <div
                   id="edit-ogp-error"
                   role="alert"
-                  aria-live="assertive"
+                  aria-live="assertive" aria-atomic="true"
                 ></div>
                 <input id="eogp-id" type="hidden" />
                 <input id="eogp-builtin" type="hidden" />
@@ -2184,7 +2184,7 @@
     >
       <div id="github-import-box" class="admin-modal">
         <h2 id="github-import-title">Import from GitHub</h2>
-        <div id="github-import-error" role="alert" aria-live="assertive"></div>
+        <div id="github-import-error" role="alert" aria-live="assertive" aria-atomic="true"></div>
         <label for="gi-url">GitHub URL</label>
         <input
           id="gi-url"
@@ -2225,7 +2225,7 @@
     >
       <div id="create-user-box" class="admin-modal">
         <h2 id="create-user-title">Create User</h2>
-        <div id="create-user-error" role="alert" aria-live="assertive"></div>
+        <div id="create-user-error" role="alert" aria-live="assertive" aria-atomic="true"></div>
         <label for="cu-username">Username</label>
         <input
           id="cu-username"
@@ -2280,7 +2280,7 @@
     >
       <div id="create-token-box" class="admin-modal">
         <h2 id="create-token-title">Create API Token</h2>
-        <div id="create-token-error" role="alert" aria-live="assertive"></div>
+        <div id="create-token-error" role="alert" aria-live="assertive" aria-atomic="true"></div>
         <label for="ct-name"
           >Token name <span class="label-hint">optional</span></label
         >
@@ -2388,7 +2388,7 @@
     >
       <div id="create-channel-box" class="admin-modal">
         <h2 id="create-channel-title">Link Channel Account</h2>
-        <div id="create-channel-error" role="alert" aria-live="assertive"></div>
+        <div id="create-channel-error" role="alert" aria-live="assertive" aria-atomic="true"></div>
         <label for="cc-type">Channel type</label>
         <select id="cc-type">
           <option value="discord">Discord</option>
@@ -2427,7 +2427,7 @@
         <div
           id="create-schedule-error"
           role="alert"
-          aria-live="assertive"
+          aria-live="assertive" aria-atomic="true"
         ></div>
         <div class="modal-columns">
           <div class="modal-col">
@@ -2551,7 +2551,7 @@
     >
       <div id="edit-schedule-box" class="admin-modal admin-modal-wide">
         <h2 id="edit-schedule-title">Edit Schedule</h2>
-        <div id="edit-schedule-error" role="alert" aria-live="assertive"></div>
+        <div id="edit-schedule-error" role="alert" aria-live="assertive" aria-atomic="true"></div>
         <input id="es-id" type="hidden" />
         <div class="modal-columns">
           <div class="modal-col">
@@ -2675,7 +2675,7 @@
     >
       <div id="create-role-box" class="admin-modal admin-modal-wide">
         <h2 id="create-role-title">Create Role</h2>
-        <div id="create-role-error" role="alert" aria-live="assertive"></div>
+        <div id="create-role-error" role="alert" aria-live="assertive" aria-atomic="true"></div>
         <label for="cr-name">Name</label>
         <input
           id="cr-name"
@@ -2724,7 +2724,7 @@
     >
       <div id="edit-role-box" class="admin-modal admin-modal-wide">
         <h2 id="edit-role-title">Edit Role</h2>
-        <div id="edit-role-error" role="alert" aria-live="assertive"></div>
+        <div id="edit-role-error" role="alert" aria-live="assertive" aria-atomic="true"></div>
         <input id="er-id" type="hidden" />
         <label for="er-name">Display name</label>
         <input id="er-name" type="text" autocomplete="off" />
@@ -2761,7 +2761,7 @@
     >
       <div id="user-roles-box" class="admin-modal">
         <h2 id="user-roles-title">Assign Roles</h2>
-        <div id="user-roles-error" role="alert" aria-live="assertive"></div>
+        <div id="user-roles-error" role="alert" aria-live="assertive" aria-atomic="true"></div>
         <input id="ur-user-id" type="hidden" />
         <div id="ur-roles-container"></div>
         <div class="modal-buttons">
@@ -2783,7 +2783,7 @@
     >
       <div id="create-policy-box" class="admin-modal">
         <h2 id="create-policy-title">Create Tool Policy</h2>
-        <div id="create-policy-error" role="alert" aria-live="assertive"></div>
+        <div id="create-policy-error" role="alert" aria-live="assertive" aria-atomic="true"></div>
         <label for="cp-name">Name</label>
         <input
           id="cp-name"
@@ -2840,7 +2840,7 @@
     >
       <div id="edit-policy-box" class="admin-modal">
         <h2 id="edit-policy-title">Edit Tool Policy</h2>
-        <div id="edit-policy-error" role="alert" aria-live="assertive"></div>
+        <div id="edit-policy-error" role="alert" aria-live="assertive" aria-atomic="true"></div>
         <input id="ep-id" type="hidden" />
         <label for="ep-name">Name</label>
         <input id="ep-name" type="text" autocomplete="off" />
@@ -2887,7 +2887,7 @@
     >
       <div id="create-ppolicy-box" class="admin-modal admin-modal-wide">
         <h2 id="create-ppolicy-title">Create Prompt</h2>
-        <div id="cpp-error" role="alert" aria-live="assertive"></div>
+        <div id="cpp-error" role="alert" aria-live="assertive" aria-atomic="true"></div>
         <label for="cpp-name"
           >Name <span class="label-hint">slug-style identifier</span></label
         >
@@ -2953,7 +2953,7 @@
     >
       <div id="edit-ppolicy-box" class="admin-modal admin-modal-wide">
         <h2 id="edit-ppolicy-title">Edit Prompt</h2>
-        <div id="epp-error" role="alert" aria-live="assertive"></div>
+        <div id="epp-error" role="alert" aria-live="assertive" aria-atomic="true"></div>
         <input id="epp-id" type="hidden" />
         <label for="epp-name">Name</label>
         <input id="epp-name" type="text" autocomplete="off" />
@@ -2997,7 +2997,7 @@
         <div
           id="create-template-error"
           role="alert"
-          aria-live="assertive"
+          aria-live="assertive" aria-atomic="true"
         ></div>
         <div class="skill-spec-body">
           <div class="skill-spec-col skill-spec-col-meta">
@@ -3314,7 +3314,7 @@
           class="skill-origin-badge"
           style="display: none"
         ></div>
-        <div id="edit-template-error" role="alert" aria-live="assertive"></div>
+        <div id="edit-template-error" role="alert" aria-live="assertive" aria-atomic="true"></div>
         <input id="etm-id" type="hidden" />
         <div class="skill-spec-body">
           <div class="skill-spec-col skill-spec-col-meta">
@@ -3635,7 +3635,7 @@
           id="mcp-create-error"
           role="alert"
           aria-live="assertive"
-          style="display: none"
+          aria-atomic="true"
         ></div>
         <input type="hidden" id="mcp-edit-id" value="" />
         <label for="mcp-name">Server Name</label>
@@ -3841,7 +3841,7 @@
           id="mcp-import-error"
           role="alert"
           aria-live="assertive"
-          style="display: none"
+          aria-atomic="true"
         ></div>
         <label for="mcp-import-json">Paste JSON</label>
         <textarea
@@ -3904,7 +3904,7 @@
           id="mcp-install-error"
           role="alert"
           aria-live="assertive"
-          style="display: none"
+          aria-atomic="true"
         ></div>
         <div id="mcp-install-summary"></div>
         <div id="mcp-install-source-select"></div>
@@ -3934,7 +3934,7 @@
     >
       <div id="model-create-box" class="admin-modal">
         <h2 id="model-create-title">Add Model</h2>
-        <div id="model-create-error" role="alert" aria-live="assertive"></div>
+        <div id="model-create-error" role="alert" aria-live="assertive" aria-atomic="true"></div>
         <input type="hidden" id="model-edit-id" value="" />
         <label for="model-alias">Alias</label>
         <input
@@ -4178,7 +4178,7 @@
     >
       <div id="coord-delete-box" class="ws-delete-modal-box">
         <h3 id="coord-delete-title">Delete Coordinators</h3>
-        <div id="coord-delete-error" role="alert" aria-live="assertive"></div>
+        <div id="coord-delete-error" role="alert" aria-live="assertive" aria-atomic="true"></div>
         <p id="coord-delete-count"></p>
         <div id="coord-delete-list" class="ws-delete-modal-list"></div>
         <div id="coord-delete-buttons" class="ws-delete-modal-buttons">
