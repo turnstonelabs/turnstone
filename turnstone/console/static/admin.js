@@ -1314,7 +1314,9 @@ function toggleScheduleNodeField() {
 function showCreateScheduleModal() {
   var overlay = document.getElementById("create-schedule-overlay");
   overlay.style.display = "flex";
-  document.getElementById("create-schedule-error").style.display = "none";
+  document
+    .getElementById("create-schedule-error")
+    .classList.remove("is-visible");
   document.getElementById("cs-name").value = "";
   document.getElementById("cs-desc").value = "";
   document.getElementById("cs-type").value = "cron";
@@ -1506,7 +1508,9 @@ function showEditScheduleModal(taskId) {
       _populateNotifyRows("es", s.notify_targets || []);
       toggleEditScheduleTypeFields();
       toggleEditScheduleNodeField();
-      document.getElementById("edit-schedule-error").style.display = "none";
+      document
+        .getElementById("edit-schedule-error")
+        .classList.remove("is-visible");
       document.getElementById("es-submit").disabled = false;
       document.getElementById("es-submit").textContent = "Save";
       var overlay = document.getElementById("edit-schedule-overlay");
@@ -1845,7 +1849,9 @@ function showCreateChannelModal() {
   }
   var overlay = document.getElementById("create-channel-overlay");
   overlay.style.display = "flex";
-  document.getElementById("create-channel-error").style.display = "none";
+  document
+    .getElementById("create-channel-error")
+    .classList.remove("is-visible");
   var ctSel = document.getElementById("cc-type");
   var uidInput = document.getElementById("cc-uid");
   ctSel.value = "discord";
@@ -1924,7 +1930,7 @@ function submitCreateChannel() {
 function showCreateUserModal() {
   var overlay = document.getElementById("create-user-overlay");
   overlay.style.display = "flex";
-  document.getElementById("create-user-error").style.display = "none";
+  document.getElementById("create-user-error").classList.remove("is-visible");
   document.getElementById("cu-username").value = "";
   document.getElementById("cu-displayname").value = "";
   document.getElementById("cu-password").value = "";
@@ -2005,7 +2011,7 @@ function showCreateTokenModal() {
   }
   var overlay = document.getElementById("create-token-overlay");
   overlay.style.display = "flex";
-  document.getElementById("create-token-error").style.display = "none";
+  document.getElementById("create-token-error").classList.remove("is-visible");
   document.getElementById("ct-name").value = "";
   document.getElementById("ct-scopes").value = "read,write,approve";
   document.getElementById("ct-expires").value = "";
@@ -3201,9 +3207,15 @@ function _resetSetting(key) {
 // Helpers
 // ---------------------------------------------------------------------------
 
+// Show an error message in a modal's [role="alert"] element. The .is-visible
+// class is the canonical toggle — see `.admin-modal [role="alert"]` in
+// style.css. Do NOT use `el.style.display = "block"` here; the CSS rule
+// `.admin-modal [role="alert"] { display: none }` is selector-equivalent and
+// will hide the element again as soon as the inline style is cleared. Hide
+// side is `el.classList.remove("is-visible")`.
 function _showModalError(el, msg) {
   el.textContent = msg;
-  el.style.display = "block";
+  el.classList.add("is-visible");
 }
 
 /* ── MCP Servers tab ─────────────────────────────────────────────────────── */
@@ -3552,7 +3564,7 @@ function showCreateMcpModal() {
   document.getElementById("mcp-oauth-client-secret").value = "";
   document.getElementById("mcp-oauth-scopes").value = "";
   document.getElementById("mcp-oauth-audience").value = "";
-  document.getElementById("mcp-create-error").style.display = "none";
+  document.getElementById("mcp-create-error").classList.remove("is-visible");
   toggleMcpTransport();
   toggleMcpAuthFields();
   _wireMcpAudienceAutofill();
@@ -3726,7 +3738,7 @@ function submitCreateMcp() {
   if (form.error) {
     var e = document.getElementById("mcp-create-error");
     e.textContent = form.error;
-    e.style.display = "";
+    e.classList.add("is-visible");
     return;
   }
   var editId = document.getElementById("mcp-edit-id").value;
@@ -3757,7 +3769,7 @@ function submitCreateMcp() {
     .catch(function (e) {
       var el = document.getElementById("mcp-create-error");
       el.textContent = e.message;
-      el.style.display = "";
+      el.classList.add("is-visible");
     })
     .finally(function () {
       document.getElementById("mcp-create-submit").disabled = false;
@@ -3939,7 +3951,7 @@ function showImportMcpModal() {
   _mcpImportTrigger = document.activeElement;
   document.getElementById("mcp-import-overlay").style.display = "flex";
   document.getElementById("mcp-import-json").value = "";
-  document.getElementById("mcp-import-error").style.display = "none";
+  document.getElementById("mcp-import-error").classList.remove("is-visible");
   document.getElementById("mcp-import-json").focus();
   _mcpImportTrap = _installTrap("mcp-import-overlay", "mcp-import-box");
 }
@@ -3956,7 +3968,7 @@ function submitImportMcp() {
   if (!raw) {
     var e = document.getElementById("mcp-import-error");
     e.textContent = "Paste a JSON config";
-    e.style.display = "";
+    e.classList.add("is-visible");
     return;
   }
   var parsed;
@@ -3965,13 +3977,13 @@ function submitImportMcp() {
   } catch (ex) {
     var e2 = document.getElementById("mcp-import-error");
     e2.textContent = "Invalid JSON: " + ex.message;
-    e2.style.display = "";
+    e2.classList.add("is-visible");
     return;
   }
   if (!parsed.mcpServers || typeof parsed.mcpServers !== "object") {
     var e3 = document.getElementById("mcp-import-error");
     e3.textContent = 'No "mcpServers" key found in JSON';
-    e3.style.display = "";
+    e3.classList.add("is-visible");
     return;
   }
   document.getElementById("mcp-import-submit").disabled = true;
@@ -4001,7 +4013,7 @@ function submitImportMcp() {
     .catch(function (e) {
       var el = document.getElementById("mcp-import-error");
       el.textContent = e.message;
-      el.style.display = "";
+      el.classList.add("is-visible");
     })
     .finally(function () {
       document.getElementById("mcp-import-submit").disabled = false;
@@ -4278,7 +4290,7 @@ function _showInstallMcpModal(srv, hasRemote, hasPackage) {
   _mcpInstallTrigger = document.activeElement;
   var ov = document.getElementById("mcp-install-overlay");
   ov.style.display = "flex";
-  document.getElementById("mcp-install-error").style.display = "none";
+  document.getElementById("mcp-install-error").classList.remove("is-visible");
 
   // Summary
   document.getElementById("mcp-install-summary").innerHTML =
@@ -4552,7 +4564,7 @@ function _doRegistryInstall(
       var errEl = document.getElementById("mcp-install-error");
       if (errEl && overlay && overlay.style.display !== "none") {
         errEl.textContent = e.message;
-        errEl.style.display = "";
+        errEl.classList.add("is-visible");
       } else {
         showToast("Install failed: " + e.message);
         // Re-render to reset card button states
