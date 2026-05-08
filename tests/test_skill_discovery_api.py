@@ -256,19 +256,13 @@ class TestSkillInstall:
     def test_install_from_skills_sh(self, client: TestClient) -> None:
         package = _sample_package()
 
-        with (
-            patch("turnstone.core.skill_sources.SkillsShClient") as mock_cls,
-            patch(
-                "turnstone.core.skill_sources.fetch_skill_from_github", new_callable=AsyncMock
-            ) as mock_fetch,
-        ):
+        with patch("turnstone.core.skill_sources.SkillsShClient") as mock_cls:
             instance = mock_cls.return_value
-            instance.resolve_github_url = AsyncMock(return_value="https://github.com/owner/repo")
-            mock_fetch.return_value = package
+            instance.download_skill = AsyncMock(return_value=package)
 
             resp = client.post(
                 "/v1/api/admin/skills/install",
-                json={"source": "skills.sh", "skill_id": "owner/test-skill"},
+                json={"source": "skills.sh", "skill_id": "owner/repo/test-skill"},
             )
 
         assert resp.status_code == 200
