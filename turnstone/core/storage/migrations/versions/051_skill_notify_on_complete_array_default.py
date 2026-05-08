@@ -24,6 +24,13 @@ This migration:
   Pydantic-schema default are flipped to ``'[]'`` in the same PR so new
   rows land correct.
 
+Downgrade is a deliberate **no-op**: pre-migration ``'{}'`` rows and
+operator-written ``'[]'`` rows are indistinguishable after upgrade, and
+``'[]'`` is the correct shape under every consumer's interpretation, so
+leaving the data untouched on downgrade is strictly safer than reversing
+it. (The known-invalid ``'{}'`` sentinel would otherwise re-emerge and
+re-trigger the original validator failures.)
+
 Revision ID: 051
 Revises: 050
 Create Date: 2026-05-08
@@ -50,11 +57,12 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # Restore the legacy ``'{}'`` sentinel only on rows that still hold the
-    # post-migration empty-array literal — operator edits stay intact.
-    conn = op.get_bind()
-    conn.execute(
-        sa.text(
-            "UPDATE prompt_templates SET notify_on_complete = '{}' WHERE notify_on_complete = '[]'"
-        )
-    )
+    # Intentional no-op. The data state cannot be cleanly inverted: a
+    # pre-migration ``'{}'`` row and an operator-written ``'[]'`` row both
+    # look like ``'[]'`` after upgrade, and rewriting every ``'[]'`` row back
+    # to ``'{}'`` would (a) destroy legitimate operator intent and
+    # (b) reintroduce the known-invalid sentinel that every consumer of
+    # ``notify_on_complete`` rejects. ``'[]'`` is the correct shape for the
+    # column under any consumer's interpretation, so leaving the data
+    # untouched on downgrade is strictly safer than reversing it.
+    pass
