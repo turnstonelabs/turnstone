@@ -2717,6 +2717,17 @@ class SQLiteBackend:
             conn.commit()
             return result.rowcount > 0
 
+    def set_skill_readonly(self, template_id: str, readonly: bool) -> bool:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.update(prompt_templates)
+                .where(prompt_templates.c.template_id == template_id)
+                .values(readonly=int(bool(readonly)), updated=now)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
     def delete_prompt_template(self, template_id: str) -> bool:
         with self._conn() as conn:
             result = conn.execute(
