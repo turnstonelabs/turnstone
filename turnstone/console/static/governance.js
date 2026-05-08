@@ -1527,8 +1527,15 @@ function showEditTemplateModal(tmplId) {
     );
     // Focus management — only on the initial open. Re-renders preserve
     // wherever focus was so a screen reader doesn't get a transition.
+    // For readonly skills, prefer the lock button so keyboard users land
+    // on the unlock affordance instead of having to Tab past every
+    // disabled spec field to reach it. Cancel is still one Shift-Tab away.
     if (isReadonly) {
-      if (cancelBtn) cancelBtn.focus();
+      if (lockBtn && lockBtn.style.display !== "none") {
+        lockBtn.focus();
+      } else if (cancelBtn) {
+        cancelBtn.focus();
+      }
     } else {
       document.getElementById("etm-name").focus();
     }
