@@ -203,7 +203,7 @@ function showCreateRoleModal() {
   document.getElementById("cr-displayname").value = "";
   document.getElementById("cr-perms-container").innerHTML =
     _buildPermCheckboxes("cr", []);
-  document.getElementById("create-role-error").style.display = "none";
+  document.getElementById("create-role-error").classList.remove("is-visible");
   document.getElementById("cr-name").focus();
   _crTrapHandler = _installTrap("create-role-overlay", "create-role-box");
 }
@@ -224,7 +224,7 @@ function submitCreateRole() {
   if (!name) {
     var e = document.getElementById("create-role-error");
     e.textContent = "Name is required";
-    e.style.display = "";
+    e.classList.add("is-visible");
     return;
   }
   if (!dname) dname = name;
@@ -253,7 +253,7 @@ function submitCreateRole() {
     .catch(function (e) {
       var el = document.getElementById("create-role-error");
       el.textContent = e.message;
-      el.style.display = "";
+      el.classList.add("is-visible");
     })
     .finally(function () {
       document.getElementById("cr-submit").disabled = false;
@@ -277,7 +277,7 @@ function showEditRoleModal(roleId) {
   var selected = (role.permissions || "").split(",");
   document.getElementById("er-perms-container").innerHTML =
     _buildPermCheckboxes("er", selected);
-  document.getElementById("edit-role-error").style.display = "none";
+  document.getElementById("edit-role-error").classList.remove("is-visible");
   _erTrapHandler = _installTrap("edit-role-overlay", "edit-role-box");
 }
 
@@ -315,7 +315,7 @@ function submitEditRole() {
     .catch(function (e) {
       var el = document.getElementById("edit-role-error");
       el.textContent = e.message;
-      el.style.display = "";
+      el.classList.add("is-visible");
     })
     .finally(function () {
       document.getElementById("er-submit").disabled = false;
@@ -533,7 +533,7 @@ function showCreatePolicyModal() {
   document.getElementById("cp-pattern").value = "";
   document.getElementById("cp-action").value = "ask";
   document.getElementById("cp-priority").value = "0";
-  document.getElementById("create-policy-error").style.display = "none";
+  document.getElementById("create-policy-error").classList.remove("is-visible");
   document.getElementById("cp-name").focus();
   _cpTrapHandler = _installTrap("create-policy-overlay", "create-policy-box");
 }
@@ -556,7 +556,7 @@ function submitCreatePolicy() {
   if (!name || !pattern) {
     var e = document.getElementById("create-policy-error");
     e.textContent = "Name and pattern are required";
-    e.style.display = "";
+    e.classList.add("is-visible");
     return;
   }
   document.getElementById("cp-submit").disabled = true;
@@ -585,7 +585,7 @@ function submitCreatePolicy() {
     .catch(function (e) {
       var el = document.getElementById("create-policy-error");
       el.textContent = e.message;
-      el.style.display = "";
+      el.classList.add("is-visible");
     })
     .finally(function () {
       document.getElementById("cp-submit").disabled = false;
@@ -610,7 +610,7 @@ function showEditPolicyModal(policyId) {
   document.getElementById("ep-action").value = policy.action;
   document.getElementById("ep-priority").value = policy.priority;
   document.getElementById("ep-enabled").checked = policy.enabled;
-  document.getElementById("edit-policy-error").style.display = "none";
+  document.getElementById("edit-policy-error").classList.remove("is-visible");
   _epTrapHandler = _installTrap("edit-policy-overlay", "edit-policy-box");
 }
 
@@ -652,7 +652,7 @@ function submitEditPolicy() {
     .catch(function (e) {
       var el = document.getElementById("edit-policy-error");
       el.textContent = e.message;
-      el.style.display = "";
+      el.classList.add("is-visible");
     })
     .finally(function () {
       document.getElementById("ep-submit").disabled = false;
@@ -2727,7 +2727,7 @@ function showGitHubImportModal() {
   urlInput.value = "";
   var errEl = document.getElementById("github-import-error");
   errEl.textContent = "";
-  errEl.style.display = "none";
+  errEl.classList.remove("is-visible");
   _giTrapHandler = _installTrap("github-import-overlay", "github-import-box");
   urlInput.focus();
 }
@@ -2746,19 +2746,19 @@ function submitGitHubImport() {
   var errEl = document.getElementById("github-import-error");
   if (!url) {
     errEl.textContent = "URL is required";
-    errEl.style.display = "";
+    errEl.classList.add("is-visible");
     return;
   }
   if (!/^https?:\/\/github\.com\//i.test(url)) {
     errEl.textContent = "Must be a GitHub URL";
-    errEl.style.display = "";
+    errEl.classList.add("is-visible");
     return;
   }
 
   var submitBtn = document.getElementById("gi-submit");
   submitBtn.disabled = true;
   submitBtn.textContent = "Installing\u2026";
-  errEl.style.display = "none";
+  errEl.classList.remove("is-visible");
 
   authFetch("/v1/api/admin/skills/install", {
     method: "POST",
@@ -2799,7 +2799,7 @@ function submitGitHubImport() {
     })
     .catch(function (e) {
       errEl.textContent = e.message;
-      errEl.style.display = "";
+      errEl.classList.add("is-visible");
     })
     .finally(function () {
       submitBtn.disabled = false;
@@ -2946,7 +2946,7 @@ function showCreatePromptPolicyModal() {
   document.getElementById("cpp-gate").value = "";
   document.getElementById("cpp-content").value = "";
   document.getElementById("cpp-priority").value = "0";
-  document.getElementById("cpp-error").style.display = "none";
+  document.getElementById("cpp-error").classList.remove("is-visible");
   document.getElementById("cpp-name").focus();
   _cppTrapHandler = _installTrap(
     "create-ppolicy-overlay",
@@ -2969,10 +2969,10 @@ function submitCreatePromptPolicy() {
   var content = document.getElementById("cpp-content").value.trim();
   if (!name || !content) {
     errEl.textContent = "Name and content are required";
-    errEl.style.display = "";
+    errEl.classList.add("is-visible");
     return;
   }
-  errEl.style.display = "none";
+  errEl.classList.remove("is-visible");
   var submitBtn = document.getElementById("cpp-submit");
   submitBtn.disabled = true;
   authFetch("/v1/api/admin/prompt-policies", {
@@ -3001,7 +3001,7 @@ function submitCreatePromptPolicy() {
     })
     .catch(function (e) {
       errEl.textContent = e.message;
-      errEl.style.display = "";
+      errEl.classList.add("is-visible");
     })
     .finally(function () {
       submitBtn.disabled = false;
@@ -3024,7 +3024,7 @@ function showEditPromptPolicyModal(policyId) {
   document.getElementById("epp-content").value = p.content || "";
   document.getElementById("epp-priority").value = p.priority || 0;
   document.getElementById("epp-enabled").checked = p.enabled;
-  document.getElementById("epp-error").style.display = "none";
+  document.getElementById("epp-error").classList.remove("is-visible");
   var ov = document.getElementById("edit-ppolicy-overlay");
   ov.style.display = "flex";
   document.getElementById("epp-name").focus();
@@ -3047,10 +3047,10 @@ function submitEditPromptPolicy() {
   var content = document.getElementById("epp-content").value.trim();
   if (!name || !content) {
     errEl.textContent = "Name and content are required";
-    errEl.style.display = "";
+    errEl.classList.add("is-visible");
     return;
   }
-  errEl.style.display = "none";
+  errEl.classList.remove("is-visible");
   var submitBtn = document.getElementById("epp-submit");
   submitBtn.disabled = true;
   authFetch("/v1/api/admin/prompt-policies/" + policyId, {
@@ -3079,7 +3079,7 @@ function submitEditPromptPolicy() {
     })
     .catch(function (e) {
       errEl.textContent = e.message;
-      errEl.style.display = "";
+      errEl.classList.add("is-visible");
     })
     .finally(function () {
       submitBtn.disabled = false;
@@ -3603,7 +3603,7 @@ function showCreateHeuristicRuleModal() {
   document.getElementById("hr-conf").value = "0.8";
   document.getElementById("hr-intent").value = "";
   document.getElementById("hr-reason").value = "";
-  document.getElementById("create-hr-error").style.display = "none";
+  document.getElementById("create-hr-error").classList.remove("is-visible");
   document.getElementById("hr-submit").disabled = false;
   document.getElementById("hr-name").focus();
   _chrTrapHandler = _installTrap("create-hr-overlay", "create-hr-box");
@@ -3618,7 +3618,7 @@ function hideCreateHRModal() {
 
 function submitCreateHeuristicRule() {
   var errEl = document.getElementById("create-hr-error");
-  errEl.style.display = "none";
+  errEl.classList.remove("is-visible");
   var argsText = document.getElementById("hr-args").value.trim();
   var argPatterns = argsText
     ? argsText.split("\n").filter(function (l) {
@@ -3658,7 +3658,7 @@ function submitCreateHeuristicRule() {
     })
     .catch(function (e) {
       errEl.textContent = e.message;
-      errEl.style.display = "";
+      errEl.classList.add("is-visible");
     })
     .finally(function () {
       btn.disabled = false;
@@ -3770,7 +3770,7 @@ function _populateEditHRModal(rule, isBuiltin) {
   document.getElementById("ehr-conf").value = rule.confidence;
   document.getElementById("ehr-intent").value = rule.intent_template || "";
   document.getElementById("ehr-reason").value = rule.reasoning_template || "";
-  document.getElementById("edit-hr-error").style.display = "none";
+  document.getElementById("edit-hr-error").classList.remove("is-visible");
   document.getElementById("ehr-submit").disabled = false;
 }
 
@@ -3820,7 +3820,7 @@ function hideEditHRModal() {
 
 function submitEditHeuristicRule() {
   var errEl = document.getElementById("edit-hr-error");
-  errEl.style.display = "none";
+  errEl.classList.remove("is-visible");
   var argsText = document.getElementById("ehr-args").value.trim();
   var argPatterns = argsText
     ? argsText.split("\n").filter(function (l) {
@@ -3874,7 +3874,7 @@ function submitEditHeuristicRule() {
     })
     .catch(function (e) {
       errEl.textContent = e.message;
-      errEl.style.display = "";
+      errEl.classList.add("is-visible");
     })
     .finally(function () {
       btn.disabled = false;
@@ -4115,7 +4115,7 @@ function showCreateOutputGuardPatternModal() {
   document.getElementById("ogp-cred").checked = false;
   document.getElementById("ogp-redact").value = "";
   document.getElementById("ogp-regex-result").textContent = "";
-  document.getElementById("create-ogp-error").style.display = "none";
+  document.getElementById("create-ogp-error").classList.remove("is-visible");
   document.getElementById("ogp-submit").disabled = false;
   document.getElementById("ogp-name").focus();
   _cogpTrapHandler = _installTrap("create-ogp-overlay", "create-ogp-box");
@@ -4161,7 +4161,7 @@ function validateOGRegex() {
 
 function submitCreateOGPattern() {
   var errEl = document.getElementById("create-ogp-error");
-  errEl.style.display = "none";
+  errEl.classList.remove("is-visible");
   var payload = {
     name: document.getElementById("ogp-name").value.trim(),
     category: document.getElementById("ogp-cat").value,
@@ -4195,7 +4195,7 @@ function submitCreateOGPattern() {
     })
     .catch(function (e) {
       errEl.textContent = e.message;
-      errEl.style.display = "";
+      errEl.classList.add("is-visible");
     })
     .finally(function () {
       btn.disabled = false;
@@ -4300,7 +4300,7 @@ function _populateEditOGPModal(pat, isBuiltin) {
   document.getElementById("eogp-cred").checked = !!pat.is_credential;
   document.getElementById("eogp-redact").value = pat.redact_label || "";
   document.getElementById("eogp-regex-result").textContent = "";
-  document.getElementById("edit-ogp-error").style.display = "none";
+  document.getElementById("edit-ogp-error").classList.remove("is-visible");
   document.getElementById("eogp-submit").disabled = false;
 }
 
@@ -4378,7 +4378,7 @@ function validateEditOGRegex() {
 
 function submitEditOGPattern() {
   var errEl = document.getElementById("edit-ogp-error");
-  errEl.style.display = "none";
+  errEl.classList.remove("is-visible");
   var patternId = document.getElementById("eogp-id").value;
   var payload = {
     name: document.getElementById("eogp-name").value.trim(),
@@ -4424,7 +4424,7 @@ function submitEditOGPattern() {
     })
     .catch(function (e) {
       errEl.textContent = e.message;
-      errEl.style.display = "";
+      errEl.classList.add("is-visible");
     })
     .finally(function () {
       btn.disabled = false;
