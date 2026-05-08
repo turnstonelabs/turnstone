@@ -197,6 +197,18 @@ class TestSkillsShClient:
             assert "custom.registry.io" in str(call_args)
 
     @pytest.mark.anyio
+    async def test_source_url_normalizes_dirty_id(self) -> None:
+        # Whitespace-bearing id from /api/search must produce the same
+        # source_url that download_skill persists, so the discover-UI
+        # "already installed" check matches.
+        from turnstone.core.skill_sources import _skills_sh_source_url
+
+        clean = _skills_sh_source_url("https://skills.sh", "owner/repo/leaf")
+        dirty = _skills_sh_source_url("https://skills.sh", " owner/repo/leaf ")
+        leading_slash = _skills_sh_source_url("https://skills.sh", "/owner/repo/leaf/")
+        assert clean == dirty == leading_slash == "https://skills.sh/skills/owner/repo/leaf"
+
+    @pytest.mark.anyio
     async def test_search_derives_source_url_when_missing(self) -> None:
         # Real skills.sh /api/search responses don't carry source_url.
         # We synthesise one from the canonical id so the discover-UI
@@ -349,6 +361,36 @@ body
         mock_response.status_code = 200
         mock_response.json.return_value = {
             "files": [{"path": "SKILL.md", "contents": "x" * (_MAX_SKILL_MD_SIZE + 1)}],
+        }
+
+        with patch("turnstone.core.skill_sources.httpx.AsyncClient") as mock_client_cls:
+            instance = AsyncMock()
+            instance.get = AsyncMock(return_value=mock_response)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = instance
+
+            client = SkillsShClient()
+            with pytest.raises(SkillSourceError, match="exceeds size cap"):
+                await client.download_skill("owner/repo/leaf")
+
+    @pytest.mark.anyio
+    async def test_download_skill_oversized_multibyte_skill_md(self) -> None:
+        # 4-byte emoji × N: code-point count stays under the cap, but UTF-8
+        # byte length is 4× higher. Catches the regression where the size
+        # cap was measured in code points rather than bytes.
+        from turnstone.core.skill_sources import _MAX_SKILL_MD_SIZE
+
+        # Half the cap in code points → 2× the cap in encoded bytes.
+        emoji_count = (_MAX_SKILL_MD_SIZE // 2) + 1
+        payload = "🎉" * emoji_count
+        assert len(payload) <= _MAX_SKILL_MD_SIZE  # would pass code-point check
+        assert len(payload.encode("utf-8")) > _MAX_SKILL_MD_SIZE  # but exceeds byte cap
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "files": [{"path": "SKILL.md", "contents": payload}],
         }
 
         with patch("turnstone.core.skill_sources.httpx.AsyncClient") as mock_client_cls:

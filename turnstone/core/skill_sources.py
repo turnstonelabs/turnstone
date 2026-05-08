@@ -65,8 +65,15 @@ def _split_skills_sh_id(skill_id: str) -> tuple[str, str, str]:
 
 
 def _skills_sh_source_url(base_url: str, skill_id: str) -> str:
-    """Canonical, dedup-stable URL for a skills.sh skill."""
-    return f"{base_url.rstrip('/')}/skills/{skill_id}"
+    """Canonical, dedup-stable URL for a skills.sh skill.
+
+    Normalizes the skill_id (strips outer whitespace and slashes) so
+    `search()` and `download_skill()` agree on the persisted URL even
+    when upstream returns sloppy ids — the discover-UI's
+    "already installed" check matches against this exact string.
+    """
+    canonical = skill_id.strip().strip("/")
+    return f"{base_url.rstrip('/')}/skills/{canonical}"
 
 
 @dataclass(frozen=True)
@@ -191,11 +198,18 @@ class SkillsShClient:
             if not path or not isinstance(contents, str):
                 continue
             if path == "SKILL.md":
-                # `len(contents)` is a cheap upper bound on the encoded byte
-                # size (every char encodes to >=1 UTF-8 byte) — using it
-                # avoids errors='ignore' silently dropping invalid units and
-                # bypassing the cap.
-                if len(contents) > _MAX_SKILL_MD_SIZE:
+                # Measure UTF-8 bytes (not code points). `len(str)` is a
+                # *lower* bound on encoded size — multi-byte chars (emoji,
+                # CJK) inflate by up to 4×, so a code-point check would let
+                # an oversized SKILL.md slip past the cap. Strict encoding
+                # surfaces lone surrogates as a clear error.
+                try:
+                    skill_md_size = len(contents.encode("utf-8"))
+                except UnicodeEncodeError as exc:
+                    raise SkillSourceError(
+                        f"SKILL.md for {skill_id} contains invalid Unicode: {exc}"
+                    ) from exc
+                if skill_md_size > _MAX_SKILL_MD_SIZE:
                     raise SkillSourceError(
                         f"SKILL.md for {skill_id} exceeds size cap ({_MAX_SKILL_MD_SIZE} bytes)"
                     )
@@ -216,13 +230,16 @@ class SkillsShClient:
                 continue
             resources[path] = contents
 
+        # Reconstruct from validated parts so the listing carries the
+        # canonical id, never the raw caller input.
+        canonical_id = f"{owner}/{repo}/{name}"
         listing = SkillListing(
-            id=skill_id,
+            id=canonical_id,
             name=parsed.name or name,
             description=parsed.description,
             author=parsed.author,
             source="skills.sh",
-            source_url=_skills_sh_source_url(self._base_url, skill_id),
+            source_url=_skills_sh_source_url(self._base_url, canonical_id),
             install_count=0,
             tags=list(parsed.tags),
         )
