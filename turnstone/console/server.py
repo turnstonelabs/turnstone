@@ -1328,7 +1328,9 @@ async def cluster_ws_detail(request: Request) -> JSONResponse:
             # Tail-N bound pushed into SQL (load_messages supports limit
             # on both backends).  Offloaded to the default executor so
             # the async SSE loop stays unblocked under rapid fan-out.
-            messages = await asyncio.to_thread(storage.load_messages, ws_id, limit=limit)
+            messages = await asyncio.to_thread(
+                storage.load_messages, ws_id, limit=limit, repair=False
+            )
         except Exception:
             log.debug("cluster_ws_detail.load_messages_failed", exc_info=True)
 

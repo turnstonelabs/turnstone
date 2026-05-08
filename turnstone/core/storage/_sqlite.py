@@ -306,7 +306,9 @@ class SQLiteBackend:
                     self._fts5_available = False
             conn.commit()
 
-    def load_messages(self, ws_id: str, *, limit: int | None = None) -> list[dict[str, Any]]:
+    def load_messages(
+        self, ws_id: str, *, limit: int | None = None, repair: bool = True
+    ) -> list[dict[str, Any]]:
         with self._conn() as conn:
             if limit is not None and limit > 0:
                 # Tail-N: fetch the last `limit` rows via DESC + LIMIT
@@ -354,7 +356,7 @@ class SQLiteBackend:
         if limit is not None and limit > 0:
             message_ids = [r[0] for r in rows]
         attachments = self.load_attachments_for_messages(ws_id, message_ids=message_ids)
-        return _reconstruct_messages(list(rows), ws_id, attachments or None)
+        return _reconstruct_messages(list(rows), ws_id, attachments or None, repair=repair)
 
     def delete_messages_after(self, ws_id: str, keep_count: int) -> int:
         with self._conn() as conn:
