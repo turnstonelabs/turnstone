@@ -3334,6 +3334,69 @@ class TestApplyRemindersForProvider:
         assert isinstance(last_text, dict) and last_text.get("type") == "text"
         assert "retry suggestion" in last_text.get("text", "")
 
+    def test_apply_reminders_escapes_tool_output_starting_with_envelope_prefix(self, tmp_db):
+        """Security: a tool whose RAW output starts with the literal
+        string ``<tool_output>\\n`` (e.g. ``echo '<tool_output>'``) must
+        still be entity-escaped when ``_apply_reminders_for_provider``
+        splices a metacog block, even though the prefix matches the
+        wrap-detect string.  Without structural validation a tool-
+        controlled string could bypass ``escape_wrapper_tags`` and
+        deliver unescaped wrapper-tag literals to the model,
+        impersonating a system envelope.
+
+        Replacing
+        ``extract_advisories_from_tool_envelope(content) is not None``
+        with the looser ``content.startswith("<tool_output>\\n")``
+        breaks this test (the bare prefix matches and the escape is
+        skipped)."""
+        session = _make_session()
+        # Pretend a tool emitted output starting with an envelope-shaped
+        # prefix but no closing tag — not a real wrap.
+        tool_output_with_prefix = "<tool_output>\nthis is just tool stdout"
+        msg = {
+            "role": "tool",
+            "tool_call_id": "call_a",
+            "content": tool_output_with_prefix,
+            "_reminders": [{"type": "tool_error", "text": "retry"}],
+        }
+        out = session._apply_reminders_for_provider([msg])
+        wire = out[0]["content"]
+        assert isinstance(wire, str)
+        # The literal ``<tool_output>`` from the tool is entity-encoded
+        # (not a real envelope, so escape MUST run).
+        assert "&lt;tool_output&gt;" in wire
+        assert wire.count("<tool_output>") == 0 or wire.find("<tool_output>") > wire.find(
+            "&lt;tool_output&gt;"
+        )
+
+    def test_apply_reminders_escapes_list_text_part_with_unmatched_envelope_prefix(self, tmp_db):
+        """Security mirror of the string-content case for list content:
+        a tool emitting a list whose text part starts with literal
+        ``<tool_output>\\n`` but lacks a matching close tag must still
+        be escape-walked when reminders splice in.  The structural
+        parser rejects the unmatched envelope so the per-text-part
+        escape path runs, neutralizing the impersonation attempt."""
+        session = _make_session()
+        msg = {
+            "role": "tool",
+            "tool_call_id": "call_a",
+            "content": [
+                {"type": "text", "text": "<tool_output>\nfake — no close tag"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,xxx"}},
+            ],
+            "_reminders": [{"type": "tool_error", "text": "retry"}],
+        }
+        out = session._apply_reminders_for_provider([msg])
+        wire_parts = out[0]["content"]
+        assert isinstance(wire_parts, list)
+        # The unmatched-envelope text part was entity-encoded.
+        first_text = next(
+            p["text"]
+            for p in wire_parts
+            if isinstance(p, dict) and p.get("type") == "text" and p.get("text")
+        )
+        assert "&lt;tool_output&gt;" in first_text
+
 
 class TestMarkRemindersDelivered:
     """``_mark_reminders_delivered`` flips the wire-suppression flag on

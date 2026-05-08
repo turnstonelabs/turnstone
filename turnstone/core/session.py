@@ -45,6 +45,7 @@ from turnstone.core.attachments import (
 )
 from turnstone.core.config import get_tavily_key
 from turnstone.core.edit import find_occurrences, pick_nearest
+from turnstone.core.history_decoration import extract_advisories_from_tool_envelope
 from turnstone.core.log import get_logger
 from turnstone.core.memory import (
     count_structured_memories,
@@ -2264,7 +2265,16 @@ class ChatSession:
                 # envelope.  Append the metacog block as a trailing
                 # ``<system-reminder>`` (same shape ``wrap_tool_result``
                 # produces when stacking multiple advisories).
-                if content.startswith("<tool_output>\n"):
+                #
+                # Detect the wrap by *parsing* the envelope structure
+                # (open + matching close + zero or more system-reminder
+                # blocks) rather than a bare ``startswith`` prefix
+                # check — a tool emitting a literal ``<tool_output>\n``
+                # prefix without the matching close tag would otherwise
+                # bypass ``escape_wrapper_tags`` and let unescaped
+                # wrapper-tag literals from untrusted tool output reach
+                # the model.
+                if extract_advisories_from_tool_envelope(content) is not None:
                     copy["content"] = content + block
                 else:
                     copy["content"] = escape_wrapper_tags(content) + block
@@ -2291,8 +2301,11 @@ class ChatSession:
                     # ``<system-reminder>`` tags so the model sees
                     # ``&lt;tool_output&gt;...`` instead of a parseable
                     # envelope.  Mirrors the string-branch detection
-                    # above.
-                    if text.startswith("<tool_output>\n"):
+                    # above and uses structural parsing (open + matching
+                    # close) instead of a prefix check so a tool
+                    # emitting a literal ``<tool_output>\n`` text part
+                    # without a matching close can't bypass the escape.
+                    if extract_advisories_from_tool_envelope(text) is not None:
                         continue
                     part["text"] = escape_wrapper_tags(text)
                 if text_parts:
