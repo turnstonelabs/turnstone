@@ -632,11 +632,22 @@ def _build_history(
                             extracted = extract_advisories_from_tool_envelope(text)
                         except Exception:
                             extracted = None
+                        # Drop the part ONLY when both (a) the parser
+                        # accepted the envelope structure AND (b) the
+                        # cleaned inner content is empty AND (c) at
+                        # least one advisory came out.  This is the
+                        # signature of an injected
+                        # ``wrap_tool_result("", advisories)`` carrier
+                        # — the inner is empty by construction.  A
+                        # tool legitimately emitting an envelope with
+                        # non-empty body or no advisory blocks is left
+                        # in place rather than silently dropped.
                         if extracted is not None:
-                            _cleaned_text, advisories_from_part = extracted
-                            extracted_advisories.extend(advisories_from_part)
-                            changed = True
-                            continue
+                            cleaned_text, advisories_from_part = extracted
+                            if not cleaned_text and advisories_from_part:
+                                extracted_advisories.extend(advisories_from_part)
+                                changed = True
+                                continue
                     new_parts.append(part)
                 if changed:
                     content = new_parts

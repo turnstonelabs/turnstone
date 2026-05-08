@@ -1212,6 +1212,42 @@ class TestBuildHistoryAdvisoryRoundTrip:
             }
         ]
 
+    def test_build_history_keeps_legitimate_envelope_text_part_with_body(self):
+        """A tool that legitimately produces output containing a
+        well-formed ``<tool_output>`` envelope as a text part (e.g.
+        documentation viewer, code analyzer demoing the wrapper, an
+        echo tool) must NOT have that part dropped on replay.  The
+        list-content drop heuristic must require both an empty cleaned
+        inner body AND at least one extracted advisory — the
+        signature of the injected ``wrap_tool_result("", advisories)``
+        carrier.  A legitimate tool envelope has non-empty inner body
+        OR no advisories, and stays in the projected list verbatim.
+
+        Removing the ``not cleaned_text and advisories_from_part``
+        guard breaks this test (the legitimate envelope gets dropped
+        from the wire content)."""
+        from turnstone.server import _build_history
+
+        legit_envelope_text = (
+            "<tool_output>\nThis is what a tool_output envelope looks like.\n</tool_output>"
+        )
+        list_content = [
+            {"type": "text", "text": "doc preview:"},
+            {"type": "text", "text": legit_envelope_text},
+        ]
+        session = self._session_with_messages(
+            [{"role": "tool", "tool_call_id": "call_a", "content": list_content}]
+        )
+        history = _build_history(session)
+        # All parts survive — none dropped.
+        wire_content = history[0]["content"]
+        assert isinstance(wire_content, list)
+        assert len(wire_content) == 2
+        assert wire_content[1]["text"] == legit_envelope_text
+        # No advisories surfaced (no system-reminder blocks were
+        # extracted from the legitimate envelope).
+        assert "advisories" not in history[0]
+
 
 class TestDetailInteractive:
     """Interactive parity for the lifted ``GET /v1/api/workstreams/{ws_id}``.
