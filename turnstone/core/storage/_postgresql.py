@@ -2397,49 +2397,58 @@ class PostgreSQLBackend:
         # Scan skill content for risk signals
         risk_level, scan_report, scan_version = _scan_skill_content(content, allowed_tools)
 
+        from turnstone.core.storage._protocol import StorageConflictError
+
         with self._conn() as conn:
-            conn.execute(
-                sa.insert(prompt_templates),
-                {
-                    "template_id": template_id,
-                    "name": name,
-                    "category": category,
-                    "content": content,
-                    "variables": variables,
-                    "is_default": 1 if is_default else 0,
-                    "org_id": org_id,
-                    "created_by": created_by,
-                    "origin": origin,
-                    "mcp_server": mcp_server,
-                    "readonly": 1 if readonly else 0,
-                    "description": description,
-                    "tags": tags,
-                    "source_url": source_url,
-                    "version": version,
-                    "author": author,
-                    "activation": activation,
-                    "token_estimate": token_estimate,
-                    "allowed_tools": allowed_tools,
-                    "license": skill_license,
-                    "compatibility": compatibility,
-                    "kind": kind,
-                    "risk_level": risk_level,
-                    "scan_report": scan_report,
-                    "scan_version": scan_version,
-                    "model": model,
-                    "auto_approve": 1 if auto_approve else 0,
-                    "temperature": temperature,
-                    "reasoning_effort": reasoning_effort,
-                    "max_tokens": max_tokens,
-                    "token_budget": token_budget,
-                    "agent_max_turns": agent_max_turns,
-                    "notify_on_complete": notify_on_complete,
-                    "enabled": 1 if enabled else 0,
-                    "priority": priority,
-                    "created": now,
-                    "updated": now,
-                },
-            )
+            try:
+                conn.execute(
+                    sa.insert(prompt_templates),
+                    {
+                        "template_id": template_id,
+                        "name": name,
+                        "category": category,
+                        "content": content,
+                        "variables": variables,
+                        "is_default": 1 if is_default else 0,
+                        "org_id": org_id,
+                        "created_by": created_by,
+                        "origin": origin,
+                        "mcp_server": mcp_server,
+                        "readonly": 1 if readonly else 0,
+                        "description": description,
+                        "tags": tags,
+                        "source_url": source_url,
+                        "version": version,
+                        "author": author,
+                        "activation": activation,
+                        "token_estimate": token_estimate,
+                        "allowed_tools": allowed_tools,
+                        "license": skill_license,
+                        "compatibility": compatibility,
+                        "kind": kind,
+                        "risk_level": risk_level,
+                        "scan_report": scan_report,
+                        "scan_version": scan_version,
+                        "model": model,
+                        "auto_approve": 1 if auto_approve else 0,
+                        "temperature": temperature,
+                        "reasoning_effort": reasoning_effort,
+                        "max_tokens": max_tokens,
+                        "token_budget": token_budget,
+                        "agent_max_turns": agent_max_turns,
+                        "notify_on_complete": notify_on_complete,
+                        "enabled": 1 if enabled else 0,
+                        "priority": priority,
+                        "created": now,
+                        "updated": now,
+                    },
+                )
+            except sa.exc.IntegrityError as exc:
+                conn.rollback()
+                msg = str(exc.orig) if exc.orig is not None else str(exc)
+                raise StorageConflictError(
+                    f"prompt_template conflict ({template_id}/{name}): {msg}"
+                ) from exc
             conn.commit()
 
     def get_prompt_template(self, template_id: str) -> dict[str, Any] | None:

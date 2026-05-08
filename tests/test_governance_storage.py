@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
 import sqlalchemy as sa
 
 # ---------------------------------------------------------------------------
@@ -316,6 +317,13 @@ class TestPromptTemplateCRUD:
 
     def test_get_prompt_template_nonexistent(self, db):
         assert db.get_prompt_template("missing") is None
+
+    def test_create_prompt_template_duplicate_id_raises_conflict(self, db):
+        from turnstone.core.storage._protocol import StorageConflictError
+
+        db.create_prompt_template("dup", "first", "general", "A")
+        with pytest.raises(StorageConflictError, match="prompt_template conflict"):
+            db.create_prompt_template("dup", "second", "general", "B")
 
     def test_list_prompt_templates_ordered_by_name(self, db):
         db.create_prompt_template("t2", "beta", "general", "B")
