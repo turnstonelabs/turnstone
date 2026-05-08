@@ -2564,16 +2564,39 @@ class PostgreSQLBackend:
             conn.commit()
             return result.rowcount > 0
 
-    def set_skill_readonly(self, template_id: str, readonly: bool) -> bool:
+    def unlock_skill(self, template_id: str, snapshot: str, changed_by: str) -> int | None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
-            result = conn.execute(
+            row = conn.execute(
+                sa.select(prompt_templates.c.template_id).where(
+                    prompt_templates.c.template_id == template_id
+                )
+            ).first()
+            if row is None:
+                return None
+            current_max = conn.execute(
+                sa.select(sa.func.coalesce(sa.func.max(skill_versions.c.version), 0)).where(
+                    skill_versions.c.skill_id == template_id
+                )
+            ).scalar()
+            next_version = int(current_max or 0) + 1
+            conn.execute(
+                sa.insert(skill_versions),
+                {
+                    "skill_id": template_id,
+                    "version": next_version,
+                    "snapshot": snapshot,
+                    "changed_by": changed_by,
+                    "created": now,
+                },
+            )
+            conn.execute(
                 sa.update(prompt_templates)
                 .where(prompt_templates.c.template_id == template_id)
-                .values(readonly=bool(readonly), updated=now)
+                .values(readonly=False, updated=now)
             )
             conn.commit()
-            return result.rowcount > 0
+            return next_version
 
     def delete_prompt_template(self, template_id: str) -> bool:
         with self._conn() as conn:

@@ -1254,13 +1254,19 @@ class StorageBackend(Protocol):
         """Update specified fields on a prompt template. Returns True if found."""
         ...
 
-    def set_skill_readonly(self, template_id: str, readonly: bool) -> bool:
-        """Toggle the readonly flag on a skill. Returns True if the row exists.
+    def unlock_skill(self, template_id: str, snapshot: str, changed_by: str) -> int | None:
+        """Atomically snapshot a readonly skill and flip ``readonly=False``.
 
-        Dedicated writer because ``readonly`` is intentionally absent from
-        :data:`SKILL_MUTABLE` — flipping provenance state is a deliberate
-        admin action (skill.unlock) that should not piggyback on the generic
-        update path.
+        Writes ``snapshot`` into ``skill_versions`` with the next sequential
+        version number, then sets ``readonly=False`` on the template row, all
+        in a single transaction so concurrent updates can't produce
+        ``(skill_id, version)`` collisions or a snapshot whose state is out of
+        sync with the row at the moment readonly is flipped.
+
+        Returns the assigned version number, or ``None`` if the template row
+        does not exist. ``readonly`` is intentionally absent from
+        :data:`SKILL_MUTABLE` — this dedicated writer is the only path for
+        flipping it (matching the ``set_mcp_oauth_client_secret_ct`` pattern).
         """
         ...
 
