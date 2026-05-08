@@ -220,6 +220,13 @@ def _classify_advisory(render_text: str) -> dict[str, str] | None:
             # notice rather than dropping the user's text.
             priority = "notice"
         body = render_text.split(_USER_INTERJECTION_BODY_MARKER, 1)[1]
+        # Suppress empty/whitespace-only advisories — ``queue_message``
+        # accepts any non-None text including ``""`` / ``"   "``, and a
+        # blank body would paint a featureless empty user bubble on
+        # replay.  Dropping at the classifier keeps the wire-shape
+        # contract uniform (no empty advisories ever ride the wire).
+        if not body.strip():
+            return None
         return {"type": "user_interjection", "text": body, "priority": priority}
     return None
 

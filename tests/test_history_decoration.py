@@ -340,6 +340,46 @@ class TestDecorateAdvisoryExtraction:
         assert adv["priority"] == "important"
         assert adv["text"] == "urgent"
 
+    def test_decorate_suppresses_empty_advisory_body(self) -> None:
+        """``queue_message`` doesn't reject empty / whitespace-only
+        text, so an advisory with an empty body can round-trip through
+        ``wrap_tool_result``.  ``_classify_advisory`` must filter those
+        out so replay doesn't paint a featureless empty user bubble.
+
+        Removing the ``if not body.strip(): return None`` guard in
+        ``_classify_advisory`` breaks this test."""
+        from turnstone.core.tool_advisory import UserInterjection, wrap_tool_result
+
+        wrapped = wrap_tool_result(
+            "tool body",
+            [UserInterjection(message="", priority="notice")],
+        )
+        messages: list[dict[str, object]] = [
+            {"role": "tool", "tool_call_id": "call_a", "content": wrapped},
+        ]
+        decorate_history_messages(messages, {}, {})
+        # Envelope is still stripped from content (the cleaning side
+        # of decoration runs unconditionally), but no advisories
+        # surface — the empty body is filtered.
+        assert messages[0]["content"] == "tool body"
+        assert "advisories" not in messages[0]
+
+    def test_decorate_suppresses_whitespace_only_advisory_body(self) -> None:
+        """Whitespace-only bodies are similarly suppressed — same
+        reasoning as the empty-body case."""
+        from turnstone.core.tool_advisory import UserInterjection, wrap_tool_result
+
+        wrapped = wrap_tool_result(
+            "tool body",
+            [UserInterjection(message="   \n\t  ", priority="notice")],
+        )
+        messages: list[dict[str, object]] = [
+            {"role": "tool", "tool_call_id": "call_a", "content": wrapped},
+        ]
+        decorate_history_messages(messages, {}, {})
+        assert messages[0]["content"] == "tool body"
+        assert "advisories" not in messages[0]
+
     def test_wrap_extract_round_trips_preexisting_entities(self) -> None:
         """A user message body containing literal HTML-entity references
         matching the wrapper-escape forms must round-trip identically
