@@ -1254,6 +1254,16 @@ class StorageBackend(Protocol):
         """Update specified fields on a prompt template. Returns True if found."""
         ...
 
+    def set_skill_readonly(self, template_id: str, readonly: bool) -> bool:
+        """Toggle the readonly flag on a skill. Returns True if the row exists.
+
+        Dedicated writer because ``readonly`` is intentionally absent from
+        :data:`SKILL_MUTABLE` — flipping provenance state is a deliberate
+        admin action (skill.unlock) that should not piggyback on the generic
+        update path.
+        """
+        ...
+
     def delete_prompt_template(self, template_id: str) -> bool:
         """Delete a prompt template. Returns True if found."""
         ...

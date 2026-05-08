@@ -7021,6 +7021,67 @@ async def admin_rescan_skill(request: Request) -> JSONResponse:
     )
 
 
+async def admin_unlock_skill(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/skills/{skill_id}/unlock — detach an installed skill from upstream.
+
+    Flips ``readonly`` False so spec fields and resources become editable. The
+    pre-unlock state is snapshotted into ``skill_versions`` so an operator can
+    diff against — or restore — what we got from the upstream source. ``origin``
+    stays ``"source"`` so the UI can still surface "modified from upstream"
+    against unlocked installs.
+    """
+    import json as _json
+
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.skills")
+    if err:
+        return err
+
+    skill_id = request.path_params["skill_id"]
+    existing = storage.get_prompt_template(skill_id)
+    if existing is None:
+        return JSONResponse({"error": "Skill not found"}, status_code=404)
+    if not existing.get("readonly"):
+        return JSONResponse({"error": "Skill is already unlocked"}, status_code=400)
+
+    audit_uid, ip = _audit_context(request)
+
+    existing_versions = storage.list_skill_versions(skill_id)
+    version_int = len(existing_versions) + 1
+    storage.create_skill_version(
+        skill_id=skill_id,
+        version=version_int,
+        snapshot=_json.dumps(existing, default=str),
+        changed_by=audit_uid,
+    )
+
+    storage.set_skill_readonly(skill_id, False)
+
+    record_audit(
+        storage,
+        audit_uid,
+        "skill.unlock",
+        "skill",
+        skill_id,
+        {
+            "name": existing.get("name", ""),
+            "source_url": existing.get("source_url", ""),
+            "origin": existing.get("origin", ""),
+        },
+        ip,
+    )
+
+    updated = storage.get_prompt_template(skill_id)
+    rc_map = storage.count_skill_resources_bulk([skill_id])
+    return JSONResponse(_skill_to_response(updated, resource_count=rc_map.get(skill_id, 0)))
+
+
 # ---------------------------------------------------------------------------
 # Admin: Skill Resources
 # ---------------------------------------------------------------------------
@@ -12314,6 +12375,11 @@ def create_app(
                     Route(
                         "/api/admin/skills/{skill_id}/rescan",
                         admin_rescan_skill,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/admin/skills/{skill_id}/unlock",
+                        admin_unlock_skill,
                         methods=["POST"],
                     ),
                     # Node metadata

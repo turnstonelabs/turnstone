@@ -2082,6 +2082,32 @@ textarea.skill-content-area {
   cursor: not-allowed;
   filter: none;
 }
+.modal-secondary {
+  flex: 1;
+  padding: 9px;
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  font: inherit;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.modal-secondary:hover {
+  background: var(--bg-highlight);
+}
+.modal-secondary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.modal-secondary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  pointer-events: none;
+}
 
 #create-user-overlay,
 #create-token-overlay,
@@ -3973,7 +3999,8 @@ textarea.skill-content-area {
   }
   .admin-action-btn,
   .modal-cancel,
-  .modal-submit {
+  .modal-submit,
+  .modal-secondary {
     transition: none;
   }
   .admin-modal input,

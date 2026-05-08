@@ -705,6 +705,7 @@ def api_client(api_storage):
         admin_create_skill,
         admin_delete_skill,
         admin_list_skills,
+        admin_unlock_skill,
         admin_update_skill,
     )
 
@@ -716,6 +717,11 @@ def api_client(api_storage):
                 Route("/api/admin/skills", admin_create_skill, methods=["POST"]),
                 Route("/api/admin/skills/{skill_id}", admin_update_skill, methods=["PUT"]),
                 Route("/api/admin/skills/{skill_id}", admin_delete_skill, methods=["DELETE"]),
+                Route(
+                    "/api/admin/skills/{skill_id}/unlock",
+                    admin_unlock_skill,
+                    methods=["POST"],
+                ),
             ],
         ),
     ]
@@ -1057,6 +1063,95 @@ class TestSkillAPI:
         )
         resp = api_client.delete("/v1/api/admin/skills/s1")
         assert resp.status_code == 200
+
+    def test_unlock_skill_flips_readonly(self, api_client, api_storage):
+        """POST /unlock on a readonly skill flips readonly to False."""
+        _create_template(
+            api_storage,
+            "s1",
+            "installed",
+            "upstream content",
+            origin="source",
+            source_url="https://skills.sh/skills/owner/repo/leaf",
+            readonly=True,
+        )
+
+        resp = api_client.post("/v1/api/admin/skills/s1/unlock")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["readonly"] is False
+        # Origin preserved so the UI can still surface "Customized from upstream".
+        assert data["origin"] == "source"
+        assert data["source_url"] == "https://skills.sh/skills/owner/repo/leaf"
+
+    def test_unlock_skill_persists(self, api_client, api_storage):
+        """Unlock side-effects survive a fresh load from storage."""
+        _create_template(api_storage, "s1", "installed", "x", origin="source", readonly=True)
+
+        api_client.post("/v1/api/admin/skills/s1/unlock")
+
+        row = api_storage.get_prompt_template("s1")
+        assert row is not None
+        assert bool(row["readonly"]) is False
+
+    def test_unlock_skill_snapshots_pre_unlock_state(self, api_client, api_storage):
+        """Pre-unlock skill state is snapshotted to skill_versions for rollback."""
+        _create_template(
+            api_storage, "s1", "installed", "upstream content", origin="source", readonly=True
+        )
+        assert api_storage.list_skill_versions("s1") == []
+
+        api_client.post("/v1/api/admin/skills/s1/unlock")
+
+        versions = api_storage.list_skill_versions("s1")
+        assert len(versions) == 1
+        assert versions[0]["version"] == 1
+
+    def test_unlock_skill_already_unlocked(self, api_client, api_storage):
+        """Unlocking an already-unlocked skill returns 400."""
+        _create_template(api_storage, "s1", "local", "content", origin="manual", readonly=False)
+
+        resp = api_client.post("/v1/api/admin/skills/s1/unlock")
+
+        assert resp.status_code == 400
+        assert "already unlocked" in resp.json()["error"].lower()
+
+    def test_unlock_skill_not_found(self, api_client):
+        """Unlocking a nonexistent skill returns 404."""
+        resp = api_client.post("/v1/api/admin/skills/missing/unlock")
+        assert resp.status_code == 404
+
+    def test_unlock_then_edit_spec_fields_succeeds(self, api_client, api_storage):
+        """After unlock, PUT can edit spec fields the readonly gate previously rejected."""
+        _create_template(
+            api_storage,
+            "s1",
+            "installed",
+            "upstream content",
+            description="upstream description",
+            origin="source",
+            readonly=True,
+        )
+
+        api_client.post("/v1/api/admin/skills/s1/unlock")
+
+        resp = api_client.put(
+            "/v1/api/admin/skills/s1",
+            json={
+                "name": "customized",
+                "content": "tuned content",
+                "description": "tuned description",
+            },
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["name"] == "customized"
+        assert data["content"] == "tuned content"
+        assert data["description"] == "tuned description"
+        # Origin still records that this came from upstream.
+        assert data["origin"] == "source"
 
     def test_skill_field_on_workstream_create(self, api_storage):
         """Console workstream creation accepts 'skill' field in request body."""

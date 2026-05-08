@@ -1414,6 +1414,10 @@ function showEditTemplateModal(tmplId) {
 
   // --- Readonly mode for imported skills ---
   var isReadonly = tmpl.readonly || false;
+  // An unlocked install retains origin="source" — combined with !readonly it
+  // means the operator detached the skill from upstream and may have edits.
+  var isUnlockedInstall =
+    !isReadonly && tmpl.origin && tmpl.origin === "source";
   var editTitle = document.getElementById("edit-template-title");
   if (editTitle)
     editTitle.textContent = isReadonly ? "View Skill" : "Edit Skill";
@@ -1426,9 +1430,21 @@ function showEditTemplateModal(tmplId) {
     } else if (isReadonly && tmpl.origin && tmpl.origin !== "manual") {
       originBadge.textContent = "Installed skill";
       originBadge.style.display = "inline-flex";
+    } else if (isUnlockedInstall && tmpl.source_url) {
+      originBadge.textContent = "Customized from  " + tmpl.source_url;
+      originBadge.style.display = "inline-flex";
+    } else if (isUnlockedInstall) {
+      originBadge.textContent = "Customized from upstream";
+      originBadge.style.display = "inline-flex";
     } else {
       originBadge.style.display = "none";
     }
+  }
+  var unlockBtn = document.getElementById("etm-unlock");
+  if (unlockBtn) {
+    unlockBtn.style.display = isReadonly ? "" : "none";
+    unlockBtn.dataset.skillId = tmplId;
+    unlockBtn.dataset.skillName = tmpl.name || "";
   }
   var submitBtn = document.getElementById("etm-submit");
   if (submitBtn) {
@@ -1499,6 +1515,47 @@ function hideEditTemplateModal() {
     _etmTriggerEl.focus();
   }
   _etmTriggerEl = null;
+}
+
+function unlockSkill() {
+  var btn = document.getElementById("etm-unlock");
+  if (!btn) return;
+  var skillId = btn.dataset.skillId;
+  var skillName = btn.dataset.skillName || "this skill";
+  if (!skillId) return;
+  var ok = window.confirm(
+    "Customize " +
+      skillName +
+      "?\n\nThis detaches the skill from its upstream source so you can edit content, description, and resources locally. The pre-customization state is saved to the skill's version history — you can review it from the History tab.\n\nUpstream updates will not flow into this skill after customization.",
+  );
+  if (!ok) return;
+  btn.disabled = true;
+  var prevText = btn.textContent;
+  btn.textContent = "Customizing…";
+  authFetch("/v1/api/admin/skills/" + skillId + "/unlock", {
+    method: "POST",
+  })
+    .then(function (r) {
+      if (!r.ok) {
+        return r.json().then(function (data) {
+          throw new Error((data && data.error) || "Unlock failed");
+        });
+      }
+      return r.json();
+    })
+    .then(function () {
+      showToast("Skill unlocked");
+      hideEditTemplateModal();
+      loadGovSkills();
+      showEditTemplateModal(skillId);
+    })
+    .catch(function (e) {
+      showToast(e.message || "Unlock failed");
+    })
+    .finally(function () {
+      btn.disabled = false;
+      btn.textContent = prevText;
+    });
 }
 
 // ---------------------------------------------------------------------------
