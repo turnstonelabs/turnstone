@@ -383,7 +383,7 @@ prompt_templates = sa.Table(
     sa.Column("max_tokens", sa.Integer, nullable=True),
     sa.Column("token_budget", sa.Integer, nullable=False, server_default="0"),
     sa.Column("agent_max_turns", sa.Integer, nullable=True),
-    sa.Column("notify_on_complete", sa.Text, nullable=False, server_default="{}"),
+    sa.Column("notify_on_complete", sa.Text, nullable=False, server_default="[]"),
     sa.Column("enabled", sa.Integer, nullable=False, server_default="1"),
     sa.Column("priority", sa.Integer, nullable=False, server_default="0"),
     sa.Column("created", sa.Text, nullable=False),

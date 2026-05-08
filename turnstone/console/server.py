@@ -6335,13 +6335,22 @@ def _parse_skill_session_config(body: dict[str, Any]) -> tuple[dict[str, Any], J
         fields["activation"] = activation
 
     if "notify_on_complete" in body:
-        nc = str(body.get("notify_on_complete", "{}")).strip()
-        if nc and nc != "{}":
+        nc = str(body.get("notify_on_complete", "[]")).strip()
+        # Tolerate the legacy ``"{}"`` sentinel inherited from migrations
+        # 011/021's server_default — older rows that haven't been touched
+        # by migration 051 yet may still carry it. Treat as empty.
+        if nc == "{}":
+            nc = "[]"
+        if nc and nc != "[]":
             try:
-                _json.loads(nc)
+                parsed = _json.loads(nc)
             except (_json.JSONDecodeError, TypeError):
                 return {}, JSONResponse(
                     {"error": "notify_on_complete must be valid JSON"}, status_code=400
+                )
+            if not isinstance(parsed, list):
+                return {}, JSONResponse(
+                    {"error": "notify_on_complete must be a JSON array"}, status_code=400
                 )
         fields["notify_on_complete"] = nc
 
@@ -6396,7 +6405,13 @@ def _skill_to_response(r: dict[str, Any], resource_count: int = 0) -> dict[str, 
         "max_tokens": r.get("max_tokens"),
         "token_budget": r.get("token_budget", 0),
         "agent_max_turns": r.get("agent_max_turns"),
-        "notify_on_complete": r.get("notify_on_complete", "{}"),
+        # Coerce the legacy ``"{}"`` sentinel from rows pre-migration 051;
+        # the field is contractually a JSON-array string everywhere else.
+        "notify_on_complete": (
+            "[]"
+            if (r.get("notify_on_complete") or "[]") == "{}"
+            else r.get("notify_on_complete", "[]")
+        ),
         "enabled": r.get("enabled", True),
         "priority": r.get("priority", 0),
         "allowed_tools": r.get("allowed_tools", "[]"),

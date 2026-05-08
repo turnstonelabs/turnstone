@@ -319,7 +319,7 @@ class SkillInfo(BaseModel):
     max_tokens: int | None = None
     token_budget: int = 0
     agent_max_turns: int | None = None
-    notify_on_complete: str = "{}"
+    notify_on_complete: str = "[]"
     enabled: bool = True
     priority: int = 0
     allowed_tools: str = "[]"
@@ -362,7 +362,7 @@ class CreateSkillRequest(BaseModel):
     max_tokens: int | None = None
     token_budget: int = 0
     agent_max_turns: int | None = None
-    notify_on_complete: str = "{}"
+    notify_on_complete: str = "[]"
     enabled: bool = True
     priority: int = 0
     allowed_tools: str = "[]"

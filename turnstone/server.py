@@ -2134,7 +2134,7 @@ async def _interactive_create_post_install(
                 # surprising) skill-template path from a deliberate
                 # operator "Approve + Always" click.
                 ws.ui._auto_approve_tools_source = {t: AutoApproveReason.SKILL for t in tools_list}
-        sess._notify_on_complete = skill_data.get("notify_on_complete", "{}")
+        sess._notify_on_complete = skill_data.get("notify_on_complete", "[]")
         sess._applied_skill_id = skill_data["template_id"]
         sess._applied_skill_version = applied_skill_version
         if skill_data.get("content"):
