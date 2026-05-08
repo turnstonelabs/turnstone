@@ -79,10 +79,10 @@ def save_messages_bulk(rows: list[dict[str, Any]]) -> None:
         log.warning("Failed to bulk-save %d messages", len(rows), exc_info=True)
 
 
-def load_messages(ws_id: str) -> list[dict[str, Any]]:
+def load_messages(ws_id: str, *, repair: bool = True) -> list[dict[str, Any]]:
     """Load messages for a workstream and reconstruct OpenAI message format."""
     try:
-        return get_storage().load_messages(ws_id)
+        return get_storage().load_messages(ws_id, repair=repair)
     except Exception:
         log.warning("Failed to load messages for ws=%s", ws_id, exc_info=True)
         return []

@@ -2269,7 +2269,10 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
         messages: list[dict[str, Any]] = []
         if storage is not None:
             try:
-                messages = await asyncio.to_thread(storage.load_messages, ws_id, limit=limit)
+                # repair=False — display read; see reconstruct_messages docstring.
+                messages = await asyncio.to_thread(
+                    storage.load_messages, ws_id, limit=limit, repair=False
+                )
             except Exception:
                 log.debug("ws.history.load_failed ws=%s", ws_id[:8], exc_info=True)
         # Audit-trail decoration — attach persisted intent_verdict and

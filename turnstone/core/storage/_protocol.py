@@ -162,7 +162,9 @@ class StorageBackend(Protocol):
         """
         ...
 
-    def load_messages(self, ws_id: str, *, limit: int | None = None) -> list[dict[str, Any]]:
+    def load_messages(
+        self, ws_id: str, *, limit: int | None = None, repair: bool = True
+    ) -> list[dict[str, Any]]:
         """Load messages for a workstream and reconstruct OpenAI message format.
 
         ``limit`` caps the number of underlying conversation rows fetched
@@ -172,6 +174,15 @@ class StorageBackend(Protocol):
         entries than ``limit`` when a tool-call group splits across the
         boundary; callers that need strict tail-N semantics must slice
         again client-side.  Default ``None`` fetches the full history.
+
+        ``repair`` (default True) post-processes the result into a
+        wire-shape valid for an LLM round-trip — drops a trailing
+        ``assistant(tool_calls)`` whose results aren't all present and
+        fills mid-conversation orphans with synthetic cancellation
+        results.  Display-only readers (``/history`` REST) should pass
+        ``repair=False`` so the user sees the actual partial state
+        instead of having the trailing turn silently stripped during
+        live tool execution.
         """
         ...
 

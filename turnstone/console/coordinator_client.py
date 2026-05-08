@@ -1488,12 +1488,17 @@ class CoordinatorClient:
         is_own_child = full.get("parent_ws_id") == self._coord_ws_id
         if not (is_self or is_own_child):
             return miss
-        # load_messages returns the full history in chronological order
-        # (no limit param in the Protocol) — slice the tail here.  Defensive
+        # load_messages returns the full history in chronological order.
+        # We slice the tail in Python because the SQL tail-N is
+        # approximate across conversation boundaries.  Defensive
         # try/except: storage errors should not break inspect.
         messages: list[Any] = []
         try:
-            all_msgs = self._storage.load_messages(ws_id)
+            # repair=False — inspect is a display read (admin viewing a
+            # child's history in the tree UI).  The LLM-context repair
+            # pass would strip trailing partial turns the operator is
+            # watching.
+            all_msgs = self._storage.load_messages(ws_id, repair=False)
             if message_limit and message_limit > 0:
                 messages = all_msgs[-message_limit:]
             else:
@@ -1725,7 +1730,11 @@ def _last_assistant_text(storage: Any, ws_id: str) -> str | None:
     in just to surface its final turn.
     """
     try:
-        rows = storage.load_messages(ws_id, limit=_WAIT_MESSAGE_TAIL_LIMIT)
+        # repair=False — this reads the tail for display ("waiting on" bubble).
+        # The repair pass would strip a trailing partial assistant turn,
+        # making us return the penultimate assistant message instead of the
+        # one the operator is watching.
+        rows = storage.load_messages(ws_id, limit=_WAIT_MESSAGE_TAIL_LIMIT, repair=False)
     except Exception:
         log.debug("coord_client.wait.load_messages_failed ws=%s", ws_id, exc_info=True)
         return None

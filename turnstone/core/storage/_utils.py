@@ -286,6 +286,8 @@ def reconstruct_messages(
     rows: list[Any],
     ws_id: str,
     attachments_by_msg: dict[int, list[dict[str, Any]]] | None = None,
+    *,
+    repair: bool = True,
 ) -> list[dict[str, Any]]:
     """Reconstruct OpenAI message format from stored conversation rows.
 
@@ -299,6 +301,17 @@ def reconstruct_messages(
     When ``attachments_by_msg`` is provided, any user row whose id has
     attachments is rebuilt with multipart list content (text +
     image_url/document parts).
+
+    When ``repair`` is True (default) the result is post-processed to
+    produce a wire-shape valid for an LLM round-trip: the trailing
+    ``assistant(tool_calls)`` turn is dropped if not all tool_call ids
+    have a matching tool result, and any mid-conversation orphaned
+    tool_calls are filled with synthetic cancellation results.  Callers
+    that consume the messages as LLM context (e.g. ``session.resume``)
+    must keep this on.  Callers reading for *display* (the ``/history``
+    REST endpoint) should pass ``repair=False`` so the user sees the
+    actual partial state — refreshing during tool execution otherwise
+    silently drops the trailing turn from the UI.
     """
     messages: list[dict[str, Any]] = []
     for row in rows:
@@ -373,6 +386,12 @@ def reconstruct_messages(
                 with contextlib.suppress(json.JSONDecodeError, TypeError):
                     tmsg["_reminders"] = json.loads(reminders_json)
             messages.append(tmsg)
+
+    if not repair:
+        # Both passes below are LLM-context corrections — trailing-turn
+        # strip and orphan synthesis.  Display callers want neither; see
+        # the reconstruct_messages docstring.
+        return messages
 
     # Repair: strip trailing incomplete tool call turns
     while messages:
