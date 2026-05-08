@@ -703,6 +703,13 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "Re-scan a skill for security signals",
         tags=["Admin"],
     ),
+    EndpointSpec(
+        "/v1/api/admin/skills/{skill_id}/unlock",
+        "POST",
+        "Unlock a readonly (installed) skill so spec fields and resources can be edited",
+        error_codes=[400, 404],
+        tags=["Admin"],
+    ),
     # --- Governance: Skill Resources ---
     EndpointSpec(
         "/v1/api/admin/skills/{skill_id}/resources",
