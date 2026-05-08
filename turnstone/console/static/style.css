@@ -2028,6 +2028,16 @@ textarea.skill-content-area {
   .skill-config-grid {
     grid-template-columns: 1fr 1fr;
   }
+  /* Touch target: 44×44 minimum on mobile (WCAG 2.5.5 / Apple HIG). */
+  .skill-lock-btn {
+    width: 44px;
+    height: 44px;
+    top: 8px;
+    right: 8px;
+  }
+  .admin-modal-skill > h2 {
+    padding-right: 56px;
+  }
 }
 
 .modal-buttons {
@@ -2096,7 +2106,9 @@ textarea.skill-content-area {
    button class. */
 .skill-lock-btn {
   position: absolute;
-  top: 14px;
+  /* top: 18px (not 14px) so the button drops below the modal's accent-line
+     decoration's visual zone instead of competing with it horizontally. */
+  top: 18px;
   right: 14px;
   width: 32px;
   height: 32px;
