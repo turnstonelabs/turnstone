@@ -6336,12 +6336,14 @@ def _parse_skill_session_config(body: dict[str, Any]) -> tuple[dict[str, Any], J
 
     if "notify_on_complete" in body:
         nc = str(body.get("notify_on_complete", "[]")).strip()
-        # Tolerate the legacy ``"{}"`` sentinel inherited from migrations
-        # 011/021's server_default — older rows that haven't been touched
-        # by migration 051 yet may still carry it. Treat as empty.
-        if nc == "{}":
+        # Normalise empty/whitespace and the legacy ``"{}"`` sentinel
+        # (inherited from migrations 011/021's server_default — older rows
+        # that haven't been touched by migration 051 may still carry it)
+        # to the canonical empty-array literal so a blank field can never
+        # bypass validation and persist a non-JSON value.
+        if not nc or nc == "{}":
             nc = "[]"
-        if nc and nc != "[]":
+        if nc != "[]":
             try:
                 parsed = _json.loads(nc)
             except (_json.JSONDecodeError, TypeError):
