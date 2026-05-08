@@ -1855,6 +1855,11 @@
 .admin-modal-skill {
   padding: 28px 28px 24px;
 }
+/* Reserve space for the absolute-positioned lock button (top-right) so a
+   long title can never collide with it. */
+.admin-modal-skill > h2 {
+  padding-right: 44px;
+}
 
 .skill-spec-body {
   display: grid;
@@ -2085,36 +2090,46 @@ textarea.skill-content-area {
   cursor: not-allowed;
   filter: none;
 }
-.modal-secondary {
-  /* Sized to content so the primary action (Save) keeps a stable footprint
-     whether or not Customize is rendered. The spacer below pushes Save right. */
-  padding: 9px 14px;
+/* Lock-icon affordance in the top-right of an installed (readonly) skill's
+   edit modal — clicking detaches the skill from upstream so spec fields
+   become editable. Reserved for the modal it lives in; not a generic
+   button class. */
+.skill-lock-btn {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
   background: transparent;
   color: var(--fg);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
-  font: inherit;
-  font-family: var(--font-ui);
-  font-size: 12px;
-  font-weight: 500;
+  font-size: 14px;
+  /* Render the lock glyph as text where supported (keeps the monochrome
+     instrument-panel aesthetic instead of a coloured emoji). Browsers
+     that don't support font-variant-emoji fall back gracefully. */
+  font-variant-emoji: text;
   cursor: pointer;
-  transition: background 0.15s;
+  transition: background 0.15s, border-color 0.15s;
+  z-index: 2;
 }
-.modal-secondary:hover {
+.skill-lock-btn:hover {
   background: var(--bg-highlight);
+  border-color: var(--accent);
+  color: var(--accent);
 }
-.modal-secondary:focus-visible {
+.skill-lock-btn:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
-.modal-secondary:disabled {
+.skill-lock-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
   pointer-events: none;
-}
-.modal-buttons-spacer {
-  flex: 1;
-  min-width: 0;
 }
 
 #create-user-overlay,
@@ -2154,6 +2169,14 @@ textarea.skill-content-area {
   align-items: center;
   justify-content: center;
   z-index: 600;
+}
+/* Confirm dialogs are launched FROM other overlays (e.g. unlock-skill from
+   the edit-template modal). They share z-index 600, so DOM order picks the
+   winner — and confirm-overlay is earlier in the DOM, so it would render
+   underneath. Bump it above the per-feature overlays but keep it below
+   toasts (z-index 700). */
+#confirm-overlay {
+  z-index: 650;
 }
 
 /* Token display (show-once) */
@@ -4008,7 +4031,7 @@ textarea.skill-content-area {
   .admin-action-btn,
   .modal-cancel,
   .modal-submit,
-  .modal-secondary {
+  .skill-lock-btn {
     transition: none;
   }
   .admin-modal input,

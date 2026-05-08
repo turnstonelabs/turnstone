@@ -3298,6 +3298,17 @@
         class="admin-modal admin-modal-wide admin-modal-skill"
       >
         <h2 id="edit-template-title">Edit Skill</h2>
+        <button
+          id="etm-lock-btn"
+          class="skill-lock-btn"
+          type="button"
+          style="display: none"
+          onclick="unlockSkill()"
+          aria-label="Customize skill (detach from upstream and unlock editing)"
+          title="Customize — detach from upstream and unlock editing"
+        >
+          <span aria-hidden="true">🔒</span>
+        </button>
         <div
           id="etm-origin-badge"
           class="skill-origin-badge"
@@ -3579,15 +3590,6 @@
           <button class="modal-cancel" onclick="hideEditTemplateModal()">
             Cancel
           </button>
-          <button
-            id="etm-unlock"
-            class="modal-secondary"
-            style="display: none"
-            onclick="unlockSkill()"
-          >
-            Customize…
-          </button>
-          <span class="modal-buttons-spacer" aria-hidden="true"></span>
           <button
             id="etm-submit"
             class="modal-submit"
