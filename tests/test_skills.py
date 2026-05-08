@@ -1108,6 +1108,28 @@ class TestSkillAPI:
         assert len(versions) == 1
         assert versions[0]["version"] == 1
 
+    def test_unlock_skill_versions_after_existing_history(self, api_client, api_storage):
+        """Unlock picks the next version number based on max(version), not list length.
+
+        Defends against regressions where len(list)+1 racing with a concurrent
+        update could produce a (skill_id, version) collision. Seeds an
+        out-of-order version (3) and verifies unlock chooses 4, not 2.
+        """
+        import json as _json
+
+        _create_template(
+            api_storage, "s1", "installed", "v0 content", origin="source", readonly=True
+        )
+        api_storage.create_skill_version(
+            skill_id="s1", version=3, snapshot=_json.dumps({"v": 3}), changed_by="prior"
+        )
+
+        resp = api_client.post("/v1/api/admin/skills/s1/unlock")
+        assert resp.status_code == 200
+
+        versions = sorted(api_storage.list_skill_versions("s1"), key=lambda v: v["version"])
+        assert [v["version"] for v in versions] == [3, 4]
+
     def test_unlock_skill_already_unlocked(self, api_client, api_storage):
         """Unlocking an already-unlocked skill returns 400."""
         _create_template(api_storage, "s1", "local", "content", origin="manual", readonly=False)

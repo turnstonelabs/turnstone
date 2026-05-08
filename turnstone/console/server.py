@@ -7052,16 +7052,12 @@ async def admin_unlock_skill(request: Request) -> JSONResponse:
 
     audit_uid, ip = _audit_context(request)
 
-    existing_versions = storage.list_skill_versions(skill_id)
-    version_int = len(existing_versions) + 1
-    storage.create_skill_version(
-        skill_id=skill_id,
-        version=version_int,
-        snapshot=_json.dumps(existing, default=str),
-        changed_by=audit_uid,
-    )
-
-    storage.set_skill_readonly(skill_id, False)
+    snapshot = _json.dumps(existing, default=str)
+    version_int = storage.unlock_skill(skill_id, snapshot, audit_uid)
+    if version_int is None:
+        # Row vanished between the existence check and the atomic unlock —
+        # treat as 404 rather than 500.
+        return JSONResponse({"error": "Skill not found"}, status_code=404)
 
     record_audit(
         storage,
@@ -7070,14 +7066,17 @@ async def admin_unlock_skill(request: Request) -> JSONResponse:
         "skill",
         skill_id,
         {
-            "name": existing.get("name", ""),
-            "source_url": existing.get("source_url", ""),
-            "origin": existing.get("origin", ""),
+            "name": existing.get("name") or "",
+            "source_url": existing.get("source_url") or "",
+            "origin": existing.get("origin") or "",
+            "snapshot_version": version_int,
         },
         ip,
     )
 
     updated = storage.get_prompt_template(skill_id)
+    if updated is None:
+        return JSONResponse({"error": "Skill not found"}, status_code=404)
     rc_map = storage.count_skill_resources_bulk([skill_id])
     return JSONResponse(_skill_to_response(updated, resource_count=rc_map.get(skill_id, 0)))
 

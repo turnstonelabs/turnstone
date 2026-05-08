@@ -2074,6 +2074,9 @@ textarea.skill-content-area {
   filter: brightness(1.1);
 }
 .modal-submit:focus-visible {
+  /* fg-bright (not accent) — modal-submit has an accent background, so
+     accent-on-accent would be invisible. Cancel/secondary use --accent
+     because their backgrounds are transparent / highlight. */
   outline: 2px solid var(--fg-bright);
   outline-offset: 2px;
 }
@@ -2083,8 +2086,9 @@ textarea.skill-content-area {
   filter: none;
 }
 .modal-secondary {
-  flex: 1;
-  padding: 9px;
+  /* Sized to content so the primary action (Save) keeps a stable footprint
+     whether or not Customize is rendered. The spacer below pushes Save right. */
+  padding: 9px 14px;
   background: transparent;
   color: var(--fg);
   border: 1px solid var(--border-strong);
@@ -2107,6 +2111,10 @@ textarea.skill-content-area {
   opacity: 0.5;
   cursor: not-allowed;
   pointer-events: none;
+}
+.modal-buttons-spacer {
+  flex: 1;
+  min-width: 0;
 }
 
 #create-user-overlay,

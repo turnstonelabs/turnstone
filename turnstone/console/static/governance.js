@@ -664,7 +664,7 @@ function submitEditPolicy() {
 // ---------------------------------------------------------------------------
 
 function loadGovSkills() {
-  authFetch("/v1/api/admin/skills")
+  return authFetch("/v1/api/admin/skills")
     .then(function (r) {
       if (!r.ok) throw new Error("Failed");
       return r.json();
@@ -1248,7 +1248,14 @@ function submitCreateTemplate() {
 }
 
 function showEditTemplateModal(tmplId) {
-  _etmTriggerEl = document.activeElement;
+  var ov = document.getElementById("edit-template-overlay");
+  // When called against an already-open modal (e.g. mutate-in-place after
+  // unlock), preserve the original trigger so focus restores to the row
+  // launcher on close, and don't reinstall the focus trap.
+  var alreadyOpen = ov && ov.style.display === "flex";
+  if (!alreadyOpen) {
+    _etmTriggerEl = document.activeElement;
+  }
   var tmpl = null;
   for (var i = 0; i < _govSkills.length; i++) {
     if (_govSkills[i].template_id === tmplId) {
@@ -1257,7 +1264,6 @@ function showEditTemplateModal(tmplId) {
     }
   }
   if (!tmpl) return;
-  var ov = document.getElementById("edit-template-overlay");
   ov.style.display = "flex";
   document.getElementById("etm-id").value = tmplId;
   document.getElementById("etm-name").value = tmpl.name;
@@ -1431,7 +1437,7 @@ function showEditTemplateModal(tmplId) {
       originBadge.textContent = "Installed skill";
       originBadge.style.display = "inline-flex";
     } else if (isUnlockedInstall && tmpl.source_url) {
-      originBadge.textContent = "Customized from  " + tmpl.source_url;
+      originBadge.textContent = "Customized from \u00a0" + tmpl.source_url;
       originBadge.style.display = "inline-flex";
     } else if (isUnlockedInstall) {
       originBadge.textContent = "Customized from upstream";
@@ -1451,7 +1457,9 @@ function showEditTemplateModal(tmplId) {
     submitBtn.style.display = "";
     submitBtn.textContent = isReadonly ? "Save Config" : "Save";
   }
-  // Spec/content fields: locked for installed skills (preserve source fidelity)
+  // Spec/content fields: locked for installed skills (preserve source fidelity).
+  // Point screen readers at the origin badge so the "why is this disabled?"
+  // affordance sighted users see is also announced.
   [
     "etm-name",
     "etm-category",
@@ -1466,7 +1474,13 @@ function showEditTemplateModal(tmplId) {
     "etm-default",
   ].forEach(function (id) {
     var el = document.getElementById(id);
-    if (el) el.disabled = isReadonly;
+    if (!el) return;
+    el.disabled = isReadonly;
+    if (isReadonly) {
+      el.setAttribute("aria-describedby", "etm-origin-badge");
+    } else {
+      el.removeAttribute("aria-describedby");
+    }
   });
   // Runtime config fields: always editable (local settings, not part of SKILL.md spec)
   [
@@ -1499,12 +1513,18 @@ function showEditTemplateModal(tmplId) {
   if (resSection) {
     _loadSkillResources(tmplId, isReadonly);
   }
-  _etmTrapHandler = _installTrap("edit-template-overlay", "edit-template-box");
-  // Focus management
-  if (isReadonly) {
-    if (cancelBtn) cancelBtn.focus();
-  } else {
-    document.getElementById("etm-name").focus();
+  if (!alreadyOpen) {
+    _etmTrapHandler = _installTrap(
+      "edit-template-overlay",
+      "edit-template-box",
+    );
+    // Focus management — only on the initial open. Re-renders preserve
+    // wherever focus was so a screen reader doesn't get a transition.
+    if (isReadonly) {
+      if (cancelBtn) cancelBtn.focus();
+    } else {
+      document.getElementById("etm-name").focus();
+    }
   }
 }
 
@@ -1523,15 +1543,25 @@ function unlockSkill() {
   var skillId = btn.dataset.skillId;
   var skillName = btn.dataset.skillName || "this skill";
   if (!skillId) return;
-  var ok = window.confirm(
-    "Customize " +
-      skillName +
-      "?\n\nThis detaches the skill from its upstream source so you can edit content, description, and resources locally. The pre-customization state is saved to the skill's version history — you can review it from the History tab.\n\nUpstream updates will not flow into this skill after customization.",
+  showConfirmModal(
+    "Customize " + skillName + "?",
+    "This detaches the skill from its upstream source so you can edit " +
+      "content, description, and resources locally. The current version is " +
+      "saved to History — you can revert from there. Future updates from " +
+      "the upstream source will not be applied.",
+    "Customize",
+    function () {
+      _performUnlockSkill(skillId);
+    },
   );
-  if (!ok) return;
-  btn.disabled = true;
-  var prevText = btn.textContent;
-  btn.textContent = "Customizing…";
+}
+
+function _performUnlockSkill(skillId) {
+  var btn = document.getElementById("etm-unlock");
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Customizing…";
+  }
   authFetch("/v1/api/admin/skills/" + skillId + "/unlock", {
     method: "POST",
   })
@@ -1544,17 +1574,21 @@ function unlockSkill() {
       return r.json();
     })
     .then(function () {
-      showToast("Skill unlocked");
-      hideEditTemplateModal();
-      loadGovSkills();
-      showEditTemplateModal(skillId);
+      showToast("Skill unlocked — fields are now editable");
+      // Refresh the cached list, then re-render the open modal in place from
+      // the fresh row. No close/reopen → no flicker, no focus bounce.
+      return loadGovSkills().then(function () {
+        showEditTemplateModal(skillId);
+      });
     })
     .catch(function (e) {
       showToast(e.message || "Unlock failed");
     })
     .finally(function () {
-      btn.disabled = false;
-      btn.textContent = prevText;
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "Customize…";
+      }
     });
 }
 
