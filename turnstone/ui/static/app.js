@@ -90,6 +90,17 @@ Pane.prototype._createDOM = function () {
   var actions = document.createElement("div");
   actions.className = "pane-actions";
 
+  var dashBtn = document.createElement("button");
+  dashBtn.className = "pane-action-btn";
+  dashBtn.title = "Back to dashboard";
+  dashBtn.setAttribute("aria-label", "Back to dashboard");
+  dashBtn.textContent = "\u2190";
+  dashBtn.onclick = function (e) {
+    e.stopPropagation();
+    showDashboard();
+  };
+  actions.appendChild(dashBtn);
+
   var splitRightBtn = document.createElement("button");
   splitRightBtn.className = "pane-action-btn";
   splitRightBtn.title = "Split right";
