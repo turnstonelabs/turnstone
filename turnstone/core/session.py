@@ -822,7 +822,7 @@ class ChatSession:
         self._token_budget: int = 0
         self._budget_warned: bool = False
         self._budget_exhausted: bool = False
-        self._notify_on_complete: str = "{}"
+        self._notify_on_complete: str = "[]"
         self._applied_skill_id: str = ""
         self._applied_skill_version: int = 0
         self._applied_skill_content: str = ""  # inline prompt from applied skill
