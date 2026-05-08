@@ -1072,7 +1072,9 @@ function showCreateTemplateModal() {
   document.getElementById("csk-auto-approve").onchange = function () {
     document.getElementById("csk-allowed-tools").disabled = this.checked;
   };
-  document.getElementById("create-template-error").style.display = "none";
+  document
+    .getElementById("create-template-error")
+    .classList.remove("is-visible");
   // Clear resource list
   _pendingResources = [];
   _renderPendingResources();
@@ -1115,7 +1117,7 @@ function submitCreateTemplate() {
   if (!name || !content) {
     var e = document.getElementById("create-template-error");
     e.textContent = "Name and content are required";
-    e.style.display = "";
+    e.classList.add("is-visible");
     return;
   }
   var varList = _detectTemplateVars(content);
@@ -1157,7 +1159,7 @@ function submitCreateTemplate() {
     } catch (ne) {
       var ne2 = document.getElementById("create-template-error");
       ne2.textContent = "Notify on completion: " + ne.message;
-      ne2.style.display = "";
+      ne2.classList.add("is-visible");
       return;
     }
   }
@@ -1240,7 +1242,7 @@ function submitCreateTemplate() {
     .catch(function (e) {
       var el = document.getElementById("create-template-error");
       el.textContent = e.message;
-      el.style.display = "";
+      el.classList.add("is-visible");
     })
     .finally(function () {
       document.getElementById("ctm-submit").disabled = false;
@@ -1322,7 +1324,9 @@ function showEditTemplateModal(tmplId) {
   document.getElementById("esk-auto-approve").onchange = function () {
     document.getElementById("esk-allowed-tools").disabled = this.checked;
   };
-  document.getElementById("edit-template-error").style.display = "none";
+  // The CSS contract for .admin-modal [role="alert"] is hide-by-default,
+  // .is-visible to show — so toggling style.display does nothing here.
+  document.getElementById("edit-template-error").classList.remove("is-visible");
   // Scan report section
   var scanSection = document.getElementById("etm-scan-section");
   if (scanSection) {
@@ -1883,7 +1887,7 @@ function submitEditTemplate() {
     } catch (ne) {
       var ne3 = document.getElementById("edit-template-error");
       ne3.textContent = "Notify on completion: " + ne.message;
-      ne3.style.display = "";
+      ne3.classList.add("is-visible");
       return;
     }
   }
@@ -1937,7 +1941,7 @@ function submitEditTemplate() {
     .catch(function (e) {
       var el = document.getElementById("edit-template-error");
       el.textContent = e.message;
-      el.style.display = "";
+      el.classList.add("is-visible");
     })
     .finally(function () {
       document.getElementById("etm-submit").disabled = false;
