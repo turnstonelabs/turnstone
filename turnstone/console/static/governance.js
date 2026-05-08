@@ -1446,16 +1446,23 @@ function showEditTemplateModal(tmplId) {
       originBadge.style.display = "none";
     }
   }
-  var unlockBtn = document.getElementById("etm-unlock");
-  if (unlockBtn) {
-    unlockBtn.style.display = isReadonly ? "" : "none";
-    unlockBtn.dataset.skillId = tmplId;
-    unlockBtn.dataset.skillName = tmpl.name || "";
+  var lockBtn = document.getElementById("etm-lock-btn");
+  if (lockBtn) {
+    // Inline-flex (not "") so display: none doesn't bleed into a
+    // browser-default block reflow on re-show.
+    lockBtn.style.display = isReadonly ? "inline-flex" : "none";
+    lockBtn.dataset.skillId = tmplId;
+    lockBtn.dataset.skillName = tmpl.name || "";
   }
   var submitBtn = document.getElementById("etm-submit");
   if (submitBtn) {
     submitBtn.style.display = "";
     submitBtn.textContent = isReadonly ? "Save Config" : "Save";
+    // Always reset to enabled — submitEditTemplate disables this on click
+    // and re-enables in .finally, but a stale disabled=true survives a
+    // mutate-in-place re-render (e.g. after unlock) and would leave the
+    // button non-functional otherwise.
+    submitBtn.disabled = false;
   }
   // Spec/content fields: locked for installed skills (preserve source fidelity).
   // Point screen readers at the origin badge so the "why is this disabled?"
@@ -1538,7 +1545,7 @@ function hideEditTemplateModal() {
 }
 
 function unlockSkill() {
-  var btn = document.getElementById("etm-unlock");
+  var btn = document.getElementById("etm-lock-btn");
   if (!btn) return;
   var skillId = btn.dataset.skillId;
   var skillName = btn.dataset.skillName || "this skill";
@@ -1557,11 +1564,8 @@ function unlockSkill() {
 }
 
 function _performUnlockSkill(skillId) {
-  var btn = document.getElementById("etm-unlock");
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = "Customizing…";
-  }
+  var btn = document.getElementById("etm-lock-btn");
+  if (btn) btn.disabled = true;
   authFetch("/v1/api/admin/skills/" + skillId + "/unlock", {
     method: "POST",
   })
@@ -1585,10 +1589,9 @@ function _performUnlockSkill(skillId) {
       showToast(e.message || "Unlock failed");
     })
     .finally(function () {
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = "Customize…";
-      }
+      // Re-enable in case the re-render didn't happen (error path); the
+      // success path hides the button anyway via showEditTemplateModal.
+      if (btn) btn.disabled = false;
     });
 }
 
