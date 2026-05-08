@@ -8,6 +8,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from turnstone.core.auth import (
+    AUTH_COOKIE,
+    AUTH_COOKIE_CONSOLE,
+    AUTH_COOKIE_SERVER,
     WRITE_PATHS,
     _extract_bearer,
     _extract_cookie,
@@ -364,6 +367,11 @@ class TestMakeSetCookie:
         val = make_set_cookie("tok_abc", secure=True)
         assert "; Secure" in val
 
+    def test_custom_cookie_name(self):
+        val = make_set_cookie("tok_abc", cookie_name="my_cookie")
+        assert "my_cookie=tok_abc" in val
+        assert "HttpOnly" in val
+
 
 class TestMakeClearCookie:
     def test_max_age_zero(self):
@@ -374,6 +382,11 @@ class TestMakeClearCookie:
 
     def test_httponly(self):
         assert "HttpOnly" in make_clear_cookie()
+
+    def test_custom_cookie_name(self):
+        val = make_clear_cookie("my_cookie")
+        assert "my_cookie=;" in val
+        assert "Max-Age=0" in val
 
 
 # ---------------------------------------------------------------------------
@@ -650,6 +663,18 @@ class TestCheckRequestWithCookie:
             None,
         )
         assert allowed is True
+
+    def test_custom_cookie_name(self, read_jwt):
+        allowed, status, _, _r = check_request(
+            "GET",
+            "/api/workstreams",
+            None,
+            cookie_header=f"custom_auth={read_jwt}",
+            jwt_secret=self._SECRET,
+            auth_cookie="custom_auth",
+        )
+        assert allowed is True
+        assert status == 200
 
 
 # ---------------------------------------------------------------------------
@@ -1019,8 +1044,6 @@ class TestServerLogin:
 
     def test_refresh_returns_new_jwt_and_cookie(self):
         """POST /api/auth/refresh re-mints the cookie with a fresh exp."""
-        from turnstone.core.auth import AUTH_COOKIE
-
         # Storage needs get_user_permissions for the refresh re-resolve path.
         # Mock is shared across tests in the class — re-arm here in case a
         # prior test left it default.
@@ -1047,7 +1070,7 @@ class TestServerLogin:
         # and refresh produce identical iat/exp claims and therefore an
         # identical token, which is fine: the cookie still gets re-set.
         cookie_hdr = refresh.headers.get("set-cookie", "")
-        assert AUTH_COOKIE in cookie_hdr
+        assert AUTH_COOKIE_SERVER in cookie_hdr
         assert "HttpOnly" in cookie_hdr
 
         # The refreshed cookie must keep working.
@@ -1158,6 +1181,19 @@ class TestServerLogin:
                 "approve",
             }
 
+    def test_logout_page_redirects_and_clears_cookie(self):
+        """GET /logout clears the server auth cookie and redirects to /."""
+        self.test_client.post(
+            "/v1/api/auth/login",
+            json={"username": "testuser", "password": "testpass"},
+        )
+        resp = self.test_client.get("/logout")
+        assert resp.status_code == 302
+        assert resp.headers.get("location") == "/?logout=1"
+        cookie = resp.headers.get("set-cookie", "")
+        assert AUTH_COOKIE_SERVER in cookie
+        assert "Max-Age=0" in cookie
+
 
 class TestConsoleLogin:
     """Test login/logout cookie flow on turnstone-console."""
@@ -1222,7 +1258,7 @@ class TestConsoleLogin:
             json={"username": "testuser", "password": "testpass"},
         )
         assert resp.status_code == 200
-        assert "turnstone_auth" in resp.headers.get("set-cookie", "")
+        assert AUTH_COOKIE_CONSOLE in resp.headers.get("set-cookie", "")
 
     def test_cookie_auth_on_api(self):
         self.test_client.post(
@@ -1240,6 +1276,19 @@ class TestConsoleLogin:
         self.test_client.post("/v1/api/auth/logout")
         resp = self.test_client.get("/v1/api/cluster/overview")
         assert resp.status_code == 401
+
+    def test_logout_page_redirects_and_clears_cookie(self):
+        """GET /logout clears the console auth cookie and redirects to /."""
+        self.test_client.post(
+            "/v1/api/auth/login",
+            json={"username": "testuser", "password": "testpass"},
+        )
+        resp = self.test_client.get("/logout")
+        assert resp.status_code == 302
+        assert resp.headers.get("location") == "/?logout=1"
+        cookie = resp.headers.get("set-cookie", "")
+        assert AUTH_COOKIE_CONSOLE in cookie
+        assert "Max-Age=0" in cookie
 
 
 # ---------------------------------------------------------------------------
