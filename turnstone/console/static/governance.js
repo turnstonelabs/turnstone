@@ -1112,6 +1112,15 @@ function hideCreateTemplateModal() {
 }
 
 function submitCreateTemplate() {
+  // Clear any prior error before re-validating — a successful submit shouldn't
+  // leave stale red text on-screen, and the in-flight PUT period shouldn't
+  // either. Cheaper than reasoning about every catch path remembering to
+  // clear on success.
+  var prevErr = document.getElementById("create-template-error");
+  if (prevErr) {
+    prevErr.classList.remove("is-visible");
+    prevErr.textContent = "";
+  }
   var name = document.getElementById("ctm-name").value.trim();
   var content = document.getElementById("ctm-content").value;
   if (!name || !content) {
@@ -1846,6 +1855,15 @@ function _addPendingResource() {
 }
 
 function submitEditTemplate() {
+  // Clear any prior error before re-validating — a successful submit shouldn't
+  // leave stale red text visible during the in-flight PUT, and a successful
+  // PUT shouldn't either. Cheaper than reasoning about every catch path
+  // remembering to clear on success.
+  var prevErr = document.getElementById("edit-template-error");
+  if (prevErr) {
+    prevErr.classList.remove("is-visible");
+    prevErr.textContent = "";
+  }
   var id = document.getElementById("etm-id").value;
   var content = document.getElementById("etm-content").value;
   var varList = _detectTemplateVars(content);
