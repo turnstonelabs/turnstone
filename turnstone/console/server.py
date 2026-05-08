@@ -7393,6 +7393,7 @@ async def admin_skill_install(request: Request) -> JSONResponse:
         fetch_skill_from_github,
         fetch_skills_from_github_repo,
     )
+    from turnstone.core.storage._protocol import StorageConflictError
     from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
 
     storage, err = require_storage_or_503(request)
@@ -7531,15 +7532,28 @@ async def admin_skill_install(request: Request) -> JSONResponse:
                 token_estimate=token_estimate,
                 allowed_tools=allowed_tools_str,
             )
-        except Exception as exc:
+        except StorageConflictError as exc:
+            # Genuine uniqueness/constraint violation racing past the
+            # pre-checks above — operator can re-try.
             log.warning(
-                "skill.install.create_failed name=%s skill_id=%s err=%s",
+                "skill.install.create_conflict name=%s skill_id=%s err=%s",
                 parsed.name,
                 skill_id,
                 exc,
                 exc_info=True,
             )
             skipped.append({"name": parsed.name, "reason": "conflict"})
+            continue
+        except Exception as exc:
+            # Anything else — DB connection, disk full, permission — is
+            # operational and shouldn't be relabeled "conflict".
+            log.exception(
+                "skill.install.create_failed name=%s skill_id=%s err=%s",
+                parsed.name,
+                skill_id,
+                exc,
+            )
+            skipped.append({"name": parsed.name, "reason": "internal error"})
             continue
 
         # Store bundled resources, tallying any failures so the caller can
