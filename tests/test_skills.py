@@ -1034,6 +1034,45 @@ class TestSkillAPI:
         assert resp.status_code == 200
         assert resp.json()["token_estimate"] == 200
 
+    def test_update_skill_notify_on_complete_empty_string_normalises_to_array(
+        self, api_client, api_storage
+    ):
+        """Empty / whitespace ``notify_on_complete`` is normalised to ``"[]"``.
+
+        Defends against a regression where ``if nc and nc != "[]":`` would
+        short-circuit on a blank value, skip JSON validation, and persist a
+        non-JSON empty string into storage.
+        """
+        _create_template(api_storage, "s1", "norm-empty", "x")
+        resp = api_client.put(
+            "/v1/api/admin/skills/s1",
+            json={"notify_on_complete": ""},
+        )
+        assert resp.status_code == 200
+        assert api_storage.get_prompt_template("s1")["notify_on_complete"] == "[]"
+
+    def test_update_skill_notify_on_complete_legacy_object_normalises(
+        self, api_client, api_storage
+    ):
+        """The legacy ``"{}"`` sentinel coerces to ``"[]"`` on write."""
+        _create_template(api_storage, "s1", "norm-obj", "x")
+        resp = api_client.put(
+            "/v1/api/admin/skills/s1",
+            json={"notify_on_complete": "{}"},
+        )
+        assert resp.status_code == 200
+        assert api_storage.get_prompt_template("s1")["notify_on_complete"] == "[]"
+
+    def test_update_skill_notify_on_complete_rejects_non_array_json(self, api_client, api_storage):
+        """Valid JSON that isn't an array is a 400 — was previously accepted."""
+        _create_template(api_storage, "s1", "reject-obj", "x")
+        resp = api_client.put(
+            "/v1/api/admin/skills/s1",
+            json={"notify_on_complete": '{"channel": "discord"}'},
+        )
+        assert resp.status_code == 400
+        assert "array" in resp.json()["error"].lower()
+
     def test_delete_skill_endpoint(self, api_client, api_storage):
         """DELETE /v1/api/admin/skills/{id} deletes the skill."""
         _create_template(api_storage, "s1", "deletable", "content")
