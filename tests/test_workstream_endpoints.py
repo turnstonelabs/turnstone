@@ -898,6 +898,97 @@ class TestHistoryInteractive:
         # Above-cap → clamps to 500 (response is still 200; we have 4 rows).
         assert client.get(base, params={"limit": 999}).status_code == 200
 
+    def test_returns_partial_trailing_turn_during_tool_execution(self, _inject_storage):
+        """The ``/history`` REST endpoint is a *display* read and must
+        surface partial state.  When the operator refreshes the page
+        mid-tool-execution — assistant ``tool_calls`` saved, only some
+        results saved — the trailing turn must come back on the wire so
+        the UI can render what the operator was watching live.
+
+        Storage's ``load_messages`` defaults to a repair pass that
+        strips this exact shape (correct for ``session.resume``, wrong
+        for display).  ``make_history_handler`` must opt out via
+        ``repair=False``; flipping that flag back on breaks this test.
+        """
+        import json
+
+        ws_id = "ws-mid-exec"
+        _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
+        _inject_storage.save_message(ws_id, "user", "kick off")
+        tc_json = json.dumps(
+            [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"command":"ls"}'},
+                },
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"command":"pwd"}'},
+                },
+            ]
+        )
+        _inject_storage.save_message(ws_id, "assistant", "Working", tool_calls=tc_json)
+        _inject_storage.save_message(ws_id, "tool", "file.txt", tool_call_id="call_1")
+        # call_2 result not yet persisted — operator refreshes here.
+        mock_ws = MagicMock()
+        mock_ws.id = ws_id
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = mock_ws
+        client = _build_history_app(mock_mgr, _inject_storage)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}/history")
+        assert r.status_code == 200
+        roles = [m.get("role") for m in r.json()["messages"]]
+        # All three rows survive — the trailing assistant + partial
+        # tool result are what the operator was watching live.  The
+        # default-repair shape would have been just ``["user"]``.
+        assert roles == ["user", "assistant", "tool"]
+
+        # Confirm the default-repair path collapses this to just the
+        # user message — locks in the regression contract.
+        with_repair = _inject_storage.load_messages(ws_id, repair=True)
+        assert [m.get("role") for m in with_repair] == ["user"]
+
+    def test_history_does_not_synthesize_orphan_results(self, _inject_storage):
+        """``repair=False`` via ``/history`` must NOT splice synthetic
+        ``"Tool execution was cancelled."`` rows for mid-conversation
+        orphaned tool_calls — the operator never saw those rows, and
+        showing them would invent UI content that doesn't reflect
+        persisted state.
+        """
+        import json
+
+        ws_id = "ws-orphan-mid"
+        _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
+        _inject_storage.save_message(ws_id, "user", "first")
+        tc_json = json.dumps(
+            [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"command":"ls"}'},
+                },
+            ]
+        )
+        _inject_storage.save_message(ws_id, "assistant", "Working", tool_calls=tc_json)
+        # Cancel landed before any tool result — next turn happens.
+        _inject_storage.save_message(ws_id, "user", "second")
+        _inject_storage.save_message(ws_id, "assistant", "ok")
+        mock_ws = MagicMock()
+        mock_ws.id = ws_id
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = mock_ws
+        client = _build_history_app(mock_mgr, _inject_storage)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}/history")
+        assert r.status_code == 200
+        roles = [m.get("role") for m in r.json()["messages"]]
+        # No synthetic tool row spliced after the orphaned tool_calls.
+        assert roles == ["user", "assistant", "user", "assistant"]
+        assert all(m.get("role") != "tool" for m in r.json()["messages"])
+
 
 class TestBuildHistoryReminderPropagation:
     """``_build_history`` must surface the ``_reminders`` side-channel on

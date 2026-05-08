@@ -451,6 +451,71 @@ class TestInterruptedWorkstreamRepair:
         assert msgs[1]["role"] == "assistant"
         assert msgs[2]["role"] == "user"
 
+    def test_repair_false_preserves_partial_trailing_turn(self, tmp_db):
+        """``repair=False`` is the display-read contract for ``/history``.
+
+        The default repair pass strips the trailing
+        ``assistant(tool_calls)`` when not all tool results are persisted
+        — correct for ``session.resume`` (LLM context), wrong for the
+        REST display read.  A user refreshing the coordinator page mid-
+        tool-execution would otherwise lose the entire trailing turn
+        from the UI.  ``repair=False`` returns the raw persisted state.
+        """
+        import json
+
+        tc_json = json.dumps(
+            [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"command":"ls"}'},
+                },
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"command":"pwd"}'},
+                },
+            ]
+        )
+        save_message("s1", "user", "hello")
+        save_message("s1", "assistant", "Checking", tool_calls=tc_json)
+        save_message("s1", "tool", "file.txt", tool_call_id="call_1")
+        # No call_2 result persisted — mid-execution refresh.
+        msgs = get_storage().load_messages("s1", repair=False)
+        # All three rows survive — the trailing partial turn is what the
+        # operator was actually watching live.
+        assert [m["role"] for m in msgs] == ["user", "assistant", "tool"]
+        assert msgs[1].get("tool_calls") and len(msgs[1]["tool_calls"]) == 2
+        assert msgs[2]["tool_call_id"] == "call_1"
+
+    def test_repair_false_does_not_synthesize_orphan_results(self, tmp_db):
+        """``repair=False`` must NOT splice synthetic ``"Tool execution
+        was cancelled."`` rows for mid-conversation orphans either —
+        the operator never saw those rows, and showing them would
+        invent UI content that doesn't reflect persisted state.
+        """
+        import json
+
+        tc_json = json.dumps(
+            [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"command":"ls"}'},
+                },
+            ]
+        )
+        save_message("s1", "user", "first")
+        save_message("s1", "assistant", "Working", tool_calls=tc_json)
+        # Cancel landed before any tool result — next turn happens.
+        save_message("s1", "user", "second")
+        save_message("s1", "assistant", "ok")
+        msgs = get_storage().load_messages("s1", repair=False)
+        roles = [m["role"] for m in msgs]
+        # No synthetic tool row spliced after the orphaned tool_calls.
+        assert roles == ["user", "assistant", "user", "assistant"]
+        assert all(m["role"] != "tool" for m in msgs)
+
 
 # ── Workstream config persistence ─────────────────────────────────────
 
