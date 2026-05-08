@@ -11,7 +11,6 @@ import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import quote
 
 import httpx
 
@@ -34,6 +33,40 @@ _RESOURCE_DIRS = ("scripts", "references", "assets")
 _TEXT_EXTENSIONS = frozenset(
     {".md", ".txt", ".sh", ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".toml", ".cfg", ".ini"}
 )
+# Per-segment charset for skills.sh ids — matches what GitHub permits in
+# owner/repo/path-segment names. Rejects whitespace, control chars, and any
+# URL-hostile content that would break the dedupe-by-source_url contract.
+_SKILLS_SH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _accept_resource(rel_path: str, byte_size: int) -> bool:
+    """Gate predicate shared by GitHub and skills.sh resource ingestion."""
+    first_seg = rel_path.split("/", 1)[0]
+    if first_seg not in _RESOURCE_DIRS:
+        return False
+    ext = os.path.splitext(rel_path)[1].lower()
+    if ext not in _TEXT_EXTENSIONS:
+        return False
+    return byte_size <= _MAX_RESOURCE_SIZE
+
+
+def _split_skills_sh_id(skill_id: str) -> tuple[str, str, str]:
+    """Split a skills.sh canonical id into (owner, repo, skill_name).
+
+    skills.sh ids are 3-segment paths like ``tavily-ai/skills/tavily-search``
+    that map directly to its REST routes (``/api/download/[owner]/[repo]/[skill]``).
+    """
+    parts = skill_id.strip().strip("/").split("/")
+    if len(parts) != 3 or not all(_SKILLS_SH_SEGMENT_RE.match(p) for p in parts):
+        raise SkillSourceError(
+            f"Invalid skills.sh skill id {skill_id!r}: expected 'owner/repo/skill-name'"
+        )
+    return parts[0], parts[1], parts[2]
+
+
+def _skills_sh_source_url(base_url: str, skill_id: str) -> str:
+    """Canonical, dedup-stable URL for a skills.sh skill."""
+    return f"{base_url.rstrip('/')}/skills/{skill_id}"
 
 
 @dataclass(frozen=True)
@@ -91,34 +124,109 @@ class SkillsShClient:
         data = resp.json()
         results: list[SkillListing] = []
         for item in data.get("skills", data.get("results", [])):
+            skill_id = str(item.get("id", item.get("name", "")))
+            # The /api/search response does not carry source_url. Derive a
+            # canonical, dedup-stable URL from the skill id so the discover
+            # UI's "already installed" check matches what download_skill
+            # persists.
+            raw_source_url = str(item.get("source_url", item.get("url", ""))).strip()
+            source_url = raw_source_url or (
+                _skills_sh_source_url(self._base_url, skill_id) if skill_id else ""
+            )
             results.append(
                 SkillListing(
-                    id=str(item.get("id", item.get("name", ""))),
+                    id=skill_id,
                     name=str(item.get("name", "")),
                     description=str(item.get("description", "")),
                     author=str(item.get("author", "")),
                     source="skills.sh",
-                    source_url=str(item.get("source_url", item.get("url", ""))),
+                    source_url=source_url,
                     install_count=int(item.get("install_count", item.get("installs", 0))),
                     tags=[str(t) for t in item.get("tags", []) if isinstance(t, str)],
                 )
             )
         return results
 
-    async def resolve_github_url(self, skill_id: str) -> str:
-        """Resolve a skills.sh skill ID to its GitHub URL."""
+    async def download_skill(self, skill_id: str) -> SkillPackage:
+        """Download a skill bundle from skills.sh and return a ready-to-install package.
+
+        Hits ``/api/download/{owner}/{repo}/{skill}`` (the unauthenticated
+        install endpoint) which returns ``{"files": [{"path", "contents"}, ...]}``
+        with the SKILL.md and any bundled resources inline. No GitHub round-trip.
+        """
+        owner, repo, name = _split_skills_sh_id(skill_id)
+
+        url = f"{self._base_url}/api/download/{owner}/{repo}/{name}"
         async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
             try:
-                resp = await client.get(f"{self._base_url}/api/skills/{quote(skill_id, safe='')}")
-                resp.raise_for_status()
+                resp = await client.get(url)
             except httpx.HTTPError as exc:
-                raise SkillSourceError(f"Failed to resolve skill {skill_id}: {exc}") from exc
+                raise SkillSourceError(f"Failed to download skill {skill_id}: {exc}") from exc
 
-        data = resp.json()
-        url = str(data.get("source_url", data.get("github_url", data.get("url", ""))))
-        if not url:
-            raise SkillSourceError(f"No source URL for skill {skill_id}")
-        return url
+        if resp.status_code == 404:
+            raise SkillNotFoundError(f"skills.sh has no skill {skill_id}")
+        if resp.status_code >= 400:
+            raise SkillSourceError(
+                f"skills.sh download failed for {skill_id}: HTTP {resp.status_code}"
+            )
+
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise SkillSourceError(
+                f"skills.sh returned non-JSON for {skill_id}: {resp.text[:200]}"
+            ) from exc
+
+        files = payload.get("files")
+        if not isinstance(files, list) or not files:
+            raise SkillSourceError(f"skills.sh returned no files for {skill_id}")
+
+        skill_md_content = ""
+        resource_pairs: list[tuple[str, str]] = []
+        for entry in files:
+            if not isinstance(entry, dict):
+                continue
+            path = str(entry.get("path", "")).strip().lstrip("/")
+            contents = entry.get("contents")
+            if not path or not isinstance(contents, str):
+                continue
+            if path == "SKILL.md":
+                # `len(contents)` is a cheap upper bound on the encoded byte
+                # size (every char encodes to >=1 UTF-8 byte) — using it
+                # avoids errors='ignore' silently dropping invalid units and
+                # bypassing the cap.
+                if len(contents) > _MAX_SKILL_MD_SIZE:
+                    raise SkillSourceError(
+                        f"SKILL.md for {skill_id} exceeds size cap ({_MAX_SKILL_MD_SIZE} bytes)"
+                    )
+                skill_md_content = contents
+            else:
+                resource_pairs.append((path, contents))
+
+        if not skill_md_content:
+            raise SkillNotFoundError(f"skills.sh bundle for {skill_id} has no SKILL.md")
+
+        parsed = parse_skill_md(skill_md_content)
+
+        resources: dict[str, str] = {}
+        for path, contents in resource_pairs:
+            if len(resources) >= _MAX_RESOURCE_FILES:
+                break
+            if not _accept_resource(path, len(contents.encode("utf-8"))):
+                continue
+            resources[path] = contents
+
+        listing = SkillListing(
+            id=skill_id,
+            name=parsed.name or name,
+            description=parsed.description,
+            author=parsed.author,
+            source="skills.sh",
+            source_url=_skills_sh_source_url(self._base_url, skill_id),
+            install_count=0,
+            tags=list(parsed.tags),
+        )
+        return SkillPackage(listing=listing, parsed=parsed, resources=resources)
 
 
 def _parse_github_url(url: str) -> tuple[str, str, str, str, bool]:
@@ -152,14 +260,7 @@ def _find_resource_files(
             if not item_path.startswith(f"{skill_md_dir}/"):
                 continue
             rel_path = item_path[len(skill_md_dir) + 1 :]
-        first_seg = rel_path.split("/")[0] if "/" in rel_path else ""
-        if first_seg not in _RESOURCE_DIRS:
-            continue
-        ext = os.path.splitext(rel_path)[1].lower()
-        if ext not in _TEXT_EXTENSIONS:
-            continue
-        size = item.get("size", 0)
-        if size > _MAX_RESOURCE_SIZE:
+        if not _accept_resource(rel_path, item.get("size", 0)):
             continue
         resource_files.append({"path": rel_path, "full_path": item_path})
     return resource_files[:_MAX_RESOURCE_FILES]

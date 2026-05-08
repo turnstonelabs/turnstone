@@ -7332,7 +7332,22 @@ async def admin_skill_discover(request: Request) -> JSONResponse:
     try:
         listings = await client.search(query=q, limit=limit)
     except SkillSourceError as exc:
+        log.warning(
+            "skill.discover.source_error q=%s discovery_url=%s err=%s",
+            q,
+            discovery_url,
+            exc,
+            exc_info=True,
+        )
         return JSONResponse({"error": f"Discovery error: {exc}"}, status_code=502)
+    except Exception as exc:
+        log.exception(
+            "skill.discover.unexpected q=%s discovery_url=%s err=%s",
+            q,
+            discovery_url,
+            exc,
+        )
+        return JSONResponse({"error": f"Unexpected discovery error: {exc}"}, status_code=500)
 
     # Mark which skills are already installed (by source_url match)
     installed_map: dict[str, dict[str, str]] = {}
@@ -7395,31 +7410,62 @@ async def admin_skill_install(request: Request) -> JSONResponse:
     if source not in ("skills.sh", "github"):
         return JSONResponse({"error": "source must be 'skills.sh' or 'github'"}, status_code=400)
 
+    skill_id_param = str(body.get("skill_id", "")).strip()
+    url_param = str(body.get("url", "")).strip()
+    log.debug(
+        "skill.install.start source=%s skill_id=%s url=%s",
+        source,
+        skill_id_param or "-",
+        url_param or "-",
+    )
+
+    def _log_install_failure(level: int, event: str, exc: BaseException) -> None:
+        log.log(
+            level,
+            "%s source=%s skill_id=%s url=%s err=%s",
+            event,
+            source,
+            skill_id_param or "-",
+            url_param or "-",
+            exc,
+            exc_info=True,
+        )
+
     try:
         if source == "skills.sh":
-            skill_id_param = str(body.get("skill_id", "")).strip()
             if not skill_id_param:
                 return JSONResponse({"error": "skill_id is required"}, status_code=400)
 
             discovery_url = _get_discovery_url(request)
             client = SkillsShClient(base_url=discovery_url)
-            github_url = await client.resolve_github_url(skill_id_param)
-            packages = [await fetch_skill_from_github(github_url)]
+            packages = [await client.download_skill(skill_id_param)]
+            log.debug(
+                "skill.install.downloaded skill_id=%s name=%s resources=%d",
+                skill_id_param,
+                packages[0].parsed.name,
+                len(packages[0].resources),
+            )
         else:
-            url = str(body.get("url", "")).strip()
-            if not url:
+            if not url_param:
                 return JSONResponse({"error": "url is required"}, status_code=400)
             try:
-                packages = [await fetch_skill_from_github(url)]
+                packages = [await fetch_skill_from_github(url_param)]
             except SkillNotFoundError:
                 # No root SKILL.md — try scanning for a multi-skill repo
-                packages = await fetch_skills_from_github_repo(url)
+                log.debug("skill.install.repo_scan url=%s", url_param)
+                packages = await fetch_skills_from_github_repo(url_param)
     except SkillNotFoundError as exc:
+        _log_install_failure(logging.WARNING, "skill.install.not_found", exc)
         return JSONResponse({"error": str(exc)}, status_code=404)
     except SkillSourceError as exc:
+        _log_install_failure(logging.WARNING, "skill.install.source_error", exc)
         return JSONResponse({"error": str(exc)}, status_code=502)
     except ValueError as exc:
+        _log_install_failure(logging.WARNING, "skill.install.value_error", exc)
         return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        _log_install_failure(logging.ERROR, "skill.install.unexpected", exc)
+        return JSONResponse({"error": f"Unexpected error fetching skill: {exc}"}, status_code=500)
 
     import json as _json
 
@@ -7432,11 +7478,20 @@ async def admin_skill_install(request: Request) -> JSONResponse:
 
         # Check for duplicate by source_url
         if pkg_source_url and storage.get_skill_by_source_url(pkg_source_url):
+            log.debug(
+                "skill.install.skip name=%s reason=already_installed source_url=%s",
+                package.parsed.name,
+                pkg_source_url,
+            )
             skipped.append({"name": package.parsed.name, "reason": "already installed"})
             continue
 
         # Check for duplicate by name
         if storage.get_prompt_template_by_name(package.parsed.name):
+            log.debug(
+                "skill.install.skip name=%s reason=name_exists",
+                package.parsed.name,
+            )
             skipped.append({"name": package.parsed.name, "reason": "name exists"})
             continue
 
@@ -7476,18 +7531,39 @@ async def admin_skill_install(request: Request) -> JSONResponse:
                 token_estimate=token_estimate,
                 allowed_tools=allowed_tools_str,
             )
-        except Exception:
+        except Exception as exc:
+            log.warning(
+                "skill.install.create_failed name=%s skill_id=%s err=%s",
+                parsed.name,
+                skill_id,
+                exc,
+                exc_info=True,
+            )
             skipped.append({"name": parsed.name, "reason": "conflict"})
             continue
 
-        # Store bundled resources
+        # Store bundled resources, tallying any failures so the caller can
+        # see that the skill row was committed but is missing some assets
+        # (the SKILL.md is still usable on its own — we don't roll back).
+        failed_resources: list[str] = []
         for res_path, res_content in package.resources.items():
-            storage.create_skill_resource(
-                resource_id=uuid.uuid4().hex,
-                skill_id=skill_id,
-                path=res_path,
-                content=res_content,
-            )
+            try:
+                storage.create_skill_resource(
+                    resource_id=uuid.uuid4().hex,
+                    skill_id=skill_id,
+                    path=res_path,
+                    content=res_content,
+                )
+            except Exception as exc:
+                failed_resources.append(res_path)
+                log.warning(
+                    "skill.install.resource_failed name=%s skill_id=%s path=%s err=%s",
+                    parsed.name,
+                    skill_id,
+                    res_path,
+                    exc,
+                    exc_info=True,
+                )
 
         record_audit(
             storage,
@@ -7495,16 +7571,38 @@ async def admin_skill_install(request: Request) -> JSONResponse:
             "skill.install",
             "skill",
             skill_id,
-            {"name": parsed.name, "source": source, "source_url": pkg_source_url},
+            {
+                "name": parsed.name,
+                "source": source,
+                "source_url": pkg_source_url,
+                "failed_resources": failed_resources,
+            },
             ip,
         )
 
         skill = storage.get_prompt_template(skill_id)
         if skill:
-            installed.append(_skill_to_response(skill, resource_count=len(package.resources)))
+            stored_resources = len(package.resources) - len(failed_resources)
+            entry = _skill_to_response(skill, resource_count=stored_resources)
+            if failed_resources:
+                entry["failed_resources"] = failed_resources
+            installed.append(entry)
+            log.info(
+                "skill.install.ok name=%s skill_id=%s resources=%d failed_resources=%d",
+                parsed.name,
+                skill_id,
+                stored_resources,
+                len(failed_resources),
+            )
 
     if not installed and skipped:
         # All skills were duplicates
+        log.debug(
+            "skill.install.done source=%s installed=0 skipped=%d total=%d",
+            source,
+            len(skipped),
+            len(packages),
+        )
         return JSONResponse(
             {
                 "error": "All skills already installed",
@@ -7515,6 +7613,13 @@ async def admin_skill_install(request: Request) -> JSONResponse:
             status_code=409,
         )
 
+    log.debug(
+        "skill.install.done source=%s installed=%d skipped=%d total=%d",
+        source,
+        len(installed),
+        len(skipped),
+        len(packages),
+    )
     # Consistent envelope for both single and batch installs
     return JSONResponse(
         {
