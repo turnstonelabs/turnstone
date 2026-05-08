@@ -1217,7 +1217,7 @@ class StorageBackend(Protocol):
         max_tokens: int | None = None,
         token_budget: int = 0,
         agent_max_turns: int | None = None,
-        notify_on_complete: str = "{}",
+        notify_on_complete: str = "[]",
         enabled: bool = True,
         allowed_tools: str = "[]",
         skill_license: str = "",
