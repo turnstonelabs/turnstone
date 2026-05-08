@@ -2593,7 +2593,9 @@ class PostgreSQLBackend:
             conn.execute(
                 sa.update(prompt_templates)
                 .where(prompt_templates.c.template_id == template_id)
-                .values(readonly=False, updated=now)
+                # readonly is an Integer column (see _schema.py); match the
+                # 0/1 idiom create_prompt_template uses for the same flag.
+                .values(readonly=0, updated=now)
             )
             conn.commit()
             return next_version
