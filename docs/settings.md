@@ -59,6 +59,21 @@ from ConfigStore. Model names and context windows are now configured per-model
 in the Models tab. A startup warning is logged if these keys appear in
 `config.toml`.
 
+### Reasoning persistence (per-model)
+
+Two boolean flags on `model_definitions` (migration 052) control how
+reasoning text round-trips per model:
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `surface_persisted_reasoning` | `True` | Surface stored reasoning text on `/history` payloads so a page reload re-renders the reasoning bubble. **Storage of reasoning bytes is independent of this flag** — they ride in `provider_data` regardless. |
+| `replay_reasoning_to_model` | `False` | Send stored reasoning blocks back to the provider on subsequent turns. Capability-gated: only takes effect when the model's `ModelCapabilities.supports_reasoning_replay` is also `True`. Set on canonical OpenAI gpt-5*/o-series and Anthropic Claude entries; unknown / local-server models default to `False` so an operator who flips the flag on a model whose API doesn't understand reasoning replay silently no-ops rather than 400-ing. |
+
+Edit both via the admin Models tab. See the architecture doc for the
+provider-side mechanics (Anthropic `thinking`, OpenAI Responses
+`reasoning` + `include=["reasoning.encrypted_content"]`, synthetic
+`reasoning_text` for Chat Completions / vLLM / llama.cpp / Gemini-compat).
+
 ### Plan / task agent overrides
 
 `plan_agent` and `task_agent` sub-sessions resolve independently from the

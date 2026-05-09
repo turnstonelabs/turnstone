@@ -69,9 +69,10 @@ class "NullUI" as NullUI {
 interface "LLMProvider" as LLMProvider <<Protocol>> {
     + provider_name: str {property}
     + get_capabilities(model) → ModelCapabilities
-    + create_streaming(client, model, messages, ...) → Iterator[StreamChunk]
-    + create_completion(client, model, messages, ...) → CompletionResult
+    + create_streaming(client, model, messages, ..., replay_reasoning_to_model) → Iterator[StreamChunk]
+    + create_completion(client, model, messages, ..., replay_reasoning_to_model) → CompletionResult
     + convert_tools(tools) → list[dict]
+    + extract_reasoning_text(provider_blocks) → str
     + retryable_error_names: frozenset[str] {property}
     --
     core/providers/_protocol.py
@@ -126,6 +127,7 @@ class "ModelCapabilities" as ModelCaps <<frozen>> {
     + supports_web_search: bool
     + supports_tool_search: bool
     + supports_vision: bool
+    + supports_reasoning_replay: bool
 }
 
 ' ChatSession

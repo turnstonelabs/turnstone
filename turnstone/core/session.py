@@ -1118,7 +1118,15 @@ class ChatSession:
             if isinstance(sc, dict):
                 return str(sc.get("server_type") or "")
         except Exception:
-            pass
+            # Best-effort lookup — synth-block source tagging is
+            # informational, never load-bearing.  Log at debug so a
+            # repeated registry-lookup failure during a session shows
+            # up under DEBUG triage but doesn't spam normal logs.
+            log.debug(
+                "_resolve_server_type lookup failed for alias=%s; defaulting to empty",
+                target_alias,
+                exc_info=True,
+            )
         return ""
 
     def _maybe_synth_reasoning_block(

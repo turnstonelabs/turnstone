@@ -281,6 +281,7 @@ Each message in the `messages` array has:
 | `role`       | string            | `"user"`, `"assistant"`, or `"tool"`          |
 | `content`    | string or null    | Text content of the message                   |
 | `tool_calls` | array or null     | Present only on assistant messages with calls  |
+| `reasoning`  | string (optional) | Concatenated reasoning / chain-of-thought text on assistant turns whose `provider_data` carried reasoning-bearing blocks (Anthropic `thinking`, OpenAI Responses `reasoning`, or synthetic `reasoning_text` from local-model servers). Present only when the active model's `surface_persisted_reasoning` flag is True. |
 
 Each entry in `tool_calls`:
 

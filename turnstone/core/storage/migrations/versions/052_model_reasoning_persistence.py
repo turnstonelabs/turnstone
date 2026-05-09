@@ -8,9 +8,10 @@ Adds two boolean (integer-coded) operator knobs:
   page refresh re-renders the reasoning bubble. **Storage of the
   reasoning bytes happens regardless of this flag** — it only controls
   the extract-and-include step in ``_build_history`` /
-  ``decorate_history_messages``.  The earlier name ``surface_persisted_reasoning``
-  was renamed because it implied a storage-control switch; this flag
-  is purely about UI rehydration.
+  ``decorate_history_messages``.  The pre-rename column was
+  ``persist_reasoning``; the rename to ``surface_persisted_reasoning``
+  happened in the review-fix wave because the original name implied a
+  storage-control switch when the flag is purely about UI rehydration.
 * ``replay_reasoning_to_model`` (default ``0``) — when true, the
   wire-build path keeps reasoning blocks in the outgoing
   ``_provider_content`` lane on subsequent provider calls. False is the
