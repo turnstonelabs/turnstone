@@ -629,6 +629,7 @@ LLMProvider (protocol)
 | `get_capabilities()` | Per-model flags (`ModelCapabilities`) |
 | `convert_tools()` | Translate OpenAI tool schemas to provider format |
 | `retryable_error_names` | Exception class names that trigger retry |
+| `extract_reasoning_text()` | Walk stored `provider_blocks`, return concatenated reasoning text for UI rehydration (per-provider block-type knowledge: Anthropic `thinking`, OpenAI Responses `reasoning`, OpenAI Chat synthetic `reasoning_text`) |
 
 **Normalized data types:**
 

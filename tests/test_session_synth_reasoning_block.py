@@ -94,6 +94,50 @@ class TestMaybeSynthReasoningBlock:
         assert out[0]["text"] == "text"
         assert "source" not in out[0]
 
+    def test_synth_appends_when_provider_blocks_are_non_reasoning(self) -> None:
+        # GoogleProvider attaches raw tool_call dicts as provider_blocks
+        # on the finish chunk (for thought_signature round-trip).  When
+        # the same turn streamed reasoning_delta (Gemini's reasoning_
+        # content extra), the synthesizer must APPEND the synthetic
+        # reasoning block rather than skip synthesis — otherwise the
+        # reasoning text is shown live but lost on page reload.
+        session = _make_session()
+        existing = [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "search", "arguments": "{}"},
+                "thought_signature": "sig123",
+            }
+        ]
+        out = session._maybe_synth_reasoning_block(existing, ["I should search"])
+        assert len(out) == 2
+        assert out[0] is existing[0]  # tool_call fidelity block survives intact
+        assert out[1]["type"] == "reasoning_text"
+        assert out[1]["text"] == "I should search"
+
+    def test_no_synth_when_openai_responses_reasoning_already_present(self) -> None:
+        # OpenAI Responses native reasoning item — synth must NOT fire
+        # even though provider_blocks contains ALSO non-reasoning items
+        # (e.g. message blocks).  The reasoning-bearing block satisfies
+        # the persistence contract on its own.
+        session = _make_session()
+        existing = [
+            {"type": "reasoning", "summary": [{"text": "openai reasoning"}]},
+            {"type": "message", "role": "assistant", "content": "answer"},
+        ]
+        out = session._maybe_synth_reasoning_block(existing, ["live reasoning text"])
+        assert out is existing
+
+    def test_no_synth_when_non_reasoning_blocks_but_reasoning_parts_empty(self) -> None:
+        # Google tool_calls with no reasoning streamed — return as-is.
+        session = _make_session()
+        existing = [
+            {"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+        ]
+        out = session._maybe_synth_reasoning_block(existing, [])
+        assert out is existing
+
 
 class TestSyntheticBlockShapeContract:
     """The synthetic block shape MUST stay outside Anthropic's valid
