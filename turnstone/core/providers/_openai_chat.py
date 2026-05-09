@@ -156,6 +156,12 @@ class OpenAIChatCompletionsProvider:
 
     # -- streaming -----------------------------------------------------------
 
+    # Phase 2 of the reasoning-persistence feature plumbs an optional
+    # ``replay_reasoning_to_model`` kwarg through every provider's
+    # ``create_streaming`` / ``create_completion``.  OpenAI Chat (and
+    # the local-model server flavours that route through this adapter)
+    # have no first-class reasoning shape on the wire, so the kwarg is
+    # accepted for Protocol conformance and ignored here.
     def create_streaming(
         self,
         *,
@@ -170,6 +176,7 @@ class OpenAIChatCompletionsProvider:
         deferred_names: frozenset[str] | None = None,
         cancel_ref: list[Any] | None = None,
         capabilities: ModelCapabilities | None = None,
+        replay_reasoning_to_model: bool = True,
     ) -> Iterator[StreamChunk]:
         caps = capabilities or self.get_capabilities(model)
         messages = self._prepare_messages(messages)
@@ -299,6 +306,8 @@ class OpenAIChatCompletionsProvider:
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,
         capabilities: ModelCapabilities | None = None,
+        # See create_streaming above for the Phase 2 reasoning-persistence rationale.
+        replay_reasoning_to_model: bool = True,
     ) -> CompletionResult:
         caps = capabilities or self.get_capabilities(model)
         messages = self._prepare_messages(messages)

@@ -133,6 +133,7 @@ class LLMProvider(Protocol):
         deferred_names: frozenset[str] | None = None,
         cancel_ref: list[Any] | None = None,
         capabilities: ModelCapabilities | None = None,
+        replay_reasoning_to_model: bool = True,
     ) -> Iterator[StreamChunk]:
         """Create a streaming request, yielding normalized StreamChunks.
 
@@ -162,8 +163,17 @@ class LLMProvider(Protocol):
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,
         capabilities: ModelCapabilities | None = None,
+        replay_reasoning_to_model: bool = True,
     ) -> CompletionResult:
-        """Create a non-streaming request, returning a normalized result."""
+        """Create a non-streaming request, returning a normalized result.
+
+        ``replay_reasoning_to_model`` mirrors the per-model
+        ``model_definitions`` operator flag.  Anthropic uses it to
+        gate the verbatim ``_provider_content`` replay (Phase 2);
+        other providers accept the kwarg for Protocol conformance and
+        ignore it (chat-template ``<think>`` content isn't part of
+        their wire-side replay path).
+        """
         ...
 
     def convert_tools(

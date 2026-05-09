@@ -293,6 +293,13 @@ class OpenAIResponsesProvider:
         deferred_names: frozenset[str] | None = None,
         cancel_ref: list[Any] | None = None,
         capabilities: ModelCapabilities | None = None,
+        # Phase 2 reasoning-persistence kwarg — accepted for Protocol
+        # conformance.  Phase 3 will gate ``include=
+        # ["reasoning.encrypted_content"]`` on this flag once OpenAI
+        # Responses captures replayable reasoning items.  Today the
+        # request kwargs don't carry reasoning, so the flag is unused
+        # but threaded for forward-compat.
+        replay_reasoning_to_model: bool = True,
     ) -> Iterator[StreamChunk]:
         if extra_params:
             log.debug("openai.responses: extra_params ignored (not supported by Responses API)")
@@ -474,6 +481,8 @@ class OpenAIResponsesProvider:
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,
         capabilities: ModelCapabilities | None = None,
+        # See create_streaming above for the Phase 2 reasoning-persistence rationale.
+        replay_reasoning_to_model: bool = True,
     ) -> CompletionResult:
         if extra_params:
             log.debug("openai.responses: extra_params ignored (not supported by Responses API)")
