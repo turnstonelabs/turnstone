@@ -1699,6 +1699,14 @@ async def list_available_models(request: Request) -> JSONResponse:
             registry=coord_registry,
             alias_filter=lambda a: a in enabled_aliases,
         )
+    elif coord_registry is not None:
+        # ConfigStore failed lifespan but coord_registry is still bound —
+        # fall through to ``registry.default`` (filtered) so the home
+        # composer isn't blank.  Mirrors the helper's tier 3 with the
+        # placeholder's enabled-rows filter applied.
+        registry_default = getattr(coord_registry, "default", "") or ""
+        if registry_default in enabled_aliases:
+            coordinator_default_alias = registry_default
     # Judge falls back to the resolved coordinator alias when
     # ``judge.model`` is empty *or* not a registered alias — judge.model
     # is alias-only (matches IntentJudge.__init__), so an unknown value is
