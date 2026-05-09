@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from turnstone.console.coordinator_alias import resolve_coordinator_alias
 from turnstone.core.log import get_logger
 from turnstone.core.session import ChatSession
 from turnstone.core.workstream import WorkstreamKind
@@ -96,18 +97,19 @@ def build_console_session_factory(
                 f"console session factory only supports kind=COORDINATOR, got {kind!r}"
             )
 
-        # Resolve coordinator.model_alias from settings if caller didn't
-        # override.  Unset ``coordinator.model_alias`` falls back to the
-        # model registry's default alias — operators get a working
-        # coordinator on a freshly-provisioned console without an extra
-        # manual setting.  Resolve to the CONCRETE alias name
-        # (``registry.default``) rather than passing None downstream:
-        # ``ChatSession.__init__`` reads ``registry.get_provider(alias)``
-        # to pick the right provider class, and passing None makes it
-        # fall through to a generic OpenAI-compat provider — which
-        # mismatches when the default is Anthropic/Google-backed.
-        explicit_alias = model_alias or (config_store.get("coordinator.model_alias") or "").strip()
-        effective_alias = explicit_alias or registry.default
+        # Resolve to the CONCRETE alias name rather than passing None
+        # downstream: ``ChatSession.__init__`` reads
+        # ``registry.get_provider(alias)`` to pick the right provider
+        # class, and passing None makes it fall through to a generic
+        # OpenAI-compat provider — which mismatches when the default is
+        # Anthropic/Google-backed.  See
+        # :func:`turnstone.console.coordinator_alias.resolve_coordinator_alias`
+        # for the three-tier chain shared with the placeholder API.
+        effective_alias = resolve_coordinator_alias(
+            explicit=model_alias,
+            config_store=config_store,
+            registry=registry,
+        )
 
         r_client, r_model, r_cfg = registry.resolve(effective_alias)
 
