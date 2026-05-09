@@ -900,12 +900,15 @@ def test_on_reasoning_token_writes_to_inflight_buffer_only() -> None:
     assert ui._ws_turn_content == []
 
 
-def test_inflight_seq_increments_only_on_actual_append() -> None:
-    """Cap-hit content tokens do NOT bump the seq — preserves the
-    invariant that every ``_seq`` corresponds to a buffered fragment.
-    Cap-hit live events get the prior seq and are dropped by the
-    snapshot dedup filter on refresh (matches the multi-turn cap
-    behaviour today: capped tokens not visible to refresh)."""
+def test_inflight_seq_advances_on_every_emit_even_at_cap() -> None:
+    """Cap-hit content tokens MUST advance ``_ws_inflight_seq``,
+    even though the buffer rejected the append. If seq stalled at
+    high-water-pre-cap, a subscriber registering AFTER the cap is
+    hit would capture ``snap_seq == stalled_seq`` and every
+    subsequent live token (also tagged with the stalled seq) would
+    be filter-dropped by the events handler — silently losing the
+    rest of the stream. The cap is a buffer-size limit, not a
+    "stop streaming" signal."""
     from turnstone.core.session_ui_base import _MAX_TURN_CONTENT_CHARS
 
     ui = _make_ui()
@@ -913,10 +916,69 @@ def test_inflight_seq_increments_only_on_actual_append() -> None:
     while ui._ws_inflight_content_size < _MAX_TURN_CONTENT_CHARS:
         ui.on_content_token(chunk)
     seq_at_cap = ui._ws_inflight_seq
-    # Cap-hit token: seq must NOT increment.
+
+    # Cap-hit token: seq MUST advance (no buffer append, but the
+    # event still gets a fresh seq for the dedup filter).
     ui.on_content_token(chunk)
-    assert ui._ws_inflight_seq == seq_at_cap
+    assert ui._ws_inflight_seq == seq_at_cap + 1
+    # Buffer remains bounded — the cap-hit token is NOT in inflight.
     assert ui._ws_inflight_content_size <= _MAX_TURN_CONTENT_CHARS + len(chunk)
+
+
+def test_subscriber_after_cap_hit_receives_subsequent_tokens() -> None:
+    """Regression for Copilot's cap+seq finding: a subscriber that
+    connects AFTER the inflight buffer is at cap must still receive
+    live tokens past the cap. Past-cap tokens are absent from
+    ``snap.content`` (the snapshot text was truncated at cap) but
+    the live stream past them must NOT be filter-dropped."""
+    from turnstone.core.session_ui_base import _MAX_TURN_CONTENT_CHARS
+
+    ui = _make_ui()
+    chunk = "x" * 1024
+    while ui._ws_inflight_content_size < _MAX_TURN_CONTENT_CHARS:
+        ui.on_content_token(chunk)
+    # Stream a few tokens PAST the cap before subscribing.
+    for _ in range(3):
+        ui.on_content_token(chunk)
+
+    lq, snap = ui.register_listener_with_in_progress_snapshot()
+    snap_seq = snap["seq"]
+
+    # Live token past cap.
+    ui.on_content_token(chunk)
+    ev = lq.get_nowait()
+    assert ev["type"] == "content"
+    # The critical invariant: seq advances per-emit, so the new
+    # event's _seq is strictly greater than the snap_seq the
+    # subscriber captured. Without this, the events handler's
+    # ``seq <= snap_seq`` filter would drop every token past the
+    # cap (silent token loss for refresh-past-cap).
+    assert ev["_seq"] > snap_seq, (
+        f"Token past cap has _seq={ev['_seq']} which is <= "
+        f"snap_seq={snap_seq} — would be silently dropped after a "
+        f"refresh past the cap."
+    )
+
+
+def test_subscriber_after_reasoning_cap_hit_receives_subsequent_tokens() -> None:
+    """Same invariant as content cap: reasoning subscribers past
+    cap must keep receiving live reasoning tokens."""
+    from turnstone.core.session_ui_base import _MAX_TURN_CONTENT_CHARS
+
+    ui = _make_ui()
+    chunk = "x" * 1024
+    while ui._ws_inflight_reasoning_size < _MAX_TURN_CONTENT_CHARS:
+        ui.on_reasoning_token(chunk)
+    for _ in range(3):
+        ui.on_reasoning_token(chunk)
+
+    lq, snap = ui.register_listener_with_in_progress_snapshot()
+    snap_seq = snap["seq"]
+
+    ui.on_reasoning_token(chunk)
+    ev = lq.get_nowait()
+    assert ev["type"] == "reasoning"
+    assert ev["_seq"] > snap_seq
 
 
 def test_on_turn_committed_resets_inflight_after_commit() -> None:
