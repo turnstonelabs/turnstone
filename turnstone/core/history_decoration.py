@@ -269,46 +269,67 @@ def extract_advisories_from_tool_envelope(
 
 
 if TYPE_CHECKING:
-    from turnstone.core.providers._anthropic import AnthropicProvider
-    from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+    from collections.abc import Callable
 
-_anthropic_provider_singleton: AnthropicProvider | None = None
-_openai_responses_provider_singleton: OpenAIResponsesProvider | None = None
+    from turnstone.core.providers._protocol import LLMProvider
 
 
-def _get_anthropic_provider() -> AnthropicProvider:
-    global _anthropic_provider_singleton
-    if _anthropic_provider_singleton is None:
-        from turnstone.core.providers._anthropic import AnthropicProvider as _Anthropic
+def _make_provider_factory(module_path: str, class_name: str) -> Callable[[], LLMProvider]:
+    """Build a thread-unsafe lazy-init factory for a provider singleton.
 
-        _anthropic_provider_singleton = _Anthropic()
-    return _anthropic_provider_singleton
+    Single source of truth for the dispatcher's per-provider lazy-load
+    pattern — each block-type entry in ``_BLOCK_TYPE_PROVIDER_FACTORY``
+    closes over this with its own (module_path, class_name) pair.
+    Adding a fourth provider is a single tuple in the dict, not a
+    new 9-line getter.
+    """
+    cached: dict[str, LLMProvider] = {}
+
+    def factory() -> LLMProvider:
+        if "instance" not in cached:
+            import importlib
+
+            module = importlib.import_module(module_path)
+            cached["instance"] = getattr(module, class_name)()
+        return cached["instance"]
+
+    return factory
 
 
-def _get_openai_responses_provider() -> OpenAIResponsesProvider:
-    global _openai_responses_provider_singleton
-    if _openai_responses_provider_singleton is None:
-        from turnstone.core.providers._openai_responses import (
-            OpenAIResponsesProvider as _OpenAIResp,
-        )
-
-        _openai_responses_provider_singleton = _OpenAIResp()
-    return _openai_responses_provider_singleton
+# Block-type → provider factory.  Routing is structural — block shape
+# is non-overlapping across providers by API design.  Three block
+# types are recognised today:
+#
+# * ``"thinking"`` — Anthropic native (Phase 1).  Walks the
+#   ``thinking`` field on each block.
+# * ``"reasoning"`` — OpenAI Responses native (Phase 3).  Walks
+#   ``summary[*].text`` (always present) and ``content[*].text``
+#   (present when ``include=["reasoning.encrypted_content"]`` is
+#   requested AND the response carries raw reasoning text).
+# * ``"reasoning_text"`` — synthetic, stamped by
+#   ``ChatSession._maybe_synth_reasoning_block`` for Chat Completions
+#   paths (vLLM, llama.cpp, Gemini-compat) where reasoning surfaces
+#   only as ``reasoning_delta`` chunks with no native block shape.
+_BLOCK_TYPE_PROVIDER_FACTORY: dict[str, Callable[[], LLMProvider]] = {
+    "thinking": _make_provider_factory("turnstone.core.providers._anthropic", "AnthropicProvider"),
+    "reasoning": _make_provider_factory(
+        "turnstone.core.providers._openai_responses", "OpenAIResponsesProvider"
+    ),
+    "reasoning_text": _make_provider_factory(
+        "turnstone.core.providers._openai_chat", "OpenAIChatCompletionsProvider"
+    ),
+}
 
 
 def extract_reasoning_text_from_provider_content(provider_content: Any) -> str:
     """Dispatch reasoning extraction by first-block ``type`` field.
 
-    Routing is structural — block shape is non-overlapping across
-    providers by API design (Anthropic ``thinking``, OpenAI Responses
-    ``reasoning``, Gemini ``thought``).  Phase 1 wires Anthropic
-    extraction; OpenAI Responses returns ``""`` until Phase 3 adds the
-    ``include=["reasoning.encrypted_content"]`` request flag.  Returns
-    ``""`` for empty / missing / non-list / unknown-type input.
+    Returns ``""`` for empty / missing / non-list / unknown-type input.
 
     Pure transform — safe from any thread.  Both history surfaces
     (interactive ``_build_history`` and lifted ``make_history_handler``)
-    call this directly.
+    call this directly.  See ``_BLOCK_TYPE_PROVIDER_FACTORY`` above
+    for the recognised block types and the providers that own them.
     """
     if not isinstance(provider_content, list) or not provider_content:
         return ""
@@ -318,11 +339,10 @@ def extract_reasoning_text_from_provider_content(provider_content: Any) -> str:
     block_type = first_block.get("type")
     if not isinstance(block_type, str):
         return ""
-    if block_type == "thinking":
-        return _get_anthropic_provider().extract_reasoning_text(provider_content)
-    if block_type == "reasoning":
-        return _get_openai_responses_provider().extract_reasoning_text(provider_content)
-    return ""
+    factory = _BLOCK_TYPE_PROVIDER_FACTORY.get(block_type)
+    if factory is None:
+        return ""
+    return factory().extract_reasoning_text(provider_content)
 
 
 def extract_reasoning_for_history(

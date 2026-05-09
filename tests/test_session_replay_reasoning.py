@@ -357,6 +357,181 @@ class TestSessionToWireBoundaryIntegration:
         )
 
 
+class TestSessionToOpenAIResponsesBoundaryIntegration:
+    """End-to-end integration: session._try_stream -> real
+    OpenAIResponsesProvider.create_streaming -> captured Responses
+    SDK boundary call.  Mirrors the AnthropicProvider test above
+    but for the path-2 (Responses API) replay flow.
+
+    Pins the include= request kwarg + reasoning input-item emission
+    actually fire at the wire boundary when the operator flag and
+    model capability both allow.
+    """
+
+    def _stub_responses_client(self) -> tuple[MagicMock, dict[str, object]]:
+        """Mock OpenAI Responses client.  ``client.responses.create``
+        captures kwargs and returns an empty stream iterator."""
+        captured: dict[str, object] = {}
+
+        def create(**kwargs: object) -> object:
+            captured.update(kwargs)
+            return iter([])
+
+        client = MagicMock()
+        client.responses.create = create
+        return client, captured
+
+    def _registry_with_reasoning_capability(
+        self, replay: bool = True, supports_replay: bool = True
+    ) -> Any:
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        return SimpleNamespace(
+            get_config=lambda alias: SimpleNamespace(
+                replay_reasoning_to_model=replay,
+                capabilities={},  # no overrides
+            ),
+            _caps=ModelCapabilities(
+                context_window=400000,
+                supports_temperature=False,
+                reasoning_effort_values=("low", "medium", "high"),
+                default_reasoning_effort="medium",
+                supports_reasoning_replay=supports_replay,
+            ),
+        )
+
+    def test_replay_true_adds_include_to_responses_request(self) -> None:
+        from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+
+        registry = self._registry_with_reasoning_capability(replay=True, supports_replay=True)
+        session = _make_session()
+        session._registry = registry
+        session._model_alias = "gpt-5"
+        client, captured = self._stub_responses_client()
+        real_provider = OpenAIResponsesProvider()
+        with (
+            patch.object(session, "_get_active_tools", return_value=None),
+            patch.object(session, "_provider_extra_params", return_value=None),
+            patch.object(session, "_get_deferred_names", return_value=frozenset()),
+            patch.object(session, "_check_cancelled"),
+        ):
+            stream = session._try_stream(
+                client=client,
+                model="gpt-5",
+                msgs=[{"role": "user", "content": "hi"}],
+                provider=real_provider,
+                capabilities=registry._caps,
+                model_alias="gpt-5",
+            )
+            list(stream)
+        assert captured.get("include") == ["reasoning.encrypted_content"]
+
+    def test_replay_false_omits_include(self) -> None:
+        from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+
+        registry = self._registry_with_reasoning_capability(replay=False, supports_replay=True)
+        session = _make_session()
+        session._registry = registry
+        session._model_alias = "gpt-5"
+        client, captured = self._stub_responses_client()
+        real_provider = OpenAIResponsesProvider()
+        with (
+            patch.object(session, "_get_active_tools", return_value=None),
+            patch.object(session, "_provider_extra_params", return_value=None),
+            patch.object(session, "_get_deferred_names", return_value=frozenset()),
+            patch.object(session, "_check_cancelled"),
+        ):
+            stream = session._try_stream(
+                client=client,
+                model="gpt-5",
+                msgs=[{"role": "user", "content": "hi"}],
+                provider=real_provider,
+                capabilities=registry._caps,
+                model_alias="gpt-5",
+            )
+            list(stream)
+        assert "include" not in captured
+
+    def test_capability_false_omits_include_even_when_flag_true(self) -> None:
+        from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+
+        # Operator flips replay=True but the model has
+        # supports_reasoning_replay=False (e.g. gpt-4o via Responses).
+        # Capability gate prevents the include= from being sent.
+        registry = self._registry_with_reasoning_capability(replay=True, supports_replay=False)
+        session = _make_session()
+        session._registry = registry
+        session._model_alias = "gpt-4o"
+        client, captured = self._stub_responses_client()
+        real_provider = OpenAIResponsesProvider()
+        with (
+            patch.object(session, "_get_active_tools", return_value=None),
+            patch.object(session, "_provider_extra_params", return_value=None),
+            patch.object(session, "_get_deferred_names", return_value=frozenset()),
+            patch.object(session, "_check_cancelled"),
+        ):
+            stream = session._try_stream(
+                client=client,
+                model="gpt-4o",
+                msgs=[{"role": "user", "content": "hi"}],
+                provider=real_provider,
+                capabilities=registry._caps,
+                model_alias="gpt-4o",
+            )
+            list(stream)
+        assert "include" not in captured
+
+    def test_replay_true_emits_reasoning_input_item(self) -> None:
+        from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+
+        registry = self._registry_with_reasoning_capability(replay=True, supports_replay=True)
+        session = _make_session()
+        session._registry = registry
+        session._model_alias = "gpt-5"
+        client, captured = self._stub_responses_client()
+        real_provider = OpenAIResponsesProvider()
+        # Multi-turn conversation with stored reasoning on assistant turn.
+        msgs: list[dict[str, object]] = [
+            {"role": "user", "content": "explain"},
+            {
+                "role": "assistant",
+                "content": "Final answer.",
+                "_provider_content": [
+                    {
+                        "type": "reasoning",
+                        "id": "r_xyz",
+                        "summary": [{"type": "summary_text", "text": "I thought"}],
+                        "encrypted_content": "blob",
+                    }
+                ],
+            },
+            {"role": "user", "content": "follow-up"},
+        ]
+        with (
+            patch.object(session, "_get_active_tools", return_value=None),
+            patch.object(session, "_provider_extra_params", return_value=None),
+            patch.object(session, "_get_deferred_names", return_value=frozenset()),
+            patch.object(session, "_check_cancelled"),
+        ):
+            stream = session._try_stream(
+                client=client,
+                model="gpt-5",
+                msgs=msgs,
+                provider=real_provider,
+                capabilities=registry._caps,
+                model_alias="gpt-5",
+            )
+            list(stream)
+        # Walk the wire input items — one of them must be the reasoning
+        # round-trip (id matches what we stored).
+        wire_input = captured.get("input")
+        assert isinstance(wire_input, list)
+        reasoning_items = [it for it in wire_input if it.get("type") == "reasoning"]
+        assert len(reasoning_items) == 1
+        assert reasoning_items[0]["id"] == "r_xyz"
+        assert reasoning_items[0]["encrypted_content"] == "blob"
+
+
 class TestUtilityCompletionPassesFlag:
     """Non-streaming utility path (title gen, compaction, extraction) —
     same plumbing requirement as streaming."""

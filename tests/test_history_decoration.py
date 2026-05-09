@@ -518,12 +518,12 @@ class TestExtractReasoningForHistory:
         extract_reasoning_for_history(messages, persist_reasoning_flag=True)
         assert messages[0]["reasoning"] == "first"
 
-    def test_first_block_reasoning_dispatches_to_openai_phase3_stub(self) -> None:
-        # OpenAI Responses extractor returns "" until Phase 3 wires
-        # ``include=["reasoning.encrypted_content"]``.  The dispatcher
-        # must still route to it (not silently fall through to "").
-        # We assert the dispatcher routed by checking the strip happens
-        # AND no reasoning field is added (because the stub returns "").
+    def test_first_block_reasoning_dispatches_to_openai_responses(self) -> None:
+        # Phase 3: dispatcher routes type=="reasoning" to the
+        # OpenAI Responses extractor, which now returns the
+        # summary[*].text concatenation.  Pre-Phase-3 this asserted
+        # "" (the stub); the assertion was tightened once the wire
+        # path landed.
         from turnstone.core.history_decoration import extract_reasoning_for_history
 
         messages = [
@@ -536,7 +536,7 @@ class TestExtractReasoningForHistory:
             }
         ]
         extract_reasoning_for_history(messages, persist_reasoning_flag=True)
-        assert "reasoning" not in messages[0]
+        assert messages[0]["reasoning"] == "s"
         assert "_provider_content" not in messages[0]
 
     def test_unknown_first_block_type_no_op(self) -> None:
@@ -595,4 +595,24 @@ class TestExtractReasoningForHistory:
         ]
         extract_reasoning_for_history(messages, persist_reasoning_flag=True)
         assert "reasoning" not in messages[0]
+        assert "_provider_content" not in messages[0]
+
+    def test_first_block_reasoning_text_dispatches_to_openai_chat(self) -> None:
+        # Phase 3 path 3: synthetic ``reasoning_text`` blocks (stamped
+        # by ChatSession._maybe_synth_reasoning_block for vLLM /
+        # llama.cpp / Gemini-compat conversations) dispatch to
+        # OpenAIChatCompletionsProvider.extract_reasoning_text.
+        from turnstone.core.history_decoration import extract_reasoning_for_history
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": "answer",
+                "_provider_content": [
+                    {"type": "reasoning_text", "text": "synth thought", "source": "vllm"},
+                ],
+            }
+        ]
+        extract_reasoning_for_history(messages, persist_reasoning_flag=True)
+        assert messages[0]["reasoning"] == "synth thought"
         assert "_provider_content" not in messages[0]
