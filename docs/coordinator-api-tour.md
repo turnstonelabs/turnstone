@@ -115,7 +115,8 @@ with a `type` field.  The recurring shapes a UI has to handle:
 | `tool_output_chunk` | Streaming tool output (e.g. long bash command)                                             | `call_id`, `chunk` |
 | `approve_request`   | One or more tool calls need operator approval                                              | `items: [{call_id, header, preview, func_name, approval_label, needs_approval}]` |
 | `approval_resolved` | Operator answered the approval prompt                                                      | `approved`, `feedback` |
-| `state_change`      | Worker-thread state transition                                                             | `state` ∈ `running`, `thinking`, `attention`, `idle`, `error` |
+| `state_change`      | Worker-thread state transition (also re-emitted with the current state on every fresh subscribe so refresh-mid-stream restores composer mode) | `state` ∈ `running`, `thinking`, `attention`, `idle`, `error` |
+| `in_progress_snapshot` | One-shot replay of the in-progress turn's content + reasoning when this client connects mid-stream                              | `content`, `reasoning` |
 | `status`            | Token usage + context-window snapshot (fires on every streaming tick)                      | `prompt_tokens`, `completion_tokens`, `total_tokens`, `context_window`, `pct`, `effort`, `cache_creation_tokens`, `cache_read_tokens` |
 | `rename`            | Session's display name changed                                                             | `name` |
 | `intent_verdict`    | Intent judge produced a verdict on a pending tool call                                     | `risk_level`, `recommendation`, `reasons` |
@@ -130,9 +131,13 @@ with a `type` field.  The recurring shapes a UI has to handle:
 
 **Reconnection contract:** a freshly-opened SSE connection receives
 the current snapshot of any pending tool approval (`approve_request`
-is re-sent if unresolved) and any in-flight `wait_*` / `batch_*`
-indicator — so a tab refresh mid-approval doesn't strand the
-operator.
+is re-sent if unresolved), any in-flight `wait_*` / `batch_*`
+indicator, the worker's current `state_change`, and an
+`in_progress_snapshot` carrying any partial content / reasoning the
+model has produced for the in-progress turn — so a tab refresh
+mid-approval, mid-tool-execution, or mid-stream restores both the
+correct composer mode and the partial assistant text without waiting
+for the response to complete.
 
 ---
 
