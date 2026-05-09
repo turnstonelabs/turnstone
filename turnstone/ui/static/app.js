@@ -91,6 +91,7 @@ Pane.prototype._createDOM = function () {
   actions.className = "pane-actions";
 
   var dashBtn = document.createElement("button");
+  dashBtn.type = "button";
   dashBtn.className = "pane-action-btn";
   dashBtn.title = "Back to dashboard";
   dashBtn.setAttribute("aria-label", "Back to dashboard");
