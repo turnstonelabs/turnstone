@@ -1096,6 +1096,31 @@ class ChatSession:
             return self._cached_capabilities
         return self._resolve_capabilities(p, m, "")
 
+    def _resolve_replay_reasoning_to_model(self, alias: str | None = None) -> bool:
+        """Read ``ModelConfig.replay_reasoning_to_model`` for an alias.
+
+        Used by the streaming + non-streaming wire-build paths to gate
+        Anthropic's verbatim ``_provider_content`` thinking-block
+        replay (Phase 2 of the reasoning-persistence feature).  The
+        resolver's miss-fallback is ``False``: when no registry / alias
+        is available, or the lookup raises, return ``False`` so the
+        provider-side strip path runs.  Losing the strip on operator-
+        flagged-on models would be a worse default than losing the
+        replay on operator-flagged-off models — replaying reasoning
+        text against an unknown operator preference shouldn't happen.
+        The False-on-miss matches the ``model_definitions`` server-side
+        default for the column, so cold workstreams behave the same as
+        unconfigured ones.
+        """
+        target_alias = alias or self._model_alias or ""
+        if not self._registry or not target_alias:
+            return False
+        try:
+            cfg: ModelConfig = self._registry.get_config(target_alias)
+            return bool(cfg.replay_reasoning_to_model)
+        except Exception:
+            return False
+
     def _save_config(self) -> None:
         """Persist LLM-affecting config so resumed workstreams behave identically."""
         save_workstream_config(
@@ -2464,6 +2489,7 @@ class ChatSession:
             reasoning_effort=reasoning_effort,
             extra_params=self._provider_extra_params(),
             capabilities=caps,
+            replay_reasoning_to_model=self._resolve_replay_reasoning_to_model(),
         )
 
     # -- tool search helpers --------------------------------------------------
@@ -2665,6 +2691,7 @@ class ChatSession:
                     deferred_names=self._get_deferred_names(),
                     cancel_ref=self._cancel_ref,
                     capabilities=capabilities or self._get_capabilities(prov, model),
+                    replay_reasoning_to_model=self._resolve_replay_reasoning_to_model(model_alias),
                 )
             except Exception as e:
                 ename = type(e).__name__
@@ -8927,6 +8954,9 @@ class ChatSession:
                         reasoning_effort=reasoning_effort or self.reasoning_effort,
                         extra_params=agent_extra,
                         capabilities=agent_caps,
+                        replay_reasoning_to_model=self._resolve_replay_reasoning_to_model(
+                            agent_alias
+                        ),
                     )
                 except Exception as e:
                     ename = type(e).__name__
