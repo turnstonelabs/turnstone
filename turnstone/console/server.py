@@ -41,6 +41,7 @@ from starlette.staticfiles import StaticFiles
 from turnstone.api.console_spec import build_console_spec
 from turnstone.api.docs import make_docs_handler, make_openapi_handler
 from turnstone.console.collector import ClusterCollector
+from turnstone.console.coordinator_alias import resolve_coordinator_alias
 from turnstone.console.coordinator_client import load_task_envelope
 from turnstone.console.metrics import ConsoleMetrics
 from turnstone.console.router import ConsoleRouter
@@ -1677,44 +1678,32 @@ async def list_available_models(request: Request) -> JSONResponse:
     if cs is not None:
         default_alias = cs.get("model.default_alias") or ""
         channel_default_alias = cs.get("channels.default_model_alias") or ""
-        coordinator_default_alias = (cs.get("coordinator.model_alias") or "").strip()
         judge_default_alias = (cs.get("judge.model") or "").strip()
     enabled_aliases = {r["alias"] for r in rows}
     if default_alias and default_alias not in enabled_aliases:
         default_alias = ""
     if channel_default_alias and channel_default_alias not in enabled_aliases:
         channel_default_alias = ""
-    # Coordinator fallback chain — three tiers, in priority order:
-    #   1. explicit ``coordinator.model_alias``
-    #   2. ``model.default_alias`` (admin-managed default in the Models tab)
-    #   3. ``registry.default`` (config.toml ``[model].default``)
-    #
-    # Tier 3 mirrors what console/session_factory.py:109-110 does when
-    # ``coordinator.model_alias`` is unset (``effective_alias =
-    # explicit_alias or registry.default``).  Without it the placeholder
-    # went blank whenever operators left both ConfigStore keys unset, even
-    # though new coordinator sessions still launch on ``registry.default``.
-    #
-    # Note: this chain extends session_factory's by inserting tier 2 as a
-    # courtesy — admins who set ``model.default_alias`` in the UI expect
-    # the home composer to advertise it.  session_factory itself does NOT
-    # consult ``model.default_alias`` today, so a configuration where
-    # ``model.default_alias`` ≠ ``registry.default`` will still drift
-    # between placeholder ("X") and runtime ("Y").  Aligning that is a
-    # session_factory change, tracked separately.
-    #
+    # Coordinator default walks the standard three-tier chain (see
+    # :func:`turnstone.console.coordinator_alias.resolve_coordinator_alias`).
+    # The placeholder restricts every tier to enabled DB rows so the home
+    # composer doesn't advertise a model the workstream-creation picker
+    # can't actually offer — the session factory uses the same chain
+    # without that filter so explicit operator pins surface as 503 at
+    # ``registry.resolve`` instead of being silently swapped out.
+    coord_registry = getattr(request.app.state, "coord_registry", None)
+    if cs is not None and coord_registry is not None:
+        coordinator_default_alias = resolve_coordinator_alias(
+            explicit=cs.get("coordinator.model_alias"),
+            config_store=cs,
+            registry=coord_registry,
+            alias_filter=lambda a: a in enabled_aliases,
+        )
     # Judge falls back to the resolved coordinator alias when
     # ``judge.model`` is empty *or* not a registered alias — judge.model
     # is alias-only (matches IntentJudge.__init__), so an unknown value is
     # operator misconfiguration that the judge itself silently inherits
     # the session model on.
-    if not coordinator_default_alias or coordinator_default_alias not in enabled_aliases:
-        coordinator_default_alias = default_alias
-    if not coordinator_default_alias:
-        coord_registry = getattr(request.app.state, "coord_registry", None)
-        registry_default = getattr(coord_registry, "default", "") if coord_registry else ""
-        if registry_default and registry_default in enabled_aliases:
-            coordinator_default_alias = registry_default
     if not judge_default_alias or judge_default_alias not in enabled_aliases:
         judge_default_alias = coordinator_default_alias
     return JSONResponse(

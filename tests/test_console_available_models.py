@@ -23,7 +23,6 @@ placeholder stays correct as the precedence rules evolve.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -64,11 +63,31 @@ def _seed_model(
     )
 
 
+class _StubRegistry:
+    """Mimics the surface ``resolve_coordinator_alias`` reads from
+    ``coord_registry``: ``.default`` and ``.has_alias()``.
+
+    Production wires this through ``ModelRegistry``, which in turn
+    pulls aliases from both DB rows and config.toml.  The fixture
+    mirrors the storage's enabled-row set so ``has_alias()`` agrees
+    with what the placeholder's enabled-row filter would accept —
+    without that alignment the helper rejects every tier-2 candidate
+    and the placeholder goes blank in cases that production handles
+    fine."""
+
+    def __init__(self, *, default: str, known: set[str]) -> None:
+        self.default = default
+        self._known = known
+
+    def has_alias(self, alias: str) -> bool:
+        return alias in self._known
+
+
 def _make_client(
     storage: SQLiteBackend,
     *,
     settings: dict[str, str] | None = None,
-    registry_default: str | None = None,
+    registry_default: str = "",
 ) -> TestClient:
     app = Starlette(
         routes=[Route("/v1/api/models", list_available_models)],
@@ -76,10 +95,11 @@ def _make_client(
     )
     app.state.auth_storage = storage
     app.state.config_store = _FakeConfigStore(dict(settings or {}))
-    if registry_default is not None:
-        # Mimic the live console's ``coord_registry`` shape — the handler
-        # only reads ``.default``, so a SimpleNamespace is enough.
-        app.state.coord_registry = SimpleNamespace(default=registry_default)
+    # ``coord_registry`` is always set in production after lifespan
+    # startup; mirror that here.  ``has_alias`` answers from the same
+    # enabled-rows set the handler filters against.
+    enabled = {r["alias"] for r in storage.list_model_definitions(enabled_only=True)}
+    app.state.coord_registry = _StubRegistry(default=registry_default, known=enabled)
     client = TestClient(app)
     client.headers.update({"X-Test-User": "admin", "X-Test-Perms": ""})
     return client
