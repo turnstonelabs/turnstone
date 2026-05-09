@@ -579,6 +579,21 @@ def _render_template(content: str, context: dict[str, str]) -> str:
     return _TEMPLATE_VAR_RE.sub(_replace, content)
 
 
+# Block types that carry reasoning content across providers.  Used by
+# ``ChatSession._maybe_synth_reasoning_block`` to decide whether
+# captured ``reasoning_parts`` need a synthetic ``reasoning_text``
+# block: if any of these types already appear in ``provider_blocks``,
+# native lane handles persistence and synthesis is a no-op.
+# - ``thinking`` / ``redacted_thinking`` — Anthropic native
+# - ``reasoning`` — OpenAI Responses native
+# - ``reasoning_text`` — synthetic (path-3 capture; included so
+#   re-running this code path against an already-synthesized list is
+#   idempotent).
+_REASONING_BEARING_BLOCK_TYPES: frozenset[str] = frozenset(
+    {"thinking", "redacted_thinking", "reasoning", "reasoning_text"}
+)
+
+
 # ---------------------------------------------------------------------------
 # SessionUI protocol — the contract every frontend must implement
 # ---------------------------------------------------------------------------
@@ -1135,20 +1150,32 @@ class ChatSession:
         reasoning_parts: list[str],
     ) -> list[dict[str, Any]]:
         """Stamp captured ``reasoning_parts`` as a synthetic ``reasoning_text``
-        block when no native ``provider_blocks`` were emitted.
+        block when no reasoning-bearing block already appears in
+        ``provider_blocks``.
 
         Anthropic emits native ``thinking`` blocks; OpenAI Responses
         emits native ``reasoning`` items via ``output_item.done``.
-        Both populate ``provider_blocks`` directly during streaming
-        and need no synthesis here.
+        Both populate ``provider_blocks`` with reasoning-bearing
+        shapes during streaming and need no synthesis here.
 
-        OpenAI Chat Completions (with vLLM ``--reasoning-parser``,
-        llama.cpp ``reasoning_format``, or Gemini's ``/v1beta/openai/``
-        endpoint if it surfaces ``reasoning_content``) streams
-        reasoning as ``reasoning_delta`` chunks but never produces a
-        provider_blocks item.  Without this synthesis the captured
-        text would be dropped at the end of the stream — visible live,
-        invisible on page reload.
+        OpenAI Chat Completions (vLLM ``--reasoning-parser``, llama.cpp
+        ``reasoning_format``, Gemini's ``/v1beta/openai/`` endpoint
+        when it surfaces ``reasoning_content``) streams reasoning as
+        ``reasoning_delta`` chunks but never emits a reasoning-bearing
+        provider block.  Without this synthesis the captured text would
+        be dropped at the end of the stream — visible live, invisible
+        on page reload.
+
+        Crucially, GoogleProvider attaches raw tool_call dicts as
+        ``provider_blocks`` on the finish chunk for ``thought_signature``
+        round-trip (``_google.py:_iter_stream``).  An earlier version
+        bailed out whenever ``provider_blocks`` was non-empty, which
+        silently lost reasoning text on Google + reasoning_delta turns.
+        The fix tests for reasoning-bearing block types specifically
+        (see ``_REASONING_BEARING_BLOCK_TYPES``) and APPENDS the
+        synthetic block to the existing list rather than replacing it
+        — preserving Google's tool-call fidelity blocks alongside the
+        new synthetic reasoning entry.
 
         The synthetic block uses ``type="reasoning_text"`` (NOT
         ``"thinking"``) so it falls through Phase 2's
@@ -1165,11 +1192,15 @@ class ChatSession:
         reasoning back into a vllm round-trip) — not consumed today;
         the field is informational metadata, not dead code.
         """
-        if provider_blocks:
-            return provider_blocks
         text = "".join(reasoning_parts)
         if not text.strip():
             return provider_blocks
+        # Native reasoning already present — Anthropic / OpenAI
+        # Responses path.  No synth needed; return reference unchanged
+        # so the existing identity contract holds.
+        for b in provider_blocks:
+            if isinstance(b, dict) and b.get("type") in _REASONING_BEARING_BLOCK_TYPES:
+                return provider_blocks
         block: dict[str, Any] = {
             "type": "reasoning_text",
             "text": text,
@@ -1177,7 +1208,9 @@ class ChatSession:
         server_type = self._resolve_server_type()
         if server_type:
             block["source"] = server_type
-        return [block]
+        # Append rather than replace so non-reasoning fidelity blocks
+        # (e.g. Google tool_calls with thought_signature) survive.
+        return [*provider_blocks, block]
 
     def _resolve_replay_reasoning_to_model(self, alias: str | None = None) -> bool:
         """Read ``ModelConfig.replay_reasoning_to_model`` for an alias.

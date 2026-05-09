@@ -256,10 +256,24 @@ class LLMProvider(Protocol):
     ) -> str:
         """Return concatenated reasoning text from stored ``provider_blocks``.
 
-        Providers without a first-class reasoning shape (OpenAI Chat,
-        Google) or that haven't been wired yet (OpenAI Responses pre-
-        Phase-3) return ``""``.  AnthropicProvider walks
-        ``type=="thinking"`` blocks and returns the concatenated
-        ``thinking`` text, capped at an operator-friendly size.
+        Each provider walks the block types it owns:
+
+        * ``AnthropicProvider`` — ``thinking`` blocks (concatenated
+          ``thinking`` text).
+        * ``OpenAIResponsesProvider`` — ``reasoning`` items
+          (concatenated ``summary`` + ``content`` text).
+        * ``OpenAIChatCompletionsProvider`` — synthetic
+          ``reasoning_text`` blocks stamped by
+          ``ChatSession._maybe_synth_reasoning_block`` for vLLM /
+          llama.cpp / Gemini-OpenAI-compat reasoning capture.
+        * ``GoogleProvider`` — inherits the OpenAI Chat extractor
+          (Gemini's ``/v1beta/openai/`` reasoning surfaces as
+          synthetic ``reasoning_text`` blocks too).
+
+        All providers return the joined text capped at
+        :data:`MAX_REASONING_DISPLAY_CHARS` for UI rendering; full
+        bytes remain in ``provider_data`` for replay.  Returns ``""``
+        when the input list contains no recognised reasoning-bearing
+        blocks for the implementing provider.
         """
         ...
