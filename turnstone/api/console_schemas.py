@@ -908,7 +908,7 @@ class ModelDefinitionInfo(BaseModel):
     temperature: float | None = None
     max_tokens: int | None = None
     reasoning_effort: str | None = None
-    persist_reasoning: bool = True
+    surface_persisted_reasoning: bool = True
     replay_reasoning_to_model: bool = False
     source: str = ""
     created_by: str = ""
@@ -928,7 +928,7 @@ class CreateModelDefinitionRequest(BaseModel):
     temperature: float | None = None
     max_tokens: int | None = None
     reasoning_effort: str | None = None
-    persist_reasoning: bool = True
+    surface_persisted_reasoning: bool = True
     replay_reasoning_to_model: bool = False
 
 
@@ -944,7 +944,7 @@ class UpdateModelDefinitionRequest(BaseModel):
     temperature: float | None = None
     max_tokens: int | None = None
     reasoning_effort: str | None = None
-    persist_reasoning: bool | None = None
+    surface_persisted_reasoning: bool | None = None
     replay_reasoning_to_model: bool | None = None
 
 

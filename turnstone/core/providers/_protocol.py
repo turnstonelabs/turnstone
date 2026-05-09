@@ -106,8 +106,34 @@ class ModelCapabilities:
 # tuning change propagates to every provider's display path uniformly.
 # Larger reasoning bodies are still stored verbatim in
 # ``provider_data``; only the rehydrated UI display payload is
-# truncated.  64 KiB matches the briefing's recommendation.
-MAX_REASONING_DISPLAY_BYTES = 64 * 1024
+# truncated.
+#
+# Named ``_CHARS`` (not ``_BYTES``) because the cap is enforced via
+# Python ``str`` slicing, which counts code points.  Reasoning text
+# that happens to contain 4-byte UTF-8 glyphs (CJK, emoji) will
+# serialise to a larger UTF-8 payload than the constant suggests —
+# fine for the UI display path (browsers handle the encoded length),
+# but worth knowing if this is ever wired to a byte-quota system.
+MAX_REASONING_DISPLAY_CHARS = 64 * 1024
+
+
+def _join_reasoning_with_cap(parts: list[str]) -> str:
+    """Join collected reasoning text parts with newline; truncate at the
+    operator-friendly UI cap.
+
+    Shared tail of every provider's ``extract_reasoning_text`` —
+    Anthropic walks ``thinking`` blocks, OpenAI Responses walks
+    ``reasoning`` items' ``summary`` + ``content``, OpenAI Chat walks
+    synthetic ``reasoning_text`` blocks.  All three converge on the
+    same emit pattern: collect strings, drop empties, join with
+    newline, cap at :data:`MAX_REASONING_DISPLAY_CHARS`.
+    """
+    if not parts:
+        return ""
+    joined = "\n".join(parts)
+    if len(joined) > MAX_REASONING_DISPLAY_CHARS:
+        return joined[:MAX_REASONING_DISPLAY_CHARS]
+    return joined
 
 
 def _lookup_capabilities(
@@ -168,6 +194,21 @@ class LLMProvider(Protocol):
         stream object (which has a ``.close()`` method) before yielding the
         first chunk.  The caller can then close it from another thread to
         abort a blocked HTTP read immediately.
+
+        ``replay_reasoning_to_model`` defaults to ``True`` here (and on
+        every concrete provider's ``create_streaming`` /
+        ``create_completion``) for back-compat with direct callers that
+        haven't been updated to thread the resolver — eval scripts,
+        ad-hoc tests, third-party harnesses.  This is INTENTIONALLY
+        the opposite of the operator-side default
+        (``ModelConfig.replay_reasoning_to_model = False``,
+        ``model_definitions`` server_default ``0``); the resolver in
+        ``ChatSession`` reads the operator value and passes it
+        explicitly, so production call sites never rely on the
+        kwarg-omitted path.  Provider-internal helpers (e.g.
+        ``OpenAIResponsesProvider._convert_messages``) default ``False``
+        because they're called BY the public entry points — once the
+        resolver-driven value lands, it's already explicit.
         """
         ...
 

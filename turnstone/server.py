@@ -477,19 +477,21 @@ def _build_history(
     # Active-model reasoning-persistence flag — defaults True so that a
     # registry/alias lookup miss still surfaces reasoning bubbles.  The
     # default-True semantic mirrors the migration's server_default for
-    # ``model_definitions.persist_reasoning`` and matches the conservative
+    # ``model_definitions.surface_persisted_reasoning`` and matches the conservative
     # rehydration default (Phase 1 spec).
-    persist_reasoning = True
+    surface_persisted_reasoning = True
     registry = getattr(session, "_registry", None)
     model_alias = getattr(session, "_model_alias", "") or ""
     if registry is not None and model_alias:
         try:
-            persist_reasoning = bool(registry.get_config(model_alias).persist_reasoning)
+            surface_persisted_reasoning = bool(
+                registry.get_config(model_alias).surface_persisted_reasoning
+            )
         except Exception:
             # Unknown alias / partially-built registry / dataclass drift —
             # fall back to the conservative default rather than failing
             # the entire history build.
-            persist_reasoning = True
+            surface_persisted_reasoning = True
     history = []
     for msg in session.messages:
         content = msg.get("content")
@@ -580,7 +582,7 @@ def _build_history(
         # ``_provider_content`` lane on ``session.messages`` (set
         # post-commit at ``session.py:3768-3771``).  The lane itself is
         # never copied into ``entry`` — the wire payload stays tight.
-        if msg.get("role") == "assistant" and persist_reasoning:
+        if msg.get("role") == "assistant" and surface_persisted_reasoning:
             reasoning_text = _extract_reasoning_text(msg.get("_provider_content"))
             if reasoning_text:
                 entry["reasoning"] = reasoning_text

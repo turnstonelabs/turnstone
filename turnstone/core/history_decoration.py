@@ -277,31 +277,44 @@ if TYPE_CHECKING:
 def _make_provider_factory(module_path: str, class_name: str) -> Callable[[], LLMProvider]:
     """Build a thread-unsafe lazy-init factory for a provider singleton.
 
-    Single source of truth for the dispatcher's per-provider lazy-load
-    pattern — each block-type entry in ``_BLOCK_TYPE_PROVIDER_FACTORY``
-    closes over this with its own (module_path, class_name) pair.
-    Adding a fourth provider is a single tuple in the dict, not a
-    new 9-line getter.
+    Each block-type entry in ``_BLOCK_TYPE_PROVIDER_FACTORY`` closes
+    over its own (module_path, class_name) pair.  Adding a fourth
+    provider is a single tuple in the dict, not a new 9-line getter.
+
+    Uses ``nonlocal`` instead of ``functools.lru_cache`` so the cache
+    state stays inside this closure (lru_cache would attach state to
+    the inner function object, which is correct but adds a per-call
+    hash lookup on a bound key for what's effectively a single-slot
+    cache).
     """
-    cached: dict[str, LLMProvider] = {}
+    instance: LLMProvider | None = None
 
     def factory() -> LLMProvider:
-        if "instance" not in cached:
+        nonlocal instance
+        if instance is None:
             import importlib
 
             module = importlib.import_module(module_path)
-            cached["instance"] = getattr(module, class_name)()
-        return cached["instance"]
+            instance = getattr(module, class_name)()
+        return instance
 
     return factory
 
 
 # Block-type → provider factory.  Routing is structural — block shape
-# is non-overlapping across providers by API design.  Three block
-# types are recognised today:
+# is non-overlapping across providers by API design.  Recognised
+# block types today:
 #
 # * ``"thinking"`` — Anthropic native (Phase 1).  Walks the
 #   ``thinking`` field on each block.
+# * ``"redacted_thinking"`` — Anthropic native (Phase 1).  Anthropic's
+#   safety system rewrites a thinking block into a sealed
+#   ``redacted_thinking`` block; the Anthropic docs note these can
+#   appear before, after, or interleaved with regular ``thinking``
+#   blocks.  Same factory: AnthropicProvider's extractor walks the
+#   full block list and filters to ``type == "thinking"``, so the
+#   redacted blocks are correctly skipped while the surrounding
+#   real thinking text still surfaces.
 # * ``"reasoning"`` — OpenAI Responses native (Phase 3).  Walks
 #   ``summary[*].text`` (always present) and ``content[*].text``
 #   (present when ``include=["reasoning.encrypted_content"]`` is
@@ -310,8 +323,12 @@ def _make_provider_factory(module_path: str, class_name: str) -> Callable[[], LL
 #   ``ChatSession._maybe_synth_reasoning_block`` for Chat Completions
 #   paths (vLLM, llama.cpp, Gemini-compat) where reasoning surfaces
 #   only as ``reasoning_delta`` chunks with no native block shape.
+_anthropic_factory = _make_provider_factory(
+    "turnstone.core.providers._anthropic", "AnthropicProvider"
+)
 _BLOCK_TYPE_PROVIDER_FACTORY: dict[str, Callable[[], LLMProvider]] = {
-    "thinking": _make_provider_factory("turnstone.core.providers._anthropic", "AnthropicProvider"),
+    "thinking": _anthropic_factory,
+    "redacted_thinking": _anthropic_factory,
     "reasoning": _make_provider_factory(
         "turnstone.core.providers._openai_responses", "OpenAIResponsesProvider"
     ),
@@ -347,7 +364,7 @@ def extract_reasoning_text_from_provider_content(provider_content: Any) -> str:
 
 def extract_reasoning_for_history(
     messages: list[dict[str, Any]],
-    persist_reasoning_flag: bool,
+    surface_persisted_reasoning_flag: bool,
 ) -> None:
     """Surface stored reasoning text on each assistant message; strip the
     raw provider content from the wire payload.
@@ -357,7 +374,7 @@ def extract_reasoning_for_history(
     — both extraction source and stamp destination are the same dict.
     Walks *messages* in place: for every assistant message, dispatches
     via :func:`extract_reasoning_text_from_provider_content` and stamps
-    ``msg["reasoning"]`` when *persist_reasoning_flag* is True and the
+    ``msg["reasoning"]`` when *surface_persisted_reasoning_flag* is True and the
     dispatcher returned non-empty text.  Strips ``_provider_content``
     unconditionally — the field is internal and never read by either UI.
 
@@ -375,12 +392,12 @@ def extract_reasoning_for_history(
             continue
         provider_content = msg.get("_provider_content")
         # Always strip the internal lane before the wire payload leaves
-        # the helper, even when persist_reasoning_flag is False or the
+        # the helper, even when surface_persisted_reasoning_flag is False or the
         # field is empty/missing.  The strip is the contract; reasoning
         # surfacing is conditional on top of it.
         if "_provider_content" in msg:
             del msg["_provider_content"]
-        if not persist_reasoning_flag:
+        if not surface_persisted_reasoning_flag:
             continue
         text = extract_reasoning_text_from_provider_content(provider_content)
         if text:

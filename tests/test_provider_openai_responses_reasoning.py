@@ -22,7 +22,7 @@ from turnstone.core.providers._openai_responses import (
     _reasoning_item_for_input,
 )
 from turnstone.core.providers._protocol import (
-    MAX_REASONING_DISPLAY_BYTES as _MAX_REASONING_DISPLAY_BYTES,
+    MAX_REASONING_DISPLAY_CHARS as _MAX_REASONING_DISPLAY_CHARS,
 )
 from turnstone.core.providers._protocol import ModelCapabilities
 
@@ -98,7 +98,7 @@ class TestExtractReasoningText:
         assert "raw reasoning" in result
 
     def test_truncation_at_64kib_cap(self, provider: OpenAIResponsesProvider) -> None:
-        long_text = "x" * (_MAX_REASONING_DISPLAY_BYTES + 1024)
+        long_text = "x" * (_MAX_REASONING_DISPLAY_CHARS + 1024)
         blocks = [
             {
                 "type": "reasoning",
@@ -107,7 +107,7 @@ class TestExtractReasoningText:
             }
         ]
         result = provider.extract_reasoning_text(blocks)
-        assert len(result) == _MAX_REASONING_DISPLAY_BYTES
+        assert len(result) == _MAX_REASONING_DISPLAY_CHARS
 
     def test_malformed_summary_entry_skipped(self, provider: OpenAIResponsesProvider) -> None:
         blocks = [

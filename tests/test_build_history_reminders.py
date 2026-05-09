@@ -147,8 +147,8 @@ class _StubRegistry:
     """Minimal model registry — only ``get_config`` is read by
     ``_build_history``."""
 
-    def __init__(self, persist_reasoning: bool = True) -> None:
-        self._cfg = SimpleNamespace(persist_reasoning=persist_reasoning)
+    def __init__(self, surface_persisted_reasoning: bool = True) -> None:
+        self._cfg = SimpleNamespace(surface_persisted_reasoning=surface_persisted_reasoning)
 
     def get_config(self, alias: str) -> Any:
         return self._cfg
@@ -156,12 +156,12 @@ class _StubRegistry:
 
 def _build_with_registry(
     messages: list[dict[str, Any]],
-    persist_reasoning: bool = True,
+    surface_persisted_reasoning: bool = True,
 ) -> list[dict[str, Any]]:
     session = SimpleNamespace(
         messages=messages,
         _ws_id="ws-test",
-        _registry=_StubRegistry(persist_reasoning=persist_reasoning),
+        _registry=_StubRegistry(surface_persisted_reasoning=surface_persisted_reasoning),
         _model_alias="claude-opus-4-7",
     )
     with patch(
@@ -187,7 +187,7 @@ class TestReasoningSurfacing:
                 {"type": "text", "text": "Final answer."},
             ],
         }
-        history = _build_with_registry([msg], persist_reasoning=True)
+        history = _build_with_registry([msg], surface_persisted_reasoning=True)
         assert len(history) == 1
         assert history[0]["reasoning"] == "let me think"
 
@@ -199,7 +199,7 @@ class TestReasoningSurfacing:
                 {"type": "thinking", "thinking": "hidden", "signature": "s"},
             ],
         }
-        history = _build_with_registry([msg], persist_reasoning=False)
+        history = _build_with_registry([msg], surface_persisted_reasoning=False)
         assert "reasoning" not in history[0]
 
     def test_provider_content_never_in_wire_entry(self) -> None:
@@ -212,12 +212,12 @@ class TestReasoningSurfacing:
                 {"type": "thinking", "thinking": "x", "signature": "s"},
             ],
         }
-        history = _build_with_registry([msg], persist_reasoning=True)
+        history = _build_with_registry([msg], surface_persisted_reasoning=True)
         assert "_provider_content" not in history[0]
 
     def test_no_reasoning_field_when_provider_content_missing(self) -> None:
         msg = {"role": "assistant", "content": "plain answer"}
-        history = _build_with_registry([msg], persist_reasoning=True)
+        history = _build_with_registry([msg], surface_persisted_reasoning=True)
         assert "reasoning" not in history[0]
 
     def test_no_reasoning_field_for_non_assistant_messages(self) -> None:
@@ -232,7 +232,7 @@ class TestReasoningSurfacing:
                 "_provider_content": [{"type": "thinking", "thinking": "leak", "signature": "s"}],
             },
         ]
-        history = _build_with_registry(msgs, persist_reasoning=True)
+        history = _build_with_registry(msgs, surface_persisted_reasoning=True)
         assert "reasoning" not in history[0]
         assert "reasoning" not in history[1]
 

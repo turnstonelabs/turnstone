@@ -65,7 +65,7 @@ class HistoryEvent(ServerEvent):
     * ``reasoning`` — concatenated reasoning text for assistant turns
       that round-tripped a thinking-block lane (Anthropic-with-thinking
       today; OpenAI Responses + Gemini in later phases). Present only
-      when the active model's ``persist_reasoning`` flag is true and
+      when the active model's ``surface_persisted_reasoning`` flag is true and
       the underlying ``provider_data`` carries reasoning blocks.
     """
 
