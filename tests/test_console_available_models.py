@@ -23,6 +23,7 @@ placeholder stays correct as the precedence rules evolve.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -78,8 +79,6 @@ def _make_client(
     if registry_default is not None:
         # Mimic the live console's ``coord_registry`` shape — the handler
         # only reads ``.default``, so a SimpleNamespace is enough.
-        from types import SimpleNamespace
-
         app.state.coord_registry = SimpleNamespace(default=registry_default)
     client = TestClient(app)
     client.headers.update({"X-Test-User": "admin", "X-Test-Perms": ""})

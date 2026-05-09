@@ -1684,18 +1684,30 @@ async def list_available_models(request: Request) -> JSONResponse:
         default_alias = ""
     if channel_default_alias and channel_default_alias not in enabled_aliases:
         channel_default_alias = ""
-    # Coordinator fallback chain mirrors console/session_factory.py:109-110:
-    # explicit ``coordinator.model_alias`` → ``model.default_alias``
-    # (admin-managed) → ``registry.default`` (the config.toml default that
-    # session_factory falls through to via ``registry.default`` when both
-    # ConfigStore keys are unset).  Without the registry tier the
-    # placeholder lies whenever an operator never set ``model.default_alias``
-    # in the admin UI — new coordinator sessions will still run on
-    # ``registry.default``.  Judge falls back to the resolved coordinator
-    # alias when ``judge.model`` is empty *or* not a registered alias —
-    # judge.model is alias-only (matches IntentJudge.__init__), so an
-    # unknown value is operator misconfiguration that the judge itself
-    # silently inherits the session model on.
+    # Coordinator fallback chain — three tiers, in priority order:
+    #   1. explicit ``coordinator.model_alias``
+    #   2. ``model.default_alias`` (admin-managed default in the Models tab)
+    #   3. ``registry.default`` (config.toml ``[model].default``)
+    #
+    # Tier 3 mirrors what console/session_factory.py:109-110 does when
+    # ``coordinator.model_alias`` is unset (``effective_alias =
+    # explicit_alias or registry.default``).  Without it the placeholder
+    # went blank whenever operators left both ConfigStore keys unset, even
+    # though new coordinator sessions still launch on ``registry.default``.
+    #
+    # Note: this chain extends session_factory's by inserting tier 2 as a
+    # courtesy — admins who set ``model.default_alias`` in the UI expect
+    # the home composer to advertise it.  session_factory itself does NOT
+    # consult ``model.default_alias`` today, so a configuration where
+    # ``model.default_alias`` ≠ ``registry.default`` will still drift
+    # between placeholder ("X") and runtime ("Y").  Aligning that is a
+    # session_factory change, tracked separately.
+    #
+    # Judge falls back to the resolved coordinator alias when
+    # ``judge.model`` is empty *or* not a registered alias — judge.model
+    # is alias-only (matches IntentJudge.__init__), so an unknown value is
+    # operator misconfiguration that the judge itself silently inherits
+    # the session model on.
     if not coordinator_default_alias or coordinator_default_alias not in enabled_aliases:
         coordinator_default_alias = default_alias
     if not coordinator_default_alias:
