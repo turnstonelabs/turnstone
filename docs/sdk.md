@@ -138,6 +138,9 @@ SSE events are deserialized into typed dataclasses. Use `event.type` to discrimi
 | `error` | `ErrorEvent` | `message` |
 | `info` | `InfoEvent` | `message` |
 | `stream_end` | `StreamEndEvent` | — |
+| `state_change` | `StateChangeEvent` | `state` ∈ `running`/`thinking`/`attention`/`idle`/`error` |
+| `in_progress_snapshot` | `InProgressSnapshotEvent` | `content`, `reasoning` (one-shot mid-stream refresh resume) |
+| `approval_resolved` | `ApprovalResolvedEvent` | `approved`, `feedback` |
 | `cancelled` | `CancelledEvent` | — |
 
 **Global events** (from `stream_global_events()`):

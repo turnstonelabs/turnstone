@@ -24,6 +24,14 @@ CS -> DB : save_message(ws_id, "user", input)
 
 group loop [while tool_calls present]
 
+    CS -> UI : on_turn_start()
+    note right of UI
+      SessionUIBase resets the per-turn inflight
+      buffers (_ws_inflight_content / reasoning /
+      seq) that fuel the SSE in_progress_snapshot
+      event for mid-stream refresh resume.
+    end note
+
     CS -> UI : on_state_change("thinking")
     CS -> UI : on_thinking_start()
 
@@ -73,6 +81,14 @@ group loop [while tool_calls present]
 
     CS -> CS : _update_token_table()\ncalibrate chars_per_token ratio
     CS -> CS : messages.append(assistant_msg)
+    CS -> UI : on_turn_committed()
+    note right of UI
+      Drops the per-turn inflight buffers — the
+      assistant message is now in the history
+      list, so the in_progress_snapshot must
+      not re-render it during the next tool-
+      execution window or the next streaming turn.
+    end note
     CS -> DB : save_message(ws_id, "assistant", content)
     CS -> DB : save_message(ws_id, "tool_call", ...) ×N
 
