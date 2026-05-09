@@ -220,10 +220,13 @@ class SessionUIBase:
         # each turn by :meth:`on_turn_start` (separate from the multi-
         # turn IDLE-piggyback buffer above so prior committed turns
         # don't leak into the snapshot and double-render against the
-        # replayed history). ``_ws_inflight_seq`` is a monotonic per-
-        # turn counter incremented only on actual append; the events
-        # handler dedups live events whose ``_seq`` is at-or-below the
-        # snapshot's seq (already in the snapshot payload).
+        # replayed history). ``_ws_inflight_seq`` is a monotonic
+        # counter incremented on EVERY emit (even when the cap
+        # rejected the buffer append) so a subscriber registering
+        # after the cap is hit doesn't have subsequent live tokens
+        # filter-dropped against a stalled ``snap_seq`` — the events
+        # handler dedups live events whose ``_seq`` is at-or-below
+        # the snapshot's seq (already in the snapshot payload).
         self._ws_inflight_content: list[str] = []
         self._ws_inflight_content_size: int = 0
         self._ws_inflight_reasoning: list[str] = []
@@ -304,9 +307,12 @@ class SessionUIBase:
         Race-free composition with the on-token writers, even though
         ``on_content_token`` / ``on_reasoning_token`` cross two locks
         (``_ws_lock`` for the buffer append, ``_listeners_lock`` for
-        the fan-out enqueue). The trick is the per-turn seq counter —
-        ``_ws_inflight_seq`` is incremented under ``_ws_lock`` only on
-        actual append; this method captures it alongside the buffer
+        the fan-out enqueue). The trick is the seq counter —
+        ``_ws_inflight_seq`` is incremented under ``_ws_lock`` on
+        every emit (even when the cap rejected the append, so a
+        subscriber that registers after the cap is hit doesn't have
+        subsequent live tokens filter-dropped against a stalled
+        snap_seq). This method captures it alongside the buffer
         contents under the same ``_ws_lock``, and the events handler's
         live drain drops any incoming event whose ``_seq`` is at-or-
         below the captured ``snap.seq`` (already in the snapshot
@@ -1315,7 +1321,6 @@ class SessionUIBase:
         with a visual gap equal to the past-cap chunk. No silent
         drop of subsequent tokens.
         """
-        seq: int = 0
         with self._ws_lock:
             if self._ws_inflight_reasoning_size < _MAX_TURN_CONTENT_CHARS:
                 self._ws_inflight_reasoning.append(text)
@@ -1352,7 +1357,6 @@ class SessionUIBase:
         orphaned list reference the snapshot just swapped out. Lock
         hold is microseconds.
         """
-        seq: int = 0
         with self._ws_lock:
             if self._ws_turn_content_size < _MAX_TURN_CONTENT_CHARS:
                 self._ws_turn_content.append(text)
