@@ -76,6 +76,23 @@ class TestModelConfig:
         assert cfg.temperature == 0.0
         assert cfg.temperature is not None
 
+    def test_reasoning_flags_default(self) -> None:
+        cfg = ModelConfig(alias="x", base_url="x", api_key="x", model="x")
+        assert cfg.persist_reasoning is True
+        assert cfg.replay_reasoning_to_model is False
+
+    def test_reasoning_flags_set(self) -> None:
+        cfg = ModelConfig(
+            alias="x",
+            base_url="x",
+            api_key="x",
+            model="x",
+            persist_reasoning=False,
+            replay_reasoning_to_model=True,
+        )
+        assert cfg.persist_reasoning is False
+        assert cfg.replay_reasoning_to_model is True
+
 
 # ---------------------------------------------------------------------------
 # ModelRegistry
@@ -685,6 +702,53 @@ class TestLoadModelRegistryWithDB:
         assert cfg.temperature is None
         assert cfg.max_tokens is None
         assert cfg.reasoning_effort is None
+
+    def test_db_reasoning_flags_loaded(self) -> None:
+        """Per-model reasoning flags from DB are carried in ModelConfig."""
+        storage = _MockStorage(
+            [
+                {
+                    "alias": "anth-thinking",
+                    "model": "claude-opus-4-7",
+                    "provider": "anthropic",
+                    "base_url": "",
+                    "api_key": "sk-anth",
+                    "context_window": 200000,
+                    "capabilities": "{}",
+                    "enabled": True,
+                    "persist_reasoning": False,
+                    "replay_reasoning_to_model": True,
+                }
+            ]
+        )
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry("http://x/v1", "x", "x", storage=storage)
+        cfg = reg.get_config("anth-thinking")
+        assert cfg.persist_reasoning is False
+        assert cfg.replay_reasoning_to_model is True
+
+    def test_db_reasoning_flags_default_when_absent(self) -> None:
+        """Pre-052 rows without the columns degrade to dataclass defaults."""
+        storage = _MockStorage(
+            [
+                {
+                    "alias": "legacy-row",
+                    "model": "gpt-5",
+                    "provider": "openai",
+                    "base_url": "",
+                    "api_key": "",
+                    "context_window": 32768,
+                    "capabilities": "{}",
+                    "enabled": True,
+                    # persist_reasoning + replay_reasoning_to_model intentionally absent
+                }
+            ]
+        )
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry("http://x/v1", "x", "x", storage=storage)
+        cfg = reg.get_config("legacy-row")
+        assert cfg.persist_reasoning is True
+        assert cfg.replay_reasoning_to_model is False
 
     def test_db_default_alias_not_clobbered(self) -> None:
         """DB model with alias='default' is not overwritten by CLI args."""

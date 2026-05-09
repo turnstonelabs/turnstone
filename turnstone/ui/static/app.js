@@ -1194,6 +1194,20 @@ Pane.prototype.replayHistory = function (messages) {
       }
       lastToolBlock = null;
     } else if (msg.role === "assistant") {
+      // Reasoning bubble (Phase 1 reasoning persistence) — render
+      // BEFORE the content bubble so the visual order matches the
+      // live SSE flow (reasoning_delta arrives before content_delta
+      // for thinking-enabled models). Mirrors the live-stream
+      // construction at the "case 'reasoning':" branch above. Only
+      // surfaces when the active model's persist_reasoning flag is
+      // true and the message round-tripped a thinking lane.
+      if (msg.reasoning && msg.reasoning.length) {
+        var reasonEl = document.createElement("div");
+        reasonEl.className = "msg reasoning";
+        reasonEl.textContent = msg.reasoning;
+        self.messagesEl.appendChild(reasonEl);
+        lastToolBlock = null;
+      }
       // Render content BEFORE the tool block so the visual order
       // matches the live SSE flow (stream_text streams content first,
       // then tool_info / approve_request paints the tool block, then

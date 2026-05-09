@@ -922,6 +922,36 @@ class AnthropicProvider:
             }
         )
 
+    # -- reasoning extraction ------------------------------------------------
+
+    def extract_reasoning_text(
+        self,
+        provider_blocks: list[dict[str, Any]] | None,
+    ) -> str:
+        if not isinstance(provider_blocks, list):
+            return ""
+        parts: list[str] = []
+        for block in provider_blocks:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "thinking":
+                continue
+            text = block.get("thinking")
+            if isinstance(text, str) and text:
+                parts.append(text)
+        if not parts:
+            return ""
+        joined = "\n".join(parts)
+        # Operator-friendly UI cap. Larger reasoning bodies are still
+        # stored verbatim in provider_data; only the rehydrated UI
+        # display payload is truncated.
+        if len(joined) > _MAX_REASONING_DISPLAY_BYTES:
+            return joined[:_MAX_REASONING_DISPLAY_BYTES]
+        return joined
+
+
+_MAX_REASONING_DISPLAY_BYTES = 64 * 1024
+
 
 def _normalize_finish_reason(reason: str) -> str:
     """Normalize Anthropic stop reasons to OpenAI-compatible strings."""

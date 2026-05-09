@@ -194,6 +194,8 @@ MODEL_DEFINITION_MUTABLE = frozenset(
         "temperature",
         "max_tokens",
         "reasoning_effort",
+        "persist_reasoning",
+        "replay_reasoning_to_model",
     }
 )
 PROMPT_POLICY_MUTABLE = frozenset({"name", "content", "tool_gate", "priority", "enabled"})

@@ -39,6 +39,12 @@ class ModelConfig:
     temperature: float | None = None
     max_tokens: int | None = None
     reasoning_effort: str | None = None
+    # Per-model reasoning-persistence flags (db-backed, admin-toggleable).
+    # persist_reasoning controls UI rehydration of stored reasoning text in
+    # /history responses; replay_reasoning_to_model controls whether
+    # reasoning blocks ride the wire on subsequent provider calls.
+    persist_reasoning: bool = True
+    replay_reasoning_to_model: bool = False
     # Server compatibility settings for openai-compatible backends.
     # Populated from capabilities["server_compat"] during load.
     server_compat: dict[str, Any] = field(default_factory=dict)
@@ -405,6 +411,10 @@ def load_model_registry(
                 row_temperature = row.get("temperature")
                 row_max_tokens = row.get("max_tokens")
                 row_reasoning_effort = row.get("reasoning_effort")
+                # Per-model reasoning flags. Defaults match the dataclass so a
+                # pre-052 row missing these columns degrades gracefully.
+                row_persist_reasoning = bool(row.get("persist_reasoning", True))
+                row_replay_reasoning = bool(row.get("replay_reasoning_to_model", False))
                 configs[alias] = ModelConfig(
                     alias=alias,
                     base_url=row_base_url,
@@ -419,6 +429,8 @@ def load_model_registry(
                     reasoning_effort=row_reasoning_effort
                     if row_reasoning_effort is not None
                     else None,
+                    persist_reasoning=row_persist_reasoning,
+                    replay_reasoning_to_model=row_replay_reasoning,
                     server_compat=row_server_compat,
                 )
         except Exception:
