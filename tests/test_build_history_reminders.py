@@ -141,3 +141,126 @@ class TestRemindersWidening:
         }
         history = _build([msg])
         assert history[0]["reminders"] == [{"type": "denial", "text": "ok"}]
+
+
+class _StubRegistry:
+    """Minimal model registry — only ``get_config`` is read by
+    ``_build_history``."""
+
+    def __init__(self, persist_reasoning: bool = True) -> None:
+        self._cfg = SimpleNamespace(persist_reasoning=persist_reasoning)
+
+    def get_config(self, alias: str) -> Any:
+        return self._cfg
+
+
+def _build_with_registry(
+    messages: list[dict[str, Any]],
+    persist_reasoning: bool = True,
+) -> list[dict[str, Any]]:
+    session = SimpleNamespace(
+        messages=messages,
+        _ws_id="ws-test",
+        _registry=_StubRegistry(persist_reasoning=persist_reasoning),
+        _model_alias="claude-opus-4-7",
+    )
+    with patch(
+        "turnstone.server._load_verdict_indexes",
+        return_value=({}, {}),
+    ):
+        return _build_history(session)
+
+
+class TestReasoningSurfacing:
+    """Phase 1 — surface stored Anthropic thinking blocks on the
+    history payload so refresh-the-page rehydrates the reasoning bubble.
+    Drives through the real ``AnthropicProvider`` extractor (no mock-of-
+    extractor) — only the model registry is stubbed.
+    """
+
+    def test_reasoning_surfaces_for_anthropic_thinking_msg(self) -> None:
+        msg = {
+            "role": "assistant",
+            "content": "Final answer.",
+            "_provider_content": [
+                {"type": "thinking", "thinking": "let me think", "signature": "s"},
+                {"type": "text", "text": "Final answer."},
+            ],
+        }
+        history = _build_with_registry([msg], persist_reasoning=True)
+        assert len(history) == 1
+        assert history[0]["reasoning"] == "let me think"
+
+    def test_reasoning_empty_when_persist_flag_false(self) -> None:
+        msg = {
+            "role": "assistant",
+            "content": "Final answer.",
+            "_provider_content": [
+                {"type": "thinking", "thinking": "hidden", "signature": "s"},
+            ],
+        }
+        history = _build_with_registry([msg], persist_reasoning=False)
+        assert "reasoning" not in history[0]
+
+    def test_provider_content_never_in_wire_entry(self) -> None:
+        # The build path does not copy ``_provider_content`` into the
+        # entry dict regardless of flag — wire payload stays tight.
+        msg = {
+            "role": "assistant",
+            "content": "Final answer.",
+            "_provider_content": [
+                {"type": "thinking", "thinking": "x", "signature": "s"},
+            ],
+        }
+        history = _build_with_registry([msg], persist_reasoning=True)
+        assert "_provider_content" not in history[0]
+
+    def test_no_reasoning_field_when_provider_content_missing(self) -> None:
+        msg = {"role": "assistant", "content": "plain answer"}
+        history = _build_with_registry([msg], persist_reasoning=True)
+        assert "reasoning" not in history[0]
+
+    def test_no_reasoning_field_for_non_assistant_messages(self) -> None:
+        # Defensive — user/tool messages with a stray _provider_content
+        # do not get the reasoning field stamped.
+        msgs: list[dict[str, Any]] = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": "out",
+                "_provider_content": [{"type": "thinking", "thinking": "leak", "signature": "s"}],
+            },
+        ]
+        history = _build_with_registry(msgs, persist_reasoning=True)
+        assert "reasoning" not in history[0]
+        assert "reasoning" not in history[1]
+
+    def test_default_true_when_registry_lookup_raises(self) -> None:
+        # Conservative default — Phase 1 spec mandates rehydration on
+        # refresh.  A registry/alias mismatch must not silently kill the
+        # bubble.
+        class BrokenRegistry:
+            def get_config(self, alias: str) -> Any:
+                raise KeyError(alias)
+
+        session = SimpleNamespace(
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": "x",
+                    "_provider_content": [
+                        {"type": "thinking", "thinking": "still works", "signature": "s"}
+                    ],
+                }
+            ],
+            _ws_id="ws-test",
+            _registry=BrokenRegistry(),
+            _model_alias="missing-alias",
+        )
+        with patch(
+            "turnstone.server._load_verdict_indexes",
+            return_value=({}, {}),
+        ):
+            history = _build_history(session)
+        assert history[0]["reasoning"] == "still works"

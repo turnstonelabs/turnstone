@@ -908,6 +908,8 @@ class ModelDefinitionInfo(BaseModel):
     temperature: float | None = None
     max_tokens: int | None = None
     reasoning_effort: str | None = None
+    persist_reasoning: bool = True
+    replay_reasoning_to_model: bool = False
     source: str = ""
     created_by: str = ""
     created: str = ""
@@ -926,6 +928,8 @@ class CreateModelDefinitionRequest(BaseModel):
     temperature: float | None = None
     max_tokens: int | None = None
     reasoning_effort: str | None = None
+    persist_reasoning: bool = True
+    replay_reasoning_to_model: bool = False
 
 
 class UpdateModelDefinitionRequest(BaseModel):
@@ -940,6 +944,8 @@ class UpdateModelDefinitionRequest(BaseModel):
     temperature: float | None = None
     max_tokens: int | None = None
     reasoning_effort: str | None = None
+    persist_reasoning: bool | None = None
+    replay_reasoning_to_model: bool | None = None
 
 
 class ListModelDefinitionsResponse(BaseModel):

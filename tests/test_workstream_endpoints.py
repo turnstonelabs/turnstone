@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import queue
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
@@ -1762,3 +1764,155 @@ class TestTenantCheckOnReadEndpoints:
         assert cold_check in offloaded, (
             f"tenant_check must be invoked through asyncio.to_thread; got {offloaded}"
         )
+
+
+class TestHistoryReasoningRehydration:
+    """The lifted ``GET /v1/api/workstreams/{ws_id}/history`` surfaces
+    stored Anthropic thinking blocks on assistant messages so a page
+    refresh re-renders the reasoning bubble. Drives through the real
+    ``AnthropicProvider.extract_reasoning_text`` and the storage
+    ``reconstruct_messages`` boundary that JSON-decodes
+    ``provider_data`` into ``_provider_content``.
+    """
+
+    def test_history_handler_surfaces_reasoning_for_anthropic_thinking(self, _inject_storage):
+        ws_id = "ws-reason-1"
+        _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
+        provider_data = json.dumps(
+            [
+                {"type": "thinking", "thinking": "let me reason", "signature": "s"},
+                {"type": "text", "text": "Final answer."},
+            ]
+        )
+        _inject_storage.save_message(
+            ws_id, "assistant", "Final answer.", provider_data=provider_data
+        )
+        # No live session — exercises the storage-only path which
+        # falls back to default persist_reasoning=True.
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = None
+        client = _build_history_app(mock_mgr, _inject_storage)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}/history")
+        assert r.status_code == 200
+        msgs = r.json()["messages"]
+        assistant = next(m for m in msgs if m.get("role") == "assistant")
+        assert assistant["reasoning"] == "let me reason"
+
+    def test_history_handler_strips_provider_content(self, _inject_storage):
+        ws_id = "ws-reason-2"
+        _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
+        provider_data = json.dumps([{"type": "thinking", "thinking": "x", "signature": "s"}])
+        _inject_storage.save_message(ws_id, "assistant", "Answer.", provider_data=provider_data)
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = None
+        client = _build_history_app(mock_mgr, _inject_storage)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}/history")
+        assert r.status_code == 200
+        for m in r.json()["messages"]:
+            assert "_provider_content" not in m
+
+    def test_history_handler_with_persist_flag_false_via_live_session(self, _inject_storage):
+        """Operator-flipped ``persist_reasoning=False`` on the active
+        model suppresses the reasoning field even when the data is
+        stored. ``_provider_content`` is still stripped from the wire.
+        """
+        ws_id = "ws-reason-3"
+        _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
+        provider_data = json.dumps([{"type": "thinking", "thinking": "hidden", "signature": "s"}])
+        _inject_storage.save_message(ws_id, "assistant", "Answer.", provider_data=provider_data)
+        live_session = SimpleNamespace(
+            id=ws_id,
+            _registry=SimpleNamespace(
+                get_config=lambda alias: SimpleNamespace(persist_reasoning=False)
+            ),
+            _model_alias="claude-opus-4-7",
+        )
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = live_session
+        client = _build_history_app(mock_mgr, _inject_storage)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}/history")
+        assert r.status_code == 200
+        for m in r.json()["messages"]:
+            if m.get("role") == "assistant":
+                assert "reasoning" not in m
+            assert "_provider_content" not in m
+
+    def test_history_handler_cold_workstream_resolves_via_workstream_config(self, _inject_storage):
+        """Cold workstream (no live session) — the handler walks
+        ``workstream_config.model_alias`` (persisted at first send by
+        the SessionManager rehydrate path) and looks up the active
+        model's ``persist_reasoning`` flag through the global registry
+        on ``app.state``. Operator flag-flip is honored uniformly
+        across live and cold workstreams.
+        """
+        ws_id = "ws-reason-cold"
+        _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
+        # Simulate the model alias persisted by the rehydrate path
+        # (session_manager.py:628-629 reads it back via the same key).
+        _inject_storage.save_workstream_config(ws_id, {"model_alias": "claude-opus-4-7"})
+        provider_data = json.dumps(
+            [{"type": "thinking", "thinking": "should not surface", "signature": "s"}]
+        )
+        _inject_storage.save_message(ws_id, "assistant", "Answer.", provider_data=provider_data)
+        # No live session — handler falls back to workstream_config + registry.
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = None
+
+        # Build the app with a global registry that reports persist=False
+        # for the saved alias.
+        cfg = _interactive_endpoint_cfg(mock_mgr)
+        handler = make_history_handler(cfg)
+        app = Starlette(
+            routes=[
+                Mount(
+                    "/v1",
+                    routes=[
+                        Route(
+                            "/api/workstreams/{ws_id}/history",
+                            handler,
+                            methods=["GET"],
+                        ),
+                    ],
+                ),
+            ],
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        app.state.workstreams = mock_mgr
+        app.state.auth_storage = _inject_storage
+        app.state.registry = SimpleNamespace(
+            get_config=lambda alias: SimpleNamespace(
+                persist_reasoning=(alias != "claude-opus-4-7"),
+            )
+        )
+        client = TestClient(app)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}/history")
+        assert r.status_code == 200
+        # Flag-flip on the saved alias is honored: reasoning suppressed.
+        for m in r.json()["messages"]:
+            if m.get("role") == "assistant":
+                assert "reasoning" not in m
+            assert "_provider_content" not in m
+
+    def test_history_handler_cold_workstream_no_alias_defaults_true(self, _inject_storage):
+        """A workstream that pre-dates the rehydrate-time alias persist
+        (or one that simply has no workstream_config row) falls through
+        to the conservative default ``True``.  Reasoning surfaces.
+        """
+        ws_id = "ws-reason-cold-no-alias"
+        _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
+        provider_data = json.dumps(
+            [{"type": "thinking", "thinking": "default-true wins", "signature": "s"}]
+        )
+        _inject_storage.save_message(ws_id, "assistant", "Answer.", provider_data=provider_data)
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = None
+        client = _build_history_app(mock_mgr, _inject_storage)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}/history")
+        assert r.status_code == 200
+        assistant = next(m for m in r.json()["messages"] if m.get("role") == "assistant")
+        assert assistant["reasoning"] == "default-true wins"

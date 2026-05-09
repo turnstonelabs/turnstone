@@ -4167,6 +4167,8 @@ class PostgreSQLBackend:
         temperature: float | None = None,
         max_tokens: int | None = None,
         reasoning_effort: str | None = None,
+        persist_reasoning: bool = True,
+        replay_reasoning_to_model: bool = False,
     ) -> None:
         from sqlalchemy.dialects import postgresql
 
@@ -4187,6 +4189,8 @@ class PostgreSQLBackend:
                     temperature=temperature,
                     max_tokens=max_tokens,
                     reasoning_effort=reasoning_effort,
+                    persist_reasoning=1 if persist_reasoning else 0,
+                    replay_reasoning_to_model=1 if replay_reasoning_to_model else 0,
                     created_by=created_by,
                     created=now,
                     updated=now,
@@ -4205,7 +4209,7 @@ class PostgreSQLBackend:
             ).fetchone()
             if row is None:
                 return None
-            return _row_to_dict(row, "enabled")
+            return _row_to_dict(row, "enabled", "persist_reasoning", "replay_reasoning_to_model")
 
     def get_model_definition_by_alias(self, alias: str) -> dict[str, Any] | None:
 
@@ -4215,7 +4219,7 @@ class PostgreSQLBackend:
             ).fetchone()
             if row is None:
                 return None
-            return _row_to_dict(row, "enabled")
+            return _row_to_dict(row, "enabled", "persist_reasoning", "replay_reasoning_to_model")
 
     def list_model_definitions(self, enabled_only: bool = False) -> list[dict[str, Any]]:
 
@@ -4224,7 +4228,10 @@ class PostgreSQLBackend:
             if enabled_only:
                 q = q.where(model_definitions.c.enabled == 1)
             rows = conn.execute(q).fetchall()
-            return [_row_to_dict(r, "enabled") for r in rows]
+            return [
+                _row_to_dict(r, "enabled", "persist_reasoning", "replay_reasoning_to_model")
+                for r in rows
+            ]
 
     def update_model_definition(self, definition_id: str, **fields: Any) -> bool:
 
@@ -4232,6 +4239,10 @@ class PostgreSQLBackend:
         fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         if "enabled" in fields:
             fields["enabled"] = 1 if fields["enabled"] else 0
+        if "persist_reasoning" in fields:
+            fields["persist_reasoning"] = 1 if fields["persist_reasoning"] else 0
+        if "replay_reasoning_to_model" in fields:
+            fields["replay_reasoning_to_model"] = 1 if fields["replay_reasoning_to_model"] else 0
         with self._conn() as conn:
             result = conn.execute(
                 sa.update(model_definitions)

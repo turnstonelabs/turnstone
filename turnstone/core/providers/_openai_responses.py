@@ -576,3 +576,15 @@ class OpenAIResponsesProvider:
     @property
     def retryable_error_names(self) -> frozenset[str]:
         return RETRYABLE_ERROR_NAMES
+
+    # -- reasoning extraction ------------------------------------------------
+
+    def extract_reasoning_text(
+        self,
+        provider_blocks: list[dict[str, Any]] | None,
+    ) -> str:
+        # Phase 3 will wire this to walk ``type=="reasoning"`` items
+        # captured via ``include=["reasoning.encrypted_content"]``.
+        # Today the request kwargs don't pass ``include`` so reasoning
+        # items in ``provider_blocks`` carry no replayable text.
+        return ""
