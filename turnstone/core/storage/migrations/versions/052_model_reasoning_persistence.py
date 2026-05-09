@@ -2,12 +2,15 @@
 
 Adds two boolean (integer-coded) operator knobs:
 
-* ``persist_reasoning`` (default ``1``) — when true, the history-build
-  path extracts stored reasoning text from ``provider_data`` and surfaces
-  it on each assistant message dict so a page refresh re-renders the
-  reasoning bubble. Storage of the reasoning bytes happens regardless;
-  this flag only controls the extract-and-include step in
-  ``_build_history`` / ``decorate_history_messages``.
+* ``surface_persisted_reasoning`` (default ``1``) — when true, the
+  history-build path extracts stored reasoning text from
+  ``provider_data`` and surfaces it on each assistant message dict so a
+  page refresh re-renders the reasoning bubble. **Storage of the
+  reasoning bytes happens regardless of this flag** — it only controls
+  the extract-and-include step in ``_build_history`` /
+  ``decorate_history_messages``.  The earlier name ``surface_persisted_reasoning``
+  was renamed because it implied a storage-control switch; this flag
+  is purely about UI rehydration.
 * ``replay_reasoning_to_model`` (default ``0``) — when true, the
   wire-build path keeps reasoning blocks in the outgoing
   ``_provider_content`` lane on subsequent provider calls. False is the
@@ -41,7 +44,7 @@ def upgrade() -> None:
     with op.batch_alter_table("model_definitions") as batch:
         batch.add_column(
             sa.Column(
-                "persist_reasoning",
+                "surface_persisted_reasoning",
                 sa.Integer,
                 nullable=False,
                 server_default="1",
@@ -60,4 +63,4 @@ def upgrade() -> None:
 def downgrade() -> None:
     with op.batch_alter_table("model_definitions") as batch:
         batch.drop_column("replay_reasoning_to_model")
-        batch.drop_column("persist_reasoning")
+        batch.drop_column("surface_persisted_reasoning")

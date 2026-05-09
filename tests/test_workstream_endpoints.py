@@ -1788,7 +1788,7 @@ class TestHistoryReasoningRehydration:
             ws_id, "assistant", "Final answer.", provider_data=provider_data
         )
         # No live session — exercises the storage-only path which
-        # falls back to default persist_reasoning=True.
+        # falls back to default surface_persisted_reasoning=True.
         mock_mgr = MagicMock()
         mock_mgr.get.return_value = None
         client = _build_history_app(mock_mgr, _inject_storage)
@@ -1814,7 +1814,7 @@ class TestHistoryReasoningRehydration:
             assert "_provider_content" not in m
 
     def test_history_handler_with_persist_flag_false_via_live_session(self, _inject_storage):
-        """Operator-flipped ``persist_reasoning=False`` on the active
+        """Operator-flipped ``surface_persisted_reasoning=False`` on the active
         model suppresses the reasoning field even when the data is
         stored. ``_provider_content`` is still stripped from the wire.
         """
@@ -1825,7 +1825,7 @@ class TestHistoryReasoningRehydration:
         live_session = SimpleNamespace(
             id=ws_id,
             _registry=SimpleNamespace(
-                get_config=lambda alias: SimpleNamespace(persist_reasoning=False)
+                get_config=lambda alias: SimpleNamespace(surface_persisted_reasoning=False)
             ),
             _model_alias="claude-opus-4-7",
         )
@@ -1844,7 +1844,7 @@ class TestHistoryReasoningRehydration:
         """Cold workstream (no live session) — the handler walks
         ``workstream_config.model_alias`` (persisted at first send by
         the SessionManager rehydrate path) and looks up the active
-        model's ``persist_reasoning`` flag through the global registry
+        model's ``surface_persisted_reasoning`` flag through the global registry
         on ``app.state``. Operator flag-flip is honored uniformly
         across live and cold workstreams.
         """
@@ -1884,7 +1884,7 @@ class TestHistoryReasoningRehydration:
         app.state.auth_storage = _inject_storage
         app.state.registry = SimpleNamespace(
             get_config=lambda alias: SimpleNamespace(
-                persist_reasoning=(alias != "claude-opus-4-7"),
+                surface_persisted_reasoning=(alias != "claude-opus-4-7"),
             )
         )
         client = TestClient(app)

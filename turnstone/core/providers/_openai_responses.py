@@ -28,11 +28,11 @@ from turnstone.core.providers._openai_common import (
     sanitize_messages,
 )
 from turnstone.core.providers._protocol import (
-    MAX_REASONING_DISPLAY_BYTES,
     CompletionResult,
     ModelCapabilities,
     StreamChunk,
     ToolCallDelta,
+    _join_reasoning_with_cap,
 )
 
 log = structlog.get_logger(__name__)
@@ -705,12 +705,7 @@ class OpenAIResponsesProvider:
                     text = c.get("text")
                     if isinstance(text, str) and text:
                         parts.append(text)
-        if not parts:
-            return ""
-        joined = "\n".join(parts)
-        if len(joined) > MAX_REASONING_DISPLAY_BYTES:
-            return joined[:MAX_REASONING_DISPLAY_BYTES]
-        return joined
+        return _join_reasoning_with_cap(parts)
 
 
 def _reasoning_item_for_input(stored: dict[str, Any]) -> dict[str, Any] | None:

@@ -480,21 +480,21 @@ class TestExtractReasoningForHistory:
         from turnstone.core.history_decoration import extract_reasoning_for_history
 
         messages = [self._anthropic_thinking_msg("let me think")]
-        extract_reasoning_for_history(messages, persist_reasoning_flag=True)
+        extract_reasoning_for_history(messages, surface_persisted_reasoning_flag=True)
         assert messages[0]["reasoning"] == "let me think"
 
     def test_strips_provider_content_after_extraction(self) -> None:
         from turnstone.core.history_decoration import extract_reasoning_for_history
 
         messages = [self._anthropic_thinking_msg("anything")]
-        extract_reasoning_for_history(messages, persist_reasoning_flag=True)
+        extract_reasoning_for_history(messages, surface_persisted_reasoning_flag=True)
         assert "_provider_content" not in messages[0]
 
     def test_strips_provider_content_when_flag_false(self) -> None:
         from turnstone.core.history_decoration import extract_reasoning_for_history
 
         messages = [self._anthropic_thinking_msg("anything")]
-        extract_reasoning_for_history(messages, persist_reasoning_flag=False)
+        extract_reasoning_for_history(messages, surface_persisted_reasoning_flag=False)
         # Strip is unconditional; reasoning is the conditional bit.
         assert "_provider_content" not in messages[0]
         assert "reasoning" not in messages[0]
@@ -515,7 +515,7 @@ class TestExtractReasoningForHistory:
                 ],
             }
         ]
-        extract_reasoning_for_history(messages, persist_reasoning_flag=True)
+        extract_reasoning_for_history(messages, surface_persisted_reasoning_flag=True)
         assert messages[0]["reasoning"] == "first"
 
     def test_first_block_reasoning_dispatches_to_openai_responses(self) -> None:
@@ -535,7 +535,7 @@ class TestExtractReasoningForHistory:
                 ],
             }
         ]
-        extract_reasoning_for_history(messages, persist_reasoning_flag=True)
+        extract_reasoning_for_history(messages, surface_persisted_reasoning_flag=True)
         assert messages[0]["reasoning"] == "s"
         assert "_provider_content" not in messages[0]
 
@@ -549,7 +549,7 @@ class TestExtractReasoningForHistory:
                 "_provider_content": [{"type": "text", "text": "no reasoning here"}],
             }
         ]
-        extract_reasoning_for_history(messages, persist_reasoning_flag=True)
+        extract_reasoning_for_history(messages, surface_persisted_reasoning_flag=True)
         assert "reasoning" not in messages[0]
         assert "_provider_content" not in messages[0]
 
@@ -557,7 +557,7 @@ class TestExtractReasoningForHistory:
         from turnstone.core.history_decoration import extract_reasoning_for_history
 
         messages = [{"role": "assistant", "content": "plain"}]
-        extract_reasoning_for_history(messages, persist_reasoning_flag=True)
+        extract_reasoning_for_history(messages, surface_persisted_reasoning_flag=True)
         assert "reasoning" not in messages[0]
         assert messages[0]["content"] == "plain"
 
@@ -569,7 +569,7 @@ class TestExtractReasoningForHistory:
             {"role": "tool", "tool_call_id": "c1", "content": "out"},
             self._anthropic_thinking_msg("only this one"),
         ]
-        extract_reasoning_for_history(messages, persist_reasoning_flag=True)
+        extract_reasoning_for_history(messages, surface_persisted_reasoning_flag=True)
         assert "reasoning" not in messages[0]
         assert "reasoning" not in messages[1]
         assert messages[2]["reasoning"] == "only this one"
@@ -578,7 +578,7 @@ class TestExtractReasoningForHistory:
         from turnstone.core.history_decoration import extract_reasoning_for_history
 
         messages = [{"role": "assistant", "content": "x", "_provider_content": []}]
-        extract_reasoning_for_history(messages, persist_reasoning_flag=True)
+        extract_reasoning_for_history(messages, surface_persisted_reasoning_flag=True)
         assert "reasoning" not in messages[0]
         # Empty-list provider_content is still stripped from the wire.
         assert "_provider_content" not in messages[0]
@@ -593,7 +593,7 @@ class TestExtractReasoningForHistory:
                 "_provider_content": ["bogus"],
             }
         ]
-        extract_reasoning_for_history(messages, persist_reasoning_flag=True)
+        extract_reasoning_for_history(messages, surface_persisted_reasoning_flag=True)
         assert "reasoning" not in messages[0]
         assert "_provider_content" not in messages[0]
 
@@ -613,6 +613,35 @@ class TestExtractReasoningForHistory:
                 ],
             }
         ]
-        extract_reasoning_for_history(messages, persist_reasoning_flag=True)
+        extract_reasoning_for_history(messages, surface_persisted_reasoning_flag=True)
         assert messages[0]["reasoning"] == "synth thought"
+        assert "_provider_content" not in messages[0]
+
+    def test_first_block_redacted_thinking_dispatches_to_anthropic(self) -> None:
+        # Anthropic's extended-thinking API documents that
+        # ``redacted_thinking`` blocks (sealed by the safety system)
+        # can appear before, after, or interleaved with regular
+        # ``thinking`` blocks.  When the redacted block lands first,
+        # the dispatcher must still route to AnthropicProvider so the
+        # surrounding real thinking text surfaces — without this the
+        # reasoning bubble silently disappears on history rehydration.
+        # Pinned by registering "redacted_thinking" as a second key
+        # in _BLOCK_TYPE_PROVIDER_FACTORY pointing at the Anthropic
+        # factory; Anthropic's extractor's type=="thinking" filter
+        # already correctly skips the redacted block.
+        from turnstone.core.history_decoration import extract_reasoning_for_history
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": "answer",
+                "_provider_content": [
+                    {"type": "redacted_thinking", "data": "sealed-blob"},
+                    {"type": "thinking", "thinking": "real thought", "signature": "s"},
+                    {"type": "text", "text": "answer"},
+                ],
+            }
+        ]
+        extract_reasoning_for_history(messages, surface_persisted_reasoning_flag=True)
+        assert messages[0]["reasoning"] == "real thought"
         assert "_provider_content" not in messages[0]

@@ -4202,7 +4202,7 @@
           // snapshot ":2021" call sites — same appendMsg("reasoning")
           // helper, just driven from history-render rather than the
           // SSE handler. Only present when the active model's
-          // persist_reasoning flag is true and the message round-tripped
+          // surface_persisted_reasoning flag is true and the message round-tripped
           // a thinking lane.
           if (typeof m.reasoning === "string" && m.reasoning.length) {
             const rEl = appendMsg("reasoning", "", { label: "reasoning" });

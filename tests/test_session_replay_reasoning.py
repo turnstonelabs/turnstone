@@ -26,29 +26,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-from turnstone.core.session import ChatSession
-from turnstone.core.session_ui_base import SessionUIBase
-
-
-class _NullUI(SessionUIBase):
-    """Bare-bones UI satisfying the SessionUIBase contract for these tests."""
-
-    def __init__(self) -> None:
-        super().__init__()
-
-
-def _make_session(**kwargs: Any) -> ChatSession:
-    defaults: dict[str, Any] = {
-        "client": MagicMock(),
-        "model": "test-model",
-        "ui": _NullUI(),
-        "instructions": None,
-        "temperature": 0.5,
-        "max_tokens": 4096,
-        "tool_timeout": 30,
-    }
-    defaults.update(kwargs)
-    return ChatSession(**defaults)
+from tests._session_helpers import make_session as _make_session
 
 
 def _registry_with_flag(persist: bool = True, replay: bool = False) -> Any:
@@ -56,7 +34,7 @@ def _registry_with_flag(persist: bool = True, replay: bool = False) -> Any:
     flags under test."""
     return SimpleNamespace(
         get_config=lambda alias: SimpleNamespace(
-            persist_reasoning=persist,
+            surface_persisted_reasoning=persist,
             replay_reasoning_to_model=replay,
         )
     )
