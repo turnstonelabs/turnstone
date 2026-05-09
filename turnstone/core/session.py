@@ -1096,6 +1096,73 @@ class ChatSession:
             return self._cached_capabilities
         return self._resolve_capabilities(p, m, "")
 
+    def _resolve_server_type(self, alias: str | None = None) -> str:
+        """Read ``server_compat.server_type`` for an alias from the registry.
+
+        Used by :meth:`_maybe_synth_reasoning_block` to tag synthetic
+        path-3 reasoning blocks with their origin server (vllm,
+        llama.cpp, sglang, etc.) — informational today, useful for
+        future per-server replay paths.  Returns ``""`` on any lookup
+        miss; the synthetic block then omits the ``source`` field.
+        """
+        target_alias = alias or self._model_alias or ""
+        if not self._registry or not target_alias:
+            return ""
+        try:
+            cfg: ModelConfig = self._registry.get_config(target_alias)
+            sc = (
+                cfg.capabilities.get("server_compat")
+                if isinstance(cfg.capabilities, dict)
+                else None
+            )
+            if isinstance(sc, dict):
+                return str(sc.get("server_type") or "")
+        except Exception:
+            pass
+        return ""
+
+    def _maybe_synth_reasoning_block(
+        self,
+        provider_blocks: list[dict[str, Any]],
+        reasoning_parts: list[str],
+    ) -> list[dict[str, Any]]:
+        """Stamp captured ``reasoning_parts`` as a synthetic ``reasoning_text``
+        block when no native ``provider_blocks`` were emitted.
+
+        Anthropic emits native ``thinking`` blocks; OpenAI Responses
+        emits native ``reasoning`` items via ``output_item.done``.
+        Both populate ``provider_blocks`` directly during streaming
+        and need no synthesis here.
+
+        OpenAI Chat Completions (with vLLM ``--reasoning-parser``,
+        llama.cpp ``reasoning_format``, or Gemini's ``/v1beta/openai/``
+        endpoint if it surfaces ``reasoning_content``) streams
+        reasoning as ``reasoning_delta`` chunks but never produces a
+        provider_blocks item.  Without this synthesis the captured
+        text would be dropped at the end of the stream — visible live,
+        invisible on page reload.
+
+        The synthetic block uses ``type="reasoning_text"`` (NOT
+        ``"thinking"``) so it falls through Phase 2's
+        ``ANTHROPIC_VALID_BLOCK_TYPES`` shape filter on cross-model
+        resumption — protecting against operator-switches from a
+        local-model session to Anthropic, which would otherwise hit
+        Anthropic's input boundary with an unsigned ``thinking`` block.
+        """
+        if provider_blocks:
+            return provider_blocks
+        text = "".join(reasoning_parts)
+        if not text.strip():
+            return provider_blocks
+        block: dict[str, Any] = {
+            "type": "reasoning_text",
+            "text": text,
+        }
+        server_type = self._resolve_server_type()
+        if server_type:
+            block["source"] = server_type
+        return [block]
+
     def _resolve_replay_reasoning_to_model(self, alias: str | None = None) -> bool:
         """Read ``ModelConfig.replay_reasoning_to_model`` for an alias.
 
@@ -3793,7 +3860,12 @@ class ChatSession:
             )
 
         # Store raw provider content blocks for multi-turn preservation
-        # (e.g. Anthropic web_search_tool_result with encrypted_content)
+        # (e.g. Anthropic web_search_tool_result with encrypted_content).
+        # Phase 3 path-3 capture: when no native blocks were emitted but
+        # ``reasoning_delta`` chunks accumulated text, synthesize a
+        # ``reasoning_text`` block so the captured reasoning survives
+        # past the live stream and surfaces on history reload.
+        provider_blocks = self._maybe_synth_reasoning_block(provider_blocks, reasoning_parts)
         if provider_blocks:
             msg["_provider_content"] = provider_blocks
 

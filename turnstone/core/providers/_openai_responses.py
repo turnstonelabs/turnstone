@@ -28,6 +28,7 @@ from turnstone.core.providers._openai_common import (
     sanitize_messages,
 )
 from turnstone.core.providers._protocol import (
+    MAX_REASONING_DISPLAY_BYTES,
     CompletionResult,
     ModelCapabilities,
     StreamChunk,
@@ -92,16 +93,68 @@ class OpenAIResponsesProvider:
     @staticmethod
     def _convert_messages(
         messages: list[dict[str, Any]],
+        *,
+        replay_reasoning_to_model: bool = False,
     ) -> tuple[str | None, list[dict[str, Any]]]:
         """Convert Chat Completions messages to Responses API input items.
 
         Returns ``(instructions, input_items)`` where *instructions* is the
         concatenated system/developer messages (or ``None``) and *input_items*
         is the Responses API ``input`` array.
+
+        When *replay_reasoning_to_model* is True, stored ``_provider_content``
+        reasoning items (``type=="reasoning"``, captured via
+        ``include=["reasoning.encrypted_content"]`` on a prior turn)
+        are emitted as ``ResponseReasoningItemParam`` input items
+        immediately before the assistant message they belong to.  The
+        SDK explicitly documents this round-trip pattern at
+        ``response_reasoning_item_param.py:33-37``: "Be sure to include
+        these items in your ``input`` to the Responses API for
+        subsequent turns of a conversation if you are manually managing
+        context".  Even with ``store=False``, ``encrypted_content``
+        round-trips correctly per ``response_create_params.py:70-74``.
+
+        When *replay_reasoning_to_model* is False, reasoning items are silently
+        dropped (they were stripped from the wire by ``sanitize_messages``
+        anyway, but we also skip the input-item emission step).
         """
+        # Capture ``_provider_content`` reasoning items per ASSISTANT
+        # ORDINAL (not raw message index) BEFORE sanitization strips
+        # the underscore-prefixed key.  Position-by-index would be
+        # unsafe: ``sanitize_messages`` drops orphan tool results
+        # (``_openai_common.py:489-498`` / ``:521-535``) and inserts
+        # synthesized error tool messages for orphaned tool_calls
+        # (``:510-517``).  Either operation shifts subsequent message
+        # indices, so a pre-vs-post-sanitize index match would
+        # silently miss reasoning attachments after any tool-message
+        # repair.  Assistant messages themselves are never dropped or
+        # duplicated by sanitize_messages — only tool messages — so
+        # the n-th assistant in the original list is invariably the
+        # n-th assistant in the sanitized list.  Ordinal-keyed lookup
+        # survives any tool-message length change.
+        reasoning_by_assistant_ordinal: dict[int, list[dict[str, Any]]] = {}
+        if replay_reasoning_to_model:
+            ord_pre = 0
+            for raw_msg in messages:
+                if raw_msg.get("role") != "assistant":
+                    continue
+                pc = raw_msg.get("_provider_content")
+                if isinstance(pc, list):
+                    items_to_replay = [
+                        b for b in pc if isinstance(b, dict) and b.get("type") == "reasoning"
+                    ]
+                    if items_to_replay:
+                        reasoning_by_assistant_ordinal[ord_pre] = items_to_replay
+                ord_pre += 1
+
         messages = sanitize_messages(messages)
         instructions_parts: list[str] = []
         items: list[dict[str, Any]] = []
+        # Track assistant ordinal in the SANITIZED list so the lookup
+        # into reasoning_by_assistant_ordinal stays aligned with the
+        # original-list ordinal.  See the long comment above for why
+        # ordinal is invariant under sanitization.
+        assistant_ordinal_post = 0
 
         for msg in messages:
             role = msg.get("role", "")
@@ -129,9 +182,15 @@ class OpenAIResponsesProvider:
                 items.append(item)
 
             elif role == "assistant":
-                # With store=False, provider_blocks cannot be replayed as input
-                # (output format != input format, and IDs aren't persisted).
-                # Rebuild from the normalized content/tool_calls instead.
+                # Phase 3 reasoning replay: emit stored reasoning items
+                # BEFORE the assistant message they belong to.  The SDK
+                # expects reasoning items to appear in input order
+                # alongside the assistant turn that produced them.
+                for r_item in reasoning_by_assistant_ordinal.get(assistant_ordinal_post, []):
+                    item_for_input = _reasoning_item_for_input(r_item)
+                    if item_for_input is not None:
+                        items.append(item_for_input)
+                assistant_ordinal_post += 1
 
                 # Text content → assistant message (plain string for input)
                 if content:
@@ -239,11 +298,33 @@ class OpenAIResponsesProvider:
         reasoning_effort: str,
         deferred_names: frozenset[str] | None,
         capabilities: ModelCapabilities | None = None,
+        replay_reasoning_to_model: bool = True,
     ) -> dict[str, Any]:
-        """Build the kwargs dict for ``client.responses.create/stream``."""
+        """Build the kwargs dict for ``client.responses.create/stream``.
+
+        ``replay_reasoning_to_model`` (Phase 3 of the reasoning-
+        persistence feature) gates two things together:
+        1. ``include=["reasoning.encrypted_content"]`` on the request
+           (so the API surfaces ``encrypted_content`` on reasoning
+           items in ``provider_blocks``).
+        2. ``_convert_messages`` round-tripping stored reasoning items
+           from ``_provider_content`` as ``input`` items on subsequent
+           turns (the SDK's ``ResponseReasoningItemParam`` shape).
+
+        Both are also gated by ``caps.supports_reasoning_replay`` —
+        models without a reasoning lane (gpt-4o, etc.) silently skip
+        replay even if the operator flag is set.
+        """
         caps = capabilities or self.get_capabilities(model)
 
-        instructions, input_items = self._convert_messages(messages)
+        # The two replay gates collapse to a single boolean: replay is
+        # active only when both the operator flag AND the model's
+        # capability allow it.  Threaded into ``_convert_messages`` so
+        # stored reasoning items become input items on the next call.
+        replay_active = bool(replay_reasoning_to_model and caps.supports_reasoning_replay)
+        instructions, input_items = self._convert_messages(
+            messages, replay_reasoning_to_model=replay_active
+        )
         tools = apply_tool_search(caps, tools, deferred_names)
         converted_tools = self._convert_tools(tools, caps)
 
@@ -260,6 +341,13 @@ class OpenAIResponsesProvider:
             "max_output_tokens": max_tokens,
             "store": False,
         }
+
+        if replay_active:
+            # SDK doc (response_create_params.py:70-74): with
+            # ``include=["reasoning.encrypted_content"]`` the API
+            # surfaces opaque ``encrypted_content`` on reasoning
+            # items, enabling stateless replay even with ``store=False``.
+            kwargs["include"] = ["reasoning.encrypted_content"]
 
         if instructions:
             kwargs["instructions"] = instructions
@@ -293,12 +381,11 @@ class OpenAIResponsesProvider:
         deferred_names: frozenset[str] | None = None,
         cancel_ref: list[Any] | None = None,
         capabilities: ModelCapabilities | None = None,
-        # Phase 2 reasoning-persistence kwarg — accepted for Protocol
-        # conformance.  Phase 3 will gate ``include=
-        # ["reasoning.encrypted_content"]`` on this flag once OpenAI
-        # Responses captures replayable reasoning items.  Today the
-        # request kwargs don't carry reasoning, so the flag is unused
-        # but threaded for forward-compat.
+        # Phase 3 reasoning-persistence kwarg — gates
+        # ``include=["reasoning.encrypted_content"]`` on the request
+        # AND ``_convert_messages`` round-tripping stored reasoning
+        # items as input.  Both are also gated by
+        # ``caps.supports_reasoning_replay`` inside ``_build_kwargs``.
         replay_reasoning_to_model: bool = True,
     ) -> Iterator[StreamChunk]:
         if extra_params:
@@ -312,6 +399,7 @@ class OpenAIResponsesProvider:
             reasoning_effort,
             deferred_names,
             capabilities=capabilities,
+            replay_reasoning_to_model=replay_reasoning_to_model,
         )
         kwargs["stream"] = True
 
@@ -481,7 +569,7 @@ class OpenAIResponsesProvider:
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,
         capabilities: ModelCapabilities | None = None,
-        # See create_streaming above for the Phase 2 reasoning-persistence rationale.
+        # See create_streaming above for the Phase 3 reasoning-persistence rationale.
         replay_reasoning_to_model: bool = True,
     ) -> CompletionResult:
         if extra_params:
@@ -495,6 +583,7 @@ class OpenAIResponsesProvider:
             reasoning_effort,
             deferred_names,
             capabilities=capabilities,
+            replay_reasoning_to_model=replay_reasoning_to_model,
         )
 
         log.debug(
@@ -592,8 +681,76 @@ class OpenAIResponsesProvider:
         self,
         provider_blocks: list[dict[str, Any]] | None,
     ) -> str:
-        # Phase 3 will wire this to walk ``type=="reasoning"`` items
-        # captured via ``include=["reasoning.encrypted_content"]``.
-        # Today the request kwargs don't pass ``include`` so reasoning
-        # items in ``provider_blocks`` carry no replayable text.
-        return ""
+        if not isinstance(provider_blocks, list):
+            return ""
+        parts: list[str] = []
+        for block in provider_blocks:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "reasoning":
+                continue
+            # Per ``ResponseReasoningItem`` (response_reasoning_item.py:31-62):
+            # ``summary`` is the human-readable summary list (always
+            # present), ``content`` is the raw reasoning text list
+            # (optional). We surface both — summary is what the model
+            # produces by default; content is only present on certain
+            # configurations.
+            for s in block.get("summary") or []:
+                if isinstance(s, dict) and s.get("type") == "summary_text":
+                    text = s.get("text")
+                    if isinstance(text, str) and text:
+                        parts.append(text)
+            for c in block.get("content") or []:
+                if isinstance(c, dict) and c.get("type") == "reasoning_text":
+                    text = c.get("text")
+                    if isinstance(text, str) and text:
+                        parts.append(text)
+        if not parts:
+            return ""
+        joined = "\n".join(parts)
+        if len(joined) > MAX_REASONING_DISPLAY_BYTES:
+            return joined[:MAX_REASONING_DISPLAY_BYTES]
+        return joined
+
+
+def _reasoning_item_for_input(stored: dict[str, Any]) -> dict[str, Any] | None:
+    """Project a stored reasoning item into ``ResponseReasoningItemParam`` shape.
+
+    The output of a Responses API call carries reasoning items shaped
+    like ``ResponseReasoningItem`` (response_reasoning_item.py:31-62);
+    we stored those verbatim into ``provider_blocks`` via
+    ``item.model_dump()`` (``_iter_stream`` line 415-420 captures all
+    output items).  To replay them as input on the next turn, the
+    Responses API expects ``ResponseReasoningItemParam``
+    (response_reasoning_item_param.py:31-62) which has the same shape
+    minus ``status`` (a server-only field).
+
+    The ``id``, ``summary``, ``content``, ``encrypted_content``, and
+    ``type`` fields all round-trip directly.  We project explicitly
+    rather than ``del stored["status"]; return stored`` so callers
+    aren't surprised by mutation of the source dict.
+
+    Returns ``None`` when ``id`` is missing or non-string — per the
+    SDK schema (``response_reasoning_item_param.py:39``) ``id`` is
+    ``Required[str]``; sending an empty string would emit a malformed
+    input item that the API may either reject (4xx) or silently
+    misroute.  Caller skips appending when None is returned.  Items
+    captured via the streaming layer always have ``id`` populated, so
+    this guard is defensive against manually-constructed or migrated
+    storage rows.
+    """
+    item_id = stored.get("id")
+    if not isinstance(item_id, str) or not item_id:
+        return None
+    out: dict[str, Any] = {
+        "type": "reasoning",
+        "id": item_id,
+        "summary": stored.get("summary") or [],
+    }
+    content = stored.get("content")
+    if content:
+        out["content"] = content
+    encrypted = stored.get("encrypted_content")
+    if encrypted:
+        out["encrypted_content"] = encrypted
+    return out
