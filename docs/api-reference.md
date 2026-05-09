@@ -325,6 +325,44 @@ finalize any in-progress assistant message.
 {"type": "stream_end"}
 ```
 
+**`state_change`** -- the worker thread transitioned to a new state. Drives
+the client's busy-mode (composer in send vs. stop, spinner indicators,
+auto-focus on idle). Sent live during normal operation AND on every fresh
+SSE subscribe (so a mid-stream page refresh restores the correct composer
+state without waiting for the next live transition).
+
+```json
+{"type": "state_change", "state": "running"}
+```
+
+| Field    | Type   | Description                                                          |
+|----------|--------|----------------------------------------------------------------------|
+| `state`  | string | One of `"running"`, `"thinking"`, `"attention"`, `"idle"`, `"error"` |
+
+**`in_progress_snapshot`** -- one-shot replay of the in-progress turn's
+content + reasoning text-so-far when this client connects mid-stream.
+Lets a refreshing browser tab restore partial assistant text immediately
+instead of waiting for the response to complete. Yielded once after the
+kind-specific replay phase (history + pending), only when at least one
+of `content` / `reasoning` is non-empty. Both halves render into the same
+assistant bubble the live `content` / `reasoning` events would target;
+clients should treat the snapshot as idempotent (skip overwrite if the
+current local buffer is already a superset prefix — covers EventSource
+auto-reconnect re-replays).
+
+```json
+{
+  "type": "in_progress_snapshot",
+  "content": "Here is the answer so far: it depends on ",
+  "reasoning": "The user is asking about a comparison; let me think about..."
+}
+```
+
+| Field        | Type   | Description                                                |
+|--------------|--------|------------------------------------------------------------|
+| `content`    | string | Joined assistant content text accumulated this turn        |
+| `reasoning`  | string | Joined reasoning / chain-of-thought text accumulated       |
+
 **`tool_info`** -- one or more tool calls that were auto-approved (no user
 action required).
 
@@ -522,7 +560,13 @@ Each SSE connection to a workstream receives its own delivery queue.  Events
 produced by the worker thread are fanned out to all registered listener queues,
 so multiple consumers (browser, console proxy, SDK) can connect
 simultaneously and each receives every event.  On reconnect the client receives
-a full history replay, so no catch-up mechanism is needed.
+the kind-specific replay (`connected` + `status` + `history` + pending
+approval / plan for interactive; `connected` + `status` + pending for coord)
+followed by a `state_change` carrying the current worker state and an
+optional `in_progress_snapshot` carrying any partial content / reasoning
+buffered for the in-progress turn — so a mid-stream refresh restores both
+the busy-mode UI and the partial assistant text without waiting for the
+response to complete.
 
 ---
 

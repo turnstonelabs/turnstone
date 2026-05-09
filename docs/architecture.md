@@ -231,11 +231,13 @@ The engine emits state changes via `_emit_state()` which calls
 
 > See also: [Core Engine Classes diagram](diagrams/png/03-core-engine-classes.png)
 
-Defined in `turnstone.core.session.SessionUI` as a `typing.Protocol` with 14
+Defined in `turnstone.core.session.SessionUI` as a `typing.Protocol` with 16
 methods. Every frontend must implement all of them.
 
 ```python
 class SessionUI(Protocol):
+    def on_turn_start(self) -> None: ...
+    def on_turn_committed(self) -> None: ...
     def on_thinking_start(self) -> None: ...
     def on_thinking_stop(self) -> None: ...
     def on_reasoning_token(self, text: str) -> None: ...
@@ -251,6 +253,14 @@ class SessionUI(Protocol):
     def on_state_change(self, state: str) -> None: ...
     def on_rename(self, name: str) -> None: ...  # propagate alias to tab/UI label
 ```
+
+`on_turn_start` fires at the top of each iteration of the send-loop;
+`on_turn_committed` fires immediately after `messages.append(assistant_msg)`.
+`SessionUIBase` uses both to reset the per-turn inflight buffers
+(`_ws_inflight_content` / `_ws_inflight_reasoning` / `_ws_inflight_seq`)
+that fuel the SSE refresh-resume `in_progress_snapshot` event — see
+the per-workstream events stream in
+[`docs/api-reference.md`](api-reference.md#get-v1apiworkstreamsws_idevents).
 
 `on_rename` is called by the `/name` command (on success) and after a successful `/resume` (if the resumed session has an alias or title). `WebUI.on_rename` broadcasts a `ws_rename` event on the global SSE channel and updates the in-memory `Workstream.name`; `TerminalUI.on_rename` is a no-op.
 
