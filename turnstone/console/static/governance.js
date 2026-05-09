@@ -143,46 +143,91 @@ function _renderGovRoles(items) {
   }
 }
 
-// All permission names for the checkbox UI
-var _ALL_PERMISSIONS = [
-  "read",
-  "write",
-  "approve",
-  "admin.users",
-  "admin.roles",
-  "admin.orgs",
-  "admin.policies",
-  "admin.skills",
-  "admin.audit",
-  "admin.usage",
-  "admin.schedules",
-  "admin.watches",
-  "admin.judge",
-  "admin.memories",
-  "admin.settings",
-  "admin.mcp",
-  "tools.approve",
-  "workstreams.create",
-  "workstreams.close",
+// Permission inventory grouped by namespace so the role modal can
+// render each section under its own heading.  Sectioning prevents the
+// row-flow grid from slicing a namespace mid-column (e.g. half of
+// ``admin.*`` ending up in column 1, the rest in column 2) and lets
+// readers who don't yet know the permission taxonomy scan by
+// concept.  Each section's permissions render as a 2-column grid;
+// the ``Scopes`` and ``Workstreams & Tools`` sections are short
+// enough to fit one row, ``Admin`` carries the bulk.
+var _PERMISSION_SECTIONS = [
+  {
+    label: "Scopes",
+    permissions: ["read", "write", "approve"],
+  },
+  {
+    label: "Admin",
+    permissions: [
+      "admin.users",
+      "admin.roles",
+      "admin.orgs",
+      "admin.policies",
+      "admin.skills",
+      "admin.audit",
+      "admin.usage",
+      "admin.schedules",
+      "admin.watches",
+      "admin.judge",
+      "admin.memories",
+      "admin.settings",
+      "admin.mcp",
+    ],
+  },
+  {
+    label: "Workstreams & Tools",
+    permissions: ["workstreams.create", "workstreams.close", "tools.approve"],
+  },
 ];
 
-function _buildPermCheckboxes(prefix, selected) {
-  var html = '<div class="perm-grid">';
-  for (var i = 0; i < _ALL_PERMISSIONS.length; i++) {
-    var p = _ALL_PERMISSIONS[i];
-    var checked = selected && selected.indexOf(p) >= 0 ? " checked" : "";
-    html +=
-      '<label class="perm-checkbox"><input type="checkbox" value="' +
-      p +
-      '" name="' +
-      prefix +
-      '-perm"' +
-      checked +
-      "> " +
-      escapeHtml(p) +
-      "</label>";
+// Flat list — kept for any caller that wants the full permission
+// inventory without caring about sectioning.
+var _ALL_PERMISSIONS = (function () {
+  var flat = [];
+  for (var i = 0; i < _PERMISSION_SECTIONS.length; i++) {
+    flat = flat.concat(_PERMISSION_SECTIONS[i].permissions);
   }
-  html += "</div>";
+  return flat;
+})();
+
+function _buildPermCheckboxes(prefix, selected) {
+  // Emits the toggle-switch component used elsewhere in the admin
+  // modals so each permission reads as a deliberate on/off rather
+  // than a generic checkbox.  Sections are wrapped in a
+  // ``.perm-section`` block with a caps-styled heading so the
+  // typographic system inside the role modal stays consistent (the
+  // surrounding label cadence is also caps + 0.08em letter-spacing).
+  // The underlying ``<input type="checkbox" name="{prefix}-perm">``
+  // shape is preserved so ``_collectPermCheckboxes`` still picks
+  // them up regardless of section.
+  var html = "";
+  for (var s = 0; s < _PERMISSION_SECTIONS.length; s++) {
+    var section = _PERMISSION_SECTIONS[s];
+    html +=
+      '<div class="perm-section">' +
+      '<div class="perm-section-label">' +
+      escapeHtml(section.label) +
+      "</div>" +
+      '<div class="perm-grid">';
+    for (var i = 0; i < section.permissions.length; i++) {
+      var p = section.permissions[i];
+      var checked = selected && selected.indexOf(p) >= 0 ? " checked" : "";
+      html +=
+        '<label class="toggle-switch perm-toggle">' +
+        '<input type="checkbox" value="' +
+        p +
+        '" name="' +
+        prefix +
+        '-perm"' +
+        checked +
+        ">" +
+        '<span class="toggle-track" aria-hidden="true"></span>' +
+        '<span class="toggle-label">' +
+        escapeHtml(p) +
+        "</span></label>";
+    }
+    html += "</div></div>";
+  }
   return html;
 }
 
@@ -346,20 +391,27 @@ function showUserRolesModal(userId) {
       var assigned = {};
       for (var i = 0; i < userRoles.length; i++)
         assigned[userRoles[i].role_id] = true;
-      var html = "";
+      // Role-assignment rows reuse the toggle-switch component for
+      // consistency with the rest of the admin UX.  Role display names
+      // are human-readable text, so no monospace override is needed.
+      var html = '<div class="user-roles-list">';
       for (var j = 0; j < allRoles.length; j++) {
         var r = allRoles[j];
         var checked = assigned[r.role_id] ? " checked" : "";
         html +=
-          '<label class="perm-checkbox"><input type="checkbox" value="' +
+          '<label class="toggle-switch user-role-toggle">' +
+          '<input type="checkbox" value="' +
           escapeHtml(r.role_id) +
           '" name="ur-role"' +
           checked +
-          "> " +
+          ">" +
+          '<span class="toggle-track" aria-hidden="true"></span>' +
+          '<span class="toggle-label">' +
           escapeHtml(r.display_name) +
-          "</label>";
+          "</span></label>";
       }
-      container.innerHTML = html;
+      html += "</div>";
+      container.innerHTML = html; // values escaped via escapeHtml above
     })
     .catch(function () {
       container.innerHTML =
@@ -3199,18 +3251,27 @@ function renderJudgeSettings() {
     var isDefault = s.source === "default";
 
     if (s.type === "bool") {
+      // Toggle switch — same component used by the admin modals.
+      // ``onchange`` reads the box's new ``.checked`` and writes via
+      // saveJudgeSetting.  The ``.toggle-label`` is a static "Enabled"
+      // because the slider position is the truth — flipping the
+      // caption text on save round-tripped through reload, so the
+      // slider moved instantly while the caption lagged 50-300ms and
+      // looked broken.  ``aria-label`` carries the setting name so
+      // screen readers get the row context inline.
       inputHtml =
-        '<label class="toggle-label" style="display:flex;align-items:center;gap:8px;cursor:pointer">' +
+        '<label class="toggle-switch toggle--flush">' +
         '<input type="checkbox" data-key="' +
         s.key +
+        '" aria-label="' +
+        escapeHtml(shortKey) +
         '" ' +
         (currentVal ? "checked" : "") +
         " onchange=\"saveJudgeSetting('" +
         s.key +
-        '\',this.checked)" style="width:16px;height:16px">' +
-        '<span style="font-size:12px">' +
-        (currentVal ? "Enabled" : "Disabled") +
-        "</span></label>";
+        "',this.checked)\">" +
+        '<span class="toggle-track" aria-hidden="true"></span>' +
+        '<span class="toggle-label">Enabled</span></label>';
     } else if (s.type === "float") {
       inputHtml =
         '<div style="display:flex;gap:8px;align-items:center">' +

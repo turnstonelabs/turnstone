@@ -1572,23 +1572,284 @@
   padding-left: 12px;
 }
 
-/* Checkbox labels inside admin modals */
-.admin-modal label.admin-checkbox {
+/* Toggle switch — modern replacement for boolean checkboxes inside
+ * admin modals.  The native <input type="checkbox"> stays in the
+ * markup (visually hidden but keyboard-focusable) so existing JS
+ * that reads `.checked` keeps working; the .toggle-track + ::before
+ * pseudo render the slider, .toggle-label carries the caption.
+ *
+ * Usage:
+ *   <label class="toggle-switch">
+ *     <input type="checkbox" id="..." />
+ *     <span class="toggle-track" aria-hidden="true"></span>
+ *     <span class="toggle-label">Enabled</span>
+ *   </label>
+ */
+/* Selector is doubled with .admin-modal so we win the specificity
+ * battle against ``.admin-modal label`` (0,1,1) — without that, the
+ * parent rule's display:block + text-transform:uppercase + margins
+ * cascade and we lose the inline-flex layout.
+ *
+ * Default margin-top: 14px matches the .admin-modal label cadence
+ * for toggles that sit directly between regular labelled rows
+ * (schedule/policy/skill modals).  When a toggle is inside an
+ * explicit ``.toggle-stack`` flex container, the stack resets the
+ * margin so the parent's gap controls spacing on its own. */
+.admin-modal label.toggle-switch,
+label.toggle-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  user-select: none;
+  margin: 14px 0 0 0;
+  padding: 0;
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg);
+}
+.admin-modal .toggle-stack > label.toggle-switch,
+.toggle-stack > label.toggle-switch {
+  margin: 0;
+}
+/* Modifier for toggles that should sit flush against the surrounding
+ * rhythm rather than carry the default 14px top margin — used when a
+ * toggle is the first row of a modal (under the h2) or when it lives
+ * in a dynamically-rendered row that already supplies its own
+ * spacing (e.g. judge bool settings). */
+.admin-modal label.toggle-switch.toggle--flush,
+label.toggle-switch.toggle--flush {
+  margin-top: 0;
+}
+.admin-modal .toggle-stack,
+.toggle-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 16px;
+}
+/* Hidden-input + track rules also need the .admin-modal prefix to
+ * outrank ``.admin-modal input:not([type="hidden"])`` (same
+ * specificity 0,2,1; that one comes later in source so without the
+ * bump it wins and forces width:100% on the hidden input, popping it
+ * back into the layout). */
+.admin-modal .toggle-switch input[type="checkbox"],
+.toggle-switch input[type="checkbox"] {
+  /* Visually hidden but still focusable + click-targetable via the
+   * <label> wrap.  Avoids display:none, which would strip the input
+   * from the keyboard tab order. */
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+.admin-modal .toggle-switch .toggle-track,
+.toggle-switch .toggle-track {
+  position: relative;
+  flex: 0 0 auto;
+  /* 40×22 meets WCAG 2.5.5 (Level AAA) target size when combined with
+   * the label's hit area, and reads as a deliberate switch on touch
+   * targets without dominating the form rhythm. */
+  width: 40px;
+  height: 22px;
+  /* Off state: depressed inset on the modal background so the track
+   * silhouette stays visible at 1.5+ contrast ratio.  The earlier
+   * ``var(--border-strong)`` solid fill was ~1.18:1 against the modal
+   * surface — visible to most readers, invisible to anyone on a
+   * glare-y screen or at ``prefers-contrast: more``. */
+  background: var(--bg);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+  border-radius: 11px;
+  transition:
+    background 0.18s ease,
+    box-shadow 0.18s ease;
+}
+.admin-modal .toggle-switch .toggle-track::before,
+.toggle-switch .toggle-track::before {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 16px;
+  height: 16px;
+  background: var(--fg);
+  border-radius: 50%;
+  transition: transform 0.18s ease;
+}
+.admin-modal .toggle-switch input:checked + .toggle-track,
+.toggle-switch input:checked + .toggle-track {
+  background: var(--accent);
+  box-shadow: none;
+}
+.admin-modal .toggle-switch input:checked + .toggle-track::before,
+.toggle-switch input:checked + .toggle-track::before {
+  transform: translateX(18px);
+  background: var(--bg);
+}
+.admin-modal .toggle-switch input:focus-visible + .toggle-track,
+.toggle-switch input:focus-visible + .toggle-track {
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+.admin-modal .toggle-switch input:disabled + .toggle-track,
+.toggle-switch input:disabled + .toggle-track {
+  opacity: 0.4;
+}
+.toggle-switch:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+.toggle-switch .toggle-label {
+  display: inline-block;
+  /* The label text rides at the modal's normal label cadence — caps
+   * + letter-spacing so it sits next to the surrounding form rows
+   * without shifting the visual rhythm. */
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+}
+
+/* Hair divider for separating conceptually-grouped toggles inside a
+ * stack — used between the lone "Enabled" toggle and the paired
+ * Reasoning toggles in the Add Model modal so the grouping reads
+ * without needing a subheading or indent.  Margin: 0 because the
+ * .toggle-stack flex container already supplies a 10px gap on each
+ * side; adding a margin on top would visually separate the divider
+ * twice. */
+.admin-modal hr.toggle-group-divider,
+hr.toggle-group-divider {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 0;
+  width: 100%;
+}
+
+/* Segmented option list — vertical card group for radio choices that
+ * benefit from a strong selected-state highlight.  The native
+ * ``<input type="radio">`` is visually hidden but stays focusable;
+ * the ``.segmented-indicator`` pseudo-circle and the row's
+ * background carry the selected state.
+ *
+ * Usage:
+ *   <div class="segmented-control" role="radiogroup">
+ *     <label class="segmented-option">
+ *       <input type="radio" name="..." value="..." />
+ *       <span class="segmented-indicator" aria-hidden="true"></span>
+ *       <span class="segmented-text">Label
+ *         <span class="segmented-hint">(hint)</span>
+ *       </span>
+ *     </label>
+ *     ...
+ *   </div>
+ */
+.admin-modal .segmented-control,
+.segmented-control {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--bg);
+  margin-top: 8px;
+}
+.admin-modal .segmented-option,
+.segmented-option {
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-size: 12px;
+  gap: 10px;
+  padding: 11px 14px;
+  cursor: pointer;
+  margin: 0;
+  font-family: var(--font-ui);
+  font-size: 13px;
   font-weight: 500;
   text-transform: none;
   letter-spacing: 0;
-  color: var(--fg);
-  cursor: pointer;
-  margin-top: 14px;
+  color: var(--fg-dim);
+  border-top: 1px solid var(--border);
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
 }
-.admin-modal label.admin-checkbox input[type="checkbox"],
-.admin-modal label.admin-checkbox input[type="radio"] {
-  width: auto;
-  margin: 0;
+.segmented-option:first-of-type {
+  border-top: none;
+}
+.segmented-option input[type="radio"] {
+  /* Visually hidden but focusable + click-targetable via the label
+   * wrap.  Keyboard arrows still cycle within the radiogroup. */
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+}
+.segmented-option .segmented-indicator {
+  position: relative;
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--bg);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+  transition:
+    background 0.15s ease,
+    box-shadow 0.15s ease;
+}
+.segmented-option .segmented-indicator::after {
+  content: "";
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: transparent;
+  transition: background 0.15s ease;
+}
+.segmented-option:hover {
+  background: var(--bg-highlight);
+  color: var(--fg);
+}
+.segmented-option:has(input:checked) {
+  background: var(--accent-dim);
+  color: var(--fg);
+}
+.segmented-option:has(input:checked) .segmented-indicator {
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.segmented-option:has(input:checked) .segmented-indicator::after {
+  background: var(--accent);
+}
+.segmented-option:has(input:focus-visible) {
+  /* Bright accent (not --accent-dim) so the ring stays visible even
+   * on the currently-selected row, which already paints --accent-dim
+   * as its background. */
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+.segmented-option .segmented-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.segmented-option .segmented-hint {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--fg-dim);
+  margin-left: 4px;
+}
+.segmented-option:has(input:checked) .segmented-hint {
+  color: var(--accent);
 }
 
 /* Admin modals */
@@ -1691,9 +1952,6 @@
   background: var(--bg-highlight);
   border-color: var(--border);
   color: var(--fg-dim);
-}
-.admin-modal label.admin-checkbox input:disabled {
-  opacity: 0.4;
 }
 .admin-modal input::placeholder,
 .admin-modal textarea::placeholder {
@@ -2755,28 +3013,64 @@ textarea.skill-content-area {
   padding: 0;
   margin-bottom: 4px;
 }
+/* Permission section grouping — keeps each namespace contiguous so
+ * the row-flow grid below doesn't slice ``admin.*`` mid-column.  The
+ * caps-styled ``.perm-section-label`` re-anchors the toggles to the
+ * modal's typographic system (matches ``.admin-modal label``: 10px
+ * caps, 0.08em letter-spacing, fg-dim). */
+.perm-section {
+  margin-top: 12px;
+}
+.perm-section:first-of-type {
+  margin-top: 0;
+}
+.perm-section-label {
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+  margin-bottom: 4px;
+}
 .perm-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 4px 16px;
-  padding: 8px 0;
+  gap: 8px 16px;
+  padding: 4px 0 0;
 }
-.perm-checkbox {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 11px;
+/* Permission rows inherit the toggle-switch component but render the
+ * permission name in monospace + lower case (it's an identifier, not
+ * a heading) — overrides the .toggle-label's caps/letter-spacing
+ * cadence used elsewhere in admin modals. */
+.admin-modal .perm-grid label.toggle-switch.perm-toggle,
+.perm-grid label.toggle-switch.perm-toggle {
+  margin: 0;
+}
+.perm-grid .toggle-switch.perm-toggle .toggle-label {
   font-family: var(--font-mono);
-  color: var(--fg);
-  padding: 3px 0;
-  cursor: pointer;
+  font-size: 11px;
+  font-weight: 500;
   text-transform: none;
   letter-spacing: normal;
+  color: var(--fg);
 }
-.perm-checkbox input[type="checkbox"] {
-  width: auto;
+
+/* User-role assignment list (Users tab → Manage roles modal).  Same
+ * toggle-switch component as elsewhere, but the labels are
+ * human-readable role display names so we keep ui-font + caps-on so
+ * the stack reads like a settings list.  Only override the layout
+ * margin (the modal already provides outer padding). */
+.admin-modal .user-roles-list,
+.user-roles-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+.admin-modal .user-roles-list label.toggle-switch.user-role-toggle,
+.user-roles-list label.toggle-switch.user-role-toggle {
   margin: 0;
-  accent-color: var(--accent);
 }
 
 /* ==========================================================================

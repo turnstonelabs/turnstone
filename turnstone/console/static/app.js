@@ -1761,11 +1761,11 @@ function _mountHomeCoordComposer() {
           id: "judge_model",
           label: "Judge Model",
           type: "select",
-          // Neutral label — the actual default is ConfigStore
-          // ``judge.model`` when set, IntentJudge's agent-model
-          // fallback when not.  "Default judge model" doesn't
-          // mislead either way.
-          choices: [{ value: "", text: "Default judge model" }],
+          // Initial placeholder; _populateHomeModelDropdowns rewrites this
+          // to "Default model (<alias>)" once /v1/api/models reports the
+          // resolved judge alias (judge.model when set, otherwise the
+          // session model — see IntentJudge.__init__).
+          choices: [{ value: "", text: "Default model" }],
         },
       ],
     },
@@ -1801,6 +1801,21 @@ function _populateHomeSkillDropdown() {
     });
 }
 
+// Format a resolved alias with its model suffix the same way as the
+// dropdown rows ("alias (model)", or just "alias" when they coincide).
+// Returns "" when alias is empty or unknown so callers can fall back
+// to a neutral placeholder.
+function _resolveModelLabel(alias, models) {
+  if (!alias) return "";
+  for (var i = 0; i < (models || []).length; i++) {
+    var m = models[i];
+    if (m.alias === alias) {
+      return m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
+    }
+  }
+  return alias;
+}
+
 // Populate Model + Judge Model dropdowns from /v1/api/models — same
 // list the interactive new-ws modal uses.  Empty/default option stays
 // at the top so submitting without a choice falls back to the
@@ -1819,6 +1834,30 @@ function _populateHomeModelDropdowns() {
       });
       _homeCoordComposer.setOptionChoices("model", choices);
       _homeCoordComposer.setOptionChoices("judge_model", choices);
+      // Both placeholders use the same "Default — alias (model)"
+      // template — the field-row labels (MODEL / JUDGE MODEL) already
+      // carry the role context, so an asymmetric "Default judge model"
+      // reads awkwardly alongside the plain "Default model" line above
+      // it.  Em-dash separator (rather than nested parens) keeps the
+      // alias's "(model)" suffix legible and matches the
+      // ``(default — alias (model))`` pattern used in the admin Roles
+      // tab.
+      var coordDefault = _resolveModelLabel(
+        data.coordinator_default_alias || "",
+        data.models || [],
+      );
+      var judgeDefault = _resolveModelLabel(
+        data.judge_default_alias || "",
+        data.models || [],
+      );
+      _homeCoordComposer.setOptionPlaceholder(
+        "model",
+        coordDefault ? "Default — " + coordDefault : "Default model",
+      );
+      _homeCoordComposer.setOptionPlaceholder(
+        "judge_model",
+        judgeDefault ? "Default — " + judgeDefault : "Default model",
+      );
     })
     .catch(function () {
       /* defaults still work even without the dropdown populated */
