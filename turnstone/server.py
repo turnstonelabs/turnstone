@@ -474,11 +474,13 @@ def _build_history(
     else:
         ws_id = getattr(session, "_ws_id", "") or ""
         verdicts_by_call_id, assessments_by_call_id = _load_verdict_indexes(ws_id)
-    # Active-model reasoning-persistence flag — defaults True so that a
-    # registry/alias lookup miss still surfaces reasoning bubbles.  The
-    # default-True semantic mirrors the migration's server_default for
-    # ``model_definitions.surface_persisted_reasoning`` and matches the conservative
-    # rehydration default (Phase 1 spec).
+    # Active-model ``surface_persisted_reasoning`` flag — single-tier
+    # resolution (live session's registry only).  This path always has
+    # a live ``ChatSession`` in hand, so the cold-workstream and
+    # app.state-registry tiers used by ``make_history_handler``
+    # (``session_routes.py:2396-2429``) are unreachable here.  Default
+    # True mirrors the migration's server_default and matches the
+    # conservative rehydration default in the Phase 1 spec.
     surface_persisted_reasoning = True
     registry = getattr(session, "_registry", None)
     model_alias = getattr(session, "_model_alias", "") or ""

@@ -4,11 +4,12 @@ Phase 2 of optional reasoning persistence wraps the verbatim
 ``_provider_content`` replay path at ``_anthropic.py:_convert_messages``
 with two gates:
 
-1. ``ANTHROPIC_VALID_BLOCK_TYPES`` shape filter — foreign-shaped
-   blocks (OpenAI Responses ``type="reasoning"`` after Phase 3 lands,
-   Gemini thought parts, anything else) fall through to the
-   text+tool_calls rebuild path rather than 400-ing the API.  Closes
-   a pre-existing latent bug.
+1. ``ANTHROPIC_VALID_BLOCK_TYPES`` per-block shape filter — foreign-
+   shaped blocks (OpenAI Responses ``type="reasoning"``, Gemini thought
+   parts, the synthetic ``reasoning_text`` from path-3 capture) are
+   dropped individually; valid Anthropic blocks in the same message
+   still ride the verbatim path.  When NO valid blocks survive, the
+   converter falls through to the text+tool_calls rebuild path.
 2. ``replay_reasoning_to_model`` operator flag — when False (the
    ``model_definitions`` server_default), thinking blocks are
    stripped before the wire payload is built.  Tool_use /
@@ -277,10 +278,10 @@ class TestShapeFilterFallthrough:
         types_present = [b["type"] for b in assistant["content"]]
         assert "reasoning" not in types_present
 
-    def test_mixed_shape_one_foreign_block_falls_through(self, provider: AnthropicProvider) -> None:
-        # Even a single foreign block in a mostly-Anthropic payload
-        # forces fall-through (the shape predicate is "all blocks
-        # match", not "majority match").
+    def test_mixed_shape_drops_foreign_keeps_valid(self, provider: AnthropicProvider) -> None:
+        # Per-block filter: a single foreign block in a mostly-Anthropic
+        # payload no longer forces fall-through.  Valid Anthropic blocks
+        # ride the verbatim path; the foreign block is dropped.
         msg = {
             "role": "assistant",
             "content": "Mixed.",
@@ -292,8 +293,71 @@ class TestShapeFilterFallthrough:
         }
         _, converted = provider._convert_messages([msg], replay_reasoning_to_model=True)
         assistant = next(m for m in converted if m["role"] == "assistant")
+        types_present = [b["type"] for b in assistant["content"]]
+        assert "reasoning" not in types_present  # foreign dropped
+        assert "thinking" in types_present  # valid + replay=True kept
+        assert "text" in types_present
         for b in assistant["content"]:
             assert b.get("type") in ANTHROPIC_VALID_BLOCK_TYPES
+
+    def test_mixed_shape_preserves_web_search_encrypted_content(
+        self, provider: AnthropicProvider
+    ) -> None:
+        # The motivating case for per-block (vs all-or-nothing) filter:
+        # cross-model resumption stamps a foreign ``reasoning`` block
+        # alongside Anthropic web-search blocks carrying encrypted
+        # citations.  An all-or-nothing filter would discard the whole
+        # message and rebuild from text+tool_calls — silently losing
+        # the encrypted_content the API needs for round-trip continuity.
+        msg = {
+            "role": "assistant",
+            "content": "From search: ...",
+            "_provider_content": [
+                {"type": "reasoning", "summary": []},  # foreign (e.g. OpenAI)
+                {
+                    "type": "server_tool_use",
+                    "id": "stu_1",
+                    "name": "web_search",
+                    "input": {"query": "x"},
+                },
+                {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "stu_1",
+                    "content": [{"type": "web_search_result", "url": "https://e.com"}],
+                    "encrypted_content": "encrypted-blob-must-survive",
+                    "encrypted_index": "encrypted-idx-must-survive",
+                },
+                {"type": "text", "text": "From search: ..."},
+            ],
+        }
+        _, converted = provider._convert_messages([msg], replay_reasoning_to_model=False)
+        assistant = next(m for m in converted if m["role"] == "assistant")
+        types_present = [b["type"] for b in assistant["content"]]
+        assert "reasoning" not in types_present  # foreign dropped
+        assert "server_tool_use" in types_present
+        assert "web_search_tool_result" in types_present
+        assert "text" in types_present
+        wsr = next(b for b in assistant["content"] if b["type"] == "web_search_tool_result")
+        assert wsr["encrypted_content"] == "encrypted-blob-must-survive"
+        assert wsr["encrypted_index"] == "encrypted-idx-must-survive"
+
+    def test_all_foreign_blocks_fall_through_to_rebuild(self, provider: AnthropicProvider) -> None:
+        # When every block is foreign-shaped (no Anthropic-valid block
+        # survives the per-block filter), the converter still falls
+        # through to text+tool_calls rebuild rather than emitting an
+        # empty assistant turn.
+        msg = {
+            "role": "assistant",
+            "content": "Final answer.",
+            "_provider_content": [
+                {"type": "reasoning", "summary": []},
+                {"type": "reasoning_text", "text": "synthetic"},  # path-3 shape
+            ],
+        }
+        _, converted = provider._convert_messages([msg], replay_reasoning_to_model=True)
+        assistant = next(m for m in converted if m["role"] == "assistant")
+        # Rebuild path: msg.content lifted into a single text block.
+        assert assistant["content"] == [{"type": "text", "text": "Final answer."}]
 
     def test_empty_provider_content_falls_through(self, provider: AnthropicProvider) -> None:
         msg = {
@@ -326,6 +390,29 @@ class TestShapeFilterFallthrough:
         _, converted = provider._convert_messages([msg])
         assistant = next(m for m in converted if m["role"] == "assistant")
         assert assistant["content"] == [{"type": "text", "text": "Plain."}]
+
+    def test_non_dict_and_missing_type_blocks_are_dropped(
+        self, provider: AnthropicProvider
+    ) -> None:
+        # Defensive branches in the per-block walk: a stray non-dict
+        # element (corrupted JSON) or a dict with no/None ``type`` key
+        # (provider drift) must be silently dropped without raising.
+        # Valid blocks in the same list still ride the verbatim path.
+        msg = {
+            "role": "assistant",
+            "content": "ok",
+            "_provider_content": [
+                {"type": "text", "text": "ok"},
+                "stray-string",  # non-dict
+                {"type": None, "text": "huh"},  # None type
+                {"no_type_key": 1},  # missing type
+                {"type": "thinking", "thinking": "t", "signature": "s"},
+            ],
+        }
+        _, converted = provider._convert_messages([msg], replay_reasoning_to_model=True)
+        assistant = next(m for m in converted if m["role"] == "assistant")
+        types_present = [b.get("type") for b in assistant["content"]]
+        assert types_present == ["text", "thinking"]
 
 
 class TestLegacyAnthropicRowsNoRegression:

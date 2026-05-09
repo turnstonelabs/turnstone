@@ -117,6 +117,17 @@ class OpenAIResponsesProvider:
         When *replay_reasoning_to_model* is False, reasoning items are silently
         dropped (they were stripped from the wire by ``sanitize_messages``
         anyway, but we also skip the input-item emission step).
+
+        Default ``False`` differs intentionally from
+        ``AnthropicProvider._convert_messages`` (which defaults
+        ``True``).  Anthropic's default exists for back-compat with
+        pre-Phase-2 callers who never threaded the kwarg; OpenAI
+        Responses replay is brand-new in Phase 3 and has no such
+        legacy.  Production callers (``_build_kwargs``) always pass
+        the resolved flag explicitly, so the default only matters in
+        tests.  Conservative-default-False keeps the persist-only
+        capture path live without forcing a downstream cost on every
+        unaware caller.
         """
         # Capture ``_provider_content`` reasoning items per ASSISTANT
         # ORDINAL (not raw message index) BEFORE sanitization strips

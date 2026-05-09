@@ -168,14 +168,18 @@ def _map_reasoning_to_effort(
 
 
 # Anthropic accepts only a closed set of content-block types on the
-# input boundary.  ``_convert_messages`` gates the verbatim
-# ``_provider_content`` replay path on this set so foreign-shaped
-# blocks (OpenAI Responses ``type="reasoning"`` after Phase 3, Gemini
-# thought parts, anything else) fall through to the text+tool_calls
-# rebuild path rather than 400-ing the API.  Web-search related blocks
-# (``server_tool_use`` / ``web_search_tool_result``) intentionally
-# stay in the set — they carry ``encrypted_content`` that the API
-# requires for round-trip continuity.
+# input boundary.  ``_convert_messages`` runs each block in
+# ``_provider_content`` through this set per-block: foreign-shaped
+# blocks (OpenAI Responses ``type="reasoning"``, Gemini thought parts,
+# the synthetic ``reasoning_text`` from path-3 capture) are dropped
+# individually; valid Anthropic blocks in the same message still ride
+# the verbatim path.  When no valid blocks survive, the converter falls
+# through to the text+tool_calls rebuild path.  Web-search blocks
+# (``server_tool_use`` / ``web_search_tool_result``) stay in the set
+# because they carry ``encrypted_content`` the API requires for
+# round-trip continuity — the per-block filter preserves them even when
+# they share a message with a foreign block (the prior all-or-nothing
+# filter would have silently dropped them in that case).
 ANTHROPIC_VALID_BLOCK_TYPES = frozenset(
     {
         "text",
@@ -342,12 +346,15 @@ class AnthropicProvider:
         (``ChatSession._try_stream`` / ``_utility_completion``) always
         pass the resolved flag explicitly.
 
-        Foreign-shaped ``_provider_content`` (e.g. OpenAI Responses
-        ``type="reasoning"`` blocks reaching Anthropic mid-workstream
-        once Phase 3 lands) fails the ``ANTHROPIC_VALID_BLOCK_TYPES``
-        shape check and falls through to the text+tool_calls rebuild
-        path — closes a pre-existing latent bug where the verbatim
-        replay would have 400'd the API.
+        Foreign-shaped blocks (OpenAI ``reasoning``, Gemini thought
+        parts, the synthetic ``reasoning_text`` from path-3 capture) are
+        dropped per-block; valid Anthropic blocks in the same message
+        still ride the verbatim path.  Critical for cross-model
+        resumption: an earlier all-or-nothing filter silently lost
+        web-search ``encrypted_content`` whenever a foreign block
+        shared a message with ``server_tool_use`` /
+        ``web_search_tool_result``.  If the filter leaves nothing, the
+        converter falls through to the text+tool_calls rebuild path.
         """
         system_parts: list[str] = []
         converted: list[dict[str, Any]] = []
@@ -370,86 +377,88 @@ class AnthropicProvider:
                 if pending_orphan_results:
                     converted.append({"role": "user", "content": pending_orphan_results})
                     pending_orphan_results = []
-                # If raw provider content was preserved, pass it through verbatim
-                # so encrypted_content/encrypted_index from web search are retained.
-                # Phase 2: gated by ``ANTHROPIC_VALID_BLOCK_TYPES`` shape check
-                # (foreign or partially-foreign payloads fall through to the
-                # text+tool_calls rebuild path) and the ``replay_reasoning_to_model``
-                # operator flag (when False, ``thinking`` blocks are stripped).
+                # Per-block shape filter: drop foreign blocks individually,
+                # apply the replay strip to valid ``thinking`` /
+                # ``redacted_thinking`` blocks.  See ``_convert_messages``
+                # docstring for why this is per-block, not all-or-nothing.
                 provider_content = msg.get("_provider_content")
-                # Inline isinstance + non-empty + all-blocks-valid check
-                # so mypy can narrow ``provider_content`` to ``list`` for
-                # the subsequent walk; pulling these into a helper boolean
-                # would require an explicit ``cast`` to recover the type.
-                if (
-                    isinstance(provider_content, list)
-                    and provider_content
-                    and all(
-                        isinstance(b, dict) and b.get("type") in ANTHROPIC_VALID_BLOCK_TYPES
-                        for b in provider_content
-                    )
-                ):
-                    # replay=True keeps the verbatim reference (existing
-                    # behaviour — pinned by an identity assertion in
-                    # test_convert_messages_uses_provider_content).  replay=False
-                    # builds a new list with thinking blocks filtered out;
-                    # tool_use / web-search blocks survive intact so their
-                    # encrypted_content round-trips correctly.
-                    if replay_reasoning_to_model:
-                        wire_blocks: list[dict[str, Any]] = provider_content
-                    else:
-                        wire_blocks = [
-                            b
-                            for b in provider_content
-                            if b.get("type") not in ANTHROPIC_REASONING_BLOCK_TYPES
-                        ]
-                    if wire_blocks:
-                        converted.append({"role": "assistant", "content": wire_blocks})
-                        # Orphan-tool detection runs on the ORIGINAL provider_content
-                        # (not the strip-filtered ``wire_blocks``) — the strip
-                        # only drops thinking blocks, so tool_use IDs are
-                        # identical between the two lists, but we keep the
-                        # source-of-truth read explicit.
-                        pc_tool_ids = [
-                            b["id"]
-                            for b in provider_content
-                            if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id")
-                        ]
-                        if pc_tool_ids:
-                            j = i + 1
-                            result_ids_pc: set[str] = set()
-                            while j < len(messages) and messages[j]["role"] == "tool":
-                                tc_id = messages[j].get("tool_call_id", "")
-                                if tc_id:
-                                    result_ids_pc.add(tc_id)
-                                j += 1
-                            orphaned_pc = [uid for uid in pc_tool_ids if uid not in result_ids_pc]
-                            if orphaned_pc:
-                                log.debug(
-                                    "Synthesizing %d tool_result(s) for orphaned provider_content tool_use IDs",
-                                    len(orphaned_pc),
-                                )
-                                synthetic_pc = [
-                                    {
-                                        "type": "tool_result",
-                                        "tool_use_id": uid,
-                                        "content": "Tool execution was cancelled.",
-                                        "is_error": True,
-                                    }
-                                    for uid in orphaned_pc
-                                ]
-                                if j == i + 1:
-                                    converted.append({"role": "user", "content": synthetic_pc})
-                                else:
-                                    pending_orphan_results = synthetic_pc
-                        i += 1
-                        continue
-                    # All blocks were stripped (message had only thinking
-                    # content + no text + no tool_calls).  Fall through to the
-                    # text+tool_calls rebuild path; if that also produces an
-                    # empty message it will be silently skipped, which is
-                    # correct: a turn with only stripped reasoning has nothing
-                    # to replay.
+                wire_blocks: list[dict[str, Any]] = []
+                valid_blocks: list[dict[str, Any]] = []
+                all_input_valid = True
+                if isinstance(provider_content, list) and provider_content:
+                    dropped_foreign: list[str] = []
+                    for b in provider_content:
+                        if not isinstance(b, dict):
+                            all_input_valid = False
+                            continue
+                        btype = b.get("type")
+                        if btype not in ANTHROPIC_VALID_BLOCK_TYPES:
+                            dropped_foreign.append(str(btype))
+                            all_input_valid = False
+                            continue
+                        valid_blocks.append(b)
+                        if (
+                            not replay_reasoning_to_model
+                            and btype in ANTHROPIC_REASONING_BLOCK_TYPES
+                        ):
+                            continue
+                        wire_blocks.append(b)
+                    if dropped_foreign:
+                        log.debug(
+                            "Dropped %d foreign block(s) from _provider_content "
+                            "during Anthropic conversion: %s",
+                            len(dropped_foreign),
+                            dropped_foreign,
+                        )
+                    # Identity-preserving fast path: when nothing was filtered
+                    # or stripped, reuse the source list reference rather than
+                    # the per-block-built copy.  Pinned by the ``is`` assertions
+                    # in test_providers.py (test_convert_messages_uses_provider_
+                    # content + test_thinking_block_multiturn_roundtrip).
+                    if all_input_valid and replay_reasoning_to_model:
+                        wire_blocks = provider_content
+                if valid_blocks and wire_blocks:
+                    converted.append({"role": "assistant", "content": wire_blocks})
+                    # Orphan-tool detection reads ``valid_blocks`` (unstripped
+                    # valid blocks) so a future widening of the strip predicate
+                    # can't accidentally drop tool_use IDs.
+                    pc_tool_ids = [
+                        b["id"] for b in valid_blocks if b.get("type") == "tool_use" and b.get("id")
+                    ]
+                    if pc_tool_ids:
+                        j = i + 1
+                        result_ids_pc: set[str] = set()
+                        while j < len(messages) and messages[j]["role"] == "tool":
+                            tc_id = messages[j].get("tool_call_id", "")
+                            if tc_id:
+                                result_ids_pc.add(tc_id)
+                            j += 1
+                        orphaned_pc = [uid for uid in pc_tool_ids if uid not in result_ids_pc]
+                        if orphaned_pc:
+                            log.debug(
+                                "Synthesizing %d tool_result(s) for orphaned provider_content tool_use IDs",
+                                len(orphaned_pc),
+                            )
+                            synthetic_pc = [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": uid,
+                                    "content": "Tool execution was cancelled.",
+                                    "is_error": True,
+                                }
+                                for uid in orphaned_pc
+                            ]
+                            if j == i + 1:
+                                converted.append({"role": "user", "content": synthetic_pc})
+                            else:
+                                pending_orphan_results = synthetic_pc
+                    i += 1
+                    continue
+                # Fall through to text+tool_calls rebuild when nothing
+                # survived the filter (missing/empty pc, all-foreign, or
+                # strip removed every remaining thinking block).  An empty
+                # rebuild is silently skipped — a turn with only stripped
+                # reasoning has nothing to replay.
 
                 content_blocks: list[dict[str, Any]] = []
                 text = msg.get("content")
