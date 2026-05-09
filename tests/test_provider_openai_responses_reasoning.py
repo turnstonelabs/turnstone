@@ -44,13 +44,6 @@ def _capable_caps() -> ModelCapabilities:
     )
 
 
-def _incapable_caps() -> ModelCapabilities:
-    return ModelCapabilities(
-        context_window=128000,
-        supports_reasoning_replay=False,
-    )
-
-
 class TestExtractReasoningText:
     def test_none_returns_empty(self, provider: OpenAIResponsesProvider) -> None:
         assert provider.extract_reasoning_text(None) == ""
@@ -193,11 +186,14 @@ class TestReasoningItemForInput:
 
 class TestBuildKwargsInclude:
     """``_build_kwargs`` adds ``include=["reasoning.encrypted_content"]``
-    only when the operator flag AND the model capability both allow."""
+    when the resolved operator flag is True.  The capability AND-gate
+    lives upstream in ``ChatSession._resolve_replay_reasoning_to_model``
+    (single source of truth across providers); the provider trusts the
+    bool it receives.  See
+    ``test_session_replay_reasoning.py::TestSessionToOpenAIResponsesBoundaryIntegration``
+    for the end-to-end gate test."""
 
-    def test_include_added_when_flag_and_capability_true(
-        self, provider: OpenAIResponsesProvider
-    ) -> None:
+    def test_include_added_when_flag_true(self, provider: OpenAIResponsesProvider) -> None:
         kwargs = provider._build_kwargs(
             model="gpt-5",
             messages=[{"role": "user", "content": "hi"}],
@@ -222,37 +218,6 @@ class TestBuildKwargsInclude:
             deferred_names=None,
             capabilities=_capable_caps(),
             replay_reasoning_to_model=False,
-        )
-        assert "include" not in kwargs
-
-    def test_include_omitted_when_capability_false(self, provider: OpenAIResponsesProvider) -> None:
-        # Defends against operator flipping the flag on a non-reasoning
-        # model — the capability gate prevents the include= from being
-        # sent (silently no-op'd).
-        kwargs = provider._build_kwargs(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": "hi"}],
-            tools=None,
-            max_tokens=1024,
-            temperature=0.5,
-            reasoning_effort="medium",
-            deferred_names=None,
-            capabilities=_incapable_caps(),
-            replay_reasoning_to_model=True,
-        )
-        assert "include" not in kwargs
-
-    def test_include_omitted_by_default(self, provider: OpenAIResponsesProvider) -> None:
-        # When neither flag nor capability is passed, replay defaults
-        # True (kwarg) but capability defaults False — net: no include.
-        kwargs = provider._build_kwargs(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": "hi"}],
-            tools=None,
-            max_tokens=1024,
-            temperature=0.5,
-            reasoning_effort="medium",
-            deferred_names=None,
         )
         assert "include" not in kwargs
 

@@ -97,6 +97,48 @@ class TestResolveReplayReasoningToModel:
         # operator preference is a worse default.
         assert session._resolve_replay_reasoning_to_model() is False
 
+    def test_caps_none_preserves_back_compat(self) -> None:
+        # When ``caps`` is omitted, the resolver returns the operator
+        # flag unchanged — matching pre-PR behaviour for any caller
+        # that hasn't been updated to thread caps yet.
+        session = _make_session()
+        session._registry = _registry_with_flag(replay=True)
+        session._model_alias = "claude-opus-4-7"
+        assert session._resolve_replay_reasoning_to_model() is True
+        assert session._resolve_replay_reasoning_to_model(caps=None) is True
+
+    def test_caps_supports_replay_true_passes_through(self) -> None:
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        session = _make_session()
+        session._registry = _registry_with_flag(replay=True)
+        session._model_alias = "claude-opus-4-7"
+        caps = ModelCapabilities(supports_reasoning_replay=True)
+        assert session._resolve_replay_reasoning_to_model(caps=caps) is True
+
+    def test_caps_supports_replay_false_blocks_replay(self) -> None:
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        # Operator flipped replay=True but the model's capability
+        # advertises supports_reasoning_replay=False — AND-gate blocks
+        # replay so the strip predicate runs at the wire build.
+        session = _make_session()
+        session._registry = _registry_with_flag(replay=True)
+        session._model_alias = "hypothetical-no-replay-claude"
+        caps = ModelCapabilities(supports_reasoning_replay=False)
+        assert session._resolve_replay_reasoning_to_model(caps=caps) is False
+
+    def test_caps_supports_replay_true_does_not_force_replay(self) -> None:
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        # Capability True but operator flag False — result must be
+        # False (the AND has to be False on either side).
+        session = _make_session()
+        session._registry = _registry_with_flag(replay=False)
+        session._model_alias = "claude-opus-4-7"
+        caps = ModelCapabilities(supports_reasoning_replay=True)
+        assert session._resolve_replay_reasoning_to_model(caps=caps) is False
+
 
 class TestStreamingCallSitePassesFlag:
     """Pin that ``_try_stream`` actually passes the resolved flag to
@@ -337,6 +379,67 @@ class TestSessionToWireBoundaryIntegration:
             f"Replay-true did not preserve thinking at wire: blocks={block_types}"
         )
 
+    def test_capability_false_strips_thinking_even_when_operator_flag_true(self) -> None:
+        # Mirror of the OpenAI Responses ``test_capability_false_omits_
+        # include_even_when_flag_true`` test below: operator flips
+        # replay=True but the model's capability advertises
+        # supports_reasoning_replay=False.  AND-gate at the resolver
+        # blocks replay, so the strip predicate fires at the wire and
+        # the thinking block does NOT reach the SDK boundary.
+        pytest.importorskip("anthropic")
+        from turnstone.core.providers._anthropic import AnthropicProvider
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        msgs: list[dict[str, object]] = [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": "Final answer.",
+                "_provider_content": [
+                    {"type": "thinking", "thinking": "secret reasoning", "signature": "s"},
+                    {"type": "text", "text": "Final answer."},
+                ],
+            },
+            {"role": "user", "content": "ack"},
+        ]
+
+        session = _make_session()
+        session._registry = _registry_with_flag(replay=True)  # operator opted in
+        session._model_alias = "hypothetical-no-replay-claude"
+        caps = ModelCapabilities(supports_reasoning_replay=False)
+        client, captured = self._stub_anthropic_client()
+        real_provider = AnthropicProvider()
+        with (
+            patch.object(session, "_get_active_tools", return_value=None),
+            patch.object(session, "_provider_extra_params", return_value=None),
+            patch.object(session, "_get_deferred_names", return_value=frozenset()),
+            patch.object(session, "_check_cancelled"),
+        ):
+            stream = session._try_stream(
+                client=client,
+                model="hypothetical-no-replay-claude",
+                msgs=msgs,
+                provider=real_provider,
+                capabilities=caps,
+                model_alias="hypothetical-no-replay-claude",
+            )
+            list(stream)
+
+        wire_msgs = captured.get("messages")
+        assert isinstance(wire_msgs, list), (
+            f"Expected messages= list at SDK boundary, got {captured}"
+        )
+        assistant = next(m for m in wire_msgs if m["role"] == "assistant")
+        block_types = [b.get("type") for b in assistant["content"] if isinstance(b, dict)]
+        assert "thinking" not in block_types, (
+            "Capability gate did not block replay: thinking block reached the wire "
+            f"despite supports_reasoning_replay=False (blocks={block_types})"
+        )
+        flat = repr(captured)
+        assert "secret reasoning" not in flat, (
+            "Reasoning text leaked into the SDK boundary payload despite capability gate"
+        )
+
 
 class TestSessionToOpenAIResponsesBoundaryIntegration:
     """End-to-end integration: session._try_stream -> real
@@ -518,6 +621,8 @@ class TestUtilityCompletionPassesFlag:
     same plumbing requirement as streaming."""
 
     def test_utility_completion_passes_resolved_flag(self) -> None:
+        from turnstone.core.providers._protocol import ModelCapabilities
+
         session = _make_session()
         session._registry = _registry_with_flag(replay=True)
         session._model_alias = "claude-opus-4-7"
@@ -530,10 +635,9 @@ class TestUtilityCompletionPassesFlag:
         mock_provider = MagicMock()
         mock_provider.create_completion = capture_completion
         session._provider = mock_provider
+        caps = ModelCapabilities(max_output_tokens=0, supports_reasoning_replay=True)
         with (
-            patch.object(
-                session, "_get_capabilities", return_value=SimpleNamespace(max_output_tokens=0)
-            ),
+            patch.object(session, "_get_capabilities", return_value=caps),
             patch.object(session, "_provider_extra_params", return_value=None),
         ):
             session._utility_completion(

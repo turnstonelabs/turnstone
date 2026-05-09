@@ -322,19 +322,16 @@ class OpenAIResponsesProvider:
            from ``_provider_content`` as ``input`` items on subsequent
            turns (the SDK's ``ResponseReasoningItemParam`` shape).
 
-        Both are also gated by ``caps.supports_reasoning_replay`` —
-        models without a reasoning lane (gpt-4o, etc.) silently skip
-        replay even if the operator flag is set.
+        The AND-gate against ``caps.supports_reasoning_replay`` lives
+        upstream in ``ChatSession._resolve_replay_reasoning_to_model``
+        (single source of truth across providers).  Production callers
+        always thread the session-resolved flag, so this method trusts
+        the bool it receives.
         """
         caps = capabilities or self.get_capabilities(model)
 
-        # The two replay gates collapse to a single boolean: replay is
-        # active only when both the operator flag AND the model's
-        # capability allow it.  Threaded into ``_convert_messages`` so
-        # stored reasoning items become input items on the next call.
-        replay_active = bool(replay_reasoning_to_model and caps.supports_reasoning_replay)
         instructions, input_items = self._convert_messages(
-            messages, replay_reasoning_to_model=replay_active
+            messages, replay_reasoning_to_model=replay_reasoning_to_model
         )
         tools = apply_tool_search(caps, tools, deferred_names)
         converted_tools = self._convert_tools(tools, caps)
@@ -353,7 +350,7 @@ class OpenAIResponsesProvider:
             "store": False,
         }
 
-        if replay_active:
+        if replay_reasoning_to_model:
             # SDK doc (response_create_params.py:70-74): with
             # ``include=["reasoning.encrypted_content"]`` the API
             # surfaces opaque ``encrypted_content`` on reasoning
@@ -395,8 +392,10 @@ class OpenAIResponsesProvider:
         # Phase 3 reasoning-persistence kwarg — gates
         # ``include=["reasoning.encrypted_content"]`` on the request
         # AND ``_convert_messages`` round-tripping stored reasoning
-        # items as input.  Both are also gated by
-        # ``caps.supports_reasoning_replay`` inside ``_build_kwargs``.
+        # items as input.  The AND-gate against
+        # ``caps.supports_reasoning_replay`` lives in
+        # ``ChatSession._resolve_replay_reasoning_to_model`` — single
+        # source of truth across providers.
         replay_reasoning_to_model: bool = True,
     ) -> Iterator[StreamChunk]:
         if extra_params:
