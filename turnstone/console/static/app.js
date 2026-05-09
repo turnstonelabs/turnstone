@@ -1813,7 +1813,7 @@ function _resolveModelLabel(alias, models) {
       return m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
     }
   }
-  return alias;
+  return "";
 }
 
 // Populate Model + Judge Model dropdowns from /v1/api/models — same
