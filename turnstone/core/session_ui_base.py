@@ -1297,23 +1297,31 @@ class SessionUIBase:
     def on_reasoning_token(self, text: str) -> None:
         """Append to the inflight reasoning buffer (capped) + enqueue.
 
-        Mirrors :meth:`on_content_token`'s shape — append under
-        ``_ws_lock``, increment ``_ws_inflight_seq`` only on actual
-        append, then enqueue with ``_seq`` so the events handler can
-        dedup live events that are already in a fresh subscriber's
-        snapshot. Cap-hit tokens reuse the prior seq; the live filter
-        drops them on refresh, matching the cap-hit semantics for
-        content (no behaviour regression vs today's no-buffer path).
+        Mirrors :meth:`on_content_token`'s shape. ``_ws_inflight_seq``
+        advances on EVERY emit — even when the buffer cap rejected
+        the append — so the dedup filter in :func:`make_events_handler`
+        stays correct for subscribers that register after the cap is
+        hit. If seq stalled at the high-water-pre-cap, those late
+        subscribers would capture ``snap_seq == high-water`` and
+        every subsequent live token (with the same stalled seq)
+        would be filter-dropped as "already in your snapshot",
+        silently losing the rest of the stream. The cap is a
+        buffer-size limit, NOT a "stop streaming" signal.
+
+        Tokens past the cap are absent from ``snap.reasoning`` (the
+        snapshot text was truncated at cap) but the live stream
+        continues normally past them — refresh-after-cap renders the
+        snapshot text up to the cap and then live tokens past it,
+        with a visual gap equal to the past-cap chunk. No silent
+        drop of subsequent tokens.
         """
         seq: int = 0
         with self._ws_lock:
             if self._ws_inflight_reasoning_size < _MAX_TURN_CONTENT_CHARS:
                 self._ws_inflight_reasoning.append(text)
                 self._ws_inflight_reasoning_size += len(text)
-                self._ws_inflight_seq += 1
-                seq = self._ws_inflight_seq
-            else:
-                seq = self._ws_inflight_seq
+            self._ws_inflight_seq += 1
+            seq = self._ws_inflight_seq
         self._enqueue({"type": "reasoning", "text": text, "_seq": seq})
 
     def on_content_token(self, text: str) -> None:
@@ -1326,10 +1334,12 @@ class SessionUIBase:
            :meth:`on_turn_start`) — fuels the SSE ``in_progress_snapshot``
            event a reconnecting client sees on mid-stream refresh.
 
-        Both caps are checked independently; ``_ws_inflight_seq`` is
-        incremented only when the inflight buffer actually appended,
-        so cap-hit tokens reuse the prior seq and get dropped by the
-        live filter on refresh (matching the multi-turn cap behaviour).
+        Both caps are checked independently. ``_ws_inflight_seq``
+        advances on EVERY emit — even when the inflight cap rejected
+        the append — so a subscriber that registers after the cap is
+        hit doesn't have every subsequent live token filter-dropped
+        against a stalled ``snap_seq``. See
+        :meth:`on_reasoning_token` for the full rationale.
 
         The cap-check + append + size-update + seq-bump run under
         ``_ws_lock`` so a concurrent
@@ -1350,10 +1360,8 @@ class SessionUIBase:
             if self._ws_inflight_content_size < _MAX_TURN_CONTENT_CHARS:
                 self._ws_inflight_content.append(text)
                 self._ws_inflight_content_size += len(text)
-                self._ws_inflight_seq += 1
-                seq = self._ws_inflight_seq
-            else:
-                seq = self._ws_inflight_seq
+            self._ws_inflight_seq += 1
+            seq = self._ws_inflight_seq
         self._enqueue({"type": "content", "text": text, "_seq": seq})
 
     def on_stream_end(self) -> None:
