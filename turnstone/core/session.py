@@ -1156,6 +1156,14 @@ class ChatSession:
         resumption — protecting against operator-switches from a
         local-model session to Anthropic, which would otherwise hit
         Anthropic's input boundary with an unsigned ``thinking`` block.
+
+        The optional ``source`` field tags the block with the
+        originating server (``vllm``, ``llamacpp``, ``sglang``, etc.)
+        when ``ModelConfig.capabilities["server_compat"]["server_type"]``
+        is populated.  Reserved for future per-server replay paths
+        (e.g. an operator-flagged path that re-injects synthetic
+        reasoning back into a vllm round-trip) — not consumed today;
+        the field is informational metadata, not dead code.
         """
         if provider_blocks:
             return provider_blocks
