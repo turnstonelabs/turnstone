@@ -110,6 +110,14 @@ class TerminalUI(SessionUI):
         self.auto_approve = False
         self.auto_approve_tools: set[str] = set()
 
+    def on_turn_start(self) -> None:
+        # Terminal UI has no inflight buffer to reset.
+        pass
+
+    def on_turn_committed(self) -> None:
+        # Terminal UI has no inflight buffer to reset.
+        pass
+
     def on_thinking_start(self) -> None:
         self.spinner = Spinner("Thinking")
         self.spinner.start()

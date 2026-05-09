@@ -19,6 +19,12 @@ class NullUI:
         self.infos = []
         self.stream_ends = 0
 
+    def on_turn_start(self):
+        pass
+
+    def on_turn_committed(self):
+        pass
+
     def on_thinking_start(self):
         pass
 
@@ -820,3 +826,109 @@ class TestForceCancelThreaded:
         assert "idle" in ui.states
         assistant_msgs = [m for m in session.messages if m["role"] == "assistant"]
         assert any("Fresh response" in m.get("content", "") for m in assistant_msgs)
+
+
+class TestSynthesizeCancelledResults:
+    """Regression coverage for ``_synthesize_cancelled_results`` — must
+    fire ``on_tool_result`` for each synthesized cancellation so live
+    SSE listeners (e.g. coord's ``--running`` indicator added by
+    tool_info) can complete the in-DOM tool batch. Without this, the
+    coord JS would spin the running indicator forever on cancelled
+    batches because ``state_change`` doesn't strip ``--running`` from
+    individual batches."""
+
+    def _ui_with_tool_result_tracking(self):
+        class _TrackingUI(NullUI):
+            def __init__(self) -> None:
+                super().__init__()
+                self.tool_results: list[tuple[str, str, str, bool]] = []
+
+            def on_tool_result(self, call_id, name, output, **kwargs):
+                self.tool_results.append(
+                    (call_id, name, output, bool(kwargs.get("is_error", False))),
+                )
+
+        return _TrackingUI()
+
+    def test_synthesizes_tool_result_for_unanswered_calls(self, tmp_db):
+        ui = self._ui_with_tool_result_tracking()
+        session = _make_session(ui=ui)
+        session.messages.append(
+            {
+                "role": "assistant",
+                "content": "calling tools",
+                "tool_calls": [
+                    {"id": "call_a", "function": {"name": "search", "arguments": "{}"}},
+                    {"id": "call_b", "function": {"name": "compute", "arguments": "{}"}},
+                ],
+            },
+        )
+        session._msg_tokens.append(1)
+
+        session._synthesize_cancelled_results("Cancelled by user.")
+
+        # Both unanswered calls fired ``on_tool_result``.
+        assert len(ui.tool_results) == 2
+        ids = {tr[0] for tr in ui.tool_results}
+        assert ids == {"call_a", "call_b"}
+        # All emitted as errors so the live UI renders them as
+        # ``coord-tool-row-result--error``.
+        assert all(tr[3] is True for tr in ui.tool_results)
+        # Reason text propagates as the synthetic tool output.
+        assert all(tr[2] == "Cancelled by user." for tr in ui.tool_results)
+        # And the message list has the synthesized tool entries
+        # (preserves the prior contract).
+        tool_msgs = [m for m in session.messages if m.get("role") == "tool"]
+        assert len(tool_msgs) == 2
+
+    def test_skips_calls_already_answered(self, tmp_db):
+        ui = self._ui_with_tool_result_tracking()
+        session = _make_session(ui=ui)
+        session.messages.append(
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_a", "function": {"name": "search", "arguments": "{}"}},
+                    {"id": "call_b", "function": {"name": "compute", "arguments": "{}"}},
+                ],
+            },
+        )
+        session._msg_tokens.append(1)
+        # call_a already answered.
+        session.messages.append(
+            {"role": "tool", "tool_call_id": "call_a", "content": "result"},
+        )
+        session._msg_tokens.append(1)
+
+        session._synthesize_cancelled_results("Cancelled by user.")
+
+        # Only call_b synthesized.
+        assert len(ui.tool_results) == 1
+        assert ui.tool_results[0][0] == "call_b"
+
+    def test_ui_emit_failure_does_not_break_synthesis(self, tmp_db):
+        """The UI hook is wrapped in try/except — a hook failure
+        during cancel must NOT compound the problem. Synthesis still
+        appends to messages + storage."""
+
+        class _ExplodingUI(NullUI):
+            def on_tool_result(self, call_id, name, output, **kwargs):
+                raise RuntimeError("ui hook blew up")
+
+        ui = _ExplodingUI()
+        session = _make_session(ui=ui)
+        session.messages.append(
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_a", "function": {"name": "search", "arguments": "{}"}},
+                ],
+            },
+        )
+        session._msg_tokens.append(1)
+
+        # Must not raise.
+        session._synthesize_cancelled_results("Cancelled by user.")
+
+        tool_msgs = [m for m in session.messages if m.get("role") == "tool"]
+        assert len(tool_msgs) == 1

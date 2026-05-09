@@ -38,6 +38,14 @@ export interface StreamEndEvent {
   type: "stream_end";
 }
 
+/** One-shot replay of the in-progress turn's content + reasoning emitted
+ *  by the events SSE handler when a fresh subscriber connects mid-stream. */
+export interface InProgressSnapshotEvent {
+  type: "in_progress_snapshot";
+  content: string;
+  reasoning: string;
+}
+
 export interface StateChangeEvent {
   type: "state_change";
   state: "idle" | "thinking" | "running" | "attention" | "error";
@@ -162,6 +170,7 @@ export type ServerEvent =
   | ContentEvent
   | ReasoningEvent
   | StreamEndEvent
+  | InProgressSnapshotEvent
   | StateChangeEvent
   | ToolInfoEvent
   | ApproveRequestEvent
@@ -259,6 +268,12 @@ export function isErrorEvent(e: ServerEvent): e is ErrorEvent {
 
 export function isStreamEndEvent(e: ServerEvent): e is StreamEndEvent {
   return e.type === "stream_end";
+}
+
+export function isInProgressSnapshotEvent(
+  e: ServerEvent,
+): e is InProgressSnapshotEvent {
+  return e.type === "in_progress_snapshot";
 }
 
 export function isStateChangeEvent(e: ServerEvent): e is StateChangeEvent {

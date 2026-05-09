@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from starlette.routing import BaseRoute
 
     from turnstone.core.session_manager import SessionManager
+    from turnstone.core.session_ui_base import SessionUIBase
     from turnstone.core.workstream import Workstream, WorkstreamKind
 
 log = get_logger(__name__)
@@ -1438,7 +1439,24 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
             # half-built shape.
             return JSONResponse({"error": "session has no UI"}, status_code=409)
 
-        client_queue = register()
+        # Register the listener AND snapshot the per-turn inflight
+        # buffers in one atomic-against-writers step. The snapshot
+        # (content / reasoning text-so-far for the current turn) is
+        # yielded as a one-shot ``in_progress_snapshot`` event after
+        # the replay phase; it lets a mid-stream page refresh restore
+        # the partial assistant text without waiting for the response
+        # to complete. ``snap.seq`` is captured to dedup live events
+        # whose ``_seq`` is already in the snapshot payload (race-
+        # free composition with ``on_content_token`` /
+        # ``on_reasoning_token`` writers across the two-lock surface
+        # — see ``register_listener_with_in_progress_snapshot``).
+        # The placeholder-UI guard above (which 409s when
+        # ``_register_listener`` is missing) already proves that
+        # ``ui`` is a ``SessionUIBase`` subclass, so the cast is
+        # tightening the type, not weakening it.
+        ui_base = cast("SessionUIBase", ui)
+        client_queue, in_progress_snap = ui_base.register_listener_with_in_progress_snapshot()
+        snap_seq: int = in_progress_snap["seq"]
 
         # Per-kind executor for the blocking ``client_queue.get``
         # wait. Interactive returns its dedicated 200-thread
@@ -1499,6 +1517,44 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                             ws_id[:8],
                             exc_info=True,
                         )
+                # Refresh-resume tail: emit the current workstream
+                # state (so the composer flips to stop-mode on a mid-
+                # stream refresh — ``state_change`` is the only event
+                # the JS busy machine listens to, and the kind-specific
+                # replay above doesn't yield it) and the in-progress
+                # snapshot (so partial content / reasoning re-renders
+                # immediately, instead of waiting for the next live
+                # token). Both are best-effort — a ws.state read
+                # failure or empty buffers just yields nothing extra.
+                try:
+                    cur_state = getattr(ws.state, "value", None)
+                    if isinstance(cur_state, str) and cur_state:
+                        yield {
+                            "data": json.dumps(
+                                {
+                                    "type": "state_change",
+                                    "state": cur_state,
+                                    "ws_id": ws_id,
+                                }
+                            )
+                        }
+                except Exception:
+                    log.debug(
+                        "ws.events.state_change_replay_failed ws=%s",
+                        ws_id[:8],
+                        exc_info=True,
+                    )
+                if in_progress_snap["content"] or in_progress_snap["reasoning"]:
+                    yield {
+                        "data": json.dumps(
+                            {
+                                "type": "in_progress_snapshot",
+                                "content": in_progress_snap["content"],
+                                "reasoning": in_progress_snap["reasoning"],
+                                "ws_id": ws_id,
+                            }
+                        )
+                    }
                 # Live phase — drain the per-UI listener queue
                 # until either the workstream closes or the client
                 # disconnects. 5s poll matches pre-lift interactive
@@ -1506,6 +1562,14 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                 # cancel-detection latency the timeout would otherwise
                 # gate; shortening to 1s 5x'd the wakeup rate without
                 # any client-observable benefit).
+                #
+                # ``_seq`` filter: ``on_content_token`` /
+                # ``on_reasoning_token`` tag each emit with the
+                # per-turn inflight seq counter. Events whose seq is
+                # already covered by the snapshot we just yielded get
+                # dropped to avoid double-rendering. ``_seq`` is
+                # internal plumbing — strip before yielding so the
+                # SDK / JS clients never see it.
                 while True:
                     if await request.is_disconnected():
                         return
@@ -1518,6 +1582,20 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                         continue  # ping keeps the connection alive
                     if event.get("type") == "ws_closed":
                         return
+                    # ``_enqueue`` puts ONE dict reference into every
+                    # listener queue (no per-listener copy). Multiple
+                    # SSE coroutines on the same workstream observe the
+                    # same dict; ``yield`` is an await point, so one
+                    # listener's ``del event["_seq"]`` would race
+                    # another listener's seq-filter read. Shallow-copy
+                    # before any mutation so each listener can filter
+                    # / strip ``_seq`` without disturbing peers.
+                    event = dict(event)
+                    seq = event.get("_seq")
+                    if seq is not None:
+                        if seq <= snap_seq:
+                            continue
+                        del event["_seq"]
                     yield {"data": json.dumps(event)}
             finally:
                 _metrics.record_sse_disconnect()

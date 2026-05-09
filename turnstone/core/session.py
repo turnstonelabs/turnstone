@@ -585,6 +585,8 @@ def _render_template(content: str, context: dict[str, str]) -> str:
 
 
 class SessionUI(Protocol):
+    def on_turn_start(self) -> None: ...
+    def on_turn_committed(self) -> None: ...
     def on_thinking_start(self) -> None: ...
     def on_thinking_stop(self) -> None: ...
     def on_reasoning_token(self, text: str) -> None: ...
@@ -2933,6 +2935,13 @@ class ChatSession:
                 if self.debug:
                     self._debug_print_request(msgs)
 
+                # Reset the per-turn inflight buffers BEFORE entering
+                # the streaming phase so the SSE refresh-resume snapshot
+                # only ever represents the CURRENT in-progress turn —
+                # not prior already-committed turns within this send
+                # loop. Distinct from on_thinking_start (which can fire
+                # twice within a single iteration on compact-retry).
+                self.ui.on_turn_start()
                 self._emit_state("thinking")
                 self.ui.on_thinking_start()
                 try:
@@ -3002,6 +3011,12 @@ class ChatSession:
                 self._mark_reminders_delivered()
                 self._print_status_line()  # Report usage for EVERY API call
                 self.messages.append(assistant_msg)
+                # Clear per-turn inflight buffers — the assistant
+                # message is now in the history list a refresh would
+                # replay, so the in_progress_snapshot shouldn't re-
+                # render the same text during the next tool-execution
+                # window or the next streaming turn.
+                self.ui.on_turn_committed()
                 self._msg_tokens.append(
                     self._assistant_pending_tokens
                     or max(
@@ -3364,6 +3379,20 @@ class ChatSession:
                 )
                 self._msg_tokens.append(1)
                 save_message(self._ws_id, "tool", reason, func_name, tool_call_id=tc_id)
+                # Emit synthetic tool_result so live SSE listeners can
+                # complete the in-DOM tool batch — without this the
+                # coord ``--running`` indicator (added by SSE
+                # tool_info) would spin forever on cancelled batches.
+                # Defensive: we're already on a cancel/error path, so
+                # a UI hook failure must not compound the problem.
+                try:
+                    self.ui.on_tool_result(tc_id, func_name, reason, is_error=True)
+                except Exception:
+                    log.debug(
+                        "session.synthesize_cancelled.ui_emit_failed ws=%s",
+                        self._ws_id[:8],
+                        exc_info=True,
+                    )
 
     # -- Rewind / retry -------------------------------------------------------
 

@@ -42,14 +42,17 @@ log = get_logger(__name__)
 _DEFAULT_LISTENER_QUEUE_MAX = 500
 
 
-# Cap on the per-turn assistant content accumulator. The accumulator
-# is piggybacked onto the ``ws_state:idle`` broadcast payload so the
-# cluster collector / dashboard can render the freshly-emitted assistant
-# turn without round-tripping storage; capping it keeps a runaway turn
-# from ballooning the broadcast event past the listener queues' size
-# budget. Lifted from WebUI in the rich ``ws_state`` payload work so
-# coord broadcasts hit the same ceiling.
-_MAX_TURN_CONTENT_CHARS = 256 * 1024
+# Cap on the assistant content / reasoning accumulators. Used by two
+# independent buffer pairs:
+#  - ``_ws_turn_content`` (multi-turn, drained at idle/error) — the
+#    IDLE-piggyback payload the cluster collector / dashboard renders
+#    without round-tripping storage.
+#  - ``_ws_inflight_content`` / ``_ws_inflight_reasoning`` (per-turn,
+#    drained at :meth:`on_turn_start`) — the SSE refresh-resume
+#    snapshot a reconnecting client sees for the in-progress turn.
+# 512 KiB gives headroom for current commercial models; bump if a
+# single turn legitimately exceeds it.
+_MAX_TURN_CONTENT_CHARS = 512 * 1024
 
 
 def fire_judge_verdict_metric(
@@ -206,8 +209,26 @@ class SessionUIBase:
         # the ``ws_state:idle`` broadcast so the dashboard renders the
         # turn without an extra storage round-trip. Cleared on IDLE /
         # ERROR transitions by :meth:`snapshot_and_consume_state_payload`.
+        # Multi-turn (per-``send()``) — accumulates across all internal
+        # turns within one user-facing send.
         self._ws_turn_content: list[str] = []
         self._ws_turn_content_size: int = 0
+        # Per-turn inflight accumulators: the in-progress turn's content
+        # + reasoning, exposed to a reconnecting SSE client via the
+        # ``in_progress_snapshot`` event so a mid-stream page refresh
+        # restores the partial assistant text. Reset at the start of
+        # each turn by :meth:`on_turn_start` (separate from the multi-
+        # turn IDLE-piggyback buffer above so prior committed turns
+        # don't leak into the snapshot and double-render against the
+        # replayed history). ``_ws_inflight_seq`` is a monotonic per-
+        # turn counter incremented only on actual append; the events
+        # handler dedups live events whose ``_seq`` is at-or-below the
+        # snapshot's seq (already in the snapshot payload).
+        self._ws_inflight_content: list[str] = []
+        self._ws_inflight_content_size: int = 0
+        self._ws_inflight_reasoning: list[str] = []
+        self._ws_inflight_reasoning_size: int = 0
+        self._ws_inflight_seq: int = 0
         # Last broadcast (activity, activity_state) tuple — used by
         # :meth:`_broadcast_activity` overrides to dedup back-to-back
         # identical activity ticks. Tool-heavy turns can fire many
@@ -269,6 +290,53 @@ class SessionUIBase:
         """Remove a client queue from the listener list."""
         with self._listeners_lock, contextlib.suppress(ValueError):
             self._listeners.remove(client_queue)
+
+    def register_listener_with_in_progress_snapshot(
+        self, maxsize: int = _DEFAULT_LISTENER_QUEUE_MAX
+    ) -> tuple[queue.Queue[dict[str, Any]], dict[str, Any]]:
+        """Register a listener AND snapshot the per-turn inflight buffers.
+
+        Used by :func:`make_events_handler` so a fresh SSE subscriber
+        connecting mid-stream can be told the in-progress turn's content
+        and reasoning text-so-far in a one-shot ``in_progress_snapshot``
+        event, on top of the kind-specific replay (history / pending).
+
+        Race-free composition with the on-token writers, even though
+        ``on_content_token`` / ``on_reasoning_token`` cross two locks
+        (``_ws_lock`` for the buffer append, ``_listeners_lock`` for
+        the fan-out enqueue). The trick is the per-turn seq counter —
+        ``_ws_inflight_seq`` is incremented under ``_ws_lock`` only on
+        actual append; this method captures it alongside the buffer
+        contents under the same ``_ws_lock``, and the events handler's
+        live drain drops any incoming event whose ``_seq`` is at-or-
+        below the captured ``snap.seq`` (already in the snapshot
+        payload). Lock acquisition order: ``_listeners_lock`` (inside
+        :meth:`_register_listener`) is taken and released first, THEN
+        ``_ws_lock`` for the snapshot copy. Sequential — no nesting,
+        no deadlock with the writer's reverse order.
+
+        Returns ``(client_queue, snapshot_dict)`` where ``snapshot_dict``
+        has keys ``content`` (str), ``reasoning`` (str), ``seq`` (int).
+        Caller checks for non-empty content / reasoning to decide
+        whether to yield the event at all (empty snapshots are common
+        between turns and on freshly-opened workstreams).
+
+        Joins the captured fragments OUTSIDE the lock — bounded at
+        ``_MAX_TURN_CONTENT_CHARS`` but still O(n) over fragments, so
+        worth not blocking concurrent on-token writers for the
+        duration. The shallow ``list(...)`` copy under the lock means
+        subsequent appends to the live buffer don't mutate our view.
+        """
+        client_queue = self._register_listener(maxsize=maxsize)
+        with self._ws_lock:
+            captured_content = list(self._ws_inflight_content)
+            captured_reasoning = list(self._ws_inflight_reasoning)
+            snap_seq = self._ws_inflight_seq
+        return client_queue, {
+            "content": "".join(captured_content),
+            "reasoning": "".join(captured_reasoning),
+            "seq": snap_seq,
+        }
 
     # ------------------------------------------------------------------
     # Approval / plan blocking gates
@@ -1165,6 +1233,56 @@ class SessionUIBase:
     # of the shared writes.
     # ------------------------------------------------------------------
 
+    def _reset_inflight_buffers_locked(self) -> None:
+        """Clear the per-turn inflight content + reasoning. Caller holds ``_ws_lock``.
+
+        ``_ws_inflight_seq`` is INTENTIONALLY not reset — it must
+        remain monotonically increasing for the lifetime of the UI so
+        a long-lived SSE subscriber's ``snap_seq`` cutoff stays a
+        valid high-water mark across turn boundaries. If we reset
+        seq=0 at every turn, turn N+1's first M tokens (M = the
+        snap_seq the subscriber captured mid-turn-N) would all carry
+        ``_seq <= snap_seq`` and get silently dropped by the dedup
+        filter in :func:`make_events_handler`. Seq is just a wire-
+        format dedup tag — its absolute value doesn't matter, only
+        that it's monotonic.
+        """
+        self._ws_inflight_content = []
+        self._ws_inflight_content_size = 0
+        self._ws_inflight_reasoning = []
+        self._ws_inflight_reasoning_size = 0
+
+    def on_turn_start(self) -> None:
+        """Reset inflight buffers at the top of each ``send()`` iteration.
+
+        Defensive — covers the FIRST iteration of a fresh ``send()``
+        where a prior ``send()`` may have crashed mid-stream and left
+        stale content in the buffers. Steady-state, the buffers are
+        already empty at this point because :meth:`on_turn_committed`
+        cleared them right after the last assistant message committed.
+        """
+        with self._ws_lock:
+            self._reset_inflight_buffers_locked()
+
+    def on_turn_committed(self) -> None:
+        """Reset inflight buffers right after the assistant message commits.
+
+        The committed message is now in ``session.messages`` (the
+        history source for SSE replay), so leaving the same text in
+        the inflight buffer would double-render it on a refresh during
+        the post-commit tool-execution window — history shows the
+        committed turn AND the ``in_progress_snapshot`` shows the
+        same text again.
+
+        Future cross-turn reasoning persistence (some commercial
+        models want reasoning preserved across user turns, not just
+        within the current send) will override this hook to copy
+        inflight reasoning to a per-message persistence store BEFORE
+        clearing — keeping the `current vs historical` boundary clean.
+        """
+        with self._ws_lock:
+            self._reset_inflight_buffers_locked()
+
     def on_thinking_start(self) -> None:
         """Track that the model is thinking; broadcast activity + enqueue."""
         with self._ws_lock:
@@ -1177,25 +1295,66 @@ class SessionUIBase:
         self._enqueue({"type": "thinking_stop"})
 
     def on_reasoning_token(self, text: str) -> None:
-        self._enqueue({"type": "reasoning", "text": text})
+        """Append to the inflight reasoning buffer (capped) + enqueue.
+
+        Mirrors :meth:`on_content_token`'s shape — append under
+        ``_ws_lock``, increment ``_ws_inflight_seq`` only on actual
+        append, then enqueue with ``_seq`` so the events handler can
+        dedup live events that are already in a fresh subscriber's
+        snapshot. Cap-hit tokens reuse the prior seq; the live filter
+        drops them on refresh, matching the cap-hit semantics for
+        content (no behaviour regression vs today's no-buffer path).
+        """
+        seq: int = 0
+        with self._ws_lock:
+            if self._ws_inflight_reasoning_size < _MAX_TURN_CONTENT_CHARS:
+                self._ws_inflight_reasoning.append(text)
+                self._ws_inflight_reasoning_size += len(text)
+                self._ws_inflight_seq += 1
+                seq = self._ws_inflight_seq
+            else:
+                seq = self._ws_inflight_seq
+        self._enqueue({"type": "reasoning", "text": text, "_seq": seq})
 
     def on_content_token(self, text: str) -> None:
-        """Append to the turn-content accumulator (capped) + enqueue.
+        """Append to both turn-content buffers (capped) + enqueue.
 
-        The cap-check + append + size-update run under ``_ws_lock``
-        so a concurrent :meth:`snapshot_and_consume_state_payload`
-        IDLE/ERROR drain can't see a torn list mid-append. In
-        production this is single-writer-per-ws (the worker thread)
-        but the snapshot reader runs from coord's adapter via
-        ``mgr.set_state``; without the lock the writer's append
-        could land in an orphaned list reference the snapshot just
-        swapped out. Lock hold is microseconds.
+        Writes under ``_ws_lock`` to two independent buffers:
+         - ``_ws_turn_content`` (multi-turn, drained at idle/error)
+           — fuels the dashboard's IDLE-piggyback content payload.
+         - ``_ws_inflight_content`` (per-turn, drained at
+           :meth:`on_turn_start`) — fuels the SSE ``in_progress_snapshot``
+           event a reconnecting client sees on mid-stream refresh.
+
+        Both caps are checked independently; ``_ws_inflight_seq`` is
+        incremented only when the inflight buffer actually appended,
+        so cap-hit tokens reuse the prior seq and get dropped by the
+        live filter on refresh (matching the multi-turn cap behaviour).
+
+        The cap-check + append + size-update + seq-bump run under
+        ``_ws_lock`` so a concurrent
+        :meth:`snapshot_and_consume_state_payload` IDLE/ERROR drain or
+        a concurrent :meth:`register_listener_with_in_progress_snapshot`
+        can't see a torn list mid-append. In production this is
+        single-writer-per-ws (the worker thread) but the snapshot
+        reader runs from coord's adapter via ``mgr.set_state``;
+        without the lock the writer's append could land in an
+        orphaned list reference the snapshot just swapped out. Lock
+        hold is microseconds.
         """
+        seq: int = 0
         with self._ws_lock:
             if self._ws_turn_content_size < _MAX_TURN_CONTENT_CHARS:
                 self._ws_turn_content.append(text)
                 self._ws_turn_content_size += len(text)
-        self._enqueue({"type": "content", "text": text})
+            if self._ws_inflight_content_size < _MAX_TURN_CONTENT_CHARS:
+                self._ws_inflight_content.append(text)
+                self._ws_inflight_content_size += len(text)
+                self._ws_inflight_seq += 1
+                seq = self._ws_inflight_seq
+            else:
+                seq = self._ws_inflight_seq
+        self._enqueue({"type": "content", "text": text, "_seq": seq})
 
     def on_stream_end(self) -> None:
         with self._ws_lock:
@@ -1460,9 +1619,18 @@ class SessionUIBase:
                 captured_content = self._ws_turn_content
                 self._ws_turn_content = []
                 self._ws_turn_content_size = 0
+                # Drain the per-turn inflight buffers too so a refresh
+                # post-cancel doesn't double-render against history.
+                # On the success path :meth:`on_turn_committed` already
+                # cleared inflight at ``messages.append`` time, so this
+                # is a no-op there. On cancel/error/exception paths
+                # nothing else clears inflight — this single chokepoint
+                # covers them all.
+                self._reset_inflight_buffers_locked()
             elif state == "error":
                 self._ws_turn_content = []
                 self._ws_turn_content_size = 0
+                self._reset_inflight_buffers_locked()
         # Join outside the lock — bounded at _MAX_TURN_CONTENT_CHARS but
         # still O(n) over the captured fragments, so worth not blocking
         # concurrent on_content_token writers for the duration.

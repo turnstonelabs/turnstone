@@ -96,6 +96,12 @@ class EvolutionNode:
 class NullUI:
     """UI adapter that discards all output. Used by HeadlessSession."""
 
+    def on_turn_start(self) -> None:
+        pass
+
+    def on_turn_committed(self) -> None:
+        pass
+
     def on_thinking_start(self) -> None:
         pass
 
