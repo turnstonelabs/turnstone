@@ -910,7 +910,17 @@ class IntentJudge:
         self._context_window = context_window
         self._rule_registry = rule_registry
 
-        # Resolve judge model via ModelRegistry alias, falling back to session
+        # Resolve judge model via ModelRegistry alias, otherwise self-
+        # consistency on the session model.  ``judge.model`` is alias-only
+        # — same contract as ``coordinator.model_alias`` /
+        # ``model.plan_alias`` / ``model.task_alias``.  A non-alias value
+        # used to be accepted as a raw model id pinned onto the session
+        # provider, but that path silently broke whenever the session
+        # provider didn't speak that model id (e.g. coordinator on
+        # Anthropic, ``judge.model = "gpt-5-mini"`` → every judge call
+        # returned ``llm_fallback``).  Operators register an alias
+        # instead; an unknown value here logs a warning and inherits the
+        # session model.
         resolved = False
         if config.model and model_registry is not None:
             try:
@@ -928,18 +938,15 @@ class IntentJudge:
             except Exception:
                 log.debug("Model alias resolution failed for %r, falling back", config.model)
 
-        if not resolved and config.model:
-            # Model name override with session provider
-            self._provider = session_provider
-            self._client_factory_args = self._extract_client_config(
-                session_client,
-                session_provider.provider_name,
-            )
-            self._model = config.model
-            caps = self._provider.get_capabilities(self._model)
-            self._judge_context_window = caps.context_window
-        elif not resolved:
-            # Self-consistency: same model as session
+        if not resolved:
+            if config.model:
+                log.warning(
+                    "judge.model=%r is not a registered alias — falling back to "
+                    "session model %r.  Register the model in the Models tab and "
+                    "set judge.model to its alias.",
+                    config.model,
+                    session_model,
+                )
             self._provider = session_provider
             self._client_factory_args = self._extract_client_config(
                 session_client,
