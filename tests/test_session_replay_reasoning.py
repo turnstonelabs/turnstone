@@ -26,6 +26,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tests._session_helpers import make_session as _make_session
 
 
@@ -256,6 +258,7 @@ class TestSessionToWireBoundaryIntegration:
         the resolver pre-set to *replay_flag*.  Returns the kwargs
         dict that reached the (mocked) Anthropic SDK boundary.
         """
+        pytest.importorskip("anthropic")
         from turnstone.core.providers._anthropic import AnthropicProvider
 
         session = _make_session()
