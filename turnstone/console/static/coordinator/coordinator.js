@@ -579,6 +579,13 @@
     if (callId && toolRows.has(callId)) {
       const entry = toolRows.get(callId);
       _appendResultToRow(entry.row, output, isError, opts);
+      // The batch may have been --running (live tool_info auto path,
+      // approval_resolved approved path, or replay-time orphan).
+      // Drop --running once every row in the batch has a result so
+      // the kicker text + visual style flip back to the post-execution
+      // state.  Per-row check (not a counter) keeps the logic
+      // resilient to out-of-order replay + late SSE deliveries.
+      _unsetBatchRunningIfAllResults(entry.batch);
       // Result blocks grow scrollHeight; without this the user pinned
       // at the bottom loses their pin when the row inflates.  appendMsg
       // already routes through _scheduleScroll on the legacy path; this
@@ -1166,6 +1173,37 @@
     return status;
   }
 
+  function _setBatchRunning(batch) {
+    if (!batch) return;
+    batch.classList.add("coord-tool-batch--running");
+    const kicker = batch.querySelector(".coord-tool-batch-kicker");
+    if (kicker) {
+      const rowCount = batch.querySelectorAll(".coord-tool-row").length;
+      kicker.textContent =
+        rowCount >= 2 ? "Running · Parallel " + rowCount : "Running";
+    }
+  }
+
+  function _unsetBatchRunningIfAllResults(batch) {
+    // Remove ``--running`` once every row in the batch has rendered a
+    // result block.  Caller invokes after each tool_result; the test
+    // is "did THIS result complete the batch?" — cheap DOM walk over
+    // the same handful of rows we already track.
+    if (!batch) return;
+    if (!batch.classList.contains("coord-tool-batch--running")) return;
+    const rows = batch.querySelectorAll(".coord-tool-row");
+    for (const row of rows) {
+      if (!row.querySelector(".coord-tool-row-result")) return;
+    }
+    batch.classList.remove("coord-tool-batch--running");
+    const kicker = batch.querySelector(".coord-tool-batch-kicker");
+    if (kicker && !batch.classList.contains("coord-tool-batch--pending")) {
+      const rowCount = rows.length;
+      kicker.textContent =
+        rowCount >= 2 ? "Parallel · " + rowCount + " tools" : "Tool";
+    }
+  }
+
   function _morphBatchResolved(batch, opts) {
     if (!batch) return;
     batch.classList.remove("coord-tool-batch--pending");
@@ -1283,9 +1321,15 @@
         _announceAssertive(_approvalAriaLabel(items));
       } else if (
         opts.auto &&
-        existing.classList.contains("coord-tool-batch--running")
+        existing.classList.contains("coord-tool-batch--running") &&
+        !existing.classList.contains("coord-tool-batch--auto")
       ) {
-        existing.classList.remove("coord-tool-batch--running");
+        // SSE tool_info clarifies an existing --running batch as
+        // auto-approved.  Keep --running (the tool is still in
+        // flight; tool_result will remove it) and add --auto so the
+        // batch reflects BOTH "auto-approved" + "running" — historical
+        // behaviour swapped --running out, which lost the running
+        // indicator the moment tool_info clarified the approval state.
         existing.classList.add("coord-tool-batch--auto");
       } else if (opts.pending) {
         // Already pending — keep the action row, just refresh
@@ -1328,7 +1372,6 @@
     );
     if (opts.pending) batch.classList.add("coord-tool-batch--pending");
     else if (opts.auto) batch.classList.add("coord-tool-batch--auto");
-    else if (opts.running) batch.classList.add("coord-tool-batch--running");
     else if (opts.resolved) {
       batch.classList.add(
         opts.resolved.approved
@@ -1336,6 +1379,12 @@
           : "coord-tool-batch--denied",
       );
     }
+    // ``running`` is additive — coexists with ``auto`` (auto-approved
+    // and currently in flight) or stands alone (replay-time orphan
+    // before SSE clarifies the approval state).  Removed by
+    // :func:`_unsetBatchRunningIfAllResults` when every row in the
+    // batch has a tool_result.
+    if (opts.running) batch.classList.add("coord-tool-batch--running");
 
     const head = document.createElement("div");
     head.className = "coord-tool-batch-head";
@@ -1960,6 +2009,47 @@
       case "reasoning":
         appendReasoningToken(ev.text || "");
         break;
+      case "in_progress_snapshot":
+        // One-shot replay of the in-progress turn's reasoning + content
+        // when this client connects mid-stream (page refresh while the
+        // model is generating).  Idempotent on EventSource auto-reconnect:
+        // skip overwrite when the current buffer is already at-or-past
+        // the snapshot length, so a stale replay can't reset the live-
+        // streamed view back to a shorter prefix.
+        if (ev.reasoning && ev.reasoning.length > currentReasoningBuf.length) {
+          if (!currentReasoningEl) {
+            currentReasoningEl = appendMsg("reasoning", "", {
+              label: "reasoning",
+            });
+            messagesEl.setAttribute("aria-live", "off");
+          }
+          currentReasoningBuf = ev.reasoning;
+          var rbody = currentReasoningEl.querySelector(".msg-body");
+          if (rbody) rbody.textContent = currentReasoningBuf;
+          _scheduleScroll();
+        }
+        if (ev.content && ev.content.length > currentAssistantBuf.length) {
+          if (!currentAssistantEl) {
+            currentAssistantEl = appendMsg("assistant", "", {
+              label: "assistant",
+            });
+            messagesEl.setAttribute("aria-live", "off");
+          }
+          currentAssistantBuf = ev.content;
+          var abody = currentAssistantEl.querySelector(".msg-body");
+          if (abody && typeof streamingRender === "function") {
+            try {
+              streamingRender(abody, currentAssistantBuf);
+            } catch (e) {
+              console.warn("coordinator streamingRender failed", e);
+              abody.textContent = currentAssistantBuf;
+            }
+          } else if (abody) {
+            abody.textContent = currentAssistantBuf;
+          }
+          _scheduleScroll();
+        }
+        break;
       case "stream_end":
         finishAssistantStream();
         break;
@@ -2007,11 +2097,19 @@
           const wasAlways =
             ev.always === true ||
             (ev.always === undefined && target.dataset.requestedAlways === "1");
+          const approved = ev.approved !== false;
           _morphBatchResolved(target, {
-            approved: ev.approved !== false,
+            approved,
             always: wasAlways,
             feedback: ev.feedback || null,
           });
+          // Approved batches start running the moment the user clicks
+          // approve — mirror the auto path so the live RUNNING
+          // indicator shows during execution (not just on refresh).
+          // Denied batches don't run at all, so no --running.
+          if (approved) {
+            _setBatchRunning(target);
+          }
         }
         break;
       }
@@ -2202,8 +2300,12 @@
         // for both kinds, matching the interactive payload name.  All
         // items in a single ``tool_info`` envelope share a dispatch
         // turn, so render them as one batch construct (parallel when
-        // ≥2, solo otherwise) rather than N separate bubbles.
-        appendToolBatch(ev.items || [], { auto: true });
+        // ≥2, solo otherwise) rather than N separate bubbles.  ``auto``
+        // marks the approval-state class; ``running`` marks "in flight"
+        // — the tool starts executing the moment auto-approval lands,
+        // and the batch should show the same RUNNING indicator the
+        // replay path renders for an unresolved committed turn.
+        appendToolBatch(ev.items || [], { auto: true, running: true });
         break;
       // Child-workstream fan-out routed through the coordinator's own
       // SSE stream.  CoordinatorManager filters the cluster event bus

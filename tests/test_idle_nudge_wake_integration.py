@@ -55,6 +55,12 @@ class _FakeUI:
         pass
 
     # ChatSession callbacks (no-op for this test)
+    def on_turn_start(self) -> None:
+        pass
+
+    def on_turn_committed(self) -> None:
+        pass
+
     def on_thinking_start(self) -> None:
         pass
 

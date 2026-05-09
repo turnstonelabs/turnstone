@@ -76,6 +76,28 @@ class ContentEvent(ServerEvent):
 
 
 @dataclass
+class InProgressSnapshotEvent(ServerEvent):
+    """One-shot replay of the in-progress turn's content + reasoning.
+
+    Emitted by the per-workstream events SSE handler immediately after
+    the kind-specific replay phase (history / pending / state_change)
+    when a fresh subscriber connects mid-stream. Lets a refreshing
+    browser tab restore the partial assistant message without waiting
+    for the response to complete and a full page reload.
+    """
+
+    type: str = "in_progress_snapshot"
+    content: str = ""
+    reasoning: str = ""
+
+
+@dataclass
+class StateChangeEvent(ServerEvent):
+    type: str = "state_change"
+    state: str = ""
+
+
+@dataclass
 class StreamEndEvent(ServerEvent):
     type: str = "stream_end"
 
@@ -358,6 +380,8 @@ _SERVER_REGISTRY: dict[str, type[ServerEvent]] = {
         ThinkingStopEvent,
         ReasoningEvent,
         ContentEvent,
+        InProgressSnapshotEvent,
+        StateChangeEvent,
         StreamEndEvent,
         ToolInfoEvent,
         ApproveRequestEvent,

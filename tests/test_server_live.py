@@ -70,6 +70,12 @@ class RecordingUI:
         self.errors: list[str] = []
         self.infos: list[str] = []
 
+    def on_turn_start(self):
+        self.events.append(("turn_start",))
+
+    def on_turn_committed(self):
+        self.events.append(("turn_committed",))
+
     def on_thinking_start(self):
         self.events.append(("thinking_start",))
 
