@@ -22,8 +22,10 @@ export interface HistoryEvent {
    * - `reminders`: metacognitive nudge bubbles (user/tool channels)
    * - `advisories`: extracted `UserInterjection` payloads on tool turns
    * - `reasoning`: concatenated reasoning text for assistant turns whose
-   *   `provider_data` carried thinking blocks (Anthropic today). Present
-   *   only when the active model's `persist_reasoning` flag is true.
+   *   `provider_data` carried reasoning-bearing blocks (Anthropic
+   *   `thinking`, OpenAI Responses `reasoning`, or synthetic
+   *   `reasoning_text` from path-3 servers). Present only when the
+   *   active model's `surface_persisted_reasoning` flag is true.
    */
   messages: Array<Record<string, unknown>>;
 }

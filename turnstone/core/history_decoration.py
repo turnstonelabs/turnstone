@@ -339,9 +339,28 @@ _BLOCK_TYPE_PROVIDER_FACTORY: dict[str, Callable[[], LLMProvider]] = {
 
 
 def extract_reasoning_text_from_provider_content(provider_content: Any) -> str:
-    """Dispatch reasoning extraction by first-block ``type`` field.
+    """Dispatch reasoning extraction by scanning for a recognised block type.
 
-    Returns ``""`` for empty / missing / non-list / unknown-type input.
+    Walks ``provider_content`` looking for the first block whose
+    ``type`` is in :data:`_BLOCK_TYPE_PROVIDER_FACTORY`, then dispatches
+    the WHOLE list to that provider's ``extract_reasoning_text``.  Each
+    provider's extractor already filters internally by its own block
+    type (Anthropic walks ``thinking``, OpenAI Responses walks
+    ``reasoning``, OpenAI Chat walks ``reasoning_text``), so passing
+    the full list is correct — interleaved foreign blocks are ignored.
+
+    Returns ``""`` for empty / missing / non-list input or when no
+    recognised reasoning-bearing block type appears anywhere in the
+    list.
+
+    Why scan instead of just inspecting ``provider_content[0]``: the
+    OpenAI Responses streaming layer captures EVERY ``output_item.done``
+    event into ``provider_blocks`` (``_openai_responses.py:415-420``),
+    not just reasoning items.  In practice the order is usually
+    ``[reasoning, message, ...]`` but the API doesn't guarantee that —
+    a hypothetical ``[message, reasoning]`` ordering would silently
+    drop the reasoning under an index-only check.  Same robustness
+    point for Anthropic's hypothetical mixed-order outputs.
 
     Pure transform — safe from any thread.  Both history surfaces
     (interactive ``_build_history`` and lifted ``make_history_handler``)
@@ -350,16 +369,16 @@ def extract_reasoning_text_from_provider_content(provider_content: Any) -> str:
     """
     if not isinstance(provider_content, list) or not provider_content:
         return ""
-    first_block = provider_content[0]
-    if not isinstance(first_block, dict):
-        return ""
-    block_type = first_block.get("type")
-    if not isinstance(block_type, str):
-        return ""
-    factory = _BLOCK_TYPE_PROVIDER_FACTORY.get(block_type)
-    if factory is None:
-        return ""
-    return factory().extract_reasoning_text(provider_content)
+    for block in provider_content:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if not isinstance(block_type, str):
+            continue
+        factory = _BLOCK_TYPE_PROVIDER_FACTORY.get(block_type)
+        if factory is not None:
+            return factory().extract_reasoning_text(provider_content)
+    return ""
 
 
 def extract_reasoning_for_history(
