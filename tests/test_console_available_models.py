@@ -88,13 +88,15 @@ def _make_client(
     *,
     settings: dict[str, str] | None = None,
     registry_default: str = "",
+    config_store: bool = True,
 ) -> TestClient:
     app = Starlette(
         routes=[Route("/v1/api/models", list_available_models)],
         middleware=[Middleware(_AuthMiddleware)],
     )
     app.state.auth_storage = storage
-    app.state.config_store = _FakeConfigStore(dict(settings or {}))
+    if config_store:
+        app.state.config_store = _FakeConfigStore(dict(settings or {}))
     # ``coord_registry`` is always set in production after lifespan
     # startup; mirror that here.  ``has_alias`` answers from the same
     # enabled-rows set the handler filters against.
@@ -217,6 +219,22 @@ def test_coordinator_skips_registry_default_when_alias_disabled(
     _seed_model(storage, definition_id="m1", alias="legacy", enabled=False)
     body = _get_models(_make_client(storage, registry_default="legacy"))
     assert body["coordinator_default_alias"] == ""
+
+
+def test_coordinator_falls_back_to_registry_default_when_config_store_missing(
+    storage: SQLiteBackend,
+) -> None:
+    """Edge case from PR #500 review: lifespan can leave
+    ``app.state.config_store`` as None (e.g. a startup exception) while
+    ``coord_registry`` still binds successfully.  The placeholder must
+    still advertise ``registry.default`` (filtered against enabled rows)
+    rather than going blank — otherwise the home composer is uselessly
+    empty in a degraded-but-recoverable state."""
+    _seed_model(storage, definition_id="m1", alias="primary")
+    body = _get_models(_make_client(storage, registry_default="primary", config_store=False))
+    assert body["default_alias"] == ""
+    assert body["coordinator_default_alias"] == "primary"
+    assert body["judge_default_alias"] == "primary"
 
 
 # ---------------------------------------------------------------------------
