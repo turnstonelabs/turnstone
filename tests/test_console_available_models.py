@@ -67,6 +67,7 @@ def _make_client(
     storage: SQLiteBackend,
     *,
     settings: dict[str, str] | None = None,
+    registry_default: str | None = None,
 ) -> TestClient:
     app = Starlette(
         routes=[Route("/v1/api/models", list_available_models)],
@@ -74,6 +75,12 @@ def _make_client(
     )
     app.state.auth_storage = storage
     app.state.config_store = _FakeConfigStore(dict(settings or {}))
+    if registry_default is not None:
+        # Mimic the live console's ``coord_registry`` shape — the handler
+        # only reads ``.default``, so a SimpleNamespace is enough.
+        from types import SimpleNamespace
+
+        app.state.coord_registry = SimpleNamespace(default=registry_default)
     client = TestClient(app)
     client.headers.update({"X-Test-User": "admin", "X-Test-Perms": ""})
     return client
@@ -163,6 +170,34 @@ def test_coordinator_set_to_unknown_alias_falls_back_to_default(
         )
     )
     assert body["coordinator_default_alias"] == "primary"
+
+
+def test_coordinator_falls_back_to_registry_default_when_config_store_empty(
+    storage: SQLiteBackend,
+) -> None:
+    """Match ``console/session_factory.py:109-110``: when both
+    ``coordinator.model_alias`` and ``model.default_alias`` are unset, new
+    coordinator sessions run on ``registry.default`` (loaded from
+    config.toml ``[model].default``).  The placeholder must report the
+    same alias rather than going blank — otherwise the home composer
+    advertises "Default model" while sessions actually launch on a
+    concrete alias."""
+    _seed_model(storage, definition_id="m1", alias="primary")
+    body = _get_models(_make_client(storage, registry_default="primary"))
+    assert body["default_alias"] == ""
+    assert body["coordinator_default_alias"] == "primary"
+    assert body["judge_default_alias"] == "primary"
+
+
+def test_coordinator_skips_registry_default_when_alias_disabled(
+    storage: SQLiteBackend,
+) -> None:
+    """Registry default points at an alias that's been disabled in the DB
+    — the placeholder stays blank rather than advertising a model that
+    workstream creation would refuse to use."""
+    _seed_model(storage, definition_id="m1", alias="legacy", enabled=False)
+    body = _get_models(_make_client(storage, registry_default="legacy"))
+    assert body["coordinator_default_alias"] == ""
 
 
 # ---------------------------------------------------------------------------

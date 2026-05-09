@@ -1684,15 +1684,25 @@ async def list_available_models(request: Request) -> JSONResponse:
         default_alias = ""
     if channel_default_alias and channel_default_alias not in enabled_aliases:
         channel_default_alias = ""
-    # Coordinator falls back to model.default_alias when its setting is
-    # empty or points at a disabled/removed alias (matches
-    # console/session_factory.py).  Judge falls back to the resolved
-    # coordinator alias when judge.model is empty *or* not a registered
-    # alias — judge.model is alias-only (matches IntentJudge.__init__),
-    # so an unknown value is operator misconfiguration that the judge
-    # itself silently inherits the session model on.
+    # Coordinator fallback chain mirrors console/session_factory.py:109-110:
+    # explicit ``coordinator.model_alias`` → ``model.default_alias``
+    # (admin-managed) → ``registry.default`` (the config.toml default that
+    # session_factory falls through to via ``registry.default`` when both
+    # ConfigStore keys are unset).  Without the registry tier the
+    # placeholder lies whenever an operator never set ``model.default_alias``
+    # in the admin UI — new coordinator sessions will still run on
+    # ``registry.default``.  Judge falls back to the resolved coordinator
+    # alias when ``judge.model`` is empty *or* not a registered alias —
+    # judge.model is alias-only (matches IntentJudge.__init__), so an
+    # unknown value is operator misconfiguration that the judge itself
+    # silently inherits the session model on.
     if not coordinator_default_alias or coordinator_default_alias not in enabled_aliases:
         coordinator_default_alias = default_alias
+    if not coordinator_default_alias:
+        coord_registry = getattr(request.app.state, "coord_registry", None)
+        registry_default = getattr(coord_registry, "default", "") if coord_registry else ""
+        if registry_default and registry_default in enabled_aliases:
+            coordinator_default_alias = registry_default
     if not judge_default_alias or judge_default_alias not in enabled_aliases:
         judge_default_alias = coordinator_default_alias
     return JSONResponse(
