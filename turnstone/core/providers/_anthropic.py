@@ -159,6 +159,35 @@ def _map_reasoning_to_effort(
     return None
 
 
+# Anthropic accepts only a closed set of content-block types on the
+# input boundary.  ``_convert_messages`` gates the verbatim
+# ``_provider_content`` replay path on this set so foreign-shaped
+# blocks (OpenAI Responses ``type="reasoning"`` after Phase 3, Gemini
+# thought parts, anything else) fall through to the text+tool_calls
+# rebuild path rather than 400-ing the API.  Web-search related blocks
+# (``server_tool_use`` / ``web_search_tool_result``) intentionally
+# stay in the set — they carry ``encrypted_content`` that the API
+# requires for round-trip continuity.
+ANTHROPIC_VALID_BLOCK_TYPES = frozenset(
+    {
+        "text",
+        "image",
+        "thinking",
+        "redacted_thinking",
+        "tool_use",
+        "tool_result",
+        "server_tool_use",
+        "web_search_tool_result",
+    }
+)
+
+# Subset of valid block types whose ``content`` is reasoning text.
+# When ``replay_reasoning_to_model=False`` the strip predicate drops
+# these (and only these) before the wire payload is built — narrow by
+# design so ``tool_use`` / web-search blocks survive.
+ANTHROPIC_REASONING_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
+
+
 # -- provider ----------------------------------------------------------------
 
 
@@ -283,10 +312,34 @@ class AnthropicProvider:
     def _convert_messages(
         self,
         messages: list[dict[str, Any]],
+        *,
+        replay_reasoning_to_model: bool = True,
     ) -> tuple[str, list[dict[str, Any]]]:
         """Convert internal (OpenAI-like) messages to Anthropic format.
 
         Returns ``(system_prompt, converted_messages)``.
+
+        ``replay_reasoning_to_model`` (Phase 2 of the reasoning-
+        persistence feature, mirroring ``ModelConfig.replay_
+        reasoning_to_model``) gates whether stored ``thinking`` blocks
+        survive the verbatim ``_provider_content`` replay path.  When
+        the caller passes ``False`` (the operator-side server_default
+        for the ``model_definitions`` row this kwarg is sourced from),
+        thinking blocks are stripped before the wire payload is built;
+        ``tool_use`` / ``server_tool_use`` / ``web_search_tool_result``
+        blocks (which carry web-search ``encrypted_content``) are
+        intentionally preserved.  The kwarg defaults to ``True`` here
+        purely for back-compat with any direct caller that hasn't been
+        updated to thread the resolver — production call sites
+        (``ChatSession._try_stream`` / ``_utility_completion``) always
+        pass the resolved flag explicitly.
+
+        Foreign-shaped ``_provider_content`` (e.g. OpenAI Responses
+        ``type="reasoning"`` blocks reaching Anthropic mid-workstream
+        once Phase 3 lands) fails the ``ANTHROPIC_VALID_BLOCK_TYPES``
+        shape check and falls through to the text+tool_calls rebuild
+        path — closes a pre-existing latent bug where the verbatim
+        replay would have 400'd the API.
         """
         system_parts: list[str] = []
         converted: list[dict[str, Any]] = []
@@ -310,12 +363,45 @@ class AnthropicProvider:
                     converted.append({"role": "user", "content": pending_orphan_results})
                     pending_orphan_results = []
                 # If raw provider content was preserved, pass it through verbatim
-                # so encrypted_content/encrypted_index from web search are retained
+                # so encrypted_content/encrypted_index from web search are retained.
+                # Phase 2: gated by ``ANTHROPIC_VALID_BLOCK_TYPES`` shape check
+                # (foreign or partially-foreign payloads fall through to the
+                # text+tool_calls rebuild path) and the ``replay_reasoning_to_model``
+                # operator flag (when False, ``thinking`` blocks are stripped).
                 provider_content = msg.get("_provider_content")
-                if provider_content:
-                    converted.append({"role": "assistant", "content": provider_content})
-                    # Check for orphaned tool_use in provider content too
-                    if isinstance(provider_content, list):
+                # Inline isinstance + non-empty + all-blocks-valid check
+                # so mypy can narrow ``provider_content`` to ``list`` for
+                # the subsequent walk; pulling these into a helper boolean
+                # would require an explicit ``cast`` to recover the type.
+                if (
+                    isinstance(provider_content, list)
+                    and provider_content
+                    and all(
+                        isinstance(b, dict) and b.get("type") in ANTHROPIC_VALID_BLOCK_TYPES
+                        for b in provider_content
+                    )
+                ):
+                    # replay=True keeps the verbatim reference (existing
+                    # behaviour — pinned by an identity assertion in
+                    # test_convert_messages_uses_provider_content).  replay=False
+                    # builds a new list with thinking blocks filtered out;
+                    # tool_use / web-search blocks survive intact so their
+                    # encrypted_content round-trips correctly.
+                    if replay_reasoning_to_model:
+                        wire_blocks: list[dict[str, Any]] = provider_content
+                    else:
+                        wire_blocks = [
+                            b
+                            for b in provider_content
+                            if b.get("type") not in ANTHROPIC_REASONING_BLOCK_TYPES
+                        ]
+                    if wire_blocks:
+                        converted.append({"role": "assistant", "content": wire_blocks})
+                        # Orphan-tool detection runs on the ORIGINAL provider_content
+                        # (not the strip-filtered ``wire_blocks``) — the strip
+                        # only drops thinking blocks, so tool_use IDs are
+                        # identical between the two lists, but we keep the
+                        # source-of-truth read explicit.
                         pc_tool_ids = [
                             b["id"]
                             for b in provider_content
@@ -348,8 +434,14 @@ class AnthropicProvider:
                                     converted.append({"role": "user", "content": synthetic_pc})
                                 else:
                                     pending_orphan_results = synthetic_pc
-                    i += 1
-                    continue
+                        i += 1
+                        continue
+                    # All blocks were stripped (message had only thinking
+                    # content + no text + no tool_calls).  Fall through to the
+                    # text+tool_calls rebuild path; if that also produces an
+                    # empty message it will be silently skipped, which is
+                    # correct: a turn with only stripped reasoning has nothing
+                    # to replay.
 
                 content_blocks: list[dict[str, Any]] = []
                 text = msg.get("content")
@@ -618,10 +710,13 @@ class AnthropicProvider:
         deferred_names: frozenset[str] | None = None,
         cancel_ref: list[Any] | None = None,
         capabilities: ModelCapabilities | None = None,
+        replay_reasoning_to_model: bool = True,
     ) -> Iterator[StreamChunk]:
         _ensure_anthropic()
         caps = capabilities or self.get_capabilities(model)
-        system_prompt, converted_msgs = self._convert_messages(messages)
+        system_prompt, converted_msgs = self._convert_messages(
+            messages, replay_reasoning_to_model=replay_reasoning_to_model
+        )
         kwargs = self._build_thinking_and_kwargs(
             caps,
             reasoning_effort,
@@ -822,10 +917,13 @@ class AnthropicProvider:
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,
         capabilities: ModelCapabilities | None = None,
+        replay_reasoning_to_model: bool = True,
     ) -> CompletionResult:
         _ensure_anthropic()
         caps = capabilities or self.get_capabilities(model)
-        system_prompt, converted_msgs = self._convert_messages(messages)
+        system_prompt, converted_msgs = self._convert_messages(
+            messages, replay_reasoning_to_model=replay_reasoning_to_model
+        )
         kwargs = self._build_thinking_and_kwargs(
             caps,
             reasoning_effort,
