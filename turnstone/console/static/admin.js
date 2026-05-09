@@ -1142,10 +1142,52 @@ function _populateScheduleSelect(selectId, url, labelKey, valueKey, opts) {
         sel.appendChild(opt);
       });
       if (opts && opts.selected) sel.value = opts.selected;
+      // Caller hook for placeholder annotation / other post-load tweaks.
+      // Used by the schedule modals to rewrite the bare "Default model"
+      // placeholder with the resolved alias so the label matches the
+      // home composer (see app.js _populateHomeModelDropdowns).
+      if (opts && typeof opts.afterPopulate === "function") {
+        try {
+          opts.afterPopulate(sel, data, items);
+        } catch (_e) {
+          /* hook errors must not break the dropdown */
+        }
+      }
     })
     .catch(function () {
       /* dropdown stays with placeholder or temporary option */
     });
+}
+
+// Update the schedule-model placeholder option (first <option>) to
+// "Default — alias (model)" using /v1/api/models's resolved
+// default_alias, mirroring the home composer.  Schedules don't carry
+// a coordinator/judge split, so they consume the workstream-creation
+// default rather than coordinator_default_alias / judge_default_alias.
+// Em-dash separator (rather than nested parens) keeps the alias's
+// "(model)" suffix legible.
+function _decorateScheduleModelPlaceholder(sel, data) {
+  if (!sel || sel.options.length === 0) return;
+  var alias = (data && data.default_alias) || "";
+  if (!alias) return;
+  var match = null;
+  var models = (data && data.models) || [];
+  for (var i = 0; i < models.length; i++) {
+    if (models[i].alias === alias) {
+      match = models[i];
+      break;
+    }
+  }
+  var label;
+  if (match) {
+    label =
+      match.alias === match.model
+        ? match.alias
+        : match.alias + " (" + match.model + ")";
+  } else {
+    label = alias;
+  }
+  sel.options[0].textContent = "Default — " + label;
 }
 
 // Channel platforms shown in admin notify-target rows.  Mirror server-side
@@ -1333,6 +1375,7 @@ function showCreateScheduleModal() {
     display: function (m) {
       return m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
     },
+    afterPopulate: _decorateScheduleModelPlaceholder,
   });
   // Populate skill dropdown
   _populateScheduleSelect(
@@ -1487,6 +1530,7 @@ function showEditScheduleModal(taskId) {
         display: function (m) {
           return m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
         },
+        afterPopulate: _decorateScheduleModelPlaceholder,
       });
       // Populate skill dropdown with current value pre-selected
       _populateScheduleSelect(
@@ -2637,7 +2681,7 @@ function loadSettings() {
 
       // Merge values + schema.  Skip role-assignment settings owned by
       // the Models → Roles sub-tab (judge.* settings still live on the
-      // Judge tab; the four model-tab roles render only there).
+      // Judge tab; the model-tab roles render only there).
       var merged = {};
       var roleKeys = {
         "coordinator.model_alias": 1,
@@ -2646,6 +2690,7 @@ function loadSettings() {
         "model.plan_effort": 1,
         "model.task_alias": 1,
         "model.task_effort": 1,
+        "channels.default_model_alias": 1,
       };
       for (var j = 0; j < valuesArr.length; j++) {
         var v = valuesArr[j];
@@ -4639,6 +4684,14 @@ var _modelCreateTrigger = null;
 // setting render a second selector inline.  Adding a new role (e.g.
 // ``perception.audio.model``) is purely additive: drop a row here once
 // the SettingDef lands in turnstone/core/settings_registry.py.
+// ``fallbackKind`` controls how the empty/blank option in the alias
+// dropdown is labelled.  Coordinator and Judge fall back to a single
+// well-defined alias (model.default_alias / coordinator alias) so we
+// surface that concrete model in the placeholder.  Plan/Task agents
+// cascade through ``[model].plan_model → [model].agent_model →
+// session model`` per turnstone/core/settings_registry.py — there's
+// no single "default" to advertise, so the blank reads "(inherit)"
+// to match the vocabulary of the reasoning-effort dropdowns.
 var MODEL_ROLES = [
   {
     label: "Coordinator",
@@ -4646,12 +4699,14 @@ var MODEL_ROLES = [
       "Console-hosted coordinator sessions that drive child workstreams.",
     aliasKey: "coordinator.model_alias",
     effortKey: "coordinator.reasoning_effort",
+    fallbackKind: "default",
   },
   {
     label: "Judge",
     description:
       "Intent-validation judge that scores tool calls before approval.",
     aliasKey: "judge.model",
+    fallbackKind: "default",
   },
   {
     label: "Plan agent",
@@ -4659,6 +4714,7 @@ var MODEL_ROLES = [
       "plan_agent sub-agent — produces high-level plans before task dispatch.",
     aliasKey: "model.plan_alias",
     effortKey: "model.plan_effort",
+    fallbackKind: "inherit",
   },
   {
     label: "Task agent",
@@ -4666,6 +4722,14 @@ var MODEL_ROLES = [
       "task_agent sub-agent — runs autonomous subtasks dispatched by the parent.",
     aliasKey: "model.task_alias",
     effortKey: "model.task_effort",
+    fallbackKind: "inherit",
+  },
+  {
+    label: "Channel adapter",
+    description:
+      "Workstreams created by channel adapters (Discord, Slack) when no model is specified at creation time.",
+    aliasKey: "channels.default_model_alias",
+    fallbackKind: "default",
   },
 ];
 
@@ -4848,11 +4912,40 @@ function _renderModelRoles(container, values, schema) {
       "aria-label",
       role.label + " model (empty = default)",
     );
+    // Format the blank/inherit option in the same "alias (model)" shape
+    // as the other rows so the dropdown reads consistently — without
+    // this the empty row was bare "(default — flatspark)" while every
+    // other row carried a "(/models/...)" suffix.  Plan/Task agent
+    // fall back through a multi-step chain (config.toml → agent_model
+    // → session) that has no single concrete "default", so they get
+    // a plain "(inherit)" instead of the misleading
+    // "(default — <coordinator-alias>)".
     var blank = document.createElement("option");
     blank.value = "";
-    blank.textContent = _modelDefaultAlias
-      ? "(default — " + _modelDefaultAlias + ")"
-      : "(default)";
+    if (role.fallbackKind === "inherit") {
+      blank.textContent = "(inherit)";
+    } else {
+      var defaultDef = null;
+      if (_modelDefaultAlias) {
+        for (var dm = 0; dm < enabledAliases.length; dm++) {
+          if (enabledAliases[dm].alias === _modelDefaultAlias) {
+            defaultDef = enabledAliases[dm];
+            break;
+          }
+        }
+      }
+      if (defaultDef) {
+        var defLabel =
+          defaultDef.alias === defaultDef.model
+            ? defaultDef.alias
+            : defaultDef.alias + " (" + defaultDef.model + ")";
+        blank.textContent = "(default — " + defLabel + ")";
+      } else if (_modelDefaultAlias) {
+        blank.textContent = "(default — " + _modelDefaultAlias + ")";
+      } else {
+        blank.textContent = "(default)";
+      }
+    }
     aliasSel.appendChild(blank);
     var currentAlias = aliasInfo.value || "";
     var matched = false;

@@ -419,11 +419,13 @@ def _build_registry() -> dict[str, SettingDef]:
             "judge.model",
             "str",
             "",
-            "Model for LLM judge (empty = same as session)",
+            "Model alias for LLM judge (empty = same as session)",
             "judge",
-            help="The judge can use a different AI model than the main conversation. Leave empty "
-            "to use the same model (self-consistency), or specify a different model for "
-            "cross-model evaluation.",
+            help="The judge can use a different AI model than the main conversation. "
+            "Specify a registered alias from the Models tab, or leave empty to use the "
+            "same model as the session (self-consistency). Values that aren’t "
+            "registered aliases inherit the session model and log a warning — "
+            "register the model in the Models tab and reference it by alias.",
         ),
         SettingDef(
             "judge.confidence_threshold",
@@ -634,13 +636,15 @@ def _build_registry() -> dict[str, SettingDef]:
             "coordinator.reasoning_effort",
             "str",
             "medium",
-            "Reasoning effort for coordinator sessions",
+            "Reasoning effort for coordinator sessions (empty = inherit from model.reasoning_effort)",
             "coordinator",
-            choices=["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+            choices=["", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
             help="Reasoning effort for coordinator sessions. Coordinators benefit from "
             "medium-or-higher effort when juggling multiple child workstreams. Use "
             "'low' only when your coordinator handles simple, one-off dispatch "
-            "workflows.",
+            "workflows. (Empty here means “inherit” — the per-model "
+            "override on the alias wins, otherwise model.reasoning_effort. Use "
+            "‘none’ to actually disable reasoning.)",
         ),
         SettingDef(
             "coordinator.max_active",

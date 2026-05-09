@@ -2507,10 +2507,11 @@
               rows="3"
               placeholder="What should the workstream do?"
             ></textarea>
-            <label class="admin-checkbox"
-              ><input id="cs-autoapprove" type="checkbox" /> Auto-approve tool
-              calls</label
-            >
+            <label class="toggle-switch">
+              <input id="cs-autoapprove" type="checkbox" />
+              <span class="toggle-track" aria-hidden="true"></span>
+              <span class="toggle-label">Auto-approve tool calls</span>
+            </label>
             <label
               >Notify on completion
               <span class="label-hint">optional</span></label
@@ -2609,13 +2610,16 @@
             </select>
             <label for="es-message">Initial message</label>
             <textarea id="es-message" rows="3"></textarea>
-            <label class="admin-checkbox"
-              ><input id="es-autoapprove" type="checkbox" /> Auto-approve tool
-              calls</label
-            >
-            <label class="admin-checkbox"
-              ><input id="es-enabled" type="checkbox" /> Enabled</label
-            >
+            <label class="toggle-switch">
+              <input id="es-autoapprove" type="checkbox" />
+              <span class="toggle-track" aria-hidden="true"></span>
+              <span class="toggle-label">Auto-approve tool calls</span>
+            </label>
+            <label class="toggle-switch">
+              <input id="es-enabled" type="checkbox" />
+              <span class="toggle-track" aria-hidden="true"></span>
+              <span class="toggle-label">Enabled</span>
+            </label>
             <label
               >Notify on completion
               <span class="label-hint">optional</span></label
@@ -2859,9 +2863,11 @@
         </select>
         <label for="ep-priority">Priority</label>
         <input id="ep-priority" type="number" value="0" min="0" max="9999" />
-        <label class="admin-checkbox"
-          ><input id="ep-enabled" type="checkbox" checked /> Enabled</label
-        >
+        <label class="toggle-switch">
+          <input id="ep-enabled" type="checkbox" checked />
+          <span class="toggle-track" aria-hidden="true"></span>
+          <span class="toggle-label">Enabled</span>
+        </label>
         <div class="modal-buttons">
           <button class="modal-cancel" onclick="hideEditPolicyModal()">
             Cancel
@@ -2963,9 +2969,11 @@
         <textarea id="epp-content" rows="10" spellcheck="false"></textarea>
         <label for="epp-priority">Priority</label>
         <input id="epp-priority" type="number" value="0" min="0" max="9999" />
-        <label class="admin-checkbox"
-          ><input id="epp-enabled" type="checkbox" checked /> Enabled</label
-        >
+        <label class="toggle-switch">
+          <input id="epp-enabled" type="checkbox" checked />
+          <span class="toggle-track" aria-hidden="true"></span>
+          <span class="toggle-label">Enabled</span>
+        </label>
         <div class="modal-buttons">
           <button class="modal-cancel" onclick="hideEditPromptPolicyModal()">
             Cancel
@@ -3083,10 +3091,11 @@
                 </option>
                 <option value="search">Search — BM25 discoverable</option>
               </select>
-              <label class="admin-checkbox"
-                ><input id="ctm-default" type="checkbox" /> Apply to new
-                workstreams by default</label
-              >
+              <label class="toggle-switch">
+                <input id="ctm-default" type="checkbox" />
+                <span class="toggle-track" aria-hidden="true"></span>
+                <span class="toggle-label">Apply to new workstreams by default</span>
+              </label>
             </div>
           </div>
           <div class="skill-spec-col skill-spec-col-content">
@@ -3189,10 +3198,11 @@
               />
             </div>
           </div>
-          <label class="admin-checkbox"
-            ><input id="csk-auto-approve" type="checkbox" /> Auto-approve all
-            tools</label
-          >
+          <label class="toggle-switch">
+            <input id="csk-auto-approve" type="checkbox" />
+            <span class="toggle-track" aria-hidden="true"></span>
+            <span class="toggle-label">Auto-approve all tools</span>
+          </label>
           <label for="csk-allowed-tools"
             >Allowed Tools
             <span class="label-hint"
@@ -3222,9 +3232,11 @@
             style="display: block; margin-top: 3px"
             >JSON array. Each: channel_type + channel_id or user_id</span
           >
-          <label class="admin-checkbox"
-            ><input id="csk-enabled" type="checkbox" checked /> Enabled</label
-          >
+          <label class="toggle-switch">
+            <input id="csk-enabled" type="checkbox" checked />
+            <span class="toggle-track" aria-hidden="true"></span>
+            <span class="toggle-label">Enabled</span>
+          </label>
         </details>
         <details class="admin-details">
           <summary>
@@ -3395,10 +3407,11 @@
                 </option>
                 <option value="search">Search — BM25 discoverable</option>
               </select>
-              <label class="admin-checkbox"
-                ><input id="etm-default" type="checkbox" /> Apply to new
-                workstreams by default</label
-              >
+              <label class="toggle-switch">
+                <input id="etm-default" type="checkbox" />
+                <span class="toggle-track" aria-hidden="true"></span>
+                <span class="toggle-label">Apply to new workstreams by default</span>
+              </label>
             </div>
           </div>
           <div class="skill-spec-col skill-spec-col-content">
@@ -3480,10 +3493,11 @@
               />
             </div>
           </div>
-          <label class="admin-checkbox"
-            ><input id="esk-auto-approve" type="checkbox" /> Auto-approve all
-            tools</label
-          >
+          <label class="toggle-switch">
+            <input id="esk-auto-approve" type="checkbox" />
+            <span class="toggle-track" aria-hidden="true"></span>
+            <span class="toggle-label">Auto-approve all tools</span>
+          </label>
           <label for="esk-allowed-tools"
             >Allowed Tools
             <span class="label-hint"
@@ -3513,9 +3527,11 @@
             style="display: block; margin-top: 3px"
             >JSON array. Each: channel_type + channel_id or user_id</span
           >
-          <label class="admin-checkbox"
-            ><input id="esk-enabled" type="checkbox" checked /> Enabled</label
-          >
+          <label class="toggle-switch">
+            <input id="esk-enabled" type="checkbox" checked />
+            <span class="toggle-track" aria-hidden="true"></span>
+            <span class="toggle-label">Enabled</span>
+          </label>
         </details>
         <div id="etm-scan-section" style="display: none" class="admin-field">
           <span class="admin-field-heading" id="etm-scan-heading"
@@ -3699,43 +3715,48 @@
           <legend style="font-size: 12px; padding: 0 6px">
             Multitenant Authorization
           </legend>
-          <label
-            style="display: block; margin: 4px 0; font-weight: 400; font-size: 13px"
-          >
-            <input
-              type="radio"
-              name="mcp-auth-type"
-              id="mcp-auth-none"
-              value="none"
-              onchange="toggleMcpAuthFields()"
-              style="margin-right: 6px"
-            />No authorization
-          </label>
-          <label
-            style="display: block; margin: 4px 0; font-weight: 400; font-size: 13px"
-          >
-            <input
-              type="radio"
-              name="mcp-auth-type"
-              id="mcp-auth-static"
-              value="static"
-              onchange="toggleMcpAuthFields()"
-              checked
-              style="margin-right: 6px"
-            />Static headers (single shared identity)
-          </label>
-          <label
-            style="display: block; margin: 4px 0; font-weight: 400; font-size: 13px"
-          >
-            <input
-              type="radio"
-              name="mcp-auth-type"
-              id="mcp-auth-oauth"
-              value="oauth_user"
-              onchange="toggleMcpAuthFields()"
-              style="margin-right: 6px"
-            />Per-user OAuth 2.1 (recommended)
-          </label>
+          <div class="segmented-control" role="radiogroup" aria-label="Multitenant Authorization">
+            <label class="segmented-option">
+              <input
+                type="radio"
+                name="mcp-auth-type"
+                id="mcp-auth-none"
+                value="none"
+                onchange="toggleMcpAuthFields()"
+              />
+              <span class="segmented-indicator" aria-hidden="true"></span>
+              <span class="segmented-text">No authorization</span>
+            </label>
+            <label class="segmented-option">
+              <input
+                type="radio"
+                name="mcp-auth-type"
+                id="mcp-auth-static"
+                value="static"
+                onchange="toggleMcpAuthFields()"
+                checked
+              />
+              <span class="segmented-indicator" aria-hidden="true"></span>
+              <span class="segmented-text"
+                >Static headers
+                <span class="segmented-hint">single shared identity</span></span
+              >
+            </label>
+            <label class="segmented-option">
+              <input
+                type="radio"
+                name="mcp-auth-type"
+                id="mcp-auth-oauth"
+                value="oauth_user"
+                onchange="toggleMcpAuthFields()"
+              />
+              <span class="segmented-indicator" aria-hidden="true"></span>
+              <span class="segmented-text"
+                >Per-user OAuth 2.1
+                <span class="segmented-hint">recommended</span></span
+              >
+            </label>
+          </div>
           <div id="mcp-oauth-fields" style="display: none; margin-top: 8px">
             <label for="mcp-oauth-as-url"
               >Authorization Server URL
@@ -3796,22 +3817,17 @@
             />
           </div>
         </fieldset>
-        <div style="display: flex; gap: 20px; margin-top: 14px">
-          <label style="margin: 0; font-size: 12px; color: var(--fg-dim)"
-            ><input
-              type="checkbox"
-              id="mcp-auto-approve"
-              style="margin-right: 5px"
-            />Auto-approve tools</label
-          >
-          <label style="margin: 0; font-size: 12px; color: var(--fg-dim)"
-            ><input
-              type="checkbox"
-              id="mcp-enabled"
-              checked
-              style="margin-right: 5px"
-            />Enabled</label
-          >
+        <div class="toggle-stack">
+          <label class="toggle-switch">
+            <input type="checkbox" id="mcp-auto-approve" />
+            <span class="toggle-track" aria-hidden="true"></span>
+            <span class="toggle-label">Auto-approve tools</span>
+          </label>
+          <label class="toggle-switch">
+            <input type="checkbox" id="mcp-enabled" checked />
+            <span class="toggle-track" aria-hidden="true"></span>
+            <span class="toggle-label">Enabled</span>
+          </label>
         </div>
         <div class="modal-buttons">
           <button class="modal-cancel" onclick="hideCreateMcpModal()">
@@ -3936,6 +3952,14 @@
         <h2 id="model-create-title">Add Model</h2>
         <div id="model-create-error" role="alert" aria-live="assertive" aria-atomic="true"></div>
         <input type="hidden" id="model-edit-id" value="" />
+        <label
+          class="toggle-switch toggle--flush"
+          title="Disable to hide this alias from every model dropdown (workstreams, schedules, channel adapters, role assignments) without removing the definition."
+        >
+          <input type="checkbox" id="model-enabled" checked />
+          <span class="toggle-track" aria-hidden="true"></span>
+          <span class="toggle-label">Active</span>
+        </label>
         <label for="model-alias">Alias</label>
         <input
           type="text"
@@ -4116,34 +4140,27 @@
           placeholder='{"supports_vision": true}'
           style="font-family: var(--font-mono); font-size: 11px"
         ></textarea>
-        <div style="display: flex; gap: 20px; margin-top: 14px; flex-wrap: wrap">
-          <label style="margin: 0; font-size: 12px; color: var(--fg-dim)"
-            ><input
-              type="checkbox"
-              id="model-enabled"
-              checked
-              style="margin-right: 5px"
-            />Enabled</label
-          >
+        <div class="toggle-stack">
           <label
-            style="margin: 0; font-size: 12px; color: var(--fg-dim)"
+            class="toggle-switch"
             title="Surface stored reasoning text on /history responses (UI bubble on page reload). Storage of reasoning bytes is unaffected by this flag — they ride in provider_data regardless."
-            ><input
+          >
+            <input
               type="checkbox"
               id="model-surface-persisted-reasoning"
               checked
-              style="margin-right: 5px"
-            />Surface persisted reasoning</label
-          >
+            />
+            <span class="toggle-track" aria-hidden="true"></span>
+            <span class="toggle-label">Surface persisted reasoning</span>
+          </label>
           <label
-            style="margin: 0; font-size: 12px; color: var(--fg-dim)"
+            class="toggle-switch"
             title="Replay stored reasoning blocks back to the model on subsequent provider calls. Capability-dependent; off by default for cost/spec compliance."
-            ><input
-              type="checkbox"
-              id="model-replay-reasoning"
-              style="margin-right: 5px"
-            />Replay reasoning to model</label
           >
+            <input type="checkbox" id="model-replay-reasoning" />
+            <span class="toggle-track" aria-hidden="true"></span>
+            <span class="toggle-label">Replay reasoning to model</span>
+          </label>
         </div>
         <div id="model-detect-area" style="margin-top: 14px">
           <button

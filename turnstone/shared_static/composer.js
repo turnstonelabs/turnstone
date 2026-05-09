@@ -690,6 +690,18 @@
     this._refreshOptionsSummary();
   };
 
+  // Update just the placeholder (first) option's text without disturbing
+  // the rest of the choice list.  Callers that resolve the effective
+  // default asynchronously use this to annotate the empty option with the
+  // concrete alias — e.g. "Default model" → "Default model (gpt-5)".
+  Composer.prototype.setOptionPlaceholder = function (id, text) {
+    var ctrl = this._optionFields && this._optionFields[id];
+    if (!ctrl || ctrl.tagName !== "SELECT") return;
+    if (ctrl.options.length === 0) return;
+    ctrl.options[0].textContent = text == null ? "" : String(text);
+    this._refreshOptionsSummary();
+  };
+
   Composer.prototype._refreshOptionsSummary = function () {
     if (!this.optionsSummaryEl) return;
     var summaryFn = this._opts.options && this._opts.options.summary;

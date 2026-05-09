@@ -996,6 +996,8 @@ class ListAvailableModelsResponse(BaseModel):
     models: list[AvailableModelInfo] = Field(default_factory=list)
     default_alias: str = ""
     channel_default_alias: str = ""
+    coordinator_default_alias: str = ""
+    judge_default_alias: str = ""
 
 
 # ---------------------------------------------------------------------------

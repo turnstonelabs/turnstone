@@ -197,6 +197,7 @@ _EXPECTED_AFFECTING_KEYS = frozenset(
         "coordinator.model_alias",
         "coordinator.reasoning_effort",
         "judge.model",
+        "channels.default_model_alias",
     }
 )
 
