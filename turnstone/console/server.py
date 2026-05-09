@@ -1671,20 +1671,37 @@ async def list_available_models(request: Request) -> JSONResponse:
     # Include effective defaults for clients (web UI, channel gateway).
     default_alias = ""
     channel_default_alias = ""
+    coordinator_default_alias = ""
+    judge_default_alias = ""
     cs = getattr(request.app.state, "config_store", None)
     if cs is not None:
         default_alias = cs.get("model.default_alias") or ""
         channel_default_alias = cs.get("channels.default_model_alias") or ""
+        coordinator_default_alias = (cs.get("coordinator.model_alias") or "").strip()
+        judge_default_alias = (cs.get("judge.model") or "").strip()
     enabled_aliases = {r["alias"] for r in rows}
     if default_alias and default_alias not in enabled_aliases:
         default_alias = ""
     if channel_default_alias and channel_default_alias not in enabled_aliases:
         channel_default_alias = ""
+    # Coordinator falls back to model.default_alias when its setting is
+    # empty or points at a disabled/removed alias (matches
+    # console/session_factory.py).  Judge falls back to the resolved
+    # coordinator alias when judge.model is empty *or* not a registered
+    # alias — judge.model is alias-only (matches IntentJudge.__init__),
+    # so an unknown value is operator misconfiguration that the judge
+    # itself silently inherits the session model on.
+    if not coordinator_default_alias or coordinator_default_alias not in enabled_aliases:
+        coordinator_default_alias = default_alias
+    if not judge_default_alias or judge_default_alias not in enabled_aliases:
+        judge_default_alias = coordinator_default_alias
     return JSONResponse(
         {
             "models": models,
             "default_alias": default_alias,
             "channel_default_alias": channel_default_alias,
+            "coordinator_default_alias": coordinator_default_alias,
+            "judge_default_alias": judge_default_alias,
         }
     )
 
@@ -7884,6 +7901,7 @@ _MODEL_AFFECTING_SETTING_KEYS: frozenset[str] = frozenset(
         "coordinator.model_alias",
         "coordinator.reasoning_effort",
         "judge.model",
+        "channels.default_model_alias",
     }
 )
 
