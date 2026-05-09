@@ -87,6 +87,27 @@ class ModelCapabilities:
     supports_tool_search: bool = False
     supports_vision: bool = False
     thinking_display: str = ""  # "summarized" for models that omit thinking by default
+    # Phase 3 reasoning-persistence: gate the per-model
+    # ``replay_reasoning_to_model`` flag.  When False, the wire-build
+    # path skips replay regardless of the operator flag (defends
+    # against operators flipping the flag on a model whose API has
+    # no reasoning-replay shape — e.g. OpenAI Chat Completions, where
+    # reasoning is purely server-side and never round-trips).  Set
+    # True for: Anthropic models with ``thinking_mode != "none"``,
+    # OpenAI Responses o-series + GPT-5+ (``include=
+    # ["reasoning.encrypted_content"]`` round-trip).  Path-3 capture
+    # (Chat Completions / vLLM / llama.cpp / Gemini-compat) is
+    # persist-only and doesn't gate on this flag.
+    supports_reasoning_replay: bool = False
+
+
+# Operator-friendly UI cap on reasoning text returned from
+# ``LLMProvider.extract_reasoning_text``.  Single source of truth so a
+# tuning change propagates to every provider's display path uniformly.
+# Larger reasoning bodies are still stored verbatim in
+# ``provider_data``; only the rehydrated UI display payload is
+# truncated.  64 KiB matches the briefing's recommendation.
+MAX_REASONING_DISPLAY_BYTES = 64 * 1024
 
 
 def _lookup_capabilities(

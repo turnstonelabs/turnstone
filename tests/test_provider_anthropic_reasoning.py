@@ -17,12 +17,12 @@ from __future__ import annotations
 
 import pytest
 
-from turnstone.core.providers._anthropic import (
-    _MAX_REASONING_DISPLAY_BYTES,
-    AnthropicProvider,
-)
+from turnstone.core.providers._anthropic import AnthropicProvider
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+from turnstone.core.providers._protocol import (
+    MAX_REASONING_DISPLAY_BYTES as _MAX_REASONING_DISPLAY_BYTES,
+)
 
 
 @pytest.fixture
@@ -115,9 +115,11 @@ class TestOtherProvidersDefault:
         blocks = [{"type": "thinking", "thinking": "would-be-text", "signature": "s"}]
         assert provider.extract_reasoning_text(blocks) == ""
 
-    def test_openai_responses_returns_empty_on_reasoning_shaped_blocks(self) -> None:
-        # Phase 3 stub — reasoning items exist but extractor returns ""
-        # until ``include=["reasoning.encrypted_content"]`` is wired.
+    def test_openai_responses_extracts_reasoning_summary(self) -> None:
+        # Phase 3: extractor now walks reasoning items captured via
+        # include=["reasoning.encrypted_content"] and returns the
+        # summary[*].text concatenation.  Pre-Phase-3 this returned
+        # "" — the stub was replaced once the wire path landed.
         provider = OpenAIResponsesProvider()
         blocks = [{"type": "reasoning", "summary": [{"type": "summary_text", "text": "x"}]}]
-        assert provider.extract_reasoning_text(blocks) == ""
+        assert provider.extract_reasoning_text(blocks) == "x"

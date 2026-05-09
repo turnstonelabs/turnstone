@@ -12,6 +12,7 @@ import sys
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core.providers._protocol import (
+    MAX_REASONING_DISPLAY_BYTES,
     CompletionResult,
     ModelCapabilities,
     StreamChunk,
@@ -80,6 +81,7 @@ _ANTHROPIC_DEFAULT = ModelCapabilities(
     thinking_mode="manual",
     supports_web_search=True,
     supports_vision=True,
+    supports_reasoning_replay=True,
 )
 
 _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
@@ -95,6 +97,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_vision=True,
         supports_temperature=False,
         thinking_display="summarized",
+        supports_reasoning_replay=True,
     ),
     "claude-opus-4-6": ModelCapabilities(
         context_window=1000000,
@@ -106,6 +109,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_web_search=True,
         supports_tool_search=True,
         supports_vision=True,
+        supports_reasoning_replay=True,
     ),
     "claude-sonnet-4-6": ModelCapabilities(
         context_window=1000000,
@@ -117,6 +121,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_web_search=True,
         supports_tool_search=True,
         supports_vision=True,
+        supports_reasoning_replay=True,
     ),
     "claude-haiku-4-5": ModelCapabilities(
         context_window=200000,
@@ -125,6 +130,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         thinking_mode="manual",
         supports_web_search=True,
         supports_vision=True,
+        supports_reasoning_replay=True,
     ),
     "claude-sonnet-4-5": ModelCapabilities(
         context_window=200000,
@@ -133,6 +139,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         thinking_mode="manual",
         supports_web_search=True,
         supports_vision=True,
+        supports_reasoning_replay=True,
     ),
     "claude-opus-4-5": ModelCapabilities(
         context_window=200000,
@@ -143,6 +150,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         effort_levels=("low", "medium", "high"),
         supports_web_search=True,
         supports_vision=True,
+        supports_reasoning_replay=True,
     ),
 }
 
@@ -1040,15 +1048,9 @@ class AnthropicProvider:
         if not parts:
             return ""
         joined = "\n".join(parts)
-        # Operator-friendly UI cap. Larger reasoning bodies are still
-        # stored verbatim in provider_data; only the rehydrated UI
-        # display payload is truncated.
-        if len(joined) > _MAX_REASONING_DISPLAY_BYTES:
-            return joined[:_MAX_REASONING_DISPLAY_BYTES]
+        if len(joined) > MAX_REASONING_DISPLAY_BYTES:
+            return joined[:MAX_REASONING_DISPLAY_BYTES]
         return joined
-
-
-_MAX_REASONING_DISPLAY_BYTES = 64 * 1024
 
 
 def _normalize_finish_reason(reason: str) -> str:

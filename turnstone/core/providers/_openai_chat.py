@@ -24,6 +24,7 @@ from turnstone.core.providers._openai_common import (
     sanitize_messages,
 )
 from turnstone.core.providers._protocol import (
+    MAX_REASONING_DISPLAY_BYTES,
     CompletionResult,
     ModelCapabilities,
     StreamChunk,
@@ -389,9 +390,32 @@ class OpenAIChatCompletionsProvider:
         self,
         provider_blocks: list[dict[str, Any]] | None,
     ) -> str:
-        # OpenAI Chat (and the local-model server flavours that route
-        # through this adapter) have no first-class reasoning shape.
-        # Chat-template ``<think>`` content is captured via the inflight
-        # buffer for live UI but not persisted to ``provider_blocks``;
-        # Phase 4 may revisit.
-        return ""
+        """Walk synthetic ``reasoning_text`` blocks (Phase 3 path-3
+        capture) and return the concatenated reasoning text.
+
+        OpenAI Chat Completions has no native reasoning shape on the
+        wire — vLLM ``--reasoning-parser``, llama.cpp
+        ``reasoning_format``, and Gemini's OpenAI-compat endpoint all
+        surface reasoning as non-canonical ``delta.reasoning_content``
+        Pydantic extras.  ``ChatSession._maybe_synth_reasoning_block``
+        captures these into a single ``{type: "reasoning_text", text,
+        source?}`` block when no native ``provider_blocks`` were
+        emitted.  This extractor unwraps those for UI rehydration.
+        """
+        if not isinstance(provider_blocks, list):
+            return ""
+        parts: list[str] = []
+        for block in provider_blocks:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "reasoning_text":
+                continue
+            text = block.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+        if not parts:
+            return ""
+        joined = "\n".join(parts)
+        if len(joined) > MAX_REASONING_DISPLAY_BYTES:
+            return joined[:MAX_REASONING_DISPLAY_BYTES]
+        return joined
