@@ -777,6 +777,58 @@ class TestModelAliasResolution:
         assert judge._client_factory_args["api_key"] == "alias-key"
         assert judge._client_factory_args["provider_name"] == "openai"
 
+    def test_unknown_alias_inherits_session_model(self):
+        """``judge.model`` is alias-only.  A value that doesn't resolve
+        through the registry inherits the session model (same path as
+        an empty config.model) rather than getting pinned onto the
+        session provider as a raw model id — that legacy behavior
+        silently broke whenever the session provider didn't speak the
+        configured model id (Anthropic session, ``judge.model =
+        "gpt-5-mini"`` → every verdict came back as ``llm_fallback``)."""
+        session_provider = _make_mock_provider()
+        session_provider.provider_name = "anthropic"
+        session_client = MagicMock()
+        session_client.base_url = "https://session.example/v1"
+        session_client.api_key = "session-key"
+
+        registry = MagicMock()
+        registry.has_alias.return_value = False  # judge.model isn't an alias
+
+        config = JudgeConfig(enabled=True, model="gpt-5-mini")
+        judge = IntentJudge(
+            config=config,
+            session_provider=session_provider,
+            session_client=session_client,
+            session_model="session-default-model",
+            context_window=100_000,
+            model_registry=registry,
+        )
+
+        assert judge._provider is session_provider
+        assert judge._model == "session-default-model"
+        # Context window mirrors the session, not the (uncalled) caps lookup.
+        assert judge._judge_context_window == 100_000
+
+    def test_empty_model_inherits_session_model(self):
+        """Empty ``config.model`` is the documented self-consistency path."""
+        session_provider = _make_mock_provider()
+        session_provider.provider_name = "openai"
+        session_client = MagicMock()
+        session_client.base_url = "https://session.example/v1"
+        session_client.api_key = "session-key"
+
+        config = JudgeConfig(enabled=True, model="")
+        judge = IntentJudge(
+            config=config,
+            session_provider=session_provider,
+            session_client=session_client,
+            session_model="session-default-model",
+            context_window=100_000,
+        )
+
+        assert judge._provider is session_provider
+        assert judge._model == "session-default-model"
+
     def test_coordinator_tool_call_returns_llm_verdict_not_fallback(self):
         """Happy-path regression for coordinator tool calls: with a properly
         resolved provider, the verdict tier must be ``llm`` — the
