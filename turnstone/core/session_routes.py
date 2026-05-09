@@ -2378,7 +2378,7 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
                 # shared mutable state beyond the per-call message
                 # list) so the off-loop hop is free.
                 await asyncio.to_thread(decorate_history_messages, messages, indexes[0], indexes[1])
-                # Active-model ``persist_reasoning`` flag.  Three-tier
+                # Active-model ``surface_persisted_reasoning`` flag.  Three-tier
                 # resolution so the operator's flag-flip takes effect
                 # uniformly — live session, storage-rehydratable cold
                 # workstream, or unknown workstream:
@@ -2393,15 +2393,22 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
                 # 3. Neither available → conservative default ``True``,
                 #    matching the migration server_default and the
                 #    rehydration default in spec.
-                persist_reasoning = True
+                surface_persisted_reasoning = True
                 resolved_alias = ""
                 resolved_registry: Any = None
                 if live_session is not None:
                     resolved_registry = getattr(live_session, "_registry", None)
                     resolved_alias = getattr(live_session, "_model_alias", "") or ""
                 if not resolved_alias and storage is not None:
+                    # Off-loop the sync storage call (mirrors get_workstream
+                    # / load_messages / load_verdict_indexes / decorate /
+                    # extract_reasoning_for_history above).  Preserves the
+                    # try/except so a DB failure degrades to the
+                    # conservative-default branch instead of bubbling out.
                     try:
-                        ws_cfg = storage.load_workstream_config(ws_id) or {}
+                        ws_cfg = (
+                            await asyncio.to_thread(storage.load_workstream_config, ws_id) or {}
+                        )
                     except Exception:
                         ws_cfg = {}
                     resolved_alias = ws_cfg.get("model_alias") or ""
@@ -2415,12 +2422,14 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
                     )
                 if resolved_registry is not None and resolved_alias:
                     try:
-                        persist_reasoning = bool(
-                            resolved_registry.get_config(resolved_alias).persist_reasoning
+                        surface_persisted_reasoning = bool(
+                            resolved_registry.get_config(resolved_alias).surface_persisted_reasoning
                         )
                     except Exception:
-                        persist_reasoning = True
-                await asyncio.to_thread(extract_reasoning_for_history, messages, persist_reasoning)
+                        surface_persisted_reasoning = True
+                await asyncio.to_thread(
+                    extract_reasoning_for_history, messages, surface_persisted_reasoning
+                )
             except Exception:
                 # Operationally interesting: a persistent decoration
                 # failure (missing migration, driver mismatch, schema

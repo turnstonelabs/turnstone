@@ -26,34 +26,13 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
 
+from tests._session_helpers import make_session as _make_session
 from turnstone.core.providers._anthropic import (
     ANTHROPIC_VALID_BLOCK_TYPES,
     AnthropicProvider,
 )
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
-from turnstone.core.session import ChatSession
-from turnstone.core.session_ui_base import SessionUIBase
-
-
-class _NullUI(SessionUIBase):
-    def __init__(self) -> None:
-        super().__init__()
-
-
-def _make_session(**kwargs: Any) -> ChatSession:
-    defaults: dict[str, Any] = {
-        "client": MagicMock(),
-        "model": "test-model",
-        "ui": _NullUI(),
-        "instructions": None,
-        "temperature": 0.5,
-        "max_tokens": 4096,
-        "tool_timeout": 30,
-    }
-    defaults.update(kwargs)
-    return ChatSession(**defaults)
 
 
 class TestMaybeSynthReasoningBlock:

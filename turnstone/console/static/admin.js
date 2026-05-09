@@ -5011,7 +5011,7 @@ function _renderModels(items) {
     // Reasoning persistence flags surface only when non-default
     // (persist=False is the operator opt-out; replay=True is the
     // operator opt-in). Default values are silent.
-    if (m.persist_reasoning === false) overrides.push("persist=off");
+    if (m.surface_persisted_reasoning === false) overrides.push("surface=off");
     if (m.replay_reasoning_to_model === true) overrides.push("replay=on");
     if (overrides.length) {
       var ovrSpan = document.createElement("span");
@@ -5201,7 +5201,7 @@ function showCreateModelModal() {
     el.style.borderColor = "";
   });
   document.getElementById("model-enabled").checked = true;
-  document.getElementById("model-persist-reasoning").checked = true;
+  document.getElementById("model-surface-persisted-reasoning").checked = true;
   document.getElementById("model-replay-reasoning").checked = false;
   document.getElementById("model-detect-result").style.display = "none";
   document.getElementById("model-detect-btn").disabled = false;
@@ -5288,8 +5288,8 @@ function showEditModelModal(definitionId) {
       // Reasoning persistence flags — defaults match the dataclass
       // defaults (persist=true, replay=false) when the API returns
       // them as undefined (legacy / pre-052 row).
-      document.getElementById("model-persist-reasoning").checked =
-        m.persist_reasoning !== false;
+      document.getElementById("model-surface-persisted-reasoning").checked =
+        m.surface_persisted_reasoning !== false;
       document.getElementById("model-replay-reasoning").checked =
         m.replay_reasoning_to_model === true;
       _applyProviderDefaults();
@@ -5436,8 +5436,8 @@ function submitCreateModel() {
   // Reasoning persistence flags — always serialize so a flip from
   // default takes effect on PUT (the server's update path keys off
   // "field present in body").
-  form.persist_reasoning = document.getElementById(
-    "model-persist-reasoning",
+  form.surface_persisted_reasoning = document.getElementById(
+    "model-surface-persisted-reasoning",
   ).checked;
   form.replay_reasoning_to_model = document.getElementById(
     "model-replay-reasoning",

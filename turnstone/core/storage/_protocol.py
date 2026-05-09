@@ -1853,7 +1853,7 @@ class StorageBackend(Protocol):
         temperature: float | None = None,
         max_tokens: int | None = None,
         reasoning_effort: str | None = None,
-        persist_reasoning: bool = True,
+        surface_persisted_reasoning: bool = True,
         replay_reasoning_to_model: bool = False,
     ) -> None:
         """Create a model definition. No-op if definition_id already exists."""

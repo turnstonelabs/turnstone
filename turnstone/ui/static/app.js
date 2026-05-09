@@ -1199,7 +1199,7 @@ Pane.prototype.replayHistory = function (messages) {
       // live SSE flow (reasoning_delta arrives before content_delta
       // for thinking-enabled models). Mirrors the live-stream
       // construction at the "case 'reasoning':" branch above. Only
-      // surfaces when the active model's persist_reasoning flag is
+      // surfaces when the active model's surface_persisted_reasoning flag is
       // true and the message round-tripped a thinking lane.
       if (msg.reasoning && msg.reasoning.length) {
         var reasonEl = document.createElement("div");

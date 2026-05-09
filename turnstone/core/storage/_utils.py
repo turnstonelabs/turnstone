@@ -194,7 +194,7 @@ MODEL_DEFINITION_MUTABLE = frozenset(
         "temperature",
         "max_tokens",
         "reasoning_effort",
-        "persist_reasoning",
+        "surface_persisted_reasoning",
         "replay_reasoning_to_model",
     }
 )

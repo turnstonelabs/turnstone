@@ -28,11 +28,15 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+from tests._session_helpers import make_session
 from turnstone.core.history_decoration import (
     extract_reasoning_for_history,
     extract_reasoning_text_from_provider_content,
 )
 from turnstone.core.providers._anthropic import AnthropicProvider
+from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+from turnstone.core.providers._protocol import StreamChunk, UsageInfo
 from turnstone.server import _build_history
 
 _MARKER = "SECRET_REASONING_MARKER_xyz123_unlikely_collision"
@@ -151,7 +155,7 @@ class TestReasoningAuditLogDiscipline:
             p.start()
         try:
             messages = [self._thinking_msg(_MARKER)]
-            extract_reasoning_for_history(messages, persist_reasoning_flag=True)
+            extract_reasoning_for_history(messages, surface_persisted_reasoning_flag=True)
             assert messages[0]["reasoning"] == _MARKER  # UI-bound is allowed
         finally:
             for p in patchers:
@@ -166,7 +170,9 @@ class TestReasoningAuditLogDiscipline:
         )
 
     def test_build_history_does_not_log_reasoning(self) -> None:
-        registry = SimpleNamespace(get_config=lambda alias: SimpleNamespace(persist_reasoning=True))
+        registry = SimpleNamespace(
+            get_config=lambda alias: SimpleNamespace(surface_persisted_reasoning=True)
+        )
         session = SimpleNamespace(
             messages=[self._thinking_msg(_MARKER)],
             _ws_id="ws-audit",
@@ -192,3 +198,136 @@ class TestReasoningAuditLogDiscipline:
             if _payload_contains_marker(args, kwargs)
         ]
         assert offending == [], f"_build_history leaked reasoning text into INFO+ logs: {offending}"
+
+    # ------------------------------------------------------------------
+    # Phase 2 + Phase 3 surfaces — added in response to a code-review
+    # finding that the original 4-test coverage missed every code path
+    # introduced after Phase 1.  Each new test mirrors the structure
+    # above: capture every Logger.info / warning / error call across
+    # the operation, assert the marker doesn't appear in any captured
+    # payload (UI-bound returns IS allowed; logging at INFO+ is NOT).
+    # ------------------------------------------------------------------
+
+    def test_openai_responses_extractor_does_not_log_reasoning(self) -> None:
+        captured, patchers = _capture_log_calls()
+        for p in patchers:
+            p.start()
+        try:
+            provider = OpenAIResponsesProvider()
+            blocks = [
+                {
+                    "type": "reasoning",
+                    "id": "r_1",
+                    "summary": [{"type": "summary_text", "text": _MARKER}],
+                }
+            ]
+            text = provider.extract_reasoning_text(blocks)
+            assert _MARKER in text  # UI-bound return is allowed
+        finally:
+            for p in patchers:
+                p.stop()
+        offending = [
+            (lvl, args, kwargs)
+            for lvl, args, kwargs in captured
+            if _payload_contains_marker(args, kwargs)
+        ]
+        assert offending == [], (
+            f"OpenAIResponsesProvider.extract_reasoning_text leaked reasoning "
+            f"text into INFO+ logs: {offending}"
+        )
+
+    def test_openai_chat_extractor_does_not_log_reasoning(self) -> None:
+        captured, patchers = _capture_log_calls()
+        for p in patchers:
+            p.start()
+        try:
+            provider = OpenAIChatCompletionsProvider()
+            blocks = [{"type": "reasoning_text", "text": _MARKER, "source": "vllm"}]
+            text = provider.extract_reasoning_text(blocks)
+            assert text == _MARKER
+        finally:
+            for p in patchers:
+                p.stop()
+        offending = [
+            (lvl, args, kwargs)
+            for lvl, args, kwargs in captured
+            if _payload_contains_marker(args, kwargs)
+        ]
+        assert offending == [], (
+            f"OpenAIChatCompletionsProvider.extract_reasoning_text leaked "
+            f"reasoning text into INFO+ logs: {offending}"
+        )
+
+    def test_synth_reasoning_block_via_stream_response_does_not_log_reasoning(
+        self,
+    ) -> None:
+        """Drives ChatSession._stream_response (which calls
+        _maybe_synth_reasoning_block at end-of-stream) with a fake
+        ``reasoning_delta=_MARKER`` chunk; asserts no log call carried
+        the marker text."""
+        session = make_session()
+        chunks = [
+            StreamChunk(reasoning_delta=_MARKER, is_first=True),
+            StreamChunk(content_delta="answer"),
+            StreamChunk(
+                finish_reason="stop",
+                usage=UsageInfo(prompt_tokens=10, completion_tokens=20, total_tokens=30),
+            ),
+        ]
+        captured, patchers = _capture_log_calls()
+        for p in patchers:
+            p.start()
+        try:
+            msg = session._stream_response(iter(chunks))
+            # Synth block stamped onto _provider_content with the marker.
+            assert msg["_provider_content"][0]["text"] == _MARKER
+        finally:
+            for p in patchers:
+                p.stop()
+        offending = [
+            (lvl, args, kwargs)
+            for lvl, args, kwargs in captured
+            if _payload_contains_marker(args, kwargs)
+        ]
+        assert offending == [], (
+            f"_stream_response + _maybe_synth_reasoning_block leaked reasoning "
+            f"text into INFO+ logs: {offending}"
+        )
+
+    def test_anthropic_convert_messages_strip_does_not_log_reasoning(self) -> None:
+        """Drives the Phase 2 strip predicate
+        (``replay_reasoning_to_model=False``) which walks thinking
+        blocks to filter them out before the wire payload is built;
+        asserts no log call carried the marker text."""
+        captured, patchers = _capture_log_calls()
+        for p in patchers:
+            p.start()
+        try:
+            provider = AnthropicProvider()
+            messages = [
+                {
+                    "role": "assistant",
+                    "content": "Final answer.",
+                    "_provider_content": [
+                        {"type": "thinking", "thinking": _MARKER, "signature": "s"},
+                        {"type": "text", "text": "Final answer."},
+                    ],
+                },
+            ]
+            _, converted = provider._convert_messages(messages, replay_reasoning_to_model=False)
+            # Strip fired — thinking block dropped from wire.
+            assistant = next(m for m in converted if m["role"] == "assistant")
+            block_types = [b.get("type") for b in assistant["content"]]
+            assert "thinking" not in block_types
+        finally:
+            for p in patchers:
+                p.stop()
+        offending = [
+            (lvl, args, kwargs)
+            for lvl, args, kwargs in captured
+            if _payload_contains_marker(args, kwargs)
+        ]
+        assert offending == [], (
+            f"AnthropicProvider._convert_messages strip predicate leaked "
+            f"reasoning text into INFO+ logs: {offending}"
+        )

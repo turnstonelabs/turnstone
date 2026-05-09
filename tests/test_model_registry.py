@@ -78,7 +78,7 @@ class TestModelConfig:
 
     def test_reasoning_flags_default(self) -> None:
         cfg = ModelConfig(alias="x", base_url="x", api_key="x", model="x")
-        assert cfg.persist_reasoning is True
+        assert cfg.surface_persisted_reasoning is True
         assert cfg.replay_reasoning_to_model is False
 
     def test_reasoning_flags_set(self) -> None:
@@ -87,10 +87,10 @@ class TestModelConfig:
             base_url="x",
             api_key="x",
             model="x",
-            persist_reasoning=False,
+            surface_persisted_reasoning=False,
             replay_reasoning_to_model=True,
         )
-        assert cfg.persist_reasoning is False
+        assert cfg.surface_persisted_reasoning is False
         assert cfg.replay_reasoning_to_model is True
 
 
@@ -716,7 +716,7 @@ class TestLoadModelRegistryWithDB:
                     "context_window": 200000,
                     "capabilities": "{}",
                     "enabled": True,
-                    "persist_reasoning": False,
+                    "surface_persisted_reasoning": False,
                     "replay_reasoning_to_model": True,
                 }
             ]
@@ -724,7 +724,7 @@ class TestLoadModelRegistryWithDB:
         with patch("turnstone.core.model_registry.load_config", return_value={}):
             reg = load_model_registry("http://x/v1", "x", "x", storage=storage)
         cfg = reg.get_config("anth-thinking")
-        assert cfg.persist_reasoning is False
+        assert cfg.surface_persisted_reasoning is False
         assert cfg.replay_reasoning_to_model is True
 
     def test_db_reasoning_flags_default_when_absent(self) -> None:
@@ -740,14 +740,14 @@ class TestLoadModelRegistryWithDB:
                     "context_window": 32768,
                     "capabilities": "{}",
                     "enabled": True,
-                    # persist_reasoning + replay_reasoning_to_model intentionally absent
+                    # surface_persisted_reasoning + replay_reasoning_to_model intentionally absent
                 }
             ]
         )
         with patch("turnstone.core.model_registry.load_config", return_value={}):
             reg = load_model_registry("http://x/v1", "x", "x", storage=storage)
         cfg = reg.get_config("legacy-row")
-        assert cfg.persist_reasoning is True
+        assert cfg.surface_persisted_reasoning is True
         assert cfg.replay_reasoning_to_model is False
 
     def test_db_default_alias_not_clobbered(self) -> None:

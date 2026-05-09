@@ -21,7 +21,7 @@ from turnstone.core.providers._anthropic import AnthropicProvider
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
 from turnstone.core.providers._protocol import (
-    MAX_REASONING_DISPLAY_BYTES as _MAX_REASONING_DISPLAY_BYTES,
+    MAX_REASONING_DISPLAY_CHARS as _MAX_REASONING_DISPLAY_CHARS,
 )
 
 
@@ -77,13 +77,13 @@ class TestExtractReasoningText:
         assert anthropic.extract_reasoning_text(blocks) == ""
 
     def test_truncation_at_64kib_cap(self, anthropic: AnthropicProvider) -> None:
-        long_text = "x" * (_MAX_REASONING_DISPLAY_BYTES + 1024)
+        long_text = "x" * (_MAX_REASONING_DISPLAY_CHARS + 1024)
         blocks = [{"type": "thinking", "thinking": long_text, "signature": "s"}]
         result = anthropic.extract_reasoning_text(blocks)
-        assert len(result) == _MAX_REASONING_DISPLAY_BYTES
+        assert len(result) == _MAX_REASONING_DISPLAY_CHARS
 
     def test_just_under_cap_not_truncated(self, anthropic: AnthropicProvider) -> None:
-        text = "y" * (_MAX_REASONING_DISPLAY_BYTES - 1)
+        text = "y" * (_MAX_REASONING_DISPLAY_CHARS - 1)
         blocks = [{"type": "thinking", "thinking": text, "signature": "s"}]
         assert anthropic.extract_reasoning_text(blocks) == text
 

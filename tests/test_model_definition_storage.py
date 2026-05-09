@@ -214,12 +214,12 @@ class TestModelDefinitionStorage:
         assert m["temperature"] is None
 
     def test_reasoning_flags_default(self, db: SQLiteBackend) -> None:
-        """persist_reasoning defaults True; replay_reasoning_to_model defaults False."""
+        """surface_persisted_reasoning defaults True; replay_reasoning_to_model defaults False."""
         did = _make_id()
         db.create_model_definition(definition_id=did, alias="reason-default", model="gpt-5")
         m = db.get_model_definition(did)
         assert m is not None
-        assert m["persist_reasoning"] is True
+        assert m["surface_persisted_reasoning"] is True
         assert m["replay_reasoning_to_model"] is False
 
     def test_create_with_explicit_reasoning_flags(self, db: SQLiteBackend) -> None:
@@ -228,27 +228,27 @@ class TestModelDefinitionStorage:
             definition_id=did,
             alias="reason-explicit",
             model="claude-opus-4-7",
-            persist_reasoning=False,
+            surface_persisted_reasoning=False,
             replay_reasoning_to_model=True,
         )
         m = db.get_model_definition(did)
         assert m is not None
-        assert m["persist_reasoning"] is False
+        assert m["surface_persisted_reasoning"] is False
         assert m["replay_reasoning_to_model"] is True
         # Same values must round-trip via the alias lookup too.
         m_alias = db.get_model_definition_by_alias("reason-explicit")
         assert m_alias is not None
-        assert m_alias["persist_reasoning"] is False
+        assert m_alias["surface_persisted_reasoning"] is False
         assert m_alias["replay_reasoning_to_model"] is True
 
-    def test_update_persist_reasoning(self, db: SQLiteBackend) -> None:
+    def test_update_surface_persisted_reasoning(self, db: SQLiteBackend) -> None:
         did = _make_id()
         db.create_model_definition(definition_id=did, alias="upd-persist", model="gpt-5")
-        ok = db.update_model_definition(did, persist_reasoning=False)
+        ok = db.update_model_definition(did, surface_persisted_reasoning=False)
         assert ok is True
         m = db.get_model_definition(did)
         assert m is not None
-        assert m["persist_reasoning"] is False
+        assert m["surface_persisted_reasoning"] is False
         assert m["replay_reasoning_to_model"] is False  # untouched
 
     def test_update_replay_reasoning_to_model(self, db: SQLiteBackend) -> None:
@@ -258,7 +258,7 @@ class TestModelDefinitionStorage:
         assert ok is True
         m = db.get_model_definition(did)
         assert m is not None
-        assert m["persist_reasoning"] is True  # untouched
+        assert m["surface_persisted_reasoning"] is True  # untouched
         assert m["replay_reasoning_to_model"] is True
 
     def test_list_returns_reasoning_flags(self, db: SQLiteBackend) -> None:
@@ -266,19 +266,19 @@ class TestModelDefinitionStorage:
             definition_id=_make_id(),
             alias="list-a",
             model="gpt-5",
-            persist_reasoning=True,
+            surface_persisted_reasoning=True,
             replay_reasoning_to_model=False,
         )
         db.create_model_definition(
             definition_id=_make_id(),
             alias="list-b",
             model="claude-opus-4-7",
-            persist_reasoning=False,
+            surface_persisted_reasoning=False,
             replay_reasoning_to_model=True,
         )
         models = db.list_model_definitions()
         by_alias = {m["alias"]: m for m in models}
-        assert by_alias["list-a"]["persist_reasoning"] is True
+        assert by_alias["list-a"]["surface_persisted_reasoning"] is True
         assert by_alias["list-a"]["replay_reasoning_to_model"] is False
-        assert by_alias["list-b"]["persist_reasoning"] is False
+        assert by_alias["list-b"]["surface_persisted_reasoning"] is False
         assert by_alias["list-b"]["replay_reasoning_to_model"] is True
