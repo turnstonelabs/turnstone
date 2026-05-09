@@ -617,6 +617,36 @@ class TestExtractReasoningForHistory:
         assert messages[0]["reasoning"] == "synth thought"
         assert "_provider_content" not in messages[0]
 
+    def test_dispatcher_scans_past_unrecognized_first_blocks(self) -> None:
+        # Regression for Copilot finding: dispatcher used to inspect
+        # only provider_content[0]['type'].  OpenAI Responses captures
+        # EVERY output_item.done event into provider_blocks (not just
+        # reasoning), so a hypothetical [message, reasoning, ...]
+        # ordering would have silently dropped the reasoning.  Now
+        # walks the list for the first recognised reasoning-bearing
+        # type and dispatches the whole list to that provider.
+        from turnstone.core.history_decoration import extract_reasoning_for_history
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": "answer",
+                "_provider_content": [
+                    # First block is a non-reasoning OpenAI Responses item.
+                    {"type": "message", "role": "assistant", "content": "answer"},
+                    # Reasoning sits later in the list.
+                    {
+                        "type": "reasoning",
+                        "id": "r_1",
+                        "summary": [{"type": "summary_text", "text": "deferred"}],
+                    },
+                ],
+            }
+        ]
+        extract_reasoning_for_history(messages, surface_persisted_reasoning_flag=True)
+        assert messages[0]["reasoning"] == "deferred"
+        assert "_provider_content" not in messages[0]
+
     def test_first_block_redacted_thinking_dispatches_to_anthropic(self) -> None:
         # Anthropic's extended-thinking API documents that
         # ``redacted_thinking`` blocks (sealed by the safety system)

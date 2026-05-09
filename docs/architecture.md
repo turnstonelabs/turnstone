@@ -634,9 +634,9 @@ LLMProvider (protocol)
 
 | Type | Fields |
 |------|--------|
-| `StreamChunk` | `content_delta`, `reasoning_delta`, `tool_call_deltas`, `info_delta`, `usage`, `finish_reason` |
-| `CompletionResult` | `content`, `tool_calls`, `finish_reason`, `usage` |
-| `ModelCapabilities` | `context_window`, `max_output_tokens`, `supports_temperature`, `token_param`, `thinking_mode`, `supports_effort`, `supports_web_search`, `supports_tool_search`, `supports_vision` |
+| `StreamChunk` | `content_delta`, `reasoning_delta`, `tool_call_deltas`, `info_delta`, `usage`, `finish_reason`, `provider_blocks` |
+| `CompletionResult` | `content`, `tool_calls`, `finish_reason`, `usage`, `provider_blocks` |
+| `ModelCapabilities` | `context_window`, `max_output_tokens`, `supports_temperature`, `token_param`, `thinking_mode`, `supports_effort`, `supports_web_search`, `supports_tool_search`, `supports_vision`, `supports_reasoning_replay` |
 | `UsageInfo` | `prompt_tokens`, `completion_tokens`, `total_tokens`, `cache_creation_tokens`, `cache_read_tokens` |
 
 **OpenAIProvider** (`_openai.py`): passes messages through unchanged (they are
@@ -723,6 +723,35 @@ and `"openai-compatible"`.
 **Per-model sampling overrides:** Each model can specify `temperature`,
 `max_tokens`, and `reasoning_effort` to override the global defaults from
 ConfigStore. When unset (`NULL`), the global default is used.
+
+**Per-model reasoning persistence:** Two booleans on `model_definitions`
+(migration 052) control how reasoning text round-trips:
+
+* `surface_persisted_reasoning` (default `True`) — gates whether stored
+  reasoning text is surfaced on `/history` payloads for UI rehydration.
+  **Storage of reasoning bytes happens regardless of this flag** — they
+  ride in `provider_data` independently. Phase-1 admin UI label "Surface
+  persisted reasoning."
+* `replay_reasoning_to_model` (default `False`) — gates whether stored
+  reasoning blocks are sent back to the provider on subsequent turns.
+  Capability-gated: `ModelCapabilities.supports_reasoning_replay` must
+  also be `True` for the wire path to actually replay (canonical OpenAI
+  gpt-5*/o-series and Anthropic Claude entries set it; unknown / local-
+  server models default to `False`).
+
+Three reasoning paths are recognised:
+
+| Path | Provider | Capture | Persist | Replay |
+|------|----------|---------|---------|--------|
+| 1 | Anthropic Messages API | `thinking_delta` | `provider_blocks` (`type="thinking"`) | Verbatim via `_provider_content` |
+| 2 | OpenAI Responses (gpt-5*, o-series) | `response.reasoning_text.delta` events | `provider_blocks` (`type="reasoning"`) — only when `include=["reasoning.encrypted_content"]` | `ResponseReasoningItemParam` input items |
+| 3 | OpenAI Chat Completions (vLLM, llama.cpp, Gemini-compat) | `delta.reasoning_content` Pydantic extras | Synthetic `{type: "reasoning_text", text, source}` block stamped at end-of-stream | None — no API surface for replay on Chat Completions |
+
+Cross-provider safety is enforced by `ANTHROPIC_VALID_BLOCK_TYPES` (a
+shape filter in `_anthropic.py:_convert_messages`): foreign blocks
+(OpenAI `reasoning`, synthetic `reasoning_text`) fall through to the
+text+tool_calls rebuild path rather than reaching Anthropic's input
+boundary as malformed content.
 
 ```toml
 [models.local]
