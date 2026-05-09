@@ -5008,6 +5008,11 @@ function _renderModels(items) {
     if (m.max_tokens != null) overrides.push("max_tok=" + m.max_tokens);
     if (m.reasoning_effort != null)
       overrides.push("effort=" + m.reasoning_effort);
+    // Reasoning persistence flags surface only when non-default
+    // (persist=False is the operator opt-out; replay=True is the
+    // operator opt-in). Default values are silent.
+    if (m.persist_reasoning === false) overrides.push("persist=off");
+    if (m.replay_reasoning_to_model === true) overrides.push("replay=on");
     if (overrides.length) {
       var ovrSpan = document.createElement("span");
       ovrSpan.className = "model-overrides-hint";
@@ -5196,6 +5201,8 @@ function showCreateModelModal() {
     el.style.borderColor = "";
   });
   document.getElementById("model-enabled").checked = true;
+  document.getElementById("model-persist-reasoning").checked = true;
+  document.getElementById("model-replay-reasoning").checked = false;
   document.getElementById("model-detect-result").style.display = "none";
   document.getElementById("model-detect-btn").disabled = false;
   document.getElementById("model-detect-btn").textContent = "Detect";
@@ -5278,6 +5285,13 @@ function showEditModelModal(definitionId) {
       document.getElementById("model-capabilities").value =
         capsText === "{}" ? "" : capsText;
       document.getElementById("model-enabled").checked = m.enabled !== false;
+      // Reasoning persistence flags — defaults match the dataclass
+      // defaults (persist=true, replay=false) when the API returns
+      // them as undefined (legacy / pre-052 row).
+      document.getElementById("model-persist-reasoning").checked =
+        m.persist_reasoning !== false;
+      document.getElementById("model-replay-reasoning").checked =
+        m.replay_reasoning_to_model === true;
       _applyProviderDefaults();
     })
     .catch(function () {
@@ -5418,6 +5432,16 @@ function submitCreateModel() {
   } else {
     form.reasoning_effort = null;
   }
+
+  // Reasoning persistence flags — always serialize so a flip from
+  // default takes effect on PUT (the server's update path keys off
+  // "field present in body").
+  form.persist_reasoning = document.getElementById(
+    "model-persist-reasoning",
+  ).checked;
+  form.replay_reasoning_to_model = document.getElementById(
+    "model-replay-reasoning",
+  ).checked;
 
   var apiKey = document.getElementById("model-api-key").value;
   if (apiKey) form.api_key = apiKey;

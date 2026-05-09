@@ -9904,6 +9904,9 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
         if not reasoning_effort:
             reasoning_effort = None
 
+    persist_reasoning = bool(body.get("persist_reasoning", True))
+    replay_reasoning_to_model = bool(body.get("replay_reasoning_to_model", False))
+
     storage.create_model_definition(
         definition_id=definition_id,
         alias=alias,
@@ -9918,6 +9921,8 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
         temperature=temperature,
         max_tokens=max_tokens,
         reasoning_effort=reasoning_effort,
+        persist_reasoning=persist_reasoning,
+        replay_reasoning_to_model=replay_reasoning_to_model,
     )
 
     record_audit(
@@ -10079,6 +10084,10 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
                 )
             else:
                 updates["reasoning_effort"] = re_val
+    if "persist_reasoning" in body:
+        updates["persist_reasoning"] = bool(body["persist_reasoning"])
+    if "replay_reasoning_to_model" in body:
+        updates["replay_reasoning_to_model"] = bool(body["replay_reasoning_to_model"])
 
     if updates:
         storage.update_model_definition(definition_id, **updates)

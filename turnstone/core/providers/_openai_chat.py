@@ -373,3 +373,16 @@ class OpenAIChatCompletionsProvider:
     @property
     def retryable_error_names(self) -> frozenset[str]:
         return RETRYABLE_ERROR_NAMES
+
+    # -- reasoning extraction ------------------------------------------------
+
+    def extract_reasoning_text(
+        self,
+        provider_blocks: list[dict[str, Any]] | None,
+    ) -> str:
+        # OpenAI Chat (and the local-model server flavours that route
+        # through this adapter) have no first-class reasoning shape.
+        # Chat-template ``<think>`` content is captured via the inflight
+        # buffer for live UI but not persisted to ``provider_blocks``;
+        # Phase 4 may revisit.
+        return ""

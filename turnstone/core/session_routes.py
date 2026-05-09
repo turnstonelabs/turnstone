@@ -2326,7 +2326,8 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
         # shares storage with the other kind. ``cfg.list_kind`` is
         # guaranteed non-None by the misconfig gate above.
         storage = getattr(request.app.state, "auth_storage", None)
-        if mgr.get(ws_id) is None:
+        live_session = mgr.get(ws_id)
+        if live_session is None:
             if storage is None:
                 return JSONResponse({"error": cfg.not_found_label}, status_code=404)
             try:
@@ -2364,6 +2365,7 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
             try:
                 from turnstone.core.history_decoration import (
                     decorate_history_messages,
+                    extract_reasoning_for_history,
                     load_verdict_indexes,
                 )
 
@@ -2376,6 +2378,49 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
                 # shared mutable state beyond the per-call message
                 # list) so the off-loop hop is free.
                 await asyncio.to_thread(decorate_history_messages, messages, indexes[0], indexes[1])
+                # Active-model ``persist_reasoning`` flag.  Three-tier
+                # resolution so the operator's flag-flip takes effect
+                # uniformly — live session, storage-rehydratable cold
+                # workstream, or unknown workstream:
+                #
+                # 1. Live session in memory → read from its registry
+                #    (already-warm path).
+                # 2. Cold workstream → ``workstream_config.model_alias``
+                #    persisted at first send (see
+                #    ``session_manager.py:628`` rehydrate path) →
+                #    resolve through the kind-appropriate registry on
+                #    ``app.state``.
+                # 3. Neither available → conservative default ``True``,
+                #    matching the migration server_default and the
+                #    rehydration default in spec.
+                persist_reasoning = True
+                resolved_alias = ""
+                resolved_registry: Any = None
+                if live_session is not None:
+                    resolved_registry = getattr(live_session, "_registry", None)
+                    resolved_alias = getattr(live_session, "_model_alias", "") or ""
+                if not resolved_alias and storage is not None:
+                    try:
+                        ws_cfg = storage.load_workstream_config(ws_id) or {}
+                    except Exception:
+                        ws_cfg = {}
+                    resolved_alias = ws_cfg.get("model_alias") or ""
+                if resolved_registry is None:
+                    # Interactive server stores the registry as
+                    # ``app.state.registry``; console stores its coord
+                    # registry as ``app.state.coord_registry``.  The
+                    # lifted handler is shared, so we try both.
+                    resolved_registry = getattr(request.app.state, "registry", None) or getattr(
+                        request.app.state, "coord_registry", None
+                    )
+                if resolved_registry is not None and resolved_alias:
+                    try:
+                        persist_reasoning = bool(
+                            resolved_registry.get_config(resolved_alias).persist_reasoning
+                        )
+                    except Exception:
+                        persist_reasoning = True
+                await asyncio.to_thread(extract_reasoning_for_history, messages, persist_reasoning)
             except Exception:
                 # Operationally interesting: a persistent decoration
                 # failure (missing migration, driver mismatch, schema

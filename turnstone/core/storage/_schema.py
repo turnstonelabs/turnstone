@@ -660,6 +660,8 @@ model_definitions = sa.Table(
     sa.Column("temperature", sa.Float, nullable=True),
     sa.Column("max_tokens", sa.Integer, nullable=True),
     sa.Column("reasoning_effort", sa.Text, nullable=True),
+    sa.Column("persist_reasoning", sa.Integer, nullable=False, server_default="1"),
+    sa.Column("replay_reasoning_to_model", sa.Integer, nullable=False, server_default="0"),
     sa.Column("created_by", sa.Text, nullable=False, server_default=""),
     sa.Column("created", sa.Text, nullable=False),
     sa.Column("updated", sa.Text, nullable=False),

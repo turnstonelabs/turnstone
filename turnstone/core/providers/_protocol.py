@@ -177,3 +177,17 @@ class LLMProvider(Protocol):
     def retryable_error_names(self) -> frozenset[str]:
         """Exception class names that should trigger retry."""
         ...
+
+    def extract_reasoning_text(
+        self,
+        provider_blocks: list[dict[str, Any]] | None,
+    ) -> str:
+        """Return concatenated reasoning text from stored ``provider_blocks``.
+
+        Providers without a first-class reasoning shape (OpenAI Chat,
+        Google) or that haven't been wired yet (OpenAI Responses pre-
+        Phase-3) return ``""``.  AnthropicProvider walks
+        ``type=="thinking"`` blocks and returns the concatenated
+        ``thinking`` text, capped at an operator-friendly size.
+        """
+        ...

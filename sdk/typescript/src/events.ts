@@ -13,6 +13,18 @@ export interface ConnectedEvent {
 
 export interface HistoryEvent {
   type: "history";
+  /**
+   * Per-message dicts the frontend consumes directly. Common optional keys:
+   * - `role`: "user" | "assistant" | "tool"
+   * - `content`: string or list (image/document parts)
+   * - `tool_calls`: assistant turns — list of `{id, name, arguments, verdict?, output_assessment?}`
+   * - `tool_call_id`: tool turns — id of the originating call
+   * - `reminders`: metacognitive nudge bubbles (user/tool channels)
+   * - `advisories`: extracted `UserInterjection` payloads on tool turns
+   * - `reasoning`: concatenated reasoning text for assistant turns whose
+   *   `provider_data` carried thinking blocks (Anthropic today). Present
+   *   only when the active model's `persist_reasoning` flag is true.
+   */
   messages: Array<Record<string, unknown>>;
 }
 

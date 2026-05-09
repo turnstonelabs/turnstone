@@ -453,3 +453,146 @@ class TestDecorateAdvisoryExtraction:
         assert tool_msg["advisories"] == [
             {"type": "user_interjection", "text": "check the logs", "priority": "notice"}
         ]
+
+
+class TestExtractReasoningForHistory:
+    """``extract_reasoning_for_history`` — Phase 1 surfaces stored
+    Anthropic thinking blocks on assistant messages and strips
+    ``_provider_content`` from the wire payload.
+
+    Drives through the real ``AnthropicProvider.extract_reasoning_text``
+    (no mock-of-extractor) — the helper test and the provider unit
+    test (``tests/test_provider_anthropic_reasoning.py``) together
+    catch a regression at either layer distinctly.
+    """
+
+    def _anthropic_thinking_msg(self, text: str = "let me think") -> dict[str, object]:
+        return {
+            "role": "assistant",
+            "content": "Final answer.",
+            "_provider_content": [
+                {"type": "thinking", "thinking": text, "signature": "sig"},
+                {"type": "text", "text": "Final answer."},
+            ],
+        }
+
+    def test_extract_thinking_surfaces_reasoning_field(self) -> None:
+        from turnstone.core.history_decoration import extract_reasoning_for_history
+
+        messages = [self._anthropic_thinking_msg("let me think")]
+        extract_reasoning_for_history(messages, persist_reasoning_flag=True)
+        assert messages[0]["reasoning"] == "let me think"
+
+    def test_strips_provider_content_after_extraction(self) -> None:
+        from turnstone.core.history_decoration import extract_reasoning_for_history
+
+        messages = [self._anthropic_thinking_msg("anything")]
+        extract_reasoning_for_history(messages, persist_reasoning_flag=True)
+        assert "_provider_content" not in messages[0]
+
+    def test_strips_provider_content_when_flag_false(self) -> None:
+        from turnstone.core.history_decoration import extract_reasoning_for_history
+
+        messages = [self._anthropic_thinking_msg("anything")]
+        extract_reasoning_for_history(messages, persist_reasoning_flag=False)
+        # Strip is unconditional; reasoning is the conditional bit.
+        assert "_provider_content" not in messages[0]
+        assert "reasoning" not in messages[0]
+
+    def test_first_block_thinking_dispatches_to_anthropic(self) -> None:
+        # Even when text and tool_use blocks follow, the first-block-type
+        # discriminator routes thinking-prefixed payloads correctly.
+        from turnstone.core.history_decoration import extract_reasoning_for_history
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": "x",
+                "_provider_content": [
+                    {"type": "thinking", "thinking": "first", "signature": "s"},
+                    {"type": "text", "text": "spoken"},
+                    {"type": "tool_use", "id": "t1", "name": "f", "input": {}},
+                ],
+            }
+        ]
+        extract_reasoning_for_history(messages, persist_reasoning_flag=True)
+        assert messages[0]["reasoning"] == "first"
+
+    def test_first_block_reasoning_dispatches_to_openai_phase3_stub(self) -> None:
+        # OpenAI Responses extractor returns "" until Phase 3 wires
+        # ``include=["reasoning.encrypted_content"]``.  The dispatcher
+        # must still route to it (not silently fall through to "").
+        # We assert the dispatcher routed by checking the strip happens
+        # AND no reasoning field is added (because the stub returns "").
+        from turnstone.core.history_decoration import extract_reasoning_for_history
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": "x",
+                "_provider_content": [
+                    {"type": "reasoning", "summary": [{"type": "summary_text", "text": "s"}]}
+                ],
+            }
+        ]
+        extract_reasoning_for_history(messages, persist_reasoning_flag=True)
+        assert "reasoning" not in messages[0]
+        assert "_provider_content" not in messages[0]
+
+    def test_unknown_first_block_type_no_op(self) -> None:
+        from turnstone.core.history_decoration import extract_reasoning_for_history
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": "x",
+                "_provider_content": [{"type": "text", "text": "no reasoning here"}],
+            }
+        ]
+        extract_reasoning_for_history(messages, persist_reasoning_flag=True)
+        assert "reasoning" not in messages[0]
+        assert "_provider_content" not in messages[0]
+
+    def test_skips_messages_without_provider_content(self) -> None:
+        from turnstone.core.history_decoration import extract_reasoning_for_history
+
+        messages = [{"role": "assistant", "content": "plain"}]
+        extract_reasoning_for_history(messages, persist_reasoning_flag=True)
+        assert "reasoning" not in messages[0]
+        assert messages[0]["content"] == "plain"
+
+    def test_user_and_tool_messages_untouched(self) -> None:
+        from turnstone.core.history_decoration import extract_reasoning_for_history
+
+        messages: list[dict[str, object]] = [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "c1", "content": "out"},
+            self._anthropic_thinking_msg("only this one"),
+        ]
+        extract_reasoning_for_history(messages, persist_reasoning_flag=True)
+        assert "reasoning" not in messages[0]
+        assert "reasoning" not in messages[1]
+        assert messages[2]["reasoning"] == "only this one"
+
+    def test_empty_provider_content_no_extraction(self) -> None:
+        from turnstone.core.history_decoration import extract_reasoning_for_history
+
+        messages = [{"role": "assistant", "content": "x", "_provider_content": []}]
+        extract_reasoning_for_history(messages, persist_reasoning_flag=True)
+        assert "reasoning" not in messages[0]
+        # Empty-list provider_content is still stripped from the wire.
+        assert "_provider_content" not in messages[0]
+
+    def test_first_block_not_a_dict_skipped(self) -> None:
+        from turnstone.core.history_decoration import extract_reasoning_for_history
+
+        messages: list[dict[str, object]] = [
+            {
+                "role": "assistant",
+                "content": "x",
+                "_provider_content": ["bogus"],
+            }
+        ]
+        extract_reasoning_for_history(messages, persist_reasoning_flag=True)
+        assert "reasoning" not in messages[0]
+        assert "_provider_content" not in messages[0]

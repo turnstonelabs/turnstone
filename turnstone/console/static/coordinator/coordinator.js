@@ -4195,6 +4195,20 @@
             appendUserMessageWithAttachments(text, [], { label: "user" });
           });
         } else if (role === "assistant") {
+          // Reasoning bubble (Phase 1 reasoning persistence) — render
+          // BEFORE the content card so the visual order matches the
+          // live SSE flow (reasoning_delta arrives before content_delta
+          // for thinking-enabled models). Mirrors the live ":1524" /
+          // snapshot ":2021" call sites — same appendMsg("reasoning")
+          // helper, just driven from history-render rather than the
+          // SSE handler. Only present when the active model's
+          // persist_reasoning flag is true and the message round-tripped
+          // a thinking lane.
+          if (typeof m.reasoning === "string" && m.reasoning.length) {
+            const rEl = appendMsg("reasoning", "", { label: "reasoning" });
+            const rBody = rEl && rEl.querySelector(".msg-body");
+            if (rBody) rBody.textContent = m.reasoning;
+          }
           // Render content BEFORE the tool batch so DOM order matches
           // chronological order (the model emits text first, then
           // dispatches tools).  Whitespace-only content (e.g. "\n\n"

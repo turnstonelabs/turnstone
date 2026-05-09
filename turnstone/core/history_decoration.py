@@ -19,7 +19,7 @@ either an async caller (via ``asyncio.to_thread``) or a sync hook.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from turnstone.core.log import get_logger
 from turnstone.core.tool_advisory import (
@@ -266,6 +266,105 @@ def extract_advisories_from_tool_envelope(
             advisories.append(classified)
         cursor = close_idx + len("\n</system-reminder>")
     return _entity_decode_wrapper_tags(inner), advisories
+
+
+if TYPE_CHECKING:
+    from turnstone.core.providers._anthropic import AnthropicProvider
+    from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+
+_anthropic_provider_singleton: AnthropicProvider | None = None
+_openai_responses_provider_singleton: OpenAIResponsesProvider | None = None
+
+
+def _get_anthropic_provider() -> AnthropicProvider:
+    global _anthropic_provider_singleton
+    if _anthropic_provider_singleton is None:
+        from turnstone.core.providers._anthropic import AnthropicProvider as _Anthropic
+
+        _anthropic_provider_singleton = _Anthropic()
+    return _anthropic_provider_singleton
+
+
+def _get_openai_responses_provider() -> OpenAIResponsesProvider:
+    global _openai_responses_provider_singleton
+    if _openai_responses_provider_singleton is None:
+        from turnstone.core.providers._openai_responses import (
+            OpenAIResponsesProvider as _OpenAIResp,
+        )
+
+        _openai_responses_provider_singleton = _OpenAIResp()
+    return _openai_responses_provider_singleton
+
+
+def extract_reasoning_text_from_provider_content(provider_content: Any) -> str:
+    """Dispatch reasoning extraction by first-block ``type`` field.
+
+    Routing is structural — block shape is non-overlapping across
+    providers by API design (Anthropic ``thinking``, OpenAI Responses
+    ``reasoning``, Gemini ``thought``).  Phase 1 wires Anthropic
+    extraction; OpenAI Responses returns ``""`` until Phase 3 adds the
+    ``include=["reasoning.encrypted_content"]`` request flag.  Returns
+    ``""`` for empty / missing / non-list / unknown-type input.
+
+    Pure transform — safe from any thread.  Both history surfaces
+    (interactive ``_build_history`` and lifted ``make_history_handler``)
+    call this directly.
+    """
+    if not isinstance(provider_content, list) or not provider_content:
+        return ""
+    first_block = provider_content[0]
+    if not isinstance(first_block, dict):
+        return ""
+    block_type = first_block.get("type")
+    if not isinstance(block_type, str):
+        return ""
+    if block_type == "thinking":
+        return _get_anthropic_provider().extract_reasoning_text(provider_content)
+    if block_type == "reasoning":
+        return _get_openai_responses_provider().extract_reasoning_text(provider_content)
+    return ""
+
+
+def extract_reasoning_for_history(
+    messages: list[dict[str, Any]],
+    persist_reasoning_flag: bool,
+) -> None:
+    """Surface stored reasoning text on each assistant message; strip the
+    raw provider content from the wire payload.
+
+    For the ``make_history_handler`` REST path where the response
+    payload IS the messages list returned from ``storage.load_messages``
+    — both extraction source and stamp destination are the same dict.
+    Walks *messages* in place: for every assistant message, dispatches
+    via :func:`extract_reasoning_text_from_provider_content` and stamps
+    ``msg["reasoning"]`` when *persist_reasoning_flag* is True and the
+    dispatcher returned non-empty text.  Strips ``_provider_content``
+    unconditionally — the field is internal and never read by either UI.
+
+    The interactive ``_build_history`` surface DOES NOT call this
+    helper; it builds new entry dicts from scratch and calls
+    :func:`extract_reasoning_text_from_provider_content` directly per
+    assistant message, stamping ``entry["reasoning"]`` inline.  The two
+    surfaces converge on the same dispatcher; only the mutation shape
+    differs.
+
+    Pure transform.  Safe to call from ``asyncio.to_thread``.
+    """
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        provider_content = msg.get("_provider_content")
+        # Always strip the internal lane before the wire payload leaves
+        # the helper, even when persist_reasoning_flag is False or the
+        # field is empty/missing.  The strip is the contract; reasoning
+        # surfacing is conditional on top of it.
+        if "_provider_content" in msg:
+            del msg["_provider_content"]
+        if not persist_reasoning_flag:
+            continue
+        text = extract_reasoning_text_from_provider_content(provider_content)
+        if text:
+            msg["reasoning"] = text
 
 
 def decorate_history_messages(

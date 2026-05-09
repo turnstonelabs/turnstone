@@ -59,6 +59,9 @@ from turnstone.core.history_decoration import (
     extract_advisories_from_tool_envelope,
 )
 from turnstone.core.history_decoration import (
+    extract_reasoning_text_from_provider_content as _extract_reasoning_text,
+)
+from turnstone.core.history_decoration import (
     load_verdict_indexes as _load_verdict_indexes,
 )
 from turnstone.core.log import get_logger
@@ -471,6 +474,22 @@ def _build_history(
     else:
         ws_id = getattr(session, "_ws_id", "") or ""
         verdicts_by_call_id, assessments_by_call_id = _load_verdict_indexes(ws_id)
+    # Active-model reasoning-persistence flag — defaults True so that a
+    # registry/alias lookup miss still surfaces reasoning bubbles.  The
+    # default-True semantic mirrors the migration's server_default for
+    # ``model_definitions.persist_reasoning`` and matches the conservative
+    # rehydration default (Phase 1 spec).
+    persist_reasoning = True
+    registry = getattr(session, "_registry", None)
+    model_alias = getattr(session, "_model_alias", "") or ""
+    if registry is not None and model_alias:
+        try:
+            persist_reasoning = bool(registry.get_config(model_alias).persist_reasoning)
+        except Exception:
+            # Unknown alias / partially-built registry / dataclass drift —
+            # fall back to the conservative default rather than failing
+            # the entire history build.
+            persist_reasoning = True
     history = []
     for msg in session.messages:
         content = msg.get("content")
@@ -556,6 +575,15 @@ def _build_history(
                 clean_reminders.append(clean)
             if clean_reminders:
                 entry["reminders"] = clean_reminders
+        # Surface stored reasoning text on assistant messages for UI
+        # rehydration (page-refresh path).  Sourced from the in-memory
+        # ``_provider_content`` lane on ``session.messages`` (set
+        # post-commit at ``session.py:3768-3771``).  The lane itself is
+        # never copied into ``entry`` — the wire payload stays tight.
+        if msg.get("role") == "assistant" and persist_reasoning:
+            reasoning_text = _extract_reasoning_text(msg.get("_provider_content"))
+            if reasoning_text:
+                entry["reasoning"] = reasoning_text
         if msg.get("tool_calls"):
             tc_entries: list[dict[str, Any]] = []
             for tc in msg["tool_calls"]:
