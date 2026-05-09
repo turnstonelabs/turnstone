@@ -180,6 +180,7 @@ PUBLIC_PATHS: frozenset[str] = frozenset(
         "/metrics",
         "/openapi.json",
         "/docs",
+        "/logout",
         "/api/auth/login",
         "/api/auth/logout",
         "/api/auth/status",
@@ -1138,7 +1139,9 @@ async def handle_auth_login(
     response = JSONResponse(resp_body)
     cookie_value = jwt_token if jwt_token else body.get("token", "")
     if cookie_value:
-        response.headers["Set-Cookie"] = make_set_cookie(cookie_value, secure=secure, cookie_name=cookie_name)
+        response.headers["Set-Cookie"] = make_set_cookie(
+            cookie_value, secure=secure, cookie_name=cookie_name
+        )
     return response
 
 
@@ -1284,13 +1287,13 @@ async def handle_auth_setup(
     secure = is_secure_request(dict(request.headers), request.url.scheme)
     response = JSONResponse(resp_body)
     if jwt_token:
-        response.headers["Set-Cookie"] = make_set_cookie(jwt_token, secure=secure, cookie_name=cookie_name)
+        response.headers["Set-Cookie"] = make_set_cookie(
+            jwt_token, secure=secure, cookie_name=cookie_name
+        )
     return response
 
 
-async def handle_auth_whoami(
-    request: Request, cookie_name: str = AUTH_COOKIE
-) -> Response:
+async def handle_auth_whoami(request: Request, cookie_name: str = AUTH_COOKIE) -> Response:
     """Shared ``GET /api/auth/whoami`` handler — return authenticated user info.
 
     Includes the JWT ``exp`` claim (epoch seconds) so the frontend can
@@ -1424,7 +1427,9 @@ async def handle_auth_refresh(
 
     response = JSONResponse(resp_body)
     secure = is_secure_request(dict(request.headers), request.url.scheme)
-    response.headers["Set-Cookie"] = make_set_cookie(new_token, secure=secure, cookie_name=cookie_name)
+    response.headers["Set-Cookie"] = make_set_cookie(
+        new_token, secure=secure, cookie_name=cookie_name
+    )
     return response
 
 
@@ -1683,5 +1688,7 @@ async def handle_oidc_callback(
     response = RedirectResponse("/?oidc_success=1", status_code=302)
     if jwt_token:
         secure = is_secure_request(dict(request.headers), request.url.scheme)
-        response.headers["Set-Cookie"] = make_set_cookie(jwt_token, secure=secure, cookie_name=cookie_name)
+        response.headers["Set-Cookie"] = make_set_cookie(
+            jwt_token, secure=secure, cookie_name=cookie_name
+        )
     return response

@@ -1581,6 +1581,7 @@ async def auth_logout(request: Request) -> Response:
 async def logout_page(request: Request) -> Response:
     """GET /logout — clear auth cookie and redirect to home."""
     from starlette.responses import RedirectResponse
+
     from turnstone.core.auth import make_clear_cookie
 
     response = RedirectResponse("/?logout=1", status_code=302)

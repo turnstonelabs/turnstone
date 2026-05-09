@@ -8,7 +8,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from turnstone.core.auth import (
-    AUTH_COOKIE,
     AUTH_COOKIE_CONSOLE,
     AUTH_COOKIE_SERVER,
     WRITE_PATHS,
@@ -70,6 +69,9 @@ class TestIsPublicPath:
 
     def test_v1_api_logout_public(self):
         assert is_public_path("/v1/api/auth/logout") is True
+
+    def test_logout_page_public(self):
+        assert is_public_path("/logout") is True
 
     def test_v1_api_workstreams_not_public(self):
         assert is_public_path("/v1/api/workstreams") is False
@@ -1187,7 +1189,7 @@ class TestServerLogin:
             "/v1/api/auth/login",
             json={"username": "testuser", "password": "testpass"},
         )
-        resp = self.test_client.get("/logout")
+        resp = self.test_client.get("/logout", follow_redirects=False)
         assert resp.status_code == 302
         assert resp.headers.get("location") == "/?logout=1"
         cookie = resp.headers.get("set-cookie", "")
@@ -1283,7 +1285,7 @@ class TestConsoleLogin:
             "/v1/api/auth/login",
             json={"username": "testuser", "password": "testpass"},
         )
-        resp = self.test_client.get("/logout")
+        resp = self.test_client.get("/logout", follow_redirects=False)
         assert resp.status_code == 302
         assert resp.headers.get("location") == "/?logout=1"
         cookie = resp.headers.get("set-cookie", "")
