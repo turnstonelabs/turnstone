@@ -14,6 +14,12 @@ from turnstone.core.session import ChatSession
 class NullUI:
     """UI adapter that discards all output."""
 
+    def on_turn_start(self):
+        pass
+
+    def on_turn_committed(self):
+        pass
+
     def on_thinking_start(self):
         pass
 

@@ -297,6 +297,49 @@ def test_extra_fields_ignored():
     assert e.text == "hi"
 
 
+def test_in_progress_snapshot_event_round_trip():
+    from turnstone.sdk.events import InProgressSnapshotEvent
+
+    payload = {
+        "type": "in_progress_snapshot",
+        "ws_id": "ws1",
+        "content": "Partial content...",
+        "reasoning": "Partial reasoning...",
+    }
+    e = ServerEvent.from_dict(payload)
+    assert isinstance(e, InProgressSnapshotEvent)
+    assert e.ws_id == "ws1"
+    assert e.content == "Partial content..."
+    assert e.reasoning == "Partial reasoning..."
+
+
+def test_in_progress_snapshot_event_strips_internal_seq():
+    """``_seq`` is server-internal plumbing — even if a stray copy
+    leaks through, ``from_dict`` must drop it (not a declared field)."""
+    from turnstone.sdk.events import InProgressSnapshotEvent
+
+    e = ServerEvent.from_dict(
+        {
+            "type": "in_progress_snapshot",
+            "ws_id": "ws1",
+            "content": "x",
+            "reasoning": "",
+            "_seq": 42,
+        }
+    )
+    assert isinstance(e, InProgressSnapshotEvent)
+    assert not hasattr(e, "_seq")
+
+
+def test_state_change_event_round_trip():
+    from turnstone.sdk.events import StateChangeEvent
+
+    e = ServerEvent.from_dict({"type": "state_change", "ws_id": "ws1", "state": "thinking"})
+    assert isinstance(e, StateChangeEvent)
+    assert e.state == "thinking"
+    assert e.ws_id == "ws1"
+
+
 def test_missing_type_defaults_to_base():
     e = ServerEvent.from_dict({"ws_id": "ws1"})
     assert type(e) is ServerEvent

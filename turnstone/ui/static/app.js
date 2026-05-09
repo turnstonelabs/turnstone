@@ -480,6 +480,49 @@ Pane.prototype.handleEvent = function (evt) {
       this.scrollToBottom(true);
       break;
 
+    case "in_progress_snapshot":
+      // One-shot replay of the in-progress turn's reasoning + content
+      // when this client connects mid-stream (page refresh while the
+      // model is generating).  Both fields may be empty; render only
+      // the non-empty halves.  Idempotent on EventSource auto-reconnect:
+      // skip overwrite when the current buffer is already at-or-past
+      // the snapshot length, so a stale replay can't reset the live-
+      // streamed view back to a shorter prefix.
+      this.removeThinkingIndicator();
+      if (evt.reasoning) {
+        if (!this.currentReasoningEl) {
+          this.currentReasoningEl = document.createElement("div");
+          this.currentReasoningEl.className = "msg reasoning";
+          this.messagesEl.appendChild(this.currentReasoningEl);
+        }
+        var curReason = this.currentReasoningEl.textContent || "";
+        if (curReason.length < evt.reasoning.length) {
+          this.currentReasoningEl.textContent = evt.reasoning;
+        }
+      }
+      if (evt.content) {
+        // Content snapshot supersedes any reasoning bubble — matches
+        // the "case content" invariant of clearing currentReasoningEl
+        // when content begins.
+        if (this.currentReasoningEl) {
+          this.currentReasoningEl = null;
+        }
+        if (!this.currentAssistantEl) {
+          this.currentAssistantEl = document.createElement("div");
+          this.currentAssistantEl.className = "msg assistant";
+          this.currentAssistantBodyEl = document.createElement("div");
+          this.currentAssistantBodyEl.className = "msg-body";
+          this.currentAssistantEl.appendChild(this.currentAssistantBodyEl);
+          this.messagesEl.appendChild(this.currentAssistantEl);
+        }
+        if (this.contentBuffer.length < evt.content.length) {
+          this.contentBuffer = evt.content;
+          streamingRender(this.currentAssistantBodyEl, this.contentBuffer);
+        }
+      }
+      this.scrollToBottom();
+      break;
+
     case "state_change":
       if (evt.state === "idle" || evt.state === "error") {
         this.setBusy(false);

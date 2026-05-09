@@ -872,3 +872,351 @@ def test_concurrent_enqueue_and_listener_registration() -> None:
     # intent survives optimization-mode assertion stripping.
     assert not producer.is_alive()
     assert all(not s.is_alive() for s in subscribers)
+
+
+# ---------------------------------------------------------------------------
+# Per-turn inflight buffers — SSE refresh-resume snapshot path
+# ---------------------------------------------------------------------------
+
+
+def test_on_content_token_writes_to_both_buffers() -> None:
+    """``on_content_token`` writes to the multi-turn buffer (IDLE
+    piggyback) AND the per-turn inflight buffer (SSE snapshot)."""
+    ui = _make_ui()
+    ui.on_content_token("hello")
+    assert ui._ws_turn_content == ["hello"]
+    assert ui._ws_inflight_content == ["hello"]
+    assert ui._ws_inflight_seq == 1
+
+
+def test_on_reasoning_token_writes_to_inflight_buffer_only() -> None:
+    """Reasoning has no multi-turn IDLE piggyback — only the inflight
+    buffer + the seq counter."""
+    ui = _make_ui()
+    ui.on_reasoning_token("thinking...")
+    assert ui._ws_inflight_reasoning == ["thinking..."]
+    assert ui._ws_inflight_seq == 1
+    # Multi-turn buffer is content-only and untouched by reasoning.
+    assert ui._ws_turn_content == []
+
+
+def test_inflight_seq_increments_only_on_actual_append() -> None:
+    """Cap-hit content tokens do NOT bump the seq — preserves the
+    invariant that every ``_seq`` corresponds to a buffered fragment.
+    Cap-hit live events get the prior seq and are dropped by the
+    snapshot dedup filter on refresh (matches the multi-turn cap
+    behaviour today: capped tokens not visible to refresh)."""
+    from turnstone.core.session_ui_base import _MAX_TURN_CONTENT_CHARS
+
+    ui = _make_ui()
+    chunk = "x" * 1024
+    while ui._ws_inflight_content_size < _MAX_TURN_CONTENT_CHARS:
+        ui.on_content_token(chunk)
+    seq_at_cap = ui._ws_inflight_seq
+    # Cap-hit token: seq must NOT increment.
+    ui.on_content_token(chunk)
+    assert ui._ws_inflight_seq == seq_at_cap
+    assert ui._ws_inflight_content_size <= _MAX_TURN_CONTENT_CHARS + len(chunk)
+
+
+def test_on_turn_committed_resets_inflight_after_commit() -> None:
+    """``on_turn_committed`` fires immediately after each
+    ``messages.append(assistant_msg)`` in the send loop. Without it,
+    the inflight buffer keeps the just-committed turn's content
+    during the post-commit tool-execution window — and a refresh in
+    that window would show the assistant turn TWICE (history list
+    + in_progress_snapshot)."""
+    ui = _make_ui()
+    ui.on_content_token("Just-finished turn ")
+    ui.on_reasoning_token("Reasoning for the turn ")
+    # Sanity: buffer is populated pre-commit.
+    assert ui._ws_inflight_content == ["Just-finished turn "]
+    assert ui._ws_inflight_reasoning == ["Reasoning for the turn "]
+
+    ui.on_turn_committed()
+
+    # Inflight content + reasoning reset; seq stays monotonic.
+    assert ui._ws_inflight_content == []
+    assert ui._ws_inflight_reasoning == []
+    # Multi-turn buffer is NOT reset by commit (it drains at idle).
+    assert ui._ws_turn_content == ["Just-finished turn "]
+
+
+def test_inflight_snapshot_empty_during_post_commit_tool_window() -> None:
+    """Models the user-reported bug: refresh during a tool-execution
+    window between commit and the next stream. Pre-fix: snapshot has
+    the just-committed turn's text → double-renders against history.
+    Post-fix: snapshot is empty → no double-render. Seq stays
+    monotonic (carries the high-water mark across turn boundaries)."""
+    ui = _make_ui()
+    ui.on_content_token("Calling tool with these args: ")
+    seq_pre_commit = ui._ws_inflight_seq
+    ui.on_turn_committed()  # session.py fires this after messages.append
+    # We're now in the tool-execution window. A reconnecting client
+    # would call register_listener_with_in_progress_snapshot.
+    _, snap = ui.register_listener_with_in_progress_snapshot()
+    assert snap["content"] == ""
+    assert snap["reasoning"] == ""
+    # Seq did NOT reset — must remain monotonic across turns.
+    assert snap["seq"] == seq_pre_commit
+
+
+def test_on_turn_start_resets_inflight_content_and_reasoning() -> None:
+    """``on_turn_start`` clears the per-turn content + reasoning
+    buffers but does NOT touch the multi-turn ``_ws_turn_content``
+    (which the dashboard's IDLE-piggyback payload depends on) and
+    does NOT reset the seq counter (must remain monotonic across
+    turn boundaries — see ``test_inflight_seq_monotonic_across_turn_boundaries``)."""
+    ui = _make_ui()
+    ui.on_content_token("turn-1 ")
+    ui.on_reasoning_token("reasoning-1 ")
+    multi_pre = list(ui._ws_turn_content)
+    multi_pre_size = ui._ws_turn_content_size
+
+    ui.on_turn_start()
+
+    assert ui._ws_inflight_content == []
+    assert ui._ws_inflight_content_size == 0
+    assert ui._ws_inflight_reasoning == []
+    assert ui._ws_inflight_reasoning_size == 0
+    # Multi-turn untouched.
+    assert ui._ws_turn_content == multi_pre
+    assert ui._ws_turn_content_size == multi_pre_size
+
+
+def test_register_listener_with_in_progress_snapshot_empty() -> None:
+    ui = _make_ui()
+    lq, snap = ui.register_listener_with_in_progress_snapshot()
+    assert isinstance(lq, queue.Queue)
+    assert lq in ui._listeners
+    assert snap == {"content": "", "reasoning": "", "seq": 0}
+
+
+def test_register_listener_with_in_progress_snapshot_populated() -> None:
+    ui = _make_ui()
+    ui.on_content_token("Hello, ")
+    ui.on_content_token("world!")
+    ui.on_reasoning_token("planning a greeting")
+    lq, snap = ui.register_listener_with_in_progress_snapshot()
+    assert snap["content"] == "Hello, world!"
+    assert snap["reasoning"] == "planning a greeting"
+    # seq counts every successful append across BOTH buffers.
+    assert snap["seq"] == 3
+    # Listener is registered — later live tokens land in lq.
+    ui.on_content_token(" Goodbye.")
+    ev = lq.get_nowait()
+    assert ev["type"] == "content"
+    assert ev["text"] == " Goodbye."
+    assert ev["_seq"] == 4
+
+
+def test_register_listener_with_in_progress_snapshot_only_inflight_not_multi_turn() -> None:
+    """The snapshot reflects the in-progress turn only — anything
+    cleared by ``on_turn_start`` (a prior committed turn within the
+    same send) must NOT appear in the snapshot, even though the
+    multi-turn buffer still has it."""
+    ui = _make_ui()
+    ui.on_content_token("PRIOR_TURN ")
+    ui.on_turn_start()  # commit boundary — inflight reset
+    ui.on_content_token("CURRENT")
+    _, snap = ui.register_listener_with_in_progress_snapshot()
+    assert snap["content"] == "CURRENT"
+    # Multi-turn buffer still has both turns (drives the IDLE piggyback).
+    assert "".join(ui._ws_turn_content) == "PRIOR_TURN CURRENT"
+
+
+def test_seq_filter_dedup_round_trip() -> None:
+    """End-to-end dedup invariant: every token appears exactly once
+    when reconstructing from snapshot + listener queue under live
+    writes that race the registration. Models the events handler."""
+    ui = _make_ui()
+    for ch in "abcde":
+        ui.on_content_token(ch)
+    lq, snap = ui.register_listener_with_in_progress_snapshot()
+    for ch in "fgh":
+        ui.on_content_token(ch)
+
+    reconstructed = snap["content"]
+    while True:
+        try:
+            ev = lq.get_nowait()
+        except queue.Empty:
+            break
+        if ev.get("_seq", 0) <= snap["seq"]:
+            continue
+        reconstructed += ev["text"]
+    assert reconstructed == "abcdefgh"
+
+
+def test_seq_filter_drops_overlap_when_register_lands_after_writer() -> None:
+    """Race: writer appends + emits while a second register snapshots
+    after the writer. The live event has _seq <= snap.seq → must be
+    dropped to avoid double-render."""
+    ui = _make_ui()
+    # Register a first listener so the writer's enqueue lands somewhere.
+    lq1, _ = ui.register_listener_with_in_progress_snapshot()
+    ui.on_content_token("X")
+    # Second register snapshots AFTER the write — snap has "X" AND
+    # the writer's enqueue is in lq1.
+    _, snap2 = ui.register_listener_with_in_progress_snapshot()
+    assert snap2["content"] == "X"
+    # Drain lq1 with the filter against snap2.seq — duplicate dropped.
+    duped: list[str] = []
+    while True:
+        try:
+            ev = lq1.get_nowait()
+        except queue.Empty:
+            break
+        if ev.get("_seq", 0) <= snap2["seq"]:
+            continue
+        duped.append(ev["text"])
+    assert duped == []
+
+
+def test_inflight_seq_monotonic_across_turn_boundaries() -> None:
+    """Regression: a subscriber registered mid-turn-N must still
+    receive turn N+1's tokens. The seq counter is monotonic across
+    turn boundaries — resetting it at on_turn_committed/on_turn_start
+    would silently drop turn N+1's first M tokens (M = the snap_seq
+    captured mid-turn-N) via the events handler's `seq <= snap_seq`
+    filter."""
+    ui = _make_ui()
+    # Turn N: stream tokens, register a listener mid-turn.
+    ui.on_content_token("turn-N tok1 ")
+    ui.on_content_token("turn-N tok2 ")
+    lq, snap = ui.register_listener_with_in_progress_snapshot()
+    snap_seq = snap["seq"]
+    assert snap_seq == 2
+    # Turn N completes, turn N+1 begins.
+    ui.on_turn_committed()
+    ui.on_turn_start()
+    # Turn N+1's first content token. With the q-1 fix, seq is
+    # monotonic (3), not reset to 1. The events handler's
+    # `seq <= snap_seq` filter must NOT swallow it.
+    ui.on_content_token("turn-N+1 tok1 ")
+    ev = lq.get_nowait()
+    assert ev["type"] == "content"
+    assert ev["text"] == "turn-N+1 tok1 "
+    assert ev["_seq"] > snap_seq, (
+        f"Token from turn N+1 has _seq={ev['_seq']} which is <= "
+        f"snap_seq={snap_seq} — the events handler's dedup filter "
+        f"would silently drop it on a long-lived SSE subscription."
+    )
+
+
+def test_snapshot_and_consume_drains_inflight_at_idle() -> None:
+    """Regression for the cancel/error path: ``on_turn_committed`` is
+    NOT called from cancel handlers, but every exit path eventually
+    fires ``_emit_state("idle")`` (cancel) or ``_emit_state("error")``
+    (exception). The IDLE/ERROR branches of
+    ``snapshot_and_consume_state_payload`` must drain the inflight
+    buffers so a refresh post-cancel doesn't double-render the
+    cancelled fragment against history's marker'd version."""
+    ui = _make_ui()
+    ui.on_content_token("partial cancelled text ")
+    ui.on_reasoning_token("partial reasoning ")
+    assert ui._ws_inflight_content_size > 0
+    assert ui._ws_inflight_reasoning_size > 0
+
+    ui.snapshot_and_consume_state_payload("idle")
+
+    assert ui._ws_inflight_content == []
+    assert ui._ws_inflight_content_size == 0
+    assert ui._ws_inflight_reasoning == []
+    assert ui._ws_inflight_reasoning_size == 0
+
+
+def test_snapshot_and_consume_drains_inflight_at_error() -> None:
+    """Regression for the exception path: ERROR-branch must drain
+    inflight too (parallel to the IDLE branch)."""
+    ui = _make_ui()
+    ui.on_content_token("partial errored text ")
+    ui.on_reasoning_token("partial errored reasoning ")
+
+    ui.snapshot_and_consume_state_payload("error")
+
+    assert ui._ws_inflight_content == []
+    assert ui._ws_inflight_reasoning == []
+
+
+def test_snapshot_and_consume_does_not_reset_seq_at_idle_or_error() -> None:
+    """The IDLE/ERROR drain clears content + reasoning but must NOT
+    reset the seq counter — long-lived subscribers' snap_seq must
+    stay valid across turn boundaries (see the q-1 invariant test)."""
+    ui = _make_ui()
+    ui.on_content_token("a")
+    ui.on_content_token("b")
+    assert ui._ws_inflight_seq == 2
+
+    ui.snapshot_and_consume_state_payload("idle")
+    assert ui._ws_inflight_seq == 2
+
+    ui.snapshot_and_consume_state_payload("error")
+    assert ui._ws_inflight_seq == 2
+
+
+def test_listeners_share_dict_reference_warning() -> None:
+    """Pinning the shape that necessitated the events-handler shallow
+    copy: ``_enqueue`` puts ONE dict reference into every listener
+    queue. If multiple SSE coroutines mutate (e.g. ``del event[\"_seq\"]``)
+    without copying first, they corrupt each other's view. The fix
+    in make_events_handler is ``event = dict(event)`` immediately
+    after ``client_queue.get`` — verify the underlying invariant
+    here so a future refactor of ``_enqueue`` can't silently break
+    the assumption the events handler relies on."""
+    ui = _make_ui()
+    lq1, _ = ui.register_listener_with_in_progress_snapshot()
+    lq2, _ = ui.register_listener_with_in_progress_snapshot()
+    ui.on_content_token("X")
+    ev1 = lq1.get_nowait()
+    ev2 = lq2.get_nowait()
+    # Same reference today — consumers MUST shallow-copy before any
+    # mutation. If a future _enqueue change makes this no longer
+    # true, the events handler's defensive copy becomes redundant
+    # but harmless; if this assertion suddenly fails the underlying
+    # invariant has shifted and the handler comment should be updated.
+    assert ev1 is ev2
+
+
+def test_concurrent_writer_and_register_with_snapshot_no_loss_no_dup() -> None:
+    """Stress: many tokens streaming + a register_with_snapshot landing
+    at a random point. End state: snapshot ∪ filtered_live == every
+    token written, exactly once."""
+    ui = _make_ui()
+    n_tokens = 500
+    snap_box: dict[str, Any] = {}
+    lq_box: dict[str, queue.Queue[Any]] = {}
+
+    def _writer() -> None:
+        for i in range(n_tokens):
+            ui.on_content_token(f"{i},")
+
+    def _registrar() -> None:
+        # Tiny sleep so the writer is mid-flight.
+        threading.Event().wait(0.001)
+        lq, snap = ui.register_listener_with_in_progress_snapshot()
+        snap_box["snap"] = snap
+        lq_box["lq"] = lq
+
+    w = threading.Thread(target=_writer)
+    r = threading.Thread(target=_registrar)
+    w.start()
+    r.start()
+    w.join()
+    r.join()
+
+    snap = snap_box["snap"]
+    lq = lq_box["lq"]
+    reconstructed = snap["content"]
+    while True:
+        try:
+            ev = lq.get_nowait()
+        except queue.Empty:
+            break
+        if ev.get("_seq", 0) <= snap["seq"]:
+            continue
+        reconstructed += ev["text"]
+    expected = "".join(f"{i}," for i in range(n_tokens))
+    assert reconstructed == expected, (
+        f"reconstruction mismatch: len(rec)={len(reconstructed)}, len(exp)={len(expected)}"
+    )
