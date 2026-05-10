@@ -1652,11 +1652,15 @@ async def command(request: Request) -> JSONResponse:
             if history:
                 ui._enqueue({"type": "history", "messages": history})
         elif cmd_word in ("/rewind", "/retry"):
-            # Refresh frontend with truncated history
+            # Refresh frontend with truncated history. Always emit the
+            # history event even when empty: editing the first message
+            # rewinds to zero messages, and the frontend dispatches the
+            # queued edit-and-resend from the history handler — skipping
+            # the event on an empty list orphans `_pendingEditSend` and
+            # leaves the composer stuck in busy.
             ui._enqueue({"type": "clear_ui"})
             history = await asyncio.to_thread(_build_history, ws.session)
-            if history:
-                ui._enqueue({"type": "history", "messages": history})
+            ui._enqueue({"type": "history", "messages": history})
             # Audit trail
             storage = getattr(request.app.state, "auth_storage", None)
             if storage:
