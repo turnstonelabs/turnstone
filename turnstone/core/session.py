@@ -599,6 +599,45 @@ _REASONING_BEARING_BLOCK_TYPES: frozenset[str] = frozenset(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Backend boundary exception classification
+# ---------------------------------------------------------------------------
+#
+# ``_record_fatal_error`` routes a fatal exception through
+# ``_format_backend_error`` (defined on :class:`ChatSession`) which
+# matches the exception's class name against the sets below.  Matching
+# by name keeps the helper free of httpx / openai / anthropic imports —
+# the three SDKs each define their own subclasses, but the names
+# (``ReadTimeout``, ``APITimeoutError``, …) are stable across them and
+# the OpenAI and Anthropic SDKs use the same names.
+#
+# Lifted to module scope (rather than ``ClassVar`` constants on
+# ``ChatSession``) so the test suite can bind ``_format_backend_error``
+# to lightweight stubs that don't subclass the session — keeping the
+# helper testable without the full ChatSession construction surface
+# (storage init, prompt composition, registry plumbing).
+
+_BACKEND_TIMEOUT_EXC_NAMES: frozenset[str] = frozenset(
+    {"ReadTimeout", "WriteTimeout", "PoolTimeout", "APITimeoutError"}
+)
+_BACKEND_CONNECT_EXC_NAMES: frozenset[str] = frozenset(
+    {"ConnectTimeout", "ConnectError", "APIConnectionError"}
+)
+_BACKEND_NOT_FOUND_EXC_NAMES: frozenset[str] = frozenset({"NotFoundError"})
+_BACKEND_AUTH_EXC_NAMES: frozenset[str] = frozenset(
+    {"AuthenticationError", "PermissionDeniedError"}
+)
+_BACKEND_RATE_LIMIT_EXC_NAMES: frozenset[str] = frozenset({"RateLimitError"})
+
+_BACKEND_KNOWN_EXC_NAMES: frozenset[str] = (
+    _BACKEND_TIMEOUT_EXC_NAMES
+    | _BACKEND_CONNECT_EXC_NAMES
+    | _BACKEND_NOT_FOUND_EXC_NAMES
+    | _BACKEND_AUTH_EXC_NAMES
+    | _BACKEND_RATE_LIMIT_EXC_NAMES
+)
+
+
 class SessionUI(Protocol):
     def on_turn_start(self) -> None: ...
     def on_turn_committed(self) -> None: ...
@@ -2536,10 +2575,20 @@ class ChatSession:
         whose ``str()`` carries the credentials verbatim, and they'd
         otherwise land in (a) the dashboard via ``on_error`` and (b)
         the coord LLM's prompt via inspect/wait.
+
+        Known backend boundary exceptions (httpx read/connect timeouts,
+        OpenAI/Anthropic SDK ``APITimeoutError`` / ``APIConnectionError``
+        / ``NotFoundError`` / ``AuthenticationError`` / ``RateLimitError``)
+        get rewritten into operator-actionable text that includes the
+        provider name, base URL, and model — the bare ``ReadTimeout:
+        timed out`` shape produced by ``f"{type(exc).__name__}: {exc}"``
+        leaves the user with no way to tell whether a model server hung,
+        the URL is wrong, or the model isn't loaded.  Unknown exceptions
+        fall through to the default formatting unchanged.
         """
         from turnstone.core.memory import persist_last_error, sanitize_error_text
 
-        raw = f"{type(exc).__name__}: {exc}"
+        raw = self._format_backend_error(exc) or f"{type(exc).__name__}: {exc}"
         safe = sanitize_error_text(raw)
         try:
             self.ui.on_error(safe)
@@ -2548,6 +2597,95 @@ class ChatSession:
         persist_last_error(self._ws_id, safe)
         self._has_persisted_error = True
         self._emit_state("error")
+
+    def _format_backend_error(self, exc: BaseException) -> str | None:
+        """Return an enriched message for known backend boundary errors.
+
+        Returns ``None`` for exceptions outside the recognised set so the
+        caller falls back to the bare ``f"{type(exc).__name__}: {exc}"``
+        shape.  Matching is by class name (see the
+        ``_BACKEND_*_EXC_NAMES`` sets above) so the same helper covers
+        httpx ``ReadTimeout`` / ``ConnectError``, OpenAI SDK
+        ``APITimeoutError`` / ``APIConnectionError`` /
+        ``NotFoundError`` / ``RateLimitError`` / ``AuthenticationError``,
+        and the Anthropic SDK equivalents (which share names).
+
+        Bad input (a ``base_url`` accessor that raises, a missing
+        ``_provider``) silently degrades to a ``"?"`` placeholder rather
+        than failing — this helper runs from the fatal-error path and
+        must never itself raise.  The returned text still goes through
+        :func:`sanitize_error_text` in the caller, so credentials in the
+        base URL are redacted before display / persist.
+        """
+        name = type(exc).__name__
+        if name not in _BACKEND_KNOWN_EXC_NAMES:
+            return None
+
+        # Pull backend identity — every branch swallows so a bad
+        # accessor on a partially-initialised session can't hide the
+        # original exception behind a NoneType error.
+        base_url = "?"
+        try:
+            raw_url = str(
+                getattr(self.client, "base_url", None)
+                or getattr(self.client, "_base_url", None)
+                or "?"
+            )
+            base_url = raw_url.split("?")[0].rstrip("/")
+        except Exception:
+            log.debug("session.fatal.base_url_lookup_failed", exc_info=True)
+        provider_label = "?"
+        try:
+            prov = self._provider
+            provider_label = (
+                getattr(prov, "provider_name", None) or type(prov).__name__ if prov else "?"
+            )
+        except Exception:
+            log.debug("session.fatal.provider_lookup_failed", exc_info=True)
+        model_label = self.model or self._model_alias or "?"
+        # Original exception text (often empty for httpx.ReadTimeout —
+        # the message is on the class name alone) — included as a
+        # "raw=" tail so operators reading logs can still grep the
+        # underlying SDK error.
+        raw_msg = str(exc).strip()
+        raw_tail = f" raw={raw_msg!r}" if raw_msg else ""
+
+        if name in _BACKEND_TIMEOUT_EXC_NAMES:
+            return (
+                f"Backend timeout ({name}): no response from {provider_label} "
+                f"at {base_url} for model={model_label}. "
+                f"The model server may be wedged — check it's accepting completion requests."
+                f"{raw_tail}"
+            )
+        if name in _BACKEND_CONNECT_EXC_NAMES:
+            return (
+                f"Backend unreachable ({name}): cannot reach {provider_label} "
+                f"at {base_url} for model={model_label}. "
+                f"Check the URL, that the server is running, and that this host can reach it."
+                f"{raw_tail}"
+            )
+        if name in _BACKEND_NOT_FOUND_EXC_NAMES:
+            return (
+                f"Backend reports model not loaded ({name}): {provider_label} "
+                f"at {base_url} has no model named '{model_label}'. "
+                f"Confirm the served model name matches the alias configuration "
+                f"(GET /v1/models on the backend lists what it actually has)."
+                f"{raw_tail}"
+            )
+        if name in _BACKEND_AUTH_EXC_NAMES:
+            return (
+                f"Backend rejected credentials ({name}): {provider_label} "
+                f"at {base_url} (model={model_label}). "
+                f"Check the API key configured for this model alias."
+                f"{raw_tail}"
+            )
+        if name in _BACKEND_RATE_LIMIT_EXC_NAMES:
+            return (
+                f"Backend rate-limited ({name}): {provider_label} "
+                f"at {base_url} (model={model_label})."
+                f"{raw_tail}"
+            )
+        return None  # unreachable — `name` is in _BACKEND_KNOWN_EXC_NAMES by construction
 
     def _provider_extra_params(
         self,
