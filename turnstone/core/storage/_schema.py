@@ -251,6 +251,76 @@ services = sa.Table(
 
 sa.Index("idx_services_type_heartbeat", services.c.service_type, services.c.last_heartbeat)
 
+
+# -- Postgres NOTIFY trigger on services -----------------------------------
+#
+# Producer side of the ``services`` channel that the console
+# ``NotifyDispatcher`` listens on for reactive node discovery.  Fires on
+# real registry changes (INSERT, DELETE, UPDATE that changes ``url`` or
+# ``metadata``) and stays quiet on heartbeat-only UPDATEs so the 30s × N
+# nodes heartbeat tick doesn't flood the channel.
+#
+# Declared in the schema (not just in migration 053) so the ``after_create``
+# DDL event installs the trigger any time ``metadata.create_all`` builds
+# the ``services`` table — covering fresh dev databases and the test
+# fixture path (``run_migrations=False``).  Migration 053 covers the
+# upgrade-on-existing-DB path; the two are mutually exclusive given the
+# ``create_tables = not run_migrations`` switch in ``init_storage``, so
+# neither double-installs.  SQLite has no equivalent — the in-process
+# notify fan-out and synthetic-sweep covers the dev path consumer-side.
+
+SERVICES_NOTIFY_TRIGGER_FN_NAME = "turnstone_notify_services"
+SERVICES_NOTIFY_TRIGGER_NAME = "services_notify"
+
+SERVICES_NOTIFY_TRIGGER_FN_SQL = f"""
+CREATE OR REPLACE FUNCTION {SERVICES_NOTIFY_TRIGGER_FN_NAME}() RETURNS trigger AS $$
+BEGIN
+    -- Skip heartbeat-only UPDATEs: same url and metadata, only
+    -- ``last_heartbeat`` changed.  ``register_service`` is an UPSERT
+    -- (on_conflict_do_update), so node restarts that change url or
+    -- metadata MUST still fire — only no-op heartbeat ticks stay
+    -- quiet.  IS NOT DISTINCT FROM treats NULLs as equal so a row
+    -- with NULL metadata before/after doesn't trip the diff.
+    IF TG_OP = 'UPDATE'
+       AND OLD.url IS NOT DISTINCT FROM NEW.url
+       AND OLD.metadata IS NOT DISTINCT FROM NEW.metadata THEN
+        RETURN NULL;
+    END IF;
+
+    PERFORM pg_notify(
+        'services',
+        json_build_object(
+            'service_type', COALESCE(NEW.service_type, OLD.service_type),
+            'service_id',   COALESCE(NEW.service_id,   OLD.service_id),
+            'op',           TG_OP
+        )::text
+    );
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+"""
+
+SERVICES_NOTIFY_TRIGGER_SQL = f"""
+CREATE TRIGGER {SERVICES_NOTIFY_TRIGGER_NAME}
+AFTER INSERT OR UPDATE OR DELETE ON services
+FOR EACH ROW EXECUTE FUNCTION {SERVICES_NOTIFY_TRIGGER_FN_NAME}();
+"""
+
+sa.event.listen(
+    services,
+    "after_create",
+    sa.DDL(SERVICES_NOTIFY_TRIGGER_FN_SQL).execute_if(  # type: ignore[no-untyped-call]
+        dialect="postgresql"
+    ),
+)
+sa.event.listen(
+    services,
+    "after_create",
+    sa.DDL(SERVICES_NOTIFY_TRIGGER_SQL).execute_if(  # type: ignore[no-untyped-call]
+        dialect="postgresql"
+    ),
+)
+
 # ---------------------------------------------------------------------------
 # Node metadata (per-node key/value with source tracking)
 # ---------------------------------------------------------------------------

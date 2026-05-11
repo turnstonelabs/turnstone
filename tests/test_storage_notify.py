@@ -42,7 +42,9 @@ class TestSqliteNotify:
             storage.notify("services", '{"op": "INSERT"}')
             got = _drain_until(stream, lambda n: n.payload == '{"op": "INSERT"}')
             assert got.channel == "services"
-            assert got.pid == 0
+            # ``pid`` is 0 on the SQLite synthetic path and the sending
+            # backend's PID on Postgres — both are valid notify shapes,
+            # so don't assert on the value here.
 
     def test_notify_filters_by_channel(self, storage):
         with storage.listen(["services"]) as stream:
@@ -68,12 +70,12 @@ class TestSqliteNotify:
         assert stream.poll(0.05) == []
         stream.close()
 
-    def test_synthetic_sweep_emits_after_interval(self, storage):
-        # Force a short sweep interval via direct attribute override —
-        # the production default (``_SQLITE_NOTIFY_SWEEP_INTERVAL``) is
-        # tuned for an idle dev backstop and is way too long for a test.
-        with storage.listen(["services"]) as stream:
-            stream._sweep_interval = 0.1
+    def test_synthetic_sweep_emits_after_interval(self, storage, _is_sqlite):
+        # Synthetic sweep is fundamentally SQLite-specific — the PG path
+        # uses real ``LISTEN``/``NOTIFY`` and has no sweep tick.  Gate
+        # so the test doesn't false-fail by waiting for a "sweep" notify
+        # that the PG stream will never produce.
+        with storage.listen(["services"], sweep_interval=0.1) as stream:
             # First poll: not yet at the interval, so likely empty.
             stream.poll(0.05)
             # Wait past the interval, then poll again — should emit a
@@ -99,6 +101,14 @@ def _is_postgres(storage):
     """Skip the wrapped test when the active backend isn't Postgres."""
     if storage.__class__.__name__ != "PostgreSQLBackend":
         pytest.skip("PostgreSQL-specific test")
+    return True
+
+
+@pytest.fixture
+def _is_sqlite(storage):
+    """Skip the wrapped test when the active backend isn't SQLite."""
+    if storage.__class__.__name__ != "SQLiteBackend":
+        pytest.skip("SQLite-specific test")
     return True
 
 
