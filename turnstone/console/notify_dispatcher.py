@@ -85,6 +85,14 @@ class NotifyDispatcher:
         self._dispatch_thread: threading.Thread | None = None
         self._dispatch_queue: queue.Queue[Notify | None] = queue.Queue(maxsize=_DISPATCH_QUEUE_MAX)
         self._drop_count = 0
+        # Set inside :meth:`_listener_loop` after each successful
+        # ``storage.listen`` open; cleared on disconnect.  Callers use
+        # :meth:`wait_until_ready` after :meth:`start` to block until the
+        # listener is actually listening (matters when the next caller
+        # action is a ``notify`` whose delivery requires the LISTEN to
+        # already be in place — e.g. tests, or any startup-path traffic
+        # that should be reactive from the first event).
+        self._listener_ready = threading.Event()
 
     @property
     def channels(self) -> list[str]:
@@ -127,6 +135,9 @@ class NotifyDispatcher:
                 return
             self._started = True
             self._stopping.clear()
+            # Clear ready so a stop/start cycle's wait_until_ready only
+            # returns True after the new listener has actually opened.
+            self._listener_ready.clear()
             self._listener_thread = threading.Thread(
                 target=self._listener_loop,
                 name="notify-dispatcher-listener",
@@ -143,6 +154,23 @@ class NotifyDispatcher:
             "notify_dispatcher.started",
             channels=self._channels,
         )
+
+    def wait_until_ready(self, timeout: float = 5.0) -> bool:
+        """Block until the listener has opened its stream, or ``timeout`` elapses.
+
+        Returns ``True`` when the listener is ready (``LISTEN`` issued
+        for every declared channel on PG; subscriber queues registered
+        on SQLite), ``False`` on timeout.  Cleared automatically on
+        disconnect — call again after a reconnect to wait for the next
+        successful reopen.
+
+        Doesn't replace :meth:`start` — call ``start()`` first, then
+        ``wait_until_ready()`` for the explicit sync point.  Production
+        startup typically doesn't need this (the first real event tends
+        to arrive well after the listener is up); tests use it to close
+        the start-vs-notify race window.
+        """
+        return self._listener_ready.wait(timeout=timeout)
 
     def stop(self, timeout: float = 5.0) -> None:
         """Signal shutdown and join the worker threads.
@@ -206,6 +234,12 @@ class NotifyDispatcher:
                     if reconcile_pending:
                         self._synthesize_reconcile()
                         reconcile_pending = False
+                    # Signal ``wait_until_ready`` callers that LISTEN is
+                    # in place (PG) / subscriber queues are bound
+                    # (SQLite).  Must come AFTER the synthesize so any
+                    # post-reconnect reconcile reaches handlers before
+                    # the caller assumes "fresh notifies will deliver".
+                    self._listener_ready.set()
                     while not self._stopping.is_set():
                         batch = stream.poll(_LISTENER_POLL_TIMEOUT)
                         for n in batch:
@@ -213,6 +247,7 @@ class NotifyDispatcher:
             except NotifyConnectionError as exc:
                 if self._stopping.is_set():
                     return
+                self._listener_ready.clear()
                 log.warning(
                     "notify_dispatcher.connection_lost",
                     error=str(exc),
@@ -225,6 +260,7 @@ class NotifyDispatcher:
             except Exception:
                 if self._stopping.is_set():
                     return
+                self._listener_ready.clear()
                 log.exception("notify_dispatcher.listener_unexpected_error")
                 reconcile_pending = True
                 if self._stopping.wait(backoff):
