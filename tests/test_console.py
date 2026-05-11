@@ -1562,6 +1562,147 @@ class TestConsoleProxy:
             assert sse_mock.await_count == 1
             assert sse_mock.await_args.kwargs.get("use_service_auth") is False
 
+    # -------------------------------------------------------------------
+    # Proxied auth endpoints — handled locally by the console, not
+    # forwarded to the upstream node.  See proxy_api's docstring (and the
+    # comment above _PROXY_AUTH_LOCAL_HANDLERS) for the JWT-audience
+    # reasoning.
+    # -------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        ("method", "path", "handler_name"),
+        [
+            ("POST", "auth/login", "auth_login"),
+            ("POST", "auth/logout", "auth_logout"),
+            ("POST", "auth/setup", "auth_setup"),
+            ("POST", "auth/refresh", "auth_refresh"),
+            ("GET", "auth/status", "auth_status"),
+            ("GET", "auth/whoami", "auth_whoami"),
+            ("GET", "auth/oidc/authorize", "oidc_authorize"),
+            ("GET", "auth/oidc/callback", "oidc_callback"),
+        ],
+    )
+    def test_proxy_auth_endpoint_dispatches_to_local_handler(
+        self, client, method, path, handler_name
+    ):
+        """Every entry in ``_PROXY_AUTH_LOCAL_HANDLERS`` must route to its
+        local console handler and never reach the upstream proxy.  The
+        lockout class of bug this dispatch was added to fix is exactly
+        what a regression here would reintroduce silently — covering all
+        eight branches keeps each path tied to its handler."""
+        from unittest.mock import AsyncMock, patch
+
+        from starlette.responses import JSONResponse
+
+        with (
+            patch(
+                f"turnstone.console.server.{handler_name}",
+                new_callable=AsyncMock,
+                return_value=JSONResponse({"status": "ok"}),
+            ) as local_mock,
+            patch(
+                "turnstone.console.server._proxy_post",
+                new_callable=AsyncMock,
+                return_value=JSONResponse({"status": "should-not-be-called"}),
+            ) as post_mock,
+            patch(
+                "turnstone.console.server._proxy_get",
+                new_callable=AsyncMock,
+                return_value=JSONResponse({"status": "should-not-be-called"}),
+            ) as get_mock,
+        ):
+            resp = client.request(method, f"/node/node-a/v1/api/{path}")
+            assert resp.status_code == 200
+            assert local_mock.await_count == 1
+            assert post_mock.await_count == 0
+            assert get_mock.await_count == 0
+
+    def test_proxy_auth_login_works_without_cookie(self, mock_collector):
+        """Without this fix the AuthMiddleware 401s before any handler
+        runs — the user is locked out of the proxied UI once the cookie
+        expires.  Test bypasses _TEST_AUTH_HEADERS to reproduce."""
+        from unittest.mock import AsyncMock, patch
+
+        from starlette.responses import JSONResponse
+        from starlette.testclient import TestClient
+
+        from turnstone.console.server import _load_static, create_app
+
+        _load_static()
+        app = create_app(collector=mock_collector, jwt_secret=_TEST_JWT_SECRET)
+        unauth_client = TestClient(app, raise_server_exceptions=False)
+        try:
+            with patch(
+                "turnstone.console.server.auth_login",
+                new_callable=AsyncMock,
+                return_value=JSONResponse({"status": "ok"}),
+            ) as local_mock:
+                resp = unauth_client.post(
+                    "/node/node-a/v1/api/auth/login",
+                    json={"username": "x", "password": "y"},
+                )
+                # AuthMiddleware must classify the proxied login path as
+                # public (is_public_path change) AND proxy_api must
+                # dispatch to the local handler (proxy_api change).
+                assert resp.status_code == 200, (
+                    f"login locked out: got {resp.status_code}, body={resp.text}"
+                )
+                assert local_mock.await_count == 1
+        finally:
+            unauth_client.close()
+
+    def test_proxy_auth_wrong_method_returns_405_not_forwarded(self, client):
+        """A non-canonical method on an auth path (e.g. PUT on auth/login)
+        must short-circuit with 405 instead of falling through to the
+        upstream proxy — falling through would forward the request
+        authenticated as the console's service token (``_proxy_auth_headers``
+        fallback)."""
+        from unittest.mock import AsyncMock, patch
+
+        from starlette.responses import JSONResponse
+
+        with (
+            patch(
+                "turnstone.console.server._proxy_post",
+                new_callable=AsyncMock,
+                return_value=JSONResponse({"status": "should-not-be-called"}),
+            ) as post_mock,
+            patch(
+                "turnstone.console.server._proxy_get",
+                new_callable=AsyncMock,
+                return_value=JSONResponse({"status": "should-not-be-called"}),
+            ) as get_mock,
+        ):
+            # PUT on a POST-only auth path → 405
+            put_resp = client.put("/node/node-a/v1/api/auth/login")
+            assert put_resp.status_code == 405
+            # POST on a GET-only auth path → 405
+            post_resp = client.post("/node/node-a/v1/api/auth/status")
+            assert post_resp.status_code == 405
+            assert post_mock.await_count == 0
+            assert get_mock.await_count == 0
+
+    def test_proxy_non_auth_endpoint_still_forwarded(self, client, mock_collector):
+        """Sanity: only auth/* paths intercept.  Other API paths still
+        forward to the upstream node."""
+        from unittest.mock import AsyncMock, patch
+
+        from starlette.responses import JSONResponse
+
+        mock_collector.get_node_detail.return_value = {
+            "node_id": "node-a",
+            "server_url": "http://a:8080",
+            "reachable": True,
+        }
+        with patch(
+            "turnstone.console.server._proxy_get",
+            new_callable=AsyncMock,
+            return_value=JSONResponse({"ok": True}),
+        ) as proxy_mock:
+            resp = client.get("/node/node-a/v1/api/workstreams")
+            assert resp.status_code == 200
+            assert proxy_mock.await_count == 1
+
 
 # ---------------------------------------------------------------------------
 # Proxy URL rewriting unit tests (no HTTP needed)

@@ -2636,10 +2636,77 @@ async def proxy_shared_static(request: Request) -> Response:
         return JSONResponse({"error": "Node unreachable"}, status_code=502)
 
 
+# Paths the console handles locally instead of forwarding to the upstream
+# node.  Tests parametrize against this set so a new dispatch branch
+# can't be added without a matching test.  Keep in lockstep with the
+# ``proxy_api`` dispatch chain below.
+_PROXY_AUTH_LOCAL_PATHS: frozenset[str] = frozenset(
+    {
+        "auth/login",
+        "auth/logout",
+        "auth/setup",
+        "auth/refresh",
+        "auth/status",
+        "auth/whoami",
+        "auth/oidc/authorize",
+        "auth/oidc/callback",
+    }
+)
+
+
 async def proxy_api(request: Request) -> Response:
-    """Proxy API requests to target node. Detects SSE vs regular."""
+    """Proxy API requests to target node, with two exceptions handled in-process:
+
+    1. ``auth/*`` endpoints in ``_PROXY_AUTH_LOCAL_PATHS`` are dispatched
+       to the console's own auth handlers so JWTs carry
+       ``JWT_AUD_CONSOLE`` and Set-Cookie lands on the console origin.
+       Forwarding upstream would mint ``JWT_AUD_SERVER`` tokens that the
+       console's ``AuthMiddleware`` rejects on the next proxied call,
+       locking the user out of the proxied UI — and ``_proxy_post``
+       drops Set-Cookie when forwarding anyway.  ``refresh`` and
+       ``whoami`` are intentionally NOT in ``PUBLIC_PATHS`` (caller must
+       still hold a valid cookie); local dispatch is about cookie-origin
+       and audience, not public access.
+    2. SSE endpoints (per-ws + global events) stream via ``_proxy_sse``.
+
+    Everything else is forwarded to ``server_url`` via ``_proxy_post`` /
+    ``_proxy_get``.
+    """
     node_id = request.path_params["node_id"]
     path = request.path_params["path"]
+
+    # Local auth dispatch.  Each branch reads its handler from module
+    # scope at call time, so ``patch("...auth_login")`` in tests works
+    # transparently.  Keep entries in lockstep with ``_PROXY_AUTH_LOCAL_PATHS``.
+    if request.method == "POST":
+        if path == "auth/login":
+            return await auth_login(request)
+        if path == "auth/logout":
+            return await auth_logout(request)
+        if path == "auth/setup":
+            return await auth_setup(request)
+        if path == "auth/refresh":
+            return await auth_refresh(request)
+    elif request.method == "GET":
+        if path == "auth/status":
+            return await auth_status(request)
+        if path == "auth/whoami":
+            return await auth_whoami(request)
+        if path == "auth/oidc/authorize":
+            return await oidc_authorize(request)
+        if path == "auth/oidc/callback":
+            return await oidc_callback(request)
+    # Path matches a local-dispatch auth endpoint but the method does not:
+    # short-circuit with 405 so the request can't fall through to
+    # ``_proxy_post`` / ``_proxy_get`` and reach the upstream
+    # authenticated as the console's service token
+    # (``_proxy_auth_headers`` falls back to the service identity when
+    # there's no user context).  Harmless today because every upstream
+    # auth route 405s on the wrong method too, but kept tight so a
+    # future upstream patch can't widen the surface by accident.
+    if path in _PROXY_AUTH_LOCAL_PATHS:
+        return JSONResponse({"error": "Method not allowed"}, status_code=405)
+
     server_url = _get_server_url(request, node_id)
     if not server_url:
         return JSONResponse({"error": "Node not found"}, status_code=404)

@@ -513,7 +513,21 @@ def is_public_path(path: str) -> bool:
     normalized = _strip_version_prefix(path)
     if normalized in PUBLIC_PATHS:
         return True
-    return any(normalized.startswith(prefix) for prefix in PUBLIC_PREFIXES)
+    if any(normalized.startswith(prefix) for prefix in PUBLIC_PREFIXES):
+        return True
+    # Console proxy: a public proxied path is still public.  Without this
+    # the login/status/setup endpoints are unreachable from inside a
+    # ``/node/{id}/...`` proxied page once the cookie expires — the
+    # AuthMiddleware 401s the login POST before any handler runs and the
+    # user is locked out of the proxied UI.
+    if normalized.startswith("/node/"):
+        proxied = _extract_proxied_path(normalized)
+        if proxied is not None:
+            if proxied in PUBLIC_PATHS:
+                return True
+            if any(proxied.startswith(prefix) for prefix in PUBLIC_PREFIXES):
+                return True
+    return False
 
 
 def required_scope(method: str, path: str) -> str:
