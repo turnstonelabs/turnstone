@@ -1516,9 +1516,13 @@ class ChatSession:
         """
         if self._registry is None:
             return
-        aliases = sorted(self._registry.list_aliases())
-        if not aliases:
-            return
+        # Hide ``default`` from the alias list — the LLM reads the English
+        # word and picks it explicitly, which routes to whichever model
+        # carries that alias rather than the operator-configured per-role
+        # default (plan_alias / task_alias).  Omitting ``model=`` already
+        # selects the per-role default; offering the literal name as an
+        # alternative invites the bypass.
+        aliases = sorted(a for a in self._registry.list_aliases() if a != "default")
         aliases_str = ", ".join(f"`{a}`" for a in aliases)
 
         new_tools: list[dict[str, Any]] = []
@@ -1532,11 +1536,22 @@ class ChatSession:
             new_tool = copy.deepcopy(tool)
             props = new_tool.get("function", {}).get("parameters", {}).get("properties", {})
             if "model" in props:
-                props["model"]["description"] = (
-                    f"Optional model alias to run this {name} on. "
-                    f"Omit to use the operator-configured {kind}. "
-                    f"Available aliases: {aliases_str}."
-                )
+                # Always rewrite — a reload that filters down to no
+                # alternatives (only ``default`` remains in the registry)
+                # must clear any stale alias names left over from a prior
+                # render, not return early and leave them in place.
+                if aliases:
+                    props["model"]["description"] = (
+                        f"Optional model alias to run this {name} on. "
+                        f"Omit to use the operator-configured {kind}. "
+                        f"Available aliases: {aliases_str}."
+                    )
+                else:
+                    props["model"]["description"] = (
+                        f"Optional model alias to run this {name} on. "
+                        "Omit to use the current session model. "
+                        "(No alternative aliases configured in this session.)"
+                    )
             new_tools.append(new_tool)
         self._tools = new_tools
 
@@ -6151,9 +6166,39 @@ class ChatSession:
         alias = str(raw).strip()
         if not alias:
             return None, None
+        # ``default`` is operator-only — the alias either back-compat-shims
+        # a single-CLI-model registry or aliases a hand-named DB row, and
+        # in both cases an LLM that explicitly routes here bypasses the
+        # operator-configured ``plan_alias`` / ``task_alias`` per-role
+        # default.  Symmetric with the description filter at
+        # ``_render_agent_tool_descriptions`` — closes the loophole where
+        # an LLM that learned the alias name out-of-band (training data,
+        # prior turn, prompt injection) can re-issue it directly.
+        if alias == "default":
+            return None, {
+                "call_id": call_id,
+                "func_name": func_name,
+                "header": f"\u2717 {func_name}: 'default' is not selectable",
+                "preview": "",
+                "needs_approval": False,
+                "error": (
+                    "Error: 'default' is not a selectable model alias for "
+                    f"{func_name}. Omit `model=` to use the operator-configured "
+                    "per-role default."
+                ),
+            }
         if self._registry is None or not self._registry.has_alias(alias):
-            available = sorted(self._registry.list_aliases()) if self._registry is not None else []
-            available_str = ", ".join(available) if available else "(no registry configured)"
+            # ``default`` excluded from the retry list so an LLM probing
+            # with a bogus alias can't enumerate it back from the error.
+            if self._registry is None:
+                available_str = "(no registry configured)"
+            else:
+                available = sorted(a for a in self._registry.list_aliases() if a != "default")
+                available_str = (
+                    ", ".join(available)
+                    if available
+                    else "(no alternative aliases configured — omit `model=`)"
+                )
             return None, {
                 "call_id": call_id,
                 "func_name": func_name,
