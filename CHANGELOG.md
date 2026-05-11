@@ -8,12 +8,403 @@ version numbers (`X.Y.Z`, with `X.Y.ZaN` / `bN` / `rcN` for pre-releases).
 
 Three release tracks are maintained:
 
-- **`stable/1.0`** — patch-only (`v1.0.x`)
-- **`stable/1.3`** — patch-only (`v1.3.x`)
 - **`stable/1.4`** — patch-only (`v1.4.x`)
-- **`main`** — experimental (`v1.5.0aN`)
+- **`stable/1.5`** — patch-only (`v1.5.x`)
+- **`main`** — experimental (next major)
 
 ## [Unreleased]
+
+## [1.5.12]
+
+### Added
+
+- **Enriched backend error messages** — provider name and attempted URL are now
+  included in session error responses, so operators can triage connectivity
+  failures without enabling debug logging.
+
+### Fixed
+
+- **`/rewind` always emits a `history` SSE event** — pre-fix, if the session
+  had no messages remaining after a rewind the history event was skipped,
+  leaving connected UIs with stale content and blocking edit-and-resend flows.
+
+## [1.5.11]
+
+This release introduces one forward-only schema migration:
+`052_model_reasoning_persistence` — `surface_persisted_reasoning` and
+`replay_reasoning_to_model` flag columns on `model_definitions`.
+
+### Added
+
+- **SSE refresh-resume** — clients that reload mid-stream (browser refresh, tab
+  restore) now receive an `in_progress_snapshot` event carrying the buffered
+  partial response, so the UI can resume rendering the in-flight turn without
+  losing content. The snapshot is keyed by a monotonic `_ws_inflight_seq`
+  counter so a reconnecting client can skip events it already saw.
+- **Reasoning persistence** (Phases 1–4) — model reasoning text can now be
+  persisted to conversation history and optionally replayed to the model on
+  subsequent turns. Phase 1 persists reasoning text on the history payload.
+  Phase 2 wires a build-time shape filter and a per-model
+  `replay_reasoning_to_model` flag. Phases 3+4 add full OpenAI Responses API
+  (`include=["reasoning.encrypted_content"]`) and Chat Completions support;
+  an `ANTHROPIC_VALID_BLOCK_TYPES` shape filter guards the Anthropic path. Two
+  new per-model capability flags (`surface_persisted_reasoning`,
+  `replay_reasoning_to_model`) both default `False` on unknown and
+  local-server models.
+- **Console home composer: placeholders + toggle** — the console landing-page
+  composer now shows context-aware placeholder text and a toggle component for
+  advanced options; an admin polish pass tightened spacing and focus behaviour
+  across the form.
+
+### Changed
+
+- **`judge.model` now requires a named alias** — raw provider model IDs on
+  `judge.model` in config are no longer accepted; the judge must reference an
+  alias registered in the model registry. The session-provider raw-model
+  fallback is removed. Existing configs using an unregistered model ID need a
+  corresponding alias entry.
+
+### Fixed
+
+- **`replay_reasoning_to_model` AND-gated with model capability** — setting the
+  flag for a model that does not declare reasoning-replay support now silently
+  no-ops instead of forwarding reasoning blocks and triggering a provider error.
+- **Coordinator alias resolution unified across placeholder + factory** — a
+  placeholder coordinator and the real coordinator factory could previously
+  resolve to different model aliases, producing a visible mismatch in the model
+  display. Both paths now share the same resolution logic.
+- **Console `cs=None` fallback in `/v1/api/models` placeholder** — an
+  under-initialised coordinator state no longer 500s when the models endpoint
+  is hit before the coordinator subsystem is fully bootstrapped.
+- **SSE `_ws_inflight_seq` always advances** — sequence numbers were previously
+  skipped when an emit was past the buffer cap, leaving gaps in the monotonic
+  counter that broke `state_change` / `in_progress_snapshot` ordering on
+  reconnect.
+- **Reasoning persistence shape + replay fixes** — per-block
+  `ANTHROPIC_VALID_BLOCK_TYPES` filter applied; `reasoning_text` is now
+  synthesised alongside non-reasoning `provider_blocks` so both appear
+  together in the history payload.
+
+## [1.5.10]
+
+This release introduces one forward-only schema migration:
+`051_skill_notify_on_complete_array_default` — backfills
+`prompt_templates.notify_on_complete` from `'{}'` to `'[]'`.
+
+### Added
+
+- **Skills unlock action** — operators can unlock an installed skill to allow
+  local customisation. Once unlocked, the skill's resource content, system
+  prompt additions, and notify configuration are editable through the admin UI.
+  Skills shipped as part of a bundle remain locked (read-only) until explicitly
+  unlocked; the unlock is logged to the audit trail. A lock icon in the
+  top-right of the Skills detail pane doubles as the unlock trigger.
+
+### Fixed
+
+- **`skills.sh` install endpoint** — the install script was targeting an
+  endpoint removed in an earlier refactor; switched to `/api/download`.
+- **Skills `notify_on_complete` default** — the field defaulted to `{}`
+  (object) instead of `[]` (array), causing notify configurations to be
+  rejected at schema validation.
+- **Skills admin UI modal errors** — `.is-visible` class used consistently
+  instead of inline `style.display`; stale error text is cleared on submit;
+  designer-review lock-icon UX applied.
+
+## [1.5.9]
+
+### Fixed
+
+- **`repair=False` on all display-read `load_messages` call sites** —
+  passing `repair=True` on display paths was silently mutating the stored
+  message list, causing divergence between what the UI showed and what the
+  model received on the next turn.
+
+## [1.5.8]
+
+This release introduces two forward-only schema migrations:
+`049_mcp_oauth_schema` — OAuth token + consent tables for MCP servers;
+`050_conversations_source_and_reminders` — `_source` and `_reminders` columns
+on `conversations`.
+
+### Added
+
+- **MCP OAuth 2.1 + PKCE** — MCP servers that require OAuth can now be
+  configured with a client ID and secret through the admin UI. The full token
+  lifecycle (acquire → refresh → rotate) is managed automatically; tokens are
+  stored encrypted at rest using a key derived from the JWT secret. The consent
+  flow runs in-browser via a provider redirect. Rolled out in phases:
+
+  - Minimum admin form and OAuth schema (`21663d15`).
+  - Token-at-rest AES-GCM encryption layer (`a4c335d7`).
+  - Per-(user, server) OAuth 2.1 + PKCE flow (`b0f7029f`).
+  - Per-(user, server) `ClientSession` pool with OAuth dispatch (`1a1043c4`).
+  - SDK 401/403 introspection via httpx response hook (`bde09134`).
+  - Phase 7 — per-user tool catalog scoping: each user sees only the tools
+    their OAuth token is permitted to call (`cfc8a6c8`).
+  - Phase 7b — per-user resource + prompt pool dispatch (`b368bdee`).
+  - Phase 8 — per-user MCP consent UX: users see a consent dialog on first
+    use of an OAuth-gated server and can revoke consent from their profile;
+    admins see per-server consent counts in the MCP Servers tab (`61051339`).
+
+- **Metacognition NudgeQueue** — all advisory channels (repeat-tool nudges,
+  watch reminders, wake triggers) are unified into a pull-model `NudgeQueue`
+  that delivers at most one nudge per turn, preventing multi-channel pile-ups
+  that inflate context. Observable changes:
+
+  - Watch results carry metadata (watch ID, `valid_until`, trigger type)
+    through to the system message so the model can reason about recency.
+  - Coordinator idle-children observer: a coordinator with no in-flight
+    children for longer than the configured idle threshold receives a nudge.
+  - Wake trigger (`IdleNudgeWatcher`): sessions waiting on an external event
+    can be unblocked via `ChatSession.deliver_wake_nudge_from_queue`.
+  - Watch switchover: watch results are now enqueued on the `NudgeQueue`
+    rather than the previous `_watch_pending` list, giving them the same
+    delivery guarantees and priority handling as other advisories.
+
+- **Structured watch-result card** — the UI renders watch results as a styled
+  card with a system-nudge marker, distinct from the assistant message body.
+  On history replay, system-nudge turns are visually distinguished from normal
+  assistant turns.
+- **Side-channel persistence** — `_source` and `_reminders` side-channel
+  fields are persisted to the `conversations` storage table and restored on
+  session resume, so metacognitive context survives process restarts. A
+  `REMINDER_TEXT_STORAGE_CAP` byte clamp prevents unbounded growth.
+
+### Fixed
+
+- **Replay consistency** — queued user messages captured mid-loop are now
+  persisted and replayed in the correct order on a subsequent `events`
+  subscription. Coordinator history replay fixed: blank assistant cards and
+  out-of-order tool results on the coordinator tree no longer occur when the
+  coordinator has mixed queued + delivered messages.
+- **Session reminder preservation on fork + resume** — `_source` and
+  `_reminders` are carried through workstream fork and restored from storage
+  on resume.
+- **NUL-byte sanitization in storage** — PostgreSQL rejects `\x00` in text
+  columns; `_source` and `_reminders` now strip NUL bytes on write.
+- **Console coordinator subsystem bootstrap** — the coordinator subsystem is
+  now committed atomically on first model add; startup teardown is offloaded
+  to avoid blocking the event loop.
+- **MCP `asyncio.timeout` over `asyncio.wait_for`** — Python 3.11's
+  `wait_for` wraps the coroutine in a fresh task, breaking anyio's `aclose`
+  scope exit. Replaced with `async with asyncio.timeout(N)` for safe cleanup.
+- **MCP pool-reuse 401 recovery** — a reused `ClientSession` returning 401
+  now replaces the pool entry with a fresh session; the carrier token is
+  owned by the pool entry to prevent a race between the 401 handler and a
+  concurrent request.
+- **OIDC hardening** — multiple security and correctness fixes:
+  SSRF + plaintext credential exfil via discovery document (sec-1, sec-3);
+  `TURNSTONE_OIDC_REDIRECT_BASE` now required, Host-header fallback removed
+  (sec-2); atomic user + identity provisioning prevents orphan rows (bug-1);
+  callback robustness — typed exceptions, shape checks, log sanitization, JS
+  race (bug-4–6, sec-4); role-mapping concurrency serialized (bug-2, perf-1);
+  stranded-user self-heal on role-mapping failure (cumulative bug-1).
+
+## [1.5.7]
+
+### Added
+
+- **Inline node picker** — a compact node-switcher dropdown in the console
+  header replaces the "← Back to console" banner, so operators can switch
+  between nodes without a full navigation.
+
+### Fixed
+
+- **Queued user messages injected mid-loop** — messages queued while a
+  generation was in progress were not being delivered at the correct seam and
+  could be dropped or reordered when the worker consumed the queue.
+- **Search tool output bounded** — pathological inputs (very long lines with
+  no whitespace) could produce search results exceeding the context budget.
+  Output is now clamped before reaching the message.
+
+## [1.5.6]
+
+### Added
+
+- **`api_surface` toggle** — model definitions gain an `api_surface` field
+  (`"chat"` | `"responses"`) that selects which OpenAI-compatible API surface
+  the provider client uses. Enables Mistral Medium reasoning via the Responses
+  surface; Chat Completions remains the default for all other models.
+- **Healthy model aliases per node** — `GET /v1/api/cluster/nodes` now
+  includes a `healthy_aliases` list per node, so the coordinator and operators
+  can see which model aliases are currently reachable without a separate
+  per-model health probe.
+- **Plan/task agent settings in Models → Roles** — the Models admin tab's
+  Roles sub-tab gains `plan_agent` and `task_agent` rows so operators can
+  configure per-kind reasoning effort and alias overrides from the UI rather
+  than editing `config.toml`. Live-refresh dropdowns update in place when
+  model definitions change.
+
+### Fixed
+
+- **Memory candidate selection** — recall now uses OR-of-terms BM25 with
+  query-aware candidate-set selection, dramatically improving recall for
+  queries whose terms span multiple stored entries.
+- **Workstream model + config preserved on rehydrate** — reopening a closed
+  workstream no longer overwrites the model alias and per-workstream config
+  with session defaults.
+- **Console home composer: attachments + user-message pills** — multipart
+  attachments in the home composer were not forwarded correctly; user-message
+  pills in the coordinator chat pane were missing.
+
+## [1.5.5]
+
+### Fixed
+
+- **Saved-workstream tool result rendering** — tool results in closed
+  workstreams were not rendering on history replay. Audit-trail decoration for
+  tool calls is now applied on the replay path.
+
+## [1.5.4]
+
+### Added
+
+- **Stage 3 SessionManager Children primitive lift** — child workstreams are
+  first-class citizens in the cluster event bus. `child_ws_state` events are
+  pushed through the cluster SSE stream so the console tree view updates in
+  real time without polling. `list_children` and `get_child` primitives on
+  `SessionManager` provide a consistent cross-node view of the coordinator's
+  spawn tree.
+- **Multi-select delete for Saved Coordinators** — the Saved Coordinators grid
+  in the console admin panel now supports checkbox multi-select with a
+  bulk-delete action.
+
+## [1.5.3]
+
+This release introduces one forward-only schema migration:
+`048_workstream_reaper_index` — partial composite index on `workstreams` for
+the orphan-reaper query.
+
+### Fixed
+
+- **Coordinator orphan reaping scoped by heartbeat** — the session manager's
+  `close_idle` pass now scopes the DB-orphan reaper by
+  `services.last_heartbeat` so workstreams belonging to a live node are not
+  incorrectly reaped. `bulk_close_stale_orphans` and `touch_workstream`
+  storage primitives added; a partial composite index keeps the reaper scan
+  cheap.
+- **Coordinator pool idle cleanup** — a periodic task on the console now
+  closes coordinator pool entries whose session has gone idle past the
+  configurable threshold, preventing pool exhaustion on long-running consoles.
+
+## [1.5.2]
+
+### Added
+
+- **Metacognition themed reminder bubble** — repeat-tool and user-reminder
+  nudges are rendered as a distinct styled bubble rather than being injected
+  inline into the assistant message, making it easier to distinguish model
+  output from metacognitive annotations. The CLI REPL gains matching
+  `on_user_reminder` / `on_tool_reminder` callbacks.
+
+### Fixed
+
+- **Metacog streak detector** — the N≥3 sequential-same-call streak detector
+  now fires correctly on the third repetition; a write-success-clear that
+  reset the counter after a successful tool call (preventing streaks across
+  mixed-outcome sequences) was removed.
+- **Metacog reminders isolated to side-channel** — reminder text no longer
+  appears in the user content turn; it flows through a dedicated side-channel
+  the session injects into the system context, preventing the model from
+  attributing it to the user.
+
+## [1.5.1]
+
+### Added
+
+- **`pending_approval_detail` on child `ws_state` SSE events** — coordinators
+  now receive the child's pending approval detail in `child_ws_state` events,
+  enabling the coordinator to surface approval prompts without a separate poll.
+
+### Fixed
+
+- **Coordinator registry auto-refresh** — the console coordinator registry now
+  refreshes when model definitions change, so a newly added alias is visible
+  to coordinators without restarting.
+- **Coordinator fan-out default** — coordinators now fan out to independent
+  child workstreams by default instead of serialising them, matching the
+  documented contract for parallel-work patterns.
+- **`wait_for_workstream` message cap raised to 10 KiB** — large plan
+  summaries and tool results from child workstreams were silently truncated at
+  the previous 4 KiB cap.
+- **Coordinator SSE isolated on dedicated thread pool** — coordinator SSE
+  polling now runs on a dedicated 200-thread executor, matching interactive's
+  `sse_executor`, so coordinator long-poll blocking no longer contends with
+  storage and routing workers on the default pool.
+
+## [1.5.0]
+
+User-visible additions: a unified workstream HTTP surface (interactive and
+coordinator under one URL family), inline child approvals, coordinator
+composer parity, progressive rendering, OIDC authentication, MCP OAuth
+foundations, and a redesigned UI built on the Design System v1 token layer.
+
+This release removes the pre-1.5 body-keyed and query-keyed URL family.
+See **Removed (BREAKING)** below before upgrading from a 1.x stable line.
+
+This release introduces the following forward-only schema migrations that the
+server applies automatically on first startup. All are additive; no data loss.
+
+- `039_workstream_kind` — `kind` + `parent_ws_id` columns on `workstreams`.
+- `040_coord_cluster_admin_perms` — grants `admin.coordinator` +
+  `admin.cluster.inspect` to the builtin-admin role.
+- `041_workstream_index_tuning` — refined indexes for the workstream query mix
+  introduced by 039.
+- `042_coord_trust_send_perm` — adds `coordinator.trust.send` permission to
+  builtin-admin.
+- `043_skill_description_required` — backfills empty `description` rows in
+  `prompt_templates`.
+- `044_skill_kind` — adds `kind` classifier column to `prompt_templates`
+  (`interactive` / `coordinator` / `any`).
+- `045_skill_risk_level_rename` — renames `prompt_templates.scan_status` →
+  `risk_level`.
+- `046_drop_hash_ring_tables` — drops the hash-ring bucket tables superseded
+  by rendezvous routing in 1.4.
+- `047_drop_coord_spawn_quota_settings` — removes the spawn-quota settings
+  rows removed from the coordinator in 1.5.0a4.
+
+### Added
+
+- **Inline child approvals** — pending tool approvals on coordinator child
+  workstreams surface directly in the coordinator tree view. A risk pill shows
+  the judge verdict (or "pending" while the judge evaluates); Approve/Deny
+  buttons appear inline so operators do not need to navigate to the child's
+  workstream. `pending_approval_detail` is exposed on
+  `GET /v1/api/dashboard` and passed through the cluster live-bulk SSE payload
+  so all connected clients render approval prompts simultaneously. LLM judge
+  verdicts are cached client-side and replayed on SSE reconnect.
+- **Coordinator composer parity** — the coordinator composer now supports
+  Stop, Send-to-queue, and Attach (file upload), matching the interactive
+  workstream composer feature set.
+- **Per-call model and judge override on coordinator composer** — operators
+  can override the model alias and judge model for a single coordinator send
+  from the composer, without changing the node-wide or role-wide defaults. Bad
+  aliases return a corrective error listing available choices.
+- **Coordinator status bar + richer history replay** — each coordinator
+  workstream gains a per-coordinator status bar showing active children, token
+  spend, and generation state. History replay in the coordinator panel is
+  extended to include tool results and thinking blocks.
+- **Coordinator child error surfacing + memory tool** — child workstream
+  errors are surfaced as distinct error rows in the coordinator tree view
+  rather than disappearing silently. The coordinator gains access to a
+  `memory` tool (same interface as interactive) for retrieving stored facts.
+- **Coordinator inline tool-batch construct** — the coordinator tool approval
+  UI replaces the separate approval dock with an inline batch construct that
+  groups all pending tool calls for a given turn into a single review card.
+- **Node capability auto-detection** — nodes report kernel-level capabilities
+  (available memory, CPU count, accelerator presence) via
+  `/v1/api/node/capabilities` at startup, enabling the console to filter model
+  aliases offered to coordinators routing to that node.
+- **Skills: paste `SKILL.md` to auto-fill the Create Skill modal** — pasting
+  a `SKILL.md` file's content into the modal auto-populates the name,
+  description, and configuration fields.
+- **Progressive mermaid rendering** — Mermaid diagrams begin rendering as
+  soon as a complete diagram block is detected in the stream rather than
+  waiting for the full response; the diagram re-renders in place as the model
+  extends it.
+- **LaTeX and MathML delimiter support** — `\(…\)` inline and `\[…\]` block
+  math delimiters are now recognised alongside the existing `$$` fences.
 
 ### Removed (BREAKING — 1.5.0)
 
