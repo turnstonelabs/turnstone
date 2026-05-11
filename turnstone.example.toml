@@ -62,6 +62,13 @@
 [database]
 # url = ""                     # postgres://user:pass@host/db or /path/to.db
                                # env: TURNSTONE_DB_URL
+# listen_url = ""              # direct-to-postgres URL for the console's
+                               # dedicated LISTEN connection.  Set this when
+                               # `url` points at pgbouncer in transaction
+                               # pooling mode (LISTEN holds session state and
+                               # is incompatible with transaction pooling —
+                               # see docs/pgbouncer.md).  Defaults to `url`
+                               # when unset.  env: TURNSTONE_DB_LISTEN_URL
 # SSL params (passed through to SQLAlchemy connection):
 # sslmode = "prefer"           # disable, allow, prefer, require, verify-ca, verify-full
 # sslrootcert = ""             # path to CA cert for verify-ca/verify-full

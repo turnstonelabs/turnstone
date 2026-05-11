@@ -84,6 +84,7 @@ Auth is always enabled. `TURNSTONE_JWT_SECRET` is required.
 |----------|---------|-------------|
 | `TURNSTONE_DB_BACKEND` | `sqlite` | Storage backend: `sqlite` or `postgresql` |
 | `TURNSTONE_DB_URL` | — | Database URL (e.g. `postgresql+psycopg://user:pass@postgres:5432/turnstone`). For SQLite, defaults to `/data/.turnstone.db` |
+| `TURNSTONE_DB_LISTEN_URL` | (falls back to `TURNSTONE_DB_URL`) | Direct-to-PostgreSQL URL for the console's dedicated `LISTEN` connection. Set this when `TURNSTONE_DB_URL` points at PgBouncer in transaction pooling mode — LISTEN is session state and the transaction-pooled connection can't hold it. See [pgbouncer.md](pgbouncer.md). |
 | `TURNSTONE_DB_POOL_SIZE` | `2` | PostgreSQL connection pool size per process (default: 2 base + 3 overflow = 5 max) |
 | `POSTGRES_USER` | `turnstone` | PostgreSQL container username (used in default `TURNSTONE_DB_URL` for cluster/channel) |
 | `POSTGRES_PASSWORD` | — | PostgreSQL container password (required for production and cluster profiles) |

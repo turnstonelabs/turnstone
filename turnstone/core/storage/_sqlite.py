@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import contextlib
+import queue
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import sqlalchemy as sa
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterable, Iterator
+
+    from turnstone.core.storage._notify import Notify, NotifyStream
 
 from turnstone.core.log import get_logger
 from turnstone.core.storage._protocol import (
@@ -129,6 +133,90 @@ def _fts5_query(query: str) -> str:
     return " ".join(safe)
 
 
+# Synthetic-sweep cadence for the SQLite ``listen`` fallback.  SQLite is
+# the dev-only path where reactive latency isn't load-bearing — a single
+# console process, no cross-process notify semantics to recover from.
+# 300 s sits comfortably above the existing per-consumer timers
+# (cluster collector's 60 s ``discovery_interval``, any future
+# ConfigStore/scheduler reload cadences) so the sweep is a true backstop
+# rather than a duplicate tick.  Future consumers that need tighter
+# SQLite-mode reactive latency should pass a custom interval through
+# :meth:`SQLiteBackend.listen` rather than lowering this default.
+_SQLITE_NOTIFY_SWEEP_INTERVAL: float = 300.0
+
+
+class _SQLiteNotifyStream:
+    """SQLite ``listen`` stream — synthetic sweep + in-process fan-out.
+
+    Each poll either drains queued in-process notifies (delivered by a
+    same-process :meth:`SQLiteBackend.notify` call) or emits one
+    synthetic ``Notify(channel, payload="sweep", pid=0)`` per subscribed
+    channel once :attr:`_sweep_interval` has elapsed since the previous
+    sweep, whichever happens first.  Consumers handle both shapes the
+    same way: re-read the relevant rows on every wake-up.
+    """
+
+    def __init__(
+        self,
+        backend: SQLiteBackend,
+        channels: list[str],
+        sweep_interval: float,
+    ) -> None:
+        self._backend = backend
+        self._channels = list(channels)
+        self._sweep_interval = sweep_interval
+        self._queue: queue.Queue[Any] = queue.Queue()
+        self._closed = False
+        self._last_sweep = time.monotonic()
+        if self._channels:
+            backend._notify_register(self._channels, self._queue)
+
+    def poll(self, timeout: float) -> list[Notify]:
+        from turnstone.core.storage._notify import Notify
+
+        if self._closed:
+            return []
+        deadline = time.monotonic() + max(0.0, timeout)
+        # Emit a synthetic-sweep tick on the first poll where the sweep
+        # interval has elapsed.  Single tick per channel per interval —
+        # PG-equivalent "one wake-up per change" semantics, not a burst.
+        now = time.monotonic()
+        if self._channels and now - self._last_sweep >= self._sweep_interval:
+            self._last_sweep = now
+            for ch in self._channels:
+                with contextlib.suppress(Exception):
+                    self._queue.put_nowait(Notify(channel=ch, payload="sweep", pid=0))
+        out: list[Notify] = []
+        try:
+            while True:
+                if self._closed:
+                    break
+                if out:
+                    # Drain everything already queued without further
+                    # blocking — produces "one poll returns the burst"
+                    # semantics so the consumer reconciles once per wake.
+                    item = self._queue.get_nowait()
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    item = self._queue.get(timeout=remaining)
+                out.append(item)
+        except queue.Empty:
+            # End-of-drain: the blocking get hit its deadline OR a
+            # get_nowait found the queue empty.  Either way we return
+            # whatever was already collected.
+            pass
+        return out
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._channels:
+            self._backend._notify_unregister(self._channels, self._queue)
+
+
 class SQLiteBackend:
     """SQLite implementation of the StorageBackend protocol."""
 
@@ -155,6 +243,15 @@ class SQLiteBackend:
         self._fts5_available = False
         self._db_unavailable = False
         self._db_unavailable_lock = threading.Lock()
+        # In-process notify fan-out: channel name -> list of stream queues.
+        # SQLite has no cross-process LISTEN/NOTIFY, so notifications are
+        # delivered synchronously to any open ``listen`` stream in the same
+        # process.  Streams register on open + unregister on close; the
+        # synthetic-sweep timer below covers consumers that need a periodic
+        # wake regardless of producer activity (matching the PG-side
+        # discovery-loop cadence).
+        self._notify_lock = threading.Lock()
+        self._notify_subs: dict[str, list[queue.Queue[Any]]] = {}
         if create_tables:
             self._init_schema()
 
@@ -2008,6 +2105,75 @@ class SQLiteBackend:
             )
             conn.commit()
             return result.rowcount > 0
+
+    # -- Cross-process notifications -------------------------------------------
+
+    def notify(self, channel: str, payload: str = "") -> None:
+        """In-process broadcast — SQLite has no cross-process channel.
+
+        SQLite deployments are single-process by design (no shared backend
+        across nodes); the storage layer delivers to any ``listen`` stream
+        open in the same process.  Cross-process consumers wouldn't be
+        served regardless — the synthetic-sweep wake-up in :meth:`listen`
+        is the parity fallback so consumer code stays backend-agnostic.
+        """
+        from turnstone.core.storage._notify import Notify
+
+        with self._notify_lock:
+            subs = list(self._notify_subs.get(channel, ()))
+        for q in subs:
+            with contextlib.suppress(Exception):
+                q.put(Notify(channel=channel, payload=payload, pid=0))
+
+    @contextlib.contextmanager
+    def listen(
+        self,
+        channels: Iterable[str],
+        *,
+        sweep_interval: float = _SQLITE_NOTIFY_SWEEP_INTERVAL,
+    ) -> Iterator[NotifyStream]:
+        """Subscribe to channels — synthetic-sweep + in-process fan-out.
+
+        The returned stream wakes every ``sweep_interval`` seconds with
+        one ``Notify(channel, payload="sweep", pid=0)`` per subscribed
+        channel; the default (:data:`_SQLITE_NOTIFY_SWEEP_INTERVAL`)
+        suits a dev backstop with a 60 s consumer-side timer.  Callers
+        that need a tighter cadence (e.g. a future consumer without its
+        own polling timer) pass a smaller value here.  In-process
+        :meth:`notify` calls deliver immediately on top of the sweep.
+        Either path produces a wake-up; consumers reconcile by re-reading
+        the relevant rows.
+
+        Channel names are de-duplicated so callers passing the same name
+        twice don't double-deliver each notify to a single stream.
+        """
+        # de-dupe + preserve insertion order — passing the same channel
+        # twice would otherwise register the stream's queue against that
+        # channel twice and deliver each notify multiple times.
+        ch_list = list(dict.fromkeys(str(c) for c in channels if c))
+        stream = _SQLiteNotifyStream(self, ch_list, sweep_interval=sweep_interval)
+        try:
+            yield stream
+        finally:
+            stream.close()
+
+    def _notify_register(self, channels: list[str], q: queue.Queue[Any]) -> None:
+        """Subscribe a stream's queue to in-process notifies on ``channels``."""
+        with self._notify_lock:
+            for ch in channels:
+                self._notify_subs.setdefault(ch, []).append(q)
+
+    def _notify_unregister(self, channels: list[str], q: queue.Queue[Any]) -> None:
+        """Detach a stream's queue from in-process notifies on ``channels``."""
+        with self._notify_lock:
+            for ch in channels:
+                subs = self._notify_subs.get(ch)
+                if subs is None:
+                    continue
+                with contextlib.suppress(ValueError):
+                    subs.remove(q)
+                if not subs:
+                    self._notify_subs.pop(ch, None)
 
     # -- Node metadata ---------------------------------------------------------
 

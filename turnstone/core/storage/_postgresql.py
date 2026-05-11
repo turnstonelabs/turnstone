@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import threading
 import time
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterable, Iterator
+
+    from turnstone.core.storage._notify import Notify, NotifyStream
 
 import sqlalchemy as sa
 
@@ -120,11 +123,105 @@ def _escape_ilike(s: str) -> str:
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _resolve_pg_listen_url(override: str, sqlalchemy_url: str) -> str:
+    """Resolve the URL used by the dedicated LISTEN connection.
+
+    Precedence:
+
+    1. ``override`` — explicitly passed via :class:`PostgreSQLBackend`
+       constructor, typically wired from ``[database] listen_url`` in
+       ``config.toml`` or ``--db-listen-url`` on the CLI.
+    2. ``TURNSTONE_DB_LISTEN_URL`` environment variable.
+    3. The engine's main DB URL.
+
+    The override is for deployments where the regular ``TURNSTONE_DB_URL``
+    points at a ``pgbouncer`` running in transaction pooling mode (the
+    project default per ``docs/pgbouncer.md``).  LISTEN holds session
+    state and is incompatible with transaction pooling; the dispatcher
+    needs to bypass pgbouncer for that single connection.  When neither
+    override is set and ``TURNSTONE_DB_URL`` already points at Postgres
+    directly (no pooler in between), the fallback uses the engine URL
+    as-is.
+
+    The SQLAlchemy ``+psycopg`` driver suffix is stripped so the URL is
+    consumable by ``psycopg.connect`` directly.
+    """
+    raw = override.strip() or os.environ.get("TURNSTONE_DB_LISTEN_URL", "").strip()
+    raw = raw or sqlalchemy_url
+    return raw.replace("postgresql+psycopg://", "postgresql://", 1)
+
+
+class _PostgreSQLNotifyStream:
+    """PostgreSQL ``listen`` stream — drains ``conn.notifies`` per poll.
+
+    Owns a dedicated psycopg autocommit connection.  Each :meth:`poll`
+    waits up to ``timeout`` seconds for notifications and returns them
+    as a list — empty on timeout, raises :class:`NotifyConnectionError`
+    on connection loss (caller reconciles + re-listens).
+
+    Closing the stream from another thread is the supported abort path:
+    ``close`` calls ``conn.close()``, which causes the in-flight
+    :meth:`poll` to wake (the next call returns ``[]`` because
+    ``_closed`` is set).
+    """
+
+    def __init__(self, conn: Any, channels: list[str]) -> None:
+        self._conn = conn
+        self._channels = list(channels)
+        self._closed = False
+        self._close_lock = threading.Lock()
+
+    def poll(self, timeout: float) -> list[Notify]:
+        from turnstone.core.storage._notify import Notify, NotifyConnectionError
+
+        if self._closed:
+            return []
+        out: list[Notify] = []
+        try:
+            # psycopg3 generator yields whatever's available within the
+            # window, then stops — bounded blocking semantics.  Per-call
+            # generator (not a long-lived one) so close() can abort by
+            # closing the connection without leaving a half-consumed
+            # generator behind.
+            for n in self._conn.notifies(timeout=max(0.0, timeout)):
+                out.append(Notify(channel=n.channel, payload=n.payload, pid=n.pid))
+        except Exception as exc:
+            if self._closed:
+                # Graceful close-from-another-thread surfaced as an
+                # operational error inside notifies() — swallow it,
+                # let the caller observe close via the next poll
+                # returning ``[]``.
+                return out
+            raise NotifyConnectionError(str(exc)) from exc
+        return out
+
+    def close(self) -> None:
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            conn = self._conn
+        # Best-effort UNLISTEN + close.  An already-broken connection
+        # raises here; the consumer's reconciliation logic will catch
+        # the underlying ``NotifyConnectionError`` on the next poll if
+        # any waiter is still blocked.
+        with contextlib.suppress(Exception):
+            conn.execute("UNLISTEN *")
+        with contextlib.suppress(Exception):
+            conn.close()
+
+
 class PostgreSQLBackend:
     """PostgreSQL implementation of the StorageBackend protocol."""
 
     def __init__(
-        self, url: str, pool_size: int = 2, max_overflow: int = 3, *, create_tables: bool = True
+        self,
+        url: str,
+        pool_size: int = 2,
+        max_overflow: int = 3,
+        *,
+        create_tables: bool = True,
+        listen_url: str = "",
     ) -> None:
         self._engine = sa.create_engine(
             url,
@@ -134,6 +231,12 @@ class PostgreSQLBackend:
         )
         self._db_unavailable = False
         self._db_unavailable_lock = threading.Lock()
+        # Operator override for the dedicated LISTEN connection's URL.
+        # Empty string means "fall back through env var, then the main
+        # engine URL" — see :func:`_resolve_pg_listen_url` for the full
+        # precedence rules.  Threaded through ``init_storage`` from
+        # ``config.toml [database] listen_url`` / ``--db-listen-url``.
+        self._listen_url_override = listen_url
         if create_tables:
             metadata.create_all(self._engine)
 
@@ -1862,6 +1965,61 @@ class PostgreSQLBackend:
             )
             conn.commit()
             return result.rowcount > 0
+
+    # -- Cross-process notifications -------------------------------------------
+
+    def notify(self, channel: str, payload: str = "") -> None:
+        """Broadcast a wake-up via ``pg_notify`` on a pooled connection.
+
+        ``channel`` and ``payload`` are bound as parameters so this is
+        safe to call with operator-supplied strings without quoting
+        gymnastics.  Postgres caps the payload at 8 KiB — keep payloads
+        signal-only (a JSON id list, an op name) and let consumers
+        re-read the underlying rows on wake-up.
+        """
+        with self._conn() as conn:
+            conn.execute(
+                sa.text("SELECT pg_notify(:channel, :payload)"),
+                {"channel": channel, "payload": payload},
+            )
+            conn.commit()
+
+    @contextlib.contextmanager
+    def listen(self, channels: Iterable[str]) -> Iterator[NotifyStream]:
+        """Subscribe to channels on a dedicated session-mode connection.
+
+        Opens a fresh ``psycopg`` connection in autocommit mode (the
+        SQLAlchemy pool is incompatible with LISTEN — it recycles
+        connections back into a pool that may be transaction-pooled by
+        pgbouncer).  Channel names are interpolated via
+        ``psycopg.sql.Identifier`` so caller-supplied channel strings
+        can't inject SQL.
+
+        ``TURNSTONE_DB_LISTEN_URL`` overrides the engine URL — see
+        :func:`_resolve_pg_listen_url` for the bypass-URL rationale.
+
+        Yields a :class:`_PostgreSQLNotifyStream`; the connection is
+        closed on context exit.
+        """
+        import psycopg
+        from psycopg import sql
+
+        ch_list = [str(c) for c in channels if c]
+        sqlalchemy_url = self._engine.url.render_as_string(hide_password=False)
+        listen_url = _resolve_pg_listen_url(self._listen_url_override, sqlalchemy_url)
+        conn = psycopg.connect(listen_url, autocommit=True)
+        stream: _PostgreSQLNotifyStream | None = None
+        try:
+            for ch in ch_list:
+                conn.execute(sql.SQL("LISTEN {}").format(sql.Identifier(ch)))
+            stream = _PostgreSQLNotifyStream(conn, ch_list)
+            yield stream
+        finally:
+            if stream is not None:
+                stream.close()
+            else:
+                with contextlib.suppress(Exception):
+                    conn.close()
 
     # -- Node metadata ---------------------------------------------------------
 

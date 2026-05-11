@@ -4770,6 +4770,12 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
 
     await close_oidc_state(app.state)
     app.state.collector.stop()
+    # Stop the dispatcher after the collector — collector.stop() drops its
+    # subscription, so the dispatcher's dispatch thread won't fire into a
+    # half-torn-down collector during shutdown.
+    notify_dispatcher = getattr(app.state, "notify_dispatcher", None)
+    if notify_dispatcher is not None:
+        notify_dispatcher.stop()
     audit_exec_shutdown = getattr(app.state, "audit_executor", None)
     if audit_exec_shutdown is not None:
         _set_audit_executor(None)
@@ -11882,6 +11888,7 @@ def create_app(
     console_url: str = "",
     router: ConsoleRouter | None = None,
     console_metrics: ConsoleMetrics | None = None,
+    notify_dispatcher: Any = None,
 ) -> Starlette:
     """Build the Starlette ASGI application for the console dashboard."""
     _spec = build_console_spec()
@@ -12508,6 +12515,7 @@ def create_app(
         lifespan=_lifespan,
     )
     app.state.collector = collector
+    app.state.notify_dispatcher = notify_dispatcher
     app.state.jwt_secret = jwt_secret
     app.state.auth_storage = auth_storage
     app.state.proxy_token_mgr = proxy_token_mgr
@@ -12603,7 +12611,7 @@ def main() -> None:
     from turnstone.core.config import add_config_arg, apply_config
 
     add_config_arg(parser)
-    apply_config(parser, ["console", "auth"])
+    apply_config(parser, ["console", "auth", "database"])
     args = parser.parse_args()
 
     from turnstone.core.log import configure_logging_from_args
@@ -12622,6 +12630,13 @@ def main() -> None:
         db_backend = os.environ.get("TURNSTONE_DB_BACKEND", "sqlite")
         db_url = os.environ.get("TURNSTONE_DB_URL", "")
         db_path = os.environ.get("TURNSTONE_DB_PATH", "")
+        # Optional dedicated LISTEN URL — config.toml ``[database] listen_url``
+        # (lifted onto args by ``apply_config``) wins over env, and an empty
+        # value falls through to the main DB URL inside the storage layer.
+        # Only used by the ``NotifyDispatcher``; ignored on SQLite.
+        db_listen_url = getattr(args, "db_listen_url", None) or os.environ.get(
+            "TURNSTONE_DB_LISTEN_URL", ""
+        )
         auth_storage = init_storage(
             db_backend,
             path=db_path,
@@ -12630,6 +12645,7 @@ def main() -> None:
             sslrootcert=os.environ.get("TURNSTONE_DB_SSLROOTCERT", ""),
             sslcert=os.environ.get("TURNSTONE_DB_SSLCERT", ""),
             sslkey=os.environ.get("TURNSTONE_DB_SSLKEY", ""),
+            listen_url=db_listen_url,
         )
     except Exception:
         log.info("Console storage not available — admin API disabled, JWT-only auth")
@@ -12659,11 +12675,21 @@ def main() -> None:
     router = ConsoleRouter(storage=auth_storage)
     console_metrics = ConsoleMetrics()
 
+    # NotifyDispatcher multiplexes the dedicated LISTEN connection for all
+    # console-side consumers.  Currently one channel: ``services`` for
+    # reactive node discovery.  Followup PRs (ConfigStore live reload,
+    # scheduler immediate dispatch) add additional channels here.
+    from turnstone.console.notify_dispatcher import NotifyDispatcher
+
+    notify_dispatcher = NotifyDispatcher(auth_storage, channels=["services"])
+    notify_dispatcher.start()
+
     collector = ClusterCollector(
         storage=auth_storage,
         token_manager=collector_token_mgr,
         router=router,
         console_metrics=console_metrics,
+        notify_dispatcher=notify_dispatcher,
     )
     collector.start()
 
@@ -12755,6 +12781,7 @@ def main() -> None:
         console_url=console_url,
         router=router,
         console_metrics=console_metrics,
+        notify_dispatcher=notify_dispatcher,
     )
 
     log.info("Console starting on %s", console_url)
