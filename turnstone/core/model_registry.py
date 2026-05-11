@@ -500,10 +500,14 @@ def load_model_registry(
             server_compat=entry_server_compat,
         )
 
-    # 3. Ensure a "default" entry from CLI args (only if not already defined
-    # by config.toml or DB — those take precedence, and only when a CLI
-    # model was actually provided)
-    if "default" not in configs and model:
+    # 3. Back-compat shim: synthesize a "default" alias from CLI/auto-detected
+    # ``--base-url`` + ``--model`` only when no DB or config.toml models exist.
+    # Auto-creating "default" alongside DB models leaks a non-routing alias
+    # into the public list — the LLM picks it in plan_agent / task_agent
+    # ``model=`` and silently bypasses the operator's per-role
+    # plan_alias / task_alias overrides (the "default" alias points at
+    # whatever LLM_BASE_URL was at boot, not at the configured default).
+    if not configs and model:
         configs["default"] = ModelConfig(
             alias="default",
             base_url=base_url,

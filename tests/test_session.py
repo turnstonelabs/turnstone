@@ -504,9 +504,51 @@ class TestAgentModelOverride:
         assert item.get("needs_approval") is False
         assert "error" in item
         assert "unknown model alias 'bogus'" in item["error"]
-        # The error guidance must list the available aliases so the LLM can retry.
-        for alias in ("default", "smart", "fast"):
+        # Error guidance lists the aliases the LLM may retry, intentionally
+        # excluding ``default`` — that alias is operator-only (see
+        # ``test_prepare_plan_default_model_rejected``).  Surfacing it here
+        # would re-enable the per-role-override bypass even though the
+        # tool description hides it.
+        for alias in ("smart", "fast"):
             assert alias in item["error"]
+        assert "default" not in item["error"]
+
+    def test_prepare_plan_default_model_rejected(self, tmp_db) -> None:
+        """``model="default"`` is rejected even when the alias exists in
+        the registry — bypasses the operator-configured ``plan_alias``."""
+        session = _make_session(registry=self._registry(), model_alias="default")
+        item = session._prepare_plan("c1", {"goal": "do x", "model": "default"})
+        assert item.get("needs_approval") is False
+        assert "error" in item
+        assert "'default' is not a selectable model alias" in item["error"]
+        assert "Omit `model=`" in item["error"]
+
+    def test_prepare_plan_default_model_rejected_with_whitespace(self, tmp_db) -> None:
+        """The ``default`` rejection runs after ``strip()`` so leading/
+        trailing whitespace can't sneak the alias past the carve-out."""
+        session = _make_session(registry=self._registry(), model_alias="default")
+        item = session._prepare_plan("c1", {"goal": "do x", "model": "  default  "})
+        assert item.get("needs_approval") is False
+        assert "'default' is not a selectable model alias" in item["error"]
+
+    def test_prepare_plan_unknown_model_with_only_default_in_registry(self, tmp_db) -> None:
+        """When the registry holds only the reserved ``default`` alias
+        (single-CLI-model back-compat), the unknown-alias error must say
+        '(no alternative aliases configured — omit `model=`)' — not the
+        misleading '(no registry configured)' that suggests routing isn't
+        wired up at all."""
+        from turnstone.core.model_registry import ModelConfig, ModelRegistry
+
+        reg = ModelRegistry(
+            models={"default": ModelConfig("default", "x", "x", "m")},
+            default="default",
+        )
+        session = _make_session(registry=reg, model_alias="default")
+        item = session._prepare_plan("c1", {"goal": "do x", "model": "bogus"})
+        assert item.get("needs_approval") is False
+        assert "unknown model alias 'bogus'" in item["error"]
+        assert "no alternative aliases configured" in item["error"]
+        assert "no registry configured" not in item["error"]
 
     # ---- _prepare_task ----
 
@@ -526,6 +568,15 @@ class TestAgentModelOverride:
         assert item.get("needs_approval") is False
         assert "error" in item
         assert "unknown model alias 'bogus'" in item["error"]
+        assert "default" not in item["error"]
+
+    def test_prepare_task_default_model_rejected(self, tmp_db) -> None:
+        """Symmetric carve-out for task_agent — see
+        ``test_prepare_plan_default_model_rejected``."""
+        session = _make_session(registry=self._registry(), model_alias="default")
+        item = session._prepare_task("c1", {"prompt": "do x", "model": "default"})
+        assert item.get("needs_approval") is False
+        assert "'default' is not a selectable model alias" in item["error"]
 
     # ---- tool description rendering ----
 
@@ -544,8 +595,11 @@ class TestAgentModelOverride:
             tool = self._agent_tool(session, name)
             assert tool is not None, f"{name} missing from session tools"
             desc = tool["function"]["parameters"]["properties"]["model"]["description"]
-            for alias in ("default", "smart", "fast"):
+            for alias in ("smart", "fast"):
                 assert f"`{alias}`" in desc, f"alias {alias} missing from {desc!r}"
+            # ``default`` is intentionally hidden — see
+            # ``test_render_omits_default_alias_from_description``.
+            assert "`default`" not in desc
 
     def test_render_no_op_without_registry(self, tmp_db) -> None:
         """No registry → leave the placeholder description untouched."""
@@ -575,6 +629,82 @@ class TestAgentModelOverride:
         assert plan_tool is not None
         desc = plan_tool["function"]["parameters"]["properties"]["model"]["description"]
         assert "`bigboi`" in desc
+
+    def test_render_omits_default_alias_from_description(self, tmp_db) -> None:
+        """The ``default`` alias is filtered from the LLM-facing alias list.
+
+        Reading "default" as English ("use the default") and passing it
+        explicitly bypasses the operator-configured per-role plan_alias /
+        task_alias.  The LLM should reach the per-role default by omitting
+        ``model=`` instead.
+        """
+        from turnstone.core.model_registry import ModelConfig, ModelRegistry
+
+        reg = ModelRegistry(
+            models={
+                "default": ModelConfig("default", "x", "x", "m"),
+                "gh200": ModelConfig("gh200", "x", "x", "m"),
+                "opus-4.7": ModelConfig("opus-4.7", "x", "x", "m"),
+            },
+            default="default",
+        )
+        session = _make_session(registry=reg, model_alias="default")
+        for name in ("plan_agent", "task_agent"):
+            tool = self._agent_tool(session, name)
+            assert tool is not None
+            desc = tool["function"]["parameters"]["properties"]["model"]["description"]
+            assert "`gh200`" in desc
+            assert "`opus-4.7`" in desc
+            assert "`default`" not in desc
+
+    def test_render_falls_back_to_base_when_only_default_alias(self, tmp_db) -> None:
+        """Single-CLI-model registries (only ``default`` in registry) leave
+        the base description untouched — the LLM sees ``"No alternative
+        aliases configured"`` rather than an empty alias list."""
+        from turnstone.core.model_registry import ModelConfig, ModelRegistry
+
+        reg = ModelRegistry(
+            models={"default": ModelConfig("default", "x", "x", "m")},
+            default="default",
+        )
+        session = _make_session(registry=reg, model_alias="default")
+        plan_tool = self._agent_tool(session, "plan_agent")
+        assert plan_tool is not None
+        desc = plan_tool["function"]["parameters"]["properties"]["model"]["description"]
+        assert "No alternative aliases configured" in desc
+
+    def test_refresh_into_only_default_resets_to_base(self, tmp_db) -> None:
+        """A reload that drops the registry to only ``default`` must clear
+        stale alias names from the previously-rendered tool descriptions —
+        not return early and leave them in place."""
+        from turnstone.core.model_registry import ModelConfig, ModelRegistry
+
+        reg = ModelRegistry(
+            models={
+                "default": ModelConfig("default", "x", "x", "m"),
+                "smart": ModelConfig("smart", "x", "x", "m"),
+                "fast": ModelConfig("fast", "x", "x", "m"),
+            },
+            default="default",
+        )
+        session = _make_session(registry=reg, model_alias="default")
+        # Sanity: initial render carries the non-default aliases.
+        plan_tool = self._agent_tool(session, "plan_agent")
+        assert plan_tool is not None
+        desc = plan_tool["function"]["parameters"]["properties"]["model"]["description"]
+        assert "`smart`" in desc and "`fast`" in desc
+
+        # Reload the registry down to only ``default`` (admin removed
+        # every other model definition).
+        reg.reload({"default": ModelConfig("default", "x", "x", "m")}, "default")
+        session.refresh_agent_tool_schemas()
+
+        plan_tool = self._agent_tool(session, "plan_agent")
+        assert plan_tool is not None
+        desc = plan_tool["function"]["parameters"]["properties"]["model"]["description"]
+        assert "`smart`" not in desc, f"stale alias survived reload: {desc!r}"
+        assert "`fast`" not in desc, f"stale alias survived reload: {desc!r}"
+        assert "No alternative aliases configured" in desc
 
     def test_module_level_constants_not_mutated(self, tmp_db) -> None:
         """Rendering must not pollute the module-level TOOLS list shared
