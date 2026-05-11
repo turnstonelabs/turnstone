@@ -83,6 +83,39 @@ class TestIsPublicPath:
     def test_shared_static_public(self):
         assert is_public_path("/shared/base.css") is True
 
+    # Console proxy: a public proxied path must still be public, otherwise
+    # the login modal can never re-authenticate from inside a ``/node/{id}/``
+    # proxied page once the cookie expires.
+    def test_proxy_v1_login_public(self):
+        assert is_public_path("/node/node-a/v1/api/auth/login") is True
+
+    def test_proxy_no_v1_login_public(self):
+        assert is_public_path("/node/node-a/api/auth/login") is True
+
+    def test_proxy_v1_status_public(self):
+        assert is_public_path("/node/node-a/v1/api/auth/status") is True
+
+    def test_proxy_v1_setup_public(self):
+        assert is_public_path("/node/node-a/v1/api/auth/setup") is True
+
+    def test_proxy_v1_logout_public(self):
+        assert is_public_path("/node/node-a/v1/api/auth/logout") is True
+
+    def test_proxy_v1_oidc_authorize_public(self):
+        assert is_public_path("/node/node-a/v1/api/auth/oidc/authorize") is True
+
+    def test_proxy_v1_oidc_callback_public(self):
+        assert is_public_path("/node/node-a/v1/api/auth/oidc/callback") is True
+
+    def test_proxy_v1_workstreams_still_not_public(self):
+        """Proxy prefix must not turn protected paths into public ones."""
+        assert is_public_path("/node/node-a/v1/api/workstreams") is False
+
+    def test_proxy_v1_refresh_still_requires_auth(self):
+        """Refresh isn't in PUBLIC_PATHS — the caller must already have
+        a valid cookie. Proxy-prefix shouldn't change that."""
+        assert is_public_path("/node/node-a/v1/api/auth/refresh") is False
+
 
 # ---------------------------------------------------------------------------
 # TestRequiredRole
