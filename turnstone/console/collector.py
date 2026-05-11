@@ -25,9 +25,13 @@ import httpx_sse
 from turnstone.core.workstream import WorkstreamKind
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from turnstone.console.metrics import ConsoleMetrics
+    from turnstone.console.notify_dispatcher import NotifyDispatcher
     from turnstone.console.router import ConsoleRouter
     from turnstone.core.auth import ServiceTokenManager
+    from turnstone.core.storage._notify import Notify
     from turnstone.core.storage._protocol import StorageBackend
 
 log = logging.getLogger("turnstone.console.collector")
@@ -73,6 +77,7 @@ class ClusterCollector:
         tls_cert: tuple[str, str] | None = None,
         router: ConsoleRouter | None = None,
         console_metrics: ConsoleMetrics | None = None,
+        notify_dispatcher: NotifyDispatcher | None = None,
     ):
         self._storage = storage
         self._discovery_interval = discovery_interval
@@ -82,6 +87,8 @@ class ClusterCollector:
         self._console_metrics = console_metrics
         self._tls_verify = tls_verify
         self._tls_cert = tls_cert
+        self._notify_dispatcher = notify_dispatcher
+        self._notify_unsubscribe: Callable[[], None] | None = None
 
         self._lock = threading.Lock()
         self._nodes: dict[str, NodeSnapshot] = {}
@@ -128,6 +135,15 @@ class ClusterCollector:
     def start(self) -> None:
         """Start background threads."""
         self._running = True
+        # Subscribe to the ``services`` channel for reactive node discovery.
+        # NOTIFY-driven wake-ups bring new-node visibility from up-to-60 s
+        # (next discovery tick) down to ~500 ms on Postgres; the 60 s
+        # discovery loop still runs as the backstop for crash-shaped node
+        # loss (NOTIFY only fires on actual writes, not on crash exits).
+        if self._notify_dispatcher is not None:
+            self._notify_unsubscribe = self._notify_dispatcher.subscribe(
+                "services", self._on_services_notify
+            )
         for target, name in [
             (self._discovery_loop, "console-discovery"),
             (self._sse_manager_thread, "console-sse"),
@@ -145,6 +161,10 @@ class ClusterCollector:
         its ``finally`` cleanup (cancel tasks, close AsyncClient).
         """
         self._running = False
+        if self._notify_unsubscribe is not None:
+            with contextlib.suppress(Exception):
+                self._notify_unsubscribe()
+            self._notify_unsubscribe = None
         # Request cancellation of all SSE tasks so they don't block the
         # manager's cleanup. The manager coroutine exits when _running is
         # False and handles remaining task cancellation in its finally block.
@@ -155,6 +175,26 @@ class ClusterCollector:
         for t in self._threads:
             t.join(timeout=5)
         log.info("ClusterCollector stopped")
+
+    def _on_services_notify(self, notify: Notify) -> None:
+        """Run a discovery tick when the ``services`` channel fires.
+
+        The dispatcher delivers both real Postgres notifications and
+        synthetic ``reconcile`` wake-ups after a reconnect — both shape
+        the same way: re-read ``services`` and diff against in-memory
+        state.  Re-uses :meth:`_discover_nodes` so the timer-driven
+        backstop and the NOTIFY-driven fast-path share one code path.
+        """
+        from turnstone.core.storage._registry import StorageUnavailableError
+
+        if not self._running:
+            return
+        try:
+            self._discover_nodes()
+        except StorageUnavailableError:
+            pass  # already logged by storage layer
+        except Exception:
+            log.exception("Node discovery error (notify-driven)")
 
     def _fanout(self, event: dict[str, Any]) -> None:
         """Copy an event to all registered SSE listener queues."""

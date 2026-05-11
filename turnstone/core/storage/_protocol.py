@@ -5,8 +5,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from contextlib import AbstractContextManager
 
+    from turnstone.core.storage._notify import NotifyStream
     from turnstone.core.workstream import WorkstreamKind
 
 
@@ -1018,6 +1020,33 @@ class StorageBackend(Protocol):
 
     def deregister_service(self, service_type: str, service_id: str) -> bool:
         """Remove a service registration. Returns True if existed."""
+        ...
+
+    # -- Cross-process notifications -------------------------------------------
+
+    def notify(self, channel: str, payload: str = "") -> None:
+        """Broadcast a wake-up on ``channel`` to any listening process.
+
+        Payloads are signal-only — a JSON-encoded string identifying
+        which rows to re-read, capped well below Postgres's 8 KiB
+        ``NOTIFY`` payload limit.  Full event content is NOT delivered
+        this way; consumers reconcile by reading the relevant table on
+        wake-up.  Safe to call from any thread.
+        """
+        ...
+
+    def listen(self, channels: Iterable[str]) -> AbstractContextManager[NotifyStream]:
+        """Subscribe to one or more channels for cross-process wake-ups.
+
+        Returns a context manager wrapping a :class:`NotifyStream` the
+        caller drains via :meth:`NotifyStream.poll`.  PostgreSQL holds a
+        dedicated session-mode connection for the lifetime of the
+        context (incompatible with ``pgbouncer`` transaction pooling —
+        see :class:`PostgreSQLBackend.listen` for the bypass-URL config).
+        SQLite emits a synthetic-sweep wake on its own cadence (see
+        ``_SQLITE_NOTIFY_SWEEP_INTERVAL``) per subscribed channel so
+        consumer code is identical across backends.
+        """
         ...
 
     # -- Node metadata ---------------------------------------------------------

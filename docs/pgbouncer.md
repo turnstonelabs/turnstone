@@ -199,4 +199,28 @@ does not support prepared statements. Turnstone's SQLAlchemy layer does
 not use server-side prepared statements by default, so this is not an
 issue.
 
+**LISTEN / NOTIFY not supported in transaction mode** — PgBouncer's
+transaction pooling assigns a real server connection only for the
+duration of each transaction, then returns it to the pool. PostgreSQL
+`LISTEN` is session state — a transaction-pooled client can't hold the
+multi-statement session a long-lived `LISTEN` needs. The console's
+`NotifyDispatcher` (reactive node discovery via the `services` channel)
+therefore opens a **dedicated, direct-to-Postgres** connection that
+bypasses PgBouncer.
+
+Configure via `config.toml` `[database] listen_url` (preferred —
+co-located with the main `url`) or the `TURNSTONE_DB_LISTEN_URL` env var
+(config.toml wins when both are set). Defaults to the main DB URL when
+unset.
+
+| Setting | Behaviour |
+|---|---|
+| unset | Listener uses `TURNSTONE_DB_URL` as-is. Fine when PgBouncer is in **session** mode, or when there's no pooler in front of Postgres. With transaction-mode PgBouncer the listener's `LISTEN` will fail and the dispatcher retries with exponential backoff (1 s → 30 s cap) without ever succeeding. Reactive NOTIFY-driven node discovery is silently lost; the cluster collector's 60 s `_discovery_loop` is the only remaining backstop. |
+| set to direct-to-PG URL (e.g. `postgresql://…/turnstone`) | Listener bypasses PgBouncer for its one dedicated connection. Reactive discovery latency drops from up-to-60 s to ~500 ms. The rest of the storage layer continues to go through PgBouncer in transaction mode. |
+
+Set this whenever PgBouncer is in transaction mode (the recommended
+setting per this doc). The override only adds one long-lived PG
+connection per console process — sized into the cluster's
+`max_connections` budget alongside the pool.
+
 See also: [Docker deployment](docker.md) · [Security](security.md)
