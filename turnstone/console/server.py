@@ -2636,29 +2636,33 @@ async def proxy_shared_static(request: Request) -> Response:
         return JSONResponse({"error": "Node unreachable"}, status_code=502)
 
 
-# Paths the console handles locally instead of forwarding to the upstream
-# node.  Tests parametrize against this set so a new dispatch branch
-# can't be added without a matching test.  Keep in lockstep with the
-# ``proxy_api`` dispatch chain below.
-_PROXY_AUTH_LOCAL_PATHS: frozenset[str] = frozenset(
-    {
-        "auth/login",
-        "auth/logout",
-        "auth/setup",
-        "auth/refresh",
-        "auth/status",
-        "auth/whoami",
-        "auth/oidc/authorize",
-        "auth/oidc/callback",
-    }
-)
+# Auth endpoints the console handles locally instead of forwarding to
+# the upstream node.  Single source of truth for the dispatch table and
+# the path set used by both the 405 short-circuit and the
+# test parametrize, so a new entry can't drift between code and tests.
+#
+# Values are handler NAMES (strings) rather than function references.
+# ``proxy_api`` resolves them via ``globals()`` at call time so test
+# ``patch("turnstone.console.server.auth_login")`` is observed; a dict
+# of refs would capture the original function at module load.
+_PROXY_AUTH_LOCAL_HANDLERS: dict[tuple[str, str], str] = {
+    ("POST", "auth/login"): "auth_login",
+    ("POST", "auth/logout"): "auth_logout",
+    ("POST", "auth/setup"): "auth_setup",
+    ("POST", "auth/refresh"): "auth_refresh",
+    ("GET", "auth/status"): "auth_status",
+    ("GET", "auth/whoami"): "auth_whoami",
+    ("GET", "auth/oidc/authorize"): "oidc_authorize",
+    ("GET", "auth/oidc/callback"): "oidc_callback",
+}
+_PROXY_AUTH_LOCAL_PATHS: frozenset[str] = frozenset(path for _, path in _PROXY_AUTH_LOCAL_HANDLERS)
 
 
 async def proxy_api(request: Request) -> Response:
     """Proxy API requests to target node, with two exceptions handled in-process:
 
-    1. ``auth/*`` endpoints in ``_PROXY_AUTH_LOCAL_PATHS`` are dispatched
-       to the console's own auth handlers so JWTs carry
+    1. ``auth/*`` endpoints in ``_PROXY_AUTH_LOCAL_HANDLERS`` are
+       dispatched to the console's own auth handlers so JWTs carry
        ``JWT_AUD_CONSOLE`` and Set-Cookie lands on the console origin.
        Forwarding upstream would mint ``JWT_AUD_SERVER`` tokens that the
        console's ``AuthMiddleware`` rejects on the next proxied call,
@@ -2675,27 +2679,13 @@ async def proxy_api(request: Request) -> Response:
     node_id = request.path_params["node_id"]
     path = request.path_params["path"]
 
-    # Local auth dispatch.  Each branch reads its handler from module
-    # scope at call time, so ``patch("...auth_login")`` in tests works
-    # transparently.  Keep entries in lockstep with ``_PROXY_AUTH_LOCAL_PATHS``.
-    if request.method == "POST":
-        if path == "auth/login":
-            return await auth_login(request)
-        if path == "auth/logout":
-            return await auth_logout(request)
-        if path == "auth/setup":
-            return await auth_setup(request)
-        if path == "auth/refresh":
-            return await auth_refresh(request)
-    elif request.method == "GET":
-        if path == "auth/status":
-            return await auth_status(request)
-        if path == "auth/whoami":
-            return await auth_whoami(request)
-        if path == "auth/oidc/authorize":
-            return await oidc_authorize(request)
-        if path == "auth/oidc/callback":
-            return await oidc_callback(request)
+    handler_name = _PROXY_AUTH_LOCAL_HANDLERS.get((request.method, path))
+    if handler_name is not None:
+        # Resolve via ``globals()`` so ``patch("...auth_login")`` in
+        # tests is observed.  A direct function-ref dict would have
+        # captured the original at module load.
+        handler = globals()[handler_name]
+        return await handler(request)  # type: ignore[no-any-return]
     # Path matches a local-dispatch auth endpoint but the method does not:
     # short-circuit with 405 so the request can't fall through to
     # ``_proxy_post`` / ``_proxy_get`` and reach the upstream
