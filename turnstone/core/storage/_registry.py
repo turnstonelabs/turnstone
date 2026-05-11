@@ -34,6 +34,7 @@ def init_storage(
     sslrootcert: str = "",
     sslcert: str = "",
     sslkey: str = "",
+    listen_url: str = "",
 ) -> StorageBackend:
     """Initialize the storage backend singleton.
 
@@ -43,6 +44,13 @@ def init_storage(
         url: PostgreSQL connection URL (e.g. postgresql+psycopg://user:pass@host/db)
         pool_size: Connection pool size (PostgreSQL only)
         run_migrations: Whether to run Alembic migrations on init
+        listen_url: Optional dedicated PostgreSQL URL for the dispatcher's
+            ``LISTEN`` connection.  Required only when ``url`` points at a
+            ``pgbouncer`` running in transaction pooling mode (LISTEN
+            holds session state and is incompatible with transaction
+            pooling — see ``docs/pgbouncer.md``).  Empty string means
+            "fall back through ``TURNSTONE_DB_LISTEN_URL`` env var, then
+            the main ``url``."  Ignored on SQLite.
     """
     global _storage
 
@@ -84,7 +92,12 @@ def init_storage(
 
             sep = "&" if "?" in url else "?"
             url += sep + urlencode(ssl_params)
-        _storage = PostgreSQLBackend(url, pool_size=pool_size, create_tables=create_tables)
+        _storage = PostgreSQLBackend(
+            url,
+            pool_size=pool_size,
+            create_tables=create_tables,
+            listen_url=listen_url,
+        )
         log.info("Storage initialized: PostgreSQL")
 
     else:

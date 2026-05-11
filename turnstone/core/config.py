@@ -143,6 +143,7 @@ _CONFIG_MAP: dict[str, dict[str, str]] = {
         "sslrootcert": "db_sslrootcert",
         "sslcert": "db_sslcert",
         "sslkey": "db_sslkey",
+        "listen_url": "db_listen_url",
     },
     "judge": {
         "enabled": "judge_enabled",

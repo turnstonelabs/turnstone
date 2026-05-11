@@ -3,6 +3,7 @@
 import asyncio
 import json
 import queue
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -147,6 +148,78 @@ class TestCollectorDiscovery:
         # Verify metadata was parsed into the NodeSnapshot
         assert c._nodes["node-a"].max_ws == 20
         assert c._nodes["node-a"].started == 1234567890.0
+
+
+class TestCollectorNotifyWireIn:
+    """NotifyDispatcher-driven discovery — reactive node visibility."""
+
+    def test_start_subscribes_to_services_channel(self):
+        # Stub dispatcher records subscriptions without spawning threads.
+        class _StubDispatcher:
+            def __init__(self):
+                self.subscriptions: list[tuple[str, Any]] = []
+
+            def subscribe(self, channel, handler):
+                self.subscriptions.append((channel, handler))
+                return lambda: None
+
+        stub = _StubDispatcher()
+        storage = MockStorage()
+        c = ClusterCollector(
+            storage=storage,
+            discovery_interval=999,
+            notify_dispatcher=stub,
+        )
+        try:
+            c.start()
+            assert len(stub.subscriptions) == 1
+            channel, handler = stub.subscriptions[0]
+            assert channel == "services"
+            assert handler == c._on_services_notify
+        finally:
+            c.stop()
+
+    def test_no_dispatcher_means_no_subscribe(self):
+        # Collector without a dispatcher (single-node / SQLite dev) just
+        # falls back to the 60 s discovery-loop polling — no error.
+        c = _make_collector(MockStorage())
+        try:
+            c.start()
+            assert c._notify_unsubscribe is None
+        finally:
+            c.stop()
+
+    def test_on_notify_runs_discovery(self):
+        # Construct a synthetic Notify and invoke the handler directly —
+        # asserts the wire-in delegates back to ``_discover_nodes``.
+        from turnstone.core.storage._notify import Notify
+
+        storage = MockStorage()
+        c = _make_collector(storage)
+        c._running = True  # bypass start() so we don't spawn threads
+        q: queue.Queue[dict[str, Any]] = queue.Queue()
+        c.register_listener(q)
+
+        storage.services = [
+            {"service_id": "node-z", "url": "http://z:8080", "metadata": "{}"},
+        ]
+        c._on_services_notify(Notify(channel="services", payload="{}", pid=0))
+
+        event = q.get_nowait()
+        assert event["type"] == "node_joined"
+        assert event["node_id"] == "node-z"
+
+    def test_on_notify_when_not_running_is_noop(self):
+        # If a stray notify arrives after stop, the handler doesn't run
+        # discovery on a half-torn-down collector.
+        from turnstone.core.storage._notify import Notify
+
+        storage = MockStorage()
+        storage.services = [{"service_id": "node-y", "url": "http://y:8080", "metadata": "{}"}]
+        c = _make_collector(storage)
+        # _running stays False (never called start()).
+        c._on_services_notify(Notify(channel="services", payload="{}", pid=0))
+        assert c.get_overview()["nodes"] == 0
 
 
 class TestCollectorSnapshot:
