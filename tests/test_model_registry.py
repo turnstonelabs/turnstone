@@ -331,7 +331,11 @@ class TestLoadModelRegistry:
                 api_key="dummy",
                 model="local-model",
             )
-        assert reg.count == 2  # "openai" + "default"
+        # The CLI ``"default"`` shim is suppressed once ``[models.*]``
+        # populates configs — only the explicit alias survives.
+        assert reg.count == 1
+        assert reg.has_alias("openai")
+        assert not reg.has_alias("default")
         assert reg.default == "openai"
         _, model, _ = reg.resolve()
         assert model == "gpt-4o"
@@ -562,7 +566,12 @@ class TestLoadModelRegistryWithDB:
         assert cfg.source == "config"
 
     def test_db_only_models_coexist(self) -> None:
-        """DB models coexist alongside config.toml models."""
+        """DB models coexist alongside config.toml models.
+
+        The CLI ``"default"`` shim is suppressed when DB / config models
+        already populate the registry — see
+        ``test_cli_default_shim_skipped_when_db_models_present``.
+        """
         storage = _MockStorage(
             [
                 {
@@ -586,7 +595,7 @@ class TestLoadModelRegistryWithDB:
             reg = load_model_registry("http://x/v1", "x", "x", storage=storage)
         assert reg.has_alias("db-only")
         assert reg.has_alias("config-only")
-        assert reg.has_alias("default")
+        assert not reg.has_alias("default")
         assert reg.get_config("db-only").source == "db"
         assert reg.get_config("config-only").source == "config"
 
@@ -606,10 +615,12 @@ class TestLoadModelRegistryWithDB:
                 }
             ]
         )
+        # The CLI default shim is suppressed when the DB row populates
+        # configs, so only the DB-sourced alias exists here.
         with patch("turnstone.core.model_registry.load_config", return_value={}):
             reg = load_model_registry("http://x/v1", "x", "x", storage=storage)
         assert reg.get_config("from-db").source == "db"
-        assert reg.get_config("default").source == ""
+        assert not reg.has_alias("default")
 
     def test_disabled_db_models_excluded(self) -> None:
         """Disabled DB models are not loaded."""
@@ -1674,6 +1685,58 @@ class TestLoadModelRegistryDBOnly:
         with patch("turnstone.core.model_registry.load_config", return_value={}):
             reg = load_model_registry(model="", storage=storage)
         assert not reg.has_alias("default")
+
+    def test_cli_default_shim_skipped_when_db_models_present(self) -> None:
+        """An auto-detected ``--model`` does NOT synthesise a ``default``
+        alias when the DB already contributes models.
+
+        Regression for the silent bypass of ``model.task_alias`` /
+        ``model.plan_alias``: a synthesised ``default`` aliased to whatever
+        ``--base-url`` was at boot leaks into the LLM-visible alias list,
+        and the LLM picks it for ``task_agent(model="default")`` — which
+        then routes around the operator-configured per-role default.
+        """
+        storage = _MockStorage(
+            [
+                {
+                    "alias": "gh200",
+                    "model": "deepseek-ai/DeepSeek-V4-Flash",
+                    "provider": "openai",
+                    "base_url": "http://gh200:8000/v1",
+                    "api_key": "sk-gh200",
+                    "context_window": 1048576,
+                    "capabilities": "{}",
+                    "enabled": True,
+                }
+            ]
+        )
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry(
+                base_url="http://flatspark:8000/v1",
+                api_key="sk-flatspark",
+                model="qwen3.6-35B-A3B",  # populated by ``detect_model``
+                storage=storage,
+            )
+        assert reg.has_alias("gh200")
+        assert not reg.has_alias("default")
+
+    def test_cli_default_shim_skipped_when_config_models_present(self) -> None:
+        """Same shim suppression when only ``[models.*]`` populates configs."""
+        fake_cfg: dict[str, Any] = {
+            "models": {"local": {"model": "qwen3-32b"}},
+        }
+        with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
+            reg = load_model_registry("http://x/v1", "x", "fallback-model")
+        assert reg.has_alias("local")
+        assert not reg.has_alias("default")
+
+    def test_cli_default_shim_still_fires_when_registry_empty(self) -> None:
+        """Single-model CLI mode (no DB, no config.toml [models.*]) keeps
+        the back-compat ``default`` alias."""
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry("http://x/v1", "x", "lone-model")
+        assert reg.has_alias("default")
+        assert reg.get_config("default").model == "lone-model"
 
 
 # ---------------------------------------------------------------------------
