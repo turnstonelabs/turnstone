@@ -73,12 +73,27 @@ WAIT_MAX_WS_IDS: int = 32
 # wait_for_workstream again with the same ws_ids — each call re-arms freshly.
 WAIT_MAX_TIMEOUT: float = 600.0
 
-# Storage-poll cadence.  500ms is short enough that the wait terminates
-# promptly after a child finishes (well under the human-perceptible-latency
-# floor), and long enough that a 60s wait incurs at most 120 cheap row
-# reads — still cheaper than the 20+ inspect_workstream model turns the
-# tool replaces.
-WAIT_POLL_INTERVAL: float = 0.5
+# Maximum ``event.wait`` interval in the bus-driven wait loop.
+# A long-running stuck child would otherwise look dead in the sidebar UI
+# because the ``wait_progress`` SSE emission piggybacks on the wait loop
+# — capping at 2 s keeps the heartbeat visible without flooding storage.
+# Today's polling effectively snapshots every 500 ms; 2 s preserves a
+# similar liveness feel while cutting per-listener SSE traffic ~4x in the
+# steady-state-quiescent case.  Tunable post-merge if profiling shows
+# storage-read pressure on state-change wakes.
+#
+# **Worst-case completion latency**: 2 s.  ``SessionManager.set_state``
+# buffers non-ERROR storage writes through ``StateWriter`` (async-flushed
+# at ~1 s cadence) while ``emit_state`` fans the event out immediately —
+# a bus-driven wake can therefore beat the flusher and read pre-transition
+# state on a terminal transition, then re-block on ``event.wait`` until
+# the heartbeat cap fires.  Pre-bus the 0.5 s poll bounded this at 0.5 s.
+# Going to 2 s is intentional: the 4x SSE-traffic reduction in the
+# steady-state-quiescent case outweighs the worst-case latency
+# regression on the most common terminal transition, and a model issuing
+# a follow-up ``inspect_workstream`` (the pre-bus pattern this tool
+# replaces) was already paying multi-second model-turn latency per probe.
+WAIT_HEARTBEAT_INTERVAL: float = 2.0
 
 # Per-ws cap on the inline ``message`` field bundled into wait_for_workstream
 # results.  Sized so a fan-out of 32 children at the cap is ~320 KiB of
@@ -184,6 +199,7 @@ def load_task_envelope(storage: Any, ws_id: str) -> tuple[dict[str, Any], bool]:
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from turnstone.core.child_event_bus import ChildEventBus
     from turnstone.core.storage._protocol import StorageBackend
 
 log = get_logger(__name__)
@@ -313,6 +329,7 @@ class CoordinatorClient:
         user_id: str,
         timeout: float = 30.0,
         http_client: httpx.Client | None = None,
+        child_event_bus: ChildEventBus,
     ) -> None:
         self._base_url = console_base_url.rstrip("/")
         self._storage = storage
@@ -325,6 +342,12 @@ class CoordinatorClient:
         # with the coordinator session.
         self._http = http_client or httpx.Client(timeout=timeout)
         self._owns_http = http_client is None
+        # In-process wakeup bus for ``wait_for_workstream``.  The wait
+        # loop blocks on a ``threading.Event`` keyed by ws_id and only
+        # re-snapshots storage on state-change wakes or the heartbeat
+        # cap.  Owned by ``CoordinatorAdapter`` in production; tests
+        # pass their own instance.
+        self._child_event_bus = child_event_bus
         # tasks per-ws lock cache — populated lazily by _task_lock().
         # Single-session so a plain dict behind a coarse lock is fine;
         # WeakValueDictionary isn't needed (entries live as long as the
@@ -447,6 +470,27 @@ class CoordinatorClient:
             return False
         return bool(row.get("user_id")) and row.get("user_id") == self._user_id
 
+    def _row_in_own_subtree(self, ws_id: str, row: dict[str, Any] | None) -> bool:
+        """Row-level subtree predicate sharing one home for read paths.
+
+        Both :meth:`wait_for_workstream`'s pre-loop ownership filter and
+        its inner ``_snapshot_all`` already have the workstream row in
+        hand (from ``get_workstreams_batch``).  Funneling them through
+        the same 4-line check keeps the predicate in lockstep with
+        :meth:`_is_own_subtree` (used by mutating ops) — both require
+        ``parent_ws_id`` AND ``user_id`` parity so a corrupted or
+        forged ``parent_ws_id`` alone can't satisfy the gate on either
+        path.  Returns False on a missing / None row so callers can
+        safely pass ``rows.get(wid)``.
+        """
+        if ws_id == self._coord_ws_id:
+            return True
+        if row is None:
+            return False
+        if row.get("parent_ws_id") != self._coord_ws_id:
+            return False
+        return bool(row.get("user_id")) and row.get("user_id") == self._user_id
+
     # -- model-invoked mutating ops (HTTP) ---------------------------------
 
     def spawn(
@@ -562,7 +606,7 @@ class CoordinatorClient:
     _WAIT_TERMINAL_STATES: ClassVar[frozenset[str]] = WAIT_TERMINAL_STATES
     _WAIT_MAX_WS_IDS: ClassVar[int] = WAIT_MAX_WS_IDS
     _WAIT_MAX_TIMEOUT: ClassVar[float] = WAIT_MAX_TIMEOUT
-    _WAIT_POLL_INTERVAL: ClassVar[float] = WAIT_POLL_INTERVAL
+    _WAIT_HEARTBEAT_INTERVAL: ClassVar[float] = WAIT_HEARTBEAT_INTERVAL
 
     def wait_for_workstream(
         self,
@@ -721,12 +765,7 @@ class CoordinatorClient:
             snaps: dict[str, dict[str, Any]] = {}
             for wid in cleaned:
                 row = rows.get(wid)
-                if row is None:
-                    snaps[wid] = {"state": "denied", "tokens": 0}
-                    continue
-                is_self = wid == self._coord_ws_id
-                is_own_child = row.get("parent_ws_id") == self._coord_ws_id
-                if not (is_self or is_own_child):
+                if row is None or not self._row_in_own_subtree(wid, row):
                     snaps[wid] = {"state": "denied", "tokens": 0}
                     continue
                 snaps[wid] = {
@@ -760,54 +799,119 @@ class CoordinatorClient:
 
         last_results: dict[str, dict[str, Any]] = {}
         complete = False
-        while True:
-            results = _snapshot_all()
-            last_results = results
-            if progress_callback is not None:
-                try:
-                    progress_callback(results, time.monotonic() - start)
-                except Exception:
-                    log.debug("coord_client.wait.progress_cb_failed", exc_info=True)
-            real_terminal = [_is_real_terminal(snap) for snap in results.values()]
-            settled = [_is_settled(snap) for snap in results.values()]
-            # ``since`` — orthogonal to mode.  If the caller supplied a
-            # prior snapshot, any diff on a ws_id that IS in ``since_map``
-            # exits the wait so a follow-up call doesn't re-count
-            # already-terminal children.  ws_ids absent from ``since_map``
-            # are ignored for the diff-exit check — they fall through to
-            # the normal mode='any' / mode='all' conditions below.  This
-            # prevents a disjoint since-dict from exiting on tick one
-            # with complete=True (previous shape did, silently).
-            if since_map and any(
-                _diff_since(snap, since_map[wid])
-                for wid, snap in results.items()
-                if wid in since_map
-            ):
-                complete = True
-                break
-            if mode == "any":
-                if any(real_terminal):
+        # Subscribe to in-process state-change events for the watched
+        # ws_ids when the bus is wired.  ``register_waiter`` returns a
+        # single ``threading.Event`` registered against every id so a
+        # wait on [A, B, C] wakes on any of A/B/C changing.  Bus is
+        # optional so test fixtures that don't wire it fall back to the
+        # legacy ``time.sleep`` cadence with no behaviour change.
+        #
+        # **Defense-in-depth ownership filter**: ``_dispatch_child_event``
+        # fires ``bus.notify(ws_id)`` for every ws_id in *any* coord's
+        # registry on this console process, so a foreign ws_id passed by
+        # an untrusted coord LLM (prompt injection) would otherwise leak
+        # wake-up timing as a side channel — _snapshot_all returns
+        # ``denied`` for the content, but the *time* at which the wait
+        # un-blocked would correlate with the foreign ws_id's next
+        # state-class event.  Filter ``cleaned`` to own-subtree ids
+        # before registering; foreign / missing ws_ids stay in the
+        # snapshot list so they still surface as ``denied`` in
+        # ``_snapshot_all`` and exit via the pure-denied short-circuit
+        # below.  Predicate shared with ``_snapshot_all`` via
+        # :meth:`_row_in_own_subtree`.
+        try:
+            pre_rows = self._storage.get_workstreams_batch(cleaned)
+        except Exception:
+            log.debug("coord_client.wait.ownership_filter_failed", exc_info=True)
+            pre_rows = {wid: None for wid in cleaned}
+        own_subtree = [wid for wid in cleaned if self._row_in_own_subtree(wid, pre_rows.get(wid))]
+        bus = self._child_event_bus
+        wake_event = bus.register_waiter(own_subtree) if own_subtree else None
+        try:
+            while True:
+                # Clear BEFORE the storage snapshot to close the
+                # subscribe/check race: any ``notify`` between clear
+                # and the next ``wake_event.wait`` leaves the Event
+                # set, so the wait returns immediately and the loop
+                # re-snapshots without losing the wake-up.
+                if wake_event is not None:
+                    wake_event.clear()
+                results = _snapshot_all()
+                last_results = results
+                if progress_callback is not None:
+                    try:
+                        progress_callback(results, time.monotonic() - start)
+                    except Exception:
+                        log.debug("coord_client.wait.progress_cb_failed", exc_info=True)
+                real_terminal = [_is_real_terminal(snap) for snap in results.values()]
+                settled = [_is_settled(snap) for snap in results.values()]
+                # ``since`` — orthogonal to mode.  If the caller supplied a
+                # prior snapshot, any diff on a ws_id that IS in ``since_map``
+                # exits the wait so a follow-up call doesn't re-count
+                # already-terminal children.  ws_ids absent from ``since_map``
+                # are ignored for the diff-exit check — they fall through to
+                # the normal mode='any' / mode='all' conditions below.  This
+                # prevents a disjoint since-dict from exiting on tick one
+                # with complete=True (previous shape did, silently).
+                if since_map and any(
+                    _diff_since(snap, since_map[wid])
+                    for wid, snap in results.items()
+                    if wid in since_map
+                ):
                     complete = True
                     break
-                # Pure-denied list: every snap is settled but none is a
-                # real terminal — no work to wait for.  Short-circuit so
-                # the model sees the denied results immediately rather
-                # than spinning the timeout (``complete=False`` because
-                # the wait condition never had a real chance to fire).
-                if all(settled):
+                if mode == "any":
+                    if any(real_terminal):
+                        complete = True
+                        break
+                    # Pure-denied list: every snap is settled but none is a
+                    # real terminal — no work to wait for.  Short-circuit so
+                    # the model sees the denied results immediately rather
+                    # than spinning the timeout (``complete=False`` because
+                    # the wait condition never had a real chance to fire).
+                    if all(settled):
+                        break
+                else:  # mode == "all"
+                    if all(settled):
+                        # Every ws_id is settled (real-terminal or denied).
+                        # The wait condition is met — the model gets the
+                        # full results dict and decides what each terminal
+                        # state means.
+                        complete = True
+                        break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     break
-            else:  # mode == "all"
-                if all(settled):
-                    # Every ws_id is settled (real-terminal or denied).
-                    # The wait condition is met — the model gets the
-                    # full results dict and decides what each terminal
-                    # state means.
-                    complete = True
-                    break
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            time.sleep(min(self._WAIT_POLL_INTERVAL, remaining))
+                if wake_event is not None:
+                    # Block until a child state-change notify fires OR
+                    # the heartbeat cap expires (so a stuck child still
+                    # emits a periodic ``wait_progress`` for the
+                    # sidebar UX).  Heartbeat cap is the only timer —
+                    # the bus is the wake source.  See
+                    # ``WAIT_HEARTBEAT_INTERVAL`` (module top) for the
+                    # worst-case completion-latency rationale: 2 s is
+                    # a deliberate 4x trade vs the pre-bus 0.5 s poll.
+                    wake_event.wait(min(remaining, self._WAIT_HEARTBEAT_INTERVAL))
+                else:
+                    # Pure-foreign / pure-denied list: every cleaned
+                    # ws_id was filtered out of ``own_subtree`` so the
+                    # bus has nothing to wake on.  The pure-denied
+                    # short-circuit above exits ``mode='any'`` on the
+                    # first tick; ``mode='all'`` falls through to here
+                    # and must burn the timeout.  Use the heartbeat
+                    # cadence for the deadline carve-up so
+                    # ``progress_callback`` keeps firing.
+                    time.sleep(min(self._WAIT_HEARTBEAT_INTERVAL, remaining))
+        finally:
+            # Always unregister so a crash mid-wait can't leak the
+            # registration past one wait's lifetime.  Bus discards
+            # empty buckets so long-lived buses don't accumulate dead
+            # keys after many waits.  Unregister against the same
+            # ``own_subtree`` list the register call used — passing
+            # ``cleaned`` here would silently no-op for foreign ids
+            # but pass an unknown bucket to ``unregister_waiter``.
+            if wake_event is not None:
+                bus.unregister_waiter(own_subtree, wake_event)
         # Bundle each terminal child's last assistant message inline so the
         # coordinator LLM doesn't have to follow up with one
         # ``inspect_workstream`` per ws.  Only ``idle`` / ``error`` ws_ids
@@ -816,7 +920,7 @@ class CoordinatorClient:
         # subset across a small thread pool — at the WAIT_MAX_WS_IDS=32
         # cap, 8 workers cuts a worst-case all-idle fan-out from 32
         # sequential storage round-trips down to 4 batches, which lands
-        # inside the WAIT_POLL_INTERVAL the model already tolerates
+        # inside the WAIT_HEARTBEAT_INTERVAL the model already tolerates
         # between ticks.  Storage backends use SQLAlchemy with
         # ``check_same_thread=False`` (SQLite) / a connection pool
         # (Postgres), so concurrent reads from the worker pool are safe.

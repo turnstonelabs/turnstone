@@ -4140,6 +4140,7 @@ def _coord_idle_cleanup_thread(
     mgr: SessionManager,
     timeout_sec: float,
     stop_event: threading.Event | None = None,
+    min_sweep_interval: float = 5.0,
 ) -> None:
     """Periodically reap idle + DB-orphan coordinator workstreams.
 
@@ -4150,7 +4151,7 @@ def _coord_idle_cleanup_thread(
     and which aren't currently loaded.  The latter pass catches coords left
     behind by prior console process incarnations.
 
-    Runs an initial sweep BEFORE the first sleep so cold-start orphans are
+    Runs an initial sweep BEFORE the first wait so cold-start orphans are
     reaped immediately rather than waiting one ``check_every`` interval (~30
     min on default 2h timeout).  This intentionally diverges from the regular
     server pattern, which has no initial sweep — the regular server runs
@@ -4158,26 +4159,90 @@ def _coord_idle_cleanup_thread(
     is a small fixed-size cache where orphans dominate the row count after
     a cold boot.
 
+    Wait shape: subscribes a callback to ``mgr._state_subscribers`` that
+    sets a ``tick_now`` event; the loop blocks on ``tick_now.wait(check_every)``
+    so any workstream state-change wakes the sweeper without waiting a
+    full check interval, AND the timeout still fires the periodic sweep
+    even when no activity happens (catching the DB-orphan-only case).
+    Net: blocked most of the time instead of repeating storage scans.
+
+    ``min_sweep_interval`` is the hard floor between successive
+    ``close_idle`` calls (default 5 s) — without it, sustained
+    state-change activity (each turn typically fires
+    thinking/running/attention/idle on the coord SessionManager) would
+    cause every ``tick_now.set`` mid-sweep to leave the next ``wait``
+    returning immediately, and the loop would tight-spin ``close_idle``
+    at the rate of its own DB latency (~20-50 calls/sec). The floor
+    bounds DB-call traffic at ``1 / min_sweep_interval`` per second
+    under any external activity while still letting a quiet system
+    fire on every state-change wake-up. Tests inject 0.0 to keep the
+    suite fast.
+
+    Default 5 s is a 6x improvement on the pre-refactor fixed 30 s
+    cadence while bounding DB-call traffic at ~0.2 calls/sec under
+    sustained activity — an order of magnitude below ``close_idle``'s
+    DB-latency budget, but tight enough that idle-row reaping still
+    feels prompt to a human watching the sidebar.  Tunable post-merge
+    if profiling shows close_idle latency dominates the cadence.
+
     ``stop_event`` is for tests — when set, the thread exits cleanly after
     the next loop check.  Production callers pass ``None`` (the daemon is
     process-lifetime).
     """
     check_every = min(300.0, timeout_sec / 4)
-    # Initial sweep — runs once before entering the sleep loop.
+    tick_now = threading.Event()
+
+    def _on_state_change(_ws_id: str, _state: Any) -> None:
+        # Any workstream state-change resets the idle clock for that
+        # ws AND may make a different ws newly-eligible (close-idle
+        # pass 2 evaluates DB rows by timestamp).  Cheap signal, full
+        # re-evaluation deferred to the next loop iteration.
+        tick_now.set()
+
+    mgr.subscribe_to_state(_on_state_change)
     try:
-        mgr.close_idle(timeout_sec)
-    except Exception:
-        log.debug("console.coord_idle_cleanup_initial_failed", exc_info=True)
-    while True:
-        if stop_event is not None and stop_event.is_set():
-            return
-        time.sleep(check_every)
-        if stop_event is not None and stop_event.is_set():
-            return
+        # Initial sweep — runs once before entering the wait loop.
+        # ``tick_now`` is intentionally not cleared here: any
+        # state-change event that arrives between subscribe and the
+        # first ``wait`` should fire close_idle immediately, not be
+        # discarded.
         try:
             mgr.close_idle(timeout_sec)
         except Exception:
-            log.debug("console.coord_idle_cleanup_failed", exc_info=True)
+            log.debug("console.coord_idle_cleanup_initial_failed", exc_info=True)
+        last_sweep_at = time.monotonic()
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return
+            tick_now.wait(check_every)
+            if stop_event is not None and stop_event.is_set():
+                return
+            # Clear BEFORE the cadence floor so any state-change event
+            # arriving during the cooldown (or during the close_idle
+            # below) leaves ``tick_now`` set — the next loop iteration
+            # then re-enters ``wait`` already-set and re-evaluates
+            # promptly.  close_idle is idempotent so a spurious extra
+            # tick is just one redundant scan.
+            tick_now.clear()
+            # Cadence floor — see docstring for the tight-spin
+            # hazard rationale.  Cooldown uses ``stop_event.wait``
+            # (not ``time.sleep``) so the test stop hook still
+            # terminates promptly during the cooldown window.
+            since_last = time.monotonic() - last_sweep_at
+            if since_last < min_sweep_interval:
+                gap = min_sweep_interval - since_last
+                if stop_event is not None:
+                    if stop_event.wait(gap):
+                        return
+                else:
+                    time.sleep(gap)
+            try:
+                mgr.close_idle(timeout_sec)
+            except Exception:
+                log.debug("console.coord_idle_cleanup_failed", exc_info=True)
+            last_sweep_at = time.monotonic()
+    finally:
+        mgr.unsubscribe_from_state(_on_state_change)
 
 
 # Guards concurrent attempts to bootstrap the coord subsystem from the
@@ -4239,12 +4304,22 @@ def _bootstrap_coord_subsystem(
         def _token_factory() -> str:
             return tm.token
 
+        # ``coord_adapter`` is bound later in this same
+        # ``_bootstrap_coord_subsystem`` call, after the adapter and
+        # manager are constructed but before any session is created
+        # — so this factory is *defined* before the adapter exists but
+        # only ever *called* after it does.  The free-variable lookup
+        # at call time resolves to the adapter built in this same
+        # bootstrap pass, giving the client a handle to the in-process
+        # wakeup bus the dispatch sink notifies on every child
+        # state-change event.
         return CoordinatorClient(
             console_base_url=console_bind_url,
             storage=storage,
             token_factory=_token_factory,
             coord_ws_id=ws_id,
             user_id=user_id,
+            child_event_bus=coord_adapter.child_event_bus,
         )
 
     # Pre-compute config-derived integers BEFORE any thread starts so a
