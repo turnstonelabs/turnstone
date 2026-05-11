@@ -43,12 +43,26 @@ def _wait_for(predicate, deadline_sec: float = 3.0) -> bool:
     return False
 
 
+def _start_ready(d, *, timeout: float = 5.0) -> None:
+    """``d.start()`` + assert the listener is actually listening.
+
+    Closes the start-vs-notify race for backends where ``storage.listen``
+    blocks on the network (Postgres ``LISTEN`` over a fresh psycopg
+    connection): without the sync, a same-thread ``storage.notify`` can
+    fire before the LISTEN registers and the notification is lost.
+    """
+    d.start()
+    if not d.wait_until_ready(timeout=timeout):
+        msg = f"dispatcher listener did not open within {timeout}s"
+        raise AssertionError(msg)
+
+
 class TestSubscribe:
     def test_subscribe_registers_handler(self, dispatcher_factory, storage):
         d = dispatcher_factory(channels=["alpha"])
         seen: list = []
         d.subscribe("alpha", lambda n: seen.append(n))
-        d.start()
+        _start_ready(d)
         # Fire a notify via the storage layer — dispatcher delivers to handler.
         storage.notify("alpha", "hello")
         assert _wait_for(lambda: any(n.payload == "hello" for n in seen))
@@ -62,7 +76,7 @@ class TestSubscribe:
         d = dispatcher_factory(channels=["alpha"])
         seen: list = []
         unsub = d.subscribe("alpha", lambda n: seen.append(n))
-        d.start()
+        _start_ready(d)
         storage.notify("alpha", "first")
         assert _wait_for(lambda: any(n.payload == "first" for n in seen))
         unsub()
@@ -92,7 +106,7 @@ class TestDispatch:
         seen_b: list = []
         d.subscribe("alpha", lambda n: seen_a.append(n))
         d.subscribe("alpha", lambda n: seen_b.append(n))
-        d.start()
+        _start_ready(d)
         storage.notify("alpha", "shared")
         assert _wait_for(lambda: seen_a and seen_b)
         assert seen_a[0].payload == "shared"
@@ -108,7 +122,7 @@ class TestDispatch:
 
         d.subscribe("alpha", _broken)
         d.subscribe("alpha", lambda n: survived.append(n))
-        d.start()
+        _start_ready(d)
         storage.notify("alpha", "after_broken")
         # The second handler runs even though the first raised.
         assert _wait_for(lambda: any(n.payload == "after_broken" for n in survived))
@@ -119,7 +133,7 @@ class TestDispatch:
         seen_b: list = []
         d.subscribe("alpha", lambda n: seen_a.append(n))
         d.subscribe("beta", lambda n: seen_b.append(n))
-        d.start()
+        _start_ready(d)
         storage.notify("alpha", "for_a")
         storage.notify("beta", "for_b")
         assert _wait_for(lambda: seen_a and seen_b)
@@ -320,7 +334,7 @@ class TestCoalescing:
             coalesce_gate.wait(0.05)
 
         d.subscribe("alpha", _slow_handler)
-        d.start()
+        _start_ready(d)
         # Burst of 10 notifies on the same channel — should coalesce
         # down to many fewer handler invocations.
         for i in range(10):

@@ -33,63 +33,30 @@ Create Date: 2026-05-10
 import sqlalchemy as sa
 from alembic import op
 
+from turnstone.core.storage._schema import (
+    SERVICES_NOTIFY_TRIGGER_FN_NAME,
+    SERVICES_NOTIFY_TRIGGER_FN_SQL,
+    SERVICES_NOTIFY_TRIGGER_NAME,
+    SERVICES_NOTIFY_TRIGGER_SQL,
+)
+
 revision = "053"
 down_revision = "052"
 branch_labels = None
 depends_on = None
 
 
-_TRIGGER_FN_NAME = "turnstone_notify_services"
-_TRIGGER_NAME = "services_notify"
-
-
-_TRIGGER_FN_SQL = f"""
-CREATE OR REPLACE FUNCTION {_TRIGGER_FN_NAME}() RETURNS trigger AS $$
-BEGIN
-    -- Skip heartbeat-only UPDATEs: same url and metadata, only
-    -- ``last_heartbeat`` changed.  ``register_service`` is an UPSERT
-    -- (on_conflict_do_update), so node restarts that change url or
-    -- metadata MUST still fire — only no-op heartbeat ticks stay
-    -- quiet.  IS NOT DISTINCT FROM treats NULLs as equal so a row
-    -- with NULL metadata before/after doesn't trip the diff.
-    IF TG_OP = 'UPDATE'
-       AND OLD.url IS NOT DISTINCT FROM NEW.url
-       AND OLD.metadata IS NOT DISTINCT FROM NEW.metadata THEN
-        RETURN NULL;
-    END IF;
-
-    PERFORM pg_notify(
-        'services',
-        json_build_object(
-            'service_type', COALESCE(NEW.service_type, OLD.service_type),
-            'service_id',   COALESCE(NEW.service_id,   OLD.service_id),
-            'op',           TG_OP
-        )::text
-    );
-    RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;
-"""
-
-
-_TRIGGER_SQL = f"""
-CREATE TRIGGER {_TRIGGER_NAME}
-AFTER INSERT OR UPDATE OR DELETE ON services
-FOR EACH ROW EXECUTE FUNCTION {_TRIGGER_FN_NAME}();
-"""
-
-
 def upgrade() -> None:
     bind = op.get_bind()
     if bind.dialect.name != "postgresql":
         return
-    op.execute(sa.text(_TRIGGER_FN_SQL))
-    op.execute(sa.text(_TRIGGER_SQL))
+    op.execute(sa.text(SERVICES_NOTIFY_TRIGGER_FN_SQL))
+    op.execute(sa.text(SERVICES_NOTIFY_TRIGGER_SQL))
 
 
 def downgrade() -> None:
     bind = op.get_bind()
     if bind.dialect.name != "postgresql":
         return
-    op.execute(sa.text(f"DROP TRIGGER IF EXISTS {_TRIGGER_NAME} ON services"))
-    op.execute(sa.text(f"DROP FUNCTION IF EXISTS {_TRIGGER_FN_NAME}()"))
+    op.execute(sa.text(f"DROP TRIGGER IF EXISTS {SERVICES_NOTIFY_TRIGGER_NAME} ON services"))
+    op.execute(sa.text(f"DROP FUNCTION IF EXISTS {SERVICES_NOTIFY_TRIGGER_FN_NAME}()"))
