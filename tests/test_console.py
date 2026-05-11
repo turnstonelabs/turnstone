@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from turnstone.console.collector import ClusterCollector, NodeSnapshot
+from turnstone.console.server import _PROXY_AUTH_LOCAL_HANDLERS
 
 # Shared test auth — JWT-based
 _TEST_JWT_SECRET = "test-jwt-secret-minimum-32-chars!"
@@ -1564,22 +1565,17 @@ class TestConsoleProxy:
 
     # -------------------------------------------------------------------
     # Proxied auth endpoints — handled locally by the console, not
-    # forwarded to the upstream node.  See proxy_api's docstring (and the
-    # comment above _PROXY_AUTH_LOCAL_HANDLERS) for the JWT-audience
-    # reasoning.
+    # forwarded to the upstream node.  Cases derive directly from
+    # ``_PROXY_AUTH_LOCAL_HANDLERS`` so a new dispatch entry can't be
+    # added without a matching test (or vice versa).  See proxy_api's
+    # docstring for the JWT-audience reasoning.
     # -------------------------------------------------------------------
 
     @pytest.mark.parametrize(
         ("method", "path", "handler_name"),
         [
-            ("POST", "auth/login", "auth_login"),
-            ("POST", "auth/logout", "auth_logout"),
-            ("POST", "auth/setup", "auth_setup"),
-            ("POST", "auth/refresh", "auth_refresh"),
-            ("GET", "auth/status", "auth_status"),
-            ("GET", "auth/whoami", "auth_whoami"),
-            ("GET", "auth/oidc/authorize", "oidc_authorize"),
-            ("GET", "auth/oidc/callback", "oidc_callback"),
+            (method, path, handler_name)
+            for (method, path), handler_name in sorted(_PROXY_AUTH_LOCAL_HANDLERS.items())
         ],
     )
     def test_proxy_auth_endpoint_dispatches_to_local_handler(
