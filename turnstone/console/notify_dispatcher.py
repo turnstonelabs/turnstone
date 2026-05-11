@@ -9,7 +9,8 @@ Consumers register at construction time by passing their channel in
 :attr:`channels`, then call :meth:`subscribe` to attach a handler.
 Registering an undeclared channel raises — the construction list is the
 single source of truth so wire-in is explicit (each future consumer
-touches one line in ``_bootstrap_console_subsystem`` to add its channel).
+touches the dispatcher construction call site at
+``turnstone/console/server.py::main`` to add its channel).
 
 On connection loss the listener wakes its handlers with a synthetic
 ``Notify(channel, payload="reconcile", pid=0)`` so every consumer

@@ -1996,7 +1996,7 @@ class PostgreSQLBackend:
         can't inject SQL.
 
         ``TURNSTONE_DB_LISTEN_URL`` overrides the engine URL — see
-        :func:`_pg_listen_url` for the bypass-URL rationale.
+        :func:`_resolve_pg_listen_url` for the bypass-URL rationale.
 
         Yields a :class:`_PostgreSQLNotifyStream`; the connection is
         closed on context exit.

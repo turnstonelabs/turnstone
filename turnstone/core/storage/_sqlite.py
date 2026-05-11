@@ -203,6 +203,9 @@ class _SQLiteNotifyStream:
                     item = self._queue.get(timeout=remaining)
                 out.append(item)
         except queue.Empty:
+            # End-of-drain: the blocking get hit its deadline OR a
+            # get_nowait found the queue empty.  Either way we return
+            # whatever was already collected.
             pass
         return out
 
@@ -2123,18 +2126,32 @@ class SQLiteBackend:
                 q.put(Notify(channel=channel, payload=payload, pid=0))
 
     @contextlib.contextmanager
-    def listen(self, channels: Iterable[str]) -> Iterator[NotifyStream]:
+    def listen(
+        self,
+        channels: Iterable[str],
+        *,
+        sweep_interval: float = _SQLITE_NOTIFY_SWEEP_INTERVAL,
+    ) -> Iterator[NotifyStream]:
         """Subscribe to channels — synthetic-sweep + in-process fan-out.
 
-        The returned stream wakes every ``_SQLITE_NOTIFY_SWEEP_INTERVAL``
-        seconds (see the constant for cadence + rationale) with one
-        ``Notify(channel, payload="sweep", pid=0)`` per subscribed
-        channel.  In-process :meth:`notify` calls deliver immediately on
-        top of that.  Either path produces a wake-up; consumers reconcile
-        by re-reading the relevant rows.
+        The returned stream wakes every ``sweep_interval`` seconds with
+        one ``Notify(channel, payload="sweep", pid=0)`` per subscribed
+        channel; the default (:data:`_SQLITE_NOTIFY_SWEEP_INTERVAL`)
+        suits a dev backstop with a 60 s consumer-side timer.  Callers
+        that need a tighter cadence (e.g. a future consumer without its
+        own polling timer) pass a smaller value here.  In-process
+        :meth:`notify` calls deliver immediately on top of the sweep.
+        Either path produces a wake-up; consumers reconcile by re-reading
+        the relevant rows.
+
+        Channel names are de-duplicated so callers passing the same name
+        twice don't double-deliver each notify to a single stream.
         """
-        ch_list = [str(c) for c in channels if c]
-        stream = _SQLiteNotifyStream(self, ch_list, sweep_interval=_SQLITE_NOTIFY_SWEEP_INTERVAL)
+        # de-dupe + preserve insertion order — passing the same channel
+        # twice would otherwise register the stream's queue against that
+        # channel twice and deliver each notify multiple times.
+        ch_list = list(dict.fromkeys(str(c) for c in channels if c))
+        stream = _SQLiteNotifyStream(self, ch_list, sweep_interval=sweep_interval)
         try:
             yield stream
         finally:
