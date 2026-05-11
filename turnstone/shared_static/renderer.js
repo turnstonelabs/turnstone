@@ -317,9 +317,34 @@ function renderMarkdown(text) {
   // regex treated the outer-open and inner-open as a single fence
   // pair, stranding the rest of the content with visible
   // \x00CB{n}\x00 sentinels.
+  //
+  // Two constraints below close the gap that mid-stream buffers
+  // expose:
+  //
+  //   1. Content can't contain its own close pattern — `(?!\1)`
+  //      inside the content quantifier blocks the lazy matcher
+  //      from extending across another N-backtick run. Without
+  //      this, a buffer like  ```mermaid\n<partial>\n```python\n
+  //      <partial>\n```  would extend mermaid's content all the
+  //      way to the FINAL ```, swallowing python and handing
+  //      mermaid a wrong (and incomplete-looking) source. With
+  //      the lookahead, content stops at the first matching run
+  //      and the open simply doesn't match anything until a true
+  //      close arrives. Inner backticks of a SMALLER count (e.g.
+  //      3-backtick inner inside a 4-backtick outer) still pass
+  //      since `\1` is the OPEN count, not just three.
+  //
+  //   2. The close must live at a line boundary — `[ \t]*(?=\n|$)`
+  //      after `\1` forbids the close from being immediately
+  //      followed by a language tag, so ```python opening another
+  //      fence can't masquerade as the previous fence's close.
+  //
+  // Together these mean an unclosed fence stays as plain markdown
+  // until its true close arrives — no intermediate parse errors
+  // flash through mermaid / hljs while a stream is in flight.
   var codeBlocks = [];
   text = text.replace(
-    /(```+)([^\s`]*)\n([\s\S]*?)\1/g,
+    /(```+)([^\s`]*)\n((?:(?!\1)[\s\S])*?)\1[ \t]*(?=\n|$)/g,
     function (m, _open, lang, code) {
       var cssLang = _langToCssClass(lang);
       codeBlocks.push(
@@ -718,38 +743,98 @@ var _TERMINAL_LANGS = {
 };
 var _hljsConfigured = false;
 
-function postRenderMarkdown(containerEl) {
-  // Syntax highlighting (skip if highlight.js unavailable)
-  if (typeof hljs !== "undefined") {
-    if (!_hljsConfigured) {
-      hljs.configure({ ignoreUnescapedHTML: true });
-      _hljsConfigured = true;
+// Source-keyed highlight cache. Mirrors _mermaidSvgCache: streamingRender
+// replaces innerHTML wholesale on every rAF tick, so the <code> elements
+// inside come up FRESH each tick — they don't carry the hljs class, and
+// nothing on them carries forward. Without a cache, running hljs per
+// tick would re-tokenize every code block every paint cycle on long
+// streamed responses with many fences. With the cache, identical
+// (language, source) pairs reuse the highlighted innerHTML synchronously.
+//
+// Cache miss runs hljs.highlightElement(el) (which mutates the element
+// in place: replaces its innerHTML with highlighted span markup and
+// adds the hljs class) and stores the resulting markup. Cache hit
+// assigns that stored markup to el.innerHTML and re-adds the hljs
+// class manually — semantically equivalent to a fresh highlightElement
+// call without paying for re-tokenization.
+//
+// The cached value is the structured span markup that hljs itself
+// produced from already-escaped text content, so re-assigning it to
+// innerHTML doesn't widen the XSS surface beyond what hljs.highlight
+// Element already does.
+//
+// FIFO-bounded so a long session with many distinct code blocks can't
+// grow unbounded.
+var _hljsCache = new Map();
+var _HLJS_CACHE_MAX = 64;
+
+// Shared FIFO eviction helper for the source-keyed caches in this
+// file (_hljsCache, _mermaidSvgCache, _mermaidErrorCache, plus the
+// raw→normalized mermaid memo). Only evicts the oldest when inserting
+// a NEW key — overwriting an existing key is an in-place update and
+// must not pay the eviction cost (which would drop an unrelated
+// cached entry). The `cache_overwrite_does_not_evict` tests pin this
+// invariant per cache.
+function _cacheFifoEntry(cache, key, value, max) {
+  if (!cache.has(key) && cache.size >= max) {
+    var firstKey = cache.keys().next().value;
+    cache.delete(firstKey);
+  }
+  cache.set(key, value);
+}
+
+function _applyCachedHljs(el, cachedHtml) {
+  el.innerHTML = cachedHtml;
+  el.classList.add("hljs");
+}
+
+function postRenderHljs(containerEl) {
+  if (typeof hljs === "undefined") return;
+  if (!_hljsConfigured) {
+    hljs.configure({ ignoreUnescapedHTML: true });
+    _hljsConfigured = true;
+  }
+  var codeEls = containerEl.querySelectorAll("pre code[class*='language-']");
+  for (var i = 0; i < codeEls.length; i++) {
+    var el = codeEls[i];
+    // Already-highlighted element (e.g. postRenderMarkdown called twice
+    // on the same DOM with no intervening innerHTML replace). The
+    // streaming path replaces innerHTML wholesale per tick, so this
+    // guard primarily protects the non-streaming render path.
+    if (el.classList.contains("hljs")) continue;
+    // Extract language name from class
+    var langClass = "";
+    for (var j = 0; j < el.classList.length; j++) {
+      if (el.classList[j].startsWith("language-")) {
+        langClass = el.classList[j].substring(9);
+        break;
+      }
     }
-    var codeEls = containerEl.querySelectorAll("pre code[class*='language-']");
-    for (var i = 0; i < codeEls.length; i++) {
-      var el = codeEls[i];
-      if (el.classList.contains("hljs")) continue;
-      // Extract language name from class
-      var langClass = "";
-      for (var j = 0; j < el.classList.length; j++) {
-        if (el.classList[j].startsWith("language-")) {
-          langClass = el.classList[j].substring(9);
-          break;
-        }
-      }
-      // Skip plaintext variants
-      if (_NO_HIGHLIGHT_LANGS[langClass]) {
-        el.classList.add("nohighlight");
-        continue;
-      }
-      // Apply highlighting
+    // Skip plaintext variants
+    if (_NO_HIGHLIGHT_LANGS[langClass]) {
+      el.classList.add("nohighlight");
+      continue;
+    }
+    // Cache key: language + separator + source. ":" isn't part of a
+    // language identifier so the prefix is unambiguous across keys.
+    var source = el.textContent;
+    var cacheKey = langClass + ":" + source;
+    if (_hljsCache.has(cacheKey)) {
+      _applyCachedHljs(el, _hljsCache.get(cacheKey));
+    } else {
       hljs.highlightElement(el);
-      // Add terminal styling class for shell languages
-      if (_TERMINAL_LANGS[langClass]) {
-        el.closest("pre").classList.add("code-terminal");
-      }
+      _cacheFifoEntry(_hljsCache, cacheKey, el.innerHTML, _HLJS_CACHE_MAX);
+    }
+    // Add terminal styling class for shell languages
+    if (_TERMINAL_LANGS[langClass]) {
+      var pre = el.closest("pre");
+      if (pre) pre.classList.add("code-terminal");
     }
   }
+}
+
+function postRenderMarkdown(containerEl) {
+  postRenderHljs(containerEl);
   // Render mermaid diagrams (lazy-loads mermaid.js on first use)
   postRenderMermaid(containerEl);
 }
@@ -826,6 +911,92 @@ function _getMermaidTheme() {
   };
 }
 
+// Mermaid label autoquoter.
+//
+// Mermaid's flowchart parser treats ( ) [ ] { } as shape delimiters
+// EVERYWHERE — including inside other labels — unless the label is
+// wrapped in "...". LLM-emitted diagrams routinely produce things
+// like  A["x"] -->|note (with parens)| B  or  D[label (foo, bar)]
+// and Mermaid then rejects them with "Parse error, got PS" (paren-
+// start in shape context — the parser entered a nested shape parse
+// at the bare `(` and ran out of expected closing tokens).
+//
+// We can't fix every malformed diagram, but the two patterns above
+// are easy to spot syntactically and quote:
+//
+//   1. Edge labels:  |content|  →  |"content"|
+//   2. Plain rectangle node labels:  ID[content]  →  ID["content"]
+//
+// Shapes whose syntax already nests delimiters — cylinders [(...)],
+// subroutines [[...]], trapezoids [/.../] [\...\], circles ((...)),
+// double circles (((...))), hexagons {{...}}, diamonds {...} — are
+// intentionally left alone. The inner delimiters are part of the
+// shape, and our regex would corrupt valid syntax. Authors using
+// those shapes must quote the label manually.
+function _normalizeMermaidSource(source) {
+  if (!source) return source;
+  // Fast path: no shape delimiters anywhere → nothing to quote.
+  if (
+    source.indexOf("(") === -1 &&
+    source.indexOf("[") === -1 &&
+    source.indexOf("{") === -1
+  ) {
+    return source;
+  }
+  var lines = source.split("\n");
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    // %% directives and comments — never rewrite. The %%{init:...}%%
+    // form contains braces that would otherwise look like a label.
+    if (/^\s*%%/.test(line)) continue;
+    line = _quoteMermaidNodeLabels(line);
+    line = _quoteMermaidEdgeLabels(line);
+    lines[i] = line;
+  }
+  return lines.join("\n");
+}
+
+function _quoteMermaidNodeLabels(line) {
+  // ID[content]  →  ID["content"]  when content needs quoting.
+  //
+  // The first character of content is restricted to NOT be [ ( / \
+  // so we skip [[subroutine]], [(cylinder)], [/trap/], [\trap\].
+  // The rest of content is restricted to NOT contain [ ] so the
+  // regex can't run away past a legitimate ].
+  return line.replace(
+    /([A-Za-z_][\w-]*)\[([^[(/\\\n][^[\]\n]*?)\]/g,
+    function (m, id, content) {
+      if (_mermaidLabelNeedsQuoting(content)) {
+        return id + '["' + content + '"]';
+      }
+      return m;
+    },
+  );
+}
+
+function _quoteMermaidEdgeLabels(line) {
+  // |content|  →  |"content"|  when content needs quoting.
+  // Edge labels can't contain a literal | (it's the delimiter), so
+  // [^|\n] is exhaustive.
+  return line.replace(/\|([^|\n]+)\|/g, function (m, content) {
+    if (_mermaidLabelNeedsQuoting(content)) {
+      return '|"' + content + '"|';
+    }
+    return m;
+  });
+}
+
+function _mermaidLabelNeedsQuoting(content) {
+  // Any literal " in content would produce nested unescaped quotes
+  // when we wrap. Punt to manual fix. This also short-circuits the
+  // already-correctly-quoted "..." case (which has " at the bounds).
+  if (content.indexOf('"') !== -1) return false;
+  // <br/> and <br> are part of Mermaid's allowed HTML in labels and
+  // don't on their own require quoting.
+  var stripped = content.replace(/<br\s*\/?>/gi, "");
+  return /[()[\]{}]/.test(stripped);
+}
+
 // Source-keyed SVG cache. Identical mermaid source produces identical
 // SVG, so we can swap in cached output synchronously without re-running
 // mermaid.render. Crucial for streaming markdown: streamingRender does
@@ -845,16 +1016,17 @@ var _mermaidSvgCache = new Map();
 var _mermaidErrorCache = new Map();
 var _MERMAID_CACHE_MAX = 64;
 
-function _cacheMermaidEntry(cache, source, value) {
-  // Only evict the oldest when inserting a new key — overwriting an
-  // existing source is an in-place update and should not pay the
-  // eviction cost (which would drop an unrelated cached entry).
-  if (!cache.has(source) && cache.size >= _MERMAID_CACHE_MAX) {
-    var firstKey = cache.keys().next().value;
-    cache.delete(firstKey);
-  }
-  cache.set(source, value);
-}
+// Raw-textContent → normalized memo. _normalizeMermaidSource splits +
+// regex-replaces line by line; on a 50-line flowchart that's ~57 µs.
+// The SVG cache short-circuits mermaid.render once we have the
+// normalized key, but the *normalize step itself* runs on every rAF
+// tick (postRenderMermaid always calls it before the SVG-cache
+// lookup, since the normalized output IS the lookup key). Memoizing
+// raw → normalized avoids repeating the split + regex for diagrams
+// whose source hasn't changed between ticks. Bounded with the same
+// _MERMAID_CACHE_MAX so eviction stays in lockstep with the SVG
+// cache it feeds.
+var _mermaidNormalizeCache = new Map();
 
 function _applyMermaidSvg(container, svg, bindFunctions) {
   container.innerHTML = svg;
@@ -921,10 +1093,12 @@ function _renderMermaidBlock(container, callback) {
     var id = "mermaid-" + ++_mermaidIdCounter;
     return mermaid.render(id, source).then(
       function (result) {
-        _cacheMermaidEntry(_mermaidSvgCache, source, {
-          svg: result.svg,
-          bindFunctions: result.bindFunctions,
-        });
+        _cacheFifoEntry(
+          _mermaidSvgCache,
+          source,
+          { svg: result.svg, bindFunctions: result.bindFunctions },
+          _MERMAID_CACHE_MAX,
+        );
         for (var i = 0; i < pending.length; i++) {
           var c = pending[i];
           if (c.isConnected) {
@@ -936,7 +1110,7 @@ function _renderMermaidBlock(container, callback) {
         var orphan = document.getElementById(id);
         if (orphan) orphan.remove();
         var msg = err && err.message ? err.message : "Diagram error";
-        _cacheMermaidEntry(_mermaidErrorCache, source, msg);
+        _cacheFifoEntry(_mermaidErrorCache, source, msg, _MERMAID_CACHE_MAX);
         for (var i = 0; i < pending.length; i++) {
           var c = pending[i];
           if (c.isConnected) _applyMermaidError(c, source, msg);
@@ -962,7 +1136,20 @@ function postRenderMermaid(containerEl) {
   for (var i = 0; i < codeEls.length; i++) {
     var pre = codeEls[i].closest("pre");
     if (!pre) continue;
-    var source = codeEls[i].textContent;
+    // Autoquote labels with bare shape-delimiter chars before
+    // caching / rendering. Identical malformed input maps to identical
+    // normalized output, so the SVG cache still hits on repeated
+    // streams of the same diagram. _mermaidNormalizeCache skips the
+    // split + per-line regex when the raw textContent hasn't changed
+    // between ticks — only on a fresh source does normalization run.
+    var raw = codeEls[i].textContent;
+    var source;
+    if (_mermaidNormalizeCache.has(raw)) {
+      source = _mermaidNormalizeCache.get(raw);
+    } else {
+      source = _normalizeMermaidSource(raw);
+      _cacheFifoEntry(_mermaidNormalizeCache, raw, source, _MERMAID_CACHE_MAX);
+    }
     var div = document.createElement("div");
     div.setAttribute("data-mermaid-source", source);
     // Use cache.has (not truthiness) so a future cached value of
@@ -1022,11 +1209,12 @@ function reRenderAllMermaid() {
 //  cycle.  renderMarkdown tolerates mid-stream partial fences / lists
 //  (they render as literal text and resolve once the closing tokens
 //  arrive), and the per-element buffer cache skips identical redundant
-//  renders (SSE retries / resumes).  hljs syntax highlighting stays
-//  deferred to streamingRenderFinalize, but mermaid runs inline on
-//  every render so closed diagram fences appear progressively as they
-//  complete (the source-keyed SVG cache makes re-renders cheap; only
-//  the first encounter with a given source pays mermaid.render).
+//  renders (SSE retries / resumes).  Both hljs syntax highlighting
+//  and mermaid run inline on every render so closed code / diagram
+//  fences appear progressively as they complete; their source-keyed
+//  caches (_hljsCache, _mermaidSvgCache) make subsequent rAF ticks
+//  that re-extract the same closed fence hit synchronously without
+//  re-invoking hljs.highlightElement / mermaid.render.
 //  renderMarkdown escapes HTML internally (see escapeHtml in
 //  utils.js); it is the trust boundary for the markup written to el
 //  below.
@@ -1036,11 +1224,14 @@ function _streamingRenderApply(el, buffer) {
   el._lastRenderedBuffer = buffer;
   var html = renderMarkdown(buffer);
   el.innerHTML = html;
-  // Progressive mermaid render — see comment above. postRenderMermaid
-  // is no-op when the element has no language-mermaid code blocks,
-  // and the source-keyed cache avoids re-invoking mermaid.render
-  // for blocks we've already rendered. Subsequent rAF ticks that
+  // Progressive hljs + mermaid render — see comment above. Both are
+  // no-ops when the element has no matching code blocks, and their
+  // source-keyed caches avoid re-tokenizing / re-rendering for
+  // sources we've already processed. Subsequent rAF ticks that
   // re-extract the same closed fence hit the cache synchronously.
+  if (typeof postRenderHljs === "function") {
+    postRenderHljs(el);
+  }
   if (typeof postRenderMermaid === "function") {
     postRenderMermaid(el);
   }
