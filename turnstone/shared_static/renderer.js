@@ -1023,9 +1023,16 @@ var _MERMAID_CACHE_MAX = 64;
 // tick (postRenderMermaid always calls it before the SVG-cache
 // lookup, since the normalized output IS the lookup key). Memoizing
 // raw → normalized avoids repeating the split + regex for diagrams
-// whose source hasn't changed between ticks. Bounded with the same
-// _MERMAID_CACHE_MAX so eviction stays in lockstep with the SVG
-// cache it feeds.
+// whose source hasn't changed between ticks.
+//
+// Bounded by _MERMAID_CACHE_MAX so its memory footprint stays in the
+// same order of magnitude as the SVG cache it feeds, but the two
+// queues evict INDEPENDENTLY: this memo keys on raw textContent while
+// the SVG cache keys on normalized source, so a single diagram can
+// occupy one slot in each with no positional coupling. The memo also
+// deliberately survives `_initMermaid` (which clears the SVG / error
+// caches on theme change) — normalization output is purely a function
+// of input text, independent of mermaid theme / config.
 var _mermaidNormalizeCache = new Map();
 
 function _applyMermaidSvg(container, svg, bindFunctions) {

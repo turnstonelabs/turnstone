@@ -288,7 +288,19 @@ function makeEl(tag) {
         .replace(/>/g, '&gt;');
     },
     get innerHTML() { return this._innerHTML; },
-    set innerHTML(v) { this._innerHTML = v; this.children = []; },
+    set innerHTML(v) {
+      // Real DOM invalidates the previous textContent when innerHTML
+      // is replaced — leaving _textContent intact would return stale
+      // data from subsequent textContent reads and mask bugs that
+      // depend on innerHTML/textContent consistency. We don't HTML-
+      // parse here, so the cheap correct behavior is to clear
+      // _textContent and let the children-derived fallback in the
+      // textContent getter (which is empty after this children = [])
+      // take over.
+      this._innerHTML = v;
+      this.children = [];
+      this._textContent = '';
+    },
     get isConnected() {
       // In real DOM this checks attachment to the document; for the
       // test harness we approximate via the parent chain. After
