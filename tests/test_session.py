@@ -1974,6 +1974,202 @@ class TestCoordinatorMemoryScope:
         assert scopes == ["workstream", "user", "global"]
 
 
+class TestMemoryToolAudit:
+    """Mutating memory tool actions emit audit rows.
+
+    Closes the gap that masked the May 2026 vllm_fork_overlay_pattern
+    investigation: only the admin-console DELETE route emitted
+    ``memory.delete``, so a long-running session whose memory was
+    deleted via the admin UI couldn't tell from logs alone whether the
+    row had been deleted out-of-band, never persisted, or was never
+    visible.  Read actions (get/search/list) intentionally stay
+    un-audited — auditing reads would multiply audit volume without
+    forensic value.
+    """
+
+    @staticmethod
+    def _audit_rows(action: str) -> list[dict]:
+        from turnstone.core.storage._registry import get_storage
+
+        return get_storage().list_audit_events(action=action)
+
+    def test_save_new_emits_memory_save(self, tmp_db):
+        session = _make_session(ws_id="ws-1", user_id="user-1")
+        item = session._prepare_memory(
+            "call_1",
+            {
+                "action": "save",
+                "name": "fact_one",
+                "content": "alpha content",
+                "scope": "user",
+                "type": "reference",
+            },
+        )
+        assert "error" not in item
+        session._exec_memory(item)
+
+        rows = self._audit_rows("memory.save")
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["user_id"] == "user-1"
+        assert row["resource_type"] == "memory"
+        assert row["resource_id"]  # memory_id was populated
+        detail = json.loads(row["detail"])
+        assert detail["name"] == "fact_one"
+        assert detail["scope"] == "user"
+        assert detail["scope_id"] == "user-1"
+        assert detail["type"] == "reference"
+        assert detail["ws_id"] == "ws-1"
+        # The "create" path must NOT also stamp an update row.
+        assert self._audit_rows("memory.update") == []
+
+    def test_save_global_scope_emits_empty_scope_id(self, tmp_db):
+        """Global memories have no scope_id — the audit row's detail
+        must still carry the key (with value ``""``) so a forensic
+        consumer can distinguish ``scope='global'`` from a row that
+        forgot to populate ``scope_id`` for a scoped write."""
+        session = _make_session(ws_id="ws-1", user_id="user-1")
+        item = session._prepare_memory(
+            "call_1",
+            {
+                "action": "save",
+                "name": "fact_global",
+                "content": "shared content",
+                "scope": "global",
+            },
+        )
+        assert "error" not in item
+        session._exec_memory(item)
+
+        rows = self._audit_rows("memory.save")
+        assert len(rows) == 1
+        detail = json.loads(rows[0]["detail"])
+        assert detail["scope"] == "global"
+        assert detail["scope_id"] == ""
+        assert detail["ws_id"] == "ws-1"
+
+    def test_save_upsert_emits_memory_update(self, tmp_db):
+        session = _make_session(ws_id="ws-1", user_id="user-1")
+        for content in ("first", "second"):
+            item = session._prepare_memory(
+                "call_x",
+                {
+                    "action": "save",
+                    "name": "fact_one",
+                    "content": content,
+                    "scope": "user",
+                    "type": "reference",
+                },
+            )
+            session._exec_memory(item)
+
+        saves = self._audit_rows("memory.save")
+        updates = self._audit_rows("memory.update")
+        assert len(saves) == 1
+        assert len(updates) == 1
+        # Same memory_id on both rows — the update audits the row save created.
+        assert saves[0]["resource_id"] == updates[0]["resource_id"]
+
+    def test_delete_emits_memory_delete(self, tmp_db):
+        session = _make_session(ws_id="ws-1", user_id="user-1")
+        save_item = session._prepare_memory(
+            "call_1",
+            {
+                "action": "save",
+                "name": "fact_one",
+                "content": "alpha",
+                "scope": "user",
+                "type": "reference",
+            },
+        )
+        session._exec_memory(save_item)
+        saved_memory_id = self._audit_rows("memory.save")[0]["resource_id"]
+
+        delete_item = session._prepare_memory(
+            "call_2",
+            {"action": "delete", "name": "fact_one", "scope": "user"},
+        )
+        _, msg = session._exec_memory(delete_item)
+        assert "Deleted memory" in msg
+
+        rows = self._audit_rows("memory.delete")
+        assert len(rows) == 1
+        # resource_id must point at the same row save audited — proves
+        # delete-by-name resolved to the right row before recording.
+        assert rows[0]["resource_id"] == saved_memory_id
+        detail = json.loads(rows[0]["detail"])
+        assert detail["name"] == "fact_one"
+        assert detail["scope"] == "user"
+        assert detail["type"] == "reference"
+
+    def test_delete_not_found_emits_no_audit(self, tmp_db):
+        session = _make_session(ws_id="ws-1", user_id="user-1")
+        delete_item = session._prepare_memory(
+            "call_1",
+            {"action": "delete", "name": "no_such_mem", "scope": "user"},
+        )
+        _, msg = session._exec_memory(delete_item)
+        assert "not found" in msg
+        assert self._audit_rows("memory.delete") == []
+
+    def test_reads_emit_no_audit(self, tmp_db):
+        session = _make_session(ws_id="ws-1", user_id="user-1")
+        session._exec_memory(
+            session._prepare_memory(
+                "call_save",
+                {
+                    "action": "save",
+                    "name": "fact_one",
+                    "content": "alpha",
+                    "scope": "user",
+                },
+            )
+        )
+
+        for spec in (
+            {"action": "get", "name": "fact_one", "scope": "user"},
+            {"action": "search", "query": "fact"},
+            {"action": "list"},
+        ):
+            item = session._prepare_memory("call_read", spec)
+            assert "error" not in item
+            session._exec_memory(item)
+
+        # Only the save above should have audited.
+        save_count = len(self._audit_rows("memory.save"))
+        update_count = len(self._audit_rows("memory.update"))
+        delete_count = len(self._audit_rows("memory.delete"))
+        assert (save_count, update_count, delete_count) == (1, 0, 0)
+
+    def test_audit_failure_does_not_break_tool_call(self, tmp_db):
+        """A blow-up inside record_audit must not propagate to the LLM.
+
+        Auditing is best-effort instrumentation; a storage hiccup that
+        prevents the audit row from landing must not also lose the
+        save/delete the user actually asked for.
+        """
+        session = _make_session(ws_id="ws-1", user_id="user-1")
+        item = session._prepare_memory(
+            "call_1",
+            {
+                "action": "save",
+                "name": "fact_one",
+                "content": "alpha",
+                "scope": "user",
+            },
+        )
+        with patch(
+            "turnstone.core.audit.record_audit",
+            side_effect=RuntimeError("audit storage exploded"),
+        ):
+            _, msg = session._exec_memory(item)
+        assert "Saved memory 'fact_one'" in msg
+        # The save itself still landed.
+        from turnstone.core.memory import get_structured_memory_by_name
+
+        assert get_structured_memory_by_name("fact_one", "user", "user-1") is not None
+
+
 class TestPerKindToolVariants:
     """Verify the ``kind_variants`` metadata applies per-kind tool overrides.
 

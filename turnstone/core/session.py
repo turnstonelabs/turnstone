@@ -50,7 +50,7 @@ from turnstone.core.log import get_logger
 from turnstone.core.memory import (
     count_structured_memories,
     delete_messages_after,
-    delete_structured_memory,
+    delete_structured_memory_by_id,
     delete_workstream,
     get_skill_by_name,
     get_structured_memory_by_name,
@@ -9638,6 +9638,56 @@ class ChatSession:
 
         return content
 
+    def _audit_memory_event(
+        self,
+        action: str,
+        memory_id: str,
+        *,
+        name: str,
+        scope: str,
+        scope_id: str,
+        mem_type: str,
+    ) -> None:
+        """Emit an audit row for a mutating memory tool action.
+
+        Closes the audit gap that previously masked out-of-band deletes
+        when investigating "save reports success but get returns
+        not-found": only the admin-console DELETE route emitted
+        ``memory.delete`` rows, so a long-running session whose row was
+        deleted by the console UI couldn't tell from logs alone whether
+        the row had been deleted, never persisted, or was never visible.
+
+        ``scope_id`` is the empty string for ``scope='global'`` and the
+        actor's user_id / ws_id for the other scopes — written as-is so
+        forensic queries can filter on it.  ``ws_id`` always rides in
+        the detail (``self._ws_id`` is unconditional on ChatSession).
+
+        Best-effort: failures log at debug and swallow so an audit hiccup
+        never breaks the tool call itself. Reads (get/search/list) are
+        intentionally not audited — they'd multiply audit volume
+        without forensic value.
+        """
+        try:
+            from turnstone.core.audit import record_audit
+
+            detail: dict[str, Any] = {
+                "name": name,
+                "scope": scope,
+                "scope_id": scope_id,
+                "type": mem_type,
+                "ws_id": self._ws_id,
+            }
+            record_audit(
+                get_storage(),
+                self._user_id,
+                action,
+                "memory",
+                memory_id,
+                detail,
+            )
+        except Exception:
+            log.debug("memory.audit_failed action=%s name=%s", action, name, exc_info=True)
+
     def _exec_memory(self, item: dict[str, Any]) -> tuple[str, str]:
         """Execute a memory tool action."""
         call_id = item["call_id"]
@@ -9659,6 +9709,14 @@ class ChatSession:
                     return call_id, msg
                 self._invalidate_memory_cache()
                 self._init_system_messages()
+                self._audit_memory_event(
+                    "memory.update" if old is not None else "memory.save",
+                    memory_id,
+                    name=item["name"],
+                    scope=item["scope"],
+                    scope_id=item["scope_id"],
+                    mem_type=item["mem_type"],
+                )
                 if old is not None:
                     msg = f"Updated memory '{item['name']}' (type={item['mem_type']}, scope={item['scope']})"
                 else:
@@ -9691,20 +9749,36 @@ class ChatSession:
 
             if action == "delete":
                 scopes = item["scopes_to_try"]
-                deleted = False
+                deleted: dict[str, str] | None = None
                 deleted_scope = ""
+                deleted_scope_id = ""
+                # Look up first so the audit row can record the deleted
+                # memory_id + type (delete-by-name returns only a bool).
+                # Falling back through the scope walk keeps the current
+                # narrowest-first IC semantics; coord sessions only see
+                # ``coordinator`` here.
                 for scope, scope_id in scopes:
-                    if delete_structured_memory(item["name"], scope, scope_id):
-                        deleted = True
+                    existing = get_structured_memory_by_name(item["name"], scope, scope_id)
+                    if existing and delete_structured_memory_by_id(existing["memory_id"]):
+                        deleted = existing
                         deleted_scope = scope
+                        deleted_scope_id = scope_id
                         break
-                if not deleted:
+                if deleted is None:
                     tried = ", ".join(s for s, _ in scopes)
                     msg = f"Error: memory '{item['name']}' not found (searched scopes: {tried})"
                     self._report_tool_result(call_id, "memory", msg, is_error=True)
                 else:
                     self._invalidate_memory_cache()
                     self._init_system_messages()
+                    self._audit_memory_event(
+                        "memory.delete",
+                        deleted["memory_id"],
+                        name=item["name"],
+                        scope=deleted_scope,
+                        scope_id=deleted_scope_id,
+                        mem_type=deleted.get("type", ""),
+                    )
                     msg = f"Deleted memory '{item['name']}' (scope={deleted_scope})"
                     self._report_tool_result(call_id, "memory", msg)
                 return call_id, msg
