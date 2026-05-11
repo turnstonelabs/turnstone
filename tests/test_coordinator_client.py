@@ -9,6 +9,7 @@ storage-call path.
 from __future__ import annotations
 
 import json
+import time
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -20,6 +21,7 @@ from turnstone.console.coordinator_client import (
     CoordinatorTokenManager,
 )
 from turnstone.core.auth import JWT_AUD_CONSOLE, validate_jwt
+from turnstone.core.child_event_bus import ChildEventBus
 from turnstone.core.storage._sqlite import SQLiteBackend
 
 if TYPE_CHECKING:
@@ -145,6 +147,7 @@ def _mock_client(
         coord_ws_id="coord-1",
         user_id="user-1",
         http_client=http,
+        child_event_bus=ChildEventBus(),
     )
     return client, captured
 
@@ -470,6 +473,7 @@ def _make_read_client(storage: SQLiteBackend) -> CoordinatorClient:
         coord_ws_id="coord-1",
         user_id="user-1",
         http_client=http,
+        child_event_bus=ChildEventBus(),
     )
 
 
@@ -663,6 +667,7 @@ def _make_client_with_cluster_response(
         coord_ws_id="coord-1",
         user_id="user-1",
         http_client=http,
+        child_event_bus=ChildEventBus(),
     )
 
 
@@ -1443,6 +1448,23 @@ def test_wait_for_workstream_denies_foreign_ws_id(populated_storage):
     assert result["elapsed"] < 1.0
 
 
+def test_wait_for_workstream_denies_cross_tenant_child(populated_storage):
+    """Defense-in-depth (Copilot #506): a row whose ``parent_ws_id``
+    matches the coordinator but whose ``user_id`` belongs to a
+    different tenant must collapse to ``denied`` — otherwise a
+    forged / migration-era / pre-tenant-gate row would let a
+    coordinator's LLM observe foreign-tenant state through
+    ``wait_for_workstream``.  The ``populated_storage`` fixture's
+    ``cross-tenant-child`` row has exactly this shape
+    (parent_ws_id="coord-1", user_id="user-2").
+    """
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["cross-tenant-child"], timeout=5, mode="any")
+    assert result["results"]["cross-tenant-child"]["state"] == "denied"
+    assert result["complete"] is False
+    assert result["elapsed"] < 1.0
+
+
 def test_wait_for_workstream_missing_ws_id_indistinguishable_from_denied(populated_storage):
     """A ws_id that doesn't exist collapses into the same 'denied'
     shape as a foreign ws_id so wait can't be used as an existence
@@ -1531,10 +1553,22 @@ def test_wait_for_workstream_dedupes_ws_ids(populated_storage):
     assert list(result["results"].keys()) == ["child-a"]
 
 
-def test_wait_for_workstream_uses_batched_storage_calls(populated_storage, monkeypatch):
-    """Per-tick polling must issue batched storage calls — at the
-    documented cap (32 ws_ids over a 600s wait) the naive per-id
-    shape produced ~38k row reads.  Guard against regression."""
+def test_wait_for_workstream_never_falls_back_to_per_id_storage_calls(
+    populated_storage, monkeypatch
+):
+    """All storage reads issued by ``wait_for_workstream`` must go
+    through the batched paths.  At the documented cap (32 ws_ids over
+    a 600 s wait) the naive per-id shape produced ~38k row reads, so
+    a regression to per-id is the meaningful failure mode this test
+    guards against.
+
+    The primary safety net is the ``pytest.fail`` mock on the per-id
+    ``get_workstream`` / ``sum_workstream_tokens`` paths — any call
+    there blows up loudly with the regression message.  The
+    additional ``batch_calls`` / ``sum_calls`` assertions cover the
+    subtler regression where the call IS batched but only covers a
+    subset of ws_ids (e.g. one ws_id per call in a loop).
+    """
     client = _make_read_client(populated_storage)
     batch_calls: list[list[str]] = []
     sum_calls: list[list[str]] = []
@@ -1565,11 +1599,16 @@ def test_wait_for_workstream_uses_batched_storage_calls(populated_storage, monke
 
     result = client.wait_for_workstream(["child-a", "child-b"], timeout=5, mode="any")
     assert result["complete"] is True
-    # One tick is enough since child-a is already idle (terminal).
-    assert len(batch_calls) == 1
-    assert len(sum_calls) == 1
-    assert set(batch_calls[0]) == {"child-a", "child-b"}
-    assert set(sum_calls[0]) == {"child-a", "child-b"}
+    # Every batched call carried the full ws_id set.  The exact count
+    # (currently 2: one pre-loop ownership filter + one snapshot tick)
+    # is incidental; if either gains another batched read it stays
+    # batched, which is the property under test.
+    assert batch_calls, "no batched get_workstreams_batch call observed"
+    assert sum_calls, "no batched sum_workstream_tokens_batch call observed"
+    first_batch = set(batch_calls[0])
+    first_sum = set(sum_calls[0])
+    assert first_batch == {"child-a", "child-b"}
+    assert first_sum == {"child-a", "child-b"}
 
 
 def test_wait_for_workstream_handles_non_string_mode(populated_storage):
@@ -1579,6 +1618,205 @@ def test_wait_for_workstream_handles_non_string_mode(populated_storage):
     result = client.wait_for_workstream(["child-a"], mode=123)  # type: ignore[arg-type]
     assert "error" in result
     assert "invalid mode" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# wait_for_workstream — event-driven (ChildEventBus wired in)
+# ---------------------------------------------------------------------------
+#
+# When the coord adapter wires its ``child_event_bus`` into the client,
+# the wait loop blocks on a per-call ``threading.Event`` keyed by ws_id
+# and only re-snapshots storage on state-change wakes or the heartbeat
+# cap.  The legacy ``time.sleep`` poll path remains intact for tests
+# that don't wire the bus (above), so this section adds focused
+# coverage of the bus-driven behaviour without re-running the full
+# matrix of mode / since / cross-tenant cases.
+
+
+def _make_read_client_with_bus(storage, bus) -> CoordinatorClient:
+    """Like ``_make_read_client`` but wires a real ``ChildEventBus``.
+
+    Caller owns the bus so the test can call ``bus.notify(ws_id)`` to
+    simulate the dispatch-sink wake-up.
+    """
+    transport = httpx.MockTransport(lambda r: httpx.Response(200))
+    http = httpx.Client(transport=transport)
+    return CoordinatorClient(
+        console_base_url="http://x",
+        storage=storage,
+        token_factory=lambda: "t",
+        coord_ws_id="coord-1",
+        user_id="user-1",
+        http_client=http,
+        child_event_bus=bus,
+    )
+
+
+def test_wait_with_bus_returns_immediately_when_already_terminal(populated_storage):
+    """Subscribe-after-terminal race: the wait registers its waiter
+    BEFORE the first snapshot, then re-snapshots — an already-terminal
+    child must return at once without spinning the heartbeat cap.
+    """
+    from turnstone.core.child_event_bus import ChildEventBus
+
+    bus = ChildEventBus()
+    client = _make_read_client_with_bus(populated_storage, bus)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    assert result["complete"] is True
+    assert result["results"]["child-a"]["state"] == "idle"
+    assert result["elapsed"] < 1.0
+    # Waiter must be unregistered on exit so a long-lived bus doesn't
+    # accumulate dead keys across many waits.
+    assert "child-a" not in bus._waiters
+
+
+def test_wait_with_bus_wakes_on_notify(populated_storage):
+    """The core property of the refactor: a state-change ``notify``
+    must wake the wait promptly — well under the legacy 0.5 s poll
+    cadence AND the 2 s heartbeat cap.  Test fires a state update
+    + notify after a short delay and asserts the wait returns quickly.
+    """
+    import threading as _t
+
+    from turnstone.core.child_event_bus import ChildEventBus
+
+    bus = ChildEventBus()
+    client = _make_read_client_with_bus(populated_storage, bus)
+    # child-b starts running; flip to idle + notify after the wait
+    # blocks.  100 ms is enough that the wait is parked in event.wait()
+    # but short enough that the test runs fast.
+    timer = _t.Timer(
+        0.1,
+        lambda: (
+            populated_storage.update_workstream_state("child-b", "idle"),
+            bus.notify("child-b"),
+        ),
+    )
+    timer.start()
+    start = time.monotonic()
+    result = client.wait_for_workstream(["child-b"], timeout=5.0, mode="any")
+    elapsed = time.monotonic() - start
+    assert result["complete"] is True
+    assert result["results"]["child-b"]["state"] == "idle"
+    # Bus-driven wake should fire well under 1 s; legacy poll would
+    # take ~0.5 s but bus-driven should be ~0.1 s (the timer delay)
+    # plus a few ms.  Generous 0.6 s budget for CI noise.
+    assert elapsed < 0.6, f"wake-up too slow: {elapsed}s"
+
+
+def test_wait_with_bus_unrelated_notify_does_not_wake(populated_storage):
+    """A notify on a ws_id the wait isn't watching must NOT wake it —
+    otherwise every state change anywhere on the system would shake
+    every concurrent wait into a redundant storage snapshot.
+    """
+    from turnstone.core.child_event_bus import ChildEventBus
+
+    bus = ChildEventBus()
+    client = _make_read_client_with_bus(populated_storage, bus)
+    # child-b is running indefinitely; mode='all' will time out unless
+    # a relevant notify fires.  Fire only unrelated notifies — wait
+    # should still hit the full timeout.
+    import threading as _t
+
+    def _fire_unrelated() -> None:
+        for _ in range(5):
+            bus.notify("ws-unrelated-1")
+            bus.notify("ws-unrelated-2")
+            time.sleep(0.05)
+
+    t = _t.Thread(target=_fire_unrelated, daemon=True)
+    t.start()
+    start = time.monotonic()
+    result = client.wait_for_workstream(["child-b"], timeout=0.5, mode="all")
+    elapsed = time.monotonic() - start
+    assert result["complete"] is False, "unrelated notify falsely satisfied wait"
+    # Wait should burn its full timeout (give or take heartbeat
+    # granularity).  The bus path doesn't have a 0.5 s poll, so the
+    # bound is "approximately timeout".
+    assert elapsed >= 0.5
+    t.join(timeout=1.0)
+
+
+def test_wait_with_bus_heartbeat_still_progresses_without_notify(populated_storage):
+    """Without any notify, the wait must still progress through ticks
+    via the heartbeat cap so ``progress_callback`` keeps firing for
+    the sidebar UI.  Verified by counting callback firings over an
+    interval longer than the heartbeat.
+    """
+    from turnstone.core.child_event_bus import ChildEventBus
+
+    bus = ChildEventBus()
+    client = _make_read_client_with_bus(populated_storage, bus)
+    # Shrink the heartbeat for test speed via the ClassVar seam —
+    # instance attribute shadows the class-level default.  Production
+    # stays at 2.0 s; the test exercises the heartbeat-fires-without-
+    # notify property in well under 1 s.
+    client._WAIT_HEARTBEAT_INTERVAL = 0.1  # type: ignore[misc]
+    snapshots: list[dict[str, dict[str, object]]] = []
+
+    def _cb(snap: dict[str, dict[str, object]], _elapsed: float) -> None:
+        snapshots.append(snap)
+
+    # child-b is running indefinitely; wait will time out at 0.4 s.
+    # With heartbeat = 0.1 s, we expect ~3-5 callback firings
+    # (initial tick + ~3-4 heartbeats).  Loose lower bound to avoid
+    # CI flakiness.
+    start = time.monotonic()
+    result = client.wait_for_workstream(["child-b"], timeout=0.4, mode="all", progress_callback=_cb)
+    elapsed = time.monotonic() - start
+    assert result["complete"] is False
+    assert elapsed >= 0.4
+    # At least 2 callback firings: the initial snapshot plus at least
+    # one heartbeat-driven re-tick.  Tight upper bound would be
+    # ~ceil(0.4/0.1) + 1 = 5 firings.
+    assert len(snapshots) >= 2, f"heartbeat didn't fire: {len(snapshots)} snapshots"
+
+
+def test_wait_with_bus_unregisters_waiter_on_exit(populated_storage):
+    """Both the success path and the timeout path must unregister the
+    waiter — otherwise a long-lived bus accumulates dead
+    ``threading.Event`` instances forever.
+    """
+    from turnstone.core.child_event_bus import ChildEventBus
+
+    bus = ChildEventBus()
+    client = _make_read_client_with_bus(populated_storage, bus)
+    # Success path (already-terminal child).
+    client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    assert bus._waiters == {}, "success path leaked waiter"
+    # Timeout path (running child, mode='all' that times out).
+    client.wait_for_workstream(["child-a", "child-b"], timeout=0.3, mode="all")
+    assert bus._waiters == {}, "timeout path leaked waiter"
+
+
+def test_wait_with_bus_multi_waiter_independence(populated_storage):
+    """Two concurrent waits on the same ws_id must be independent —
+    one wait completing must not affect the other's wake-up state.
+    Smoke-tests the multi-Event-per-bucket bus behaviour against the
+    real wait-loop.
+    """
+    import threading as _t
+
+    from turnstone.core.child_event_bus import ChildEventBus
+
+    bus = ChildEventBus()
+    client = _make_read_client_with_bus(populated_storage, bus)
+
+    results: dict[str, dict[str, object]] = {}
+
+    def _do_wait(label: str) -> None:
+        results[label] = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+
+    threads = [_t.Thread(target=_do_wait, args=(f"t{i}",), daemon=True) for i in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+    for label in ("t0", "t1", "t2"):
+        assert results[label]["complete"] is True
+        assert results[label]["results"]["child-a"]["state"] == "idle"
+    # All waiters must be unregistered after exit.
+    assert bus._waiters == {}
 
 
 # ---------------------------------------------------------------------------

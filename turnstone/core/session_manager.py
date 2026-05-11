@@ -22,6 +22,7 @@ from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamStat
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from turnstone.core.child_event_bus import ChildEventBus
     from turnstone.core.session import ChatSession, SessionUI
     from turnstone.core.state_writer import StateWriter
     from turnstone.core.storage._protocol import StorageBackend
@@ -251,6 +252,19 @@ class SessionManager:
     @property
     def kind(self) -> WorkstreamKind:
         return self._adapter.kind
+
+    @property
+    def child_event_bus(self) -> ChildEventBus | None:
+        """Delegate to the adapter's per-workstream wakeup bus.
+
+        Returns ``None`` for adapters that don't host one (today only the
+        coord adapter does; interactive's child surface is degenerate
+        and has nothing to wait on yet). Manager-level property gives
+        adapter-agnostic callers (tests, future cross-kind tools) a
+        stable lookup that doesn't depend on knowing which adapter is
+        attached.
+        """
+        return getattr(self._adapter, "child_event_bus", None)
 
     @property
     def _service_type(self) -> str | None:

@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 from turnstone.core import session_worker
 from turnstone.core.adapters._ui_cleanup import cleanup_session_ui
+from turnstone.core.child_event_bus import ChildEventBus
 from turnstone.core.child_source import ClusterChildSource
 from turnstone.core.children_registry import ChildrenRegistry
 from turnstone.core.log import get_logger
@@ -67,6 +68,14 @@ class CoordinatorAdapter:
         # method names which still exist as thin shims for the
         # cluster-routing + cleanup callers.
         self._registry = ChildrenRegistry()
+        # In-process wakeup primitive for ``wait_for_workstream``. The
+        # dispatch sink (:meth:`_dispatch_child_event`) calls
+        # ``notify(child_ws_id)`` after each translated child event;
+        # waiters block on per-call ``threading.Event``s instead of
+        # polling storage. Owned by the adapter so the manager-level
+        # exposure can simply delegate; ``CoordinatorClient`` picks it
+        # up via the coord client factory closure.
+        self._child_event_bus = ChildEventBus()
         # Cross-node child events arrive via ``ClusterChildSource``
         # (Stage 3 Step 2): a strategy that subscribes to the
         # collector's listener channel and runs a daemon thread that
@@ -76,6 +85,17 @@ class CoordinatorAdapter:
         # place. Constructed lazily by ``start_child_event_fanout`` so
         # the collector reference is available.
         self._child_source: ClusterChildSource | None = None
+
+    @property
+    def child_event_bus(self) -> ChildEventBus:
+        """In-process wakeup bus consumed by ``wait_for_workstream``.
+
+        Exposed so the coord client factory in the console bootstrap
+        can pass it to :class:`CoordinatorClient` without reaching
+        into a private attr, and so :class:`SessionManager` can
+        delegate its own ``child_event_bus`` property here.
+        """
+        return self._child_event_bus
 
     def attach(self, manager: SessionManager) -> None:
         """Late-bind the owning :class:`SessionManager`.
@@ -639,6 +659,13 @@ class CoordinatorAdapter:
                     "detail": event.get("detail") or {},
                 }
             _enqueue_on_ui(owning_ws.ui, coord_id, child_event)
+            # Wake any in-process ``wait_for_workstream`` subscriber on
+            # this child. Notify runs AFTER the UI enqueue so the SSE
+            # fan-out keeps priority (a wait that wakes early sees the
+            # state already enqueued for its owning dashboard). The bus
+            # is a no-op when no waiter is registered — the steady
+            # state for the hot dispatch path.
+            self._child_event_bus.notify(ws_id)
 
 
 def _enqueue_on_ui(ui: Any, coord_ws_id: str, payload: dict[str, Any]) -> None:
