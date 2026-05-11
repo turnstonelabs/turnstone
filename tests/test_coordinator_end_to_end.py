@@ -40,6 +40,7 @@ from turnstone.console.server import (
     _require_coord_mgr,
 )
 from turnstone.core.auth import AuthResult
+from turnstone.core.child_event_bus import ChildEventBus
 from turnstone.core.session_manager import SessionManager
 from turnstone.core.session_routes import (
     SessionEndpointConfig,
@@ -286,6 +287,7 @@ def test_coordinator_client_spawn_close_delete(tmp_path):
         coord_ws_id="coord-42",
         user_id="user-1",
         http_client=http,
+        child_event_bus=ChildEventBus(),
     )
 
     # spawn ---------------------------------------------------------------
@@ -387,6 +389,7 @@ def _read_client(storage: SQLiteBackend) -> CoordinatorClient:
         coord_ws_id="coord-root",
         user_id="user-1",
         http_client=http,
+        child_event_bus=ChildEventBus(),
     )
 
 

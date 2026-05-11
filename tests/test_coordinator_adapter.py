@@ -716,3 +716,82 @@ class TestCoordinatorAdapterDispatchChildEvent:
             },
         )
         assert recorder.enqueued == []
+
+    def test_dispatch_notifies_child_event_bus_on_state_event(self) -> None:
+        """Every translated state-class event must call
+        ``ChildEventBus.notify(ws_id)`` so a registered
+        ``wait_for_workstream`` waiter wakes promptly.  Notify fires
+        AFTER the UI enqueue so the SSE fan-out keeps priority — the
+        order assertion here is structural (one notify call, matching
+        ws_id) since the bus side-effect lookup is what guards against
+        regressions, not the relative event ordering.
+        """
+        adapter, _, _ = self._setup()
+        adapter._registry.merge_children("coord-a", ["child-a1"])
+        bus = adapter.child_event_bus
+        event = bus.register_waiter(["child-a1"])
+        adapter._dispatch_child_event(
+            {
+                "type": "cluster_state",
+                "ws_id": "child-a1",
+                "state": "idle",
+            }
+        )
+        assert event.is_set(), "bus notify did not fire on cluster_state dispatch"
+
+    def test_dispatch_notifies_for_all_state_class_event_types(self) -> None:
+        """The dispatch sink translates six event types into the
+        ``child_ws_*`` SSE shape; all six must also fire the bus so
+        a wait on any of them wakes.  ``ws_created`` is intentionally
+        NOT in this set — waiters register against ws_ids they already
+        know exist (the wait tool takes a pre-known list)."""
+        for etype, extra in [
+            ("cluster_state", {"state": "running"}),
+            ("ws_closed", {"reason": "evicted"}),
+            ("ws_rename", {"name": "renamed"}),
+            ("intent_verdict", {"verdict": {"call_id": "c1"}}),
+            ("approval_resolved", {"approved": True}),
+            ("approve_request", {"detail": {}}),
+        ]:
+            adapter, _, _ = self._setup()
+            adapter._registry.merge_children("coord-a", ["child-a1"])
+            bus = adapter.child_event_bus
+            event = bus.register_waiter(["child-a1"])
+            adapter._dispatch_child_event(
+                {"type": etype, "ws_id": "child-a1", **extra},
+            )
+            assert event.is_set(), f"bus notify did not fire on {etype} dispatch"
+
+    def test_dispatch_does_not_notify_for_unrelated_ws_id(self) -> None:
+        """Bus is keyed by ws_id — a dispatch for ws X must not wake a
+        waiter registered against ws Y, or every state change anywhere
+        in the system would shake every concurrent wait."""
+        adapter, _, _ = self._setup()
+        adapter._registry.merge_children("coord-a", ["child-a1"])
+        bus = adapter.child_event_bus
+        event = bus.register_waiter(["child-other"])
+        adapter._dispatch_child_event(
+            {
+                "type": "cluster_state",
+                "ws_id": "child-a1",
+                "state": "idle",
+            }
+        )
+        assert not event.is_set(), "bus notify spuriously fired on unrelated ws_id"
+
+    def test_dispatch_does_not_notify_for_unknown_child(self) -> None:
+        """Events whose ws_id isn't in any coord's registry are dropped
+        BEFORE the bus notify (early return at ``coord_id is None``).
+        Notify only fires for events the dispatch sink fully translated,
+        keeping the bus side-effect aligned with the UI enqueue."""
+        adapter, _, _ = self._setup()
+        bus = adapter.child_event_bus
+        event = bus.register_waiter(["ws-orphan"])
+        adapter._dispatch_child_event(
+            {
+                "type": "cluster_state",
+                "ws_id": "ws-orphan",
+                "state": "idle",
+            }
+        )
+        assert not event.is_set(), "bus notify fired for ws_id the dispatch dropped"
