@@ -37,6 +37,19 @@ class ClientType(enum.StrEnum):
     WEB = "web"
     CLI = "cli"
     CHAT = "chat"
+    SCHEDULED = "scheduled"
+
+
+# Subset of ``ClientType`` values where the user is present to complete
+# an in-flight OAuth consent flow (browser redirect + return).  CHAT and
+# SCHEDULED users cannot drive a browser redirect from inside their
+# delivery surface, so consent-required errors must be persisted to
+# ``mcp_pending_consent`` for later surfacing rather than relying on the
+# in-flight SSE rendering path.  Used by ``ChatSession`` to set
+# ``_is_interactive_for_consent`` at construction time.
+INTERACTIVE_CONSENT_CLIENT_TYPES: frozenset[ClientType] = frozenset(
+    {ClientType.WEB, ClientType.CLI}
+)
 
 
 @dataclasses.dataclass
@@ -56,6 +69,7 @@ _ENV_MAP: dict[ClientType, str] = {
     ClientType.WEB: "env/web.md",
     ClientType.CLI: "env/cli.md",
     ClientType.CHAT: "env/chat.md",
+    ClientType.SCHEDULED: "env/scheduled.md",
 }
 
 

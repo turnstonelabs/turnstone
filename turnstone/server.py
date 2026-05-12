@@ -2822,6 +2822,27 @@ async def mcp_oauth_revoke_connection(request: Request) -> Response:
     return await handle_mcp_oauth_revoke_connection(request)
 
 
+async def mcp_oauth_list_pending(request: Request) -> Response:
+    """GET /v1/api/mcp/oauth/pending — list deferred-consent records (Phase 9)."""
+    from turnstone.core.mcp_oauth import handle_mcp_oauth_list_pending
+
+    return await handle_mcp_oauth_list_pending(request)
+
+
+async def mcp_oauth_clear_pending(request: Request) -> Response:
+    """DELETE /v1/api/mcp/oauth/pending/{server_name} — dismiss a deferred-consent record."""
+    from turnstone.core.mcp_oauth import handle_mcp_oauth_clear_pending
+
+    return await handle_mcp_oauth_clear_pending(request)
+
+
+async def mcp_oauth_clear_all_pending(request: Request) -> Response:
+    """DELETE /v1/api/mcp/oauth/pending — bulk-dismiss deferred-consent records."""
+    from turnstone.core.mcp_oauth import handle_mcp_oauth_clear_all_pending
+
+    return await handle_mcp_oauth_clear_all_pending(request)
+
+
 def list_interface_settings(request: Request) -> JSONResponse:
     """GET /v1/api/admin/settings — return interface settings from ConfigStore.
 
@@ -4062,6 +4083,17 @@ def create_app(
                     Route(
                         "/api/mcp/oauth/connections/{server_name}",
                         mcp_oauth_revoke_connection,
+                        methods=["DELETE"],
+                    ),
+                    Route("/api/mcp/oauth/pending", mcp_oauth_list_pending),
+                    Route(
+                        "/api/mcp/oauth/pending",
+                        mcp_oauth_clear_all_pending,
+                        methods=["DELETE"],
+                    ),
+                    Route(
+                        "/api/mcp/oauth/pending/{server_name}",
+                        mcp_oauth_clear_pending,
                         methods=["DELETE"],
                     ),
                     Route("/api/admin/settings", list_interface_settings),

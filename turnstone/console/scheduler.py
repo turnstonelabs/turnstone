@@ -319,6 +319,12 @@ class TaskScheduler:
                 user_id=task.get("created_by", ""),
                 skill=task.get("skill", ""),
                 notify_targets=task.get("notify_targets", "[]"),
+                # Mark the resulting ChatSession as non-interactive-for-
+                # consent so OAuth-MCP errors get persisted to
+                # ``mcp_pending_consent`` for later dashboard surfacing,
+                # rather than relying on an in-flight SSE redirect the
+                # absent user can't complete.
+                client_type="scheduled",
             )
             ws_id = resp.ws_id
         except Exception:

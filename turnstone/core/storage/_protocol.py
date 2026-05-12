@@ -93,6 +93,27 @@ class MCPOAuthPendingState(TypedDict):
     created_at: str
 
 
+class MCPPendingConsentRow(TypedDict):
+    """Row shape for deferred-consent records.
+
+    Emitted by the pool dispatchers (Phase 5+) when a non-interactive
+    run (scheduled / channel) hits ``mcp_consent_required`` or
+    ``mcp_insufficient_scope`` and the user can't be prompted in the
+    moment.  Composite PK ``(user_id, server_name)`` collapses repeat
+    occurrences for the same server into one row.
+    """
+
+    user_id: str
+    server_name: str
+    error_code: str
+    scopes_required: str | None
+    last_ws_id: str | None
+    last_tool_call_id: str | None
+    first_seen_at: str
+    last_seen_at: str
+    occurrence_count: int
+
+
 @runtime_checkable
 class StorageBackend(Protocol):
     """Protocol that every storage backend adapter must implement.
@@ -1863,6 +1884,89 @@ class StorageBackend(Protocol):
 
     def cleanup_expired_mcp_oauth_pending_states(self, max_age_seconds: int = 600) -> int:
         """Bulk-delete expired pending MCP OAuth rows. Returns count deleted."""
+        ...
+
+    # -- MCP pending-consent (Phase 9; deferred-consent persistence) ----------
+
+    def upsert_mcp_pending_consent(
+        self,
+        user_id: str,
+        server_name: str,
+        error_code: str,
+        scopes_required: str | None,
+        last_ws_id: str | None,
+        last_tool_call_id: str | None,
+        now_iso: str,
+    ) -> None:
+        """Insert or refresh a deferred-consent record for ``(user, server)``.
+
+        On insert: ``first_seen_at = last_seen_at = now_iso``,
+        ``occurrence_count = 1``.  On conflict (existing row for the
+        same composite PK): rewrites ``error_code``, ``scopes_required``,
+        ``last_ws_id``, ``last_tool_call_id``, ``last_seen_at`` to the
+        current values; bumps ``occurrence_count`` by 1.  Preserves
+        ``first_seen_at`` so the dashboard can show how long the
+        deferred-consent need has been pending.
+        """
+        ...
+
+    def list_mcp_pending_consent_by_user(self, user_id: str) -> list[MCPPendingConsentRow]:
+        """Return all deferred-consent records for ``user_id``.
+
+        Ordered by ``last_seen_at`` DESC.  Empty list when the user has
+        none.  Used by the dashboard badge endpoint to render the
+        servers-need-consent list.
+        """
+        ...
+
+    def delete_mcp_pending_consent(self, user_id: str, server_name: str) -> bool:
+        """Delete the pending-consent row for ``(user, server)``. Returns True if existed.
+
+        Called automatically by the OAuth callback handler when consent
+        completes, and manually via the user-facing DELETE endpoint.
+        """
+        ...
+
+    def delete_all_mcp_pending_consent_by_user(self, user_id: str) -> int:
+        """Bulk-delete every pending-consent row for ``user_id``. Returns count.
+
+        Used by the manual "dismiss all" endpoint from the settings
+        modal.
+        """
+        ...
+
+    def count_mcp_consented_users_by_server(self, server_name: str) -> int:
+        """Distinct-user count of non-expired tokens for ``server_name``.
+
+        ``expires_at IS NULL`` is treated as non-expired (refresh-only
+        tokens with no advertised expiry).  Used by the admin status
+        indicator to show "N users consented" per MCP server row.
+        """
+        ...
+
+    def count_mcp_consented_users_grouped_by_server(self) -> dict[str, int]:
+        """Bulk distinct-user count of non-expired tokens, grouped by server.
+
+        Single round-trip variant of
+        :meth:`count_mcp_consented_users_by_server` for the admin list
+        handler — replaces the N-call loop that issued one query per
+        server with one ``GROUP BY`` query returning ``{server_name:
+        count}`` for every server that has at least one non-expired
+        token.  Servers with zero consented users are absent from the
+        result; callers should ``dict.get(name, 0)`` rather than
+        indexing.
+        """
+        ...
+
+    def any_oauth_user_mcp_servers(self) -> bool:
+        """Install-level gate for OAuth-MCP features.
+
+        Returns True iff at least one ``mcp_servers`` row has
+        ``auth_type='oauth_user'``.  Used to short-circuit the pending-
+        consent badge endpoint to ``{pending: 0}`` on local-auth installs
+        with no OAuth MCP servers, so those code paths exercise zero new
+        storage queries.
+        """
         ...
 
     # -- Model definitions -----------------------------------------------------

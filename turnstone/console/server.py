@@ -1652,6 +1652,27 @@ async def mcp_oauth_revoke_connection(request: Request) -> Response:
     return await handle_mcp_oauth_revoke_connection(request)
 
 
+async def mcp_oauth_list_pending(request: Request) -> Response:
+    """GET /v1/api/mcp/oauth/pending — list deferred-consent records (Phase 9)."""
+    from turnstone.core.mcp_oauth import handle_mcp_oauth_list_pending
+
+    return await handle_mcp_oauth_list_pending(request)
+
+
+async def mcp_oauth_clear_pending(request: Request) -> Response:
+    """DELETE /v1/api/mcp/oauth/pending/{server_name} — dismiss a deferred-consent record."""
+    from turnstone.core.mcp_oauth import handle_mcp_oauth_clear_pending
+
+    return await handle_mcp_oauth_clear_pending(request)
+
+
+async def mcp_oauth_clear_all_pending(request: Request) -> Response:
+    """DELETE /v1/api/mcp/oauth/pending — bulk-dismiss deferred-consent records."""
+    from turnstone.core.mcp_oauth import handle_mcp_oauth_clear_all_pending
+
+    return await handle_mcp_oauth_clear_all_pending(request)
+
+
 # ---------------------------------------------------------------------------
 # Route handlers — available models (lightweight, no admin permission)
 # ---------------------------------------------------------------------------
@@ -8818,10 +8839,19 @@ def _mask_mcp_secrets(server: dict[str, Any], reveal: bool = False) -> dict[str,
 def _mcp_server_to_detail(
     server: dict[str, Any],
     node_statuses: dict[str, dict[str, Any]] | None = None,
+    consented_users_count: int | None = None,
 ) -> dict[str, Any]:
-    """Convert a storage dict to a McpServerDetail-shaped dict."""
+    """Convert a storage dict to a McpServerDetail-shaped dict.
+
+    *consented_users_count* is the Phase 9 admin pill data — distinct
+    non-expired tokens issued for this ``(server_name)``.  Omitted
+    (``None``) when the row's ``auth_type`` is not ``oauth_user``, so
+    static / none rows don't carry an irrelevant ``0``.
+    """
     d = dict(server)
     d["status"] = node_statuses or {}
+    if consented_users_count is not None:
+        d["consented_users_count"] = consented_users_count
     return d
 
 
@@ -8872,8 +8902,31 @@ async def admin_list_mcp_servers(request: Request) -> JSONResponse:
     reveal = str(request.query_params.get("reveal", "")).lower() in ("true", "1")
     servers = storage.list_mcp_servers()
 
-    # Collect live status from all nodes
-    node_statuses = await _collect_mcp_status(request)
+    # Phase 9: bulk-aggregate consented-users-count across all oauth_user
+    # rows in a single GROUP BY query (rather than N per-row sync DB
+    # round-trips inside this async handler).  Run in parallel with the
+    # cross-node HTTP status fan-out below — neither has a data
+    # dependency on the other, so awaiting them sequentially would
+    # stack the DB latency on top of the fan-out latency.  Skipped
+    # entirely when no row is oauth_user so static-only installs
+    # exercise zero new storage queries.
+    has_oauth_user = any(s.get("auth_type") == "oauth_user" for s in servers)
+    status_task: asyncio.Task[dict[str, dict[str, dict[str, Any]]]] = asyncio.create_task(
+        _collect_mcp_status(request)
+    )
+    count_task: asyncio.Task[dict[str, int]] | None = (
+        asyncio.create_task(asyncio.to_thread(storage.count_mcp_consented_users_grouped_by_server))
+        if has_oauth_user
+        else None
+    )
+
+    node_statuses = await status_task
+    consent_counts: dict[str, int] = {}
+    if count_task is not None:
+        try:
+            consent_counts = await count_task
+        except Exception:
+            log.debug("admin.mcp_consented_users_bulk_count_failed", exc_info=True)
 
     db_names: set[str] = set()
     result = []
@@ -8885,8 +8938,14 @@ async def admin_list_mcp_servers(request: Request) -> JSONResponse:
             status = node_servers.get(s["name"])
             if status:
                 per_node[node_id] = status
+        # Phase 9: surface the consented-users-count pill for
+        # oauth_user rows.  Aggregate was pre-computed above with a
+        # single bulk GROUP BY query; we just look up here.
+        consent_count: int | None = None
+        if s.get("auth_type") == "oauth_user":
+            consent_count = consent_counts.get(s["name"], 0)
         s = _mask_mcp_secrets(s, reveal)
-        result.append(_mcp_server_to_detail(s, per_node))
+        result.append(_mcp_server_to_detail(s, per_node, consent_count))
 
     # Merge config-sourced servers visible on nodes but not in DB
     config_names: set[str] = set()
@@ -9525,6 +9584,92 @@ async def admin_mcp_refresh_one(request: Request) -> JSONResponse:
 async def admin_mcp_reconnect_one(request: Request) -> JSONResponse:
     """POST /v1/api/admin/mcp-servers/{name}/reconnect — force-reconnect one server."""
     return await _admin_mcp_action(request, "reconnect")
+
+
+async def admin_mcp_bulk_revoke(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/mcp-servers/{name}/bulk-revoke — clear every user's token (Phase 9).
+
+    Admin-side counterpart to the per-user
+    ``DELETE /v1/api/mcp/oauth/connections/{server_name}`` revoke that
+    shipped in Phase 8.  Used to drop orphaned tokens after an
+    ``auth_type`` transition (oauth_user → static) or after rotating
+    the configured OAuth client.
+
+    Authoritative local delete via
+    :meth:`StorageBackend.delete_mcp_oauth_rows_by_server_name` —
+    purges both ``mcp_user_tokens`` and ``mcp_oauth_pending`` rows for
+    the named server.  Upstream RFC 7009 revoke is intentionally NOT
+    attempted in bulk (would require per-row decrypt + N upstream HTTP
+    calls); operators who need upstream cleanup should use the per-
+    user revoke endpoint or let tokens expire naturally.  The audit
+    detail records ``upstream_revoke_outcome="bulk_admin_no_upstream"``
+    so the deferral is visible.
+
+    Pool eviction is NOT performed by this handler.  Per-user revoke
+    has a per-(user, server) eviction primitive
+    (``MCPClientManager.evict_user_session``); bulk-revoke would need a
+    per-server iteration over consented users that no current primitive
+    supports.  Stale in-flight sessions surface as a per-user 401 on
+    the next dispatch, which refreshes through the now-empty token row
+    and emits ``mcp_consent_required`` — the documented v1 fallback.
+    See :func:`turnstone.core.mcp_client._dispatch_pool` retry path.
+    """
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.mcp")
+    if err:
+        return err
+
+    name = request.path_params.get("name", "").strip()
+    if not name or "__" in name:
+        return JSONResponse({"error": "invalid server name"}, status_code=400)
+
+    existing = storage.get_mcp_server_by_name(name)
+    if existing is None:
+        return JSONResponse({"error": "No such server"}, status_code=404)
+    if existing.get("auth_type") != "oauth_user":
+        return JSONResponse(
+            {"error": "bulk-revoke is only valid for auth_type=oauth_user servers"},
+            status_code=400,
+        )
+
+    target_id = existing.get("server_id", name)
+    consented_before = 0
+    try:
+        consented_before = storage.count_mcp_consented_users_by_server(name)
+    except Exception:
+        log.debug("admin.mcp_bulk_revoke_pre_count_failed server=%s", name, exc_info=True)
+
+    deleted = storage.delete_mcp_oauth_rows_by_server_name(name)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "mcp_server.oauth.bulk_revoked",
+        "mcp_server",
+        target_id,
+        {
+            "name": name,
+            "rows_deleted": deleted,
+            "consented_users_before": consented_before,
+            "upstream_revoke_outcome": "bulk_admin_no_upstream",
+        },
+        ip,
+    )
+
+    return JSONResponse(
+        {
+            "status": "ok",
+            "rows_deleted": deleted,
+            "consented_users_before": consented_before,
+        }
+    )
 
 
 async def admin_import_mcp_config(request: Request) -> JSONResponse:
@@ -12247,6 +12392,17 @@ def create_app(
                         mcp_oauth_revoke_connection,
                         methods=["DELETE"],
                     ),
+                    Route("/api/mcp/oauth/pending", mcp_oauth_list_pending),
+                    Route(
+                        "/api/mcp/oauth/pending",
+                        mcp_oauth_clear_all_pending,
+                        methods=["DELETE"],
+                    ),
+                    Route(
+                        "/api/mcp/oauth/pending/{server_name}",
+                        mcp_oauth_clear_pending,
+                        methods=["DELETE"],
+                    ),
                     Route("/api/admin/users", admin_list_users),
                     Route("/api/admin/users", admin_create_user, methods=["POST"]),
                     Route("/api/admin/users/{user_id}", admin_delete_user, methods=["DELETE"]),
@@ -12430,6 +12586,11 @@ def create_app(
                     Route(
                         "/api/admin/mcp-servers/{name}/reconnect",
                         admin_mcp_reconnect_one,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/admin/mcp-servers/{name}/bulk-revoke",
+                        admin_mcp_bulk_revoke,
                         methods=["POST"],
                     ),
                     Route(

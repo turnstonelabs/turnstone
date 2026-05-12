@@ -27,6 +27,7 @@ import urllib.parse
 import uuid
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -45,6 +46,7 @@ from turnstone.core.config import load_config
 from turnstone.core.log import get_logger
 from turnstone.core.mcp_http_parsers import (
     MAX_INSUFFICIENT_SCOPE_REPORTED,
+    is_valid_scope_token,
     parse_www_authenticate_error,
     parse_www_authenticate_scope,
 )
@@ -509,6 +511,20 @@ class MCPClientManager:
 
         # Notification debounce (per-server)
         self._last_notification_refresh: dict[str, float] = {}
+
+        # Last refresh outcome (Phase 9 — admin status indicator).  Per-
+        # server tuple of ``(unix_ts, outcome)`` where outcome is one of
+        # ``ok`` or ``error:<ExceptionClassName>``.  Populated by
+        # ``_refresh_server`` on every call (success and failure paths),
+        # which means manual operator-driven refresh (``refresh_sync``)
+        # AND the ``_cb_auto_reconnect`` follow-up that schedules
+        # ``_refresh_server`` directly both populate the field — adding
+        # a future schedule site only needs to call ``_refresh_server``
+        # to participate.  Read by the admin status endpoint to render
+        # the per-server "last refresh" pill.  No initial entry is
+        # created at server-register time — absence surfaces as ``null``
+        # in the admin JSON, which the UI renders as "never".
+        self._last_refresh: dict[str, tuple[float, str]] = {}
 
         # Per-(user, server) state for auth_type=oauth_user. Loop-bound:
         # mutated only on the mcp-loop. Sync threads interact via
@@ -2131,14 +2147,51 @@ class MCPClientManager:
 
         Returns ``(added_tools, removed_tools)`` names (tool diff only,
         for backward compatibility with ``/mcp refresh`` output).
+
+        Writes the ``_last_refresh`` entry on every call so the Phase 9
+        admin status pill reflects every refresh path — manual
+        operator-driven ``refresh_sync`` AND the ``_cb_auto_reconnect``
+        follow-up that schedules ``_refresh_server`` directly.
+        Centralising the write here means future schedule sites
+        automatically populate the field.
+
+        Uses ``asyncio.gather(return_exceptions=True)`` so that a failure
+        in one of the three concurrent sub-refreshes does NOT orphan the
+        others mid-mutation: every sibling reaches completion (success
+        or per-task failure) before the outcome is computed.  The
+        ``_last_refresh`` write is ``"ok"`` iff all three succeeded; on
+        any failure the outcome is ``f"error:{type(first_exc).__name__}"``
+        and the first exception is re-raised so the outer caller's error
+        path (``_refresh_all``'s except, or the manual-refresh sync
+        wrapper) sees the same shape it did before this rework.
+        Partial-success mutations of ``state.tools`` / ``state.resources``
+        / ``state.prompts`` are bounded to whichever sub-refresh
+        succeeded — the documented trade-off vs leaving orphan tasks
+        running after the error is observed.
         """
-        tool_diff, _, _ = await asyncio.gather(
+        results = await asyncio.gather(
             self._refresh_server_tools(name),
             self._refresh_server_resources(name),
             self._refresh_server_prompts(name),
+            return_exceptions=True,
         )
+        first_exc: BaseException | None = next(
+            (r for r in results if isinstance(r, BaseException)), None
+        )
+        if first_exc is not None:
+            self._last_refresh[name] = (
+                time.time(),
+                f"error:{type(first_exc).__name__}",
+            )
+            raise first_exc
+        tool_diff = results[0]
+        # ``return_exceptions=True`` widens the static type; on the all-
+        # success path each entry is the awaited result.  We narrow the
+        # tool-diff entry to the documented ``(added, removed)`` shape.
+        assert isinstance(tool_diff, tuple)
         added, removed = tool_diff
         self._last_error.pop(name, None)
+        self._last_refresh[name] = (time.time(), "ok")
         return added, removed
 
     async def _refresh_all(
@@ -2167,6 +2220,7 @@ class MCPClientManager:
                             [t["function"]["name"] for t in post.tools] if post is not None else []
                         )
                         results[name] = (new_names, [])
+                        self._last_refresh[name] = (time.time(), "ok")
                     continue
                 added, removed = await self._refresh_server(name)
                 self._cb_record_success(name)
@@ -2175,6 +2229,20 @@ class MCPClientManager:
                 log.warning("Refresh failed for MCP server '%s'", name, exc_info=True)
                 self._set_error(name, f"Refresh failed: {exc}")
                 results[name] = ([], [])
+                # Overwrite unconditionally with the freshest observed
+                # outcome.  Two cases produce the write:
+                # (1) Reconnect branch: ``_connect_one`` raised before
+                #     ``_refresh_server`` could write — no prior entry
+                #     from this iteration exists yet, so the write is
+                #     the only fresh signal.
+                # (2) ``_refresh_server`` branch: it already wrote a
+                #     fresh ``error:<ClassName>`` before re-raising, so
+                #     the outer overwrite is a no-op for the value.
+                # Using ``setdefault`` here would preserve a stale prior
+                # ``"ok"`` from the previous successful refresh when the
+                # current attempt fails — the admin pill would show
+                # "ok" for a broken server.
+                self._last_refresh[name] = (time.time(), f"error:{type(exc).__name__}")
 
         # Final sync to clean up templates from servers that are no longer connected
         try:
@@ -2952,6 +3020,7 @@ class MCPClientManager:
         transport = cfg.get("type", "stdio")
         cb_deadline = self._circuit_open_until.get(name)
         cb_open = cb_deadline is not None and time.monotonic() < cb_deadline
+        last_refresh = self._last_refresh.get(name)
         # Inline predicate (instead of reusing ``connected``) so mypy narrows
         # ``state`` for the attribute reads — a separate boolean wouldn't.
         return {
@@ -2967,6 +3036,10 @@ class MCPClientManager:
             "url": cfg.get("url", "") if transport != "stdio" else "",
             "circuit_open": cb_open,
             "consecutive_failures": self._consecutive_failures.get(name, 0),
+            # Phase 9 admin status: last manual / auto-reconnect refresh.
+            # ``null`` when no refresh has occurred since process start.
+            "last_refresh_at": last_refresh[0] if last_refresh is not None else None,
+            "last_refresh_outcome": last_refresh[1] if last_refresh is not None else None,
         }
 
     def get_all_server_status(self) -> dict[str, dict[str, Any]]:
@@ -3303,6 +3376,7 @@ class MCPClientManager:
         *,
         user_id: str | None = None,
         timeout: int = 120,
+        is_interactive_for_consent: bool = True,
     ) -> str:
         """Execute an MCP tool call synchronously (blocks the calling thread).
 
@@ -3348,6 +3422,7 @@ class MCPClientManager:
                     arguments=arguments,
                     server_row=pool_target[2],
                     timeout=timeout,
+                    is_interactive_for_consent=is_interactive_for_consent,
                 )
 
         if mapping is None or server_name is None or original_name is None:
@@ -3500,6 +3575,54 @@ class MCPClientManager:
             return None
         return server_name, original, row
 
+    def _record_pending_consent_best_effort(
+        self,
+        *,
+        user_id: str,
+        server_name: str,
+        result: str,
+    ) -> None:
+        """Persist a deferred-consent row for non-interactive callers.
+
+        Called from the three sync dispatchers when the dispatch returns
+        a structured-error envelope AND the caller is not interactive
+        (CHAT / SCHEDULED).  Filters out structured-error codes that
+        aren't user-consent-shaped (key-unknown, url-insecure,
+        *_forbidden) — those are operator-actionable and outside the
+        scope of the dashboard pending-consent badge.
+
+        Best-effort.  A storage exception is logged but never raised:
+        the structured-error envelope must reach the agent unchanged
+        regardless of whether the pending-consent row was persisted, so
+        a transient DB failure doesn't change the agent-observable
+        contract.
+        """
+        if self._storage is None:
+            return
+        parsed = _parse_pending_consent_envelope(result)
+        if parsed is None:
+            return
+        code, scopes = parsed
+        scopes_str = " ".join(scopes) if scopes else None
+        try:
+            self._storage.upsert_mcp_pending_consent(
+                user_id=user_id,
+                server_name=server_name,
+                error_code=code,
+                scopes_required=scopes_str,
+                last_ws_id=None,
+                last_tool_call_id=None,
+                now_iso=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S"),
+            )
+        except Exception:
+            log.warning(
+                "mcp_pool.pending_consent_persist_failed user=%s server=%s code=%s",
+                user_id,
+                server_name,
+                code,
+                exc_info=True,
+            )
+
     def _dispatch_pool_sync(
         self,
         *,
@@ -3509,6 +3632,7 @@ class MCPClientManager:
         arguments: dict[str, Any],
         server_row: dict[str, Any],
         timeout: int,
+        is_interactive_for_consent: bool = True,
     ) -> str:
         """Synchronous wrapper for pool dispatch.
 
@@ -3581,6 +3705,10 @@ class MCPClientManager:
                 server_row=server_row,
             )
         if _is_structured_error(result):
+            if not is_interactive_for_consent:
+                self._record_pending_consent_best_effort(
+                    user_id=user_id, server_name=server_name, result=result
+                )
             raise RuntimeError(result)
         return result
 
@@ -3636,6 +3764,7 @@ class MCPClientManager:
         uri: str,
         server_row: dict[str, Any],
         timeout: int,
+        is_interactive_for_consent: bool = True,
     ) -> str:
         """Synchronous wrapper for pool resource read.
 
@@ -3679,6 +3808,10 @@ class MCPClientManager:
                 server_row=server_row,
             )
         if _is_structured_error(result):
+            if not is_interactive_for_consent:
+                self._record_pending_consent_best_effort(
+                    user_id=user_id, server_name=server_name, result=result
+                )
             raise RuntimeError(result)
         return result
 
@@ -3722,6 +3855,7 @@ class MCPClientManager:
         arguments: dict[str, str] | None,
         server_row: dict[str, Any],
         timeout: int,
+        is_interactive_for_consent: bool = True,
     ) -> list[dict[str, Any]]:
         """Synchronous wrapper for pool prompt invocation.
 
@@ -3765,6 +3899,10 @@ class MCPClientManager:
             # Structured-error path — surface as RuntimeError so the
             # agent-loop renders the JSON via its except-Exception
             # handler.
+            if not is_interactive_for_consent:
+                self._record_pending_consent_best_effort(
+                    user_id=user_id, server_name=server_name, result=result
+                )
             raise RuntimeError(result)
         return result
 
@@ -4604,7 +4742,12 @@ class MCPClientManager:
         return best
 
     def read_resource_sync(
-        self, uri: str, *, user_id: str | None = None, timeout: int = 120
+        self,
+        uri: str,
+        *,
+        user_id: str | None = None,
+        timeout: int = 120,
+        is_interactive_for_consent: bool = True,
     ) -> str:
         """Read a resource by URI synchronously (blocks the calling thread).
 
@@ -4627,6 +4770,7 @@ class MCPClientManager:
                     uri=pool_target[1],
                     server_row=pool_target[2],
                     timeout=timeout,
+                    is_interactive_for_consent=is_interactive_for_consent,
                 )
 
         mapping = self._resource_map.get(uri)
@@ -4689,6 +4833,7 @@ class MCPClientManager:
         *,
         user_id: str | None = None,
         timeout: int = 30,
+        is_interactive_for_consent: bool = True,
     ) -> list[dict[str, Any]]:
         """Invoke an MCP prompt synchronously and return expanded messages.
 
@@ -4727,6 +4872,7 @@ class MCPClientManager:
                     arguments=arguments,
                     server_row=pool_target[2],
                     timeout=timeout,
+                    is_interactive_for_consent=is_interactive_for_consent,
                 )
 
         if static_mapping is None:
@@ -4910,6 +5056,64 @@ def _structured_error(
     if consent_url is not None:
         err["consent_url"] = consent_url
     return json.dumps({"error": err})
+
+
+# Structured-error codes that represent a deferred-consent need.  When
+# encountered on a non-interactive call (chat / scheduled), the sync
+# dispatcher persists a row to ``mcp_pending_consent`` so the dashboard
+# badge can surface the deferred work later.  Operator-actionable codes
+# (key-unknown, url-insecure, *_forbidden) are intentionally excluded —
+# the user cannot resolve them by completing a consent flow.
+_PENDING_CONSENT_PERSIST_CODES: frozenset[str] = frozenset(
+    {"mcp_consent_required", "mcp_insufficient_scope"}
+)
+
+
+def _parse_pending_consent_envelope(
+    result: str,
+) -> tuple[str, list[str] | None] | None:
+    """Extract ``(error_code, scopes_required)`` from a structured-error JSON.
+
+    Returns ``None`` when the envelope's ``code`` is not in
+    :data:`_PENDING_CONSENT_PERSIST_CODES`.  Callers should already have
+    gated on :func:`_is_structured_error`; this helper deliberately
+    re-parses (cheap on the failure path) rather than threading the
+    decoded dict through the sync-dispatcher hot path.
+
+    Defends against non-dict JSON values (``null``, strings, numbers)
+    via the same ``isinstance(decoded, dict)`` guard
+    :func:`_is_structured_error` uses, so a misuse from a future caller
+    that bypasses the structured-error contract surfaces as a clean
+    ``None`` rather than an ``AttributeError`` propagating out of the
+    sync dispatcher's hot path.
+    """
+    try:
+        decoded = json.loads(result)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    err = decoded.get("error")
+    if not isinstance(err, dict):
+        return None
+    code = err.get("code", "")
+    if code not in _PENDING_CONSENT_PERSIST_CODES:
+        return None
+    scopes = err.get("scopes_required")
+    if isinstance(scopes, list):
+        # Defense-in-depth scope filter — production paths construct
+        # this list via ``parse_www_authenticate_scope`` which already
+        # validates and caps, but the helper is reusable; re-applying
+        # the predicate here forecloses any future caller that bypasses
+        # the upstream filter from landing attacker-controlled bytes in
+        # ``mcp_pending_consent.scopes_required``.  Type-filter BEFORE
+        # ``is_valid_scope_token`` so non-string entries (``None``,
+        # ints) don't slip through as their ``str()`` repr (e.g.
+        # ``None`` → ``"None"`` passes the ASCII grammar).  Cap mirrors
+        # ``MAX_INSUFFICIENT_SCOPE_REPORTED`` semantics.
+        cleaned = [s for s in scopes if isinstance(s, str) and is_valid_scope_token(s)]
+        return code, cleaned[:MAX_INSUFFICIENT_SCOPE_REPORTED]
+    return code, None
 
 
 def _is_structured_error(result: str) -> bool:
