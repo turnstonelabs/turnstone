@@ -6090,14 +6090,22 @@ function openSettingsMenu(triggerEl) {
     }
   };
 
-  // Defer listener wiring + focus so the click that opened the menu
-  // doesn't immediately trigger the mousedown-close path.
+  // Attach the keydown listener synchronously so an Escape press
+  // queued behind the opening click isn't silently dropped: the
+  // global keydown handler at the bottom of this file returns early
+  // when _settingsMenu is set (the dashboard-Escape-wipes-composer
+  // guard), so without a synchronous menu-side listener there's a
+  // brief window where Escape has no handler at all.  Mousedown +
+  // initial focus stay deferred — mousedown to avoid the click that
+  // opened the menu firing its own outside-click close, initial
+  // focus because the menu DOM needs a tick to settle layout before
+  // we call focus() on its first item.
+  document.addEventListener("keydown", _settingsMenuCloseHandler);
   var activeMenu = menu;
   var closeHandler = _settingsMenuCloseHandler;
   setTimeout(function () {
     if (_settingsMenu !== activeMenu || !closeHandler) return;
     document.addEventListener("mousedown", closeHandler);
-    document.addEventListener("keydown", closeHandler);
     var first = activeMenu.querySelector(".ws-tab-dropdown-item");
     if (first) first.focus();
   }, 0);
