@@ -45,9 +45,11 @@
           id="settings-btn"
           class="header-btn btn"
           type="button"
-          onclick="openSettingsPanel()"
-          aria-label="MCP server connections"
-          title="MCP server connections"
+          onclick="toggleSettingsMenu(this)"
+          aria-haspopup="menu"
+          aria-expanded="false"
+          aria-label="Settings"
+          title="Settings"
         >
           &#9881;
         </button>
@@ -79,8 +81,7 @@
     <div
       id="dashboard"
       class="dashboard-overlay"
-      role="dialog"
-      aria-modal="true"
+      role="region"
       aria-label="Dashboard"
     >
       <div class="dashboard-content">

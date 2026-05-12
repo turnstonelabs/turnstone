@@ -2161,7 +2161,16 @@ audio.media-player {
 .dashboard-overlay {
   display: none;
   position: fixed;
-  inset: 0;
+  /* Start below the 48px .appbar so the global header (turnstone title,
+     MCP status, theme/settings buttons, and the console proxy's
+     node-picker pill) stays visible and interactive while the dashboard
+     is open.  Otherwise the picker is unreachable from the proxied
+     dashboard view and users can't switch nodes without first opening
+     a workstream.  Matches .appbar { height: 48px } in ui-base.css. */
+  top: 48px;
+  right: 0;
+  bottom: 0;
+  left: 0;
   background: var(--bg);
   z-index: 50;
   overflow-y: auto;
