@@ -2876,8 +2876,12 @@ function showTabDropdown(chevronEl, wsId) {
         if (!btns.length) return;
         var idx = btns.indexOf(document.activeElement);
         if (e.key === "ArrowDown") btns[(idx + 1) % btns.length].focus();
+        // idx <= 0 covers both "first item" (wrap to last) and "no
+        // current focus" (idx === -1, which would otherwise yield
+        // len-2 via the modulo).  Same shape as openSettingsMenu and
+        // the proxy node-picker (turnstone/console/server.py:275).
         else if (e.key === "ArrowUp")
-          btns[(idx - 1 + btns.length) % btns.length].focus();
+          btns[idx <= 0 ? btns.length - 1 : idx - 1].focus();
         else if (e.key === "Home") btns[0].focus();
         else if (e.key === "End") btns[btns.length - 1].focus();
       }
@@ -3814,7 +3818,10 @@ function closeWorkstream(wsId) {
 function showDashboard() {
   dashboardVisible = true;
   document.getElementById("dashboard").classList.add("active");
-  document.getElementById("ui-header").inert = true;
+  // ui-header stays interactive while the dashboard is open so the
+  // theme toggle, settings menu, and the console proxy's node-picker
+  // pill remain reachable.  See .dashboard-overlay { top: 48px } in
+  // style.css for the matching layout offset.
   document.getElementById("tab-bar").inert = true;
   document.getElementById("split-root").inert = true;
   loadDashboard();
@@ -3830,7 +3837,6 @@ function showDashboard() {
 function hideDashboard() {
   dashboardVisible = false;
   document.getElementById("dashboard").classList.remove("active");
-  document.getElementById("ui-header").inert = false;
   document.getElementById("tab-bar").inert = false;
   document.getElementById("split-root").inert = false;
   document.getElementById("dashboard-input").value = "";
@@ -5235,8 +5241,8 @@ function _refreshConsentBadge() {
   // count is already reflected in the button's aria-label/title.
   if (n === 0) {
     if (existing) existing.remove();
-    btn.setAttribute("aria-label", "MCP server connections");
-    btn.setAttribute("title", "MCP server connections");
+    btn.setAttribute("aria-label", "Settings");
+    btn.setAttribute("title", "Settings");
     return;
   }
   if (!existing) {
@@ -5247,11 +5253,7 @@ function _refreshConsentBadge() {
   }
   existing.textContent = String(n);
   var label =
-    "MCP server connections (" +
-    n +
-    " pending consent" +
-    (n === 1 ? "" : "s") +
-    ")";
+    "Settings (" + n + " MCP consent" + (n === 1 ? "" : "s") + " pending)";
   btn.setAttribute("aria-label", label);
   btn.setAttribute("title", label);
 }
@@ -5932,6 +5934,192 @@ function closeSettingsPanel() {
   _settingsReturnFocus = null;
 }
 
+// ---------------------------------------------------------------------------
+//  Settings menu (gear icon dropdown — MCP connections + Logout)
+// ---------------------------------------------------------------------------
+//
+// Reuses the .ws-tab-dropdown shell for visual + behavioural consistency
+// with the workstream tab dropdown and the console proxy's node-picker.
+// Keyboard handling matches the proxy node-picker (the APG-correct
+// reference): Tab closes the menu WITHOUT preventDefault so focus
+// moves naturally to the next focusable; Escape closes + refocuses
+// the trigger.  showTabDropdown collapses Tab and Escape into a
+// single preventDefault branch — that's a pre-existing divergence,
+// tracked as a follow-up to align showTabDropdown to APG.  ArrowUp
+// uses an `idx <= 0` guard (not modulo) so the no-focus case wraps
+// to the last item rather than the second-to-last — same shape as
+// showTabDropdown and the proxy node-picker.
+
+var _settingsMenu = null;
+var _settingsMenuCloseHandler = null;
+// Cached at open time so closeSettingsMenu can reset ARIA without
+// re-querying by id, and so the menu-item click path can refocus
+// the trigger BEFORE close — that way openSettingsPanel captures
+// the gear (not <body>) as _settingsReturnFocus.
+var _settingsMenuTrigger = null;
+
+function toggleSettingsMenu(triggerEl) {
+  if (_settingsMenu) closeSettingsMenu();
+  else openSettingsMenu(triggerEl);
+}
+
+function openSettingsMenu(triggerEl) {
+  if (_settingsMenu) return;
+  _settingsMenuTrigger = triggerEl;
+  triggerEl.setAttribute("aria-expanded", "true");
+  triggerEl.setAttribute("aria-controls", "settings-menu");
+
+  var menu = document.createElement("div");
+  menu.id = "settings-menu";
+  menu.className = "ws-tab-dropdown";
+  menu.setAttribute("role", "menu");
+  menu.setAttribute("aria-label", "Settings");
+  menu.addEventListener("contextmenu", function (e) {
+    e.preventDefault();
+  });
+
+  var pendingCount = _pendingConsentServers.size;
+  var items = [
+    {
+      label:
+        "MCP connections" + (pendingCount ? " (" + pendingCount + ")" : ""),
+      action: function () {
+        openSettingsPanel();
+      },
+    },
+    { separator: true },
+    {
+      label: "Logout",
+      // Destructive styling matches Delete in the workstream tab dropdown.
+      // Logout doesn't lose data, but it interrupts the session and the red
+      // hover/focus tint reduces misclick risk on a dense menu.
+      cls: "destructive",
+      action: function () {
+        logout();
+      },
+    },
+  ];
+
+  items.forEach(function (item) {
+    if (item.separator) {
+      var sep = document.createElement("div");
+      sep.className = "ws-tab-dropdown-sep";
+      sep.setAttribute("role", "separator");
+      menu.appendChild(sep);
+      return;
+    }
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "ws-tab-dropdown-item" + (item.cls ? " " + item.cls : "");
+    btn.setAttribute("role", "menuitem");
+    btn.setAttribute("tabindex", "-1");
+    var labelSpan = document.createElement("span");
+    labelSpan.className = "ws-tab-dropdown-label";
+    labelSpan.textContent = item.label;
+    btn.appendChild(labelSpan);
+    btn.onclick = function () {
+      // Refocus the trigger BEFORE close — closeSettingsMenu removes
+      // the menu DOM (including this button), and item.action() may
+      // call openSettingsPanel which captures document.activeElement
+      // as the eventual return-focus target.  Without this refocus,
+      // activeElement falls back to <body> and focus restoration
+      // sends the user nowhere when the panel later closes.
+      if (_settingsMenuTrigger) _settingsMenuTrigger.focus();
+      closeSettingsMenu();
+      item.action();
+    };
+    menu.appendChild(btn);
+  });
+
+  document.body.appendChild(menu);
+
+  // Right-align under the gear so the menu hangs off the right edge of
+  // the appbar without overflowing the viewport.  Right-edge override
+  // runs BEFORE the left-edge floor so a menu wider than the viewport
+  // still gets clamped to mx=4 instead of going negative — matches the
+  // proxy node-picker order in turnstone/console/server.py:307-309.
+  var tr = triggerEl.getBoundingClientRect();
+  var mr = menu.getBoundingClientRect();
+  var mx = tr.right - mr.width;
+  var my = tr.bottom + 4;
+  if (my + mr.height > window.innerHeight) my = tr.top - mr.height - 4;
+  if (mx + mr.width > window.innerWidth) mx = window.innerWidth - mr.width - 4;
+  if (mx < 4) mx = 4;
+  menu.style.left = mx + "px";
+  menu.style.top = my + "px";
+  _settingsMenu = menu;
+
+  _settingsMenuCloseHandler = function (e) {
+    if (e.type === "keydown") {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeSettingsMenu();
+        triggerEl.focus();
+      } else if (e.key === "Tab") {
+        // Per WAI-ARIA APG menu pattern: Tab closes the menu AND lets
+        // focus move naturally to the next focusable element — don't
+        // preventDefault, otherwise Tab is a dead key inside the menu.
+        closeSettingsMenu();
+      } else if (
+        e.key === "ArrowDown" ||
+        e.key === "ArrowUp" ||
+        e.key === "Home" ||
+        e.key === "End"
+      ) {
+        e.preventDefault();
+        var btns = Array.from(menu.querySelectorAll(".ws-tab-dropdown-item"));
+        if (!btns.length) return;
+        var idx = btns.indexOf(document.activeElement);
+        if (e.key === "ArrowDown") btns[(idx + 1) % btns.length].focus();
+        // idx <= 0 covers both "first item" (wrap to last) and "no
+        // current focus" (idx === -1, which would otherwise yield
+        // len-2 via the modulo).  Matches showTabDropdown and the
+        // proxy node-picker (turnstone/console/server.py:275).
+        else if (e.key === "ArrowUp")
+          btns[idx <= 0 ? btns.length - 1 : idx - 1].focus();
+        else if (e.key === "Home") btns[0].focus();
+        else if (e.key === "End") btns[btns.length - 1].focus();
+      }
+    } else if (
+      e.type === "mousedown" &&
+      !menu.contains(e.target) &&
+      e.target !== triggerEl &&
+      !triggerEl.contains(e.target)
+    ) {
+      closeSettingsMenu();
+    }
+  };
+
+  // Defer listener wiring + focus so the click that opened the menu
+  // doesn't immediately trigger the mousedown-close path.
+  var activeMenu = menu;
+  var closeHandler = _settingsMenuCloseHandler;
+  setTimeout(function () {
+    if (_settingsMenu !== activeMenu || !closeHandler) return;
+    document.addEventListener("mousedown", closeHandler);
+    document.addEventListener("keydown", closeHandler);
+    var first = activeMenu.querySelector(".ws-tab-dropdown-item");
+    if (first) first.focus();
+  }, 0);
+}
+
+function closeSettingsMenu() {
+  if (_settingsMenu) {
+    _settingsMenu.remove();
+    _settingsMenu = null;
+  }
+  if (_settingsMenuCloseHandler) {
+    document.removeEventListener("mousedown", _settingsMenuCloseHandler);
+    document.removeEventListener("keydown", _settingsMenuCloseHandler);
+    _settingsMenuCloseHandler = null;
+  }
+  if (_settingsMenuTrigger) {
+    _settingsMenuTrigger.setAttribute("aria-expanded", "false");
+    _settingsMenuTrigger.removeAttribute("aria-controls");
+    _settingsMenuTrigger = null;
+  }
+}
+
 function loadMcpConnections() {
   var loadingEl = document.getElementById("settings-mcp-loading");
   var emptyEl = document.getElementById("settings-mcp-empty");
@@ -6135,6 +6323,13 @@ document.addEventListener("keydown", function (e) {
     var modal = document.getElementById(modalIds[mi]);
     if (modal && modal.style.display !== "none") return;
   }
+  // Settings menu is a transient dropdown, not a modal overlay, but
+  // the global Escape handler must not reach hideDashboard() while
+  // it's open — that would wipe the composer out from under the user
+  // (hideDashboard clears dashboard-input.value and _dashboardStagedFiles).
+  // The menu's own keydown handler (registered async via setTimeout(0)
+  // in openSettingsMenu) handles Escape and Tab.
+  if (_settingsMenu) return;
 
   if (e.key === "Escape" && dashboardVisible) {
     e.preventDefault();
