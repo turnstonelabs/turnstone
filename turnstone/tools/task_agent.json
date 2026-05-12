@@ -1,6 +1,6 @@
 {
   "name": "task_agent",
-  "description": "Delegate a general-purpose task to an autonomous sub-agent. The agent can read, write, edit, search, and run commands but does NOT have access to memory, recall, watch, plan_agent, or task_agent — it cannot save memories, search conversation history, set up watches, or delegate further. All context must be in the prompt. Provide a clear, self-contained task description. Optionally pass `skill=<name>` to run the sub-agent under a specific persona; use `skill(action='search', query='...')` to find an appropriate name first. An empty `skill` value is acceptable — the sub-agent runs as a competent general-purpose task helper.",
+  "description": "Delegate a general-purpose task to an autonomous sub-agent. The agent can read, write, edit, search, and run commands but does NOT have access to memory, recall, watch, skill, plan_agent, or task_agent — it cannot save memories, search conversation history, set up watches, switch skills mid-task, or delegate further. All context must be in the prompt. Provide a clear, self-contained task description. Optionally pass `skill=<name>` to run the sub-agent under a specific persona (the skill is fixed at invocation and cannot be changed mid-task); use `skill(action='search', query='...')` to find an appropriate name first. An empty `skill` value is acceptable — the sub-agent runs as a competent general-purpose task helper.",
   "parameters": {
     "type": "object",
     "properties": {

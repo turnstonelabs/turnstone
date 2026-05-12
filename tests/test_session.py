@@ -498,7 +498,13 @@ class TestTaskExec:
         with patch("turnstone.core.session.get_skill_by_name", return_value=skill):
             item = session._prepare_task("c1", {"prompt": "investigate X", "skill": "research"})
 
-        assert item["skill"] is skill
+        # Item carries the minimized projection — name/content/risk_level
+        # only — not the raw prompt_templates row.
+        assert item["skill"] == {
+            "name": "research",
+            "content": skill["content"],
+            "risk_level": "",
+        }
         assert item.get("needs_approval") is True
         assert "skill: research" in item["header"]
 
@@ -531,6 +537,21 @@ class TestTaskExec:
         # Default-persona literals also present (sanity check on the constant).
         assert "# Task Agent" in sys_msg
         assert "autonomous task agent with full tool access" in sys_msg
+
+    @pytest.mark.parametrize("skill_value", ["", "   ", "\t\n"])
+    def test_prepare_task_empty_or_whitespace_skill_treated_as_omitted(
+        self, tmp_db, skill_value
+    ) -> None:
+        """Documented contract: ``skill=""`` (and whitespace-only) behaves
+        identically to omitting the skill arg.  LLMs sometimes echo empty
+        strings rather than omit the field; this pins the documented
+        behavior so a future refactor of the ``(args.get("skill") or "").strip()``
+        chokepoint can't quietly diverge."""
+        session = _make_session()
+        item = session._prepare_task("c1", {"prompt": "do x", "skill": skill_value})
+        assert item.get("needs_approval") is True
+        assert item["skill"] is None
+        assert "skill:" not in item["header"]
 
     def test_prepare_task_unknown_skill_returns_error(self, tmp_db) -> None:
         """Unknown skill name → clean error item, no approval needed.
