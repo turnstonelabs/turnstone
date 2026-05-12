@@ -14,6 +14,97 @@ Three release tracks are maintained:
 
 ## [Unreleased]
 
+## [1.5.13]
+
+This release introduces one forward-only schema migration:
+`053_services_notify_trigger` — installs the `services_notify` PostgreSQL
+trigger that backs the new LISTEN/NOTIFY dispatcher (no-op on SQLite, where
+the dispatcher uses in-process fan-out).
+
+### Added
+
+- **Reactive node discovery via PG LISTEN/NOTIFY** — the console gains a
+  `NotifyDispatcher` that holds a dedicated session-mode PostgreSQL `LISTEN`
+  connection (bypasses pgbouncer transaction pooling) and fans wake-ups out to
+  per-channel handlers on a separate dispatch thread. The cluster collector
+  subscribes to a new `services` channel and reacts to node register /
+  deregister within ~500 ms instead of waiting up to 60 s for the next discovery
+  loop; the 60 s loop is retained as the backstop for crash-shaped loss
+  (NOTIFY only fires on real writes). The storage layer also gains a uniform
+  `notify` / `listen` API with an SQLite synthetic-sweep fallback so consumer
+  code is identical across backends. `TURNSTONE_DB_LISTEN_URL` (or
+  `[database] listen_url` in `config.toml`) points the dispatcher at a
+  direct-to-Postgres URL; defaults to the main DB URL when unset.
+- **Event-driven `wait_for_workstream`** — coord's block-wait tool no longer
+  polls storage every 500 ms. A new in-process `ChildEventBus` notifies waiters
+  whenever a child state change is dispatched to the UI, and the wait loop
+  blocks on `threading.Event.wait` with a 2 s heartbeat cap (matching the
+  existing `wait_progress` SSE cadence). A 600 s wait that previously hit
+  storage ~2400 times now wakes only on real state transitions, with ~4× lower
+  SSE traffic in the quiescent case.
+- **Memory tool audit trail** — the memory tool now emits `memory.save`,
+  `memory.update`, and `memory.delete` audit events (the admin-console DELETE
+  route previously emitted only `memory.delete`, so tool-initiated mutations
+  had no audit footprint). All emissions are best-effort and never break the
+  tool call itself.
+- **`task_agent` per-call personas via `skill=`** — `task_agent` now accepts
+  an optional `skill=<name>` argument that loads the named skill's content as
+  the sub-agent's persona in place of the hardcoded identity statement. The
+  fixed operating-guidance block (one-shot, tool-use over narration,
+  no follow-up questions) is still layered on top of every persona. High- and
+  critical-risk skills surface their risk tier in the approval header and
+  emit a `task_agent.high_risk_skill` warning, matching the existing
+  session-load gate.
+
+### Fixed
+
+- **Per-role plan / task model overrides could be bypassed by the LLM** — the
+  back-compat `default` alias auto-synthesised by `load_model_registry`
+  remained visible to the model even when an operator had configured
+  `model.task_alias` / `model.plan_alias`, so `task_agent(model="default")`
+  routed to whichever backend the synthesised alias was attached to at boot
+  instead of the configured per-role default. The synthesised alias is now
+  only added when neither the DB nor `[models.*]` populates the registry,
+  filtered out of the LLM-visible alias list, and explicitly rejected at the
+  validator chokepoint as defense-in-depth.
+- **Mermaid streaming parse errors + progressive `hljs`** — live-streamed
+  mermaid blocks with bare `(`, `[`, `{` inside unquoted edge or rectangle
+  node labels were re-entering the shape parser and producing
+  `Parse error, got 'PS'` messages. The renderer now autoquotes the two
+  affected label forms (`|content|` and `ID[content]`) before the SVG cache
+  lookup; shapes whose syntax already nests delimiters (cylinders, subroutines,
+  trapezoids, etc.) are intentionally left alone. The companion `hljs` change
+  highlights code blocks progressively as they stream rather than only after
+  completion.
+- **Re-auth from inside the proxy-prefixed UI** — on a proxied node page
+  (`/node/{id}/...`), an expiring JWT triggered an in-page login modal whose
+  POST went to `/v1/api/auth/login` and was rewritten to
+  `/node/{id}/v1/api/auth/login`. Two latent bugs both blocked re-auth: the
+  console's `AuthMiddleware` didn't recognise the `/node/{id}/` prefix over a
+  public path, and `proxy_api` would have forwarded the login request to the
+  upstream node (which mints `JWT_AUD_SERVER` tokens the console then rejects).
+  Both fixed: proxied public paths stay public, and `proxy_api` now dispatches
+  every entry in `_PROXY_AUTH_LOCAL_HANDLERS` (login, logout, setup, refresh,
+  status, whoami, oidc/authorize, oidc/callback) to the console's own auth
+  handlers. The dispatch table is a single `(method, path) → handler` mapping
+  so the test parametrize list can't drift from the implementation.
+- **Appbar visibility + gear-icon dropdown on the dashboard** — the dashboard
+  overlay was covering the entire appbar, hiding the proxy-injected node
+  picker. The overlay now starts at `top: 48px` and the dashboard's role
+  downgrades from `dialog+aria-modal` to `region` so the appbar above it
+  remains reachable. The gear icon converts from a direct settings-panel
+  click into a dropdown with "MCP connections" and "Logout" (the latter with
+  `.destructive` styling). The settings-menu keydown handler is now attached
+  synchronously so `Escape` can't fall through the brief window between the
+  menu opening and its listeners being installed.
+- **PostgreSQL test backend on the notify dispatcher suite** — migration 053's
+  `services_notify` trigger lives only in the alembic chain, but the test
+  fixture creates tables via `metadata.create_all`. The trigger function +
+  trigger are now declared in `_schema.py` and attached via
+  `sa.event.listen(services, "after_create", ...)` DDL events gated on the
+  PostgreSQL dialect, with the same SQL constants imported by migration 053
+  so there's a single source of truth.
+
 ## [1.5.12]
 
 ### Added
