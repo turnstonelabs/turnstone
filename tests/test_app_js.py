@@ -340,7 +340,7 @@ def test_phase8_no_unsafe_dom_write_in_settings_panel() -> None:
 
 
 def test_phase8_settings_button_in_index_html() -> None:
-    """The gear-icon entry-point for the settings panel must remain
+    """The gear-icon entry-point for the settings menu must remain
     in the appbar's actions span. The console proxy IIFE prepends a
     node pill to ``header.firstChild`` (turnstone/console/server.py:
     202); our button is appended inside ``<span class='appbar-actions'>``
@@ -351,9 +351,10 @@ def test_phase8_settings_button_in_index_html() -> None:
         "index.html must keep the #settings-btn — onclick handlers "
         "and the consent badge target it by id."
     )
-    assert 'onclick="openSettingsPanel()"' in body, (
-        "settings-btn must wire onclick=openSettingsPanel() — losing "
-        "the binding leaves the panel unreachable."
+    assert 'onclick="toggleSettingsMenu(this)"' in body, (
+        "settings-btn must wire onclick=toggleSettingsMenu(this) — "
+        "the gear opens a dropdown with MCP connections + Logout; "
+        "losing the binding leaves the menu unreachable."
     )
     # The button must live inside <span class="appbar-actions"> so the
     # console proxy's header.insertBefore(pill, header.firstChild)
@@ -363,6 +364,76 @@ def test_phase8_settings_button_in_index_html() -> None:
     assert 'id="settings-btn"' in body[actions_open:actions_close], (
         "settings-btn must be inside <span class='appbar-actions'> "
         "so the console proxy's firstChild prepend doesn't shift it."
+    )
+
+
+def test_settings_menu_handlers_defined() -> None:
+    """The gear-icon dropdown exposes a toggle/open/close trio that the
+    inline ``onclick="toggleSettingsMenu(this)"`` in index.html depends
+    on, plus the menu items themselves must wire to existing entry
+    points (``openSettingsPanel`` for MCP connections, ``logout`` for
+    sign-out). Pin all four so a rename or deletion fails loudly here
+    instead of silently leaving the gear's menu broken or wired to a
+    stale function."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    for name in [
+        "function toggleSettingsMenu",
+        "function openSettingsMenu",
+        "function closeSettingsMenu",
+    ]:
+        assert name in body, f"Missing required handler: {name}"
+    # Bound to the settings-menu region so we don't accidentally match
+    # an unrelated openSettingsPanel/logout call elsewhere in the file.
+    start = body.index("function openSettingsMenu(")
+    end = body.index("function closeSettingsMenu(", start)
+    section = body[start:end]
+    assert "openSettingsPanel()" in section, (
+        "Settings menu's MCP-connections item must call openSettingsPanel() "
+        "— otherwise the existing settings overlay is unreachable from the "
+        "new dropdown."
+    )
+    assert "logout()" in section, (
+        "Settings menu's Logout item must call logout() — that's the "
+        "shared auth.js entry point that clears the cookie + session state."
+    )
+
+
+def test_dashboard_overlay_is_region_not_dialog() -> None:
+    """The dashboard overlay must be role='region' (not role='dialog' +
+    aria-modal='true').  The role downgrade is what allows ui-header to
+    stay interactive while the dashboard is open — see the comment at
+    showDashboard() in app.js.  A revert to role='dialog' + aria-modal
+    would re-trap focus and break the gear/theme buttons + the console
+    proxy's node-picker pill while the dashboard is open."""
+    body = _INDEX_HTML.read_text(encoding="utf-8")
+    idx = body.index('id="dashboard"')
+    # Bound to ~600 chars after the tag so we only check this element's
+    # attributes — same shape as test_phase8_settings_modal_in_index_html.
+    chunk = body[idx : idx + 600]
+    assert 'role="region"' in chunk, (
+        "dashboard must be role='region' — see showDashboard() comment."
+    )
+    assert "aria-modal" not in chunk, (
+        "dashboard must NOT be aria-modal — re-trapping focus breaks "
+        "the appbar's interactive controls (theme toggle, settings menu, "
+        "proxy node-picker pill) while the dashboard is open."
+    )
+
+
+def test_close_settings_menu_resets_aria() -> None:
+    """closeSettingsMenu must reset aria-expanded='false' AND remove
+    aria-controls from the gear trigger.  Without the reset the gear
+    keeps reporting 'expanded' to assistive tech after the menu closes;
+    without the removal aria-controls points at a dead DOM id."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    start = body.index("function closeSettingsMenu(")
+    # Bound to ~600 chars so we don't catch unrelated handlers.
+    section = body[start : start + 600]
+    assert 'setAttribute("aria-expanded", "false")' in section, (
+        "closeSettingsMenu must set aria-expanded='false' on the gear."
+    )
+    assert 'removeAttribute("aria-controls")' in section, (
+        "closeSettingsMenu must remove aria-controls from the gear."
     )
 
 
