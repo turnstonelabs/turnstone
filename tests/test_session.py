@@ -459,6 +459,192 @@ class TestPlanExec:
 
 
 # ---------------------------------------------------------------------------
+# Tests — _exec_task (optional skill substitutes the hardcoded identity)
+# ---------------------------------------------------------------------------
+
+
+class TestTaskExec:
+    """Tests for _exec_task: optional skill= replaces the default persona,
+    but operating guidance (one-shot, tool-use over narration, no follow-ups)
+    is always preserved."""
+
+    @staticmethod
+    def _capture_exec_messages(session, item):
+        """Run _exec_task with _run_agent patched; return system message text."""
+        captured: dict = {}
+
+        def fake_run_agent(messages, **kwargs):
+            captured["messages"] = list(messages)
+            return "done"
+
+        with patch.object(session, "_run_agent", side_effect=fake_run_agent):
+            session._exec_task(item)
+        return captured["messages"][0]["content"]
+
+    def test_known_skill_renders_into_system_message(self, tmp_db) -> None:
+        """Validated skill content (with template vars resolved) replaces
+        the default '# Task Agent' persona, but the operating guidance
+        (the numbered list) is preserved — those are sub-agent semantics
+        that a persona should layer on top of, not replace.
+
+        Covers the full prepare→exec round-trip so a future regression
+        in either half (skill not stored on the item, or exec ignoring it)
+        is caught."""
+        session = _make_session()
+        skill = {
+            "name": "research",
+            "content": "# Research Agent\nws={{ws_id}} model={{model}} node={{node_id}}",
+        }
+        with patch("turnstone.core.session.get_skill_by_name", return_value=skill):
+            item = session._prepare_task("c1", {"prompt": "investigate X", "skill": "research"})
+
+        assert item["skill"] is skill
+        assert item.get("needs_approval") is True
+        assert "skill: research" in item["header"]
+
+        sys_msg = self._capture_exec_messages(session, item)
+        # Skill persona rendered with template vars resolved
+        assert "# Research Agent" in sys_msg
+        assert f"ws={session._ws_id}" in sys_msg
+        assert f"model={session.model}" in sys_msg
+        # Default persona is gone — skill substitutes for it.
+        assert "# Task Agent" not in sys_msg
+        assert "autonomous task agent with full tool access" not in sys_msg
+        # Operating guidance survives regardless of skill.
+        assert ChatSession._TASK_OPERATING_GUIDANCE in sys_msg
+
+    def test_omitted_skill_uses_hardcoded_identity(self, tmp_db) -> None:
+        """Regression guard: without skill=, the default '# Task Agent'
+        persona AND the operating guidance both appear verbatim.
+
+        Pins the no-skill path so the substitution branch can't
+        accidentally swallow the default case."""
+        session = _make_session()
+        item = session._prepare_task("c1", {"prompt": "do x"})
+
+        assert item["skill"] is None
+        assert "skill:" not in item["header"]
+
+        sys_msg = self._capture_exec_messages(session, item)
+        assert ChatSession._TASK_DEFAULT_IDENTITY in sys_msg
+        assert ChatSession._TASK_OPERATING_GUIDANCE in sys_msg
+        # Default-persona literals also present (sanity check on the constant).
+        assert "# Task Agent" in sys_msg
+        assert "autonomous task agent with full tool access" in sys_msg
+
+    def test_prepare_task_unknown_skill_returns_error(self, tmp_db) -> None:
+        """Unknown skill name → clean error item, no approval needed.
+
+        Skill validation lives in _prepare_task so an LLM passing a
+        bogus name fails fast at approval time rather than at exec."""
+        session = _make_session()
+        with patch("turnstone.core.session.get_skill_by_name", return_value=None):
+            item = session._prepare_task("c1", {"prompt": "do x", "skill": "ghost"})
+        assert item.get("needs_approval") is False
+        assert "unknown skill 'ghost'" in item["error"]
+        assert "skill(action='search')" in item["error"]
+
+    def test_prepare_task_disabled_skill_returns_error(self, tmp_db) -> None:
+        """Disabled skill → distinct error, mirrors the enabled gate that
+        ``_exec_skill(action='load')`` (session.py:8404) and skill-search
+        already apply.  Distinct from the unknown-skill phrasing so the
+        LLM's recovery path can tell 'not found' from 'quarantined'."""
+        session = _make_session()
+        disabled_skill = {
+            "name": "retired",
+            "content": "# Retired",
+            "enabled": False,
+        }
+        with patch("turnstone.core.session.get_skill_by_name", return_value=disabled_skill):
+            item = session._prepare_task("c1", {"prompt": "do x", "skill": "retired"})
+        assert item.get("needs_approval") is False
+        assert "is disabled" in item["error"]
+        # Distinct wording from the unknown-skill error, so the LLM can
+        # tell them apart at recovery time.
+        assert "unknown skill" not in item["error"]
+
+    def test_prepare_task_high_risk_skill_surfaces_in_header(self, tmp_db, caplog) -> None:
+        """High/critical risk skills surface the tier in the approval header
+        and emit a structured warning, mirroring the signal ``_load_skills``
+        emits for session-level skills (session.py:1336)."""
+        import logging
+
+        session = _make_session()
+        risky_skill = {
+            "name": "danger",
+            "content": "# Danger",
+            "enabled": True,
+            "risk_level": "critical",
+        }
+        with (
+            caplog.at_level(logging.WARNING, logger="turnstone.core.session"),
+            patch("turnstone.core.session.get_skill_by_name", return_value=risky_skill),
+        ):
+            item = session._prepare_task("c1", {"prompt": "do x", "skill": "danger"})
+        assert item.get("needs_approval") is True
+        assert "skill: danger" in item["header"]
+        assert "risk: critical" in item["header"]
+        warning_seen = any("high_risk_skill" in r.getMessage() for r in caplog.records)
+        assert warning_seen, "expected task_agent.high_risk_skill warning"
+
+    def test_prepare_task_normal_risk_skill_omits_tier_from_header(self, tmp_db) -> None:
+        """Header only surfaces high/critical — low/medium/safe skills don't
+        pollute the approval line."""
+        session = _make_session()
+        ok_skill = {
+            "name": "research",
+            "content": "# Research",
+            "enabled": True,
+            "risk_level": "low",
+        }
+        with patch("turnstone.core.session.get_skill_by_name", return_value=ok_skill):
+            item = session._prepare_task("c1", {"prompt": "do x", "skill": "research"})
+        assert "skill: research" in item["header"]
+        assert "risk:" not in item["header"]
+
+    def test_evaluate_intent_projects_skill_for_task_agent(self, tmp_db, monkeypatch) -> None:
+        """Judge projection includes the skill name so heuristic arg_patterns
+        can match on it and the audit row records which persona was chosen.
+
+        Mirrors the long-standing ``spawn_workstream`` projection at
+        session.py:4603 — without it, policy rules targeting risky
+        skills via ``task_agent`` silently no-op."""
+        session = _make_session()
+        fake_verdict = MagicMock()
+        fake_verdict.to_dict.return_value = {"verdict_id": "v0", "tier": "heuristic"}
+        fake_judge = MagicMock()
+        fake_judge.evaluate.side_effect = lambda items, *_a, **_kw: [fake_verdict] * len(items)
+        monkeypatch.setattr(session, "_ensure_judge", lambda: fake_judge)
+
+        skill = {"name": "research", "content": "# Research", "enabled": True}
+        with patch("turnstone.core.session.get_skill_by_name", return_value=skill):
+            item = session._prepare_task("c1", {"prompt": "investigate X", "skill": "research"})
+        session._evaluate_intent([item])
+
+        fa = item["func_args"]
+        assert fa["skill"] == "research"
+        assert fa["prompt"] == "investigate X"
+
+    def test_evaluate_intent_projects_empty_skill_when_omitted(self, tmp_db, monkeypatch) -> None:
+        """Symmetric regression guard: no-skill case projects skill="" so
+        the func_args shape is stable across both branches (the judge can
+        always read ``func_args["skill"]`` without a KeyError)."""
+        session = _make_session()
+        fake_verdict = MagicMock()
+        fake_verdict.to_dict.return_value = {"verdict_id": "v0", "tier": "heuristic"}
+        fake_judge = MagicMock()
+        fake_judge.evaluate.side_effect = lambda items, *_a, **_kw: [fake_verdict] * len(items)
+        monkeypatch.setattr(session, "_ensure_judge", lambda: fake_judge)
+
+        item = session._prepare_task("c1", {"prompt": "do x"})
+        session._evaluate_intent([item])
+
+        fa = item["func_args"]
+        assert fa["skill"] == ""
+        assert fa["prompt"] == "do x"
+
+
+# ---------------------------------------------------------------------------
 # Per-call model override on plan_agent / task_agent
 # ---------------------------------------------------------------------------
 
