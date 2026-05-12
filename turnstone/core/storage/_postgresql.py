@@ -19,6 +19,7 @@ import sqlalchemy as sa
 from turnstone.core.log import get_logger
 from turnstone.core.storage._protocol import (
     MCPOAuthPendingState,
+    MCPPendingConsentRow,
     MCPUserToken,
     MCPUserTokenMetadataRow,
     OIDCIdentity,
@@ -33,6 +34,7 @@ from turnstone.core.storage._schema import (
     heuristic_rules,
     intent_verdicts,
     mcp_oauth_pending,
+    mcp_pending_consent,
     mcp_servers,
     mcp_user_tokens,
     metadata,
@@ -4307,6 +4309,136 @@ class PostgreSQLBackend:
             )
             conn.commit()
             return result.rowcount
+
+    # -- MCP pending-consent (Phase 9) ----------------------------------------
+
+    def upsert_mcp_pending_consent(
+        self,
+        user_id: str,
+        server_name: str,
+        error_code: str,
+        scopes_required: str | None,
+        last_ws_id: str | None,
+        last_tool_call_id: str | None,
+        now_iso: str,
+    ) -> None:
+        from sqlalchemy.dialects import postgresql
+
+        stmt = postgresql.insert(mcp_pending_consent).values(
+            user_id=user_id,
+            server_name=server_name,
+            error_code=error_code,
+            scopes_required=scopes_required,
+            last_ws_id=last_ws_id,
+            last_tool_call_id=last_tool_call_id,
+            first_seen_at=now_iso,
+            last_seen_at=now_iso,
+            occurrence_count=1,
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["user_id", "server_name"],
+            set_={
+                "error_code": stmt.excluded.error_code,
+                "scopes_required": stmt.excluded.scopes_required,
+                "last_ws_id": stmt.excluded.last_ws_id,
+                "last_tool_call_id": stmt.excluded.last_tool_call_id,
+                "last_seen_at": stmt.excluded.last_seen_at,
+                "occurrence_count": mcp_pending_consent.c.occurrence_count + 1,
+            },
+        )
+        with self._conn() as conn:
+            conn.execute(stmt)
+            conn.commit()
+
+    def list_mcp_pending_consent_by_user(self, user_id: str) -> list[MCPPendingConsentRow]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                sa.select(mcp_pending_consent)
+                .where(mcp_pending_consent.c.user_id == user_id)
+                .order_by(mcp_pending_consent.c.last_seen_at.desc())
+            ).fetchall()
+        out: list[MCPPendingConsentRow] = []
+        for r in rows:
+            m = r._mapping
+            out.append(
+                MCPPendingConsentRow(
+                    user_id=m["user_id"],
+                    server_name=m["server_name"],
+                    error_code=m["error_code"],
+                    scopes_required=m["scopes_required"],
+                    last_ws_id=m["last_ws_id"],
+                    last_tool_call_id=m["last_tool_call_id"],
+                    first_seen_at=m["first_seen_at"],
+                    last_seen_at=m["last_seen_at"],
+                    occurrence_count=m["occurrence_count"],
+                )
+            )
+        return out
+
+    def delete_mcp_pending_consent(self, user_id: str, server_name: str) -> bool:
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.delete(mcp_pending_consent).where(
+                    (mcp_pending_consent.c.user_id == user_id)
+                    & (mcp_pending_consent.c.server_name == server_name)
+                )
+            )
+            conn.commit()
+            return bool(result.rowcount)
+
+    def delete_all_mcp_pending_consent_by_user(self, user_id: str) -> int:
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.delete(mcp_pending_consent).where(mcp_pending_consent.c.user_id == user_id)
+            )
+            conn.commit()
+            return int(result.rowcount or 0)
+
+    def count_mcp_consented_users_by_server(self, server_name: str) -> int:
+        # ``expires_at IS NULL`` => non-expired (refresh-only tokens with no
+        # advertised expiry).  Compare lexically against ISO-8601 strings,
+        # mirroring the convention in ``mcp_user_tokens.expires_at``.
+        now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.select(sa.func.count(sa.distinct(mcp_user_tokens.c.user_id)))
+                .where(mcp_user_tokens.c.server_name == server_name)
+                .where(
+                    sa.or_(
+                        mcp_user_tokens.c.expires_at.is_(None),
+                        mcp_user_tokens.c.expires_at > now_iso,
+                    )
+                )
+            ).scalar()
+        return int(result or 0)
+
+    def count_mcp_consented_users_grouped_by_server(self) -> dict[str, int]:
+        now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            rows = conn.execute(
+                sa.select(
+                    mcp_user_tokens.c.server_name,
+                    sa.func.count(sa.distinct(mcp_user_tokens.c.user_id)),
+                )
+                .where(
+                    sa.or_(
+                        mcp_user_tokens.c.expires_at.is_(None),
+                        mcp_user_tokens.c.expires_at > now_iso,
+                    )
+                )
+                .group_by(mcp_user_tokens.c.server_name)
+            ).fetchall()
+        return {row[0]: int(row[1] or 0) for row in rows}
+
+    def any_oauth_user_mcp_servers(self) -> bool:
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.select(sa.literal(1))
+                .select_from(mcp_servers)
+                .where(mcp_servers.c.auth_type == "oauth_user")
+                .limit(1)
+            ).scalar()
+        return result is not None
 
     # -- Model definitions -----------------------------------------------------
 

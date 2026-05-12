@@ -112,7 +112,12 @@ from turnstone.core.tools import (
 from turnstone.core.watch import WATCH_REMINDER_OPTIONAL_KEYS
 from turnstone.core.web import check_ssrf, strip_html
 from turnstone.core.workstream import WorkstreamKind
-from turnstone.prompts import ClientType, SessionContext, compose_system_message
+from turnstone.prompts import (
+    INTERACTIVE_CONSENT_CLIENT_TYPES,
+    ClientType,
+    SessionContext,
+    compose_system_message,
+)
 from turnstone.ui.colors import DIM, GRAY, GREEN, RED, RESET, YELLOW, bold, cyan, dim
 
 log = get_logger(__name__)
@@ -851,6 +856,15 @@ class ChatSession:
         self._mcp_user_id: str | None = user_id or None
         self._username = username
         self._client_type = client_type
+        # Whether the user is online to complete an in-flight OAuth
+        # consent redirect.  WEB and CLI users are; CHAT (Discord /
+        # Slack) and SCHEDULED (autonomous runs) are not — their
+        # consent-required errors must be persisted to
+        # ``mcp_pending_consent`` by the pool dispatchers for later
+        # surfacing on the dashboard badge, rather than relying on the
+        # in-flight SSE rendering path that Phase 8 ships for
+        # interactive surfaces.
+        self._is_interactive_for_consent: bool = client_type in INTERACTIVE_CONSENT_CLIENT_TYPES
         self._config_store = config_store
         # Initialize rule registry for configurable judge rules
         self._rule_registry = None
@@ -8595,6 +8609,7 @@ class ChatSession:
                 args,
                 user_id=self._mcp_user_id,
                 timeout=self.tool_timeout,
+                is_interactive_for_consent=self._is_interactive_for_consent,
             )
         except TimeoutError:
             output = f"MCP tool timed out after {self.tool_timeout}s"
@@ -8677,7 +8692,10 @@ class ChatSession:
             # 401 / 403 / consent-required handling. Otherwise the
             # static path runs byte-identical (invariant 1).
             output = self._mcp_client.read_resource_sync(
-                uri, user_id=self._mcp_user_id, timeout=self.tool_timeout
+                uri,
+                user_id=self._mcp_user_id,
+                timeout=self.tool_timeout,
+                is_interactive_for_consent=self._is_interactive_for_consent,
             )
         except TimeoutError:
             output = f"MCP resource read timed out after {self.tool_timeout}s"
@@ -8774,6 +8792,7 @@ class ChatSession:
                 arguments or None,
                 user_id=self._mcp_user_id,
                 timeout=self.tool_timeout,
+                is_interactive_for_consent=self._is_interactive_for_consent,
             )
             output = "\n\n".join(f"[{m['role']}]: {m['content']}" for m in messages)
         except TimeoutError:

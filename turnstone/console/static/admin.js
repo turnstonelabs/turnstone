@@ -3314,6 +3314,11 @@ function _renderMcpServers(items) {
     var totalTools = 0,
       totalRes = 0,
       totalPrompts = 0;
+    // Phase 9: aggregate the most-recent refresh entry across nodes
+    // so the admin pill reflects "the freshest known state" rather
+    // than picking an arbitrary node.
+    var newestRefreshAt = null;
+    var newestRefreshOutcome = null;
     for (var j = 0; j < nodeIds.length; j++) {
       var ns = statusEntries[nodeIds[j]];
       if (ns.connected) {
@@ -3325,6 +3330,13 @@ function _renderMcpServers(items) {
       if (ns.error) {
         anyError = true;
         if (!firstError) firstError = ns.error;
+      }
+      if (
+        typeof ns.last_refresh_at === "number" &&
+        (newestRefreshAt === null || ns.last_refresh_at > newestRefreshAt)
+      ) {
+        newestRefreshAt = ns.last_refresh_at;
+        newestRefreshOutcome = ns.last_refresh_outcome || null;
       }
     }
 
@@ -3349,6 +3361,38 @@ function _renderMcpServers(items) {
       dotClass = "mcp-status-dot disabled";
       rowClass = "mcp-row-disabled";
       statusText = "idle";
+    }
+
+    // Phase 9: refresh pill shows the short-relative age (e.g. "12m") with
+    // outcome-tinted color (ok vs err) and the full ISO timestamp + outcome
+    // in the tooltip.  Pill is omitted (and the cell stays unchanged from
+    // its pre-Phase-9 shape) when no node has yet recorded a refresh
+    // outcome for this server.
+    var refreshPill = "";
+    if (newestRefreshAt !== null) {
+      var ageSeconds = Math.max(0, Math.floor(Date.now() / 1000 - newestRefreshAt));
+      var ageShort;
+      if (ageSeconds < 60) ageShort = ageSeconds + "s";
+      else if (ageSeconds < 3600) ageShort = Math.floor(ageSeconds / 60) + "m";
+      else if (ageSeconds < 86400) ageShort = Math.floor(ageSeconds / 3600) + "h";
+      else ageShort = Math.floor(ageSeconds / 86400) + "d";
+      var outcomeText = newestRefreshOutcome || "unknown";
+      var pillCls =
+        outcomeText === "ok" ? "mcp-refresh-pill-ok" : "mcp-refresh-pill-err";
+      var pillTitle =
+        "Last refresh " +
+        new Date(newestRefreshAt * 1000).toISOString() +
+        " (" +
+        outcomeText +
+        ")";
+      refreshPill =
+        ' <span class="mcp-refresh-pill ' +
+        pillCls +
+        '" title="' +
+        escapeHtml(pillTitle) +
+        '">' +
+        escapeHtml(ageShort) +
+        "</span>";
     }
 
     var transportCls =
@@ -3385,6 +3429,24 @@ function _renderMcpServers(items) {
         '<button class="admin-btn-action" data-mcp-oauth-connect="' +
         escapeHtml(s.name) +
         '">connect</button>';
+      // Phase 9: surface the consented-users count + bulk-revoke
+      // affordance only when at least one user has consented.
+      var consentCount =
+        typeof s.consented_users_count === "number"
+          ? s.consented_users_count
+          : 0;
+      if (consentCount > 0) {
+        actionBtns +=
+          '<button class="admin-btn-danger" data-mcp-bulk-revoke="' +
+          escapeHtml(s.name) +
+          '" data-mcp-consent-count="' +
+          consentCount +
+          '" title="Drop all ' +
+          consentCount +
+          " user consents for this server">bulk-revoke (" +
+          consentCount +
+          ")</button>";
+      }
     }
     var actions = isConfig
       ? actionBtns
@@ -3429,6 +3491,7 @@ function _renderMcpServers(items) {
       dotClass +
       '" aria-hidden="true"></span>' +
       escapeHtml(statusText) +
+      refreshPill +
       "</span>" +
       '<span class="admin-col admin-col-mactions">' +
       actions +
@@ -3505,6 +3568,42 @@ function _renderMcpServers(items) {
         "&return_url=" +
         encodeURIComponent(window.location.href);
       window.open(url, "_blank", "noopener");
+    });
+  });
+  el.querySelectorAll("[data-mcp-bulk-revoke]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var name = this.getAttribute("data-mcp-bulk-revoke");
+      var count = this.getAttribute("data-mcp-consent-count") || "?";
+      showConfirmModal(
+        "Bulk-revoke MCP consents",
+        "Drop all " +
+          count +
+          ' user consents for server "' +
+          name +
+          '"? Users will need to re-consent on next use. Upstream revoke is not attempted in bulk; tokens at the authorization server will expire naturally.',
+        "Bulk-revoke",
+        function () {
+          authFetch(
+            "/v1/api/admin/mcp-servers/" +
+              encodeURIComponent(name) +
+              "/bulk-revoke",
+            { method: "POST" },
+          )
+            .then(function (r) {
+              if (!r.ok) throw new Error();
+              return r.json();
+            })
+            .then(function (j) {
+              showToast(
+                "Bulk-revoked " + (j.rows_deleted || 0) + " row(s) for " + name,
+              );
+              loadAdminMcp();
+            })
+            .catch(function () {
+              showToast("Failed to bulk-revoke " + name);
+            });
+        },
+      );
     });
   });
   el.querySelectorAll("[data-mcp-delete]").forEach(function (btn) {

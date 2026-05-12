@@ -807,6 +807,15 @@ mcp_user_tokens = sa.Table(
     sa.Column("last_refreshed", sa.Text, nullable=True),
     sa.PrimaryKeyConstraint("user_id", "server_name"),
 )
+# Phase 9: covers the ``WHERE server_name = ? AND (expires_at IS NULL
+# OR expires_at > now)`` shape used by ``count_mcp_consented_users_*``
+# for the admin status pill.  The composite PK can't satisfy filters
+# that don't lead with ``user_id``.
+sa.Index(
+    "idx_mcp_user_tokens_server",
+    mcp_user_tokens.c.server_name,
+    mcp_user_tokens.c.expires_at,
+)
 
 mcp_oauth_pending = sa.Table(
     "mcp_oauth_pending",
@@ -820,6 +829,32 @@ mcp_oauth_pending = sa.Table(
 )
 
 sa.Index("idx_mcp_pending_created", mcp_oauth_pending.c.created_at)
+
+# Per-(user, server) pending-consent state for non-interactive contexts.
+# Populated by the pool dispatchers when a scheduled / channel-driven run
+# hits ``mcp_consent_required`` or ``mcp_insufficient_scope`` and the user
+# can't be prompted in the moment.  Read on dashboard load to render the
+# "N MCP servers need consent" badge.  Cleared by the OAuth callback when
+# the matching ``(user, server)`` completes consent.
+#
+# Composite PK ``(user_id, server_name)`` collapses repeat occurrences for
+# the same server into one row; ``occurrence_count`` + ``last_*`` fields
+# carry recency metadata for the dashboard without inflating row count.
+mcp_pending_consent = sa.Table(
+    "mcp_pending_consent",
+    metadata,
+    sa.Column("user_id", sa.Text, nullable=False),
+    sa.Column("server_name", sa.Text, nullable=False),
+    sa.Column("error_code", sa.Text, nullable=False),
+    sa.Column("scopes_required", sa.Text, nullable=True),
+    sa.Column("last_ws_id", sa.Text, nullable=True),
+    sa.Column("last_tool_call_id", sa.Text, nullable=True),
+    sa.Column("first_seen_at", sa.Text, nullable=False),
+    sa.Column("last_seen_at", sa.Text, nullable=False),
+    sa.Column("occurrence_count", sa.Integer, nullable=False, server_default="1"),
+    sa.PrimaryKeyConstraint("user_id", "server_name"),
+)
+sa.Index("idx_mcp_pending_consent_user", mcp_pending_consent.c.user_id)
 
 # ── TLS / ACME (lacme integration) ──────────────────────────────────────────
 

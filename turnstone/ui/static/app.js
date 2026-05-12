@@ -5230,6 +5230,35 @@ function _clearConsentBadge() {
   _refreshConsentBadge();
 }
 
+// Hydrate the pending-consent badge from the Phase 9 persistence endpoint
+// on dashboard load.  Closes the gap that pre-Phase-9 left open: a
+// scheduled / channel-driven run that hit ``mcp_consent_required`` while
+// the user wasn't online produced an in-flight SSE event that nobody saw.
+// The endpoint short-circuits to ``{pending: 0}`` on installs with no
+// ``auth_type=oauth_user`` MCP servers, so the call is cheap on local-
+// auth deployments.  Failures are silent — the badge will be re-driven
+// by the next in-flight tool error if any.
+function loadPendingConsents() {
+  authFetch("/v1/api/mcp/oauth/pending")
+    .then(function (r) {
+      if (!r.ok) return null;
+      return r.json();
+    })
+    .then(function (data) {
+      if (!data || !Array.isArray(data.servers)) return;
+      for (var i = 0; i < data.servers.length; i++) {
+        var row = data.servers[i];
+        if (row && typeof row.server_name === "string") {
+          _pendingConsentServers.add(row.server_name);
+        }
+      }
+      _refreshConsentBadge();
+    })
+    .catch(function () {
+      // Endpoint failures must not block dashboard init.
+    });
+}
+
 function _refreshConsentBadge() {
   var btn = document.getElementById("settings-btn");
   if (!btn) return;
@@ -6154,6 +6183,12 @@ function loadMcpConnections() {
       // failed fetch keeps the pending-consent signal until the user
       // gets confirmation that consents are in fact reachable.
       _clearConsentBadge();
+      // Phase 9: re-hydrate the badge from the persistent pending-
+      // consent table.  Phase 8 cleared in-memory state on settings-
+      // panel open (signal-acknowledged); Phase 9 records are
+      // DB-backed, so we re-pull them now to keep the badge in sync
+      // with what's actually pending across page lifetimes.
+      loadPendingConsents();
     })
     .catch(function (err) {
       loadingEl.style.display = "none";
@@ -6583,6 +6618,7 @@ initLogin();
 pollHealth();
 loadInterfaceSettings();
 initWorkstreams();
+loadPendingConsents();
 
 function loadInterfaceSettings() {
   authFetch("/v1/api/admin/settings")

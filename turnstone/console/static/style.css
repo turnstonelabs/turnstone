@@ -3602,6 +3602,28 @@ textarea.skill-content-area {
   opacity: 0.4;
 }
 
+/* Phase 9 — last-refresh pill in the MCP status cell.  Compact age +
+   outcome indicator inline with the existing status text.  Uses the
+   semantic theme tokens (--bg-highlight, --fg-dim, --warn) defined in
+   shared_static/base.css so the pill follows dark/light theme swaps. */
+.mcp-refresh-pill {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 4px;
+  border-radius: var(--radius-sm);
+  font-size: 0.8em;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.85;
+}
+.mcp-refresh-pill-ok {
+  background: var(--bg-highlight);
+  color: var(--fg-dim);
+}
+.mcp-refresh-pill-err {
+  background: color-mix(in srgb, var(--warn) 15%, transparent);
+  color: var(--warn);
+}
+
 .mcp-detail-modal::before {
   background: linear-gradient(
     90deg,
