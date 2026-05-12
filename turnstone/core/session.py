@@ -4592,7 +4592,18 @@ class ChatSession:
             elif name == "notify":
                 it["func_args"] = {"message": (it.get("message") or "")[:200]}
             elif name == "task_agent":
-                it["func_args"] = {"prompt": (it.get("prompt") or "")[:200]}
+                # Pending items reach this point already shaped by
+                # ``_prepare_task``, so ``it["skill"]`` is the resolved
+                # skill_data dict (or ``None``), not the raw string the
+                # LLM passed.  Mirror the ``spawn_workstream`` projection
+                # so heuristic ``arg_pattern`` rules can match on skill
+                # name and the judge / audit row sees which persona was
+                # selected.
+                skill_dict = it.get("skill") or {}
+                it["func_args"] = {
+                    "prompt": (it.get("prompt") or "")[:200],
+                    "skill": skill_dict.get("name", "") if isinstance(skill_dict, dict) else "",
+                }
             elif name == "plan_agent":
                 it["func_args"] = {"goal": (it.get("prompt") or "")[:200]}
             # Coordinator tool args — only the ``needs_approval=True`` set
@@ -6224,17 +6235,66 @@ class ChatSession:
         model_override, err = self._validate_agent_model_override(call_id, "task_agent", args)
         if err is not None:
             return err
+        skill_arg = (args.get("skill") or "").strip()
+        skill_data: dict[str, Any] | None = None
+        if skill_arg:
+            skill_data = get_skill_by_name(skill_arg)
+            if skill_data is None:
+                return {
+                    "call_id": call_id,
+                    "func_name": "task_agent",
+                    "header": f"\u2717 task_agent: unknown skill '{skill_arg}'",
+                    "preview": "",
+                    "needs_approval": False,
+                    "error": (
+                        f"Error: unknown skill '{skill_arg}'. "
+                        "Use skill(action='search') to find available names."
+                    ),
+                }
+            # ``enabled=False`` is an admin's quarantine flag \u2014 mirror the
+            # gate that ``_exec_skill(action='load')`` and skill-search
+            # apply so task_agent can't sidestep it.  Distinct from the
+            # not-found case so the LLM's recovery path can tell them apart.
+            if not skill_data.get("enabled", True):
+                return {
+                    "call_id": call_id,
+                    "func_name": "task_agent",
+                    "header": f"\u2717 task_agent: skill '{skill_arg}' is disabled",
+                    "preview": "",
+                    "needs_approval": False,
+                    "error": (
+                        f"Error: skill '{skill_arg}' is disabled and cannot be used. "
+                        "Use skill(action='search') to find available names."
+                    ),
+                }
         preview_text = prompt[:300] + ("..." if len(prompt) > 300 else "")
+        header = "\u2699 task_agent (autonomous agent"
+        if skill_data:
+            header += f", skill: {skill_data['name']}"
+            # Surface high/critical risk at approval time so the operator
+            # sees the same signal ``_load_skills`` emits for session-level
+            # skills (session.py:1336).  Log mirrors that path's structured
+            # event for forensic continuity.
+            risk_tier = skill_data.get("risk_level", "")
+            if risk_tier in ("high", "critical"):
+                header += f", risk: {risk_tier}"
+                log.warning(
+                    "task_agent.high_risk_skill",
+                    skill=skill_data["name"],
+                    risk_level=risk_tier,
+                )
+        header += ")"
         return {
             "call_id": call_id,
             "func_name": "task_agent",
-            "header": "\u2699 task_agent (autonomous agent)",
+            "header": header,
             "preview": f"    {preview_text}",
             "needs_approval": True,
             "approval_label": "task_agent",
             "execute": self._exec_task,
             "prompt": prompt,
             "model_override": model_override,
+            "skill": skill_data,
         }
 
     def _prepare_plan(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -9420,35 +9480,68 @@ class ChatSession:
         self.ui.on_info(f"[{label} done] {len(content)} chars")
         return content
 
+    _TASK_DEFAULT_IDENTITY = (
+        "# Task Agent\n\n"
+        "You are an autonomous task agent with full tool access. "
+        "You can use bash, read_file, write_file, edit_file, search, "
+        "math, web_fetch, and web_search."
+    )
+    # Operating guidance always applies — these are sub-agent semantics
+    # (one-shot, tool-use over narration, no follow-up questions) that a
+    # persona skill should layer on top of, not replace.
+    _TASK_OPERATING_GUIDANCE = (
+        "1. **Follow through on actions:** Do not describe changes — "
+        "use the tools to make them. After read_file, call edit_file "
+        "or write_file.\n\n"
+        "2. **Tool selection:**\n"
+        "   - Use read_file before edit_file on existing files.\n"
+        "   - Use write_file for new files (not bash).\n"
+        "   - Use bash for shell commands (git, python, tests).\n"
+        "   - Use search to find code across files.\n\n"
+        "3. **Complete the task fully.** Do not ask follow-up "
+        "questions — execute the work as described in the prompt."
+    )
+
     def _exec_task(self, item: dict[str, Any]) -> tuple[str, str]:
         """Delegate to a general-purpose autonomous sub-agent."""
         call_id, prompt = item["call_id"], item["prompt"]
-        task_instruction = {
-            "role": "system",
-            "content": (
-                "# Task Agent\n\n"
-                "You are an autonomous task agent with full tool access. "
-                "You can use bash, read_file, write_file, edit_file, search, "
-                "math, web_fetch, and web_search.\n\n"
-                "1. **Follow through on actions:** Do not describe changes — "
-                "use the tools to make them. After read_file, call edit_file "
-                "or write_file.\n\n"
-                "2. **Tool selection:**\n"
-                "   - Use read_file before edit_file on existing files.\n"
-                "   - Use write_file for new files (not bash).\n"
-                "   - Use bash for shell commands (git, python, tests).\n"
-                "   - Use search to find code across files.\n\n"
-                "3. **Complete the task fully.** Do not ask follow-up "
-                "questions — execute the work as described in the prompt."
-            ),
-        }
+        skill_data = item.get("skill")
+        if skill_data:
+            # Structured forensic record naming the skill the LLM ran
+            # under.  The approval row captures the choice at consent
+            # time; this log captures it at exec time so post-incident
+            # search ("which sessions ran skill X?") doesn't have to
+            # cross-walk approval and exec tables.
+            log.info(
+                "task_agent.skill_invoked",
+                skill=skill_data["name"],
+                risk_level=skill_data.get("risk_level", ""),
+                ws_id=self._ws_id,
+            )
+            context = {
+                "model": self.model,
+                "ws_id": self._ws_id,
+                "node_id": self._node_id or "",
+            }
+            persona = _render_template(skill_data["content"], context)
+            if len(persona) > _MAX_SKILL_CONTENT:
+                log.warning(
+                    "skill_content.truncated",
+                    length=len(persona),
+                    agent="task",
+                    skill=skill_data.get("name", ""),
+                )
+                persona = persona[:_MAX_SKILL_CONTENT]
+        else:
+            persona = self._TASK_DEFAULT_IDENTITY
+        identity = persona + "\n\n" + self._TASK_OPERATING_GUIDANCE
         # Task agent gets the base system prompt (tool patterns) merged
         # with its own identity in a single system message. No conversation
         # history — it's an autonomous sub-agent. Merged to avoid
         # multi-system-message errors on models like Qwen.
         base = self._agent_system_messages[0]["content"] if self._agent_system_messages else ""
         agent_messages = [
-            {"role": "system", "content": base + "\n\n" + task_instruction["content"]},
+            {"role": "system", "content": base + "\n\n" + identity},
             {"role": "user", "content": prompt},
         ]
         try:
