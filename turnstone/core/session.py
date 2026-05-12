@@ -6267,6 +6267,17 @@ class ChatSession:
                         "Use skill(action='search') to find available names."
                     ),
                 }
+            # ``get_skill_by_name`` returns the full prompt_templates row
+            # (~30 columns including ``scan_report``, ``installed_by``,
+            # ``source_url``, etc.).  Project to the minimal field set
+            # that ``_exec_task`` and ``_evaluate_intent`` actually read,
+            # so the approval item doesn't drag governance metadata
+            # through any future audit serializer.
+            skill_data = {
+                "name": skill_data["name"],
+                "content": skill_data["content"],
+                "risk_level": skill_data.get("risk_level", ""),
+            }
         preview_text = prompt[:300] + ("..." if len(prompt) > 300 else "")
         header = "\u2699 task_agent (autonomous agent"
         if skill_data:
