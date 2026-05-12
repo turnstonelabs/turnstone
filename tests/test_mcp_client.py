@@ -788,7 +788,11 @@ class TestSessionIntegration:
         assert call_id == "call_789"
         assert output == "result text"
         mock_mcp.call_tool_sync.assert_called_once_with(
-            "mcp__test__search", {"query": "hello"}, user_id=None, timeout=30
+            "mcp__test__search",
+            {"query": "hello"},
+            user_id=None,
+            timeout=30,
+            is_interactive_for_consent=True,
         )
 
     def test_exec_mcp_tool_error(self, tmp_db):
@@ -1054,6 +1058,147 @@ class TestRefreshServer:
                 await mgr._refresh_server_tools("ghost")
 
         asyncio.run(_run())
+
+
+class TestLastRefreshTracking:
+    """Phase 9 admin status pill — ``_last_refresh`` is written on every
+    refresh path so the admin UI reflects manual-refresh AND auto-
+    reconnect outcomes uniformly.  This test class pins the contract.
+    """
+
+    @staticmethod
+    def _seed_minimal(mgr: MCPClientManager, name: str = "srv") -> MagicMock:
+        mock_session = MagicMock()
+        mock_session.list_tools = AsyncMock(return_value=MagicMock(tools=[]))
+        mock_session.list_resources = AsyncMock(return_value=MagicMock(resources=[]))
+        mock_session.list_resource_templates = AsyncMock(
+            return_value=MagicMock(resourceTemplates=[])
+        )
+        mock_session.list_prompts = AsyncMock(return_value=MagicMock(prompts=[]))
+        _seed_static_state(
+            mgr,
+            name,
+            session=mock_session,
+            tools=[],
+            supports_resources=True,
+            supports_prompts=True,
+        )
+        return mock_session
+
+    def test_last_refresh_written_on_success(self) -> None:
+        async def _run() -> None:
+            mgr = MCPClientManager({})
+            self._seed_minimal(mgr)
+            assert "srv" not in mgr._last_refresh
+
+            await mgr._refresh_server("srv")
+
+            entry = mgr._last_refresh.get("srv")
+            assert entry is not None
+            ts, outcome = entry
+            assert outcome == "ok"
+            assert isinstance(ts, float) and ts > 0
+
+        asyncio.run(_run())
+
+    def test_last_refresh_written_on_tool_refresh_failure(self) -> None:
+        """When ``_refresh_server_tools`` raises, the outcome reflects
+        the exception class and the exception still propagates."""
+
+        async def _run() -> None:
+            mgr = MCPClientManager({})
+            mock_session = self._seed_minimal(mgr)
+            mock_session.list_tools = AsyncMock(side_effect=RuntimeError("upstream down"))
+
+            with pytest.raises(RuntimeError, match="upstream down"):
+                await mgr._refresh_server("srv")
+
+            entry = mgr._last_refresh.get("srv")
+            assert entry is not None
+            _, outcome = entry
+            assert outcome == "error:RuntimeError"
+
+        asyncio.run(_run())
+
+    def test_last_refresh_records_first_exception_when_multiple_fail(
+        self,
+    ) -> None:
+        """``return_exceptions=True`` lets sibling tasks complete; the
+        outcome reflects the FIRST exception encountered."""
+
+        async def _run() -> None:
+            mgr = MCPClientManager({})
+            mock_session = self._seed_minimal(mgr)
+            # Tools succeeds; resources raises first (gather preserves
+            # argument order in its results list, so resources is the
+            # first failure regardless of which awaitable finished first
+            # in wall-clock terms).
+            mock_session.list_resources = AsyncMock(side_effect=ValueError("res boom"))
+            mock_session.list_prompts = AsyncMock(side_effect=KeyError("prompts boom"))
+
+            with pytest.raises((ValueError, KeyError)):
+                await mgr._refresh_server("srv")
+
+            entry = mgr._last_refresh.get("srv")
+            assert entry is not None
+            _, outcome = entry
+            # Either of the two failing tasks could be "first" in
+            # gather's results list ordering — the order is positional
+            # so resources (arg #2) comes before prompts (arg #3).
+            assert outcome == "error:ValueError"
+
+        asyncio.run(_run())
+
+    def test_refresh_all_overwrites_stale_ok_on_reconnect_failure(
+        self,
+    ) -> None:
+        """The chokepoint bug-1 fix: a prior successful refresh's ``'ok'``
+        entry MUST be overwritten when a subsequent reconnect fails —
+        otherwise the admin pill shows misleading "ok" while the server
+        is in fact broken."""
+
+        async def _run() -> None:
+            mgr = MCPClientManager({})
+            # Server is configured but has no live session — _refresh_all
+            # routes to the reconnect branch.
+            mgr._server_configs["srv"] = {"type": "stdio", "command": "x"}
+            # Pre-seed a stale "ok" from an earlier successful refresh.
+            mgr._last_refresh["srv"] = (1000.0, "ok")
+
+            async def _raise(*_a: object, **_kw: object) -> None:
+                raise ConnectionError("reconnect failed")
+
+            mgr._connect_one = _raise  # type: ignore[assignment]
+
+            await mgr._refresh_all("srv")
+
+            entry = mgr._last_refresh.get("srv")
+            assert entry is not None
+            ts, outcome = entry
+            # Outcome reflects the new failure, not the stale ok.
+            assert outcome == "error:ConnectionError"
+            assert ts > 1000.0
+
+        asyncio.run(_run())
+
+    def test_get_server_status_surfaces_last_refresh_fields(self) -> None:
+        """``get_server_status`` surfaces ``last_refresh_at`` and
+        ``last_refresh_outcome`` for the admin pill — null when no
+        refresh has occurred yet, populated after one."""
+        mgr = MCPClientManager({})
+        mgr._server_configs["srv"] = {"type": "stdio", "command": "x"}
+
+        # No refresh yet — fields must be present and null so the JS
+        # renderer can branch on absence cleanly.
+        status = mgr.get_server_status("srv")
+        assert status["last_refresh_at"] is None
+        assert status["last_refresh_outcome"] is None
+
+        # Populate the tuple directly and re-read.
+        mgr._last_refresh["srv"] = (12345.5, "ok")
+        status = mgr.get_server_status("srv")
+        assert status["last_refresh_at"] == 12345.5
+        assert status["last_refresh_outcome"] == "ok"
 
 
 class TestListeners:

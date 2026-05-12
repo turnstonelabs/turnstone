@@ -612,6 +612,97 @@ class TestCallback:
         assert plain is not None
         assert plain["refresh_token"] is None
 
+    def test_callback_clears_pending_consent_on_success(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        """Successful callback must drop any ``mcp_pending_consent`` rows
+        for the just-consented ``(user, server)`` (Phase 9 lifecycle
+        contract).  Regression guard for the dashboard-stays-stale-after-
+        consent invariant.
+        """
+        _seed_oauth_user_server(storage)
+        self._seed_pending(storage)
+        # Seed a deferred-consent record that a prior non-interactive run
+        # would have left behind.  Plus a cross-tenant record that must
+        # NOT be touched.
+        storage.upsert_mcp_pending_consent(
+            user_id="user-1",
+            server_name="srv-oauth",
+            error_code="mcp_consent_required",
+            scopes_required=None,
+            last_ws_id="ws-1",
+            last_tool_call_id="tool-1",
+            now_iso="2026-05-11T12:00:00",
+        )
+        storage.upsert_mcp_pending_consent(
+            user_id="other-user",
+            server_name="srv-oauth",
+            error_code="mcp_consent_required",
+            scopes_required=None,
+            last_ws_id=None,
+            last_tool_call_id=None,
+            now_iso="2026-05-11T12:00:00",
+        )
+        token_store = _make_token_store(storage)
+        http_client_mock.get.return_value = _mk_response(200, _good_as_metadata_doc())
+        http_client_mock.post.return_value = _mk_response(
+            200,
+            {"access_token": "opaque-aaa", "expires_in": 3600},
+        )
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        with _public_addr_patch():
+            resp = client.get(
+                "/v1/api/mcp/oauth/callback?code=c&state=valid-state",
+                follow_redirects=False,
+            )
+        assert resp.status_code == 302
+        # Callback completed → user-1's deferred-consent row was cleared.
+        assert storage.list_mcp_pending_consent_by_user("user-1") == []
+        # Cross-tenant row survives — clear is per-(user, server).
+        other = storage.list_mcp_pending_consent_by_user("other-user")
+        assert len(other) == 1
+        assert other[0]["server_name"] == "srv-oauth"
+
+    def test_callback_storage_failure_does_not_block_redirect(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        """If the post-persist ``delete_mcp_pending_consent`` raises, the
+        callback's redirect still completes (best-effort contract).  The
+        stale badge is preferred over a broken consent flow.
+        """
+        _seed_oauth_user_server(storage)
+        self._seed_pending(storage)
+        token_store = _make_token_store(storage)
+        http_client_mock.get.return_value = _mk_response(200, _good_as_metadata_doc())
+        http_client_mock.post.return_value = _mk_response(
+            200,
+            {"access_token": "opaque-aaa", "expires_in": 3600},
+        )
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        original_delete = storage.delete_mcp_pending_consent
+
+        def _raise(*_a: Any, **_kw: Any) -> bool:
+            raise RuntimeError("storage offline")
+
+        storage.delete_mcp_pending_consent = _raise  # type: ignore[method-assign]
+        try:
+            with _public_addr_patch():
+                resp = client.get(
+                    "/v1/api/mcp/oauth/callback?code=c&state=valid-state",
+                    follow_redirects=False,
+                )
+        finally:
+            storage.delete_mcp_pending_consent = original_delete  # type: ignore[method-assign]
+
+        assert resp.status_code == 302
+        # Token persistence still succeeded — the user-visible contract.
+        plain = token_store.get_user_token("user-1", "srv-oauth")
+        assert plain is not None
+
 
 # ---------------------------------------------------------------------------
 # 503 paths when mcp_token_store is None

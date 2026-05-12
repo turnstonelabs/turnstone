@@ -2350,6 +2350,22 @@ async def _handle_mcp_oauth_callback_inner(request: Request) -> Response:
         },
     )
 
+    # Phase 9 — clear any deferred-consent records for this (user,
+    # server) now that consent has completed.  Best-effort: a storage
+    # failure here doesn't change the user-observable callback success;
+    # the worst case is a stale badge that the user can dismiss
+    # manually.  ``delete_mcp_pending_consent`` returns False on
+    # no-such-row (the common case for interactive consent flows that
+    # never deferred), which is fine.
+    try:
+        await asyncio.to_thread(storage.delete_mcp_pending_consent, user_id, server_name)
+    except Exception:
+        log.debug(
+            "mcp_server.oauth.pending_consent_clear_failed",
+            server_name=server_name,
+            exc_info=True,
+        )
+
     return RedirectResponse(pending["return_url"] or "/", status_code=302)
 
 
@@ -2619,6 +2635,153 @@ async def _handle_mcp_oauth_revoke_connection_inner(request: Request) -> Respons
 
 
 # ---------------------------------------------------------------------------
+# Pending-consent endpoints (Phase 9)
+# ---------------------------------------------------------------------------
+
+
+async def handle_mcp_oauth_list_pending(request: Request) -> Response:
+    """``GET /v1/api/mcp/oauth/pending``.
+
+    Returns the authenticated user's deferred-consent records — populated
+    by the pool dispatchers when a non-interactive run (scheduled /
+    channel) hits ``mcp_consent_required`` or ``mcp_insufficient_scope``.
+    Used by the dashboard badge to surface deferred consent needs on
+    next login.
+
+    Install-level gate: when no ``mcp_servers`` row has
+    ``auth_type='oauth_user'``, the entire feature is dark — we
+    short-circuit to ``{pending: 0, servers: []}`` without querying the
+    pending table at all.  This keeps local-auth installs on a
+    zero-new-storage-query path.
+    """
+    return _apply_security_headers(await _handle_mcp_oauth_list_pending_inner(request))
+
+
+_INSTALL_GATE_CACHE_TTL_S = 60.0
+
+
+async def _install_gate_passes(app_state: Any, storage: Any) -> bool:
+    """Cached install-level gate for OAuth-MCP features.
+
+    Returns True iff at least one ``mcp_servers`` row has
+    ``auth_type='oauth_user'``.  Result is cached on ``app_state`` for
+    :data:`_INSTALL_GATE_CACHE_TTL_S` seconds — admin-rare transitions
+    don't justify a per-request DB round-trip on every dashboard load.
+
+    Reset semantics: cache is invalidated by time only.  Operators who
+    just enabled an ``oauth_user`` row see the gate flip within the TTL
+    window.  False positives (cache says True but the row was just
+    deleted) are bounded by the same window — the downstream list
+    query already filters by user, so the cost is at most one cheap
+    user-scoped read.
+    """
+    now = time.monotonic()
+    cached = getattr(app_state, "_mcp_install_gate_cache", None)
+    if cached is not None:
+        cached_value, cached_at = cached
+        if (now - cached_at) < _INSTALL_GATE_CACHE_TTL_S:
+            return bool(cached_value)
+    value = bool(await asyncio.to_thread(storage.any_oauth_user_mcp_servers))
+    app_state._mcp_install_gate_cache = (value, now)
+    return value
+
+
+async def _handle_mcp_oauth_list_pending_inner(request: Request) -> Response:
+    from starlette.responses import JSONResponse
+
+    user_id = _require_user_id(request)
+    if user_id is None:
+        return JSONResponse({"error": "Authentication required"}, status_code=401)
+
+    storage = _get_storage(request.app.state)
+    if storage is None:
+        return JSONResponse({"pending": 0, "servers": []})
+
+    if not await _install_gate_passes(request.app.state, storage):
+        return JSONResponse({"pending": 0, "servers": []})
+
+    rows = await asyncio.to_thread(storage.list_mcp_pending_consent_by_user, user_id)
+    return JSONResponse({"pending": len(rows), "servers": list(rows)})
+
+
+async def handle_mcp_oauth_clear_pending(request: Request) -> Response:
+    """``DELETE /v1/api/mcp/oauth/pending/{server_name}``.
+
+    Manual user-initiated dismissal of a single deferred-consent record.
+    Called from the dashboard settings modal when the user opts to clear
+    the entry without completing consent (e.g., the underlying
+    auth_type was changed and the deferred record is now stale).
+
+    Returns 204 in both the existed-and-deleted and never-existed cases
+    to keep cross-tenant existence non-observable.
+    """
+    return _apply_security_headers(await _handle_mcp_oauth_clear_pending_inner(request))
+
+
+async def _handle_mcp_oauth_clear_pending_inner(request: Request) -> Response:
+    from starlette.responses import JSONResponse, Response
+
+    user_id = _require_user_id(request)
+    if user_id is None:
+        return JSONResponse({"error": "Authentication required"}, status_code=401)
+
+    server_name = request.path_params.get("server_name", "").strip()
+    if not server_name:
+        return JSONResponse({"error": "Missing server_name"}, status_code=400)
+
+    storage = _get_storage(request.app.state)
+    if storage is None:
+        return JSONResponse({"error": "Storage unavailable"}, status_code=503)
+
+    cleared = bool(
+        await asyncio.to_thread(storage.delete_mcp_pending_consent, user_id, server_name)
+    )
+    # Audit even on no-op deletes (returns 204 either way for cross-tenant
+    # non-observability) so an attacker who tries to scrub deferred-consent
+    # breadcrumbs leaves an audit trail of the attempts.
+    await _audit_event(
+        request.app.state,
+        user_id=user_id,
+        action="mcp_server.oauth.pending_consent_dismissed",
+        server_name=server_name,
+        detail={"mode": "single", "cleared": 1 if cleared else 0},
+    )
+    return Response(status_code=204)
+
+
+async def handle_mcp_oauth_clear_all_pending(request: Request) -> Response:
+    """``DELETE /v1/api/mcp/oauth/pending``.
+
+    Bulk dismiss of every deferred-consent record for the authenticated
+    user.  Returns the count cleared so the dashboard can update its
+    badge in one round-trip.
+    """
+    return _apply_security_headers(await _handle_mcp_oauth_clear_all_pending_inner(request))
+
+
+async def _handle_mcp_oauth_clear_all_pending_inner(request: Request) -> Response:
+    from starlette.responses import JSONResponse
+
+    user_id = _require_user_id(request)
+    if user_id is None:
+        return JSONResponse({"error": "Authentication required"}, status_code=401)
+
+    storage = _get_storage(request.app.state)
+    if storage is None:
+        return JSONResponse({"error": "Storage unavailable"}, status_code=503)
+
+    cleared = await asyncio.to_thread(storage.delete_all_mcp_pending_consent_by_user, user_id)
+    await _audit_event(
+        request.app.state,
+        user_id=user_id,
+        action="mcp_server.oauth.pending_consent_dismissed",
+        server_name="(bulk)",
+        detail={"mode": "bulk", "cleared": cleared},
+    )
+    return JSONResponse({"cleared": cleared})
+
+
+# ---------------------------------------------------------------------------
 # Lifespan integration
 # ---------------------------------------------------------------------------
 
@@ -2674,7 +2837,10 @@ __all__ = [
     "get_user_access_token_classified",
     "handle_mcp_oauth_authorize",
     "handle_mcp_oauth_callback",
+    "handle_mcp_oauth_clear_all_pending",
+    "handle_mcp_oauth_clear_pending",
     "handle_mcp_oauth_list_connections",
+    "handle_mcp_oauth_list_pending",
     "handle_mcp_oauth_revoke_connection",
     "initialize_mcp_oauth_state",
     "pop_pending_state",
