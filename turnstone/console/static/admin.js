@@ -3363,10 +3363,11 @@ function _renderMcpServers(items) {
       statusText = "idle";
     }
 
-    // Phase 9: format the refresh pill as "<short-relative> <outcome>"
-    // when we have a refresh entry from any node.  Pill is omitted (and
-    // the cell stays unchanged from its pre-Phase-9 shape) when no node
-    // has yet recorded a refresh outcome for this server.
+    // Phase 9: refresh pill shows the short-relative age (e.g. "12m") with
+    // outcome-tinted color (ok vs err) and the full ISO timestamp + outcome
+    // in the tooltip.  Pill is omitted (and the cell stays unchanged from
+    // its pre-Phase-9 shape) when no node has yet recorded a refresh
+    // outcome for this server.
     var refreshPill = "";
     if (newestRefreshAt !== null) {
       var ageSeconds = Math.max(0, Math.floor(Date.now() / 1000 - newestRefreshAt));

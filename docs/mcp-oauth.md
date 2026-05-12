@@ -61,7 +61,7 @@ mcp_token_encryption_key = "base64-fernet-key"
 # mcp_token_encryption_keys = ["new-key", "old-key"]
 ```
 
-Keep this in `config.toml` rather than environment variables — see [`feedback_secrets_not_in_env.md`](https://github.com/turnstonelabs/turnstone) for the rationale around in-process LLM prompt injection defending against env-borne secrets.
+Keep this in `config.toml` rather than environment variables. An in-process LLM with shell-tool access can read the server's environment via `env` / `os.environ` and exfiltrate any secret stored there; secrets in `config.toml` are only loaded into the server at startup and never re-read on a tool-driven path, so a prompt-injection attack against the agent cannot reach them.
 
 ---
 
