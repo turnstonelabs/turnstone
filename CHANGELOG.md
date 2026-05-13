@@ -14,6 +14,21 @@ Three release tracks are maintained:
 
 ## [Unreleased]
 
+## [1.5.15]
+
+### Fixed
+
+- **Admin console blank-page on MCP server rows with consented users** — a
+  Phase 9 (1.5.14) regression in `admin.js` used double-quote string
+  delimiters on the bulk-revoke button HTML literal, but the literal embeds
+  a `"` mid-attribute. JS closed the string early, turned `bulk-revoke (`
+  into bare tokens, and the resulting `SyntaxError` wiped out every global
+  in `admin.js` — `showAdmin` and all other admin entry points became
+  undefined, so the console UI was non-functional whenever the rendered MCP
+  server list contained at least one row with `consented_users_count > 0`.
+  Switch the literal to single-quote delimiters to match the surrounding
+  block.
+
 ## [1.5.14]
 
 Backports OAuth-MCP Phase 9 from `main` to the `stable/1.5` track.
