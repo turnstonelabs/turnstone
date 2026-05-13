@@ -3370,11 +3370,15 @@ function _renderMcpServers(items) {
     // outcome for this server.
     var refreshPill = "";
     if (newestRefreshAt !== null) {
-      var ageSeconds = Math.max(0, Math.floor(Date.now() / 1000 - newestRefreshAt));
+      var ageSeconds = Math.max(
+        0,
+        Math.floor(Date.now() / 1000 - newestRefreshAt),
+      );
       var ageShort;
       if (ageSeconds < 60) ageShort = ageSeconds + "s";
       else if (ageSeconds < 3600) ageShort = Math.floor(ageSeconds / 60) + "m";
-      else if (ageSeconds < 86400) ageShort = Math.floor(ageSeconds / 3600) + "h";
+      else if (ageSeconds < 86400)
+        ageShort = Math.floor(ageSeconds / 3600) + "h";
       else ageShort = Math.floor(ageSeconds / 86400) + "d";
       var outcomeText = newestRefreshOutcome || "unknown";
       var pillCls =
@@ -3443,7 +3447,7 @@ function _renderMcpServers(items) {
           consentCount +
           '" title="Drop all ' +
           consentCount +
-          " user consents for this server">bulk-revoke (" +
+          ' user consents for this server">bulk-revoke (' +
           consentCount +
           ")</button>";
       }
