@@ -14,6 +14,29 @@ Three release tracks are maintained:
 
 ## [Unreleased]
 
+## [1.5.14]
+
+Backports OAuth-MCP Phase 9 from `main` to the `stable/1.5` track.
+
+### Added
+
+- **OAuth-MCP Phase 9 — admin status, deferred-consent persistence, operator
+  docs** — completes the per-(user, server) OAuth-MCP build-out. The sync pool
+  dispatchers now upsert into a new `mcp_pending_consent` table on
+  `mcp_consent_required` / `mcp_insufficient_scope`, so a non-interactive run
+  (scheduled / channel) that hits an unconsented server surfaces the deferred
+  prompt to the user on their next dashboard load via the gear-icon badge —
+  rows are cleared automatically by the OAuth callback handler on consent
+  completion, or via new DELETE endpoints for manual dismiss. The MCP Servers
+  admin row gains a `consented_users_count` pill and a two-step-confirm
+  bulk-revoke button for `auth_type=oauth_user` servers (upstream RFC 7009
+  revoke is intentionally not attempted in bulk to avoid N synchronous
+  round-trips against the provider). Operator-facing docs land at
+  `docs/mcp-oauth.md` and `docs/operations/mcp-oauth-headless.md`.
+
+  Introduces forward-only migrations `054_mcp_pending_consent` and
+  `055_mcp_user_tokens_server_index`.
+
 ## [1.5.13]
 
 This release introduces one forward-only schema migration:
