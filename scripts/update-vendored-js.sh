@@ -50,11 +50,14 @@ update_refs() {
     local old_pattern="$1"  # e.g. katex-0.16.38
     local new_pattern="$2"  # e.g. katex-0.16.39
 
-    # Find all files with version references (excludes vendored JS and worktrees)
+    # Find all files with version references. Excludes the old versioned vendor
+    # directory itself (about to be rm -rf'd anyway) so we don't bother rewriting
+    # self-references inside it — but does NOT exclude all of shared_static/,
+    # because shared_static/renderer.js loads the vendored libs and needs the bump.
     local files
-    files=$(grep -rl --include='*.toml' --include='*.html' --include='*.js' --include='*.md' \
+    files=$(grep -rl --include='*.toml' --include='*.html' --include='*.js' --include='*.md' --include='*.py' \
         -F "$old_pattern" . \
-        --exclude-dir='.claude' --exclude-dir='node_modules' --exclude-dir='shared_static' \
+        --exclude-dir='.claude' --exclude-dir='node_modules' --exclude-dir="$old_pattern" \
         2>/dev/null || true)
     for f in $files; do
         sed -i "s|${old_pattern}|${new_pattern}|g" "$f"
