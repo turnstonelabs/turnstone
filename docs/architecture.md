@@ -91,7 +91,7 @@ turnstone/
     discord/          Discord adapter (bot, cog, views, streaming, config)
     slack/            Slack adapter (Socket Mode bot, DM routing, approval buttons)
   shared_static/      Shared design system (base.css, auth.js, theme.js, toast.js, utils.js, kb.js)
-    katex-0.16.45/    Vendored KaTeX math rendering library (MIT, woff2 fonts)
+    katex-0.16.46/    Vendored KaTeX math rendering library (MIT, woff2 fonts)
   ui/
     colors.py         ANSI color constants with NO_COLOR support
     markdown.py       Streaming terminal markdown renderer (line-buffered)
