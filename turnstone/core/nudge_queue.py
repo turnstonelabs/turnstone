@@ -19,11 +19,11 @@ Channels:
 Drain preserves FIFO order; non-matching entries stay queued.  Each
 entry can carry an optional ``valid_until`` predicate that drain
 evaluates outside the queue lock; entries whose predicate returns
-``False`` (or raises) are silently dropped without delivery — used by
-producers whose payload becomes stale if the underlying state changes
-between enqueue and drain (e.g. ``idle_children`` re-checks the active
-child set, dropping the nudge if every child finished while the queue
-sat).  Operations are atomic under an internal :class:`threading.Lock`.
+``False`` are dropped (logged at ``info`` — normal lifecycle outcome,
+e.g. ``idle_children`` after every child closed) and entries whose
+predicate raises are dropped (logged at ``warning`` with ``exc_info``
+— a misbehaving predicate).  Operations are atomic under an internal
+:class:`threading.Lock`.
 """
 
 from __future__ import annotations
@@ -32,8 +32,12 @@ import threading
 from collections import deque
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
+from turnstone.core.log import get_logger
+
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+log = get_logger(__name__)
 
 Channel = Literal["user", "tool", "any"]
 _VALID_CHANNELS: frozenset[str] = frozenset({"user", "tool", "any"})
@@ -139,7 +143,12 @@ class NudgeQueue:
                 self._items = kept
         # Predicates evaluate outside the lock — they may do storage
         # I/O or other work that shouldn't block other producers /
-        # the drain consumer's other queues.
+        # the drain consumer's other queues.  Drop-level distinction:
+        # a ``False`` return is a normal lifecycle outcome (the
+        # producer's snapshot is stale — e.g. ``idle_children`` after
+        # every child closed) and logs at ``info``; a raised exception
+        # is a wiring bug (predicate is misbehaving) and stays at
+        # ``warning`` with ``exc_info`` so the traceback surfaces.
         out: list[tuple[str, str, dict[str, Any] | None]] = []
         for entry in candidates:
             if entry.valid_until is None:
@@ -148,11 +157,27 @@ class NudgeQueue:
             try:
                 if entry.valid_until():
                     out.append((entry.nudge_type, entry.text, entry.metadata))
+                    continue
+                log.info(
+                    "nudge_queue.predicate_dropped",
+                    extra={
+                        "nudge_type": entry.nudge_type,
+                        "channel": entry.channel,
+                        "reason": "predicate_false",
+                        "text_len": len(entry.text),
+                    },
+                )
             except Exception:
-                # Predicate raising is treated as "no longer valid" —
-                # drop silently rather than letting one bad predicate
-                # poison the whole drain batch.
-                pass
+                log.warning(
+                    "nudge_queue.predicate_dropped",
+                    extra={
+                        "nudge_type": entry.nudge_type,
+                        "channel": entry.channel,
+                        "reason": "predicate_raised",
+                        "text_len": len(entry.text),
+                    },
+                    exc_info=True,
+                )
         return out
 
     def __len__(self) -> int:

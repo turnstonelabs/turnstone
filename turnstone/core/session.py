@@ -1670,13 +1670,17 @@ class ChatSession:
         The closure carries:
           - a soft cap on per-session ``"watch_triggered"`` depth via
             :data:`_WATCH_QUEUE_SOFT_CAP` + drop-oldest-on-saturation.
-          - a ``valid_until`` predicate that re-checks
-            ``storage.is_watch_active(watch_id)`` at drain time so a
-            cancelled watch's last splat doesn't ride out a future wake.
           - producer-side :func:`sanitize_payload` over the whole
             formatted message so steering-vector / control-char payloads
             sourced from arbitrary shell output can't tamper with the
             envelope at interpolation time.
+
+        No ``valid_until`` predicate is wired: ``WatchRunner._poll_watch``
+        commits ``active=False`` for terminal fires right after dispatch
+        returns, and an ``is_watch_active`` predicate would race that
+        write at drain time and drop the fire the model was meant to see.
+        A user-cancelled watch's last splat is informative (the reminder
+        carries ``is_final=True``), not stale-noise to suppress.
         """
         self._watch_runner = runner
         nudge_queue = self._nudge_queue
@@ -1707,18 +1711,6 @@ class ChatSession:
                     _WATCH_QUEUE_SOFT_CAP,
                 )
 
-            def _still_active() -> bool:
-                # Re-checked at drain time outside the queue lock — if
-                # the watch was cancelled between fire and drain, the
-                # entry gets dropped silently rather than splicing a
-                # stale result onto the user's next turn.  Single-column
-                # ``is_watch_active`` avoids the full-row marshal of
-                # ``get_watch`` on this hot path.
-                try:
-                    return get_storage().is_watch_active(watch_id)
-                except Exception:
-                    return False
-
             def _maybe_sanitize(v: Any) -> Any:
                 return sanitize_payload(v) if isinstance(v, str) else v
 
@@ -1731,7 +1723,6 @@ class ChatSession:
                 "watch_triggered",
                 sanitized,
                 "any",
-                valid_until=_still_active,
                 metadata=metadata or None,
             )
 
@@ -10473,15 +10464,22 @@ class ChatSession:
                 msg = "Error: storage unavailable"
                 self._report_tool_result(call_id, "watch", msg, is_error=True)
                 return call_id, msg
-            watches = storage.list_watches_for_ws(self._ws_id)
-            target = None
-            for w in watches:
-                if w["name"] == name or w["watch_id"].startswith(name):
-                    target = w
-                    break
+            target = storage.find_watch_by_name(self._ws_id, name)
             if target is None:
                 msg = f'Watch "{name}" not found.'
                 self._report_tool_result(call_id, "watch", msg, is_error=True)
+                return call_id, msg
+            # In either branch below the row leaves ``list_due_watches``
+            # view (already-inactive or just-cancelled with empty
+            # next_poll), so the runner's retry-deactivate branch will
+            # never reclaim a pending ``_terminal_dispatched`` entry.
+            # Clear it here to bound the lifetime of any leftover from
+            # a previous dispatch-then-failed-row-write.
+            if self._watch_runner is not None:
+                self._watch_runner.forget_terminal_dispatched(target["watch_id"])
+            if not target["active"]:
+                msg = f'Watch "{target["name"]}" already completed (auto-cancelled).'
+                self._report_tool_result(call_id, "watch", msg)
                 return call_id, msg
             storage.update_watch(target["watch_id"], active=False, next_poll="")
             msg = f'Watch "{target["name"]}" cancelled.'

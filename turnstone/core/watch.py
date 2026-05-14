@@ -289,6 +289,17 @@ class WatchRunner:
         self._dispatch_fns: dict[str, Callable[[dict[str, Any], str], None]] = {}
         self._dispatch_lock = threading.Lock()
 
+        # Watch ids whose terminal reminder has already been dispatched
+        # but whose row write has not yet been confirmed.  Populated
+        # between ``_dispatch_result`` and ``update_watch`` in
+        # :meth:`_poll_watch`; on a subsequent tick the same row will
+        # still appear in ``list_due_watches`` (active=1, next_poll
+        # unchanged) — the guard at the top of ``_poll_watch`` retries
+        # the row write WITHOUT re-dispatching.  Bounded by transient
+        # storage failure depth (~MAX_WATCHES_PER_WS × num_ws).
+        self._terminal_dispatched: set[str] = set()
+        self._terminal_dispatched_lock = threading.Lock()
+
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -314,14 +325,18 @@ class WatchRunner:
     def set_dispatch_fn(self, ws_id: str, fn: Callable[[dict[str, Any], str], None]) -> None:
         """Register a per-workstream dispatch fn.
 
-        The fn signature is ``(reminder, watch_id)`` — the runner passes
-        the originating ``watch_id`` so dispatch closures can capture
-        per-watch metadata (e.g. a ``valid_until`` predicate that
-        re-checks ``storage.is_watch_active(watch_id)`` before
-        delivering a stale entry).  ``reminder`` is the structured dict
-        returned by :func:`build_watch_reminder` — ``text`` carries the
-        formatted body, the remaining fields ride as queue-entry
-        metadata so the frontend can render a ``.msg.watch-result`` card.
+        The fn signature is ``(reminder, watch_id)``.  ``reminder`` is
+        the structured dict returned by :func:`build_watch_reminder` —
+        ``text`` carries the formatted body, the remaining fields ride
+        as queue-entry metadata so the frontend can render a
+        ``.msg.watch-result`` card.  ``watch_id`` is passed for
+        closures that need per-watch metadata in their queue plumbing
+        (e.g. correlating a fire back to the originating row in logs);
+        do NOT use it to gate delivery against
+        ``storage.is_watch_active(watch_id)`` — see
+        :meth:`ChatSession.set_watch_runner` for why that pattern
+        races :meth:`_poll_watch`'s commit of ``active=False`` and
+        drops fires the model was meant to see.
         """
         with self._dispatch_lock:
             self._dispatch_fns[ws_id] = fn
@@ -338,6 +353,22 @@ class WatchRunner:
         """
         with self._dispatch_lock:
             return self._dispatch_fns.get(ws_id)
+
+    def forget_terminal_dispatched(self, watch_id: str) -> None:
+        """Discard ``watch_id`` from the pending-terminal-dispatched
+        set if present.  Called by paths that take a watch out of
+        :meth:`StorageBackend.list_due_watches` view independent of
+        the runner's own poll (most importantly the user-cancel path
+        in :meth:`ChatSession._exec_watch`).  Without this, a
+        ``_poll_watch`` whose row write failed AFTER dispatch would
+        leak ``watch_id`` in ``_terminal_dispatched`` indefinitely —
+        the user-cancel writes ``next_poll=''`` which excludes the
+        row from ``list_due_watches``, so the retry-deactivate branch
+        at the top of :meth:`_poll_watch` never fires to clear the
+        entry.
+        """
+        with self._terminal_dispatched_lock:
+            self._terminal_dispatched.discard(watch_id)
 
     # -- Main loop -----------------------------------------------------------
 
@@ -383,6 +414,21 @@ class WatchRunner:
         prev_output = watch_row.get("last_output")
         created = watch_row.get("created", "")
 
+        # Re-poll of a row whose terminal reminder already shipped but
+        # whose ``active=False`` write didn't land — retry just the row
+        # write so the row stops appearing in ``list_due_watches``; do
+        # NOT re-dispatch the reminder, which the model already saw.
+        with self._terminal_dispatched_lock:
+            already_dispatched = watch_id in self._terminal_dispatched
+        if already_dispatched:
+            try:
+                self._storage.update_watch(watch_id, active=False, next_poll="")
+                with self._terminal_dispatched_lock:
+                    self._terminal_dispatched.discard(watch_id)
+            except Exception:
+                log.exception("watch_runner.retry_deactivate_failed", extra={"watch_id": watch_id})
+            return
+
         # Safety check
         blocked = is_command_blocked(command)
         if blocked:
@@ -416,22 +462,17 @@ class WatchRunner:
         now = datetime.now(UTC)
         now_str = now.strftime("%Y-%m-%dT%H:%M:%S")
 
-        # Update DB
-        update_fields: dict[str, Any] = {
-            "poll_count": poll_count,
-            "last_output": output,
-            "last_exit_code": exit_code,
-            "last_poll": now_str,
-        }
-        if is_final:
-            update_fields["active"] = False
-            update_fields["next_poll"] = ""
-        else:
-            next_poll = now + timedelta(seconds=watch_row["interval_secs"])
-            update_fields["next_poll"] = next_poll.strftime("%Y-%m-%dT%H:%M:%S")
-        self._storage.update_watch(watch_id, **update_fields)
-
-        # Dispatch result if condition fired or final
+        # Dispatch before committing the row update.  Belt-and-braces
+        # given the rest of the fix (closure no longer wires a
+        # ``valid_until`` predicate, cancel-by-name uses
+        # :meth:`find_watch_by_name` which ignores the ``active``
+        # filter): either order would deliver the reminder today, but
+        # this ordering preserves the invariant against re-wiring an
+        # ``is_watch_active`` predicate or adding a new
+        # ``active``-filtered read on this hot path.  Combined with the
+        # ``_terminal_dispatched`` guard above it also bounds the
+        # duplicate-fire blast radius if the row write fails after the
+        # reminder shipped.
         if fired or is_final:
             # Compute elapsed from created time
             elapsed_secs = 0.0
@@ -454,6 +495,33 @@ class WatchRunner:
                 reason=reason,
             )
             self._dispatch_result(ws_id, reminder, watch_id)
+            if is_final:
+                # Mark BEFORE the row write so a raise below routes the
+                # next tick into the retry-deactivate branch instead of
+                # re-firing the reminder.
+                with self._terminal_dispatched_lock:
+                    self._terminal_dispatched.add(watch_id)
+
+        # Update DB
+        update_fields: dict[str, Any] = {
+            "poll_count": poll_count,
+            "last_output": output,
+            "last_exit_code": exit_code,
+            "last_poll": now_str,
+        }
+        if is_final:
+            update_fields["active"] = False
+            update_fields["next_poll"] = ""
+        else:
+            next_poll = now + timedelta(seconds=watch_row["interval_secs"])
+            update_fields["next_poll"] = next_poll.strftime("%Y-%m-%dT%H:%M:%S")
+        self._storage.update_watch(watch_id, **update_fields)
+
+        if is_final:
+            # Row write committed; the retry-deactivate branch will
+            # never be reached for this watch_id.
+            with self._terminal_dispatched_lock:
+                self._terminal_dispatched.discard(watch_id)
 
         log.debug(
             "watch_runner.polled",
