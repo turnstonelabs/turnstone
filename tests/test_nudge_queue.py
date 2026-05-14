@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 
 import pytest
@@ -401,8 +402,10 @@ class TestValidation:
 
 
 class TestValidUntil:
-    """``valid_until`` predicate: drain re-checks freshness; falsy /
-    raising predicates drop the entry without delivery.
+    """``valid_until`` predicate: drain re-checks freshness.  Falsy
+    predicates drop the entry without delivery and log at ``info``
+    (normal lifecycle outcome); raising predicates drop the entry and
+    log at ``warning`` with ``exc_info`` (misbehaving predicate).
     """
 
     def test_valid_until_true_delivers(self):
@@ -411,26 +414,52 @@ class TestValidUntil:
         out = q.drain({"any"})
         assert out == [("a", "1", None)]
 
-    def test_valid_until_false_drops_silently(self):
+    def test_valid_until_false_drops_with_info_log(self, caplog: pytest.LogCaptureFixture):
         q = NudgeQueue()
         q.enqueue("a", "1", "any", valid_until=lambda: False)
-        out = q.drain({"any"})
+        with caplog.at_level(logging.INFO, logger="turnstone.core.nudge_queue"):
+            out = q.drain({"any"})
         assert out == []
         # Already removed from queue (drain partition removes BEFORE
         # predicate check — falsy doesn't return to queue).
         assert len(q) == 0
+        # The drop emits a structured info record so a wiring
+        # regression (a predicate that always returns False) is still
+        # observable, without spamming ``warning`` for the routine
+        # lifecycle case where ``valid_until`` is doing its job.
+        # structlog renders the event name + extras into ``msg`` as a
+        # single rendered string, so substring-match like the
+        # ``watch_dispatch.queue_full`` assertion in
+        # tests/test_watch_dispatch.py.
+        drops = [r for r in caplog.records if "nudge_queue.predicate_dropped" in r.getMessage()]
+        assert len(drops) == 1
+        assert drops[0].levelno == logging.INFO
+        assert "predicate_false" in drops[0].getMessage()
+        assert "'nudge_type': 'a'" in drops[0].getMessage()
+        assert "'channel': 'any'" in drops[0].getMessage()
+        assert "'text_len': 1" in drops[0].getMessage()
 
-    def test_valid_until_exception_drops_silently(self):
+    def test_valid_until_exception_drops_with_warning(self, caplog: pytest.LogCaptureFixture):
         q = NudgeQueue()
 
         def boom() -> bool:
             raise RuntimeError("predicate crash")
 
         q.enqueue("a", "1", "any", valid_until=boom)
-        out = q.drain({"any"})
+        with caplog.at_level(logging.WARNING, logger="turnstone.core.nudge_queue"):
+            out = q.drain({"any"})
         assert out == []
         # Crash-on-predicate is treated as "no longer valid" — drop, not propagate.
         assert len(q) == 0
+        # Stays at ``warning`` (with ``exc_info``) because a raising
+        # predicate is a bug, not a normal lifecycle outcome.
+        drops = [r for r in caplog.records if "nudge_queue.predicate_dropped" in r.getMessage()]
+        assert len(drops) == 1
+        assert drops[0].levelno == logging.WARNING
+        rendered = drops[0].getMessage()
+        assert "predicate_raised" in rendered
+        assert "RuntimeError" in rendered
+        assert "predicate crash" in rendered
 
     def test_valid_until_evaluated_outside_lock(self):
         """The predicate may do non-trivial work (e.g. storage I/O)

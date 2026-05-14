@@ -1003,6 +1003,23 @@ class StorageBackend(Protocol):
         """Return active watches for a workstream, ordered by created DESC."""
         ...
 
+    def find_watch_by_name(self, ws_id: str, name_or_prefix: str) -> dict[str, Any] | None:
+        """Return a watch in ``ws_id`` whose ``name`` matches
+        ``name_or_prefix`` exactly, or whose ``watch_id`` starts with it.
+
+        Unlike :meth:`list_watches_for_ws` this DOES NOT filter on the
+        ``active`` flag — callers can inspect ``row["active"]`` to
+        distinguish a still-running watch from one that fired and
+        auto-cancelled.  Returns ``None`` if no match.
+
+        When multiple rows match, prefers active rows over inactive
+        ones, then most-recently-created.  Without the active
+        preference, a recreated-after-completion name would let the
+        older inactive row shadow the new active one in the cancel
+        path.
+        """
+        ...
+
     def list_watches_for_node(self, node_id: str) -> list[dict[str, Any]]:
         """Return all active watches on a node, ordered by created DESC."""
         ...

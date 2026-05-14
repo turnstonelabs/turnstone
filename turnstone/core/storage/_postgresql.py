@@ -73,6 +73,9 @@ from turnstone.core.storage._utils import (
     HEURISTIC_RULE_MUTABLE as _HEURISTIC_RULE_MUTABLE,
 )
 from turnstone.core.storage._utils import (
+    LIKE_ESCAPE as _LIKE_ESCAPE,
+)
+from turnstone.core.storage._utils import (
     MCP_SERVER_MUTABLE as _MCP_SERVER_MUTABLE,
 )
 from turnstone.core.storage._utils import (
@@ -103,6 +106,9 @@ from turnstone.core.storage._utils import (
     VERDICT_MUTABLE as _VERDICT_MUTABLE,
 )
 from turnstone.core.storage._utils import (
+    escape_like as _escape_like,
+)
+from turnstone.core.storage._utils import (
     normalize_search_terms as _normalize_search_terms,
 )
 from turnstone.core.storage._utils import (
@@ -118,11 +124,6 @@ from turnstone.core.storage._utils import (
 from turnstone.core.workstream import BULK_CLOSE_STATE_VALUES, WorkstreamKind
 
 log = get_logger(__name__)
-
-
-def _escape_ilike(s: str) -> str:
-    """Escape ILIKE metacharacters for use with ESCAPE '\\\\'."""
-    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _resolve_pg_listen_url(override: str, sqlalchemy_url: str) -> str:
@@ -1834,6 +1835,33 @@ class PostgreSQLBackend:
                 .order_by(watches.c.created.desc())
             ).fetchall()
             return [dict(r._mapping) for r in rows]
+
+    def find_watch_by_name(self, ws_id: str, name_or_prefix: str) -> dict[str, Any] | None:
+
+        if not name_or_prefix:
+            return None
+        like_pattern = _escape_like(name_or_prefix) + "%"
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(watches)
+                .where(
+                    (watches.c.ws_id == ws_id)
+                    & (
+                        (watches.c.name == name_or_prefix)
+                        | watches.c.watch_id.like(like_pattern, escape=_LIKE_ESCAPE)
+                    )
+                )
+                # Active rows win over inactive ones with the same name.
+                # _prepare_watch's duplicate-name guard filters active=1,
+                # so a model can recreate a name after the previous one
+                # auto-cancelled; a cancel-by-name request on the live
+                # row must not be shadowed by the older completed row.
+                .order_by(watches.c.active.desc(), watches.c.created.desc())
+                .limit(1)
+            ).fetchone()
+            if row is None:
+                return None
+            return dict(row._mapping)
 
     def list_watches_for_node(self, node_id: str) -> list[dict[str, Any]]:
 
@@ -3671,7 +3699,7 @@ class PostgreSQLBackend:
             clauses = []
             params: dict[str, str] = {}
             for i, t in enumerate(terms):
-                escaped = _escape_ilike(t)
+                escaped = _escape_like(t)
                 clauses.append(
                     f"(name ILIKE :n{i} ESCAPE '\\' "
                     f"OR description ILIKE :d{i} ESCAPE '\\' "
@@ -3750,7 +3778,7 @@ class PostgreSQLBackend:
             scope_clauses, params = self._build_scope_or_clause(scopes)
             term_clauses = []
             for i, t in enumerate(terms):
-                escaped = _escape_ilike(t)
+                escaped = _escape_like(t)
                 term_clauses.append(
                     f"(name ILIKE :n{i} ESCAPE '\\' "
                     f"OR description ILIKE :d{i} ESCAPE '\\' "
