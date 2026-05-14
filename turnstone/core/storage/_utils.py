@@ -102,9 +102,13 @@ def sanitize_text(value: str | None) -> str | None:
 # SQL LIKE escaping
 # ---------------------------------------------------------------------------
 
-# Use a non-default escape character so callers passing the result to
-# SQLAlchemy's ``.like(pattern, escape=LIKE_ESCAPE)`` get the same
-# semantics on SQLite and PostgreSQL.  ``\`` is the SQL standard.
+# The escape character paired with :func:`escape_like`.  Callers MUST
+# pass ``escape=LIKE_ESCAPE`` to SQLAlchemy's ``.like()`` — without
+# that kwarg, ``.like()`` uses no escape character at all and the
+# ``\%`` / ``\_`` sequences produced by :func:`escape_like` would be
+# interpreted as a literal backslash followed by a wildcard.  ``\``
+# is the SQL standard escape character and works identically on SQLite
+# and PostgreSQL when passed explicitly.
 LIKE_ESCAPE = "\\"
 
 
