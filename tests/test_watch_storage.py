@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import sqlalchemy as sa
+
+from turnstone.core.storage._schema import watches as watches_table
+
 
 def _make_watch_kwargs(**overrides):
     """Build default kwargs for create_watch."""
@@ -100,6 +104,91 @@ class TestWatchListQueries:
         db.create_watch(**_make_watch_kwargs(watch_id="w1", ws_id="ws-1"))
         db.update_watch("w1", active=False)
         assert db.list_watches_for_ws("ws-1") == []
+
+    def test_find_by_name_returns_inactive(self, db):
+        """``find_watch_by_name`` ignores the active filter — that is
+        what lets the cancel-by-name UX distinguish 'already completed'
+        from 'no such watch.'
+        """
+        db.create_watch(**_make_watch_kwargs(watch_id="w1", ws_id="ws-1", name="completed"))
+        db.update_watch("w1", active=False)
+
+        row = db.find_watch_by_name("ws-1", "completed")
+        assert row is not None
+        assert row["watch_id"] == "w1"
+        assert not row["active"]
+
+    def test_find_by_name_matches_watch_id_prefix(self, db):
+        db.create_watch(**_make_watch_kwargs(watch_id="abcdef123", ws_id="ws-1", name="x"))
+        row = db.find_watch_by_name("ws-1", "abc")
+        assert row is not None
+        assert row["watch_id"] == "abcdef123"
+
+    def test_find_by_name_scoped_to_ws(self, db):
+        db.create_watch(**_make_watch_kwargs(watch_id="w1", ws_id="ws-1", name="shared"))
+        db.create_watch(**_make_watch_kwargs(watch_id="w2", ws_id="ws-2", name="shared"))
+
+        row = db.find_watch_by_name("ws-1", "shared")
+        assert row is not None
+        assert row["watch_id"] == "w1"
+
+    def test_find_by_name_returns_none_when_missing(self, db):
+        assert db.find_watch_by_name("ws-1", "ghost") is None
+
+    def test_find_by_name_empty_input_returns_none(self, db):
+        db.create_watch(**_make_watch_kwargs(watch_id="w1", ws_id="ws-1", name="x"))
+        assert db.find_watch_by_name("ws-1", "") is None
+
+    def test_find_by_name_treats_percent_as_literal(self, db):
+        """A model-supplied '%' must NOT match arbitrary watch_ids.
+
+        Pre-escape, ``watch_id.like(f"{name_or_prefix}%")`` would
+        interpret '%' as 'match anything' and pick up the first row in
+        the workstream regardless of name.
+        """
+        db.create_watch(**_make_watch_kwargs(watch_id="w1", ws_id="ws-1", name="real-watch"))
+        assert db.find_watch_by_name("ws-1", "%") is None
+
+    def test_find_by_name_treats_underscore_as_literal(self, db):
+        """Same as the '%' case for the single-char LIKE wildcard."""
+        db.create_watch(**_make_watch_kwargs(watch_id="abcd", ws_id="ws-1", name="real-watch"))
+        # '_' would otherwise match any single char, picking up
+        # watch_ids beginning with 'a', 'b', etc.
+        assert db.find_watch_by_name("ws-1", "_") is None
+
+    def test_find_by_name_prefers_active_over_newer_inactive(self, db):
+        """If a same-name pair exists where the inactive row is NEWER
+        than the active row, find_watch_by_name must still return the
+        active row.  Pre-fix the query was ``ORDER BY created DESC
+        LIMIT 1`` — which would return the newer inactive row and
+        cause the cancel UX to report 'already completed' for a name
+        whose live row is still polling.
+
+        Reachable in practice because storage allows out-of-band
+        writes (e.g. ``delete_watches_for_ws`` cleanup followed by
+        re-create, an admin manually flipping ``active``, or test
+        scaffolding) that bypass the create-time duplicate-name
+        guard.
+        """
+        # Older active watch.
+        db.create_watch(**_make_watch_kwargs(watch_id="w-active", ws_id="ws-1", name="recurring"))
+        # Newer inactive watch with the same name.  ``create_watch``
+        # stamps ``created`` to ``now`` at second resolution, so we
+        # bypass the API to give the inactive row a deterministically
+        # later timestamp.
+        db.create_watch(**_make_watch_kwargs(watch_id="w-inactive", ws_id="ws-1", name="recurring"))
+        with db._conn() as conn:
+            conn.execute(
+                sa.update(watches_table)
+                .where(watches_table.c.watch_id == "w-inactive")
+                .values(active=0, next_poll="", created="2099-01-01T00:00:00")
+            )
+            conn.commit()
+
+        row = db.find_watch_by_name("ws-1", "recurring")
+        assert row is not None
+        assert row["watch_id"] == "w-active"
+        assert row["active"]
 
     def test_list_for_node(self, db):
         db.create_watch(**_make_watch_kwargs(watch_id="w1", node_id="n1"))

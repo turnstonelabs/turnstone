@@ -232,58 +232,51 @@ class TestSoftCap:
 
 
 # ---------------------------------------------------------------------------
-# valid_until predicate
+# Predicate independence
 # ---------------------------------------------------------------------------
 
 
-class TestValidUntil:
-    """The ``valid_until`` predicate captured at dispatch time re-checks
-    the watch's ``active`` flag at drain time, so a cancelled watch's
-    last splat doesn't ride out a future wake.
+class TestPredicateIndependence:
+    """The watch closure does NOT wire a ``valid_until`` predicate.
+
+    Earlier the closure wired ``_still_active`` (re-reading
+    ``is_watch_active`` at drain time).  That predicate raced
+    ``WatchRunner._poll_watch``'s commit of ``active=False`` and silently
+    dropped every terminal fire.  The closure now enqueues without a
+    predicate; entries survive drain regardless of the row's ``active``
+    column state.
     """
 
-    def test_valid_until_drops_when_watch_inactive(self, tmp_db, monkeypatch):
+    def test_drain_delivers_even_when_storage_reports_inactive(self, tmp_db, monkeypatch):
         session = _make_session_for_dispatch()
         _runner, dispatch = _register_runner(session)
 
-        # Storage stub returns False at drain time.
-        is_active_calls = patch_session_storage(monkeypatch, active=False)
-
-        dispatch(_reminder("body"), "watch-1")
-        # Drain fires the predicate; entry should NOT be delivered.
-        out = session._nudge_queue.drain({"any"})
-        assert out == []
-        # Predicate ran once with the dispatched watch_id.
-        assert is_active_calls == ["watch-1"]
-
-    def test_valid_until_drops_when_storage_raises(self, tmp_db, monkeypatch):
-        """The closure's broad-except in the predicate translates a
-        storage-layer exception to ``False`` so the drain doesn't
-        propagate; the predicate captured ``watch_id`` correctly
-        (otherwise storage wouldn't even be touched).
-        """
-        session = _make_session_for_dispatch()
-        _runner, dispatch = _register_runner(session)
-
-        patch_session_storage(monkeypatch, raise_on_is_active=True)
-
-        dispatch(_reminder("body"), "watch-bound-id")
-        out = session._nudge_queue.drain({"any"})
-        assert out == []
-
-    def test_valid_until_delivers_when_watch_active(self, tmp_db, monkeypatch):
-        """Happy-path counter-test for the predicate above: the entry
-        DOES drain when the watch is still active.
-        """
-        session = _make_session_for_dispatch()
-        _runner, dispatch = _register_runner(session)
-
-        patch_session_storage(monkeypatch, active=True)
+        # Even if storage reports active=False, the entry should still
+        # drain — no predicate to drop it.
+        patch_session_storage(monkeypatch, active=False)
 
         dispatch(_reminder("body"), "watch-1")
         out = session._nudge_queue.drain({"any"})
         assert len(out) == 1
         assert out[0][0] == "watch_triggered"
+
+    def test_dispatch_never_calls_is_watch_active(self, tmp_db, monkeypatch):
+        """Pin the invariant directly: the closure must NOT consult
+        ``storage.is_watch_active`` anywhere along the enqueue + drain
+        path.  Without this assertion, a future change that re-wires
+        an ``is_watch_active`` predicate would silently bring back the
+        bug that motivates this whole module.
+        """
+        session = _make_session_for_dispatch()
+        _runner, dispatch = _register_runner(session)
+
+        is_active_calls = patch_session_storage(monkeypatch, active=True)
+
+        dispatch(_reminder("body"), "watch-bound-id")
+        session._nudge_queue.drain({"any"})
+        assert is_active_calls == [], (
+            f"watch closure must not call is_watch_active; got {is_active_calls!r}"
+        )
 
 
 # ---------------------------------------------------------------------------

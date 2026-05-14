@@ -99,6 +99,33 @@ def sanitize_text(value: str | None) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# SQL LIKE escaping
+# ---------------------------------------------------------------------------
+
+# Use a non-default escape character so callers passing the result to
+# SQLAlchemy's ``.like(pattern, escape=LIKE_ESCAPE)`` get the same
+# semantics on SQLite and PostgreSQL.  ``\`` is the SQL standard.
+LIKE_ESCAPE = "\\"
+
+
+def escape_like(value: str) -> str:
+    """Escape ``%`` and ``_`` (and the escape character itself) so the
+    string can be safely embedded in a SQL ``LIKE`` pattern.
+
+    Pair with ``column.like(escape_like(prefix) + "%", escape=LIKE_ESCAPE)``
+    to do a true prefix match against caller-supplied input.  Without
+    this, untrusted text containing ``%`` or ``_`` is interpreted as a
+    wildcard — e.g. a model-supplied watch name of ``"%"`` would match
+    every row in the queried partition.
+    """
+    return (
+        value.replace(LIKE_ESCAPE, LIKE_ESCAPE * 2)
+        .replace("%", LIKE_ESCAPE + "%")
+        .replace("_", LIKE_ESCAPE + "_")
+    )
+
+
+# ---------------------------------------------------------------------------
 # Row helper
 # ---------------------------------------------------------------------------
 
