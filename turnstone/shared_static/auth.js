@@ -762,12 +762,10 @@ function logout() {
       /* AbortController not available; the _loggedOut flag handles it */
     }
   });
-  fetch("/v1/api/auth/logout", { method: "POST" }).then(function () {
-    sessionStorage.removeItem("turnstone_permissions");
-    if (_authChannel) _authChannel.postMessage("logout");
-    if (typeof window.onLogout === "function") window.onLogout();
-    showLogin();
-  });
+  sessionStorage.removeItem("turnstone_permissions");
+  if (_authChannel) _authChannel.postMessage("logout");
+  if (typeof window.onLogout === "function") window.onLogout();
+  window.location.href = "/logout";
 }
 
 // Schedule on initial load if already authenticated.  The whoami
