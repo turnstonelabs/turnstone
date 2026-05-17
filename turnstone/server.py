@@ -46,6 +46,7 @@ from turnstone.api.docs import make_docs_handler, make_openapi_handler
 from turnstone.api.server_spec import build_server_spec
 from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
 from turnstone.core.auth import (
+    AUTH_COOKIE_SERVER,
     DENY_EMPTY_SUB,
     JWT_AUD_SERVER,
     AuthMiddleware,
@@ -2738,14 +2739,25 @@ async def auth_login(request: Request) -> Response:
     """POST /v1/api/auth/login — authenticate and return JWT."""
     from turnstone.core.auth import handle_auth_login
 
-    return await handle_auth_login(request, JWT_AUD_SERVER)
+    return await handle_auth_login(request, JWT_AUD_SERVER, cookie_name=AUTH_COOKIE_SERVER)
 
 
 async def auth_logout(request: Request) -> Response:
     """POST /v1/api/auth/logout — clear auth cookie."""
     from turnstone.core.auth import handle_auth_logout
 
-    return await handle_auth_logout(request)
+    return await handle_auth_logout(request, cookie_name=AUTH_COOKIE_SERVER)
+
+
+async def logout_page(request: Request) -> Response:
+    """GET /logout — clear auth cookie and redirect to home."""
+    from starlette.responses import RedirectResponse
+
+    from turnstone.core.auth import make_clear_cookie
+
+    response = RedirectResponse("/?logout=1", status_code=302)
+    response.headers["Set-Cookie"] = make_clear_cookie(AUTH_COOKIE_SERVER)
+    return response
 
 
 async def auth_status(request: Request) -> Response:
@@ -2759,14 +2771,14 @@ async def auth_setup(request: Request) -> Response:
     """POST /v1/api/auth/setup — create first admin user (public, one-time only)."""
     from turnstone.core.auth import handle_auth_setup
 
-    return await handle_auth_setup(request, JWT_AUD_SERVER)
+    return await handle_auth_setup(request, JWT_AUD_SERVER, cookie_name=AUTH_COOKIE_SERVER)
 
 
 async def auth_whoami(request: Request) -> Response:
     """GET /v1/api/auth/whoami — return authenticated user info."""
     from turnstone.core.auth import handle_auth_whoami
 
-    return await handle_auth_whoami(request)
+    return await handle_auth_whoami(request, cookie_name=AUTH_COOKIE_SERVER)
 
 
 async def auth_refresh(request: Request) -> Response:
@@ -2777,7 +2789,7 @@ async def auth_refresh(request: Request) -> Response:
     """
     from turnstone.core.auth import handle_auth_refresh
 
-    return await handle_auth_refresh(request, JWT_AUD_SERVER)
+    return await handle_auth_refresh(request, JWT_AUD_SERVER, cookie_name=AUTH_COOKIE_SERVER)
 
 
 async def oidc_authorize(request: Request) -> Response:
@@ -2791,7 +2803,7 @@ async def oidc_callback(request: Request) -> Response:
     """GET /v1/api/auth/oidc/callback — OIDC callback, exchange code for JWT."""
     from turnstone.core.auth import handle_oidc_callback
 
-    return await handle_oidc_callback(request, JWT_AUD_SERVER)
+    return await handle_oidc_callback(request, JWT_AUD_SERVER, cookie_name=AUTH_COOKIE_SERVER)
 
 
 async def mcp_oauth_authorize(request: Request) -> Response:
@@ -3862,7 +3874,12 @@ def _build_middleware(cors_origins: list[str] | None = None) -> list[Middleware]
         stack.append(cors_middleware(cors_origins))
     stack.extend(
         [
-            Middleware(AuthMiddleware, jwt_audience=JWT_AUD_SERVER, jwt_version=jwt_version_slot()),
+            Middleware(
+                AuthMiddleware,
+                jwt_audience=JWT_AUD_SERVER,
+                jwt_version=jwt_version_slot(),
+                auth_cookie=AUTH_COOKIE_SERVER,
+            ),
             Middleware(RateLimitMiddleware),
         ]
     )
@@ -4055,6 +4072,7 @@ def create_app(
     app = Starlette(
         routes=[
             Route("/", index),
+            Route("/logout", logout_page),
             Mount(
                 "/v1",
                 routes=[
