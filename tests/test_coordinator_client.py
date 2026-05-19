@@ -1228,6 +1228,49 @@ def test_list_skills_hides_interactive_only_skills(tmp_path):
         assert skill["kind"] in {"coordinator", "any"}
 
 
+def test_list_skills_omits_allowed_tools_when_empty(tmp_path):
+    """``allowed_tools`` is the auto-approve allowlist (tools exempt
+    from the operator approval gate), NOT the set of tools the skill
+    can use.  An empty list reads as "no tool access" to a model
+    that doesn't know the semantics — real misdiagnosis source: a
+    code-review skill with no auto-approve allowlist looked like it
+    had been spawned with zero tools.  Dropping the key when empty
+    removes the ambiguity at the source; absence of the field carries
+    the unambiguous meaning "no tool is pre-approved for this skill"
+    while a tool list reads as "these specific tools bypass the prompt".
+    """
+    st = SQLiteBackend(str(tmp_path / "skills_empty.db"))
+    st.create_prompt_template(
+        template_id="s-empty",
+        name="empty-skill",
+        category="ops",
+        content="",
+        variables="[]",
+        is_default=False,
+        org_id="",
+        created_by="test",
+        tags="[]",
+        allowed_tools="[]",
+    )
+    st.create_prompt_template(
+        template_id="s-nonempty",
+        name="nonempty-skill",
+        category="ops",
+        content="",
+        variables="[]",
+        is_default=False,
+        org_id="",
+        created_by="test",
+        tags="[]",
+        allowed_tools='["read_file"]',
+    )
+    client = _make_read_client(st)
+    result = client.list_skills()
+    by_name = {s["name"]: s for s in result["skills"]}
+    assert "allowed_tools" not in by_name["empty-skill"]
+    assert by_name["nonempty-skill"]["allowed_tools"] == ["read_file"]
+
+
 def test_list_skills_projects_allowed_tools_capped_with_sentinel(tmp_path):
     """Each row carries the skill's allowed_tools (capped at the projection
     cap with a +N more sentinel) so coordinators can pick a skill without
