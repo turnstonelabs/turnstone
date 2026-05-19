@@ -50,6 +50,41 @@ def test_load_config_invalid_toml(tmp_path):
     assert load_config() == {}
 
 
+def test_load_config_warns_when_world_readable(tmp_path, caplog):
+    """Secrets in config.toml — warn if anyone but the owner can read it."""
+    import logging
+    import os
+
+    _reset_cache()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[database]\nurl = "postgresql+psycopg://u:secret@h/d"\n')
+    os.chmod(cfg, 0o644)
+    set_config_path(str(cfg))
+
+    with caplog.at_level(logging.WARNING, logger="turnstone.core.config"):
+        load_config()
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("group/world-readable" in m for m in messages)
+
+
+def test_load_config_quiet_when_mode_0600(tmp_path, caplog):
+    import logging
+    import os
+
+    _reset_cache()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[database]\nurl = "postgresql+psycopg://u:secret@h/d"\n')
+    os.chmod(cfg, 0o600)
+    set_config_path(str(cfg))
+
+    with caplog.at_level(logging.WARNING, logger="turnstone.core.config"):
+        load_config()
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any("group/world-readable" in m for m in messages)
+
+
 def test_load_config_caches(tmp_path):
     _reset_cache()
     cfg = tmp_path / "config.toml"
