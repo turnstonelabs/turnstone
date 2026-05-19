@@ -1278,21 +1278,29 @@ class CoordinatorClient:
             allowed_tools: list[str] = [str(t) for t in allowed_full[:_SKILL_TOOLS_PROJECTION_CAP]]
             if len(allowed_full) > _SKILL_TOOLS_PROJECTION_CAP:
                 allowed_tools.append(f"+{len(allowed_full) - _SKILL_TOOLS_PROJECTION_CAP} more")
-            skills.append(
-                {
-                    "name": r.get("name") or "",
-                    "category": r.get("category") or "",
-                    "tags": tags,
-                    "version": r.get("version") or "",
-                    "description": r.get("description") or "",
-                    "model": r.get("model") or "",
-                    "enabled": bool(r.get("enabled")),
-                    "risk_level": r.get("risk_level") or "",
-                    "activation": r.get("activation") or "",
-                    "kind": r["kind"],
-                    "allowed_tools": allowed_tools,
-                }
-            )
+            skill_row: dict[str, Any] = {
+                "name": r.get("name") or "",
+                "category": r.get("category") or "",
+                "tags": tags,
+                "version": r.get("version") or "",
+                "description": r.get("description") or "",
+                "model": r.get("model") or "",
+                "enabled": bool(r.get("enabled")),
+                "risk_level": r.get("risk_level") or "",
+                "activation": r.get("activation") or "",
+                "kind": r["kind"],
+            }
+            # Omit ``allowed_tools`` when empty: an empty list reads as
+            # "no tools are usable by this skill" to a model that doesn't
+            # know the semantics, but the actual meaning is "no tools are
+            # pre-approved (auto-approve exemption list)".  Real
+            # misdiagnosis happened in testing when a code-review skill
+            # with no auto-approve allowlist looked like it had been
+            # spawned with zero tool access.  Dropping the key altogether
+            # when empty removes the ambiguity at the source.
+            if allowed_tools:
+                skill_row["allowed_tools"] = allowed_tools
+            skills.append(skill_row)
         return {"skills": skills, "truncated": truncated}
 
     # ------------------------------------------------------------------
