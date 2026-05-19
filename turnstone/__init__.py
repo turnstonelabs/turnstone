@@ -1,3 +1,3 @@
 """turnstone - Multi-node AI orchestration platform with tool use, agent routing, and cluster simulation."""
 
-__version__ = "1.5.16"
+__version__ = "1.5.17"
