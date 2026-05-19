@@ -2616,3 +2616,362 @@ def test_cleanup_dead_task_child_refs_storage_batch_failure_swallows(populated_s
 
     populated_storage.get_workstreams_batch = _boom  # type: ignore[method-assign]
     assert client.cleanup_dead_task_child_refs("coord-1") == 0
+
+
+# ---------------------------------------------------------------------------
+# inspect_workstream — three-tier output compression
+# ---------------------------------------------------------------------------
+#
+# A coord doing a fan-out wave against tool-heavy children would
+# otherwise blow the context budget on raw output alone.  Mirrors the
+# search tool's Tier-1/Tier-2/Tier-3 ladder.
+
+
+def _make_inspect_result(
+    *, ws_id: str = "ws-test", state: str = "running", n_messages: int = 5
+) -> dict[str, Any]:
+    """Build an inspect-result dict shaped like ``coordinator_client.inspect()``.
+
+    Production output keys (``ws_id``, ``skill_id``) mirror the storage
+    row that ``inspect()`` spreads from ``get_workstream``.  Tests that
+    synthesize an inspect result must match these keys — otherwise a
+    formatter that looks at the production keys silently emits null
+    values against a fixture that uses different ones (real bug-1
+    regression source: skeleton tier read ``skill`` from a fixture
+    that wrote ``skill`` while production wrote ``skill_id``).
+    """
+    return {
+        "ws_id": ws_id,
+        "state": state,
+        "title": "test workstream",
+        "skill_id": "researcher",
+        "messages": [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i} content"}
+            for i in range(n_messages)
+        ],
+        "verdicts": [],
+    }
+
+
+def test_format_inspect_tiered_full_fits_returns_full_tier():
+    """Small payloads pass through with `_tier='full'` — no compression."""
+    from turnstone.console.coordinator_client import _format_inspect_tiered
+
+    result = _make_inspect_result(n_messages=3)
+    out = _format_inspect_tiered(result)
+    parsed = json.loads(out)
+    assert parsed["_tier"] == "full"
+    # Every message verbatim.
+    assert len(parsed["messages"]) == 3
+    assert parsed["messages"][0]["content"] == "msg 0 content"
+
+
+def test_format_inspect_tiered_compact_when_full_exceeds_budget():
+    """Large messages trigger the compact tier — head/tail-snipped
+    content with the rest of the row intact."""
+    from turnstone.console.coordinator_client import (
+        _INSPECT_MSG_CONTENT_HEAD,
+        _INSPECT_MSG_CONTENT_TAIL,
+        _INSPECT_OUTPUT_BUDGET,
+        _format_inspect_tiered,
+    )
+
+    # Each message ~5KB; with 20 messages, full tier blows the 32KB budget.
+    fat = "X" * 5000
+    result = {
+        "id": "ws-fat",
+        "state": "running",
+        "messages": [{"role": "assistant", "content": fat} for _ in range(20)],
+        "verdicts": [],
+    }
+    out = _format_inspect_tiered(result)
+    parsed = json.loads(out)
+    assert parsed["_tier"] == "compact"
+    # Every message preserved (compact keeps the count, just snips content).
+    assert len(parsed["messages"]) == 20
+    # Head/tail snip kicked in.
+    msg_content = parsed["messages"][0]["content"]
+    assert msg_content.startswith("X" * _INSPECT_MSG_CONTENT_HEAD)
+    assert msg_content.endswith("X" * _INSPECT_MSG_CONTENT_TAIL)
+    assert "chars elided" in msg_content
+    # Budget invariant — the load-bearing contract of the formatter.
+    # Without this assertion, a future change to ``_tier_note`` or
+    # ``_compact_message`` could push the output over budget and the
+    # ``_truncate_output`` head+tail safety net would silently mask
+    # the regression, re-introducing the middle-message-drop pathology.
+    assert len(out) <= _INSPECT_OUTPUT_BUDGET
+
+
+def test_format_inspect_tiered_compact_when_content_below_snip_threshold():
+    """When per-message content is below the snip threshold but the
+    message COUNT alone overflows the budget, compact tier must still
+    stay within budget — by trimming the message list (head + tail of
+    messages) rather than degrading straight to skeleton.  Bug-3
+    regression cover: with 400 × 100-char messages, the original
+    formatter fell through to skeleton because adding ``_tier_note``
+    to an un-snipped tier-2 produced output strictly larger than
+    tier-1 (both over budget).  The fix preserves messages from both
+    ends of the list and inserts an ``_omitted`` sentinel."""
+    from turnstone.console.coordinator_client import (
+        _INSPECT_OUTPUT_BUDGET,
+        _format_inspect_tiered,
+    )
+
+    # 400 × ~100 chars → Tier-1 ~53 KB (over budget), per-message
+    # content under the 964-char snip threshold so content-snipping
+    # saves nothing.  Without the list-trim rung the formatter would
+    # fall to skeleton and drop all 400 messages.
+    smallish = "S" * 100
+    result = {
+        "ws_id": "ws-many-small",
+        "state": "running",
+        "messages": [
+            {"role": "assistant" if i % 2 == 0 else "user", "content": smallish} for i in range(400)
+        ],
+        "verdicts": [],
+    }
+    out = _format_inspect_tiered(result)
+    parsed = json.loads(out)
+    # Should NOT fall through to skeleton — message-list trim preserves
+    # head + tail of the conversation.
+    assert parsed["_tier"] == "compact"
+    assert "messages" in parsed
+    # Some messages must survive; the trim shape is head + tail with an
+    # ``_omitted`` sentinel between them.
+    assert len(parsed["messages"]) > 0
+    assert len(parsed["messages"]) < 400
+    # Budget invariant.
+    assert len(out) <= _INSPECT_OUTPUT_BUDGET
+
+
+def test_format_inspect_tiered_skeleton_when_compact_also_exceeds_budget():
+    """Tier 3 fallback: counts + last assistant preview only.  Trigger by
+    flooding with messages whose content is a multi-block list — the
+    snipper correctly leaves non-string content unchanged (mirrors
+    Anthropic/OpenAI multi-block content shape), so even after the
+    (5, 10) message-list trim the surviving 15 messages don't fit in
+    the 32 KB budget."""
+    from turnstone.console.coordinator_client import (
+        _INSPECT_OUTPUT_BUDGET,
+        _format_inspect_tiered,
+    )
+
+    # 50 messages × multi-block content (~30 KB each — list-shape
+    # content bypasses the head/tail string snipper because lists
+    # aren't strings).  Even (5, 10) trim leaves 15 × 30 KB which
+    # blows the 32 KB budget — forces skeleton.
+    fat_block = {"type": "text", "text": "Y" * 3000}
+    result = {
+        "ws_id": "ws-flood",
+        "state": "running",
+        "title": "flood",
+        "skill_id": "researcher",
+        "messages": [
+            {
+                "role": "assistant" if i % 2 == 0 else "user",
+                "content": [fat_block] * 10,
+            }
+            for i in range(50)
+        ],
+        "verdicts": [],
+    }
+    out = _format_inspect_tiered(result)
+    parsed = json.loads(out)
+    assert parsed["_tier"] == "skeleton"
+    assert parsed["message_count"] == 50
+    # Role distribution surfaces — the "what shape of activity" signal.
+    assert parsed["roles"]["assistant"] == 25
+    assert parsed["roles"]["user"] == 25
+    # No `messages` field at skeleton tier — only the aggregate signal.
+    assert "messages" not in parsed
+    # Budget invariant.
+    assert len(out) <= _INSPECT_OUTPUT_BUDGET
+
+
+def test_format_inspect_tiered_skeleton_keeps_terminal_state_fields():
+    """``close_reason`` / ``last_error`` survive the skeleton fall — they're
+    small, load-bearing, and the operator needs them to understand WHY
+    a terminal child landed in its state."""
+    from turnstone.console.coordinator_client import (
+        _INSPECT_OUTPUT_BUDGET,
+        _format_inspect_tiered,
+    )
+
+    # Same flood pattern as the bare-skeleton test (multi-block content
+    # bypasses the string snipper) — paired with terminal-state fields
+    # that must survive the skeleton fall.
+    fat_block = {"type": "text", "text": "Z" * 3000}
+    result = {
+        "ws_id": "ws-closed",
+        "state": "closed",
+        "title": "done",
+        "skill_id": "researcher",
+        "messages": [{"role": "user", "content": [fat_block] * 10} for _ in range(50)],
+        "verdicts": [],
+        "close_reason": "task complete: report attached",
+        "live": None,  # filtered by truthy check
+    }
+    out = _format_inspect_tiered(result)
+    parsed = json.loads(out)
+    assert parsed["_tier"] == "skeleton"
+    assert parsed["close_reason"] == "task complete: report attached"
+    # Falsy ``live`` doesn't bleed through.
+    assert "live" not in parsed
+    assert len(out) <= _INSPECT_OUTPUT_BUDGET
+
+
+def test_format_inspect_tiered_error_shapes_bypass_tiering():
+    """Cross-tenant / not-found responses keep their original shape — they
+    carry no messages, are already tiny, and changing them would break
+    callers that key on the ``error`` field."""
+    from turnstone.console.coordinator_client import _format_inspect_tiered
+
+    result = {"error": "workstream not found", "ws_id": "ws-foreign"}
+    out = _format_inspect_tiered(result)
+    parsed = json.loads(out)
+    assert parsed == {"error": "workstream not found", "ws_id": "ws-foreign"}
+    # No `_tier` annotation — error shapes are self-describing.
+    assert "_tier" not in parsed
+
+
+def test_format_inspect_tiered_compact_preserves_tool_call_linkage():
+    """Compact tier keeps ``tool_name`` / ``tool_call_id`` / ``name`` so a
+    model reading the snipped trace can still pair a tool call to its
+    response — the linkage is load-bearing for "what happened" signal."""
+    from turnstone.console.coordinator_client import _format_inspect_tiered
+
+    fat = "Q" * 5000
+    result = {
+        "ws_id": "ws-tools",
+        "state": "running",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": fat,
+                "tool_name": "bash",
+                "tool_call_id": "call-1",
+            }
+            for _ in range(20)
+        ],
+        "verdicts": [],
+    }
+    out = _format_inspect_tiered(result)
+    parsed = json.loads(out)
+    assert parsed["_tier"] == "compact"
+    first = parsed["messages"][0]
+    assert first["tool_name"] == "bash"
+    assert first["tool_call_id"] == "call-1"
+
+
+def test_format_inspect_tiered_compact_preserves_assistant_tool_calls():
+    """Compact tier must preserve the assistant-side ``tool_calls`` list
+    (OpenAI shape: ``[{id, type, function: {name, arguments}}]``) so a
+    model reading the snipped trace can see WHICH tool was called and
+    pair it with the corresponding result row via ``id`` ↔ ``tool_call_id``.
+    Bug-2 regression cover: the pre-fix compactor stripped ``tool_calls``,
+    leaving the audit reader with a tool-result orphan against an
+    invisible call.
+
+    ``function.arguments`` strings are snipped head/tail (analogous to
+    content) because they can be multi-KB JSON; ``id`` and
+    ``function.name`` are preserved verbatim — they're the linkage."""
+    from turnstone.console.coordinator_client import (
+        _INSPECT_TOOL_ARG_HEAD,
+        _INSPECT_TOOL_ARG_TAIL,
+        _format_inspect_tiered,
+    )
+
+    fat_content = "C" * 5000  # forces compact tier
+    fat_args = "A" * 5000  # forces argument snipping
+    tool_calls = [
+        {
+            "id": "call-abc-123",
+            "type": "function",
+            "function": {"name": "bash", "arguments": fat_args},
+        },
+        {
+            "id": "call-def-456",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": fat_args},
+        },
+    ]
+    result = {
+        "ws_id": "ws-tool-calls",
+        "state": "running",
+        "messages": [
+            {"role": "assistant", "content": fat_content, "tool_calls": tool_calls}
+            for _ in range(20)
+        ],
+        "verdicts": [],
+    }
+    out = _format_inspect_tiered(result)
+    parsed = json.loads(out)
+    assert parsed["_tier"] == "compact"
+    first = parsed["messages"][0]
+    # tool_calls survives compaction.
+    assert "tool_calls" in first
+    assert len(first["tool_calls"]) == 2
+    # Linkage fields verbatim.
+    assert first["tool_calls"][0]["id"] == "call-abc-123"
+    assert first["tool_calls"][0]["function"]["name"] == "bash"
+    assert first["tool_calls"][1]["id"] == "call-def-456"
+    assert first["tool_calls"][1]["function"]["name"] == "read_file"
+    # arguments snipped head/tail — both prefix and suffix preserved.
+    snipped_args = first["tool_calls"][0]["function"]["arguments"]
+    assert snipped_args.startswith("A" * _INSPECT_TOOL_ARG_HEAD)
+    assert snipped_args.endswith("A" * _INSPECT_TOOL_ARG_TAIL)
+    assert "chars elided" in snipped_args
+
+
+def test_format_inspect_tiered_compact_passes_small_messages_through_unsnipped():
+    """Messages under the snip threshold pass through verbatim at compact
+    tier — snipping a 100-byte message costs more bytes (the elision
+    marker) than it saves."""
+    from turnstone.console.coordinator_client import _format_inspect_tiered
+
+    # Mix: a few large messages force compact tier; small messages must
+    # not be snipped.
+    big = "B" * 5000
+    small = "S" * 50
+    result = {
+        "id": "ws-mixed",
+        "state": "running",
+        "messages": [{"role": "assistant", "content": big} for _ in range(15)]
+        + [{"role": "user", "content": small}],
+        "verdicts": [],
+    }
+    out = _format_inspect_tiered(result)
+    parsed = json.loads(out)
+    assert parsed["_tier"] == "compact"
+    # The trailing small message is exact, not snipped.
+    assert parsed["messages"][-1]["content"] == small
+
+
+def test_format_inspect_tiered_emits_tier_note_when_compressed():
+    """The ``_tier_note`` advisory tells the LLM how to ask for a tighter
+    or fuller view next time — actionable feedback rather than a bare
+    "we compressed your output" signal."""
+    from turnstone.console.coordinator_client import _format_inspect_tiered
+
+    fat = "F" * 5000
+    result = {
+        "id": "ws-noted",
+        "state": "running",
+        "messages": [{"role": "assistant", "content": fat} for _ in range(20)],
+        "verdicts": [],
+    }
+    out = _format_inspect_tiered(result)
+    parsed = json.loads(out)
+    assert "_tier_note" in parsed
+    assert "message_limit" in parsed["_tier_note"]
+
+
+def test_format_inspect_tiered_full_tier_omits_tier_note():
+    """When the full tier fits, no note is emitted — the absence of a
+    note is the signal that nothing was compressed."""
+    from turnstone.console.coordinator_client import _format_inspect_tiered
+
+    out = _format_inspect_tiered(_make_inspect_result(n_messages=2))
+    parsed = json.loads(out)
+    assert parsed["_tier"] == "full"
+    assert "_tier_note" not in parsed

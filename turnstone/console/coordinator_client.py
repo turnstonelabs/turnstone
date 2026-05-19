@@ -1792,6 +1792,292 @@ def _serialize_verdicts(rows: list[Any]) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# inspect_workstream — tiered output compression
+# ---------------------------------------------------------------------------
+#
+# A coord doing a fan-out wave of inspect_workstream calls against
+# tool-heavy children can blow the context budget on raw output alone
+# (one child with a 100 KB bash result × N children).  The previous
+# safety net was ``_truncate_output``'s head+tail strategy, which
+# silently drops *middle* messages — exactly the wrong shape for a
+# coordinator trying to understand a child's trajectory (the LAST
+# message tells the model what the child concluded; the FIRST sets
+# the brief; the middle is the connective tissue).
+#
+# The three-tier degradation pattern matches the ``search`` tool's
+# Tier-1/Tier-2/Tier-3 ladder at ``session.py:_format_search_results``.
+# First tier whose serialized size fits the budget wins; the LLM
+# learns which tier it got via the ``_tier`` field in the response
+# (no API change to the coordinator tool).
+#
+# Budget chosen well under ``tool_truncation`` (typically 256 KB+) so
+# the head+tail safety net never fires for inspect_workstream — that
+# strategy silently drops middle messages, which is exactly the
+# pathology this formatter exists to avoid.
+
+_INSPECT_OUTPUT_BUDGET: int = 32_768
+# Per-message head/tail snip when Tier 2 needs to compress content.
+# Head dominates because the first ~600 chars of an assistant message
+# usually contains the conclusion / direction; the tail is the
+# follow-through.  Tool results compress similarly: head shows what
+# the tool was asked / what it found at the top; tail shows the final
+# state / error suffix.
+_INSPECT_MSG_CONTENT_HEAD: int = 600
+_INSPECT_MSG_CONTENT_TAIL: int = 300
+# Threshold below which a message's content passes through unsnipped
+# even in Tier 2.  Snipping a sub-1KB message costs more bytes (the
+# elision marker) than it saves.
+_INSPECT_MSG_SNIP_THRESHOLD: int = _INSPECT_MSG_CONTENT_HEAD + _INSPECT_MSG_CONTENT_TAIL + 64
+# Skeleton-tier preview length on the last assistant message.  Single
+# value because the skeleton wants ONE meaningful signal ("what did
+# the child last say"), not a head/tail snip.
+_INSPECT_SKELETON_LAST_PREVIEW: int = 400
+
+# Snip lengths for tool-call ``function.arguments`` strings on
+# assistant turns.  Tighter than content snipping because tool calls
+# often appear in clusters (10+ per turn for a fan-out) and the
+# arguments JSON is dense — keep just enough to see what was invoked
+# and the head of the args structure.
+_INSPECT_TOOL_ARG_HEAD: int = 300
+_INSPECT_TOOL_ARG_TAIL: int = 100
+_INSPECT_TOOL_ARG_SNIP_THRESHOLD: int = _INSPECT_TOOL_ARG_HEAD + _INSPECT_TOOL_ARG_TAIL + 64
+
+# Message-list trim ladder for the compact tier when per-message
+# content snipping alone doesn't free enough budget.  Each rung is
+# ``(head_count, tail_count)`` — keep the first N + last M messages,
+# elide the middle as ``{"_omitted": K}``.  Tail-weighted because the
+# last assistant turn carries the load-bearing "what did the child
+# conclude" signal (same rationale as ``_inspect_skeleton``'s
+# last-assistant preview).  Tried in order; first rung whose
+# serialized emission fits the budget wins.  Mirrors the per-file
+# sample ladder in ``_format_search_results`` at session.py:254.
+_INSPECT_LIST_TRIM_LADDER: tuple[tuple[int, int], ...] = ((20, 30), (10, 20), (5, 10))
+
+
+def _snip_head_tail(text: str, head: int, tail: int) -> str:
+    """Head/tail snip with elision marker; passthrough when shorter than threshold."""
+    if not isinstance(text, str) or len(text) <= head + tail + 64:
+        return text
+    elided = len(text) - head - tail
+    return text[:head] + f"\n...[{elided} chars elided]...\n" + text[-tail:]
+
+
+def _compact_tool_calls(tool_calls: Any) -> Any:
+    """Snip ``function.arguments`` on each tool-call entry; keep ``id`` and
+    ``function.name`` verbatim.
+
+    OpenAI shape: ``[{"id": ..., "type": "function", "function":
+    {"name": ..., "arguments": "<json-string>"}}, ...]``.  The
+    arguments string is the dominant size term on a fan-out turn that
+    issued many tool calls with multi-KB JSON arguments each;
+    preserving them verbatim re-opens the same size pressure the
+    compact tier is trying to relieve.  Non-list / non-dict entries
+    pass through so a future shape change doesn't crash the formatter.
+    """
+    if not isinstance(tool_calls, list):
+        return tool_calls
+    out: list[Any] = []
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            out.append(call)
+            continue
+        compact_call: dict[str, Any] = {}
+        for k in ("id", "type"):
+            v = call.get(k)
+            if v:
+                compact_call[k] = v
+        func = call.get("function")
+        if isinstance(func, dict):
+            compact_func: dict[str, Any] = {}
+            name = func.get("name")
+            if name:
+                compact_func["name"] = name
+            args = func.get("arguments", "")
+            if args:
+                compact_func["arguments"] = _snip_head_tail(
+                    args, _INSPECT_TOOL_ARG_HEAD, _INSPECT_TOOL_ARG_TAIL
+                )
+            compact_call["function"] = compact_func
+        out.append(compact_call)
+    return out
+
+
+def _compact_message(msg: dict[str, Any]) -> dict[str, Any]:
+    """Tier-2 per-message projection: keep role + identifier keys, snip content + tool_calls.
+
+    Tool-call linkage is the load-bearing "what happened" signal:
+    ``tool_call_id`` on the result side matches an ``id`` in
+    ``tool_calls`` on the issuing assistant turn.  Stripping
+    ``tool_calls`` (the pre-fix shape) left tool results dangling
+    against an invisible call — the audit reader could see "bash
+    returned X" but not "the assistant asked for ``ls /tmp``".  The
+    ``arguments`` string is the size offender, so we snip it head/tail
+    rather than dropping the call entirely.
+    """
+    content = msg.get("content", "")
+    snipped = _snip_head_tail(content, _INSPECT_MSG_CONTENT_HEAD, _INSPECT_MSG_CONTENT_TAIL)
+    compact: dict[str, Any] = {"role": msg.get("role"), "content": snipped}
+    # Tool-result linkage (result-side keys).
+    for k in ("tool_name", "tool_call_id", "name"):
+        v = msg.get(k)
+        if v:
+            compact[k] = v
+    # Tool-call request linkage (issuing-side list), snipped per-call.
+    tool_calls = msg.get("tool_calls")
+    if tool_calls:
+        compact["tool_calls"] = _compact_tool_calls(tool_calls)
+    return compact
+
+
+def _inspect_skeleton(result: dict[str, Any]) -> dict[str, Any]:
+    """Tier-3 fallback: state + counts + last assistant preview + terminal info.
+
+    Drops every message, keeping only aggregate signal: state, message
+    count, role distribution, verdict count + risk distribution, and a
+    short preview of the most recent assistant turn (the "what did this
+    child last say" signal).  Terminal-state fields (``close_reason``,
+    ``last_error``) and the ``live`` block pass through unchanged
+    because they're already small and load-bearing.
+    """
+    messages = result.get("messages") or []
+    verdicts = result.get("verdicts") or []
+    role_counts: dict[str, int] = {}
+    for m in messages:
+        role = m.get("role") if isinstance(m, dict) else None
+        if role:
+            role_counts[role] = role_counts.get(role, 0) + 1
+    verdicts_by_risk: dict[str, int] = {}
+    for v in verdicts:
+        if isinstance(v, dict):
+            risk = v.get("risk_level") or "unknown"
+            verdicts_by_risk[risk] = verdicts_by_risk.get(risk, 0) + 1
+    last_preview = ""
+    for m in reversed(messages):
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        c = m.get("content", "")
+        if isinstance(c, str) and c:
+            last_preview = c[:_INSPECT_SKELETON_LAST_PREVIEW]
+            if len(c) > _INSPECT_SKELETON_LAST_PREVIEW:
+                last_preview += "..."
+            break
+    skeleton: dict[str, Any] = {
+        # Storage row keys verbatim from ``get_workstreams_batch``
+        # (the projection backing ``get_workstream`` → ``inspect()``):
+        # ``ws_id``, ``skill_id``.  No fallback to ``id`` / ``skill``
+        # — fail loud on storage column drift rather than silently
+        # emitting null.
+        "ws_id": result["ws_id"],
+        "state": result.get("state"),
+        "title": result.get("title"),
+        "skill": result["skill_id"],
+        "message_count": len(messages),
+        "roles": role_counts,
+        "verdict_count": len(verdicts),
+        "verdicts_by_risk": verdicts_by_risk,
+        "last_assistant_preview": last_preview,
+        "_tier": "skeleton",
+        "_tier_note": (
+            "Output exceeded the inspect_workstream budget at both full and compact "
+            "tiers; skeleton-only.  Re-call with a smaller ``message_limit`` to fit "
+            "the compact tier, or read individual messages via the storage admin path."
+        ),
+    }
+    for k in ("close_reason", "last_error", "live"):
+        v = result.get(k)
+        if v:
+            skeleton[k] = v
+    return skeleton
+
+
+def _format_inspect_tiered(result: dict[str, Any], *, budget: int = _INSPECT_OUTPUT_BUDGET) -> str:
+    """Serialize an ``inspect_workstream`` result with tiered degradation.
+
+    Tier 1 (full):    every message verbatim — used when the size fits.
+    Tier 2 (compact): per-message ``{role, head/tail-snipped content,
+                      tool linkage, snipped tool_calls.arguments}`` for
+                      every message, then a head+tail message-list trim
+                      ladder when content snipping alone doesn't free
+                      enough budget.
+    Tier 3 (skeleton): no messages — counts + last assistant preview only.
+
+    First emission whose JSON serialization fits ``budget`` wins.
+    ``_tier`` appears on every non-error emission so the coordinator
+    LLM (and any audit reader) can see which compression rung the
+    output landed on without inferring from length.  Error-shape
+    results (missing or cross-tenant ws_id) bypass tiering entirely —
+    they're already small and the ``error`` key signals the shape.
+
+    The intermediate Tier-2 list-trim rungs exist because content
+    snipping alone fails on workloads where many small messages
+    overflow the budget by sheer count (``message_limit=200`` × a few
+    hundred chars each).  In that regime, dropping content-snipping
+    saves zero bytes per message, so without the list-trim ladder
+    Tier-2 produces output strictly larger than Tier-1 (added
+    ``_tier_note``) and the formatter fell through to skeleton —
+    losing every message when a head+tail message-list trim would
+    have preserved dozens.  Mirrors the per-file sample ladder in
+    ``_format_search_results`` (session.py:_SEARCH_TIER2_SAMPLE_LADDER).
+    """
+    if "error" in result:
+        # Cross-tenant guard / not-found responses — pass through.
+        return json.dumps(result, default=str, separators=(",", ":"))
+    tier1 = {**result, "_tier": "full"}
+    out1 = json.dumps(tier1, default=str, separators=(",", ":"))
+    if len(out1) <= budget:
+        return out1
+    messages = result.get("messages") or []
+    compact_msgs = [_compact_message(m) if isinstance(m, dict) else m for m in messages]
+    tier2_note_full = (
+        "Output exceeded the inspect_workstream budget at the full tier; messages "
+        "are head/tail-snipped at "
+        f"{_INSPECT_MSG_CONTENT_HEAD}/{_INSPECT_MSG_CONTENT_TAIL} chars.  Re-call "
+        "with a smaller ``message_limit`` for a tighter tail, or include_provider_"
+        "content=False if it was on."
+    )
+    tier2 = {
+        **result,
+        "messages": compact_msgs,
+        "_tier": "compact",
+        "_tier_note": tier2_note_full,
+    }
+    out2 = json.dumps(tier2, default=str, separators=(",", ":"))
+    if len(out2) <= budget:
+        return out2
+    # Tier-2 list-trim ladder: keep head N + tail M, elide the middle.
+    # Tail-weighted because the recent turns carry the load-bearing
+    # signal ("what did the child conclude") — same reason
+    # ``_inspect_skeleton`` keeps a last-assistant preview rather than
+    # a first-user preview.
+    total = len(compact_msgs)
+    for head_n, tail_n in _INSPECT_LIST_TRIM_LADDER:
+        if head_n + tail_n >= total:
+            # Rung doesn't actually trim — would re-emit Tier-2 verbatim.
+            continue
+        omitted = total - head_n - tail_n
+        trimmed: list[Any] = (
+            compact_msgs[:head_n] + [{"_omitted": omitted}] + compact_msgs[-tail_n:]
+        )
+        tier2_trim_note = (
+            f"Output exceeded the inspect_workstream budget at the compact tier; "
+            f"keeping first {head_n} + last {tail_n} of {total} messages, eliding "
+            f"{omitted} middle messages.  Re-call with a smaller ``message_limit`` "
+            "to fit the full compact tier."
+        )
+        tier2_trim = {
+            **result,
+            "messages": trimmed,
+            "_tier": "compact",
+            "_tier_note": tier2_trim_note,
+        }
+        out2_trim = json.dumps(tier2_trim, default=str, separators=(",", ":"))
+        if len(out2_trim) <= budget:
+            return out2_trim
+    skeleton = _inspect_skeleton(result)
+    return json.dumps(skeleton, default=str, separators=(",", ":"))
+
+
+# ---------------------------------------------------------------------------
 # wait_for_workstream — last-message extraction
 # ---------------------------------------------------------------------------
 
