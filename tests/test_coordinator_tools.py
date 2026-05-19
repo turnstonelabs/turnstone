@@ -270,6 +270,21 @@ def test_spawn_exec_surfaces_client_error(coord_session):
     assert ui.tool_results[-1][3] is True  # is_error
 
 
+def test_spawn_exec_treats_missing_ws_id_on_success_path_as_error(coord_session):
+    """A malformed upstream response (200-success-shape with no
+    ``ws_id``) used to emit ``{"child_ws_id": null}`` to the LLM,
+    which then chased a null id through follow-up tools.  Now matches
+    the matching guard in ``_exec_spawn_batch``: surface as a tool
+    error so the model retries instead of acting on garbage."""
+    sess, coord, ui = coord_session
+    # No ``error`` field, but ``ws_id`` is missing — the silent-null path.
+    coord.spawn.return_value = {"name": "c", "node_id": "node-1", "status": 200}
+    item = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "hi"}))
+    _call_id, output = sess._exec_spawn_workstream(item)
+    assert "no ws_id" in output
+    assert ui.tool_results[-1][3] is True  # is_error
+
+
 # ---------------------------------------------------------------------------
 # inspect_workstream
 # ---------------------------------------------------------------------------

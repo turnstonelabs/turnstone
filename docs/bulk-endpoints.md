@@ -110,6 +110,13 @@ owns it; the node is just currently unreachable.
 
 ### Example — `spawn_batch`
 
+This is the coordinator-tool result shape (the JSON the LLM receives),
+not an HTTP API response — the table above keys it under "model tool"
+to distinguish it from the `/v1/api/...` endpoints in the same table.
+The underlying HTTP spawn endpoint still returns `ws_id`; the tool
+result re-keys it to `child_ws_id` to defuse a coordinator-LLM recency
+bias (see `docs/coordinator-skills.md`).
+
 ```json
 {
   "results": {

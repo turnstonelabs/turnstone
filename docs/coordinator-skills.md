@@ -180,7 +180,10 @@ bias where seeing `ws_id` in a spawn return primed re-spawn loops
 instead of progression to the wait phase.
 
 A UI that wants human-readable identifiers should render the `name`
-field and keep the ws_id as the click-through key.
+field and keep the workstream id as the click-through key — note
+that the id *value* is the same regardless of whether it arrived
+under the `child_ws_id` key (spawn return) or the `ws_id` key
+(every other tool's input/output); only the field name differs.
 
 ---
 
