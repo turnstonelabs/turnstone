@@ -1623,6 +1623,63 @@ class StorageBackend(Protocol):
         """
         ...
 
+    def upsert_intent_verdict(
+        self,
+        verdict_id: str,
+        ws_id: str,
+        call_id: str,
+        func_name: str,
+        func_args: str,
+        intent_summary: str,
+        risk_level: str,
+        confidence: float,
+        recommendation: str,
+        reasoning: str,
+        evidence: str,
+        tier: str,
+        judge_model: str,
+        latency_ms: int,
+        user_decision: str = "pending",
+    ) -> None:
+        """INSERT a verdict row, or UPDATE the judge-output fields on conflict.
+
+        Async LLM judge verdicts with ``tier="llm_fallback"`` deliberately
+        reuse the heuristic verdict's ``verdict_id`` so the row gets
+        "upgraded in place" from heuristic → fallback when the LLM tier
+        doesn't return a real verdict (timeout / cancelled / no-content).
+        A plain INSERT collides on ``intent_verdicts_pkey``; this method
+        ``ON CONFLICT (verdict_id) DO UPDATE`` updates only the columns
+        that genuinely change between the two tiers:
+
+        - ``tier`` (the upgrade itself)
+        - ``reasoning`` (gets " (LLM judge did not return a verdict)" appended)
+        - ``judge_model`` (heuristic carries "", fallback carries the model)
+
+        Every other column is EXCLUDED from the on-conflict SET clause:
+
+        - Identity columns (``verdict_id``, ``ws_id``, ``call_id``,
+          ``func_name``, ``func_args``) — already the same row.
+        - Carried-verbatim columns (``intent_summary``, ``risk_level``,
+          ``confidence``, ``recommendation``, ``evidence``, ``latency_ms``) —
+          the fallback copies them from the heuristic verdict; updating
+          would be a no-op.
+        - ``user_decision`` — LOAD-BEARING exclusion.  ``IntentVerdict.to_dict()``
+          doesn't project it, so a fallback verdict reaching this layer
+          defaults the kwarg to ``"pending"``.  If the operator already
+          resolved the approval between heuristic INSERT and fallback
+          fire, the row's ``user_decision`` was already updated to
+          ``"approved"``/``"denied"``/``"timeout"`` (or stamped to an
+          auto-approve reason at heuristic-INSERT time).  Clobbering it
+          back to ``"pending"`` would undo that.
+        - ``created`` — preserve the original timestamp.
+
+        Used by :meth:`SessionUIBase._persist_intent_verdict` for every
+        async LLM-tier delivery; the synchronous heuristic-bulk path
+        (:meth:`create_intent_verdicts_bulk`) stays as plain INSERT
+        since each heuristic UUID is freshly generated per turn.
+        """
+        ...
+
     def create_intent_verdicts_bulk(self, verdicts: list[dict[str, Any]]) -> None:
         """Insert many intent_verdict rows in one transaction.
 
