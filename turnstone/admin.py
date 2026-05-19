@@ -12,14 +12,36 @@ import uuid
 from typing import Any
 
 
-def _get_storage() -> Any:
-    """Initialize and return the storage backend."""
+def _get_storage(args: argparse.Namespace) -> Any:
+    """Initialize and return the storage backend.
+
+    Precedence (matches turnstone-server): CLI / config.toml ``[database]``
+    > ``TURNSTONE_DB_*`` env vars > hardcoded defaults.
+    """
     from turnstone.core.storage import init_storage
 
-    db_backend = os.environ.get("TURNSTONE_DB_BACKEND", "sqlite")
-    db_url = os.environ.get("TURNSTONE_DB_URL", "")
-    db_path = os.environ.get("TURNSTONE_DB_PATH", "")
-    return init_storage(db_backend, path=db_path, url=db_url)
+    def _pick(arg_name: str, env_name: str, default: str = "") -> Any:
+        # `is not None` (not truthy) so a legitimate falsy TOML value
+        # like `pool_size = 0` or `url = ""` still beats the env fallback.
+        val = getattr(args, arg_name, None)
+        if val is not None:
+            return val
+        return os.environ.get(env_name, default)
+
+    db_backend = str(_pick("db_backend", "TURNSTONE_DB_BACKEND", "sqlite"))
+    db_url = str(_pick("db_url", "TURNSTONE_DB_URL"))
+    db_path = str(_pick("db_path", "TURNSTONE_DB_PATH"))
+    db_pool_size = int(_pick("db_pool_size", "TURNSTONE_DB_POOL_SIZE", "2"))
+    return init_storage(
+        db_backend,
+        path=db_path,
+        url=db_url,
+        pool_size=db_pool_size,
+        sslmode=str(_pick("db_sslmode", "TURNSTONE_DB_SSLMODE")),
+        sslrootcert=str(_pick("db_sslrootcert", "TURNSTONE_DB_SSLROOTCERT")),
+        sslcert=str(_pick("db_sslcert", "TURNSTONE_DB_SSLCERT")),
+        sslkey=str(_pick("db_sslkey", "TURNSTONE_DB_SSLKEY")),
+    )
 
 
 def _cmd_create_user(args: argparse.Namespace) -> None:
@@ -37,7 +59,7 @@ def _cmd_create_user(args: argparse.Namespace) -> None:
         print("Error: invalid username (1-64 chars: letters, digits, . _ -)", file=sys.stderr)
         sys.exit(1)
 
-    storage = _get_storage()
+    storage = _get_storage(args)
     user_id = uuid.uuid4().hex
 
     # Prompt for password
@@ -76,7 +98,7 @@ def _cmd_create_user(args: argparse.Namespace) -> None:
 def _cmd_create_token(args: argparse.Namespace) -> None:
     from turnstone.core.auth import generate_token, hash_token, token_prefix
 
-    storage = _get_storage()
+    storage = _get_storage(args)
 
     if storage.get_user(args.user) is None:
         print(f"Error: user {args.user} not found", file=sys.stderr)
@@ -110,7 +132,7 @@ def _cmd_create_token(args: argparse.Namespace) -> None:
 
 
 def _cmd_list_users(args: argparse.Namespace) -> None:
-    storage = _get_storage()
+    storage = _get_storage(args)
     users = storage.list_users()
     if not users:
         print("No users found.")
@@ -120,7 +142,7 @@ def _cmd_list_users(args: argparse.Namespace) -> None:
 
 
 def _cmd_list_tokens(args: argparse.Namespace) -> None:
-    storage = _get_storage()
+    storage = _get_storage(args)
     tokens = storage.list_api_tokens(args.user)
     if not tokens:
         print(f"No tokens found for user {args.user}.")
@@ -134,7 +156,7 @@ def _cmd_list_tokens(args: argparse.Namespace) -> None:
 
 
 def _cmd_revoke_token(args: argparse.Namespace) -> None:
-    storage = _get_storage()
+    storage = _get_storage(args)
     if storage.delete_api_token(args.token_id):
         print(f"Revoked token {args.token_id}")
     else:
@@ -297,7 +319,7 @@ def _cmd_list_node_metadata(args: argparse.Namespace) -> None:
     """List metadata for a node."""
     import json
 
-    storage = _get_storage()
+    storage = _get_storage(args)
     rows = storage.get_node_metadata(args.node_id)
     if not rows:
         print(f"No metadata for node: {args.node_id}")
@@ -324,7 +346,7 @@ def _cmd_set_node_metadata(args: argparse.Namespace) -> None:
     """Set a metadata key on a node."""
     import json
 
-    storage = _get_storage()
+    storage = _get_storage(args)
 
     # Check for auto-source conflict
     existing = storage.get_node_metadata(args.node_id)
@@ -345,7 +367,7 @@ def _cmd_set_node_metadata(args: argparse.Namespace) -> None:
 
 def _cmd_delete_node_metadata(args: argparse.Namespace) -> None:
     """Delete a metadata key from a node."""
-    storage = _get_storage()
+    storage = _get_storage(args)
 
     existing = storage.get_node_metadata(args.node_id)
     for r in existing:
@@ -395,6 +417,10 @@ def main() -> None:
         prog="turnstone-admin",
         description="Turnstone user and token administration",
     )
+    from turnstone.core.config import add_config_arg, apply_config
+
+    add_config_arg(parser)
+    apply_config(parser, ["database"])
     sub = parser.add_subparsers(dest="command")
 
     p_cu = sub.add_parser("create-user", help="Create a new user")
