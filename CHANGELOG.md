@@ -14,6 +14,107 @@ Three release tracks are maintained:
 
 ## [Unreleased]
 
+## [1.5.17]
+
+Backports a clutch of coordinator-tool clarity fixes plus a watch-delivery
+correctness fix from `main` to the `stable/1.5` track, plus a previously-
+latent intent-verdicts persistence bug exposed by the new heuristic-verdict
+INSERT paths.  No schema changes.
+
+### Fixed
+
+- **`intent_verdicts` PK collisions on every llm_fallback delivery** —
+  async LLM-tier "llm_fallback" verdicts (`turnstone/core/judge.py` —
+  `_deliver_fallbacks` and the in-loop fallback path) deliberately
+  reuse the heuristic verdict's `verdict_id` so the row gets
+  "upgraded in place" from `tier="heuristic"` → `tier="llm_fallback"`
+  when the LLM judge times out, is cancelled, or returns no content.
+  The consumer `_persist_intent_verdict` was doing a plain INSERT,
+  hitting the `intent_verdicts_pkey` constraint on every fallback
+  delivery; Postgres logged the duplicate-key error, the application
+  try/except swallowed it at `log.debug`, and the row never actually
+  got upgraded — the LLM judge's annotation
+  (`"(LLM judge did not return a verdict)"`) was lost.  The collision
+  rate exploded on this release because the new heuristic-INSERT
+  paths in the auto-approve early-return branches of `approve_tools`
+  (introduced below) leave no gap for the fallback to land cleanly
+  into.  Fix: new `upsert_intent_verdict` storage method using
+  `ON CONFLICT (verdict_id) DO UPDATE` that updates only `tier`,
+  `reasoning`, `judge_model` — the three fields that genuinely
+  change between heuristic and llm_fallback.  Every other column
+  (identity, carried-verbatim, and `user_decision`) is excluded;
+  `user_decision` in particular would otherwise be clobbered back
+  to `"pending"` when a fallback arrives after the operator has
+  already resolved the approval.  The bulk-INSERT path stays as
+  plain INSERT — fresh UUIDs in `judge.evaluate` make in-turn dups
+  impossible; the inverse race (fallback wins before bulk lands) is
+  reachable but unchanged in observable behavior by this fix,
+  documented at the bulk site for a future hardening pass.
+- **Coordinator LLM re-spawn loops on large fan-outs** — the spawn-tool
+  return JSON used `ws_id` as its key, which primed the model's recency
+  bias to feed the spawn result straight back into another
+  `spawn_workstream(ws_id=...)` call instead of progressing to
+  `wait_for_workstream(ws_ids=[...])`.  On 10+ child fan-outs this cascaded
+  into self-inflicted re-spawn loops.  The LLM-facing tool result now emits
+  `child_ws_id` (the storage column / HTTP API contract is unchanged); the
+  field name is already an existing project term so the rename aligns
+  rather than introduces new vocabulary.  Also handles the silent
+  upstream-omits-ws_id success-shape edge that previously emitted
+  `{"child_ws_id": null}` to the LLM — now surfaces a tool error so the
+  model retries rather than chasing a null id.
+- **`inspect_workstream` blowing the coordinator context budget** — a
+  coord doing a fan-out wave against tool-heavy children could land
+  >100 KB of raw output per inspect call, and the previous safety net
+  (`_truncate_output`'s head+tail strategy) silently dropped *middle*
+  messages — exactly the wrong shape for understanding a child's
+  trajectory (the FIRST sets the brief, the LAST shows the conclusion,
+  the middle is the connective tissue).  Output now goes through a
+  three-tier degradation ladder mirroring the search tool's
+  `_format_search_results`: `_tier="full"` (every message verbatim) →
+  `_tier="compact"` (per-message head/tail-snipped content + snipped
+  `tool_calls.arguments`, falling through a `(20,30)` / `(10,20)` /
+  `(5,10)` message-list trim ladder) → `_tier="skeleton"` (counts, role
+  distribution, last-assistant preview).  Budget 32 KiB matches the
+  search tool's; the chosen tier is annotated on the response so the
+  model can recall with a tighter `message_limit` if signal was lost.
+- **Auto-approved verdicts indistinguishable from pending review** —
+  `intent_verdict` rows for auto-approved tool calls landed with
+  `user_decision=""`, which read identically to "still waiting for the
+  operator" in the audit trail and led to a real misdiagnosis incident.
+  The column now carries an explicit vocabulary at insert: `pending` /
+  `approved` / `denied` / `timeout` / `policy` / `blanket` / `skill` /
+  `always` / `auto_approve_tools`.  The auto-approve early-return
+  branches in `approve_tools` now persist heuristic verdicts stamped
+  with their reason (previously dropped on the floor), and late LLM-tier
+  verdicts that arrive for an already-auto-approved call_id are stamped
+  via a TTL-pruned lookup map — so the audit row carries the
+  auto-approve reason even when the LLM judge daemon completes after
+  the synchronous approval cycle finished.  `resolve_approval` gains a
+  `timeout` kwarg writing `"timeout"` (the previous shape collapsed
+  passive timeouts and active denials into the same column).
+- **`list_skills` empty `allowed_tools` misread as "no tool access"** —
+  the response previously emitted `"allowed_tools": []` for every skill
+  that hadn't declared an auto-approve allowlist, which a coordinator
+  model read as "this skill can't use any tools" (real misdiagnosis: a
+  code-review child appeared to have been spawned with zero tool
+  access).  The field is now omitted entirely when empty — absence
+  carries the unambiguous meaning "no tool is pre-approved for this
+  skill", presence (non-empty list) keeps the standard Claude Code
+  skill-spec shape.  The tool description rewrite makes the
+  auto-approve-allowlist semantics explicit so a future reader doesn't
+  re-derive the gating misread.
+- **Watch terminal-fires silently dropped on backpressure** —
+  delivery now routes terminal events through the same path as
+  normal fires instead of being filtered out when the consumer was
+  saturated.
+
+### Documentation
+
+- **Storage `LIKE_ESCAPE` contract** — clarify that callers passing
+  `.like(escape=...)` must use the same escape character that the
+  storage helper assumes; previous wording let a reader pass a
+  different escape and silently produce no matches.
+
 ## [1.5.15]
 
 ### Fixed
