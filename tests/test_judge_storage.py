@@ -118,6 +118,123 @@ class TestIntentVerdictCRUD:
         assert ok is False
 
 
+class TestIntentVerdictUpsert:
+    """``upsert_intent_verdict`` — the LLM-tier-aware persistence path.
+
+    Backs the heuristic → llm_fallback "upgrade in place" pattern.
+    The async judge's fallback verdicts deliberately reuse the
+    heuristic ``verdict_id``; a plain INSERT would collide on the
+    PK and the upgrade would be lost to a silently-swallowed
+    exception (Postgres logged ``intent_verdicts_pkey`` violations
+    for every fallback delivery on stable/1.5 smoke tests).
+    """
+
+    def test_upsert_on_fresh_id_inserts(self, db):
+        """No conflict — behaves like a regular INSERT."""
+        db.upsert_intent_verdict(**_make_verdict_kwargs())
+        v = db.get_intent_verdict("v_001")
+        assert v is not None
+        assert v["tier"] == "heuristic"
+        assert v["user_decision"] == "pending"
+
+    def test_upsert_on_conflict_upgrades_tier_reasoning_judge_model(self, db):
+        """On PK conflict: tier, reasoning, judge_model update — every
+        other field is preserved.  Mirrors what the judge emits when
+        promoting heuristic → llm_fallback."""
+        db.upsert_intent_verdict(
+            **_make_verdict_kwargs(
+                tier="heuristic",
+                reasoning="initial heuristic reasoning",
+                judge_model="",
+            )
+        )
+        db.upsert_intent_verdict(
+            **_make_verdict_kwargs(
+                tier="llm_fallback",
+                reasoning="initial heuristic reasoning (LLM judge did not return a verdict)",
+                judge_model="gpt-5-judge",
+            )
+        )
+        v = db.get_intent_verdict("v_001")
+        assert v is not None
+        # The three fields that should change.
+        assert v["tier"] == "llm_fallback"
+        assert "LLM judge did not return" in v["reasoning"]
+        assert v["judge_model"] == "gpt-5-judge"
+
+    def test_upsert_on_conflict_preserves_user_decision(self, db):
+        """LOAD-BEARING: a manually-resolved approval (user_decision=
+        ``"approved"``) or auto-approve-stamped row (user_decision=
+        ``"policy"``/``"blanket"``/etc.) must NOT be clobbered back to
+        ``"pending"`` when the late LLM-fallback verdict lands.
+        ``IntentVerdict.to_dict()`` doesn't project user_decision, so
+        the upsert's defaulted ``"pending"`` would silently overwrite
+        the real value if user_decision were in the on-conflict
+        SET clause."""
+        db.upsert_intent_verdict(**_make_verdict_kwargs())
+        ok = db.update_intent_verdict("v_001", user_decision="approved")
+        assert ok is True
+        # Simulate the late LLM-fallback delivery — same verdict_id,
+        # default user_decision (the IntentVerdict.to_dict() shape).
+        db.upsert_intent_verdict(
+            **_make_verdict_kwargs(
+                tier="llm_fallback",
+                reasoning="extended (LLM judge did not return a verdict)",
+                judge_model="gpt-5-judge",
+            )
+        )
+        v = db.get_intent_verdict("v_001")
+        assert v is not None
+        assert v["user_decision"] == "approved"  # NOT clobbered to "pending"
+        assert v["tier"] == "llm_fallback"  # but the upgrade did land
+
+    def test_upsert_on_conflict_preserves_identity_and_carried_fields(self, db):
+        """Identity columns (ws_id, call_id, func_name, func_args) and
+        carried-verbatim columns (intent_summary, risk_level,
+        confidence, recommendation, evidence, latency_ms) are
+        excluded from the on-conflict SET — verify they aren't
+        changed even when the second upsert passes different values
+        (defensive against a future judge bug that ships divergent
+        carried fields)."""
+        db.upsert_intent_verdict(**_make_verdict_kwargs())
+        db.upsert_intent_verdict(
+            **_make_verdict_kwargs(
+                # Same verdict_id (conflict trigger), divergent everything else.
+                ws_id="ws-different",
+                call_id="tc_different",
+                func_name="bash_v2",
+                func_args='{"command":"rm -rf /"}',
+                intent_summary="totally different summary",
+                risk_level="critical",
+                confidence=0.0,
+                recommendation="deny",
+                evidence='["dangerous"]',
+                latency_ms=99999,
+                # The three fields that DO update.
+                tier="llm_fallback",
+                reasoning="upgraded reasoning",
+                judge_model="judge-v2",
+            )
+        )
+        v = db.get_intent_verdict("v_001")
+        assert v is not None
+        # All preserved from the first upsert (identity + carried).
+        assert v["ws_id"] == "ws-abc"
+        assert v["call_id"] == "tc_001"
+        assert v["func_name"] == "bash"
+        assert v["func_args"] == '{"command":"echo hello"}'
+        assert v["intent_summary"] == "Echo a greeting to stdout"
+        assert v["risk_level"] == "low"
+        assert v["confidence"] == 0.85
+        assert v["recommendation"] == "approve"
+        assert v["evidence"] == '["The command only prints text."]'
+        assert v["latency_ms"] == 2
+        # Only the three updated.
+        assert v["tier"] == "llm_fallback"
+        assert v["reasoning"] == "upgraded reasoning"
+        assert v["judge_model"] == "judge-v2"
+
+
 # ---------------------------------------------------------------------------
 # Bulk insert
 # ---------------------------------------------------------------------------

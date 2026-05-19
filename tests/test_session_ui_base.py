@@ -167,8 +167,8 @@ def test_on_intent_verdict_persists_verdict_row() -> None:
     }
     with _patch_get_storage(storage):
         ui.on_intent_verdict(verdict)
-    storage.create_intent_verdict.assert_called_once()
-    kwargs = storage.create_intent_verdict.call_args.kwargs
+    storage.upsert_intent_verdict.assert_called_once()
+    kwargs = storage.upsert_intent_verdict.call_args.kwargs
     assert kwargs["verdict_id"] == "v1"
     assert kwargs["ws_id"] == "ws-1"
     assert kwargs["call_id"] == "c1"
@@ -426,8 +426,8 @@ def test_on_intent_verdict_consumes_auto_approve_reason() -> None:
     ui._auto_approve_reasons["c-x"] = ("auto_approve_tools", 0.0)
     with _patch_get_storage(storage):
         ui.on_intent_verdict({"verdict_id": "v-x", "call_id": "c-x"})
-    storage.create_intent_verdict.assert_called_once()
-    kwargs = storage.create_intent_verdict.call_args.kwargs
+    storage.upsert_intent_verdict.assert_called_once()
+    kwargs = storage.upsert_intent_verdict.call_args.kwargs
     assert kwargs["user_decision"] == "auto_approve_tools"
     # Consumed on read so the same call_id can't double-stamp later.
     assert "c-x" not in ui._auto_approve_reasons
@@ -465,7 +465,7 @@ def test_on_intent_verdict_auto_reason_survives_resolve_cycle() -> None:
     # The auto verdict's INSERT carried the policy reason.
     insert_calls = {
         c.kwargs["verdict_id"]: c.kwargs["user_decision"]
-        for c in storage.create_intent_verdict.call_args_list
+        for c in storage.upsert_intent_verdict.call_args_list
     }
     assert insert_calls["v-auto"] == "policy"
     assert insert_calls["v-pending"] == "pending"

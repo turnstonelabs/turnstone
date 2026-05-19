@@ -909,6 +909,25 @@ class SessionUIBase:
                 }
                 for v in verdicts
             ]
+            # Plain INSERT (not UPSERT) at the bulk site.  The race
+            # where a daemon-judge verdict lands BEFORE this bulk
+            # write IS reachable today: ``_evaluate_intent``
+            # (session.py) spawns the daemon thread before
+            # ``approve_tools`` is called, and the daemon's first
+            # emission (heuristic-only short batch, fast LLM response,
+            # or cancel-event ``_deliver_fallbacks`` from judge.py)
+            # can fire ``_persist_intent_verdict`` before this bulk
+            # INSERT runs.  Outcome of that race is unchanged by the
+            # per-row UPSERT switch: the bulk INSERT statement aborts
+            # on PK collision regardless of whether the colliding row
+            # was planted by INSERT or UPSERT, and the wrapping
+            # ``try/except`` swallows it.  Race A (daemon fires AFTER
+            # bulk) IS improved by the fix: heuristic→llm_fallback
+            # upgrade-in-place now lands.  Future bulk-side hardening
+            # (``ON CONFLICT DO NOTHING``) would preserve the OTHER
+            # rows in the batch when one collides, but would keep the
+            # daemon's ``tier`` ("llm"/"llm_fallback") for the
+            # colliding row instead of the bulk's heuristic stamp.
             storage.create_intent_verdicts_bulk(rows)
         except Exception:
             log.debug("Failed to bulk-persist intent verdicts", exc_info=True)
@@ -919,15 +938,21 @@ class SessionUIBase:
         *,
         default_tier: str = "llm",
     ) -> None:
-        """Persist an intent-judge verdict row.
+        """Persist an intent-judge verdict row via UPSERT.
 
-        Used by both the async LLM-tier path (``on_intent_verdict``,
-        default tier ``"llm"``) and the synchronous heuristic-tier
-        path (``approve_tools``, caller passes ``default_tier="heuristic"``).
+        Used by the async LLM-tier path (``on_intent_verdict``,
+        default tier ``"llm"``).  Routes through ``upsert_intent_verdict``
+        because ``tier="llm_fallback"`` verdicts deliberately reuse the
+        heuristic verdict's ``verdict_id`` (see ``judge.py`` —
+        ``_deliver_fallbacks`` and the in-loop fallback path)
+        so the row gets "upgraded in place" from heuristic →
+        llm_fallback.  A plain INSERT would collide on the PK and the
+        upgrade would be lost to a silently-swallowed exception.
         ``default_tier`` only matters when the verdict dict doesn't
-        already carry a ``tier`` key — both real producers always set it,
-        but the fallback is the right call-site label so a malformed
-        verdict still lands on the correct row classification.
+        already carry a ``tier`` key — both real producers always set
+        it, but the fallback is the right call-site label so a
+        malformed verdict still lands on the correct row
+        classification.
         """
         try:
             from turnstone.core.storage._registry import get_storage
@@ -935,7 +960,7 @@ class SessionUIBase:
             storage = get_storage()
             if storage is None:
                 return
-            storage.create_intent_verdict(
+            storage.upsert_intent_verdict(
                 verdict_id=verdict.get("verdict_id", ""),
                 ws_id=self.ws_id,
                 call_id=verdict.get("call_id", ""),

@@ -3551,6 +3551,61 @@ class SQLiteBackend:
             )
             conn.commit()
 
+    def upsert_intent_verdict(
+        self,
+        verdict_id: str,
+        ws_id: str,
+        call_id: str,
+        func_name: str,
+        func_args: str,
+        intent_summary: str,
+        risk_level: str,
+        confidence: float,
+        recommendation: str,
+        reasoning: str,
+        evidence: str,
+        tier: str,
+        judge_model: str,
+        latency_ms: int,
+        user_decision: str = "pending",
+    ) -> None:
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        stmt = sqlite_insert(intent_verdicts).values(
+            verdict_id=verdict_id,
+            ws_id=ws_id,
+            call_id=call_id,
+            func_name=func_name,
+            func_args=func_args,
+            intent_summary=intent_summary,
+            risk_level=risk_level,
+            confidence=confidence,
+            recommendation=recommendation,
+            reasoning=reasoning,
+            evidence=evidence,
+            tier=tier,
+            judge_model=judge_model,
+            latency_ms=latency_ms,
+            user_decision=user_decision,
+            created=now,
+        )
+        # On verdict_id conflict, update only the three fields that
+        # genuinely change between heuristic and llm_fallback.  See the
+        # protocol docstring for the full exclusion rationale —
+        # ``user_decision`` exclusion in particular is load-bearing.
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["verdict_id"],
+            set_={
+                "tier": tier,
+                "reasoning": reasoning,
+                "judge_model": judge_model,
+            },
+        )
+        with self._conn() as conn:
+            conn.execute(stmt)
+            conn.commit()
+
     def create_intent_verdicts_bulk(self, verdicts: list[dict[str, Any]]) -> None:
         if not verdicts:
             return
