@@ -179,6 +179,24 @@ class SessionUIBase:
         # ``/dashboard`` payload.  Capped so a long-running skill
         # workstream can't fill the live block with stale rows.
         self._recent_auto_approvals: list[dict[str, Any]] = []
+        # Maps ``call_id`` → ``(auto_approve_reason, inserted_ts)`` for
+        # verdicts that arrive AFTER ``approve_tools`` already returned.
+        # The LLM judge tier is asynchronous: ``on_intent_verdict`` can
+        # fire seconds later for a tool that ``approve_tools``
+        # short-circuited via one of the auto-approve branches.  Without
+        # this lookup the late-arriving LLM verdict lands with
+        # ``user_decision="pending"`` and stays that way forever (no
+        # ``resolve_approval`` cycle on the auto-approve path).
+        #
+        # Lifetime is bounded by ``_AUTO_APPROVE_REASON_TTL`` rather
+        # than by a count-cap or by session lifetime: a fixed cap
+        # would silently break the fix on the (N+1)th in-flight
+        # auto-approve; "evict on consume" alone would leak entries
+        # whenever the LLM judge is disabled (no ``on_intent_verdict``
+        # ever fires to drain them).  TTL means entries clear lazily
+        # on the next ``_record_auto_approves`` write whether or not
+        # the LLM judge tier is active.  Guarded by ``_ws_lock``.
+        self._auto_approve_reasons: dict[str, tuple[str, float]] = {}
         # Foreground gate — used by the CLI's WorkstreamTerminalUI to
         # block output when the workstream is in the background.
         # Starts set so non-CLI UIs can skip any explicit management.
@@ -367,6 +385,7 @@ class SessionUIBase:
         feedback: str | None = None,
         *,
         always: bool = False,
+        timeout: bool = False,
     ) -> None:
         """Unblock a pending approval with the caller's decision.
 
@@ -383,8 +402,22 @@ class SessionUIBase:
         can label their resolved-status pill correctly).  Keyword-only
         + default ``False`` so the four pre-existing callers (cancel,
         timeout, channel adapters) compile unchanged.
+
+        ``timeout`` flips the persisted ``user_decision`` from
+        ``"denied"`` to ``"timeout"`` so the audit trail can
+        distinguish an active user denial from a passive
+        approval-timeout expiry — the feedback string carries the
+        same information today but operators querying on the
+        ``user_decision`` column alone could not tell them apart.
+        Mutually exclusive with ``approved=True`` (a timeout is a
+        passive denial); the combination raises ``ValueError`` so a
+        future caller can't accidentally ship a row whose audit
+        column says ``"timeout"`` while the SSE event reports
+        ``approved=True``.
         """
-        decision_str = "approved" if approved else "denied"
+        if timeout and approved:
+            raise ValueError("resolve_approval: timeout=True is incompatible with approved=True")
+        decision_str = "timeout" if timeout else ("approved" if approved else "denied")
         # Swap-and-clear + set decision under lock to avoid racing
         # with the daemon judge thread's ``on_intent_verdict`` appends.
         with self._ws_lock:
@@ -544,8 +577,15 @@ class SessionUIBase:
                                 # the early return — the fall-through
                                 # branch never runs on this path, so without
                                 # this the policy bypass is invisible to
-                                # /dashboard + audit.
+                                # /dashboard + audit.  ``_record_auto_approves``
+                                # MUST run before ``_persist_auto_approved_*``
+                                # so the call_id → reason lookup map is
+                                # populated before the heuristic INSERTs go
+                                # in: otherwise an LLM judge verdict firing
+                                # in the gap lands with ``user_decision=
+                                # "pending"`` and stays that way.
                                 self._record_auto_approves(items)
+                                self._persist_auto_approved_heuristic_verdicts(items)
                                 self._enqueue(
                                     {
                                         "type": "tool_info",
@@ -608,7 +648,12 @@ class SessionUIBase:
                 self._ws_current_activity = f"⚙ {label}: {preview}" if label else ""
                 self._ws_activity_state = "tool" if label else ""
             self._broadcast_activity()
+            # ``_record_auto_approves`` runs FIRST so the call_id → reason
+            # lookup is populated before the heuristic INSERT can race
+            # against a concurrent LLM judge verdict — see the matching
+            # comment on the policy-deny branch above.
             self._record_auto_approves(items)
+            self._persist_auto_approved_heuristic_verdicts(items)
             self._enqueue({"type": "tool_info", "items": self._serialize_approval_items(items)})
             return True, None
 
@@ -628,19 +673,34 @@ class SessionUIBase:
         # commit instead of N (was visible as time-to-render-prompt
         # latency for fan-out turns); the per-item Prometheus call stays
         # in the loop because it's a lock+increment, not a DB round-trip.
+        #
+        # ``user_decision`` is stamped per-verdict here so the row lands
+        # with a meaningful value at insert: auto-approved items
+        # (mixed-path case: policy allowed some, others still prompt)
+        # carry their auto_approve_reason directly; items still pending
+        # operator decision carry ``"pending"`` and get updated by
+        # ``resolve_approval`` on close.  ``_pending_verdicts`` only
+        # tracks the latter — auto-approved verdicts are already final.
         heuristic_verdicts: list[dict[str, Any]] = []
+        pending_verdicts: list[dict[str, Any]] = []
         for item in items:
             hv = item.get("_heuristic_verdict")
-            if hv:
-                heuristic_verdicts.append(hv)
-                # Subclass-overridden Prometheus surface: WebUI feeds
-                # the per-node /metrics endpoint, ConsoleCoordinatorUI
-                # feeds the console's /metrics endpoint via ConsoleMetrics.
-                self._record_judge_metric(hv)
+            if not hv:
+                continue
+            if item.get("auto_approved"):
+                hv["user_decision"] = item.get("auto_approve_reason", "") or "pending"
+            else:
+                hv["user_decision"] = "pending"
+                pending_verdicts.append(hv)
+            heuristic_verdicts.append(hv)
+            # Subclass-overridden Prometheus surface: WebUI feeds
+            # the per-node /metrics endpoint, ConsoleCoordinatorUI
+            # feeds the console's /metrics endpoint via ConsoleMetrics.
+            self._record_judge_metric(hv)
         self._persist_intent_verdicts_bulk(heuristic_verdicts, default_tier="heuristic")
 
         with self._ws_lock:
-            self._pending_verdicts = heuristic_verdicts
+            self._pending_verdicts = pending_verdicts
 
         # Record any items the policy block already auto-approved
         # before falling through to the prompt — without this the
@@ -676,8 +736,14 @@ class SessionUIBase:
         if not self._approval_event.wait(timeout=self._APPROVAL_WAIT_TIMEOUT):
             # Approval timed out (e.g., user disconnected). Deny via
             # resolve_approval so verdicts and state are updated consistently.
+            # Feedback string derives from ``_APPROVAL_WAIT_TIMEOUT`` so the
+            # text follows the constant if the timeout knob moves.
             log.warning("Approval timed out for ws_id=%s", self.ws_id)
-            self.resolve_approval(False, "Approval timed out after 1 hour")
+            self.resolve_approval(
+                False,
+                f"Approval timed out after {self._APPROVAL_WAIT_TIMEOUT}s",
+                timeout=True,
+            )
         self._pending_approval = None
         approved, feedback = self._approval_result
 
@@ -714,8 +780,17 @@ class SessionUIBase:
         ``user_decision`` immediately (if the approval already
         resolved) or parks the verdict in ``_pending_verdicts`` for
         ``resolve_approval`` to stamp on close.
+
+        When the verdict arrives for a call_id that ``approve_tools``
+        already auto-approved (the LLM judge is async and can fire
+        seconds after the auto-approve path returned), stamp the
+        ``auto_approve_reason`` onto the verdict before persist so
+        the row lands with a meaningful ``user_decision`` instead of
+        the default ``"pending"`` (which would never be updated for
+        this code path).
         """
         call_id = verdict.get("call_id", "")
+        auto_reason = ""
         if call_id:
             with self._ws_lock:
                 if (
@@ -725,6 +800,14 @@ class SessionUIBase:
                     oldest_key = next(iter(self._llm_verdicts))
                     del self._llm_verdicts[oldest_key]
                 self._llm_verdicts[call_id] = verdict
+                # Pop (not get) — once consumed the entry isn't useful
+                # again; TTL pruning at the writer side keeps the
+                # never-consumed case bounded too.
+                entry = self._auto_approve_reasons.pop(call_id, None)
+                if entry is not None:
+                    auto_reason = entry[0]
+            if auto_reason:
+                verdict["user_decision"] = auto_reason
         self._enqueue({"type": "intent_verdict", **verdict})
         # Kind-specific cross-stream broadcast — ConsoleCoordinatorUI
         # overrides to push onto the cluster bus so a coord parent's
@@ -743,6 +826,17 @@ class SessionUIBase:
         # WRONG decision.  Storage UPDATE happens outside the lock
         # on the already-resolved path — no contention with other
         # ws-scoped work.
+        # If ``auto_reason`` was stamped above, the verdict already
+        # carries the final ``user_decision`` for this row.  Neither
+        # path below applies: appending to ``_pending_verdicts`` would
+        # cause ``resolve_approval`` (on the manual-approval sibling
+        # in a mixed batch) to overwrite the auto-reason with
+        # ``"approved"``/``"denied"``/``"timeout"``; the
+        # ``_persist_verdict_decisions`` immediate-stamp path would
+        # overwrite it the same way from a prior cycle's decision.
+        # Skip both so the audit trail keeps the auto-approve reason.
+        if auto_reason:
+            return
         with self._ws_lock:
             decision = self._last_verdict_decision
             if not decision:
@@ -811,6 +905,7 @@ class SessionUIBase:
                     "tier": v.get("tier", default_tier),
                     "judge_model": v.get("judge_model", ""),
                     "latency_ms": v.get("latency_ms", 0),
+                    "user_decision": v.get("user_decision", "pending"),
                 }
                 for v in verdicts
             ]
@@ -855,6 +950,7 @@ class SessionUIBase:
                 tier=verdict.get("tier", default_tier),
                 judge_model=verdict.get("judge_model", ""),
                 latency_ms=verdict.get("latency_ms", 0),
+                user_decision=verdict.get("user_decision", "pending"),
             )
         except Exception:
             log.debug("Failed to persist intent verdict", exc_info=True)
@@ -955,6 +1051,14 @@ class SessionUIBase:
     # workstreams that auto-approve dozens of tool calls per turn.
     _RECENT_AUTO_APPROVALS_MAX = 10
 
+    # TTL on the call_id → auto_approve_reason map.  Sized to comfortably
+    # cover the LLM judge's worst-case latency (cold start + a slow model
+    # + queue depth).  Pruning happens lazily at write time so the cost
+    # is paid only on the next auto-approve event; a session that goes
+    # quiet after auto-approving never pays the prune cost at all but
+    # the resident-set is also tiny.
+    _AUTO_APPROVE_REASON_TTL = 60.0
+
     @staticmethod
     def _serialize_approval_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Project each item to the wire shape the SSE event payload uses.
@@ -1026,6 +1130,38 @@ class SessionUIBase:
             else:
                 it["auto_approve_reason"] = reason
 
+    def _persist_auto_approved_heuristic_verdicts(self, items: list[dict[str, Any]]) -> None:
+        """Persist heuristic verdicts for items the auto-approve path resolved.
+
+        The manual-approval block at the bottom of ``approve_tools``
+        handles its own verdict persistence (and stamps
+        ``user_decision`` per item — auto-approved items in a
+        mixed-path batch carry their reason, pending items carry
+        ``"pending"``).  The auto-approve early-return branches
+        (policy-allow-with-deny, blanket flag, auto_approve_tools
+        match) used to drop heuristic verdicts on the floor — an
+        operator querying ``user_decision`` for the auto-approve
+        reason would find no row at all, conflating "we auto-approved
+        silently" with "the judge didn't run".  This helper closes
+        that gap: walk ``items``, persist each auto-approved verdict
+        with its reason stamped, and fan a metric row per verdict.
+        Safe to call with empty items.
+        """
+        if not items:
+            return
+        verdicts: list[dict[str, Any]] = []
+        for it in items:
+            if not it.get("auto_approved"):
+                continue
+            hv = it.get("_heuristic_verdict")
+            if not hv:
+                continue
+            hv["user_decision"] = it.get("auto_approve_reason", "") or "pending"
+            verdicts.append(hv)
+            self._record_judge_metric(hv)
+        if verdicts:
+            self._persist_intent_verdicts_bulk(verdicts, default_tier="heuristic")
+
     def _record_auto_approves(self, items: list[dict[str, Any]]) -> None:
         """Append auto-approved items to the per-ws ring buffer + audit log.
 
@@ -1062,6 +1198,32 @@ class SessionUIBase:
             overflow = len(self._recent_auto_approvals) - self._RECENT_AUTO_APPROVALS_MAX
             if overflow > 0:
                 self._recent_auto_approvals = self._recent_auto_approvals[overflow:]
+            # Mirror call_id → reason into the lookup map so a late
+            # ``on_intent_verdict`` (LLM judge tier) can stamp the
+            # right ``user_decision`` instead of leaving the verdict
+            # stuck as ``"pending"`` forever.  Prune expired entries
+            # first (lazy TTL eviction) so a session with the LLM
+            # judge disabled doesn't accumulate entries that will
+            # never be consumed.  Skip the rebuild when the map is
+            # empty or all entries are still fresh — the common case
+            # on a healthy LLM-judge-enabled session where entries
+            # drain via ``on_intent_verdict.pop`` within the TTL.
+            cutoff = ts - self._AUTO_APPROVE_REASON_TTL
+            if self._auto_approve_reasons and any(
+                ins_ts < cutoff for _, ins_ts in self._auto_approve_reasons.values()
+            ):
+                self._auto_approve_reasons = {
+                    cid: (reason, ins_ts)
+                    for cid, (reason, ins_ts) in self._auto_approve_reasons.items()
+                    if ins_ts >= cutoff
+                }
+            for entry in appended:
+                cid = entry["call_id"]
+                if cid:
+                    self._auto_approve_reasons[cid] = (
+                        entry["auto_approve_reason"],
+                        ts,
+                    )
         # Audit emission — one row per ``approve_tools`` call (not one
         # per item) keeps the audit table from blowing up on
         # tool-heavy turns while still capturing every tool name +

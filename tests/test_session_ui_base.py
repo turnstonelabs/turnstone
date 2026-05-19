@@ -353,6 +353,192 @@ def test_resolve_approval_stamps_all_pending_verdicts() -> None:
 
 
 # ---------------------------------------------------------------------------
+# user_decision value space — pending / approved / denied / timeout
+# / auto-approve reasons (policy / blanket / skill / always / auto_approve_tools).
+# Guards the "user_decision is never empty for new rows" invariant.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_approval_timeout_kwarg_writes_timeout_value() -> None:
+    """``resolve_approval(False, ..., timeout=True)`` writes
+    ``user_decision="timeout"`` so the audit trail can distinguish a
+    passive timeout expiry from an active user denial — the feedback
+    string used to carry this distinction but the column alone could not."""
+    storage = MagicMock()
+    ui = _make_ui()
+    with _patch_get_storage(storage):
+        ui.on_intent_verdict({"verdict_id": "v1", "call_id": "c1"})
+    with _patch_get_storage(storage):
+        ui.resolve_approval(False, "expired", timeout=True)
+    storage.update_intent_verdict.assert_any_call("v1", user_decision="timeout")
+    assert ui._last_verdict_decision == "timeout"
+
+
+def test_resolve_approval_timeout_with_approved_raises() -> None:
+    """``timeout=True`` is mutually exclusive with ``approved=True`` —
+    the combination would land a row whose audit column says
+    ``"timeout"`` while the SSE event reports ``approved=True``. Fail
+    loud so the inconsistency can't ship silently."""
+    import pytest
+
+    ui = _make_ui()
+    with pytest.raises(ValueError, match="timeout"):
+        ui.resolve_approval(True, timeout=True)
+
+
+def test_record_auto_approves_populates_reason_lookup() -> None:
+    """``_record_auto_approves`` must seed
+    ``_auto_approve_reasons[call_id]`` with the per-item reason so a
+    late-arriving LLM judge verdict can recover the auto-approve
+    reason via ``on_intent_verdict``."""
+    storage = MagicMock()
+    ui = _make_ui()
+    items = [
+        {
+            "call_id": "c-policy",
+            "func_name": "bash",
+            "auto_approved": True,
+            "auto_approve_reason": "policy",
+        },
+        {
+            "call_id": "c-blanket",
+            "func_name": "list_workstreams",
+            "auto_approved": True,
+            "auto_approve_reason": "blanket",
+        },
+    ]
+    with _patch_get_storage(storage):
+        ui._record_auto_approves(items)
+    assert "c-policy" in ui._auto_approve_reasons
+    assert "c-blanket" in ui._auto_approve_reasons
+    assert ui._auto_approve_reasons["c-policy"][0] == "policy"
+    assert ui._auto_approve_reasons["c-blanket"][0] == "blanket"
+
+
+def test_on_intent_verdict_consumes_auto_approve_reason() -> None:
+    """A late LLM verdict for a previously auto-approved call_id picks
+    up the reason from ``_auto_approve_reasons``, stamps it on the
+    verdict before persist, and pops the entry so re-use isn't
+    possible. Closes the misdiagnosis bug where auto-approved tools
+    landed verdict rows with ``user_decision=""``."""
+    storage = MagicMock()
+    ui = _make_ui()
+    ui._auto_approve_reasons["c-x"] = ("auto_approve_tools", 0.0)
+    with _patch_get_storage(storage):
+        ui.on_intent_verdict({"verdict_id": "v-x", "call_id": "c-x"})
+    storage.create_intent_verdict.assert_called_once()
+    kwargs = storage.create_intent_verdict.call_args.kwargs
+    assert kwargs["user_decision"] == "auto_approve_tools"
+    # Consumed on read so the same call_id can't double-stamp later.
+    assert "c-x" not in ui._auto_approve_reasons
+    # Auto-stamped verdicts must NOT join _pending_verdicts — the
+    # row's final decision is already set; appending would let a
+    # later resolve_approval overwrite the auto-reason with the
+    # manual decision (real audit-trail clobber bug).
+    assert ui._pending_verdicts == []
+
+
+def test_on_intent_verdict_auto_reason_survives_resolve_cycle() -> None:
+    """Mixed-batch case: one tool was auto-approved (policy), another
+    needs manual approval. The LLM judge fires for the auto-approved
+    sibling DURING the manual-approval wait. The verdict must land
+    with ``user_decision="policy"`` and stay that way even after
+    ``resolve_approval`` fires for the pending sibling — the prior
+    bug was that the auto-stamped row got overwritten with
+    ``"approved"``/``"denied"`` by the resolve path."""
+    storage = MagicMock()
+    ui = _make_ui()
+    ui._auto_approve_reasons["c-auto"] = ("policy", 0.0)
+    with _patch_get_storage(storage):
+        # LLM verdict fires for the auto-approved sibling.
+        ui.on_intent_verdict({"verdict_id": "v-auto", "call_id": "c-auto"})
+        # Now the pending sibling gets a verdict + manual resolve.
+        ui.on_intent_verdict({"verdict_id": "v-pending", "call_id": "c-pending"})
+        ui.resolve_approval(True, "looks good")
+    # Only the pending verdict should be UPDATEd to "approved" — the
+    # auto-stamped one stays "policy" via its INSERT.
+    update_calls = {
+        c.args[0]: c.kwargs.get("user_decision")
+        for c in storage.update_intent_verdict.call_args_list
+    }
+    assert update_calls == {"v-pending": "approved"}
+    # The auto verdict's INSERT carried the policy reason.
+    insert_calls = {
+        c.kwargs["verdict_id"]: c.kwargs["user_decision"]
+        for c in storage.create_intent_verdict.call_args_list
+    }
+    assert insert_calls["v-auto"] == "policy"
+    assert insert_calls["v-pending"] == "pending"
+
+
+def test_persist_auto_approved_heuristic_verdicts_stamps_reason() -> None:
+    """The auto-approve early-return branches in ``approve_tools`` used
+    to drop heuristic verdicts on the floor — auditors couldn't tell
+    whether the judge ran or the call was simply silently auto-approved.
+    ``_persist_auto_approved_heuristic_verdicts`` closes that gap and
+    stamps each verdict with the item's reason."""
+    storage = MagicMock()
+    ui = _make_ui()
+    items = [
+        {
+            "call_id": "c-1",
+            "auto_approved": True,
+            "auto_approve_reason": "blanket",
+            "_heuristic_verdict": {
+                "verdict_id": "v-1",
+                "call_id": "c-1",
+                "risk_level": "low",
+                "recommendation": "review",
+            },
+        },
+        # No _heuristic_verdict — skipped (judge didn't run for this item).
+        {"call_id": "c-2", "auto_approved": True, "auto_approve_reason": "blanket"},
+        # Not auto_approved — skipped (this helper only handles auto-approved).
+        {
+            "call_id": "c-3",
+            "_heuristic_verdict": {"verdict_id": "v-3", "call_id": "c-3"},
+        },
+    ]
+    with _patch_get_storage(storage):
+        ui._persist_auto_approved_heuristic_verdicts(items)
+    storage.create_intent_verdicts_bulk.assert_called_once()
+    rows = storage.create_intent_verdicts_bulk.call_args.args[0]
+    assert len(rows) == 1
+    assert rows[0]["verdict_id"] == "v-1"
+    assert rows[0]["user_decision"] == "blanket"
+
+
+def test_auto_approve_reasons_ttl_prune_drops_stale_entries() -> None:
+    """Lazy TTL eviction at write time: entries older than
+    ``_AUTO_APPROVE_REASON_TTL`` are pruned on the next
+    ``_record_auto_approves`` call. Without this, a session with the
+    LLM judge disabled would accumulate entries that never get
+    consumed."""
+    import time as time_module
+
+    storage = MagicMock()
+    ui = _make_ui()
+    # Seed two stale entries (well past the TTL).
+    stale_ts = time_module.time() - ui._AUTO_APPROVE_REASON_TTL - 30.0
+    ui._auto_approve_reasons["c-stale-1"] = ("policy", stale_ts)
+    ui._auto_approve_reasons["c-stale-2"] = ("blanket", stale_ts)
+    items = [
+        {
+            "call_id": "c-fresh",
+            "auto_approved": True,
+            "auto_approve_reason": "skill",
+            "func_name": "bash",
+        }
+    ]
+    with _patch_get_storage(storage):
+        ui._record_auto_approves(items)
+    # Stale entries pruned; only the fresh one remains.
+    assert "c-stale-1" not in ui._auto_approve_reasons
+    assert "c-stale-2" not in ui._auto_approve_reasons
+    assert "c-fresh" in ui._auto_approve_reasons
+
+
+# ---------------------------------------------------------------------------
 # Output guard persistence
 # ---------------------------------------------------------------------------
 

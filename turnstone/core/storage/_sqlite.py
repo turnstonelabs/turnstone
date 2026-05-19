@@ -3524,6 +3524,7 @@ class SQLiteBackend:
         tier: str,
         judge_model: str,
         latency_ms: int,
+        user_decision: str = "pending",
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
@@ -3544,6 +3545,7 @@ class SQLiteBackend:
                     "tier": tier,
                     "judge_model": judge_model,
                     "latency_ms": latency_ms,
+                    "user_decision": user_decision,
                     "created": now,
                 },
             )
@@ -3569,6 +3571,7 @@ class SQLiteBackend:
                 "tier": v.get("tier", "heuristic"),
                 "judge_model": v.get("judge_model", ""),
                 "latency_ms": v.get("latency_ms", 0),
+                "user_decision": v.get("user_decision", "pending"),
                 "created": now,
             }
             for v in verdicts
