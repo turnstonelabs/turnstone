@@ -14,6 +14,25 @@ Three release tracks are maintained:
 
 ## [Unreleased]
 
+### Added
+
+- **`turnstone-admin` reads `config.toml`** — the admin CLI now honors
+  the same `[database]` section that `turnstone-server` does, with the
+  same precedence (`CLI / config.toml > TURNSTONE_DB_* env > defaults`).
+  Operators with DB credentials in `config.toml` no longer need to
+  re-export `TURNSTONE_DB_URL` before every admin invocation.  Newly
+  plumbed through to `init_storage`: `pool_size`, `sslmode`,
+  `sslrootcert`, `sslcert`, `sslkey` — previously the admin CLI
+  silently dropped these.  A new `--config PATH` flag mirrors the
+  one already on `turnstone-server`.
+
+### Security
+
+- **Permissive `config.toml` now warns** — `turnstone.core.config.load_config`
+  logs a single warning when the resolved config file is group- or
+  world-readable (any bit in `0o077`).  DB password and TLS key paths
+  live in `[database]`; operators usually want the file at `0600`.
+
 ## [1.5.17]
 
 Backports a clutch of coordinator-tool clarity fixes plus a watch-delivery
