@@ -1607,8 +1607,20 @@ class StorageBackend(Protocol):
         tier: str,
         judge_model: str,
         latency_ms: int,
+        user_decision: str = "pending",
     ) -> None:
-        """Record an intent validation verdict."""
+        """Record an intent validation verdict.
+
+        ``user_decision`` defaults to ``"pending"`` rather than ``""``
+        so an audit reader can distinguish "in-flight" rows from
+        legacy pre-fix rows (which carry ``""`` from the column's
+        server_default and indicate "convention not yet established
+        when this row was written"). Resolution writers
+        (:meth:`update_intent_verdict`) later overwrite the field with
+        ``"approved"`` / ``"denied"`` / ``"timeout"`` (user-driven) or
+        ``"policy"`` / ``"blanket"`` / ``"auto_approve_tools"``
+        (auto-approve reason, mirroring :class:`AutoApproveReason`).
+        """
         ...
 
     def create_intent_verdicts_bulk(self, verdicts: list[dict[str, Any]]) -> None:
@@ -1618,10 +1630,12 @@ class StorageBackend(Protocol):
         (``verdict_id`` / ``ws_id`` / ``call_id`` / ``func_name`` /
         ``func_args`` / ``intent_summary`` / ``risk_level`` /
         ``confidence`` / ``recommendation`` / ``reasoning`` / ``evidence`` /
-        ``tier`` / ``judge_model`` / ``latency_ms``). Used by the
-        synchronous heuristic-verdict persistence loop in
-        ``approve_tools`` so a tool-heavy turn doesn't pay N×commit
-        latency before the approval prompt renders.
+        ``tier`` / ``judge_model`` / ``latency_ms`` /
+        ``user_decision``). ``user_decision`` defaults to ``"pending"``
+        when absent — see :meth:`create_intent_verdict` for the
+        vocabulary. Used by the synchronous heuristic-verdict
+        persistence loop in ``approve_tools`` so a tool-heavy turn
+        doesn't pay N×commit latency before the approval prompt renders.
         """
         ...
 

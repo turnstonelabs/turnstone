@@ -51,7 +51,11 @@ class TestIntentVerdictCRUD:
         assert v["tier"] == "heuristic"
         assert v["judge_model"] == ""
         assert v["latency_ms"] == 2
-        assert v["user_decision"] == ""
+        # ``user_decision`` defaults to ``"pending"`` (not the empty
+        # string) so an audit reader can distinguish in-flight rows
+        # from pre-convention legacy rows that carry the column's
+        # server_default of ``""``.
+        assert v["user_decision"] == "pending"
         assert "created" in v
 
     def test_get_nonexistent(self, db):
