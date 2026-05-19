@@ -54,6 +54,27 @@ def set_config_path(path: str) -> None:
     _cache = None  # invalidate cache so next load_config() re-reads
 
 
+def _warn_if_world_readable(cfg_path: Path) -> None:
+    """Warn once if config.toml is group- or world-readable.
+
+    DB passwords, OIDC client secrets, and TLS key paths live in this
+    file — operators usually want it at 0600.  POSIX-only; no-ops where
+    ``stat()`` modes are meaningless (Windows).
+    """
+    try:
+        mode = cfg_path.stat().st_mode & 0o777
+    except OSError:
+        return
+    if mode & 0o077:
+        log.warning(
+            "%s is mode %04o (group/world-readable); secrets live here — "
+            "run `chmod 0600 %s` to restrict access",
+            cfg_path,
+            mode,
+            cfg_path,
+        )
+
+
 def load_config(section: str | None = None) -> dict[str, Any]:
     """Load config.toml and return the full dict or a specific section.
 
@@ -66,6 +87,7 @@ def load_config(section: str | None = None) -> dict[str, Any]:
         cfg_path = _resolve_config_path()
         if cfg_path.is_file():
             try:
+                _warn_if_world_readable(cfg_path)
                 _cache = tomllib.loads(cfg_path.read_text(encoding="utf-8"))
             except Exception as exc:
                 log.warning("Failed to parse %s: %s", cfg_path, exc)
