@@ -7252,6 +7252,8 @@ class ChatSession:
         }
 
     def _exec_inspect_workstream(self, item: dict[str, Any]) -> tuple[str, str]:
+        from turnstone.console.coordinator_client import _format_inspect_tiered
+
         call_id = item["call_id"]
         ws_id = item["ws_id"]
         try:
@@ -7264,8 +7266,13 @@ class ChatSession:
             msg = f"Error: inspect_workstream failed: {e}"
             self._report_tool_result(call_id, "inspect_workstream", msg, is_error=True)
             return call_id, msg
-        output = json.dumps(result, default=str, separators=(",", ":"))
-        # Summary for UI: state + message count
+        # Tiered output: full → compact (head/tail-snipped messages) →
+        # skeleton (counts + last-assistant preview).  First tier that
+        # fits the budget wins; the LLM sees a ``_tier`` field on every
+        # non-error response.  ``_truncate_output`` remains the safety
+        # net for the (rare) skeleton-exceeds-budget case — guarding
+        # against a single-field blowup we didn't anticipate.
+        output = _format_inspect_tiered(result)
         desc = f"{result.get('state', '?')} ({len(result.get('messages', []))} msgs)"
         self._report_tool_result(call_id, "inspect_workstream", desc)
         return call_id, self._truncate_output(output)
