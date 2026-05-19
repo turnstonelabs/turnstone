@@ -1824,10 +1824,6 @@ _INSPECT_OUTPUT_BUDGET: int = 32_768
 # state / error suffix.
 _INSPECT_MSG_CONTENT_HEAD: int = 600
 _INSPECT_MSG_CONTENT_TAIL: int = 300
-# Threshold below which a message's content passes through unsnipped
-# even in Tier 2.  Snipping a sub-1KB message costs more bytes (the
-# elision marker) than it saves.
-_INSPECT_MSG_SNIP_THRESHOLD: int = _INSPECT_MSG_CONTENT_HEAD + _INSPECT_MSG_CONTENT_TAIL + 64
 # Skeleton-tier preview length on the last assistant message.  Single
 # value because the skeleton wants ONE meaningful signal ("what did
 # the child last say"), not a head/tail snip.
@@ -1840,7 +1836,12 @@ _INSPECT_SKELETON_LAST_PREVIEW: int = 400
 # and the head of the args structure.
 _INSPECT_TOOL_ARG_HEAD: int = 300
 _INSPECT_TOOL_ARG_TAIL: int = 100
-_INSPECT_TOOL_ARG_SNIP_THRESHOLD: int = _INSPECT_TOOL_ARG_HEAD + _INSPECT_TOOL_ARG_TAIL + 64
+
+# Bytes ``_snip_head_tail`` reserves for the elision marker itself
+# (``\n...[N chars elided]...\n``).  A text shorter than
+# ``head + tail + this margin`` passes through unsnipped — snipping
+# would cost more bytes (the marker) than it saves.
+_INSPECT_ELISION_MARGIN: int = 64
 
 # Message-list trim ladder for the compact tier when per-message
 # content snipping alone doesn't free enough budget.  Each rung is
@@ -1856,7 +1857,7 @@ _INSPECT_LIST_TRIM_LADDER: tuple[tuple[int, int], ...] = ((20, 30), (10, 20), (5
 
 def _snip_head_tail(text: str, head: int, tail: int) -> str:
     """Head/tail snip with elision marker; passthrough when shorter than threshold."""
-    if not isinstance(text, str) or len(text) <= head + tail + 64:
+    if not isinstance(text, str) or len(text) <= head + tail + _INSPECT_ELISION_MARGIN:
         return text
     elided = len(text) - head - tail
     return text[:head] + f"\n...[{elided} chars elided]...\n" + text[-tail:]
