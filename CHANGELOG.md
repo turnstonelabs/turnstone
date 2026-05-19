@@ -14,6 +14,12 @@ Three release tracks are maintained:
 
 ## [Unreleased]
 
+## [1.5.18]
+
+Backports the `turnstone-admin` config-loading alignment from `main`
+plus the accompanying `load_config` permission-warning hardening.  No
+schema changes.
+
 ### Added
 
 - **`turnstone-admin` reads `config.toml`** — the admin CLI now honors
