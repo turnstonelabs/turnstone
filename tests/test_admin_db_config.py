@@ -22,7 +22,6 @@ if TYPE_CHECKING:
 
 import turnstone.core.config as config_mod
 from turnstone.admin import _get_storage
-from turnstone.core.config import apply_config
 
 
 def _reset_cache() -> None:
@@ -38,7 +37,7 @@ def _build_args(config_path: str | None) -> argparse.Namespace:
     """
     config_mod.set_config_path(config_path or "/nonexistent/turnstone-admin-test.toml")
     parser = argparse.ArgumentParser()
-    apply_config(parser, ["database"])
+    config_mod.apply_config(parser, ["database"])
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("list-users")
     return parser.parse_args(["list-users"])
