@@ -7005,6 +7005,17 @@ class ChatSession:
             msg = f"Error: {result['error']}"
             self._report_tool_result(call_id, "spawn_workstream", msg, is_error=True)
             return call_id, msg
+        # Defensive: absence of ``error`` is the success signal, but
+        # a malformed upstream response could land here with no
+        # ``ws_id``.  Without this check the LLM gets
+        # ``{"child_ws_id": null}`` and chases a null id through
+        # follow-up tools.  Mirrors the matching guard in
+        # ``_exec_spawn_batch`` (denied row on empty ws_id).
+        child_ws_id = str(result.get("ws_id") or "")
+        if not child_ws_id:
+            msg = "Error: spawn returned no ws_id"
+            self._report_tool_result(call_id, "spawn_workstream", msg, is_error=True)
+            return call_id, msg
         # Successful spawn — surface child_ws_id + node_id + name +
         # routing strategy so the coordinator can follow up with inspect
         # / send and explain why a given node was chosen.  ``status`` was
@@ -7023,14 +7034,14 @@ class ChatSession:
                 # straight back into another ``spawn_workstream(ws_id=...)``
                 # call.  On large fan-outs this cascaded into self-inflicted
                 # re-spawn loops instead of progressing to ``wait_for_workstream``.
-                "child_ws_id": result.get("ws_id"),
+                "child_ws_id": child_ws_id,
                 "name": result.get("name"),
                 "node_id": result.get("node_id"),
                 "routing_strategy": result.get("routing_strategy"),
             },
             separators=(",", ":"),
         )
-        self._report_tool_result(call_id, "spawn_workstream", f"spawned {result.get('ws_id', '?')}")
+        self._report_tool_result(call_id, "spawn_workstream", f"spawned {child_ws_id}")
         return call_id, summary
 
     # Cap per batch call.  Matches the ``wait_for_workstream`` ws_ids
