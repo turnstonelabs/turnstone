@@ -215,7 +215,12 @@ def test_spawn_exec_does_not_surface_misleading_status_field(coord_session):
     summary tempted callers to write ``if result["status"] == "idle"``
     which silently never matched.  The summary now omits the field
     entirely; lifecycle state lives on the workstream row and is read
-    via inspect_workstream."""
+    via inspect_workstream.
+
+    Also asserts the return key is ``child_ws_id`` (not ``ws_id``) so
+    the coordinator LLM doesn't recency-bias toward feeding the spawn
+    output back into another ``spawn_workstream(ws_id=...)`` call.
+    """
     sess, coord, _ui = coord_session
     coord.spawn.return_value = {
         "ws_id": "child-7",
@@ -227,8 +232,9 @@ def test_spawn_exec_does_not_surface_misleading_status_field(coord_session):
     _call_id, output = sess._exec_spawn_workstream(item)
     body = json.loads(output)
     assert "status" not in body
+    assert "ws_id" not in body
     # The substantive fields are still here.
-    assert body["ws_id"] == "child-7"
+    assert body["child_ws_id"] == "child-7"
     assert body["node_id"] == "node-1"
 
 
@@ -248,6 +254,10 @@ def test_spawn_batch_exec_does_not_surface_misleading_status_field(coord_session
     body = json.loads(output)
     assert "0" in body["results"]
     assert "status" not in body["results"]["0"]
+    # Per-result entries surface ``child_ws_id``, not ``ws_id`` — same
+    # recency-bias rationale as the spawn_workstream test above.
+    assert body["results"]["0"]["child_ws_id"] == "c-x"
+    assert "ws_id" not in body["results"]["0"]
 
 
 def test_spawn_exec_surfaces_client_error(coord_session):
@@ -1410,9 +1420,13 @@ def test_spawn_batch_exec_serialises_spawns_and_returns_results(coord_session):
     assert body["denied"] == []
     # Keyed by input index (stringified).
     assert set(body["results"].keys()) == {"0", "1", "2"}
-    assert body["results"]["0"]["ws_id"] == "child-0"
+    assert body["results"]["0"]["child_ws_id"] == "child-0"
     assert body["results"]["1"]["node_id"] == "n-1"
-    assert body["results"]["2"]["ws_id"] == "child-2"
+    assert body["results"]["2"]["child_ws_id"] == "child-2"
+    # Confirm we don't leak the old ``ws_id`` key alongside the new
+    # ``child_ws_id`` — see test_spawn_exec_does_not_surface_misleading_status_field
+    # for the rationale on the rename.
+    assert "ws_id" not in body["results"]["0"]
 
 
 def test_spawn_batch_exec_surfaces_per_item_errors_in_denied(coord_session):

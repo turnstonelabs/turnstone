@@ -169,11 +169,15 @@ validates ws_id against `parent_ws_id=coord_ws_id` AND
   the wait into reporting "complete".
 
 Pattern: capture each spawn result in the next tool call's input.
-The JSON tool-result carries `{"ws_id": "...", "name": "...",
+The JSON tool-result carries `{"child_ws_id": "...", "name": "...",
 "node_id": "...", "routing_strategy": "..."}`; the model should
-extract the ws_id and pass it to `inspect_workstream` /
-`wait_for_workstream` / `send_to_workstream` / `close_workstream`
-verbatim.
+extract the `child_ws_id` and pass it as `ws_id` (or in the `ws_ids`
+list) to `inspect_workstream` / `wait_for_workstream` /
+`send_to_workstream` / `close_workstream` verbatim.  The asymmetry
+— spawn returns `child_ws_id` but the other tools accept `ws_id` /
+`ws_ids` — is intentional: it defuses a coordinator-LLM recency
+bias where seeing `ws_id` in a spawn return primed re-spawn loops
+instead of progression to the wait phase.
 
 A UI that wants human-readable identifiers should render the `name`
 field and keep the ws_id as the click-through key.

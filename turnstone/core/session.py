@@ -7005,9 +7005,9 @@ class ChatSession:
             msg = f"Error: {result['error']}"
             self._report_tool_result(call_id, "spawn_workstream", msg, is_error=True)
             return call_id, msg
-        # Successful spawn — surface ws_id + node_id + name + routing
-        # strategy so the coordinator can follow up with inspect / send
-        # and explain why a given node was chosen.  ``status`` was
+        # Successful spawn — surface child_ws_id + node_id + name +
+        # routing strategy so the coordinator can follow up with inspect
+        # / send and explain why a given node was chosen.  ``status`` was
         # historically included but it was the routing-proxy's HTTP
         # code (always 200 on this branch); the absence of an
         # ``error`` field is the success signal.  Dropped here to
@@ -7018,7 +7018,12 @@ class ChatSession:
         # ``inspect_workstream``.
         summary = json.dumps(
             {
-                "ws_id": result.get("ws_id"),
+                # Key is ``child_ws_id`` (not ``ws_id``) so the coordinator
+                # LLM doesn't recency-bias toward feeding the spawn-return
+                # straight back into another ``spawn_workstream(ws_id=...)``
+                # call.  On large fan-outs this cascaded into self-inflicted
+                # re-spawn loops instead of progressing to ``wait_for_workstream``.
+                "child_ws_id": result.get("ws_id"),
                 "name": result.get("name"),
                 "node_id": result.get("node_id"),
                 "routing_strategy": result.get("routing_strategy"),
@@ -7156,7 +7161,9 @@ class ChatSession:
                 denied.append({"idx": idx, "reason": "spawn returned no ws_id"})
                 continue
             results[str(idx)] = {
-                "ws_id": ws_id,
+                # ``child_ws_id`` (not ``ws_id``) — see the matching
+                # comment in ``_exec_spawn_workstream``.
+                "child_ws_id": ws_id,
                 "name": result.get("name", ""),
                 "node_id": result.get("node_id", ""),
                 # ``status`` deliberately omitted — see the matching
