@@ -719,6 +719,11 @@ def test_phase8_consent_url_prefix_check_in_click_handler() -> None:
 import subprocess  # noqa: E402
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+# Bundles that completed the var → const/let sweep.  Add a new JS file
+# here only after it has itself been swept — the var-free + const-reassign
+# guards below will otherwise fail loudly on any pre-sweep `var` it
+# contains.  coordinator.js is intentionally excluded (already modern;
+# 3 surviving `var` are by design per the sweep briefing).
 _SWEPT_BUNDLES = [
     _REPO_ROOT / "turnstone/ui/static/app.js",
     _REPO_ROOT / "turnstone/console/static/admin.js",
@@ -839,9 +844,7 @@ def _is_regex_context_at(text: str, slash_pos: int) -> bool:
                 k -= 1
             ident = text[k + 1 : i + 1]
             return ident in _REGEX_OK_KEYWORDS
-        if ch in ")]":
-            return False
-        return True
+        return ch not in ")]"
     return True
 
 
@@ -932,9 +935,8 @@ def _build_brace_map(
                     continue
         if ch == "{":
             stack.append(i)
-        elif ch == "}":
-            if stack:
-                open_to_close[stack.pop()] = i
+        elif ch == "}" and stack:
+            open_to_close[stack.pop()] = i
         i += 1
     return open_to_close, line_starts
 
@@ -971,18 +973,21 @@ def _enclosing_block(
 @pytest.mark.parametrize("bundle", _SWEPT_BUNDLES, ids=lambda p: p.name)
 def test_swept_bundle_has_no_const_reassign(bundle: Path) -> None:
     """For each ``const X = …`` declaration, fail if X is reassigned
-    *within the same block scope* (``X = …``, ``X +=``, ``X++`` etc., with
-    lookbehind to skip ``obj.X = …`` property writes).  Block scope is
-    found by brace-tracking with regex/string/comment awareness, so a
-    same-named ``let X`` in an unrelated function doesn't false-positive
-    against a ``const X`` in this one.  Caught the original
-    ``_redactApiKeys`` shipped bug — ``TypeError`` was invisible to
-    ``node --check`` and to whole-file keyword scans."""
+    *within the same block scope* (``X = …``, ``X +=``, ``X++``, ``++X``,
+    etc., with lookbehind to skip ``obj.X = …`` property writes).  Block
+    scope is found by brace-tracking with regex/string/comment awareness,
+    so a same-named ``let X`` in an unrelated function doesn't
+    false-positive against a ``const X`` in this one.  Caught the
+    original ``_redactApiKeys`` shipped bug (postfix ``redacted = …``)
+    and a sibling ``++_paneCounter`` prefix-increment that the first
+    iteration of this guard missed — both were ``TypeError`` at
+    call-time, invisible to ``node --check`` and to whole-file
+    keyword scans."""
     body = bundle.read_text(encoding="utf-8")
     lines = body.splitlines()
     open_to_close, line_starts = _build_brace_map(body)
     const_decl = re.compile(r"^(\s*)const\s+(\w+)\b")
-    bugs: list[tuple[int, str, int]] = []
+    bugs: list[tuple[int, str, int, str, str]] = []
     for idx, line in enumerate(lines):
         m = const_decl.match(line)
         if not m:
@@ -990,12 +995,21 @@ def test_swept_bundle_has_no_const_reassign(bundle: Path) -> None:
         name = m.group(2)
         decl_offset = line_starts[idx] + len(m.group(1))
         start_line, end_line = _enclosing_block(decl_offset, open_to_close, line_starts, len(lines))
+        # Reassignment forms: postfix `X++`/`X--`, prefix `++X`/`--X`,
+        # compound `X +=`/`X -=`/.../`X ??=`, plain `X =` (not ==/===).
+        # Negative lookbehind skips property writes (`obj.X = …`).
         pat = re.compile(
+            r"(?:"
+            r"(?<![A-Za-z0-9_$])(?:\+\+|--)"  # prefix `++X` / `--X`
+            + re.escape(name)
+            + r"(?![A-Za-z0-9_$])"
+            + r"|"
             r"(?<![A-Za-z0-9_$.])"
             + re.escape(name)
-            + r"\s*(?:\+\+|--|"
-            + r"(?:\+|-|\*\*?|/|%|&&?|\|\|?|\^|<<|>>>?|\?\?)=|"
-            + r"=(?!=))"
+            + r"\s*(?:\+\+|--|"  # postfix `X++` / `X--`
+            + r"(?:\+|-|\*\*?|/|%|&&?|\|\|?|\^|<<|>>>?|\?\?)=|"  # compound
+            + r"=(?!=))"  # plain `X =`
+            + r")"
         )
         decl_other = re.compile(
             r"(?:^\s*(?:let|const|var)\s+|\bfor\s*\(\s*(?:let|const|var)\s+)"
@@ -1015,13 +1029,19 @@ def test_swept_bundle_has_no_const_reassign(bundle: Path) -> None:
                 cleaned = param.sub("(", stripped)
                 if not pat.search(cleaned):
                     continue
-            bugs.append((idx + 1, name, j + 1))
+            bugs.append((idx + 1, name, j + 1, lines[idx].strip(), lines[j].strip()))
             break
-    assert not bugs, (
-        f"{bundle.name}: ``const`` declaration reassigned within its block "
-        f"scope — {bugs[:3]}{' …' if len(bugs) > 3 else ''}.  Change to "
-        f"``let`` or eliminate the reassignment."
-    )
+    if bugs:
+        detail = "\n".join(
+            f"  {bundle.name}:{decl_ln} const {name} reassigned at "
+            f"{bundle.name}:{reass_ln}\n    decl:   {decl_text}\n    reass:  {reass_text}"
+            for decl_ln, name, reass_ln, decl_text, reass_text in bugs[:3]
+        )
+        suffix = f"\n  ... and {len(bugs) - 3} more" if len(bugs) > 3 else ""
+        raise AssertionError(
+            f"const declaration(s) reassigned within block scope.  "
+            f"Change to `let` or eliminate the reassignment:\n{detail}{suffix}"
+        )
 
 
 def test_redact_api_keys_runtime_smoke() -> None:
@@ -1057,7 +1077,6 @@ def test_redact_api_keys_runtime_smoke() -> None:
         )
     except FileNotFoundError:
         pytest.skip("node binary not available on PATH")
-    assert proc.returncode == 0, "_redactApiKeys runtime smoke failed.  stdout=%r stderr=%r" % (
-        proc.stdout,
-        proc.stderr,
+    assert proc.returncode == 0, (
+        f"_redactApiKeys runtime smoke failed.  stdout={proc.stdout!r} stderr={proc.stderr!r}"
     )

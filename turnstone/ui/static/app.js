@@ -7,7 +7,7 @@
 //  1. Pane class — per-workstream UI state
 // ===========================================================================
 
-const _paneCounter = 0;
+let _paneCounter = 0;
 
 class Pane {
   constructor(wsId) {
