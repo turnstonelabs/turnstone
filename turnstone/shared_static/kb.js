@@ -1,14 +1,14 @@
 /* Shared keyboard shortcuts overlay — turnstone design system
    Configure: window.TURNSTONE_KB_SHORTCUTS = [{title, keys: [{desc, badge}]}] */
 
-var _kbPreviousFocus = null;
+let _kbPreviousFocus = null;
 
 function showKbHelp() {
   _kbPreviousFocus = document.activeElement;
-  var existing = document.getElementById("kb-overlay");
+  const existing = document.getElementById("kb-overlay");
   if (existing) existing.remove();
-  var shortcuts = window.TURNSTONE_KB_SHORTCUTS || [];
-  var html =
+  const shortcuts = window.TURNSTONE_KB_SHORTCUTS || [];
+  let html =
     '<div id="kb-box" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts" tabindex="-1">' +
     "<h2>Keyboard shortcuts</h2>";
   shortcuts.forEach(function (section) {
@@ -25,7 +25,7 @@ function showKbHelp() {
   html +=
     '<div class="kb-hint">Press <span class="kb-key">Esc</span> to close</div>' +
     "</div>";
-  var overlay = document.createElement("div");
+  const overlay = document.createElement("div");
   overlay.id = "kb-overlay";
   setSafeHtml(overlay, html);
   overlay.onclick = function (e) {
@@ -36,7 +36,7 @@ function showKbHelp() {
 }
 
 function hideKbHelp() {
-  var el = document.getElementById("kb-overlay");
+  const el = document.getElementById("kb-overlay");
   if (el) el.remove();
   if (_kbPreviousFocus && _kbPreviousFocus.focus) {
     _kbPreviousFocus.focus();
@@ -46,7 +46,7 @@ function hideKbHelp() {
 
 document.addEventListener("keydown", function (e) {
   if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
-  var login = document.getElementById("login-overlay");
+  const login = document.getElementById("login-overlay");
   if (login && login.style.display !== "none") return;
   if (e.key === "?" && !e.ctrlKey && !e.metaKey) {
     e.preventDefault();
@@ -54,7 +54,7 @@ document.addEventListener("keydown", function (e) {
     return;
   }
   if (e.key === "Escape") {
-    var kb = document.getElementById("kb-overlay");
+    const kb = document.getElementById("kb-overlay");
     if (kb) {
       e.preventDefault();
       hideKbHelp();
