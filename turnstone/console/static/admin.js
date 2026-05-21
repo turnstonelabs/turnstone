@@ -3110,9 +3110,10 @@ function _toggleSettingsSection(headerEl) {
 
 function _onSettingChange(inp) {
   // ``inp`` is the input element the listener fired on — passed in by
-  // the delegated handler so we avoid a document-wide selector per
-  // keystroke.  Save button + restart badge for this key live inside
-  // the same ``.settings-row`` (which carries the unique ``data-row-key``).
+  // the per-input event-listener callback so we avoid a document-wide
+  // selector per keystroke.  Save button + restart badge for this key
+  // live inside the same ``.settings-row`` (which carries the unique
+  // ``data-row-key``).
   var row = inp.closest(".settings-row");
   if (!row) return;
   var saveBtn = row.querySelector("[data-save-key]");

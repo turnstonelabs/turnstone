@@ -363,7 +363,7 @@ _COORD_JS = (
 _CONSOLE_ADMIN_JS = Path(__file__).resolve().parent.parent / "turnstone/console/static/admin.js"
 
 
-_DOM_WRITE_LINT_TARGETS = [
+_UNSAFE_CODE_SINK_LINT_TARGETS = [
     ("turnstone/ui/static/app.js", _APP_JS),
     ("turnstone/shared_static/utils.js", _UTILS_JS),
     ("turnstone/shared_static/auth.js", _AUTH_JS),
@@ -375,8 +375,8 @@ _DOM_WRITE_LINT_TARGETS = [
 
 @pytest.mark.parametrize(
     "label,path",
-    _DOM_WRITE_LINT_TARGETS,
-    ids=[label for label, _ in _DOM_WRITE_LINT_TARGETS],
+    _UNSAFE_CODE_SINK_LINT_TARGETS,
+    ids=[label for label, _ in _UNSAFE_CODE_SINK_LINT_TARGETS],
 )
 def test_no_unsafe_code_sinks_in_static_assets(label: str, path: Path) -> None:
     """Whole-file pin: no direct DOM-write *or* dynamic-code sinks
