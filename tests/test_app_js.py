@@ -236,11 +236,16 @@ def test_replay_renders_user_interjection_advisory_after_tool_block() -> None:
 _INDEX_HTML = Path(__file__).resolve().parent.parent / "turnstone/ui/static/index.html"
 _STYLE_CSS = Path(__file__).resolve().parent.parent / "turnstone/ui/static/style.css"
 
-# The Phase-8 D-chunk pins the absence of an unsafe DOM-write API
-# in two regions of app.js. Spell the property name out of literal
-# concatenation so the tooling that flags occurrences in code
-# strings doesn't false-positive on the test source.
-_UNSAFE_DOM_WRITE_RE = re.compile(r"\.inner" + r"HTML\s*=")
+# Pins the absence of unsafe DOM-write sinks. Spell the property names
+# out of literal concatenation so the tooling that flags occurrences in
+# code strings doesn't false-positive on the test source. The trailing
+# ``(?!=)`` negative-lookahead excludes ``===`` / ``==`` reads — only
+# the assignment / call sinks are flagged. ``insertAdjacent`` + HTML
+# is *not* covered here because two existing call sites
+# (``app.js:1287`` and ``app.js:1538``) consume ``renderVerdictBadge``
+# HTML output; broadening the lint would require cleaning that helper
+# first. Tracked as a follow-up to the DOM-cleanup PR.
+_UNSAFE_DOM_WRITE_RE = re.compile(r"\.(?:inner|outer)" + r"HTML\s*=(?!=)" + r"|document\.write\(")
 
 
 def test_phase8_mcp_error_helpers_defined_in_app_js() -> None:
@@ -316,6 +321,84 @@ def test_phase8_appendtooloutput_dispatches_mcp_error_before_renderer() -> None:
     assert parse_idx < render_idx, (
         "tryParseMcpError must run BEFORE renderToolOutput so the "
         "interactive card path takes precedence over plain rendering."
+    )
+
+
+_UTILS_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/utils.js"
+_AUTH_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/auth.js"
+_KB_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/kb.js"
+_COORD_JS = (
+    Path(__file__).resolve().parent.parent / "turnstone/console/static/coordinator/coordinator.js"
+)
+
+
+def test_no_unsafe_dom_writes_in_interactive_assets() -> None:
+    """Whole-file pin: no direct DOM-write sinks
+    (``inner``/``outer``-HTML assignment, legacy doc-write) in the
+    interactive surface or the shared modules it loads.  Renderer
+    output routes through the ``setMarkdown`` helper in utils.js (or
+    ``setSafeHtml`` for pre-baked HTML strings), both of which parse
+    via ``DOMParser`` + ``replaceChildren``; every other site uses DOM
+    construction (``createElement`` + ``textContent`` + ``append`` /
+    ``replaceChildren``).
+
+    Coverage now spans the interactive entry point, the shared
+    helpers (utils / auth / kb), and the coord chat entry — the
+    surfaces that render LLM output, tool results, or user input.
+    The console admin / governance JS bundles remain outside this
+    scan (different threat model, admin-only behind auth gate);
+    cleaning them is a separate effort.
+
+    ``insertAdjacent`` + HTML is deliberately *not* covered yet; two
+    existing app.js sites (the verdict-badge writers at lines 1287 and
+    1538) consume the HTML-string output of ``renderVerdictBadge``, so
+    broadening the lint requires cleaning that helper first."""
+    targets = [
+        ("turnstone/ui/static/app.js", _APP_JS),
+        ("turnstone/shared_static/utils.js", _UTILS_JS),
+        ("turnstone/shared_static/auth.js", _AUTH_JS),
+        ("turnstone/shared_static/kb.js", _KB_JS),
+        ("turnstone/console/static/coordinator/coordinator.js", _COORD_JS),
+    ]
+    for label, path in targets:
+        body = path.read_text(encoding="utf-8")
+        offenders = [
+            (i, line.rstrip())
+            for i, line in enumerate(body.splitlines(), start=1)
+            if _UNSAFE_DOM_WRITE_RE.search(line)
+        ]
+        assert not offenders, (
+            f"Found {len(offenders)} unsafe DOM-write sink(s) in "
+            f"{label}:\n"
+            + "\n".join(f"  line {n}: {line}" for n, line in offenders[:10])
+            + "\nUse DOM construction (createElement + textContent + "
+            "append/replaceChildren) or route renderer output through "
+            "setMarkdown() in shared/utils.js."
+        )
+
+
+def test_shared_utils_defines_set_markdown_helper() -> None:
+    """The ``setMarkdown`` helper in ``shared/utils.js`` is the single
+    audited entry point for rendering markdown content into a DOM
+    element from ``app.js``.  It parses ``renderMarkdown``'s output via
+    ``DOMParser`` (avoiding the unsafe sink entirely) and runs
+    ``postRenderMarkdown`` on the result.  A refactor that drops or
+    renames it would break the two interactive call sites silently at
+    runtime."""
+    body = _UTILS_JS.read_text(encoding="utf-8")
+    assert "function setMarkdown(el, content)" in body, (
+        "shared/utils.js must define setMarkdown(el, content) — "
+        "app.js routes both renderer-output sites through this helper."
+    )
+    # The DOMParser path is what avoids the unsafe sink.  The absence
+    # of the unsafe assignment inside the helper is pinned by the
+    # broader ``test_no_unsafe_dom_writes_in_interactive_assets`` scan
+    # above; pin DOMParser presence here too so a refactor that swaps
+    # to e.g. ``Range.createContextualFragment`` forces an explicit
+    # reviewer decision.
+    assert "DOMParser()" in body, (
+        "setMarkdown must parse via DOMParser, not the unsafe DOM-write "
+        "sink — that is what keeps the audit surface at one location."
     )
 
 
