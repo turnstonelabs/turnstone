@@ -3,38 +3,38 @@
 // ---------------------------------------------------------------------------
 // Module state
 // ---------------------------------------------------------------------------
-var _govRoles = [];
-var _govPolicies = [];
-var _govSkills = [];
-var _govUsageRange = "7d";
-var _govUsageGroupBy = "day";
-var _govAuditEvents = [];
-var _govAuditTotal = 0;
-var _govAuditOffset = 0;
-var _skillCurrentView = "installed";
-var _skillDiscoverResults = [];
-var _skillDiscoverQuery = "";
-var _pendingResources = [];
-var _giTrapHandler = null;
-var _giTriggerEl = null;
+let _govRoles = [];
+let _govPolicies = [];
+let _govSkills = [];
+let _govUsageRange = "7d";
+let _govUsageGroupBy = "day";
+let _govAuditEvents = [];
+let _govAuditTotal = 0;
+let _govAuditOffset = 0;
+let _skillCurrentView = "installed";
+let _skillDiscoverResults = [];
+let _skillDiscoverQuery = "";
+let _pendingResources = [];
+let _giTrapHandler = null;
+let _giTriggerEl = null;
 
 // Trap handler refs for modals
-var _crTrapHandler = null; // create role
-var _erTrapHandler = null; // edit role
-var _urTrapHandler = null; // user roles
-var _cpTrapHandler = null; // create policy
-var _epTrapHandler = null; // edit policy
-var _ctmTrapHandler = null; // create template
-var _etmTrapHandler = null; // edit template
+let _crTrapHandler = null; // create role
+let _erTrapHandler = null; // edit role
+let _urTrapHandler = null; // user roles
+let _cpTrapHandler = null; // create policy
+let _epTrapHandler = null; // edit policy
+let _ctmTrapHandler = null; // create template
+let _etmTrapHandler = null; // edit template
 
 // Trigger element refs for focus restoration
-var _crTriggerEl = null;
-var _erTriggerEl = null;
-var _urTriggerEl = null;
-var _cpTriggerEl = null;
-var _epTriggerEl = null;
-var _ctmTriggerEl = null;
-var _etmTriggerEl = null;
+let _crTriggerEl = null;
+let _erTriggerEl = null;
+let _urTriggerEl = null;
+let _cpTriggerEl = null;
+let _epTriggerEl = null;
+let _ctmTriggerEl = null;
+let _etmTriggerEl = null;
 
 // ---------------------------------------------------------------------------
 // Roles
@@ -59,30 +59,30 @@ function loadGovRoles() {
 }
 
 function _renderGovRoles(items) {
-  var el = document.getElementById("admin-roles-table");
+  const el = document.getElementById("admin-roles-table");
   if (!items.length) {
     setSafeHtml(el, '<div class="dashboard-empty">No roles defined</div>');
     return;
   }
-  var html = "";
-  for (var i = 0; i < items.length; i++) {
-    var r = items[i];
+  let html = "";
+  for (let i = 0; i < items.length; i++) {
+    const r = items[i];
     // Render permissions as badges
-    var perms = (r.permissions || "").split(",");
-    var badges = "";
-    for (var j = 0; j < perms.length; j++) {
-      var p = perms[j].trim();
+    const perms = (r.permissions || "").split(",");
+    let badges = "";
+    for (let j = 0; j < perms.length; j++) {
+      let p = perms[j].trim();
       if (!p) continue;
-      var cls = "scope-badge";
+      let cls = "scope-badge";
       if (p === "approve" || p.indexOf("admin.") === 0) cls += " scope-approve";
       else if (p === "write" || p.indexOf("workstreams.") === 0)
         cls += " scope-write";
       badges += '<span class="' + cls + '">' + escapeHtml(p) + "</span>";
     }
-    var typeLabel = r.builtin
+    const typeLabel = r.builtin
       ? '<span class="scope-badge scope-channel">builtin</span>'
       : "";
-    var actions = r.builtin
+    let actions = r.builtin
       ? ""
       : '<button class="admin-btn-action" data-edit-role="' +
         escapeHtml(r.role_id) +
@@ -108,18 +108,18 @@ function _renderGovRoles(items) {
   }
   setSafeHtml(el, html);
   // Bind edit
-  var editBtns = el.querySelectorAll("[data-edit-role]");
-  for (var k = 0; k < editBtns.length; k++) {
+  const editBtns = el.querySelectorAll("[data-edit-role]");
+  for (let k = 0; k < editBtns.length; k++) {
     editBtns[k].addEventListener("click", function () {
       showEditRoleModal(this.getAttribute("data-edit-role"));
     });
   }
   // Bind delete
-  var delBtns = el.querySelectorAll("[data-delete-role]");
-  for (var k = 0; k < delBtns.length; k++) {
+  const delBtns = el.querySelectorAll("[data-delete-role]");
+  for (let k = 0; k < delBtns.length; k++) {
     delBtns[k].addEventListener("click", function () {
-      var rid = this.getAttribute("data-delete-role");
-      var rname = this.getAttribute("data-role-name");
+      const rid = this.getAttribute("data-delete-role");
+      const rname = this.getAttribute("data-role-name");
       showConfirmModal(
         "Delete Role",
         'Delete role "' +
@@ -153,7 +153,7 @@ function _renderGovRoles(items) {
 // concept.  Each section's permissions render as a 2-column grid;
 // the ``Scopes`` and ``Workstreams & Tools`` sections are short
 // enough to fit one row, ``Admin`` carries the bulk.
-var _PERMISSION_SECTIONS = [
+const _PERMISSION_SECTIONS = [
   {
     label: "Scopes",
     permissions: ["read", "write", "approve"],
@@ -184,9 +184,9 @@ var _PERMISSION_SECTIONS = [
 
 // Flat list — kept for any caller that wants the full permission
 // inventory without caring about sectioning.
-var _ALL_PERMISSIONS = (function () {
-  var flat = [];
-  for (var i = 0; i < _PERMISSION_SECTIONS.length; i++) {
+const _ALL_PERMISSIONS = (function () {
+  let flat = [];
+  for (let i = 0; i < _PERMISSION_SECTIONS.length; i++) {
     flat = flat.concat(_PERMISSION_SECTIONS[i].permissions);
   }
   return flat;
@@ -202,18 +202,18 @@ function _buildPermCheckboxes(prefix, selected) {
   // The underlying ``<input type="checkbox" name="{prefix}-perm">``
   // shape is preserved so ``_collectPermCheckboxes`` still picks
   // them up regardless of section.
-  var html = "";
-  for (var s = 0; s < _PERMISSION_SECTIONS.length; s++) {
-    var section = _PERMISSION_SECTIONS[s];
+  let html = "";
+  for (let s = 0; s < _PERMISSION_SECTIONS.length; s++) {
+    const section = _PERMISSION_SECTIONS[s];
     html +=
       '<div class="perm-section">' +
       '<div class="perm-section-label">' +
       escapeHtml(section.label) +
       "</div>" +
       '<div class="perm-grid">';
-    for (var i = 0; i < section.permissions.length; i++) {
-      var p = section.permissions[i];
-      var checked = selected && selected.indexOf(p) >= 0 ? " checked" : "";
+    for (let i = 0; i < section.permissions.length; i++) {
+      let p = section.permissions[i];
+      const checked = selected && selected.indexOf(p) >= 0 ? " checked" : "";
       html +=
         '<label class="toggle-switch perm-toggle">' +
         '<input type="checkbox" value="' +
@@ -234,17 +234,17 @@ function _buildPermCheckboxes(prefix, selected) {
 }
 
 function _collectPermCheckboxes(prefix) {
-  var boxes = document.querySelectorAll(
+  const boxes = document.querySelectorAll(
     'input[name="' + prefix + '-perm"]:checked',
   );
-  var perms = [];
-  for (var i = 0; i < boxes.length; i++) perms.push(boxes[i].value);
+  const perms = [];
+  for (let i = 0; i < boxes.length; i++) perms.push(boxes[i].value);
   return perms.join(",");
 }
 
 function showCreateRoleModal() {
   _crTriggerEl = document.activeElement;
-  var ov = document.getElementById("create-role-overlay");
+  const ov = document.getElementById("create-role-overlay");
   ov.style.display = "flex";
   document.getElementById("cr-name").value = "";
   document.getElementById("cr-displayname").value = "";
@@ -267,11 +267,11 @@ function hideCreateRoleModal() {
 }
 
 function submitCreateRole() {
-  var name = document.getElementById("cr-name").value.trim();
-  var dname = document.getElementById("cr-displayname").value.trim();
-  var perms = _collectPermCheckboxes("cr");
+  const name = document.getElementById("cr-name").value.trim();
+  let dname = document.getElementById("cr-displayname").value.trim();
+  const perms = _collectPermCheckboxes("cr");
   if (!name) {
-    var e = document.getElementById("create-role-error");
+    const e = document.getElementById("create-role-error");
     e.textContent = "Name is required";
     e.classList.add("is-visible");
     return;
@@ -300,7 +300,7 @@ function submitCreateRole() {
       loadGovRoles();
     })
     .catch(function (e) {
-      var el = document.getElementById("create-role-error");
+      const el = document.getElementById("create-role-error");
       el.textContent = e.message;
       el.classList.add("is-visible");
     })
@@ -311,19 +311,19 @@ function submitCreateRole() {
 
 function showEditRoleModal(roleId) {
   _erTriggerEl = document.activeElement;
-  var role = null;
-  for (var i = 0; i < _govRoles.length; i++) {
+  let role = null;
+  for (let i = 0; i < _govRoles.length; i++) {
     if (_govRoles[i].role_id === roleId) {
       role = _govRoles[i];
       break;
     }
   }
   if (!role) return;
-  var ov = document.getElementById("edit-role-overlay");
+  const ov = document.getElementById("edit-role-overlay");
   ov.style.display = "flex";
   document.getElementById("er-id").value = roleId;
   document.getElementById("er-name").value = role.display_name;
-  var selected = (role.permissions || "").split(",");
+  const selected = (role.permissions || "").split(",");
   setSafeHtml(
     document.getElementById("er-perms-container"),
     _buildPermCheckboxes("er", selected),
@@ -342,9 +342,9 @@ function hideEditRoleModal() {
 }
 
 function submitEditRole() {
-  var roleId = document.getElementById("er-id").value;
-  var dname = document.getElementById("er-name").value.trim();
-  var perms = _collectPermCheckboxes("er");
+  const roleId = document.getElementById("er-id").value;
+  let dname = document.getElementById("er-name").value.trim();
+  const perms = _collectPermCheckboxes("er");
   document.getElementById("er-submit").disabled = true;
   authFetch("/v1/api/admin/roles/" + roleId, {
     method: "PUT",
@@ -364,7 +364,7 @@ function submitEditRole() {
       loadGovRoles();
     })
     .catch(function (e) {
-      var el = document.getElementById("edit-role-error");
+      const el = document.getElementById("edit-role-error");
       el.textContent = e.message;
       el.classList.add("is-visible");
     })
@@ -376,10 +376,10 @@ function submitEditRole() {
 // User roles modal (launched from Users tab)
 function showUserRolesModal(userId) {
   _urTriggerEl = document.activeElement;
-  var ov = document.getElementById("user-roles-overlay");
+  const ov = document.getElementById("user-roles-overlay");
   ov.style.display = "flex";
   document.getElementById("ur-user-id").value = userId;
-  var container = document.getElementById("ur-roles-container");
+  const container = document.getElementById("ur-roles-container");
   setSafeHtml(container, '<div class="dashboard-empty">Loading...</div>');
   _urTrapHandler = _installTrap("user-roles-overlay", "user-roles-box");
   // Fetch all roles and user's current roles
@@ -392,18 +392,18 @@ function showUserRolesModal(userId) {
     }),
   ])
     .then(function (results) {
-      var allRoles = results[0].roles || [];
-      var userRoles = results[1].roles || [];
-      var assigned = {};
-      for (var i = 0; i < userRoles.length; i++)
+      const allRoles = results[0].roles || [];
+      const userRoles = results[1].roles || [];
+      const assigned = {};
+      for (let i = 0; i < userRoles.length; i++)
         assigned[userRoles[i].role_id] = true;
       // Role-assignment rows reuse the toggle-switch component for
       // consistency with the rest of the admin UX.  Role display names
       // are human-readable text, so no monospace override is needed.
-      var html = '<div class="user-roles-list">';
-      for (var j = 0; j < allRoles.length; j++) {
-        var r = allRoles[j];
-        var checked = assigned[r.role_id] ? " checked" : "";
+      let html = '<div class="user-roles-list">';
+      for (let j = 0; j < allRoles.length; j++) {
+        const r = allRoles[j];
+        const checked = assigned[r.role_id] ? " checked" : "";
         html +=
           '<label class="toggle-switch user-role-toggle">' +
           '<input type="checkbox" value="' +
@@ -437,10 +437,10 @@ function hideUserRolesModal() {
 }
 
 function submitUserRoles() {
-  var userId = document.getElementById("ur-user-id").value;
-  var boxes = document.querySelectorAll('input[name="ur-role"]');
-  var selected = [];
-  for (var i = 0; i < boxes.length; i++) {
+  const userId = document.getElementById("ur-user-id").value;
+  const boxes = document.querySelectorAll('input[name="ur-role"]');
+  const selected = [];
+  for (let i = 0; i < boxes.length; i++) {
     if (boxes[i].checked) selected.push(boxes[i].value);
   }
   // Get current user roles to diff
@@ -449,12 +449,12 @@ function submitUserRoles() {
       return r.json();
     })
     .then(function (data) {
-      var current = {};
-      var roles = data.roles || [];
-      for (var i = 0; i < roles.length; i++) current[roles[i].role_id] = true;
-      var promises = [];
+      const current = {};
+      const roles = data.roles || [];
+      for (let i = 0; i < roles.length; i++) current[roles[i].role_id] = true;
+      const promises = [];
       // Assign new
-      for (var j = 0; j < selected.length; j++) {
+      for (let j = 0; j < selected.length; j++) {
         if (!current[selected[j]]) {
           promises.push(
             authFetch("/v1/api/admin/users/" + userId + "/roles", {
@@ -466,9 +466,9 @@ function submitUserRoles() {
         }
       }
       // Unassign removed
-      var selMap = {};
-      for (var k = 0; k < selected.length; k++) selMap[selected[k]] = true;
-      for (var rid in current) {
+      const selMap = {};
+      for (let k = 0; k < selected.length; k++) selMap[selected[k]] = true;
+      for (let rid in current) {
         if (!selMap[rid]) {
           promises.push(
             authFetch("/v1/api/admin/users/" + userId + "/roles/" + rid, {
@@ -511,7 +511,7 @@ function loadGovPolicies() {
 }
 
 function _renderGovPolicies(items) {
-  var el = document.getElementById("admin-policies-table");
+  const el = document.getElementById("admin-policies-table");
   if (!items.length) {
     setSafeHtml(
       el,
@@ -519,11 +519,11 @@ function _renderGovPolicies(items) {
     );
     return;
   }
-  var html = "";
-  for (var i = 0; i < items.length; i++) {
-    var p = items[i];
-    var actionCls = "policy-badge policy-" + p.action;
-    var statusDot = p.enabled
+  let html = "";
+  for (let i = 0; i < items.length; i++) {
+    let p = items[i];
+    let actionCls = "policy-badge policy-" + p.action;
+    const statusDot = p.enabled
       ? '<span class="watch-active" title="Enabled">\u25CF active</span>'
       : '<span class="watch-completed" title="Disabled">\u25CB disabled</span>';
     html +=
@@ -564,8 +564,8 @@ function _renderGovPolicies(items) {
   });
   el.querySelectorAll("[data-delete-policy]").forEach(function (btn) {
     btn.addEventListener("click", function () {
-      var pid = this.getAttribute("data-delete-policy");
-      var pname = this.getAttribute("data-policy-name");
+      const pid = this.getAttribute("data-delete-policy");
+      const pname = this.getAttribute("data-policy-name");
       showConfirmModal(
         "Delete Policy",
         'Delete policy "' + pname + '"?',
@@ -591,7 +591,7 @@ function _renderGovPolicies(items) {
 
 function showCreatePolicyModal() {
   _cpTriggerEl = document.activeElement;
-  var ov = document.getElementById("create-policy-overlay");
+  const ov = document.getElementById("create-policy-overlay");
   ov.style.display = "flex";
   document.getElementById("cp-name").value = "";
   document.getElementById("cp-pattern").value = "";
@@ -612,13 +612,13 @@ function hideCreatePolicyModal() {
 }
 
 function submitCreatePolicy() {
-  var name = document.getElementById("cp-name").value.trim();
-  var pattern = document.getElementById("cp-pattern").value.trim();
-  var action = document.getElementById("cp-action").value;
-  var priority =
+  const name = document.getElementById("cp-name").value.trim();
+  const pattern = document.getElementById("cp-pattern").value.trim();
+  const action = document.getElementById("cp-action").value;
+  const priority =
     parseInt(document.getElementById("cp-priority").value, 10) || 0;
   if (!name || !pattern) {
-    var e = document.getElementById("create-policy-error");
+    const e = document.getElementById("create-policy-error");
     e.textContent = "Name and pattern are required";
     e.classList.add("is-visible");
     return;
@@ -647,7 +647,7 @@ function submitCreatePolicy() {
       loadGovPolicies();
     })
     .catch(function (e) {
-      var el = document.getElementById("create-policy-error");
+      const el = document.getElementById("create-policy-error");
       el.textContent = e.message;
       el.classList.add("is-visible");
     })
@@ -658,15 +658,15 @@ function submitCreatePolicy() {
 
 function showEditPolicyModal(policyId) {
   _epTriggerEl = document.activeElement;
-  var policy = null;
-  for (var i = 0; i < _govPolicies.length; i++) {
+  let policy = null;
+  for (let i = 0; i < _govPolicies.length; i++) {
     if (_govPolicies[i].policy_id === policyId) {
       policy = _govPolicies[i];
       break;
     }
   }
   if (!policy) return;
-  var ov = document.getElementById("edit-policy-overlay");
+  const ov = document.getElementById("edit-policy-overlay");
   ov.style.display = "flex";
   document.getElementById("ep-id").value = policyId;
   document.getElementById("ep-name").value = policy.name;
@@ -688,7 +688,7 @@ function hideEditPolicyModal() {
 }
 
 function submitEditPolicy() {
-  var id = document.getElementById("ep-id").value;
+  const id = document.getElementById("ep-id").value;
   document.getElementById("ep-submit").disabled = true;
   authFetch("/v1/api/admin/policies/" + id, {
     method: "PUT",
@@ -714,7 +714,7 @@ function submitEditPolicy() {
       loadGovPolicies();
     })
     .catch(function (e) {
-      var el = document.getElementById("edit-policy-error");
+      const el = document.getElementById("edit-policy-error");
       el.textContent = e.message;
       el.classList.add("is-visible");
     })
@@ -746,38 +746,38 @@ function loadGovSkills() {
 }
 
 function _renderGovSkills(items) {
-  var el = document.getElementById("admin-skills-table");
+  const el = document.getElementById("admin-skills-table");
   if (!items.length) {
     setSafeHtml(el, '<div class="dashboard-empty">No skills configured</div>');
     return;
   }
-  var html = "";
-  for (var i = 0; i < items.length; i++) {
-    var t = items[i];
-    var activationBadge = "";
-    var activation = t.activation || "named";
+  let html = "";
+  for (let i = 0; i < items.length; i++) {
+    const t = items[i];
+    let activationBadge = "";
+    const activation = t.activation || "named";
     if (activation === "default") {
       activationBadge =
         '<span class="scope-badge scope-approve">default</span>';
     } else if (activation === "search") {
       activationBadge = '<span class="scope-badge">search</span>';
     }
-    var defBadge =
+    const defBadge =
       t.is_default && activation !== "default"
         ? '<span class="scope-badge scope-approve">default</span>'
         : "";
-    var originBadge =
+    const originBadge =
       t.origin === "mcp"
         ? ' <span class="scope-badge scope-mcp">mcp:' +
           escapeHtml(t.mcp_server) +
           "</span>"
         : "";
-    var catBadge =
+    const catBadge =
       '<span class="scope-badge">' + escapeHtml(t.category) + "</span>";
     // Build risk column content with tooltip
-    var riskCell = "";
+    let riskCell = "";
     if (t.risk_level) {
-      var scanClass =
+      const scanClass =
         {
           safe: "scope-scan-safe",
           low: "scope-scan-low",
@@ -785,7 +785,7 @@ function _renderGovSkills(items) {
           high: "scope-scan-high",
           critical: "scope-scan-critical",
         }[t.risk_level] || "";
-      var scanIcon =
+      const scanIcon =
         {
           safe: "\u2713 ",
           low: "",
@@ -793,15 +793,15 @@ function _renderGovSkills(items) {
           high: "\u25C6 ",
           critical: "\u26A0 ",
         }[t.risk_level] || "";
-      var tipParts = [];
+      const tipParts = [];
       try {
-        var report = JSON.parse(t.scan_report || "{}");
+        let report = JSON.parse(t.scan_report || "{}");
         if (report.composite != null) {
           tipParts.push("Score: " + report.composite.toFixed(2));
         }
-        var axes = ["content", "supply_chain", "vulnerability", "capability"];
-        for (var ai = 0; ai < axes.length; ai++) {
-          var d = (report.details || {})[axes[ai]] || {};
+        const axes = ["content", "supply_chain", "vulnerability", "capability"];
+        for (let ai = 0; ai < axes.length; ai++) {
+          const d = (report.details || {})[axes[ai]] || {};
           if (d.flags && d.flags.length) {
             tipParts.push(
               axes[ai].replace(/_/g, " ") + ": " + d.flags.join(", "),
@@ -809,7 +809,7 @@ function _renderGovSkills(items) {
           }
         }
       } catch (e) {}
-      var tipText = tipParts.length ? tipParts.join("\n") : t.risk_level;
+      const tipText = tipParts.length ? tipParts.join("\n") : t.risk_level;
       riskCell =
         '<span class="scope-badge ' +
         scanClass +
@@ -825,7 +825,7 @@ function _renderGovSkills(items) {
       riskCell =
         '<span class="scope-badge" style="opacity:0.4" title="Not scanned">\u2014</span>';
     }
-    var resBadge = "";
+    let resBadge = "";
     if (t.resource_count > 0) {
       resBadge =
         ' <span class="scope-badge" title="' +
@@ -834,8 +834,8 @@ function _renderGovSkills(items) {
         t.resource_count +
         " res</span>";
     }
-    var editLabel = t.readonly ? "view" : "edit";
-    var deleteDisabled = "";
+    const editLabel = t.readonly ? "view" : "edit";
+    const deleteDisabled = "";
     html +=
       '<div class="admin-row" role="listitem">' +
       '<span class="admin-col admin-col-tmcat">' +
@@ -880,8 +880,8 @@ function _renderGovSkills(items) {
   });
   el.querySelectorAll("[data-delete-tmpl]").forEach(function (btn) {
     btn.addEventListener("click", function () {
-      var tid = this.getAttribute("data-delete-tmpl");
-      var tname = this.getAttribute("data-tmpl-name");
+      const tid = this.getAttribute("data-delete-tmpl");
+      const tname = this.getAttribute("data-tmpl-name");
       showConfirmModal(
         "Delete Skill",
         'Delete skill "' + tname + '"?',
@@ -914,9 +914,9 @@ function _renderGovSkills(items) {
 // Trigger on any paste whose first non-whitespace bytes look like an opening
 // YAML frontmatter delimiter — restrictive enough to ignore normal markdown
 // pastes, permissive enough to catch CRLF and trailing-space variants.
-var _SKILL_FRONTMATTER_RE = /^---\s*\r?\n/;
+const _SKILL_FRONTMATTER_RE = /^---\s*\r?\n/;
 
-var _SKILL_FIELD_MAP = {
+const _SKILL_FIELD_MAP = {
   name: "ctm-name",
   description: "skill-description",
   tags: "skill-tags",
@@ -932,21 +932,21 @@ var _SKILL_FIELD_MAP = {
 // fresh paste supersedes the previous one.  Acts as a generation token: any
 // callback that observes _ctmPasteController != its captured controller knows
 // the modal moved on and must not touch the DOM.
-var _ctmPasteController = null;
+let _ctmPasteController = null;
 
 // Returns "filled" if we set the value, "skipped" if the field was already
 // non-empty (we don't clobber user input), or "absent" if we couldn't find or
 // match the option.  Tracking this lets the caller report what actually
 // happened so the user knows whether their pre-typed values survived.
 function _setSkillFormField(id, value) {
-  var el = document.getElementById(id);
+  const el = document.getElementById(id);
   if (!el) return "absent";
   if (el.value && String(el.value).trim()) return "skipped";
   if (el.tagName === "SELECT") {
     // License is a fixed option list — only set the value if it matches an
     // option.  Custom licenses fall through to the default "— not specified —"
     // and the user can edit manually.
-    for (var i = 0; i < el.options.length; i++) {
+    for (let i = 0; i < el.options.length; i++) {
       if (el.options[i].value === value) {
         el.value = value;
         return "filled";
@@ -966,10 +966,10 @@ function _applyParsedSkill(parsed, contentTextarea, fieldMap) {
   contentTextarea.value = parsed.content || "";
   contentTextarea.dispatchEvent(new Event("input", { bubbles: true }));
 
-  var filled = 0;
-  var skipped = 0;
+  let filled = 0;
+  let skipped = 0;
   function _apply(id, value) {
-    var outcome = _setSkillFormField(id, value);
+    const outcome = _setSkillFormField(id, value);
     if (outcome === "filled") filled++;
     else if (outcome === "skipped") skipped++;
   }
@@ -990,28 +990,28 @@ function _applyParsedSkill(parsed, contentTextarea, fieldMap) {
 }
 
 function _setSkillPasteHintBusy(busy) {
-  var hint = document.getElementById("ctm-paste-hint");
+  const hint = document.getElementById("ctm-paste-hint");
   if (!hint) return;
-  var rest = hint.querySelector(".skill-paste-hint-rest");
-  var busyEl = hint.querySelector(".skill-paste-hint-busy");
+  const rest = hint.querySelector(".skill-paste-hint-rest");
+  const busyEl = hint.querySelector(".skill-paste-hint-busy");
   if (rest) rest.style.display = busy ? "none" : "";
   if (busyEl) busyEl.style.display = busy ? "" : "none";
 }
 
 function _handleSkillContentPaste(event, fieldMap) {
-  var clipboard = event.clipboardData || window.clipboardData;
+  const clipboard = event.clipboardData || window.clipboardData;
   if (!clipboard) return;
-  var text = clipboard.getData("text/plain");
+  const text = clipboard.getData("text/plain");
   if (!text || !_SKILL_FRONTMATTER_RE.test(text)) return;
 
   event.preventDefault();
-  var textarea = event.target;
+  const textarea = event.target;
 
   // Cancel any prior paste fetch — a fresh paste supersedes whatever was in
   // flight.  The previous handler's callbacks see _ctmPasteController !=
   // their captured controller and bail before touching the DOM.
   if (_ctmPasteController) _ctmPasteController.abort();
-  var controller = new AbortController();
+  const controller = new AbortController();
   _ctmPasteController = controller;
 
   // Optimistic paint — drop the raw text into the textarea immediately so the
@@ -1043,8 +1043,8 @@ function _handleSkillContentPaste(event, fieldMap) {
     .then(function (res) {
       if (!_isCurrent()) return;
       if (res.ok) {
-        var counts = _applyParsedSkill(res.data, textarea, fieldMap);
-        var msg = "Populated from SKILL.md";
+        const counts = _applyParsedSkill(res.data, textarea, fieldMap);
+        let msg = "Populated from SKILL.md";
         if (counts.skipped) {
           msg += " (" + counts.filled + " set, " + counts.skipped + " kept)";
         }
@@ -1079,11 +1079,11 @@ function _handleSkillContentPaste(event, fieldMap) {
 }
 
 function _detectTemplateVars(content) {
-  var matches = content.match(/\{\{(\w+)\}\}/g) || [];
-  var seen = {};
-  var result = [];
-  for (var i = 0; i < matches.length; i++) {
-    var v = matches[i].replace(/[{}]/g, "");
+  const matches = content.match(/\{\{(\w+)\}\}/g) || [];
+  const seen = {};
+  const result = [];
+  for (let i = 0; i < matches.length; i++) {
+    const v = matches[i].replace(/[{}]/g, "");
     if (!seen[v]) {
       seen[v] = true;
       result.push(v);
@@ -1093,8 +1093,8 @@ function _detectTemplateVars(content) {
 }
 
 function _updateVarsDisplay(contentId, displayId) {
-  var content = document.getElementById(contentId).value || "";
-  var vars = _detectTemplateVars(content);
+  const content = document.getElementById(contentId).value || "";
+  const vars = _detectTemplateVars(content);
   document.getElementById(displayId).textContent = vars.length
     ? vars.join(", ")
     : "(none)";
@@ -1102,7 +1102,7 @@ function _updateVarsDisplay(contentId, displayId) {
 
 function showCreateTemplateModal() {
   _ctmTriggerEl = document.activeElement;
-  var ov = document.getElementById("create-template-overlay");
+  const ov = document.getElementById("create-template-overlay");
   ov.style.display = "flex";
   document.getElementById("ctm-name").value = "";
   document.getElementById("ctm-category").value = "general";
@@ -1113,7 +1113,7 @@ function showCreateTemplateModal() {
   document.getElementById("skill-license").value = "";
   document.getElementById("skill-compatibility").value = "";
   document.getElementById("skill-activation").value = "named";
-  var ctmContent = document.getElementById("ctm-content");
+  const ctmContent = document.getElementById("ctm-content");
   ctmContent.value = "";
   document.getElementById("ctm-variables").textContent = "(none)";
   ctmContent.oninput = function () {
@@ -1162,7 +1162,7 @@ function hideCreateTemplateModal() {
   if (_ctmPasteController) {
     _ctmPasteController.abort();
     _ctmPasteController = null;
-    var ctmContent = document.getElementById("ctm-content");
+    const ctmContent = document.getElementById("ctm-content");
     if (ctmContent) {
       ctmContent.disabled = false;
       ctmContent.removeAttribute("aria-busy");
@@ -1182,22 +1182,22 @@ function submitCreateTemplate() {
   // leave stale red text on-screen, and the in-flight PUT period shouldn't
   // either. Cheaper than reasoning about every catch path remembering to
   // clear on success.
-  var prevErr = document.getElementById("create-template-error");
+  const prevErr = document.getElementById("create-template-error");
   if (prevErr) {
     prevErr.classList.remove("is-visible");
     prevErr.textContent = "";
   }
-  var name = document.getElementById("ctm-name").value.trim();
-  var content = document.getElementById("ctm-content").value;
+  const name = document.getElementById("ctm-name").value.trim();
+  const content = document.getElementById("ctm-content").value;
   if (!name || !content) {
-    var e = document.getElementById("create-template-error");
+    const e = document.getElementById("create-template-error");
     e.textContent = "Name and content are required";
     e.classList.add("is-visible");
     return;
   }
-  var varList = _detectTemplateVars(content);
-  var tagsRaw = (document.getElementById("skill-tags").value || "").trim();
-  var tagsArray = tagsRaw
+  const varList = _detectTemplateVars(content);
+  const tagsRaw = (document.getElementById("skill-tags").value || "").trim();
+  const tagsArray = tagsRaw
     ? tagsRaw
         .split(",")
         .map(function (t) {
@@ -1206,14 +1206,14 @@ function submitCreateTemplate() {
         .filter(Boolean)
     : [];
   // Session config fields
-  var csTemp = document.getElementById("csk-temperature").value.trim();
-  var csMaxTok = document.getElementById("csk-max-tokens").value.trim();
-  var csBudget = document.getElementById("csk-token-budget").value.trim();
-  var csMaxTurns = document.getElementById("csk-agent-max-turns").value.trim();
-  var csAllowed = (
+  const csTemp = document.getElementById("csk-temperature").value.trim();
+  const csMaxTok = document.getElementById("csk-max-tokens").value.trim();
+  const csBudget = document.getElementById("csk-token-budget").value.trim();
+  const csMaxTurns = document.getElementById("csk-agent-max-turns").value.trim();
+  const csAllowed = (
     document.getElementById("csk-allowed-tools").value || ""
   ).trim();
-  var csAllowedArr = csAllowed
+  const csAllowedArr = csAllowed
     ? csAllowed
         .split(",")
         .map(function (t) {
@@ -1221,26 +1221,26 @@ function submitCreateTemplate() {
         })
         .filter(Boolean)
     : [];
-  var csNotifyRaw = (
+  const csNotifyRaw = (
     document.getElementById("csk-notify-on-complete").value || ""
   ).trim();
-  var csNotifyVal = "[]";
+  let csNotifyVal = "[]";
   if (csNotifyRaw) {
     try {
-      var csNotifyParsed = JSON.parse(csNotifyRaw);
+      const csNotifyParsed = JSON.parse(csNotifyRaw);
       if (!Array.isArray(csNotifyParsed))
         throw new Error("must be a JSON array");
       csNotifyVal = JSON.stringify(csNotifyParsed);
     } catch (ne) {
-      var ne2 = document.getElementById("create-template-error");
+      const ne2 = document.getElementById("create-template-error");
       ne2.textContent = "Notify on completion: " + ne.message;
       ne2.classList.add("is-visible");
       return;
     }
   }
   document.getElementById("ctm-submit").disabled = true;
-  var csVersion = (document.getElementById("skill-version").value || "").trim();
-  var createBody = {
+  const csVersion = (document.getElementById("skill-version").value || "").trim();
+  const createBody = {
     name: name,
     category: document.getElementById("ctm-category").value,
     description: (
@@ -1282,7 +1282,7 @@ function submitCreateTemplate() {
     })
     .then(function (data) {
       if (_pendingResources.length && data && data.template_id) {
-        var promises = _pendingResources.map(function (res) {
+        const promises = _pendingResources.map(function (res) {
           return authFetch(
             "/v1/api/admin/skills/" + data.template_id + "/resources",
             {
@@ -1315,7 +1315,7 @@ function submitCreateTemplate() {
       }
     })
     .catch(function (e) {
-      var el = document.getElementById("create-template-error");
+      const el = document.getElementById("create-template-error");
       el.textContent = e.message;
       el.classList.add("is-visible");
     })
@@ -1325,16 +1325,16 @@ function submitCreateTemplate() {
 }
 
 function showEditTemplateModal(tmplId) {
-  var ov = document.getElementById("edit-template-overlay");
+  const ov = document.getElementById("edit-template-overlay");
   // When called against an already-open modal (e.g. mutate-in-place after
   // unlock), preserve the original trigger so focus restores to the row
   // launcher on close, and don't reinstall the focus trap.
-  var alreadyOpen = ov && ov.style.display === "flex";
+  const alreadyOpen = ov && ov.style.display === "flex";
   if (!alreadyOpen) {
     _etmTriggerEl = document.activeElement;
   }
-  var tmpl = null;
-  for (var i = 0; i < _govSkills.length; i++) {
+  let tmpl = null;
+  for (let i = 0; i < _govSkills.length; i++) {
     if (_govSkills[i].template_id === tmplId) {
       tmpl = _govSkills[i];
       break;
@@ -1347,9 +1347,9 @@ function showEditTemplateModal(tmplId) {
   document.getElementById("etm-category").value = tmpl.category;
   document.getElementById("etm-description").value = tmpl.description || "";
   // Parse tags from JSON array to comma-separated display
-  var tagsDisplay = "";
+  let tagsDisplay = "";
   try {
-    var tagsList = JSON.parse(tmpl.tags || "[]");
+    const tagsList = JSON.parse(tmpl.tags || "[]");
     tagsDisplay = tagsList.join(", ");
   } catch (e) {
     tagsDisplay = tmpl.tags || "";
@@ -1382,9 +1382,9 @@ function showEditTemplateModal(tmplId) {
   document.getElementById("esk-auto-approve").checked =
     tmpl.auto_approve || false;
   // allowed_tools: parse JSON array to comma-separated display
-  var allowedDisplay = "";
+  let allowedDisplay = "";
   try {
-    var allowed = JSON.parse(tmpl.allowed_tools || "[]");
+    const allowed = JSON.parse(tmpl.allowed_tools || "[]");
     allowedDisplay = allowed.join(", ");
   } catch (e) {
     allowedDisplay = tmpl.allowed_tools || "";
@@ -1393,7 +1393,7 @@ function showEditTemplateModal(tmplId) {
   document.getElementById("esk-allowed-tools").disabled =
     tmpl.auto_approve || false;
   document.getElementById("esk-enabled").checked = tmpl.enabled !== false;
-  var notifyVal = tmpl.notify_on_complete || "[]";
+  const notifyVal = tmpl.notify_on_complete || "[]";
   document.getElementById("esk-notify-on-complete").value =
     notifyVal && notifyVal !== "[]" ? notifyVal : "";
   document.getElementById("esk-auto-approve").onchange = function () {
@@ -1403,22 +1403,22 @@ function showEditTemplateModal(tmplId) {
   // .is-visible to show — so toggling style.display does nothing here.
   document.getElementById("edit-template-error").classList.remove("is-visible");
   // Scan report section
-  var scanSection = document.getElementById("etm-scan-section");
+  const scanSection = document.getElementById("etm-scan-section");
   if (scanSection) {
     if (tmpl.risk_level) {
       scanSection.style.display = "";
-      var scanClassMap = {
+      const scanClassMap = {
         safe: "scope-scan-safe",
         low: "scope-scan-low",
         medium: "scope-scan-medium",
         high: "scope-scan-high",
         critical: "scope-scan-critical",
       };
-      var report = {};
+      let report = {};
       try {
         report = JSON.parse(tmpl.scan_report || "{}");
       } catch (e) {}
-      var scanHtml =
+      let scanHtml =
         '<span class="scope-badge ' +
         (scanClassMap[tmpl.risk_level] || "") +
         '">' +
@@ -1436,10 +1436,10 @@ function showEditTemplateModal(tmplId) {
           escapeHtml(tmpl.scan_version) +
           "</span>";
       }
-      var axes = ["content", "supply_chain", "vulnerability", "capability"];
-      for (var ai = 0; ai < axes.length; ai++) {
-        var axis = axes[ai];
-        var d = (report.details || {})[axis] || {};
+      const axes = ["content", "supply_chain", "vulnerability", "capability"];
+      for (let ai = 0; ai < axes.length; ai++) {
+        const axis = axes[ai];
+        const d = (report.details || {})[axis] || {};
         scanHtml +=
           '<div class="scan-axis"><span class="scan-axis-name">' +
           escapeHtml(axis.replace(/_/g, " ")) +
@@ -1459,7 +1459,7 @@ function showEditTemplateModal(tmplId) {
       scanSection.style.display = "none";
     }
   }
-  var rescanBtn = document.getElementById("etm-rescan-btn");
+  const rescanBtn = document.getElementById("etm-rescan-btn");
   if (rescanBtn) {
     rescanBtn.onclick = function () {
       rescanBtn.disabled = true;
@@ -1492,22 +1492,22 @@ function showEditTemplateModal(tmplId) {
   }
   // Reset collapsible state before applying readonly rules (prevents state leak
   // when switching between readonly and editable skills in the same session)
-  var allDetails = document.querySelectorAll(
+  const allDetails = document.querySelectorAll(
     "#edit-template-box .admin-details",
   );
-  for (var d = 0; d < allDetails.length; d++) allDetails[d].open = false;
+  for (let d = 0; d < allDetails.length; d++) allDetails[d].open = false;
 
   // --- Readonly mode for imported skills ---
-  var isReadonly = tmpl.readonly || false;
+  const isReadonly = tmpl.readonly || false;
   // An unlocked install retains origin="source" — combined with !readonly it
   // means the operator detached the skill from upstream and may have edits.
-  var isUnlockedInstall =
+  const isUnlockedInstall =
     !isReadonly && tmpl.origin && tmpl.origin === "source";
-  var editTitle = document.getElementById("edit-template-title");
+  const editTitle = document.getElementById("edit-template-title");
   if (editTitle)
     editTitle.textContent = isReadonly ? "View Skill" : "Edit Skill";
   // Origin badge — show provenance for installed skills
-  var originBadge = document.getElementById("etm-origin-badge");
+  const originBadge = document.getElementById("etm-origin-badge");
   if (originBadge) {
     if (isReadonly && tmpl.source_url) {
       originBadge.textContent = "Installed from \u00a0" + tmpl.source_url;
@@ -1525,7 +1525,7 @@ function showEditTemplateModal(tmplId) {
       originBadge.style.display = "none";
     }
   }
-  var lockBtn = document.getElementById("etm-lock-btn");
+  const lockBtn = document.getElementById("etm-lock-btn");
   if (lockBtn) {
     // Inline-flex (not "") so display: none doesn't bleed into a
     // browser-default block reflow on re-show.
@@ -1533,7 +1533,7 @@ function showEditTemplateModal(tmplId) {
     lockBtn.dataset.skillId = tmplId;
     lockBtn.dataset.skillName = tmpl.name || "";
   }
-  var submitBtn = document.getElementById("etm-submit");
+  const submitBtn = document.getElementById("etm-submit");
   if (submitBtn) {
     submitBtn.style.display = "";
     submitBtn.textContent = isReadonly ? "Save Config" : "Save";
@@ -1559,7 +1559,7 @@ function showEditTemplateModal(tmplId) {
     "etm-content",
     "etm-default",
   ].forEach(function (id) {
-    var el = document.getElementById(id);
+    const el = document.getElementById(id);
     if (!el) return;
     el.disabled = isReadonly;
     if (isReadonly) {
@@ -1579,23 +1579,23 @@ function showEditTemplateModal(tmplId) {
     "esk-auto-approve",
     "esk-enabled",
   ].forEach(function (id) {
-    var el = document.getElementById(id);
+    const el = document.getElementById(id);
     if (el) el.disabled = false;
   });
   // esk-allowed-tools follows auto_approve state, not readonly state
-  var allowedToolsEl = document.getElementById("esk-allowed-tools");
+  const allowedToolsEl = document.getElementById("esk-allowed-tools");
   if (allowedToolsEl) allowedToolsEl.disabled = tmpl.auto_approve || false;
-  var cancelBtn = document.querySelector("#edit-template-box .modal-cancel");
+  const cancelBtn = document.querySelector("#edit-template-box .modal-cancel");
   if (cancelBtn) cancelBtn.textContent = isReadonly ? "Close" : "Cancel";
   // Auto-expand Runtime Config collapsible for installed skills so config is visible
   if (isReadonly) {
-    var details = document.querySelectorAll(
+    const details = document.querySelectorAll(
       "#edit-template-box .admin-details",
     );
-    for (var d = 0; d < details.length; d++) details[d].open = true;
+    for (let d = 0; d < details.length; d++) details[d].open = true;
   }
   // --- Skill Resources ---
-  var resSection = document.getElementById("etm-resources-section");
+  const resSection = document.getElementById("etm-resources-section");
   if (resSection) {
     _loadSkillResources(tmplId, isReadonly);
   }
@@ -1631,10 +1631,10 @@ function hideEditTemplateModal() {
 }
 
 function unlockSkill() {
-  var btn = document.getElementById("etm-lock-btn");
+  const btn = document.getElementById("etm-lock-btn");
   if (!btn) return;
-  var skillId = btn.dataset.skillId;
-  var skillName = btn.dataset.skillName || "this skill";
+  const skillId = btn.dataset.skillId;
+  const skillName = btn.dataset.skillName || "this skill";
   if (!skillId) return;
   showConfirmModal(
     "Customize " + skillName + "?",
@@ -1650,7 +1650,7 @@ function unlockSkill() {
 }
 
 function _performUnlockSkill(skillId) {
-  var btn = document.getElementById("etm-lock-btn");
+  const btn = document.getElementById("etm-lock-btn");
   if (btn) btn.disabled = true;
   authFetch("/v1/api/admin/skills/" + skillId + "/unlock", {
     method: "POST",
@@ -1686,9 +1686,9 @@ function _performUnlockSkill(skillId) {
 // ---------------------------------------------------------------------------
 
 function _loadSkillResources(skillId, readonly) {
-  var container = document.getElementById("etm-resources-list");
-  var addBtn = document.getElementById("etm-add-resource-btn");
-  var addForm = document.getElementById("etm-add-resource-form");
+  const container = document.getElementById("etm-resources-list");
+  const addBtn = document.getElementById("etm-add-resource-btn");
+  const addForm = document.getElementById("etm-add-resource-form");
   if (!container) return;
   setSafeHtml(container, '<div class="dashboard-empty">Loading...</div>');
   if (addBtn) addBtn.style.display = readonly ? "none" : "";
@@ -1700,7 +1700,7 @@ function _loadSkillResources(skillId, readonly) {
       return r.json();
     })
     .then(function (data) {
-      var resources = data.resources || [];
+      const resources = data.resources || [];
       if (!resources.length) {
         setSafeHtml(
           container,
@@ -1708,10 +1708,10 @@ function _loadSkillResources(skillId, readonly) {
         );
         return;
       }
-      var html = "";
-      for (var i = 0; i < resources.length; i++) {
-        var res = resources[i];
-        var sizeStr =
+      let html = "";
+      for (let i = 0; i < resources.length; i++) {
+        const res = resources[i];
+        const sizeStr =
           res.size > 1024
             ? (res.size / 1024).toFixed(1) + " KB"
             : res.size + " B";
@@ -1737,7 +1737,7 @@ function _loadSkillResources(skillId, readonly) {
       if (!readonly) {
         container.querySelectorAll("[data-del-res]").forEach(function (btn) {
           btn.addEventListener("click", function () {
-            var path = this.getAttribute("data-del-res");
+            const path = this.getAttribute("data-del-res");
             showConfirmModal(
               "Delete Resource",
               'Delete "' + path + '"?',
@@ -1758,7 +1758,7 @@ function _loadSkillResources(skillId, readonly) {
                     showToast("Resource deleted");
                     _loadSkillResources(skillId, readonly);
                     loadGovSkills();
-                    var addBtn = document.getElementById(
+                    const addBtn = document.getElementById(
                       "etm-add-resource-btn",
                     );
                     if (addBtn) addBtn.focus();
@@ -1781,16 +1781,16 @@ function _loadSkillResources(skillId, readonly) {
 }
 
 function _showAddResourceForm(skillId) {
-  var form = document.getElementById("etm-add-resource-form");
+  const form = document.getElementById("etm-add-resource-form");
   if (!form) return;
   form.style.display = "";
   document.getElementById("etm-res-path").value = "";
   document.getElementById("etm-res-content").value = "";
   document.getElementById("etm-res-content-type").value = "text/plain";
   document.getElementById("etm-res-submit").onclick = function () {
-    var path = (document.getElementById("etm-res-path").value || "").trim();
-    var content = document.getElementById("etm-res-content").value || "";
-    var contentType = document.getElementById("etm-res-content-type").value;
+    const path = (document.getElementById("etm-res-path").value || "").trim();
+    const content = document.getElementById("etm-res-content").value || "";
+    const contentType = document.getElementById("etm-res-content-type").value;
     if (!path || !content) {
       showToast("Path and content are required");
       return;
@@ -1831,7 +1831,7 @@ function _showAddResourceForm(skillId) {
         showToast(e.message || "Failed to add resource");
       })
       .finally(function () {
-        var btn = document.getElementById("etm-res-submit");
+        const btn = document.getElementById("etm-res-submit");
         if (btn) {
           btn.disabled = false;
           btn.textContent = "Upload";
@@ -1845,7 +1845,7 @@ function _showAddResourceForm(skillId) {
 // ---------------------------------------------------------------------------
 
 function _renderPendingResources() {
-  var container = document.getElementById("ctm-resources-list");
+  const container = document.getElementById("ctm-resources-list");
   if (!container) return;
   if (!_pendingResources.length) {
     setSafeHtml(
@@ -1854,10 +1854,10 @@ function _renderPendingResources() {
     );
     return;
   }
-  var html = "";
-  for (var i = 0; i < _pendingResources.length; i++) {
-    var r = _pendingResources[i];
-    var sizeStr =
+  let html = "";
+  for (let i = 0; i < _pendingResources.length; i++) {
+    const r = _pendingResources[i];
+    const sizeStr =
       r.content.length > 1024
         ? (r.content.length / 1024).toFixed(1) + " KB"
         : r.content.length + " B";
@@ -1880,7 +1880,7 @@ function _renderPendingResources() {
   setSafeHtml(container, html);
   container.querySelectorAll("[data-remove-res]").forEach(function (btn) {
     btn.addEventListener("click", function () {
-      var idx = parseInt(this.getAttribute("data-remove-res"), 10);
+      let idx = parseInt(this.getAttribute("data-remove-res"), 10);
       _pendingResources.splice(idx, 1);
       _renderPendingResources();
     });
@@ -1888,9 +1888,9 @@ function _renderPendingResources() {
 }
 
 function _addPendingResource() {
-  var path = (document.getElementById("ctm-res-path").value || "").trim();
-  var content = document.getElementById("ctm-res-content").value || "";
-  var contentType = document.getElementById("ctm-res-content-type").value;
+  const path = (document.getElementById("ctm-res-path").value || "").trim();
+  const content = document.getElementById("ctm-res-content").value || "";
+  const contentType = document.getElementById("ctm-res-content-type").value;
   if (!path || !content) {
     showToast("Path and content are required");
     return;
@@ -1931,16 +1931,16 @@ function submitEditTemplate() {
   // leave stale red text visible during the in-flight PUT, and a successful
   // PUT shouldn't either. Cheaper than reasoning about every catch path
   // remembering to clear on success.
-  var prevErr = document.getElementById("edit-template-error");
+  const prevErr = document.getElementById("edit-template-error");
   if (prevErr) {
     prevErr.classList.remove("is-visible");
     prevErr.textContent = "";
   }
-  var id = document.getElementById("etm-id").value;
-  var content = document.getElementById("etm-content").value;
-  var varList = _detectTemplateVars(content);
-  var tagsRaw = (document.getElementById("etm-tags").value || "").trim();
-  var tagsArray = tagsRaw
+  const id = document.getElementById("etm-id").value;
+  const content = document.getElementById("etm-content").value;
+  const varList = _detectTemplateVars(content);
+  const tagsRaw = (document.getElementById("etm-tags").value || "").trim();
+  const tagsArray = tagsRaw
     ? tagsRaw
         .split(",")
         .map(function (t) {
@@ -1949,14 +1949,14 @@ function submitEditTemplate() {
         .filter(Boolean)
     : [];
   // Session config fields
-  var esTemp = document.getElementById("esk-temperature").value.trim();
-  var esMaxTok = document.getElementById("esk-max-tokens").value.trim();
-  var esBudget = document.getElementById("esk-token-budget").value.trim();
-  var esMaxTurns = document.getElementById("esk-agent-max-turns").value.trim();
-  var esAllowed = (
+  const esTemp = document.getElementById("esk-temperature").value.trim();
+  const esMaxTok = document.getElementById("esk-max-tokens").value.trim();
+  const esBudget = document.getElementById("esk-token-budget").value.trim();
+  const esMaxTurns = document.getElementById("esk-agent-max-turns").value.trim();
+  const esAllowed = (
     document.getElementById("esk-allowed-tools").value || ""
   ).trim();
-  var esAllowedArr = esAllowed
+  const esAllowedArr = esAllowed
     ? esAllowed
         .split(",")
         .map(function (t) {
@@ -1964,26 +1964,26 @@ function submitEditTemplate() {
         })
         .filter(Boolean)
     : [];
-  var esNotifyRaw = (
+  const esNotifyRaw = (
     document.getElementById("esk-notify-on-complete").value || ""
   ).trim();
-  var esNotifyVal = "[]";
+  let esNotifyVal = "[]";
   if (esNotifyRaw) {
     try {
-      var esNotifyParsed = JSON.parse(esNotifyRaw);
+      const esNotifyParsed = JSON.parse(esNotifyRaw);
       if (!Array.isArray(esNotifyParsed))
         throw new Error("must be a JSON array");
       esNotifyVal = JSON.stringify(esNotifyParsed);
     } catch (ne) {
-      var ne3 = document.getElementById("edit-template-error");
+      const ne3 = document.getElementById("edit-template-error");
       ne3.textContent = "Notify on completion: " + ne.message;
       ne3.classList.add("is-visible");
       return;
     }
   }
   document.getElementById("etm-submit").disabled = true;
-  var esVersion = (document.getElementById("etm-version").value || "").trim();
-  var updateBody = {
+  const esVersion = (document.getElementById("etm-version").value || "").trim();
+  const updateBody = {
     name: document.getElementById("etm-name").value.trim(),
     category: document.getElementById("etm-category").value,
     description: (
@@ -2029,7 +2029,7 @@ function submitEditTemplate() {
       loadGovSkills();
     })
     .catch(function (e) {
-      var el = document.getElementById("edit-template-error");
+      const el = document.getElementById("edit-template-error");
       el.textContent = e.message;
       el.classList.add("is-visible");
     })
@@ -2043,17 +2043,17 @@ function submitEditTemplate() {
 // ---------------------------------------------------------------------------
 
 function loadGovUsage() {
-  var now = new Date();
-  var since;
+  const now = new Date();
+  let since;
   if (_govUsageRange === "24h") since = new Date(now - 24 * 60 * 60 * 1000);
   else if (_govUsageRange === "30d")
     since = new Date(now - 30 * 24 * 60 * 60 * 1000);
   else since = new Date(now - 7 * 24 * 60 * 60 * 1000);
-  var sinceStr = since.toISOString().slice(0, 19);
+  const sinceStr = since.toISOString().slice(0, 19);
 
   // Fetch summary + breakdown in parallel
-  var summaryUrl = "/v1/api/admin/usage?since=" + encodeURIComponent(sinceStr);
-  var breakdownUrl = summaryUrl + "&group_by=" + _govUsageGroupBy;
+  const summaryUrl = "/v1/api/admin/usage?since=" + encodeURIComponent(sinceStr);
+  const breakdownUrl = summaryUrl + "&group_by=" + _govUsageGroupBy;
 
   Promise.all([
     authFetch(summaryUrl).then(function (r) {
@@ -2075,21 +2075,21 @@ function loadGovUsage() {
 }
 
 function _renderGovUsage(summary, breakdown) {
-  var container = document.getElementById("admin-usage-content");
-  var s = (summary.breakdown && summary.breakdown[0]) || {};
-  var prompt = s.prompt_tokens || 0;
-  var completion = s.completion_tokens || 0;
-  var total = prompt + completion;
-  var tools = s.tool_calls_count || 0;
-  var cacheWrite = s.cache_creation_tokens || 0;
-  var cacheRead = s.cache_read_tokens || 0;
+  const container = document.getElementById("admin-usage-content");
+  const s = (summary.breakdown && summary.breakdown[0]) || {};
+  const prompt = s.prompt_tokens || 0;
+  const completion = s.completion_tokens || 0;
+  const total = prompt + completion;
+  const tools = s.tool_calls_count || 0;
+  const cacheWrite = s.cache_creation_tokens || 0;
+  const cacheRead = s.cache_read_tokens || 0;
 
-  var cacheZero = cacheWrite === 0 && cacheRead === 0;
-  var cacheCls =
+  const cacheZero = cacheWrite === 0 && cacheRead === 0;
+  const cacheCls =
     "usage-readout usage-readout-secondary" +
     (cacheZero ? " usage-readout-zero" : "");
 
-  var html =
+  let html =
     '<div class="usage-summary">' +
     '<div class="usage-readout"><span class="usage-readout-value">' +
     formatTokens(total) +
@@ -2117,19 +2117,19 @@ function _renderGovUsage(summary, breakdown) {
     "</div>";
 
   // Bar chart breakdown
-  var items = breakdown.breakdown || [];
+  const items = breakdown.breakdown || [];
   if (items.length) {
-    var maxVal = 0;
-    for (var i = 0; i < items.length; i++) {
-      var v = (items[i].prompt_tokens || 0) + (items[i].completion_tokens || 0);
+    let maxVal = 0;
+    for (let i = 0; i < items.length; i++) {
+      const v = (items[i].prompt_tokens || 0) + (items[i].completion_tokens || 0);
       if (v > maxVal) maxVal = v;
     }
     html += '<div class="usage-chart">';
-    for (var j = 0; j < items.length; j++) {
-      var item = items[j];
-      var val = (item.prompt_tokens || 0) + (item.completion_tokens || 0);
-      var pct = maxVal > 0 ? Math.round((val / maxVal) * 100) : 0;
-      var label = item.key || "\u2014";
+    for (let j = 0; j < items.length; j++) {
+      const item = items[j];
+      const val = (item.prompt_tokens || 0) + (item.completion_tokens || 0);
+      const pct = maxVal > 0 ? Math.round((val / maxVal) * 100) : 0;
+      const label = item.key || "\u2014";
       html +=
         '<div class="usage-bar-row">' +
         '<span class="usage-bar-label">' +
@@ -2154,8 +2154,8 @@ function _renderGovUsage(summary, breakdown) {
 function setUsageRange(range) {
   _govUsageRange = range;
   // Update button states
-  var btns = document.querySelectorAll(".usage-range-btn");
-  for (var i = 0; i < btns.length; i++) {
+  const btns = document.querySelectorAll(".usage-range-btn");
+  for (let i = 0; i < btns.length; i++) {
     btns[i].classList.toggle(
       "active",
       btns[i].getAttribute("data-range") === range,
@@ -2170,8 +2170,8 @@ function setUsageRange(range) {
 
 function setUsageGroupBy(groupBy) {
   _govUsageGroupBy = groupBy;
-  var btns = document.querySelectorAll(".usage-group-btn");
-  for (var i = 0; i < btns.length; i++) {
+  const btns = document.querySelectorAll(".usage-group-btn");
+  for (let i = 0; i < btns.length; i++) {
     btns[i].classList.toggle(
       "active",
       btns[i].getAttribute("data-group") === groupBy,
@@ -2193,9 +2193,9 @@ function loadGovAudit(append) {
     _govAuditOffset = 0;
     _govAuditEvents = [];
   }
-  var url = "/v1/api/admin/audit?limit=50&offset=" + _govAuditOffset;
-  var actionFilter = document.getElementById("audit-action-filter");
-  var userFilter = document.getElementById("audit-user-filter");
+  let url = "/v1/api/admin/audit?limit=50&offset=" + _govAuditOffset;
+  const actionFilter = document.getElementById("audit-action-filter");
+  const userFilter = document.getElementById("audit-user-filter");
   if (actionFilter && actionFilter.value)
     url += "&action=" + encodeURIComponent(actionFilter.value);
   if (userFilter && userFilter.value)
@@ -2208,7 +2208,7 @@ function loadGovAudit(append) {
     })
     .then(function (data) {
       _govAuditTotal = data.total || 0;
-      var events = data.events || [];
+      const events = data.events || [];
       _govAuditEvents = _govAuditEvents.concat(events);
       _renderGovAudit(_govAuditEvents, _govAuditTotal);
     })
@@ -2221,9 +2221,9 @@ function loadGovAudit(append) {
 }
 
 function _relativeTime(isoStr) {
-  var now = Date.now();
-  var then = new Date(isoStr + "Z").getTime();
-  var diff = Math.max(0, Math.floor((now - then) / 1000));
+  const now = Date.now();
+  const then = new Date(isoStr + "Z").getTime();
+  const diff = Math.max(0, Math.floor((now - then) / 1000));
   if (diff < 60) return diff + "s ago";
   if (diff < 3600) return Math.floor(diff / 60) + "m ago";
   if (diff < 86400) return Math.floor(diff / 3600) + "h ago";
@@ -2231,21 +2231,21 @@ function _relativeTime(isoStr) {
 }
 
 function _renderGovAudit(events, total) {
-  var el = document.getElementById("admin-audit-table");
+  const el = document.getElementById("admin-audit-table");
   if (!events.length) {
     setSafeHtml(el, '<div class="dashboard-empty">No audit events</div>');
     return;
   }
-  var html = "";
-  for (var i = 0; i < events.length; i++) {
-    var ev = events[i];
-    var detail = "";
+  let html = "";
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i];
+    let detail = "";
     try {
-      var d = JSON.parse(ev.detail || "{}");
-      var keys = Object.keys(d);
+      const d = JSON.parse(ev.detail || "{}");
+      const keys = Object.keys(d);
       if (keys.length) {
-        var parts = [];
-        for (var k = 0; k < Math.min(keys.length, 3); k++) {
+        const parts = [];
+        for (let k = 0; k < Math.min(keys.length, 3); k++) {
           parts.push(keys[k] + "=" + String(d[keys[k]]).slice(0, 30));
         }
         detail = parts.join(", ");
@@ -2254,7 +2254,7 @@ function _renderGovAudit(events, total) {
       detail = ev.detail;
     }
 
-    var actionCls = "audit-badge";
+    let actionCls = "audit-badge";
     if (ev.action.indexOf("delete") >= 0 || ev.action.indexOf("revoke") >= 0)
       actionCls += " audit-danger";
     else if (
@@ -2305,7 +2305,7 @@ function _renderGovAudit(events, total) {
   }
   setSafeHtml(el, html);
 
-  var loadMoreBtn = el.querySelector(".audit-load-more");
+  const loadMoreBtn = el.querySelector(".audit-load-more");
   if (loadMoreBtn) loadMoreBtn.addEventListener("click", loadMoreAudit);
 }
 
@@ -2316,10 +2316,10 @@ function loadMoreAudit() {
 
 // Populate audit user filter from admin users list
 function _populateAuditUserFilter() {
-  var sel = document.getElementById("audit-user-filter");
+  const sel = document.getElementById("audit-user-filter");
   if (!sel) return;
-  var html = '<option value="">All users</option>';
-  for (var i = 0; i < _adminUsers.length; i++) {
+  let html = '<option value="">All users</option>';
+  for (let i = 0; i < _adminUsers.length; i++) {
     html +=
       '<option value="' +
       escapeHtml(_adminUsers[i].user_id) +
@@ -2334,17 +2334,17 @@ function _populateAuditUserFilter() {
 // Memories tab
 // ---------------------------------------------------------------------------
 
-var _adminMemories = [];
-var _memDetailTrap = null;
-var _memDetailTrigger = null;
-var _memSearchTimer = null;
-var _memSearchBound = false;
+let _adminMemories = [];
+let _memDetailTrap = null;
+let _memDetailTrigger = null;
+let _memSearchTimer = null;
+let _memSearchBound = false;
 
 function loadAdminMemories() {
   clearTimeout(_memSearchTimer);
   // Bind search debounce on first load
   if (!_memSearchBound) {
-    var searchEl = document.getElementById("mem-search");
+    const searchEl = document.getElementById("mem-search");
     if (searchEl) {
       searchEl.addEventListener("input", function () {
         clearTimeout(_memSearchTimer);
@@ -2354,11 +2354,11 @@ function loadAdminMemories() {
     _memSearchBound = true;
   }
 
-  var memType = document.getElementById("mem-filter-type").value;
-  var scope = document.getElementById("mem-filter-scope").value;
-  var query = (document.getElementById("mem-search").value || "").trim();
+  const memType = document.getElementById("mem-filter-type").value;
+  const scope = document.getElementById("mem-filter-scope").value;
+  const query = (document.getElementById("mem-search").value || "").trim();
 
-  var url;
+  let url;
   if (query) {
     url =
       "/v1/api/admin/memories/search?q=" +
@@ -2390,30 +2390,30 @@ function loadAdminMemories() {
 }
 
 function _renderAdminMemories(items, total) {
-  var el = document.getElementById("admin-memories-table");
+  const el = document.getElementById("admin-memories-table");
   if (!items.length) {
     setSafeHtml(el, '<div class="dashboard-empty">No memories found</div>');
     return;
   }
 
-  var html = "";
-  for (var i = 0; i < items.length; i++) {
-    var m = items[i];
+  let html = "";
+  for (let i = 0; i < items.length; i++) {
+    const m = items[i];
 
     // Type badge
-    var typeCls = "scope-badge mem-type-" + escapeHtml(m.type);
-    var typeBadge =
+    const typeCls = "scope-badge mem-type-" + escapeHtml(m.type);
+    const typeBadge =
       '<span class="' + typeCls + '">' + escapeHtml(m.type) + "</span>";
 
     // Scope badge
-    var scopeLabel = m.scope;
+    let scopeLabel = m.scope;
     if (m.scope_id) scopeLabel += ":" + m.scope_id;
-    var scopeCls = "scope-badge mem-scope-" + escapeHtml(m.scope);
-    var scopeBadge =
+    const scopeCls = "scope-badge mem-scope-" + escapeHtml(m.scope);
+    const scopeBadge =
       '<span class="' + scopeCls + '">' + escapeHtml(scopeLabel) + "</span>";
 
     // Description (truncated)
-    var desc = m.description || "";
+    let desc = m.description || "";
     if (desc.length > 60) desc = desc.substring(0, 57) + "…";
 
     html +=
@@ -2449,19 +2449,19 @@ function _renderAdminMemories(items, total) {
   setSafeHtml(el, html);
 
   // Bind view buttons
-  var viewBtns = el.querySelectorAll("[data-view-memory]");
-  for (var v = 0; v < viewBtns.length; v++) {
+  const viewBtns = el.querySelectorAll("[data-view-memory]");
+  for (let v = 0; v < viewBtns.length; v++) {
     viewBtns[v].addEventListener("click", function () {
       showMemoryDetailModal(this.getAttribute("data-view-memory"));
     });
   }
 
   // Bind delete buttons
-  var delBtns = el.querySelectorAll("[data-delete-memory]");
-  for (var d = 0; d < delBtns.length; d++) {
+  const delBtns = el.querySelectorAll("[data-delete-memory]");
+  for (let d = 0; d < delBtns.length; d++) {
     delBtns[d].addEventListener("click", function () {
-      var mid = this.getAttribute("data-delete-memory");
-      var mname = this.getAttribute("data-delete-name");
+      const mid = this.getAttribute("data-delete-memory");
+      const mname = this.getAttribute("data-delete-name");
       deleteAdminMemory(mid, mname);
     });
   }
@@ -2469,7 +2469,7 @@ function _renderAdminMemories(items, total) {
 
 function showMemoryDetailModal(memoryId) {
   _memDetailTrigger = document.activeElement;
-  var ov = document.getElementById("memory-detail-overlay");
+  const ov = document.getElementById("memory-detail-overlay");
   ov.style.display = "flex";
   setSafeHtml(
     document.getElementById("memory-detail-body"),
@@ -2477,12 +2477,12 @@ function showMemoryDetailModal(memoryId) {
   );
 
   // Disable delete button and clear stale handler while loading
-  var delBtn = document.getElementById("mem-detail-delete");
+  const delBtn = document.getElementById("mem-detail-delete");
   delBtn.disabled = true;
   delBtn.onclick = null;
 
   // Focus close button for keyboard accessibility
-  var closeBtn = ov.querySelector(".modal-cancel");
+  const closeBtn = ov.querySelector(".modal-cancel");
   if (closeBtn) closeBtn.focus();
 
   authFetch("/v1/api/admin/memories/" + encodeURIComponent(memoryId))
@@ -2491,10 +2491,10 @@ function showMemoryDetailModal(memoryId) {
       return r.json();
     })
     .then(function (m) {
-      var scopeLabel = m.scope;
+      let scopeLabel = m.scope;
       if (m.scope_id) scopeLabel += ":" + m.scope_id;
 
-      var html =
+      let html =
         '<div class="mem-detail-grid">' +
         '<div class="mem-detail-field"><span class="mem-detail-label">Name</span>' +
         escapeHtml(m.name) +
@@ -2590,9 +2590,9 @@ function deleteAdminMemory(memoryId, memoryName) {
 
 function switchSkillView(view) {
   _skillCurrentView = view;
-  var btns = document.querySelectorAll("#admin-skills [data-skill-view]");
-  for (var i = 0; i < btns.length; i++) {
-    var isActive = btns[i].getAttribute("data-skill-view") === view;
+  const btns = document.querySelectorAll("#admin-skills [data-skill-view]");
+  for (let i = 0; i < btns.length; i++) {
+    const isActive = btns[i].getAttribute("data-skill-view") === view;
     btns[i].classList.toggle("active", isActive);
     btns[i].setAttribute("aria-selected", isActive ? "true" : "false");
     btns[i].setAttribute("tabindex", isActive ? "0" : "-1");
@@ -2601,19 +2601,19 @@ function switchSkillView(view) {
     view === "installed" ? "" : "none";
   document.getElementById("skill-view-discover").style.display =
     view === "discover" ? "" : "none";
-  var toolbar = document.getElementById("skill-installed-toolbar");
+  const toolbar = document.getElementById("skill-installed-toolbar");
   if (toolbar) toolbar.style.display = view === "installed" ? "" : "none";
 
   if (view === "installed") {
     loadGovSkills();
   } else {
-    var q = document.getElementById("skill-discover-q");
+    const q = document.getElementById("skill-discover-q");
     if (q) q.focus();
   }
 }
 
 function searchSkillDiscover() {
-  var q = (document.getElementById("skill-discover-q").value || "").trim();
+  const q = (document.getElementById("skill-discover-q").value || "").trim();
   if (!q) {
     showToast("Enter a search query");
     return;
@@ -2621,13 +2621,13 @@ function searchSkillDiscover() {
   _skillDiscoverResults = [];
   _skillDiscoverQuery = q;
 
-  var el = document.getElementById("skill-discover-results");
+  const el = document.getElementById("skill-discover-results");
   setSafeHtml(el, '<div class="dashboard-empty">Searching\u2026</div>');
 
-  var searchBtn = document.getElementById("skill-discover-search-btn");
+  const searchBtn = document.getElementById("skill-discover-search-btn");
   if (searchBtn) searchBtn.disabled = true;
 
-  var url = "/v1/api/admin/skills/discover?limit=20&q=" + encodeURIComponent(q);
+  let url = "/v1/api/admin/skills/discover?limit=20&q=" + encodeURIComponent(q);
 
   authFetch(url)
     .then(function (r) {
@@ -2653,21 +2653,21 @@ function searchSkillDiscover() {
 }
 
 function _renderSkillDiscoverResults() {
-  var el = document.getElementById("skill-discover-results");
+  const el = document.getElementById("skill-discover-results");
   if (!_skillDiscoverResults.length) {
     setSafeHtml(el, '<div class="dashboard-empty">No skills found</div>');
     return;
   }
 
-  var html = "";
-  for (var i = 0; i < _skillDiscoverResults.length; i++) {
-    var s = _skillDiscoverResults[i];
-    var nameLabel = escapeHtml(s.name || "");
-    var actionHtml;
+  let html = "";
+  for (let i = 0; i < _skillDiscoverResults.length; i++) {
+    const s = _skillDiscoverResults[i];
+    const nameLabel = escapeHtml(s.name || "");
+    let actionHtml;
     if (s.installed) {
-      var scanBadgeHtml = "";
+      let scanBadgeHtml = "";
       if (s.risk_level) {
-        var scanCls =
+        const scanCls =
           {
             safe: "scope-scan-safe",
             low: "scope-scan-low",
@@ -2694,14 +2694,14 @@ function _renderSkillDiscoverResults() {
     }
 
     // Tags
-    var tagHtml = "";
-    var tags = s.tags || [];
-    for (var t = 0; t < tags.length && t < 4; t++) {
+    let tagHtml = "";
+    const tags = s.tags || [];
+    for (let t = 0; t < tags.length && t < 4; t++) {
       tagHtml += '<span class="scope-badge">' + escapeHtml(tags[t]) + "</span>";
     }
 
     // Source + install count badge
-    var metaHtml = "";
+    let metaHtml = "";
     if (s.source) {
       metaHtml +=
         '<span class="scope-badge mcp-transport-http">' +
@@ -2745,7 +2745,7 @@ function _renderSkillDiscoverResults() {
   // Bind install handlers
   el.querySelectorAll("[data-skill-install]").forEach(function (btn) {
     btn.addEventListener("click", function () {
-      var idx = parseInt(this.getAttribute("data-skill-install"), 10);
+      let idx = parseInt(this.getAttribute("data-skill-install"), 10);
       installDiscoveredSkill(_skillDiscoverResults[idx]);
     });
   });
@@ -2755,9 +2755,9 @@ function installDiscoveredSkill(skill) {
   if (!skill) return;
 
   // Disable the button
-  var btns = document.querySelectorAll("[data-skill-install]");
-  for (var i = 0; i < btns.length; i++) {
-    var idx = parseInt(btns[i].getAttribute("data-skill-install"), 10);
+  const btns = document.querySelectorAll("[data-skill-install]");
+  for (let i = 0; i < btns.length; i++) {
+    let idx = parseInt(btns[i].getAttribute("data-skill-install"), 10);
     if (
       _skillDiscoverResults[idx] &&
       _skillDiscoverResults[idx].id === skill.id
@@ -2768,7 +2768,7 @@ function installDiscoveredSkill(skill) {
     }
   }
 
-  var body;
+  let body;
   if (skill.source === "github") {
     body = { source: "github", url: skill.source_url };
   } else {
@@ -2788,11 +2788,11 @@ function installDiscoveredSkill(skill) {
       return r.json();
     })
     .then(function (data) {
-      var first = (data.installed && data.installed[0]) || {};
-      var tierMsg = first.risk_level ? " [" + first.risk_level + "]" : "";
+      const first = (data.installed && data.installed[0]) || {};
+      const tierMsg = first.risk_level ? " [" + first.risk_level + "]" : "";
       showToast("Skill installed: " + (skill.name || skill.id) + tierMsg);
       // Mark as installed in results with scan data
-      for (var j = 0; j < _skillDiscoverResults.length; j++) {
+      for (let j = 0; j < _skillDiscoverResults.length; j++) {
         if (_skillDiscoverResults[j].id === skill.id) {
           _skillDiscoverResults[j].installed = true;
           _skillDiscoverResults[j].risk_level = first.risk_level || "";
@@ -2810,9 +2810,9 @@ function installDiscoveredSkill(skill) {
 function showGitHubImportModal() {
   _giTriggerEl = document.activeElement;
   document.getElementById("github-import-overlay").style.display = "";
-  var urlInput = document.getElementById("gi-url");
+  const urlInput = document.getElementById("gi-url");
   urlInput.value = "";
-  var errEl = document.getElementById("github-import-error");
+  const errEl = document.getElementById("github-import-error");
   errEl.textContent = "";
   errEl.classList.remove("is-visible");
   _giTrapHandler = _installTrap("github-import-overlay", "github-import-box");
@@ -2829,8 +2829,8 @@ function hideGitHubImportModal() {
 }
 
 function submitGitHubImport() {
-  var url = (document.getElementById("gi-url").value || "").trim();
-  var errEl = document.getElementById("github-import-error");
+  let url = (document.getElementById("gi-url").value || "").trim();
+  const errEl = document.getElementById("github-import-error");
   if (!url) {
     errEl.textContent = "URL is required";
     errEl.classList.add("is-visible");
@@ -2842,7 +2842,7 @@ function submitGitHubImport() {
     return;
   }
 
-  var submitBtn = document.getElementById("gi-submit");
+  const submitBtn = document.getElementById("gi-submit");
   submitBtn.disabled = true;
   submitBtn.textContent = "Installing\u2026";
   errEl.classList.remove("is-visible");
@@ -2861,12 +2861,12 @@ function submitGitHubImport() {
     })
     .then(function (data) {
       hideGitHubImportModal();
-      var count = data.installed.length;
-      var skipCount = (data.skipped || []).length;
-      var msg;
+      const count = data.installed.length;
+      const skipCount = (data.skipped || []).length;
+      let msg;
       if (count === 1 && !skipCount) {
-        var name = data.installed[0].name || "";
-        var tierMsg = data.installed[0].risk_level
+        const name = data.installed[0].name || "";
+        const tierMsg = data.installed[0].risk_level
           ? " [" + data.installed[0].risk_level + "]"
           : "";
         msg = "Skill installed: " + name + tierMsg;
@@ -2898,11 +2898,11 @@ function submitGitHubImport() {
 // Prompt Policies (system message composition)
 // ---------------------------------------------------------------------------
 
-var _promptPolicies = [];
-var _cppTrapHandler = null;
-var _cppTriggerEl = null;
-var _eppTrapHandler = null;
-var _eppTriggerEl = null;
+let _promptPolicies = [];
+let _cppTrapHandler = null;
+let _cppTriggerEl = null;
+let _eppTrapHandler = null;
+let _eppTriggerEl = null;
 
 function loadPromptPolicies() {
   authFetch("/v1/api/admin/prompt-policies")
@@ -2915,9 +2915,9 @@ function loadPromptPolicies() {
       _renderPromptPolicies(_promptPolicies);
     })
     .catch(function () {
-      var el = document.getElementById("admin-prompt-policies-table");
+      const el = document.getElementById("admin-prompt-policies-table");
       el.textContent = "";
-      var empty = document.createElement("div");
+      const empty = document.createElement("div");
       empty.className = "dashboard-empty";
       empty.textContent = "Failed to load prompts";
       el.appendChild(empty);
@@ -2925,62 +2925,62 @@ function loadPromptPolicies() {
 }
 
 function _renderPromptPolicies(items) {
-  var el = document.getElementById("admin-prompt-policies-table");
+  const el = document.getElementById("admin-prompt-policies-table");
   el.textContent = "";
   if (!items.length) {
-    var empty = document.createElement("div");
+    const empty = document.createElement("div");
     empty.className = "dashboard-empty";
     empty.textContent = "No prompts defined";
     el.appendChild(empty);
     return;
   }
-  for (var i = 0; i < items.length; i++) {
-    var p = items[i];
-    var row = document.createElement("div");
+  for (let i = 0; i < items.length; i++) {
+    let p = items[i];
+    const row = document.createElement("div");
     row.className = "admin-row";
     row.setAttribute("role", "listitem");
 
-    var colName = document.createElement("span");
+    const colName = document.createElement("span");
     colName.className = "admin-col admin-col-pname";
     colName.textContent = p.name;
     row.appendChild(colName);
 
-    var colGate = document.createElement("span");
+    const colGate = document.createElement("span");
     colGate.className = "admin-col admin-col-ppattern";
     if (p.tool_gate) {
-      var code = document.createElement("code");
+      const code = document.createElement("code");
       code.textContent = p.tool_gate;
       colGate.appendChild(code);
     } else {
-      var em = document.createElement("em");
+      const em = document.createElement("em");
       em.textContent = "unconditional";
       colGate.appendChild(em);
     }
     row.appendChild(colGate);
 
-    var colPri = document.createElement("span");
+    const colPri = document.createElement("span");
     colPri.className = "admin-col admin-col-ppriority";
     colPri.textContent = String(p.priority);
     row.appendChild(colPri);
 
-    var colStatus = document.createElement("span");
+    const colStatus = document.createElement("span");
     colStatus.className = "admin-col admin-col-pstatus";
-    var dot = document.createElement("span");
+    const dot = document.createElement("span");
     dot.className = p.enabled ? "watch-active" : "watch-completed";
     dot.title = p.enabled ? "Enabled" : "Disabled";
     dot.textContent = p.enabled ? "\u25CF active" : "\u25CB disabled";
     colStatus.appendChild(dot);
     row.appendChild(colStatus);
 
-    var colActions = document.createElement("span");
+    const colActions = document.createElement("span");
     colActions.className = "admin-col admin-col-actions";
-    var editBtn = document.createElement("button");
+    const editBtn = document.createElement("button");
     editBtn.className = "admin-btn-action";
     editBtn.textContent = "edit";
     editBtn.setAttribute("data-edit-ppolicy", p.policy_id);
     editBtn.setAttribute("aria-label", "Edit prompt " + p.name);
     colActions.appendChild(editBtn);
-    var delBtn = document.createElement("button");
+    const delBtn = document.createElement("button");
     delBtn.className = "admin-btn-danger";
     delBtn.textContent = "delete";
     delBtn.setAttribute("data-delete-ppolicy", p.policy_id);
@@ -2998,8 +2998,8 @@ function _renderPromptPolicies(items) {
   });
   el.querySelectorAll("[data-delete-ppolicy]").forEach(function (btn) {
     btn.addEventListener("click", function () {
-      var pid = this.getAttribute("data-delete-ppolicy");
-      var pname = this.getAttribute("data-ppolicy-name");
+      const pid = this.getAttribute("data-delete-ppolicy");
+      const pname = this.getAttribute("data-ppolicy-name");
       showConfirmModal(
         "Delete Prompt",
         'Delete prompt "' + pname + '"?',
@@ -3027,7 +3027,7 @@ function _renderPromptPolicies(items) {
 
 function showCreatePromptPolicyModal() {
   _cppTriggerEl = document.activeElement;
-  var ov = document.getElementById("create-ppolicy-overlay");
+  const ov = document.getElementById("create-ppolicy-overlay");
   ov.style.display = "flex";
   document.getElementById("cpp-name").value = "";
   document.getElementById("cpp-gate").value = "";
@@ -3051,16 +3051,16 @@ function hideCreatePromptPolicyModal() {
 }
 
 function submitCreatePromptPolicy() {
-  var errEl = document.getElementById("cpp-error");
-  var name = document.getElementById("cpp-name").value.trim();
-  var content = document.getElementById("cpp-content").value.trim();
+  const errEl = document.getElementById("cpp-error");
+  const name = document.getElementById("cpp-name").value.trim();
+  const content = document.getElementById("cpp-content").value.trim();
   if (!name || !content) {
     errEl.textContent = "Name and content are required";
     errEl.classList.add("is-visible");
     return;
   }
   errEl.classList.remove("is-visible");
-  var submitBtn = document.getElementById("cpp-submit");
+  const submitBtn = document.getElementById("cpp-submit");
   submitBtn.disabled = true;
   authFetch("/v1/api/admin/prompt-policies", {
     method: "POST",
@@ -3097,8 +3097,8 @@ function submitCreatePromptPolicy() {
 
 function showEditPromptPolicyModal(policyId) {
   _eppTriggerEl = document.activeElement;
-  var p = null;
-  for (var i = 0; i < _promptPolicies.length; i++) {
+  let p = null;
+  for (let i = 0; i < _promptPolicies.length; i++) {
     if (_promptPolicies[i].policy_id === policyId) {
       p = _promptPolicies[i];
       break;
@@ -3112,7 +3112,7 @@ function showEditPromptPolicyModal(policyId) {
   document.getElementById("epp-priority").value = p.priority || 0;
   document.getElementById("epp-enabled").checked = p.enabled;
   document.getElementById("epp-error").classList.remove("is-visible");
-  var ov = document.getElementById("edit-ppolicy-overlay");
+  const ov = document.getElementById("edit-ppolicy-overlay");
   ov.style.display = "flex";
   document.getElementById("epp-name").focus();
   _eppTrapHandler = _installTrap("edit-ppolicy-overlay", "edit-ppolicy-box");
@@ -3128,17 +3128,17 @@ function hideEditPromptPolicyModal() {
 }
 
 function submitEditPromptPolicy() {
-  var errEl = document.getElementById("epp-error");
-  var policyId = document.getElementById("epp-id").value;
-  var name = document.getElementById("epp-name").value.trim();
-  var content = document.getElementById("epp-content").value.trim();
+  const errEl = document.getElementById("epp-error");
+  const policyId = document.getElementById("epp-id").value;
+  const name = document.getElementById("epp-name").value.trim();
+  const content = document.getElementById("epp-content").value.trim();
   if (!name || !content) {
     errEl.textContent = "Name and content are required";
     errEl.classList.add("is-visible");
     return;
   }
   errEl.classList.remove("is-visible");
-  var submitBtn = document.getElementById("epp-submit");
+  const submitBtn = document.getElementById("epp-submit");
   submitBtn.disabled = true;
   authFetch("/v1/api/admin/prompt-policies/" + policyId, {
     method: "PUT",
@@ -3177,48 +3177,48 @@ function submitEditPromptPolicy() {
 // Judge tab — settings, heuristic rules, output guard patterns
 // ---------------------------------------------------------------------------
 
-var _judgeSettings = [];
-var _judgeHeuristicRules = [];
-var _judgeOGPatterns = [];
-var _judgeModelDefs = [];
-var _chrTrapHandler = null; // create heuristic rule
-var _cogpTrapHandler = null; // create output guard pattern
-var _chrTriggerEl = null;
-var _cogpTriggerEl = null;
-var _ehrTrapHandler = null; // edit heuristic rule
-var _eogpTrapHandler = null; // edit output guard pattern
-var _ehrTriggerEl = null;
-var _eogpTriggerEl = null;
+let _judgeSettings = [];
+let _judgeHeuristicRules = [];
+let _judgeOGPatterns = [];
+let _judgeModelDefs = [];
+let _chrTrapHandler = null; // create heuristic rule
+let _cogpTrapHandler = null; // create output guard pattern
+let _chrTriggerEl = null;
+let _cogpTriggerEl = null;
+let _ehrTrapHandler = null; // edit heuristic rule
+let _eogpTrapHandler = null; // edit output guard pattern
+let _ehrTriggerEl = null;
+let _eogpTriggerEl = null;
 
 // -- Sub-section switcher ---------------------------------------------------
 
 function switchJudgeSection(section) {
-  var sections = document.querySelectorAll(".judge-section");
-  for (var i = 0; i < sections.length; i++) sections[i].style.display = "none";
-  var switcher = document.querySelector("#admin-judge .admin-subtab-switcher");
-  var btns = switcher ? switcher.querySelectorAll(".admin-subtab-btn") : [];
-  for (var i = 0; i < btns.length; i++) {
-    var isActive = btns[i].getAttribute("data-section") === section;
+  const sections = document.querySelectorAll(".judge-section");
+  for (let i = 0; i < sections.length; i++) sections[i].style.display = "none";
+  const switcher = document.querySelector("#admin-judge .admin-subtab-switcher");
+  const btns = switcher ? switcher.querySelectorAll(".admin-subtab-btn") : [];
+  for (let i = 0; i < btns.length; i++) {
+    const isActive = btns[i].getAttribute("data-section") === section;
     btns[i].classList.toggle("active", isActive);
     btns[i].setAttribute("aria-selected", isActive ? "true" : "false");
     btns[i].setAttribute("tabindex", isActive ? "0" : "-1");
   }
-  var target = document.getElementById(section + "-section");
+  const target = document.getElementById(section + "-section");
   if (target) target.style.display = "";
 }
 
 // Arrow key navigation for judge sub-section tabs
 (function () {
-  var switcher = document.querySelector("#admin-judge .admin-subtab-switcher");
+  const switcher = document.querySelector("#admin-judge .admin-subtab-switcher");
   if (!switcher) return;
   switcher.addEventListener("keydown", function (e) {
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
-    var btns = switcher.querySelectorAll(".admin-subtab-btn");
-    var secs = [];
-    for (var i = 0; i < btns.length; i++)
+    const btns = switcher.querySelectorAll(".admin-subtab-btn");
+    const secs = [];
+    for (let i = 0; i < btns.length; i++)
       secs.push(btns[i].getAttribute("data-section"));
-    var current = switcher.querySelector(".admin-subtab-btn.active");
-    var idx = secs.indexOf(current ? current.getAttribute("data-section") : "");
+    const current = switcher.querySelector(".admin-subtab-btn.active");
+    let idx = secs.indexOf(current ? current.getAttribute("data-section") : "");
     if (e.key === "ArrowRight") idx = (idx + 1) % secs.length;
     else idx = (idx - 1 + secs.length) % secs.length;
     e.preventDefault();
@@ -3270,7 +3270,7 @@ function loadJudgeSettings() {
 }
 
 function renderJudgeSettings() {
-  var c = document.getElementById("judge-settings-container");
+  const c = document.getElementById("judge-settings-container");
   if (!_judgeSettings.length) {
     setSafeHtml(
       c,
@@ -3278,16 +3278,16 @@ function renderJudgeSettings() {
     );
     return;
   }
-  var html = "";
-  for (var i = 0; i < _judgeSettings.length; i++) {
-    var s = _judgeSettings[i];
+  let html = "";
+  for (let i = 0; i < _judgeSettings.length; i++) {
+    const s = _judgeSettings[i];
     if (s.key === "judge.model") continue;
-    var shortKey = s.key.replace("judge.", "");
-    var inputHtml = "";
-    var currentVal = s.value;
-    var isDefault = s.source === "default";
+    const shortKey = s.key.replace("judge.", "");
+    let inputHtml = "";
+    const currentVal = s.value;
+    const isDefault = s.source === "default";
 
-    var eKey = escapeHtml(s.key);
+    const eKey = escapeHtml(s.key);
     if (s.type === "bool") {
       // Toggle switch — same component used by the admin modals.
       // The delegated change handler (wired after setSafeHtml below)
@@ -3358,7 +3358,7 @@ function renderJudgeSettings() {
         '">Save</button></div>';
     }
 
-    var resetBtn = !isDefault
+    const resetBtn = !isDefault
       ? ' <button class="admin-action-btn" style="font-size:11px;padding:2px 6px" data-judge-reset-key="' +
         eKey +
         '">Reset</button>'
@@ -3390,9 +3390,9 @@ function renderJudgeSettings() {
   // would break out if a key ever contained an apostrophe.  Bool
   // checkboxes auto-save on change; text/number/password inputs are
   // paired with an explicit Save button (no per-keystroke save).
-  var inputs = c.querySelectorAll("[data-judge-key]");
-  for (var ii = 0; ii < inputs.length; ii++) {
-    var inp = inputs[ii];
+  const inputs = c.querySelectorAll("[data-judge-key]");
+  for (let ii = 0; ii < inputs.length; ii++) {
+    const inp = inputs[ii];
     if (inp.type === "checkbox") {
       inp.addEventListener("change", function () {
         saveJudgeSetting(this.getAttribute("data-judge-key"), this.checked);
@@ -3401,14 +3401,14 @@ function renderJudgeSettings() {
     // text/number/password: no auto-save listener — the adjacent Save
     // button (data-judge-save-key) is the commit gesture.
   }
-  var saveBtns = c.querySelectorAll("[data-judge-save-key]");
-  for (var sb = 0; sb < saveBtns.length; sb++) {
+  const saveBtns = c.querySelectorAll("[data-judge-save-key]");
+  for (let sb = 0; sb < saveBtns.length; sb++) {
     saveBtns[sb].addEventListener("click", function () {
       saveJudgeSettingFromInput(this.getAttribute("data-judge-save-key"));
     });
   }
-  var resetBtns = c.querySelectorAll("[data-judge-reset-key]");
-  for (var rb = 0; rb < resetBtns.length; rb++) {
+  const resetBtns = c.querySelectorAll("[data-judge-reset-key]");
+  for (let rb = 0; rb < resetBtns.length; rb++) {
     resetBtns[rb].addEventListener("click", function () {
       resetJudgeSetting(this.getAttribute("data-judge-reset-key"));
     });
@@ -3442,7 +3442,7 @@ function saveJudgeSettingFromInput(key) {
   // CSS attribute-selector metacharacters (``"``, ``\``).  Keys today
   // come from a static server-side registry without those chars, but
   // the helper is cheap and makes the selector future-proof.
-  var input = document.querySelector(
+  const input = document.querySelector(
     '[data-judge-key="' + cssEscape(key) + '"]',
   );
   if (!input) return;
@@ -3490,15 +3490,15 @@ function loadJudgeHeuristicRules() {
 }
 
 function renderHeuristicRules() {
-  var c = document.getElementById("judge-heuristic-table-container");
+  const c = document.getElementById("judge-heuristic-table-container");
   if (!_judgeHeuristicRules.length) {
     setSafeHtml(c, '<div class="dashboard-empty">No rules found</div>');
     return;
   }
-  var html = "";
-  for (var i = 0; i < _judgeHeuristicRules.length; i++) {
-    var r = _judgeHeuristicRules[i];
-    var sourceBadge =
+  let html = "";
+  for (let i = 0; i < _judgeHeuristicRules.length; i++) {
+    const r = _judgeHeuristicRules[i];
+    const sourceBadge =
       r.source === "builtin"
         ? '<span class="scope-badge">built-in</span>'
         : r.source === "builtin-overridden"
@@ -3506,11 +3506,11 @@ function renderHeuristicRules() {
           : r.source === "builtin-disabled"
             ? '<span class="scope-badge">built-in</span>'
             : '<span class="scope-badge scope-write">custom</span>';
-    var statusBadge = r.enabled
+    const statusBadge = r.enabled
       ? '<span class="scope-badge scope-scan-safe">active</span>'
       : '<span class="scope-badge scope-deny">disabled</span>';
-    var actions = "";
-    var eName = escapeHtml(r.name);
+    let actions = "";
+    const eName = escapeHtml(r.name);
     if (!r.rule_id) {
       // Pure built-in: Disable + Edit
       actions =
@@ -3662,8 +3662,8 @@ function toggleHeuristicRule(ruleId, enabled) {
 }
 
 function deleteHeuristicRule(ruleId) {
-  var ruleName = "";
-  for (var j = 0; j < _judgeHeuristicRules.length; j++) {
+  let ruleName = "";
+  for (let j = 0; j < _judgeHeuristicRules.length; j++) {
     if (_judgeHeuristicRules[j].rule_id === ruleId) {
       ruleName = _judgeHeuristicRules[j].name;
       break;
@@ -3697,7 +3697,7 @@ function deleteHeuristicRule(ruleId) {
 
 function showCreateHeuristicRuleModal() {
   _chrTriggerEl = document.activeElement;
-  var ov = document.getElementById("create-hr-overlay");
+  const ov = document.getElementById("create-hr-overlay");
   ov.style.display = "flex";
   document.getElementById("hr-name").value = "";
   document.getElementById("hr-tier").value = "medium";
@@ -3722,15 +3722,15 @@ function hideCreateHRModal() {
 }
 
 function submitCreateHeuristicRule() {
-  var errEl = document.getElementById("create-hr-error");
+  const errEl = document.getElementById("create-hr-error");
   errEl.classList.remove("is-visible");
-  var argsText = document.getElementById("hr-args").value.trim();
-  var argPatterns = argsText
+  const argsText = document.getElementById("hr-args").value.trim();
+  const argPatterns = argsText
     ? argsText.split("\n").filter(function (l) {
         return l.trim();
       })
     : [];
-  var payload = {
+  const payload = {
     name: document.getElementById("hr-name").value.trim(),
     tier: document.getElementById("hr-tier").value,
     risk_level: document.getElementById("hr-risk").value,
@@ -3742,7 +3742,7 @@ function submitCreateHeuristicRule() {
     reasoning_template: document.getElementById("hr-reason").value.trim(),
     enabled: true,
   };
-  var btn = document.getElementById("hr-submit");
+  const btn = document.getElementById("hr-submit");
   btn.disabled = true;
   authFetch("/v1/api/admin/judge/heuristic-rules", {
     method: "POST",
@@ -3773,15 +3773,15 @@ function submitCreateHeuristicRule() {
 // -- Heuristic Rule: disable / edit / reset ---------------------------------
 
 function disableBuiltinHeuristicRule(name) {
-  var rule = null;
-  for (var i = 0; i < _judgeHeuristicRules.length; i++) {
+  let rule = null;
+  for (let i = 0; i < _judgeHeuristicRules.length; i++) {
     if (_judgeHeuristicRules[i].name === name) {
       rule = _judgeHeuristicRules[i];
       break;
     }
   }
   if (!rule) return;
-  var payload = {
+  const payload = {
     name: rule.name,
     risk_level: rule.risk_level,
     confidence: rule.confidence,
@@ -3817,8 +3817,8 @@ function disableBuiltinHeuristicRule(name) {
 }
 
 function resetHeuristicRule(ruleId) {
-  var ruleName = "";
-  for (var j = 0; j < _judgeHeuristicRules.length; j++) {
+  let ruleName = "";
+  for (let j = 0; j < _judgeHeuristicRules.length; j++) {
     if (_judgeHeuristicRules[j].rule_id === ruleId) {
       ruleName = _judgeHeuristicRules[j].name;
       break;
@@ -3863,7 +3863,7 @@ function _populateEditHRModal(rule, isBuiltin) {
   document.getElementById("ehr-rec").value = rule.recommendation;
   document.getElementById("ehr-tool").value = rule.tool_pattern;
   // arg_patterns comes as JSON string from API
-  var args = rule.arg_patterns || "[]";
+  let args = rule.arg_patterns || "[]";
   if (typeof args === "string") {
     try {
       args = JSON.parse(args);
@@ -3881,8 +3881,8 @@ function _populateEditHRModal(rule, isBuiltin) {
 
 function showEditHeuristicRuleModal(ruleId) {
   _ehrTriggerEl = document.activeElement;
-  var rule = null;
-  for (var i = 0; i < _judgeHeuristicRules.length; i++) {
+  let rule = null;
+  for (let i = 0; i < _judgeHeuristicRules.length; i++) {
     if (_judgeHeuristicRules[i].rule_id === ruleId) {
       rule = _judgeHeuristicRules[i];
       break;
@@ -3890,7 +3890,7 @@ function showEditHeuristicRuleModal(ruleId) {
   }
   if (!rule) return;
   _populateEditHRModal(rule, !!rule.builtin);
-  var ov = document.getElementById("edit-hr-overlay");
+  const ov = document.getElementById("edit-hr-overlay");
   ov.style.display = "flex";
   document.getElementById("ehr-tier").focus();
   _ehrTrapHandler = _installTrap("edit-hr-overlay", "edit-hr-box");
@@ -3898,8 +3898,8 @@ function showEditHeuristicRuleModal(ruleId) {
 
 function showEditBuiltinHeuristicRuleModal(name) {
   _ehrTriggerEl = document.activeElement;
-  var rule = null;
-  for (var i = 0; i < _judgeHeuristicRules.length; i++) {
+  let rule = null;
+  for (let i = 0; i < _judgeHeuristicRules.length; i++) {
     if (
       _judgeHeuristicRules[i].name === name &&
       !_judgeHeuristicRules[i].rule_id
@@ -3910,7 +3910,7 @@ function showEditBuiltinHeuristicRuleModal(name) {
   }
   if (!rule) return;
   _populateEditHRModal(rule, true);
-  var ov = document.getElementById("edit-hr-overlay");
+  const ov = document.getElementById("edit-hr-overlay");
   ov.style.display = "flex";
   document.getElementById("ehr-tier").focus();
   _ehrTrapHandler = _installTrap("edit-hr-overlay", "edit-hr-box");
@@ -3924,16 +3924,16 @@ function hideEditHRModal() {
 }
 
 function submitEditHeuristicRule() {
-  var errEl = document.getElementById("edit-hr-error");
+  const errEl = document.getElementById("edit-hr-error");
   errEl.classList.remove("is-visible");
-  var argsText = document.getElementById("ehr-args").value.trim();
-  var argPatterns = argsText
+  const argsText = document.getElementById("ehr-args").value.trim();
+  const argPatterns = argsText
     ? argsText.split("\n").filter(function (l) {
         return l.trim();
       })
     : [];
-  var ruleId = document.getElementById("ehr-id").value;
-  var payload = {
+  const ruleId = document.getElementById("ehr-id").value;
+  const payload = {
     name: document.getElementById("ehr-name").value.trim(),
     tier: document.getElementById("ehr-tier").value,
     risk_level: document.getElementById("ehr-risk").value,
@@ -3945,10 +3945,10 @@ function submitEditHeuristicRule() {
     reasoning_template: document.getElementById("ehr-reason").value.trim(),
     priority: parseInt(document.getElementById("ehr-priority").value, 10) || 0,
   };
-  var btn = document.getElementById("ehr-submit");
+  const btn = document.getElementById("ehr-submit");
   btn.disabled = true;
 
-  var url, method;
+  let url, method;
   if (ruleId) {
     // Existing DB row — update in place
     url = "/v1/api/admin/judge/heuristic-rules/" + ruleId;
@@ -4007,15 +4007,15 @@ function loadJudgeOGPatterns() {
 }
 
 function renderOGPatterns() {
-  var c = document.getElementById("judge-og-table-container");
+  const c = document.getElementById("judge-og-table-container");
   if (!_judgeOGPatterns.length) {
     setSafeHtml(c, '<div class="dashboard-empty">No patterns found</div>');
     return;
   }
-  var html = "";
-  for (var i = 0; i < _judgeOGPatterns.length; i++) {
-    var p = _judgeOGPatterns[i];
-    var sourceBadge =
+  let html = "";
+  for (let i = 0; i < _judgeOGPatterns.length; i++) {
+    let p = _judgeOGPatterns[i];
+    const sourceBadge =
       p.source === "builtin"
         ? '<span class="scope-badge">built-in</span>'
         : p.source === "builtin-overridden"
@@ -4023,11 +4023,11 @@ function renderOGPatterns() {
           : p.source === "builtin-disabled"
             ? '<span class="scope-badge">built-in</span>'
             : '<span class="scope-badge scope-write">custom</span>';
-    var statusBadge = p.enabled
+    const statusBadge = p.enabled
       ? '<span class="scope-badge scope-scan-safe">active</span>'
       : '<span class="scope-badge scope-deny">disabled</span>';
-    var actions = "";
-    var eName = escapeHtml(p.name);
+    let actions = "";
+    const eName = escapeHtml(p.name);
     if (!p.pattern_id) {
       // Pure built-in: Disable + Edit
       actions =
@@ -4174,8 +4174,8 @@ function toggleOGPattern(patternId, enabled) {
 }
 
 function deleteOGPattern(patternId) {
-  var patName = "";
-  for (var j = 0; j < _judgeOGPatterns.length; j++) {
+  let patName = "";
+  for (let j = 0; j < _judgeOGPatterns.length; j++) {
     if (_judgeOGPatterns[j].pattern_id === patternId) {
       patName = _judgeOGPatterns[j].name;
       break;
@@ -4209,7 +4209,7 @@ function deleteOGPattern(patternId) {
 
 function showCreateOutputGuardPatternModal() {
   _cogpTriggerEl = document.activeElement;
-  var ov = document.getElementById("create-ogp-overlay");
+  const ov = document.getElementById("create-ogp-overlay");
   ov.style.display = "flex";
   document.getElementById("ogp-name").value = "";
   document.getElementById("ogp-cat").value = "prompt_injection";
@@ -4235,8 +4235,8 @@ function hideCreateOGPModal() {
 }
 
 function validateOGRegex() {
-  var pattern = document.getElementById("ogp-pattern").value;
-  var resultEl = document.getElementById("ogp-regex-result");
+  const pattern = document.getElementById("ogp-pattern").value;
+  const resultEl = document.getElementById("ogp-regex-result");
   if (!pattern) {
     resultEl.textContent = "";
     return;
@@ -4266,9 +4266,9 @@ function validateOGRegex() {
 }
 
 function submitCreateOGPattern() {
-  var errEl = document.getElementById("create-ogp-error");
+  const errEl = document.getElementById("create-ogp-error");
   errEl.classList.remove("is-visible");
-  var payload = {
+  const payload = {
     name: document.getElementById("ogp-name").value.trim(),
     category: document.getElementById("ogp-cat").value,
     risk_level: document.getElementById("ogp-risk").value,
@@ -4280,7 +4280,7 @@ function submitCreateOGPattern() {
     redact_label: document.getElementById("ogp-redact").value.trim(),
     enabled: true,
   };
-  var btn = document.getElementById("ogp-submit");
+  const btn = document.getElementById("ogp-submit");
   btn.disabled = true;
   authFetch("/v1/api/admin/judge/output-guard-patterns", {
     method: "POST",
@@ -4311,15 +4311,15 @@ function submitCreateOGPattern() {
 // -- Output Guard Pattern: disable / edit / reset ---------------------------
 
 function disableBuiltinOGPattern(name) {
-  var pat = null;
-  for (var i = 0; i < _judgeOGPatterns.length; i++) {
+  let pat = null;
+  for (let i = 0; i < _judgeOGPatterns.length; i++) {
     if (_judgeOGPatterns[i].name === name) {
       pat = _judgeOGPatterns[i];
       break;
     }
   }
   if (!pat) return;
-  var payload = {
+  const payload = {
     name: pat.name,
     category: pat.category,
     risk_level: pat.risk_level,
@@ -4355,8 +4355,8 @@ function disableBuiltinOGPattern(name) {
 }
 
 function resetOGPattern(patternId) {
-  var patName = "";
-  for (var j = 0; j < _judgeOGPatterns.length; j++) {
+  let patName = "";
+  for (let j = 0; j < _judgeOGPatterns.length; j++) {
     if (_judgeOGPatterns[j].pattern_id === patternId) {
       patName = _judgeOGPatterns[j].name;
       break;
@@ -4412,8 +4412,8 @@ function _populateEditOGPModal(pat, isBuiltin) {
 
 function showEditOGPatternModal(patternId) {
   _eogpTriggerEl = document.activeElement;
-  var pat = null;
-  for (var i = 0; i < _judgeOGPatterns.length; i++) {
+  let pat = null;
+  for (let i = 0; i < _judgeOGPatterns.length; i++) {
     if (_judgeOGPatterns[i].pattern_id === patternId) {
       pat = _judgeOGPatterns[i];
       break;
@@ -4421,7 +4421,7 @@ function showEditOGPatternModal(patternId) {
   }
   if (!pat) return;
   _populateEditOGPModal(pat, !!pat.builtin);
-  var ov = document.getElementById("edit-ogp-overlay");
+  const ov = document.getElementById("edit-ogp-overlay");
   ov.style.display = "flex";
   document.getElementById("eogp-cat").focus();
   _eogpTrapHandler = _installTrap("edit-ogp-overlay", "edit-ogp-box");
@@ -4429,8 +4429,8 @@ function showEditOGPatternModal(patternId) {
 
 function showEditBuiltinOGPatternModal(name) {
   _eogpTriggerEl = document.activeElement;
-  var pat = null;
-  for (var i = 0; i < _judgeOGPatterns.length; i++) {
+  let pat = null;
+  for (let i = 0; i < _judgeOGPatterns.length; i++) {
     if (_judgeOGPatterns[i].name === name && !_judgeOGPatterns[i].pattern_id) {
       pat = _judgeOGPatterns[i];
       break;
@@ -4438,7 +4438,7 @@ function showEditBuiltinOGPatternModal(name) {
   }
   if (!pat) return;
   _populateEditOGPModal(pat, true);
-  var ov = document.getElementById("edit-ogp-overlay");
+  const ov = document.getElementById("edit-ogp-overlay");
   ov.style.display = "flex";
   document.getElementById("eogp-cat").focus();
   _eogpTrapHandler = _installTrap("edit-ogp-overlay", "edit-ogp-box");
@@ -4452,8 +4452,8 @@ function hideEditOGPModal() {
 }
 
 function validateEditOGRegex() {
-  var pattern = document.getElementById("eogp-pattern").value;
-  var resultEl = document.getElementById("eogp-regex-result");
+  const pattern = document.getElementById("eogp-pattern").value;
+  const resultEl = document.getElementById("eogp-regex-result");
   if (!pattern) {
     resultEl.textContent = "";
     return;
@@ -4483,10 +4483,10 @@ function validateEditOGRegex() {
 }
 
 function submitEditOGPattern() {
-  var errEl = document.getElementById("edit-ogp-error");
+  const errEl = document.getElementById("edit-ogp-error");
   errEl.classList.remove("is-visible");
-  var patternId = document.getElementById("eogp-id").value;
-  var payload = {
+  const patternId = document.getElementById("eogp-id").value;
+  const payload = {
     name: document.getElementById("eogp-name").value.trim(),
     category: document.getElementById("eogp-cat").value,
     risk_level: document.getElementById("eogp-risk").value,
@@ -4498,10 +4498,10 @@ function submitEditOGPattern() {
     redact_label: document.getElementById("eogp-redact").value.trim(),
     priority: parseInt(document.getElementById("eogp-priority").value, 10) || 0,
   };
-  var btn = document.getElementById("eogp-submit");
+  const btn = document.getElementById("eogp-submit");
   btn.disabled = true;
 
-  var url, method;
+  let url, method;
   if (patternId) {
     url = "/v1/api/admin/judge/output-guard-patterns/" + patternId;
     method = "PUT";
