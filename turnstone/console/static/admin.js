@@ -1,23 +1,23 @@
 /* Admin panel — user & token management for turnstone console */
 
-var _adminTab = "users";
-var _adminUsers = [];
-var _adminTokenUserId = "";
-var _adminChannelUserId = "";
-var _lastCreatedToken = "";
-var _cuTrapHandler = null;
-var _ctTrapHandler = null;
-var _tcTrapHandler = null;
-var _ccTrapHandler = null;
-var _cfTrapHandler = null;
-var _adminWatches = [];
-var _confirmCallbackFn = null;
-var _confirmTriggerEl = null;
-var _mobileSidebarOpen = false;
+let _adminTab = "users";
+let _adminUsers = [];
+let _adminTokenUserId = "";
+let _adminChannelUserId = "";
+let _lastCreatedToken = "";
+let _cuTrapHandler = null;
+let _ctTrapHandler = null;
+let _tcTrapHandler = null;
+let _ccTrapHandler = null;
+let _cfTrapHandler = null;
+let _adminWatches = [];
+let _confirmCallbackFn = null;
+let _confirmTriggerEl = null;
+let _mobileSidebarOpen = false;
 
 // Settings whose choices are populated dynamically from the live model
 // alias list, and whose empty-string option renders as "(server default)".
-var ALIAS_SETTING_KEYS = [
+const ALIAS_SETTING_KEYS = [
   "model.default_alias",
   "model.plan_alias",
   "model.task_alias",
@@ -28,7 +28,7 @@ var ALIAS_SETTING_KEYS = [
 // opposed to "no value" — distinct from the literal "none" choice (e.g.
 // reasoning_effort="none" actually disables reasoning, very different
 // from leaving it unset).
-var INHERIT_EMPTY_LABEL_KEYS = ["model.plan_effort", "model.task_effort"];
+const INHERIT_EMPTY_LABEL_KEYS = ["model.plan_effort", "model.task_effort"];
 
 // ---------------------------------------------------------------------------
 // View switching (called from app.js showHome/drillDown pattern)
@@ -38,7 +38,7 @@ function showAdmin() {
   /* global currentView, showHome */
   // Toggle: if already in admin view, go back to the home landing
   if (currentView === "admin") {
-    var adminBtn = document.getElementById("admin-btn");
+    const adminBtn = document.getElementById("admin-btn");
     if (adminBtn) {
       adminBtn.classList.remove("active");
       adminBtn.setAttribute("aria-expanded", "false");
@@ -48,7 +48,7 @@ function showAdmin() {
   }
 
   currentView = "admin";
-  var homeView = document.getElementById("view-home");
+  const homeView = document.getElementById("view-home");
   if (homeView) homeView.style.display = "none";
   document.getElementById("view-filtered").style.display = "none";
   document.getElementById("view-admin").style.display = "";
@@ -57,7 +57,7 @@ function showAdmin() {
   document.getElementById("main").scrollTop = 0;
 
   // Highlight admin button as active
-  var adminBtn = document.getElementById("admin-btn");
+  const adminBtn = document.getElementById("admin-btn");
   if (adminBtn) {
     adminBtn.classList.add("active");
     adminBtn.setAttribute("aria-expanded", "true");
@@ -65,8 +65,8 @@ function showAdmin() {
   history.pushState({ view: "admin" }, "");
 
   // Permission gating: hide nav items the user cannot access
-  var perms = sessionStorage.getItem("turnstone_permissions") || "";
-  var tabPerms = {
+  const perms = sessionStorage.getItem("turnstone_permissions") || "";
+  const tabPerms = {
     users: "admin.users",
     tokens: "admin.users",
     channels: "admin.users",
@@ -86,11 +86,11 @@ function showAdmin() {
     models: "admin.models",
   };
   if (perms) {
-    var permSet = perms.split(",");
-    var navItems = document.querySelectorAll(".admin-nav");
-    for (var i = 0; i < navItems.length; i++) {
-      var tabName = navItems[i].getAttribute("data-tab");
-      var needed = tabPerms[tabName];
+    const permSet = perms.split(",");
+    const navItems = document.querySelectorAll(".admin-nav");
+    for (let i = 0; i < navItems.length; i++) {
+      const tabName = navItems[i].getAttribute("data-tab");
+      const needed = tabPerms[tabName];
       if (needed && permSet.indexOf(needed) < 0) {
         navItems[i].style.display = "none";
       } else {
@@ -100,31 +100,31 @@ function showAdmin() {
   }
 
   // Hide groups where all children are permission-hidden
-  var groups = document.querySelectorAll(".admin-sidebar-group");
-  for (var g = 0; g < groups.length; g++) {
-    var visibleInGroup = groups[g].querySelectorAll(
+  const groups = document.querySelectorAll(".admin-sidebar-group");
+  for (let g = 0; g < groups.length; g++) {
+    const visibleInGroup = groups[g].querySelectorAll(
       '.admin-nav:not([style*="display: none"])',
     );
     groups[g].style.display = visibleInGroup.length > 0 ? "" : "none";
   }
 
   // Mobile: ensure sidebar starts hidden + inert; desktop: ensure it's accessible
-  var sidebar = document.getElementById("admin-sidebar");
+  const sidebar = document.getElementById("admin-sidebar");
 
   // Inject close header for mobile drawer (once)
   if (!document.getElementById("admin-sidebar-close")) {
-    var closeHeader = document.createElement("div");
+    const closeHeader = document.createElement("div");
     closeHeader.id = "admin-sidebar-close";
     closeHeader.className = "admin-sidebar-close";
-    var label = document.createElement("span");
+    let label = document.createElement("span");
     label.textContent = "Navigation";
-    var closeBtn = document.createElement("button");
+    const closeBtn = document.createElement("button");
     closeBtn.setAttribute("aria-label", "Close navigation");
     closeBtn.textContent = "\u00d7";
     closeBtn.addEventListener("click", function () {
       if (_mobileSidebarOpen) {
         _toggleMobileSidebar();
-        var mt = document.getElementById("admin-mobile-toggle");
+        const mt = document.getElementById("admin-mobile-toggle");
         if (mt) mt.focus();
       }
     });
@@ -145,12 +145,12 @@ function showAdmin() {
   }
 
   // Mobile backdrop listener (idempotent)
-  var backdrop = document.getElementById("admin-sidebar-backdrop");
+  const backdrop = document.getElementById("admin-sidebar-backdrop");
   if (backdrop && !backdrop._listenerAttached) {
     backdrop.addEventListener("click", function () {
       if (_mobileSidebarOpen) {
         _toggleMobileSidebar();
-        var mt = document.getElementById("admin-mobile-toggle");
+        const mt = document.getElementById("admin-mobile-toggle");
         if (mt) mt.focus();
       }
     });
@@ -158,16 +158,16 @@ function showAdmin() {
   }
 
   // Switch to the first visible nav item
-  var visibleNavs = document.querySelectorAll(
+  const visibleNavs = document.querySelectorAll(
     '.admin-nav:not([style*="display: none"])',
   );
   if (visibleNavs.length > 0) {
     switchAdminTab(visibleNavs[0].getAttribute("data-tab"));
   } else {
     // No tabs visible — show empty state
-    var panels = document.querySelectorAll(".admin-panel");
-    for (var j = 0; j < panels.length; j++) panels[j].style.display = "none";
-    var empty = document.getElementById("admin-no-permissions");
+    const panels = document.querySelectorAll(".admin-panel");
+    for (let j = 0; j < panels.length; j++) panels[j].style.display = "none";
+    let empty = document.getElementById("admin-no-permissions");
     if (!empty) {
       empty = document.createElement("div");
       empty.id = "admin-no-permissions";
@@ -180,7 +180,7 @@ function showAdmin() {
 }
 
 function _injectMobileToggle(tab) {
-  var toggle = document.getElementById("admin-mobile-toggle");
+  let toggle = document.getElementById("admin-mobile-toggle");
   if (!toggle) {
     toggle = document.createElement("button");
     toggle.id = "admin-mobile-toggle";
@@ -191,9 +191,9 @@ function _injectMobileToggle(tab) {
       _toggleMobileSidebar();
     };
   }
-  var panel = document.getElementById("admin-" + tab);
+  const panel = document.getElementById("admin-" + tab);
   if (!panel) return;
-  var toolbar = panel.querySelector(".admin-toolbar");
+  const toolbar = panel.querySelector(".admin-toolbar");
   if (toolbar) {
     if (!toolbar.contains(toggle))
       toolbar.insertBefore(toggle, toolbar.firstChild);
@@ -205,16 +205,16 @@ function _injectMobileToggle(tab) {
 
 function _toggleMobileSidebar() {
   _mobileSidebarOpen = !_mobileSidebarOpen;
-  var sidebar = document.getElementById("admin-sidebar");
+  const sidebar = document.getElementById("admin-sidebar");
   sidebar.classList.toggle("open", _mobileSidebarOpen);
   sidebar.classList.toggle("collapsed", !_mobileSidebarOpen);
   sidebar.setAttribute("aria-hidden", _mobileSidebarOpen ? "false" : "true");
   if (_mobileSidebarOpen) sidebar.removeAttribute("inert");
   else sidebar.setAttribute("inert", "");
-  var backdrop = document.getElementById("admin-sidebar-backdrop");
+  const backdrop = document.getElementById("admin-sidebar-backdrop");
   if (backdrop) backdrop.classList.toggle("visible", _mobileSidebarOpen);
   // Update hamburger aria-label to reflect current state
-  var mt = document.getElementById("admin-mobile-toggle");
+  const mt = document.getElementById("admin-mobile-toggle");
   if (mt) {
     mt.setAttribute(
       "aria-label",
@@ -224,7 +224,7 @@ function _toggleMobileSidebar() {
   }
   // Move focus into drawer on open; callers handle focus-return on close
   if (_mobileSidebarOpen) {
-    var closeBtn = sidebar.querySelector(".admin-sidebar-close button");
+    const closeBtn = sidebar.querySelector(".admin-sidebar-close button");
     if (closeBtn) closeBtn.focus();
   }
 }
@@ -232,16 +232,16 @@ function _toggleMobileSidebar() {
 function switchAdminTab(tab) {
   _adminTab = tab;
   // Hide no-permissions empty state if it was showing
-  var noPerms = document.getElementById("admin-no-permissions");
+  const noPerms = document.getElementById("admin-no-permissions");
   if (noPerms) noPerms.style.display = "none";
-  var navItems = document.querySelectorAll(".admin-nav");
-  for (var i = 0; i < navItems.length; i++) {
-    var isActive = navItems[i].getAttribute("data-tab") === tab;
+  const navItems = document.querySelectorAll(".admin-nav");
+  for (let i = 0; i < navItems.length; i++) {
+    const isActive = navItems[i].getAttribute("data-tab") === tab;
     navItems[i].classList.toggle("active", isActive);
     navItems[i].setAttribute("aria-selected", isActive ? "true" : "false");
     navItems[i].setAttribute("tabindex", isActive ? "0" : "-1");
   }
-  var panels = [
+  const panels = [
     "users",
     "tokens",
     "channels",
@@ -261,8 +261,8 @@ function switchAdminTab(tab) {
     "prompt-policies",
     "judge",
   ];
-  for (var p = 0; p < panels.length; p++) {
-    var el = document.getElementById("admin-" + panels[p]);
+  for (let p = 0; p < panels.length; p++) {
+    const el = document.getElementById("admin-" + panels[p]);
     if (el) el.style.display = panels[p] === tab ? "" : "none";
   }
 
@@ -289,9 +289,9 @@ function switchAdminTab(tab) {
   if (tab === "judge") loadJudgeTab();
 
   // Update breadcrumb with active tab label
-  var activeNav = document.querySelector('.admin-nav[data-tab="' + tab + '"]');
-  var label = activeNav ? activeNav.textContent : tab;
-  var bcLabel = document.getElementById("breadcrumb-label");
+  const activeNav = document.querySelector('.admin-nav[data-tab="' + tab + '"]');
+  let label = activeNav ? activeNav.textContent : tab;
+  const bcLabel = document.getElementById("breadcrumb-label");
   if (bcLabel) bcLabel.textContent = "Admin / " + label;
 
   // Inject mobile hamburger toggle into active panel's toolbar
@@ -301,8 +301,8 @@ function switchAdminTab(tab) {
   if (window.innerWidth <= 700 && _mobileSidebarOpen) {
     _toggleMobileSidebar();
     // Move focus to the newly active panel instead of leaving it in the inert sidebar
-    var panel = document.getElementById("admin-" + tab);
-    var focusTarget =
+    const panel = document.getElementById("admin-" + tab);
+    const focusTarget =
       panel &&
       panel.querySelector("h2, .section-header, button:not([disabled])");
     if (focusTarget) {
@@ -336,7 +336,7 @@ function loadAdminUsers() {
 }
 
 function _renderUsers(users) {
-  var container = document.getElementById("admin-users-table");
+  const container = document.getElementById("admin-users-table");
   if (!users.length) {
     setSafeHtml(
       container,
@@ -344,9 +344,9 @@ function _renderUsers(users) {
     );
     return;
   }
-  var html = "";
-  for (var i = 0; i < users.length; i++) {
-    var u = users[i];
+  let html = "";
+  for (let i = 0; i < users.length; i++) {
+    const u = users[i];
     html +=
       '<div class="admin-row" role="listitem" data-expandable data-user-id="' +
       escapeHtml(u.user_id) +
@@ -377,15 +377,15 @@ function _renderUsers(users) {
   }
   setSafeHtml(container, html);
   // Bind roles buttons
-  var roleBtns = container.querySelectorAll("[data-user-roles]");
-  for (var rj = 0; rj < roleBtns.length; rj++) {
+  const roleBtns = container.querySelectorAll("[data-user-roles]");
+  for (let rj = 0; rj < roleBtns.length; rj++) {
     roleBtns[rj].addEventListener("click", function () {
       showUserRolesModal(this.getAttribute("data-user-roles"));
     });
   }
   // Bind delete buttons via delegation (avoids inline JS injection)
-  var btns = container.querySelectorAll("[data-delete-user]");
-  for (var j = 0; j < btns.length; j++) {
+  const btns = container.querySelectorAll("[data-delete-user]");
+  for (let j = 0; j < btns.length; j++) {
     btns[j].addEventListener("click", function () {
       confirmDeleteUser(
         this.getAttribute("data-delete-user"),
@@ -394,12 +394,12 @@ function _renderUsers(users) {
     });
   }
   // Bind expandable row click + keyboard handlers for OIDC detail panel
-  var rows = container.querySelectorAll(".admin-row[data-expandable]");
-  for (var k = 0; k < rows.length; k++) {
+  const rows = container.querySelectorAll(".admin-row[data-expandable]");
+  for (let k = 0; k < rows.length; k++) {
     (function (row) {
-      var _expand = function () {
-        var uid = row.getAttribute("data-user-id");
-        var uname = row.getAttribute("data-username");
+      const _expand = function () {
+        let uid = row.getAttribute("data-user-id");
+        let uname = row.getAttribute("data-username");
         _toggleOidcPanel(uid, uname, row);
       };
       row.addEventListener("click", function (e) {
@@ -448,11 +448,11 @@ function confirmDeleteUser(userId, username) {
 // ---------------------------------------------------------------------------
 
 function _toggleOidcPanel(userId, username, rowEl) {
-  var existing = rowEl.nextElementSibling;
+  const existing = rowEl.nextElementSibling;
   if (existing && existing.classList.contains("oidc-detail-panel")) {
     // Collapse
     existing.style.maxHeight = "0";
-    var indicator = rowEl.querySelector(".admin-expand-indicator");
+    const indicator = rowEl.querySelector(".admin-expand-indicator");
     if (indicator) indicator.classList.remove("expanded");
     rowEl.setAttribute("aria-expanded", "false");
     setTimeout(function () {
@@ -461,14 +461,14 @@ function _toggleOidcPanel(userId, username, rowEl) {
     return;
   }
   // Collapse any other open panel first
-  var openPanels = document.querySelectorAll(
+  const openPanels = document.querySelectorAll(
     "#admin-users-table .oidc-detail-panel",
   );
-  for (var i = 0; i < openPanels.length; i++) {
+  for (let i = 0; i < openPanels.length; i++) {
     openPanels[i].style.maxHeight = "0";
-    var prevRow = openPanels[i].previousElementSibling;
+    const prevRow = openPanels[i].previousElementSibling;
     if (prevRow) {
-      var ind = prevRow.querySelector(".admin-expand-indicator");
+      const ind = prevRow.querySelector(".admin-expand-indicator");
       if (ind) ind.classList.remove("expanded");
       prevRow.setAttribute("aria-expanded", "false");
     }
@@ -479,11 +479,11 @@ function _toggleOidcPanel(userId, username, rowEl) {
     })(openPanels[i]);
   }
   // Mark expanded
-  var indicator = rowEl.querySelector(".admin-expand-indicator");
+  const indicator = rowEl.querySelector(".admin-expand-indicator");
   if (indicator) indicator.classList.add("expanded");
   rowEl.setAttribute("aria-expanded", "true");
   // Create panel (role="none" so it doesn't break the parent role="list")
-  var panel = document.createElement("div");
+  const panel = document.createElement("div");
   panel.className = "oidc-detail-panel";
   panel.setAttribute("role", "none");
   setSafeHtml(
@@ -510,7 +510,7 @@ function _toggleOidcPanel(userId, username, rowEl) {
       _renderOidcDetail(panel, data.oidc_identities || [], userId, username);
     })
     .catch(function () {
-      var body = panel.querySelector(".oidc-detail-body");
+      const body = panel.querySelector(".oidc-detail-body");
       if (body)
         setSafeHtml(
           body,
@@ -520,12 +520,12 @@ function _toggleOidcPanel(userId, username, rowEl) {
 }
 
 function _buildOidcRow(oid, userId, username) {
-  var shortIssuer = _issuerShortName(oid.issuer || "");
-  var shortSubject =
+  const shortIssuer = _issuerShortName(oid.issuer || "");
+  const shortSubject =
     (oid.subject || "").length > 12
       ? (oid.subject || "").slice(0, 12) + "\u2026"
       : oid.subject || "";
-  var lastLogin = oid.last_login ? _relativeTime(oid.last_login) : "never";
+  const lastLogin = oid.last_login ? _relativeTime(oid.last_login) : "never";
   return (
     '<div class="oidc-identity-row">' +
     '<span class="oidc-identity-issuer"><span class="scope-badge">' +
@@ -563,7 +563,7 @@ function _buildOidcRow(oid, userId, username) {
 }
 
 function _renderOidcDetail(panel, identities, userId, username) {
-  var body = panel.querySelector(".oidc-detail-body");
+  const body = panel.querySelector(".oidc-detail-body");
   if (!body) return;
   if (!identities.length) {
     setSafeHtml(
@@ -573,30 +573,30 @@ function _renderOidcDetail(panel, identities, userId, username) {
     panel.style.maxHeight = panel.scrollHeight + "px";
     return;
   }
-  var html = "";
-  for (var i = 0; i < identities.length; i++) {
+  let html = "";
+  for (let i = 0; i < identities.length; i++) {
     html += _buildOidcRow(identities[i], userId, username);
   }
   setSafeHtml(body, html);
   // Update panel height for animation
   panel.style.maxHeight = panel.scrollHeight + "px";
   // Bind unlink buttons
-  var btns = body.querySelectorAll("[data-oidc-issuer]");
-  for (var j = 0; j < btns.length; j++) {
+  const btns = body.querySelectorAll("[data-oidc-issuer]");
+  for (let j = 0; j < btns.length; j++) {
     btns[j].addEventListener("click", function (e) {
       e.stopPropagation();
-      var issuer = this.getAttribute("data-oidc-issuer");
-      var subject = this.getAttribute("data-oidc-subject");
-      var uname = this.getAttribute("data-oidc-username");
-      var uid = this.getAttribute("data-oidc-user-id");
+      const issuer = this.getAttribute("data-oidc-issuer");
+      const subject = this.getAttribute("data-oidc-subject");
+      const uname = this.getAttribute("data-oidc-username");
+      const uid = this.getAttribute("data-oidc-user-id");
       _confirmUnlinkOidc(issuer, subject, uname, uid);
     });
   }
 }
 
 function _confirmUnlinkOidc(issuer, subject, username, userId) {
-  var shortIssuer = _issuerShortName(issuer);
-  var shortSubject =
+  const shortIssuer = _issuerShortName(issuer);
+  const shortSubject =
     subject.length > 16 ? subject.slice(0, 16) + "\u2026" : subject;
   showConfirmModal(
     "Unlink OIDC Identity",
@@ -620,20 +620,20 @@ function _confirmUnlinkOidc(issuer, subject, username, userId) {
           if (!r.ok) throw new Error("Unlink failed");
           showToast("OIDC identity unlinked");
           // Refresh the panel content in place (no close/reopen flicker)
-          var allRows = document.querySelectorAll(
+          const allRows = document.querySelectorAll(
             "#admin-users-table .admin-row[data-expandable]",
           );
-          var targetRow = null;
-          for (var ri = 0; ri < allRows.length; ri++) {
+          let targetRow = null;
+          for (let ri = 0; ri < allRows.length; ri++) {
             if (allRows[ri].getAttribute("data-user-id") === userId) {
               targetRow = allRows[ri];
               break;
             }
           }
           if (targetRow) {
-            var panel = targetRow.nextElementSibling;
+            const panel = targetRow.nextElementSibling;
             if (panel && panel.classList.contains("oidc-detail-panel")) {
-              var body = panel.querySelector(".oidc-detail-body");
+              const body = panel.querySelector(".oidc-detail-body");
               if (body)
                 setSafeHtml(
                   body,
@@ -675,7 +675,7 @@ function _confirmUnlinkOidc(issuer, subject, username, userId) {
 
 function _issuerShortName(issuer) {
   try {
-    var host = new URL(issuer).hostname;
+    const host = new URL(issuer).hostname;
     if (host.includes("google")) return "google";
     if (host.includes("microsoftonline") || host.includes("azure"))
       return "azure";
@@ -690,10 +690,10 @@ function _issuerShortName(issuer) {
 
 function _relativeTime(isoStr) {
   try {
-    var then = new Date(
+    const then = new Date(
       isoStr + (isoStr.includes("Z") || isoStr.includes("+") ? "" : "Z"),
     );
-    var diff = (Date.now() - then.getTime()) / 1000;
+    const diff = (Date.now() - then.getTime()) / 1000;
     if (diff < 60) return "just now";
     if (diff < 3600) return Math.floor(diff / 60) + "m ago";
     if (diff < 86400) return Math.floor(diff / 3600) + "h ago";
@@ -709,12 +709,12 @@ function _relativeTime(isoStr) {
 // ---------------------------------------------------------------------------
 
 function _populateTokenUserSelect() {
-  var sel = document.getElementById("admin-token-user");
-  var current = sel.value;
+  const sel = document.getElementById("admin-token-user");
+  let current = sel.value;
   setSafeHtml(sel, '<option value="">Select user...</option>');
-  for (var i = 0; i < _adminUsers.length; i++) {
-    var u = _adminUsers[i];
-    var opt = document.createElement("option");
+  for (let i = 0; i < _adminUsers.length; i++) {
+    const u = _adminUsers[i];
+    const opt = document.createElement("option");
     opt.value = u.user_id;
     opt.textContent = u.username + " (" + u.display_name + ")";
     sel.appendChild(opt);
@@ -723,7 +723,7 @@ function _populateTokenUserSelect() {
 }
 
 function loadAdminTokens() {
-  var userId = document.getElementById("admin-token-user").value;
+  const userId = document.getElementById("admin-token-user").value;
   _adminTokenUserId = userId;
   if (!userId) {
     setSafeHtml(
@@ -749,7 +749,7 @@ function loadAdminTokens() {
 }
 
 function _renderTokens(tokens) {
-  var container = document.getElementById("admin-tokens-table");
+  const container = document.getElementById("admin-tokens-table");
   if (!tokens.length) {
     setSafeHtml(
       container,
@@ -757,10 +757,10 @@ function _renderTokens(tokens) {
     );
     return;
   }
-  var html = "";
-  for (var i = 0; i < tokens.length; i++) {
-    var t = tokens[i];
-    var expires = t.expires ? escapeHtml(t.expires).slice(0, 10) : "\u2014";
+  let html = "";
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    const expires = t.expires ? escapeHtml(t.expires).slice(0, 10) : "\u2014";
     html +=
       '<div class="admin-row" role="listitem">' +
       '<span class="admin-col admin-col-prefix"><code>' +
@@ -787,8 +787,8 @@ function _renderTokens(tokens) {
   }
   setSafeHtml(container, html);
   // Bind revoke buttons via delegation (avoids inline JS injection)
-  var rbtns = container.querySelectorAll("[data-revoke-token]");
-  for (var j = 0; j < rbtns.length; j++) {
+  const rbtns = container.querySelectorAll("[data-revoke-token]");
+  for (let j = 0; j < rbtns.length; j++) {
     rbtns[j].addEventListener("click", function () {
       confirmRevokeToken(this.getAttribute("data-revoke-token"));
     });
@@ -797,12 +797,12 @@ function _renderTokens(tokens) {
 
 function _renderScopeBadges(scopes) {
   if (!scopes) return "";
-  var parts = scopes.split(",");
-  var html = "";
-  for (var i = 0; i < parts.length; i++) {
-    var s = parts[i].trim();
+  const parts = scopes.split(",");
+  let html = "";
+  for (let i = 0; i < parts.length; i++) {
+    const s = parts[i].trim();
     if (!s) continue;
-    var cls = "scope-badge";
+    let cls = "scope-badge";
     if (s === "approve") cls += " scope-approve";
     else if (s === "write") cls += " scope-write";
     html += '<span class="' + cls + '">' + escapeHtml(s) + "</span>";
@@ -836,12 +836,12 @@ function confirmRevokeToken(tokenId) {
 // ---------------------------------------------------------------------------
 
 function _populateChannelUserSelect() {
-  var sel = document.getElementById("admin-channel-user");
-  var current = sel.value;
+  const sel = document.getElementById("admin-channel-user");
+  let current = sel.value;
   setSafeHtml(sel, '<option value="">Select user...</option>');
-  for (var i = 0; i < _adminUsers.length; i++) {
-    var u = _adminUsers[i];
-    var opt = document.createElement("option");
+  for (let i = 0; i < _adminUsers.length; i++) {
+    const u = _adminUsers[i];
+    const opt = document.createElement("option");
     opt.value = u.user_id;
     opt.textContent = u.username + " (" + u.display_name + ")";
     sel.appendChild(opt);
@@ -850,7 +850,7 @@ function _populateChannelUserSelect() {
 }
 
 function loadAdminChannels() {
-  var userId = document.getElementById("admin-channel-user").value;
+  const userId = document.getElementById("admin-channel-user").value;
   _adminChannelUserId = userId;
   if (!userId) {
     setSafeHtml(
@@ -880,7 +880,7 @@ function loadAdminChannels() {
 }
 
 function _renderChannels(channels) {
-  var container = document.getElementById("admin-channels-table");
+  const container = document.getElementById("admin-channels-table");
   if (!channels.length) {
     setSafeHtml(
       container,
@@ -888,15 +888,15 @@ function _renderChannels(channels) {
     );
     return;
   }
-  var html = "";
-  for (var i = 0; i < channels.length; i++) {
-    var c = channels[i];
+  let html = "";
+  for (let i = 0; i < channels.length; i++) {
+    const c = channels[i];
     // Per-platform badge class (scope-discord / scope-slack) so different
     // adapters render with their own color.  Falls back to the generic
     // scope-channel for unknown platforms; the per-platform class wins
     // by being the only class set, not by source order.
-    var ctSlug = (c.channel_type || "").toLowerCase().replace(/[^a-z0-9]/g, "");
-    var ctClass =
+    const ctSlug = (c.channel_type || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    const ctClass =
       ctSlug && (ctSlug === "discord" || ctSlug === "slack")
         ? "scope-badge scope-" + ctSlug
         : "scope-badge scope-channel";
@@ -923,8 +923,8 @@ function _renderChannels(channels) {
       "</div>";
   }
   setSafeHtml(container, html);
-  var btns = container.querySelectorAll("[data-unlink-type]");
-  for (var j = 0; j < btns.length; j++) {
+  const btns = container.querySelectorAll("[data-unlink-type]");
+  for (let j = 0; j < btns.length; j++) {
     btns[j].addEventListener("click", function () {
       confirmUnlinkChannel(
         this.getAttribute("data-unlink-type"),
@@ -967,11 +967,11 @@ function confirmUnlinkChannel(channelType, channelUserId) {
 // Schedules
 // ---------------------------------------------------------------------------
 
-var _csTrapHandler = null;
-var _esTrapHandler = null;
-var _srTrapHandler = null;
-var _editScheduleTriggerEl = null;
-var _runsScheduleTriggerEl = null;
+let _csTrapHandler = null;
+let _esTrapHandler = null;
+let _srTrapHandler = null;
+let _editScheduleTriggerEl = null;
+let _runsScheduleTriggerEl = null;
 
 function loadAdminSchedules() {
   authFetch("/v1/api/admin/schedules")
@@ -991,7 +991,7 @@ function loadAdminSchedules() {
 }
 
 function _renderSchedules(schedules) {
-  var container = document.getElementById("admin-schedules-table");
+  const container = document.getElementById("admin-schedules-table");
   if (!schedules.length) {
     setSafeHtml(
       container,
@@ -999,23 +999,23 @@ function _renderSchedules(schedules) {
     );
     return;
   }
-  var html = "";
-  for (var i = 0; i < schedules.length; i++) {
-    var s = schedules[i];
-    var typeLabel = s.schedule_type === "cron" ? "cron" : "at";
-    var typeCls = s.schedule_type === "cron" ? "scope-write" : "scope-approve";
-    var schedule =
+  let html = "";
+  for (let i = 0; i < schedules.length; i++) {
+    const s = schedules[i];
+    const typeLabel = s.schedule_type === "cron" ? "cron" : "at";
+    const typeCls = s.schedule_type === "cron" ? "scope-write" : "scope-approve";
+    const schedule =
       s.schedule_type === "cron"
         ? s.cron_expr
         : _utcToLocalDatetime(s.at_time).replace("T", " ");
-    var target = s.target_mode;
-    var nextRun = s.next_run
+    const target = s.target_mode;
+    const nextRun = s.next_run
       ? _utcToLocalDatetime(s.next_run).replace("T", " ")
       : "\u2014";
-    var enabled = s.enabled;
-    var statusCls = enabled ? "sched-active" : "sched-disabled";
-    var statusLabel = enabled ? "active" : "disabled";
-    var statusDot = enabled ? "\u25cf " : "\u25cb ";
+    const enabled = s.enabled;
+    let statusCls = enabled ? "sched-active" : "sched-disabled";
+    let statusLabel = enabled ? "active" : "disabled";
+    let statusDot = enabled ? "\u25cf " : "\u25cb ";
     if (s.schedule_type === "at" && !enabled && s.last_run) {
       statusCls = "sched-expired";
       statusLabel = "completed";
@@ -1071,20 +1071,20 @@ function _renderSchedules(schedules) {
   }
   setSafeHtml(container, html);
   // Bind buttons
-  var editBtns = container.querySelectorAll("[data-edit-sched]");
-  for (var j = 0; j < editBtns.length; j++) {
+  const editBtns = container.querySelectorAll("[data-edit-sched]");
+  for (let j = 0; j < editBtns.length; j++) {
     editBtns[j].addEventListener("click", function () {
       showEditScheduleModal(this.getAttribute("data-edit-sched"));
     });
   }
-  var runsBtns = container.querySelectorAll("[data-runs-sched]");
-  for (var k = 0; k < runsBtns.length; k++) {
+  const runsBtns = container.querySelectorAll("[data-runs-sched]");
+  for (let k = 0; k < runsBtns.length; k++) {
     runsBtns[k].addEventListener("click", function () {
       showScheduleRuns(this.getAttribute("data-runs-sched"));
     });
   }
-  var toggleBtns = container.querySelectorAll("[data-toggle-sched]");
-  for (var m = 0; m < toggleBtns.length; m++) {
+  const toggleBtns = container.querySelectorAll("[data-toggle-sched]");
+  for (let m = 0; m < toggleBtns.length; m++) {
     toggleBtns[m].addEventListener("click", function () {
       toggleSchedule(
         this.getAttribute("data-toggle-sched"),
@@ -1092,8 +1092,8 @@ function _renderSchedules(schedules) {
       );
     });
   }
-  var delBtns = container.querySelectorAll("[data-delete-sched]");
-  for (var n = 0; n < delBtns.length; n++) {
+  const delBtns = container.querySelectorAll("[data-delete-sched]");
+  for (let n = 0; n < delBtns.length; n++) {
     delBtns[n].addEventListener("click", function () {
       confirmDeleteSchedule(
         this.getAttribute("data-delete-sched"),
@@ -1145,12 +1145,12 @@ function confirmDeleteSchedule(taskId, name) {
 // --- Schedule helpers: dropdowns, notify rows, timezone ---
 
 function _populateScheduleSelect(selectId, url, labelKey, valueKey, opts) {
-  var sel = document.getElementById(selectId);
+  const sel = document.getElementById(selectId);
   // Keep the first option (placeholder) and remove the rest
   while (sel.options.length > 1) sel.remove(1);
   // Add temporary option for pre-selected value so form is correct before fetch completes
   if (opts && opts.selected) {
-    var tmp = document.createElement("option");
+    const tmp = document.createElement("option");
     tmp.value = opts.selected;
     tmp.textContent = opts.selected;
     tmp.dataset.temporary = "1";
@@ -1162,12 +1162,12 @@ function _populateScheduleSelect(selectId, url, labelKey, valueKey, opts) {
       return r.json();
     })
     .then(function (data) {
-      var temp = sel.querySelector("[data-temporary]");
+      const temp = sel.querySelector("[data-temporary]");
       if (temp) temp.remove();
-      var items = opts && opts.listKey ? data[opts.listKey] : data;
+      const items = opts && opts.listKey ? data[opts.listKey] : data;
       if (!Array.isArray(items)) return;
       items.forEach(function (item) {
-        var opt = document.createElement("option");
+        const opt = document.createElement("option");
         opt.value = item[valueKey];
         opt.textContent =
           opts && opts.display ? opts.display(item) : item[labelKey];
@@ -1200,17 +1200,17 @@ function _populateScheduleSelect(selectId, url, labelKey, valueKey, opts) {
 // "(model)" suffix legible.
 function _decorateScheduleModelPlaceholder(sel, data) {
   if (!sel || sel.options.length === 0) return;
-  var alias = (data && data.default_alias) || "";
+  const alias = (data && data.default_alias) || "";
   if (!alias) return;
-  var match = null;
-  var models = (data && data.models) || [];
-  for (var i = 0; i < models.length; i++) {
+  let match = null;
+  const models = (data && data.models) || [];
+  for (let i = 0; i < models.length; i++) {
     if (models[i].alias === alias) {
       match = models[i];
       break;
     }
   }
-  var label;
+  let label;
   if (match) {
     label =
       match.alias === match.model
@@ -1225,7 +1225,7 @@ function _decorateScheduleModelPlaceholder(sel, data) {
 // Channel platforms shown in admin notify-target rows.  Mirror server-side
 // channel adapters; expand here when a new adapter ships (Discord / Slack
 // today, MS Teams / etc. later).
-var _NOTIFY_CHANNEL_TYPES = [
+const _NOTIFY_CHANNEL_TYPES = [
   {
     value: "discord",
     label: "Discord",
@@ -1239,7 +1239,7 @@ var _NOTIFY_CHANNEL_TYPES = [
 ];
 
 function _notifyIdPlaceholder(channelType) {
-  for (var i = 0; i < _NOTIFY_CHANNEL_TYPES.length; i++) {
+  for (let i = 0; i < _NOTIFY_CHANNEL_TYPES.length; i++) {
     if (_NOTIFY_CHANNEL_TYPES[i].value === channelType) {
       return _NOTIFY_CHANNEL_TYPES[i].id_hint;
     }
@@ -1248,35 +1248,35 @@ function _notifyIdPlaceholder(channelType) {
 }
 
 function _addNotifyRow(prefix, targetType, targetId, channelType) {
-  var container = document.getElementById(prefix + "-notify-rows");
-  var row = document.createElement("div");
+  const container = document.getElementById(prefix + "-notify-rows");
+  const row = document.createElement("div");
   row.className = "notify-row";
 
-  var ctSel = document.createElement("select");
+  const ctSel = document.createElement("select");
   ctSel.setAttribute("aria-label", "Channel platform");
   ctSel.className = "notify-row-ct";
-  for (var i = 0; i < _NOTIFY_CHANNEL_TYPES.length; i++) {
-    var ctOpt = document.createElement("option");
+  for (let i = 0; i < _NOTIFY_CHANNEL_TYPES.length; i++) {
+    const ctOpt = document.createElement("option");
     ctOpt.value = _NOTIFY_CHANNEL_TYPES[i].value;
     ctOpt.textContent = _NOTIFY_CHANNEL_TYPES[i].label;
     ctSel.appendChild(ctOpt);
   }
   ctSel.value = channelType || "discord";
 
-  var typeSel = document.createElement("select");
+  const typeSel = document.createElement("select");
   typeSel.setAttribute("aria-label", "Target type");
   typeSel.className = "notify-row-target";
-  var optCh = document.createElement("option");
+  const optCh = document.createElement("option");
   optCh.value = "channel_id";
   optCh.textContent = "Channel";
-  var optUsr = document.createElement("option");
+  const optUsr = document.createElement("option");
   optUsr.value = "user_id";
   optUsr.textContent = "User DM";
   typeSel.appendChild(optCh);
   typeSel.appendChild(optUsr);
   if (targetType) typeSel.value = targetType;
 
-  var idInput = document.createElement("input");
+  const idInput = document.createElement("input");
   idInput.type = "text";
   idInput.className = "notify-row-id";
   idInput.placeholder = _notifyIdPlaceholder(ctSel.value);
@@ -1290,7 +1290,7 @@ function _addNotifyRow(prefix, targetType, targetId, channelType) {
     idInput.placeholder = _notifyIdPlaceholder(ctSel.value);
   });
 
-  var removeBtn = document.createElement("button");
+  const removeBtn = document.createElement("button");
   removeBtn.type = "button";
   removeBtn.className = "notify-row-remove";
   removeBtn.setAttribute("aria-label", "Remove target");
@@ -1308,18 +1308,18 @@ function _addNotifyRow(prefix, targetType, targetId, channelType) {
 }
 
 function _collectNotifyTargets(prefix) {
-  var rows = document
+  const rows = document
     .getElementById(prefix + "-notify-rows")
     .querySelectorAll(".notify-row");
-  var targets = [];
-  for (var i = 0; i < rows.length; i++) {
-    var ct = (rows[i].querySelector(".notify-row-ct") || {}).value || "discord";
-    var type =
+  const targets = [];
+  for (let i = 0; i < rows.length; i++) {
+    const ct = (rows[i].querySelector(".notify-row-ct") || {}).value || "discord";
+    const type =
       (rows[i].querySelector(".notify-row-target") || {}).value || "channel_id";
-    var idEl = rows[i].querySelector(".notify-row-id");
-    var id = ((idEl && idEl.value) || "").trim();
+    const idEl = rows[i].querySelector(".notify-row-id");
+    const id = ((idEl && idEl.value) || "").trim();
     if (!id) continue;
-    var t = { channel_type: ct };
+    const t = { channel_type: ct };
     t[type] = id;
     targets.push(t);
   }
@@ -1327,12 +1327,12 @@ function _collectNotifyTargets(prefix) {
 }
 
 function _populateNotifyRows(prefix, targets) {
-  var container = document.getElementById(prefix + "-notify-rows");
+  const container = document.getElementById(prefix + "-notify-rows");
   while (container.firstChild) container.removeChild(container.firstChild);
   if (!Array.isArray(targets)) return;
   targets.forEach(function (t) {
-    var targetType = "channel_id" in t ? "channel_id" : "user_id";
-    var targetId = t[targetType] || "";
+    const targetType = "channel_id" in t ? "channel_id" : "user_id";
+    const targetId = t[targetType] || "";
     _addNotifyRow(prefix, targetType, targetId, t.channel_type || "discord");
   });
 }
@@ -1340,7 +1340,7 @@ function _populateNotifyRows(prefix, targets) {
 function _localToUtcIso(localDatetimeStr) {
   // datetime-local gives "YYYY-MM-DDTHH:MM" in browser local time
   // Convert to UTC ISO string for the server
-  var d = new Date(localDatetimeStr);
+  const d = new Date(localDatetimeStr);
   if (isNaN(d.getTime())) return "";
   return d.toISOString().replace(/\.\d{3}Z$/, "+00:00");
 }
@@ -1348,9 +1348,9 @@ function _localToUtcIso(localDatetimeStr) {
 function _utcToLocalDatetime(utcStr) {
   // Convert UTC ISO string to datetime-local format in browser local time
   if (!utcStr) return "";
-  var d = new Date(utcStr);
+  const d = new Date(utcStr);
   if (isNaN(d.getTime())) return utcStr.slice(0, 16);
-  var pad = function (n) {
+  const pad = function (n) {
     return n < 10 ? "0" + n : "" + n;
   };
   return (
@@ -1369,7 +1369,7 @@ function _utcToLocalDatetime(utcStr) {
 // --- Create Schedule Modal ---
 
 function toggleScheduleTypeFields() {
-  var t = document.getElementById("cs-type").value;
+  const t = document.getElementById("cs-type").value;
   document.getElementById("cs-cron-group").style.display =
     t === "cron" ? "" : "none";
   document.getElementById("cs-at-group").style.display =
@@ -1379,14 +1379,14 @@ function toggleScheduleTypeFields() {
 }
 
 function toggleScheduleNodeField() {
-  var v = document.getElementById("cs-target").value;
+  const v = document.getElementById("cs-target").value;
   document.getElementById("cs-node-group").style.display =
     v === "node" ? "" : "none";
   if (v === "node") document.getElementById("cs-node").focus();
 }
 
 function showCreateScheduleModal() {
-  var overlay = document.getElementById("create-schedule-overlay");
+  const overlay = document.getElementById("create-schedule-overlay");
   overlay.style.display = "flex";
   document
     .getElementById("create-schedule-error")
@@ -1438,24 +1438,24 @@ function showCreateScheduleModal() {
 function hideCreateScheduleModal() {
   document.getElementById("create-schedule-overlay").style.display = "none";
   _csTrapHandler = _removeTrap(_csTrapHandler);
-  var trigger = document.querySelector("#admin-schedules .admin-action-btn");
+  const trigger = document.querySelector("#admin-schedules .admin-action-btn");
   if (trigger) trigger.focus();
 }
 
 function submitCreateSchedule() {
-  var name = (document.getElementById("cs-name").value || "").trim();
-  var desc = (document.getElementById("cs-desc").value || "").trim();
-  var schedType = document.getElementById("cs-type").value;
-  var cronExpr = (document.getElementById("cs-cron").value || "").trim();
-  var atTime = document.getElementById("cs-at").value || "";
-  var targetMode = document.getElementById("cs-target").value;
-  var nodeId = (document.getElementById("cs-node").value || "").trim();
-  var model = (document.getElementById("cs-model").value || "").trim();
-  var message = (document.getElementById("cs-message").value || "").trim();
-  var skill = (document.getElementById("cs-template").value || "").trim();
-  var autoApprove = document.getElementById("cs-autoapprove").checked;
-  var notifyTargets = _collectNotifyTargets("cs");
-  var errEl = document.getElementById("create-schedule-error");
+  const name = (document.getElementById("cs-name").value || "").trim();
+  const desc = (document.getElementById("cs-desc").value || "").trim();
+  const schedType = document.getElementById("cs-type").value;
+  const cronExpr = (document.getElementById("cs-cron").value || "").trim();
+  let atTime = document.getElementById("cs-at").value || "";
+  let targetMode = document.getElementById("cs-target").value;
+  const nodeId = (document.getElementById("cs-node").value || "").trim();
+  const model = (document.getElementById("cs-model").value || "").trim();
+  const message = (document.getElementById("cs-message").value || "").trim();
+  const skill = (document.getElementById("cs-template").value || "").trim();
+  const autoApprove = document.getElementById("cs-autoapprove").checked;
+  const notifyTargets = _collectNotifyTargets("cs");
+  const errEl = document.getElementById("create-schedule-error");
 
   if (!name) return _showModalError(errEl, "Name is required");
   if (!message) return _showModalError(errEl, "Initial message is required");
@@ -1471,7 +1471,7 @@ function submitCreateSchedule() {
 
   if (targetMode === "node") targetMode = nodeId;
 
-  var btn = document.getElementById("cs-submit");
+  const btn = document.getElementById("cs-submit");
   btn.disabled = true;
   btn.textContent = "Creating\u2026";
 
@@ -1514,7 +1514,7 @@ function submitCreateSchedule() {
 // --- Edit Schedule Modal ---
 
 function toggleEditScheduleTypeFields() {
-  var t = document.getElementById("es-type").value;
+  const t = document.getElementById("es-type").value;
   document.getElementById("es-cron-group").style.display =
     t === "cron" ? "" : "none";
   document.getElementById("es-at-group").style.display =
@@ -1524,7 +1524,7 @@ function toggleEditScheduleTypeFields() {
 }
 
 function toggleEditScheduleNodeField() {
-  var v = document.getElementById("es-target").value;
+  const v = document.getElementById("es-target").value;
   document.getElementById("es-node-group").style.display =
     v === "node" ? "" : "none";
   if (v === "node") document.getElementById("es-node").focus();
@@ -1544,7 +1544,7 @@ function showEditScheduleModal(taskId) {
       document.getElementById("es-type").value = s.schedule_type;
       document.getElementById("es-cron").value = s.cron_expr || "";
       document.getElementById("es-at").value = _utcToLocalDatetime(s.at_time);
-      var isSpecificNode =
+      const isSpecificNode =
         s.target_mode &&
         s.target_mode !== "auto" &&
         s.target_mode !== "pool" &&
@@ -1589,7 +1589,7 @@ function showEditScheduleModal(taskId) {
         .classList.remove("is-visible");
       document.getElementById("es-submit").disabled = false;
       document.getElementById("es-submit").textContent = "Save";
-      var overlay = document.getElementById("edit-schedule-overlay");
+      const overlay = document.getElementById("edit-schedule-overlay");
       overlay.style.display = "flex";
       _esTrapHandler = _installTrap(
         "edit-schedule-overlay",
@@ -1614,18 +1614,18 @@ function hideEditScheduleModal() {
 }
 
 function submitEditSchedule() {
-  var taskId = document.getElementById("es-id").value;
-  var name = (document.getElementById("es-name").value || "").trim();
-  var message = (document.getElementById("es-message").value || "").trim();
-  var schedType = document.getElementById("es-type").value;
-  var cronExpr = (document.getElementById("es-cron").value || "").trim();
-  var targetMode = document.getElementById("es-target").value;
+  const taskId = document.getElementById("es-id").value;
+  const name = (document.getElementById("es-name").value || "").trim();
+  const message = (document.getElementById("es-message").value || "").trim();
+  const schedType = document.getElementById("es-type").value;
+  const cronExpr = (document.getElementById("es-cron").value || "").trim();
+  let targetMode = document.getElementById("es-target").value;
   if (targetMode === "node")
     targetMode = (document.getElementById("es-node").value || "").trim();
-  var atTime = document.getElementById("es-at").value || "";
+  let atTime = document.getElementById("es-at").value || "";
 
-  var editNotifyTargets = _collectNotifyTargets("es");
-  var errEl = document.getElementById("edit-schedule-error");
+  const editNotifyTargets = _collectNotifyTargets("es");
+  const errEl = document.getElementById("edit-schedule-error");
 
   if (!name) return _showModalError(errEl, "Name is required");
   if (!message) return _showModalError(errEl, "Initial message is required");
@@ -1639,7 +1639,7 @@ function submitEditSchedule() {
     atTime = _localToUtcIso(atTime);
   }
 
-  var btn = document.getElementById("es-submit");
+  const btn = document.getElementById("es-submit");
   btn.disabled = true;
   btn.textContent = "Saving\u2026";
 
@@ -1692,23 +1692,23 @@ function showScheduleRuns(taskId) {
       return r.json();
     })
     .then(function (data) {
-      var runs = data.runs || [];
-      var container = document.getElementById("schedule-runs-table");
+      const runs = data.runs || [];
+      const container = document.getElementById("schedule-runs-table");
       if (!runs.length) {
         setSafeHtml(
           container,
           '<div class="dashboard-empty">No runs yet</div>',
         );
       } else {
-        var html =
+        let html =
           '<div class="admin-colheaders sched-runs-grid" aria-hidden="true">' +
           '<span class="admin-col">STARTED</span>' +
           '<span class="admin-col">NODE</span>' +
           '<span class="admin-col">STATUS</span>' +
           '<span class="admin-col">ERROR</span></div>';
-        for (var i = 0; i < runs.length; i++) {
-          var r = runs[i];
-          var statusCls =
+        for (let i = 0; i < runs.length; i++) {
+          const r = runs[i];
+          let statusCls =
             r.status === "dispatched"
               ? "sched-active"
               : r.status === "failed"
@@ -1735,7 +1735,7 @@ function showScheduleRuns(taskId) {
         }
         setSafeHtml(container, html);
       }
-      var overlay = document.getElementById("schedule-runs-overlay");
+      const overlay = document.getElementById("schedule-runs-overlay");
       overlay.style.display = "flex";
       _srTrapHandler = _installTrap(
         "schedule-runs-overlay",
@@ -1761,15 +1761,15 @@ function hideScheduleRunsModal() {
 // ---------------------------------------------------------------------------
 
 function _populateWatchNodeSelect() {
-  var sel = document.getElementById("admin-watch-node");
-  var current = sel.value;
-  var seen = {};
+  const sel = document.getElementById("admin-watch-node");
+  let current = sel.value;
+  const seen = {};
   setSafeHtml(sel, '<option value="">All nodes</option>');
-  for (var i = 0; i < _adminWatches.length; i++) {
-    var nid = _adminWatches[i].node_id || "";
+  for (let i = 0; i < _adminWatches.length; i++) {
+    const nid = _adminWatches[i].node_id || "";
     if (nid && !seen[nid]) {
       seen[nid] = true;
-      var opt = document.createElement("option");
+      const opt = document.createElement("option");
       opt.value = nid;
       opt.textContent = nid;
       sel.appendChild(opt);
@@ -1787,8 +1787,8 @@ function loadAdminWatches() {
     .then(function (data) {
       _adminWatches = data.watches || [];
       _populateWatchNodeSelect();
-      var nodeFilter = document.getElementById("admin-watch-node").value;
-      var filtered = _adminWatches;
+      const nodeFilter = document.getElementById("admin-watch-node").value;
+      let filtered = _adminWatches;
       if (nodeFilter) {
         filtered = _adminWatches.filter(function (w) {
           return w.node_id === nodeFilter;
@@ -1812,7 +1812,7 @@ function _formatInterval(secs) {
 }
 
 function _renderWatches(watches) {
-  var container = document.getElementById("admin-watches-table");
+  const container = document.getElementById("admin-watches-table");
   if (!watches.length) {
     setSafeHtml(
       container,
@@ -1820,23 +1820,23 @@ function _renderWatches(watches) {
     );
     return;
   }
-  var html = "";
-  for (var i = 0; i < watches.length; i++) {
-    var w = watches[i];
-    var name = w.name || w.watch_id || "\u2014";
-    var nodeShort = (w.node_id || "").slice(0, 8);
-    var cmd = w.command || "";
-    var cmdTrunc = cmd.length > 40 ? cmd.slice(0, 40) + "\u2026" : cmd;
-    var interval = _formatInterval(w.interval_secs);
-    var pollMax = w.max_polls ? w.max_polls : "\u221e";
-    var pollLabel = (w.poll_count || 0) + "/" + pollMax;
-    var cond = w.stop_on || "on change";
-    var condTrunc = cond.length > 30 ? cond.slice(0, 30) + "\u2026" : cond;
-    var active = w.active;
-    var statusCls = active ? "watch-active" : "watch-completed";
-    var statusLabel = active ? "active" : "done";
-    var statusDot = active ? "\u25cf " : "\u25cb ";
-    var cancelBtn = active
+  let html = "";
+  for (let i = 0; i < watches.length; i++) {
+    const w = watches[i];
+    const name = w.name || w.watch_id || "\u2014";
+    const nodeShort = (w.node_id || "").slice(0, 8);
+    const cmd = w.command || "";
+    const cmdTrunc = cmd.length > 40 ? cmd.slice(0, 40) + "\u2026" : cmd;
+    const interval = _formatInterval(w.interval_secs);
+    const pollMax = w.max_polls ? w.max_polls : "\u221e";
+    const pollLabel = (w.poll_count || 0) + "/" + pollMax;
+    const cond = w.stop_on || "on change";
+    const condTrunc = cond.length > 30 ? cond.slice(0, 30) + "\u2026" : cond;
+    const active = w.active;
+    let statusCls = active ? "watch-active" : "watch-completed";
+    let statusLabel = active ? "active" : "done";
+    let statusDot = active ? "\u25cf " : "\u25cb ";
+    const cancelBtn = active
       ? '<button class="admin-btn-danger" data-cancel-watch="' +
         escapeHtml(w.watch_id) +
         '" data-watch-node="' +
@@ -1883,8 +1883,8 @@ function _renderWatches(watches) {
   }
   setSafeHtml(container, html);
   // Bind cancel buttons
-  var btns = container.querySelectorAll("[data-cancel-watch]");
-  for (var j = 0; j < btns.length; j++) {
+  const btns = container.querySelectorAll("[data-cancel-watch]");
+  for (let j = 0; j < btns.length; j++) {
     btns[j].addEventListener("click", function () {
       _cancelWatch(
         this.getAttribute("data-cancel-watch"),
@@ -1930,13 +1930,13 @@ function showCreateChannelModal() {
     showToast("Select a user first");
     return;
   }
-  var overlay = document.getElementById("create-channel-overlay");
+  const overlay = document.getElementById("create-channel-overlay");
   overlay.style.display = "flex";
   document
     .getElementById("create-channel-error")
     .classList.remove("is-visible");
-  var ctSel = document.getElementById("cc-type");
-  var uidInput = document.getElementById("cc-uid");
+  const ctSel = document.getElementById("cc-type");
+  const uidInput = document.getElementById("cc-uid");
   ctSel.value = "discord";
   uidInput.value = "";
   uidInput.placeholder = _notifyIdPlaceholder(ctSel.value);
@@ -1954,19 +1954,19 @@ function showCreateChannelModal() {
 function hideCreateChannelModal() {
   document.getElementById("create-channel-overlay").style.display = "none";
   _ccTrapHandler = _removeTrap(_ccTrapHandler);
-  var trigger = document.querySelector("#admin-channels .admin-action-btn");
+  const trigger = document.querySelector("#admin-channels .admin-action-btn");
   if (trigger) trigger.focus();
 }
 
 function submitCreateChannel() {
-  var channelType = document.getElementById("cc-type").value;
-  var channelUserId = (document.getElementById("cc-uid").value || "").trim();
-  var errEl = document.getElementById("create-channel-error");
+  const channelType = document.getElementById("cc-type").value;
+  const channelUserId = (document.getElementById("cc-uid").value || "").trim();
+  const errEl = document.getElementById("create-channel-error");
 
   if (!channelUserId)
     return _showModalError(errEl, "External user ID is required");
 
-  var btn = document.getElementById("cc-submit");
+  const btn = document.getElementById("cc-submit");
   btn.disabled = true;
   btn.textContent = "Linking\u2026";
 
@@ -2011,7 +2011,7 @@ function submitCreateChannel() {
 // ---------------------------------------------------------------------------
 
 function showCreateUserModal() {
-  var overlay = document.getElementById("create-user-overlay");
+  const overlay = document.getElementById("create-user-overlay");
   overlay.style.display = "flex";
   document.getElementById("create-user-error").classList.remove("is-visible");
   document.getElementById("cu-username").value = "";
@@ -2029,18 +2029,18 @@ function showCreateUserModal() {
 function hideCreateUserModal() {
   document.getElementById("create-user-overlay").style.display = "none";
   _cuTrapHandler = _removeTrap(_cuTrapHandler);
-  var trigger = document.querySelector("#admin-users .admin-action-btn");
+  const trigger = document.querySelector("#admin-users .admin-action-btn");
   if (trigger) trigger.focus();
 }
 
 function submitCreateUser() {
-  var username = (document.getElementById("cu-username").value || "").trim();
-  var displayName = (
+  const username = (document.getElementById("cu-username").value || "").trim();
+  const displayName = (
     document.getElementById("cu-displayname").value || ""
   ).trim();
-  var password = document.getElementById("cu-password").value || "";
-  var confirm = document.getElementById("cu-confirm").value || "";
-  var errEl = document.getElementById("create-user-error");
+  const password = document.getElementById("cu-password").value || "";
+  const confirm = document.getElementById("cu-confirm").value || "";
+  const errEl = document.getElementById("create-user-error");
 
   if (!username) return _showModalError(errEl, "Username is required");
   if (!displayName) return _showModalError(errEl, "Display name is required");
@@ -2050,7 +2050,7 @@ function submitCreateUser() {
   if (password !== confirm)
     return _showModalError(errEl, "Passwords do not match");
 
-  var btn = document.getElementById("cu-submit");
+  const btn = document.getElementById("cu-submit");
   btn.disabled = true;
   btn.textContent = "Creating\u2026";
 
@@ -2092,7 +2092,7 @@ function showCreateTokenModal() {
     showToast("Select a user first");
     return;
   }
-  var overlay = document.getElementById("create-token-overlay");
+  const overlay = document.getElementById("create-token-overlay");
   overlay.style.display = "flex";
   document.getElementById("create-token-error").classList.remove("is-visible");
   document.getElementById("ct-name").value = "";
@@ -2109,21 +2109,21 @@ function showCreateTokenModal() {
 function hideCreateTokenModal() {
   document.getElementById("create-token-overlay").style.display = "none";
   _ctTrapHandler = _removeTrap(_ctTrapHandler);
-  var trigger = document.querySelector("#admin-tokens .admin-action-btn");
+  const trigger = document.querySelector("#admin-tokens .admin-action-btn");
   if (trigger) trigger.focus();
 }
 
 function submitCreateToken() {
-  var name = (document.getElementById("ct-name").value || "").trim();
-  var scopes = document.getElementById("ct-scopes").value;
-  var expiresDays = document.getElementById("ct-expires").value;
-  var errEl = document.getElementById("create-token-error");
+  const name = (document.getElementById("ct-name").value || "").trim();
+  const scopes = document.getElementById("ct-scopes").value;
+  const expiresDays = document.getElementById("ct-expires").value;
+  const errEl = document.getElementById("create-token-error");
 
-  var btn = document.getElementById("ct-submit");
+  const btn = document.getElementById("ct-submit");
   btn.disabled = true;
   btn.textContent = "Creating\u2026";
 
-  var body = { name: name, scopes: scopes };
+  const body = { name: name, scopes: scopes };
   if (expiresDays) body.expires_days = parseInt(expiresDays, 10);
 
   authFetch(
@@ -2168,7 +2168,7 @@ function hideTokenCreatedModal() {
   document.getElementById("token-created-overlay").style.display = "none";
   _tcTrapHandler = _removeTrap(_tcTrapHandler);
   _lastCreatedToken = "";
-  var trigger = document.querySelector("#admin-tokens .admin-action-btn");
+  const trigger = document.querySelector("#admin-tokens .admin-action-btn");
   if (trigger) trigger.focus();
 }
 
@@ -2180,10 +2180,10 @@ function copyCreatedToken() {
     });
   } else {
     // Fallback: select the text
-    var el = document.getElementById("token-created-value");
-    var range = document.createRange();
+    const el = document.getElementById("token-created-value");
+    const range = document.createRange();
     range.selectNodeContents(el);
-    var sel = window.getSelection();
+    const sel = window.getSelection();
     sel.removeAllRanges();
     sel.addRange(range);
     showToast("Select and copy the token");
@@ -2197,18 +2197,18 @@ function copyCreatedToken() {
 function _modalFocusTrap(boxId) {
   return function (e) {
     if (e.key === "Tab") {
-      var box = document.getElementById(boxId);
+      const box = document.getElementById(boxId);
       if (!box) return;
-      var focusable = box.querySelectorAll(
+      const focusable = box.querySelectorAll(
         "input:not([disabled]):not([type='hidden']), select:not([disabled]), textarea:not([disabled]), button:not([disabled])",
       );
-      var visible = [];
-      for (var i = 0; i < focusable.length; i++) {
+      const visible = [];
+      for (let i = 0; i < focusable.length; i++) {
         if (focusable[i].offsetParent !== null) visible.push(focusable[i]);
       }
       if (visible.length === 0) return;
-      var first = visible[0];
-      var last = visible[visible.length - 1];
+      const first = visible[0];
+      const last = visible[visible.length - 1];
       if (e.shiftKey) {
         if (document.activeElement === first) {
           e.preventDefault();
@@ -2225,7 +2225,7 @@ function _modalFocusTrap(boxId) {
 }
 
 function _installTrap(overlayId, boxId, trapRef) {
-  var overlay = document.getElementById(overlayId);
+  const overlay = document.getElementById(overlayId);
   if (overlay) {
     overlay.onclick = function (e) {
       if (e.target === overlay) {
@@ -2266,7 +2266,7 @@ function _installTrap(overlayId, boxId, trapRef) {
     };
   }
   document.body.style.overflow = "hidden";
-  var handler = _modalFocusTrap(boxId);
+  const handler = _modalFocusTrap(boxId);
   document.addEventListener("keydown", handler);
   return handler;
 }
@@ -2281,62 +2281,62 @@ function _removeTrap(handler) {
 document.addEventListener("keydown", function (e) {
   if (e.key !== "Escape") return;
   // Close any open settings help popover first
-  var openHelp = document.querySelector('.settings-help-popover[style=""]');
+  const openHelp = document.querySelector('.settings-help-popover[style=""]');
   if (openHelp) {
     e.preventDefault();
     _closeAllSettingsHelp();
     return;
   }
-  var cu = document.getElementById("create-user-overlay");
+  const cu = document.getElementById("create-user-overlay");
   if (cu && cu.style.display !== "none") {
     e.preventDefault();
     hideCreateUserModal();
     return;
   }
-  var ct = document.getElementById("create-token-overlay");
+  const ct = document.getElementById("create-token-overlay");
   if (ct && ct.style.display !== "none") {
     e.preventDefault();
     hideCreateTokenModal();
     return;
   }
-  var tc = document.getElementById("token-created-overlay");
+  const tc = document.getElementById("token-created-overlay");
   if (tc && tc.style.display !== "none") {
     e.preventDefault();
     hideTokenCreatedModal();
     return;
   }
-  var cc = document.getElementById("create-channel-overlay");
+  const cc = document.getElementById("create-channel-overlay");
   if (cc && cc.style.display !== "none") {
     e.preventDefault();
     hideCreateChannelModal();
     return;
   }
-  var cso = document.getElementById("create-schedule-overlay");
+  const cso = document.getElementById("create-schedule-overlay");
   if (cso && cso.style.display !== "none") {
     e.preventDefault();
     hideCreateScheduleModal();
     return;
   }
-  var eso = document.getElementById("edit-schedule-overlay");
+  const eso = document.getElementById("edit-schedule-overlay");
   if (eso && eso.style.display !== "none") {
     e.preventDefault();
     hideEditScheduleModal();
     return;
   }
-  var sro = document.getElementById("schedule-runs-overlay");
+  const sro = document.getElementById("schedule-runs-overlay");
   if (sro && sro.style.display !== "none") {
     e.preventDefault();
     hideScheduleRunsModal();
     return;
   }
-  var cf = document.getElementById("confirm-overlay");
+  const cf = document.getElementById("confirm-overlay");
   if (cf && cf.style.display !== "none") {
     e.preventDefault();
     hideConfirmModal();
     return;
   }
   // Governance modals
-  var govOverlays = [
+  const govOverlays = [
     ["create-role-overlay", hideCreateRoleModal],
     ["edit-role-overlay", hideEditRoleModal],
     ["user-roles-overlay", hideUserRolesModal],
@@ -2358,8 +2358,8 @@ document.addEventListener("keydown", function (e) {
     ["create-ogp-overlay", hideCreateOGPModal],
     ["edit-ogp-overlay", hideEditOGPModal],
   ];
-  for (var gi = 0; gi < govOverlays.length; gi++) {
-    var govEl = document.getElementById(govOverlays[gi][0]);
+  for (let gi = 0; gi < govOverlays.length; gi++) {
+    const govEl = document.getElementById(govOverlays[gi][0]);
     if (govEl && govEl.style.display !== "none") {
       e.preventDefault();
       govOverlays[gi][1]();
@@ -2370,7 +2370,7 @@ document.addEventListener("keydown", function (e) {
   if (_mobileSidebarOpen && window.innerWidth <= 700) {
     e.preventDefault();
     _toggleMobileSidebar();
-    var mt = document.getElementById("admin-mobile-toggle");
+    const mt = document.getElementById("admin-mobile-toggle");
     if (mt) mt.focus();
     return;
   }
@@ -2378,24 +2378,24 @@ document.addEventListener("keydown", function (e) {
 
 // Sidebar arrow key navigation (vertical)
 (function () {
-  var sidebar = document.getElementById("admin-sidebar");
+  const sidebar = document.getElementById("admin-sidebar");
   if (!sidebar) return;
   sidebar.addEventListener("keydown", function (e) {
     if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
     e.preventDefault();
-    var allNavs = document.querySelectorAll(
+    const allNavs = document.querySelectorAll(
       '.admin-nav:not([style*="display: none"])',
     );
-    var navOrder = [];
-    for (var ni = 0; ni < allNavs.length; ni++) {
+    const navOrder = [];
+    for (let ni = 0; ni < allNavs.length; ni++) {
       navOrder.push(allNavs[ni].getAttribute("data-tab"));
     }
     if (navOrder.length === 0) return;
-    var idx = navOrder.indexOf(_adminTab);
+    let idx = navOrder.indexOf(_adminTab);
     if (e.key === "ArrowDown") idx = (idx + 1) % navOrder.length;
     else idx = (idx - 1 + navOrder.length) % navOrder.length;
     switchAdminTab(navOrder[idx]);
-    var btn = document.querySelector(
+    const btn = document.querySelector(
       '.admin-nav[data-tab="' + navOrder[idx] + '"]',
     );
     if (btn) btn.focus();
@@ -2404,15 +2404,15 @@ document.addEventListener("keydown", function (e) {
 
 // Sync sidebar aria-hidden/inert when crossing mobile/desktop breakpoint
 (function () {
-  var resizeTimer;
+  let resizeTimer;
   window.addEventListener("resize", function () {
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(function () {
       if (typeof currentView === "undefined" || currentView !== "admin") return;
-      var sidebar = document.getElementById("admin-sidebar");
+      const sidebar = document.getElementById("admin-sidebar");
       if (!sidebar) return;
-      var isMobile = window.innerWidth <= 700;
-      var backdrop = document.getElementById("admin-sidebar-backdrop");
+      const isMobile = window.innerWidth <= 700;
+      const backdrop = document.getElementById("admin-sidebar-backdrop");
       if (!isMobile) {
         // Crossed into desktop: close drawer cleanly if it was open
         if (_mobileSidebarOpen) _toggleMobileSidebar();
@@ -2441,10 +2441,10 @@ function showConfirmModal(title, message, actionLabel, callback) {
   _confirmTriggerEl = document.activeElement;
   document.getElementById("confirm-title").textContent = title;
   document.getElementById("confirm-message").textContent = message;
-  var btn = document.getElementById("confirm-submit");
+  const btn = document.getElementById("confirm-submit");
   btn.textContent = actionLabel;
   btn.disabled = false;
-  var overlay = document.getElementById("confirm-overlay");
+  const overlay = document.getElementById("confirm-overlay");
   overlay.style.display = "flex";
   _cfTrapHandler = _installTrap("confirm-overlay", "confirm-box");
   setTimeout(function () {
@@ -2467,9 +2467,9 @@ function hideConfirmModal() {
 }
 
 function _confirmCallback() {
-  var fn = _confirmCallbackFn;
+  const fn = _confirmCallbackFn;
   _confirmCallbackFn = null;
-  var btn = document.getElementById("confirm-submit");
+  const btn = document.getElementById("confirm-submit");
   if (btn) btn.disabled = true;
   if (fn) fn();
   hideConfirmModal();
@@ -2479,10 +2479,10 @@ function _confirmCallback() {
 // Settings — form-based editor grouped by section
 // ---------------------------------------------------------------------------
 
-var _settingsOriginal = {}; // original values for dirty detection
+let _settingsOriginal = {}; // original values for dirty detection
 
 // Section display order
-var _settingsSectionOrder = [
+const _settingsSectionOrder = [
   "model",
   "session",
   "tools",
@@ -2498,7 +2498,7 @@ var _settingsSectionOrder = [
 ];
 
 function _settingsSectionLabel(section) {
-  var labels = {
+  const labels = {
     model: "Model",
     session: "Session",
     tools: "Tools",
@@ -2520,8 +2520,8 @@ function _settingsSectionLabel(section) {
 // ---------------------------------------------------------------------------
 
 function loadTlsCerts() {
-  var statusEl = document.getElementById("tls-ca-status");
-  var listEl = document.getElementById("tls-cert-list");
+  const statusEl = document.getElementById("tls-ca-status");
+  const listEl = document.getElementById("tls-cert-list");
   if (!statusEl || !listEl) return;
 
   // Fetch CA status and cert list in parallel
@@ -2536,13 +2536,13 @@ function loadTlsCerts() {
     }),
   ])
     .then(function (results) {
-      var data = results[0];
-      var certData = results[1];
+      const data = results[0];
+      const certData = results[1];
       while (statusEl.firstChild) statusEl.removeChild(statusEl.firstChild);
       while (listEl.firstChild) listEl.removeChild(listEl.firstChild);
 
       if (!data.enabled) {
-        var msg = document.createElement("div");
+        let msg = document.createElement("div");
         msg.className = "dashboard-empty";
         msg.textContent =
           "TLS is not enabled. Set tls.enabled = true in Settings.";
@@ -2551,19 +2551,19 @@ function loadTlsCerts() {
       }
 
       // CA status bar
-      var bar = document.createElement("div");
+      const bar = document.createElement("div");
       bar.className = "tls-ca-bar";
-      var caLabel = document.createElement("span");
+      const caLabel = document.createElement("span");
       caLabel.textContent = "CA: " + data.ca_cn;
-      var countLabel = document.createElement("span");
+      const countLabel = document.createElement("span");
       countLabel.textContent = "Certificates: " + data.cert_count;
       bar.appendChild(caLabel);
       bar.appendChild(countLabel);
       statusEl.appendChild(bar);
 
-      var certs = certData.certs || [];
+      const certs = certData.certs || [];
       if (certs.length === 0) {
-        var empty = document.createElement("div");
+        let empty = document.createElement("div");
         empty.className = "dashboard-empty";
         empty.textContent = "No certificates issued yet.";
         listEl.appendChild(empty);
@@ -2572,36 +2572,36 @@ function loadTlsCerts() {
 
       // Cert rows
       certs.forEach(function (c) {
-        var row = document.createElement("div");
+        const row = document.createElement("div");
         row.className = "admin-row";
         row.setAttribute("role", "listitem");
 
-        var colDomain = document.createElement("span");
+        const colDomain = document.createElement("span");
         colDomain.className = "admin-col";
         colDomain.textContent = c.domain;
 
-        var colSans = document.createElement("span");
+        const colSans = document.createElement("span");
         colSans.className = "admin-col";
         colSans.textContent = (c.domains || [c.domain]).join(", ");
 
-        var colIssued = document.createElement("span");
+        const colIssued = document.createElement("span");
         colIssued.className = "admin-col";
         colIssued.textContent = (c.issued_at || "")
           .slice(0, 16)
           .replace("T", " ");
 
-        var colExpires = document.createElement("span");
+        const colExpires = document.createElement("span");
         colExpires.className = "admin-col";
-        var expires = new Date(c.expires_at);
-        var isExpired = expires < new Date();
+        const expires = new Date(c.expires_at);
+        const isExpired = expires < new Date();
         colExpires.textContent =
           (isExpired ? "EXPIRED " : "") +
           (c.expires_at || "").slice(0, 16).replace("T", " ");
         if (isExpired) colExpires.style.color = "var(--red)";
 
-        var colActions = document.createElement("span");
+        const colActions = document.createElement("span");
         colActions.className = "admin-col admin-col-actions";
-        var renewBtn = document.createElement("button");
+        const renewBtn = document.createElement("button");
         renewBtn.className = "admin-btn-action";
         renewBtn.textContent = "Renew";
         renewBtn.setAttribute(
@@ -2611,7 +2611,7 @@ function loadTlsCerts() {
         renewBtn.onclick = function () {
           tlsRenewCert(c.domain);
         };
-        var deleteBtn = document.createElement("button");
+        const deleteBtn = document.createElement("button");
         deleteBtn.className = "admin-btn-danger";
         deleteBtn.textContent = "Delete";
         deleteBtn.setAttribute(
@@ -2635,7 +2635,7 @@ function loadTlsCerts() {
     .catch(function () {
       while (statusEl.firstChild) statusEl.removeChild(statusEl.firstChild);
       while (listEl.firstChild) listEl.removeChild(listEl.firstChild);
-      var errMsg = document.createElement("div");
+      const errMsg = document.createElement("div");
       errMsg.className = "dashboard-empty";
       errMsg.textContent = "Failed to load TLS status";
       statusEl.appendChild(errMsg);
@@ -2690,7 +2690,7 @@ function tlsDeleteCert(domain) {
 // ---------------------------------------------------------------------------
 
 function loadSettings() {
-  var el = document.getElementById("admin-settings-content");
+  const el = document.getElementById("admin-settings-content");
   if (!el) return;
 
   Promise.all([
@@ -2708,21 +2708,21 @@ function loadSettings() {
     }),
   ])
     .then(function (results) {
-      var valuesArr = results[0].settings || [];
-      var schemaArr = results[1].schema || [];
-      var modelDefs = results[2].models || [];
+      const valuesArr = results[0].settings || [];
+      const schemaArr = results[1].schema || [];
+      const modelDefs = results[2].models || [];
 
       // Build schema lookup
-      var schemaMap = {};
-      for (var i = 0; i < schemaArr.length; i++) {
+      const schemaMap = {};
+      for (let i = 0; i < schemaArr.length; i++) {
         schemaMap[schemaArr[i].key] = schemaArr[i];
       }
 
       // Merge values + schema.  Skip role-assignment settings owned by
       // the Models → Roles sub-tab (judge.* settings still live on the
       // Judge tab; the model-tab roles render only there).
-      var merged = {};
-      var roleKeys = {
+      const merged = {};
+      const roleKeys = {
         "coordinator.model_alias": 1,
         "coordinator.reasoning_effort": 1,
         "model.plan_alias": 1,
@@ -2731,11 +2731,11 @@ function loadSettings() {
         "model.task_effort": 1,
         "channels.default_model_alias": 1,
       };
-      for (var j = 0; j < valuesArr.length; j++) {
-        var v = valuesArr[j];
+      for (let j = 0; j < valuesArr.length; j++) {
+        const v = valuesArr[j];
         if (v.key.startsWith("judge.")) continue;
         if (roleKeys[v.key]) continue;
-        var s = schemaMap[v.key] || {};
+        const s = schemaMap[v.key] || {};
         merged[v.key] = {
           key: v.key,
           value: v.value,
@@ -2757,13 +2757,13 @@ function loadSettings() {
       }
 
       // Inject dynamic choices for model alias settings from model definitions.
-      var enabledAliases = [""];
-      for (var m = 0; m < modelDefs.length; m++) {
+      const enabledAliases = [""];
+      for (let m = 0; m < modelDefs.length; m++) {
         if (modelDefs[m].enabled) enabledAliases.push(modelDefs[m].alias);
       }
       if (enabledAliases.length > 1) {
-        for (var ak = 0; ak < ALIAS_SETTING_KEYS.length; ak++) {
-          var aliasKey = ALIAS_SETTING_KEYS[ak];
+        for (let ak = 0; ak < ALIAS_SETTING_KEYS.length; ak++) {
+          const aliasKey = ALIAS_SETTING_KEYS[ak];
           if (merged[aliasKey]) merged[aliasKey].choices = enabledAliases;
         }
       }
@@ -2771,11 +2771,11 @@ function loadSettings() {
       _settingsOriginal = {};
 
       // Group by section
-      var grouped = {};
-      var keys = Object.keys(merged);
-      for (var k = 0; k < keys.length; k++) {
-        var item = merged[keys[k]];
-        var sec = item.section || "other";
+      const grouped = {};
+      const keys = Object.keys(merged);
+      for (let k = 0; k < keys.length; k++) {
+        const item = merged[keys[k]];
+        const sec = item.section || "other";
         if (!grouped[sec]) grouped[sec] = [];
         grouped[sec].push(item);
       }
@@ -2794,11 +2794,11 @@ function loadSettings() {
 }
 
 function _renderSettings(container, grouped) {
-  var html = "";
+  let html = "";
 
-  for (var i = 0; i < _settingsSectionOrder.length; i++) {
-    var sec = _settingsSectionOrder[i];
-    var items = grouped[sec];
+  for (let i = 0; i < _settingsSectionOrder.length; i++) {
+    const sec = _settingsSectionOrder[i];
+    const items = grouped[sec];
     if (!items || items.length === 0) continue;
 
     html +=
@@ -2814,7 +2814,7 @@ function _renderSettings(container, grouped) {
     html +=
       '<div class="settings-section-body" id="settings-body-' + sec + '">';
 
-    for (var j = 0; j < items.length; j++) {
+    for (let j = 0; j < items.length; j++) {
       html += _renderSettingRow(items[j]);
     }
 
@@ -2822,10 +2822,10 @@ function _renderSettings(container, grouped) {
   }
 
   // Render any sections not in the explicit order
-  var allSections = Object.keys(grouped);
-  for (var s = 0; s < allSections.length; s++) {
+  const allSections = Object.keys(grouped);
+  for (let s = 0; s < allSections.length; s++) {
     if (_settingsSectionOrder.indexOf(allSections[s]) === -1) {
-      var extra = grouped[allSections[s]];
+      const extra = grouped[allSections[s]];
       html +=
         '<div class="settings-section" data-section="' +
         allSections[s] +
@@ -2840,7 +2840,7 @@ function _renderSettings(container, grouped) {
         '<div class="settings-section-body" id="settings-body-' +
         allSections[s] +
         '">';
-      for (var x = 0; x < extra.length; x++) {
+      for (let x = 0; x < extra.length; x++) {
         html += _renderSettingRow(extra[x]);
       }
       html += "</div></div>";
@@ -2852,8 +2852,8 @@ function _renderSettings(container, grouped) {
   // Bind handlers via data-* attributes — a key with an apostrophe
   // would otherwise break out of the JS string when the HTML parser
   // decodes &#39; before JS evaluation.
-  var sectionHeaders = container.querySelectorAll(".settings-section-header");
-  for (var sh = 0; sh < sectionHeaders.length; sh++) {
+  const sectionHeaders = container.querySelectorAll(".settings-section-header");
+  for (let sh = 0; sh < sectionHeaders.length; sh++) {
     sectionHeaders[sh].addEventListener("click", function () {
       _toggleSettingsSection(this);
     });
@@ -2861,8 +2861,8 @@ function _renderSettings(container, grouped) {
       _onSettingsHeaderKey(e, this);
     });
   }
-  var helpBtns = container.querySelectorAll(".settings-help-btn");
-  for (var hb = 0; hb < helpBtns.length; hb++) {
+  const helpBtns = container.querySelectorAll(".settings-help-btn");
+  for (let hb = 0; hb < helpBtns.length; hb++) {
     helpBtns[hb].addEventListener("click", function (e) {
       _toggleSettingsHelp(e, this);
     });
@@ -2870,29 +2870,29 @@ function _renderSettings(container, grouped) {
 
   // Store original values for dirty detection + wire per-key change
   // handlers off data-setting-key (no key interpolation into JS).
-  var inputs = container.querySelectorAll("[data-setting-key]");
-  for (var n = 0; n < inputs.length; n++) {
-    var inp = inputs[n];
-    var key = inp.getAttribute("data-setting-key");
+  const inputs = container.querySelectorAll("[data-setting-key]");
+  for (let n = 0; n < inputs.length; n++) {
+    const inp = inputs[n];
+    const key = inp.getAttribute("data-setting-key");
     if (inp.type === "checkbox") {
       _settingsOriginal[key] = inp.checked;
     } else {
       _settingsOriginal[key] = inp.value;
     }
-    var evtName =
+    const evtName =
       inp.type === "checkbox" || inp.tagName === "SELECT" ? "change" : "input";
     inp.addEventListener(evtName, function () {
       _onSettingChange(this);
     });
   }
-  var saveBtns = container.querySelectorAll("[data-save-key]");
-  for (var sb = 0; sb < saveBtns.length; sb++) {
+  const saveBtns = container.querySelectorAll("[data-save-key]");
+  for (let sb = 0; sb < saveBtns.length; sb++) {
     saveBtns[sb].addEventListener("click", function () {
       _saveSettingValue(this.getAttribute("data-save-key"));
     });
   }
-  var resetBtns = container.querySelectorAll("[data-reset-key]");
-  for (var rb = 0; rb < resetBtns.length; rb++) {
+  const resetBtns = container.querySelectorAll("[data-reset-key]");
+  for (let rb = 0; rb < resetBtns.length; rb++) {
     resetBtns[rb].addEventListener("click", function () {
       _resetSetting(this.getAttribute("data-reset-key"));
     });
@@ -2900,15 +2900,15 @@ function _renderSettings(container, grouped) {
 }
 
 function _renderSettingRow(item) {
-  var shortKey =
+  const shortKey =
     item.key.indexOf(".") !== -1
       ? item.key.substring(item.key.indexOf(".") + 1)
       : item.key;
-  var escapedKey = escapeHtml(item.key);
-  var escapedShort = escapeHtml(shortKey);
-  var escapedDesc = escapeHtml(item.description);
+  const escapedKey = escapeHtml(item.key);
+  const escapedShort = escapeHtml(shortKey);
+  const escapedDesc = escapeHtml(item.description);
 
-  var html = '<div class="settings-row" data-row-key="' + escapedKey + '">';
+  let html = '<div class="settings-row" data-row-key="' + escapedKey + '">';
 
   // Label column
   html += '<div class="settings-label-col">';
@@ -2951,7 +2951,7 @@ function _renderSettingRow(item) {
       (item.source === "storage" ? "***" : "not set") +
       '">';
   } else if (item.type === "bool") {
-    var checked =
+    const checked =
       item.value === true || item.value === "true" ? " checked" : "";
     html +=
       '<label class="settings-toggle"><input type="checkbox" data-setting-key="' +
@@ -2968,9 +2968,9 @@ function _renderSettingRow(item) {
       '" aria-label="' +
       escapedShort +
       '">';
-    for (var c = 0; c < item.choices.length; c++) {
-      var sel = item.choices[c] === String(item.value) ? " selected" : "";
-      var label;
+    for (let c = 0; c < item.choices.length; c++) {
+      const sel = item.choices[c] === String(item.value) ? " selected" : "";
+      let label;
       if (item.choices[c] !== "") {
         label = escapeHtml(item.choices[c]);
       } else if (ALIAS_SETTING_KEYS.indexOf(item.key) !== -1) {
@@ -2991,12 +2991,12 @@ function _renderSettingRow(item) {
     }
     html += "</select>";
   } else if (item.type === "int" || item.type === "float") {
-    var step = item.type === "float" ? "0.01" : "1";
-    var minAttr =
+    const step = item.type === "float" ? "0.01" : "1";
+    const minAttr =
       item.min_value !== null && item.min_value !== undefined
         ? ' min="' + item.min_value + '"'
         : "";
-    var maxAttr =
+    const maxAttr =
       item.max_value !== null && item.max_value !== undefined
         ? ' max="' + item.max_value + '"'
         : "";
@@ -3065,11 +3065,11 @@ function _renderSettingRow(item) {
 
 function _toggleSettingsHelp(e, btn) {
   e.stopPropagation();
-  var popover = btn
+  const popover = btn
     .closest(".settings-label-col")
     .querySelector(".settings-help-popover");
   if (!popover) return;
-  var isVisible = popover.style.display !== "none";
+  const isVisible = popover.style.display !== "none";
   // Close any other open popovers and reset their buttons
   _closeAllSettingsHelp(popover);
   popover.style.display = isVisible ? "none" : "";
@@ -3077,13 +3077,13 @@ function _toggleSettingsHelp(e, btn) {
 }
 
 function _closeAllSettingsHelp(except) {
-  var allOpen = document.querySelectorAll('.settings-help-popover[style=""]');
-  for (var i = 0; i < allOpen.length; i++) {
+  const allOpen = document.querySelectorAll('.settings-help-popover[style=""]');
+  for (let i = 0; i < allOpen.length; i++) {
     if (allOpen[i] !== except) {
       allOpen[i].style.display = "none";
-      var col = allOpen[i].closest(".settings-label-col");
+      const col = allOpen[i].closest(".settings-label-col");
       if (col) {
-        var helpBtn = col.querySelector(".settings-help-btn");
+        const helpBtn = col.querySelector(".settings-help-btn");
         if (helpBtn) helpBtn.setAttribute("aria-expanded", "false");
       }
     }
@@ -3098,7 +3098,7 @@ function _onSettingsHeaderKey(e, el) {
 }
 
 function _toggleSettingsSection(headerEl) {
-  var section = headerEl.parentElement;
+  const section = headerEl.parentElement;
   if (section.hasAttribute("data-collapsed")) {
     section.removeAttribute("data-collapsed");
     headerEl.setAttribute("aria-expanded", "true");
@@ -3114,21 +3114,21 @@ function _onSettingChange(inp) {
   // selector per keystroke.  Save button + restart badge for this key
   // live inside the same ``.settings-row`` (which carries the unique
   // ``data-row-key``).
-  var row = inp.closest(".settings-row");
+  const row = inp.closest(".settings-row");
   if (!row) return;
-  var saveBtn = row.querySelector("[data-save-key]");
+  const saveBtn = row.querySelector("[data-save-key]");
   if (!saveBtn) return;
-  var key = inp.getAttribute("data-setting-key");
+  const key = inp.getAttribute("data-setting-key");
 
-  var current;
+  let current;
   if (inp.type === "checkbox") {
     current = inp.checked;
   } else {
     current = inp.value;
   }
 
-  var orig = _settingsOriginal[key];
-  var dirty;
+  const orig = _settingsOriginal[key];
+  let dirty;
   if (inp.type === "checkbox") {
     dirty = current !== orig;
   } else if (inp.type === "number" && current !== "" && orig !== "") {
@@ -3139,7 +3139,7 @@ function _onSettingChange(inp) {
   }
 
   // Disable save for empty number fields (server will reject)
-  var emptyNumber = inp.type === "number" && current === "";
+  const emptyNumber = inp.type === "number" && current === "";
   if (dirty && !emptyNumber) {
     saveBtn.classList.add("visible");
   } else {
@@ -3147,18 +3147,18 @@ function _onSettingChange(inp) {
   }
 
   // Show/hide restart badge alongside dirty state (but keep it if already saved)
-  var restartBadge = row.querySelector("[data-restart-key]");
+  const restartBadge = row.querySelector("[data-restart-key]");
   if (restartBadge && !restartBadge.classList.contains("saved")) {
     restartBadge.classList.toggle("visible", dirty);
   }
 }
 
 function _saveSettingValue(key) {
-  var inp = document.querySelector('[data-setting-key="' + key + '"]');
-  var saveBtn = document.querySelector('[data-save-key="' + key + '"]');
+  const inp = document.querySelector('[data-setting-key="' + key + '"]');
+  const saveBtn = document.querySelector('[data-save-key="' + key + '"]');
   if (!inp) return;
 
-  var value;
+  let value;
   if (inp.type === "checkbox") {
     value = inp.checked;
   } else if (inp.type === "number") {
@@ -3214,18 +3214,18 @@ function _saveSettingValue(key) {
       }
 
       // Update source badge to "storage"
-      var row = document.querySelector('[data-row-key="' + key + '"]');
+      const row = document.querySelector('[data-row-key="' + key + '"]');
       if (row) {
-        var badge = row.querySelector(".scope-badge");
+        const badge = row.querySelector(".scope-badge");
         if (badge) {
           badge.className = "scope-badge scope-write";
           badge.textContent = "storage";
         }
         // Add reset button if not present
         if (!row.querySelector('[data-reset-key="' + key + '"]')) {
-          var actions = row.querySelector(".settings-actions");
+          const actions = row.querySelector(".settings-actions");
           if (actions) {
-            var resetBtn = document.createElement("button");
+            const resetBtn = document.createElement("button");
             resetBtn.className = "settings-reset-btn";
             resetBtn.setAttribute("data-reset-key", key);
             resetBtn.textContent = "reset";
@@ -3238,7 +3238,7 @@ function _saveSettingValue(key) {
       }
 
       // Show restart badge post-save (stays until page reload = restart)
-      var restartBadge = document.querySelector(
+      const restartBadge = document.querySelector(
         '[data-restart-key="' + key + '"]',
       );
       if (restartBadge) {
@@ -3265,13 +3265,13 @@ function _saveSettingValue(key) {
       // onThemeChange — it would fire a redundant PUT since the settings
       // save above already persisted the value.
       if (key === "interface.theme") {
-        var isLight = value === "light";
+        const isLight = value === "light";
         document.documentElement.dataset.theme = isLight ? "light" : "";
         localStorage.setItem(
           "turnstone_interface.theme",
           isLight ? "light" : "dark",
         );
-        var themeBtn = document.getElementById("theme-toggle");
+        const themeBtn = document.getElementById("theme-toggle");
         if (themeBtn) {
           themeBtn.textContent = isLight ? "\u2600" : "\u263E";
           themeBtn.title = isLight
@@ -3336,20 +3336,20 @@ function _showModalError(el, msg) {
 
 /* ── MCP Servers tab ─────────────────────────────────────────────────────── */
 
-var _mcpServers = [];
-var _mcpCreateTrap = null;
-var _mcpCreateTrigger = null;
-var _mcpImportTrap = null;
-var _mcpImportTrigger = null;
-var _mcpDetailTrap = null;
-var _mcpDetailTrigger = null;
-var _mcpInstallTrap = null;
-var _mcpInstallTrigger = null;
-var _mcpInstallServer = null;
-var _mcpCurrentView = "servers";
-var _registryResults = [];
-var _registryCursor = null;
-var _registryQuery = "";
+let _mcpServers = [];
+let _mcpCreateTrap = null;
+let _mcpCreateTrigger = null;
+let _mcpImportTrap = null;
+let _mcpImportTrigger = null;
+let _mcpDetailTrap = null;
+let _mcpDetailTrigger = null;
+let _mcpInstallTrap = null;
+let _mcpInstallTrigger = null;
+let _mcpInstallServer = null;
+let _mcpCurrentView = "servers";
+let _registryResults = [];
+let _registryCursor = null;
+let _registryQuery = "";
 
 function loadAdminMcp() {
   authFetch("/v1/api/admin/mcp-servers")
@@ -3370,7 +3370,7 @@ function loadAdminMcp() {
 }
 
 function _renderMcpServers(items) {
-  var el = document.getElementById("admin-mcp-table");
+  const el = document.getElementById("admin-mcp-table");
   if (!items.length) {
     setSafeHtml(
       el,
@@ -3378,24 +3378,24 @@ function _renderMcpServers(items) {
     );
     return;
   }
-  var html = "";
-  for (var i = 0; i < items.length; i++) {
-    var s = items[i];
-    var statusEntries = s.status || {};
-    var nodeIds = Object.keys(statusEntries);
-    var anyConnected = false;
-    var anyError = false;
-    var firstError = "";
-    var totalTools = 0,
+  let html = "";
+  for (let i = 0; i < items.length; i++) {
+    const s = items[i];
+    const statusEntries = s.status || {};
+    const nodeIds = Object.keys(statusEntries);
+    let anyConnected = false;
+    let anyError = false;
+    let firstError = "";
+    let totalTools = 0,
       totalRes = 0,
       totalPrompts = 0;
     // Phase 9: aggregate the most-recent refresh entry across nodes
     // so the admin pill reflects "the freshest known state" rather
     // than picking an arbitrary node.
-    var newestRefreshAt = null;
-    var newestRefreshOutcome = null;
-    for (var j = 0; j < nodeIds.length; j++) {
-      var ns = statusEntries[nodeIds[j]];
+    let newestRefreshAt = null;
+    let newestRefreshOutcome = null;
+    for (let j = 0; j < nodeIds.length; j++) {
+      const ns = statusEntries[nodeIds[j]];
       if (ns.connected) {
         anyConnected = true;
         totalTools += ns.tools || 0;
@@ -3415,9 +3415,9 @@ function _renderMcpServers(items) {
       }
     }
 
-    var dotClass = "mcp-status-dot disabled";
-    var rowClass = "mcp-row-disabled";
-    var statusText = "disabled";
+    let dotClass = "mcp-status-dot disabled";
+    let rowClass = "mcp-row-disabled";
+    let statusText = "disabled";
     if (!s.enabled) {
       statusText = "disabled";
     } else if (anyConnected) {
@@ -3443,22 +3443,22 @@ function _renderMcpServers(items) {
     // in the tooltip.  Pill is omitted (and the cell stays unchanged from
     // its pre-Phase-9 shape) when no node has yet recorded a refresh
     // outcome for this server.
-    var refreshPill = "";
+    let refreshPill = "";
     if (newestRefreshAt !== null) {
-      var ageSeconds = Math.max(
+      const ageSeconds = Math.max(
         0,
         Math.floor(Date.now() / 1000 - newestRefreshAt),
       );
-      var ageShort;
+      let ageShort;
       if (ageSeconds < 60) ageShort = ageSeconds + "s";
       else if (ageSeconds < 3600) ageShort = Math.floor(ageSeconds / 60) + "m";
       else if (ageSeconds < 86400)
         ageShort = Math.floor(ageSeconds / 3600) + "h";
       else ageShort = Math.floor(ageSeconds / 86400) + "d";
-      var outcomeText = newestRefreshOutcome || "unknown";
-      var pillCls =
+      const outcomeText = newestRefreshOutcome || "unknown";
+      const pillCls =
         outcomeText === "ok" ? "mcp-refresh-pill-ok" : "mcp-refresh-pill-err";
-      var pillTitle =
+      const pillTitle =
         "Last refresh " +
         new Date(newestRefreshAt * 1000).toISOString() +
         " (" +
@@ -3474,29 +3474,29 @@ function _renderMcpServers(items) {
         "</span>";
     }
 
-    var transportCls =
+    const transportCls =
       s.transport === "stdio" ? "mcp-transport-stdio" : "mcp-transport-http";
-    var toolsVal = anyConnected
+    const toolsVal = anyConnected
       ? totalTools
       : '<span class="mcp-count-dim">--</span>';
-    var resVal = anyConnected
+    const resVal = anyConnected
       ? totalRes
       : '<span class="mcp-count-dim">--</span>';
-    var promptsVal = anyConnected
+    const promptsVal = anyConnected
       ? totalPrompts
       : '<span class="mcp-count-dim">--</span>';
 
-    var isConfig = s.source === "config";
-    var isRegistry = !!s.registry_name;
-    var nameBadge = isConfig
+    const isConfig = s.source === "config";
+    const isRegistry = !!s.registry_name;
+    const nameBadge = isConfig
       ? ' <span class="scope-badge scope-config">config</span>'
       : isRegistry
         ? ' <span class="scope-badge scope-registry">registry</span>'
         : ' <span class="scope-badge scope-manual">manual</span>';
-    var detailAttr = isConfig
+    const detailAttr = isConfig
       ? 'data-mcp-detail-name="' + escapeHtml(s.name) + '"'
       : 'data-mcp-detail="' + escapeHtml(s.server_id) + '"';
-    var actionBtns =
+    let actionBtns =
       '<button class="admin-btn-action" data-mcp-refresh="' +
       escapeHtml(s.name) +
       '">refresh</button>' +
@@ -3510,7 +3510,7 @@ function _renderMcpServers(items) {
         '">connect</button>';
       // Phase 9: surface the consented-users count + bulk-revoke
       // affordance only when at least one user has consented.
-      var consentCount =
+      const consentCount =
         typeof s.consented_users_count === "number"
           ? s.consented_users_count
           : 0;
@@ -3527,7 +3527,7 @@ function _renderMcpServers(items) {
           ")</button>";
       }
     }
-    var actions = isConfig
+    const actions = isConfig
       ? actionBtns
       : actionBtns +
         '<button class="admin-btn-action" data-mcp-edit="' +
@@ -3598,7 +3598,7 @@ function _renderMcpServers(items) {
   });
   el.querySelectorAll("[data-mcp-refresh]").forEach(function (btn) {
     btn.addEventListener("click", function () {
-      var name = this.getAttribute("data-mcp-refresh");
+      const name = this.getAttribute("data-mcp-refresh");
       authFetch(
         "/v1/api/admin/mcp-servers/" + encodeURIComponent(name) + "/refresh",
         { method: "POST" },
@@ -3618,7 +3618,7 @@ function _renderMcpServers(items) {
   });
   el.querySelectorAll("[data-mcp-reconnect]").forEach(function (btn) {
     btn.addEventListener("click", function () {
-      var name = this.getAttribute("data-mcp-reconnect");
+      const name = this.getAttribute("data-mcp-reconnect");
       authFetch(
         "/v1/api/admin/mcp-servers/" + encodeURIComponent(name) + "/reconnect",
         { method: "POST" },
@@ -3638,10 +3638,10 @@ function _renderMcpServers(items) {
   });
   el.querySelectorAll("[data-mcp-oauth-connect]").forEach(function (btn) {
     btn.addEventListener("click", function () {
-      var name = this.getAttribute("data-mcp-oauth-connect");
+      const name = this.getAttribute("data-mcp-oauth-connect");
       // Open the OAuth /start endpoint in a new window so the redirect
       // chain (AS → callback → return_url) doesn't displace the admin UI.
-      var url =
+      let url =
         "/v1/api/mcp/oauth/start?server=" +
         encodeURIComponent(name) +
         "&return_url=" +
@@ -3651,8 +3651,8 @@ function _renderMcpServers(items) {
   });
   el.querySelectorAll("[data-mcp-bulk-revoke]").forEach(function (btn) {
     btn.addEventListener("click", function () {
-      var name = this.getAttribute("data-mcp-bulk-revoke");
-      var count = this.getAttribute("data-mcp-consent-count") || "?";
+      const name = this.getAttribute("data-mcp-bulk-revoke");
+      const count = this.getAttribute("data-mcp-consent-count") || "?";
       showConfirmModal(
         "Bulk-revoke MCP consents",
         "Drop all " +
@@ -3687,8 +3687,8 @@ function _renderMcpServers(items) {
   });
   el.querySelectorAll("[data-mcp-delete]").forEach(function (btn) {
     btn.addEventListener("click", function () {
-      var sid = this.getAttribute("data-mcp-delete");
-      var sname = this.getAttribute("data-mcp-name");
+      const sid = this.getAttribute("data-mcp-delete");
+      const sname = this.getAttribute("data-mcp-name");
       showConfirmModal(
         "Delete MCP Server",
         'Delete server "' + sname + '"?',
@@ -3714,7 +3714,7 @@ function _renderMcpServers(items) {
 }
 
 function toggleMcpTransport() {
-  var v = document.getElementById("mcp-transport").value;
+  const v = document.getElementById("mcp-transport").value;
   document.getElementById("mcp-stdio-fields").style.display =
     v === "stdio" ? "" : "none";
   document.getElementById("mcp-http-fields").style.display =
@@ -3725,26 +3725,26 @@ function toggleMcpTransport() {
 }
 
 function _selectedMcpAuthType() {
-  var radios = document.getElementsByName("mcp-auth-type");
-  for (var i = 0; i < radios.length; i++) {
+  const radios = document.getElementsByName("mcp-auth-type");
+  for (let i = 0; i < radios.length; i++) {
     if (radios[i].checked) return radios[i].value;
   }
   return "static";
 }
 
 function toggleMcpAuthFields() {
-  var authType = _selectedMcpAuthType();
-  var oauthDiv = document.getElementById("mcp-oauth-fields");
+  const authType = _selectedMcpAuthType();
+  const oauthDiv = document.getElementById("mcp-oauth-fields");
   if (oauthDiv) {
     oauthDiv.style.display = authType === "oauth_user" ? "" : "none";
   }
   // The "Headers" textarea (inside mcp-http-fields) is only meaningful
   // for static auth; hide it for 'none' / 'oauth_user' so operators
   // don't accidentally configure stale credentials.
-  var headersInput = document.getElementById("mcp-headers");
+  const headersInput = document.getElementById("mcp-headers");
   if (headersInput) {
-    var headersLabel = document.querySelector('label[for="mcp-headers"]');
-    var show = authType === "static";
+    const headersLabel = document.querySelector('label[for="mcp-headers"]');
+    const show = authType === "static";
     headersInput.style.display = show ? "" : "none";
     if (headersLabel) headersLabel.style.display = show ? "" : "none";
   }
@@ -3752,18 +3752,18 @@ function toggleMcpAuthFields() {
 
 function _wireMcpAudienceAutofill() {
   // Idempotent — only attach the listener once per page lifetime.
-  var urlInput = document.getElementById("mcp-url");
+  const urlInput = document.getElementById("mcp-url");
   if (!urlInput || urlInput.dataset.audAutofill === "1") return;
   urlInput.dataset.audAutofill = "1";
   urlInput.addEventListener("blur", function () {
-    var aud = document.getElementById("mcp-oauth-audience");
+    const aud = document.getElementById("mcp-oauth-audience");
     if (aud && !aud.value.trim()) aud.value = urlInput.value.trim();
   });
 }
 
 function showCreateMcpModal() {
   _mcpCreateTrigger = document.activeElement;
-  var ov = document.getElementById("mcp-create-overlay");
+  const ov = document.getElementById("mcp-create-overlay");
   ov.style.display = "flex";
   document.getElementById("mcp-edit-id").value = "";
   document.getElementById("mcp-create-title").textContent = "Add MCP Server";
@@ -3812,13 +3812,13 @@ function showEditMcpModal(serverId) {
       document.getElementById("mcp-transport").value = s.transport;
       document.getElementById("mcp-command").value = s.command || "";
       try {
-        var argsList = JSON.parse(s.args || "[]");
+        const argsList = JSON.parse(s.args || "[]");
         document.getElementById("mcp-args").value = argsList.join("\n");
       } catch (e) {
         document.getElementById("mcp-args").value = "";
       }
       try {
-        var envObj = JSON.parse(s.env || "{}");
+        const envObj = JSON.parse(s.env || "{}");
         document.getElementById("mcp-env").value = Object.keys(envObj)
           .map(function (k) {
             return k + "=" + envObj[k];
@@ -3829,7 +3829,7 @@ function showEditMcpModal(serverId) {
       }
       document.getElementById("mcp-url").value = s.url || "";
       try {
-        var hdrObj = JSON.parse(s.headers || "{}");
+        const hdrObj = JSON.parse(s.headers || "{}");
         document.getElementById("mcp-headers").value = Object.keys(hdrObj)
           .map(function (k) {
             return k + ": " + hdrObj[k];
@@ -3841,7 +3841,7 @@ function showEditMcpModal(serverId) {
       document.getElementById("mcp-auto-approve").checked =
         s.auto_approve || false;
       document.getElementById("mcp-enabled").checked = s.enabled !== false;
-      var authType = s.auth_type || "static";
+      const authType = s.auth_type || "static";
       document.getElementById("mcp-auth-none").checked = authType === "none";
       document.getElementById("mcp-auth-static").checked =
         authType === "static";
@@ -3874,15 +3874,15 @@ function hideCreateMcpModal() {
 }
 
 function _parseMcpForm() {
-  var name = document.getElementById("mcp-name").value.trim();
-  var transport = document.getElementById("mcp-transport").value;
+  const name = document.getElementById("mcp-name").value.trim();
+  const transport = document.getElementById("mcp-transport").value;
   if (!name) return { error: "Name is required" };
   if (!/^[a-zA-Z0-9._-]+$/.test(name))
     return { error: "Name must match [a-zA-Z0-9._-]+" };
   if (name.indexOf("__") >= 0) return { error: "Name must not contain '__'" };
 
-  var authType = _selectedMcpAuthType();
-  var payload = {
+  const authType = _selectedMcpAuthType();
+  const payload = {
     name: name,
     transport: transport,
     auto_approve: document.getElementById("mcp-auto-approve").checked,
@@ -3892,7 +3892,7 @@ function _parseMcpForm() {
 
   if (transport === "stdio") {
     payload.command = document.getElementById("mcp-command").value.trim();
-    var argsText = document.getElementById("mcp-args").value.trim();
+    const argsText = document.getElementById("mcp-args").value.trim();
     payload.args = argsText
       ? argsText
           .split("\n")
@@ -3901,11 +3901,11 @@ function _parseMcpForm() {
           })
           .filter(Boolean)
       : [];
-    var envText = document.getElementById("mcp-env").value.trim();
-    var envObj = {};
+    const envText = document.getElementById("mcp-env").value.trim();
+    const envObj = {};
     if (envText) {
       envText.split("\n").forEach(function (line) {
-        var eq = line.indexOf("=");
+        const eq = line.indexOf("=");
         if (eq > 0)
           envObj[line.substring(0, eq).trim()] = line.substring(eq + 1).trim();
       });
@@ -3914,11 +3914,11 @@ function _parseMcpForm() {
   } else {
     payload.url = document.getElementById("mcp-url").value.trim();
     if (authType === "static") {
-      var hdrText = document.getElementById("mcp-headers").value.trim();
-      var hdrObj = {};
+      const hdrText = document.getElementById("mcp-headers").value.trim();
+      const hdrObj = {};
       if (hdrText) {
         hdrText.split("\n").forEach(function (line) {
-          var colon = line.indexOf(":");
+          const colon = line.indexOf(":");
           if (colon > 0)
             hdrObj[line.substring(0, colon).trim()] = line
               .substring(colon + 1)
@@ -3948,7 +3948,7 @@ function _parseMcpForm() {
     payload.oauth_audience = document
       .getElementById("mcp-oauth-audience")
       .value.trim();
-    var secret = document.getElementById("mcp-oauth-client-secret").value;
+    const secret = document.getElementById("mcp-oauth-client-secret").value;
     // Submit only when the operator typed a value; redacted in audit log.
     if (secret) payload.oauth_client_secret = secret;
   }
@@ -3957,16 +3957,16 @@ function _parseMcpForm() {
 }
 
 function submitCreateMcp() {
-  var form = _parseMcpForm();
+  const form = _parseMcpForm();
   if (form.error) {
-    var e = document.getElementById("mcp-create-error");
+    const e = document.getElementById("mcp-create-error");
     e.textContent = form.error;
     e.classList.add("is-visible");
     return;
   }
-  var editId = document.getElementById("mcp-edit-id").value;
-  var method = editId ? "PUT" : "POST";
-  var url = editId
+  const editId = document.getElementById("mcp-edit-id").value;
+  const method = editId ? "PUT" : "POST";
+  let url = editId
     ? "/v1/api/admin/mcp-servers/" + editId
     : "/v1/api/admin/mcp-servers";
 
@@ -3990,7 +3990,7 @@ function submitCreateMcp() {
       loadAdminMcp();
     })
     .catch(function (e) {
-      var el = document.getElementById("mcp-create-error");
+      const el = document.getElementById("mcp-create-error");
       el.textContent = e.message;
       el.classList.add("is-visible");
     })
@@ -4000,12 +4000,12 @@ function submitCreateMcp() {
 }
 
 function _flagMcpSyncPending() {
-  var btn = document.getElementById("mcp-sync-btn");
+  const btn = document.getElementById("mcp-sync-btn");
   if (btn) btn.classList.add("mcp-sync-pending");
 }
 
 function _clearMcpSyncPending() {
-  var btn = document.getElementById("mcp-sync-btn");
+  const btn = document.getElementById("mcp-sync-btn");
   if (btn) btn.classList.remove("mcp-sync-pending");
 }
 
@@ -4016,16 +4016,16 @@ function reloadMcpNodes() {
       return r.json();
     })
     .then(function (data) {
-      var results = data.results || {};
-      var nodeIds = Object.keys(results);
-      var totalAdded = 0,
+      const results = data.results || {};
+      const nodeIds = Object.keys(results);
+      let totalAdded = 0,
         totalRemoved = 0;
-      for (var i = 0; i < nodeIds.length; i++) {
-        var nr = results[nodeIds[i]];
+      for (let i = 0; i < nodeIds.length; i++) {
+        const nr = results[nodeIds[i]];
         totalAdded += (nr.added || []).length;
         totalRemoved += (nr.removed || []).length;
       }
-      var msg = "Reload sent to " + nodeIds.length + " node(s)";
+      let msg = "Reload sent to " + nodeIds.length + " node(s)";
       if (totalAdded) msg += ", +" + totalAdded + " added";
       if (totalRemoved) msg += ", -" + totalRemoved + " removed";
       showToast(msg);
@@ -4038,7 +4038,7 @@ function reloadMcpNodes() {
 }
 
 function showMcpDetailByName(name) {
-  for (var i = 0; i < _mcpServers.length; i++) {
+  for (let i = 0; i < _mcpServers.length; i++) {
     if (_mcpServers[i].name === name) {
       return _openMcpDetail(_mcpServers[i]);
     }
@@ -4046,7 +4046,7 @@ function showMcpDetailByName(name) {
 }
 
 function showMcpDetailModal(serverId) {
-  for (var i = 0; i < _mcpServers.length; i++) {
+  for (let i = 0; i < _mcpServers.length; i++) {
     if (_mcpServers[i].server_id === serverId) {
       return _openMcpDetail(_mcpServers[i]);
     }
@@ -4057,7 +4057,7 @@ function _openMcpDetail(s) {
   if (!s) return;
   _mcpDetailTrigger = document.activeElement;
 
-  var html = '<div class="modal-columns">';
+  let html = '<div class="modal-columns">';
   html += '<div class="modal-col">';
   html += '<div class="mcp-detail-section"><h3>Configuration</h3>';
   html +=
@@ -4072,7 +4072,7 @@ function _openMcpDetail(s) {
       escapeHtml(s.command || "") +
       "</code></p>";
     try {
-      var a = JSON.parse(s.args || "[]");
+      const a = JSON.parse(s.args || "[]");
       if (a.length)
         html +=
           '<p style="font-size:12px;color:var(--fg-dim)">Args: <code>' +
@@ -4099,7 +4099,7 @@ function _openMcpDetail(s) {
         "</code></p>";
     }
     try {
-      var meta =
+      const meta =
         typeof s.registry_meta === "string"
           ? JSON.parse(s.registry_meta)
           : s.registry_meta || {};
@@ -4123,20 +4123,20 @@ function _openMcpDetail(s) {
   html += "</div>";
 
   html += '<div class="modal-col">';
-  var statusEntries = s.status || {};
-  var nodeIds = Object.keys(statusEntries);
+  const statusEntries = s.status || {};
+  const nodeIds = Object.keys(statusEntries);
   html += '<div class="mcp-detail-section"><h3>Node Status</h3>';
   if (nodeIds.length === 0) {
     html +=
       '<p style="font-size:12px;color:var(--fg-dim)">Not connected on any node</p>';
   } else {
     html += '<ul class="mcp-detail-list">';
-    for (var j = 0; j < nodeIds.length; j++) {
-      var ns = statusEntries[nodeIds[j]];
-      var dot = ns.connected
+    for (let j = 0; j < nodeIds.length; j++) {
+      const ns = statusEntries[nodeIds[j]];
+      const dot = ns.connected
         ? '<span class="mcp-status-dot connected"></span>'
         : '<span class="mcp-status-dot error"></span>';
-      var nodeInfo =
+      let nodeInfo =
         escapeHtml(nodeIds[j]) +
         " — " +
         (ns.tools || 0) +
@@ -4187,24 +4187,24 @@ function hideImportMcpModal() {
 }
 
 function submitImportMcp() {
-  var raw = document.getElementById("mcp-import-json").value.trim();
+  const raw = document.getElementById("mcp-import-json").value.trim();
   if (!raw) {
-    var e = document.getElementById("mcp-import-error");
+    const e = document.getElementById("mcp-import-error");
     e.textContent = "Paste a JSON config";
     e.classList.add("is-visible");
     return;
   }
-  var parsed;
+  let parsed;
   try {
     parsed = JSON.parse(raw);
   } catch (ex) {
-    var e2 = document.getElementById("mcp-import-error");
+    const e2 = document.getElementById("mcp-import-error");
     e2.textContent = "Invalid JSON: " + ex.message;
     e2.classList.add("is-visible");
     return;
   }
   if (!parsed.mcpServers || typeof parsed.mcpServers !== "object") {
-    var e3 = document.getElementById("mcp-import-error");
+    const e3 = document.getElementById("mcp-import-error");
     e3.textContent = 'No "mcpServers" key found in JSON';
     e3.classList.add("is-visible");
     return;
@@ -4224,7 +4224,7 @@ function submitImportMcp() {
     })
     .then(function (data) {
       hideImportMcpModal();
-      var msg = "Imported " + (data.imported || []).length;
+      let msg = "Imported " + (data.imported || []).length;
       if ((data.skipped || []).length)
         msg += ", skipped " + data.skipped.length;
       if ((data.errors || []).length)
@@ -4234,7 +4234,7 @@ function submitImportMcp() {
       loadAdminMcp();
     })
     .catch(function (e) {
-      var el = document.getElementById("mcp-import-error");
+      const el = document.getElementById("mcp-import-error");
       el.textContent = e.message;
       el.classList.add("is-visible");
     })
@@ -4247,9 +4247,9 @@ function submitImportMcp() {
 
 function switchMcpView(view) {
   _mcpCurrentView = view;
-  var btns = document.querySelectorAll("#admin-mcp .mcp-view-btn");
-  for (var i = 0; i < btns.length; i++) {
-    var isActive = btns[i].getAttribute("data-mcp-view") === view;
+  const btns = document.querySelectorAll("#admin-mcp .mcp-view-btn");
+  for (let i = 0; i < btns.length; i++) {
+    const isActive = btns[i].getAttribute("data-mcp-view") === view;
     btns[i].classList.toggle("active", isActive);
     btns[i].setAttribute("aria-selected", isActive ? "true" : "false");
     btns[i].setAttribute("tabindex", isActive ? "0" : "-1");
@@ -4262,32 +4262,32 @@ function switchMcpView(view) {
     view === "servers" ? "" : "none";
   if (view === "servers") loadAdminMcp();
   if (view === "registry") {
-    var q = document.getElementById("mcp-registry-q");
+    const q = document.getElementById("mcp-registry-q");
     if (q) q.focus();
     if (!_registryResults.length) searchMcpRegistry();
   }
 }
 
 function searchMcpRegistry(append) {
-  var q = document.getElementById("mcp-registry-q").value.trim();
+  const q = document.getElementById("mcp-registry-q").value.trim();
   if (!append) {
     _registryResults = [];
     _registryCursor = null;
     _registryQuery = q;
-    var filterEl = document.getElementById("mcp-registry-filter");
+    const filterEl = document.getElementById("mcp-registry-filter");
     if (filterEl) filterEl.value = "";
   }
-  var url = "/v1/api/admin/mcp-registry/search?limit=20";
+  let url = "/v1/api/admin/mcp-registry/search?limit=20";
   if (_registryQuery) url += "&search=" + encodeURIComponent(_registryQuery);
   if (append && _registryCursor)
     url += "&cursor=" + encodeURIComponent(_registryCursor);
 
-  var resultsEl = document.getElementById("mcp-registry-results");
+  const resultsEl = document.getElementById("mcp-registry-results");
   if (!append) {
     setSafeHtml(resultsEl, '<div class="dashboard-empty">Searching…</div>');
   }
-  var searchBtn = document.getElementById("mcp-registry-search-btn");
-  var moreBtn = document.getElementById("mcp-registry-more");
+  const searchBtn = document.getElementById("mcp-registry-search-btn");
+  const moreBtn = document.getElementById("mcp-registry-more");
   if (searchBtn) searchBtn.disabled = true;
   if (moreBtn) moreBtn.disabled = true;
 
@@ -4329,7 +4329,7 @@ function _applyRegistryFilter() {
 }
 
 function _renderRegistryResults() {
-  var el = document.getElementById("mcp-registry-results");
+  const el = document.getElementById("mcp-registry-results");
   if (!_registryResults.length) {
     setSafeHtml(el, '<div class="dashboard-empty">No servers found</div>');
     document.getElementById("mcp-registry-pagination").style.display = "none";
@@ -4337,15 +4337,15 @@ function _renderRegistryResults() {
   }
 
   // Client-side type filter
-  var filterEl = document.getElementById("mcp-registry-filter");
-  var typeFilter = filterEl ? filterEl.value : "";
+  const filterEl = document.getElementById("mcp-registry-filter");
+  const typeFilter = filterEl ? filterEl.value : "";
 
-  var html = "";
-  var visibleCount = 0;
-  for (var i = 0; i < _registryResults.length; i++) {
-    var srv = _registryResults[i];
-    var hasRemote = srv.remotes && srv.remotes.length > 0;
-    var pkgTypes = (srv.packages || []).map(function (p) {
+  let html = "";
+  let visibleCount = 0;
+  for (let i = 0; i < _registryResults.length; i++) {
+    const srv = _registryResults[i];
+    const hasRemote = srv.remotes && srv.remotes.length > 0;
+    const pkgTypes = (srv.packages || []).map(function (p) {
       return p.registry_type;
     });
 
@@ -4356,8 +4356,8 @@ function _renderRegistryResults() {
     visibleCount++;
 
     // Action button
-    var srvLabel = escapeHtml(srv.title || srv.name);
-    var actionHtml = "";
+    const srvLabel = escapeHtml(srv.title || srv.name);
+    let actionHtml = "";
     if (srv.installed && srv.update_available) {
       actionHtml =
         '<button class="mcp-install-btn mcp-update-btn" data-reg-install="' +
@@ -4377,12 +4377,12 @@ function _renderRegistryResults() {
     }
 
     // Source type badges
-    var sourceBadges = "";
+    let sourceBadges = "";
     if (hasRemote) {
       sourceBadges +=
         '<span class="scope-badge mcp-transport-http">remote</span>';
     }
-    for (var p = 0; p < (srv.packages || []).length; p++) {
+    for (let p = 0; p < (srv.packages || []).length; p++) {
       sourceBadges +=
         '<span class="scope-badge mcp-transport-stdio">' +
         escapeHtml(srv.packages[p].registry_type) +
@@ -4390,8 +4390,8 @@ function _renderRegistryResults() {
     }
 
     // Repo link for trust signal
-    var repoLink = "";
-    var repoUrl = (srv.repository || {}).url || "";
+    let repoLink = "";
+    const repoUrl = (srv.repository || {}).url || "";
     if (repoUrl && /^https?:\/\//i.test(repoUrl)) {
       repoLink =
         ' <a href="' +
@@ -4437,10 +4437,10 @@ function _renderRegistryResults() {
   }
 
   // Pagination
-  var pagEl = document.getElementById("mcp-registry-pagination");
-  var moreBtn = document.getElementById("mcp-registry-more");
-  var countEl = document.getElementById("mcp-registry-count");
-  var isFiltered = typeFilter && visibleCount < _registryResults.length;
+  const pagEl = document.getElementById("mcp-registry-pagination");
+  const moreBtn = document.getElementById("mcp-registry-more");
+  const countEl = document.getElementById("mcp-registry-count");
+  const isFiltered = typeFilter && visibleCount < _registryResults.length;
   if (_registryCursor) {
     pagEl.style.display = "";
     moreBtn.style.display = "";
@@ -4461,7 +4461,7 @@ function _renderRegistryResults() {
   // Bind install buttons
   el.querySelectorAll("[data-reg-install]").forEach(function (btn) {
     btn.addEventListener("click", function () {
-      var idx = parseInt(this.getAttribute("data-reg-install"), 10);
+      let idx = parseInt(this.getAttribute("data-reg-install"), 10);
       _initiateRegistryInstall(_registryResults[idx]);
     });
   });
@@ -4471,21 +4471,21 @@ function _renderRegistryResults() {
 
 function _initiateRegistryInstall(srv) {
   _mcpInstallServer = srv;
-  var hasRemote = srv.remotes && srv.remotes.length > 0;
-  var hasPackage = srv.packages && srv.packages.length > 0;
+  const hasRemote = srv.remotes && srv.remotes.length > 0;
+  const hasPackage = srv.packages && srv.packages.length > 0;
 
   // Check if remote needs configuration
-  var remoteNeedsConfig = false;
+  let remoteNeedsConfig = false;
   if (hasRemote) {
-    var remote = srv.remotes[0];
-    for (var hi = 0; hi < (remote.headers || []).length; hi++) {
+    const remote = srv.remotes[0];
+    for (let hi = 0; hi < (remote.headers || []).length; hi++) {
       if (remote.headers[hi].is_required) {
         remoteNeedsConfig = true;
         break;
       }
     }
-    var varKeys = Object.keys(remote.variables || {});
-    for (var vi = 0; vi < varKeys.length; vi++) {
+    const varKeys = Object.keys(remote.variables || {});
+    for (let vi = 0; vi < varKeys.length; vi++) {
       if (remote.variables[varKeys[vi]].is_required) {
         remoteNeedsConfig = true;
         break;
@@ -4496,9 +4496,9 @@ function _initiateRegistryInstall(srv) {
   // One-click: remote with no config needed and no package alternative
   if (hasRemote && !remoteNeedsConfig && !hasPackage) {
     // Disable the clicked Install button for loading feedback
-    var cardBtns = document.querySelectorAll("[data-reg-install]");
-    for (var bi = 0; bi < cardBtns.length; bi++) {
-      var idx = parseInt(cardBtns[bi].getAttribute("data-reg-install"), 10);
+    const cardBtns = document.querySelectorAll("[data-reg-install]");
+    for (let bi = 0; bi < cardBtns.length; bi++) {
+      let idx = parseInt(cardBtns[bi].getAttribute("data-reg-install"), 10);
       if (_registryResults[idx] && _registryResults[idx].name === srv.name) {
         cardBtns[bi].disabled = true;
         cardBtns[bi].textContent = "Installing\u2026";
@@ -4515,7 +4515,7 @@ function _initiateRegistryInstall(srv) {
 
 function _showInstallMcpModal(srv, hasRemote, hasPackage) {
   _mcpInstallTrigger = document.activeElement;
-  var ov = document.getElementById("mcp-install-overlay");
+  const ov = document.getElementById("mcp-install-overlay");
   ov.style.display = "flex";
   document.getElementById("mcp-install-error").classList.remove("is-visible");
 
@@ -4533,15 +4533,15 @@ function _showInstallMcpModal(srv, hasRemote, hasPackage) {
   );
 
   // Source selector (only if both remote AND package)
-  var srcEl = document.getElementById("mcp-install-source-select");
+  const srcEl = document.getElementById("mcp-install-source-select");
   if (hasRemote && hasPackage) {
-    var srcHtml = '<div class="mcp-install-source-group">';
+    let srcHtml = '<div class="mcp-install-source-group">';
     srcHtml +=
       '<label class="mcp-install-source-label">' +
       '<input type="radio" name="mcp-install-src" value="remote" checked> ' +
       'Remote <span class="mcp-install-source-type">streamable-http</span>' +
       "</label>";
-    for (var pi = 0; pi < srv.packages.length; pi++) {
+    for (let pi = 0; pi < srv.packages.length; pi++) {
       srcHtml +=
         '<label class="mcp-install-source-label">' +
         '<input type="radio" name="mcp-install-src" value="package-' +
@@ -4555,8 +4555,8 @@ function _showInstallMcpModal(srv, hasRemote, hasPackage) {
     }
     srcHtml += "</div>";
     setSafeHtml(srcEl, srcHtml);
-    var srcRadios = srcEl.querySelectorAll('input[name="mcp-install-src"]');
-    for (var sr = 0; sr < srcRadios.length; sr++) {
+    const srcRadios = srcEl.querySelectorAll('input[name="mcp-install-src"]');
+    for (let sr = 0; sr < srcRadios.length; sr++) {
       srcRadios[sr].addEventListener("change", _updateInstallFields);
     }
   } else {
@@ -4568,16 +4568,16 @@ function _showInstallMcpModal(srv, hasRemote, hasPackage) {
 }
 
 function _updateInstallFields() {
-  var srv = _mcpInstallServer;
+  const srv = _mcpInstallServer;
   if (!srv) return;
-  var fieldsEl = document.getElementById("mcp-install-fields");
-  var srcRadio = document.querySelector(
+  const fieldsEl = document.getElementById("mcp-install-fields");
+  const srcRadio = document.querySelector(
     'input[name="mcp-install-src"]:checked',
   );
-  var srcVal = srcRadio ? srcRadio.value : "";
+  const srcVal = srcRadio ? srcRadio.value : "";
 
-  var source = "remote";
-  var pkgIndex = 0;
+  let source = "remote";
+  let pkgIndex = 0;
   if (srcVal.startsWith("package-")) {
     source = "package";
     pkgIndex = parseInt(srcVal.replace("package-", ""), 10);
@@ -4585,12 +4585,12 @@ function _updateInstallFields() {
     source = "package";
   }
 
-  var html = "";
+  let html = "";
   if (source === "package") {
-    var pkg = srv.packages && srv.packages[pkgIndex];
-    var pkgId = pkg ? pkg.identifier : "";
-    var pkgType = pkg ? pkg.registry_type : "";
-    var runner =
+    const pkg = srv.packages && srv.packages[pkgIndex];
+    const pkgId = pkg ? pkg.identifier : "";
+    const pkgType = pkg ? pkg.registry_type : "";
+    const runner =
       pkgType === "npm" ? "npx" : pkgType === "pypi" ? "uvx" : pkgType;
     html +=
       '<div class="mcp-registry-notice" role="alert" style="margin-bottom:14px">' +
@@ -4603,11 +4603,11 @@ function _updateInstallFields() {
       "Verify the package source before proceeding.</div>";
   }
   if (source === "remote" && srv.remotes && srv.remotes.length > 0) {
-    var remote = srv.remotes[0];
+    const remote = srv.remotes[0];
     // URL variables
-    var varKeys = Object.keys(remote.variables || {});
-    for (var vi = 0; vi < varKeys.length; vi++) {
-      var v = remote.variables[varKeys[vi]];
+    const varKeys = Object.keys(remote.variables || {});
+    for (let vi = 0; vi < varKeys.length; vi++) {
+      const v = remote.variables[varKeys[vi]];
       html +=
         '<label for="mcp-inst-var-' +
         vi +
@@ -4625,8 +4625,8 @@ function _updateInstallFields() {
           escapeHtml(varKeys[vi]) +
           '">';
         if (!v.is_required) html += '<option value="">--</option>';
-        for (var ci = 0; ci < v.choices.length; ci++) {
-          var sel = v.choices[ci] === (v["default"] || "") ? " selected" : "";
+        for (let ci = 0; ci < v.choices.length; ci++) {
+          const sel = v.choices[ci] === (v["default"] || "") ? " selected" : "";
           html +=
             '<option value="' +
             escapeHtml(v.choices[ci]) +
@@ -4651,8 +4651,8 @@ function _updateInstallFields() {
       }
     }
     // Required headers
-    for (var hi = 0; hi < (remote.headers || []).length; hi++) {
-      var h = remote.headers[hi];
+    for (let hi = 0; hi < (remote.headers || []).length; hi++) {
+      const h = remote.headers[hi];
       html +=
         '<label for="mcp-inst-hdr-' +
         hi +
@@ -4674,10 +4674,10 @@ function _updateInstallFields() {
         '">';
     }
   } else if (source === "package" && srv.packages && srv.packages[pkgIndex]) {
-    var pkg = srv.packages[pkgIndex];
-    var evs = pkg.environment_variables || [];
-    for (var ei = 0; ei < evs.length; ei++) {
-      var ev = evs[ei];
+    const pkg = srv.packages[pkgIndex];
+    const evs = pkg.environment_variables || [];
+    for (let ei = 0; ei < evs.length; ei++) {
+      const ev = evs[ei];
       html +=
         '<label for="mcp-inst-env-' +
         ei +
@@ -4722,22 +4722,22 @@ function hideInstallMcpModal() {
 }
 
 function submitInstallMcp() {
-  var srv = _mcpInstallServer;
+  const srv = _mcpInstallServer;
   if (!srv) return;
-  var fieldsEl = document.getElementById("mcp-install-fields");
-  var source = fieldsEl.getAttribute("data-source") || "remote";
-  var pkgIndex = parseInt(fieldsEl.getAttribute("data-pkg-index") || "0", 10);
-  var index = source === "remote" ? 0 : pkgIndex;
+  const fieldsEl = document.getElementById("mcp-install-fields");
+  let source = fieldsEl.getAttribute("data-source") || "remote";
+  let pkgIndex = parseInt(fieldsEl.getAttribute("data-pkg-index") || "0", 10);
+  const index = source === "remote" ? 0 : pkgIndex;
 
-  var variables = {};
+  const variables = {};
   fieldsEl.querySelectorAll("[data-var-name]").forEach(function (el) {
     variables[el.getAttribute("data-var-name")] = el.value;
   });
-  var headers = {};
+  const headers = {};
   fieldsEl.querySelectorAll("[data-hdr-name]").forEach(function (el) {
     if (el.value) headers[el.getAttribute("data-hdr-name")] = el.value;
   });
-  var env = {};
+  const env = {};
   fieldsEl.querySelectorAll("[data-env-name]").forEach(function (el) {
     if (el.value) env[el.getAttribute("data-env-name")] = el.value;
   });
@@ -4753,7 +4753,7 @@ function _doRegistryInstall(
   env,
   headers,
 ) {
-  var submitBtn = document.getElementById("mcp-install-submit");
+  const submitBtn = document.getElementById("mcp-install-submit");
   if (submitBtn) submitBtn.disabled = true;
 
   authFetch("/v1/api/admin/mcp-registry/install", {
@@ -4776,11 +4776,11 @@ function _doRegistryInstall(
       return r.json();
     })
     .then(function (data) {
-      var overlay = document.getElementById("mcp-install-overlay");
+      const overlay = document.getElementById("mcp-install-overlay");
       if (overlay && overlay.style.display !== "none") {
         hideInstallMcpModal();
       }
-      var serverName = data.name || registryName;
+      const serverName = data.name || registryName;
       showToast("Installed " + serverName + " — connecting to nodes\u2026");
       // Re-search to update installed status
       if (_mcpCurrentView === "registry" && _registryResults.length) {
@@ -4792,8 +4792,8 @@ function _doRegistryInstall(
       }
     })
     .catch(function (e) {
-      var overlay = document.getElementById("mcp-install-overlay");
-      var errEl = document.getElementById("mcp-install-error");
+      const overlay = document.getElementById("mcp-install-overlay");
+      const errEl = document.getElementById("mcp-install-error");
       if (errEl && overlay && overlay.style.display !== "none") {
         errEl.textContent = e.message;
         errEl.classList.add("is-visible");
@@ -4817,24 +4817,24 @@ function _pollInstallStatus(serverId, serverName, attempt) {
       })
       .then(function (data) {
         if (!data) return;
-        var status = data.status || {};
-        var nodeIds = Object.keys(status);
-        var anyConnected = false;
-        var errors = [];
-        for (var i = 0; i < nodeIds.length; i++) {
-          var ns = status[nodeIds[i]];
+        const status = data.status || {};
+        const nodeIds = Object.keys(status);
+        let anyConnected = false;
+        const errors = [];
+        for (let i = 0; i < nodeIds.length; i++) {
+          const ns = status[nodeIds[i]];
           if (ns.connected) anyConnected = true;
           if (ns.error) errors.push(ns.error);
         }
         if (anyConnected) {
-          var tools = 0;
-          for (var j = 0; j < nodeIds.length; j++) {
+          let tools = 0;
+          for (let j = 0; j < nodeIds.length; j++) {
             if (status[nodeIds[j]].connected) {
               tools = status[nodeIds[j]].tools || 0;
               break;
             }
           }
-          var msg = serverName + " connected";
+          let msg = serverName + " connected";
           if (tools)
             msg += " (" + tools + " tool" + (tools !== 1 ? "s" : "") + ")";
           if (errors.length)
@@ -4860,10 +4860,10 @@ function _pollInstallStatus(serverId, serverName, attempt) {
 // Models tab
 // ---------------------------------------------------------------------------
 
-var _modelDefs = [];
-var _modelDefaultAlias = "";
-var _modelCreateTrap = null;
-var _modelCreateTrigger = null;
+let _modelDefs = [];
+let _modelDefaultAlias = "";
+let _modelCreateTrap = null;
+let _modelCreateTrigger = null;
 
 // Roles surfaced in the Models → Roles sub-tab.  Each entry maps a
 // settings-registry key onto a UX label.  ``effortKey`` is optional —
@@ -4879,7 +4879,7 @@ var _modelCreateTrigger = null;
 // session model`` per turnstone/core/settings_registry.py — there's
 // no single "default" to advertise, so the blank reads "(inherit)"
 // to match the vocabulary of the reasoning-effort dropdowns.
-var MODEL_ROLES = [
+const MODEL_ROLES = [
   {
     label: "Coordinator",
     description:
@@ -4926,12 +4926,12 @@ var MODEL_ROLES = [
 // access but not Settings, hide the sub-tab button + force the
 // Definitions panel visible so they don't see a perpetual 403 loader.
 function _modelRolesAccessible() {
-  var perms = sessionStorage.getItem("turnstone_permissions") || "";
+  const perms = sessionStorage.getItem("turnstone_permissions") || "";
   return perms.split(",").indexOf("admin.settings") !== -1;
 }
 
 function _applyModelRolesPermission() {
-  var btn = document.getElementById("models-tab-roles");
+  const btn = document.getElementById("models-tab-roles");
   if (!btn) return;
   if (_modelRolesAccessible()) {
     btn.style.display = "";
@@ -4964,9 +4964,9 @@ function loadAdminModels() {
       }
     })
     .catch(function () {
-      var el = document.getElementById("admin-models-table");
+      const el = document.getElementById("admin-models-table");
       el.textContent = "";
-      var d = document.createElement("div");
+      const d = document.createElement("div");
       d.className = "dashboard-empty";
       d.textContent = "Failed to load models";
       el.appendChild(d);
@@ -4974,32 +4974,32 @@ function loadAdminModels() {
 }
 
 function switchModelsSection(section) {
-  var sections = document.querySelectorAll("#admin-models .models-section");
-  for (var i = 0; i < sections.length; i++) sections[i].style.display = "none";
-  var switcher = document.querySelector("#admin-models .admin-subtab-switcher");
-  var btns = switcher ? switcher.querySelectorAll(".admin-subtab-btn") : [];
-  for (var k = 0; k < btns.length; k++) {
-    var isActive = btns[k].getAttribute("data-section") === section;
+  const sections = document.querySelectorAll("#admin-models .models-section");
+  for (let i = 0; i < sections.length; i++) sections[i].style.display = "none";
+  const switcher = document.querySelector("#admin-models .admin-subtab-switcher");
+  const btns = switcher ? switcher.querySelectorAll(".admin-subtab-btn") : [];
+  for (let k = 0; k < btns.length; k++) {
+    const isActive = btns[k].getAttribute("data-section") === section;
     btns[k].classList.toggle("active", isActive);
     btns[k].setAttribute("aria-selected", isActive ? "true" : "false");
     btns[k].setAttribute("tabindex", isActive ? "0" : "-1");
   }
-  var target = document.getElementById(section + "-section");
+  const target = document.getElementById(section + "-section");
   if (target) target.style.display = "";
 }
 
 // Arrow key navigation for Models sub-tabs (matches the Judge tab).
 (function () {
-  var switcher = document.querySelector("#admin-models .admin-subtab-switcher");
+  const switcher = document.querySelector("#admin-models .admin-subtab-switcher");
   if (!switcher) return;
   switcher.addEventListener("keydown", function (e) {
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
-    var btns = switcher.querySelectorAll(".admin-subtab-btn");
-    var secs = [];
-    for (var i = 0; i < btns.length; i++)
+    const btns = switcher.querySelectorAll(".admin-subtab-btn");
+    const secs = [];
+    for (let i = 0; i < btns.length; i++)
       secs.push(btns[i].getAttribute("data-section"));
-    var current = switcher.querySelector(".admin-subtab-btn.active");
-    var idx = secs.indexOf(current ? current.getAttribute("data-section") : "");
+    let current = switcher.querySelector(".admin-subtab-btn.active");
+    let idx = secs.indexOf(current ? current.getAttribute("data-section") : "");
     if (e.key === "ArrowRight") idx = (idx + 1) % secs.length;
     else idx = (idx - 1 + secs.length) % secs.length;
     e.preventDefault();
@@ -5010,14 +5010,14 @@ function switchModelsSection(section) {
 
 function _modelRolesError(container, msg) {
   while (container.firstChild) container.removeChild(container.firstChild);
-  var d = document.createElement("div");
+  const d = document.createElement("div");
   d.className = "dashboard-empty";
   d.textContent = msg;
   container.appendChild(d);
 }
 
 function loadAdminModelRoles() {
-  var c = document.getElementById("admin-models-roles-container");
+  const c = document.getElementById("admin-models-roles-container");
   if (!c) return;
   // Reads ``_modelDefs`` / ``_modelDefaultAlias`` populated by the most
   // recent ``loadAdminModels`` — both entry points into the Models tab
@@ -5036,12 +5036,12 @@ function loadAdminModelRoles() {
     }),
   ])
     .then(function (results) {
-      var values = {};
-      var arr = results[0].settings || [];
-      for (var i = 0; i < arr.length; i++) values[arr[i].key] = arr[i];
-      var schema = {};
-      var sa = results[1].schema || [];
-      for (var j = 0; j < sa.length; j++) schema[sa[j].key] = sa[j];
+      const values = {};
+      const arr = results[0].settings || [];
+      for (let i = 0; i < arr.length; i++) values[arr[i].key] = arr[i];
+      const schema = {};
+      const sa = results[1].schema || [];
+      for (let j = 0; j < sa.length; j++) schema[sa[j].key] = sa[j];
       _renderModelRoles(c, values, schema);
     })
     .catch(function () {
@@ -5050,17 +5050,17 @@ function loadAdminModelRoles() {
 }
 
 function _renderModelRoles(container, values, schema) {
-  var enabledAliases = [];
-  for (var i = 0; i < _modelDefs.length; i++) {
+  const enabledAliases = [];
+  for (let i = 0; i < _modelDefs.length; i++) {
     if (_modelDefs[i].enabled) enabledAliases.push(_modelDefs[i]);
   }
   container.textContent = "";
-  for (var r = 0; r < MODEL_ROLES.length; r++) {
-    var role = MODEL_ROLES[r];
-    var aliasInfo = values[role.aliasKey];
+  for (let r = 0; r < MODEL_ROLES.length; r++) {
+    const role = MODEL_ROLES[r];
+    const aliasInfo = values[role.aliasKey];
     if (!aliasInfo) continue; // setting not registered (e.g. older server)
 
-    var row = document.createElement("div");
+    const row = document.createElement("div");
     row.className = "model-role-row";
 
     // The dropdown's selected-option text is the single source of
@@ -5068,32 +5068,32 @@ function _renderModelRoles(container, values, schema) {
     // "(default — <alias>)", otherwise it shows the chosen alias.  No
     // separate badge: redundant with the select, and prone to
     // confusing color contrasts on freshly-rendered rows.
-    var head = document.createElement("div");
+    const head = document.createElement("div");
     head.className = "model-role-head";
-    var nameEl = document.createElement("span");
+    const nameEl = document.createElement("span");
     nameEl.className = "model-role-label";
     nameEl.textContent = role.label;
     head.appendChild(nameEl);
     row.appendChild(head);
 
     if (role.description) {
-      var desc = document.createElement("div");
+      const desc = document.createElement("div");
       desc.className = "model-role-desc";
       desc.textContent = role.description;
       row.appendChild(desc);
     }
 
-    var controls = document.createElement("div");
+    const controls = document.createElement("div");
     controls.className = "model-role-controls";
 
     // Alias dropdown
-    var aliasWrap = document.createElement("label");
+    const aliasWrap = document.createElement("label");
     aliasWrap.className = "model-role-control";
-    var aliasLabel = document.createElement("span");
+    const aliasLabel = document.createElement("span");
     aliasLabel.className = "model-role-control-label";
     aliasLabel.textContent = "Model";
     aliasWrap.appendChild(aliasLabel);
-    var aliasSel = document.createElement("select");
+    const aliasSel = document.createElement("select");
     aliasSel.setAttribute("data-role-key", role.aliasKey);
     aliasSel.setAttribute(
       "aria-label",
@@ -5107,14 +5107,14 @@ function _renderModelRoles(container, values, schema) {
     // → session) that has no single concrete "default", so they get
     // a plain "(inherit)" instead of the misleading
     // "(default — <coordinator-alias>)".
-    var blank = document.createElement("option");
+    const blank = document.createElement("option");
     blank.value = "";
     if (role.fallbackKind === "inherit") {
       blank.textContent = "(inherit)";
     } else {
-      var defaultDef = null;
+      let defaultDef = null;
       if (_modelDefaultAlias) {
-        for (var dm = 0; dm < enabledAliases.length; dm++) {
+        for (let dm = 0; dm < enabledAliases.length; dm++) {
           if (enabledAliases[dm].alias === _modelDefaultAlias) {
             defaultDef = enabledAliases[dm];
             break;
@@ -5122,7 +5122,7 @@ function _renderModelRoles(container, values, schema) {
         }
       }
       if (defaultDef) {
-        var defLabel =
+        const defLabel =
           defaultDef.alias === defaultDef.model
             ? defaultDef.alias
             : defaultDef.alias + " (" + defaultDef.model + ")";
@@ -5134,11 +5134,11 @@ function _renderModelRoles(container, values, schema) {
       }
     }
     aliasSel.appendChild(blank);
-    var currentAlias = aliasInfo.value || "";
-    var matched = false;
-    for (var m = 0; m < enabledAliases.length; m++) {
-      var md = enabledAliases[m];
-      var opt = document.createElement("option");
+    const currentAlias = aliasInfo.value || "";
+    let matched = false;
+    for (let m = 0; m < enabledAliases.length; m++) {
+      const md = enabledAliases[m];
+      const opt = document.createElement("option");
       opt.value = md.alias;
       opt.textContent =
         md.alias === md.model ? md.alias : md.alias + " (" + md.model + ")";
@@ -5149,7 +5149,7 @@ function _renderModelRoles(container, values, schema) {
       aliasSel.appendChild(opt);
     }
     if (currentAlias && !matched) {
-      var manual = document.createElement("option");
+      const manual = document.createElement("option");
       manual.value = currentAlias;
       manual.textContent = currentAlias + " (manual)";
       manual.selected = true;
@@ -5163,19 +5163,19 @@ function _renderModelRoles(container, values, schema) {
 
     // Optional reasoning effort dropdown
     if (role.effortKey && values[role.effortKey] && schema[role.effortKey]) {
-      var effortWrap = document.createElement("label");
+      const effortWrap = document.createElement("label");
       effortWrap.className = "model-role-control";
-      var effortLabel = document.createElement("span");
+      const effortLabel = document.createElement("span");
       effortLabel.className = "model-role-control-label";
       effortLabel.textContent = "Reasoning effort";
       effortWrap.appendChild(effortLabel);
-      var effortSel = document.createElement("select");
+      const effortSel = document.createElement("select");
       effortSel.setAttribute("data-role-key", role.effortKey);
       effortSel.setAttribute("aria-label", role.label + " reasoning effort");
-      var choices = schema[role.effortKey].choices || [];
-      var currentEffort = values[role.effortKey].value;
-      for (var c2 = 0; c2 < choices.length; c2++) {
-        var eo = document.createElement("option");
+      const choices = schema[role.effortKey].choices || [];
+      const currentEffort = values[role.effortKey].value;
+      for (let c2 = 0; c2 < choices.length; c2++) {
+        const eo = document.createElement("option");
         eo.value = choices[c2];
         eo.textContent = choices[c2] === "" ? "(inherit)" : choices[c2];
         if (currentEffort === choices[c2]) eo.selected = true;
@@ -5220,36 +5220,36 @@ function _saveModelRole(key, value) {
 }
 
 function _renderModels(items) {
-  var el = document.getElementById("admin-models-table");
+  const el = document.getElementById("admin-models-table");
   // Clear previous content
   el.textContent = "";
   if (!items.length) {
-    var empty = document.createElement("div");
+    let empty = document.createElement("div");
     empty.className = "dashboard-empty";
     empty.textContent = "No model definitions configured";
     el.appendChild(empty);
     return;
   }
-  for (var i = 0; i < items.length; i++) {
-    var m = items[i];
-    var isConfig = m.source === "config";
+  for (let i = 0; i < items.length; i++) {
+    const m = items[i];
+    const isConfig = m.source === "config";
 
     // Status
-    var dotClass = m.enabled
+    let dotClass = m.enabled
       ? "model-status-dot enabled"
       : "model-status-dot disabled";
-    var rowClass = m.enabled ? "model-row-enabled" : "model-row-disabled";
-    var statusText = m.enabled ? "enabled" : "disabled";
+    let rowClass = m.enabled ? "model-row-enabled" : "model-row-disabled";
+    let statusText = m.enabled ? "enabled" : "disabled";
 
     // Context window formatting (0 = auto-detect)
-    var ctxText = m.context_window
+    const ctxText = m.context_window
       ? m.context_window >= 1000
         ? Math.round(m.context_window / 1000) + "k"
         : String(m.context_window)
       : "auto";
 
     // Provider badge class
-    var providerCls =
+    const providerCls =
       m.provider === "anthropic"
         ? "model-provider-anthropic"
         : m.provider === "google"
@@ -5259,16 +5259,16 @@ function _renderModels(items) {
             : "model-provider-openai";
 
     // Build row via DOM
-    var row = document.createElement("div");
+    const row = document.createElement("div");
     row.className = "admin-row models-grid " + rowClass;
     row.setAttribute("role", "listitem");
 
     // Alias + source badge + default badge
-    var isDefault = m.alias === _modelDefaultAlias;
-    var colAlias = document.createElement("span");
+    const isDefault = m.alias === _modelDefaultAlias;
+    const colAlias = document.createElement("span");
     colAlias.className = "admin-col";
     colAlias.textContent = m.alias;
-    var badge = document.createElement("span");
+    const badge = document.createElement("span");
     badge.className = isConfig
       ? "scope-badge scope-config"
       : "scope-badge scope-db";
@@ -5276,14 +5276,14 @@ function _renderModels(items) {
     colAlias.appendChild(document.createTextNode(" "));
     colAlias.appendChild(badge);
     if (isDefault) {
-      var defBadge = document.createElement("span");
+      const defBadge = document.createElement("span");
       defBadge.className = "scope-badge scope-default";
       defBadge.textContent = "default";
       colAlias.appendChild(document.createTextNode(" "));
       colAlias.appendChild(defBadge);
     }
     // Per-model sampling override indicators
-    var overrides = [];
+    const overrides = [];
     if (m.temperature != null) overrides.push("temp=" + m.temperature);
     if (m.max_tokens != null) overrides.push("max_tok=" + m.max_tokens);
     if (m.reasoning_effort != null)
@@ -5294,7 +5294,7 @@ function _renderModels(items) {
     if (m.surface_persisted_reasoning === false) overrides.push("surface=off");
     if (m.replay_reasoning_to_model === true) overrides.push("replay=on");
     if (overrides.length) {
-      var ovrSpan = document.createElement("span");
+      const ovrSpan = document.createElement("span");
       ovrSpan.className = "model-overrides-hint";
       ovrSpan.textContent = overrides.join(", ");
       ovrSpan.title = "Per-model overrides (override global defaults)";
@@ -5308,32 +5308,32 @@ function _renderModels(items) {
     row.appendChild(colAlias);
 
     // Model ID
-    var colModel = document.createElement("span");
+    const colModel = document.createElement("span");
     colModel.className = "admin-col";
-    var code = document.createElement("code");
+    const code = document.createElement("code");
     code.textContent = m.model;
     colModel.appendChild(code);
     row.appendChild(colModel);
 
     // Provider
-    var colProvider = document.createElement("span");
+    const colProvider = document.createElement("span");
     colProvider.className = "admin-col";
-    var provBadge = document.createElement("span");
+    const provBadge = document.createElement("span");
     provBadge.className = "model-provider-badge " + providerCls;
     provBadge.textContent = m.provider;
     colProvider.appendChild(provBadge);
     row.appendChild(colProvider);
 
     // Context window
-    var colCtx = document.createElement("span");
+    const colCtx = document.createElement("span");
     colCtx.className = "admin-col";
     colCtx.textContent = ctxText;
     row.appendChild(colCtx);
 
     // Status
-    var colStatus = document.createElement("span");
+    const colStatus = document.createElement("span");
     colStatus.className = "admin-col";
-    var dot = document.createElement("span");
+    const dot = document.createElement("span");
     dot.className = dotClass;
     dot.setAttribute("aria-hidden", "true");
     colStatus.appendChild(dot);
@@ -5341,10 +5341,10 @@ function _renderModels(items) {
     row.appendChild(colStatus);
 
     // Actions
-    var colActions = document.createElement("span");
+    const colActions = document.createElement("span");
     colActions.className = "admin-col";
     if (!isDefault && m.enabled) {
-      var defBtn = document.createElement("button");
+      const defBtn = document.createElement("button");
       defBtn.className = "admin-btn-action";
       defBtn.textContent = "set default";
       defBtn.setAttribute("data-model-set-default", m.alias);
@@ -5353,14 +5353,14 @@ function _renderModels(items) {
       colActions.appendChild(defBtn);
     }
     if (!isConfig) {
-      var editBtn = document.createElement("button");
+      const editBtn = document.createElement("button");
       editBtn.className = "admin-btn-action";
       editBtn.textContent = "edit";
       editBtn.setAttribute("data-model-edit", m.definition_id);
       editBtn.setAttribute("title", "Edit " + m.alias);
       colActions.appendChild(editBtn);
 
-      var delBtn = document.createElement("button");
+      const delBtn = document.createElement("button");
       delBtn.className = "admin-btn-danger";
       delBtn.textContent = "del";
       delBtn.setAttribute("data-model-delete", m.definition_id);
@@ -5376,8 +5376,8 @@ function _renderModels(items) {
   // Bind event handlers
   el.querySelectorAll("[data-model-set-default]").forEach(function (btn) {
     btn.addEventListener("click", function () {
-      var alias = this.getAttribute("data-model-set-default");
-      var self = this;
+      const alias = this.getAttribute("data-model-set-default");
+      const self = this;
       self.disabled = true;
       self.textContent = "setting\u2026";
       authFetch("/v1/api/admin/settings/model.default_alias", {
@@ -5405,8 +5405,8 @@ function _renderModels(items) {
   });
   el.querySelectorAll("[data-model-delete]").forEach(function (btn) {
     btn.addEventListener("click", function () {
-      var did = this.getAttribute("data-model-delete");
-      var dalias = this.getAttribute("data-model-alias");
+      const did = this.getAttribute("data-model-delete");
+      const dalias = this.getAttribute("data-model-alias");
       showConfirmModal(
         "Delete Model",
         'Delete model "' + dalias + '"?',
@@ -5441,17 +5441,17 @@ function _isPlainObject(v) {
 }
 
 function _toggleThinkingParam() {
-  var mode = document.getElementById("model-thinking-mode").value;
-  var row = document.getElementById("model-thinking-param-row");
+  const mode = document.getElementById("model-thinking-mode").value;
+  const row = document.getElementById("model-thinking-param-row");
   row.style.display = mode ? "" : "none";
   // Set default when first enabling
-  var paramEl = document.getElementById("model-thinking-param");
+  const paramEl = document.getElementById("model-thinking-param");
   if (mode && !paramEl.value) paramEl.value = "enable_thinking";
 }
 
 function showCreateModelModal() {
   _modelCreateTrigger = document.activeElement;
-  var ov = document.getElementById("model-create-overlay");
+  const ov = document.getElementById("model-create-overlay");
   ov.style.display = "flex";
   document.getElementById("model-edit-id").value = "";
   document.getElementById("model-create-title").textContent = "Add Model";
@@ -5476,7 +5476,7 @@ function showCreateModelModal() {
   document.getElementById("model-capabilities").value = "";
   // Clear validation error styling from prior submit attempts
   ["model-extra-body", "model-capabilities"].forEach(function (id) {
-    var el = document.getElementById(id);
+    const el = document.getElementById(id);
     el.removeAttribute("aria-invalid");
     el.style.borderColor = "";
   });
@@ -5521,7 +5521,7 @@ function showEditModelModal(definitionId) {
       document.getElementById("model-reasoning-effort").value =
         m.reasoning_effort != null ? m.reasoning_effort : "";
       // Parse capabilities JSON and extract server_compat for structured fields
-      var capsObj = {};
+      let capsObj = {};
       try {
         capsObj = JSON.parse(m.capabilities || "{}");
       } catch (e) {
@@ -5529,15 +5529,15 @@ function showEditModelModal(definitionId) {
       }
       // Defend against null/array/primitive values in the DB
       if (!_isPlainObject(capsObj)) capsObj = {};
-      var sc = _isPlainObject(capsObj.server_compat)
+      const sc = _isPlainObject(capsObj.server_compat)
         ? capsObj.server_compat
         : {};
       // Only extract thinking_mode into the dropdown when the UI can
       // represent it ("manual" or "").  Values like "adaptive" (Anthropic-
       // only) stay in the raw capabilities JSON so they aren't silently
       // lost on save.
-      var tmVal = capsObj.thinking_mode || "";
-      var tmRepresentable = tmVal === "" || tmVal === "manual";
+      const tmVal = capsObj.thinking_mode || "";
+      const tmRepresentable = tmVal === "" || tmVal === "manual";
       if (tmRepresentable) {
         document.getElementById("model-thinking-mode").value = tmVal;
         document.getElementById("model-thinking-param").value =
@@ -5550,8 +5550,8 @@ function showEditModelModal(definitionId) {
       // Server compat: server_type, api_surface, and extra_body workarounds
       document.getElementById("model-server-type").value = sc.server_type || "";
       document.getElementById("model-api-surface").value = sc.api_surface || "";
-      var eb = sc.extra_body || {};
-      var ebText = JSON.stringify(eb, null, 2);
+      const eb = sc.extra_body || {};
+      const ebText = JSON.stringify(eb, null, 2);
       document.getElementById("model-extra-body").value =
         ebText === "{}" ? "" : ebText;
       // Remove structured fields from capabilities display — only delete
@@ -5561,7 +5561,7 @@ function showEditModelModal(definitionId) {
         delete capsObj.thinking_mode;
         delete capsObj.thinking_param;
       }
-      var capsText = JSON.stringify(capsObj, null, 2);
+      const capsText = JSON.stringify(capsObj, null, 2);
       document.getElementById("model-capabilities").value =
         capsText === "{}" ? "" : capsText;
       document.getElementById("model-enabled").checked = m.enabled !== false;
@@ -5588,8 +5588,8 @@ function hideCreateModelModal() {
 }
 
 function submitCreateModel() {
-  var alias = document.getElementById("model-alias").value.trim();
-  var modelName = document.getElementById("model-name").value.trim();
+  const alias = document.getElementById("model-alias").value.trim();
+  const modelName = document.getElementById("model-name").value.trim();
   if (!alias) {
     _showModelError("Alias is required");
     return;
@@ -5603,9 +5603,9 @@ function submitCreateModel() {
     return;
   }
 
-  var capsEl = document.getElementById("model-capabilities");
-  var capsText = capsEl.value.trim();
-  var caps = {};
+  const capsEl = document.getElementById("model-capabilities");
+  const capsText = capsEl.value.trim();
+  let caps = {};
   capsEl.removeAttribute("aria-invalid");
   capsEl.style.borderColor = "";
   if (capsText) {
@@ -5629,12 +5629,12 @@ function submitCreateModel() {
 
   // Thinking mode → capabilities (provider uses this to inject
   // the correct chat_template_kwargs param automatically).
-  var thinkingMode = document.getElementById("model-thinking-mode").value;
+  const thinkingMode = document.getElementById("model-thinking-mode").value;
   if (thinkingMode) {
     caps.thinking_mode = thinkingMode;
     // Preserve thinking_param so Granite/DeepSeek "thinking" key
     // isn't silently reverted to the default "enable_thinking".
-    var savedParam = document.getElementById("model-thinking-param").value;
+    const savedParam = document.getElementById("model-thinking-param").value;
     if (savedParam) caps.thinking_param = savedParam;
   }
 
@@ -5642,20 +5642,20 @@ function submitCreateModel() {
   // openai-compatible aliases — for other providers the section is hidden
   // but the form values can linger after a provider switch, so gate the
   // whole block on the active provider to keep persisted state honest.
-  var serverCompat = {};
-  var providerVal = document.getElementById("model-provider").value;
-  var ebEl = document.getElementById("model-extra-body");
+  const serverCompat = {};
+  const providerVal = document.getElementById("model-provider").value;
+  const ebEl = document.getElementById("model-extra-body");
   ebEl.removeAttribute("aria-invalid");
   ebEl.style.borderColor = "";
   if (providerVal === "openai-compatible") {
-    var serverType = document.getElementById("model-server-type").value;
+    const serverType = document.getElementById("model-server-type").value;
     if (serverType) serverCompat.server_type = serverType;
-    var apiSurface = document.getElementById("model-api-surface").value;
+    const apiSurface = document.getElementById("model-api-surface").value;
     if (apiSurface) serverCompat.api_surface = apiSurface;
-    var ebText = ebEl.value.trim();
+    const ebText = ebEl.value.trim();
     if (ebText) {
       try {
-        var ebParsed = JSON.parse(ebText);
+        const ebParsed = JSON.parse(ebText);
         if (!_isPlainObject(ebParsed)) {
           throw new Error("not an object");
         }
@@ -5672,7 +5672,7 @@ function submitCreateModel() {
     caps.server_compat = serverCompat;
   }
 
-  var form = {
+  const form = {
     alias: alias,
     model: modelName,
     provider: document.getElementById("model-provider").value,
@@ -5684,9 +5684,9 @@ function submitCreateModel() {
   };
 
   // Per-model sampling overrides — null when empty (use global default)
-  var tempVal = document.getElementById("model-temperature").value.trim();
+  const tempVal = document.getElementById("model-temperature").value.trim();
   if (tempVal !== "") {
-    var t = parseFloat(tempVal);
+    const t = parseFloat(tempVal);
     if (isNaN(t) || t < 0 || t > 2) {
       _showModelError("Temperature must be between 0 and 2");
       return;
@@ -5695,9 +5695,9 @@ function submitCreateModel() {
   } else {
     form.temperature = null;
   }
-  var mtVal = document.getElementById("model-max-tokens").value.trim();
+  const mtVal = document.getElementById("model-max-tokens").value.trim();
   if (mtVal !== "") {
-    var mt = parseInt(mtVal, 10);
+    const mt = parseInt(mtVal, 10);
     if (isNaN(mt) || mt < 1) {
       _showModelError("Max tokens must be at least 1");
       return;
@@ -5706,7 +5706,7 @@ function submitCreateModel() {
   } else {
     form.max_tokens = null;
   }
-  var reVal = document.getElementById("model-reasoning-effort").value;
+  const reVal = document.getElementById("model-reasoning-effort").value;
   if (reVal !== "") {
     form.reasoning_effort = reVal;
   } else {
@@ -5723,12 +5723,12 @@ function submitCreateModel() {
     "model-replay-reasoning",
   ).checked;
 
-  var apiKey = document.getElementById("model-api-key").value;
+  const apiKey = document.getElementById("model-api-key").value;
   if (apiKey) form.api_key = apiKey;
 
-  var editId = document.getElementById("model-edit-id").value;
-  var method = editId ? "PUT" : "POST";
-  var url = editId
+  const editId = document.getElementById("model-edit-id").value;
+  const method = editId ? "PUT" : "POST";
+  let url = editId
     ? "/v1/api/admin/model-definitions/" + encodeURIComponent(editId)
     : "/v1/api/admin/model-definitions";
 
@@ -5760,13 +5760,13 @@ function submitCreateModel() {
 }
 
 function _showModelError(msg) {
-  var e = document.getElementById("model-create-error");
+  const e = document.getElementById("model-create-error");
   e.textContent = msg;
   e.classList.add("is-visible");
 }
 
 function _detectResultLine(text, color) {
-  var div = document.createElement("div");
+  const div = document.createElement("div");
   div.style.marginTop = "3px";
   if (color) div.style.color = "var(--" + color + ")";
   div.textContent = text;
@@ -5774,7 +5774,7 @@ function _detectResultLine(text, color) {
 }
 
 function _clearDetectResult() {
-  var rd = document.getElementById("model-detect-result");
+  const rd = document.getElementById("model-detect-result");
   if (rd) {
     rd.style.display = "none";
     rd.textContent = "";
@@ -5783,22 +5783,22 @@ function _clearDetectResult() {
 }
 
 function detectModel() {
-  var btn = document.getElementById("model-detect-btn");
-  var resultDiv = document.getElementById("model-detect-result");
+  const btn = document.getElementById("model-detect-btn");
+  const resultDiv = document.getElementById("model-detect-result");
   btn.disabled = true;
   btn.setAttribute("aria-busy", "true");
   btn.textContent = "Detecting\u2026";
   resultDiv.style.display = "none";
   resultDiv.textContent = "";
 
-  var form = {
+  const form = {
     provider: document.getElementById("model-provider").value,
     base_url: document.getElementById("model-base-url").value.trim(),
     model: document.getElementById("model-name").value.trim(),
   };
-  var apiKey = document.getElementById("model-api-key").value;
+  const apiKey = document.getElementById("model-api-key").value;
   if (apiKey) form.api_key = apiKey;
-  var editId = document.getElementById("model-edit-id").value;
+  const editId = document.getElementById("model-edit-id").value;
   if (editId) form.definition_id = editId;
 
   authFetch("/v1/api/admin/model-definitions/detect", {
@@ -5823,22 +5823,22 @@ function detectModel() {
         resultDiv.style.borderColor = "var(--red)";
         return;
       }
-      var line1 = "\u2713 Connected";
+      let line1 = "\u2713 Connected";
       if (d.available_models && d.available_models.length) {
         line1 += " \u2014 " + d.available_models.length + " model(s) available";
       }
       resultDiv.appendChild(_detectResultLine(line1, "green"));
 
       if (d.model_found === false) {
-        var models = d.available_models || [];
-        var msg =
+        const models = d.available_models || [];
+        let msg =
           '\u26A0 Model "' +
           form.model +
           '" not found in ' +
           models.length +
           " available model(s)";
         if (models.length > 0) {
-          var shown = models.slice(0, 8);
+          const shown = models.slice(0, 8);
           msg += ": " + shown.join(", ");
           if (models.length > 8)
             msg += ", \u2026 +" + (models.length - 8) + " more";
@@ -5847,11 +5847,11 @@ function detectModel() {
       }
 
       if (d.available_models && d.available_models.length > 0) {
-        var dl = document.getElementById("model-name-suggestions");
+        const dl = document.getElementById("model-name-suggestions");
         if (dl) {
           dl.textContent = "";
           d.available_models.forEach(function (m) {
-            var opt = document.createElement("option");
+            const opt = document.createElement("option");
             opt.value = m;
             dl.appendChild(opt);
           });
@@ -5863,7 +5863,7 @@ function detectModel() {
             "Context window: " + d.context_window.toLocaleString() + " tokens",
           ),
         );
-        var ctxInput = document.getElementById("model-ctx-window");
+        const ctxInput = document.getElementById("model-ctx-window");
         if (parseInt(ctxInput.value, 10) === 0) {
           ctxInput.value = d.context_window;
         }
@@ -5873,8 +5873,8 @@ function detectModel() {
           _detectResultLine("Server type: " + d.server_type),
         );
         // Auto-fill server type if not already set and value is a known option
-        var stEl = document.getElementById("model-server-type");
-        var stOpts = Array.from(stEl.options).map(function (o) {
+        const stEl = document.getElementById("model-server-type");
+        const stOpts = Array.from(stEl.options).map(function (o) {
           return o.value;
         });
         if (!stEl.value && stOpts.indexOf(d.server_type) !== -1)
@@ -5882,22 +5882,22 @@ function detectModel() {
       }
       // Auto-fill capabilities from suggested profile
       if (d.suggested_capabilities) {
-        var sc2 = d.suggested_capabilities;
-        var tmEl = document.getElementById("model-thinking-mode");
+        const sc2 = d.suggested_capabilities;
+        const tmEl = document.getElementById("model-thinking-mode");
         if (!tmEl.value && sc2.thinking_mode) {
           tmEl.value = sc2.thinking_mode;
         }
         if (sc2.thinking_param) {
-          var tpEl = document.getElementById("model-thinking-param");
+          const tpEl = document.getElementById("model-thinking-param");
           if (!tpEl.value) tpEl.value = sc2.thinking_param;
         }
         _toggleThinkingParam();
       }
       // Auto-fill server compat from suggested profile
       if (d.suggested_server_compat) {
-        var ssc = d.suggested_server_compat;
-        var stEl2 = document.getElementById("model-server-type");
-        var stOpts2 = Array.from(stEl2.options).map(function (o) {
+        const ssc = d.suggested_server_compat;
+        const stEl2 = document.getElementById("model-server-type");
+        const stOpts2 = Array.from(stEl2.options).map(function (o) {
           return o.value;
         });
         if (
@@ -5908,15 +5908,15 @@ function detectModel() {
           stEl2.value = ssc.server_type;
         // Restrict to the known set so a hostile detect response can't
         // smuggle a non-listed value into the form.
-        var _SURFACE_SUGGESTABLE = { chat: 1, responses: 1 };
+        const _SURFACE_SUGGESTABLE = { chat: 1, responses: 1 };
         if (ssc.api_surface && _SURFACE_SUGGESTABLE[ssc.api_surface]) {
-          var asEl = document.getElementById("model-api-surface");
+          const asEl = document.getElementById("model-api-surface");
           if (!asEl.value) asEl.value = ssc.api_surface;
         }
         if (ssc.extra_body) {
-          var ebEl2 = document.getElementById("model-extra-body");
+          const ebEl2 = document.getElementById("model-extra-body");
           if (!ebEl2.value.trim()) {
-            var ebJson = JSON.stringify(ssc.extra_body, null, 2);
+            const ebJson = JSON.stringify(ssc.extra_body, null, 2);
             if (ebJson !== "{}") ebEl2.value = ebJson;
           }
         }
@@ -5945,14 +5945,14 @@ function detectModel() {
 /* Capability auto-fill: when the user types a known model name or
    changes the provider, look up static capabilities and pre-fill
    context_window and the capabilities textarea. */
-var _capsTimer = null;
+let _capsTimer = null;
 function _onModelFieldChange() {
   clearTimeout(_capsTimer);
   _capsTimer = setTimeout(function () {
-    var overlay = document.getElementById("model-create-overlay");
+    const overlay = document.getElementById("model-create-overlay");
     if (!overlay || overlay.style.display === "none") return;
-    var provider = document.getElementById("model-provider").value;
-    var modelName = document.getElementById("model-name").value.trim();
+    const provider = document.getElementById("model-provider").value;
+    const modelName = document.getElementById("model-name").value.trim();
     if (!modelName) return;
     authFetch(
       "/v1/api/admin/model-capabilities?provider=" +
@@ -5965,22 +5965,22 @@ function _onModelFieldChange() {
       })
       .then(function (d) {
         if (!d.known || !d.capabilities) return;
-        var ctxInput = document.getElementById("model-ctx-window");
+        const ctxInput = document.getElementById("model-ctx-window");
         if (
           parseInt(ctxInput.value, 10) === 0 &&
           d.capabilities.context_window
         ) {
           ctxInput.value = d.capabilities.context_window;
         }
-        var capsInput = document.getElementById("model-capabilities");
+        const capsInput = document.getElementById("model-capabilities");
         if (!capsInput.value.trim()) {
-          var caps = Object.assign({}, d.capabilities);
+          let caps = Object.assign({}, d.capabilities);
           delete caps.context_window;
           delete caps.max_output_tokens;
           delete caps.token_param;
           delete caps.supports_streaming;
           delete caps.supports_tools;
-          var text = JSON.stringify(caps, null, 2);
+          const text = JSON.stringify(caps, null, 2);
           if (text !== "{}") capsInput.value = text;
         }
       })
@@ -5992,7 +5992,7 @@ function _onModelFieldChange() {
 /* Provider-specific placeholder hints for base_url and model ID fields.
    Keep URLs in sync with _PROVIDER_DEFAULT_URLS in console/server.py
    and GOOGLE_DEFAULT_BASE_URL in core/providers/_google.py. */
-var _providerDefaults = {
+const _providerDefaults = {
   openai: {
     urlPlaceholder: "https://api.openai.com/v1",
     modelPlaceholder: "gpt-5",
@@ -6013,13 +6013,13 @@ var _providerDefaults = {
 
 /* Update placeholders when provider changes. */
 function _applyProviderDefaults() {
-  var provider = document.getElementById("model-provider").value;
-  var def = _providerDefaults[provider];
+  const provider = document.getElementById("model-provider").value;
+  const def = _providerDefaults[provider];
   if (!def) return;
   document.getElementById("model-base-url").placeholder = def.urlPlaceholder;
   document.getElementById("model-name").placeholder = def.modelPlaceholder;
   // Server compat section only applies to local model servers
-  var scSection = document.getElementById("model-server-compat-section");
+  const scSection = document.getElementById("model-server-compat-section");
   if (scSection) {
     scSection.style.display = provider === "openai-compatible" ? "" : "none";
   }
@@ -6028,9 +6028,9 @@ function _applyProviderDefaults() {
 /* Populate the model name datalist with known model prefixes for the
    selected provider.  Called on page load and provider change. */
 function _refreshModelSuggestions() {
-  var dl = document.getElementById("model-name-suggestions");
+  const dl = document.getElementById("model-name-suggestions");
   if (!dl) return;
-  var provider = document.getElementById("model-provider").value;
+  const provider = document.getElementById("model-provider").value;
   authFetch(
     "/v1/api/admin/model-capabilities/known?provider=" +
       encodeURIComponent(provider),
@@ -6041,7 +6041,7 @@ function _refreshModelSuggestions() {
     .then(function (d) {
       dl.textContent = "";
       (d.models || []).forEach(function (m) {
-        var opt = document.createElement("option");
+        const opt = document.createElement("option");
         opt.value = m;
         dl.appendChild(opt);
       });
@@ -6053,8 +6053,8 @@ function _refreshModelSuggestions() {
 
 /* Register listeners once at page load */
 (function () {
-  var nameEl = document.getElementById("model-name");
-  var provEl = document.getElementById("model-provider");
+  const nameEl = document.getElementById("model-name");
+  const provEl = document.getElementById("model-provider");
   if (nameEl) nameEl.addEventListener("input", _onModelFieldChange);
   if (provEl) {
     provEl.addEventListener("change", _onModelFieldChange);
@@ -6064,22 +6064,22 @@ function _refreshModelSuggestions() {
   }
   /* Clear stale detect results when probe-relevant inputs change */
   ["model-base-url", "model-api-key"].forEach(function (id) {
-    var el = document.getElementById(id);
+    const el = document.getElementById(id);
     if (el) el.addEventListener("input", _clearDetectResult);
   });
 })();
 
 function _flagModelSyncPending() {
-  var btn = document.getElementById("model-sync-btn");
+  const btn = document.getElementById("model-sync-btn");
   if (btn) btn.classList.add("model-sync-pending");
 }
 function _clearModelSyncPending() {
-  var btn = document.getElementById("model-sync-btn");
+  const btn = document.getElementById("model-sync-btn");
   if (btn) btn.classList.remove("model-sync-pending");
 }
 
 function reloadModelNodes() {
-  var btn = document.getElementById("model-sync-btn");
+  const btn = document.getElementById("model-sync-btn");
   btn.disabled = true;
   btn.textContent = "Syncing...";
   authFetch("/v1/api/admin/model-definitions/reload", { method: "POST" })
@@ -6105,10 +6105,10 @@ function reloadModelNodes() {
 // Node Metadata tab
 // ---------------------------------------------------------------------------
 
-var _nodeMetaCache = {};
+let _nodeMetaCache = {};
 
 function loadAdminNodeMetadata() {
-  var container = document.getElementById("admin-node-metadata-content");
+  const container = document.getElementById("admin-node-metadata-content");
   if (!container) return;
   setSafeHtml(container, '<div class="dashboard-empty">Loading\u2026</div>');
 
@@ -6131,9 +6131,9 @@ function loadAdminNodeMetadata() {
 }
 
 function _renderNodeMetadata() {
-  var container = document.getElementById("admin-node-metadata-content");
+  const container = document.getElementById("admin-node-metadata-content");
   if (!container) return;
-  var nodeIds = Object.keys(_nodeMetaCache).sort();
+  const nodeIds = Object.keys(_nodeMetaCache).sort();
   if (!nodeIds.length) {
     setSafeHtml(
       container,
@@ -6142,9 +6142,9 @@ function _renderNodeMetadata() {
     return;
   }
 
-  var html = "";
+  let html = "";
   nodeIds.forEach(function (nid) {
-    var meta = _nodeMetaCache[nid] || [];
+    const meta = _nodeMetaCache[nid] || [];
     html +=
       '<div class="settings-section" data-section="nm-' +
       escapeHtml(nid) +
@@ -6177,11 +6177,11 @@ function _renderNodeMetadata() {
       html +=
         '<th scope="col"><span class="sr-only">Actions</span></th></tr></thead><tbody>';
       meta.forEach(function (m) {
-        var valStr =
+        const valStr =
           typeof m.value === "object"
             ? JSON.stringify(m.value)
             : String(m.value);
-        var isAuto = m.source === "auto";
+        const isAuto = m.source === "auto";
         html += "<tr>";
         html += '<td class="nm-key">' + escapeHtml(m.key) + "</td>";
         html +=
@@ -6238,8 +6238,8 @@ function _renderNodeMetadata() {
   // Bind section-header click/keydown (no inline handlers — keys come
   // from operator-controlled node IDs and would be a footgun in a
   // ``onclick="..._('NID')"`` attribute).
-  var nmHeaders = container.querySelectorAll(".settings-section-header");
-  for (var nh = 0; nh < nmHeaders.length; nh++) {
+  const nmHeaders = container.querySelectorAll(".settings-section-header");
+  for (let nh = 0; nh < nmHeaders.length; nh++) {
     nmHeaders[nh].addEventListener("click", function () {
       _toggleSettingsSection(this);
     });
@@ -6249,8 +6249,8 @@ function _renderNodeMetadata() {
   }
 
   // Bind button handlers (data-* attrs carry node/key context)
-  var delBtns = container.querySelectorAll(".nm-del-btn");
-  for (var d = 0; d < delBtns.length; d++) {
+  const delBtns = container.querySelectorAll(".nm-del-btn");
+  for (let d = 0; d < delBtns.length; d++) {
     delBtns[d].addEventListener("click", function () {
       _deleteNodeMeta(
         this.getAttribute("data-node"),
@@ -6258,8 +6258,8 @@ function _renderNodeMetadata() {
       );
     });
   }
-  var addBtns = container.querySelectorAll(".nm-add-btn");
-  for (var a = 0; a < addBtns.length; a++) {
+  const addBtns = container.querySelectorAll(".nm-add-btn");
+  for (let a = 0; a < addBtns.length; a++) {
     addBtns[a].addEventListener("click", function () {
       _addNodeMeta(this.getAttribute("data-node"));
     });
@@ -6267,17 +6267,17 @@ function _renderNodeMetadata() {
 }
 
 function _addNodeMeta(nodeId) {
-  var keyEl = document.getElementById("nm-key-" + nodeId);
-  var valEl = document.getElementById("nm-val-" + nodeId);
+  const keyEl = document.getElementById("nm-key-" + nodeId);
+  const valEl = document.getElementById("nm-val-" + nodeId);
   if (!keyEl || !valEl) return;
-  var key = keyEl.value.trim();
-  var rawVal = valEl.value.trim();
+  const key = keyEl.value.trim();
+  const rawVal = valEl.value.trim();
   if (!key) {
     showToast("Key is required", "error");
     return;
   }
 
-  var value;
+  let value;
   try {
     value = JSON.parse(rawVal);
   } catch (e) {
