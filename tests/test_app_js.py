@@ -238,14 +238,31 @@ _STYLE_CSS = Path(__file__).resolve().parent.parent / "turnstone/ui/static/style
 
 # Pins the absence of unsafe DOM-write sinks. Spell the property names
 # out of literal concatenation so the tooling that flags occurrences in
-# code strings doesn't false-positive on the test source. The trailing
-# ``(?!=)`` negative-lookahead excludes ``===`` / ``==`` reads — only
-# the assignment / call sinks are flagged. ``insertAdjacent`` + HTML
-# is *not* covered here because two existing call sites
-# (``app.js:1287`` and ``app.js:1538``) consume ``renderVerdictBadge``
-# HTML output; broadening the lint would require cleaning that helper
-# first. Tracked as a follow-up to the DOM-cleanup PR.
-_UNSAFE_DOM_WRITE_RE = re.compile(r"\.(?:inner|outer)" + r"HTML\s*=(?!=)" + r"|document\.write\(")
+# code strings doesn't false-positive on the test source.
+#
+# The pattern catches:
+# * plain assignment — ``el.innerHTML = X``, ``el.outerHTML = X``
+# * concat-assignment — ``el.innerHTML += X``, ``el.outerHTML += X``
+#   (``\+?`` makes the ``+`` optional so a future regression that
+#   switches sinks to concat-assignment doesn't bypass the lint)
+# * doc-write — ``document.write(...)``
+#
+# The trailing ``(?!=)`` negative-lookahead excludes ``===`` / ``==``
+# reads — only the assignment / call sinks are flagged.
+#
+# The scan in ``test_no_unsafe_dom_writes_in_static_assets`` runs the
+# regex over the *entire file body* (not line-by-line) so that ``\s*``
+# can span newlines and catch multi-line sinks like
+# ``el.innerHTML\n  = X``.
+#
+# ``insertAdjacent`` + HTML is *not* covered here because two existing
+# call sites (``app.js:1287`` and ``app.js:1538``) consume
+# ``renderVerdictBadge`` HTML output; broadening the lint would require
+# cleaning that helper first.  Tracked as a follow-up to the DOM-cleanup
+# PR.
+_UNSAFE_DOM_WRITE_RE = re.compile(
+    r"\.(?:inner|outer)" + r"HTML\s*\+?=(?!=)" + r"|document\.write\("
+)
 
 
 def test_phase8_mcp_error_helpers_defined_in_app_js() -> None:
@@ -362,11 +379,15 @@ def test_no_unsafe_dom_writes_in_interactive_assets() -> None:
     ]
     for label, path in targets:
         body = path.read_text(encoding="utf-8")
-        offenders = [
-            (i, line.rstrip())
-            for i, line in enumerate(body.splitlines(), start=1)
-            if _UNSAFE_DOM_WRITE_RE.search(line)
-        ]
+        # Scan whole-file (not line-by-line) so the regex's ``\s*``
+        # spans newlines and catches multi-line sinks like
+        # ``el.innerHTML\n  = X``.  Map match positions back to line
+        # numbers for the failure message.
+        lines = body.splitlines()
+        offenders: list[tuple[int, str]] = []
+        for m in _UNSAFE_DOM_WRITE_RE.finditer(body):
+            line_no = body.count("\n", 0, m.start()) + 1
+            offenders.append((line_no, lines[line_no - 1].rstrip()))
         assert not offenders, (
             f"Found {len(offenders)} unsafe DOM-write sink(s) in "
             f"{label}:\n"
