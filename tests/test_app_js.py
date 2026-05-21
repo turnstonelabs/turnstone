@@ -1106,3 +1106,44 @@ def test_beforeunload_closes_sse_connections() -> None:
     assert "for (const id in panes)" in handler, (
         "beforeunload handler must iterate the panes registry with `for (const id in panes)`."
     )
+
+
+def test_dead_sse_defensive_reconnect_registered() -> None:
+    """Pin the defensive reconnect: visibilitychange + focus listeners
+    must re-establish SSE connections that were closed by beforeunload
+    when the navigation didn't actually complete (e.g. another
+    beforeunload handler's "Are you sure?" dialog dismissed).  Without
+    these, the page stays alive with dead SSEs and no automatic
+    recovery — UI silently stops receiving events.
+
+    The two listeners cover different cancellation shapes: visibilitychange
+    catches hide/show; focus catches modal/browser-UI/OS-level focus loss
+    and return.  Both call the same idempotent reconnect helper."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    # Both event registrations must be present.
+    assert 'addEventListener("visibilitychange"' in body, (
+        "visibilitychange listener missing — defensive reconnect won't fire on tab return."
+    )
+    assert 'addEventListener("focus"' in body, (
+        "focus listener missing — defensive reconnect won't catch "
+        "modal-dismissed cancellation paths."
+    )
+    # The reconnect helper must check readyState against CLOSED and call
+    # connectGlobalSSE / Pane.connectSSE for dead connections.
+    helper = re.search(
+        r"function\s+_reconnectDeadSSEs\s*\(\s*\)\s*\{",
+        body,
+    )
+    assert helper is not None, (
+        "_reconnectDeadSSEs helper missing — reconnect logic must live in "
+        "a named function the listeners can share."
+    )
+    helper_body = body[helper.start() : helper.start() + 800]
+    assert "EventSource.CLOSED" in helper_body, (
+        "_reconnectDeadSSEs must gate on readyState === EventSource.CLOSED "
+        "so live or CONNECTING sockets aren't disrupted."
+    )
+    assert "connectGlobalSSE()" in helper_body, (
+        "_reconnectDeadSSEs must reconnect the global SSE when closed."
+    )
+    assert "connectSSE(" in helper_body, "_reconnectDeadSSEs must reconnect dead per-pane SSEs."

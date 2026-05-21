@@ -6642,6 +6642,40 @@ window.addEventListener("beforeunload", function () {
   }
 });
 
+// Defensive reconnect: covers the edge case where beforeunload fires but
+// navigation is then cancelled (e.g. another beforeunload listener — present
+// or future — sets returnValue and the user picks "Stay" in the dialog).
+// In that path, our handler already closed the SSEs but the page is still
+// alive with no automatic reconnect.  Both events are registered because
+// they catch different cancellation shapes: visibilitychange fires on
+// hide/show; focus fires when the window regains focus from a modal /
+// browser-UI / OS-level interruption.  Idempotent — when SSEs are alive
+// the check is a no-op, so this is also safe on every tab return.
+//
+// Out of scope here: visibility-based DISCONNECT (close-on-hidden to
+// support many tabs).  That belongs to the SSE fan-in design where the
+// connection lifecycle is being rethought — see ~/pr-c-sse-consolidation.md.
+function _reconnectDeadSSEs() {
+  if (globalEvtSource && globalEvtSource.readyState === EventSource.CLOSED) {
+    connectGlobalSSE();
+  }
+  for (const id in panes) {
+    const p = panes[id];
+    if (
+      p &&
+      p.evtSource &&
+      p.evtSource.readyState === EventSource.CLOSED &&
+      p.wsId
+    ) {
+      p.connectSSE(p.wsId);
+    }
+  }
+}
+document.addEventListener("visibilitychange", function () {
+  if (document.visibilityState === "visible") _reconnectDeadSSEs();
+});
+window.addEventListener("focus", _reconnectDeadSSEs);
+
 function loadInterfaceSettings() {
   authFetch("/v1/api/admin/settings")
     .then(function (r) {
