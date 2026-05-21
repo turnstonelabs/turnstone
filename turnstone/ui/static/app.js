@@ -734,7 +734,7 @@ Pane.prototype.handleEvent = function (evt) {
       break;
 
     case "clear_ui":
-      this.messagesEl.innerHTML = "";
+      this.messagesEl.replaceChildren();
       break;
   }
 };
@@ -1149,7 +1149,7 @@ Pane.prototype._editAndResend = function (msgEl, newText) {
 
 Pane.prototype.replayHistory = function (messages) {
   var self = this;
-  this.messagesEl.innerHTML = "";
+  this.messagesEl.replaceChildren();
   if (!messages.length) {
     this.showEmptyState();
     return;
@@ -1227,10 +1227,8 @@ Pane.prototype.replayHistory = function (messages) {
         el.className = "msg assistant";
         var bodyEl = document.createElement("div");
         bodyEl.className = "msg-body";
-        var rendered = renderMarkdown(msg.content);
-        bodyEl.innerHTML = rendered;
         el.appendChild(bodyEl);
-        postRenderMarkdown(el);
+        setMarkdown(bodyEl, msg.content);
         self.messagesEl.appendChild(el);
         lastToolBlock = null;
       }
@@ -1258,9 +1256,10 @@ Pane.prototype.replayHistory = function (messages) {
               var args = JSON.parse(tc.arguments);
               if (tc.name === "bash") {
                 var preview = Object.values(args)[0] || "";
-                cmd.innerHTML =
-                  '<span class="dollar">$ </span>' +
-                  escapeHtml(String(preview));
+                var dollar = document.createElement("span");
+                dollar.className = "dollar";
+                dollar.textContent = "$ ";
+                cmd.append(dollar, String(preview));
               } else {
                 var parts = [];
                 var keys = Object.keys(args);
@@ -1592,7 +1591,7 @@ Pane.prototype.showInlineToolBlock = function (
 
     var approveBtn = document.createElement("button");
     approveBtn.className = "ts-approval-btn ts-approval-btn--approve";
-    approveBtn.innerHTML = '<span class="key">y</span> Approve';
+    approveBtn.append(makeKeyLabel("y", "Approve"));
     approveBtn.onclick = function () {
       self.resolveApproval(true, false, self.getFeedback());
     };
@@ -1600,7 +1599,7 @@ Pane.prototype.showInlineToolBlock = function (
 
     var denyBtn = document.createElement("button");
     denyBtn.className = "ts-approval-btn ts-approval-btn--deny";
-    denyBtn.innerHTML = '<span class="key">n</span> Deny';
+    denyBtn.append(makeKeyLabel("n", "Deny"));
     denyBtn.onclick = function () {
       self.resolveApproval(false, false, self.getFeedback());
     };
@@ -1611,7 +1610,7 @@ Pane.prototype.showInlineToolBlock = function (
       alwaysBtn.className = "ts-approval-btn ts-approval-btn--always";
       alwaysBtn.title = alwaysTitle;
       alwaysBtn.setAttribute("aria-label", alwaysTitle);
-      alwaysBtn.innerHTML = '<span class="key">a</span> Always';
+      alwaysBtn.append(makeKeyLabel("a", "Always"));
       alwaysBtn.onclick = function () {
         self.resolveApproval(true, true, self.getFeedback());
       };
@@ -1928,11 +1927,13 @@ Pane.prototype.updateVerdictBadge = function (verdict) {
         if (tierDiv) detail.insertBefore(evidenceEl, tierDiv);
         else detail.appendChild(evidenceEl);
       }
-      evidenceEl.innerHTML = verdict.evidence
-        .map(function (e) {
-          return "<div>\u2022 " + escapeHtml(e) + "</div>";
-        })
-        .join("");
+      evidenceEl.replaceChildren(
+        ...verdict.evidence.map(function (e) {
+          var div = document.createElement("div");
+          div.textContent = "\u2022 " + e;
+          return div;
+        }),
+      );
     } else if (evidenceEl) {
       evidenceEl.remove();
     }
@@ -2368,7 +2369,7 @@ function renderLayout() {
   }
 
   // Clear and rebuild
-  root.innerHTML = "";
+  root.replaceChildren();
   if (splitRoot) {
     _renderLayoutNode(splitRoot, root);
   }
@@ -3025,7 +3026,7 @@ window.onLogout = function () {
   focusedPaneId = null;
   workstreams = {};
   currentWsId = null;
-  document.getElementById("split-root").innerHTML = "";
+  document.getElementById("split-root").replaceChildren();
   if (globalEvtSource) {
     globalEvtSource.close();
     globalEvtSource = null;
@@ -3461,7 +3462,10 @@ function showNewWsModal(forkFromWsId) {
     });
 
   var tplSelect = document.getElementById("new-ws-skill");
-  tplSelect.innerHTML = '<option value="">Use defaults</option>';
+  var defaultOpt = document.createElement("option");
+  defaultOpt.value = "";
+  defaultOpt.textContent = "Use defaults";
+  tplSelect.replaceChildren(defaultOpt);
   authFetch("/v1/api/skills")
     .then(function (r) {
       return r.json();
@@ -3662,7 +3666,7 @@ function _reassignPanesForClosedWs(closedWsId, tabIdsBeforeClose) {
       dp.disconnectSSE();
       if (remaining.length) {
         dp.wsId = remaining[0];
-        dp.messagesEl.innerHTML = "";
+        dp.messagesEl.replaceChildren();
         dp.showEmptyState();
         dp.updateWsName();
         dp.connectSSE(remaining[0]);
@@ -3750,7 +3754,7 @@ function _reassignPanesForClosedWs(closedWsId, tabIdsBeforeClose) {
       // Reassign pane to the target workstream
       p.disconnectSSE();
       p.wsId = newWsId;
-      p.messagesEl.innerHTML = "";
+      p.messagesEl.replaceChildren();
       p.showEmptyState();
       p.updateWsName();
       p.connectSSE(newWsId);
@@ -3763,7 +3767,7 @@ function _reassignPanesForClosedWs(closedWsId, tabIdsBeforeClose) {
       p.disconnectSSE();
       if (remaining.length) {
         p.wsId = remaining[0];
-        p.messagesEl.innerHTML = "";
+        p.messagesEl.replaceChildren();
         p.showEmptyState();
         p.updateWsName();
         p.connectSSE(remaining[0]);
@@ -3854,9 +3858,10 @@ function toggleDashboard() {
 
 function loadDashboard() {
   var tableEl = document.getElementById("dash-ws-table");
-  tableEl.innerHTML = '<div class="dashboard-empty">Loading\u2026</div>';
-  document.getElementById("dashboard-saved-cards").innerHTML =
-    '<div class="dashboard-empty">Loading\u2026</div>';
+  tableEl.replaceChildren(makeEmptyState("Loading\u2026"));
+  document
+    .getElementById("dashboard-saved-cards")
+    .replaceChildren(makeEmptyState("Loading\u2026"));
   var dashP = authFetch("/v1/api/dashboard").then(function (r) {
     return r.json();
   });
@@ -3879,9 +3884,10 @@ function loadDashboard() {
       renderSavedWorkstreams(savedList);
     })
     .catch(function () {
-      tableEl.innerHTML = '<div class="dashboard-empty">Failed to load</div>';
-      document.getElementById("dashboard-saved-cards").innerHTML =
-        '<div class="dashboard-empty">Failed to load</div>';
+      tableEl.replaceChildren(makeEmptyState("Failed to load"));
+      document
+        .getElementById("dashboard-saved-cards")
+        .replaceChildren(makeEmptyState("Failed to load"));
     });
 }
 
@@ -3892,10 +3898,9 @@ function renderDashboardTable(wsList, agg) {
   document.getElementById("dash-summary").textContent =
     activeCount + " active \u00b7 " + wsList.length + " total";
   var table = document.getElementById("dash-ws-table");
-  table.innerHTML = "";
+  table.replaceChildren();
   if (!wsList.length) {
-    table.innerHTML =
-      '<div class="dashboard-empty">No active workstreams</div>';
+    table.replaceChildren(makeEmptyState("No active workstreams"));
     updateDashFooter(agg);
     return;
   }
@@ -3930,17 +3935,15 @@ function renderDashboardTable(wsList, agg) {
 
     var stateCell = document.createElement("span");
     stateCell.className = "dash-cell-state";
-    stateCell.innerHTML =
-      '<span class="dash-state-dot" data-state="' +
-      escapeHtml(liveState) +
-      '" aria-hidden="true"></span>' +
-      '<span class="dash-state-label" data-state="' +
-      escapeHtml(liveState) +
-      '">' +
-      sd.symbol +
-      " " +
-      sd.label +
-      "</span>";
+    var stateDot = document.createElement("span");
+    stateDot.className = "dash-state-dot";
+    stateDot.setAttribute("data-state", liveState);
+    stateDot.setAttribute("aria-hidden", "true");
+    var stateLabel = document.createElement("span");
+    stateLabel.className = "dash-state-label";
+    stateLabel.setAttribute("data-state", liveState);
+    stateLabel.textContent = sd.symbol + " " + sd.label;
+    stateCell.append(stateDot, stateLabel);
     main.appendChild(stateCell);
 
     var nameCell = document.createElement("span");
@@ -4012,9 +4015,12 @@ function updateDashFooter(agg) {
   if (!agg) return;
   var nodesEl = document.getElementById("dash-footer-nodes");
   var statsEl = document.getElementById("dash-footer-stats");
-  nodesEl.innerHTML =
-    '<span class="dash-footer-node-dot"></span> ' +
-    escapeHtml((agg.node || "local") + " (" + (agg.total_count || 0) + " ws)");
+  var footerDot = document.createElement("span");
+  footerDot.className = "dash-footer-node-dot";
+  nodesEl.replaceChildren(
+    footerDot,
+    " " + (agg.node || "local") + " (" + (agg.total_count || 0) + " ws)",
+  );
   var parts = [];
   if (agg.total_tokens) parts.push(formatTokens(agg.total_tokens) + " tokens");
   if (agg.total_tool_calls) parts.push(agg.total_tool_calls + " tool calls");
@@ -4815,7 +4821,10 @@ function buildToolDiv(item) {
   var headerText = stripAnsi(item.header || "");
   var cleaned = headerText.replace(/^[^\s]+\s+\w+:\s*/, "");
   if (item.func_name === "bash" && cleaned) {
-    cmd.innerHTML = '<span class="dollar">$ </span>' + escapeHtml(cleaned);
+    var dollarSpan = document.createElement("span");
+    dollarSpan.className = "dollar";
+    dollarSpan.textContent = "$ ";
+    cmd.append(dollarSpan, cleaned);
   } else {
     cmd.textContent = cleaned || headerText;
   }
@@ -4825,18 +4834,24 @@ function buildToolDiv(item) {
     var diff = document.createElement("div");
     diff.className = "tool-diff";
     var lines = stripAnsi(item.preview).split("\n");
-    diff.innerHTML = lines
-      .map(function (line) {
-        var trimmed = line.trim();
-        if (trimmed.startsWith("-"))
-          return '<span class="diff-del">' + escapeHtml(line) + "</span>";
-        if (trimmed.startsWith("+"))
-          return '<span class="diff-add">' + escapeHtml(line) + "</span>";
-        if (trimmed.startsWith("Warning:"))
-          return '<span class="diff-warn">' + escapeHtml(line) + "</span>";
-        return escapeHtml(line);
-      })
-      .join("\n");
+    var diffNodes = [];
+    lines.forEach(function (line, i) {
+      if (i > 0) diffNodes.push("\n");
+      var trimmed = line.trim();
+      var cls = null;
+      if (trimmed.startsWith("-")) cls = "diff-del";
+      else if (trimmed.startsWith("+")) cls = "diff-add";
+      else if (trimmed.startsWith("Warning:")) cls = "diff-warn";
+      if (cls !== null) {
+        var span = document.createElement("span");
+        span.className = cls;
+        span.textContent = line;
+        diffNodes.push(span);
+      } else {
+        diffNodes.push(line);
+      }
+    });
+    diff.append(...diffNodes);
     div.appendChild(diff);
   }
 
@@ -5622,9 +5637,7 @@ function _updatePlanRejectBtn() {
   var btn = document.getElementById("btn-plan-reject");
   var hasFeedback =
     document.getElementById("plan-feedback").value.trim().length > 0;
-  btn.innerHTML = hasFeedback
-    ? '<span class="key">Esc</span> Amend'
-    : '<span class="key">Esc</span> Reject';
+  btn.replaceChildren(makeKeyLabel("Esc", hasFeedback ? "Amend" : "Reject"));
   btn.style.background = hasFeedback ? "var(--accent)" : "";
   btn.style.color = hasFeedback ? "var(--on-color)" : "";
   btn.onclick = function () {
@@ -5767,8 +5780,7 @@ function _addInlinePlan(content, action, feedback, origin) {
   var body = document.createElement("div");
   body.className = "plan-inline-body";
   try {
-    body.innerHTML = renderMarkdown(content);
-    postRenderMarkdown(body);
+    setMarkdown(body, content);
   } catch (e) {
     body.textContent = content;
   }
