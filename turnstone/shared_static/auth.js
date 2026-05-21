@@ -8,14 +8,14 @@
    3. If auth_enabled + has_users → show login (username:password)
    4. Legacy: token-based login still supported via toggle */
 
-var _AUTH_TITLE = window.TURNSTONE_AUTH_TITLE || "turnstone";
-var _loginTrapHandler = null;
-var _loginBusy = false;
-var _authMode = "login"; // "login", "setup", "token"
-var _authUpgradeReload = false;
+const _AUTH_TITLE = window.TURNSTONE_AUTH_TITLE || "turnstone";
+let _loginTrapHandler = null;
+let _loginBusy = false;
+let _authMode = "login"; // "login", "setup", "token"
+let _authUpgradeReload = false;
 
 // Cross-tab auth sync — when one tab logs in/out, others follow.
-var _authChannel =
+const _authChannel =
   typeof BroadcastChannel !== "undefined"
     ? new BroadcastChannel("turnstone_auth")
     : null;
@@ -37,12 +37,12 @@ if (_authChannel) {
 }
 
 async function authFetch(url, opts) {
-  var maxRetries = 2;
-  for (var attempt = 0; attempt <= maxRetries; attempt++) {
-    var r = await fetch(url, opts);
+  const maxRetries = 2;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const r = await fetch(url, opts);
     if (r.status === 401) {
       try {
-        var body = await r.clone().json();
+        const body = await r.clone().json();
         if (body && body.code === "version_mismatch") {
           _authUpgradeReload = true;
           showLogin("upgrade");
@@ -62,7 +62,7 @@ async function authFetch(url, opts) {
       throw new Error("auth");
     }
     if (r.status === 429 && attempt < maxRetries) {
-      var retryAfter = parseInt(r.headers.get("Retry-After") || "1", 10);
+      const retryAfter = parseInt(r.headers.get("Retry-After") || "1", 10);
       showToast("Rate limited \u2014 retrying in " + retryAfter + "s");
       await new Promise(function (resolve) {
         setTimeout(resolve, retryAfter * 1000);
@@ -70,7 +70,7 @@ async function authFetch(url, opts) {
       continue;
     }
     // Successful auth — ensure logout button and SSE connection
-    var _lb = document.getElementById("logout-btn");
+    const _lb = document.getElementById("logout-btn");
     if (_lb) _lb.style.display = "";
     if (typeof _ensureSSE === "function") _ensureSSE();
     return r;
@@ -86,22 +86,22 @@ async function authFetch(url, opts) {
 // hammering the server for every authFetch.  The reactive _tryRefresh()
 // path above covers cases where the timer didn't fire (tab restored from
 // disk cache after expiry, system clock jump, etc).
-var _REFRESH_AT_FRACTION = 0.9;
+const _REFRESH_AT_FRACTION = 0.9;
 // Floor so we don't spin on tiny lifetimes; ceil so very long-lived
 // cookies still refresh once a day for permission re-resolution.
-var _REFRESH_MIN_DELAY_MS = 30 * 1000;
-var _REFRESH_MAX_DELAY_MS = 24 * 60 * 60 * 1000;
-var _refreshTimer = null;
-var _refreshInFlight = null;
+const _REFRESH_MIN_DELAY_MS = 30 * 1000;
+const _REFRESH_MAX_DELAY_MS = 24 * 60 * 60 * 1000;
+let _refreshTimer = null;
+let _refreshInFlight = null;
 // Logout race guard: a refresh (or whoami) in flight when the user
 // clicks Logout can land AFTER /logout and re-populate state, silently
 // undoing the logout.  _loggedOut is set synchronously in logout() and
 // every fetch's .then bails on its post-fetch effects when it sees the
 // flag.  _refreshAbort / _whoamiAbort are the AbortControllers for any
 // in-flight /refresh and /whoami respectively.
-var _loggedOut = false;
-var _refreshAbort = null;
-var _whoamiAbort = null;
+let _loggedOut = false;
+let _refreshAbort = null;
+let _whoamiAbort = null;
 
 // Permissions-ready: one-shot promise resolved after the initial whoami
 // completes (success OR failure).  Lets permission-gated UI await the
@@ -109,13 +109,13 @@ var _whoamiAbort = null;
 // guessing a setTimeout duration.  Subsequent logins/logouts refresh
 // permissions through the existing onLoginSuccess / onLogout hooks, so
 // one-shot is sufficient for the page-load gate problem.
-var _permissionsReadyResolve = null;
-var _permissionsReady = new Promise(function (resolve) {
+let _permissionsReadyResolve = null;
+const _permissionsReady = new Promise(function (resolve) {
   _permissionsReadyResolve = resolve;
 });
 function _markPermissionsReady() {
   if (_permissionsReadyResolve) {
-    var r = _permissionsReadyResolve;
+    const r = _permissionsReadyResolve;
     _permissionsReadyResolve = null;
     r();
   }
@@ -140,14 +140,14 @@ async function _tryRefresh() {
     typeof AbortController !== "undefined" ? new AbortController() : null;
   _refreshInFlight = (async function () {
     try {
-      var r = await fetch("/v1/api/auth/refresh", {
+      const r = await fetch("/v1/api/auth/refresh", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "same-origin",
         signal: _refreshAbort ? _refreshAbort.signal : undefined,
       });
       if (!r.ok) return false;
-      var data = null;
+      let data = null;
       try {
         data = await r.json();
       } catch (_e) {
@@ -197,11 +197,11 @@ function _scheduleRefreshAt(epochSeconds) {
     _refreshTimer = null;
   }
   if (typeof epochSeconds !== "number" || !isFinite(epochSeconds)) return;
-  var nowMs = Date.now();
-  var expMs = epochSeconds * 1000;
-  var remaining = expMs - nowMs;
+  const nowMs = Date.now();
+  const expMs = epochSeconds * 1000;
+  const remaining = expMs - nowMs;
   if (remaining <= 0) return; // already expired; reactive path handles it
-  var delay = Math.floor(remaining * _REFRESH_AT_FRACTION);
+  let delay = Math.floor(remaining * _REFRESH_AT_FRACTION);
   if (delay < _REFRESH_MIN_DELAY_MS) delay = _REFRESH_MIN_DELAY_MS;
   if (delay > _REFRESH_MAX_DELAY_MS) delay = _REFRESH_MAX_DELAY_MS;
   _refreshTimer = setTimeout(function () {
@@ -239,7 +239,7 @@ function _scheduleRefreshFromWhoami() {
   // prior in-flight whoami before starting a new one AND guard the
   // post-fetch effects with `_whoamiAbort === ctrl` so a late arrival
   // from a superseded call is fully neutralised.
-  var prior = _whoamiAbort;
+  const prior = _whoamiAbort;
   if (prior) {
     try {
       prior.abort();
@@ -247,7 +247,7 @@ function _scheduleRefreshFromWhoami() {
       /* AbortController not available; the equality check below covers it */
     }
   }
-  var ctrl =
+  const ctrl =
     typeof AbortController !== "undefined" ? new AbortController() : null;
   _whoamiAbort = ctrl;
   fetch("/v1/api/auth/whoami", {
@@ -293,7 +293,7 @@ function _cancelRefreshTimer() {
 }
 
 function initLogin() {
-  var overlay = document.createElement("div");
+  const overlay = document.createElement("div");
   overlay.id = "login-overlay";
   overlay.style.display = "none";
   overlay.setAttribute("role", "dialog");
@@ -304,8 +304,8 @@ function initLogin() {
   _bindLoginEvents();
 
   // OIDC callback: detect success or error from URL params
-  var _oidcParams = new URLSearchParams(window.location.search);
-  var _oidcError = _oidcParams.get("oidc_error");
+  const _oidcParams = new URLSearchParams(window.location.search);
+  const _oidcError = _oidcParams.get("oidc_error");
   if (_oidcError) {
     history.replaceState({}, "", window.location.pathname);
     // showLogin's status-fetch resolves _switchMode (which clears errors)
@@ -382,8 +382,8 @@ function _bindLoginEvents() {
   });
 
   // Escape key clears errors
-  var inputs = document.querySelectorAll("#login-box input");
-  for (var i = 0; i < inputs.length; i++) {
+  const inputs = document.querySelectorAll("#login-box input");
+  for (let i = 0; i < inputs.length; i++) {
     inputs[i].addEventListener("keydown", function (e) {
       if (e.key === "Escape") _clearError();
     });
@@ -401,13 +401,13 @@ function _bindLoginEvents() {
 
 function _switchMode(mode) {
   _authMode = mode;
-  var setupFields = document.getElementById("setup-fields");
-  var loginFields = document.getElementById("login-fields");
-  var tokenFields = document.getElementById("token-fields");
-  var toggleDiv = document.getElementById("login-toggle");
-  var toggleBtn = document.getElementById("toggle-token");
-  var subtitle = document.getElementById("login-subtitle");
-  var btn = document.getElementById("login-submit");
+  const setupFields = document.getElementById("setup-fields");
+  const loginFields = document.getElementById("login-fields");
+  const tokenFields = document.getElementById("token-fields");
+  const toggleDiv = document.getElementById("login-toggle");
+  const toggleBtn = document.getElementById("toggle-token");
+  const subtitle = document.getElementById("login-subtitle");
+  const btn = document.getElementById("login-submit");
 
   setupFields.style.display = "none";
   loginFields.style.display = "none";
@@ -444,9 +444,9 @@ function _switchMode(mode) {
 }
 
 function _updateOIDCUI(data) {
-  var section = document.getElementById("oidc-section");
-  var btn = document.getElementById("oidc-btn");
-  var divider = document.getElementById("oidc-divider");
+  const section = document.getElementById("oidc-section");
+  const btn = document.getElementById("oidc-btn");
+  const divider = document.getElementById("oidc-divider");
   if (!section) return;
 
   if (!data.oidc_enabled || _authMode === "setup") {
@@ -469,7 +469,7 @@ function _updateOIDCUI(data) {
 }
 
 function _clearError() {
-  var errEl = document.getElementById("login-error");
+  const errEl = document.getElementById("login-error");
   if (errEl && errEl.style.display !== "none") {
     errEl.style.display = "none";
     errEl.textContent = "";
@@ -477,7 +477,7 @@ function _clearError() {
 }
 
 function _showError(msg) {
-  var errEl = document.getElementById("login-error");
+  const errEl = document.getElementById("login-error");
   if (errEl) {
     errEl.textContent = msg;
     errEl.style.display = "block";
@@ -485,17 +485,17 @@ function _showError(msg) {
 }
 
 function showLogin(reason, oidcError) {
-  var overlay = document.getElementById("login-overlay");
+  const overlay = document.getElementById("login-overlay");
   if (!overlay) return;
   overlay.style.display = "flex";
   document.body.style.overflow = "hidden";
-  var logoutBtn = document.getElementById("logout-btn");
+  const logoutBtn = document.getElementById("logout-btn");
   if (logoutBtn) logoutBtn.style.display = "none";
   _clearError();
 
   // Check auth status to determine mode
-  var _loginReason = reason;
-  var _oidcError = oidcError;
+  const _loginReason = reason;
+  const _oidcError = oidcError;
   fetch("/v1/api/auth/status")
     .then(function (r) {
       return r.json();
@@ -506,7 +506,7 @@ function showLogin(reason, oidcError) {
       } else {
         _switchMode("login");
         if (_loginReason === "upgrade") {
-          var subtitle = document.getElementById("login-subtitle");
+          const subtitle = document.getElementById("login-subtitle");
           if (subtitle)
             subtitle.textContent =
               "The server was updated \u2014 please sign in again";
@@ -526,18 +526,18 @@ function showLogin(reason, oidcError) {
     document.removeEventListener("keydown", _loginTrapHandler);
   _loginTrapHandler = function (e) {
     if (e.key === "Tab") {
-      var box = document.getElementById("login-box");
-      var focusable = box.querySelectorAll(
+      const box = document.getElementById("login-box");
+      const focusable = box.querySelectorAll(
         'input:not([style*="display: none"]):not([style*="display:none"]), button:not([style*="display: none"]):not([style*="display:none"])',
       );
       // Filter to visible elements
-      var visible = [];
-      for (var i = 0; i < focusable.length; i++) {
+      const visible = [];
+      for (let i = 0; i < focusable.length; i++) {
         if (focusable[i].offsetParent !== null) visible.push(focusable[i]);
       }
       if (visible.length === 0) return;
-      var first = visible[0];
-      var last = visible[visible.length - 1];
+      const first = visible[0];
+      const last = visible[visible.length - 1];
       if (e.shiftKey) {
         if (document.activeElement === first) {
           e.preventDefault();
@@ -555,7 +555,7 @@ function showLogin(reason, oidcError) {
 }
 
 function hideLogin() {
-  var overlay = document.getElementById("login-overlay");
+  const overlay = document.getElementById("login-overlay");
   if (overlay) overlay.style.display = "none";
   document.body.style.overflow = "";
   if (_loginTrapHandler) {
@@ -572,8 +572,8 @@ function _handleSubmit() {
 }
 
 function _submitLogin() {
-  var username = (document.getElementById("login-username").value || "").trim();
-  var password = document.getElementById("login-password").value || "";
+  const username = (document.getElementById("login-username").value || "").trim();
+  const password = document.getElementById("login-password").value || "";
 
   if (!username) {
     _showError("Username is required");
@@ -611,7 +611,7 @@ function _submitLogin() {
 }
 
 function _submitToken() {
-  var token = (document.getElementById("login-token").value || "").trim();
+  const token = (document.getElementById("login-token").value || "").trim();
   if (!token) {
     _showError("Token is required");
     return;
@@ -644,12 +644,12 @@ function _submitToken() {
 }
 
 function _submitSetup() {
-  var username = (document.getElementById("setup-username").value || "").trim();
-  var displayName = (
+  const username = (document.getElementById("setup-username").value || "").trim();
+  const displayName = (
     document.getElementById("setup-displayname").value || ""
   ).trim();
-  var password = document.getElementById("setup-password").value || "";
-  var confirm = document.getElementById("setup-confirm").value || "";
+  const password = document.getElementById("setup-password").value || "";
+  const confirm = document.getElementById("setup-confirm").value || "";
 
   if (!username) {
     _showError("Username is required");
@@ -713,15 +713,15 @@ function _storePermissions(data) {
 
 function _setBusy(busy, label) {
   _loginBusy = busy;
-  var btn = document.getElementById("login-submit");
-  var inputs = document.querySelectorAll("#login-box input");
+  const btn = document.getElementById("login-submit");
+  const inputs = document.querySelectorAll("#login-box input");
   btn.disabled = busy;
   if (busy) {
     btn.textContent = label || "Signing in\u2026";
   } else {
     btn.textContent = _authMode === "setup" ? "Create account" : "Sign in";
   }
-  for (var i = 0; i < inputs.length; i++) {
+  for (let i = 0; i < inputs.length; i++) {
     inputs[i].disabled = busy;
   }
 }
@@ -738,7 +738,7 @@ function _onSuccess() {
   // refreshes work again.
   _loggedOut = false;
   hideLogin();
-  var logoutBtn = document.getElementById("logout-btn");
+  const logoutBtn = document.getElementById("logout-btn");
   if (logoutBtn) logoutBtn.style.display = "";
   if (_authChannel) _authChannel.postMessage("login");
   if (typeof window.onLoginSuccess === "function") window.onLoginSuccess();
