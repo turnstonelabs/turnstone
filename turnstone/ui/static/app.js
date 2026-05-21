@@ -7,7 +7,7 @@
 //  1. Pane class — per-workstream UI state
 // ===========================================================================
 
-var _paneCounter = 0;
+const _paneCounter = 0;
 
 class Pane {
   constructor(wsId) {
@@ -50,7 +50,7 @@ class Pane {
   }
 
   updateWsName() {
-    var nameEl = this.headerEl.querySelector(".pane-ws-name");
+    const nameEl = this.headerEl.querySelector(".pane-ws-name");
     if (nameEl) {
       nameEl.textContent = this.wsId
         ? (workstreams[this.wsId] && workstreams[this.wsId].name) ||
@@ -81,17 +81,17 @@ class Pane {
   // the heavier work (querySelectorAll-driven promote sweep + cancel-
   // timer cleanup wired via the queue's onIdle hook).
   setBusy(b) {
-    var next = !!b;
+    const next = !!b;
     this.composer.setBusy(next);
     this.messagesEl.dataset.busy = next ? "true" : "false";
-    var edge = next !== this.busy;
+    const edge = next !== this.busy;
     this.busy = next;
     if (edge && !next) this.queue.onIdleEdge();
   }
 
   showEmptyState() {
     if (!this.messagesEl.querySelector(".empty-state")) {
-      var el = document.createElement("div");
+      const el = document.createElement("div");
       el.className = "empty-state";
       el.textContent = "Type a message to start";
       this.messagesEl.appendChild(el);
@@ -99,13 +99,13 @@ class Pane {
   }
 
   removeEmptyState() {
-    var el = this.messagesEl.querySelector(".empty-state");
+    const el = this.messagesEl.querySelector(".empty-state");
     if (el) el.remove();
   }
 
   addThinkingIndicator() {
     if (this.messagesEl.querySelector(".thinking-indicator")) return;
-    var el = document.createElement("div");
+    const el = document.createElement("div");
     el.className = "thinking-indicator";
     el.textContent = "Thinking";
     this.messagesEl.appendChild(el);
@@ -113,7 +113,7 @@ class Pane {
   }
 
   removeThinkingIndicator() {
-    var el = this.messagesEl.querySelector(".thinking-indicator");
+    const el = this.messagesEl.querySelector(".thinking-indicator");
     if (el) el.remove();
   }
 
@@ -124,7 +124,7 @@ class Pane {
     // the bubble below it lands in the right place even when the wake
     // fires long after the user's last real message.
     this.removeEmptyState();
-    var el = document.createElement("div");
+    const el = document.createElement("div");
     el.className = "msg user system-nudge";
     el.setAttribute("data-source", "system_nudge");
     el.setAttribute("aria-label", "system nudge");
@@ -151,18 +151,18 @@ class Pane {
     // ``watch_triggered`` reminders branch off into a structured
     // .msg.watch-result card.
     this.removeEmptyState();
-    var anchor;
+    let anchor;
     if (source === "system_nudge") {
       anchor = this.addSystemNudgeMarker();
     } else {
-      var userBubbles = this.messagesEl.querySelectorAll(
+      const userBubbles = this.messagesEl.querySelectorAll(
         ".msg.user:not(.system-nudge)",
       );
       anchor = userBubbles.length ? userBubbles[userBubbles.length - 1] : null;
     }
-    for (var i = 0; i < reminders.length; i++) {
-      var r = reminders[i] || {};
-      var el =
+    for (let i = 0; i < reminders.length; i++) {
+      const r = reminders[i] || {};
+      const el =
         r.type === "watch_triggered"
           ? _buildWatchResultBubble(r)
           : _buildDefaultReminderBubble(r);
@@ -192,10 +192,10 @@ class Pane {
     // reminders also branch on r.type so a watch_triggered drained at
     // the tool seam (channel="any") renders the structured card.
     this.removeEmptyState();
-    var anchor = null;
+    let anchor = null;
     if (toolCallId) {
-      var escapedId = CSS.escape(toolCallId);
-      var toolEl = this.messagesEl.querySelector(
+      const escapedId = CSS.escape(toolCallId);
+      const toolEl = this.messagesEl.querySelector(
         '.ts-approval-tool[data-call-id="' + escapedId + '"]',
       );
       if (toolEl) {
@@ -203,12 +203,12 @@ class Pane {
       }
     }
     if (!anchor) {
-      var blocks = this.messagesEl.querySelectorAll(".ts-approval");
+      const blocks = this.messagesEl.querySelectorAll(".ts-approval");
       if (blocks.length) anchor = blocks[blocks.length - 1];
     }
-    for (var i = 0; i < reminders.length; i++) {
-      var r = reminders[i] || {};
-      var el =
+    for (let i = 0; i < reminders.length; i++) {
+      const r = reminders[i] || {};
+      const el =
         r.type === "watch_triggered"
           ? _buildWatchResultBubble(r)
           : _buildDefaultReminderBubble(r);
@@ -224,25 +224,25 @@ class Pane {
 
   addUserMessage(text, attachments) {
     this.removeEmptyState();
-    var el = document.createElement("div");
+    const el = document.createElement("div");
     el.className = "msg user";
-    var textEl = document.createElement("div");
+    const textEl = document.createElement("div");
     textEl.className = "msg-user-text";
     textEl.textContent = text;
     el.appendChild(textEl);
     if (Array.isArray(attachments) && attachments.length > 0) {
-      var pills = document.createElement("div");
+      const pills = document.createElement("div");
       pills.className = "msg-user-attach";
       attachments.forEach(function (a) {
-        var pill = document.createElement("span");
+        const pill = document.createElement("span");
         pill.className =
           "msg-user-attach-pill msg-user-attach-pill-" + (a.kind || "other");
-        var icon = document.createElement("span");
+        const icon = document.createElement("span");
         icon.className = "msg-user-attach-icon";
         icon.setAttribute("aria-hidden", "true");
         icon.textContent = a.kind === "image" ? "\ud83d\uddbc" : "\ud83d\udcc4";
         pill.appendChild(icon);
-        var nameEl = document.createElement("span");
+        const nameEl = document.createElement("span");
         nameEl.className = "msg-user-attach-name";
         nameEl.textContent =
           a.filename || (a.kind === "image" ? "image" : "document");
@@ -258,37 +258,37 @@ class Pane {
 
   getFeedback() {
     if (!this.approvalBlockEl) return null;
-    var inp = this.approvalBlockEl.querySelector(".ts-approval-feedback");
+    const inp = this.approvalBlockEl.querySelector(".ts-approval-feedback");
     return inp && inp.value.trim() ? inp.value.trim() : null;
   }
 
   appendToolOutputChunk(callId, chunk) {
     if (!chunk) return;
-    var stripped = stripAnsi(chunk);
+    const stripped = stripAnsi(chunk);
     if (!stripped) return;
 
-    var escapedId = callId ? CSS.escape(callId) : "";
-    var el = escapedId
+    const escapedId = callId ? CSS.escape(callId) : "";
+    let el = escapedId
       ? this.messagesEl.querySelector(
           '.tool-output-stream[data-call-id="' + escapedId + '"]',
         )
       : null;
     if (!el) {
-      var target = escapedId
+      let target = escapedId
         ? this.messagesEl.querySelector(
             '.ts-approval-tool[data-call-id="' + escapedId + '"]',
           )
         : null;
       if (!target) {
-        var blocks = this.messagesEl.querySelectorAll(".ts-approval");
+        const blocks = this.messagesEl.querySelectorAll(".ts-approval");
         if (!blocks.length) return;
-        var block = blocks[blocks.length - 1];
-        var tools = block.querySelectorAll(
+        const block = blocks[blocks.length - 1];
+        const tools = block.querySelectorAll(
           '.ts-approval-tool[data-func-name="bash"]',
         );
         target = tools.length ? tools[tools.length - 1] : null;
         if (!target) {
-          var allTools = block.querySelectorAll(".ts-approval-tool");
+          const allTools = block.querySelectorAll(".ts-approval-tool");
           target = allTools.length ? allTools[allTools.length - 1] : null;
         }
       }
@@ -310,20 +310,20 @@ class Pane {
 
   showOutputWarning(evt) {
     if (!evt.call_id || evt.risk_level === "none") return;
-    var escapedId = CSS.escape(evt.call_id);
-    var toolDiv = this.messagesEl.querySelector(
+    const escapedId = CSS.escape(evt.call_id);
+    const toolDiv = this.messagesEl.querySelector(
       '.ts-approval-tool[data-call-id="' + escapedId + '"]',
     );
     if (!toolDiv) return;
     // Shared DOM-builder with replayHistory \u2014 single source of truth for
     // role / class / escape semantics.  Argument shape mirrors the
     // server-side output_assessment dict (risk_level / flags / redacted).
-    var warning = _buildOutputWarningEl({
+    const warning = _buildOutputWarningEl({
       risk_level: evt.risk_level,
       flags: evt.flags,
       redacted: evt.redacted,
     });
-    var nextEl = toolDiv.nextElementSibling;
+    const nextEl = toolDiv.nextElementSibling;
     if (nextEl && nextEl.classList.contains("tool-output")) {
       nextEl.insertAdjacentElement("afterend", warning);
     } else {
@@ -333,16 +333,16 @@ class Pane {
 
   updateVerdictBadge(verdict) {
     if (!verdict || !verdict.call_id) return;
-    var escapedId = CSS.escape(verdict.call_id);
-    var badge = this.messagesEl.querySelector(
+    const escapedId = CSS.escape(verdict.call_id);
+    const badge = this.messagesEl.querySelector(
       '.verdict-badge[data-call-id="' + escapedId + '"]',
     );
     if (!badge) {
       // Badge no longer in DOM (tool block replaced by output) — show
       // a toast so the user still sees the late-arriving verdict.
-      var conf = Math.round((verdict.confidence || 0) * 100);
-      var rec = verdict.recommendation || "review";
-      var func = verdict.func_name || "";
+      const conf = Math.round((verdict.confidence || 0) * 100);
+      const rec = verdict.recommendation || "review";
+      const func = verdict.func_name || "";
       showToast(
         "Judge verdict for " + func + ": " + rec + " (" + conf + "%)",
         rec === "approve" ? "success" : rec === "deny" ? "error" : "warning",
@@ -350,26 +350,26 @@ class Pane {
       return;
     }
 
-    var risk = verdict.risk_level || "medium";
+    const risk = verdict.risk_level || "medium";
     badge.className = "verdict-badge verdict-" + risk + " ts-verdict-badge";
     badge.setAttribute("data-risk", risk);
 
-    var riskEl = badge.querySelector(".verdict-risk");
-    var recEl = badge.querySelector(".verdict-rec");
-    var confEl = badge.querySelector(".verdict-conf");
+    const riskEl = badge.querySelector(".verdict-risk");
+    const recEl = badge.querySelector(".verdict-rec");
+    const confEl = badge.querySelector(".verdict-conf");
     if (riskEl) riskEl.textContent = risk.toUpperCase();
     if (recEl) recEl.textContent = verdict.recommendation || "review";
     if (confEl)
       confEl.textContent = Math.round((verdict.confidence || 0) * 100) + "%";
 
-    var spinner = badge.querySelector(".verdict-judge-spinner");
+    const spinner = badge.querySelector(".verdict-judge-spinner");
     if (spinner) spinner.remove();
 
-    var detail = badge.nextElementSibling;
+    const detail = badge.nextElementSibling;
     if (detail && detail.classList.contains("verdict-detail")) {
-      var summaryEl = detail.querySelector(".verdict-summary");
-      var reasonEl = detail.querySelector(".verdict-reasoning");
-      var tierEl = detail.querySelector(".verdict-tier");
+      const summaryEl = detail.querySelector(".verdict-summary");
+      const reasonEl = detail.querySelector(".verdict-reasoning");
+      const tierEl = detail.querySelector(".verdict-tier");
       if (summaryEl) summaryEl.textContent = verdict.intent_summary || "";
       if (reasonEl) reasonEl.textContent = verdict.reasoning || "";
       if (tierEl)
@@ -377,18 +377,18 @@ class Pane {
           (verdict.tier || "llm") +
           " tier" +
           (verdict.judge_model ? " | " + verdict.judge_model : "");
-      var evidenceEl = detail.querySelector(".verdict-evidence");
+      let evidenceEl = detail.querySelector(".verdict-evidence");
       if (verdict.evidence && verdict.evidence.length) {
         if (!evidenceEl) {
           evidenceEl = document.createElement("div");
           evidenceEl.className = "verdict-evidence";
-          var tierDiv = detail.querySelector(".verdict-tier");
+          const tierDiv = detail.querySelector(".verdict-tier");
           if (tierDiv) detail.insertBefore(evidenceEl, tierDiv);
           else detail.appendChild(evidenceEl);
         }
         evidenceEl.replaceChildren(
           ...verdict.evidence.map(function (e) {
-            var div = document.createElement("div");
+            const div = document.createElement("div");
             div.textContent = "\u2022 " + e;
             return div;
           }),
@@ -403,16 +403,16 @@ class Pane {
 
   updateVerdictGlow(recommendation) {
     if (!this.approvalBlockEl) return;
-    var prompt = this.approvalBlockEl.querySelector(".ts-approval-body");
+    const prompt = this.approvalBlockEl.querySelector(".ts-approval-body");
     if (!prompt) return;
 
     // Collect all verdict badges currently visible in this approval block
-    var badges = this.approvalBlockEl.querySelectorAll(".verdict-badge");
-    var worst = recommendation;
-    for (var i = 0; i < badges.length; i++) {
-      var recEl = badges[i].querySelector(".verdict-rec");
+    const badges = this.approvalBlockEl.querySelectorAll(".verdict-badge");
+    let worst = recommendation;
+    for (let i = 0; i < badges.length; i++) {
+      const recEl = badges[i].querySelector(".verdict-rec");
       if (recEl) {
-        var r = recEl.textContent;
+        const r = recEl.textContent;
         if (r === "deny") {
           worst = "deny";
           break;
@@ -432,7 +432,7 @@ class Pane {
   }
 
   addInfoMessage(text) {
-    var el = document.createElement("div");
+    const el = document.createElement("div");
     el.className = "msg info";
     el.textContent = stripAnsi(text);
     this.messagesEl.appendChild(el);
@@ -440,7 +440,7 @@ class Pane {
   }
 
   addErrorMessage(text) {
-    var el = document.createElement("div");
+    const el = document.createElement("div");
     el.className = "msg error";
     el.setAttribute("role", "alert");
     el.textContent = stripAnsi(text);
@@ -499,7 +499,7 @@ class Pane {
     // Right-click context menu for split/close actions — skip interactive
     // elements (textareas, links, buttons) so native copy/paste works
     this.el.addEventListener("contextmenu", (e) => {
-      var tag = e.target.tagName;
+      const tag = e.target.tagName;
       if (
         tag === "TEXTAREA" ||
         tag === "INPUT" ||
@@ -508,7 +508,7 @@ class Pane {
         e.target.isContentEditable
       )
         return;
-      var sel = window.getSelection();
+      const sel = window.getSelection();
       if (sel && sel.toString().length > 0) return;
       e.preventDefault();
       setFocusedPane(this.id);
@@ -519,7 +519,7 @@ class Pane {
     this.headerEl = document.createElement("div");
     this.headerEl.className = "pane-header";
 
-    var wsName = document.createElement("span");
+    const wsName = document.createElement("span");
     wsName.className = "pane-ws-name";
     wsName.textContent = this.wsId
       ? (workstreams[this.wsId] && workstreams[this.wsId].name) ||
@@ -527,10 +527,10 @@ class Pane {
       : "";
     this.headerEl.appendChild(wsName);
 
-    var actions = document.createElement("div");
+    const actions = document.createElement("div");
     actions.className = "pane-actions";
 
-    var splitRightBtn = document.createElement("button");
+    const splitRightBtn = document.createElement("button");
     splitRightBtn.className = "pane-action-btn";
     splitRightBtn.title = "Split right";
     splitRightBtn.setAttribute("aria-label", "Split right");
@@ -541,7 +541,7 @@ class Pane {
     };
     actions.appendChild(splitRightBtn);
 
-    var splitDownBtn = document.createElement("button");
+    const splitDownBtn = document.createElement("button");
     splitDownBtn.className = "pane-action-btn";
     splitDownBtn.title = "Split down";
     splitDownBtn.setAttribute("aria-label", "Split down");
@@ -552,7 +552,7 @@ class Pane {
     };
     actions.appendChild(splitDownBtn);
 
-    var closeBtn = document.createElement("button");
+    const closeBtn = document.createElement("button");
     closeBtn.className = "pane-action-btn pane-close-btn";
     closeBtn.title = "Close pane";
     closeBtn.setAttribute("aria-label", "Close pane");
@@ -667,7 +667,7 @@ class Pane {
 
   connectSSE(wsId) {
     this.disconnectSSE();
-    var wsChanged = this.wsId !== wsId;
+    const wsChanged = this.wsId !== wsId;
     this.wsId = wsId;
     if (wsChanged) {
       this.attachments.clearChips();
@@ -685,14 +685,14 @@ class Pane {
     };
 
     this.evtSource.onmessage = (e) => {
-      var data = JSON.parse(e.data);
+      const data = JSON.parse(e.data);
       this.handleEvent(data);
     };
 
     this.evtSource.onerror = () => {
       this.evtSource.close();
       this.evtSource = null;
-      var loginOverlay = document.getElementById("login-overlay");
+      const loginOverlay = document.getElementById("login-overlay");
       if (loginOverlay && loginOverlay.style.display !== "none") return;
       this.statusBarEl.classList.add("ws-sb-disconnected");
       this._sbTokens.textContent = "Reconnecting\u2026";
@@ -714,21 +714,21 @@ class Pane {
               // Reconnect all disconnected panes, reassigning stale ws_ids.
               // Two passes: (1) reassign stale panes, (2) reconnect all.
               // Track assigned ws_ids to avoid multiple panes on the same ws.
-              var remaining = Object.keys(workstreams);
+              const remaining = Object.keys(workstreams);
               if (!remaining.length) {
                 showDashboard();
                 return;
               }
-              var usedWsIds = {};
-              for (var pid in panes) {
+              const usedWsIds = {};
+              for (let pid in panes) {
                 if (panes[pid].wsId && workstreams[panes[pid].wsId])
                   usedWsIds[panes[pid].wsId] = true;
               }
-              for (var pid2 in panes) {
-                var p2 = panes[pid2];
+              for (let pid2 in panes) {
+                const p2 = panes[pid2];
                 if (p2.wsId && !workstreams[p2.wsId]) {
-                  var newWsId = null;
-                  for (var ri = 0; ri < remaining.length; ri++) {
+                  let newWsId = null;
+                  for (let ri = 0; ri < remaining.length; ri++) {
                     if (!usedWsIds[remaining[ri]]) {
                       newWsId = remaining[ri];
                       break;
@@ -748,8 +748,8 @@ class Pane {
                 }
               }
               // Pass 2: reconnect all panes and sync focused pane
-              for (var pid3 in panes) {
-                var p3 = panes[pid3];
+              for (let pid3 in panes) {
+                const p3 = panes[pid3];
                 if (pid3 === focusedPaneId) currentWsId = p3.wsId;
                 if (!p3.evtSource && p3.wsId && workstreams[p3.wsId]) {
                   setTimeout(
@@ -867,7 +867,7 @@ class Pane {
             this.currentReasoningEl.className = "msg reasoning";
             this.messagesEl.appendChild(this.currentReasoningEl);
           }
-          var curReason = this.currentReasoningEl.textContent || "";
+          const curReason = this.currentReasoningEl.textContent || "";
           if (curReason.length < evt.reasoning.length) {
             this.currentReasoningEl.textContent = evt.reasoning;
           }
@@ -1071,9 +1071,9 @@ class Pane {
         this._sbModel.textContent = this.modelAlias || this.model || "—";
         this._sbModel.title = this.model || "";
         if (evt.skip_permissions) {
-          var existing = document.querySelector(".skip-permissions-warning");
+          const existing = document.querySelector(".skip-permissions-warning");
           if (!existing) {
-            var warn = document.createElement("div");
+            const warn = document.createElement("div");
             warn.className = "skip-permissions-warning";
             warn.textContent =
               "\u26a0 Running with --skip-permissions: all tool calls are auto-approved";
@@ -1086,7 +1086,7 @@ class Pane {
         this.replayHistory(evt.messages);
         // Dispatch pending edit-and-resend after rewind history arrives
         if (this._pendingEditSend) {
-          var editText = this._pendingEditSend;
+          const editText = this._pendingEditSend;
           this._pendingEditSend = null;
           this.setBusy(true);
           this.addUserMessage(editText);
@@ -1111,16 +1111,16 @@ class Pane {
   }
 
   _addUserMsgActions(el, text) {
-    var bar = document.createElement("div");
+    const bar = document.createElement("div");
     bar.className = "msg-actions";
     bar.setAttribute("role", "toolbar");
     bar.setAttribute("aria-label", "Message actions");
     // Edit button
-    var editBtn = document.createElement("button");
+    const editBtn = document.createElement("button");
     editBtn.className = "msg-action-btn";
     editBtn.title = "Edit & resend";
     editBtn.setAttribute("aria-label", "Edit and resend this message");
-    var editIcon = document.createElement("span");
+    const editIcon = document.createElement("span");
     editIcon.className = "icon-edit";
     editIcon.setAttribute("aria-hidden", "true");
     editBtn.appendChild(editIcon);
@@ -1130,14 +1130,14 @@ class Pane {
     });
     bar.appendChild(editBtn);
     // Rewind-to-here button
-    var rewindBtn = document.createElement("button");
+    const rewindBtn = document.createElement("button");
     rewindBtn.className = "msg-action-btn";
     rewindBtn.title = "Rewind to before this message";
     rewindBtn.setAttribute(
       "aria-label",
       "Rewind conversation to before this message",
     );
-    var rewindIcon = document.createElement("span");
+    const rewindIcon = document.createElement("span");
     rewindIcon.className = "icon-rewind";
     rewindIcon.setAttribute("aria-hidden", "true");
     rewindBtn.appendChild(rewindIcon);
@@ -1150,7 +1150,7 @@ class Pane {
   }
 
   _addRetryAction(el) {
-    var bar = el.querySelector(".msg-actions");
+    let bar = el.querySelector(".msg-actions");
     if (!bar) {
       bar = document.createElement("div");
       bar.className = "msg-actions";
@@ -1158,11 +1158,11 @@ class Pane {
       bar.setAttribute("aria-label", "Message actions");
       el.appendChild(bar);
     }
-    var btn = document.createElement("button");
+    const btn = document.createElement("button");
     btn.className = "msg-action-btn";
     btn.title = "Retry (regenerate response)";
     btn.setAttribute("aria-label", "Retry last response");
-    var icon = document.createElement("span");
+    const icon = document.createElement("span");
     icon.className = "icon-retry";
     icon.setAttribute("aria-hidden", "true");
     btn.appendChild(icon);
@@ -1187,10 +1187,10 @@ class Pane {
   _rewindToMessage(msgEl) {
     if (this.busy) return;
     // Count how many user messages come at or after this one
-    var userMsgs = this.messagesEl.querySelectorAll(".msg.user");
-    var idx = Array.prototype.indexOf.call(userMsgs, msgEl);
+    const userMsgs = this.messagesEl.querySelectorAll(".msg.user");
+    const idx = Array.prototype.indexOf.call(userMsgs, msgEl);
     if (idx < 0) return;
-    var turnsToRewind = userMsgs.length - idx;
+    const turnsToRewind = userMsgs.length - idx;
     if (turnsToRewind < 1) return;
     authFetch("/v1/api/command", {
       method: "POST",
@@ -1207,26 +1207,26 @@ class Pane {
   _startEdit(msgEl, originalText) {
     if (this.busy) return;
     // Save current child nodes for cancel restoration
-    var savedNodes = [];
+    const savedNodes = [];
     while (msgEl.firstChild) {
       savedNodes.push(msgEl.removeChild(msgEl.firstChild));
     }
     msgEl.classList.add("msg-editing");
 
-    var form = document.createElement("div");
+    const form = document.createElement("div");
     form.className = "msg-edit-form";
 
-    var textarea = document.createElement("textarea");
+    const textarea = document.createElement("textarea");
     textarea.className = "msg-edit-textarea";
     textarea.setAttribute("aria-label", "Edit message text");
     textarea.value = originalText;
     textarea.rows = Math.min(originalText.split("\n").length + 1, 8);
     form.appendChild(textarea);
 
-    var actions = document.createElement("div");
+    const actions = document.createElement("div");
     actions.className = "msg-edit-actions";
 
-    var cancelBtn = document.createElement("button");
+    const cancelBtn = document.createElement("button");
     cancelBtn.className = "msg-edit-btn";
     cancelBtn.textContent = "Cancel";
     cancelBtn.addEventListener("click", () => {
@@ -1239,11 +1239,11 @@ class Pane {
     });
     actions.appendChild(cancelBtn);
 
-    var sendBtn = document.createElement("button");
+    const sendBtn = document.createElement("button");
     sendBtn.className = "msg-edit-btn msg-edit-btn-send";
     sendBtn.textContent = "Send";
     sendBtn.addEventListener("click", () => {
-      var newText = textarea.value.trim();
+      const newText = textarea.value.trim();
       if (!newText) return;
       this._editAndResend(msgEl, newText);
     });
@@ -1269,10 +1269,10 @@ class Pane {
   _editAndResend(msgEl, newText) {
     if (this.busy) return;
     // Count turns to rewind (from this message onward)
-    var userMsgs = this.messagesEl.querySelectorAll(".msg.user");
-    var idx = Array.prototype.indexOf.call(userMsgs, msgEl);
+    const userMsgs = this.messagesEl.querySelectorAll(".msg.user");
+    const idx = Array.prototype.indexOf.call(userMsgs, msgEl);
     if (idx < 0) return;
-    var turnsToRewind = userMsgs.length - idx;
+    const turnsToRewind = userMsgs.length - idx;
 
     this.setBusy(true);
     // Store pending send — dispatched when the rewind history event arrives
@@ -1319,10 +1319,10 @@ class Pane {
     // (or after the loop, for legacy rows missing tool_call_id).
     // Replaces a JSON.stringify→dataset→JSON.parse round-trip with an
     // in-memory map keyed by call_id.
-    var pendingAssessments = {};
-    var lastToolBlock = null;
-    for (var i = 0; i < messages.length; i++) {
-      var msg = messages[i];
+    const pendingAssessments = {};
+    let lastToolBlock = null;
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
       if (msg.role === "user") {
         if (msg.source === "system_nudge") {
           // Wake-driven empty user turn: render the thin marker
@@ -1355,7 +1355,7 @@ class Pane {
         // surfaces when the active model's surface_persisted_reasoning flag is
         // true and the message round-tripped a thinking lane.
         if (msg.reasoning && msg.reasoning.length) {
-          var reasonEl = document.createElement("div");
+          const reasonEl = document.createElement("div");
           reasonEl.className = "msg reasoning";
           reasonEl.textContent = msg.reasoning;
           this.messagesEl.appendChild(reasonEl);
@@ -1376,9 +1376,9 @@ class Pane {
         // surfacing one on replay would be a phantom card that diverges
         // from what the originating tab saw.
         if (msg.content && msg.content.trim()) {
-          var el = document.createElement("div");
+          const el = document.createElement("div");
           el.className = "msg assistant";
-          var bodyEl = document.createElement("div");
+          const bodyEl = document.createElement("div");
           bodyEl.className = "msg-body";
           el.appendChild(bodyEl);
           setMarkdown(bodyEl, msg.content);
@@ -1389,36 +1389,36 @@ class Pane {
           if (msg.pending) {
             lastToolBlock = null;
           } else {
-            var wasDenied = !!msg.denied;
-            var block = document.createElement("div");
+            const wasDenied = !!msg.denied;
+            const block = document.createElement("div");
             block.className =
               "msg ts-approval ts-approval--inline " +
               (wasDenied ? "denied" : "approved");
             msg.tool_calls.forEach((tc) => {
-              var div = document.createElement("div");
+              const div = document.createElement("div");
               div.className = "ts-approval-tool";
               div.dataset.funcName = tc.name;
               div.dataset.callId = tc.id || "";
-              var nameEl = document.createElement("div");
+              const nameEl = document.createElement("div");
               nameEl.className = "tool-name";
               nameEl.textContent = tc.name;
               div.appendChild(nameEl);
-              var cmd = document.createElement("div");
+              const cmd = document.createElement("div");
               cmd.className = "tool-cmd";
               try {
-                var args = JSON.parse(tc.arguments);
+                const args = JSON.parse(tc.arguments);
                 if (tc.name === "bash") {
-                  var preview = Object.values(args)[0] || "";
-                  var dollar = document.createElement("span");
+                  const preview = Object.values(args)[0] || "";
+                  const dollar = document.createElement("span");
                   dollar.className = "dollar";
                   dollar.textContent = "$ ";
                   cmd.append(dollar, String(preview));
                 } else {
-                  var parts = [];
-                  var keys = Object.keys(args);
-                  for (var k = 0; k < keys.length; k++) {
-                    var val = args[keys[k]];
-                    var valStr =
+                  const parts = [];
+                  const keys = Object.keys(args);
+                  for (let k = 0; k < keys.length; k++) {
+                    const val = args[keys[k]];
+                    let valStr =
                       val === null || val === undefined ? "null" : String(val);
                     if (valStr.length > 80)
                       valStr = valStr.substring(0, 77) + "...";
@@ -1460,7 +1460,7 @@ class Pane {
                 };
               }
             });
-            var badge = document.createElement("div");
+            const badge = document.createElement("div");
             badge.setAttribute("role", "status");
             if (wasDenied) {
               badge.className = "ts-approval-badge ts-approval-badge--denied";
@@ -1476,19 +1476,19 @@ class Pane {
         }
       } else if (msg.role === "tool") {
         if (lastToolBlock) {
-          var stripped = stripAnsi(msg.content || "").trim();
-          var isDenied =
+          const stripped = stripAnsi(msg.content || "").trim();
+          const isDenied =
             msg.denied ||
             /^Denied by user/.test(stripped) ||
             /^Blocked/.test(stripped);
-          var isToolError = !!msg.is_error;
+          const isToolError = !!msg.is_error;
           // Anchor the rendered output to the specific .ts-approval-tool
           // element matching this result's tool_call_id — mirrors the
           // live appendToolOutput path so multi-tool batches show
           // [hdr A][out A][hdr B][out B] rather than [A][B][out A][out B].
           // Falls back to "before badge" when tool_call_id is absent
           // (legacy rows pre-dating the wire-format addition).
-          var resultTarget = null;
+          let resultTarget = null;
           if (msg.tool_call_id) {
             resultTarget = lastToolBlock.querySelector(
               '.ts-approval-tool[data-call-id="' +
@@ -1503,23 +1503,23 @@ class Pane {
           // .after call was always relative to the same anchor).
           // Resulting order with all present:
           //   [tool div][output][output-warning]
-          var insertCursor = resultTarget;
-          var insertChained = (node) => {
+          let insertCursor = resultTarget;
+          const insertChained = (node) => {
             if (insertCursor) {
               insertCursor.after(node);
               insertCursor = node;
             } else {
-              var bdg = lastToolBlock.querySelector(".ts-approval-badge");
+              const bdg = lastToolBlock.querySelector(".ts-approval-badge");
               if (bdg) lastToolBlock.insertBefore(node, bdg);
               else lastToolBlock.appendChild(node);
             }
           };
           if (stripped && !isDenied) {
-            var media = !isToolError ? tryParseMedia(stripped) : null;
+            const media = !isToolError ? tryParseMedia(stripped) : null;
             if (media) {
               insertChained(buildMediaEmbed(media, stripped));
             } else {
-              var out = renderToolOutput(stripped, isToolError);
+              const out = renderToolOutput(stripped, isToolError);
               if (out.textContent.split("\n").length > 10) {
                 makeCollapsible(out);
               }
@@ -1535,7 +1535,7 @@ class Pane {
           // assistant branch).  Skip when the tool result was denied —
           // the ✗ denied badge already signals the deny path.
           if (!isDenied && msg.tool_call_id) {
-            var pending = pendingAssessments[msg.tool_call_id];
+            const pending = pendingAssessments[msg.tool_call_id];
             if (pending) {
               insertChained(_buildOutputWarningEl(pending.assessment));
               delete pendingAssessments[msg.tool_call_id];
@@ -1571,9 +1571,9 @@ class Pane {
     // tool_call_id (legacy / migrated rows pre-dating the wire-format
     // addition).  Render the warning under the tool div itself rather
     // than dropping the safety information silently.
-    var leftoverIds = Object.keys(pendingAssessments);
-    for (var p = 0; p < leftoverIds.length; p++) {
-      var leftover = pendingAssessments[leftoverIds[p]];
+    const leftoverIds = Object.keys(pendingAssessments);
+    for (let p = 0; p < leftoverIds.length; p++) {
+      const leftover = pendingAssessments[leftoverIds[p]];
       if (!leftover) continue;
       leftover.toolDiv.insertAdjacentElement(
         "afterend",
@@ -1606,8 +1606,8 @@ class Pane {
 
   _attachRetryToLastAssistant() {
     // Remove any previous retry buttons
-    var old = this.messagesEl.querySelectorAll(".msg.assistant .msg-actions");
-    for (var i = 0; i < old.length; i++) old[i].parentNode.removeChild(old[i]);
+    const old = this.messagesEl.querySelectorAll(".msg.assistant .msg-actions");
+    for (let i = 0; i < old.length; i++) old[i].parentNode.removeChild(old[i]);
     // Find the last assistant message with content and add retry.
     // Reasoning blocks emit as .msg.reasoning (distinct modifier) so the
     // .msg.assistant selector already excludes them — no extra guard needed.
@@ -1619,21 +1619,21 @@ class Pane {
     // guard fires correctly even when the tool turn carried a metacog
     // reminder.  Without this skip, retry lands on a stale prior
     // assistant content bubble belonging to an earlier turn.
-    var lastChild = this.messagesEl.lastElementChild;
+    let lastChild = this.messagesEl.lastElementChild;
     while (lastChild && lastChild.classList.contains("user-reminder")) {
       lastChild = lastChild.previousElementSibling;
     }
     if (lastChild && lastChild.classList.contains("ts-approval")) {
       return;
     }
-    var assistants = this.messagesEl.querySelectorAll(".msg.assistant");
+    const assistants = this.messagesEl.querySelectorAll(".msg.assistant");
     if (assistants.length) {
       this._addRetryAction(assistants[assistants.length - 1]);
     }
   }
 
   showInlineToolBlock(items, autoApproved, judgePending) {
-    var block = document.createElement("div");
+    const block = document.createElement("div");
     block.className =
       "msg ts-approval ts-approval--inline" + (autoApproved ? " approved" : "");
     if (!autoApproved) {
@@ -1642,7 +1642,7 @@ class Pane {
     }
 
     // Track the highest-priority recommendation for glow
-    var glowRec = null;
+    let glowRec = null;
 
     items.forEach((item) => {
       block.appendChild(buildToolDiv(item));
@@ -1650,13 +1650,13 @@ class Pane {
       // verdict under ``heuristic_verdict`` (matches the api/server_schemas
       // PendingApprovalItem shape).  Falls back to the legacy ``verdict``
       // key in case a stale SSE payload arrives mid-deploy.
-      var heuristic = item.heuristic_verdict || item.verdict;
+      const heuristic = item.heuristic_verdict || item.verdict;
       if (heuristic) {
         block.insertAdjacentHTML(
           "beforeend",
           renderVerdictBadge(heuristic, judgePending),
         );
-        var rec = heuristic.recommendation || "review";
+        const rec = heuristic.recommendation || "review";
         if (
           !glowRec ||
           rec === "deny" ||
@@ -1668,13 +1668,13 @@ class Pane {
     });
 
     if (autoApproved) {
-      var badge = document.createElement("div");
+      const badge = document.createElement("div");
       badge.setAttribute("role", "status");
       badge.className = "ts-approval-badge ts-approval-badge--approved";
       badge.textContent = "\u2713 auto-approved";
       block.appendChild(badge);
     } else {
-      var prompt = document.createElement("div");
+      const prompt = document.createElement("div");
       prompt.className = "ts-approval-body";
 
       // Apply verdict glow on initial heuristic verdict
@@ -1686,7 +1686,7 @@ class Pane {
         else prompt.classList.add("ts-verdict-glow--review");
       }
 
-      var alwaysNames = items
+      const alwaysNames = items
         .filter((it) => {
           return (
             it.needs_approval &&
@@ -1699,14 +1699,14 @@ class Pane {
           return it.approval_label || it.func_name;
         });
       block.dataset.alwaysNames = JSON.stringify(alwaysNames);
-      var alwaysTitle = alwaysNames.length
+      const alwaysTitle = alwaysNames.length
         ? "Always approve " + alwaysNames.join(", ")
         : "Always approve this tool type";
 
-      var actionsDiv = document.createElement("div");
+      const actionsDiv = document.createElement("div");
       actionsDiv.className = "ts-approval-actions";
 
-      var approveBtn = document.createElement("button");
+      const approveBtn = document.createElement("button");
       approveBtn.className = "ts-approval-btn ts-approval-btn--approve";
       approveBtn.append(makeKeyLabel("y", "Approve"));
       approveBtn.onclick = () => {
@@ -1714,7 +1714,7 @@ class Pane {
       };
       actionsDiv.appendChild(approveBtn);
 
-      var denyBtn = document.createElement("button");
+      const denyBtn = document.createElement("button");
       denyBtn.className = "ts-approval-btn ts-approval-btn--deny";
       denyBtn.append(makeKeyLabel("n", "Deny"));
       denyBtn.onclick = () => {
@@ -1723,7 +1723,7 @@ class Pane {
       actionsDiv.appendChild(denyBtn);
 
       if (alwaysNames.length) {
-        var alwaysBtn = document.createElement("button");
+        const alwaysBtn = document.createElement("button");
         alwaysBtn.className = "ts-approval-btn ts-approval-btn--always";
         alwaysBtn.title = alwaysTitle;
         alwaysBtn.setAttribute("aria-label", alwaysTitle);
@@ -1736,7 +1736,7 @@ class Pane {
 
       prompt.appendChild(actionsDiv);
 
-      var fbInput = document.createElement("input");
+      const fbInput = document.createElement("input");
       fbInput.type = "text";
       fbInput.className = "ts-approval-feedback";
       fbInput.placeholder = "feedback (optional)";
@@ -1761,18 +1761,18 @@ class Pane {
     this.pendingApproval = false;
 
     // Remove prompt
-    var prompt = this.approvalBlockEl.querySelector(".ts-approval-body");
+    const prompt = this.approvalBlockEl.querySelector(".ts-approval-body");
     if (prompt) prompt.remove();
 
     // Add badge
-    var badge = document.createElement("div");
+    const badge = document.createElement("div");
     badge.setAttribute("role", "status");
     if (approved) {
       badge.className = "ts-approval-badge ts-approval-badge--approved";
-      var label = "\u2713 approved";
+      let label = "\u2713 approved";
       if (always) {
-        var raw = this.approvalBlockEl.dataset.alwaysNames;
-        var names = raw ? JSON.parse(raw) : [];
+        const raw = this.approvalBlockEl.dataset.alwaysNames;
+        const names = raw ? JSON.parse(raw) : [];
         label = names.length
           ? "\u2713 always approve " + names.join(", ")
           : "\u2713 always approve";
@@ -1814,18 +1814,18 @@ class Pane {
   }
 
   appendToolOutput(callId, name, output, isError) {
-    var escapedId = callId ? CSS.escape(callId) : "";
-    var target = escapedId
+    const escapedId = callId ? CSS.escape(callId) : "";
+    let target = escapedId
       ? this.messagesEl.querySelector(
           '.ts-approval-tool[data-call-id="' + escapedId + '"]',
         )
       : null;
     if (!target) {
-      var blocks = this.messagesEl.querySelectorAll(".ts-approval");
+      const blocks = this.messagesEl.querySelectorAll(".ts-approval");
       if (!blocks.length) return;
-      var block = blocks[blocks.length - 1];
-      var tools = block.querySelectorAll(".ts-approval-tool");
-      for (var i = tools.length - 1; i >= 0; i--) {
+      const block = blocks[blocks.length - 1];
+      const tools = block.querySelectorAll(".ts-approval-tool");
+      for (let i = tools.length - 1; i >= 0; i--) {
         if (tools[i].dataset.funcName === name) {
           target = tools[i];
           break;
@@ -1836,20 +1836,20 @@ class Pane {
     if (!target) return;
 
     // Remove the streaming output element for this tool
-    var streamEl = null;
+    let streamEl = null;
     if (escapedId) {
       streamEl = this.messagesEl.querySelector(
         '.tool-output-stream[data-call-id="' + escapedId + '"]',
       );
     } else {
-      var next = target.nextElementSibling;
+      const next = target.nextElementSibling;
       if (next && next.classList.contains("tool-output-stream")) {
         streamEl = next;
       }
     }
     if (streamEl) streamEl.remove();
 
-    var stripped = stripAnsi(output || "").trim();
+    const stripped = stripAnsi(output || "").trim();
     if (!stripped) return;
 
     // Skip rendering for denied/blocked tool results — the ✗ denied
@@ -1858,8 +1858,8 @@ class Pane {
     // the guard in the history-replay path (the live path used to be
     // safe because no tool_result event was ever emitted for denied
     // items, but we now emit one so _tool_error_flags gets set).
-    var parentBlock = target.closest(".ts-approval");
-    var isDenied =
+    const parentBlock = target.closest(".ts-approval");
+    const isDenied =
       (parentBlock && parentBlock.classList.contains("denied")) ||
       /^Denied by user/.test(stripped) ||
       /^Blocked/.test(stripped);
@@ -1867,9 +1867,9 @@ class Pane {
 
     // Detect structured media output and render interactive embed
     if (!isError) {
-      var media = tryParseMedia(stripped);
+      const media = tryParseMedia(stripped);
       if (media) {
-        var embed = buildMediaEmbed(media, stripped);
+        const embed = buildMediaEmbed(media, stripped);
         target.after(embed);
         this.scrollToBottom();
         return;
@@ -1880,7 +1880,7 @@ class Pane {
     // consent / re-consent / forbidden / operator card.  The existing
     // ✗ error badge from appendToolErrorBadge still fires below.
     if (isError) {
-      var mcpErr = tryParseMcpError(stripped);
+      const mcpErr = tryParseMcpError(stripped);
       if (mcpErr) {
         if (parentBlock && !parentBlock.classList.contains("denied")) {
           parentBlock.classList.add("error");
@@ -1892,7 +1892,7 @@ class Pane {
       }
     }
 
-    var out = renderToolOutput(stripped, isError);
+    const out = renderToolOutput(stripped, isError);
 
     // Mark the parent approval block as errored
     if (isError && parentBlock && !parentBlock.classList.contains("denied")) {
@@ -1909,7 +1909,7 @@ class Pane {
   }
 
   sendMessage() {
-    var text = this.inputEl.value.trim();
+    const text = this.inputEl.value.trim();
     if (!text) return;
 
     if (text.startsWith("/")) {
@@ -1924,15 +1924,15 @@ class Pane {
       return;
     }
 
-    var isBusy = this.busy;
-    var queuedEl = null;
-    var snap = this.attachments.snapshot();
+    const isBusy = this.busy;
+    let queuedEl = null;
+    const snap = this.attachments.snapshot();
 
     if (isBusy) {
       // Server re-parses the !!! prefix to set queue priority — the
       // optimistic bubble strips it for display.
-      var displayText = text;
-      var priority = "notice";
+      let displayText = text;
+      let priority = "notice";
       if (text.startsWith("!!!")) {
         displayText = text.slice(3).trimStart();
         priority = "important";
@@ -2008,7 +2008,7 @@ class Pane {
 
   cancelGeneration() {
     if (!this.busy || !this.wsId || this.stopBtn.disabled) return;
-    var isForce = this.stopBtn.dataset.forceCancel === "true";
+    const isForce = this.stopBtn.dataset.forceCancel === "true";
     this.stopBtn.disabled = true;
     authFetch(
       "/v1/api/workstreams/" + encodeURIComponent(this.wsId) + "/cancel",
@@ -2048,30 +2048,30 @@ class Pane {
 // rendering only.  All text goes through textContent so shell output
 // containing angle brackets / scripts / steering bytes renders inertly.
 function _buildWatchResultBubble(r) {
-  var el = document.createElement("div");
+  const el = document.createElement("div");
   el.className = "msg watch-result";
   el.setAttribute("role", "article");
   el.setAttribute("data-ts-role", "watch");
   el.setAttribute("aria-label", "watch");
-  var header = document.createElement("div");
+  const header = document.createElement("div");
   header.className = "msg-watch-header";
   header.textContent =
     "watch" + (r.watch_name ? " · " + String(r.watch_name) : "");
   el.appendChild(header);
   if (r.command) {
-    var cmd = document.createElement("div");
+    const cmd = document.createElement("div");
     cmd.className = "msg-watch-cmd";
     cmd.textContent = "$ " + String(r.command);
     el.appendChild(cmd);
   }
-  var body = document.createElement("pre");
+  const body = document.createElement("pre");
   body.className = "msg-watch-body";
   body.textContent = r.text || "";
   el.appendChild(body);
   if (r.poll_count != null && r.max_polls != null) {
-    var footer = document.createElement("div");
+    const footer = document.createElement("div");
     footer.className = "msg-watch-footer";
-    var finalSuffix = r.is_final ? " · final" : "";
+    const finalSuffix = r.is_final ? " · final" : "";
     footer.textContent =
       "poll " + String(r.poll_count) + "/" + String(r.max_polls) + finalSuffix;
     el.appendChild(footer);
@@ -2082,15 +2082,15 @@ function _buildWatchResultBubble(r) {
 // Default ``.msg.user-reminder`` bubble — yellow themed advisory used
 // for every metacog nudge other than ``watch_triggered``.
 function _buildDefaultReminderBubble(r) {
-  var el = document.createElement("div");
+  const el = document.createElement("div");
   el.className = "msg user-reminder";
-  var body = document.createElement("div");
+  const body = document.createElement("div");
   body.className = "msg-body";
-  var labelEl = document.createElement("span");
+  const labelEl = document.createElement("span");
   labelEl.className = "msg-user-reminder-label";
   labelEl.textContent =
     "metacognition" + (r.type ? " · " + String(r.type) : "");
-  var textEl = document.createElement("span");
+  const textEl = document.createElement("span");
   textEl.className = "msg-user-reminder-text";
   textEl.textContent = r.text || "";
   body.appendChild(labelEl);
@@ -2104,16 +2104,16 @@ function _buildDefaultReminderBubble(r) {
 // via showOutputWarning.  Single source of truth keeps the two
 // surfaces from drifting on role / class / escape semantics.
 function _buildOutputWarningEl(assessment) {
-  var risk = (assessment && assessment.risk_level) || "medium";
-  var flags = (assessment && assessment.flags) || [];
-  var warning = document.createElement("div");
+  const risk = (assessment && assessment.risk_level) || "medium";
+  const flags = (assessment && assessment.flags) || [];
+  const warning = document.createElement("div");
   warning.className = "output-warning output-warning-" + risk;
   // role="status" (polite) rather than "alert" (assertive) — these
   // are findings, not emergencies; the assertive announcement live
   // would interrupt the user mid-typing on a high-risk match, which
   // is more disruptive than informative.
   warning.setAttribute("role", "status");
-  var labelEl = document.createElement("span");
+  const labelEl = document.createElement("span");
   labelEl.className = "output-warning-label";
   labelEl.textContent = "⚠ " + String(risk).toUpperCase();
   warning.appendChild(labelEl);
@@ -2121,7 +2121,7 @@ function _buildOutputWarningEl(assessment) {
     warning.appendChild(document.createTextNode(" " + flags.join(", ")));
   }
   if (assessment && assessment.redacted) {
-    var redacted = document.createElement("span");
+    const redacted = document.createElement("span");
     redacted.className = "output-warning-redacted";
     redacted.textContent = " (credentials redacted)";
     warning.appendChild(redacted);
@@ -2133,10 +2133,10 @@ function _buildOutputWarningEl(assessment) {
 //  2. Layout tree + rendering
 // ===========================================================================
 
-var panes = {};
-var focusedPaneId = null;
-var splitRoot = null;
-var MAX_PANES = 6;
+const panes = {};
+let focusedPaneId = null;
+let splitRoot = null;
+const MAX_PANES = 6;
 
 function getFocusedPane() {
   return panes[focusedPaneId] || null;
@@ -2157,21 +2157,21 @@ function setFocusedPane(paneId) {
 }
 
 function createPane(wsId) {
-  var p = new Pane(wsId);
+  const p = new Pane(wsId);
   panes[p.id] = p;
   return p;
 }
 
 function updatePaneHeaders() {
-  var root = document.getElementById("split-root");
-  var leafCount = countLeaves(splitRoot);
+  const root = document.getElementById("split-root");
+  const leafCount = countLeaves(splitRoot);
   if (leafCount > 1) {
     root.classList.add("multi-pane");
   } else {
     root.classList.remove("multi-pane");
   }
   // Hide tab-bar split button when already in multi-pane mode
-  var splitBtn = document.getElementById("split-btn");
+  const splitBtn = document.getElementById("split-btn");
   if (splitBtn) {
     if (leafCount > 1) {
       splitBtn.classList.add("hidden");
@@ -2196,8 +2196,8 @@ function findLeafAndParent(node, paneId, parent, childIndex) {
     return null;
   }
   // split
-  for (var i = 0; i < node.children.length; i++) {
-    var result = findLeafAndParent(node.children[i], paneId, node, i);
+  for (let i = 0; i < node.children.length; i++) {
+    const result = findLeafAndParent(node.children[i], paneId, node, i);
     if (result) return result;
   }
   return null;
@@ -2206,8 +2206,8 @@ function findLeafAndParent(node, paneId, parent, childIndex) {
 function countLeaves(node) {
   if (!node) return 0;
   if (node.type === "leaf") return 1;
-  var count = 0;
-  for (var i = 0; i < node.children.length; i++) {
+  let count = 0;
+  for (let i = 0; i < node.children.length; i++) {
     count += countLeaves(node.children[i]);
   }
   return count;
@@ -2222,12 +2222,12 @@ function getFirstLeaf(node) {
 function replaceNode(tree, target, replacement) {
   if (tree === target) return replacement;
   if (tree.type === "split") {
-    for (var i = 0; i < tree.children.length; i++) {
+    for (let i = 0; i < tree.children.length; i++) {
       if (tree.children[i] === target) {
         tree.children[i] = replacement;
         return tree;
       }
-      var result = replaceNode(tree.children[i], target, replacement);
+      const result = replaceNode(tree.children[i], target, replacement);
       if (result !== tree.children[i]) {
         tree.children[i] = result;
         return tree;
@@ -2240,23 +2240,23 @@ function replaceNode(tree, target, replacement) {
 function splitPane(paneId, direction) {
   if (countLeaves(splitRoot) >= MAX_PANES) return;
   // Guard: viewport too narrow/short to fit another pane
-  var root = document.getElementById("split-root");
-  var minDim = direction === "horizontal" ? 200 : 150;
-  var available =
+  const root = document.getElementById("split-root");
+  const minDim = direction === "horizontal" ? 200 : 150;
+  const available =
     direction === "horizontal" ? root.clientWidth : root.clientHeight;
   if (available < minDim * 2 + 4) {
     showToast("Not enough space to split");
     return;
   }
-  var found = findLeafAndParent(splitRoot, paneId, null, -1);
+  const found = findLeafAndParent(splitRoot, paneId, null, -1);
   if (!found) return;
 
   // Find a workstream not already shown in any pane
-  var wsIds = Object.keys(workstreams);
-  var newWsId = null;
-  for (var i = 0; i < wsIds.length; i++) {
-    var inUse = false;
-    for (var pid in panes) {
+  const wsIds = Object.keys(workstreams);
+  let newWsId = null;
+  for (let i = 0; i < wsIds.length; i++) {
+    let inUse = false;
+    for (let pid in panes) {
       if (panes[pid].wsId === wsIds[i]) {
         inUse = true;
         break;
@@ -2272,9 +2272,9 @@ function splitPane(paneId, direction) {
     return;
   }
 
-  var newPane = createPane(newWsId);
-  var newLeaf = { type: "leaf", pane: newPane };
-  var newSplit = {
+  const newPane = createPane(newWsId);
+  const newLeaf = { type: "leaf", pane: newPane };
+  const newSplit = {
     type: "split",
     direction: direction,
     children: [found.node, newLeaf],
@@ -2290,14 +2290,14 @@ function splitPane(paneId, direction) {
 
 function closePane(paneId) {
   if (countLeaves(splitRoot) <= 1) return;
-  var found = findLeafAndParent(splitRoot, paneId, null, -1);
+  let found = findLeafAndParent(splitRoot, paneId, null, -1);
   if (!found || !found.parent) {
     // paneId is the root leaf — shouldn't happen if count > 1
     // but handle: root must be a split
     if (splitRoot.type === "split") {
       // Find which child contains our pane
-      for (var ci = 0; ci < splitRoot.children.length; ci++) {
-        var childFound = findLeafAndParent(
+      for (let ci = 0; ci < splitRoot.children.length; ci++) {
+        const childFound = findLeafAndParent(
           splitRoot.children[ci],
           paneId,
           splitRoot,
@@ -2313,14 +2313,14 @@ function closePane(paneId) {
   }
 
   // Sibling is the other child
-  var siblingIdx = found.childIndex === 0 ? 1 : 0;
-  var sibling = found.parent.children[siblingIdx];
+  const siblingIdx = found.childIndex === 0 ? 1 : 0;
+  const sibling = found.parent.children[siblingIdx];
 
   // Replace parent split with sibling
   splitRoot = replaceNode(splitRoot, found.parent, sibling);
 
   // Cleanup the closed pane
-  var closedPane = panes[paneId];
+  const closedPane = panes[paneId];
   if (closedPane) {
     closedPane.disconnectSSE();
     delete panes[paneId];
@@ -2328,7 +2328,7 @@ function closePane(paneId) {
 
   // If focused pane was closed, focus first available
   if (focusedPaneId === paneId) {
-    var first = getFirstLeaf(splitRoot);
+    const first = getFirstLeaf(splitRoot);
     if (first) {
       focusedPaneId = null; // reset so setFocusedPane triggers
       setFocusedPane(first.id);
@@ -2339,11 +2339,11 @@ function closePane(paneId) {
 }
 
 function renderLayout() {
-  var root = document.getElementById("split-root");
+  const root = document.getElementById("split-root");
 
   // Save scroll positions before clearing
-  var scrollPositions = {};
-  for (var pid in panes) {
+  const scrollPositions = {};
+  for (let pid in panes) {
     scrollPositions[pid] = panes[pid].messagesEl.scrollTop;
   }
 
@@ -2354,7 +2354,7 @@ function renderLayout() {
   }
 
   // Restore scroll positions
-  for (var pid2 in panes) {
+  for (let pid2 in panes) {
     if (scrollPositions[pid2] !== undefined) {
       panes[pid2].messagesEl.scrollTop = scrollPositions[pid2];
     }
@@ -2371,16 +2371,16 @@ function _renderLayoutNode(node, container) {
   }
 
   // split node
-  var splitContainer = document.createElement("div");
+  const splitContainer = document.createElement("div");
   splitContainer.className = "split-container split-" + node.direction;
 
-  var child0 = document.createElement("div");
+  const child0 = document.createElement("div");
   child0.className = "split-child";
   child0.style.flex = String(node.ratio);
   _renderLayoutNode(node.children[0], child0);
   splitContainer.appendChild(child0);
 
-  var handle = document.createElement("div");
+  const handle = document.createElement("div");
   handle.className = "split-handle";
   handle.setAttribute("role", "separator");
   handle.setAttribute("tabindex", "0");
@@ -2399,7 +2399,7 @@ function _renderLayoutNode(node, container) {
   );
   splitContainer.appendChild(handle);
 
-  var child1 = document.createElement("div");
+  const child1 = document.createElement("div");
   child1.className = "split-child";
   child1.style.flex = String(1 - node.ratio);
   _renderLayoutNode(node.children[1], child1);
@@ -2411,16 +2411,16 @@ function _renderLayoutNode(node, container) {
 
 function _dragBounds(node, handle) {
   // Compute min/max ratio from container size and CSS min dimensions
-  var container = handle.parentElement;
-  var totalSize =
+  const container = handle.parentElement;
+  const totalSize =
     node.direction === "horizontal"
       ? container.clientWidth
       : container.clientHeight;
-  var minPx = node.direction === "horizontal" ? 200 : 150; // match CSS min-width/min-height
-  var handlePx = 4;
-  var usable = totalSize - handlePx;
-  var minRatio = usable > 0 ? Math.max(0.05, minPx / usable) : 0.1;
-  var maxRatio = usable > 0 ? Math.min(0.95, 1 - minPx / usable) : 0.9;
+  const minPx = node.direction === "horizontal" ? 200 : 150; // match CSS min-width/min-height
+  const handlePx = 4;
+  const usable = totalSize - handlePx;
+  const minRatio = usable > 0 ? Math.max(0.05, minPx / usable) : 0.1;
+  const maxRatio = usable > 0 ? Math.min(0.95, 1 - minPx / usable) : 0.9;
   return { minRatio: minRatio, maxRatio: maxRatio, totalSize: totalSize };
 }
 
@@ -2439,23 +2439,23 @@ function setupDragHandle(handle, node, children) {
     e.preventDefault();
     handle.setPointerCapture(e.pointerId);
     handle.classList.add("dragging");
-    var startRatio = node.ratio;
-    var bounds = _dragBounds(node, handle);
-    var startPos = node.direction === "horizontal" ? e.clientX : e.clientY;
+    const startRatio = node.ratio;
+    const bounds = _dragBounds(node, handle);
+    const startPos = node.direction === "horizontal" ? e.clientX : e.clientY;
     document.body.style.cursor =
       node.direction === "horizontal" ? "col-resize" : "row-resize";
     document.body.style.userSelect = "none";
 
-    var onMove = function (e2) {
-      var delta =
+    const onMove = function (e2) {
+      const delta =
         (node.direction === "horizontal" ? e2.clientX : e2.clientY) - startPos;
-      var newRatio = Math.max(
+      const newRatio = Math.max(
         bounds.minRatio,
         Math.min(bounds.maxRatio, startRatio + delta / bounds.totalSize),
       );
       _applyRatio(node, children, handle, newRatio);
     };
-    var onUp = function () {
+    const onUp = function () {
       handle.classList.remove("dragging");
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
@@ -2471,16 +2471,16 @@ function setupDragHandle(handle, node, children) {
 
   // Keyboard resizing (arrow keys)
   handle.addEventListener("keydown", function (e) {
-    var bounds = _dragBounds(node, handle);
-    var step = e.shiftKey ? 0.1 : 0.02;
-    var delta = 0;
+    const bounds = _dragBounds(node, handle);
+    const step = e.shiftKey ? 0.1 : 0.02;
+    let delta = 0;
     if (e.key === "ArrowRight" || e.key === "ArrowDown") delta = step;
     else if (e.key === "ArrowLeft" || e.key === "ArrowUp") delta = -step;
     else if (e.key === "Home") delta = -(node.ratio - bounds.minRatio);
     else if (e.key === "End") delta = bounds.maxRatio - node.ratio;
     else return;
     e.preventDefault();
-    var newRatio = Math.max(
+    const newRatio = Math.max(
       bounds.minRatio,
       Math.min(bounds.maxRatio, node.ratio + delta),
     );
@@ -2516,12 +2516,12 @@ function deserializeLayout(data, _seen) {
     if (!data.wsId || !workstreams[data.wsId] || _seen[data.wsId]) return null;
     if (Object.keys(panes).length >= MAX_PANES) return null;
     _seen[data.wsId] = true;
-    var p = createPane(data.wsId);
+    const p = createPane(data.wsId);
     return { type: "leaf", pane: p };
   }
   if (data.type === "split") {
-    var left = deserializeLayout(data.children[0], _seen);
-    var right = deserializeLayout(data.children[1], _seen);
+    const left = deserializeLayout(data.children[0], _seen);
+    const right = deserializeLayout(data.children[1], _seen);
     if (!left && !right) return null;
     if (!left) return right;
     if (!right) return left;
@@ -2537,7 +2537,7 @@ function deserializeLayout(data, _seen) {
 
 function saveLayout() {
   try {
-    var data = serializeLayout(splitRoot);
+    const data = serializeLayout(splitRoot);
     if (data) {
       localStorage.setItem("turnstone_split_layout", JSON.stringify(data));
     }
@@ -2548,13 +2548,13 @@ function saveLayout() {
 
 function restoreLayout() {
   try {
-    var raw = localStorage.getItem("turnstone_split_layout");
+    const raw = localStorage.getItem("turnstone_split_layout");
     if (!raw) return false;
-    var data = JSON.parse(raw);
-    var tree = deserializeLayout(data);
+    const data = JSON.parse(raw);
+    const tree = deserializeLayout(data);
     if (!tree) return false;
     splitRoot = tree;
-    var first = getFirstLeaf(splitRoot);
+    const first = getFirstLeaf(splitRoot);
     if (first) {
       setFocusedPane(first.id);
     }
@@ -2568,20 +2568,20 @@ function restoreLayout() {
 //  3b. Pane context menu
 // ===========================================================================
 
-var _ctxMenu = null;
-var _ctxCloseHandler = null;
-var _ctxTriggerElement = null;
+let _ctxMenu = null;
+let _ctxCloseHandler = null;
+let _ctxTriggerElement = null;
 
-var _tabDropdown = null;
-var _tabDropdownCloseHandler = null;
-var _tabDropdownTrigger = null;
+let _tabDropdown = null;
+let _tabDropdownCloseHandler = null;
+let _tabDropdownTrigger = null;
 
 function showPaneContextMenu(x, y, paneId) {
   closeTabDropdown();
   closePaneContextMenu();
   _ctxTriggerElement = document.activeElement;
 
-  var menu = document.createElement("div");
+  const menu = document.createElement("div");
   menu.className = "pane-ctx-menu";
   menu.setAttribute("role", "menu");
   menu.setAttribute("aria-label", "Pane actions");
@@ -2589,16 +2589,16 @@ function showPaneContextMenu(x, y, paneId) {
     e.preventDefault();
   });
 
-  var canClose = splitRoot && countLeaves(splitRoot) > 1;
+  const canClose = splitRoot && countLeaves(splitRoot) > 1;
   // Can split only if under pane limit AND there's an unused workstream
-  var usedWs = {};
-  for (var pid in panes) usedWs[panes[pid].wsId] = true;
-  var hasUnused = Object.keys(workstreams).some(function (id) {
+  const usedWs = {};
+  for (let pid in panes) usedWs[panes[pid].wsId] = true;
+  const hasUnused = Object.keys(workstreams).some(function (id) {
     return !usedWs[id];
   });
-  var canSplit = countLeaves(splitRoot) < MAX_PANES && hasUnused;
+  const canSplit = countLeaves(splitRoot) < MAX_PANES && hasUnused;
 
-  var items = [
+  const items = [
     {
       label: "Split Right",
       key: "Ctrl+\\",
@@ -2628,23 +2628,23 @@ function showPaneContextMenu(x, y, paneId) {
 
   items.forEach(function (item) {
     if (item.separator) {
-      var sep = document.createElement("div");
+      const sep = document.createElement("div");
       sep.className = "pane-ctx-sep";
       sep.setAttribute("role", "separator");
       menu.appendChild(sep);
       return;
     }
-    var btn = document.createElement("button");
+    const btn = document.createElement("button");
     btn.className = "pane-ctx-item";
     btn.setAttribute("role", "menuitem");
     btn.setAttribute("tabindex", "-1");
     btn.disabled = !!item.disabled;
-    var labelSpan = document.createElement("span");
+    const labelSpan = document.createElement("span");
     labelSpan.className = "pane-ctx-label";
     labelSpan.textContent = item.label;
     btn.appendChild(labelSpan);
     if (item.key) {
-      var keySpan = document.createElement("span");
+      const keySpan = document.createElement("span");
       keySpan.className = "pane-ctx-key";
       keySpan.textContent = item.key;
       btn.appendChild(keySpan);
@@ -2658,9 +2658,9 @@ function showPaneContextMenu(x, y, paneId) {
 
   // Position: ensure menu stays within viewport
   document.body.appendChild(menu);
-  var rect = menu.getBoundingClientRect();
-  var mx = x;
-  var my = y;
+  const rect = menu.getBoundingClientRect();
+  let mx = x;
+  let my = y;
   if (mx + rect.width > window.innerWidth)
     mx = window.innerWidth - rect.width - 4;
   if (my + rect.height > window.innerHeight)
@@ -2684,11 +2684,11 @@ function showPaneContextMenu(x, y, paneId) {
         e.key === "End"
       ) {
         e.preventDefault();
-        var btns = Array.from(
+        const btns = Array.from(
           menu.querySelectorAll(".pane-ctx-item:not(:disabled)"),
         );
         if (!btns.length) return;
-        var idx = btns.indexOf(document.activeElement);
+        const idx = btns.indexOf(document.activeElement);
         if (e.key === "ArrowDown") btns[(idx + 1) % btns.length].focus();
         else if (e.key === "ArrowUp")
           btns[(idx - 1 + btns.length) % btns.length].focus();
@@ -2703,7 +2703,7 @@ function showPaneContextMenu(x, y, paneId) {
     document.addEventListener("mousedown", _ctxCloseHandler);
     document.addEventListener("keydown", _ctxCloseHandler);
     // Focus first enabled item
-    var first = menu.querySelector(".pane-ctx-item:not(:disabled)");
+    const first = menu.querySelector(".pane-ctx-item:not(:disabled)");
     if (first) first.focus();
   }, 0);
 }
@@ -2734,7 +2734,7 @@ function showTabDropdown(chevronEl, wsId) {
   _tabDropdownTrigger = chevronEl;
   chevronEl.setAttribute("aria-expanded", "true");
 
-  var menu = document.createElement("div");
+  const menu = document.createElement("div");
   menu.className = "ws-tab-dropdown";
   menu.setAttribute("role", "menu");
   menu.setAttribute("aria-label", "Workstream actions");
@@ -2742,8 +2742,8 @@ function showTabDropdown(chevronEl, wsId) {
     e.preventDefault();
   });
 
-  var isLastWs = Object.keys(workstreams).length <= 1;
-  var items = [
+  const isLastWs = Object.keys(workstreams).length <= 1;
+  const items = [
     {
       label: "Refresh title",
       cls: "mobile-hide",
@@ -2787,13 +2787,13 @@ function showTabDropdown(chevronEl, wsId) {
 
   items.forEach(function (item) {
     if (item.separator) {
-      var sep = document.createElement("div");
+      const sep = document.createElement("div");
       sep.className = "ws-tab-dropdown-sep";
       sep.setAttribute("role", "separator");
       menu.appendChild(sep);
       return;
     }
-    var btn = document.createElement("button");
+    const btn = document.createElement("button");
     btn.className = "ws-tab-dropdown-item" + (item.cls ? " " + item.cls : "");
     btn.setAttribute("role", "menuitem");
     btn.setAttribute("tabindex", "-1");
@@ -2804,12 +2804,12 @@ function showTabDropdown(chevronEl, wsId) {
         "Cannot " + item.label.toLowerCase() + " the last workstream",
       );
     }
-    var labelSpan = document.createElement("span");
+    const labelSpan = document.createElement("span");
     labelSpan.className = "ws-tab-dropdown-label";
     labelSpan.textContent = item.label;
     btn.appendChild(labelSpan);
     if (item.key) {
-      var keySpan = document.createElement("span");
+      const keySpan = document.createElement("span");
       keySpan.className = "ws-tab-dropdown-key";
       keySpan.textContent = item.key;
       keySpan.setAttribute("aria-hidden", "true");
@@ -2826,10 +2826,10 @@ function showTabDropdown(chevronEl, wsId) {
   document.body.appendChild(menu);
 
   // Position below chevron, right-aligned
-  var cr = chevronEl.getBoundingClientRect();
-  var mr = menu.getBoundingClientRect();
-  var mx = cr.right - mr.width;
-  var my = cr.bottom + 2;
+  const cr = chevronEl.getBoundingClientRect();
+  const mr = menu.getBoundingClientRect();
+  let mx = cr.right - mr.width;
+  let my = cr.bottom + 2;
   if (mx < 0) mx = 4;
   if (my + mr.height > window.innerHeight) my = cr.top - mr.height - 2;
   if (mx + mr.width > window.innerWidth) mx = window.innerWidth - mr.width - 4;
@@ -2852,9 +2852,9 @@ function showTabDropdown(chevronEl, wsId) {
         e.key === "End"
       ) {
         e.preventDefault();
-        var btns = Array.from(menu.querySelectorAll(".ws-tab-dropdown-item"));
+        const btns = Array.from(menu.querySelectorAll(".ws-tab-dropdown-item"));
         if (!btns.length) return;
-        var idx = btns.indexOf(document.activeElement);
+        const idx = btns.indexOf(document.activeElement);
         if (e.key === "ArrowDown") btns[(idx + 1) % btns.length].focus();
         // idx <= 0 covers both "first item" (wrap to last) and "no
         // current focus" (idx === -1, which would otherwise yield
@@ -2873,13 +2873,13 @@ function showTabDropdown(chevronEl, wsId) {
       closeTabDropdown();
     }
   };
-  var closeHandler = _tabDropdownCloseHandler;
-  var activeMenu = menu;
+  const closeHandler = _tabDropdownCloseHandler;
+  const activeMenu = menu;
   setTimeout(function () {
     if (_tabDropdown !== activeMenu || !closeHandler) return;
     document.addEventListener("mousedown", closeHandler);
     document.addEventListener("keydown", closeHandler);
-    var first = activeMenu.querySelector(".ws-tab-dropdown-item");
+    const first = activeMenu.querySelector(".ws-tab-dropdown-item");
     if (first) first.focus();
   }, 0);
 }
@@ -2907,15 +2907,15 @@ function closeTabDropdown() {
 //  4. Global state
 // ===========================================================================
 
-var workstreams = {};
-var currentWsId = null;
-var globalEvtSource = null;
-var globalRetryDelay = 1000;
-var dashboardVisible = false;
-var _historyNavigation = false;
-var _lastHealth = null;
+let workstreams = {};
+let currentWsId = null;
+let globalEvtSource = null;
+let globalRetryDelay = 1000;
+let dashboardVisible = false;
+let _historyNavigation = false;
+let _lastHealth = null;
 
-var STATE_DISPLAY = {
+const STATE_DISPLAY = {
   running: { symbol: "\u25b8", label: "run" },
   thinking: { symbol: "\u25cc", label: "think" },
   attention: { symbol: "\u25c6", label: "attn" },
@@ -2935,7 +2935,7 @@ function pollHealth() {
     .then(function (data) {
       pollHealth._failCount = 0;
       _lastHealth = data;
-      var mcpEl = document.getElementById("mcp-status");
+      const mcpEl = document.getElementById("mcp-status");
       if (mcpEl) {
         if (data.mcp && data.mcp.servers > 0) {
           mcpEl.textContent =
@@ -2955,7 +2955,7 @@ function pollHealth() {
           mcpEl.style.opacity = "0";
         }
       }
-      var el = document.getElementById("health-indicator");
+      const el = document.getElementById("health-indicator");
       if (!el) return;
       if (data.status === "degraded") {
         el.textContent = "backend degraded";
@@ -2978,7 +2978,7 @@ function pollHealth() {
       if (!pollHealth._failCount) pollHealth._failCount = 0;
       pollHealth._failCount++;
       if (pollHealth._failCount >= 2) {
-        var el = document.getElementById("health-indicator");
+        const el = document.getElementById("health-indicator");
         if (!el) return;
         el.textContent = "health unknown";
         el.className = "health-degraded";
@@ -2997,7 +2997,7 @@ window.onLoginSuccess = function () {
 };
 
 window.onLogout = function () {
-  for (var id in panes) {
+  for (let id in panes) {
     panes[id].disconnectSSE();
     delete panes[id];
   }
@@ -3017,9 +3017,9 @@ window.onLogout = function () {
 // ===========================================================================
 
 window.onThemeChange = function (next) {
-  var btn = document.getElementById("theme-toggle");
+  const btn = document.getElementById("theme-toggle");
   if (btn) {
-    var isLight = next === "light";
+    const isLight = next === "light";
     btn.textContent = isLight ? "\u2600" : "\u263E";
     btn.title = isLight ? "Switch to dark theme" : "Switch to light theme";
     btn.setAttribute(
@@ -3029,7 +3029,7 @@ window.onThemeChange = function (next) {
   }
   reRenderAllMermaid();
   // Persist theme to server settings so it propagates to other clients
-  var themeValue = next === "light" ? "light" : "dark";
+  const themeValue = next === "light" ? "light" : "dark";
   authFetch("/v1/api/admin/settings/interface.theme", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
@@ -3037,9 +3037,9 @@ window.onThemeChange = function (next) {
   }).catch(function () {});
 };
 (function () {
-  var btn = document.getElementById("theme-toggle");
+  const btn = document.getElementById("theme-toggle");
   if (btn) {
-    var isLight = document.documentElement.dataset.theme === "light";
+    const isLight = document.documentElement.dataset.theme === "light";
     btn.textContent = isLight ? "\u2600" : "\u263E";
     btn.title = isLight ? "Switch to dark theme" : "Switch to light theme";
     btn.setAttribute(
@@ -3053,9 +3053,9 @@ window.onThemeChange = function (next) {
 //  8. Tab bar
 // ===========================================================================
 
-var tabBar = document.getElementById("tab-bar");
-var tabList = document.getElementById("tab-list");
-var newTabBtn = document.getElementById("new-tab-btn");
+const tabBar = document.getElementById("tab-bar");
+const tabList = document.getElementById("tab-list");
+const newTabBtn = document.getElementById("new-tab-btn");
 
 function renderTabBar() {
   closeTabDropdown();
@@ -3063,10 +3063,10 @@ function renderTabBar() {
     t.remove();
   });
 
-  var wsIds = Object.keys(workstreams);
+  const wsIds = Object.keys(workstreams);
   wsIds.forEach(function (wsId) {
-    var ws = workstreams[wsId];
-    var tab = document.createElement("div");
+    const ws = workstreams[wsId];
+    const tab = document.createElement("div");
     tab.className = "ws-tab" + (wsId === currentWsId ? " active" : "");
     tab.dataset.wsId = wsId;
     tab.setAttribute("role", "tab");
@@ -3083,23 +3083,23 @@ function renderTabBar() {
       }
     };
 
-    var indicator = document.createElement("span");
+    const indicator = document.createElement("span");
     indicator.className = "tab-indicator";
     indicator.dataset.state = ws.state || "idle";
     indicator.setAttribute("aria-label", ws.state || "idle");
     tab.appendChild(indicator);
 
-    var name = document.createElement("span");
+    const name = document.createElement("span");
     name.className = "tab-name";
     name.textContent = ws.name || wsId.substring(0, 6);
     tab.appendChild(name);
 
-    var wsidBadge = document.createElement("span");
+    const wsidBadge = document.createElement("span");
     wsidBadge.className = "tab-wsid";
     wsidBadge.textContent = wsId.substring(0, 7);
     tab.appendChild(wsidBadge);
 
-    var chevron = document.createElement("button");
+    const chevron = document.createElement("button");
     chevron.className = "tab-chevron";
     chevron.textContent = "\u25BE";
     chevron.title = "Workstream actions";
@@ -3126,31 +3126,31 @@ function renderTabBar() {
 function updateTabIndicator(wsId, state, extra) {
   workstreams[wsId] = workstreams[wsId] || {};
   workstreams[wsId].state = state;
-  var tab = tabBar.querySelector('.ws-tab[data-ws-id="' + wsId + '"]');
+  const tab = tabBar.querySelector('.ws-tab[data-ws-id="' + wsId + '"]');
   if (tab) {
-    var ind = tab.querySelector(".tab-indicator");
+    const ind = tab.querySelector(".tab-indicator");
     if (ind) ind.dataset.state = state;
   }
-  var row = document.querySelector(
+  const row = document.querySelector(
     '#dash-ws-table .dash-row[data-ws-id="' + wsId + '"]',
   );
   if (row) {
-    var sd = STATE_DISPLAY[state] || STATE_DISPLAY.idle;
+    const sd = STATE_DISPLAY[state] || STATE_DISPLAY.idle;
     row.dataset.state = state;
-    var dot = row.querySelector(".dash-state-dot");
+    const dot = row.querySelector(".dash-state-dot");
     if (dot) dot.dataset.state = state;
-    var label = row.querySelector(".dash-state-label");
+    const label = row.querySelector(".dash-state-label");
     if (label) {
       label.dataset.state = state;
       label.textContent = sd.symbol + " " + sd.label;
     }
     if (extra) {
       if (extra.tokens !== undefined) {
-        var tokEl = row.querySelector(".dash-cell-tokens");
+        const tokEl = row.querySelector(".dash-cell-tokens");
         if (tokEl) tokEl.textContent = formatTokens(extra.tokens);
       }
       if (extra.context_ratio !== undefined) {
-        var ctxEl = row.querySelector(".dash-cell-ctx");
+        const ctxEl = row.querySelector(".dash-cell-ctx");
         if (ctxEl) {
           ctxEl.className = "dash-cell-ctx " + ctxClass(extra.context_ratio);
           ctxEl.textContent =
@@ -3160,7 +3160,7 @@ function updateTabIndicator(wsId, state, extra) {
         }
       }
       if (extra.activity !== undefined) {
-        var sub = row.querySelector(".dash-row-sub");
+        const sub = row.querySelector(".dash-row-sub");
         if (sub) {
           sub.textContent = extra.activity || "";
           if (extra.activity_state === "approval")
@@ -3174,7 +3174,7 @@ function updateTabIndicator(wsId, state, extra) {
 
 function switchTab(wsId) {
   closeTabDropdown();
-  var pane = getFocusedPane();
+  let pane = getFocusedPane();
   if (!pane) {
     // Bootstrap the first pane on a fresh-loaded page that had no
     // workstreams to render at init time. Without this, creating
@@ -3199,7 +3199,7 @@ function switchTab(wsId) {
 
   // In multi-pane mode, focus an existing pane showing this ws
   if (splitRoot && countLeaves(splitRoot) > 1) {
-    for (var pid in panes) {
+    for (let pid in panes) {
       if (panes[pid].wsId === wsId && pid !== focusedPaneId) {
         setFocusedPane(pid);
         return;
@@ -3227,40 +3227,40 @@ function switchTab(wsId) {
 //  9. New workstream modal
 // ===========================================================================
 
-var _newWsTrapHandler = null;
-var _forkFromWsId = "";
+let _newWsTrapHandler = null;
+let _forkFromWsId = "";
 
 // Staged files for the new-workstream modal.  Distinct from the pane's
 // chip strip: there's no ws_id yet, so we hold File objects in memory
 // and ship them all in one multipart create request on submit.
-var _newWsStagedFiles = [];
+let _newWsStagedFiles = [];
 
 // Per-kind size caps (mirrored from turnstone/core/attachments.py so the
 // browser can fail fast before uploading).  Keep in sync.
-var _NEW_WS_IMAGE_CAP = 4 * 1024 * 1024;
-var _NEW_WS_TEXT_CAP = 512 * 1024;
-var _NEW_WS_MAX_FILES = 10;
+const _NEW_WS_IMAGE_CAP = 4 * 1024 * 1024;
+const _NEW_WS_TEXT_CAP = 512 * 1024;
+const _NEW_WS_MAX_FILES = 10;
 
 function _newWsRenderChips() {
-  var chipsEl = document.getElementById("new-ws-attach-chips");
+  const chipsEl = document.getElementById("new-ws-attach-chips");
   if (!chipsEl) return;
   chipsEl.textContent = "";
-  for (var i = 0; i < _newWsStagedFiles.length; i++) {
+  for (let i = 0; i < _newWsStagedFiles.length; i++) {
     (function (idx) {
-      var f = _newWsStagedFiles[idx];
-      var chip = document.createElement("span");
+      const f = _newWsStagedFiles[idx];
+      const chip = document.createElement("span");
       chip.className = "new-ws-attach-chip";
       chip.setAttribute("role", "listitem");
-      var label = document.createElement("span");
+      const label = document.createElement("span");
       label.className = "new-ws-attach-chip-name";
       label.textContent = f.name;
       label.title = f.name + " (" + f.size + " bytes)";
       chip.appendChild(label);
-      var size = document.createElement("span");
+      const size = document.createElement("span");
       size.className = "new-ws-attach-chip-size";
       size.textContent = _formatAttachSize(f.size);
       chip.appendChild(size);
-      var rm = document.createElement("button");
+      const rm = document.createElement("button");
       rm.type = "button";
       rm.className = "new-ws-attach-chip-remove";
       rm.setAttribute("aria-label", "Remove " + f.name);
@@ -3279,20 +3279,20 @@ function _newWsRenderChips() {
 // text/* MIMEs, allowlisted application/* MIMEs, and known text extensions.
 // Surfaces unsupported types client-side so the user sees a clear error
 // instead of a generic create failure after the server rejects.
-var _ATTACH_IMAGE_MIMES = [
+const _ATTACH_IMAGE_MIMES = [
   "image/png",
   "image/jpeg",
   "image/gif",
   "image/webp",
 ];
-var _ATTACH_TEXT_APP_MIMES = [
+const _ATTACH_TEXT_APP_MIMES = [
   "application/json",
   "application/xml",
   "application/x-yaml",
   "application/yaml",
   "application/toml",
 ];
-var _ATTACH_TEXT_EXTENSIONS = [
+const _ATTACH_TEXT_EXTENSIONS = [
   ".c",
   ".conf",
   ".cpp",
@@ -3321,12 +3321,12 @@ var _ATTACH_TEXT_EXTENSIONS = [
 ];
 
 function _isAttachmentAllowed(file) {
-  var mime = (file.type || "").toLowerCase();
+  const mime = (file.type || "").toLowerCase();
   if (_ATTACH_IMAGE_MIMES.indexOf(mime) !== -1) return true;
   if (mime.indexOf("text/") === 0) return true;
   if (_ATTACH_TEXT_APP_MIMES.indexOf(mime) !== -1) return true;
-  var name = (file.name || "").toLowerCase();
-  var dot = name.lastIndexOf(".");
+  const name = (file.name || "").toLowerCase();
+  const dot = name.lastIndexOf(".");
   if (dot >= 0 && _ATTACH_TEXT_EXTENSIONS.indexOf(name.substr(dot)) !== -1) {
     return true;
   }
@@ -3334,9 +3334,9 @@ function _isAttachmentAllowed(file) {
 }
 
 function _newWsAddFiles(files) {
-  var errEl = document.getElementById("new-ws-error");
-  for (var i = 0; i < files.length; i++) {
-    var f = files[i];
+  const errEl = document.getElementById("new-ws-error");
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
     if (_newWsStagedFiles.length >= _NEW_WS_MAX_FILES) {
       errEl.textContent =
         "At most " + _NEW_WS_MAX_FILES + " attachments per workstream";
@@ -3351,8 +3351,8 @@ function _newWsAddFiles(files) {
       errEl.style.display = "block";
       return;
     }
-    var isImage = (f.type || "").indexOf("image/") === 0;
-    var cap = isImage ? _NEW_WS_IMAGE_CAP : _NEW_WS_TEXT_CAP;
+    const isImage = (f.type || "").indexOf("image/") === 0;
+    const cap = isImage ? _NEW_WS_IMAGE_CAP : _NEW_WS_TEXT_CAP;
     if (f.size > cap) {
       errEl.textContent =
         f.name + " exceeds the " + _formatAttachSize(cap) + " cap";
@@ -3371,13 +3371,13 @@ function newWorkstream() {
 
 function showNewWsModal(forkFromWsId) {
   _forkFromWsId = forkFromWsId || "";
-  var overlay = document.getElementById("new-ws-overlay");
+  const overlay = document.getElementById("new-ws-overlay");
   overlay.style.display = "flex";
   document.body.style.overflow = "hidden";
 
   // Update title and button text based on mode
-  var titleEl = document.getElementById("new-ws-title");
-  var submitBtn = document.getElementById("new-ws-submit");
+  const titleEl = document.getElementById("new-ws-title");
+  const submitBtn = document.getElementById("new-ws-submit");
   if (_forkFromWsId) {
     titleEl.textContent = "Fork Workstream";
     submitBtn.textContent = "Fork";
@@ -3387,8 +3387,8 @@ function showNewWsModal(forkFromWsId) {
   }
 
   // Hide skill dropdown when forking (not relevant — fork copies history)
-  var skillLabel = document.querySelector('label[for="new-ws-skill"]');
-  var skillSelect = document.getElementById("new-ws-skill");
+  const skillLabel = document.querySelector('label[for="new-ws-skill"]');
+  const skillSelect = document.getElementById("new-ws-skill");
   if (_forkFromWsId) {
     if (skillLabel) skillLabel.style.display = "none";
     if (skillSelect) skillSelect.style.display = "none";
@@ -3402,19 +3402,19 @@ function showNewWsModal(forkFromWsId) {
   };
 
   // Populate model dropdown
-  var modelSelect = document.getElementById("new-ws-model");
-  var judgeSelect = document.getElementById("new-ws-judge-model");
-  var fp = getFocusedPane();
-  var curModel = fp ? fp.modelAlias || fp.model || "" : "";
+  const modelSelect = document.getElementById("new-ws-model");
+  const judgeSelect = document.getElementById("new-ws-judge-model");
+  const fp = getFocusedPane();
+  const curModel = fp ? fp.modelAlias || fp.model || "" : "";
   modelSelect.textContent = "";
   judgeSelect.textContent = "";
-  var defaultOpt = document.createElement("option");
+  const defaultOpt = document.createElement("option");
   defaultOpt.value = "";
   defaultOpt.textContent = curModel
     ? "Default (" + curModel + ")"
     : "Default model";
   modelSelect.appendChild(defaultOpt);
-  var defJudgeOpt = document.createElement("option");
+  const defJudgeOpt = document.createElement("option");
   defJudgeOpt.value = "";
   defJudgeOpt.textContent = "Default (agent model)";
   judgeSelect.appendChild(defJudgeOpt);
@@ -3424,13 +3424,13 @@ function showNewWsModal(forkFromWsId) {
     })
     .then(function (data) {
       (data.models || []).forEach(function (m) {
-        var opt = document.createElement("option");
+        const opt = document.createElement("option");
         opt.value = m.alias;
         opt.textContent =
           m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
         modelSelect.appendChild(opt);
 
-        var judgeOpt = document.createElement("option");
+        const judgeOpt = document.createElement("option");
         judgeOpt.value = m.alias;
         judgeOpt.textContent = opt.textContent;
         judgeSelect.appendChild(judgeOpt);
@@ -3440,20 +3440,20 @@ function showNewWsModal(forkFromWsId) {
       /* ignore — default model still works */
     });
 
-  var tplSelect = document.getElementById("new-ws-skill");
-  var defaultOpt = document.createElement("option");
-  defaultOpt.value = "";
-  defaultOpt.textContent = "Use defaults";
-  tplSelect.replaceChildren(defaultOpt);
+  const tplSelect = document.getElementById("new-ws-skill");
+  const tplDefaultOpt = document.createElement("option");
+  tplDefaultOpt.value = "";
+  tplDefaultOpt.textContent = "Use defaults";
+  tplSelect.replaceChildren(tplDefaultOpt);
   authFetch("/v1/api/skills")
     .then(function (r) {
       return r.json();
     })
     .then(function (data) {
       (data.skills || []).forEach(function (t) {
-        var opt = document.createElement("option");
+        const opt = document.createElement("option");
         opt.value = t.name;
-        var label = t.name;
+        let label = t.name;
         if (t.is_default) label += " (default)";
         if (t.origin === "mcp") label += " [MCP]";
         opt.textContent = label;
@@ -3465,22 +3465,20 @@ function showNewWsModal(forkFromWsId) {
     });
 
   document.getElementById("new-ws-name").value = "";
-  var initEl = document.getElementById("new-ws-initial-message");
+  const initEl = document.getElementById("new-ws-initial-message");
   if (initEl) initEl.value = "";
-  var errEl = document.getElementById("new-ws-error");
+  const errEl = document.getElementById("new-ws-error");
   errEl.style.display = "none";
   errEl.textContent = "";
-  var submitBtn = document.getElementById("new-ws-submit");
   submitBtn.disabled = false;
-  submitBtn.textContent = _forkFromWsId ? "Fork" : "Create";
 
   // Reset attachment staging.  Forks don't carry attachments —
   // disable the attach UI in that case (the fork inherits its
   // parent's history; new attachments go on the next manual send).
   _newWsStagedFiles = [];
-  var attachRow = document.getElementById("new-ws-attach-row");
-  var attachInput = document.getElementById("new-ws-attach-input");
-  var attachBtn = document.getElementById("new-ws-attach-btn");
+  const attachRow = document.getElementById("new-ws-attach-row");
+  const attachInput = document.getElementById("new-ws-attach-input");
+  const attachBtn = document.getElementById("new-ws-attach-btn");
   if (attachRow) attachRow.style.display = _forkFromWsId ? "none" : "";
   if (attachInput) attachInput.value = "";
   _newWsRenderChips();
@@ -3515,12 +3513,12 @@ function showNewWsModal(forkFromWsId) {
       return;
     }
     if (e.key !== "Tab") return;
-    var box = document.getElementById("new-ws-box");
-    var focusable = box.querySelectorAll(
+    const box = document.getElementById("new-ws-box");
+    const focusable = box.querySelectorAll(
       'input, select, button, [tabindex]:not([tabindex="-1"])',
     );
     if (!focusable.length) return;
-    var first = focusable[0],
+    const first = focusable[0],
       last = focusable[focusable.length - 1];
     if (e.shiftKey) {
       if (document.activeElement === first) {
@@ -3552,18 +3550,20 @@ function hideNewWsModal() {
 }
 
 function submitNewWs() {
-  var submitBtn = document.getElementById("new-ws-submit");
+  const submitBtn = document.getElementById("new-ws-submit");
   if (submitBtn.disabled) return;
   submitBtn.disabled = true;
   submitBtn.textContent = _forkFromWsId ? "Forking\u2026" : "Creating\u2026";
 
-  var body = {};
-  var name = document.getElementById("new-ws-name").value.trim();
-  var model = document.getElementById("new-ws-model").value.trim();
-  var judge_model = document.getElementById("new-ws-judge-model").value.trim();
-  var skill = document.getElementById("new-ws-skill").value;
-  var initEl = document.getElementById("new-ws-initial-message");
-  var initial_message = initEl ? initEl.value.trim() : "";
+  const body = {};
+  const name = document.getElementById("new-ws-name").value.trim();
+  const model = document.getElementById("new-ws-model").value.trim();
+  const judge_model = document
+    .getElementById("new-ws-judge-model")
+    .value.trim();
+  const skill = document.getElementById("new-ws-skill").value;
+  const initEl = document.getElementById("new-ws-initial-message");
+  const initial_message = initEl ? initEl.value.trim() : "";
   if (name) body.name = name;
   if (model) body.model = model;
   if (judge_model) body.judge_model = judge_model;
@@ -3571,15 +3571,15 @@ function submitNewWs() {
   if (_forkFromWsId) body.resume_ws = _forkFromWsId;
   if (initial_message) body.initial_message = initial_message;
 
-  var errEl = document.getElementById("new-ws-error");
+  const errEl = document.getElementById("new-ws-error");
   errEl.style.display = "none";
 
-  var fetchOpts;
-  var staged = _forkFromWsId ? [] : _newWsStagedFiles.slice();
+  let fetchOpts;
+  const staged = _forkFromWsId ? [] : _newWsStagedFiles.slice();
   if (staged.length > 0) {
-    var form = new FormData();
+    const form = new FormData();
     form.append("meta", JSON.stringify(body));
-    for (var i = 0; i < staged.length; i++) {
+    for (let i = 0; i < staged.length; i++) {
       form.append("file", staged[i], staged[i].name);
     }
     // Don't set Content-Type — the browser adds the correct boundary.
@@ -3622,16 +3622,16 @@ function submitNewWs() {
 }
 
 function _reassignPanesForClosedWs(closedWsId, tabIdsBeforeClose) {
-  var remaining = Object.keys(workstreams);
+  const remaining = Object.keys(workstreams);
   // Collect panes showing the closed ws
-  var affected = [];
-  for (var pid in panes) {
+  const affected = [];
+  for (let pid in panes) {
     if (panes[pid].wsId === closedWsId) affected.push(pid);
   }
   if (!affected.length) return;
 
   // Determine target ws based on close_tab_action setting
-  var action = "last_used";
+  let action = "last_used";
   try {
     action =
       localStorage.getItem("turnstone_interface.close_tab_action") ||
@@ -3640,8 +3640,8 @@ function _reassignPanesForClosedWs(closedWsId, tabIdsBeforeClose) {
 
   if (action === "dashboard" && remaining.length > 0) {
     // Show dashboard, but still need to reassign panes to valid ws
-    for (var di = 0; di < affected.length; di++) {
-      var dp = panes[affected[di]];
+    for (let di = 0; di < affected.length; di++) {
+      const dp = panes[affected[di]];
       dp.disconnectSSE();
       if (remaining.length) {
         dp.wsId = remaining[0];
@@ -3661,7 +3661,7 @@ function _reassignPanesForClosedWs(closedWsId, tabIdsBeforeClose) {
   }
 
   // Determine preferred target ws_id
-  var preferredWsId = null;
+  let preferredWsId = null;
   if (action === "last_used") {
     if (
       _lastActiveWsId &&
@@ -3671,18 +3671,18 @@ function _reassignPanesForClosedWs(closedWsId, tabIdsBeforeClose) {
       preferredWsId = _lastActiveWsId;
     }
   } else if (action === "nearest_left" || action === "nearest_right") {
-    var idx = tabIdsBeforeClose ? tabIdsBeforeClose.indexOf(closedWsId) : -1;
+    const idx = tabIdsBeforeClose ? tabIdsBeforeClose.indexOf(closedWsId) : -1;
     if (idx >= 0) {
       if (action === "nearest_left") {
         // Walk left, then right
-        for (var li = idx - 1; li >= 0; li--) {
+        for (let li = idx - 1; li >= 0; li--) {
           if (workstreams[tabIdsBeforeClose[li]]) {
             preferredWsId = tabIdsBeforeClose[li];
             break;
           }
         }
         if (!preferredWsId) {
-          for (var ri = idx + 1; ri < tabIdsBeforeClose.length; ri++) {
+          for (let ri = idx + 1; ri < tabIdsBeforeClose.length; ri++) {
             if (workstreams[tabIdsBeforeClose[ri]]) {
               preferredWsId = tabIdsBeforeClose[ri];
               break;
@@ -3691,14 +3691,14 @@ function _reassignPanesForClosedWs(closedWsId, tabIdsBeforeClose) {
         }
       } else {
         // Walk right, then left
-        for (var ri2 = idx + 1; ri2 < tabIdsBeforeClose.length; ri2++) {
+        for (let ri2 = idx + 1; ri2 < tabIdsBeforeClose.length; ri2++) {
           if (workstreams[tabIdsBeforeClose[ri2]]) {
             preferredWsId = tabIdsBeforeClose[ri2];
             break;
           }
         }
         if (!preferredWsId) {
-          for (var li2 = idx - 1; li2 >= 0; li2--) {
+          for (let li2 = idx - 1; li2 >= 0; li2--) {
             if (workstreams[tabIdsBeforeClose[li2]]) {
               preferredWsId = tabIdsBeforeClose[li2];
               break;
@@ -3710,19 +3710,19 @@ function _reassignPanesForClosedWs(closedWsId, tabIdsBeforeClose) {
   }
 
   // Build set of ws_ids already shown by non-affected panes
-  var usedWsIds = {};
-  for (var pid2 in panes) {
+  const usedWsIds = {};
+  for (let pid2 in panes) {
     if (affected.indexOf(pid2) === -1) usedWsIds[panes[pid2].wsId] = true;
   }
 
-  for (var i = 0; i < affected.length; i++) {
-    var p = panes[affected[i]];
+  for (let i = 0; i < affected.length; i++) {
+    const p = panes[affected[i]];
     // Try the preferred ws first, then fall back to first unused
-    var newWsId = null;
+    let newWsId = null;
     if (preferredWsId && !usedWsIds[preferredWsId]) {
       newWsId = preferredWsId;
     } else {
-      for (var j = 0; j < remaining.length; j++) {
+      for (let j = 0; j < remaining.length; j++) {
         if (!usedWsIds[remaining[j]]) {
           newWsId = remaining[j];
           break;
@@ -3764,7 +3764,7 @@ function _reassignPanesForClosedWs(closedWsId, tabIdsBeforeClose) {
 
 function closeWorkstream(wsId) {
   // Capture tab order from DOM (visual order) before deletion for close_tab_action=nearest_left/right
-  var tabIdsBeforeClose = Array.from(
+  const tabIdsBeforeClose = Array.from(
     document.querySelectorAll("#tab-list .ws-tab"),
   ).map(function (tab) {
     return tab.dataset.wsId;
@@ -3783,7 +3783,7 @@ function closeWorkstream(wsId) {
         delete workstreams[wsId];
         renderTabBar();
         _reassignPanesForClosedWs(wsId, tabIdsBeforeClose);
-        var remaining = Object.keys(workstreams);
+        const remaining = Object.keys(workstreams);
         if (remaining.length === 0) {
           loadDashboard();
           showDashboard();
@@ -3826,7 +3826,7 @@ function hideDashboard() {
   _dashboardStagedFiles = [];
   _renderDashboardChips();
   _refreshDashboardSubmitLabel();
-  var pane = getFocusedPane();
+  const pane = getFocusedPane();
   if (pane) pane.inputEl.focus();
 }
 
@@ -3836,28 +3836,28 @@ function toggleDashboard() {
 }
 
 function loadDashboard() {
-  var tableEl = document.getElementById("dash-ws-table");
+  const tableEl = document.getElementById("dash-ws-table");
   tableEl.replaceChildren(makeEmptyState("Loading\u2026"));
   document
     .getElementById("dashboard-saved-cards")
     .replaceChildren(makeEmptyState("Loading\u2026"));
-  var dashP = authFetch("/v1/api/dashboard").then(function (r) {
+  const dashP = authFetch("/v1/api/dashboard").then(function (r) {
     return r.json();
   });
-  var sessP = authFetch("/v1/api/workstreams/saved").then(function (r) {
+  const sessP = authFetch("/v1/api/workstreams/saved").then(function (r) {
     return r.json();
   });
   Promise.all([dashP, sessP])
     .then(function (res) {
-      var dashData = res[0];
-      var wsList = dashData.workstreams || [];
-      var agg = dashData.aggregate || {};
+      const dashData = res[0];
+      const wsList = dashData.workstreams || [];
+      const agg = dashData.aggregate || {};
       renderDashboardTable(wsList, agg);
-      var activeWsIds = {};
+      const activeWsIds = {};
       wsList.forEach(function (ws) {
         activeWsIds[ws.ws_id] = true;
       });
-      var savedList = (res[1].workstreams || []).filter(function (s) {
+      const savedList = (res[1].workstreams || []).filter(function (s) {
         return !activeWsIds[s.ws_id];
       });
       renderSavedWorkstreams(savedList);
@@ -3871,12 +3871,12 @@ function loadDashboard() {
 }
 
 function renderDashboardTable(wsList, agg) {
-  var activeCount = wsList.filter(function (w) {
+  const activeCount = wsList.filter(function (w) {
     return w.state !== "idle";
   }).length;
   document.getElementById("dash-summary").textContent =
     activeCount + " active \u00b7 " + wsList.length + " total";
-  var table = document.getElementById("dash-ws-table");
+  const table = document.getElementById("dash-ws-table");
   table.replaceChildren();
   if (!wsList.length) {
     table.replaceChildren(makeEmptyState("No active workstreams"));
@@ -3884,23 +3884,23 @@ function renderDashboardTable(wsList, agg) {
     return;
   }
   wsList.forEach(function (ws) {
-    var liveState =
+    const liveState =
       (workstreams[ws.ws_id] && workstreams[ws.ws_id].state) ||
       ws.state ||
       "idle";
-    var liveName =
+    const liveName =
       (workstreams[ws.ws_id] && workstreams[ws.ws_id].name) ||
       ws.name ||
       ws.ws_id;
-    var sd = STATE_DISPLAY[liveState] || STATE_DISPLAY.idle;
+    const sd = STATE_DISPLAY[liveState] || STATE_DISPLAY.idle;
 
-    var row = document.createElement("div");
+    const row = document.createElement("div");
     row.className = "dash-row";
     row.dataset.wsId = ws.ws_id;
     row.dataset.state = liveState;
     row.setAttribute("role", "button");
     row.setAttribute("tabindex", "0");
-    var ariaLabel = liveName + " \u2014 " + sd.label;
+    let ariaLabel = liveName + " \u2014 " + sd.label;
     if (ws.model_alias || ws.model)
       ariaLabel += ", model: " + (ws.model_alias || ws.model);
     if (ws.title) ariaLabel += ", task: " + ws.title;
@@ -3909,50 +3909,50 @@ function renderDashboardTable(wsList, agg) {
       ariaLabel += ", " + Math.round(ws.context_ratio * 100) + "% context";
     row.setAttribute("aria-label", ariaLabel);
 
-    var main = document.createElement("div");
+    const main = document.createElement("div");
     main.className = "dash-row-main";
 
-    var stateCell = document.createElement("span");
+    const stateCell = document.createElement("span");
     stateCell.className = "dash-cell-state";
-    var stateDot = document.createElement("span");
+    const stateDot = document.createElement("span");
     stateDot.className = "dash-state-dot";
     stateDot.setAttribute("data-state", liveState);
     stateDot.setAttribute("aria-hidden", "true");
-    var stateLabel = document.createElement("span");
+    const stateLabel = document.createElement("span");
     stateLabel.className = "dash-state-label";
     stateLabel.setAttribute("data-state", liveState);
     stateLabel.textContent = sd.symbol + " " + sd.label;
     stateCell.append(stateDot, stateLabel);
     main.appendChild(stateCell);
 
-    var nameCell = document.createElement("span");
+    const nameCell = document.createElement("span");
     nameCell.className = "dash-cell-name";
     nameCell.textContent = liveName;
     main.appendChild(nameCell);
 
-    var modelCell = document.createElement("span");
+    const modelCell = document.createElement("span");
     modelCell.className = "dash-cell-model";
     modelCell.textContent = ws.model_alias || ws.model || "";
     if (ws.model) modelCell.title = ws.model;
     main.appendChild(modelCell);
 
-    var nodeCell = document.createElement("span");
+    const nodeCell = document.createElement("span");
     nodeCell.className = "dash-cell-node";
     nodeCell.textContent = ws.node || "local";
     if (ws.node) nodeCell.title = ws.node;
     main.appendChild(nodeCell);
 
-    var taskCell = document.createElement("span");
+    const taskCell = document.createElement("span");
     taskCell.className = "dash-cell-task";
     taskCell.textContent = ws.title || "";
     main.appendChild(taskCell);
 
-    var tokensCell = document.createElement("span");
+    const tokensCell = document.createElement("span");
     tokensCell.className = "dash-cell-tokens";
     tokensCell.textContent = ws.tokens ? formatTokens(ws.tokens) : "";
     main.appendChild(tokensCell);
 
-    var ctxCell = document.createElement("span");
+    const ctxCell = document.createElement("span");
     ctxCell.className = "dash-cell-ctx " + ctxClass(ws.context_ratio);
     ctxCell.textContent =
       ws.context_ratio > 0 ? Math.round(ws.context_ratio * 100) + "%" : "";
@@ -3960,7 +3960,7 @@ function renderDashboardTable(wsList, agg) {
 
     row.appendChild(main);
 
-    var sub = document.createElement("div");
+    const sub = document.createElement("div");
     sub.className = "dash-row-sub";
     if (ws.activity_state === "approval") sub.classList.add("sub-attention");
     sub.textContent = ws.activity || "";
@@ -3982,8 +3982,8 @@ function renderDashboardTable(wsList, agg) {
   table.onkeydown = function (e) {
     if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
     e.preventDefault();
-    var rows = Array.from(table.querySelectorAll(".dash-row"));
-    var idx = rows.indexOf(document.activeElement);
+    const rows = Array.from(table.querySelectorAll(".dash-row"));
+    const idx = rows.indexOf(document.activeElement);
     if (idx === -1) return;
     if (e.key === "ArrowDown" && idx < rows.length - 1) rows[idx + 1].focus();
     if (e.key === "ArrowUp" && idx > 0) rows[idx - 1].focus();
@@ -3992,15 +3992,15 @@ function renderDashboardTable(wsList, agg) {
 
 function updateDashFooter(agg) {
   if (!agg) return;
-  var nodesEl = document.getElementById("dash-footer-nodes");
-  var statsEl = document.getElementById("dash-footer-stats");
-  var footerDot = document.createElement("span");
+  const nodesEl = document.getElementById("dash-footer-nodes");
+  const statsEl = document.getElementById("dash-footer-stats");
+  const footerDot = document.createElement("span");
   footerDot.className = "dash-footer-node-dot";
   nodesEl.replaceChildren(
     footerDot,
     " " + (agg.node || "local") + " (" + (agg.total_count || 0) + " ws)",
   );
-  var parts = [];
+  const parts = [];
   if (agg.total_tokens) parts.push(formatTokens(agg.total_tokens) + " tokens");
   if (agg.total_tool_calls) parts.push(agg.total_tool_calls + " tool calls");
   if (agg.uptime_seconds)
@@ -4015,8 +4015,8 @@ function updateDashFooter(agg) {
 // controller (from /shared/cards.js) owns mode state, checkbox
 // decoration, the toolbar wiring, and the confirmation modal — see
 // createSavedCardsController for the shared bits.
-var _wsSavedItems = [];
-var _wsDeleteController = createSavedCardsController({
+let _wsSavedItems = [];
+const _wsDeleteController = createSavedCardsController({
   idPrefix: "ws-delete",
   buttonId: "ws-delete-btn",
   noun: "workstream",
@@ -4040,17 +4040,17 @@ var _wsDeleteController = createSavedCardsController({
 function renderSavedWorkstreams(items) {
   _wsSavedItems = items;
   _wsDeleteController.setItems(items);
-  var c = document.getElementById("dashboard-saved-cards");
+  const c = document.getElementById("dashboard-saved-cards");
   c.replaceChildren();
   if (!items.length) {
-    var empty = document.createElement("div");
+    const empty = document.createElement("div");
     empty.className = "dashboard-empty";
     empty.textContent = "No saved workstreams";
     c.appendChild(empty);
     return;
   }
   items.forEach(function (sess) {
-    var card = renderSessionCard(sess, {
+    const card = renderSessionCard(sess, {
       ariaLabel: _wsDeleteController.ariaLabel,
       onActivate: function (s) {
         if (_wsDeleteController.blockActivate()) return;
@@ -4087,13 +4087,13 @@ function confirmWsDelete() {
 
 // --- Workstream title management ---
 
-var _lastActiveWsId = null;
+let _lastActiveWsId = null;
 
 function refreshWorkstreamTitle(optWsId) {
-  var wsId = optWsId || getCurrentWsId();
+  const wsId = optWsId || getCurrentWsId();
   if (!wsId) return;
 
-  var url =
+  const url =
     "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/refresh-title";
 
   authFetch(url, { method: "POST" })
@@ -4110,19 +4110,19 @@ function refreshWorkstreamTitle(optWsId) {
     });
 }
 
-var _editTitleTrap = null;
+let _editTitleTrap = null;
 
 function editWorkstreamTitle(optWsId) {
-  var wsId = optWsId || getCurrentWsId();
+  const wsId = optWsId || getCurrentWsId();
   if (!wsId) return;
-  var currentTitle = "";
-  var tabEl = document.querySelector(
+  let currentTitle = "";
+  const tabEl = document.querySelector(
     '.ws-tab[data-ws-id="' + wsId + '"] .tab-name',
   );
   if (tabEl) currentTitle = tabEl.textContent.trim();
 
-  var overlay = document.getElementById("edit-title-overlay");
-  var input = document.getElementById("edit-title-input");
+  const overlay = document.getElementById("edit-title-overlay");
+  const input = document.getElementById("edit-title-input");
   input.value = currentTitle;
   overlay.style.display = "flex";
   overlay.onclick = function (e) {
@@ -4138,10 +4138,10 @@ function editWorkstreamTitle(optWsId) {
       return;
     }
     if (e.key === "Tab") {
-      var box = document.getElementById("edit-title-box");
-      var focusable = box.querySelectorAll("input, button");
-      var first = focusable[0];
-      var last = focusable[focusable.length - 1];
+      const box = document.getElementById("edit-title-box");
+      const focusable = box.querySelectorAll("input, button");
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
       if (e.shiftKey && document.activeElement === first) {
         e.preventDefault();
         last.focus();
@@ -4165,21 +4165,21 @@ function cancelEditTitle() {
     document.removeEventListener("keydown", _editTitleTrap);
     _editTitleTrap = null;
   }
-  var chevron = document.querySelector(".ws-tab.active .tab-chevron");
+  const chevron = document.querySelector(".ws-tab.active .tab-chevron");
   if (chevron) chevron.focus();
 }
 
 function submitEditTitle() {
-  var wsId = getCurrentWsId();
+  const wsId = getCurrentWsId();
   if (!wsId) return;
-  var input = document.getElementById("edit-title-input");
-  var newTitle = input.value.trim();
+  const input = document.getElementById("edit-title-input");
+  const newTitle = input.value.trim();
   if (!newTitle) {
     showToast("Title cannot be empty", "warning");
     return;
   }
 
-  var url = "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/title";
+  const url = "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/title";
 
   authFetch(url, {
     method: "POST",
@@ -4193,7 +4193,7 @@ function submitEditTitle() {
     .then(function (data) {
       cancelEditTitle();
       // Optimistic update — SSE ws_rename will confirm
-      var nameEls = document.querySelectorAll(
+      const nameEls = document.querySelectorAll(
         '[data-ws-id="' + wsId + '"] .tab-name',
       );
       nameEls.forEach(function (el) {
@@ -4209,21 +4209,21 @@ function submitEditTitle() {
 
 // --- Workstream deletion ---
 
-var _pendingDeleteWsId = null;
-var _deleteWsTrap = null;
+let _pendingDeleteWsId = null;
+let _deleteWsTrap = null;
 
 function confirmDeleteWorkstream(optWsId) {
-  var wsId = optWsId || getCurrentWsId();
+  const wsId = optWsId || getCurrentWsId();
   if (!wsId) return;
   if (Object.keys(workstreams).length <= 1) return;
-  var tabEl = document.querySelector(
+  const tabEl = document.querySelector(
     '.ws-tab[data-ws-id="' + wsId + '"] .tab-name',
   );
-  var name = tabEl ? tabEl.textContent.trim() : wsId.substring(0, 12);
+  const name = tabEl ? tabEl.textContent.trim() : wsId.substring(0, 12);
 
   _pendingDeleteWsId = wsId;
-  var overlay = document.getElementById("delete-ws-overlay");
-  var msg = document.getElementById("delete-ws-message");
+  const overlay = document.getElementById("delete-ws-overlay");
+  const msg = document.getElementById("delete-ws-message");
   msg.textContent = 'Delete "' + name + '"? This cannot be undone.';
   overlay.style.display = "flex";
 
@@ -4236,10 +4236,10 @@ function confirmDeleteWorkstream(optWsId) {
       return;
     }
     if (e.key === "Tab") {
-      var box = document.getElementById("delete-ws-box");
-      var focusable = box.querySelectorAll("button");
-      var first = focusable[0];
-      var last = focusable[focusable.length - 1];
+      const box = document.getElementById("delete-ws-box");
+      const focusable = box.querySelectorAll("button");
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
       if (e.shiftKey && document.activeElement === first) {
         e.preventDefault();
         last.focus();
@@ -4251,7 +4251,7 @@ function confirmDeleteWorkstream(optWsId) {
   };
   document.addEventListener("keydown", _deleteWsTrap);
 
-  var cancelBtn = overlay.querySelector("button");
+  const cancelBtn = overlay.querySelector("button");
   if (cancelBtn) cancelBtn.focus();
 }
 
@@ -4262,21 +4262,21 @@ function cancelDeleteWs() {
     document.removeEventListener("keydown", _deleteWsTrap);
     _deleteWsTrap = null;
   }
-  var chevron = document.querySelector(".ws-tab.active .tab-chevron");
+  const chevron = document.querySelector(".ws-tab.active .tab-chevron");
   if (chevron) {
     chevron.focus();
   } else {
-    var fallback = document.getElementById("new-tab-btn");
+    const fallback = document.getElementById("new-tab-btn");
     if (fallback) fallback.focus();
   }
 }
 
 function executeDeleteWs() {
-  var wsId = _pendingDeleteWsId;
+  const wsId = _pendingDeleteWsId;
   if (!wsId) return;
   cancelDeleteWs();
 
-  var url = "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/delete";
+  const url = "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/delete";
 
   authFetch(url, { method: "POST" })
     .then(function (r) {
@@ -4302,13 +4302,13 @@ function executeDeleteWs() {
 }
 
 function getCurrentWsId() {
-  var activeTab = document.querySelector(".ws-tab.active");
+  const activeTab = document.querySelector(".ws-tab.active");
   if (activeTab) return activeTab.dataset.wsId || "";
   return "";
 }
 
 function forkWorkstream(optWsId) {
-  var wsId = optWsId || getCurrentWsId();
+  const wsId = optWsId || getCurrentWsId();
   if (!wsId) return;
   showNewWsModal(wsId);
 }
@@ -4345,33 +4345,33 @@ function dashboardResumeSession(wsId) {
 // Staged files for the dashboard composer. Reuses the same file-list pattern
 // as the new-workstream modal but lives independently so the two flows don't
 // stomp on each other's state.
-var _dashboardStagedFiles = [];
+let _dashboardStagedFiles = [];
 
 // Per-kind size caps mirrored from turnstone/core/attachments.py — keep in sync.
-var _DASH_IMAGE_CAP = 4 * 1024 * 1024;
-var _DASH_TEXT_CAP = 512 * 1024;
-var _DASH_MAX_FILES = 10;
+const _DASH_IMAGE_CAP = 4 * 1024 * 1024;
+const _DASH_TEXT_CAP = 512 * 1024;
+const _DASH_MAX_FILES = 10;
 
 function _renderDashboardChips() {
-  var chipsEl = document.getElementById("dashboard-attach-chips");
+  const chipsEl = document.getElementById("dashboard-attach-chips");
   if (!chipsEl) return;
   chipsEl.textContent = "";
-  for (var i = 0; i < _dashboardStagedFiles.length; i++) {
+  for (let i = 0; i < _dashboardStagedFiles.length; i++) {
     (function (idx) {
-      var f = _dashboardStagedFiles[idx];
-      var chip = document.createElement("span");
+      const f = _dashboardStagedFiles[idx];
+      const chip = document.createElement("span");
       chip.className = "new-ws-attach-chip";
       chip.setAttribute("role", "listitem");
-      var label = document.createElement("span");
+      const label = document.createElement("span");
       label.className = "new-ws-attach-chip-name";
       label.textContent = f.name;
       label.title = f.name + " (" + f.size + " bytes)";
       chip.appendChild(label);
-      var size = document.createElement("span");
+      const size = document.createElement("span");
       size.className = "new-ws-attach-chip-size";
       size.textContent = _formatAttachSize(f.size);
       chip.appendChild(size);
-      var rm = document.createElement("button");
+      const rm = document.createElement("button");
       rm.type = "button";
       rm.className = "new-ws-attach-chip-remove";
       rm.setAttribute("aria-label", "Remove " + f.name);
@@ -4388,8 +4388,8 @@ function _renderDashboardChips() {
 }
 
 function _addDashboardFiles(files) {
-  for (var i = 0; i < files.length; i++) {
-    var f = files[i];
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
     if (_dashboardStagedFiles.length >= _DASH_MAX_FILES) {
       _dashboardError(
         "At most " + _DASH_MAX_FILES + " attachments per workstream",
@@ -4406,8 +4406,8 @@ function _addDashboardFiles(files) {
       );
       return;
     }
-    var isImage = (f.type || "").indexOf("image/") === 0;
-    var cap = isImage ? _DASH_IMAGE_CAP : _DASH_TEXT_CAP;
+    const isImage = (f.type || "").indexOf("image/") === 0;
+    const cap = isImage ? _DASH_IMAGE_CAP : _DASH_TEXT_CAP;
     if (f.size > cap) {
       _dashboardError(
         f.name + " exceeds the " + _formatAttachSize(cap) + " cap",
@@ -4420,14 +4420,14 @@ function _addDashboardFiles(files) {
   _refreshDashboardSubmitLabel();
 }
 
-var _dashboardErrorTimer = null;
+let _dashboardErrorTimer = null;
 
 function _dashboardError(msg) {
   // Live-region message + outline.  title= alone is invisible to screen
   // readers and on touch devices, so we surface the message visibly
   // beneath the textarea via aria-live="polite".
-  var input = document.getElementById("dashboard-input");
-  var errEl = document.getElementById("dashboard-error");
+  const input = document.getElementById("dashboard-input");
+  const errEl = document.getElementById("dashboard-error");
   if (errEl) {
     errEl.textContent = msg;
   }
@@ -4443,18 +4443,18 @@ function _dashboardError(msg) {
 }
 
 function _refreshDashboardSubmitLabel() {
-  var btn = document.getElementById("dashboard-submit-btn");
+  const btn = document.getElementById("dashboard-submit-btn");
   if (!btn) return;
-  var input = document.getElementById("dashboard-input");
-  var hasText = input && input.value.trim().length > 0;
-  var hasFiles = _dashboardStagedFiles.length > 0;
+  const input = document.getElementById("dashboard-input");
+  const hasText = input && input.value.trim().length > 0;
+  const hasFiles = _dashboardStagedFiles.length > 0;
   btn.textContent = hasText || hasFiles ? "Send" : "Create";
 }
 
 function _loadDashboardOptionsLists() {
   // Models
-  var modelSel = document.getElementById("dashboard-model");
-  var judgeSel = document.getElementById("dashboard-judge-model");
+  const modelSel = document.getElementById("dashboard-model");
+  const judgeSel = document.getElementById("dashboard-judge-model");
   if (modelSel && modelSel.options.length <= 1) {
     authFetch("/v1/api/models")
       .then(function (r) {
@@ -4462,13 +4462,13 @@ function _loadDashboardOptionsLists() {
       })
       .then(function (data) {
         (data.models || []).forEach(function (m) {
-          var opt = document.createElement("option");
+          const opt = document.createElement("option");
           opt.value = m.alias;
           opt.textContent =
             m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
           modelSel.appendChild(opt);
           if (judgeSel) {
-            var jOpt = document.createElement("option");
+            const jOpt = document.createElement("option");
             jOpt.value = m.alias;
             jOpt.textContent = opt.textContent;
             judgeSel.appendChild(jOpt);
@@ -4480,7 +4480,7 @@ function _loadDashboardOptionsLists() {
       });
   }
   // Skills
-  var skillSel = document.getElementById("dashboard-skill");
+  const skillSel = document.getElementById("dashboard-skill");
   if (skillSel && skillSel.options.length <= 1) {
     authFetch("/v1/api/skills")
       .then(function (r) {
@@ -4488,9 +4488,9 @@ function _loadDashboardOptionsLists() {
       })
       .then(function (data) {
         (data.skills || []).forEach(function (t) {
-          var opt = document.createElement("option");
+          const opt = document.createElement("option");
           opt.value = t.name;
-          var label = t.name;
+          let label = t.name;
           if (t.is_default) label += " (default)";
           if (t.origin === "mcp") label += " [MCP]";
           opt.textContent = label;
@@ -4506,15 +4506,15 @@ function _loadDashboardOptionsLists() {
 // localStorage key for the dashboard composer's Options-panel disclosure
 // state — power users who set non-default model/skill repeatedly want the
 // panel to stay open across reloads instead of clicking it every time.
-var _DASH_OPTIONS_LS_KEY = "turnstone.dashboard.options_open";
+const _DASH_OPTIONS_LS_KEY = "turnstone.dashboard.options_open";
 // In-memory fallback for environments where localStorage throws (private
 // mode, storage quota, embedded WebViews).  null means "no preference
 // recorded this session yet — use the closed default".
-var _dashOptionsOpenSession = null;
+let _dashOptionsOpenSession = null;
 
 function _setDashboardOptionsOpen(open) {
-  var panel = document.getElementById("dashboard-options");
-  var btn = document.getElementById("dashboard-options-btn");
+  const panel = document.getElementById("dashboard-options");
+  const btn = document.getElementById("dashboard-options-btn");
   if (!panel || !btn) return;
   if (open) {
     panel.removeAttribute("hidden");
@@ -4526,9 +4526,9 @@ function _setDashboardOptionsOpen(open) {
 }
 
 function _toggleDashboardOptions() {
-  var panel = document.getElementById("dashboard-options");
+  const panel = document.getElementById("dashboard-options");
   if (!panel) return;
-  var nextOpen = panel.hasAttribute("hidden");
+  const nextOpen = panel.hasAttribute("hidden");
   _setDashboardOptionsOpen(nextOpen);
   _dashOptionsOpenSession = nextOpen;
   try {
@@ -4544,14 +4544,14 @@ function _restoreDashboardOptionsState() {
   // → closed default.  Only override based on a genuinely-successful
   // localStorage read; on throw, fall back to the session value so the
   // panel stays where the user last put it within the same tab.
-  var saved = null;
-  var lsAvailable = true;
+  let saved = null;
+  let lsAvailable = true;
   try {
     saved = localStorage.getItem(_DASH_OPTIONS_LS_KEY);
   } catch (_) {
     lsAvailable = false;
   }
-  var open;
+  let open;
   if (lsAvailable && saved !== null) {
     open = saved === "1";
   } else if (_dashOptionsOpenSession !== null) {
@@ -4567,12 +4567,12 @@ function _restoreDashboardOptionsState() {
 // glance that they've overridden defaults — without having to expand
 // the panel.  Hidden when everything is default.
 function _refreshDashboardOptionsSummary() {
-  var summary = document.getElementById("dashboard-options-summary");
+  const summary = document.getElementById("dashboard-options-summary");
   if (!summary) return;
-  var bits = [];
-  var modelSel = document.getElementById("dashboard-model");
-  var judgeSel = document.getElementById("dashboard-judge-model");
-  var skillSel = document.getElementById("dashboard-skill");
+  const bits = [];
+  const modelSel = document.getElementById("dashboard-model");
+  const judgeSel = document.getElementById("dashboard-judge-model");
+  const skillSel = document.getElementById("dashboard-skill");
   if (modelSel && modelSel.value) bits.push(modelSel.value);
   if (judgeSel && judgeSel.value) bits.push("judge: " + judgeSel.value);
   if (skillSel && skillSel.value) bits.push(skillSel.value);
@@ -4589,15 +4589,15 @@ function _refreshDashboardOptionsSummary() {
 // "press Enter → quick-send-empty-config" split. One path: build the
 // create payload from text + attachments + options, send it, switch.
 function dashboardSubmit() {
-  var input = document.getElementById("dashboard-input");
-  var btn = document.getElementById("dashboard-submit-btn");
-  var text = input.value.trim();
-  var staged = _dashboardStagedFiles.slice();
+  const input = document.getElementById("dashboard-input");
+  const btn = document.getElementById("dashboard-submit-btn");
+  const text = input.value.trim();
+  const staged = _dashboardStagedFiles.slice();
 
-  var body = {};
-  var model = document.getElementById("dashboard-model").value.trim();
-  var judge = document.getElementById("dashboard-judge-model").value.trim();
-  var skill = document.getElementById("dashboard-skill").value;
+  const body = {};
+  const model = document.getElementById("dashboard-model").value.trim();
+  const judge = document.getElementById("dashboard-judge-model").value.trim();
+  const skill = document.getElementById("dashboard-skill").value;
   if (model) body.model = model;
   if (judge) body.judge_model = judge;
   if (skill) body.skill = skill;
@@ -4606,11 +4606,11 @@ function dashboardSubmit() {
   input.disabled = true;
   btn.disabled = true;
 
-  var fetchOpts;
+  let fetchOpts;
   if (staged.length > 0) {
-    var form = new FormData();
+    const form = new FormData();
     form.append("meta", JSON.stringify(body));
-    for (var i = 0; i < staged.length; i++) {
+    for (let i = 0; i < staged.length; i++) {
       form.append("file", staged[i], staged[i].name);
     }
     fetchOpts = { method: "POST", body: form };
@@ -4640,7 +4640,7 @@ function dashboardSubmit() {
       // dispatched it. Echo into the pane so the user sees their own text
       // immediately rather than waiting for SSE to backfill.
       if (text) {
-        var pane = getFocusedPane();
+        const pane = getFocusedPane();
         if (pane) {
           pane.setBusy(true);
           pane.addUserMessage(text);
@@ -4655,7 +4655,7 @@ function dashboardSubmit() {
       // error toast in that case.  Otherwise fall back to a generic
       // string so we never render "Connection error: undefined".
       if (err && err.message === "auth") return;
-      var detail = (err && err.message) || "Unable to reach the server";
+      const detail = (err && err.message) || "Unable to reach the server";
       _dashboardError("Connection error: " + detail);
     });
 }
@@ -4674,7 +4674,7 @@ function connectGlobalSSE() {
     globalRetryDelay = 1000;
   };
   globalEvtSource.onmessage = function (e) {
-    var data = JSON.parse(e.data);
+    const data = JSON.parse(e.data);
     if (data.type === "ws_state") {
       updateTabIndicator(data.ws_id, data.state, {
         tokens: data.tokens,
@@ -4683,11 +4683,11 @@ function connectGlobalSSE() {
         activity_state: data.activity_state,
       });
     } else if (data.type === "ws_activity") {
-      var row = document.querySelector(
+      const row = document.querySelector(
         '#dash-ws-table .dash-row[data-ws-id="' + data.ws_id + '"]',
       );
       if (row) {
-        var sub = row.querySelector(".dash-row-sub");
+        const sub = row.querySelector(".dash-row-sub");
         if (sub) {
           sub.textContent = data.activity || "";
           if (data.activity_state === "approval")
@@ -4698,14 +4698,14 @@ function connectGlobalSSE() {
     } else if (data.type === "ws_rename") {
       if (workstreams[data.ws_id]) workstreams[data.ws_id].name = data.name;
       // Update ALL matching tab elements (not just first one)
-      var nameEls = document.querySelectorAll(
+      const nameEls = document.querySelectorAll(
         '[data-ws-id="' + data.ws_id + '"] .tab-name',
       );
       nameEls.forEach(function (el) {
         el.textContent = data.name;
       });
       // Update all panes showing this workstream
-      for (var id in panes) {
+      for (let id in panes) {
         if (panes[id].wsId === data.ws_id) panes[id].updateWsName();
       }
     } else if (data.type === "ws_created") {
@@ -4714,16 +4714,16 @@ function connectGlobalSSE() {
       workstreams[data.ws_id].state = "idle";
       renderTabBar();
     } else if (data.type === "ws_closed") {
-      var wsId = data.ws_id;
+      const wsId = data.ws_id;
       // Capture tab order from DOM (visual order) before deletion for close_tab_action=nearest_left/right
-      var sseTabIds = Array.from(
+      const sseTabIds = Array.from(
         document.querySelectorAll("#tab-list .ws-tab"),
       ).map(function (tab) {
         return tab.dataset.wsId;
       });
       // Disconnect per-ws SSE on affected panes immediately so stale
       // events from the dying workstream don't leak into reassigned panes.
-      for (var cid in panes) {
+      for (let cid in panes) {
         if (panes[cid].wsId === wsId) panes[cid].disconnectSSE();
       }
       delete workstreams[wsId];
@@ -4771,12 +4771,12 @@ function stripAnsi(s) {
 }
 
 function buildToolDiv(item) {
-  var div = document.createElement("div");
+  const div = document.createElement("div");
   div.className = "ts-approval-tool";
   div.dataset.funcName = item.func_name || "";
   div.dataset.callId = item.call_id || "";
 
-  var name = document.createElement("div");
+  const name = document.createElement("div");
   name.className = "tool-name" + (item.error ? " tool-name--error" : "");
   name.textContent = item.func_name || "";
   // Inline auto-approve indicator — surfaces tools that bypassed the
@@ -4786,21 +4786,21 @@ function buildToolDiv(item) {
   // gives the operator the same signal on the per-ws page they
   // navigated into.
   if (item.auto_approved) {
-    var badge = document.createElement("span");
+    const badge = document.createElement("span");
     badge.className = "tool-auto-approved";
-    var reason = item.auto_approve_reason || "auto_approve_tools";
+    const reason = item.auto_approve_reason || "auto_approve_tools";
     badge.textContent = " auto: " + reason;
     badge.title = "Tool auto-approved (no operator prompt) — reason: " + reason;
     name.appendChild(badge);
   }
   div.appendChild(name);
 
-  var cmd = document.createElement("div");
+  const cmd = document.createElement("div");
   cmd.className = "tool-cmd";
-  var headerText = stripAnsi(item.header || "");
-  var cleaned = headerText.replace(/^[^\s]+\s+\w+:\s*/, "");
+  const headerText = stripAnsi(item.header || "");
+  const cleaned = headerText.replace(/^[^\s]+\s+\w+:\s*/, "");
   if (item.func_name === "bash" && cleaned) {
-    var dollarSpan = document.createElement("span");
+    const dollarSpan = document.createElement("span");
     dollarSpan.className = "dollar";
     dollarSpan.textContent = "$ ";
     cmd.append(dollarSpan, cleaned);
@@ -4810,19 +4810,19 @@ function buildToolDiv(item) {
   div.appendChild(cmd);
 
   if (item.preview) {
-    var diff = document.createElement("div");
+    const diff = document.createElement("div");
     diff.className = "tool-diff";
-    var lines = stripAnsi(item.preview).split("\n");
-    var diffNodes = [];
+    const lines = stripAnsi(item.preview).split("\n");
+    const diffNodes = [];
     lines.forEach(function (line, i) {
       if (i > 0) diffNodes.push("\n");
-      var trimmed = line.trim();
-      var cls = null;
+      const trimmed = line.trim();
+      let cls = null;
       if (trimmed.startsWith("-")) cls = "diff-del";
       else if (trimmed.startsWith("+")) cls = "diff-add";
       else if (trimmed.startsWith("Warning:")) cls = "diff-warn";
       if (cls !== null) {
-        var span = document.createElement("span");
+        const span = document.createElement("span");
         span.className = cls;
         span.textContent = line;
         diffNodes.push(span);
@@ -4839,17 +4839,17 @@ function buildToolDiv(item) {
 
 function renderVerdictBadge(verdict, judgePending) {
   if (!verdict) return "";
-  var risk = verdict.risk_level || "medium";
-  var rec = verdict.recommendation || "review";
-  var conf = Math.round((verdict.confidence || 0) * 100);
-  var summary = verdict.intent_summary || "";
-  var spinnerHtml = "";
+  const risk = verdict.risk_level || "medium";
+  const rec = verdict.recommendation || "review";
+  const conf = Math.round((verdict.confidence || 0) * 100);
+  const summary = verdict.intent_summary || "";
+  let spinnerHtml = "";
   if (judgePending) {
     spinnerHtml =
       '<span class="verdict-judge-spinner">' +
       '<span class="judge-spinner-dot"></span> judge analyzing\u2026</span>';
   }
-  var callId = escapeHtml(verdict.call_id || "");
+  const callId = escapeHtml(verdict.call_id || "");
   return (
     '<div class="verdict-badge verdict-' +
     escapeHtml(risk) +
@@ -4896,10 +4896,10 @@ function renderVerdictBadge(verdict, judgePending) {
 }
 
 function toggleVerdictDetail(btn) {
-  var badge = btn.closest(".verdict-badge");
-  var detail = badge ? badge.nextElementSibling : null;
+  const badge = btn.closest(".verdict-badge");
+  const detail = badge ? badge.nextElementSibling : null;
   if (detail && detail.classList.contains("verdict-detail")) {
-    var isHidden = detail.style.display === "none";
+    const isHidden = detail.style.display === "none";
     detail.style.display = isHidden ? "block" : "none";
     btn.textContent = isHidden ? "hide" : "details";
   }
@@ -4912,7 +4912,7 @@ function toggleVerdictDetail(btn) {
 function appendToolErrorBadge(blockEl) {
   if (!blockEl) return;
   if (blockEl.querySelector(".ts-approval-badge--error")) return;
-  var errBadge = document.createElement("div");
+  const errBadge = document.createElement("div");
   errBadge.setAttribute("role", "status");
   errBadge.className = "ts-approval-badge ts-approval-badge--error";
   errBadge.textContent = "✗ error";
@@ -4924,7 +4924,7 @@ function makeCollapsible(el) {
   el.setAttribute("tabindex", "0");
   el.setAttribute("role", "button");
   el.setAttribute("aria-label", "Tool output (collapsed). Activate to expand.");
-  var handler = function () {
+  const handler = function () {
     this.classList.remove("collapsed");
     this.removeAttribute("tabindex");
     this.removeAttribute("role");
@@ -4944,8 +4944,9 @@ function makeCollapsible(el) {
 // ===========================================================================
 
 function tryParseMedia(text) {
+  let obj;
   try {
-    var obj = JSON.parse(text);
+    obj = JSON.parse(text);
   } catch (e) {
     return null;
   }
@@ -4957,21 +4958,21 @@ function tryParseMedia(text) {
 }
 
 function _formatRuntime(item) {
-  var mins = 0;
+  let mins = 0;
   if (typeof item.runtime_minutes === "number") {
     mins = Math.round(item.runtime_minutes);
   } else if (typeof item.runtime_ticks === "number") {
     mins = Math.round(item.runtime_ticks / 600000000);
   }
   if (!mins) return "";
-  var h = Math.floor(mins / 60);
-  var m = mins % 60;
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
   return h > 0 ? h + "h " + m + "m" : m + "m";
 }
 
 function _redactApiKeys(text) {
   // Query-string style: api_key=VALUE
-  var redacted = text.replace(
+  let redacted = text.replace(
     /(?:api_key|apiKey|api-key|token)=[^&\s"]+/g,
     function (m) {
       return m.split("=")[0] + "=***";
@@ -4990,8 +4991,9 @@ function _redactApiKeys(text) {
  * Returns a formatted string if valid JSON, otherwise null.
  */
 function _tryPrettyJson(text) {
+  let obj;
   try {
-    var obj = JSON.parse(text);
+    obj = JSON.parse(text);
   } catch (e) {
     return null;
   }
@@ -5004,10 +5006,10 @@ function _tryPrettyJson(text) {
  * Otherwise renders as plain text. Always redacts API keys.
  */
 function renderToolOutput(stripped, isError) {
-  var out = document.createElement("div");
+  const out = document.createElement("div");
   out.className = "tool-output" + (isError ? " tool-output-error" : "");
   if (!isError) {
-    var pretty = _tryPrettyJson(stripped);
+    const pretty = _tryPrettyJson(stripped);
     if (pretty) {
       out.textContent = pretty;
       return out;
@@ -5018,11 +5020,11 @@ function renderToolOutput(stripped, isError) {
 }
 
 function buildMediaEmbed(media, rawJson) {
-  var wrapper = document.createElement("div");
+  const wrapper = document.createElement("div");
   wrapper.className = "media-embed";
 
   if (media.stream_url) {
-    var card = buildMediaCard(media);
+    const card = buildMediaCard(media);
     card.querySelector(".media-card-info").appendChild(buildPlayButton(media));
     wrapper.appendChild(card);
   } else if (media.results) {
@@ -5036,7 +5038,7 @@ function buildMediaEmbed(media, rawJson) {
   }
 
   // Collapsed raw JSON for inspection (with redacted API keys)
-  var raw = document.createElement("div");
+  const raw = document.createElement("div");
   raw.className = "tool-output";
   raw.textContent = _tryPrettyJson(rawJson) || _redactApiKeys(rawJson);
   makeCollapsible(raw);
@@ -5046,13 +5048,13 @@ function buildMediaEmbed(media, rawJson) {
 }
 
 function buildMediaCard(item) {
-  var card = document.createElement("div");
+  const card = document.createElement("div");
   card.className = "media-card";
 
   // Thumbnail
-  var thumbUrl = item.thumbnail_url || item.image_url || "";
+  const thumbUrl = item.thumbnail_url || item.image_url || "";
   if (thumbUrl) {
-    var img = document.createElement("img");
+    const img = document.createElement("img");
     img.className = "media-card-thumb";
     img.loading = "lazy";
     img.alt = item.title || item.name || "Media thumbnail";
@@ -5064,13 +5066,13 @@ function buildMediaCard(item) {
   }
 
   // Info container
-  var info = document.createElement("div");
+  const info = document.createElement("div");
   info.className = "media-card-info";
 
   // Title (Year)
-  var title = document.createElement("div");
+  const title = document.createElement("div");
   title.className = "media-card-title";
-  var titleText = item.title || item.name || "Untitled";
+  let titleText = item.title || item.name || "Untitled";
   if (item.year || item.production_year) {
     titleText += " (" + (item.year || item.production_year) + ")";
   }
@@ -5078,17 +5080,17 @@ function buildMediaCard(item) {
   info.appendChild(title);
 
   // Metadata line: type, runtime, genres
-  var metaParts = [];
+  const metaParts = [];
   if (item.type || item.media_type) {
     metaParts.push(item.type || item.media_type);
   }
-  var runtime = _formatRuntime(item);
+  const runtime = _formatRuntime(item);
   if (runtime) metaParts.push(runtime);
   if (item.genres && item.genres.length) {
     metaParts.push(item.genres.join(", "));
   }
   if (metaParts.length) {
-    var meta = document.createElement("div");
+    const meta = document.createElement("div");
     meta.className = "media-card-meta";
     meta.textContent = metaParts.join(" \u00b7 ");
     info.appendChild(meta);
@@ -5099,7 +5101,7 @@ function buildMediaCard(item) {
 }
 
 function buildPlayButton(media) {
-  var btn = document.createElement("button");
+  const btn = document.createElement("button");
   btn.className = "media-play-btn";
   btn.type = "button";
   btn.dataset.streamUrl = media.stream_url || "";
@@ -5120,28 +5122,28 @@ function buildPlayButton(media) {
     "Play " + (media.title || media.name || "media"),
   );
 
-  var icon = document.createElement("span");
+  const icon = document.createElement("span");
   icon.textContent = "\u25b6";
   btn.appendChild(icon);
-  var label = document.createElement("span");
+  const label = document.createElement("span");
   label.textContent = "Play";
   btn.appendChild(label);
   return btn;
 }
 
 function buildMediaResultsList(results, totalCount) {
-  var container = document.createElement("div");
+  const container = document.createElement("div");
   container.className = "media-results-list";
 
-  for (var i = 0; i < results.length; i++) {
-    var item = results[i];
-    var row = document.createElement("div");
+  for (let i = 0; i < results.length; i++) {
+    const item = results[i];
+    const row = document.createElement("div");
     row.className = "media-result-row";
 
     // Small thumbnail
-    var thumbUrl = item.thumbnail_url || item.image_url || "";
+    const thumbUrl = item.thumbnail_url || item.image_url || "";
     if (thumbUrl) {
-      var img = document.createElement("img");
+      const img = document.createElement("img");
       img.className = "media-result-thumb";
       img.loading = "lazy";
       img.alt = item.name || item.title || "Media thumbnail";
@@ -5153,9 +5155,9 @@ function buildMediaResultsList(results, totalCount) {
     }
 
     // Title (Year)
-    var titleSpan = document.createElement("span");
+    const titleSpan = document.createElement("span");
     titleSpan.className = "media-result-title";
-    var titleText = item.name || item.title || "Untitled";
+    let titleText = item.name || item.title || "Untitled";
     if (item.year || item.production_year) {
       titleText += " (" + (item.year || item.production_year) + ")";
     }
@@ -5163,11 +5165,11 @@ function buildMediaResultsList(results, totalCount) {
     row.appendChild(titleSpan);
 
     // Metadata: type, runtime or season info
-    var metaParts = [];
+    const metaParts = [];
     if (item.type || item.media_type) {
       metaParts.push(item.type || item.media_type);
     }
-    var runtime = _formatRuntime(item);
+    const runtime = _formatRuntime(item);
     if (runtime) metaParts.push(runtime);
     if (item.season_name) metaParts.push(item.season_name);
     if (
@@ -5182,7 +5184,7 @@ function buildMediaResultsList(results, totalCount) {
       );
     }
     if (metaParts.length) {
-      var metaSpan = document.createElement("span");
+      const metaSpan = document.createElement("span");
       metaSpan.className = "media-result-meta";
       metaSpan.textContent = " \u00b7 " + metaParts.join(" \u00b7 ");
       row.appendChild(metaSpan);
@@ -5193,7 +5195,7 @@ function buildMediaResultsList(results, totalCount) {
 
   // "showing X of Y results" footer
   if (typeof totalCount === "number" && totalCount > results.length) {
-    var count = document.createElement("div");
+    const count = document.createElement("div");
     count.className = "media-results-count";
     count.textContent =
       "showing " + results.length + " of " + totalCount + " results";
@@ -5210,7 +5212,7 @@ function buildMediaResultsList(results, totalCount) {
 // Module-level set of servers with an unresolved consent prompt; drives the
 // gear-icon badge so the user has a stable signal that re-consent is pending
 // after the inline card scrolls out of view.
-var _pendingConsentServers = new Set();
+const _pendingConsentServers = new Set();
 
 function _onConsentDetected(server) {
   if (typeof server === "string" && server) {
@@ -5240,8 +5242,8 @@ function loadPendingConsents() {
     })
     .then(function (data) {
       if (!data || !Array.isArray(data.servers)) return;
-      for (var i = 0; i < data.servers.length; i++) {
-        var row = data.servers[i];
+      for (let i = 0; i < data.servers.length; i++) {
+        const row = data.servers[i];
         if (row && typeof row.server_name === "string") {
           _pendingConsentServers.add(row.server_name);
         }
@@ -5254,10 +5256,10 @@ function loadPendingConsents() {
 }
 
 function _refreshConsentBadge() {
-  var btn = document.getElementById("settings-btn");
+  const btn = document.getElementById("settings-btn");
   if (!btn) return;
-  var existing = btn.querySelector(".settings-consent-badge");
-  var n = _pendingConsentServers.size;
+  let existing = btn.querySelector(".settings-consent-badge");
+  const n = _pendingConsentServers.size;
   // Keep the visible badge and the accessible name in lockstep so screen-
   // reader users get the same pending-consent signal that sighted users
   // get from the red dot. The badge itself stays aria-hidden because the
@@ -5275,7 +5277,7 @@ function _refreshConsentBadge() {
     btn.appendChild(existing);
   }
   existing.textContent = String(n);
-  var label =
+  const label =
     "Settings (" + n + " MCP consent" + (n === 1 ? "" : "s") + " pending)";
   btn.setAttribute("aria-label", label);
   btn.setAttribute("title", label);
@@ -5291,13 +5293,14 @@ function _refreshConsentBadge() {
  *   - mcp_oauth_url_insecure (operator action)
  */
 function tryParseMcpError(text) {
+  let obj;
   try {
-    var obj = JSON.parse(text);
+    obj = JSON.parse(text);
   } catch (e) {
     return null;
   }
   if (!obj || typeof obj !== "object") return null;
-  var err = obj.error;
+  const err = obj.error;
   if (!err || typeof err !== "object") return null;
   if (typeof err.code !== "string" || err.code.indexOf("mcp_") !== 0)
     return null;
@@ -5337,47 +5340,47 @@ function _mcpErrorTitle(err) {
  * media-embed pattern: visible card on top, collapsible raw JSON below.
  */
 function buildMcpErrorEmbed(err, rawJson) {
-  var category = _mcpErrorCategory(err.code);
-  var wrapper = document.createElement("div");
+  const category = _mcpErrorCategory(err.code);
+  const wrapper = document.createElement("div");
   wrapper.className = "mcp-error-card mcp-error-" + category;
 
-  var icon = document.createElement("div");
+  const icon = document.createElement("div");
   icon.className = "mcp-error-icon";
   icon.setAttribute("aria-hidden", "true");
   icon.textContent = "⚠";
   wrapper.appendChild(icon);
 
-  var body = document.createElement("div");
+  const body = document.createElement("div");
   body.className = "mcp-error-body";
 
-  var title = document.createElement("div");
+  const title = document.createElement("div");
   title.className = "mcp-error-title";
   title.textContent = _mcpErrorTitle(err);
   body.appendChild(title);
 
   if (err.detail) {
-    var detail = document.createElement("div");
+    const detail = document.createElement("div");
     detail.className = "mcp-error-detail";
     detail.textContent = String(err.detail);
     body.appendChild(detail);
   }
 
   if (err.server) {
-    var serverLine = document.createElement("div");
+    const serverLine = document.createElement("div");
     serverLine.className = "mcp-error-server";
     serverLine.appendChild(document.createTextNode("server: "));
-    var serverCode = document.createElement("code");
+    const serverCode = document.createElement("code");
     serverCode.textContent = String(err.server);
     serverLine.appendChild(serverCode);
     body.appendChild(serverLine);
   }
 
   if (Array.isArray(err.scopes_required) && err.scopes_required.length) {
-    var scopesLine = document.createElement("div");
+    const scopesLine = document.createElement("div");
     scopesLine.className = "mcp-error-scopes";
     scopesLine.appendChild(document.createTextNode("scopes: "));
-    for (var i = 0; i < err.scopes_required.length; i++) {
-      var pill = document.createElement("span");
+    for (let i = 0; i < err.scopes_required.length; i++) {
+      const pill = document.createElement("span");
       pill.className = "mcp-scope-pill";
       pill.textContent = String(err.scopes_required[i]);
       scopesLine.appendChild(pill);
@@ -5386,10 +5389,10 @@ function buildMcpErrorEmbed(err, rawJson) {
   }
 
   if (category === "actionable") {
-    var btn = document.createElement("button");
+    const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "mcp-error-action-btn";
-    var serverLabel = err.server ? String(err.server) : "server";
+    const serverLabel = err.server ? String(err.server) : "server";
     btn.textContent =
       err.code === "mcp_insufficient_scope"
         ? "Re-consent with new scopes →"
@@ -5401,7 +5404,7 @@ function buildMcpErrorEmbed(err, rawJson) {
         : "Connect to " + serverLabel,
     );
     btn.addEventListener("click", function () {
-      var consentUrl = err.consent_url;
+      const consentUrl = err.consent_url;
       if (!consentUrl || typeof consentUrl !== "string") {
         // Defensive: should always be present per the dispatcher.  If a
         // path forgets to include it the user can still connect via the
@@ -5419,8 +5422,8 @@ function buildMcpErrorEmbed(err, rawJson) {
         showToast("Invalid consent URL");
         return;
       }
-      var sep = consentUrl.indexOf("?") >= 0 ? "&" : "?";
-      var url =
+      const sep = consentUrl.indexOf("?") >= 0 ? "&" : "?";
+      const url =
         consentUrl +
         sep +
         "return_url=" +
@@ -5433,11 +5436,11 @@ function buildMcpErrorEmbed(err, rawJson) {
 
   wrapper.appendChild(body);
 
-  var details = document.createElement("details");
-  var summary = document.createElement("summary");
+  const details = document.createElement("details");
+  const summary = document.createElement("summary");
   summary.textContent = "raw payload";
   details.appendChild(summary);
-  var pre = document.createElement("pre");
+  const pre = document.createElement("pre");
   pre.className = "tool-output";
   pre.textContent = _tryPrettyJson(rawJson) || _redactApiKeys(rawJson);
   details.appendChild(pre);
@@ -5450,8 +5453,8 @@ function buildMcpErrorEmbed(err, rawJson) {
 //  HLS lazy-loader (follows the mermaid.js lazy-load pattern in
 //  /shared/renderer.js)
 // ---------------------------------------------------------------------------
-var _hlsState = "idle";
-var _hlsQueue = [];
+let _hlsState = "idle";
+let _hlsQueue = [];
 
 function _loadHls(callback) {
   if (_hlsState === "ready") {
@@ -5461,20 +5464,20 @@ function _loadHls(callback) {
   _hlsQueue.push(callback);
   if (_hlsState === "loading") return;
   _hlsState = "loading";
-  var script = document.createElement("script");
+  const script = document.createElement("script");
   script.src = "/shared/hls-1.6.16/hls.min.js";
   script.onload = function () {
     _hlsState = "ready";
-    var q = _hlsQueue;
+    const q = _hlsQueue;
     _hlsQueue = [];
-    for (var i = 0; i < q.length; i++) q[i]();
+    for (let i = 0; i < q.length; i++) q[i]();
   };
   script.onerror = function () {
     _hlsState = "idle";
-    var q = _hlsQueue;
+    const q = _hlsQueue;
     _hlsQueue = [];
     // Fall through — _activatePlayer will use stream_url since Hls is undefined
-    for (var i = 0; i < q.length; i++) q[i]();
+    for (let i = 0; i < q.length; i++) q[i]();
   };
   document.head.appendChild(script);
 }
@@ -5487,12 +5490,12 @@ function _isHlsUrl(url) {
 //  Click-to-play delegated handler (follows img-placeholder pattern)
 // ---------------------------------------------------------------------------
 function _activatePlayer(btn) {
-  var url = btn.dataset.streamUrl;
-  var hlsUrl = btn.dataset.hlsUrl;
-  var isAudio = btn.dataset.audioOnly === "true";
-  var directStream = btn.dataset.directStream === "true";
+  const url = btn.dataset.streamUrl;
+  const hlsUrl = btn.dataset.hlsUrl;
+  const isAudio = btn.dataset.audioOnly === "true";
+  const directStream = btn.dataset.directStream === "true";
 
-  var player = document.createElement(isAudio ? "audio" : "video");
+  const player = document.createElement(isAudio ? "audio" : "video");
   player.controls = true;
   player.autoplay = true;
   player.className = "media-player";
@@ -5507,7 +5510,7 @@ function _activatePlayer(btn) {
     typeof Hls !== "undefined" &&
     Hls.isSupported()
   ) {
-    var hls = new Hls();
+    const hls = new Hls();
     hls.loadSource(hlsUrl);
     hls.attachMedia(player);
   } else if (
@@ -5521,16 +5524,16 @@ function _activatePlayer(btn) {
   }
 
   player.addEventListener("error", function () {
-    var card = player.closest(".media-embed");
-    var titleEl = card ? card.querySelector(".media-card-title") : null;
-    var label = titleEl ? ": " + titleEl.textContent : "";
+    const card = player.closest(".media-embed");
+    const titleEl = card ? card.querySelector(".media-card-title") : null;
+    const label = titleEl ? ": " + titleEl.textContent : "";
 
-    var err = document.createElement("div");
+    const err = document.createElement("div");
     err.className = "media-player-error";
     err.setAttribute("role", "alert");
     err.textContent = "Failed to load stream" + label;
 
-    var retry = document.createElement("button");
+    const retry = document.createElement("button");
     retry.className = "media-play-btn";
     retry.type = "button";
     retry.dataset.streamUrl = url;
@@ -5540,7 +5543,7 @@ function _activatePlayer(btn) {
     retry.setAttribute("aria-label", "Retry" + label);
     retry.appendChild(document.createTextNode("\u25b6 Retry"));
 
-    var container = document.createElement("div");
+    const container = document.createElement("div");
     container.appendChild(err);
     container.appendChild(retry);
     player.replaceWith(container);
@@ -5550,19 +5553,19 @@ function _activatePlayer(btn) {
 }
 
 document.addEventListener("click", function (e) {
-  var btn = e.target.closest(".media-play-btn");
+  const btn = e.target.closest(".media-play-btn");
   if (!btn) return;
   e.preventDefault();
   btn.disabled = true;
-  var labelEl = btn.querySelector("span:last-child");
+  const labelEl = btn.querySelector("span:last-child");
   if (labelEl) {
     labelEl.textContent = "Loading\u2026";
   } else {
     btn.textContent = "\u25b6 Loading\u2026";
   }
 
-  var hlsUrl = btn.dataset.hlsUrl;
-  var isAudio = btn.dataset.audioOnly === "true";
+  const hlsUrl = btn.dataset.hlsUrl;
+  const isAudio = btn.dataset.audioOnly === "true";
 
   // If HLS URL present and not audio, ensure hls.js is loaded first
   if (hlsUrl && !isAudio && _isHlsUrl(hlsUrl)) {
@@ -5576,7 +5579,7 @@ document.addEventListener("click", function (e) {
 
 document.addEventListener("keydown", function (e) {
   if (e.key !== "Enter") return;
-  var btn = e.target.closest(".media-play-btn");
+  const btn = e.target.closest(".media-play-btn");
   if (!btn) return;
   btn.click();
 });
@@ -5585,22 +5588,22 @@ document.addEventListener("keydown", function (e) {
 //  13. Plan review dialog
 // ===========================================================================
 
-var _planContent = "";
-var _planPaneId = null;
-var _planWsId = null;
+let _planContent = "";
+let _planPaneId = null;
+let _planWsId = null;
 
 function showPlanDialog(content) {
   _planContent = content;
   _planPaneId = focusedPaneId;
-  var paneNow = panes[_planPaneId];
+  const paneNow = panes[_planPaneId];
   _planWsId = paneNow ? paneNow.wsId : currentWsId;
   document.getElementById("plan-content").textContent = content;
-  var feedbackEl = document.getElementById("plan-feedback");
+  const feedbackEl = document.getElementById("plan-feedback");
   feedbackEl.value = "";
   _updatePlanRejectBtn();
 
   // Disable focused pane input
-  var pane = panes[_planPaneId];
+  const pane = panes[_planPaneId];
   if (pane) {
     pane.inputEl.disabled = true;
     pane.sendBtn.disabled = true;
@@ -5613,8 +5616,8 @@ function showPlanDialog(content) {
 }
 
 function _updatePlanRejectBtn() {
-  var btn = document.getElementById("btn-plan-reject");
-  var hasFeedback =
+  const btn = document.getElementById("btn-plan-reject");
+  const hasFeedback =
     document.getElementById("plan-feedback").value.trim().length > 0;
   btn.replaceChildren(makeKeyLabel("Esc", hasFeedback ? "Amend" : "Reject"));
   btn.style.background = hasFeedback ? "var(--accent)" : "";
@@ -5625,13 +5628,13 @@ function _updatePlanRejectBtn() {
 }
 
 function resolvePlan(defaultFeedback) {
-  var feedback = document.getElementById("plan-feedback").value.trim();
+  let feedback = document.getElementById("plan-feedback").value.trim();
   if (!feedback && defaultFeedback) feedback = defaultFeedback;
   // Removing 'active' synchronously is what lets dismissPlanDialog's
   // early-return guard treat the server's echoed plan_resolved as a no-op.
   document.getElementById("plan-overlay").classList.remove("active");
 
-  var pane = panes[_planPaneId];
+  const pane = panes[_planPaneId];
   if (pane) {
     pane.inputEl.disabled = false;
     pane.sendBtn.disabled = false;
@@ -5641,7 +5644,7 @@ function resolvePlan(defaultFeedback) {
   // Critical: fire the API call first — this unblocks the server.
   // Use the ws_id captured when the dialog opened, not the current pane
   // (user may have switched tabs while the dialog was open).
-  var wsId = _planWsId || (pane ? pane.wsId : currentWsId);
+  const wsId = _planWsId || (pane ? pane.wsId : currentWsId);
   _planWsId = null;
   authFetch("/v1/api/plan", {
     method: "POST",
@@ -5651,11 +5654,14 @@ function resolvePlan(defaultFeedback) {
     if (pane) pane.addErrorMessage("Connection error: " + err.message);
   });
 
-  // Render plan inline in the chat (best-effort)
+  // Render plan inline in the chat (best-effort).  `action` is hoisted so
+  // the catch handler can still build a fallback message if the inline
+  // render throws after the action label was computed.
+  let action;
   try {
-    var isReject = feedback === "reject";
-    var isAmend = feedback && !isReject;
-    var action = isReject ? "rejected" : isAmend ? "amending" : "approved";
+    const isReject = feedback === "reject";
+    const isAmend = feedback && !isReject;
+    action = isReject ? "rejected" : isAmend ? "amending" : "approved";
     _addInlinePlan(_planContent, action, feedback);
   } catch (err) {
     console.error("Failed to render inline plan:", err);
@@ -5673,11 +5679,11 @@ function dismissPlanDialog(feedback) {
   // Do NOT call /v1/api/plan — the server has already moved on.  The early
   // return also handles self-receipt: the client that called resolvePlan()
   // already removed the active class, so this is a no-op for that client.
-  var overlay = document.getElementById("plan-overlay");
+  const overlay = document.getElementById("plan-overlay");
   if (!overlay.classList.contains("active")) return;
   overlay.classList.remove("active");
 
-  var pane = panes[_planPaneId];
+  const pane = panes[_planPaneId];
   if (pane) {
     pane.inputEl.disabled = false;
     pane.sendBtn.disabled = false;
@@ -5686,10 +5692,10 @@ function dismissPlanDialog(feedback) {
     if (!matchMedia("(pointer: coarse)").matches) pane.inputEl.focus();
   }
 
-  var fb = feedback || "";
-  var isReject = fb === "reject";
-  var isAmend = fb && !isReject;
-  var action = isReject ? "rejected" : isAmend ? "amending" : "approved";
+  const fb = feedback || "";
+  const isReject = fb === "reject";
+  const isAmend = fb && !isReject;
+  const action = isReject ? "rejected" : isAmend ? "amending" : "approved";
 
   // Race fallback: if plan_resolved arrives before plan_review (e.g. SSE
   // reconnect ordering), _planContent is empty and _addInlinePlan early-
@@ -5721,7 +5727,7 @@ function dismissPlanDialog(feedback) {
 }
 
 function _announce(text) {
-  var el = document.getElementById("toast");
+  const el = document.getElementById("toast");
   if (!el) return;
   // Re-set textContent in two ticks so screen readers re-announce even
   // when the message is identical to the previous one.
@@ -5733,15 +5739,15 @@ function _announce(text) {
 
 function _addInlinePlan(content, action, feedback, origin) {
   if (!content) return;
-  var pane = panes[_planPaneId];
+  const pane = panes[_planPaneId];
   if (!pane) return;
 
-  var wrapper = document.createElement("div");
+  const wrapper = document.createElement("div");
   wrapper.className = "plan-inline";
 
-  var header = document.createElement("div");
+  const header = document.createElement("div");
   header.className = "plan-inline-header";
-  var label =
+  let label =
     action === "rejected"
       ? "Plan rejected"
       : action === "amending"
@@ -5750,13 +5756,13 @@ function _addInlinePlan(content, action, feedback, origin) {
   // Disambiguate remote dismissal — otherwise the desktop user sees "Plan
   // approved" with no attribution and may wonder if the agent self-approved.
   if (origin === "remote") label += " (synced)";
-  var labelEl = document.createElement("span");
+  const labelEl = document.createElement("span");
   labelEl.className = "plan-inline-label plan-" + action;
   labelEl.textContent = label;
   header.appendChild(labelEl);
   wrapper.appendChild(header);
 
-  var body = document.createElement("div");
+  const body = document.createElement("div");
   body.className = "plan-inline-body";
   try {
     setMarkdown(body, content);
@@ -5773,7 +5779,7 @@ function _addInlinePlan(content, action, feedback, origin) {
   wrapper.appendChild(body);
 
   if (feedback && action === "amending") {
-    var fb = document.createElement("div");
+    const fb = document.createElement("div");
     fb.className = "plan-inline-feedback";
     fb.textContent = "Feedback: " + feedback;
     wrapper.appendChild(fb);
@@ -5795,11 +5801,11 @@ document
 // button label, paperclip + drag-drop + paste-image stage files, options
 // toggle expands the dropdown panel.
 (function () {
-  var input = document.getElementById("dashboard-input");
-  var attachBtn = document.getElementById("dashboard-attach-btn");
-  var attachInput = document.getElementById("dashboard-attach-input");
-  var optionsBtn = document.getElementById("dashboard-options-btn");
-  var composer = document.getElementById("dashboard-composer");
+  const input = document.getElementById("dashboard-input");
+  const attachBtn = document.getElementById("dashboard-attach-btn");
+  const attachInput = document.getElementById("dashboard-attach-input");
+  const optionsBtn = document.getElementById("dashboard-options-btn");
+  const composer = document.getElementById("dashboard-composer");
   if (!input) return;
 
   input.addEventListener("keydown", function (e) {
@@ -5811,11 +5817,11 @@ document
   input.addEventListener("input", _refreshDashboardSubmitLabel);
   input.addEventListener("paste", function (e) {
     if (!e.clipboardData) return;
-    var items = e.clipboardData.items || [];
-    var pasted = [];
-    for (var i = 0; i < items.length; i++) {
+    const items = e.clipboardData.items || [];
+    const pasted = [];
+    for (let i = 0; i < items.length; i++) {
       if (items[i].kind === "file") {
-        var f = items[i].getAsFile();
+        const f = items[i].getAsFile();
         if (f) pasted.push(f);
       }
     }
@@ -5842,7 +5848,7 @@ document
   // Keep the inline summary chip in sync with whichever non-default
   // model / judge / skill is selected.  Listening on the options panel
   // catches all three selects with one handler.
-  var optionsPanel = document.getElementById("dashboard-options");
+  const optionsPanel = document.getElementById("dashboard-options");
   if (optionsPanel) {
     optionsPanel.addEventListener("change", _refreshDashboardOptionsSummary);
   }
@@ -5878,13 +5884,13 @@ document
 //  15. MCP server connections settings panel
 // ===========================================================================
 
-var _pendingRevokeServer = null;
-var _settingsTrap = null;
-var _revokeMcpTrap = null;
-var _settingsReturnFocus = null;
+let _pendingRevokeServer = null;
+let _settingsTrap = null;
+let _revokeMcpTrap = null;
+let _settingsReturnFocus = null;
 
 function openSettingsPanel() {
-  var overlay = document.getElementById("settings-overlay");
+  const overlay = document.getElementById("settings-overlay");
   if (!overlay) return;
   _settingsReturnFocus = document.activeElement;
   overlay.style.display = "flex";
@@ -5894,21 +5900,21 @@ function openSettingsPanel() {
     if (e.key === "Escape") {
       // If the nested revoke confirmation is open, let its own trap
       // handle Escape — closing inner-first matches the delete-ws flow.
-      var inner = document.getElementById("revoke-mcp-overlay");
+      const inner = document.getElementById("revoke-mcp-overlay");
       if (inner && inner.style.display !== "none") return;
       e.preventDefault();
       closeSettingsPanel();
       return;
     }
     if (e.key === "Tab") {
-      var box = document.getElementById("settings-box");
+      const box = document.getElementById("settings-box");
       if (!box) return;
-      var focusable = box.querySelectorAll(
+      const focusable = box.querySelectorAll(
         "button, [href], input, select, textarea, [tabindex]:not([tabindex='-1'])",
       );
       if (!focusable.length) return;
-      var first = focusable[0];
-      var last = focusable[focusable.length - 1];
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
       if (e.shiftKey && document.activeElement === first) {
         e.preventDefault();
         last.focus();
@@ -5922,7 +5928,7 @@ function openSettingsPanel() {
 
   loadMcpConnections();
 
-  var closeBtn = document.getElementById("settings-close-btn");
+  const closeBtn = document.getElementById("settings-close-btn");
   if (closeBtn) closeBtn.focus();
 }
 
@@ -5933,11 +5939,11 @@ function closeSettingsPanel() {
   // Escape-key path inside the parent's keydown trap defers to the
   // inner trap; this branch is the close-button path that doesn't go
   // through that trap.
-  var inner = document.getElementById("revoke-mcp-overlay");
+  const inner = document.getElementById("revoke-mcp-overlay");
   if (inner && inner.style.display !== "none") {
     cancelRevokeMcp();
   }
-  var overlay = document.getElementById("settings-overlay");
+  const overlay = document.getElementById("settings-overlay");
   if (overlay) overlay.style.display = "none";
   if (_settingsTrap) {
     document.removeEventListener("keydown", _settingsTrap);
@@ -5970,13 +5976,13 @@ function closeSettingsPanel() {
 // to the last item rather than the second-to-last — same shape as
 // showTabDropdown and the proxy node-picker.
 
-var _settingsMenu = null;
-var _settingsMenuCloseHandler = null;
+let _settingsMenu = null;
+let _settingsMenuCloseHandler = null;
 // Cached at open time so closeSettingsMenu can reset ARIA without
 // re-querying by id, and so the menu-item click path can refocus
 // the trigger BEFORE close — that way openSettingsPanel captures
 // the gear (not <body>) as _settingsReturnFocus.
-var _settingsMenuTrigger = null;
+let _settingsMenuTrigger = null;
 
 function toggleSettingsMenu(triggerEl) {
   if (_settingsMenu) closeSettingsMenu();
@@ -5989,7 +5995,7 @@ function openSettingsMenu(triggerEl) {
   triggerEl.setAttribute("aria-expanded", "true");
   triggerEl.setAttribute("aria-controls", "settings-menu");
 
-  var menu = document.createElement("div");
+  const menu = document.createElement("div");
   menu.id = "settings-menu";
   menu.className = "ws-tab-dropdown";
   menu.setAttribute("role", "menu");
@@ -5998,8 +6004,8 @@ function openSettingsMenu(triggerEl) {
     e.preventDefault();
   });
 
-  var pendingCount = _pendingConsentServers.size;
-  var items = [
+  const pendingCount = _pendingConsentServers.size;
+  const items = [
     {
       label:
         "MCP connections" + (pendingCount ? " (" + pendingCount + ")" : ""),
@@ -6022,18 +6028,18 @@ function openSettingsMenu(triggerEl) {
 
   items.forEach(function (item) {
     if (item.separator) {
-      var sep = document.createElement("div");
+      const sep = document.createElement("div");
       sep.className = "ws-tab-dropdown-sep";
       sep.setAttribute("role", "separator");
       menu.appendChild(sep);
       return;
     }
-    var btn = document.createElement("button");
+    const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "ws-tab-dropdown-item" + (item.cls ? " " + item.cls : "");
     btn.setAttribute("role", "menuitem");
     btn.setAttribute("tabindex", "-1");
-    var labelSpan = document.createElement("span");
+    const labelSpan = document.createElement("span");
     labelSpan.className = "ws-tab-dropdown-label";
     labelSpan.textContent = item.label;
     btn.appendChild(labelSpan);
@@ -6058,10 +6064,10 @@ function openSettingsMenu(triggerEl) {
   // runs BEFORE the left-edge floor so a menu wider than the viewport
   // still gets clamped to mx=4 instead of going negative — matches the
   // proxy node-picker order in turnstone/console/server.py:307-309.
-  var tr = triggerEl.getBoundingClientRect();
-  var mr = menu.getBoundingClientRect();
-  var mx = tr.right - mr.width;
-  var my = tr.bottom + 4;
+  const tr = triggerEl.getBoundingClientRect();
+  const mr = menu.getBoundingClientRect();
+  let mx = tr.right - mr.width;
+  let my = tr.bottom + 4;
   if (my + mr.height > window.innerHeight) my = tr.top - mr.height - 4;
   if (mx + mr.width > window.innerWidth) mx = window.innerWidth - mr.width - 4;
   if (mx < 4) mx = 4;
@@ -6087,9 +6093,9 @@ function openSettingsMenu(triggerEl) {
         e.key === "End"
       ) {
         e.preventDefault();
-        var btns = Array.from(menu.querySelectorAll(".ws-tab-dropdown-item"));
+        const btns = Array.from(menu.querySelectorAll(".ws-tab-dropdown-item"));
         if (!btns.length) return;
-        var idx = btns.indexOf(document.activeElement);
+        const idx = btns.indexOf(document.activeElement);
         if (e.key === "ArrowDown") btns[(idx + 1) % btns.length].focus();
         // idx <= 0 covers both "first item" (wrap to last) and "no
         // current focus" (idx === -1, which would otherwise yield
@@ -6121,12 +6127,12 @@ function openSettingsMenu(triggerEl) {
   // focus because the menu DOM needs a tick to settle layout before
   // we call focus() on its first item.
   document.addEventListener("keydown", _settingsMenuCloseHandler);
-  var activeMenu = menu;
-  var closeHandler = _settingsMenuCloseHandler;
+  const activeMenu = menu;
+  const closeHandler = _settingsMenuCloseHandler;
   setTimeout(function () {
     if (_settingsMenu !== activeMenu || !closeHandler) return;
     document.addEventListener("mousedown", closeHandler);
-    var first = activeMenu.querySelector(".ws-tab-dropdown-item");
+    const first = activeMenu.querySelector(".ws-tab-dropdown-item");
     if (first) first.focus();
   }, 0);
 }
@@ -6149,10 +6155,10 @@ function closeSettingsMenu() {
 }
 
 function loadMcpConnections() {
-  var loadingEl = document.getElementById("settings-mcp-loading");
-  var emptyEl = document.getElementById("settings-mcp-empty");
-  var tableEl = document.getElementById("settings-mcp-table");
-  var errorEl = document.getElementById("settings-mcp-error");
+  const loadingEl = document.getElementById("settings-mcp-loading");
+  const emptyEl = document.getElementById("settings-mcp-empty");
+  const tableEl = document.getElementById("settings-mcp-table");
+  const errorEl = document.getElementById("settings-mcp-error");
   if (!loadingEl || !emptyEl || !tableEl || !errorEl) return;
   loadingEl.style.display = "";
   emptyEl.style.display = "none";
@@ -6166,7 +6172,7 @@ function loadMcpConnections() {
     })
     .then(function (data) {
       loadingEl.style.display = "none";
-      var connections =
+      const connections =
         data && Array.isArray(data.connections) ? data.connections : [];
       renderMcpConnections(connections);
       // Clear AFTER the table renders so the badge reflects "user has
@@ -6193,9 +6199,9 @@ function _clearChildren(node) {
 }
 
 function renderMcpConnections(list) {
-  var emptyEl = document.getElementById("settings-mcp-empty");
-  var tableEl = document.getElementById("settings-mcp-table");
-  var tbody = document.getElementById("settings-mcp-tbody");
+  const emptyEl = document.getElementById("settings-mcp-empty");
+  const tableEl = document.getElementById("settings-mcp-table");
+  const tbody = document.getElementById("settings-mcp-tbody");
   if (!emptyEl || !tableEl || !tbody) return;
   if (!list.length) {
     tableEl.style.display = "none";
@@ -6205,24 +6211,24 @@ function renderMcpConnections(list) {
   emptyEl.style.display = "none";
   tableEl.style.display = "";
   _clearChildren(tbody);
-  for (var i = 0; i < list.length; i++) {
-    var conn = list[i];
-    var tr = document.createElement("tr");
+  for (let i = 0; i < list.length; i++) {
+    const conn = list[i];
+    const tr = document.createElement("tr");
 
-    var serverTd = document.createElement("td");
+    const serverTd = document.createElement("td");
     serverTd.textContent = conn.server_name || "";
     tr.appendChild(serverTd);
 
-    var scopesTd = document.createElement("td");
+    const scopesTd = document.createElement("td");
     scopesTd.textContent = conn.scopes || "(none)";
     tr.appendChild(scopesTd);
 
-    var createdTd = document.createElement("td");
+    const createdTd = document.createElement("td");
     createdTd.textContent = _formatRelativeTimestamp(conn.created);
     createdTd.title = conn.created || "";
     tr.appendChild(createdTd);
 
-    var refreshedTd = document.createElement("td");
+    const refreshedTd = document.createElement("td");
     if (conn.last_refreshed) {
       refreshedTd.textContent = _formatRelativeTimestamp(conn.last_refreshed);
       refreshedTd.title = conn.last_refreshed;
@@ -6231,12 +6237,12 @@ function renderMcpConnections(list) {
     }
     tr.appendChild(refreshedTd);
 
-    var actionTd = document.createElement("td");
-    var btn = document.createElement("button");
+    const actionTd = document.createElement("td");
+    const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "settings-revoke-btn";
     btn.textContent = "Revoke";
-    var serverNameForRevoke = conn.server_name || "";
+    const serverNameForRevoke = conn.server_name || "";
     btn.setAttribute(
       "aria-label",
       "Revoke connection to " + serverNameForRevoke,
@@ -6256,8 +6262,8 @@ function renderMcpConnections(list) {
 function promptRevokeMcp(server) {
   if (!server) return;
   _pendingRevokeServer = server;
-  var msg = document.getElementById("revoke-mcp-message");
-  var overlay = document.getElementById("revoke-mcp-overlay");
+  const msg = document.getElementById("revoke-mcp-message");
+  const overlay = document.getElementById("revoke-mcp-overlay");
   if (msg) {
     msg.textContent =
       "Disconnect " +
@@ -6274,12 +6280,12 @@ function promptRevokeMcp(server) {
       return;
     }
     if (e.key === "Tab") {
-      var box = document.getElementById("revoke-mcp-box");
+      const box = document.getElementById("revoke-mcp-box");
       if (!box) return;
-      var focusable = box.querySelectorAll("button");
+      const focusable = box.querySelectorAll("button");
       if (!focusable.length) return;
-      var first = focusable[0];
-      var last = focusable[focusable.length - 1];
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
       if (e.shiftKey && document.activeElement === first) {
         e.preventDefault();
         last.focus();
@@ -6291,13 +6297,15 @@ function promptRevokeMcp(server) {
   };
   document.addEventListener("keydown", _revokeMcpTrap);
 
-  var cancelBtn = overlay ? overlay.querySelector("button:not(.danger)") : null;
+  const cancelBtn = overlay
+    ? overlay.querySelector("button:not(.danger)")
+    : null;
   if (cancelBtn) cancelBtn.focus();
 }
 
 function cancelRevokeMcp() {
   _pendingRevokeServer = null;
-  var overlay = document.getElementById("revoke-mcp-overlay");
+  const overlay = document.getElementById("revoke-mcp-overlay");
   if (overlay) overlay.style.display = "none";
   if (_revokeMcpTrap) {
     document.removeEventListener("keydown", _revokeMcpTrap);
@@ -6306,7 +6314,7 @@ function cancelRevokeMcp() {
 }
 
 function confirmRevokeMcp() {
-  var server = _pendingRevokeServer;
+  const server = _pendingRevokeServer;
   if (!server) {
     cancelRevokeMcp();
     return;
@@ -6329,11 +6337,11 @@ function confirmRevokeMcp() {
 function _formatRelativeTimestamp(iso) {
   if (!iso) return "—";
   try {
-    var d = new Date(iso);
+    const d = new Date(iso);
     if (isNaN(d.getTime())) return iso;
-    var now = new Date();
-    var diffMs = now.getTime() - d.getTime();
-    var sec = Math.round(diffMs / 1000);
+    const now = new Date();
+    const diffMs = now.getTime() - d.getTime();
+    const sec = Math.round(diffMs / 1000);
     if (sec < 60) return "just now";
     if (sec < 3600) return Math.round(sec / 60) + "m ago";
     if (sec < 86400) return Math.round(sec / 3600) + "h ago";
@@ -6345,7 +6353,7 @@ function _formatRelativeTimestamp(iso) {
 
 document.addEventListener("keydown", function (e) {
   // Defer to modal's own keydown handler when any modal is open
-  var modalIds = [
+  const modalIds = [
     "new-ws-overlay",
     "edit-title-overlay",
     "delete-ws-overlay",
@@ -6353,8 +6361,8 @@ document.addEventListener("keydown", function (e) {
     "settings-overlay",
     "revoke-mcp-overlay",
   ];
-  for (var mi = 0; mi < modalIds.length; mi++) {
-    var modal = document.getElementById(modalIds[mi]);
+  for (let mi = 0; mi < modalIds.length; mi++) {
+    const modal = document.getElementById(modalIds[mi]);
     if (modal && modal.style.display !== "none") return;
   }
   // Settings menu is a transient dropdown, not a modal overlay, but
@@ -6372,7 +6380,7 @@ document.addEventListener("keydown", function (e) {
   }
 
   // Get focused pane for approval / busy checks
-  var pane = getFocusedPane();
+  const pane = getFocusedPane();
 
   // Escape: cancel generation when busy
   if (e.key === "Escape" && pane && pane.busy && !pane.pendingApproval) {
@@ -6396,8 +6404,8 @@ document.addEventListener("keydown", function (e) {
   // Ctrl+1..9: switch tabs
   if (e.ctrlKey && e.key >= "1" && e.key <= "9") {
     e.preventDefault();
-    var idx = parseInt(e.key) - 1;
-    var wsIds = Object.keys(workstreams);
+    const idx = parseInt(e.key) - 1;
+    const wsIds = Object.keys(workstreams);
     if (idx < wsIds.length) switchTab(wsIds[idx]);
     return;
   }
@@ -6414,8 +6422,8 @@ document.addEventListener("keydown", function (e) {
   // still work when no workstream is focused.
   if (e.ctrlKey && e.shiftKey) {
     closeTabDropdown();
-    var wsActionKey = e.key.toLowerCase();
-    var activeWsId = !dashboardVisible && getCurrentWsId();
+    const wsActionKey = e.key.toLowerCase();
+    const activeWsId = !dashboardVisible && getCurrentWsId();
     if (wsActionKey === "e" && activeWsId) {
       e.preventDefault();
       editWorkstreamTitle();
@@ -6454,7 +6462,7 @@ document.addEventListener("keydown", function (e) {
     (e.key === "ArrowLeft" || e.key === "ArrowRight")
   ) {
     e.preventDefault();
-    var paneIds = [];
+    const paneIds = [];
     (function collectIds(n) {
       if (!n) return;
       if (n.type === "leaf") {
@@ -6465,7 +6473,7 @@ document.addEventListener("keydown", function (e) {
       }
     })(splitRoot);
     if (paneIds.length > 1) {
-      var ci = paneIds.indexOf(focusedPaneId);
+      let ci = paneIds.indexOf(focusedPaneId);
       if (e.key === "ArrowRight") ci = (ci + 1) % paneIds.length;
       else ci = (ci - 1 + paneIds.length) % paneIds.length;
       setFocusedPane(paneIds[ci]);
@@ -6484,7 +6492,7 @@ document.addEventListener("keydown", function (e) {
 
   // Inline approval keybindings
   if (pane && pane.pendingApproval) {
-    var fbInput =
+    const fbInput =
       pane.approvalBlockEl &&
       pane.approvalBlockEl.querySelector(".ts-approval-feedback");
     if (fbInput && document.activeElement === fbInput) {
@@ -6507,13 +6515,13 @@ document.addEventListener("keydown", function (e) {
     } else if (e.key === "a") {
       pane.resolveApproval(true, true, pane.getFeedback());
     } else if (e.key === "d") {
-      var details = pane.approvalBlockEl
+      const details = pane.approvalBlockEl
         ? pane.approvalBlockEl.querySelectorAll(".verdict-detail")
         : [];
       details.forEach(function (d) {
-        var isHidden = d.style.display === "none";
+        const isHidden = d.style.display === "none";
         d.style.display = isHidden ? "block" : "none";
-        var btn2 = d.previousElementSibling
+        const btn2 = d.previousElementSibling
           ? d.previousElementSibling.querySelector(".verdict-expand")
           : null;
         if (btn2) btn2.textContent = isHidden ? "hide" : "details";
@@ -6529,14 +6537,14 @@ document.addEventListener("keydown", function (e) {
       resolvePlan("");
     } else if (e.key === "Escape") {
       e.preventDefault();
-      var hasFb =
+      const hasFb =
         document.getElementById("plan-feedback").value.trim().length > 0;
       resolvePlan(hasFb ? "" : "reject");
     } else if (e.key === "Tab") {
-      var focusable = document.querySelectorAll(
+      const focusable = document.querySelectorAll(
         "#plan-dialog input, #plan-dialog button",
       );
-      var first = focusable[0],
+      const first = focusable[0],
         last = focusable[focusable.length - 1];
       if (e.shiftKey && document.activeElement === first) {
         e.preventDefault();
@@ -6563,7 +6571,7 @@ function initWorkstreams() {
         workstreams[ws.ws_id] = { name: ws.name, state: ws.state };
       });
       connectGlobalSSE();
-      var wsIds = Object.keys(workstreams);
+      const wsIds = Object.keys(workstreams);
       if (!wsIds.length) {
         renderTabBar();
         showDashboard();
@@ -6571,21 +6579,21 @@ function initWorkstreams() {
       }
       if (!Object.keys(panes).length) {
         if (!restoreLayout()) {
-          var p = createPane(wsIds[0]);
+          const p = createPane(wsIds[0]);
           splitRoot = { type: "leaf", pane: p };
           setFocusedPane(p.id);
         }
         renderLayout();
       }
       renderTabBar();
-      for (var id in panes) {
+      for (let id in panes) {
         if (!panes[id].evtSource) {
           panes[id].showEmptyState();
           panes[id].connectSSE(panes[id].wsId);
         }
       }
-      var params = new URLSearchParams(location.search);
-      var targetWs = params.get("ws_id");
+      const params = new URLSearchParams(location.search);
+      const targetWs = params.get("ws_id");
       if (targetWs && workstreams[targetWs]) {
         history.replaceState(
           { turnstone: "workstream", wsId: targetWs },
@@ -6617,11 +6625,11 @@ function loadInterfaceSettings() {
       return r.json();
     })
     .then(function (data) {
-      var settings = data.settings || [];
-      for (var i = 0; i < settings.length; i++) {
-        var s = settings[i];
+      const settings = data.settings || [];
+      for (let i = 0; i < settings.length; i++) {
+        const s = settings[i];
         if (s.key && s.key.indexOf("interface.") === 0) {
-          var lsKey = "turnstone_" + s.key;
+          const lsKey = "turnstone_" + s.key;
           try {
             // Only write server value if no local value exists — this
             // preserves the user's theme choice when switching between
@@ -6635,13 +6643,13 @@ function loadInterfaceSettings() {
       }
       // Apply theme from localStorage (set by theme.js initTheme or
       // a previous toggle) — don't let a node's default override it.
-      var theme = localStorage.getItem("turnstone_interface.theme");
-      var currentTheme = document.documentElement.dataset.theme;
+      const theme = localStorage.getItem("turnstone_interface.theme");
+      const currentTheme = document.documentElement.dataset.theme;
       if (theme) {
-        var effectiveTheme = theme === "light" ? "light" : "";
+        const effectiveTheme = theme === "light" ? "light" : "";
         if (effectiveTheme !== currentTheme) {
           document.documentElement.dataset.theme = effectiveTheme;
-          var btn = document.getElementById("theme-toggle");
+          const btn = document.getElementById("theme-toggle");
           if (btn) {
             btn.textContent = theme === "light" ? "\u2600" : "\u263E";
             btn.title =
