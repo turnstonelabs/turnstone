@@ -336,10 +336,10 @@
   }
 
   // User-message bubble with attachment-pill cluster appended below
-  // the text.  Mirrors Pane.prototype.addUserMessage in the
-  // interactive UI so live-send and history-replay both render the
-  // same chip strip the composer staged on submit.  Attachments is a
-  // list of {kind, filename}; falsy/empty falls through to plain text.
+  // the text.  Mirrors Pane.addUserMessage in the interactive UI so
+  // live-send and history-replay both render the same chip strip the
+  // composer staged on submit.  Attachments is a list of
+  // {kind, filename}; falsy/empty falls through to plain text.
   function appendUserMessageWithAttachments(text, attachments, opts) {
     const el = appendText("user", text, opts);
     if (!Array.isArray(attachments) || attachments.length === 0) return el;
@@ -436,7 +436,7 @@
 
   // Metacognitive reminder bubble (user-channel correction / denial /
   // resume / start / completion AND tool-channel tool_error / repeat).
-  // Mirrors Pane.prototype.addUserReminder / addToolReminder in the
+  // Mirrors Pane.addUserReminder / addToolReminder in the
   // interactive UI — yellow themed bubble slotted directly below the
   // message it advises.  ``watch_triggered`` reminders branch off into
   // the structured ``.msg.watch-result`` card.  ``anchor`` is the DOM
@@ -563,7 +563,7 @@
     } else if (argsRaw) {
       // Malformed JSON or non-object args — show the raw payload
       // truncated.  Matches the interactive replay's substring(0, 100)
-      // fallback at ui/static/app.js Pane.prototype.replayHistory.
+      // fallback at ui/static/app.js Pane.replayHistory.
       header = name;
       preview = argsRaw.length > 200 ? argsRaw.slice(0, 200) + "…" : argsRaw;
     }
