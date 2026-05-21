@@ -361,6 +361,9 @@ _COORD_JS = (
     Path(__file__).resolve().parent.parent / "turnstone/console/static/coordinator/coordinator.js"
 )
 _CONSOLE_ADMIN_JS = Path(__file__).resolve().parent.parent / "turnstone/console/static/admin.js"
+_CONSOLE_GOVERNANCE_JS = (
+    Path(__file__).resolve().parent.parent / "turnstone/console/static/governance.js"
+)
 
 
 _UNSAFE_CODE_SINK_LINT_TARGETS = [
@@ -370,6 +373,7 @@ _UNSAFE_CODE_SINK_LINT_TARGETS = [
     ("turnstone/shared_static/kb.js", _KB_JS),
     ("turnstone/console/static/coordinator/coordinator.js", _COORD_JS),
     ("turnstone/console/static/admin.js", _CONSOLE_ADMIN_JS),
+    ("turnstone/console/static/governance.js", _CONSOLE_GOVERNANCE_JS),
 ]
 
 
@@ -395,15 +399,17 @@ def test_no_unsafe_code_sinks_in_static_assets(label: str, path: Path) -> None:
        uses ``createElement`` + ``textContent`` + ``append`` /
        ``replaceChildren``.  Missing escapes are structurally
        impossible — no HTML string is ever interpolated.
-    2. **Sink-free string-concat** (``admin.js``): operator-facing
-       admin pages still build HTML via ``escapeHtml`` + string concat,
-       but the unsafe sink is off the call site (everything routes
-       through ``setSafeHtml``).  XSS defence still depends on every
-       interpolated value going through escapeHtml; the lint catches
-       the sink but cannot catch a missing escape.
+    2. **Sink-free string-concat** (``admin.js``, ``governance.js``):
+       operator-facing admin / governance pages still build HTML via
+       ``escapeHtml`` + string concat, but the unsafe sink is off the
+       call site (everything routes through ``setSafeHtml``).  XSS
+       defence still depends on every interpolated value going through
+       escapeHtml; the lint catches the sink but cannot catch a missing
+       escape.
 
-    ``console/static/governance.js`` and ``console/static/app.js``
-    remain pending follow-ups — same posture as admin.js once cleaned.
+    ``console/static/app.js`` (the cluster dashboard / node table
+    surface) is the last admin-side bundle still pending — same posture
+    as admin.js once cleaned.
 
     The regex covers inner/outer-HTML assignment (plain and
     concat-assignment), legacy doc-write, and the dynamic-code
