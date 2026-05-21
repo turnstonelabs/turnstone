@@ -675,3 +675,178 @@ class TestExtractReasoningForHistory:
         extract_reasoning_for_history(messages, surface_persisted_reasoning_flag=True)
         assert messages[0]["reasoning"] == "real thought"
         assert "_provider_content" not in messages[0]
+
+
+class TestAttachVllmChatReasoningField:
+    """``attach_vllm_chat_reasoning_field`` — Phase 5 surfaces persisted
+    reasoning as the vLLM-specific ``reasoning`` field on outgoing
+    assistant messages so vLLM-served reasoning models can thread CoT
+    across turns.
+
+    Drives through the real ``extract_reasoning_text_from_provider_content``
+    dispatcher — no extractor mocks — so a regression in either layer
+    surfaces distinctly.  All 3 caller-side gates (provider isinstance,
+    server_type, operator flag) are exercised by
+    ``test_session_chat_reasoning_replay.py``; this class pins the
+    helper's projection contract in isolation.
+    """
+
+    def _assistant_with(self, provider_content: list[dict[str, object]]) -> dict[str, object]:
+        return {
+            "role": "assistant",
+            "content": "Final answer.",
+            "_provider_content": provider_content,
+        }
+
+    def test_synthetic_reasoning_text_attaches_field(self) -> None:
+        # Path 3 capture (vLLM --reasoning-parser, llama.cpp
+        # reasoning_format, Gemini-compat) lands in _provider_content as
+        # a synthetic reasoning_text block; helper must round-trip it
+        # back onto the same model on the next turn.
+        from turnstone.core.history_decoration import attach_vllm_chat_reasoning_field
+
+        msgs = [self._assistant_with([{"type": "reasoning_text", "text": "synth thought"}])]
+        out = attach_vllm_chat_reasoning_field(msgs)
+        assert out[0]["reasoning"] == "synth thought"
+
+    def test_anthropic_thinking_attaches_field(self) -> None:
+        # Cross-provider switch: workstream started with Anthropic,
+        # operator flipped model to a vLLM-served reasoning model.
+        # Helper extracts the thinking text and discards the signature
+        # (vLLM doesn't validate signatures).
+        from turnstone.core.history_decoration import attach_vllm_chat_reasoning_field
+
+        msgs = [
+            self._assistant_with(
+                [
+                    {"type": "thinking", "thinking": "claude was here", "signature": "sig"},
+                    {"type": "text", "text": "answer"},
+                ]
+            )
+        ]
+        out = attach_vllm_chat_reasoning_field(msgs)
+        assert out[0]["reasoning"] == "claude was here"
+        # Signature is dropped at extraction; ``reasoning`` field carries
+        # plain text only.
+        assert "sig" not in out[0]["reasoning"]
+
+    def test_openai_responses_reasoning_attaches_field(self) -> None:
+        # Cross-provider switch: workstream started on gpt-5, operator
+        # flipped to a vLLM-served model.  Helper extracts the
+        # summary[*].text concatenation.
+        from turnstone.core.history_decoration import attach_vllm_chat_reasoning_field
+
+        msgs = [
+            self._assistant_with(
+                [
+                    {
+                        "type": "reasoning",
+                        "id": "r_1",
+                        "summary": [{"type": "summary_text", "text": "responses thought"}],
+                    }
+                ]
+            )
+        ]
+        out = attach_vllm_chat_reasoning_field(msgs)
+        assert out[0]["reasoning"] == "responses thought"
+
+    def test_no_provider_content_returns_unchanged(self) -> None:
+        from turnstone.core.history_decoration import attach_vllm_chat_reasoning_field
+
+        msgs: list[dict[str, object]] = [{"role": "assistant", "content": "plain"}]
+        out = attach_vllm_chat_reasoning_field(msgs)
+        assert "reasoning" not in out[0]
+        # No copy made when there's nothing to attach — same object.
+        assert out[0] is msgs[0]
+
+    def test_empty_provider_content_returns_unchanged(self) -> None:
+        from turnstone.core.history_decoration import attach_vllm_chat_reasoning_field
+
+        msgs: list[dict[str, object]] = [
+            {"role": "assistant", "content": "x", "_provider_content": []}
+        ]
+        out = attach_vllm_chat_reasoning_field(msgs)
+        assert "reasoning" not in out[0]
+        assert out[0] is msgs[0]
+
+    def test_unknown_block_type_returns_unchanged(self) -> None:
+        # _provider_content has blocks but none are reasoning-bearing.
+        from turnstone.core.history_decoration import attach_vllm_chat_reasoning_field
+
+        msgs: list[dict[str, object]] = [
+            self._assistant_with([{"type": "text", "text": "no reasoning here"}])
+        ]
+        out = attach_vllm_chat_reasoning_field(msgs)
+        assert "reasoning" not in out[0]
+        assert out[0] is msgs[0]
+
+    def test_does_not_touch_user_tool_system_messages(self) -> None:
+        # Only assistant messages get the reasoning field.  User / tool /
+        # system messages pass through by reference.
+        from turnstone.core.history_decoration import attach_vllm_chat_reasoning_field
+
+        msgs: list[dict[str, object]] = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "c1", "content": "out"},
+            # Even an assistant-shaped non-assistant role (defensive — shouldn't happen)
+            # must not have provider_content read.
+        ]
+        out = attach_vllm_chat_reasoning_field(msgs)
+        assert "reasoning" not in out[0]
+        assert "reasoning" not in out[1]
+        assert "reasoning" not in out[2]
+        # All three return by reference (no allocation when no attach).
+        for original, returned in zip(msgs, out, strict=True):
+            assert original is returned
+
+    def test_preserves_provider_content_for_downstream_sanitize(self) -> None:
+        # Helper attaches ``reasoning`` but leaves ``_provider_content``
+        # in place.  Downstream ``sanitize_messages`` (in the provider's
+        # _prepare_messages) strips the ``_``-prefixed sibling key
+        # before the wire payload leaves.  Helper isn't responsible for
+        # that strip — composition with sanitize is the contract.
+        from turnstone.core.history_decoration import attach_vllm_chat_reasoning_field
+
+        original_content = [{"type": "reasoning_text", "text": "kept"}]
+        msgs = [self._assistant_with(original_content)]
+        out = attach_vllm_chat_reasoning_field(msgs)
+        assert out[0]["reasoning"] == "kept"
+        # Provider content survives on the helper's output dict.
+        assert out[0]["_provider_content"] == original_content
+
+    def test_does_not_mutate_input_messages(self) -> None:
+        # Pure transform: input list and input dicts are untouched.
+        # Callers can keep iterating the original list without surprise.
+        from turnstone.core.history_decoration import attach_vllm_chat_reasoning_field
+
+        original = self._assistant_with([{"type": "reasoning_text", "text": "x"}])
+        msgs = [original]
+        attach_vllm_chat_reasoning_field(msgs)
+        assert "reasoning" not in original
+        # Original dict untouched even though the function returned a
+        # modified copy.
+
+    def test_mixed_messages_only_attaches_to_assistants_with_reasoning(self) -> None:
+        # Realistic shape: a workstream with user, assistant-with-reasoning,
+        # tool, assistant-plain, user.  Only the first assistant gets the
+        # reasoning field; everything else passes through by reference.
+        from turnstone.core.history_decoration import attach_vllm_chat_reasoning_field
+
+        with_reasoning = self._assistant_with([{"type": "reasoning_text", "text": "thinking"}])
+        plain_assistant: dict[str, object] = {"role": "assistant", "content": "second"}
+        msgs: list[dict[str, object]] = [
+            {"role": "user", "content": "q1"},
+            with_reasoning,
+            {"role": "tool", "tool_call_id": "c1", "content": "result"},
+            plain_assistant,
+            {"role": "user", "content": "q2"},
+        ]
+        out = attach_vllm_chat_reasoning_field(msgs)
+        assert out[0] is msgs[0]
+        assert out[1]["reasoning"] == "thinking"
+        assert out[1] is not with_reasoning  # new dict for the attached one
+        assert out[2] is msgs[2]
+        assert out[3] is plain_assistant
+        assert "reasoning" not in out[3]
+        assert out[4] is msgs[4]

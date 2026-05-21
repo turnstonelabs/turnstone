@@ -73,7 +73,8 @@ class TestMaybeSynthReasoningBlock:
         session = _make_session()
         session._registry = SimpleNamespace(
             get_config=lambda alias: SimpleNamespace(
-                capabilities={"server_compat": {"server_type": "vllm"}},
+                capabilities={},
+                server_compat={"server_type": "vllm"},
             )
         )
         session._model_alias = "qwen3-32b"
@@ -296,7 +297,8 @@ class TestStreamResponseSynthBlockIntegration:
         session = _make_session()
         session._registry = SimpleNamespace(
             get_config=lambda alias: SimpleNamespace(
-                capabilities={"server_compat": {"server_type": "vllm"}},
+                capabilities={},
+                server_compat={"server_type": "vllm"},
             )
         )
         session._model_alias = "qwen3-32b"
@@ -319,16 +321,21 @@ class TestResolveServerType:
     def test_returns_empty_when_no_alias(self) -> None:
         session = _make_session()
         session._registry = SimpleNamespace(
-            get_config=lambda alias: SimpleNamespace(capabilities={})
+            get_config=lambda alias: SimpleNamespace(capabilities={}, server_compat={})
         )
         session._model_alias = ""
         assert session._resolve_server_type() == ""
 
     def test_returns_server_type_when_present(self) -> None:
+        # Mirrors production ModelConfig shape: server_compat lives at
+        # the top-level dataclass field, NOT inside capabilities.  Both
+        # model_registry loader paths pop("server_compat") out of caps
+        # before construction (see model_registry.py:401, 485).
         session = _make_session()
         session._registry = SimpleNamespace(
             get_config=lambda alias: SimpleNamespace(
-                capabilities={"server_compat": {"server_type": "llama.cpp"}}
+                capabilities={},
+                server_compat={"server_type": "llama.cpp"},
             )
         )
         session._model_alias = "local-model"
@@ -339,6 +346,7 @@ class TestResolveServerType:
         session._registry = SimpleNamespace(
             get_config=lambda alias: SimpleNamespace(
                 capabilities={"context_window": 32768},
+                server_compat={},
             )
         )
         session._model_alias = "local-model"

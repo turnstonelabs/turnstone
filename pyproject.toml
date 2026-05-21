@@ -22,7 +22,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "openai>=2.24",
+    "openai>=2.37",
     "httpx>=0.28",
     "mcp>=1.27",
     "starlette>=0.45",

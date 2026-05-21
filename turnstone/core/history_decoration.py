@@ -423,6 +423,51 @@ def extract_reasoning_for_history(
             msg["reasoning"] = text
 
 
+def attach_vllm_chat_reasoning_field(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Project persisted reasoning onto outgoing assistant messages as a
+    non-standard ``reasoning`` field consumed by vLLM's chat template.
+
+    vLLM's ``ChatMessage`` (``vllm/entrypoints/openai/chat_completion/
+    protocol.py``) accepts a non-standard ``reasoning`` input field that
+    propagates into the template render context as both ``reasoning``
+    and ``reasoning_content``.  Templates from reasoning-aware families
+    (Qwen3, DeepSeek-R1) inline that text on the next turn; templates
+    that don't read the field silently drop it.  Either way the field
+    name doesn't conflict with the OpenAI spec — ``sanitize_messages``
+    preserves it because it isn't ``_``-prefixed, and the OpenAI Python
+    SDK passes unknown message-level fields through to the wire
+    (TypedDict input shape, no runtime validation).
+
+    Pure transform: returns a new list with new dict copies for the
+    assistant messages that get a ``reasoning`` field attached.  Other
+    messages and assistant messages without reasoning text pass through
+    by reference.  The original messages are never mutated.
+
+    All three gates (provider isinstance, ``server_type == "vllm"``,
+    operator flag ``replay_reasoning_to_model``) MUST be checked by the
+    caller — this helper assumes the decision has already been made.
+    See ``ChatSession._maybe_attach_vllm_chat_reasoning`` for the
+    integration point.
+    """
+    out: list[dict[str, Any]] = []
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            out.append(msg)
+            continue
+        provider_content = msg.get("_provider_content")
+        if not provider_content:
+            out.append(msg)
+            continue
+        text = extract_reasoning_text_from_provider_content(provider_content)
+        if not text:
+            out.append(msg)
+            continue
+        out.append({**msg, "reasoning": text})
+    return out
+
+
 def decorate_history_messages(
     messages: list[dict[str, Any]],
     verdicts_by_call_id: dict[str, dict[str, Any]],

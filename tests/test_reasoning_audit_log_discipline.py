@@ -331,3 +331,73 @@ class TestReasoningAuditLogDiscipline:
             f"AnthropicProvider._convert_messages strip predicate leaked "
             f"reasoning text into INFO+ logs: {offending}"
         )
+
+    def test_attach_vllm_chat_reasoning_field_does_not_log_reasoning(self) -> None:
+        """Phase 5 surface — ``attach_vllm_chat_reasoning_field`` extracts
+        persisted reasoning text and attaches it as a ``reasoning`` field
+        on the outgoing assistant message dict.  The attached text is
+        wire-bound (vLLM template render) and UI-bound (history rehydration
+        already covered by Phase 1 tests above), but MUST NOT appear in
+        any INFO+ log call along the way."""
+        from turnstone.core.history_decoration import attach_vllm_chat_reasoning_field
+
+        captured, patchers = _capture_log_calls()
+        for p in patchers:
+            p.start()
+        try:
+            messages = [self._thinking_msg(_MARKER)]
+            out = attach_vllm_chat_reasoning_field(messages)
+            # Wire-bound attach succeeded — marker IS allowed in the
+            # returned dict's reasoning field.
+            assert out[0]["reasoning"] == _MARKER
+        finally:
+            for p in patchers:
+                p.stop()
+        offending = [
+            (lvl, args, kwargs)
+            for lvl, args, kwargs in captured
+            if _payload_contains_marker(args, kwargs)
+        ]
+        assert offending == [], (
+            f"attach_vllm_chat_reasoning_field leaked reasoning text into INFO+ logs: {offending}"
+        )
+
+    def test_maybe_attach_vllm_chat_reasoning_does_not_log_reasoning(self) -> None:
+        """Phase 5 gate method on ChatSession — the session-level
+        composite gate calls ``attach_vllm_chat_reasoning_field`` when
+        all 3 conditions pass.  Pin that the gate path itself doesn't
+        log reasoning text (the registry / capability lookups happen
+        adjacent to the reasoning bytes; a defensive ``log.warning``
+        showing the message dict on an error path would silently
+        violate the contract)."""
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+
+        session = make_session()
+        session._registry = SimpleNamespace(
+            get_config=lambda _alias: SimpleNamespace(
+                replay_reasoning_to_model=True,
+                capabilities={},
+                server_compat={"server_type": "vllm"},
+            )
+        )
+        session._model_alias = "qwen3"
+        provider = OpenAIChatCompletionsProvider()
+
+        captured, patchers = _capture_log_calls()
+        for p in patchers:
+            p.start()
+        try:
+            out = session._maybe_attach_vllm_chat_reasoning([self._thinking_msg(_MARKER)], provider)
+            assert out[0]["reasoning"] == _MARKER
+        finally:
+            for p in patchers:
+                p.stop()
+        offending = [
+            (lvl, args, kwargs)
+            for lvl, args, kwargs in captured
+            if _payload_contains_marker(args, kwargs)
+        ]
+        assert offending == [], (
+            f"ChatSession._maybe_attach_vllm_chat_reasoning leaked reasoning "
+            f"text into INFO+ logs: {offending}"
+        )

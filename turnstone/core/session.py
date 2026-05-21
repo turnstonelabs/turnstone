@@ -45,7 +45,10 @@ from turnstone.core.attachments import (
 )
 from turnstone.core.config import get_tavily_key
 from turnstone.core.edit import find_occurrences, pick_nearest
-from turnstone.core.history_decoration import extract_advisories_from_tool_envelope
+from turnstone.core.history_decoration import (
+    attach_vllm_chat_reasoning_field,
+    extract_advisories_from_tool_envelope,
+)
 from turnstone.core.log import get_logger
 from turnstone.core.memory import (
     count_structured_memories,
@@ -1169,20 +1172,23 @@ class ChatSession:
 
         Used by :meth:`_maybe_synth_reasoning_block` to tag synthetic
         path-3 reasoning blocks with their origin server (vllm,
-        llama.cpp, sglang, etc.) — informational today, useful for
-        future per-server replay paths.  Returns ``""`` on any lookup
-        miss; the synthetic block then omits the ``source`` field.
+        llama.cpp, sglang, etc.) — informational there but load-bearing
+        for :meth:`_maybe_attach_vllm_chat_reasoning` (Phase 5 gate).
+        Returns ``""`` on any lookup miss.
+
+        Reads ``cfg.server_compat`` (the dedicated dataclass field set
+        by the model_registry loader) — NOT ``cfg.capabilities``.  Both
+        loader paths (DB at ``model_registry.py:401`` and config.toml at
+        ``model_registry.py:485``) ``caps.pop("server_compat", {})`` and
+        hoist the dict to the top-level field, so the capabilities dict
+        never carries server_compat in production.
         """
         target_alias = alias or self._model_alias or ""
         if not self._registry or not target_alias:
             return ""
         try:
             cfg: ModelConfig = self._registry.get_config(target_alias)
-            sc = (
-                cfg.capabilities.get("server_compat")
-                if isinstance(cfg.capabilities, dict)
-                else None
-            )
+            sc = cfg.server_compat if isinstance(cfg.server_compat, dict) else None
             if isinstance(sc, dict):
                 return str(sc.get("server_type") or "")
         except Exception:
@@ -1239,11 +1245,14 @@ class ChatSession:
 
         The optional ``source`` field tags the block with the
         originating server (``vllm``, ``llamacpp``, ``sglang``, etc.)
-        when ``ModelConfig.capabilities["server_compat"]["server_type"]``
-        is populated.  Reserved for future per-server replay paths
-        (e.g. an operator-flagged path that re-injects synthetic
-        reasoning back into a vllm round-trip) — not consumed today;
-        the field is informational metadata, not dead code.
+        resolved via :meth:`_resolve_server_type`, which reads
+        ``cfg.server_compat["server_type"]`` (the dedicated dataclass
+        field hoisted by the model_registry loader, NOT
+        ``cfg.capabilities``).  The synthetic block's ``source`` field
+        itself is informational metadata; Phase 5's vLLM replay path
+        (:meth:`_maybe_attach_vllm_chat_reasoning`) reads
+        ``cfg.server_compat`` directly rather than the synthetic
+        block's tag.
         """
         text = "".join(reasoning_parts)
         if not text.strip():
@@ -1307,6 +1316,63 @@ class ChatSession:
         if caps is None:
             return operator_on
         return operator_on and bool(caps.supports_reasoning_replay)
+
+    def _maybe_attach_vllm_chat_reasoning(
+        self,
+        messages: list[dict[str, Any]],
+        provider: LLMProvider,
+        alias: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Conditionally attach vLLM's non-standard ``reasoning`` field to
+        outgoing assistant messages so a vLLM-served reasoning model can
+        thread CoT across turns.
+
+        Phase 5 of reasoning-persistence — parallel path to Paths 1+2,
+        not a modification.  Three gates:
+
+        1. Provider is ``OpenAIChatCompletionsProvider`` (Chat Completions
+           surface, not Responses or Anthropic — those have their own
+           replay paths with loud-failure-protected dual-gates).
+        2. ``server_compat.server_type == "vllm"`` — bounds blast radius
+           to vLLM; canonical OpenAI / llama.cpp / sglang never see the
+           non-standard field.
+        3. Operator-set ``ModelConfig.replay_reasoning_to_model`` — same
+           per-model toggle PR #498 added; defaults False.
+
+        The static ``supports_reasoning_replay`` capability gate that
+        guards Paths 1+2 is intentionally NOT used here.  vLLM's chat
+        template silently drops ``reasoning`` if the loaded template
+        doesn't read ``reasoning_content`` — the gate would add code-
+        edit friction (capability tables live in
+        ``providers/_openai_common.py``, not the admin UI) without
+        preventing the silent failure that's the actual misconfiguration
+        risk.  See ``project_reasoning_replay_capability_gate.md`` for
+        the full asymmetry rationale.
+
+        Returns *messages* unchanged when any gate fails.
+        """
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+
+        if not isinstance(provider, OpenAIChatCompletionsProvider):
+            return messages
+        target_alias = alias or self._model_alias or ""
+        if not self._registry or not target_alias:
+            return messages
+        try:
+            cfg = self._registry.get_config(target_alias)
+        except Exception:
+            return messages
+        # Read both gate fields off the single ``cfg`` we already
+        # fetched, rather than re-entering ``_resolve_server_type``
+        # (which would do a second ``get_config`` call).  Mirrors the
+        # field location ``_resolve_server_type`` reads, so the two
+        # gates stay aligned if the loader ever changes shape.
+        sc = cfg.server_compat if isinstance(cfg.server_compat, dict) else None
+        if not isinstance(sc, dict) or sc.get("server_type") != "vllm":
+            return messages
+        if not bool(cfg.replay_reasoning_to_model):
+            return messages
+        return attach_vllm_chat_reasoning_field(messages)
 
     def _save_config(self) -> None:
         """Persist LLM-affecting config so resumed workstreams behave identically."""
@@ -2772,6 +2838,7 @@ class ChatSession:
         """
         caps = self._get_capabilities()
         clamped = min(max_tokens, caps.max_output_tokens) if caps.max_output_tokens else max_tokens
+        messages = self._maybe_attach_vllm_chat_reasoning(messages, self._provider)
         return self._provider.create_completion(
             client=self.client,
             model=self.model,
@@ -2968,6 +3035,7 @@ class ChatSession:
             msg_count,
             role_counts,
         )
+        msgs = self._maybe_attach_vllm_chat_reasoning(msgs, prov, model_alias)
         last_err: Exception | None = None
         for attempt in range(self._MAX_RETRIES + 1):
             self._check_cancelled()
@@ -9375,6 +9443,13 @@ class ChatSession:
             messages: list[dict[str, Any]],
             _tools: list[dict[str, Any]] | None = tools,
         ) -> CompletionResult:
+            # NOTE: Phase 5 vLLM ``reasoning`` field replay is intentionally
+            # NOT wired here.  Agent assistant messages are built from
+            # ``CompletionResult.content + tool_calls`` only (no
+            # ``_provider_content`` carried), so the helper would no-op
+            # every turn anyway.  Plan/task agents are excluded from the
+            # persistence/replay contract — their conversation history
+            # is in-memory and rebuilt per ``_run_agent`` invocation.
             last_err: Exception | None = None
             for attempt in range(self._MAX_RETRIES + 1):
                 try:
