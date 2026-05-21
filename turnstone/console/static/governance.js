@@ -3310,15 +3310,24 @@ function renderJudgeSettings() {
         '<span class="toggle-track" aria-hidden="true"></span>' +
         '<span class="toggle-label">Enabled</span></label>';
     } else if (s.type === "float") {
+      // currentVal/min/max are expected to be numeric, but
+      // ``admin_list_judge_settings`` can fall back to returning the
+      // raw stored string when deserialization fails — escape +
+      // stringify defensively so a non-numeric fallback can't break
+      // out of the value/min/max attribute boundary.
       inputHtml =
         '<div style="display:flex;gap:8px;align-items:center">' +
         '<input type="number" step="0.01" data-judge-key="' +
         eKey +
         '" value="' +
-        currentVal +
+        escapeHtml(String(currentVal != null ? currentVal : "")) +
         '"' +
-        (s.min_value != null ? ' min="' + s.min_value + '"' : "") +
-        (s.max_value != null ? ' max="' + s.max_value + '"' : "") +
+        (s.min_value != null
+          ? ' min="' + escapeHtml(String(s.min_value)) + '"'
+          : "") +
+        (s.max_value != null
+          ? ' max="' + escapeHtml(String(s.max_value)) + '"'
+          : "") +
         ' style="width:100px;padding:4px 8px;background:var(--bg);border:1px solid var(--border-strong);color:var(--fg);border-radius:3px">' +
         '<button class="admin-action-btn" data-judge-save-key="' +
         eKey +
@@ -3335,44 +3344,6 @@ function renderJudgeSettings() {
         '<button class="admin-action-btn" data-judge-save-key="' +
         eKey +
         '">Save</button></div>';
-    } else if (shortKey === "model") {
-      // Model picker: select from model definitions
-      inputHtml =
-        '<div style="display:flex;gap:8px;align-items:center">' +
-        '<select data-judge-key="' +
-        eKey +
-        '"' +
-        ' style="width:240px;padding:4px 8px;background:var(--bg);border:1px solid var(--border-strong);color:var(--fg);border-radius:3px">' +
-        '<option value="">(same as session)</option>';
-      for (var m = 0; m < _judgeModelDefs.length; m++) {
-        var md = _judgeModelDefs[m];
-        if (!md.enabled) continue;
-        inputHtml +=
-          '<option value="' +
-          escapeHtml(md.alias) +
-          '"' +
-          (currentVal === md.alias ? " selected" : "") +
-          ">" +
-          escapeHtml(md.alias) +
-          " (" +
-          escapeHtml(md.model) +
-          ")</option>";
-      }
-      // Also allow the current value if it's not in model defs (manual entry)
-      if (
-        currentVal &&
-        !_judgeModelDefs.some(function (md) {
-          return md.alias === currentVal;
-        })
-      ) {
-        inputHtml +=
-          '<option value="' +
-          escapeHtml(currentVal) +
-          '" selected>' +
-          escapeHtml(currentVal) +
-          " (manual)</option>";
-      }
-      inputHtml += "</select></div>";
     } else {
       inputHtml =
         '<div style="display:flex;gap:8px;align-items:center">' +
@@ -3416,19 +3387,15 @@ function renderJudgeSettings() {
   // setAttribute (escapeHtml'd in the HTML builder) and are read back
   // via getAttribute, avoiding the prior ``onclick="..._('KEY')"``
   // pattern that embedded a JS-string inside an HTML-attribute and
-  // would break out if a key ever contained an apostrophe.  Bool +
-  // select inputs auto-save on change; text/number/password inputs
-  // are paired with an explicit Save button (no per-keystroke save).
+  // would break out if a key ever contained an apostrophe.  Bool
+  // checkboxes auto-save on change; text/number/password inputs are
+  // paired with an explicit Save button (no per-keystroke save).
   var inputs = c.querySelectorAll("[data-judge-key]");
   for (var ii = 0; ii < inputs.length; ii++) {
     var inp = inputs[ii];
     if (inp.type === "checkbox") {
       inp.addEventListener("change", function () {
         saveJudgeSetting(this.getAttribute("data-judge-key"), this.checked);
-      });
-    } else if (inp.tagName === "SELECT") {
-      inp.addEventListener("change", function () {
-        saveJudgeSetting(this.getAttribute("data-judge-key"), this.value);
       });
     }
     // text/number/password: no auto-save listener — the adjacent Save
