@@ -299,7 +299,7 @@ function initLogin() {
   overlay.setAttribute("role", "dialog");
   overlay.setAttribute("aria-modal", "true");
   overlay.setAttribute("aria-labelledby", "login-title");
-  overlay.innerHTML = _buildLoginHTML();
+  setSafeHtml(overlay, _buildLoginHTML());
   document.body.appendChild(overlay);
   _bindLoginEvents();
 

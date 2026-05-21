@@ -324,7 +324,7 @@
     }
     const body = document.createElement("div");
     body.className = "msg-body";
-    body.innerHTML = html;
+    setSafeHtml(body, html);
     el.appendChild(body);
     messagesEl.appendChild(el);
     _scheduleScroll();

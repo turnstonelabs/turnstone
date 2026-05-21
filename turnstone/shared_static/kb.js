@@ -27,7 +27,7 @@ function showKbHelp() {
     "</div>";
   var overlay = document.createElement("div");
   overlay.id = "kb-overlay";
-  overlay.innerHTML = html;
+  setSafeHtml(overlay, html);
   overlay.onclick = function (e) {
     if (e.target === overlay) hideKbHelp();
   };
