@@ -116,7 +116,7 @@ function showAdmin() {
     const closeHeader = document.createElement("div");
     closeHeader.id = "admin-sidebar-close";
     closeHeader.className = "admin-sidebar-close";
-    let label = document.createElement("span");
+    const label = document.createElement("span");
     label.textContent = "Navigation";
     const closeBtn = document.createElement("button");
     closeBtn.setAttribute("aria-label", "Close navigation");
@@ -290,7 +290,7 @@ function switchAdminTab(tab) {
 
   // Update breadcrumb with active tab label
   const activeNav = document.querySelector('.admin-nav[data-tab="' + tab + '"]');
-  let label = activeNav ? activeNav.textContent : tab;
+  const label = activeNav ? activeNav.textContent : tab;
   const bcLabel = document.getElementById("breadcrumb-label");
   if (bcLabel) bcLabel.textContent = "Admin / " + label;
 
@@ -398,8 +398,8 @@ function _renderUsers(users) {
   for (let k = 0; k < rows.length; k++) {
     (function (row) {
       const _expand = function () {
-        let uid = row.getAttribute("data-user-id");
-        let uname = row.getAttribute("data-username");
+        const uid = row.getAttribute("data-user-id");
+        const uname = row.getAttribute("data-username");
         _toggleOidcPanel(uid, uname, row);
       };
       row.addEventListener("click", function (e) {
@@ -710,7 +710,7 @@ function _relativeTime(isoStr) {
 
 function _populateTokenUserSelect() {
   const sel = document.getElementById("admin-token-user");
-  let current = sel.value;
+  const current = sel.value;
   setSafeHtml(sel, '<option value="">Select user...</option>');
   for (let i = 0; i < _adminUsers.length; i++) {
     const u = _adminUsers[i];
@@ -837,7 +837,7 @@ function confirmRevokeToken(tokenId) {
 
 function _populateChannelUserSelect() {
   const sel = document.getElementById("admin-channel-user");
-  let current = sel.value;
+  const current = sel.value;
   setSafeHtml(sel, '<option value="">Select user...</option>');
   for (let i = 0; i < _adminUsers.length; i++) {
     const u = _adminUsers[i];
@@ -1708,7 +1708,7 @@ function showScheduleRuns(taskId) {
           '<span class="admin-col">ERROR</span></div>';
         for (let i = 0; i < runs.length; i++) {
           const r = runs[i];
-          let statusCls =
+          const statusCls =
             r.status === "dispatched"
               ? "sched-active"
               : r.status === "failed"
@@ -1762,7 +1762,7 @@ function hideScheduleRunsModal() {
 
 function _populateWatchNodeSelect() {
   const sel = document.getElementById("admin-watch-node");
-  let current = sel.value;
+  const current = sel.value;
   const seen = {};
   setSafeHtml(sel, '<option value="">All nodes</option>');
   for (let i = 0; i < _adminWatches.length; i++) {
@@ -1833,9 +1833,9 @@ function _renderWatches(watches) {
     const cond = w.stop_on || "on change";
     const condTrunc = cond.length > 30 ? cond.slice(0, 30) + "\u2026" : cond;
     const active = w.active;
-    let statusCls = active ? "watch-active" : "watch-completed";
-    let statusLabel = active ? "active" : "done";
-    let statusDot = active ? "\u25cf " : "\u25cb ";
+    const statusCls = active ? "watch-active" : "watch-completed";
+    const statusLabel = active ? "active" : "done";
+    const statusDot = active ? "\u25cf " : "\u25cb ";
     const cancelBtn = active
       ? '<button class="admin-btn-danger" data-cancel-watch="' +
         escapeHtml(w.watch_id) +
@@ -2542,7 +2542,7 @@ function loadTlsCerts() {
       while (listEl.firstChild) listEl.removeChild(listEl.firstChild);
 
       if (!data.enabled) {
-        let msg = document.createElement("div");
+        const msg = document.createElement("div");
         msg.className = "dashboard-empty";
         msg.textContent =
           "TLS is not enabled. Set tls.enabled = true in Settings.";
@@ -2563,7 +2563,7 @@ function loadTlsCerts() {
 
       const certs = certData.certs || [];
       if (certs.length === 0) {
-        let empty = document.createElement("div");
+        const empty = document.createElement("div");
         empty.className = "dashboard-empty";
         empty.textContent = "No certificates issued yet.";
         listEl.appendChild(empty);
@@ -3641,7 +3641,7 @@ function _renderMcpServers(items) {
       const name = this.getAttribute("data-mcp-oauth-connect");
       // Open the OAuth /start endpoint in a new window so the redirect
       // chain (AS → callback → return_url) doesn't displace the admin UI.
-      let url =
+      const url =
         "/v1/api/mcp/oauth/start?server=" +
         encodeURIComponent(name) +
         "&return_url=" +
@@ -3966,7 +3966,7 @@ function submitCreateMcp() {
   }
   const editId = document.getElementById("mcp-edit-id").value;
   const method = editId ? "PUT" : "POST";
-  let url = editId
+  const url = editId
     ? "/v1/api/admin/mcp-servers/" + editId
     : "/v1/api/admin/mcp-servers";
 
@@ -4461,7 +4461,7 @@ function _renderRegistryResults() {
   // Bind install buttons
   el.querySelectorAll("[data-reg-install]").forEach(function (btn) {
     btn.addEventListener("click", function () {
-      let idx = parseInt(this.getAttribute("data-reg-install"), 10);
+      const idx = parseInt(this.getAttribute("data-reg-install"), 10);
       _initiateRegistryInstall(_registryResults[idx]);
     });
   });
@@ -4498,7 +4498,7 @@ function _initiateRegistryInstall(srv) {
     // Disable the clicked Install button for loading feedback
     const cardBtns = document.querySelectorAll("[data-reg-install]");
     for (let bi = 0; bi < cardBtns.length; bi++) {
-      let idx = parseInt(cardBtns[bi].getAttribute("data-reg-install"), 10);
+      const idx = parseInt(cardBtns[bi].getAttribute("data-reg-install"), 10);
       if (_registryResults[idx] && _registryResults[idx].name === srv.name) {
         cardBtns[bi].disabled = true;
         cardBtns[bi].textContent = "Installing\u2026";
@@ -4725,8 +4725,8 @@ function submitInstallMcp() {
   const srv = _mcpInstallServer;
   if (!srv) return;
   const fieldsEl = document.getElementById("mcp-install-fields");
-  let source = fieldsEl.getAttribute("data-source") || "remote";
-  let pkgIndex = parseInt(fieldsEl.getAttribute("data-pkg-index") || "0", 10);
+  const source = fieldsEl.getAttribute("data-source") || "remote";
+  const pkgIndex = parseInt(fieldsEl.getAttribute("data-pkg-index") || "0", 10);
   const index = source === "remote" ? 0 : pkgIndex;
 
   const variables = {};
@@ -4998,7 +4998,7 @@ function switchModelsSection(section) {
     const secs = [];
     for (let i = 0; i < btns.length; i++)
       secs.push(btns[i].getAttribute("data-section"));
-    let current = switcher.querySelector(".admin-subtab-btn.active");
+    const current = switcher.querySelector(".admin-subtab-btn.active");
     let idx = secs.indexOf(current ? current.getAttribute("data-section") : "");
     if (e.key === "ArrowRight") idx = (idx + 1) % secs.length;
     else idx = (idx - 1 + secs.length) % secs.length;
@@ -5224,7 +5224,7 @@ function _renderModels(items) {
   // Clear previous content
   el.textContent = "";
   if (!items.length) {
-    let empty = document.createElement("div");
+    const empty = document.createElement("div");
     empty.className = "dashboard-empty";
     empty.textContent = "No model definitions configured";
     el.appendChild(empty);
@@ -5235,11 +5235,11 @@ function _renderModels(items) {
     const isConfig = m.source === "config";
 
     // Status
-    let dotClass = m.enabled
+    const dotClass = m.enabled
       ? "model-status-dot enabled"
       : "model-status-dot disabled";
-    let rowClass = m.enabled ? "model-row-enabled" : "model-row-disabled";
-    let statusText = m.enabled ? "enabled" : "disabled";
+    const rowClass = m.enabled ? "model-row-enabled" : "model-row-disabled";
+    const statusText = m.enabled ? "enabled" : "disabled";
 
     // Context window formatting (0 = auto-detect)
     const ctxText = m.context_window
@@ -5728,7 +5728,7 @@ function submitCreateModel() {
 
   const editId = document.getElementById("model-edit-id").value;
   const method = editId ? "PUT" : "POST";
-  let url = editId
+  const url = editId
     ? "/v1/api/admin/model-definitions/" + encodeURIComponent(editId)
     : "/v1/api/admin/model-definitions";
 
@@ -5974,7 +5974,7 @@ function _onModelFieldChange() {
         }
         const capsInput = document.getElementById("model-capabilities");
         if (!capsInput.value.trim()) {
-          let caps = Object.assign({}, d.capabilities);
+          const caps = Object.assign({}, d.capabilities);
           delete caps.context_window;
           delete caps.max_output_tokens;
           delete caps.token_param;

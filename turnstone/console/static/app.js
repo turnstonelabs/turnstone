@@ -223,7 +223,7 @@ function recomputeOverview() {
       totalWs++;
       nodeWsTokens += ws.tokens || 0;
     });
-    let aggTokens = (node.aggregate || {}).total_tokens || 0;
+    const aggTokens = (node.aggregate || {}).total_tokens || 0;
     totalTokens += aggTokens || nodeWsTokens;
     totalToolCalls += (node.aggregate || {}).total_tool_calls || 0;
     if (node.version) versions[node.version] = true;
@@ -865,10 +865,10 @@ function toggleGroup(prefix) {
       '"]',
   );
   if (!body) return;
-  let isExpanded = expandedGroups[prefix];
+  const isExpanded = expandedGroups[prefix];
   if (isExpanded) body.classList.remove("collapsed");
   else body.classList.add("collapsed");
-  let groupEl = body.parentElement;
+  const groupEl = body.parentElement;
   if (groupEl) groupEl.setAttribute("aria-expanded", String(isExpanded));
   const chevron = groupEl ? groupEl.querySelector(".node-group-chevron") : null;
   if (chevron) {
@@ -1885,7 +1885,7 @@ function _populateHomeModelDropdowns() {
     })
     .then(function (data) {
       const choices = (data.models || []).map(function (m) {
-        let label =
+        const label =
           m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
         return { value: m.alias, text: label };
       });
@@ -1938,7 +1938,7 @@ function submitHomeCoord(textFromComposer) {
   // read from the composer.
   const task =
     textFromComposer != null ? textFromComposer : _homeCoordComposer.value;
-  let opts = _homeCoordComposer.getOptionValues();
+  const opts = _homeCoordComposer.getOptionValues();
   // Snapshot at submit time so a chip remove mid-request can't race
   // the multipart payload (the actual reset only fires on the success
   // branch, after the response lands).

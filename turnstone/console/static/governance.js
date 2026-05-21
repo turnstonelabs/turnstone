@@ -71,7 +71,7 @@ function _renderGovRoles(items) {
     const perms = (r.permissions || "").split(",");
     let badges = "";
     for (let j = 0; j < perms.length; j++) {
-      let p = perms[j].trim();
+      const p = perms[j].trim();
       if (!p) continue;
       let cls = "scope-badge";
       if (p === "approve" || p.indexOf("admin.") === 0) cls += " scope-approve";
@@ -82,7 +82,7 @@ function _renderGovRoles(items) {
     const typeLabel = r.builtin
       ? '<span class="scope-badge scope-channel">builtin</span>'
       : "";
-    let actions = r.builtin
+    const actions = r.builtin
       ? ""
       : '<button class="admin-btn-action" data-edit-role="' +
         escapeHtml(r.role_id) +
@@ -212,7 +212,7 @@ function _buildPermCheckboxes(prefix, selected) {
       "</div>" +
       '<div class="perm-grid">';
     for (let i = 0; i < section.permissions.length; i++) {
-      let p = section.permissions[i];
+      const p = section.permissions[i];
       const checked = selected && selected.indexOf(p) >= 0 ? " checked" : "";
       html +=
         '<label class="toggle-switch perm-toggle">' +
@@ -343,7 +343,7 @@ function hideEditRoleModal() {
 
 function submitEditRole() {
   const roleId = document.getElementById("er-id").value;
-  let dname = document.getElementById("er-name").value.trim();
+  const dname = document.getElementById("er-name").value.trim();
   const perms = _collectPermCheckboxes("er");
   document.getElementById("er-submit").disabled = true;
   authFetch("/v1/api/admin/roles/" + roleId, {
@@ -521,8 +521,8 @@ function _renderGovPolicies(items) {
   }
   let html = "";
   for (let i = 0; i < items.length; i++) {
-    let p = items[i];
-    let actionCls = "policy-badge policy-" + p.action;
+    const p = items[i];
+    const actionCls = "policy-badge policy-" + p.action;
     const statusDot = p.enabled
       ? '<span class="watch-active" title="Enabled">\u25CF active</span>'
       : '<span class="watch-completed" title="Disabled">\u25CB disabled</span>';
@@ -795,7 +795,7 @@ function _renderGovSkills(items) {
         }[t.risk_level] || "";
       const tipParts = [];
       try {
-        let report = JSON.parse(t.scan_report || "{}");
+        const report = JSON.parse(t.scan_report || "{}");
         if (report.composite != null) {
           tipParts.push("Score: " + report.composite.toFixed(2));
         }
@@ -1880,7 +1880,7 @@ function _renderPendingResources() {
   setSafeHtml(container, html);
   container.querySelectorAll("[data-remove-res]").forEach(function (btn) {
     btn.addEventListener("click", function () {
-      let idx = parseInt(this.getAttribute("data-remove-res"), 10);
+      const idx = parseInt(this.getAttribute("data-remove-res"), 10);
       _pendingResources.splice(idx, 1);
       _renderPendingResources();
     });
@@ -2494,7 +2494,7 @@ function showMemoryDetailModal(memoryId) {
       let scopeLabel = m.scope;
       if (m.scope_id) scopeLabel += ":" + m.scope_id;
 
-      let html =
+      const html =
         '<div class="mem-detail-grid">' +
         '<div class="mem-detail-field"><span class="mem-detail-label">Name</span>' +
         escapeHtml(m.name) +
@@ -2627,7 +2627,7 @@ function searchSkillDiscover() {
   const searchBtn = document.getElementById("skill-discover-search-btn");
   if (searchBtn) searchBtn.disabled = true;
 
-  let url = "/v1/api/admin/skills/discover?limit=20&q=" + encodeURIComponent(q);
+  const url = "/v1/api/admin/skills/discover?limit=20&q=" + encodeURIComponent(q);
 
   authFetch(url)
     .then(function (r) {
@@ -2745,7 +2745,7 @@ function _renderSkillDiscoverResults() {
   // Bind install handlers
   el.querySelectorAll("[data-skill-install]").forEach(function (btn) {
     btn.addEventListener("click", function () {
-      let idx = parseInt(this.getAttribute("data-skill-install"), 10);
+      const idx = parseInt(this.getAttribute("data-skill-install"), 10);
       installDiscoveredSkill(_skillDiscoverResults[idx]);
     });
   });
@@ -2757,7 +2757,7 @@ function installDiscoveredSkill(skill) {
   // Disable the button
   const btns = document.querySelectorAll("[data-skill-install]");
   for (let i = 0; i < btns.length; i++) {
-    let idx = parseInt(btns[i].getAttribute("data-skill-install"), 10);
+    const idx = parseInt(btns[i].getAttribute("data-skill-install"), 10);
     if (
       _skillDiscoverResults[idx] &&
       _skillDiscoverResults[idx].id === skill.id
@@ -2829,7 +2829,7 @@ function hideGitHubImportModal() {
 }
 
 function submitGitHubImport() {
-  let url = (document.getElementById("gi-url").value || "").trim();
+  const url = (document.getElementById("gi-url").value || "").trim();
   const errEl = document.getElementById("github-import-error");
   if (!url) {
     errEl.textContent = "URL is required";
@@ -2935,7 +2935,7 @@ function _renderPromptPolicies(items) {
     return;
   }
   for (let i = 0; i < items.length; i++) {
-    let p = items[i];
+    const p = items[i];
     const row = document.createElement("div");
     row.className = "admin-row";
     row.setAttribute("role", "listitem");
@@ -4014,7 +4014,7 @@ function renderOGPatterns() {
   }
   let html = "";
   for (let i = 0; i < _judgeOGPatterns.length; i++) {
-    let p = _judgeOGPatterns[i];
+    const p = _judgeOGPatterns[i];
     const sourceBadge =
       p.source === "builtin"
         ? '<span class="scope-badge">built-in</span>'
