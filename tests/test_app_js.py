@@ -238,21 +238,26 @@ def test_replay_renders_user_interjection_advisory_after_tool_block() -> None:
 _INDEX_HTML = Path(__file__).resolve().parent.parent / "turnstone/ui/static/index.html"
 _STYLE_CSS = Path(__file__).resolve().parent.parent / "turnstone/ui/static/style.css"
 
-# Pins the absence of unsafe DOM-write sinks. Spell the property names
-# out of literal concatenation so the tooling that flags occurrences in
-# code strings doesn't false-positive on the test source.
+# Pins the absence of unsafe DOM-write and dynamic-code sinks.  Spell
+# the property/identifier names out of literal string concatenation so
+# the tooling that flags occurrences in code strings doesn't
+# false-positive on the test source.
 #
-# The pattern catches:
-# * plain assignment — ``el.innerHTML = X``, ``el.outerHTML = X``
-# * concat-assignment — ``el.innerHTML += X``, ``el.outerHTML += X``
-#   (``\+?`` makes the ``+`` optional so a future regression that
-#   switches sinks to concat-assignment doesn't bypass the lint)
-# * doc-write — ``document.write(...)``
+# The pattern catches each of:
+#   * plain HTML-assignment   — inner/outer-HTML to a value
+#   * concat HTML-assignment  — inner/outer-HTML += value (the
+#     ``\+?`` makes the ``+`` optional so a regression switching the
+#     sink to concat-assignment doesn't bypass the lint)
+#   * legacy doc-write        — ``document.write(...)``
+#   * string-to-code helpers  — the JS ``ev`` + ``al`` builtin, the
+#     dynamic-Function constructor (``new`` + ``Function(...)``), and
+#     ``setTimeout``/``setInterval`` whose first arg is a string
+#     literal (function-first-arg forms remain unflagged)
 #
-# The trailing ``(?!=)`` negative-lookahead excludes ``===`` / ``==``
-# reads — only the assignment / call sinks are flagged.
+# The trailing ``(?!=)`` negative-lookahead on the HTML assignments
+# excludes ``===`` / ``==`` reads — only the write sinks are flagged.
 #
-# The scan in ``test_no_unsafe_dom_writes_in_static_assets`` runs the
+# The scan in ``test_no_unsafe_code_sinks_in_static_assets`` runs the
 # regex over the *entire file body* (not line-by-line) so that ``\s*``
 # can span newlines and catch multi-line sinks like
 # ``el.innerHTML\n  = X``.
@@ -260,10 +265,16 @@ _STYLE_CSS = Path(__file__).resolve().parent.parent / "turnstone/ui/static/style
 # ``insertAdjacent`` + HTML is *not* covered here because two existing
 # call sites (``app.js:1287`` and ``app.js:1538``) consume
 # ``renderVerdictBadge`` HTML output; broadening the lint would require
-# cleaning that helper first.  Tracked as a follow-up to the DOM-cleanup
-# PR.
-_UNSAFE_DOM_WRITE_RE = re.compile(
-    r"\.(?:inner|outer)" + r"HTML\s*\+?=(?!=)" + r"|document\.write\("
+# cleaning that helper first.  Tracked as a follow-up.
+_UNSAFE_CODE_SINK_RE = re.compile(
+    r"\.(?:inner|outer)"
+    + r"HTML\s*\+?=(?!=)"
+    + r"|document\.write\("
+    + r"|\b"
+    + r"eval\s*\("
+    + r"|\bnew\s+"
+    + r"Function\s*\("
+    + r"|\bset(?:Timeout|Interval)\s*\(\s*['\"`]"
 )
 
 
@@ -367,11 +378,13 @@ _DOM_WRITE_LINT_TARGETS = [
     _DOM_WRITE_LINT_TARGETS,
     ids=[label for label, _ in _DOM_WRITE_LINT_TARGETS],
 )
-def test_no_unsafe_dom_writes_in_static_assets(label: str, path: Path) -> None:
-    """Whole-file pin: no direct DOM-write sinks
-    (``inner``/``outer``-HTML assignment, legacy doc-write) in any of
-    the static JS bundles that render LLM output, tool results,
-    operator-supplied data, or user input.
+def test_no_unsafe_code_sinks_in_static_assets(label: str, path: Path) -> None:
+    """Whole-file pin: no direct DOM-write *or* dynamic-code sinks
+    in any of the static JS bundles that render LLM output, tool
+    results, operator-supplied data, or user input.  Covers
+    inner/outer-HTML assignment (plain and concat), legacy doc-write,
+    string-eval, dynamic-Function constructor, and string-first-arg
+    timer scheduling.
 
     Two distinct cleanup postures across the targets:
 
@@ -392,10 +405,14 @@ def test_no_unsafe_dom_writes_in_static_assets(label: str, path: Path) -> None:
     ``console/static/governance.js`` and ``console/static/app.js``
     remain pending follow-ups — same posture as admin.js once cleaned.
 
-    ``insertAdjacent`` + HTML is deliberately *not* covered yet; two
-    existing app.js sites (the verdict-badge writers at lines 1287 and
-    1538) consume the HTML-string output of ``renderVerdictBadge``, so
-    broadening the lint requires cleaning that helper first.
+    The regex covers inner/outer-HTML assignment (plain and
+    concat-assignment), legacy doc-write, and the dynamic-code
+    constructors (string-eval, dynamic-Function, string-first-arg
+    timer scheduling).  ``insertAdjacent`` + HTML is deliberately
+    *not* covered yet; two existing app.js sites (the verdict-badge
+    writers at lines 1287 and 1538) consume the HTML-string output of
+    ``renderVerdictBadge``, so broadening the lint requires cleaning
+    that helper first.
 
     Parametrized so each target is its own pytest case — a failure on
     one file is attributed precisely without masking offenders in the
@@ -408,11 +425,11 @@ def test_no_unsafe_dom_writes_in_static_assets(label: str, path: Path) -> None:
     body = path.read_text(encoding="utf-8")
     lines = body.splitlines()
     offenders: list[tuple[int, str]] = []
-    for m in _UNSAFE_DOM_WRITE_RE.finditer(body):
+    for m in _UNSAFE_CODE_SINK_RE.finditer(body):
         line_no = body.count("\n", 0, m.start()) + 1
         offenders.append((line_no, lines[line_no - 1].rstrip()))
     assert not offenders, (
-        f"Found {len(offenders)} unsafe DOM-write sink(s) in "
+        f"Found {len(offenders)} unsafe code/DOM sink(s) in "
         f"{label}:\n"
         + "\n".join(f"  line {n}: {line}" for n, line in offenders[:10])
         + "\nUse DOM construction (createElement + textContent + "
@@ -436,7 +453,7 @@ def test_shared_utils_defines_set_markdown_helper() -> None:
     )
     # The DOMParser path is what avoids the unsafe sink.  The absence
     # of the unsafe assignment inside the helper is pinned by the
-    # broader ``test_no_unsafe_dom_writes_in_interactive_assets`` scan
+    # broader ``test_no_unsafe_code_sinks_in_static_assets`` scan
     # above; pin DOMParser presence here too so a refactor that swaps
     # to e.g. ``Range.createContextualFragment`` forces an explicit
     # reviewer decision.
@@ -459,7 +476,7 @@ def test_phase8_no_unsafe_dom_write_in_settings_panel() -> None:
     # top-level keydown handler block).
     end = body.index('document.addEventListener("keydown"', start)
     section = body[start:end]
-    assert not _UNSAFE_DOM_WRITE_RE.search(section), (
+    assert not _UNSAFE_CODE_SINK_RE.search(section), (
         "Section 15 must not assign to the unsafe DOM-write property — "
         "server names and scope values flow through here and would be "
         "XSS-injectable. Use textContent / DOM APIs instead."
@@ -599,7 +616,7 @@ def test_phase8_xss_safe_render_in_build_mcp_error_embed() -> None:
     end_match = re.search(r"\n}\n", rest)
     assert end_match is not None
     fn = rest[: end_match.end()]
-    assert not _UNSAFE_DOM_WRITE_RE.search(fn), (
+    assert not _UNSAFE_CODE_SINK_RE.search(fn), (
         "buildMcpErrorEmbed must not use the unsafe-DOM-write API — "
         "server names and detail strings flow through here. An "
         "adversarial server name must render harmlessly via "
