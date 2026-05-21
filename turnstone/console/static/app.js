@@ -30,9 +30,9 @@ window.onLogout = function () {
   }
 };
 window.onThemeChange = function (next) {
-  var btn = document.getElementById("theme-toggle");
+  const btn = document.getElementById("theme-toggle");
   if (btn) {
-    var isLight = next === "light";
+    const isLight = next === "light";
     btn.textContent = isLight ? "\u2600" : "\u263E";
     btn.title = isLight ? "Switch to dark theme" : "Switch to light theme";
     btn.setAttribute(
@@ -41,7 +41,7 @@ window.onThemeChange = function (next) {
     );
   }
   // Persist to server so admin settings and node UIs see the change
-  var themeValue = next === "light" ? "light" : "dark";
+  const themeValue = next === "light" ? "light" : "dark";
   authFetch("/v1/api/admin/settings/interface.theme", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
@@ -50,9 +50,9 @@ window.onThemeChange = function (next) {
 };
 // Set initial theme button text and aria
 (function () {
-  var btn = document.getElementById("theme-toggle");
+  const btn = document.getElementById("theme-toggle");
   if (btn) {
-    var isLight = document.documentElement.dataset.theme === "light";
+    const isLight = document.documentElement.dataset.theme === "light";
     btn.textContent = isLight ? "\u2600" : "\u263E";
     btn.title = isLight ? "Switch to dark theme" : "Switch to light theme";
     btn.setAttribute(
@@ -63,25 +63,25 @@ window.onThemeChange = function (next) {
 })();
 
 // --- State ---
-var currentView = "home"; // "home" | "overview" | "filtered" | "admin"
-var currentFilter = { state: null, node: null, page: 1, per_page: 50 };
-var expandedGroups = {};
-var _lastOverviewJson = "";
-var _lastNodesJson = "";
-var evtSource = null;
-var retryDelay = 1000;
-var clusterState = null;
-var _navigatingFromPopstate = false;
+let currentView = "home"; // "home" | "overview" | "filtered" | "admin"
+let currentFilter = { state: null, node: null, page: 1, per_page: 50 };
+const expandedGroups = {};
+let _lastOverviewJson = "";
+let _lastNodesJson = "";
+let evtSource = null;
+let retryDelay = 1000;
+let clusterState = null;
+let _navigatingFromPopstate = false;
 
 // --- Constants ---
-var STATE_DISPLAY = {
+const STATE_DISPLAY = {
   running: { symbol: "\u25b8", label: "run" },
   thinking: { symbol: "\u25cc", label: "think" },
   attention: { symbol: "\u25c6", label: "attn" },
   idle: { symbol: "\u00b7", label: "idle" },
   error: { symbol: "\u2716", label: "err" },
 };
-var STATE_ORDER = ["running", "thinking", "attention", "error", "idle"];
+const STATE_ORDER = ["running", "thinking", "attention", "error", "idle"];
 
 // --- Cluster State Model ---
 function applySnapshot(data) {
@@ -98,9 +98,9 @@ function applySnapshot(data) {
 
 function patchClusterState(data) {
   if (!clusterState) return;
-  var t = data.type;
+  const t = data.type;
   if (t === "cluster_state") {
-    var node = clusterState.nodes[data.node_id];
+    const node = clusterState.nodes[data.node_id];
     if (node) {
       (node.workstreams || []).forEach(function (ws) {
         if (ws.id === data.ws_id) {
@@ -113,7 +113,7 @@ function patchClusterState(data) {
       });
     }
   } else if (t === "ws_created") {
-    var targetNode = clusterState.nodes[data.node_id];
+    const targetNode = clusterState.nodes[data.node_id];
     if (targetNode) {
       targetNode.workstreams = targetNode.workstreams || [];
       targetNode.workstreams.push({
@@ -145,7 +145,7 @@ function patchClusterState(data) {
     // they're already typed in clusterState from the matching ws_created
     // event.  Skipping interactive closes avoids per-close fan-out into
     // /v1/api/workstreams/saved on busy clusters.
-    var wasCoordinator = false;
+    let wasCoordinator = false;
     Object.keys(clusterState.nodes).forEach(function (nid) {
       (clusterState.nodes[nid].workstreams || []).forEach(function (ws) {
         if (ws.id === data.ws_id && ws.kind === "coordinator") {
@@ -154,7 +154,7 @@ function patchClusterState(data) {
       });
     });
     Object.keys(clusterState.nodes).forEach(function (nid) {
-      var n = clusterState.nodes[nid];
+      const n = clusterState.nodes[nid];
       n.workstreams = (n.workstreams || []).filter(function (ws) {
         return ws.id !== data.ws_id;
       });
@@ -189,7 +189,7 @@ function patchClusterState(data) {
   scheduleRender();
 }
 
-var _renderTimer = null;
+let _renderTimer = null;
 function scheduleRender() {
   if (_renderTimer) return;
   _renderTimer = requestAnimationFrame(function () {
@@ -201,42 +201,42 @@ function scheduleRender() {
 
 function recomputeOverview() {
   if (!clusterState) return;
-  var states = { running: 0, thinking: 0, attention: 0, idle: 0, error: 0 };
-  var totalTokens = 0,
+  const states = { running: 0, thinking: 0, attention: 0, idle: 0, error: 0 };
+  let totalTokens = 0,
     totalToolCalls = 0,
     totalWs = 0;
-  var mcpServers = 0,
+  let mcpServers = 0,
     mcpResources = 0,
     mcpPrompts = 0;
-  var versions = {};
+  const versions = {};
   Object.keys(clusterState.nodes).forEach(function (nid) {
     // Skip the "console" pseudo-node — coordinators aren't compute-
     // node workstreams, and counting them here would inflate the
     // cluster totals.  The active-coordinators list surfaces them
     // separately.
     if (nid === "console") return;
-    var node = clusterState.nodes[nid];
-    var nodeWsTokens = 0;
+    const node = clusterState.nodes[nid];
+    let nodeWsTokens = 0;
     (node.workstreams || []).forEach(function (ws) {
-      var s = ws.state || "idle";
+      const s = ws.state || "idle";
       states[s] = (states[s] || 0) + 1;
       totalWs++;
       nodeWsTokens += ws.tokens || 0;
     });
-    var aggTokens = (node.aggregate || {}).total_tokens || 0;
+    let aggTokens = (node.aggregate || {}).total_tokens || 0;
     totalTokens += aggTokens || nodeWsTokens;
     totalToolCalls += (node.aggregate || {}).total_tool_calls || 0;
     if (node.version) versions[node.version] = true;
-    var mcp = (node.health || {}).mcp || {};
+    const mcp = (node.health || {}).mcp || {};
     mcpServers += mcp.servers || 0;
     mcpResources += mcp.resources || 0;
     mcpPrompts += mcp.prompts || 0;
   });
-  var versionList = Object.keys(versions).sort();
+  const versionList = Object.keys(versions).sort();
   // Count only real compute nodes for the cluster summary — the
   // "console" pseudo-node hosts coordinators, which are surfaced
   // separately by the active-coordinators list.
-  var realNodeCount = Object.keys(clusterState.nodes).filter(function (nid) {
+  const realNodeCount = Object.keys(clusterState.nodes).filter(function (nid) {
     return nid !== "console";
   }).length;
   clusterState.overview = {
@@ -258,13 +258,13 @@ function recomputeOverview() {
 }
 
 function buildNodeInfoFromSnapshot(node) {
-  var states = { running: 0, thinking: 0, attention: 0, idle: 0, error: 0 };
-  var ws = node.workstreams || [];
+  const states = { running: 0, thinking: 0, attention: 0, idle: 0, error: 0 };
+  const ws = node.workstreams || [];
   ws.forEach(function (w) {
-    var s = w.state || "idle";
+    const s = w.state || "idle";
     states[s] = (states[s] || 0) + 1;
   });
-  var aggTokens = (node.aggregate || {}).total_tokens || 0;
+  let aggTokens = (node.aggregate || {}).total_tokens || 0;
   if (!aggTokens) {
     ws.forEach(function (w) {
       aggTokens += w.tokens || 0;
@@ -297,7 +297,7 @@ function renderFromState() {
     _renderHomeView();
     // Home view also hosts the inline node-list (cluster details);
     // render it so the next SSE tick doesn't leave it stale.
-    var nodesList = Object.keys(clusterState.nodes)
+    const nodesList = Object.keys(clusterState.nodes)
       .filter(function (nid) {
         // Exclude the "console" pseudo-node from the nodes list — it's
         // a synthetic carrier for coordinators, not a compute node.
@@ -307,12 +307,12 @@ function renderFromState() {
         return buildNodeInfoFromSnapshot(clusterState.nodes[nid]);
       });
     nodesList.sort(function (a, b) {
-      var d = b.ws_running + b.ws_attention - (a.ws_running + a.ws_attention);
+      const d = b.ws_running + b.ws_attention - (a.ws_running + a.ws_attention);
       return d !== 0 ? d : a.node_id.localeCompare(b.node_id);
     });
     renderNodeGroups(nodesList, nodesList.length);
   } else if (currentView === "filtered") {
-    var allWs = [];
+    let allWs = [];
     Object.keys(clusterState.nodes).forEach(function (nid) {
       (clusterState.nodes[nid].workstreams || []).forEach(function (ws) {
         allWs.push(ws);
@@ -328,7 +328,7 @@ function renderFromState() {
         return ws.node === currentFilter.node;
       });
     }
-    var stateOrder = {
+    const stateOrder = {
       running: 0,
       thinking: 1,
       attention: 2,
@@ -338,12 +338,12 @@ function renderFromState() {
     allWs.sort(function (a, b) {
       return (stateOrder[a.state] || 9) - (stateOrder[b.state] || 9);
     });
-    var total = allWs.length;
-    var perPage = currentFilter.per_page || 50;
-    var pages = Math.max(1, Math.ceil(total / perPage));
-    var page = Math.min(currentFilter.page || 1, pages);
-    var start = (page - 1) * perPage;
-    var pageWs = allWs.slice(start, start + perPage);
+    const total = allWs.length;
+    const perPage = currentFilter.per_page || 50;
+    const pages = Math.max(1, Math.ceil(total / perPage));
+    const page = Math.min(currentFilter.page || 1, pages);
+    const start = (page - 1) * perPage;
+    const pageWs = allWs.slice(start, start + perPage);
     document.getElementById("filtered-summary").textContent =
       "Page " + page + " of " + pages + " (" + total + " total)";
     renderWsTable(document.getElementById("filtered-ws-table"), pageWs);
@@ -362,17 +362,17 @@ function connectSSE() {
     evtSource = null;
   }
   evtSource = new EventSource("/v1/api/cluster/events");
-  var statusBar = document.getElementById("status-bar");
+  const statusBar = document.getElementById("status-bar");
   evtSource.onopen = function () {
     retryDelay = 1000;
     statusBar.classList.remove("disconnected");
     statusBar.textContent = "";
-    var csb = document.getElementById("cluster-status-bar");
+    const csb = document.getElementById("cluster-status-bar");
     if (csb) csb.classList.remove("stale");
   };
   evtSource.onmessage = function (e) {
     try {
-      var data = JSON.parse(e.data);
+      const data = JSON.parse(e.data);
       handleClusterEvent(data);
     } catch (err) {
       /* ignore malformed SSE */
@@ -382,11 +382,11 @@ function connectSSE() {
     evtSource.close();
     evtSource = null;
     // Don't show reconnecting state if login overlay is visible
-    var loginOverlay = document.getElementById("login-overlay");
+    const loginOverlay = document.getElementById("login-overlay");
     if (loginOverlay && loginOverlay.style.display !== "none") return;
     statusBar.textContent = "Reconnecting\u2026";
     statusBar.classList.add("disconnected");
-    var csb = document.getElementById("cluster-status-bar");
+    const csb = document.getElementById("cluster-status-bar");
     if (csb) csb.classList.add("stale");
     // Raw fetch (not authFetch) — need to inspect status before throwing
     fetch("/v1/api/cluster/overview")
@@ -451,9 +451,9 @@ function showHome() {
   currentView = "home";
   currentFilter = { state: null, node: null, page: 1, per_page: 50 };
   _setLandingView("home");
-  var adminView = document.getElementById("view-admin");
+  const adminView = document.getElementById("view-admin");
   if (adminView) adminView.style.display = "none";
-  var adminBtn = document.getElementById("admin-btn");
+  const adminBtn = document.getElementById("admin-btn");
   if (adminBtn) {
     adminBtn.classList.remove("active");
     adminBtn.setAttribute("aria-expanded", "false");
@@ -470,9 +470,9 @@ function _setLandingView(which) {
   // Toggle the two top-level landing panes.  The node list lives inside
   // #view-home as a sibling section, and clicking a node navigates
   // straight to /node/<id>/ rather than swapping in a detail pane.
-  var views = ["home", "filtered"];
+  const views = ["home", "filtered"];
   views.forEach(function (name) {
-    var el = document.getElementById("view-" + name);
+    const el = document.getElementById("view-" + name);
     if (!el) return;
     el.style.display = name === which ? "" : "none";
   });
@@ -495,7 +495,7 @@ function loadOverview() {
 
 // --- Status Bar ---
 function renderStatusBar(overview) {
-  var cacheKey =
+  const cacheKey =
     JSON.stringify(overview) +
     "|" +
     currentView +
@@ -504,28 +504,28 @@ function renderStatusBar(overview) {
   if (cacheKey === _lastOverviewJson) return;
   _lastOverviewJson = cacheKey;
 
-  var states = overview.states || {};
-  var agg = overview.aggregate || {};
+  const states = overview.states || {};
+  const agg = overview.aggregate || {};
 
-  var statesContainer = document.getElementById("csb-states");
+  const statesContainer = document.getElementById("csb-states");
   statesContainer.replaceChildren();
   STATE_ORDER.forEach(function (state) {
-    var count = states[state] || 0;
-    var sd = STATE_DISPLAY[state] || STATE_DISPLAY.idle;
-    var pill = document.createElement("button");
+    const count = states[state] || 0;
+    const sd = STATE_DISPLAY[state] || STATE_DISPLAY.idle;
+    const pill = document.createElement("button");
     pill.className = "csb-state";
     if (currentView === "filtered" && currentFilter.state === state) {
       pill.classList.add("active");
     }
     pill.setAttribute("aria-label", sd.label + ": " + count + " workstreams");
-    var stateDot = document.createElement("span");
+    const stateDot = document.createElement("span");
     stateDot.className = "csb-state-dot";
     stateDot.setAttribute("data-state", state);
     stateDot.setAttribute("aria-hidden", "true");
-    var stateCount = document.createElement("span");
+    const stateCount = document.createElement("span");
     stateCount.className = "csb-state-count" + (count === 0 ? " zero" : "");
     stateCount.textContent = formatCount(count);
-    var stateLabel = document.createElement("span");
+    const stateLabel = document.createElement("span");
     stateLabel.className = "csb-state-label";
     stateLabel.textContent = sd.label;
     pill.append(stateDot, stateCount, stateLabel);
@@ -535,9 +535,9 @@ function renderStatusBar(overview) {
     statesContainer.appendChild(pill);
   });
 
-  var metricsContainer = document.getElementById("csb-metrics");
+  const metricsContainer = document.getElementById("csb-metrics");
   metricsContainer.replaceChildren();
-  var metrics = [
+  const metrics = [
     { value: overview.nodes || 0, label: "nodes", format: formatCount },
     { value: overview.workstreams || 0, label: "ws", format: formatCount },
     { value: agg.total_tokens || 0, label: "tokens", format: formatTokens },
@@ -545,12 +545,12 @@ function renderStatusBar(overview) {
   ];
   metrics.forEach(function (m) {
     if (m.value === 0 && m.label !== "nodes" && m.label !== "ws") return;
-    var el = document.createElement("span");
+    const el = document.createElement("span");
     el.className = "csb-metric";
-    var valSpan = document.createElement("span");
+    const valSpan = document.createElement("span");
     valSpan.className = "csb-metric-value";
     valSpan.textContent = m.format(m.value);
-    var labelSpan = document.createElement("span");
+    const labelSpan = document.createElement("span");
     labelSpan.className = "csb-metric-label";
     labelSpan.textContent = m.label;
     el.appendChild(valSpan);
@@ -562,25 +562,25 @@ function renderStatusBar(overview) {
     overview.versions &&
     overview.versions.length > 1
   ) {
-    var driftEl = document.createElement("span");
+    const driftEl = document.createElement("span");
     driftEl.className = "csb-metric csb-version-drift";
     driftEl.title = "Versions detected: " + overview.versions.join(", ");
-    var warnSpan = document.createElement("span");
+    const warnSpan = document.createElement("span");
     warnSpan.className = "csb-metric-value drift-warn";
     warnSpan.textContent = "DRIFT";
-    var verLabel = document.createElement("span");
+    const verLabel = document.createElement("span");
     verLabel.className = "csb-metric-label";
     verLabel.textContent = overview.versions.join(" / ");
     driftEl.appendChild(warnSpan);
     driftEl.appendChild(verLabel);
     metricsContainer.appendChild(driftEl);
   } else if (overview.versions && overview.versions.length === 1) {
-    var verEl = document.createElement("span");
+    const verEl = document.createElement("span");
     verEl.className = "csb-metric";
-    var valSpan = document.createElement("span");
+    const valSpan = document.createElement("span");
     valSpan.className = "csb-metric-value";
     valSpan.textContent = overview.versions[0];
-    var verLbl = document.createElement("span");
+    const verLbl = document.createElement("span");
     verLbl.className = "csb-metric-label";
     verLbl.textContent = "ver";
     verEl.appendChild(valSpan);
@@ -589,34 +589,34 @@ function renderStatusBar(overview) {
   }
   // MCP aggregate metrics
   if (overview.mcp_servers && overview.mcp_servers > 0) {
-    var mcpDivider = document.createElement("span");
+    const mcpDivider = document.createElement("span");
     mcpDivider.className = "csb-divider";
     mcpDivider.setAttribute("aria-hidden", "true");
     metricsContainer.appendChild(mcpDivider);
-    var mcpTitles = {
+    const mcpTitles = {
       mcp: "MCP servers",
       rsrc: "MCP resources",
       pmpt: "MCP prompts",
     };
-    var mcpMetrics = [
+    const mcpMetrics = [
       { value: overview.mcp_servers, label: "mcp" },
       { value: overview.mcp_resources, label: "rsrc" },
       { value: overview.mcp_prompts, label: "pmpt" },
     ];
     mcpMetrics.forEach(function (m) {
-      var el = document.createElement("span");
+      const el = document.createElement("span");
       el.className = "csb-metric";
       el.title = mcpTitles[m.label] || "";
       if (m.label === "mcp") {
-        var dot = document.createElement("span");
+        const dot = document.createElement("span");
         dot.className = "csb-mcp-dot";
         dot.setAttribute("aria-hidden", "true");
         el.appendChild(dot);
       }
-      var valSpan = document.createElement("span");
+      const valSpan = document.createElement("span");
       valSpan.className = "csb-metric-value";
       valSpan.textContent = formatCount(m.value);
-      var labelSpan = document.createElement("span");
+      const labelSpan = document.createElement("span");
       labelSpan.className = "csb-metric-label";
       labelSpan.textContent = m.label;
       el.appendChild(valSpan);
@@ -628,7 +628,7 @@ function renderStatusBar(overview) {
 
 // --- Node Grouping ---
 function extractNodePrefix(nodeId) {
-  var stripped = nodeId.replace(/[-_][a-z0-9]*\d[a-z0-9]*$/i, "");
+  let stripped = nodeId.replace(/[-_][a-z0-9]*\d[a-z0-9]*$/i, "");
   if (!stripped || stripped === nodeId) {
     stripped = nodeId.replace(/[-_]?\d+$/, "");
   }
@@ -638,10 +638,10 @@ function extractNodePrefix(nodeId) {
 }
 
 function groupNodes(nodes) {
-  var groupMap = {};
-  var groupOrder = [];
+  const groupMap = {};
+  const groupOrder = [];
   nodes.forEach(function (node) {
-    var prefix = extractNodePrefix(node.node_id);
+    const prefix = extractNodePrefix(node.node_id);
     if (!groupMap[prefix]) {
       groupMap[prefix] = {
         prefix: prefix,
@@ -659,7 +659,7 @@ function groupNodes(nodes) {
       };
       groupOrder.push(prefix);
     }
-    var g = groupMap[prefix];
+    const g = groupMap[prefix];
     g.nodes.push(node);
     g.ws_total += node.ws_total || 0;
     g.ws_running += node.ws_running || 0;
@@ -670,21 +670,21 @@ function groupNodes(nodes) {
     g.total_tokens += node.total_tokens || 0;
     if (!node.reachable) g.all_reachable = false;
     if (node.health && node.health.status === "degraded") g.any_degraded = true;
-    var nodeVer = node.version || "";
+    const nodeVer = node.version || "";
     if (nodeVer) g.versions.add(nodeVer);
   });
   groupOrder.forEach(function (prefix) {
     groupMap[prefix].nodes.sort(function (a, b) {
-      var d = b.ws_running + b.ws_attention - (a.ws_running + a.ws_attention);
+      const d = b.ws_running + b.ws_attention - (a.ws_running + a.ws_attention);
       return d !== 0 ? d : a.node_id.localeCompare(b.node_id);
     });
   });
-  var groups = groupOrder.map(function (p) {
+  const groups = groupOrder.map(function (p) {
     return groupMap[p];
   });
   groups.sort(function (a, b) {
-    var aAct = a.ws_running + a.ws_attention;
-    var bAct = b.ws_running + b.ws_attention;
+    const aAct = a.ws_running + a.ws_attention;
+    const bAct = b.ws_running + b.ws_attention;
     if (bAct !== aAct) return bAct - aAct;
     return a.prefix.localeCompare(b.prefix);
   });
@@ -695,7 +695,7 @@ function groupNodes(nodes) {
 // inside each multi-node group body.  Returns a DocumentFragment built
 // via createElement so the static label list is constructed once with
 // no HTML parsing / string interpolation per render.
-var _NODE_COLHEADER_LABELS = [
+const _NODE_COLHEADER_LABELS = [
   ["ncol ncol-node", "NODE"],
   ["ncol ncol-ws", "WS"],
   ["ncol ncol-run", "RUN"],
@@ -706,9 +706,9 @@ var _NODE_COLHEADER_LABELS = [
 ];
 
 function buildColHeaders() {
-  var frag = document.createDocumentFragment();
-  for (var i = 0; i < _NODE_COLHEADER_LABELS.length; i++) {
-    var span = document.createElement("span");
+  const frag = document.createDocumentFragment();
+  for (let i = 0; i < _NODE_COLHEADER_LABELS.length; i++) {
+    const span = document.createElement("span");
     span.className = _NODE_COLHEADER_LABELS[i][0];
     span.textContent = _NODE_COLHEADER_LABELS[i][1];
     frag.appendChild(span);
@@ -719,7 +719,7 @@ function buildColHeaders() {
 // Build a numeric cell for the node table.  ``highlighted`` adds
 // ``has-value`` so non-zero counts get the CSS treatment.
 function _buildNodeNumCell(value, highlighted, cellClass) {
-  var cell = document.createElement("span");
+  const cell = document.createElement("span");
   cell.className = cellClass + (highlighted ? " has-value" : "");
   cell.textContent = String(value);
   return cell;
@@ -729,12 +729,12 @@ function _buildNodeNumCell(value, highlighted, cellClass) {
 // node row or a group header — the structure is identical, only the
 // outer cell class differs.
 function _buildHealthCell(cellClass, healthPct, healthFillClass) {
-  var cell = document.createElement("span");
+  const cell = document.createElement("span");
   cell.className = cellClass;
-  var bar = document.createElement("span");
+  const bar = document.createElement("span");
   bar.className = "health-bar";
   if (healthPct > 0) {
-    var fill = document.createElement("span");
+    const fill = document.createElement("span");
     fill.className = "health-bar-fill " + healthFillClass;
     fill.style.width = healthPct + "%";
     bar.appendChild(fill);
@@ -744,7 +744,7 @@ function _buildHealthCell(cellClass, healthPct, healthFillClass) {
 }
 
 function buildNodeRow(node) {
-  var row = document.createElement("div");
+  const row = document.createElement("div");
   row.className = "node-row";
   if (node.ws_attention > 0) row.classList.add("has-attention");
   else if (node.ws_running > 0) row.classList.add("has-running");
@@ -767,33 +767,33 @@ function buildNodeRow(node) {
       (node.version ? ", version " + node.version : ""),
   );
 
-  var isDegraded = node.health && node.health.status === "degraded";
-  var dotClass = node.reachable
+  const isDegraded = node.health && node.health.status === "degraded";
+  const dotClass = node.reachable
     ? isDegraded
       ? "node-dot degraded"
       : "node-dot"
     : "node-dot unreachable";
-  var displayTokens = node.total_tokens || node.ws_tokens || 0;
-  var maxWs = node.max_ws || 10;
-  var healthPct =
+  const displayTokens = node.total_tokens || node.ws_tokens || 0;
+  const maxWs = node.max_ws || 10;
+  const healthPct =
     maxWs > 0 ? Math.min(Math.round((node.ws_total / maxWs) * 100), 100) : 0;
-  var healthFillClass =
+  const healthFillClass =
     healthPct < 50 ? "low" : healthPct < 80 ? "mid" : "high";
 
-  var healthTitle = "";
+  let healthTitle = "";
   if (node.health && node.health.backend) {
     healthTitle = "backend: " + node.health.backend.status;
   }
 
   // Name cell — dot, node id, optional degraded badge.
-  var nameCell = document.createElement("span");
+  const nameCell = document.createElement("span");
   nameCell.className = "node-cell node-cell-name";
   if (healthTitle) nameCell.setAttribute("title", healthTitle);
-  var dot = document.createElement("span");
+  const dot = document.createElement("span");
   dot.className = dotClass;
   nameCell.append(dot, node.node_id);
   if (isDegraded) {
-    var degradedEl = document.createElement("span");
+    const degradedEl = document.createElement("span");
     degradedEl.className = "node-degraded-badge";
     // Only attach the descriptive title / aria-label when there's a
     // backend-status string to surface.  An empty aria-label would
@@ -830,12 +830,12 @@ function buildNodeRow(node) {
     ),
   );
 
-  var tokensCell = document.createElement("span");
+  const tokensCell = document.createElement("span");
   tokensCell.className = "node-cell node-cell-num";
   tokensCell.textContent = formatTokens(displayTokens);
   row.appendChild(tokensCell);
 
-  var versionCell = document.createElement("span");
+  const versionCell = document.createElement("span");
   versionCell.className = "node-cell node-cell-version";
   versionCell.textContent = node.version || "";
   row.appendChild(versionCell);
@@ -844,7 +844,7 @@ function buildNodeRow(node) {
     _buildHealthCell("node-cell node-cell-health", healthPct, healthFillClass),
   );
 
-  var nodeUrl = "/node/" + encodeURIComponent(node.node_id) + "/";
+  const nodeUrl = "/node/" + encodeURIComponent(node.node_id) + "/";
   row.onclick = function () {
     window.location.href = nodeUrl;
   };
@@ -859,18 +859,18 @@ function buildNodeRow(node) {
 
 function toggleGroup(prefix) {
   expandedGroups[prefix] = !expandedGroups[prefix];
-  var body = document.querySelector(
+  const body = document.querySelector(
     '.node-group-body[data-prefix="' +
       prefix.replace(/\\/g, "\\\\").replace(/"/g, '\\"') +
       '"]',
   );
   if (!body) return;
-  var isExpanded = expandedGroups[prefix];
+  let isExpanded = expandedGroups[prefix];
   if (isExpanded) body.classList.remove("collapsed");
   else body.classList.add("collapsed");
-  var groupEl = body.parentElement;
+  let groupEl = body.parentElement;
   if (groupEl) groupEl.setAttribute("aria-expanded", String(isExpanded));
-  var chevron = groupEl ? groupEl.querySelector(".node-group-chevron") : null;
+  const chevron = groupEl ? groupEl.querySelector(".node-group-chevron") : null;
   if (chevron) {
     if (isExpanded) chevron.classList.add("expanded");
     else chevron.classList.remove("expanded");
@@ -878,43 +878,43 @@ function toggleGroup(prefix) {
 }
 
 function renderNodeGroups(nodes, total) {
-  var json = JSON.stringify(nodes);
+  const json = JSON.stringify(nodes);
   if (json === _lastNodesJson) return;
   _lastNodesJson = json;
 
-  var table = document.getElementById("node-table");
+  const table = document.getElementById("node-table");
   table.replaceChildren();
   if (!nodes.length) {
     table.appendChild(makeEmptyState("No nodes discovered"));
     return;
   }
 
-  var topHeaders = document.createElement("div");
+  const topHeaders = document.createElement("div");
   topHeaders.className = "node-colheaders";
   topHeaders.setAttribute("aria-hidden", "true");
   topHeaders.appendChild(buildColHeaders());
   table.appendChild(topHeaders);
 
-  var groups = groupNodes(nodes);
+  const groups = groupNodes(nodes);
 
   groups.forEach(function (group) {
     // Single-node group — render as plain row
     if (group.nodes.length === 1) {
-      var wrapper = document.createElement("div");
+      const wrapper = document.createElement("div");
       wrapper.className = "node-group node-group-single";
       wrapper.appendChild(buildNodeRow(group.nodes[0]));
       table.appendChild(wrapper);
       return;
     }
 
-    var groupEl = document.createElement("div");
+    const groupEl = document.createElement("div");
     groupEl.className = "node-group";
-    var isExpanded = !!expandedGroups[group.prefix];
+    const isExpanded = !!expandedGroups[group.prefix];
     groupEl.setAttribute("role", "listitem");
     groupEl.setAttribute("aria-expanded", String(isExpanded));
 
     // Group header
-    var header = document.createElement("div");
+    const header = document.createElement("div");
     header.className = "node-group-header";
     if (group.ws_attention > 0) header.classList.add("has-attention");
     else if (group.ws_running > 0) header.classList.add("has-running");
@@ -939,19 +939,19 @@ function renderNodeGroups(nodes, total) {
         (group.versions.size > 1 ? ", version drift detected" : ""),
     );
 
-    var chevronClass = "node-group-chevron" + (isExpanded ? " expanded" : "");
-    var totalMaxWs = 0;
+    const chevronClass = "node-group-chevron" + (isExpanded ? " expanded" : "");
+    let totalMaxWs = 0;
     group.nodes.forEach(function (n) {
       totalMaxWs += n.max_ws || 10;
     });
-    var healthPct =
+    const healthPct =
       totalMaxWs > 0
         ? Math.min(Math.round((group.ws_total / totalMaxWs) * 100), 100)
         : 0;
-    var healthFillClass =
+    const healthFillClass =
       healthPct < 50 ? "low" : healthPct < 80 ? "mid" : "high";
-    var groupVersionText = "";
-    var groupVersionDrift = false;
+    let groupVersionText = "";
+    let groupVersionDrift = false;
     if (group.versions.size === 1) {
       groupVersionText = Array.from(group.versions)[0];
     } else if (group.versions.size > 1) {
@@ -960,18 +960,18 @@ function renderNodeGroups(nodes, total) {
     }
 
     // Group-name cell: chevron + prefix + node count + optional degraded badge.
-    var nameCell = document.createElement("span");
+    const nameCell = document.createElement("span");
     nameCell.className = "node-group-name";
-    var chevron = document.createElement("span");
+    const chevron = document.createElement("span");
     chevron.className = chevronClass;
     chevron.setAttribute("aria-hidden", "true");
     chevron.textContent = "▸";
-    var badge = document.createElement("span");
+    const badge = document.createElement("span");
     badge.className = "node-group-badge";
     badge.textContent = group.nodes.length + " nodes";
     nameCell.append(chevron, group.prefix, badge);
     if (group.any_degraded) {
-      var degradedEl = document.createElement("span");
+      const degradedEl = document.createElement("span");
       degradedEl.className = "node-degraded-badge";
       degradedEl.textContent = "degraded";
       nameCell.appendChild(degradedEl);
@@ -1000,17 +1000,17 @@ function renderNodeGroups(nodes, total) {
       ),
     );
 
-    var groupTokensCell = document.createElement("span");
+    const groupTokensCell = document.createElement("span");
     groupTokensCell.className = "node-group-cell num";
     groupTokensCell.textContent = formatTokens(group.total_tokens);
     header.appendChild(groupTokensCell);
 
-    var groupVersionCell = document.createElement("span");
+    const groupVersionCell = document.createElement("span");
     groupVersionCell.className =
       "node-group-cell node-cell-version" + (groupVersionDrift ? " drift" : "");
     groupVersionCell.textContent = groupVersionText;
     if (groupVersionDrift) {
-      var driftBadge = document.createElement("span");
+      const driftBadge = document.createElement("span");
       driftBadge.className = "node-version-drift-badge";
       driftBadge.textContent = "drift";
       groupVersionCell.appendChild(driftBadge);
@@ -1025,7 +1025,7 @@ function renderNodeGroups(nodes, total) {
       ),
     );
 
-    var prefix = group.prefix;
+    const prefix = group.prefix;
     header.onclick = function () {
       toggleGroup(prefix);
     };
@@ -1038,11 +1038,11 @@ function renderNodeGroups(nodes, total) {
     groupEl.appendChild(header);
 
     // Group body
-    var body = document.createElement("div");
+    const body = document.createElement("div");
     body.className = "node-group-body" + (isExpanded ? "" : " collapsed");
     body.dataset.prefix = group.prefix;
 
-    var colHeaders = document.createElement("div");
+    const colHeaders = document.createElement("div");
     colHeaders.className = "node-colheaders";
     colHeaders.setAttribute("aria-hidden", "true");
     colHeaders.appendChild(buildColHeaders());
@@ -1062,15 +1062,15 @@ function drillDownByState(state) {
   currentView = "filtered";
   currentFilter = { state: state, node: null, page: 1, per_page: 50 };
   _setLandingView("filtered");
-  var adminView = document.getElementById("view-admin");
+  const adminView = document.getElementById("view-admin");
   if (adminView) adminView.style.display = "none";
-  var adminBtn = document.getElementById("admin-btn");
+  const adminBtn = document.getElementById("admin-btn");
   if (adminBtn) {
     adminBtn.classList.remove("active");
     adminBtn.setAttribute("aria-expanded", "false");
   }
   document.getElementById("breadcrumb").style.display = "";
-  var sd = STATE_DISPLAY[state] || STATE_DISPLAY.idle;
+  const sd = STATE_DISPLAY[state] || STATE_DISPLAY.idle;
   document.getElementById("breadcrumb-label").textContent =
     sd.symbol + " " + sd.label;
   document.getElementById("filtered-title").textContent =
@@ -1087,9 +1087,9 @@ function drillDownByNode(nodeId) {
   currentView = "filtered";
   currentFilter = { state: null, node: nodeId, page: 1, per_page: 50 };
   _setLandingView("filtered");
-  var adminView = document.getElementById("view-admin");
+  const adminView = document.getElementById("view-admin");
   if (adminView) adminView.style.display = "none";
-  var adminBtn = document.getElementById("admin-btn");
+  const adminBtn = document.getElementById("admin-btn");
   if (adminBtn) {
     adminBtn.classList.remove("active");
     adminBtn.setAttribute("aria-expanded", "false");
@@ -1124,7 +1124,7 @@ function loadFilteredWorkstreams() {
 function renderPagination(container, page, pages) {
   container.replaceChildren();
   if (pages <= 1) return;
-  var prev = document.createElement("button");
+  const prev = document.createElement("button");
   prev.textContent = "\u25c4 Prev";
   prev.disabled = page <= 1;
   prev.onclick = function () {
@@ -1133,10 +1133,10 @@ function renderPagination(container, page, pages) {
     else loadFilteredWorkstreams();
   };
   container.appendChild(prev);
-  var info = document.createElement("span");
+  const info = document.createElement("span");
   info.textContent = page + " / " + pages;
   container.appendChild(info);
-  var next = document.createElement("button");
+  const next = document.createElement("button");
   next.textContent = "Next \u25ba";
   next.disabled = page >= pages;
   next.onclick = function () {
@@ -1157,12 +1157,12 @@ function renderPagination(container, page, pages) {
 //
 // Expansion state persists in localStorage keyed by coordinator ws_id so
 // the browser remembers the operator's preferred layout across reloads.
-var _DASH_EXPAND_KEY_PREFIX = "coord-dashboard-expanded-";
+const _DASH_EXPAND_KEY_PREFIX = "coord-dashboard-expanded-";
 
 function _isExpanded(coordWsId) {
   if (!coordWsId) return false;
   try {
-    var v = localStorage.getItem(_DASH_EXPAND_KEY_PREFIX + coordWsId);
+    const v = localStorage.getItem(_DASH_EXPAND_KEY_PREFIX + coordWsId);
     return v === "1";
   } catch (_) {
     return false;
@@ -1182,15 +1182,15 @@ function _setExpanded(coordWsId, expanded) {
 }
 
 function _bucketByParent(wsList) {
-  var byId = {};
+  const byId = {};
   wsList.forEach(function (ws) {
     if (ws.id) byId[ws.id] = ws;
   });
-  var childrenMap = {};
-  var roots = [];
-  var orphans = [];
+  const childrenMap = {};
+  const roots = [];
+  const orphans = [];
   wsList.forEach(function (ws) {
-    var parent = ws.parent_ws_id || null;
+    const parent = ws.parent_ws_id || null;
     if (parent && byId[parent]) {
       (childrenMap[parent] = childrenMap[parent] || []).push(ws);
     } else if (parent) {
@@ -1205,26 +1205,26 @@ function _bucketByParent(wsList) {
 function renderWsTable(container, wsList) {
   container.replaceChildren();
   if (!wsList.length) {
-    var empty = document.createElement("div");
+    const empty = document.createElement("div");
     empty.className = "dashboard-empty";
     empty.textContent = "No workstreams";
     container.appendChild(empty);
     return;
   }
-  var groups = _bucketByParent(wsList);
+  const groups = _bucketByParent(wsList);
 
   function appendRow(ws, opts) {
     opts = opts || {};
-    var row = _renderWsRow(ws, opts, container);
+    const row = _renderWsRow(ws, opts, container);
     container.appendChild(row);
     // Render children ALWAYS — expand/collapse is a CSS display toggle
     // on the child rows.  This lets the caret swap a class instead of
     // rebuilding the table, which preserves focus, avoids SR re-
     // announcement, and stays cheap regardless of row count.
     if (opts.childCount != null) {
-      var kids = groups.childrenMap[ws.id] || [];
+      const kids = groups.childrenMap[ws.id] || [];
       kids.forEach(function (child) {
-        var childRow = _renderWsRow(
+        const childRow = _renderWsRow(
           child,
           { isChild: true, parentWsId: ws.id, collapsed: !opts.expanded },
           container,
@@ -1235,8 +1235,8 @@ function renderWsTable(container, wsList) {
   }
 
   groups.roots.forEach(function (ws) {
-    var kids = groups.childrenMap[ws.id] || [];
-    var isCoord = ws.kind === "coordinator" || kids.length > 0;
+    const kids = groups.childrenMap[ws.id] || [];
+    const isCoord = ws.kind === "coordinator" || kids.length > 0;
     if (isCoord) {
       appendRow(ws, {
         isCoordinator: true,
@@ -1254,10 +1254,10 @@ function renderWsTable(container, wsList) {
 
 function _renderWsRow(ws, opts, container) {
   opts = opts || {};
-  var state = ws.state || "idle";
-  var sd = STATE_DISPLAY[state] || STATE_DISPLAY.idle;
+  const state = ws.state || "idle";
+  const sd = STATE_DISPLAY[state] || STATE_DISPLAY.idle;
 
-  var row = document.createElement("div");
+  const row = document.createElement("div");
   row.className = "dash-row";
   if (opts.isCoordinator) row.classList.add("dash-row--coordinator");
   if (opts.isChild) {
@@ -1273,7 +1273,7 @@ function _renderWsRow(ws, opts, container) {
   row.dataset.state = state;
   row.setAttribute("tabindex", "0");
   row.setAttribute("role", "button");
-  var ariaLabel = sd.label + ": " + (ws.name || ws.id || "unnamed");
+  let ariaLabel = sd.label + ": " + (ws.name || ws.id || "unnamed");
   if (ws.model_alias || ws.model)
     ariaLabel += ", model: " + (ws.model_alias || ws.model);
   if (ws.node) ariaLabel += " on " + ws.node;
@@ -1286,14 +1286,14 @@ function _renderWsRow(ws, opts, container) {
   if (opts.isOrphan) ariaLabel += ", orphan";
   row.setAttribute("aria-label", ariaLabel);
 
-  var main = document.createElement("div");
+  const main = document.createElement("div");
   main.className = "dash-row-main";
 
   // Expand / collapse caret — coordinator rows only.  The caret is a
   // button so it's keyboard-reachable; clicking it toggles without
   // bubbling to the row-level deep link handler.
   if (opts.isCoordinator && opts.childCount != null && opts.childCount > 0) {
-    var caret = document.createElement("button");
+    const caret = document.createElement("button");
     caret.type = "button";
     caret.className = "dash-caret";
     caret.setAttribute("aria-expanded", opts.expanded ? "true" : "false");
@@ -1309,8 +1309,8 @@ function _renderWsRow(ws, opts, container) {
     caret.textContent = opts.expanded ? "\u25BE" : "\u25B8"; // ▾ / ▸
     caret.onclick = function (e) {
       e.stopPropagation();
-      var coordWsId = ws.id;
-      var nowExpanded = caret.getAttribute("aria-expanded") !== "true";
+      const coordWsId = ws.id;
+      const nowExpanded = caret.getAttribute("aria-expanded") !== "true";
       _setExpanded(coordWsId, nowExpanded);
       // Toggle CSS class on child rows — no table rebuild, so focus
       // stays on the caret and screen readers don't re-announce the
@@ -1324,9 +1324,9 @@ function _renderWsRow(ws, opts, container) {
       caret.textContent = nowExpanded ? "\u25BE" : "\u25B8";
       row.dataset.expanded = nowExpanded ? "true" : "false";
       if (container) {
-        var selector =
+        const selector =
           '.dash-row--child[data-parent-ws-id="' + cssEscape(coordWsId) + '"]';
-        var kids = container.querySelectorAll(selector);
+        const kids = container.querySelectorAll(selector);
         kids.forEach(function (k) {
           k.classList.toggle("dash-row--collapsed", !nowExpanded);
         });
@@ -1340,21 +1340,21 @@ function _renderWsRow(ws, opts, container) {
     // Indentation placeholder so child rows align visually with their
     // parent's post-caret content.  Not a caret — nested coordinators
     // aren't supported in v1.
-    var indent = document.createElement("span");
+    const indent = document.createElement("span");
     indent.className = "dash-caret-placeholder";
     indent.setAttribute("aria-hidden", "true");
     main.appendChild(indent);
   }
 
   // STATE
-  var stateCell = document.createElement("span");
+  const stateCell = document.createElement("span");
   stateCell.className = "dash-cell-state";
-  var dot = document.createElement("span");
+  const dot = document.createElement("span");
   dot.className = "dash-state-dot";
   dot.dataset.state = state;
   dot.setAttribute("aria-hidden", "true");
   stateCell.appendChild(dot);
-  var stateLabel = document.createElement("span");
+  const stateLabel = document.createElement("span");
   stateLabel.className = "dash-state-label";
   stateLabel.dataset.state = state;
   stateLabel.textContent = sd.symbol + " " + sd.label;
@@ -1362,9 +1362,9 @@ function _renderWsRow(ws, opts, container) {
   main.appendChild(stateCell);
 
   // NAME (with optional child-count summary for collapsed coordinators)
-  var nameCell = document.createElement("span");
+  const nameCell = document.createElement("span");
   nameCell.className = "dash-cell-name";
-  var nameText = ws.name || ws.title || ws.id || "";
+  const nameText = ws.name || ws.title || ws.id || "";
   nameCell.textContent = nameText;
   if (opts.isCoordinator && opts.childCount != null && opts.childCount > 0) {
     // Render the "(N children)" summary only when there actually are
@@ -1373,7 +1373,7 @@ function _renderWsRow(ws, opts, container) {
     // otherwise always print "(0 children)".  CSS hides it when the
     // row is expanded (see [data-expanded="true"] .dash-child-count
     // in style.css).
-    var summary = document.createElement("span");
+    const summary = document.createElement("span");
     summary.className = "dash-child-count";
     summary.textContent =
       " (" +
@@ -1382,7 +1382,7 @@ function _renderWsRow(ws, opts, container) {
     nameCell.appendChild(summary);
   }
   if (opts.isOrphan) {
-    var orphanBadge = document.createElement("span");
+    const orphanBadge = document.createElement("span");
     orphanBadge.className = "dash-orphan-badge";
     orphanBadge.textContent = " orphan";
     nameCell.appendChild(orphanBadge);
@@ -1390,14 +1390,14 @@ function _renderWsRow(ws, opts, container) {
   main.appendChild(nameCell);
 
   // MODEL
-  var modelCell = document.createElement("span");
+  const modelCell = document.createElement("span");
   modelCell.className = "dash-cell-model";
   modelCell.textContent = ws.model_alias || ws.model || "";
   if (ws.model) modelCell.title = ws.model;
   main.appendChild(modelCell);
 
   // NODE (clickable)
-  var nodeCell = document.createElement("span");
+  const nodeCell = document.createElement("span");
   nodeCell.className = "dash-cell-node";
   nodeCell.textContent = ws.node || "";
   nodeCell.onclick = function (e) {
@@ -1407,19 +1407,19 @@ function _renderWsRow(ws, opts, container) {
   main.appendChild(nodeCell);
 
   // TASK
-  var taskCell = document.createElement("span");
+  const taskCell = document.createElement("span");
   taskCell.className = "dash-cell-task";
   taskCell.textContent = ws.title || "";
   main.appendChild(taskCell);
 
   // TOKENS
-  var tokensCell = document.createElement("span");
+  const tokensCell = document.createElement("span");
   tokensCell.className = "dash-cell-tokens";
   tokensCell.textContent = ws.tokens ? formatTokens(ws.tokens) : "";
   main.appendChild(tokensCell);
 
   // CTX
-  var ctxCell = document.createElement("span");
+  const ctxCell = document.createElement("span");
   ctxCell.className = "dash-cell-ctx " + ctxClass(ws.context_ratio || 0);
   ctxCell.textContent =
     ws.context_ratio > 0 ? Math.round(ws.context_ratio * 100) + "%" : "";
@@ -1428,7 +1428,7 @@ function _renderWsRow(ws, opts, container) {
   row.appendChild(main);
 
   // Sub-line
-  var sub = document.createElement("div");
+  const sub = document.createElement("div");
   sub.className = "dash-row-sub";
   if (ws.activity_state === "approval") sub.classList.add("sub-attention");
   sub.textContent = ws.activity || "";
@@ -1437,7 +1437,7 @@ function _renderWsRow(ws, opts, container) {
   // Deep link: click opens proxied server UI at this workstream.
   // Coordinator rows route to /coordinator/{ws_id}; node-backed
   // workstreams route to the proxied /node/{node_id}/?ws_id=X UI.
-  var wsNodeId = ws.node;
+  const wsNodeId = ws.node;
   if (opts.isCoordinator || ws.kind === "coordinator") {
     row.classList.add("has-link");
     (function (wsId) {
@@ -1479,7 +1479,7 @@ function _renderWsRow(ws, opts, container) {
 
 // --- Navigation ---
 window.addEventListener("popstate", function (e) {
-  var overlay = document.getElementById("login-overlay");
+  const overlay = document.getElementById("login-overlay");
   if (overlay && overlay.style.display !== "none") return;
   _navigatingFromPopstate = true;
   try {
@@ -1507,7 +1507,7 @@ window.addEventListener("popstate", function (e) {
 // ---------------------------------------------------------------------------
 
 function _hasCoordPermission() {
-  var perms = sessionStorage.getItem("turnstone_permissions") || "";
+  const perms = sessionStorage.getItem("turnstone_permissions") || "";
   return perms.split(",").indexOf("admin.coordinator") !== -1;
 }
 
@@ -1517,14 +1517,14 @@ function _hasCoordPermission() {
 // On success redirects to /coordinator/{ws_id}; on failure surfaces
 // the server's error text inline through errEl.
 function _createCoordinator(opts) {
-  var name = (opts.name || "").trim();
-  var skill = opts.skill || "";
-  var model = (opts.model || "").trim();
-  var judgeModel = (opts.judge_model || "").trim();
-  var task = (opts.task || "").trim();
-  var errEl = opts.errEl;
-  var setBusy = opts.setBusy || function () {};
-  var onSuccess = opts.onSuccess || function () {};
+  const name = (opts.name || "").trim();
+  const skill = opts.skill || "";
+  const model = (opts.model || "").trim();
+  const judgeModel = (opts.judge_model || "").trim();
+  const task = (opts.task || "").trim();
+  const errEl = opts.errEl;
+  const setBusy = opts.setBusy || function () {};
+  const onSuccess = opts.onSuccess || function () {};
 
   // Error region is always rendered with reserved min-height (see
   // .home-composer-error in style.css) so toggling validation messages
@@ -1533,7 +1533,7 @@ function _createCoordinator(opts) {
   errEl.textContent = "";
   setBusy(true);
 
-  var body = {};
+  const body = {};
   if (name) body.name = name;
   if (skill) body.skill = skill;
   if (model) body.model = model;
@@ -1545,12 +1545,12 @@ function _createCoordinator(opts) {
   // reserves attachments for the very first turn (same flow the
   // interactive UI's new-ws modal uses against the server).  Plain
   // JSON stays the default when no files are attached.
-  var files = Array.isArray(opts.files) ? opts.files : [];
-  var fetchOpts;
+  const files = Array.isArray(opts.files) ? opts.files : [];
+  let fetchOpts;
   if (files.length > 0) {
-    var form = new FormData();
+    const form = new FormData();
     form.append("meta", JSON.stringify(body));
-    for (var i = 0; i < files.length; i++) {
+    for (let i = 0; i < files.length; i++) {
       form.append("file", files[i], files[i].name);
     }
     // Don't set Content-Type — the browser adds the correct boundary.
@@ -1594,31 +1594,31 @@ function _createCoordinator(opts) {
 // picks them up automatically via scheduleRender → renderFromState.
 // ---------------------------------------------------------------------------
 
-var _homeComposerInit = false;
-var _homeCoordComposer = null; // shared Composer instance
-var _homeCoordBusy = false;
+let _homeComposerInit = false;
+let _homeCoordComposer = null; // shared Composer instance
+let _homeCoordBusy = false;
 
 // Attachment staging for the home coord composer.  The coord ws_id
 // doesn't exist until the create POST resolves, so we hold File
 // objects in memory and ship them as multipart parts on submit (same
 // pattern interactive uses for its new-ws modal + dashboard composer).
-var _homeStagedFiles = [];
+let _homeStagedFiles = [];
 
 // Per-kind size caps + allowlist mirrored from turnstone/core/attachments.py
 // so the browser can fail fast.  Keep in sync with the interactive
 // UI's _ATTACH_* constants in turnstone/ui/static/app.js.
-var _HOME_IMAGE_CAP = 4 * 1024 * 1024;
-var _HOME_TEXT_CAP = 512 * 1024;
-var _HOME_MAX_FILES = 10;
-var _HOME_IMAGE_MIMES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
-var _HOME_TEXT_APP_MIMES = [
+const _HOME_IMAGE_CAP = 4 * 1024 * 1024;
+const _HOME_TEXT_CAP = 512 * 1024;
+const _HOME_MAX_FILES = 10;
+const _HOME_IMAGE_MIMES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+const _HOME_TEXT_APP_MIMES = [
   "application/json",
   "application/xml",
   "application/x-yaml",
   "application/yaml",
   "application/toml",
 ];
-var _HOME_TEXT_EXTENSIONS = [
+const _HOME_TEXT_EXTENSIONS = [
   ".c",
   ".conf",
   ".cpp",
@@ -1653,12 +1653,12 @@ function _homeFormatSize(n) {
 }
 
 function _homeIsAttachmentAllowed(file) {
-  var mime = (file.type || "").toLowerCase();
+  const mime = (file.type || "").toLowerCase();
   if (_HOME_IMAGE_MIMES.indexOf(mime) !== -1) return true;
   if (mime.indexOf("text/") === 0) return true;
   if (_HOME_TEXT_APP_MIMES.indexOf(mime) !== -1) return true;
-  var name = (file.name || "").toLowerCase();
-  var dot = name.lastIndexOf(".");
+  const name = (file.name || "").toLowerCase();
+  const dot = name.lastIndexOf(".");
   if (dot >= 0 && _HOME_TEXT_EXTENSIONS.indexOf(name.substr(dot)) !== -1) {
     return true;
   }
@@ -1666,7 +1666,7 @@ function _homeIsAttachmentAllowed(file) {
 }
 
 function _homeShowError(msg) {
-  var errEl = document.getElementById("home-coord-error");
+  const errEl = document.getElementById("home-coord-error");
   if (!errEl) return;
   // Element is always rendered (min-height reserves the row); just
   // toggle the message text so layout doesn't shift on validation.
@@ -1675,35 +1675,35 @@ function _homeShowError(msg) {
 
 function _homeRenderChips() {
   if (!_homeCoordComposer || !_homeCoordComposer.chipsEl) return;
-  var chipsEl = _homeCoordComposer.chipsEl;
+  const chipsEl = _homeCoordComposer.chipsEl;
   chipsEl.textContent = "";
-  for (var i = 0; i < _homeStagedFiles.length; i++) {
+  for (let i = 0; i < _homeStagedFiles.length; i++) {
     (function (idx) {
-      var f = _homeStagedFiles[idx];
-      var isImage = (f.type || "").indexOf("image/") === 0;
-      var chip = document.createElement("span");
+      const f = _homeStagedFiles[idx];
+      const isImage = (f.type || "").indexOf("image/") === 0;
+      const chip = document.createElement("span");
       chip.className =
         "composer-chip composer-chip-" + (isImage ? "image" : "text");
       chip.setAttribute("role", "listitem");
 
-      var icon = document.createElement("span");
+      const icon = document.createElement("span");
       icon.className = "composer-chip-icon";
       icon.setAttribute("aria-hidden", "true");
       icon.textContent = isImage ? "🖼" : "📄";
       chip.appendChild(icon);
 
-      var name = document.createElement("span");
+      const name = document.createElement("span");
       name.className = "composer-chip-name";
       name.textContent = f.name;
       name.title = f.name + " (" + f.size + " bytes)";
       chip.appendChild(name);
 
-      var size = document.createElement("span");
+      const size = document.createElement("span");
       size.className = "composer-chip-size";
       size.textContent = _homeFormatSize(f.size);
       chip.appendChild(size);
 
-      var rm = document.createElement("button");
+      const rm = document.createElement("button");
       rm.type = "button";
       rm.className = "composer-chip-remove";
       rm.setAttribute("aria-label", "Remove " + f.name);
@@ -1735,8 +1735,8 @@ function _homeStageFile(file) {
     );
     return;
   }
-  var isImage = (file.type || "").indexOf("image/") === 0;
-  var cap = isImage ? _HOME_IMAGE_CAP : _HOME_TEXT_CAP;
+  const isImage = (file.type || "").indexOf("image/") === 0;
+  const cap = isImage ? _HOME_IMAGE_CAP : _HOME_TEXT_CAP;
   if (file.size > cap) {
     _homeShowError(file.name + " exceeds the " + _homeFormatSize(cap) + " cap");
     return;
@@ -1767,7 +1767,7 @@ function _ensureHomeComposerInit() {
 }
 
 function _mountHomeCoordComposer() {
-  var mount = document.getElementById("home-coord-composer-mount");
+  const mount = document.getElementById("home-coord-composer-mount");
   if (!mount || _homeCoordComposer) return;
   _homeCoordComposer = new Composer(mount, {
     layout: "stacked",
@@ -1787,7 +1787,7 @@ function _mountHomeCoordComposer() {
     options: {
       storageKey: "turnstone.console.home_coord.options_open",
       summary: function (v) {
-        var bits = [];
+        const bits = [];
         if (v.name) bits.push(v.name);
         if (v.skill) bits.push(v.skill);
         if (v.model) bits.push(v.model);
@@ -1845,7 +1845,7 @@ function _populateHomeSkillDropdown() {
       return r.ok ? r.json() : { skills: [] };
     })
     .then(function (data) {
-      var choices = (data.skills || []).map(function (t) {
+      const choices = (data.skills || []).map(function (t) {
         return {
           value: t.name,
           text: t.is_default ? t.name + " (default)" : t.name,
@@ -1864,8 +1864,8 @@ function _populateHomeSkillDropdown() {
 // to a neutral placeholder.
 function _resolveModelLabel(alias, models) {
   if (!alias) return "";
-  for (var i = 0; i < (models || []).length; i++) {
-    var m = models[i];
+  for (let i = 0; i < (models || []).length; i++) {
+    const m = models[i];
     if (m.alias === alias) {
       return m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
     }
@@ -1884,8 +1884,8 @@ function _populateHomeModelDropdowns() {
       return r.ok ? r.json() : { models: [] };
     })
     .then(function (data) {
-      var choices = (data.models || []).map(function (m) {
-        var label =
+      const choices = (data.models || []).map(function (m) {
+        let label =
           m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
         return { value: m.alias, text: label };
       });
@@ -1899,11 +1899,11 @@ function _populateHomeModelDropdowns() {
       // alias's "(model)" suffix legible and matches the
       // ``(default — alias (model))`` pattern used in the admin Roles
       // tab.
-      var coordDefault = _resolveModelLabel(
+      const coordDefault = _resolveModelLabel(
         data.coordinator_default_alias || "",
         data.models || [],
       );
-      var judgeDefault = _resolveModelLabel(
+      const judgeDefault = _resolveModelLabel(
         data.judge_default_alias || "",
         data.models || [],
       );
@@ -1922,7 +1922,7 @@ function _populateHomeModelDropdowns() {
 }
 
 function _refreshHomeComposerVisibility() {
-  var panel = document.getElementById("coord-composer-panel");
+  const panel = document.getElementById("coord-composer-panel");
   if (!panel) return;
   panel.style.display = _hasCoordPermission() ? "" : "none";
 }
@@ -1936,13 +1936,13 @@ function submitHomeCoord(textFromComposer) {
   // text arg is passed when the Composer's Enter-key handler fires;
   // direct callers (Ctrl/Cmd+Enter) invoke with no argument and we
   // read from the composer.
-  var task =
+  const task =
     textFromComposer != null ? textFromComposer : _homeCoordComposer.value;
-  var opts = _homeCoordComposer.getOptionValues();
+  let opts = _homeCoordComposer.getOptionValues();
   // Snapshot at submit time so a chip remove mid-request can't race
   // the multipart payload (the actual reset only fires on the success
   // branch, after the response lands).
-  var files = _homeStagedFiles.slice();
+  const files = _homeStagedFiles.slice();
   // Files-without-text would upload pending attachment rows but the
   // server's _coord_create_post_install only reserves+dispatches when
   // initial_message is non-empty — uploaded files would orphan as
@@ -1981,7 +1981,7 @@ function submitHomeCoord(textFromComposer) {
 document.addEventListener("keydown", function (e) {
   if (e.key !== "Enter" || !(e.ctrlKey || e.metaKey)) return;
   if (!_homeCoordComposer) return;
-  var mount = document.getElementById("home-coord-composer-mount");
+  const mount = document.getElementById("home-coord-composer-mount");
   if (!mount || !mount.contains(e.target)) return;
   e.preventDefault();
   if (!_homeCoordComposer.sendBtn.disabled) submitHomeCoord();
@@ -1992,7 +1992,7 @@ document.addEventListener("keydown", function (e) {
 // coord list has changed.  renderFromState fires on every SSE patch
 // (state_change, ws_created, ws_closed, ...) and most of those don't
 // affect the coord list.
-var _homeCoordsFingerprint = "";
+let _homeCoordsFingerprint = "";
 
 // Active-coordinators list is SSE-driven — the console collector
 // registers a "console" pseudo-node and the coordinator manager fans
@@ -2004,7 +2004,7 @@ var _homeCoordsFingerprint = "";
 
 function _activeCoordsFromClusterState() {
   if (!clusterState) return [];
-  var node = clusterState.nodes && clusterState.nodes["console"];
+  const node = clusterState.nodes && clusterState.nodes["console"];
   if (!node) return [];
   return (node.workstreams || []).filter(function (ws) {
     return ws && ws.kind === "coordinator";
@@ -2016,11 +2016,11 @@ function _renderHomeView() {
   // — the coordinator manager fans out ws_created / ws_closed /
   // cluster_state via the collector's pseudo-node so the home view
   // stays in sync without polling.
-  var coords = _activeCoordsFromClusterState();
+  const coords = _activeCoordsFromClusterState();
   coords.sort(function (a, b) {
     // Most-recently-active first.  updated is absent on freshly-created
     // rows; fall back to id so the ordering is stable either way.
-    var au = a.updated || 0,
+    const au = a.updated || 0,
       bu = b.updated || 0;
     if (au !== bu) return bu - au;
     return (a.id || "").localeCompare(b.id || "");
@@ -2034,9 +2034,9 @@ function _renderHomeView() {
   // stable enough that unrelated sub-hundred drift doesn't trigger
   // a full rebuild on every SSE tick; the rendered value still
   // re-renders when the bucket changes.
-  var coordsFp = coords.length + "|";
-  for (var i = 0; i < coords.length; i++) {
-    var c = coords[i];
+  let coordsFp = coords.length + "|";
+  for (let i = 0; i < coords.length; i++) {
+    const c = coords[i];
     coordsFp +=
       (c.id || "") +
       ":" +
@@ -2061,15 +2061,15 @@ function _renderHomeView() {
   }
   if (coordsFp !== _homeCoordsFingerprint) {
     _homeCoordsFingerprint = coordsFp;
-    var countEl = document.getElementById("active-coord-count");
+    const countEl = document.getElementById("active-coord-count");
     if (countEl) {
       countEl.textContent = coords.length ? "(" + coords.length + ")" : "";
     }
-    var listEl = document.getElementById("active-coord-list");
+    const listEl = document.getElementById("active-coord-list");
     if (listEl) {
       listEl.replaceChildren();
       if (!coords.length) {
-        var empty = document.createElement("div");
+        const empty = document.createElement("div");
         empty.className = "dashboard-empty";
         empty.textContent = "No active coordinator sessions. Start one above.";
         listEl.appendChild(empty);
@@ -2097,8 +2097,8 @@ function _renderHomeView() {
 // triggers a parallel fetch.  Single boolean is enough because the
 // renderer reads from the latest response — a coalesced re-fetch right
 // after the in-flight one resolves catches any state change.
-var _savedCoordsInFlight = false;
-var _savedCoordsRetry = false;
+let _savedCoordsInFlight = false;
+let _savedCoordsRetry = false;
 
 function loadSavedCoordinators() {
   if (!_hasCoordPermission()) return;
@@ -2155,10 +2155,10 @@ function loadSavedCoordinators() {
 // Pagination caps Select-All fan-out at COORD_PAGE_SIZE — the controller
 // only ever sees the visible page, so a confirm-all batch is bounded to
 // COORD_PAGE_SIZE parallel POSTs against the routing proxy.
-var COORD_PAGE_SIZE = 24;
-var _coordPage = 0;
-var _coordSavedItems = [];
-var _coordDeleteController = createSavedCardsController({
+const COORD_PAGE_SIZE = 24;
+let _coordPage = 0;
+let _coordSavedItems = [];
+const _coordDeleteController = createSavedCardsController({
   idPrefix: "coord-delete",
   buttonId: "coord-delete-btn",
   noun: "coordinator",
@@ -2195,9 +2195,9 @@ var _coordDeleteController = createSavedCardsController({
 
 function renderSavedCoordinators(items) {
   _coordSavedItems = items;
-  var section = document.getElementById("saved-coordinators");
-  var cards = document.getElementById("saved-coord-cards");
-  var countEl = document.getElementById("saved-coord-count");
+  const section = document.getElementById("saved-coordinators");
+  const cards = document.getElementById("saved-coord-cards");
+  const countEl = document.getElementById("saved-coord-count");
   if (!section || !cards) return;
   if (!items.length) {
     section.style.display = "none";
@@ -2209,10 +2209,10 @@ function renderSavedCoordinators(items) {
     return;
   }
   // Clamp the page index after deletes (or upstream churn) shrink the list.
-  var pages = Math.max(1, Math.ceil(items.length / COORD_PAGE_SIZE));
+  const pages = Math.max(1, Math.ceil(items.length / COORD_PAGE_SIZE));
   if (_coordPage > pages - 1) _coordPage = pages - 1;
   if (_coordPage < 0) _coordPage = 0;
-  var visible = items.slice(
+  const visible = items.slice(
     _coordPage * COORD_PAGE_SIZE,
     (_coordPage + 1) * COORD_PAGE_SIZE,
   );
@@ -2222,7 +2222,7 @@ function renderSavedCoordinators(items) {
   if (countEl) countEl.textContent = "(" + items.length + ")";
   cards.replaceChildren();
   visible.forEach(function (sess) {
-    var card = renderSessionCard(sess, {
+    const card = renderSessionCard(sess, {
       ariaLabel: _coordDeleteController.ariaLabel,
       onActivate: function (s, cardEl) {
         if (_coordDeleteController.blockActivate()) return;
@@ -2267,10 +2267,10 @@ function renderSavedCoordinators(items) {
 }
 
 function _renderCoordPagination() {
-  var pag = document.getElementById("coord-pagination");
+  const pag = document.getElementById("coord-pagination");
   if (!pag) return;
-  var total = _coordSavedItems.length;
-  var pages = Math.max(1, Math.ceil(total / COORD_PAGE_SIZE));
+  const total = _coordSavedItems.length;
+  const pages = Math.max(1, Math.ceil(total / COORD_PAGE_SIZE));
   // Single-page lists and delete-mode hide the controls — page changes
   // would invalidate the user's checkbox selections, so we lock them out.
   if (pages <= 1 || _coordDeleteController.inMode()) {
@@ -2278,7 +2278,7 @@ function _renderCoordPagination() {
     return;
   }
   pag.style.display = "";
-  var label = document.getElementById("coord-page-label");
+  const label = document.getElementById("coord-page-label");
   if (label) {
     /* Visible text uses the terse "X / Y" form to match the
        filtered-pagination control elsewhere in the console; the long
@@ -2293,9 +2293,9 @@ function _renderCoordPagination() {
         pages,
     );
   }
-  var prev = document.getElementById("coord-page-prev");
+  const prev = document.getElementById("coord-page-prev");
   if (prev) prev.disabled = _coordPage <= 0;
-  var next = document.getElementById("coord-page-next");
+  const next = document.getElementById("coord-page-next");
   if (next) next.disabled = _coordPage >= pages - 1;
 }
 
@@ -2307,7 +2307,7 @@ function coordPagePrev() {
 }
 
 function coordPageNext() {
-  var pages = Math.max(1, Math.ceil(_coordSavedItems.length / COORD_PAGE_SIZE));
+  const pages = Math.max(1, Math.ceil(_coordSavedItems.length / COORD_PAGE_SIZE));
   if (_coordPage < pages - 1) {
     _coordPage++;
     renderSavedCoordinators(_coordSavedItems);
@@ -2344,7 +2344,7 @@ function confirmCoordDelete() {
 // --- Init ---
 // SSE connects after auth is confirmed — either via onLoginSuccess after
 // login, or after the first successful data load (page refresh with valid cookie).
-var _sseStarted = false;
+let _sseStarted = false;
 function _ensureSSE() {
   if (!_sseStarted) {
     _sseStarted = true;
