@@ -6619,6 +6619,29 @@ loadInterfaceSettings();
 initWorkstreams();
 loadPendingConsents();
 
+// Free the HTTP/1.1 6-connection-per-host budget before the refresh
+// document fetch starts.  Each pane holds a long-lived per-ws SSE +
+// the global SSE; at 5–6 panes the cap is hit and the new document
+// load queues behind the existing connections.  Chrome leaves the
+// document fetch in (pending) indefinitely; Firefox surfaces
+// "interrupted while page was loading" and leaves the new page
+// stuck on "Loading…".  Best-effort close on unload frees the slots.
+//
+// This is a tactical mitigation — the real fix is the console SSE
+// fan-in (one connection per page regardless of pane count).  See
+// the [[sse-fanout-pending]] memory + ~/pr-c-sse-consolidation.md
+// briefing for the architectural work.
+window.addEventListener("beforeunload", function () {
+  try {
+    if (globalEvtSource) globalEvtSource.close();
+    for (const id in panes) {
+      if (panes[id] && panes[id].evtSource) panes[id].evtSource.close();
+    }
+  } catch (_e) {
+    /* best-effort — never block unload */
+  }
+});
+
 function loadInterfaceSettings() {
   authFetch("/v1/api/admin/settings")
     .then(function (r) {

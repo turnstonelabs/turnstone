@@ -1080,3 +1080,29 @@ def test_redact_api_keys_runtime_smoke() -> None:
     assert proc.returncode == 0, (
         f"_redactApiKeys runtime smoke failed.  stdout={proc.stdout!r} stderr={proc.stderr!r}"
     )
+
+
+def test_beforeunload_closes_sse_connections() -> None:
+    """Pin the multi-pane refresh mitigation: the ``beforeunload``
+    handler closes ``globalEvtSource`` and every pane's ``evtSource``
+    before the page navigates away, freeing the browser's HTTP/1.1
+    6-connection-per-host budget so the refresh document fetch can
+    open a slot.  Without this handler, refresh at MAX_PANES hangs
+    in Chrome and leaves Firefox stuck on the loading state.
+
+    This is a tactical mitigation; the real fix is the console SSE
+    fan-in (one connection per page).  Pinning the handler here
+    prevents a future refactor from silently dropping it before
+    the fan-in lands."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    # Locate the registration site, then walk forward by a fixed window
+    # large enough to cover the handler body.  Simpler than balancing
+    # braces in regex — the handler is small + tightly scoped.
+    anchor = body.find('addEventListener("beforeunload"')
+    assert anchor != -1, "beforeunload handler missing — refresh at MAX_PANES will hang."
+    handler = body[anchor : anchor + 800]
+    assert "globalEvtSource.close()" in handler, "beforeunload handler must close globalEvtSource."
+    assert ".evtSource.close()" in handler, "beforeunload handler must close per-pane evtSource."
+    assert "for (const id in panes)" in handler, (
+        "beforeunload handler must iterate the panes registry with `for (const id in panes)`."
+    )
