@@ -477,6 +477,829 @@ class Pane {
       this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
     }
   }
+
+  _createDOM() {
+    this.el = document.createElement("div");
+    this.el.className = "pane";
+    this.el.dataset.paneId = this.id;
+
+    // Focus on mousedown (before child clicks)
+    this.el.addEventListener("mousedown", () => {
+      setFocusedPane(this.id);
+    });
+    // Also track keyboard focus moving into this pane (e.g. Tab into textarea)
+    this.el.addEventListener(
+      "focusin",
+      () => {
+        setFocusedPane(this.id);
+      },
+      true,
+    );
+
+    // Right-click context menu for split/close actions — skip interactive
+    // elements (textareas, links, buttons) so native copy/paste works
+    this.el.addEventListener("contextmenu", (e) => {
+      var tag = e.target.tagName;
+      if (
+        tag === "TEXTAREA" ||
+        tag === "INPUT" ||
+        tag === "A" ||
+        tag === "BUTTON" ||
+        e.target.isContentEditable
+      )
+        return;
+      var sel = window.getSelection();
+      if (sel && sel.toString().length > 0) return;
+      e.preventDefault();
+      setFocusedPane(this.id);
+      showPaneContextMenu(e.clientX, e.clientY, this.id);
+    });
+
+    // Pane header (visible only in multi-pane mode)
+    this.headerEl = document.createElement("div");
+    this.headerEl.className = "pane-header";
+
+    var wsName = document.createElement("span");
+    wsName.className = "pane-ws-name";
+    wsName.textContent = this.wsId
+      ? (workstreams[this.wsId] && workstreams[this.wsId].name) ||
+        this.wsId.substring(0, 8)
+      : "";
+    this.headerEl.appendChild(wsName);
+
+    var actions = document.createElement("div");
+    actions.className = "pane-actions";
+
+    var splitRightBtn = document.createElement("button");
+    splitRightBtn.className = "pane-action-btn";
+    splitRightBtn.title = "Split right";
+    splitRightBtn.setAttribute("aria-label", "Split right");
+    splitRightBtn.textContent = "\u2502";
+    splitRightBtn.onclick = (e) => {
+      e.stopPropagation();
+      splitPane(this.id, "horizontal");
+    };
+    actions.appendChild(splitRightBtn);
+
+    var splitDownBtn = document.createElement("button");
+    splitDownBtn.className = "pane-action-btn";
+    splitDownBtn.title = "Split down";
+    splitDownBtn.setAttribute("aria-label", "Split down");
+    splitDownBtn.textContent = "\u2500";
+    splitDownBtn.onclick = (e) => {
+      e.stopPropagation();
+      splitPane(this.id, "vertical");
+    };
+    actions.appendChild(splitDownBtn);
+
+    var closeBtn = document.createElement("button");
+    closeBtn.className = "pane-action-btn pane-close-btn";
+    closeBtn.title = "Close pane";
+    closeBtn.setAttribute("aria-label", "Close pane");
+    closeBtn.textContent = "\u00d7";
+    closeBtn.onclick = (e) => {
+      e.stopPropagation();
+      if (countLeaves(splitRoot) > 1) closePane(this.id);
+    };
+    actions.appendChild(closeBtn);
+
+    this.headerEl.appendChild(actions);
+    this.el.appendChild(this.headerEl);
+
+    // Messages area
+    this.messagesEl = document.createElement("div");
+    this.messagesEl.className = "pane-messages";
+    this.messagesEl.setAttribute("role", "log");
+    this.messagesEl.setAttribute("aria-live", "polite");
+    this.messagesEl.setAttribute("aria-label", "Chat messages");
+    this.el.appendChild(this.messagesEl);
+
+    // Per-workstream status bar (above input)
+    this.statusBarEl = document.createElement("div");
+    this.statusBarEl.className = "ws-status-bar";
+    this.statusBarEl.setAttribute("role", "status");
+    this.statusBarEl.setAttribute("aria-live", "polite");
+    this.statusBarEl.setAttribute("aria-atomic", "true");
+    this.statusBarEl.setAttribute("aria-label", "Workstream status");
+
+    this._sbModel = document.createElement("span");
+    this._sbModel.className = "ws-sb-model";
+    this._sbModel.textContent = "\u2014";
+    this._sbModel.setAttribute("aria-label", "Model");
+    this._sbTokens = document.createElement("span");
+    this._sbTokens.className = "ws-sb-tokens";
+    this._sbTokens.textContent = "0 / \u2014";
+    this._sbTokens.setAttribute("aria-label", "Token usage");
+    this._sbTools = document.createElement("span");
+    this._sbTools.className = "ws-sb-tools";
+    this._sbTools.textContent = "0 tools";
+    this._sbTools.setAttribute("aria-label", "Tool calls this turn");
+    this._sbTurns = document.createElement("span");
+    this._sbTurns.className = "ws-sb-turns";
+    this._sbTurns.textContent = "turn 0";
+    this._sbTurns.setAttribute("aria-label", "Conversation turn");
+
+    this.statusBarEl.appendChild(this._sbModel);
+    this.statusBarEl.appendChild(this._sbTokens);
+    this.statusBarEl.appendChild(this._sbTools);
+    this.statusBarEl.appendChild(this._sbTurns);
+    this.el.appendChild(this.statusBarEl);
+
+    // Input area — DOM + behavior comes from shared/composer.js.  The
+    // pane keeps the attachment-upload pipeline (because attachments are
+    // pane-specific state) and routes file events through the composer's
+    // attach/paste/drop callbacks.
+    this.composer = new Composer(this.el, {
+      attachments: {
+        onAttach: (file) => {
+          this.attachments.upload(file);
+        },
+      },
+      stopBtn: true,
+      queueWhileBusy: true,
+      busyPlaceholder: "Queue a message\u2026 (!!! for urgent)",
+      onSend: () => {
+        this.sendMessage();
+      },
+      onStop: () => {
+        this.cancelGeneration();
+      },
+      dragDrop: { targetEl: this.el, dropClass: "pane-drop-target" },
+    });
+    this.inputEl = this.composer.inputEl;
+    this.sendBtn = this.composer.sendBtn;
+    this.stopBtn = this.composer.stopBtn;
+    // Lazy wsId read \u2014 a tab swap (Pane re-bound to a new workstream)
+    // changes the closure target without re-instantiating the controllers.
+    this.attachments = createAttachmentController({
+      chipsEl: this.composer.chipsEl,
+      getWsId: () => {
+        return this.wsId;
+      },
+      onError: (msg) => {
+        showToast(msg);
+      },
+    });
+    this.queue = createQueueController({
+      messagesEl: this.messagesEl,
+      getWsId: () => {
+        return this.wsId;
+      },
+      onAfterDequeue: () => {
+        this.attachments.rehydrate();
+      },
+      // Idle-edge cleanup of the cancel/force-stop timers — without
+      // this they fire on the *next* busy turn, relabel Stop to "Force
+      // Stop", and surface a misleading "Cancel didn't complete in
+      // time" toast about a turn the user already moved past.
+      onIdle: () => {
+        if (this._cancelTimeout) {
+          clearTimeout(this._cancelTimeout);
+          this._cancelTimeout = null;
+        }
+        if (this._forceTimeout) {
+          clearTimeout(this._forceTimeout);
+          this._forceTimeout = null;
+        }
+      },
+    });
+  }
+
+  connectSSE(wsId) {
+    this.disconnectSSE();
+    var wsChanged = this.wsId !== wsId;
+    this.wsId = wsId;
+    if (wsChanged) {
+      this.attachments.clearChips();
+      this.attachments.rehydrate();
+    }
+
+    this.evtSource = new EventSource(
+      "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/events",
+    );
+
+    this.evtSource.onopen = () => {
+      this.retryDelay = 1000;
+      this.statusBarEl.classList.remove("ws-sb-disconnected");
+      if (this._lastStatusEvt) this.updateStatus(this._lastStatusEvt);
+    };
+
+    this.evtSource.onmessage = (e) => {
+      var data = JSON.parse(e.data);
+      this.handleEvent(data);
+    };
+
+    this.evtSource.onerror = () => {
+      this.evtSource.close();
+      this.evtSource = null;
+      var loginOverlay = document.getElementById("login-overlay");
+      if (loginOverlay && loginOverlay.style.display !== "none") return;
+      this.statusBarEl.classList.add("ws-sb-disconnected");
+      this._sbTokens.textContent = "Reconnecting\u2026";
+      // Only the focused pane refreshes the global workstream list to avoid
+      // race conditions when multiple panes disconnect simultaneously.
+      if (this.id === focusedPaneId) {
+        fetch("/v1/api/workstreams")
+          .then((r) => {
+            if (r.status === 401) {
+              showLogin();
+              return;
+            }
+            return r.json().then((data) => {
+              workstreams = {};
+              (data.workstreams || []).forEach((ws) => {
+                workstreams[ws.ws_id] = { name: ws.name, state: ws.state };
+              });
+              renderTabBar();
+              // Reconnect all disconnected panes, reassigning stale ws_ids.
+              // Two passes: (1) reassign stale panes, (2) reconnect all.
+              // Track assigned ws_ids to avoid multiple panes on the same ws.
+              var remaining = Object.keys(workstreams);
+              if (!remaining.length) {
+                showDashboard();
+                return;
+              }
+              var usedWsIds = {};
+              for (var pid in panes) {
+                if (panes[pid].wsId && workstreams[panes[pid].wsId])
+                  usedWsIds[panes[pid].wsId] = true;
+              }
+              for (var pid2 in panes) {
+                var p2 = panes[pid2];
+                if (p2.wsId && !workstreams[p2.wsId]) {
+                  var newWsId = null;
+                  for (var ri = 0; ri < remaining.length; ri++) {
+                    if (!usedWsIds[remaining[ri]]) {
+                      newWsId = remaining[ri];
+                      break;
+                    }
+                  }
+                  if (newWsId) {
+                    p2.disconnectSSE();
+                    p2.wsId = newWsId;
+                    usedWsIds[newWsId] = true;
+                    while (p2.messagesEl.firstChild)
+                      p2.messagesEl.removeChild(p2.messagesEl.firstChild);
+                    p2.showEmptyState();
+                    p2.updateWsName();
+                  }
+                  // else: more panes than workstreams — leave pane stale,
+                  // connectSSE below will pick it up or it stays disconnected.
+                }
+              }
+              // Pass 2: reconnect all panes and sync focused pane
+              for (var pid3 in panes) {
+                var p3 = panes[pid3];
+                if (pid3 === focusedPaneId) currentWsId = p3.wsId;
+                if (!p3.evtSource && p3.wsId && workstreams[p3.wsId]) {
+                  setTimeout(
+                    ((pp) => {
+                      return () => {
+                        pp.connectSSE(pp.wsId);
+                      };
+                    })(p3),
+                    this.retryDelay,
+                  );
+                }
+              }
+              this.retryDelay = Math.min(this.retryDelay * 2, 30000);
+            });
+          })
+          .catch(() => {
+            setTimeout(() => {
+              this.connectSSE(this.wsId);
+            }, this.retryDelay);
+            this.retryDelay = Math.min(this.retryDelay * 2, 30000);
+          });
+      } else {
+        // Non-focused pane: just retry own connection after delay
+        setTimeout(() => {
+          this.connectSSE(this.wsId);
+        }, this.retryDelay);
+        this.retryDelay = Math.min(this.retryDelay * 2, 30000);
+      }
+    };
+  }
+
+  handleEvent(evt) {
+    // Guard: drop events that belong to a different workstream.
+    // This prevents cross-contamination during tab switches and reconnects.
+    if (evt.ws_id && evt.ws_id !== this.wsId) return;
+    switch (evt.type) {
+      case "thinking_start":
+        this.isThinking = true;
+        this.setBusy(true);
+        this.removeEmptyState();
+        this.addThinkingIndicator();
+        break;
+
+      case "thinking_stop":
+        this.isThinking = false;
+        this.removeThinkingIndicator();
+        break;
+
+      case "reasoning":
+        this.removeThinkingIndicator();
+        if (!this.currentReasoningEl) {
+          this.currentReasoningEl = document.createElement("div");
+          this.currentReasoningEl.className = "msg reasoning";
+          this.messagesEl.appendChild(this.currentReasoningEl);
+        }
+        this.currentReasoningEl.textContent += evt.text;
+        this.scrollToBottom();
+        break;
+
+      case "content":
+        this.removeThinkingIndicator();
+        if (this.currentReasoningEl) {
+          this.currentReasoningEl = null;
+        }
+        if (!this.currentAssistantEl) {
+          this.currentAssistantEl = document.createElement("div");
+          this.currentAssistantEl.className = "msg assistant";
+          this.currentAssistantBodyEl = document.createElement("div");
+          this.currentAssistantBodyEl.className = "msg-body";
+          this.currentAssistantEl.appendChild(this.currentAssistantBodyEl);
+          this.messagesEl.appendChild(this.currentAssistantEl);
+        }
+        this.contentBuffer += evt.text;
+        streamingRender(this.currentAssistantBodyEl, this.contentBuffer);
+        this.scrollToBottom();
+        break;
+
+      case "stream_end":
+        if (this._cancelTimeout) {
+          clearTimeout(this._cancelTimeout);
+          this._cancelTimeout = null;
+        }
+        if (this._forceTimeout) {
+          clearTimeout(this._forceTimeout);
+          this._forceTimeout = null;
+        }
+        // Finalize the current streaming segment's markdown.  This fires
+        // per-segment (between tool calls), NOT per-turn.  Busy state is
+        // managed by state_change events instead.
+        if (this.currentAssistantBodyEl && this.contentBuffer) {
+          streamingRenderFinalize(
+            this.currentAssistantBodyEl,
+            this.contentBuffer,
+          );
+        }
+        this.currentAssistantBodyEl = null;
+        this.currentAssistantEl = null;
+        this.currentReasoningEl = null;
+        this.contentBuffer = "";
+        this.scrollToBottom(true);
+        break;
+
+      case "in_progress_snapshot":
+        // One-shot replay of the in-progress turn's reasoning + content
+        // when this client connects mid-stream (page refresh while the
+        // model is generating).  Both fields may be empty; render only
+        // the non-empty halves.  Idempotent on EventSource auto-reconnect:
+        // skip overwrite when the current buffer is already at-or-past
+        // the snapshot length, so a stale replay can't reset the live-
+        // streamed view back to a shorter prefix.
+        this.removeThinkingIndicator();
+        if (evt.reasoning) {
+          if (!this.currentReasoningEl) {
+            this.currentReasoningEl = document.createElement("div");
+            this.currentReasoningEl.className = "msg reasoning";
+            this.messagesEl.appendChild(this.currentReasoningEl);
+          }
+          var curReason = this.currentReasoningEl.textContent || "";
+          if (curReason.length < evt.reasoning.length) {
+            this.currentReasoningEl.textContent = evt.reasoning;
+          }
+        }
+        if (evt.content) {
+          // Content snapshot supersedes any reasoning bubble — matches
+          // the "case content" invariant of clearing currentReasoningEl
+          // when content begins.
+          if (this.currentReasoningEl) {
+            this.currentReasoningEl = null;
+          }
+          if (!this.currentAssistantEl) {
+            this.currentAssistantEl = document.createElement("div");
+            this.currentAssistantEl.className = "msg assistant";
+            this.currentAssistantBodyEl = document.createElement("div");
+            this.currentAssistantBodyEl.className = "msg-body";
+            this.currentAssistantEl.appendChild(this.currentAssistantBodyEl);
+            this.messagesEl.appendChild(this.currentAssistantEl);
+          }
+          if (this.contentBuffer.length < evt.content.length) {
+            this.contentBuffer = evt.content;
+            streamingRender(this.currentAssistantBodyEl, this.contentBuffer);
+          }
+        }
+        this.scrollToBottom();
+        break;
+
+      case "state_change":
+        if (evt.state === "idle" || evt.state === "error") {
+          this.setBusy(false);
+          this._attachRetryToLastAssistant();
+          // Only steal focus if this is the active pane and no approval pending.
+          if (this.id === focusedPaneId && !this.pendingApproval) {
+            this.inputEl.focus();
+          }
+        } else if (
+          evt.state === "thinking" ||
+          evt.state === "running" ||
+          evt.state === "attention"
+        ) {
+          this.setBusy(true);
+        }
+        break;
+
+      case "tool_info":
+        this.showInlineToolBlock(evt.items, true);
+        break;
+
+      case "approve_request":
+        this.showInlineToolBlock(evt.items, false, evt.judge_pending);
+        break;
+
+      case "intent_verdict":
+        this.updateVerdictBadge(evt);
+        break;
+
+      case "output_warning":
+        this.showOutputWarning(evt);
+        break;
+
+      case "approval_resolved":
+        this.resolveApproval(evt.approved, false, evt.feedback, true);
+        break;
+
+      case "tool_output_chunk":
+        this.appendToolOutputChunk(evt.call_id || "", evt.chunk);
+        break;
+
+      case "tool_result":
+        this.appendToolOutput(
+          evt.call_id || "",
+          evt.name,
+          evt.output,
+          evt.is_error,
+        );
+        break;
+
+      case "status":
+        this.updateStatus(evt);
+        break;
+
+      case "plan_review":
+        showPlanDialog(evt.content);
+        break;
+
+      case "plan_resolved":
+        // Plan was resolved on another client (or by server-initiated cancel).
+        // Only act if our modal is for this pane's workstream.
+        if (_planWsId === this.wsId) {
+          dismissPlanDialog(evt.feedback);
+        }
+        break;
+
+      case "info":
+        this.addInfoMessage(evt.message);
+        break;
+
+      case "error":
+        // Show the error but don't change busy state — state_change
+        // handles idle/error transitions.  on_error fires for non-terminal
+        // errors (tool parse failures, truncation) mid-turn too.
+        this.addErrorMessage(evt.message);
+        break;
+
+      case "user_reminder":
+        // Metacognitive nudges — render as their own bubble below the
+        // user message they advise (semantically: a hint to the model
+        // right before its turn).  The originating tab's optimistic
+        // addUserMessage already ran when the user clicked send, so by
+        // the time this SSE event arrives the just-sent user bubble is
+        // at the bottom of messagesEl and addUserReminder's "anchor to
+        // most recent .msg.user" lookup finds it correctly; the
+        // insertAdjacentElement('afterend', el) call drops the bubble
+        // immediately below.
+        //
+        // Wake-driven reminders (``evt.source === "system_nudge"``)
+        // render the thin .msg.user.system-nudge marker first and
+        // anchor below it, so non-originating tabs see the same shape
+        // the originating tab does.
+        //
+        // Multi-tab caveat (non-wake): the server emits no user_message
+        // SSE event for real user input today, so a non-originating tab
+        // sees the reminder without a paired user-message render — the
+        // anchor falls on a stale prior user bubble, mis-positioning
+        // the reminder.  The next /history reload corrects it.
+        // Acceptable cost for stage 1; closing the gap is a follow-up
+        // that adds a user_message SSE event.
+        if (Array.isArray(evt.reminders) && evt.reminders.length) {
+          this.addUserReminder(evt.reminders, evt.source || "");
+        }
+        break;
+
+      case "tool_reminder":
+        // Metacognitive tool-channel nudge (tool_error / repeat) —
+        // render as the same yellow themed bubble used for user-channel
+        // reminders, anchored below the .ts-approval block whose tool
+        // result triggered the batch's reminder.  evt.tool_call_id
+        // identifies the specific tool element; addToolReminder walks
+        // up to its parent approval block and inserts the bubble
+        // immediately after.
+        if (Array.isArray(evt.reminders) && evt.reminders.length) {
+          this.addToolReminder(evt.reminders, evt.tool_call_id || "");
+        }
+        break;
+
+      case "message_queued":
+        // Confirmation from server that a queued message was accepted.
+        // The UI already showed the message optimistically in addQueuedMessage.
+        break;
+
+      case "busy_error":
+        // Server is still busy — don't transition to send mode.
+        // Re-enable the stop button so the user can try cancelling.
+        this.addErrorMessage(evt.message);
+        this.stopBtn.textContent = "\u25a0 Stop";
+        this.stopBtn.setAttribute("aria-label", "Stop generation");
+        delete this.stopBtn.dataset.forceCancel;
+        this.stopBtn.disabled = false;
+        break;
+
+      case "cancelled":
+        // Cancel requested but worker thread may still be finishing.
+        // Show "Cancelling..." state; state_change will transition to ready.
+        // If state_change already arrived (busy is false), the cancel is
+        // already handled — don't re-enter the cancelling state.
+        if (!this.busy) break;
+        // Clear any prior timeouts first (duplicate cancelled events).
+        clearTimeout(this._cancelTimeout);
+        clearTimeout(this._forceTimeout);
+        this.currentAssistantEl = null;
+        this.currentReasoningEl = null;
+        this.contentBuffer = "";
+        this.stopBtn.disabled = true;
+        this.stopBtn.textContent = "Cancelling\u2026";
+        this.stopBtn.setAttribute("aria-label", "Cancelling generation");
+        this.scrollToBottom(true);
+        // After 2s, offer "Force Stop" for a harder cancel that abandons
+        // the stuck worker thread.  Safety timeout at 10s auto-recovers
+        // if state_change never arrives (connection drop).
+        this._cancelTimeout = setTimeout(() => {
+          if (this.busy) {
+            this.stopBtn.disabled = false;
+            this.stopBtn.textContent = "\u26a0 Force Stop";
+            this.stopBtn.setAttribute("aria-label", "Force stop generation");
+            this.stopBtn.dataset.forceCancel = "true";
+          }
+        }, 2000);
+        this._forceTimeout = setTimeout(() => {
+          if (this.busy) {
+            this.addInfoMessage(
+              "Cancel didn\u2019t complete in time. You may need to resend your last message.",
+            );
+            this.setBusy(false);
+          }
+        }, 10000);
+        break;
+
+      case "connected":
+        this.model = evt.model || "";
+        this.modelAlias = evt.model_alias || evt.model || "";
+        this._sbModel.textContent = this.modelAlias || this.model || "—";
+        this._sbModel.title = this.model || "";
+        if (evt.skip_permissions) {
+          var existing = document.querySelector(".skip-permissions-warning");
+          if (!existing) {
+            var warn = document.createElement("div");
+            warn.className = "skip-permissions-warning";
+            warn.textContent =
+              "\u26a0 Running with --skip-permissions: all tool calls are auto-approved";
+            document.getElementById("ui-header").appendChild(warn);
+          }
+        }
+        break;
+
+      case "history":
+        this.replayHistory(evt.messages);
+        // Dispatch pending edit-and-resend after rewind history arrives
+        if (this._pendingEditSend) {
+          var editText = this._pendingEditSend;
+          this._pendingEditSend = null;
+          this.setBusy(true);
+          this.addUserMessage(editText);
+          authFetch(
+            "/v1/api/workstreams/" + encodeURIComponent(this.wsId) + "/send",
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ message: editText }),
+            },
+          ).catch((err) => {
+            this.addErrorMessage("Connection error: " + err.message);
+            this.setBusy(false);
+          });
+        }
+        break;
+
+      case "clear_ui":
+        this.messagesEl.replaceChildren();
+        break;
+    }
+  }
+
+  _addUserMsgActions(el, text) {
+    var bar = document.createElement("div");
+    bar.className = "msg-actions";
+    bar.setAttribute("role", "toolbar");
+    bar.setAttribute("aria-label", "Message actions");
+    // Edit button
+    var editBtn = document.createElement("button");
+    editBtn.className = "msg-action-btn";
+    editBtn.title = "Edit & resend";
+    editBtn.setAttribute("aria-label", "Edit and resend this message");
+    var editIcon = document.createElement("span");
+    editIcon.className = "icon-edit";
+    editIcon.setAttribute("aria-hidden", "true");
+    editBtn.appendChild(editIcon);
+    editBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this._startEdit(el, text);
+    });
+    bar.appendChild(editBtn);
+    // Rewind-to-here button
+    var rewindBtn = document.createElement("button");
+    rewindBtn.className = "msg-action-btn";
+    rewindBtn.title = "Rewind to before this message";
+    rewindBtn.setAttribute(
+      "aria-label",
+      "Rewind conversation to before this message",
+    );
+    var rewindIcon = document.createElement("span");
+    rewindIcon.className = "icon-rewind";
+    rewindIcon.setAttribute("aria-hidden", "true");
+    rewindBtn.appendChild(rewindIcon);
+    rewindBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this._rewindToMessage(el);
+    });
+    bar.appendChild(rewindBtn);
+    el.appendChild(bar);
+  }
+
+  _addRetryAction(el) {
+    var bar = el.querySelector(".msg-actions");
+    if (!bar) {
+      bar = document.createElement("div");
+      bar.className = "msg-actions";
+      bar.setAttribute("role", "toolbar");
+      bar.setAttribute("aria-label", "Message actions");
+      el.appendChild(bar);
+    }
+    var btn = document.createElement("button");
+    btn.className = "msg-action-btn";
+    btn.title = "Retry (regenerate response)";
+    btn.setAttribute("aria-label", "Retry last response");
+    var icon = document.createElement("span");
+    icon.className = "icon-retry";
+    icon.setAttribute("aria-hidden", "true");
+    btn.appendChild(icon);
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this._retryLast();
+    });
+    bar.insertBefore(btn, bar.firstChild);
+  }
+
+  _retryLast() {
+    if (this.busy) return;
+    authFetch("/v1/api/command", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ command: "/retry", ws_id: this.wsId }),
+    }).catch((err) => {
+      this.addErrorMessage("Retry failed: " + err.message);
+    });
+  }
+
+  _rewindToMessage(msgEl) {
+    if (this.busy) return;
+    // Count how many user messages come at or after this one
+    var userMsgs = this.messagesEl.querySelectorAll(".msg.user");
+    var idx = Array.prototype.indexOf.call(userMsgs, msgEl);
+    if (idx < 0) return;
+    var turnsToRewind = userMsgs.length - idx;
+    if (turnsToRewind < 1) return;
+    authFetch("/v1/api/command", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        command: "/rewind " + turnsToRewind,
+        ws_id: this.wsId,
+      }),
+    }).catch((err) => {
+      this.addErrorMessage("Rewind failed: " + err.message);
+    });
+  }
+
+  _startEdit(msgEl, originalText) {
+    if (this.busy) return;
+    // Save current child nodes for cancel restoration
+    var savedNodes = [];
+    while (msgEl.firstChild) {
+      savedNodes.push(msgEl.removeChild(msgEl.firstChild));
+    }
+    msgEl.classList.add("msg-editing");
+
+    var form = document.createElement("div");
+    form.className = "msg-edit-form";
+
+    var textarea = document.createElement("textarea");
+    textarea.className = "msg-edit-textarea";
+    textarea.setAttribute("aria-label", "Edit message text");
+    textarea.value = originalText;
+    textarea.rows = Math.min(originalText.split("\n").length + 1, 8);
+    form.appendChild(textarea);
+
+    var actions = document.createElement("div");
+    actions.className = "msg-edit-actions";
+
+    var cancelBtn = document.createElement("button");
+    cancelBtn.className = "msg-edit-btn";
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.addEventListener("click", () => {
+      // Restore original nodes
+      while (msgEl.firstChild) msgEl.removeChild(msgEl.firstChild);
+      savedNodes.forEach((n) => {
+        msgEl.appendChild(n);
+      });
+      msgEl.classList.remove("msg-editing");
+    });
+    actions.appendChild(cancelBtn);
+
+    var sendBtn = document.createElement("button");
+    sendBtn.className = "msg-edit-btn msg-edit-btn-send";
+    sendBtn.textContent = "Send";
+    sendBtn.addEventListener("click", () => {
+      var newText = textarea.value.trim();
+      if (!newText) return;
+      this._editAndResend(msgEl, newText);
+    });
+    actions.appendChild(sendBtn);
+
+    // Ctrl+Enter to send, Escape to cancel
+    textarea.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        sendBtn.click();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        cancelBtn.click();
+      }
+    });
+
+    form.appendChild(actions);
+    msgEl.appendChild(form);
+    textarea.focus();
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+  }
+
+  _editAndResend(msgEl, newText) {
+    if (this.busy) return;
+    // Count turns to rewind (from this message onward)
+    var userMsgs = this.messagesEl.querySelectorAll(".msg.user");
+    var idx = Array.prototype.indexOf.call(userMsgs, msgEl);
+    if (idx < 0) return;
+    var turnsToRewind = userMsgs.length - idx;
+
+    this.setBusy(true);
+    // Store pending send — dispatched when the rewind history event arrives
+    this._pendingEditSend = newText;
+    authFetch("/v1/api/command", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        command: "/rewind " + turnsToRewind,
+        ws_id: this.wsId,
+      }),
+    })
+      .then((r) => {
+        if (r && !r.ok) {
+          this._pendingEditSend = null;
+          this.setBusy(false);
+          this.addErrorMessage(
+            "Rewind failed (HTTP " + r.status + " " + r.statusText + ")",
+          );
+        }
+      })
+      .catch((err) => {
+        this._pendingEditSend = null;
+        this.addErrorMessage("Rewind failed: " + err.message);
+        this.setBusy(false);
+      });
+  }
 }
 
 // Build a structured ``.msg.watch-result`` card for a
@@ -536,840 +1359,6 @@ function _buildDefaultReminderBubble(r) {
   el.appendChild(body);
   return el;
 }
-
-Pane.prototype._createDOM = function () {
-  var self = this;
-
-  this.el = document.createElement("div");
-  this.el.className = "pane";
-  this.el.dataset.paneId = this.id;
-
-  // Focus on mousedown (before child clicks)
-  this.el.addEventListener("mousedown", function () {
-    setFocusedPane(self.id);
-  });
-  // Also track keyboard focus moving into this pane (e.g. Tab into textarea)
-  this.el.addEventListener(
-    "focusin",
-    function () {
-      setFocusedPane(self.id);
-    },
-    true,
-  );
-
-  // Right-click context menu for split/close actions — skip interactive
-  // elements (textareas, links, buttons) so native copy/paste works
-  this.el.addEventListener("contextmenu", function (e) {
-    var tag = e.target.tagName;
-    if (
-      tag === "TEXTAREA" ||
-      tag === "INPUT" ||
-      tag === "A" ||
-      tag === "BUTTON" ||
-      e.target.isContentEditable
-    )
-      return;
-    var sel = window.getSelection();
-    if (sel && sel.toString().length > 0) return;
-    e.preventDefault();
-    setFocusedPane(self.id);
-    showPaneContextMenu(e.clientX, e.clientY, self.id);
-  });
-
-  // Pane header (visible only in multi-pane mode)
-  this.headerEl = document.createElement("div");
-  this.headerEl.className = "pane-header";
-
-  var wsName = document.createElement("span");
-  wsName.className = "pane-ws-name";
-  wsName.textContent = this.wsId
-    ? (workstreams[this.wsId] && workstreams[this.wsId].name) ||
-      this.wsId.substring(0, 8)
-    : "";
-  this.headerEl.appendChild(wsName);
-
-  var actions = document.createElement("div");
-  actions.className = "pane-actions";
-
-  var splitRightBtn = document.createElement("button");
-  splitRightBtn.className = "pane-action-btn";
-  splitRightBtn.title = "Split right";
-  splitRightBtn.setAttribute("aria-label", "Split right");
-  splitRightBtn.textContent = "\u2502";
-  splitRightBtn.onclick = function (e) {
-    e.stopPropagation();
-    splitPane(self.id, "horizontal");
-  };
-  actions.appendChild(splitRightBtn);
-
-  var splitDownBtn = document.createElement("button");
-  splitDownBtn.className = "pane-action-btn";
-  splitDownBtn.title = "Split down";
-  splitDownBtn.setAttribute("aria-label", "Split down");
-  splitDownBtn.textContent = "\u2500";
-  splitDownBtn.onclick = function (e) {
-    e.stopPropagation();
-    splitPane(self.id, "vertical");
-  };
-  actions.appendChild(splitDownBtn);
-
-  var closeBtn = document.createElement("button");
-  closeBtn.className = "pane-action-btn pane-close-btn";
-  closeBtn.title = "Close pane";
-  closeBtn.setAttribute("aria-label", "Close pane");
-  closeBtn.textContent = "\u00d7";
-  closeBtn.onclick = function (e) {
-    e.stopPropagation();
-    if (countLeaves(splitRoot) > 1) closePane(self.id);
-  };
-  actions.appendChild(closeBtn);
-
-  this.headerEl.appendChild(actions);
-  this.el.appendChild(this.headerEl);
-
-  // Messages area
-  this.messagesEl = document.createElement("div");
-  this.messagesEl.className = "pane-messages";
-  this.messagesEl.setAttribute("role", "log");
-  this.messagesEl.setAttribute("aria-live", "polite");
-  this.messagesEl.setAttribute("aria-label", "Chat messages");
-  this.el.appendChild(this.messagesEl);
-
-  // Per-workstream status bar (above input)
-  this.statusBarEl = document.createElement("div");
-  this.statusBarEl.className = "ws-status-bar";
-  this.statusBarEl.setAttribute("role", "status");
-  this.statusBarEl.setAttribute("aria-live", "polite");
-  this.statusBarEl.setAttribute("aria-atomic", "true");
-  this.statusBarEl.setAttribute("aria-label", "Workstream status");
-
-  this._sbModel = document.createElement("span");
-  this._sbModel.className = "ws-sb-model";
-  this._sbModel.textContent = "\u2014";
-  this._sbModel.setAttribute("aria-label", "Model");
-  this._sbTokens = document.createElement("span");
-  this._sbTokens.className = "ws-sb-tokens";
-  this._sbTokens.textContent = "0 / \u2014";
-  this._sbTokens.setAttribute("aria-label", "Token usage");
-  this._sbTools = document.createElement("span");
-  this._sbTools.className = "ws-sb-tools";
-  this._sbTools.textContent = "0 tools";
-  this._sbTools.setAttribute("aria-label", "Tool calls this turn");
-  this._sbTurns = document.createElement("span");
-  this._sbTurns.className = "ws-sb-turns";
-  this._sbTurns.textContent = "turn 0";
-  this._sbTurns.setAttribute("aria-label", "Conversation turn");
-
-  this.statusBarEl.appendChild(this._sbModel);
-  this.statusBarEl.appendChild(this._sbTokens);
-  this.statusBarEl.appendChild(this._sbTools);
-  this.statusBarEl.appendChild(this._sbTurns);
-  this.el.appendChild(this.statusBarEl);
-
-  // Input area — DOM + behavior comes from shared/composer.js.  The
-  // pane keeps the attachment-upload pipeline (because attachments are
-  // pane-specific state) and routes file events through the composer's
-  // attach/paste/drop callbacks.
-  this.composer = new Composer(this.el, {
-    attachments: {
-      onAttach: function (file) {
-        self.attachments.upload(file);
-      },
-    },
-    stopBtn: true,
-    queueWhileBusy: true,
-    busyPlaceholder: "Queue a message\u2026 (!!! for urgent)",
-    onSend: function () {
-      self.sendMessage();
-    },
-    onStop: function () {
-      self.cancelGeneration();
-    },
-    dragDrop: { targetEl: this.el, dropClass: "pane-drop-target" },
-  });
-  this.inputEl = this.composer.inputEl;
-  this.sendBtn = this.composer.sendBtn;
-  this.stopBtn = this.composer.stopBtn;
-  // Lazy wsId read \u2014 a tab swap (Pane re-bound to a new workstream)
-  // changes the closure target without re-instantiating the controllers.
-  this.attachments = createAttachmentController({
-    chipsEl: this.composer.chipsEl,
-    getWsId: function () {
-      return self.wsId;
-    },
-    onError: function (msg) {
-      showToast(msg);
-    },
-  });
-  this.queue = createQueueController({
-    messagesEl: this.messagesEl,
-    getWsId: function () {
-      return self.wsId;
-    },
-    onAfterDequeue: function () {
-      self.attachments.rehydrate();
-    },
-    // Idle-edge cleanup of the cancel/force-stop timers — without
-    // this they fire on the *next* busy turn, relabel Stop to "Force
-    // Stop", and surface a misleading "Cancel didn't complete in
-    // time" toast about a turn the user already moved past.
-    onIdle: function () {
-      if (self._cancelTimeout) {
-        clearTimeout(self._cancelTimeout);
-        self._cancelTimeout = null;
-      }
-      if (self._forceTimeout) {
-        clearTimeout(self._forceTimeout);
-        self._forceTimeout = null;
-      }
-    },
-  });
-};
-
-Pane.prototype.connectSSE = function (wsId) {
-  var self = this;
-  this.disconnectSSE();
-  var wsChanged = this.wsId !== wsId;
-  this.wsId = wsId;
-  if (wsChanged) {
-    this.attachments.clearChips();
-    this.attachments.rehydrate();
-  }
-
-  this.evtSource = new EventSource(
-    "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/events",
-  );
-
-  this.evtSource.onopen = function () {
-    self.retryDelay = 1000;
-    self.statusBarEl.classList.remove("ws-sb-disconnected");
-    if (self._lastStatusEvt) self.updateStatus(self._lastStatusEvt);
-  };
-
-  this.evtSource.onmessage = function (e) {
-    var data = JSON.parse(e.data);
-    self.handleEvent(data);
-  };
-
-  this.evtSource.onerror = function () {
-    self.evtSource.close();
-    self.evtSource = null;
-    var loginOverlay = document.getElementById("login-overlay");
-    if (loginOverlay && loginOverlay.style.display !== "none") return;
-    self.statusBarEl.classList.add("ws-sb-disconnected");
-    self._sbTokens.textContent = "Reconnecting\u2026";
-    // Only the focused pane refreshes the global workstream list to avoid
-    // race conditions when multiple panes disconnect simultaneously.
-    if (self.id === focusedPaneId) {
-      fetch("/v1/api/workstreams")
-        .then(function (r) {
-          if (r.status === 401) {
-            showLogin();
-            return;
-          }
-          return r.json().then(function (data) {
-            workstreams = {};
-            (data.workstreams || []).forEach(function (ws) {
-              workstreams[ws.ws_id] = { name: ws.name, state: ws.state };
-            });
-            renderTabBar();
-            // Reconnect all disconnected panes, reassigning stale ws_ids.
-            // Two passes: (1) reassign stale panes, (2) reconnect all.
-            // Track assigned ws_ids to avoid multiple panes on the same ws.
-            var remaining = Object.keys(workstreams);
-            if (!remaining.length) {
-              showDashboard();
-              return;
-            }
-            var usedWsIds = {};
-            for (var pid in panes) {
-              if (panes[pid].wsId && workstreams[panes[pid].wsId])
-                usedWsIds[panes[pid].wsId] = true;
-            }
-            for (var pid2 in panes) {
-              var p2 = panes[pid2];
-              if (p2.wsId && !workstreams[p2.wsId]) {
-                var newWsId = null;
-                for (var ri = 0; ri < remaining.length; ri++) {
-                  if (!usedWsIds[remaining[ri]]) {
-                    newWsId = remaining[ri];
-                    break;
-                  }
-                }
-                if (newWsId) {
-                  p2.disconnectSSE();
-                  p2.wsId = newWsId;
-                  usedWsIds[newWsId] = true;
-                  while (p2.messagesEl.firstChild)
-                    p2.messagesEl.removeChild(p2.messagesEl.firstChild);
-                  p2.showEmptyState();
-                  p2.updateWsName();
-                }
-                // else: more panes than workstreams — leave pane stale,
-                // connectSSE below will pick it up or it stays disconnected.
-              }
-            }
-            // Pass 2: reconnect all panes and sync focused pane
-            for (var pid3 in panes) {
-              var p3 = panes[pid3];
-              if (pid3 === focusedPaneId) currentWsId = p3.wsId;
-              if (!p3.evtSource && p3.wsId && workstreams[p3.wsId]) {
-                setTimeout(
-                  (function (pp) {
-                    return function () {
-                      pp.connectSSE(pp.wsId);
-                    };
-                  })(p3),
-                  self.retryDelay,
-                );
-              }
-            }
-            self.retryDelay = Math.min(self.retryDelay * 2, 30000);
-          });
-        })
-        .catch(function () {
-          setTimeout(function () {
-            self.connectSSE(self.wsId);
-          }, self.retryDelay);
-          self.retryDelay = Math.min(self.retryDelay * 2, 30000);
-        });
-    } else {
-      // Non-focused pane: just retry own connection after delay
-      setTimeout(function () {
-        self.connectSSE(self.wsId);
-      }, self.retryDelay);
-      self.retryDelay = Math.min(self.retryDelay * 2, 30000);
-    }
-  };
-};
-
-Pane.prototype.handleEvent = function (evt) {
-  // Guard: drop events that belong to a different workstream.
-  // This prevents cross-contamination during tab switches and reconnects.
-  if (evt.ws_id && evt.ws_id !== this.wsId) return;
-  var self = this;
-  switch (evt.type) {
-    case "thinking_start":
-      this.isThinking = true;
-      this.setBusy(true);
-      this.removeEmptyState();
-      this.addThinkingIndicator();
-      break;
-
-    case "thinking_stop":
-      this.isThinking = false;
-      this.removeThinkingIndicator();
-      break;
-
-    case "reasoning":
-      this.removeThinkingIndicator();
-      if (!this.currentReasoningEl) {
-        this.currentReasoningEl = document.createElement("div");
-        this.currentReasoningEl.className = "msg reasoning";
-        this.messagesEl.appendChild(this.currentReasoningEl);
-      }
-      this.currentReasoningEl.textContent += evt.text;
-      this.scrollToBottom();
-      break;
-
-    case "content":
-      this.removeThinkingIndicator();
-      if (this.currentReasoningEl) {
-        this.currentReasoningEl = null;
-      }
-      if (!this.currentAssistantEl) {
-        this.currentAssistantEl = document.createElement("div");
-        this.currentAssistantEl.className = "msg assistant";
-        this.currentAssistantBodyEl = document.createElement("div");
-        this.currentAssistantBodyEl.className = "msg-body";
-        this.currentAssistantEl.appendChild(this.currentAssistantBodyEl);
-        this.messagesEl.appendChild(this.currentAssistantEl);
-      }
-      this.contentBuffer += evt.text;
-      streamingRender(this.currentAssistantBodyEl, this.contentBuffer);
-      this.scrollToBottom();
-      break;
-
-    case "stream_end":
-      if (this._cancelTimeout) {
-        clearTimeout(this._cancelTimeout);
-        this._cancelTimeout = null;
-      }
-      if (this._forceTimeout) {
-        clearTimeout(this._forceTimeout);
-        this._forceTimeout = null;
-      }
-      // Finalize the current streaming segment's markdown.  This fires
-      // per-segment (between tool calls), NOT per-turn.  Busy state is
-      // managed by state_change events instead.
-      if (this.currentAssistantBodyEl && this.contentBuffer) {
-        streamingRenderFinalize(
-          this.currentAssistantBodyEl,
-          this.contentBuffer,
-        );
-      }
-      this.currentAssistantBodyEl = null;
-      this.currentAssistantEl = null;
-      this.currentReasoningEl = null;
-      this.contentBuffer = "";
-      this.scrollToBottom(true);
-      break;
-
-    case "in_progress_snapshot":
-      // One-shot replay of the in-progress turn's reasoning + content
-      // when this client connects mid-stream (page refresh while the
-      // model is generating).  Both fields may be empty; render only
-      // the non-empty halves.  Idempotent on EventSource auto-reconnect:
-      // skip overwrite when the current buffer is already at-or-past
-      // the snapshot length, so a stale replay can't reset the live-
-      // streamed view back to a shorter prefix.
-      this.removeThinkingIndicator();
-      if (evt.reasoning) {
-        if (!this.currentReasoningEl) {
-          this.currentReasoningEl = document.createElement("div");
-          this.currentReasoningEl.className = "msg reasoning";
-          this.messagesEl.appendChild(this.currentReasoningEl);
-        }
-        var curReason = this.currentReasoningEl.textContent || "";
-        if (curReason.length < evt.reasoning.length) {
-          this.currentReasoningEl.textContent = evt.reasoning;
-        }
-      }
-      if (evt.content) {
-        // Content snapshot supersedes any reasoning bubble — matches
-        // the "case content" invariant of clearing currentReasoningEl
-        // when content begins.
-        if (this.currentReasoningEl) {
-          this.currentReasoningEl = null;
-        }
-        if (!this.currentAssistantEl) {
-          this.currentAssistantEl = document.createElement("div");
-          this.currentAssistantEl.className = "msg assistant";
-          this.currentAssistantBodyEl = document.createElement("div");
-          this.currentAssistantBodyEl.className = "msg-body";
-          this.currentAssistantEl.appendChild(this.currentAssistantBodyEl);
-          this.messagesEl.appendChild(this.currentAssistantEl);
-        }
-        if (this.contentBuffer.length < evt.content.length) {
-          this.contentBuffer = evt.content;
-          streamingRender(this.currentAssistantBodyEl, this.contentBuffer);
-        }
-      }
-      this.scrollToBottom();
-      break;
-
-    case "state_change":
-      if (evt.state === "idle" || evt.state === "error") {
-        this.setBusy(false);
-        this._attachRetryToLastAssistant();
-        // Only steal focus if this is the active pane and no approval pending.
-        if (this.id === focusedPaneId && !this.pendingApproval) {
-          this.inputEl.focus();
-        }
-      } else if (
-        evt.state === "thinking" ||
-        evt.state === "running" ||
-        evt.state === "attention"
-      ) {
-        this.setBusy(true);
-      }
-      break;
-
-    case "tool_info":
-      this.showInlineToolBlock(evt.items, true);
-      break;
-
-    case "approve_request":
-      this.showInlineToolBlock(evt.items, false, evt.judge_pending);
-      break;
-
-    case "intent_verdict":
-      this.updateVerdictBadge(evt);
-      break;
-
-    case "output_warning":
-      this.showOutputWarning(evt);
-      break;
-
-    case "approval_resolved":
-      this.resolveApproval(evt.approved, false, evt.feedback, true);
-      break;
-
-    case "tool_output_chunk":
-      this.appendToolOutputChunk(evt.call_id || "", evt.chunk);
-      break;
-
-    case "tool_result":
-      this.appendToolOutput(
-        evt.call_id || "",
-        evt.name,
-        evt.output,
-        evt.is_error,
-      );
-      break;
-
-    case "status":
-      this.updateStatus(evt);
-      break;
-
-    case "plan_review":
-      showPlanDialog(evt.content);
-      break;
-
-    case "plan_resolved":
-      // Plan was resolved on another client (or by server-initiated cancel).
-      // Only act if our modal is for this pane's workstream.
-      if (_planWsId === this.wsId) {
-        dismissPlanDialog(evt.feedback);
-      }
-      break;
-
-    case "info":
-      this.addInfoMessage(evt.message);
-      break;
-
-    case "error":
-      // Show the error but don't change busy state — state_change
-      // handles idle/error transitions.  on_error fires for non-terminal
-      // errors (tool parse failures, truncation) mid-turn too.
-      this.addErrorMessage(evt.message);
-      break;
-
-    case "user_reminder":
-      // Metacognitive nudges — render as their own bubble below the
-      // user message they advise (semantically: a hint to the model
-      // right before its turn).  The originating tab's optimistic
-      // addUserMessage already ran when the user clicked send, so by
-      // the time this SSE event arrives the just-sent user bubble is
-      // at the bottom of messagesEl and addUserReminder's "anchor to
-      // most recent .msg.user" lookup finds it correctly; the
-      // insertAdjacentElement('afterend', el) call drops the bubble
-      // immediately below.
-      //
-      // Wake-driven reminders (``evt.source === "system_nudge"``)
-      // render the thin .msg.user.system-nudge marker first and
-      // anchor below it, so non-originating tabs see the same shape
-      // the originating tab does.
-      //
-      // Multi-tab caveat (non-wake): the server emits no user_message
-      // SSE event for real user input today, so a non-originating tab
-      // sees the reminder without a paired user-message render — the
-      // anchor falls on a stale prior user bubble, mis-positioning
-      // the reminder.  The next /history reload corrects it.
-      // Acceptable cost for stage 1; closing the gap is a follow-up
-      // that adds a user_message SSE event.
-      if (Array.isArray(evt.reminders) && evt.reminders.length) {
-        this.addUserReminder(evt.reminders, evt.source || "");
-      }
-      break;
-
-    case "tool_reminder":
-      // Metacognitive tool-channel nudge (tool_error / repeat) —
-      // render as the same yellow themed bubble used for user-channel
-      // reminders, anchored below the .ts-approval block whose tool
-      // result triggered the batch's reminder.  evt.tool_call_id
-      // identifies the specific tool element; addToolReminder walks
-      // up to its parent approval block and inserts the bubble
-      // immediately after.
-      if (Array.isArray(evt.reminders) && evt.reminders.length) {
-        this.addToolReminder(evt.reminders, evt.tool_call_id || "");
-      }
-      break;
-
-    case "message_queued":
-      // Confirmation from server that a queued message was accepted.
-      // The UI already showed the message optimistically in addQueuedMessage.
-      break;
-
-    case "busy_error":
-      // Server is still busy — don't transition to send mode.
-      // Re-enable the stop button so the user can try cancelling.
-      this.addErrorMessage(evt.message);
-      this.stopBtn.textContent = "\u25a0 Stop";
-      this.stopBtn.setAttribute("aria-label", "Stop generation");
-      delete this.stopBtn.dataset.forceCancel;
-      this.stopBtn.disabled = false;
-      break;
-
-    case "cancelled":
-      // Cancel requested but worker thread may still be finishing.
-      // Show "Cancelling..." state; state_change will transition to ready.
-      // If state_change already arrived (busy is false), the cancel is
-      // already handled — don't re-enter the cancelling state.
-      if (!this.busy) break;
-      // Clear any prior timeouts first (duplicate cancelled events).
-      clearTimeout(this._cancelTimeout);
-      clearTimeout(this._forceTimeout);
-      this.currentAssistantEl = null;
-      this.currentReasoningEl = null;
-      this.contentBuffer = "";
-      this.stopBtn.disabled = true;
-      this.stopBtn.textContent = "Cancelling\u2026";
-      this.stopBtn.setAttribute("aria-label", "Cancelling generation");
-      this.scrollToBottom(true);
-      // After 2s, offer "Force Stop" for a harder cancel that abandons
-      // the stuck worker thread.  Safety timeout at 10s auto-recovers
-      // if state_change never arrives (connection drop).
-      var self = this;
-      this._cancelTimeout = setTimeout(function () {
-        if (self.busy) {
-          self.stopBtn.disabled = false;
-          self.stopBtn.textContent = "\u26a0 Force Stop";
-          self.stopBtn.setAttribute("aria-label", "Force stop generation");
-          self.stopBtn.dataset.forceCancel = "true";
-        }
-      }, 2000);
-      this._forceTimeout = setTimeout(function () {
-        if (self.busy) {
-          self.addInfoMessage(
-            "Cancel didn\u2019t complete in time. You may need to resend your last message.",
-          );
-          self.setBusy(false);
-        }
-      }, 10000);
-      break;
-
-    case "connected":
-      this.model = evt.model || "";
-      this.modelAlias = evt.model_alias || evt.model || "";
-      this._sbModel.textContent = this.modelAlias || this.model || "—";
-      this._sbModel.title = this.model || "";
-      if (evt.skip_permissions) {
-        var existing = document.querySelector(".skip-permissions-warning");
-        if (!existing) {
-          var warn = document.createElement("div");
-          warn.className = "skip-permissions-warning";
-          warn.textContent =
-            "\u26a0 Running with --skip-permissions: all tool calls are auto-approved";
-          document.getElementById("ui-header").appendChild(warn);
-        }
-      }
-      break;
-
-    case "history":
-      this.replayHistory(evt.messages);
-      // Dispatch pending edit-and-resend after rewind history arrives
-      if (this._pendingEditSend) {
-        var editText = this._pendingEditSend;
-        this._pendingEditSend = null;
-        this.setBusy(true);
-        this.addUserMessage(editText);
-        authFetch(
-          "/v1/api/workstreams/" + encodeURIComponent(self.wsId) + "/send",
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ message: editText }),
-          },
-        ).catch(function (err) {
-          self.addErrorMessage("Connection error: " + err.message);
-          self.setBusy(false);
-        });
-      }
-      break;
-
-    case "clear_ui":
-      this.messagesEl.replaceChildren();
-      break;
-  }
-};
-
-Pane.prototype._addUserMsgActions = function (el, text) {
-  var self = this;
-  var bar = document.createElement("div");
-  bar.className = "msg-actions";
-  bar.setAttribute("role", "toolbar");
-  bar.setAttribute("aria-label", "Message actions");
-  // Edit button
-  var editBtn = document.createElement("button");
-  editBtn.className = "msg-action-btn";
-  editBtn.title = "Edit & resend";
-  editBtn.setAttribute("aria-label", "Edit and resend this message");
-  var editIcon = document.createElement("span");
-  editIcon.className = "icon-edit";
-  editIcon.setAttribute("aria-hidden", "true");
-  editBtn.appendChild(editIcon);
-  editBtn.addEventListener("click", function (e) {
-    e.stopPropagation();
-    self._startEdit(el, text);
-  });
-  bar.appendChild(editBtn);
-  // Rewind-to-here button
-  var rewindBtn = document.createElement("button");
-  rewindBtn.className = "msg-action-btn";
-  rewindBtn.title = "Rewind to before this message";
-  rewindBtn.setAttribute(
-    "aria-label",
-    "Rewind conversation to before this message",
-  );
-  var rewindIcon = document.createElement("span");
-  rewindIcon.className = "icon-rewind";
-  rewindIcon.setAttribute("aria-hidden", "true");
-  rewindBtn.appendChild(rewindIcon);
-  rewindBtn.addEventListener("click", function (e) {
-    e.stopPropagation();
-    self._rewindToMessage(el);
-  });
-  bar.appendChild(rewindBtn);
-  el.appendChild(bar);
-};
-
-Pane.prototype._addRetryAction = function (el) {
-  var self = this;
-  var bar = el.querySelector(".msg-actions");
-  if (!bar) {
-    bar = document.createElement("div");
-    bar.className = "msg-actions";
-    bar.setAttribute("role", "toolbar");
-    bar.setAttribute("aria-label", "Message actions");
-    el.appendChild(bar);
-  }
-  var btn = document.createElement("button");
-  btn.className = "msg-action-btn";
-  btn.title = "Retry (regenerate response)";
-  btn.setAttribute("aria-label", "Retry last response");
-  var icon = document.createElement("span");
-  icon.className = "icon-retry";
-  icon.setAttribute("aria-hidden", "true");
-  btn.appendChild(icon);
-  btn.addEventListener("click", function (e) {
-    e.stopPropagation();
-    self._retryLast();
-  });
-  bar.insertBefore(btn, bar.firstChild);
-};
-
-Pane.prototype._retryLast = function () {
-  if (this.busy) return;
-  var self = this;
-  authFetch("/v1/api/command", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ command: "/retry", ws_id: this.wsId }),
-  }).catch(function (err) {
-    self.addErrorMessage("Retry failed: " + err.message);
-  });
-};
-
-Pane.prototype._rewindToMessage = function (msgEl) {
-  if (this.busy) return;
-  var self = this;
-  // Count how many user messages come at or after this one
-  var userMsgs = this.messagesEl.querySelectorAll(".msg.user");
-  var idx = Array.prototype.indexOf.call(userMsgs, msgEl);
-  if (idx < 0) return;
-  var turnsToRewind = userMsgs.length - idx;
-  if (turnsToRewind < 1) return;
-  authFetch("/v1/api/command", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      command: "/rewind " + turnsToRewind,
-      ws_id: this.wsId,
-    }),
-  }).catch(function (err) {
-    self.addErrorMessage("Rewind failed: " + err.message);
-  });
-};
-
-Pane.prototype._startEdit = function (msgEl, originalText) {
-  if (this.busy) return;
-  var self = this;
-  // Save current child nodes for cancel restoration
-  var savedNodes = [];
-  while (msgEl.firstChild) {
-    savedNodes.push(msgEl.removeChild(msgEl.firstChild));
-  }
-  msgEl.classList.add("msg-editing");
-
-  var form = document.createElement("div");
-  form.className = "msg-edit-form";
-
-  var textarea = document.createElement("textarea");
-  textarea.className = "msg-edit-textarea";
-  textarea.setAttribute("aria-label", "Edit message text");
-  textarea.value = originalText;
-  textarea.rows = Math.min(originalText.split("\n").length + 1, 8);
-  form.appendChild(textarea);
-
-  var actions = document.createElement("div");
-  actions.className = "msg-edit-actions";
-
-  var cancelBtn = document.createElement("button");
-  cancelBtn.className = "msg-edit-btn";
-  cancelBtn.textContent = "Cancel";
-  cancelBtn.addEventListener("click", function () {
-    // Restore original nodes
-    while (msgEl.firstChild) msgEl.removeChild(msgEl.firstChild);
-    savedNodes.forEach(function (n) {
-      msgEl.appendChild(n);
-    });
-    msgEl.classList.remove("msg-editing");
-  });
-  actions.appendChild(cancelBtn);
-
-  var sendBtn = document.createElement("button");
-  sendBtn.className = "msg-edit-btn msg-edit-btn-send";
-  sendBtn.textContent = "Send";
-  sendBtn.addEventListener("click", function () {
-    var newText = textarea.value.trim();
-    if (!newText) return;
-    self._editAndResend(msgEl, newText);
-  });
-  actions.appendChild(sendBtn);
-
-  // Ctrl+Enter to send, Escape to cancel
-  textarea.addEventListener("keydown", function (e) {
-    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
-      e.preventDefault();
-      sendBtn.click();
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      cancelBtn.click();
-    }
-  });
-
-  form.appendChild(actions);
-  msgEl.appendChild(form);
-  textarea.focus();
-  textarea.setSelectionRange(textarea.value.length, textarea.value.length);
-};
-
-Pane.prototype._editAndResend = function (msgEl, newText) {
-  if (this.busy) return;
-  var self = this;
-  // Count turns to rewind (from this message onward)
-  var userMsgs = this.messagesEl.querySelectorAll(".msg.user");
-  var idx = Array.prototype.indexOf.call(userMsgs, msgEl);
-  if (idx < 0) return;
-  var turnsToRewind = userMsgs.length - idx;
-
-  this.setBusy(true);
-  // Store pending send — dispatched when the rewind history event arrives
-  this._pendingEditSend = newText;
-  authFetch("/v1/api/command", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      command: "/rewind " + turnsToRewind,
-      ws_id: self.wsId,
-    }),
-  })
-    .then(function (r) {
-      if (r && !r.ok) {
-        self._pendingEditSend = null;
-        self.setBusy(false);
-        self.addErrorMessage(
-          "Rewind failed (HTTP " + r.status + " " + r.statusText + ")",
-        );
-      }
-    })
-    .catch(function (err) {
-      self._pendingEditSend = null;
-      self.addErrorMessage("Rewind failed: " + err.message);
-      self.setBusy(false);
-    });
-};
 
 Pane.prototype.replayHistory = function (messages) {
   var self = this;
