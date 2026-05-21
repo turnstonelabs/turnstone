@@ -1300,6 +1300,337 @@ class Pane {
         this.setBusy(false);
       });
   }
+
+  replayHistory(messages) {
+    this.messagesEl.replaceChildren();
+    if (!messages.length) {
+      this.showEmptyState();
+      return;
+    }
+    // Suppress the polite live region while we batch-build the replay
+    // — messagesEl is aria-live="polite" so a fresh replay would otherwise
+    // queue an announcement for every approved/denied/verdict pill we
+    // insert.  Restored after the loop so live SSE updates announce
+    // normally.  WCAG 4.1.3 — historical content should not behave like
+    // real-time updates.
+    this.messagesEl.setAttribute("aria-busy", "true");
+    // pendingAssessments[call_id] = output_assessment dict.  Populated
+    // from the assistant branch, consumed by the role==="tool" branch
+    // (or after the loop, for legacy rows missing tool_call_id).
+    // Replaces a JSON.stringify→dataset→JSON.parse round-trip with an
+    // in-memory map keyed by call_id.
+    var pendingAssessments = {};
+    var lastToolBlock = null;
+    for (var i = 0; i < messages.length; i++) {
+      var msg = messages[i];
+      if (msg.role === "user") {
+        if (msg.source === "system_nudge") {
+          // Wake-driven empty user turn: render the thin marker
+          // (replaces the previously-skipped synthetic empty bubble)
+          // and anchor reminder bubbles below it.
+          this.addUserReminder(
+            Array.isArray(msg.reminders) ? msg.reminders : [],
+            "system_nudge",
+          );
+          lastToolBlock = null;
+          continue;
+        }
+        // addUserMessage first so addUserReminder's "anchor to most
+        // recent .msg.user" lookup finds THIS message's bubble (not the
+        // previous user message's, which would associate the reminder
+        // with the wrong turn).  addUserReminder then drops the bubble
+        // immediately below the just-rendered user message via
+        // insertAdjacentElement('afterend', el).
+        this.addUserMessage(msg.content || "", msg.attachments || null);
+        if (Array.isArray(msg.reminders) && msg.reminders.length) {
+          this.addUserReminder(msg.reminders);
+        }
+        lastToolBlock = null;
+      } else if (msg.role === "assistant") {
+        // Reasoning bubble (Phase 1 reasoning persistence) — render
+        // BEFORE the content bubble so the visual order matches the
+        // live SSE flow (reasoning_delta arrives before content_delta
+        // for thinking-enabled models). Mirrors the live-stream
+        // construction at the "case 'reasoning':" branch above. Only
+        // surfaces when the active model's surface_persisted_reasoning flag is
+        // true and the message round-tripped a thinking lane.
+        if (msg.reasoning && msg.reasoning.length) {
+          var reasonEl = document.createElement("div");
+          reasonEl.className = "msg reasoning";
+          reasonEl.textContent = msg.reasoning;
+          this.messagesEl.appendChild(reasonEl);
+          lastToolBlock = null;
+        }
+        // Render content BEFORE the tool block so the visual order
+        // matches the live SSE flow (stream_text streams content first,
+        // then tool_info / approve_request paints the tool block, then
+        // tool_result fills it in).  Order also matters structurally:
+        // the tool-result message in the NEXT iteration anchors via
+        // lastToolBlock, which the tool-block branch sets last — so
+        // content must run first to avoid clobbering that anchor.
+        //
+        // Whitespace-only content (e.g. "\n\n" from a reasoning-parser
+        // model that strips <think>…</think> and leaves only trailing
+        // newlines before the tool call) is treated as empty — the
+        // live stream never accumulated a visible bubble for it, so
+        // surfacing one on replay would be a phantom card that diverges
+        // from what the originating tab saw.
+        if (msg.content && msg.content.trim()) {
+          var el = document.createElement("div");
+          el.className = "msg assistant";
+          var bodyEl = document.createElement("div");
+          bodyEl.className = "msg-body";
+          el.appendChild(bodyEl);
+          setMarkdown(bodyEl, msg.content);
+          this.messagesEl.appendChild(el);
+          lastToolBlock = null;
+        }
+        if (msg.tool_calls && msg.tool_calls.length) {
+          if (msg.pending) {
+            lastToolBlock = null;
+          } else {
+            var wasDenied = !!msg.denied;
+            var block = document.createElement("div");
+            block.className =
+              "msg ts-approval ts-approval--inline " +
+              (wasDenied ? "denied" : "approved");
+            msg.tool_calls.forEach((tc) => {
+              var div = document.createElement("div");
+              div.className = "ts-approval-tool";
+              div.dataset.funcName = tc.name;
+              div.dataset.callId = tc.id || "";
+              var nameEl = document.createElement("div");
+              nameEl.className = "tool-name";
+              nameEl.textContent = tc.name;
+              div.appendChild(nameEl);
+              var cmd = document.createElement("div");
+              cmd.className = "tool-cmd";
+              try {
+                var args = JSON.parse(tc.arguments);
+                if (tc.name === "bash") {
+                  var preview = Object.values(args)[0] || "";
+                  var dollar = document.createElement("span");
+                  dollar.className = "dollar";
+                  dollar.textContent = "$ ";
+                  cmd.append(dollar, String(preview));
+                } else {
+                  var parts = [];
+                  var keys = Object.keys(args);
+                  for (var k = 0; k < keys.length; k++) {
+                    var val = args[keys[k]];
+                    var valStr =
+                      val === null || val === undefined ? "null" : String(val);
+                    if (valStr.length > 80)
+                      valStr = valStr.substring(0, 77) + "...";
+                    parts.push(keys[k] + ": " + valStr);
+                  }
+                  cmd.textContent = parts.join("\n");
+                }
+              } catch (e) {
+                cmd.textContent = tc.arguments.substring(0, 100);
+              }
+              div.appendChild(cmd);
+              // Verdict badge — anchor to THIS tool's row (div) rather
+              // than the whole block, so a multi-tool batch with one
+              // flagged call doesn't drift the badge above unrelated
+              // calls.  Same renderVerdictBadge helper as live; pass
+              // judgePending=false because any verdict on replay is
+              // final — no spinner.
+              if (tc.verdict) {
+                div.insertAdjacentHTML(
+                  "beforeend",
+                  renderVerdictBadge(tc.verdict, false),
+                );
+              }
+              block.appendChild(div);
+              // Output-guard finding — defer insertion until the tool
+              // result lands so the warning anchors under the output
+              // (mirrors live showOutputWarning placement).  Stash in
+              // a function-local map keyed by call_id so the
+              // role==="tool" branch below can pick it up; legacy rows
+              // missing tool_call_id are flushed at end-of-replay.
+              if (
+                tc.output_assessment &&
+                tc.output_assessment.risk_level &&
+                tc.output_assessment.risk_level !== "none"
+              ) {
+                pendingAssessments[tc.id || ""] = {
+                  assessment: tc.output_assessment,
+                  toolDiv: div,
+                };
+              }
+            });
+            var badge = document.createElement("div");
+            badge.setAttribute("role", "status");
+            if (wasDenied) {
+              badge.className = "ts-approval-badge ts-approval-badge--denied";
+              badge.textContent = "\u2717 denied";
+            } else {
+              badge.className = "ts-approval-badge ts-approval-badge--approved";
+              badge.textContent = "\u2713 approved";
+            }
+            block.appendChild(badge);
+            this.messagesEl.appendChild(block);
+            lastToolBlock = block;
+          }
+        }
+      } else if (msg.role === "tool") {
+        if (lastToolBlock) {
+          var stripped = stripAnsi(msg.content || "").trim();
+          var isDenied =
+            msg.denied ||
+            /^Denied by user/.test(stripped) ||
+            /^Blocked/.test(stripped);
+          var isToolError = !!msg.is_error;
+          // Anchor the rendered output to the specific .ts-approval-tool
+          // element matching this result's tool_call_id — mirrors the
+          // live appendToolOutput path so multi-tool batches show
+          // [hdr A][out A][hdr B][out B] rather than [A][B][out A][out B].
+          // Falls back to "before badge" when tool_call_id is absent
+          // (legacy rows pre-dating the wire-format addition).
+          var resultTarget = null;
+          if (msg.tool_call_id) {
+            resultTarget = lastToolBlock.querySelector(
+              '.ts-approval-tool[data-call-id="' +
+                CSS.escape(msg.tool_call_id) +
+                '"]',
+            );
+          }
+          // Cursor-style append: cursor advances after each insert so
+          // the next sibling lands AFTER the previous one.  Fixes the
+          // bug where calling resultTarget.after(node) twice put the
+          // second node BETWEEN resultTarget and the first (the second
+          // .after call was always relative to the same anchor).
+          // Resulting order with all present:
+          //   [tool div][output][output-warning]
+          var insertCursor = resultTarget;
+          var insertChained = (node) => {
+            if (insertCursor) {
+              insertCursor.after(node);
+              insertCursor = node;
+            } else {
+              var bdg = lastToolBlock.querySelector(".ts-approval-badge");
+              if (bdg) lastToolBlock.insertBefore(node, bdg);
+              else lastToolBlock.appendChild(node);
+            }
+          };
+          if (stripped && !isDenied) {
+            var media = !isToolError ? tryParseMedia(stripped) : null;
+            if (media) {
+              insertChained(buildMediaEmbed(media, stripped));
+            } else {
+              var out = renderToolOutput(stripped, isToolError);
+              if (out.textContent.split("\n").length > 10) {
+                makeCollapsible(out);
+              }
+              insertChained(out);
+            }
+          }
+          if (isToolError && !lastToolBlock.classList.contains("denied")) {
+            lastToolBlock.classList.add("error");
+            appendToolErrorBadge(lastToolBlock);
+          }
+          // Output-guard warning — pull the assessment out of the
+          // function-local pendingAssessments map (populated in the
+          // assistant branch).  Skip when the tool result was denied —
+          // the ✗ denied badge already signals the deny path.
+          if (!isDenied && msg.tool_call_id) {
+            var pending = pendingAssessments[msg.tool_call_id];
+            if (pending) {
+              insertChained(_buildOutputWarningEl(pending.assessment));
+              delete pendingAssessments[msg.tool_call_id];
+            }
+          }
+        }
+        // Tool-channel metacog reminders (tool_error / repeat) attach
+        // to the LAST tool message in a batch; on replay we render the
+        // bubble immediately below the .ts-approval block that owns
+        // the tool result.  addToolReminder's empty-toolCallId fallback
+        // resolves to "last .ts-approval block" — which is exactly
+        // lastToolBlock here.
+        if (Array.isArray(msg.reminders) && msg.reminders.length) {
+          this.addToolReminder(msg.reminders, "");
+        }
+        // Queued user messages spliced into the last tool-result envelope
+        // (Seam 1) replay as proper user bubbles after the tool block.
+        // ``decorate_history_messages`` extracts the user_interjection
+        // advisory from the persisted envelope and the wire layer projects
+        // it onto ``msg.advisories``; rendering through ``addUserMessage``
+        // matches the live shape a Seam 2/3 message would produce.  The
+        // walk/filter is shared via ``replayAdvisoriesAfterTool`` in
+        // ``shared/utils.js`` so coord and interactive can never drift on
+        // advisory-shape filtering.
+        replayAdvisoriesAfterTool(msg.advisories, (text) => {
+          this.addUserMessage(text, null);
+          lastToolBlock = null;
+        });
+      }
+    }
+    // Flush any output_assessments left in the map — these correspond
+    // to assistant tool_calls whose tool result row didn't carry a
+    // tool_call_id (legacy / migrated rows pre-dating the wire-format
+    // addition).  Render the warning under the tool div itself rather
+    // than dropping the safety information silently.
+    var leftoverIds = Object.keys(pendingAssessments);
+    for (var p = 0; p < leftoverIds.length; p++) {
+      var leftover = pendingAssessments[leftoverIds[p]];
+      if (!leftover) continue;
+      leftover.toolDiv.insertAdjacentElement(
+        "afterend",
+        _buildOutputWarningEl(leftover.assessment),
+      );
+    }
+    this._attachRetryToLastAssistant();
+    this.scrollToBottom();
+    // Focus the input so keyboard users land on the next-action target
+    // after replay finishes — but only when this is the focused pane,
+    // there's no pending approval competing for focus, and an input
+    // element actually exists.  Skipping when not the focused pane
+    // avoids stealing focus from another tab the user is interacting
+    // with while a background replay completes.
+    if (
+      this.id === focusedPaneId &&
+      !this.pendingApproval &&
+      this.inputEl &&
+      !this.busy
+    ) {
+      try {
+        this.inputEl.focus({ preventScroll: true });
+      } catch (_) {
+        this.inputEl.focus();
+      }
+    }
+    // Restore live-region semantics now that the batch build is done.
+    this.messagesEl.removeAttribute("aria-busy");
+  }
+
+  _attachRetryToLastAssistant() {
+    // Remove any previous retry buttons
+    var old = this.messagesEl.querySelectorAll(".msg.assistant .msg-actions");
+    for (var i = 0; i < old.length; i++) old[i].parentNode.removeChild(old[i]);
+    // Find the last assistant message with content and add retry.
+    // Reasoning blocks emit as .msg.reasoning (distinct modifier) so the
+    // .msg.assistant selector already excludes them — no extra guard needed.
+    //
+    // Skip retry attachment when the most recent semantic turn is
+    // tool-only — last DOM child is a .ts-approval block.  Walk back
+    // past .user-reminder bubbles (added via addToolReminder /
+    // addUserReminder AFTER the .ts-approval block they advise) so the
+    // guard fires correctly even when the tool turn carried a metacog
+    // reminder.  Without this skip, retry lands on a stale prior
+    // assistant content bubble belonging to an earlier turn.
+    var lastChild = this.messagesEl.lastElementChild;
+    while (lastChild && lastChild.classList.contains("user-reminder")) {
+      lastChild = lastChild.previousElementSibling;
+    }
+    if (lastChild && lastChild.classList.contains("ts-approval")) {
+      return;
+    }
+    var assistants = this.messagesEl.querySelectorAll(".msg.assistant");
+    if (assistants.length) {
+      this._addRetryAction(assistants[assistants.length - 1]);
+    }
+  }
 }
 
 // Build a structured ``.msg.watch-result`` card for a
@@ -1360,311 +1691,6 @@ function _buildDefaultReminderBubble(r) {
   return el;
 }
 
-Pane.prototype.replayHistory = function (messages) {
-  var self = this;
-  this.messagesEl.replaceChildren();
-  if (!messages.length) {
-    this.showEmptyState();
-    return;
-  }
-  // Suppress the polite live region while we batch-build the replay
-  // — messagesEl is aria-live="polite" so a fresh replay would otherwise
-  // queue an announcement for every approved/denied/verdict pill we
-  // insert.  Restored after the loop so live SSE updates announce
-  // normally.  WCAG 4.1.3 — historical content should not behave like
-  // real-time updates.
-  this.messagesEl.setAttribute("aria-busy", "true");
-  // pendingAssessments[call_id] = output_assessment dict.  Populated
-  // from the assistant branch, consumed by the role==="tool" branch
-  // (or after the loop, for legacy rows missing tool_call_id).
-  // Replaces a JSON.stringify→dataset→JSON.parse round-trip with an
-  // in-memory map keyed by call_id.
-  var pendingAssessments = {};
-  var lastToolBlock = null;
-  for (var i = 0; i < messages.length; i++) {
-    var msg = messages[i];
-    if (msg.role === "user") {
-      if (msg.source === "system_nudge") {
-        // Wake-driven empty user turn: render the thin marker
-        // (replaces the previously-skipped synthetic empty bubble)
-        // and anchor reminder bubbles below it.
-        this.addUserReminder(
-          Array.isArray(msg.reminders) ? msg.reminders : [],
-          "system_nudge",
-        );
-        lastToolBlock = null;
-        continue;
-      }
-      // addUserMessage first so addUserReminder's "anchor to most
-      // recent .msg.user" lookup finds THIS message's bubble (not the
-      // previous user message's, which would associate the reminder
-      // with the wrong turn).  addUserReminder then drops the bubble
-      // immediately below the just-rendered user message via
-      // insertAdjacentElement('afterend', el).
-      this.addUserMessage(msg.content || "", msg.attachments || null);
-      if (Array.isArray(msg.reminders) && msg.reminders.length) {
-        this.addUserReminder(msg.reminders);
-      }
-      lastToolBlock = null;
-    } else if (msg.role === "assistant") {
-      // Reasoning bubble (Phase 1 reasoning persistence) — render
-      // BEFORE the content bubble so the visual order matches the
-      // live SSE flow (reasoning_delta arrives before content_delta
-      // for thinking-enabled models). Mirrors the live-stream
-      // construction at the "case 'reasoning':" branch above. Only
-      // surfaces when the active model's surface_persisted_reasoning flag is
-      // true and the message round-tripped a thinking lane.
-      if (msg.reasoning && msg.reasoning.length) {
-        var reasonEl = document.createElement("div");
-        reasonEl.className = "msg reasoning";
-        reasonEl.textContent = msg.reasoning;
-        self.messagesEl.appendChild(reasonEl);
-        lastToolBlock = null;
-      }
-      // Render content BEFORE the tool block so the visual order
-      // matches the live SSE flow (stream_text streams content first,
-      // then tool_info / approve_request paints the tool block, then
-      // tool_result fills it in).  Order also matters structurally:
-      // the tool-result message in the NEXT iteration anchors via
-      // lastToolBlock, which the tool-block branch sets last — so
-      // content must run first to avoid clobbering that anchor.
-      //
-      // Whitespace-only content (e.g. "\n\n" from a reasoning-parser
-      // model that strips <think>…</think> and leaves only trailing
-      // newlines before the tool call) is treated as empty — the
-      // live stream never accumulated a visible bubble for it, so
-      // surfacing one on replay would be a phantom card that diverges
-      // from what the originating tab saw.
-      if (msg.content && msg.content.trim()) {
-        var el = document.createElement("div");
-        el.className = "msg assistant";
-        var bodyEl = document.createElement("div");
-        bodyEl.className = "msg-body";
-        el.appendChild(bodyEl);
-        setMarkdown(bodyEl, msg.content);
-        self.messagesEl.appendChild(el);
-        lastToolBlock = null;
-      }
-      if (msg.tool_calls && msg.tool_calls.length) {
-        if (msg.pending) {
-          lastToolBlock = null;
-        } else {
-          var wasDenied = !!msg.denied;
-          var block = document.createElement("div");
-          block.className =
-            "msg ts-approval ts-approval--inline " +
-            (wasDenied ? "denied" : "approved");
-          msg.tool_calls.forEach(function (tc) {
-            var div = document.createElement("div");
-            div.className = "ts-approval-tool";
-            div.dataset.funcName = tc.name;
-            div.dataset.callId = tc.id || "";
-            var nameEl = document.createElement("div");
-            nameEl.className = "tool-name";
-            nameEl.textContent = tc.name;
-            div.appendChild(nameEl);
-            var cmd = document.createElement("div");
-            cmd.className = "tool-cmd";
-            try {
-              var args = JSON.parse(tc.arguments);
-              if (tc.name === "bash") {
-                var preview = Object.values(args)[0] || "";
-                var dollar = document.createElement("span");
-                dollar.className = "dollar";
-                dollar.textContent = "$ ";
-                cmd.append(dollar, String(preview));
-              } else {
-                var parts = [];
-                var keys = Object.keys(args);
-                for (var k = 0; k < keys.length; k++) {
-                  var val = args[keys[k]];
-                  var valStr =
-                    val === null || val === undefined ? "null" : String(val);
-                  if (valStr.length > 80)
-                    valStr = valStr.substring(0, 77) + "...";
-                  parts.push(keys[k] + ": " + valStr);
-                }
-                cmd.textContent = parts.join("\n");
-              }
-            } catch (e) {
-              cmd.textContent = tc.arguments.substring(0, 100);
-            }
-            div.appendChild(cmd);
-            // Verdict badge — anchor to THIS tool's row (div) rather
-            // than the whole block, so a multi-tool batch with one
-            // flagged call doesn't drift the badge above unrelated
-            // calls.  Same renderVerdictBadge helper as live; pass
-            // judgePending=false because any verdict on replay is
-            // final — no spinner.
-            if (tc.verdict) {
-              div.insertAdjacentHTML(
-                "beforeend",
-                renderVerdictBadge(tc.verdict, false),
-              );
-            }
-            block.appendChild(div);
-            // Output-guard finding — defer insertion until the tool
-            // result lands so the warning anchors under the output
-            // (mirrors live showOutputWarning placement).  Stash in
-            // a function-local map keyed by call_id so the
-            // role==="tool" branch below can pick it up; legacy rows
-            // missing tool_call_id are flushed at end-of-replay.
-            if (
-              tc.output_assessment &&
-              tc.output_assessment.risk_level &&
-              tc.output_assessment.risk_level !== "none"
-            ) {
-              pendingAssessments[tc.id || ""] = {
-                assessment: tc.output_assessment,
-                toolDiv: div,
-              };
-            }
-          });
-          var badge = document.createElement("div");
-          badge.setAttribute("role", "status");
-          if (wasDenied) {
-            badge.className = "ts-approval-badge ts-approval-badge--denied";
-            badge.textContent = "\u2717 denied";
-          } else {
-            badge.className = "ts-approval-badge ts-approval-badge--approved";
-            badge.textContent = "\u2713 approved";
-          }
-          block.appendChild(badge);
-          self.messagesEl.appendChild(block);
-          lastToolBlock = block;
-        }
-      }
-    } else if (msg.role === "tool") {
-      if (lastToolBlock) {
-        var stripped = stripAnsi(msg.content || "").trim();
-        var isDenied =
-          msg.denied ||
-          /^Denied by user/.test(stripped) ||
-          /^Blocked/.test(stripped);
-        var isToolError = !!msg.is_error;
-        // Anchor the rendered output to the specific .ts-approval-tool
-        // element matching this result's tool_call_id — mirrors the
-        // live appendToolOutput path so multi-tool batches show
-        // [hdr A][out A][hdr B][out B] rather than [A][B][out A][out B].
-        // Falls back to "before badge" when tool_call_id is absent
-        // (legacy rows pre-dating the wire-format addition).
-        var resultTarget = null;
-        if (msg.tool_call_id) {
-          resultTarget = lastToolBlock.querySelector(
-            '.ts-approval-tool[data-call-id="' +
-              CSS.escape(msg.tool_call_id) +
-              '"]',
-          );
-        }
-        // Cursor-style append: cursor advances after each insert so
-        // the next sibling lands AFTER the previous one.  Fixes the
-        // bug where calling resultTarget.after(node) twice put the
-        // second node BETWEEN resultTarget and the first (the second
-        // .after call was always relative to the same anchor).
-        // Resulting order with all present:
-        //   [tool div][output][output-warning]
-        var insertCursor = resultTarget;
-        var insertChained = function (node) {
-          if (insertCursor) {
-            insertCursor.after(node);
-            insertCursor = node;
-          } else {
-            var bdg = lastToolBlock.querySelector(".ts-approval-badge");
-            if (bdg) lastToolBlock.insertBefore(node, bdg);
-            else lastToolBlock.appendChild(node);
-          }
-        };
-        if (stripped && !isDenied) {
-          var media = !isToolError ? tryParseMedia(stripped) : null;
-          if (media) {
-            insertChained(buildMediaEmbed(media, stripped));
-          } else {
-            var out = renderToolOutput(stripped, isToolError);
-            if (out.textContent.split("\n").length > 10) {
-              makeCollapsible(out);
-            }
-            insertChained(out);
-          }
-        }
-        if (isToolError && !lastToolBlock.classList.contains("denied")) {
-          lastToolBlock.classList.add("error");
-          appendToolErrorBadge(lastToolBlock);
-        }
-        // Output-guard warning — pull the assessment out of the
-        // function-local pendingAssessments map (populated in the
-        // assistant branch).  Skip when the tool result was denied —
-        // the ✗ denied badge already signals the deny path.
-        if (!isDenied && msg.tool_call_id) {
-          var pending = pendingAssessments[msg.tool_call_id];
-          if (pending) {
-            insertChained(_buildOutputWarningEl(pending.assessment));
-            delete pendingAssessments[msg.tool_call_id];
-          }
-        }
-      }
-      // Tool-channel metacog reminders (tool_error / repeat) attach
-      // to the LAST tool message in a batch; on replay we render the
-      // bubble immediately below the .ts-approval block that owns
-      // the tool result.  addToolReminder's empty-toolCallId fallback
-      // resolves to "last .ts-approval block" — which is exactly
-      // lastToolBlock here.
-      if (Array.isArray(msg.reminders) && msg.reminders.length) {
-        this.addToolReminder(msg.reminders, "");
-      }
-      // Queued user messages spliced into the last tool-result envelope
-      // (Seam 1) replay as proper user bubbles after the tool block.
-      // ``decorate_history_messages`` extracts the user_interjection
-      // advisory from the persisted envelope and the wire layer projects
-      // it onto ``msg.advisories``; rendering through ``addUserMessage``
-      // matches the live shape a Seam 2/3 message would produce.  The
-      // walk/filter is shared via ``replayAdvisoriesAfterTool`` in
-      // ``shared/utils.js`` so coord and interactive can never drift on
-      // advisory-shape filtering.
-      var self = this;
-      replayAdvisoriesAfterTool(msg.advisories, function (text) {
-        self.addUserMessage(text, null);
-        lastToolBlock = null;
-      });
-    }
-  }
-  // Flush any output_assessments left in the map — these correspond
-  // to assistant tool_calls whose tool result row didn't carry a
-  // tool_call_id (legacy / migrated rows pre-dating the wire-format
-  // addition).  Render the warning under the tool div itself rather
-  // than dropping the safety information silently.
-  var leftoverIds = Object.keys(pendingAssessments);
-  for (var p = 0; p < leftoverIds.length; p++) {
-    var leftover = pendingAssessments[leftoverIds[p]];
-    if (!leftover) continue;
-    leftover.toolDiv.insertAdjacentElement(
-      "afterend",
-      _buildOutputWarningEl(leftover.assessment),
-    );
-  }
-  this._attachRetryToLastAssistant();
-  this.scrollToBottom();
-  // Focus the input so keyboard users land on the next-action target
-  // after replay finishes — but only when this is the focused pane,
-  // there's no pending approval competing for focus, and an input
-  // element actually exists.  Skipping when not the focused pane
-  // avoids stealing focus from another tab the user is interacting
-  // with while a background replay completes.
-  if (
-    this.id === focusedPaneId &&
-    !this.pendingApproval &&
-    this.inputEl &&
-    !this.busy
-  ) {
-    try {
-      this.inputEl.focus({ preventScroll: true });
-    } catch (_) {
-      this.inputEl.focus();
-    }
-  }
-  // Restore live-region semantics now that the batch build is done.
-  this.messagesEl.removeAttribute("aria-busy");
-};
-
 // Shared output-warning DOM builder — used by both replayHistory
 // (saved-workstream rendering) and the live appendToolOutput path
 // via showOutputWarning.  Single source of truth keeps the two
@@ -1694,34 +1720,6 @@ function _buildOutputWarningEl(assessment) {
   }
   return warning;
 }
-
-Pane.prototype._attachRetryToLastAssistant = function () {
-  // Remove any previous retry buttons
-  var old = this.messagesEl.querySelectorAll(".msg.assistant .msg-actions");
-  for (var i = 0; i < old.length; i++) old[i].parentNode.removeChild(old[i]);
-  // Find the last assistant message with content and add retry.
-  // Reasoning blocks emit as .msg.reasoning (distinct modifier) so the
-  // .msg.assistant selector already excludes them — no extra guard needed.
-  //
-  // Skip retry attachment when the most recent semantic turn is
-  // tool-only — last DOM child is a .ts-approval block.  Walk back
-  // past .user-reminder bubbles (added via addToolReminder /
-  // addUserReminder AFTER the .ts-approval block they advise) so the
-  // guard fires correctly even when the tool turn carried a metacog
-  // reminder.  Without this skip, retry lands on a stale prior
-  // assistant content bubble belonging to an earlier turn.
-  var lastChild = this.messagesEl.lastElementChild;
-  while (lastChild && lastChild.classList.contains("user-reminder")) {
-    lastChild = lastChild.previousElementSibling;
-  }
-  if (lastChild && lastChild.classList.contains("ts-approval")) {
-    return;
-  }
-  var assistants = this.messagesEl.querySelectorAll(".msg.assistant");
-  if (assistants.length) {
-    this._addRetryAction(assistants[assistants.length - 1]);
-  }
-};
 
 Pane.prototype.showInlineToolBlock = function (
   items,

@@ -117,8 +117,8 @@ def test_replay_history_renders_content_before_tool_block() -> None:
     The test pins the order via the offsets of the ``msg.content`` and
     ``msg.tool_calls`` branch headers inside the function body."""
     body = _APP_JS.read_text(encoding="utf-8")
-    start = body.index("Pane.prototype.replayHistory = function")
-    end = body.index("Pane.prototype._attachRetryToLastAssistant", start)
+    start = body.index("\n  replayHistory(")
+    end = body.index("\n  _attachRetryToLastAssistant(", start)
     fn = body[start:end]
     # Locate the assistant branch and bound the search to its body —
     # the function also handles user / tool roles which would otherwise
@@ -154,8 +154,8 @@ def test_replay_history_renders_persisted_verdict_badge() -> None:
     call. This test pins the call site so a refactor that drops the
     decoration regresses the audit surface."""
     body = _APP_JS.read_text(encoding="utf-8")
-    start = body.index("Pane.prototype.replayHistory = function")
-    end = body.index("Pane.prototype._attachRetryToLastAssistant", start)
+    start = body.index("\n  replayHistory(")
+    end = body.index("\n  _attachRetryToLastAssistant(", start)
     fn = body[start:end]
     # Match a `renderVerdictBadge(<something>.verdict, ...)` call inside
     # the replay loop.  Loose on whitespace + identifier so a future
@@ -210,8 +210,8 @@ def test_replay_renders_user_interjection_advisory_after_tool_block() -> None:
     invocation regresses the queued-during-batch replay shape
     silently."""
     body = _APP_JS.read_text(encoding="utf-8")
-    start = body.index("Pane.prototype.replayHistory = function")
-    end = body.index("Pane.prototype._attachRetryToLastAssistant", start)
+    start = body.index("\n  replayHistory(")
+    end = body.index("\n  _attachRetryToLastAssistant(", start)
     fn = body[start:end]
     # The replay loop must invoke the shared helper, passing
     # ``msg.advisories`` and a renderer that routes through
