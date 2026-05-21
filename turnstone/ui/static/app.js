@@ -1631,6 +1631,414 @@ class Pane {
       this._addRetryAction(assistants[assistants.length - 1]);
     }
   }
+
+  showInlineToolBlock(items, autoApproved, judgePending) {
+    var block = document.createElement("div");
+    block.className =
+      "msg ts-approval ts-approval--inline" + (autoApproved ? " approved" : "");
+    if (!autoApproved) {
+      block.setAttribute("role", "alertdialog");
+      block.setAttribute("aria-label", "Tool approval required");
+    }
+
+    // Track the highest-priority recommendation for glow
+    var glowRec = null;
+
+    items.forEach((item) => {
+      block.appendChild(buildToolDiv(item));
+      // Render verdict badge if present.  Server emits the heuristic
+      // verdict under ``heuristic_verdict`` (matches the api/server_schemas
+      // PendingApprovalItem shape).  Falls back to the legacy ``verdict``
+      // key in case a stale SSE payload arrives mid-deploy.
+      var heuristic = item.heuristic_verdict || item.verdict;
+      if (heuristic) {
+        block.insertAdjacentHTML(
+          "beforeend",
+          renderVerdictBadge(heuristic, judgePending),
+        );
+        var rec = heuristic.recommendation || "review";
+        if (
+          !glowRec ||
+          rec === "deny" ||
+          (rec === "review" && glowRec === "approve")
+        ) {
+          glowRec = rec;
+        }
+      }
+    });
+
+    if (autoApproved) {
+      var badge = document.createElement("div");
+      badge.setAttribute("role", "status");
+      badge.className = "ts-approval-badge ts-approval-badge--approved";
+      badge.textContent = "\u2713 auto-approved";
+      block.appendChild(badge);
+    } else {
+      var prompt = document.createElement("div");
+      prompt.className = "ts-approval-body";
+
+      // Apply verdict glow on initial heuristic verdict
+      if (glowRec) {
+        if (glowRec === "approve")
+          prompt.classList.add("ts-verdict-glow--approve");
+        else if (glowRec === "deny")
+          prompt.classList.add("ts-verdict-glow--deny");
+        else prompt.classList.add("ts-verdict-glow--review");
+      }
+
+      var alwaysNames = items
+        .filter((it) => {
+          return (
+            it.needs_approval &&
+            it.func_name &&
+            it.func_name !== "__budget_override__" &&
+            !it.error
+          );
+        })
+        .map((it) => {
+          return it.approval_label || it.func_name;
+        });
+      block.dataset.alwaysNames = JSON.stringify(alwaysNames);
+      var alwaysTitle = alwaysNames.length
+        ? "Always approve " + alwaysNames.join(", ")
+        : "Always approve this tool type";
+
+      var actionsDiv = document.createElement("div");
+      actionsDiv.className = "ts-approval-actions";
+
+      var approveBtn = document.createElement("button");
+      approveBtn.className = "ts-approval-btn ts-approval-btn--approve";
+      approveBtn.append(makeKeyLabel("y", "Approve"));
+      approveBtn.onclick = () => {
+        this.resolveApproval(true, false, this.getFeedback());
+      };
+      actionsDiv.appendChild(approveBtn);
+
+      var denyBtn = document.createElement("button");
+      denyBtn.className = "ts-approval-btn ts-approval-btn--deny";
+      denyBtn.append(makeKeyLabel("n", "Deny"));
+      denyBtn.onclick = () => {
+        this.resolveApproval(false, false, this.getFeedback());
+      };
+      actionsDiv.appendChild(denyBtn);
+
+      if (alwaysNames.length) {
+        var alwaysBtn = document.createElement("button");
+        alwaysBtn.className = "ts-approval-btn ts-approval-btn--always";
+        alwaysBtn.title = alwaysTitle;
+        alwaysBtn.setAttribute("aria-label", alwaysTitle);
+        alwaysBtn.append(makeKeyLabel("a", "Always"));
+        alwaysBtn.onclick = () => {
+          this.resolveApproval(true, true, this.getFeedback());
+        };
+        actionsDiv.appendChild(alwaysBtn);
+      }
+
+      prompt.appendChild(actionsDiv);
+
+      var fbInput = document.createElement("input");
+      fbInput.type = "text";
+      fbInput.className = "ts-approval-feedback";
+      fbInput.placeholder = "feedback (optional)";
+      prompt.appendChild(fbInput);
+
+      block.appendChild(prompt);
+      this.pendingApproval = true;
+      this.approvalBlockEl = block;
+      this.inputEl.disabled = true;
+      this.sendBtn.disabled = true;
+      requestAnimationFrame(() => {
+        fbInput.focus();
+      });
+    }
+
+    this.messagesEl.appendChild(block);
+    this.scrollToBottom();
+  }
+
+  resolveApproval(approved, always, feedback, skipPost) {
+    if (!this.approvalBlockEl) return;
+    this.pendingApproval = false;
+
+    // Remove prompt
+    var prompt = this.approvalBlockEl.querySelector(".ts-approval-body");
+    if (prompt) prompt.remove();
+
+    // Add badge
+    var badge = document.createElement("div");
+    badge.setAttribute("role", "status");
+    if (approved) {
+      badge.className = "ts-approval-badge ts-approval-badge--approved";
+      var label = "\u2713 approved";
+      if (always) {
+        var raw = this.approvalBlockEl.dataset.alwaysNames;
+        var names = raw ? JSON.parse(raw) : [];
+        label = names.length
+          ? "\u2713 always approve " + names.join(", ")
+          : "\u2713 always approve";
+      }
+      badge.textContent = feedback ? label + ": " + feedback : label;
+      this.approvalBlockEl.classList.add("approved");
+    } else {
+      badge.className = "ts-approval-badge ts-approval-badge--denied";
+      badge.textContent = "\u2717 denied" + (feedback ? ": " + feedback : "");
+      this.approvalBlockEl.classList.add("denied");
+    }
+    this.approvalBlockEl.appendChild(badge);
+    this.approvalBlockEl = null;
+
+    // Re-enable input
+    this.inputEl.disabled = false;
+    this.sendBtn.disabled = this.busy;
+    this.inputEl.focus();
+
+    // POST to server (skip when server already resolved, e.g. timeout)
+    if (!skipPost) {
+      authFetch(
+        "/v1/api/workstreams/" + encodeURIComponent(this.wsId) + "/approve",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            approved: approved,
+            feedback: feedback || null,
+            always: !!always,
+          }),
+        },
+      ).catch((err) => {
+        this.addErrorMessage("Connection error: " + err.message);
+      });
+    }
+
+    this.scrollToBottom();
+  }
+
+  appendToolOutput(callId, name, output, isError) {
+    var escapedId = callId ? CSS.escape(callId) : "";
+    var target = escapedId
+      ? this.messagesEl.querySelector(
+          '.ts-approval-tool[data-call-id="' + escapedId + '"]',
+        )
+      : null;
+    if (!target) {
+      var blocks = this.messagesEl.querySelectorAll(".ts-approval");
+      if (!blocks.length) return;
+      var block = blocks[blocks.length - 1];
+      var tools = block.querySelectorAll(".ts-approval-tool");
+      for (var i = tools.length - 1; i >= 0; i--) {
+        if (tools[i].dataset.funcName === name) {
+          target = tools[i];
+          break;
+        }
+      }
+      if (!target && tools.length) target = tools[tools.length - 1];
+    }
+    if (!target) return;
+
+    // Remove the streaming output element for this tool
+    var streamEl = null;
+    if (escapedId) {
+      streamEl = this.messagesEl.querySelector(
+        '.tool-output-stream[data-call-id="' + escapedId + '"]',
+      );
+    } else {
+      var next = target.nextElementSibling;
+      if (next && next.classList.contains("tool-output-stream")) {
+        streamEl = next;
+      }
+    }
+    if (streamEl) streamEl.remove();
+
+    var stripped = stripAnsi(output || "").trim();
+    if (!stripped) return;
+
+    // Skip rendering for denied/blocked tool results — the ✗ denied
+    // badge from resolveApproval already shows the denial reason; the
+    // SSE tool_result event would otherwise duplicate the text.  Mirror
+    // the guard in the history-replay path (the live path used to be
+    // safe because no tool_result event was ever emitted for denied
+    // items, but we now emit one so _tool_error_flags gets set).
+    var parentBlock = target.closest(".ts-approval");
+    var isDenied =
+      (parentBlock && parentBlock.classList.contains("denied")) ||
+      /^Denied by user/.test(stripped) ||
+      /^Blocked/.test(stripped);
+    if (isDenied) return;
+
+    // Detect structured media output and render interactive embed
+    if (!isError) {
+      var media = tryParseMedia(stripped);
+      if (media) {
+        var embed = buildMediaEmbed(media, stripped);
+        target.after(embed);
+        this.scrollToBottom();
+        return;
+      }
+    }
+
+    // Detect structured MCP error envelope and render an interactive
+    // consent / re-consent / forbidden / operator card.  The existing
+    // ✗ error badge from appendToolErrorBadge still fires below.
+    if (isError) {
+      var mcpErr = tryParseMcpError(stripped);
+      if (mcpErr) {
+        if (parentBlock && !parentBlock.classList.contains("denied")) {
+          parentBlock.classList.add("error");
+          appendToolErrorBadge(parentBlock);
+        }
+        target.after(buildMcpErrorEmbed(mcpErr, stripped));
+        this.scrollToBottom();
+        return;
+      }
+    }
+
+    var out = renderToolOutput(stripped, isError);
+
+    // Mark the parent approval block as errored
+    if (isError && parentBlock && !parentBlock.classList.contains("denied")) {
+      parentBlock.classList.add("error");
+      appendToolErrorBadge(parentBlock);
+    }
+
+    if (out.textContent.split("\n").length > 10) {
+      makeCollapsible(out);
+    }
+
+    target.after(out);
+    this.scrollToBottom();
+  }
+
+  sendMessage() {
+    var text = this.inputEl.value.trim();
+    if (!text) return;
+
+    if (text.startsWith("/")) {
+      if (this.busy) return; // commands not allowed while busy
+      authFetch("/v1/api/command", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ command: text, ws_id: this.wsId }),
+      });
+      this.addUserMessage(text);
+      this.composer.clear();
+      return;
+    }
+
+    var isBusy = this.busy;
+    var queuedEl = null;
+    var snap = this.attachments.snapshot();
+
+    if (isBusy) {
+      // Server re-parses the !!! prefix to set queue priority — the
+      // optimistic bubble strips it for display.
+      var displayText = text;
+      var priority = "notice";
+      if (text.startsWith("!!!")) {
+        displayText = text.slice(3).trimStart();
+        priority = "important";
+      }
+      this.removeEmptyState();
+      queuedEl = this.queue.addQueuedMessage(displayText, priority);
+    } else {
+      this.setBusy(true);
+      this.addUserMessage(text, snap.attachments);
+    }
+    this.composer.clear();
+
+    authFetch(
+      "/v1/api/workstreams/" + encodeURIComponent(this.wsId) + "/send",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: text,
+          attachment_ids: snap.attachment_ids,
+        }),
+      },
+    )
+      .then((r) => {
+        return r.json();
+      })
+      .then((data) => {
+        if (data.status === "queued" && data.msg_id) {
+          // queuedEl-present path: bind() handles the three known races
+          // (pre-bind dismiss, promote sweep raced ahead, normal accept).
+          // queuedEl-absent path: client thought it was idle but the
+          // server saw a live worker (SSE state_change hadn't arrived
+          // yet). Flip busy so subsequent sends queue correctly; the
+          // optimistic user bubble is already in the log and the server
+          // still delivers the message on worker drain — accept the
+          // small UX gap (no in-UI dismiss for THIS message).
+          if (queuedEl) this.queue.bind(queuedEl, data.msg_id);
+          else this.setBusy(true);
+          this.attachments.consume(
+            data.attached_ids,
+            data.dropped_attachment_ids,
+          );
+        } else if (data.status === "busy") {
+          if (queuedEl) this.queue.remove(queuedEl);
+          this.addErrorMessage("Server is busy. Please wait.");
+          if (!isBusy) this.setBusy(false);
+        } else if (data.status === "queue_full") {
+          if (queuedEl) this.queue.remove(queuedEl);
+          this.addErrorMessage("Message queue full. Please wait.");
+        } else if (data.status === "attachments_busy") {
+          // Attachments can't ride a queued user turn — server held the
+          // chips' reservations long enough to bounce the request and
+          // released them. Surface to the user; chips stay in the
+          // composer so they can retry once the assistant finishes.
+          if (queuedEl) this.queue.remove(queuedEl);
+          this.addErrorMessage(
+            "Attachments can't be sent while the assistant is working. " +
+              "Send a text-only message now, or wait and resend with attachments.",
+          );
+        } else {
+          this.attachments.consume(
+            data.attached_ids,
+            data.dropped_attachment_ids,
+          );
+        }
+      })
+      .catch((err) => {
+        if (queuedEl) this.queue.remove(queuedEl);
+        this.addErrorMessage("Connection error: " + err.message);
+        if (!isBusy) this.setBusy(false);
+      });
+  }
+
+  cancelGeneration() {
+    if (!this.busy || !this.wsId || this.stopBtn.disabled) return;
+    var isForce = this.stopBtn.dataset.forceCancel === "true";
+    this.stopBtn.disabled = true;
+    authFetch(
+      "/v1/api/workstreams/" + encodeURIComponent(this.wsId) + "/cancel",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ force: isForce }),
+      },
+    )
+      .then(() => {
+        if (isForce) {
+          // Force cancel abandons the worker — transition immediately.
+          // Clear timeouts to prevent stale timers firing on next send.
+          if (this._cancelTimeout) {
+            clearTimeout(this._cancelTimeout);
+            this._cancelTimeout = null;
+          }
+          if (this._forceTimeout) {
+            clearTimeout(this._forceTimeout);
+            this._forceTimeout = null;
+          }
+          this.addInfoMessage("Force stopped. Previous generation abandoned.");
+          this.setBusy(false);
+        }
+      })
+      .catch((err) => {
+        this.addErrorMessage("Cancel error: " + err.message);
+        this.stopBtn.disabled = false;
+      });
+  }
 }
 
 // Build a structured ``.msg.watch-result`` card for a
@@ -1720,424 +2128,6 @@ function _buildOutputWarningEl(assessment) {
   }
   return warning;
 }
-
-Pane.prototype.showInlineToolBlock = function (
-  items,
-  autoApproved,
-  judgePending,
-) {
-  var self = this;
-  var block = document.createElement("div");
-  block.className =
-    "msg ts-approval ts-approval--inline" + (autoApproved ? " approved" : "");
-  if (!autoApproved) {
-    block.setAttribute("role", "alertdialog");
-    block.setAttribute("aria-label", "Tool approval required");
-  }
-
-  // Track the highest-priority recommendation for glow
-  var glowRec = null;
-
-  items.forEach(function (item) {
-    block.appendChild(buildToolDiv(item));
-    // Render verdict badge if present.  Server emits the heuristic
-    // verdict under ``heuristic_verdict`` (matches the api/server_schemas
-    // PendingApprovalItem shape).  Falls back to the legacy ``verdict``
-    // key in case a stale SSE payload arrives mid-deploy.
-    var heuristic = item.heuristic_verdict || item.verdict;
-    if (heuristic) {
-      block.insertAdjacentHTML(
-        "beforeend",
-        renderVerdictBadge(heuristic, judgePending),
-      );
-      var rec = heuristic.recommendation || "review";
-      if (
-        !glowRec ||
-        rec === "deny" ||
-        (rec === "review" && glowRec === "approve")
-      ) {
-        glowRec = rec;
-      }
-    }
-  });
-
-  if (autoApproved) {
-    var badge = document.createElement("div");
-    badge.setAttribute("role", "status");
-    badge.className = "ts-approval-badge ts-approval-badge--approved";
-    badge.textContent = "\u2713 auto-approved";
-    block.appendChild(badge);
-  } else {
-    var prompt = document.createElement("div");
-    prompt.className = "ts-approval-body";
-
-    // Apply verdict glow on initial heuristic verdict
-    if (glowRec) {
-      if (glowRec === "approve")
-        prompt.classList.add("ts-verdict-glow--approve");
-      else if (glowRec === "deny")
-        prompt.classList.add("ts-verdict-glow--deny");
-      else prompt.classList.add("ts-verdict-glow--review");
-    }
-
-    var alwaysNames = items
-      .filter(function (it) {
-        return (
-          it.needs_approval &&
-          it.func_name &&
-          it.func_name !== "__budget_override__" &&
-          !it.error
-        );
-      })
-      .map(function (it) {
-        return it.approval_label || it.func_name;
-      });
-    block.dataset.alwaysNames = JSON.stringify(alwaysNames);
-    var alwaysTitle = alwaysNames.length
-      ? "Always approve " + alwaysNames.join(", ")
-      : "Always approve this tool type";
-
-    var actionsDiv = document.createElement("div");
-    actionsDiv.className = "ts-approval-actions";
-
-    var approveBtn = document.createElement("button");
-    approveBtn.className = "ts-approval-btn ts-approval-btn--approve";
-    approveBtn.append(makeKeyLabel("y", "Approve"));
-    approveBtn.onclick = function () {
-      self.resolveApproval(true, false, self.getFeedback());
-    };
-    actionsDiv.appendChild(approveBtn);
-
-    var denyBtn = document.createElement("button");
-    denyBtn.className = "ts-approval-btn ts-approval-btn--deny";
-    denyBtn.append(makeKeyLabel("n", "Deny"));
-    denyBtn.onclick = function () {
-      self.resolveApproval(false, false, self.getFeedback());
-    };
-    actionsDiv.appendChild(denyBtn);
-
-    if (alwaysNames.length) {
-      var alwaysBtn = document.createElement("button");
-      alwaysBtn.className = "ts-approval-btn ts-approval-btn--always";
-      alwaysBtn.title = alwaysTitle;
-      alwaysBtn.setAttribute("aria-label", alwaysTitle);
-      alwaysBtn.append(makeKeyLabel("a", "Always"));
-      alwaysBtn.onclick = function () {
-        self.resolveApproval(true, true, self.getFeedback());
-      };
-      actionsDiv.appendChild(alwaysBtn);
-    }
-
-    prompt.appendChild(actionsDiv);
-
-    var fbInput = document.createElement("input");
-    fbInput.type = "text";
-    fbInput.className = "ts-approval-feedback";
-    fbInput.placeholder = "feedback (optional)";
-    prompt.appendChild(fbInput);
-
-    block.appendChild(prompt);
-    this.pendingApproval = true;
-    this.approvalBlockEl = block;
-    this.inputEl.disabled = true;
-    this.sendBtn.disabled = true;
-    requestAnimationFrame(function () {
-      fbInput.focus();
-    });
-  }
-
-  this.messagesEl.appendChild(block);
-  this.scrollToBottom();
-};
-
-Pane.prototype.resolveApproval = function (
-  approved,
-  always,
-  feedback,
-  skipPost,
-) {
-  if (!this.approvalBlockEl) return;
-  this.pendingApproval = false;
-
-  // Remove prompt
-  var prompt = this.approvalBlockEl.querySelector(".ts-approval-body");
-  if (prompt) prompt.remove();
-
-  // Add badge
-  var badge = document.createElement("div");
-  badge.setAttribute("role", "status");
-  if (approved) {
-    badge.className = "ts-approval-badge ts-approval-badge--approved";
-    var label = "\u2713 approved";
-    if (always) {
-      var raw = this.approvalBlockEl.dataset.alwaysNames;
-      var names = raw ? JSON.parse(raw) : [];
-      label = names.length
-        ? "\u2713 always approve " + names.join(", ")
-        : "\u2713 always approve";
-    }
-    badge.textContent = feedback ? label + ": " + feedback : label;
-    this.approvalBlockEl.classList.add("approved");
-  } else {
-    badge.className = "ts-approval-badge ts-approval-badge--denied";
-    badge.textContent = "\u2717 denied" + (feedback ? ": " + feedback : "");
-    this.approvalBlockEl.classList.add("denied");
-  }
-  this.approvalBlockEl.appendChild(badge);
-  this.approvalBlockEl = null;
-
-  // Re-enable input
-  this.inputEl.disabled = false;
-  this.sendBtn.disabled = this.busy;
-  this.inputEl.focus();
-
-  // POST to server (skip when server already resolved, e.g. timeout)
-  if (!skipPost) {
-    var self = this;
-    authFetch(
-      "/v1/api/workstreams/" + encodeURIComponent(this.wsId) + "/approve",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          approved: approved,
-          feedback: feedback || null,
-          always: !!always,
-        }),
-      },
-    ).catch(function (err) {
-      self.addErrorMessage("Connection error: " + err.message);
-    });
-  }
-
-  this.scrollToBottom();
-};
-
-Pane.prototype.appendToolOutput = function (callId, name, output, isError) {
-  var escapedId = callId ? CSS.escape(callId) : "";
-  var target = escapedId
-    ? this.messagesEl.querySelector(
-        '.ts-approval-tool[data-call-id="' + escapedId + '"]',
-      )
-    : null;
-  if (!target) {
-    var blocks = this.messagesEl.querySelectorAll(".ts-approval");
-    if (!blocks.length) return;
-    var block = blocks[blocks.length - 1];
-    var tools = block.querySelectorAll(".ts-approval-tool");
-    for (var i = tools.length - 1; i >= 0; i--) {
-      if (tools[i].dataset.funcName === name) {
-        target = tools[i];
-        break;
-      }
-    }
-    if (!target && tools.length) target = tools[tools.length - 1];
-  }
-  if (!target) return;
-
-  // Remove the streaming output element for this tool
-  var streamEl = null;
-  if (escapedId) {
-    streamEl = this.messagesEl.querySelector(
-      '.tool-output-stream[data-call-id="' + escapedId + '"]',
-    );
-  } else {
-    var next = target.nextElementSibling;
-    if (next && next.classList.contains("tool-output-stream")) {
-      streamEl = next;
-    }
-  }
-  if (streamEl) streamEl.remove();
-
-  var stripped = stripAnsi(output || "").trim();
-  if (!stripped) return;
-
-  // Skip rendering for denied/blocked tool results — the ✗ denied
-  // badge from resolveApproval already shows the denial reason; the
-  // SSE tool_result event would otherwise duplicate the text.  Mirror
-  // the guard in the history-replay path (the live path used to be
-  // safe because no tool_result event was ever emitted for denied
-  // items, but we now emit one so _tool_error_flags gets set).
-  var parentBlock = target.closest(".ts-approval");
-  var isDenied =
-    (parentBlock && parentBlock.classList.contains("denied")) ||
-    /^Denied by user/.test(stripped) ||
-    /^Blocked/.test(stripped);
-  if (isDenied) return;
-
-  // Detect structured media output and render interactive embed
-  if (!isError) {
-    var media = tryParseMedia(stripped);
-    if (media) {
-      var embed = buildMediaEmbed(media, stripped);
-      target.after(embed);
-      this.scrollToBottom();
-      return;
-    }
-  }
-
-  // Detect structured MCP error envelope and render an interactive
-  // consent / re-consent / forbidden / operator card.  The existing
-  // ✗ error badge from appendToolErrorBadge still fires below.
-  if (isError) {
-    var mcpErr = tryParseMcpError(stripped);
-    if (mcpErr) {
-      if (parentBlock && !parentBlock.classList.contains("denied")) {
-        parentBlock.classList.add("error");
-        appendToolErrorBadge(parentBlock);
-      }
-      target.after(buildMcpErrorEmbed(mcpErr, stripped));
-      this.scrollToBottom();
-      return;
-    }
-  }
-
-  var out = renderToolOutput(stripped, isError);
-
-  // Mark the parent approval block as errored
-  if (isError && parentBlock && !parentBlock.classList.contains("denied")) {
-    parentBlock.classList.add("error");
-    appendToolErrorBadge(parentBlock);
-  }
-
-  if (out.textContent.split("\n").length > 10) {
-    makeCollapsible(out);
-  }
-
-  target.after(out);
-  this.scrollToBottom();
-};
-
-Pane.prototype.sendMessage = function () {
-  var text = this.inputEl.value.trim();
-  if (!text) return;
-
-  if (text.startsWith("/")) {
-    if (this.busy) return; // commands not allowed while busy
-    authFetch("/v1/api/command", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ command: text, ws_id: this.wsId }),
-    });
-    this.addUserMessage(text);
-    this.composer.clear();
-    return;
-  }
-
-  var self = this;
-  var isBusy = this.busy;
-  var queuedEl = null;
-  var snap = this.attachments.snapshot();
-
-  if (isBusy) {
-    // Server re-parses the !!! prefix to set queue priority — the
-    // optimistic bubble strips it for display.
-    var displayText = text;
-    var priority = "notice";
-    if (text.startsWith("!!!")) {
-      displayText = text.slice(3).trimStart();
-      priority = "important";
-    }
-    this.removeEmptyState();
-    queuedEl = this.queue.addQueuedMessage(displayText, priority);
-  } else {
-    this.setBusy(true);
-    this.addUserMessage(text, snap.attachments);
-  }
-  this.composer.clear();
-
-  authFetch("/v1/api/workstreams/" + encodeURIComponent(this.wsId) + "/send", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      message: text,
-      attachment_ids: snap.attachment_ids,
-    }),
-  })
-    .then(function (r) {
-      return r.json();
-    })
-    .then(function (data) {
-      if (data.status === "queued" && data.msg_id) {
-        // queuedEl-present path: bind() handles the three known races
-        // (pre-bind dismiss, promote sweep raced ahead, normal accept).
-        // queuedEl-absent path: client thought it was idle but the
-        // server saw a live worker (SSE state_change hadn't arrived
-        // yet). Flip busy so subsequent sends queue correctly; the
-        // optimistic user bubble is already in the log and the server
-        // still delivers the message on worker drain — accept the
-        // small UX gap (no in-UI dismiss for THIS message).
-        if (queuedEl) self.queue.bind(queuedEl, data.msg_id);
-        else self.setBusy(true);
-        self.attachments.consume(
-          data.attached_ids,
-          data.dropped_attachment_ids,
-        );
-      } else if (data.status === "busy") {
-        if (queuedEl) self.queue.remove(queuedEl);
-        self.addErrorMessage("Server is busy. Please wait.");
-        if (!isBusy) self.setBusy(false);
-      } else if (data.status === "queue_full") {
-        if (queuedEl) self.queue.remove(queuedEl);
-        self.addErrorMessage("Message queue full. Please wait.");
-      } else if (data.status === "attachments_busy") {
-        // Attachments can't ride a queued user turn — server held the
-        // chips' reservations long enough to bounce the request and
-        // released them. Surface to the user; chips stay in the
-        // composer so they can retry once the assistant finishes.
-        if (queuedEl) self.queue.remove(queuedEl);
-        self.addErrorMessage(
-          "Attachments can't be sent while the assistant is working. " +
-            "Send a text-only message now, or wait and resend with attachments.",
-        );
-      } else {
-        self.attachments.consume(
-          data.attached_ids,
-          data.dropped_attachment_ids,
-        );
-      }
-    })
-    .catch(function (err) {
-      if (queuedEl) self.queue.remove(queuedEl);
-      self.addErrorMessage("Connection error: " + err.message);
-      if (!isBusy) self.setBusy(false);
-    });
-};
-
-Pane.prototype.cancelGeneration = function () {
-  if (!this.busy || !this.wsId || this.stopBtn.disabled) return;
-  var self = this;
-  var isForce = this.stopBtn.dataset.forceCancel === "true";
-  this.stopBtn.disabled = true;
-  authFetch(
-    "/v1/api/workstreams/" + encodeURIComponent(this.wsId) + "/cancel",
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ force: isForce }),
-    },
-  )
-    .then(function () {
-      if (isForce) {
-        // Force cancel abandons the worker — transition immediately.
-        // Clear timeouts to prevent stale timers firing on next send.
-        if (self._cancelTimeout) {
-          clearTimeout(self._cancelTimeout);
-          self._cancelTimeout = null;
-        }
-        if (self._forceTimeout) {
-          clearTimeout(self._forceTimeout);
-          self._forceTimeout = null;
-        }
-        self.addInfoMessage("Force stopped. Previous generation abandoned.");
-        self.setBusy(false);
-      }
-    })
-    .catch(function (err) {
-      self.addErrorMessage("Cancel error: " + err.message);
-      self.stopBtn.disabled = false;
-    });
-};
 
 // ===========================================================================
 //  2. Layout tree + rendering

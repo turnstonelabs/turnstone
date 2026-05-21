@@ -337,8 +337,8 @@ def test_phase8_appendtooloutput_dispatches_mcp_error_before_renderer() -> None:
     interactive consent card replace the JSON dump; reverse the calls
     and the user sees the raw error envelope as text again."""
     body = _APP_JS.read_text(encoding="utf-8")
-    start = body.index("Pane.prototype.appendToolOutput = function")
-    end = body.index("Pane.prototype.", start + 10)
+    start = body.index("\n  appendToolOutput(")
+    end = body.index("\n  sendMessage(", start)
     fn = body[start:end]
     parse_idx = fn.find("tryParseMcpError(")
     render_idx = fn.find("renderToolOutput(")
