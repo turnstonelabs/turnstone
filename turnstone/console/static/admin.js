@@ -2806,7 +2806,7 @@ function _renderSettings(container, grouped) {
       sec +
       '" data-collapsed>';
     html +=
-      '<div class="settings-section-header" onclick="_toggleSettingsSection(this)" onkeydown="_onSettingsHeaderKey(event,this)" role="button" tabindex="0" aria-expanded="false" aria-controls="settings-body-' +
+      '<div class="settings-section-header" role="button" tabindex="0" aria-expanded="false" aria-controls="settings-body-' +
       sec +
       '">';
     html += "<span>" + _settingsSectionLabel(sec) + "</span>";
@@ -2831,7 +2831,7 @@ function _renderSettings(container, grouped) {
         allSections[s] +
         '" data-collapsed>';
       html +=
-        '<div class="settings-section-header" onclick="_toggleSettingsSection(this)" onkeydown="_onSettingsHeaderKey(event,this)" role="button" tabindex="0" aria-expanded="false" aria-controls="settings-body-' +
+        '<div class="settings-section-header" role="button" tabindex="0" aria-expanded="false" aria-controls="settings-body-' +
         allSections[s] +
         '">';
       html += "<span>" + _settingsSectionLabel(allSections[s]) + "</span>";
@@ -2849,7 +2849,27 @@ function _renderSettings(container, grouped) {
 
   setSafeHtml(container, html);
 
-  // Store original values for dirty detection
+  // Bind handlers via data-* attributes — a key with an apostrophe
+  // would otherwise break out of the JS string when the HTML parser
+  // decodes &#39; before JS evaluation.
+  var sectionHeaders = container.querySelectorAll(".settings-section-header");
+  for (var sh = 0; sh < sectionHeaders.length; sh++) {
+    sectionHeaders[sh].addEventListener("click", function () {
+      _toggleSettingsSection(this);
+    });
+    sectionHeaders[sh].addEventListener("keydown", function (e) {
+      _onSettingsHeaderKey(e, this);
+    });
+  }
+  var helpBtns = container.querySelectorAll(".settings-help-btn");
+  for (var hb = 0; hb < helpBtns.length; hb++) {
+    helpBtns[hb].addEventListener("click", function (e) {
+      _toggleSettingsHelp(e, this);
+    });
+  }
+
+  // Store original values for dirty detection + wire per-key change
+  // handlers off data-setting-key (no key interpolation into JS).
   var inputs = container.querySelectorAll("[data-setting-key]");
   for (var n = 0; n < inputs.length; n++) {
     var inp = inputs[n];
@@ -2859,6 +2879,23 @@ function _renderSettings(container, grouped) {
     } else {
       _settingsOriginal[key] = inp.value;
     }
+    var evtName =
+      inp.type === "checkbox" || inp.tagName === "SELECT" ? "change" : "input";
+    inp.addEventListener(evtName, function () {
+      _onSettingChange(this);
+    });
+  }
+  var saveBtns = container.querySelectorAll("[data-save-key]");
+  for (var sb = 0; sb < saveBtns.length; sb++) {
+    saveBtns[sb].addEventListener("click", function () {
+      _saveSettingValue(this.getAttribute("data-save-key"));
+    });
+  }
+  var resetBtns = container.querySelectorAll("[data-reset-key]");
+  for (var rb = 0; rb < resetBtns.length; rb++) {
+    resetBtns[rb].addEventListener("click", function () {
+      _resetSetting(this.getAttribute("data-reset-key"));
+    });
   }
 }
 
@@ -2879,7 +2916,7 @@ function _renderSettingRow(item) {
   html += escapeHtml(shortKey);
   if (item.help) {
     html +=
-      ' <button class="settings-help-btn" onclick="_toggleSettingsHelp(event, this)" ' +
+      ' <button class="settings-help-btn" ' +
       'aria-label="Help for ' +
       escapedShort +
       '" aria-expanded="false" title="More info">?</button>';
@@ -2912,9 +2949,7 @@ function _renderSettingRow(item) {
       escapedShort +
       '" autocomplete="off" value="" placeholder="' +
       (item.source === "storage" ? "***" : "not set") +
-      '" oninput="_onSettingChange(\'' +
-      escapedKey +
-      "')\">";
+      '">';
   } else if (item.type === "bool") {
     var checked =
       item.value === true || item.value === "true" ? " checked" : "";
@@ -2925,18 +2960,14 @@ function _renderSettingRow(item) {
       escapedShort +
       '"' +
       checked +
-      " onchange=\"_onSettingChange('" +
-      escapedKey +
-      '\')"><span class="settings-toggle-slider"></span></label>';
+      '><span class="settings-toggle-slider"></span></label>';
   } else if (item.choices && item.choices.length > 0) {
     html +=
       '<select data-setting-key="' +
       escapedKey +
       '" aria-label="' +
       escapedShort +
-      '" onchange="_onSettingChange(\'' +
-      escapedKey +
-      "')\">";
+      '">';
     for (var c = 0; c < item.choices.length; c++) {
       var sel = item.choices[c] === String(item.value) ? " selected" : "";
       var label;
@@ -2981,9 +3012,7 @@ function _renderSettingRow(item) {
       '"' +
       minAttr +
       maxAttr +
-      " oninput=\"_onSettingChange('" +
-      escapedKey +
-      "')\">";
+      ">";
   } else {
     // str
     html +=
@@ -2993,9 +3022,7 @@ function _renderSettingRow(item) {
       escapedShort +
       '" value="' +
       escapeHtml(String(item.value != null ? item.value : "")) +
-      '" oninput="_onSettingChange(\'' +
-      escapedKey +
-      "')\">";
+      '">';
   }
   html += "</div>";
 
@@ -3021,18 +3048,14 @@ function _renderSettingRow(item) {
   html +=
     '<button class="settings-save-btn" data-save-key="' +
     escapedKey +
-    '" onclick="_saveSettingValue(\'' +
-    escapedKey +
-    "')\">save</button>";
+    '">save</button>';
 
   // Reset link (when stored — including secrets, to clear legacy overrides)
   if (item.source === "storage") {
     html +=
       '<button class="settings-reset-btn" data-reset-key="' +
       escapedKey +
-      '" onclick="_resetSetting(\'' +
-      escapedKey +
-      "')\">reset</button>";
+      '">reset</button>';
   }
 
   html += "</div>";
@@ -3085,10 +3108,16 @@ function _toggleSettingsSection(headerEl) {
   }
 }
 
-function _onSettingChange(key) {
-  var inp = document.querySelector('[data-setting-key="' + key + '"]');
-  var saveBtn = document.querySelector('[data-save-key="' + key + '"]');
-  if (!inp || !saveBtn) return;
+function _onSettingChange(inp) {
+  // ``inp`` is the input element the listener fired on — passed in by
+  // the delegated handler so we avoid a document-wide selector per
+  // keystroke.  Save button + restart badge for this key live inside
+  // the same ``.settings-row`` (which carries the unique ``data-row-key``).
+  var row = inp.closest(".settings-row");
+  if (!row) return;
+  var saveBtn = row.querySelector("[data-save-key]");
+  if (!saveBtn) return;
+  var key = inp.getAttribute("data-setting-key");
 
   var current;
   if (inp.type === "checkbox") {
@@ -3117,7 +3146,7 @@ function _onSettingChange(key) {
   }
 
   // Show/hide restart badge alongside dirty state (but keep it if already saved)
-  var restartBadge = document.querySelector('[data-restart-key="' + key + '"]');
+  var restartBadge = row.querySelector("[data-restart-key]");
   if (restartBadge && !restartBadge.classList.contains("saved")) {
     restartBadge.classList.toggle("visible", dirty);
   }
@@ -4508,8 +4537,7 @@ function _showInstallMcpModal(srv, hasRemote, hasPackage) {
     var srcHtml = '<div class="mcp-install-source-group">';
     srcHtml +=
       '<label class="mcp-install-source-label">' +
-      '<input type="radio" name="mcp-install-src" value="remote" checked ' +
-      'onchange="_updateInstallFields()"> ' +
+      '<input type="radio" name="mcp-install-src" value="remote" checked> ' +
       'Remote <span class="mcp-install-source-type">streamable-http</span>' +
       "</label>";
     for (var pi = 0; pi < srv.packages.length; pi++) {
@@ -4517,7 +4545,7 @@ function _showInstallMcpModal(srv, hasRemote, hasPackage) {
         '<label class="mcp-install-source-label">' +
         '<input type="radio" name="mcp-install-src" value="package-' +
         pi +
-        '" onchange="_updateInstallFields()"> ' +
+        '"> ' +
         'Package <span class="mcp-install-source-type">' +
         escapeHtml(srv.packages[pi].registry_type) +
         " / " +
@@ -4526,6 +4554,10 @@ function _showInstallMcpModal(srv, hasRemote, hasPackage) {
     }
     srcHtml += "</div>";
     setSafeHtml(srcEl, srcHtml);
+    var srcRadios = srcEl.querySelectorAll('input[name="mcp-install-src"]');
+    for (var sr = 0; sr < srcRadios.length; sr++) {
+      srcRadios[sr].addEventListener("change", _updateInstallFields);
+    }
   } else {
     srcEl.replaceChildren();
   }
@@ -6117,9 +6149,7 @@ function _renderNodeMetadata() {
       escapeHtml(nid) +
       '" data-collapsed>';
     html +=
-      '<div class="settings-section-header" onclick="_toggleSettingsSection(this)" ';
-    html += 'onkeydown="_onSettingsHeaderKey(event,this)" ';
-    html += 'role="button" tabindex="0" aria-expanded="false" ';
+      '<div class="settings-section-header" role="button" tabindex="0" aria-expanded="false" ';
     html += 'aria-controls="nm-body-' + escapeHtml(nid) + '">';
     html +=
       "<span>" +
@@ -6203,6 +6233,19 @@ function _renderNodeMetadata() {
     html += "</div></div>";
   });
   setSafeHtml(container, html);
+
+  // Bind section-header click/keydown (no inline handlers — keys come
+  // from operator-controlled node IDs and would be a footgun in a
+  // ``onclick="..._('NID')"`` attribute).
+  var nmHeaders = container.querySelectorAll(".settings-section-header");
+  for (var nh = 0; nh < nmHeaders.length; nh++) {
+    nmHeaders[nh].addEventListener("click", function () {
+      _toggleSettingsSection(this);
+    });
+    nmHeaders[nh].addEventListener("keydown", function (e) {
+      _onSettingsHeaderKey(e, this);
+    });
+  }
 
   // Bind button handlers (data-* attrs carry node/key context)
   var delBtns = container.querySelectorAll(".nm-del-btn");
