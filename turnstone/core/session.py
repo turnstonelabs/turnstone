@@ -1172,9 +1172,16 @@ class ChatSession:
 
         Used by :meth:`_maybe_synth_reasoning_block` to tag synthetic
         path-3 reasoning blocks with their origin server (vllm,
-        llama.cpp, sglang, etc.) — informational there but load-bearing
-        for :meth:`_maybe_attach_vllm_chat_reasoning` (Phase 5 gate).
-        Returns ``""`` on any lookup miss.
+        llama.cpp, sglang, etc.) — informational metadata for UI
+        rehydration.  Returns ``""`` on any lookup miss.
+
+        Phase 5 (:meth:`_maybe_attach_vllm_chat_reasoning`) does NOT
+        call this resolver — it reads ``cfg.server_compat["server_type"]``
+        directly off the single ``cfg`` it already fetched for the
+        ``replay_reasoning_to_model`` flag check, to avoid a second
+        ``registry.get_config`` round-trip.  Both readers MUST stay
+        aligned on the same field path; if you change one, change the
+        other.
 
         Reads ``cfg.server_compat`` (the dedicated dataclass field set
         by the model_registry loader) — NOT ``cfg.capabilities``.  Both
@@ -1346,8 +1353,10 @@ class ChatSession:
         edit friction (capability tables live in
         ``providers/_openai_common.py``, not the admin UI) without
         preventing the silent failure that's the actual misconfiguration
-        risk.  See ``project_reasoning_replay_capability_gate.md`` for
-        the full asymmetry rationale.
+        risk.  Paths 1+2 keep the dual-gate because their failure mode
+        is loud (Anthropic 400 on unsigned thinking, OpenAI Responses
+        400 on ResponseReasoningItemParam for non-reasoning models);
+        Path C's failure is silent so the gate doesn't help.
 
         Returns *messages* unchanged when any gate fails.
         """
