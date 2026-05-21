@@ -51,15 +51,17 @@ function loadGovRoles() {
       _renderGovRoles(_govRoles);
     })
     .catch(function () {
-      document.getElementById("admin-roles-table").innerHTML =
-        '<div class="dashboard-empty">Failed to load roles</div>';
+      setSafeHtml(
+        document.getElementById("admin-roles-table"),
+        '<div class="dashboard-empty">Failed to load roles</div>',
+      );
     });
 }
 
 function _renderGovRoles(items) {
   var el = document.getElementById("admin-roles-table");
   if (!items.length) {
-    el.innerHTML = '<div class="dashboard-empty">No roles defined</div>';
+    setSafeHtml(el, '<div class="dashboard-empty">No roles defined</div>');
     return;
   }
   var html = "";
@@ -104,7 +106,7 @@ function _renderGovRoles(items) {
       actions +
       "</span></div>";
   }
-  el.innerHTML = html;
+  setSafeHtml(el, html);
   // Bind edit
   var editBtns = el.querySelectorAll("[data-edit-role]");
   for (var k = 0; k < editBtns.length; k++) {
@@ -246,8 +248,10 @@ function showCreateRoleModal() {
   ov.style.display = "flex";
   document.getElementById("cr-name").value = "";
   document.getElementById("cr-displayname").value = "";
-  document.getElementById("cr-perms-container").innerHTML =
-    _buildPermCheckboxes("cr", []);
+  setSafeHtml(
+    document.getElementById("cr-perms-container"),
+    _buildPermCheckboxes("cr", []),
+  );
   document.getElementById("create-role-error").classList.remove("is-visible");
   document.getElementById("cr-name").focus();
   _crTrapHandler = _installTrap("create-role-overlay", "create-role-box");
@@ -320,8 +324,10 @@ function showEditRoleModal(roleId) {
   document.getElementById("er-id").value = roleId;
   document.getElementById("er-name").value = role.display_name;
   var selected = (role.permissions || "").split(",");
-  document.getElementById("er-perms-container").innerHTML =
-    _buildPermCheckboxes("er", selected);
+  setSafeHtml(
+    document.getElementById("er-perms-container"),
+    _buildPermCheckboxes("er", selected),
+  );
   document.getElementById("edit-role-error").classList.remove("is-visible");
   _erTrapHandler = _installTrap("edit-role-overlay", "edit-role-box");
 }
@@ -374,7 +380,7 @@ function showUserRolesModal(userId) {
   ov.style.display = "flex";
   document.getElementById("ur-user-id").value = userId;
   var container = document.getElementById("ur-roles-container");
-  container.innerHTML = '<div class="dashboard-empty">Loading...</div>';
+  setSafeHtml(container, '<div class="dashboard-empty">Loading...</div>');
   _urTrapHandler = _installTrap("user-roles-overlay", "user-roles-box");
   // Fetch all roles and user's current roles
   Promise.all([
@@ -411,11 +417,13 @@ function showUserRolesModal(userId) {
           "</span></label>";
       }
       html += "</div>";
-      container.innerHTML = html; // values escaped via escapeHtml above
+      setSafeHtml(container, html);
     })
     .catch(function () {
-      container.innerHTML =
-        '<div class="dashboard-empty">Failed to load roles</div>';
+      setSafeHtml(
+        container,
+        '<div class="dashboard-empty">Failed to load roles</div>',
+      );
     });
 }
 
@@ -495,16 +503,20 @@ function loadGovPolicies() {
       _renderGovPolicies(_govPolicies);
     })
     .catch(function () {
-      document.getElementById("admin-policies-table").innerHTML =
-        '<div class="dashboard-empty">Failed to load policies</div>';
+      setSafeHtml(
+        document.getElementById("admin-policies-table"),
+        '<div class="dashboard-empty">Failed to load policies</div>',
+      );
     });
 }
 
 function _renderGovPolicies(items) {
   var el = document.getElementById("admin-policies-table");
   if (!items.length) {
-    el.innerHTML =
-      '<div class="dashboard-empty">No tool policies defined</div>';
+    setSafeHtml(
+      el,
+      '<div class="dashboard-empty">No tool policies defined</div>',
+    );
     return;
   }
   var html = "";
@@ -544,7 +556,7 @@ function _renderGovPolicies(items) {
       '">delete</button>' +
       "</span></div>";
   }
-  el.innerHTML = html;
+  setSafeHtml(el, html);
   el.querySelectorAll("[data-edit-policy]").forEach(function (btn) {
     btn.addEventListener("click", function () {
       showEditPolicyModal(this.getAttribute("data-edit-policy"));
@@ -726,15 +738,17 @@ function loadGovSkills() {
       _renderGovSkills(_govSkills);
     })
     .catch(function () {
-      document.getElementById("admin-skills-table").innerHTML =
-        '<div class="dashboard-empty">Failed to load skills</div>';
+      setSafeHtml(
+        document.getElementById("admin-skills-table"),
+        '<div class="dashboard-empty">Failed to load skills</div>',
+      );
     });
 }
 
 function _renderGovSkills(items) {
   var el = document.getElementById("admin-skills-table");
   if (!items.length) {
-    el.innerHTML = '<div class="dashboard-empty">No skills configured</div>';
+    setSafeHtml(el, '<div class="dashboard-empty">No skills configured</div>');
     return;
   }
   var html = "";
@@ -858,7 +872,7 @@ function _renderGovSkills(items) {
       ">delete</button>" +
       "</span></div>";
   }
-  el.innerHTML = html;
+  setSafeHtml(el, html);
   el.querySelectorAll("[data-edit-tmpl]").forEach(function (btn) {
     btn.addEventListener("click", function () {
       showEditTemplateModal(this.getAttribute("data-edit-tmpl"));
@@ -1440,7 +1454,7 @@ function showEditTemplateModal(tmplId) {
         }
         scanHtml += "</div>";
       }
-      document.getElementById("etm-scan-report").innerHTML = scanHtml;
+      setSafeHtml(document.getElementById("etm-scan-report"), scanHtml);
     } else {
       scanSection.style.display = "none";
     }
@@ -1676,7 +1690,7 @@ function _loadSkillResources(skillId, readonly) {
   var addBtn = document.getElementById("etm-add-resource-btn");
   var addForm = document.getElementById("etm-add-resource-form");
   if (!container) return;
-  container.innerHTML = '<div class="dashboard-empty">Loading...</div>';
+  setSafeHtml(container, '<div class="dashboard-empty">Loading...</div>');
   if (addBtn) addBtn.style.display = readonly ? "none" : "";
   if (addForm) addForm.style.display = "none";
 
@@ -1688,8 +1702,10 @@ function _loadSkillResources(skillId, readonly) {
     .then(function (data) {
       var resources = data.resources || [];
       if (!resources.length) {
-        container.innerHTML =
-          '<div class="dashboard-empty">No resource files</div>';
+        setSafeHtml(
+          container,
+          '<div class="dashboard-empty">No resource files</div>',
+        );
         return;
       }
       var html = "";
@@ -1717,7 +1733,7 @@ function _loadSkillResources(skillId, readonly) {
               '">delete</button>') +
           "</span></div>";
       }
-      container.innerHTML = html;
+      setSafeHtml(container, html);
       if (!readonly) {
         container.querySelectorAll("[data-del-res]").forEach(function (btn) {
           btn.addEventListener("click", function () {
@@ -1757,8 +1773,10 @@ function _loadSkillResources(skillId, readonly) {
       }
     })
     .catch(function () {
-      container.innerHTML =
-        '<div class="dashboard-empty">Failed to load resources</div>';
+      setSafeHtml(
+        container,
+        '<div class="dashboard-empty">Failed to load resources</div>',
+      );
     });
 }
 
@@ -1830,8 +1848,10 @@ function _renderPendingResources() {
   var container = document.getElementById("ctm-resources-list");
   if (!container) return;
   if (!_pendingResources.length) {
-    container.innerHTML =
-      '<div class="dashboard-empty">No resource files yet</div>';
+    setSafeHtml(
+      container,
+      '<div class="dashboard-empty">No resource files yet</div>',
+    );
     return;
   }
   var html = "";
@@ -1857,7 +1877,7 @@ function _renderPendingResources() {
       '">remove</button>' +
       "</span></div>";
   }
-  container.innerHTML = html;
+  setSafeHtml(container, html);
   container.querySelectorAll("[data-remove-res]").forEach(function (btn) {
     btn.addEventListener("click", function () {
       var idx = parseInt(this.getAttribute("data-remove-res"), 10);
@@ -2047,8 +2067,10 @@ function loadGovUsage() {
       _renderGovUsage(results[0], results[1]);
     })
     .catch(function () {
-      document.getElementById("admin-usage-content").innerHTML =
-        '<div class="dashboard-empty">Failed to load usage data</div>';
+      setSafeHtml(
+        document.getElementById("admin-usage-content"),
+        '<div class="dashboard-empty">Failed to load usage data</div>',
+      );
     });
 }
 
@@ -2126,7 +2148,7 @@ function _renderGovUsage(summary, breakdown) {
     html += '<div class="dashboard-empty">No usage data for this period</div>';
   }
 
-  container.innerHTML = html;
+  setSafeHtml(container, html);
 }
 
 function setUsageRange(range) {
@@ -2191,8 +2213,10 @@ function loadGovAudit(append) {
       _renderGovAudit(_govAuditEvents, _govAuditTotal);
     })
     .catch(function () {
-      document.getElementById("admin-audit-table").innerHTML =
-        '<div class="dashboard-empty">Failed to load audit events</div>';
+      setSafeHtml(
+        document.getElementById("admin-audit-table"),
+        '<div class="dashboard-empty">Failed to load audit events</div>',
+      );
     });
 }
 
@@ -2209,7 +2233,7 @@ function _relativeTime(isoStr) {
 function _renderGovAudit(events, total) {
   var el = document.getElementById("admin-audit-table");
   if (!events.length) {
-    el.innerHTML = '<div class="dashboard-empty">No audit events</div>';
+    setSafeHtml(el, '<div class="dashboard-empty">No audit events</div>');
     return;
   }
   var html = "";
@@ -2273,13 +2297,16 @@ function _renderGovAudit(events, total) {
   // Pagination
   if (events.length < total) {
     html +=
-      '<div class="pagination"><button class="audit-load-more" onclick="loadMoreAudit()">Load more (' +
+      '<div class="pagination"><button class="audit-load-more">Load more (' +
       events.length +
       " of " +
       total +
       ")</button></div>";
   }
-  el.innerHTML = html;
+  setSafeHtml(el, html);
+
+  var loadMoreBtn = el.querySelector(".audit-load-more");
+  if (loadMoreBtn) loadMoreBtn.addEventListener("click", loadMoreAudit);
 }
 
 function loadMoreAudit() {
@@ -2300,7 +2327,7 @@ function _populateAuditUserFilter() {
       escapeHtml(_adminUsers[i].username) +
       "</option>";
   }
-  sel.innerHTML = html;
+  setSafeHtml(sel, html);
 }
 
 // ---------------------------------------------------------------------------
@@ -2355,15 +2382,17 @@ function loadAdminMemories() {
       _renderAdminMemories(_adminMemories, data.total || _adminMemories.length);
     })
     .catch(function () {
-      document.getElementById("admin-memories-table").innerHTML =
-        '<div class="dashboard-empty">Failed to load memories</div>';
+      setSafeHtml(
+        document.getElementById("admin-memories-table"),
+        '<div class="dashboard-empty">Failed to load memories</div>',
+      );
     });
 }
 
 function _renderAdminMemories(items, total) {
   var el = document.getElementById("admin-memories-table");
   if (!items.length) {
-    el.innerHTML = '<div class="dashboard-empty">No memories found</div>';
+    setSafeHtml(el, '<div class="dashboard-empty">No memories found</div>');
     return;
   }
 
@@ -2417,7 +2446,7 @@ function _renderAdminMemories(items, total) {
       "</div>";
   }
 
-  el.innerHTML = html;
+  setSafeHtml(el, html);
 
   // Bind view buttons
   var viewBtns = el.querySelectorAll("[data-view-memory]");
@@ -2442,8 +2471,10 @@ function showMemoryDetailModal(memoryId) {
   _memDetailTrigger = document.activeElement;
   var ov = document.getElementById("memory-detail-overlay");
   ov.style.display = "flex";
-  document.getElementById("memory-detail-body").innerHTML =
-    '<div class="dashboard-empty">Loading…</div>';
+  setSafeHtml(
+    document.getElementById("memory-detail-body"),
+    '<div class="dashboard-empty">Loading…</div>',
+  );
 
   // Disable delete button and clear stale handler while loading
   var delBtn = document.getElementById("mem-detail-delete");
@@ -2499,7 +2530,7 @@ function showMemoryDetailModal(memoryId) {
         escapeHtml(m.content) +
         "</pre>";
 
-      document.getElementById("memory-detail-body").innerHTML = html;
+      setSafeHtml(document.getElementById("memory-detail-body"), html);
 
       // Wire delete button now that data is loaded
       delBtn.disabled = false;
@@ -2508,8 +2539,10 @@ function showMemoryDetailModal(memoryId) {
       };
     })
     .catch(function () {
-      document.getElementById("memory-detail-body").innerHTML =
-        '<div class="dashboard-empty">Failed to load memory</div>';
+      setSafeHtml(
+        document.getElementById("memory-detail-body"),
+        '<div class="dashboard-empty">Failed to load memory</div>',
+      );
     });
 
   _memDetailTrap = _installTrap("memory-detail-overlay", "memory-detail-box");
@@ -2589,7 +2622,7 @@ function searchSkillDiscover() {
   _skillDiscoverQuery = q;
 
   var el = document.getElementById("skill-discover-results");
-  el.innerHTML = '<div class="dashboard-empty">Searching\u2026</div>';
+  setSafeHtml(el, '<div class="dashboard-empty">Searching\u2026</div>');
 
   var searchBtn = document.getElementById("skill-discover-search-btn");
   if (searchBtn) searchBtn.disabled = true;
@@ -2609,8 +2642,10 @@ function searchSkillDiscover() {
       _renderSkillDiscoverResults();
     })
     .catch(function (e) {
-      el.innerHTML =
-        '<div class="dashboard-empty">' + escapeHtml(e.message) + "</div>";
+      setSafeHtml(
+        el,
+        '<div class="dashboard-empty">' + escapeHtml(e.message) + "</div>",
+      );
     })
     .finally(function () {
       if (searchBtn) searchBtn.disabled = false;
@@ -2620,7 +2655,7 @@ function searchSkillDiscover() {
 function _renderSkillDiscoverResults() {
   var el = document.getElementById("skill-discover-results");
   if (!_skillDiscoverResults.length) {
-    el.innerHTML = '<div class="dashboard-empty">No skills found</div>';
+    setSafeHtml(el, '<div class="dashboard-empty">No skills found</div>');
     return;
   }
 
@@ -2705,7 +2740,7 @@ function _renderSkillDiscoverResults() {
       "</div></div>";
   }
 
-  el.innerHTML = html;
+  setSafeHtml(el, html);
 
   // Bind install handlers
   el.querySelectorAll("[data-skill-install]").forEach(function (btn) {
@@ -3215,9 +3250,6 @@ function loadJudgeTab() {
 }
 
 // -- Settings section -------------------------------------------------------
-// NOTE: innerHTML usage below is safe — all dynamic values are escaped via
-// escapeHtml before interpolation into the HTML string, and the
-// data originates from our own admin API (authenticated, same-origin).
 
 function loadJudgeSettings() {
   authFetch("/v1/api/admin/judge/settings")
@@ -3230,15 +3262,20 @@ function loadJudgeSettings() {
       renderJudgeSettings();
     })
     .catch(function () {
-      document.getElementById("judge-settings-container").innerHTML =
-        '<div class="dashboard-empty">Failed to load settings</div>';
+      setSafeHtml(
+        document.getElementById("judge-settings-container"),
+        '<div class="dashboard-empty">Failed to load settings</div>',
+      );
     });
 }
 
 function renderJudgeSettings() {
   var c = document.getElementById("judge-settings-container");
   if (!_judgeSettings.length) {
-    c.innerHTML = '<div class="dashboard-empty">No judge settings found</div>';
+    setSafeHtml(
+      c,
+      '<div class="dashboard-empty">No judge settings found</div>',
+    );
     return;
   }
   var html = "";
@@ -3250,63 +3287,61 @@ function renderJudgeSettings() {
     var currentVal = s.value;
     var isDefault = s.source === "default";
 
+    var eKey = escapeHtml(s.key);
     if (s.type === "bool") {
       // Toggle switch — same component used by the admin modals.
-      // ``onchange`` reads the box's new ``.checked`` and writes via
-      // saveJudgeSetting.  The ``.toggle-label`` is a static "Enabled"
-      // because the slider position is the truth — flipping the
-      // caption text on save round-tripped through reload, so the
-      // slider moved instantly while the caption lagged 50-300ms and
-      // looked broken.  ``aria-label`` carries the setting name so
-      // screen readers get the row context inline.
+      // The delegated change handler (wired after setSafeHtml below)
+      // reads ``data-judge-key`` and writes via saveJudgeSetting.  The
+      // ``.toggle-label`` is a static "Enabled" because the slider
+      // position is the truth — flipping the caption text on save
+      // round-tripped through reload, so the slider moved instantly
+      // while the caption lagged 50-300ms and looked broken.
+      // ``aria-label`` carries the setting name so screen readers get
+      // the row context inline.
       inputHtml =
         '<label class="toggle-switch toggle--flush">' +
-        '<input type="checkbox" data-key="' +
-        s.key +
+        '<input type="checkbox" data-judge-key="' +
+        eKey +
         '" aria-label="' +
         escapeHtml(shortKey) +
         '" ' +
         (currentVal ? "checked" : "") +
-        " onchange=\"saveJudgeSetting('" +
-        s.key +
-        "',this.checked)\">" +
+        ">" +
         '<span class="toggle-track" aria-hidden="true"></span>' +
         '<span class="toggle-label">Enabled</span></label>';
     } else if (s.type === "float") {
       inputHtml =
         '<div style="display:flex;gap:8px;align-items:center">' +
-        '<input type="number" step="0.01" data-key="' +
-        s.key +
+        '<input type="number" step="0.01" data-judge-key="' +
+        eKey +
         '" value="' +
         currentVal +
         '"' +
         (s.min_value != null ? ' min="' + s.min_value + '"' : "") +
         (s.max_value != null ? ' max="' + s.max_value + '"' : "") +
         ' style="width:100px;padding:4px 8px;background:var(--bg);border:1px solid var(--border-strong);color:var(--fg);border-radius:3px">' +
-        '<button class="admin-action-btn" onclick="saveJudgeSettingFromInput(\'' +
-        s.key +
-        "')\">Save</button></div>";
+        '<button class="admin-action-btn" data-judge-save-key="' +
+        eKey +
+        '">Save</button></div>';
     } else if (s.is_secret) {
       inputHtml =
         '<div style="display:flex;gap:8px;align-items:center">' +
-        '<input type="password" data-key="' +
-        s.key +
+        '<input type="password" data-judge-key="' +
+        eKey +
         '" value="' +
         escapeHtml(currentVal || "") +
         '" placeholder="(not set)"' +
         ' style="width:240px;padding:4px 8px;background:var(--bg);border:1px solid var(--border-strong);color:var(--fg);border-radius:3px">' +
-        '<button class="admin-action-btn" onclick="saveJudgeSettingFromInput(\'' +
-        s.key +
-        "')\">Save</button></div>";
+        '<button class="admin-action-btn" data-judge-save-key="' +
+        eKey +
+        '">Save</button></div>';
     } else if (shortKey === "model") {
       // Model picker: select from model definitions
       inputHtml =
         '<div style="display:flex;gap:8px;align-items:center">' +
-        '<select data-key="' +
-        s.key +
-        '" onchange="saveJudgeSetting(\'' +
-        s.key +
-        "',this.value)\"" +
+        '<select data-judge-key="' +
+        eKey +
+        '"' +
         ' style="width:240px;padding:4px 8px;background:var(--bg);border:1px solid var(--border-strong);color:var(--fg);border-radius:3px">' +
         '<option value="">(same as session)</option>';
       for (var m = 0; m < _judgeModelDefs.length; m++) {
@@ -3341,21 +3376,21 @@ function renderJudgeSettings() {
     } else {
       inputHtml =
         '<div style="display:flex;gap:8px;align-items:center">' +
-        '<input type="text" data-key="' +
-        s.key +
+        '<input type="text" data-judge-key="' +
+        eKey +
         '" value="' +
         escapeHtml(currentVal || "") +
         '"' +
         ' style="width:240px;padding:4px 8px;background:var(--bg);border:1px solid var(--border-strong);color:var(--fg);border-radius:3px">' +
-        '<button class="admin-action-btn" onclick="saveJudgeSettingFromInput(\'' +
-        s.key +
-        "')\">Save</button></div>";
+        '<button class="admin-action-btn" data-judge-save-key="' +
+        eKey +
+        '">Save</button></div>';
     }
 
     var resetBtn = !isDefault
-      ? ' <button class="admin-action-btn" style="font-size:11px;padding:2px 6px" onclick="resetJudgeSetting(\'' +
-        s.key +
-        "')\">Reset</button>"
+      ? ' <button class="admin-action-btn" style="font-size:11px;padding:2px 6px" data-judge-reset-key="' +
+        eKey +
+        '">Reset</button>'
       : "";
 
     html +=
@@ -3375,7 +3410,42 @@ function renderJudgeSettings() {
       inputHtml +
       "</div>";
   }
-  c.innerHTML = html;
+  setSafeHtml(c, html);
+
+  // Wire delegated handlers via data-* attributes — keys flow through
+  // setAttribute (escapeHtml'd in the HTML builder) and are read back
+  // via getAttribute, avoiding the prior ``onclick="..._('KEY')"``
+  // pattern that embedded a JS-string inside an HTML-attribute and
+  // would break out if a key ever contained an apostrophe.  Bool +
+  // select inputs auto-save on change; text/number/password inputs
+  // are paired with an explicit Save button (no per-keystroke save).
+  var inputs = c.querySelectorAll("[data-judge-key]");
+  for (var ii = 0; ii < inputs.length; ii++) {
+    var inp = inputs[ii];
+    if (inp.type === "checkbox") {
+      inp.addEventListener("change", function () {
+        saveJudgeSetting(this.getAttribute("data-judge-key"), this.checked);
+      });
+    } else if (inp.tagName === "SELECT") {
+      inp.addEventListener("change", function () {
+        saveJudgeSetting(this.getAttribute("data-judge-key"), this.value);
+      });
+    }
+    // text/number/password: no auto-save listener — the adjacent Save
+    // button (data-judge-save-key) is the commit gesture.
+  }
+  var saveBtns = c.querySelectorAll("[data-judge-save-key]");
+  for (var sb = 0; sb < saveBtns.length; sb++) {
+    saveBtns[sb].addEventListener("click", function () {
+      saveJudgeSettingFromInput(this.getAttribute("data-judge-save-key"));
+    });
+  }
+  var resetBtns = c.querySelectorAll("[data-judge-reset-key]");
+  for (var rb = 0; rb < resetBtns.length; rb++) {
+    resetBtns[rb].addEventListener("click", function () {
+      resetJudgeSetting(this.getAttribute("data-judge-reset-key"));
+    });
+  }
 }
 
 function saveJudgeSetting(key, value) {
@@ -3401,7 +3471,13 @@ function saveJudgeSetting(key, value) {
 }
 
 function saveJudgeSettingFromInput(key) {
-  var input = document.querySelector('[data-key="' + key + '"]');
+  // ``cssEscape`` (shared/utils.js) defends against keys that contain
+  // CSS attribute-selector metacharacters (``"``, ``\``).  Keys today
+  // come from a static server-side registry without those chars, but
+  // the helper is cheap and makes the selector future-proof.
+  var input = document.querySelector(
+    '[data-judge-key="' + cssEscape(key) + '"]',
+  );
   if (!input) return;
   saveJudgeSetting(key, input.value);
 }
@@ -3439,15 +3515,17 @@ function loadJudgeHeuristicRules() {
       renderHeuristicRules();
     })
     .catch(function () {
-      document.getElementById("judge-heuristic-table-container").innerHTML =
-        '<div class="dashboard-empty">Failed to load rules</div>';
+      setSafeHtml(
+        document.getElementById("judge-heuristic-table-container"),
+        '<div class="dashboard-empty">Failed to load rules</div>',
+      );
     });
 }
 
 function renderHeuristicRules() {
   var c = document.getElementById("judge-heuristic-table-container");
   if (!_judgeHeuristicRules.length) {
-    c.innerHTML = '<div class="dashboard-empty">No rules found</div>';
+    setSafeHtml(c, '<div class="dashboard-empty">No rules found</div>');
     return;
   }
   var html = "";
@@ -3464,7 +3542,6 @@ function renderHeuristicRules() {
     var statusBadge = r.enabled
       ? '<span class="scope-badge scope-scan-safe">active</span>'
       : '<span class="scope-badge scope-deny">disabled</span>';
-    // Note: all dynamic values are escaped via escapeHtml() — safe for innerHTML
     var actions = "";
     var eName = escapeHtml(r.name);
     if (!r.rule_id) {
@@ -3556,7 +3633,7 @@ function renderHeuristicRules() {
       actions +
       "</span></div>";
   }
-  c.innerHTML = html;
+  setSafeHtml(c, html);
   // Bind data-attribute event handlers
   c.querySelectorAll("[data-disable-builtin-hr]").forEach(function (btn) {
     btn.addEventListener("click", function () {
@@ -3955,15 +4032,17 @@ function loadJudgeOGPatterns() {
       renderOGPatterns();
     })
     .catch(function () {
-      document.getElementById("judge-og-table-container").innerHTML =
-        '<div class="dashboard-empty">Failed to load patterns</div>';
+      setSafeHtml(
+        document.getElementById("judge-og-table-container"),
+        '<div class="dashboard-empty">Failed to load patterns</div>',
+      );
     });
 }
 
 function renderOGPatterns() {
   var c = document.getElementById("judge-og-table-container");
   if (!_judgeOGPatterns.length) {
-    c.innerHTML = '<div class="dashboard-empty">No patterns found</div>';
+    setSafeHtml(c, '<div class="dashboard-empty">No patterns found</div>');
     return;
   }
   var html = "";
@@ -3980,7 +4059,6 @@ function renderOGPatterns() {
     var statusBadge = p.enabled
       ? '<span class="scope-badge scope-scan-safe">active</span>'
       : '<span class="scope-badge scope-deny">disabled</span>';
-    // Note: all dynamic values are escaped via escapeHtml() — safe for innerHTML
     var actions = "";
     var eName = escapeHtml(p.name);
     if (!p.pattern_id) {
@@ -4069,7 +4147,7 @@ function renderOGPatterns() {
       actions +
       "</span></div>";
   }
-  c.innerHTML = html;
+  setSafeHtml(c, html);
   // Bind data-attribute event handlers
   c.querySelectorAll("[data-disable-builtin-ogp]").forEach(function (btn) {
     btn.addEventListener("click", function () {
