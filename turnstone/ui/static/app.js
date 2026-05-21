@@ -9,31 +9,532 @@
 
 var _paneCounter = 0;
 
-function Pane(wsId) {
-  this.id = "p" + ++_paneCounter;
-  this.wsId = wsId || null;
-  this.evtSource = null;
-  this.el = null;
-  this.headerEl = null;
-  this.messagesEl = null;
-  this.inputEl = null;
-  this.sendBtn = null;
-  this.stopBtn = null;
-  this.currentAssistantEl = null;
-  this.currentReasoningEl = null;
-  this.contentBuffer = "";
-  this.busy = false;
-  this.isThinking = false;
-  this.pendingApproval = false;
-  this.approvalBlockEl = null;
-  this.retryDelay = 1000;
-  this.model = "";
-  this.modelAlias = "";
-  this._lastStatusEvt = null;
-  this._cancelTimeout = null;
-  this._forceTimeout = null;
-  this._pendingEditSend = null;
-  this._createDOM();
+class Pane {
+  constructor(wsId) {
+    this.id = "p" + ++_paneCounter;
+    this.wsId = wsId || null;
+    this.evtSource = null;
+    this.el = null;
+    this.headerEl = null;
+    this.messagesEl = null;
+    this.inputEl = null;
+    this.sendBtn = null;
+    this.stopBtn = null;
+    this.currentAssistantEl = null;
+    this.currentReasoningEl = null;
+    this.contentBuffer = "";
+    this.busy = false;
+    this.isThinking = false;
+    this.pendingApproval = false;
+    this.approvalBlockEl = null;
+    this.retryDelay = 1000;
+    this.model = "";
+    this.modelAlias = "";
+    this._lastStatusEvt = null;
+    this._cancelTimeout = null;
+    this._forceTimeout = null;
+    this._pendingEditSend = null;
+    this._createDOM();
+  }
+
+  reset() {
+    this.currentAssistantEl = null;
+    this.currentReasoningEl = null;
+    this.contentBuffer = "";
+    this.setBusy(false);
+    this.pendingApproval = false;
+    this.approvalBlockEl = null;
+    this._pendingEditSend = null;
+    this.inputEl.disabled = false;
+    this.attachments.clearChips();
+  }
+
+  updateWsName() {
+    var nameEl = this.headerEl.querySelector(".pane-ws-name");
+    if (nameEl) {
+      nameEl.textContent = this.wsId
+        ? (workstreams[this.wsId] && workstreams[this.wsId].name) ||
+          this.wsId.substring(0, 8)
+        : "";
+    }
+  }
+
+  disconnectSSE() {
+    if (this._cancelTimeout) {
+      clearTimeout(this._cancelTimeout);
+      this._cancelTimeout = null;
+    }
+    if (this._forceTimeout) {
+      clearTimeout(this._forceTimeout);
+      this._forceTimeout = null;
+    }
+    if (this.evtSource) {
+      this.evtSource.close();
+      this.evtSource = null;
+    }
+  }
+
+  // composer.setBusy runs unconditionally so the Stop button label /
+  // dataset.forceCancel / placeholder stay canonical even on a redundant
+  // call (Pane.reset() and any future caller relies on that idempotent
+  // reset). queue.onIdleEdge runs only on the actual edge — it carries
+  // the heavier work (querySelectorAll-driven promote sweep + cancel-
+  // timer cleanup wired via the queue's onIdle hook).
+  setBusy(b) {
+    var next = !!b;
+    this.composer.setBusy(next);
+    this.messagesEl.dataset.busy = next ? "true" : "false";
+    var edge = next !== this.busy;
+    this.busy = next;
+    if (edge && !next) this.queue.onIdleEdge();
+  }
+
+  showEmptyState() {
+    if (!this.messagesEl.querySelector(".empty-state")) {
+      var el = document.createElement("div");
+      el.className = "empty-state";
+      el.textContent = "Type a message to start";
+      this.messagesEl.appendChild(el);
+    }
+  }
+
+  removeEmptyState() {
+    var el = this.messagesEl.querySelector(".empty-state");
+    if (el) el.remove();
+  }
+
+  addThinkingIndicator() {
+    if (this.messagesEl.querySelector(".thinking-indicator")) return;
+    var el = document.createElement("div");
+    el.className = "thinking-indicator";
+    el.textContent = "Thinking";
+    this.messagesEl.appendChild(el);
+    this.scrollToBottom();
+  }
+
+  removeThinkingIndicator() {
+    var el = this.messagesEl.querySelector(".thinking-indicator");
+    if (el) el.remove();
+  }
+
+  addSystemNudgeMarker() {
+    // Thin .msg.user.system-nudge marker rendered as the anchor for
+    // wake-driven reminder bubbles.  Replaces the previously-invisible
+    // synthetic empty user turn with a visible-but-subtle DOM element so
+    // the bubble below it lands in the right place even when the wake
+    // fires long after the user's last real message.
+    this.removeEmptyState();
+    var el = document.createElement("div");
+    el.className = "msg user system-nudge";
+    el.setAttribute("data-source", "system_nudge");
+    el.setAttribute("aria-label", "system nudge");
+    el.textContent = "system nudge";
+    this.messagesEl.appendChild(el);
+    return el;
+  }
+
+  addUserReminder(reminders, source) {
+    // Render each metacognitive reminder as its own bubble immediately
+    // BELOW the user message it advises — semantically the reminder is
+    // a hint to the model right before the assistant turn.  Always
+    // called AFTER the corresponding addUserMessage (live: optimistic
+    // local render ran before the SSE event arrived; replay:
+    // replayHistory renders the user message first), so "most recent
+    // .msg.user" is always THIS turn's bubble — insertAdjacentElement
+    // afterend drops the reminder directly below it.  When no .msg.user
+    // exists at all (e.g. a non-originating tab receiving a reminder
+    // before any user turn has rendered) we append; the next /history
+    // reload corrects any anchor anomaly.
+    //
+    // ``source === "system_nudge"`` is the wake-driven case: render
+    // a thin .msg.user.system-nudge marker first and anchor below it.
+    // ``watch_triggered`` reminders branch off into a structured
+    // .msg.watch-result card.
+    this.removeEmptyState();
+    var anchor;
+    if (source === "system_nudge") {
+      anchor = this.addSystemNudgeMarker();
+    } else {
+      var userBubbles = this.messagesEl.querySelectorAll(
+        ".msg.user:not(.system-nudge)",
+      );
+      anchor = userBubbles.length ? userBubbles[userBubbles.length - 1] : null;
+    }
+    for (var i = 0; i < reminders.length; i++) {
+      var r = reminders[i] || {};
+      var el =
+        r.type === "watch_triggered"
+          ? _buildWatchResultBubble(r)
+          : _buildDefaultReminderBubble(r);
+      if (anchor) {
+        anchor.insertAdjacentElement("afterend", el);
+        // Anchor advances so multiple reminders stack below the user
+        // message in queued order (rather than each landing
+        // immediately-after the user msg, which would reverse them).
+        anchor = el;
+      } else {
+        this.messagesEl.appendChild(el);
+      }
+    }
+    this.scrollToBottom(true);
+  }
+
+  addToolReminder(reminders, toolCallId) {
+    // Render each metacognitive tool-channel reminder (tool_error /
+    // repeat) as the same yellow themed bubble used for user-channel
+    // reminders, anchored below the .ts-approval block that produced
+    // the tool result.  toolCallId is the live-path anchor (SSE event
+    // carries it); during replay it's an empty string and we fall back
+    // to "last .ts-approval block in messagesEl", which is correct
+    // because messages render in order — the assistant block carrying
+    // the tool batch is always the most recent approval block by the
+    // time we hit the tool message that owns the reminder.  Tool-channel
+    // reminders also branch on r.type so a watch_triggered drained at
+    // the tool seam (channel="any") renders the structured card.
+    this.removeEmptyState();
+    var anchor = null;
+    if (toolCallId) {
+      var escapedId = CSS.escape(toolCallId);
+      var toolEl = this.messagesEl.querySelector(
+        '.ts-approval-tool[data-call-id="' + escapedId + '"]',
+      );
+      if (toolEl) {
+        anchor = toolEl.closest(".ts-approval");
+      }
+    }
+    if (!anchor) {
+      var blocks = this.messagesEl.querySelectorAll(".ts-approval");
+      if (blocks.length) anchor = blocks[blocks.length - 1];
+    }
+    for (var i = 0; i < reminders.length; i++) {
+      var r = reminders[i] || {};
+      var el =
+        r.type === "watch_triggered"
+          ? _buildWatchResultBubble(r)
+          : _buildDefaultReminderBubble(r);
+      if (anchor) {
+        anchor.insertAdjacentElement("afterend", el);
+        anchor = el;
+      } else {
+        this.messagesEl.appendChild(el);
+      }
+    }
+    this.scrollToBottom(true);
+  }
+
+  addUserMessage(text, attachments) {
+    this.removeEmptyState();
+    var el = document.createElement("div");
+    el.className = "msg user";
+    var textEl = document.createElement("div");
+    textEl.className = "msg-user-text";
+    textEl.textContent = text;
+    el.appendChild(textEl);
+    if (Array.isArray(attachments) && attachments.length > 0) {
+      var pills = document.createElement("div");
+      pills.className = "msg-user-attach";
+      attachments.forEach(function (a) {
+        var pill = document.createElement("span");
+        pill.className =
+          "msg-user-attach-pill msg-user-attach-pill-" + (a.kind || "other");
+        var icon = document.createElement("span");
+        icon.className = "msg-user-attach-icon";
+        icon.setAttribute("aria-hidden", "true");
+        icon.textContent = a.kind === "image" ? "\ud83d\uddbc" : "\ud83d\udcc4";
+        pill.appendChild(icon);
+        var nameEl = document.createElement("span");
+        nameEl.className = "msg-user-attach-name";
+        nameEl.textContent =
+          a.filename || (a.kind === "image" ? "image" : "document");
+        pill.appendChild(nameEl);
+        pills.appendChild(pill);
+      });
+      el.appendChild(pills);
+    }
+    this._addUserMsgActions(el, text);
+    this.messagesEl.appendChild(el);
+    this.scrollToBottom(true);
+  }
+
+  getFeedback() {
+    if (!this.approvalBlockEl) return null;
+    var inp = this.approvalBlockEl.querySelector(".ts-approval-feedback");
+    return inp && inp.value.trim() ? inp.value.trim() : null;
+  }
+
+  appendToolOutputChunk(callId, chunk) {
+    if (!chunk) return;
+    var stripped = stripAnsi(chunk);
+    if (!stripped) return;
+
+    var escapedId = callId ? CSS.escape(callId) : "";
+    var el = escapedId
+      ? this.messagesEl.querySelector(
+          '.tool-output-stream[data-call-id="' + escapedId + '"]',
+        )
+      : null;
+    if (!el) {
+      var target = escapedId
+        ? this.messagesEl.querySelector(
+            '.ts-approval-tool[data-call-id="' + escapedId + '"]',
+          )
+        : null;
+      if (!target) {
+        var blocks = this.messagesEl.querySelectorAll(".ts-approval");
+        if (!blocks.length) return;
+        var block = blocks[blocks.length - 1];
+        var tools = block.querySelectorAll(
+          '.ts-approval-tool[data-func-name="bash"]',
+        );
+        target = tools.length ? tools[tools.length - 1] : null;
+        if (!target) {
+          var allTools = block.querySelectorAll(".ts-approval-tool");
+          target = allTools.length ? allTools[allTools.length - 1] : null;
+        }
+      }
+      if (!target) return;
+
+      el = document.createElement("pre");
+      el.className = "tool-output tool-output-stream";
+      el.dataset.callId = callId;
+      el.setAttribute("aria-label", "Streaming command output");
+      el.setAttribute("aria-live", "off");
+      el.textContent = "";
+      target.after(el);
+    }
+
+    el.appendChild(document.createTextNode(stripped));
+    el.scrollTop = el.scrollHeight;
+    this.scrollToBottom();
+  }
+
+  showOutputWarning(evt) {
+    if (!evt.call_id || evt.risk_level === "none") return;
+    var escapedId = CSS.escape(evt.call_id);
+    var toolDiv = this.messagesEl.querySelector(
+      '.ts-approval-tool[data-call-id="' + escapedId + '"]',
+    );
+    if (!toolDiv) return;
+    // Shared DOM-builder with replayHistory \u2014 single source of truth for
+    // role / class / escape semantics.  Argument shape mirrors the
+    // server-side output_assessment dict (risk_level / flags / redacted).
+    var warning = _buildOutputWarningEl({
+      risk_level: evt.risk_level,
+      flags: evt.flags,
+      redacted: evt.redacted,
+    });
+    var nextEl = toolDiv.nextElementSibling;
+    if (nextEl && nextEl.classList.contains("tool-output")) {
+      nextEl.insertAdjacentElement("afterend", warning);
+    } else {
+      toolDiv.insertAdjacentElement("afterend", warning);
+    }
+  }
+
+  updateVerdictBadge(verdict) {
+    if (!verdict || !verdict.call_id) return;
+    var escapedId = CSS.escape(verdict.call_id);
+    var badge = this.messagesEl.querySelector(
+      '.verdict-badge[data-call-id="' + escapedId + '"]',
+    );
+    if (!badge) {
+      // Badge no longer in DOM (tool block replaced by output) — show
+      // a toast so the user still sees the late-arriving verdict.
+      var conf = Math.round((verdict.confidence || 0) * 100);
+      var rec = verdict.recommendation || "review";
+      var func = verdict.func_name || "";
+      showToast(
+        "Judge verdict for " + func + ": " + rec + " (" + conf + "%)",
+        rec === "approve" ? "success" : rec === "deny" ? "error" : "warning",
+      );
+      return;
+    }
+
+    var risk = verdict.risk_level || "medium";
+    badge.className = "verdict-badge verdict-" + risk + " ts-verdict-badge";
+    badge.setAttribute("data-risk", risk);
+
+    var riskEl = badge.querySelector(".verdict-risk");
+    var recEl = badge.querySelector(".verdict-rec");
+    var confEl = badge.querySelector(".verdict-conf");
+    if (riskEl) riskEl.textContent = risk.toUpperCase();
+    if (recEl) recEl.textContent = verdict.recommendation || "review";
+    if (confEl)
+      confEl.textContent = Math.round((verdict.confidence || 0) * 100) + "%";
+
+    var spinner = badge.querySelector(".verdict-judge-spinner");
+    if (spinner) spinner.remove();
+
+    var detail = badge.nextElementSibling;
+    if (detail && detail.classList.contains("verdict-detail")) {
+      var summaryEl = detail.querySelector(".verdict-summary");
+      var reasonEl = detail.querySelector(".verdict-reasoning");
+      var tierEl = detail.querySelector(".verdict-tier");
+      if (summaryEl) summaryEl.textContent = verdict.intent_summary || "";
+      if (reasonEl) reasonEl.textContent = verdict.reasoning || "";
+      if (tierEl)
+        tierEl.textContent =
+          (verdict.tier || "llm") +
+          " tier" +
+          (verdict.judge_model ? " | " + verdict.judge_model : "");
+      var evidenceEl = detail.querySelector(".verdict-evidence");
+      if (verdict.evidence && verdict.evidence.length) {
+        if (!evidenceEl) {
+          evidenceEl = document.createElement("div");
+          evidenceEl.className = "verdict-evidence";
+          var tierDiv = detail.querySelector(".verdict-tier");
+          if (tierDiv) detail.insertBefore(evidenceEl, tierDiv);
+          else detail.appendChild(evidenceEl);
+        }
+        evidenceEl.replaceChildren(
+          ...verdict.evidence.map(function (e) {
+            var div = document.createElement("div");
+            div.textContent = "\u2022 " + e;
+            return div;
+          }),
+        );
+      } else if (evidenceEl) {
+        evidenceEl.remove();
+      }
+    }
+
+    this.updateVerdictGlow(verdict.recommendation);
+  }
+
+  updateVerdictGlow(recommendation) {
+    if (!this.approvalBlockEl) return;
+    var prompt = this.approvalBlockEl.querySelector(".ts-approval-body");
+    if (!prompt) return;
+
+    // Collect all verdict badges currently visible in this approval block
+    var badges = this.approvalBlockEl.querySelectorAll(".verdict-badge");
+    var worst = recommendation;
+    for (var i = 0; i < badges.length; i++) {
+      var recEl = badges[i].querySelector(".verdict-rec");
+      if (recEl) {
+        var r = recEl.textContent;
+        if (r === "deny") {
+          worst = "deny";
+          break;
+        }
+        if (r === "review" && worst !== "deny") worst = "review";
+      }
+    }
+
+    prompt.classList.remove(
+      "ts-verdict-glow--approve",
+      "ts-verdict-glow--deny",
+      "ts-verdict-glow--review",
+    );
+    if (worst === "approve") prompt.classList.add("ts-verdict-glow--approve");
+    else if (worst === "deny") prompt.classList.add("ts-verdict-glow--deny");
+    else prompt.classList.add("ts-verdict-glow--review");
+  }
+
+  addInfoMessage(text) {
+    var el = document.createElement("div");
+    el.className = "msg info";
+    el.textContent = stripAnsi(text);
+    this.messagesEl.appendChild(el);
+    this.scrollToBottom();
+  }
+
+  addErrorMessage(text) {
+    var el = document.createElement("div");
+    el.className = "msg error";
+    el.setAttribute("role", "alert");
+    el.textContent = stripAnsi(text);
+    this.messagesEl.appendChild(el);
+    this.scrollToBottom();
+  }
+
+  updateStatus(evt) {
+    StatusBar.paint(
+      {
+        rootEl: this.statusBarEl,
+        modelEl: this._sbModel,
+        tokensEl: this._sbTokens,
+        toolsEl: this._sbTools,
+        turnsEl: this._sbTurns,
+      },
+      evt,
+      { alias: this.modelAlias, model: this.model },
+    );
+    this._lastStatusEvt = evt;
+  }
+
+  isNearBottom() {
+    return (
+      this.messagesEl.scrollHeight -
+        this.messagesEl.scrollTop -
+        this.messagesEl.clientHeight <
+      80
+    );
+  }
+
+  scrollToBottom(force) {
+    if (force || this.isNearBottom()) {
+      this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
+    }
+  }
+}
+
+// Build a structured ``.msg.watch-result`` card for a
+// ``watch_triggered`` reminder — full-width treatment with command
+// preview header + shell output body + poll counter footer.  Mirrors
+// the coordinator pane's buildWatchResultBubble; first-pass functional
+// rendering only.  All text goes through textContent so shell output
+// containing angle brackets / scripts / steering bytes renders inertly.
+function _buildWatchResultBubble(r) {
+  var el = document.createElement("div");
+  el.className = "msg watch-result";
+  el.setAttribute("role", "article");
+  el.setAttribute("data-ts-role", "watch");
+  el.setAttribute("aria-label", "watch");
+  var header = document.createElement("div");
+  header.className = "msg-watch-header";
+  header.textContent =
+    "watch" + (r.watch_name ? " · " + String(r.watch_name) : "");
+  el.appendChild(header);
+  if (r.command) {
+    var cmd = document.createElement("div");
+    cmd.className = "msg-watch-cmd";
+    cmd.textContent = "$ " + String(r.command);
+    el.appendChild(cmd);
+  }
+  var body = document.createElement("pre");
+  body.className = "msg-watch-body";
+  body.textContent = r.text || "";
+  el.appendChild(body);
+  if (r.poll_count != null && r.max_polls != null) {
+    var footer = document.createElement("div");
+    footer.className = "msg-watch-footer";
+    var finalSuffix = r.is_final ? " · final" : "";
+    footer.textContent =
+      "poll " + String(r.poll_count) + "/" + String(r.max_polls) + finalSuffix;
+    el.appendChild(footer);
+  }
+  return el;
+}
+
+// Default ``.msg.user-reminder`` bubble — yellow themed advisory used
+// for every metacog nudge other than ``watch_triggered``.
+function _buildDefaultReminderBubble(r) {
+  var el = document.createElement("div");
+  el.className = "msg user-reminder";
+  var body = document.createElement("div");
+  body.className = "msg-body";
+  var labelEl = document.createElement("span");
+  labelEl.className = "msg-user-reminder-label";
+  labelEl.textContent =
+    "metacognition" + (r.type ? " · " + String(r.type) : "");
+  var textEl = document.createElement("span");
+  textEl.className = "msg-user-reminder-text";
+  textEl.textContent = r.text || "";
+  body.appendChild(labelEl);
+  body.appendChild(textEl);
+  el.appendChild(body);
+  return el;
 }
 
 Pane.prototype._createDOM = function () {
@@ -223,72 +724,6 @@ Pane.prototype._createDOM = function () {
       }
     },
   });
-};
-
-Pane.prototype.reset = function () {
-  this.currentAssistantEl = null;
-  this.currentReasoningEl = null;
-  this.contentBuffer = "";
-  this.setBusy(false);
-  this.pendingApproval = false;
-  this.approvalBlockEl = null;
-  this._pendingEditSend = null;
-  this.inputEl.disabled = false;
-  this.attachments.clearChips();
-};
-
-Pane.prototype.updateWsName = function () {
-  var nameEl = this.headerEl.querySelector(".pane-ws-name");
-  if (nameEl) {
-    nameEl.textContent = this.wsId
-      ? (workstreams[this.wsId] && workstreams[this.wsId].name) ||
-        this.wsId.substring(0, 8)
-      : "";
-  }
-};
-
-Pane.prototype.disconnectSSE = function () {
-  if (this._cancelTimeout) {
-    clearTimeout(this._cancelTimeout);
-    this._cancelTimeout = null;
-  }
-  if (this._forceTimeout) {
-    clearTimeout(this._forceTimeout);
-    this._forceTimeout = null;
-  }
-  if (this.evtSource) {
-    this.evtSource.close();
-    this.evtSource = null;
-  }
-};
-
-// composer.setBusy runs unconditionally so the Stop button label /
-// dataset.forceCancel / placeholder stay canonical even on a redundant
-// call (Pane.reset() and any future caller relies on that idempotent
-// reset). queue.onIdleEdge runs only on the actual edge — it carries
-// the heavier work (querySelectorAll-driven promote sweep + cancel-
-// timer cleanup wired via the queue's onIdle hook).
-Pane.prototype.setBusy = function (b) {
-  var next = !!b;
-  this.composer.setBusy(next);
-  this.messagesEl.dataset.busy = next ? "true" : "false";
-  var edge = next !== this.busy;
-  this.busy = next;
-  if (edge && !next) this.queue.onIdleEdge();
-};
-
-Pane.prototype.showEmptyState = function () {
-  if (!this.messagesEl.querySelector(".empty-state")) {
-    var el = document.createElement("div");
-    el.className = "empty-state";
-    el.textContent = "Type a message to start";
-    this.messagesEl.appendChild(el);
-  }
-};
-
-Pane.prototype.removeEmptyState = function () {
-  var el = this.messagesEl.querySelector(".empty-state");
-  if (el) el.remove();
 };
 
 Pane.prototype.connectSSE = function (wsId) {
@@ -737,217 +1172,6 @@ Pane.prototype.handleEvent = function (evt) {
       this.messagesEl.replaceChildren();
       break;
   }
-};
-
-Pane.prototype.addThinkingIndicator = function () {
-  if (this.messagesEl.querySelector(".thinking-indicator")) return;
-  var el = document.createElement("div");
-  el.className = "thinking-indicator";
-  el.textContent = "Thinking";
-  this.messagesEl.appendChild(el);
-  this.scrollToBottom();
-};
-
-Pane.prototype.removeThinkingIndicator = function () {
-  var el = this.messagesEl.querySelector(".thinking-indicator");
-  if (el) el.remove();
-};
-
-// Build a structured ``.msg.watch-result`` card for a
-// ``watch_triggered`` reminder — full-width treatment with command
-// preview header + shell output body + poll counter footer.  Mirrors
-// the coordinator pane's buildWatchResultBubble; first-pass functional
-// rendering only.  All text goes through textContent so shell output
-// containing angle brackets / scripts / steering bytes renders inertly.
-function _buildWatchResultBubble(r) {
-  var el = document.createElement("div");
-  el.className = "msg watch-result";
-  el.setAttribute("role", "article");
-  el.setAttribute("data-ts-role", "watch");
-  el.setAttribute("aria-label", "watch");
-  var header = document.createElement("div");
-  header.className = "msg-watch-header";
-  header.textContent =
-    "watch" + (r.watch_name ? " · " + String(r.watch_name) : "");
-  el.appendChild(header);
-  if (r.command) {
-    var cmd = document.createElement("div");
-    cmd.className = "msg-watch-cmd";
-    cmd.textContent = "$ " + String(r.command);
-    el.appendChild(cmd);
-  }
-  var body = document.createElement("pre");
-  body.className = "msg-watch-body";
-  body.textContent = r.text || "";
-  el.appendChild(body);
-  if (r.poll_count != null && r.max_polls != null) {
-    var footer = document.createElement("div");
-    footer.className = "msg-watch-footer";
-    var finalSuffix = r.is_final ? " · final" : "";
-    footer.textContent =
-      "poll " + String(r.poll_count) + "/" + String(r.max_polls) + finalSuffix;
-    el.appendChild(footer);
-  }
-  return el;
-}
-
-// Default ``.msg.user-reminder`` bubble — yellow themed advisory used
-// for every metacog nudge other than ``watch_triggered``.
-function _buildDefaultReminderBubble(r) {
-  var el = document.createElement("div");
-  el.className = "msg user-reminder";
-  var body = document.createElement("div");
-  body.className = "msg-body";
-  var labelEl = document.createElement("span");
-  labelEl.className = "msg-user-reminder-label";
-  labelEl.textContent =
-    "metacognition" + (r.type ? " · " + String(r.type) : "");
-  var textEl = document.createElement("span");
-  textEl.className = "msg-user-reminder-text";
-  textEl.textContent = r.text || "";
-  body.appendChild(labelEl);
-  body.appendChild(textEl);
-  el.appendChild(body);
-  return el;
-}
-
-Pane.prototype.addSystemNudgeMarker = function () {
-  // Thin .msg.user.system-nudge marker rendered as the anchor for
-  // wake-driven reminder bubbles.  Replaces the previously-invisible
-  // synthetic empty user turn with a visible-but-subtle DOM element so
-  // the bubble below it lands in the right place even when the wake
-  // fires long after the user's last real message.
-  this.removeEmptyState();
-  var el = document.createElement("div");
-  el.className = "msg user system-nudge";
-  el.setAttribute("data-source", "system_nudge");
-  el.setAttribute("aria-label", "system nudge");
-  el.textContent = "system nudge";
-  this.messagesEl.appendChild(el);
-  return el;
-};
-
-Pane.prototype.addUserReminder = function (reminders, source) {
-  // Render each metacognitive reminder as its own bubble immediately
-  // BELOW the user message it advises — semantically the reminder is
-  // a hint to the model right before the assistant turn.  Always
-  // called AFTER the corresponding addUserMessage (live: optimistic
-  // local render ran before the SSE event arrived; replay:
-  // replayHistory renders the user message first), so "most recent
-  // .msg.user" is always THIS turn's bubble — insertAdjacentElement
-  // afterend drops the reminder directly below it.  When no .msg.user
-  // exists at all (e.g. a non-originating tab receiving a reminder
-  // before any user turn has rendered) we append; the next /history
-  // reload corrects any anchor anomaly.
-  //
-  // ``source === "system_nudge"`` is the wake-driven case: render
-  // a thin .msg.user.system-nudge marker first and anchor below it.
-  // ``watch_triggered`` reminders branch off into a structured
-  // .msg.watch-result card.
-  this.removeEmptyState();
-  var anchor;
-  if (source === "system_nudge") {
-    anchor = this.addSystemNudgeMarker();
-  } else {
-    var userBubbles = this.messagesEl.querySelectorAll(
-      ".msg.user:not(.system-nudge)",
-    );
-    anchor = userBubbles.length ? userBubbles[userBubbles.length - 1] : null;
-  }
-  for (var i = 0; i < reminders.length; i++) {
-    var r = reminders[i] || {};
-    var el =
-      r.type === "watch_triggered"
-        ? _buildWatchResultBubble(r)
-        : _buildDefaultReminderBubble(r);
-    if (anchor) {
-      anchor.insertAdjacentElement("afterend", el);
-      // Anchor advances so multiple reminders stack below the user
-      // message in queued order (rather than each landing
-      // immediately-after the user msg, which would reverse them).
-      anchor = el;
-    } else {
-      this.messagesEl.appendChild(el);
-    }
-  }
-  this.scrollToBottom(true);
-};
-
-Pane.prototype.addToolReminder = function (reminders, toolCallId) {
-  // Render each metacognitive tool-channel reminder (tool_error /
-  // repeat) as the same yellow themed bubble used for user-channel
-  // reminders, anchored below the .ts-approval block that produced
-  // the tool result.  toolCallId is the live-path anchor (SSE event
-  // carries it); during replay it's an empty string and we fall back
-  // to "last .ts-approval block in messagesEl", which is correct
-  // because messages render in order — the assistant block carrying
-  // the tool batch is always the most recent approval block by the
-  // time we hit the tool message that owns the reminder.  Tool-channel
-  // reminders also branch on r.type so a watch_triggered drained at
-  // the tool seam (channel="any") renders the structured card.
-  this.removeEmptyState();
-  var anchor = null;
-  if (toolCallId) {
-    var escapedId = CSS.escape(toolCallId);
-    var toolEl = this.messagesEl.querySelector(
-      '.ts-approval-tool[data-call-id="' + escapedId + '"]',
-    );
-    if (toolEl) {
-      anchor = toolEl.closest(".ts-approval");
-    }
-  }
-  if (!anchor) {
-    var blocks = this.messagesEl.querySelectorAll(".ts-approval");
-    if (blocks.length) anchor = blocks[blocks.length - 1];
-  }
-  for (var i = 0; i < reminders.length; i++) {
-    var r = reminders[i] || {};
-    var el =
-      r.type === "watch_triggered"
-        ? _buildWatchResultBubble(r)
-        : _buildDefaultReminderBubble(r);
-    if (anchor) {
-      anchor.insertAdjacentElement("afterend", el);
-      anchor = el;
-    } else {
-      this.messagesEl.appendChild(el);
-    }
-  }
-  this.scrollToBottom(true);
-};
-
-Pane.prototype.addUserMessage = function (text, attachments) {
-  this.removeEmptyState();
-  var el = document.createElement("div");
-  el.className = "msg user";
-  var textEl = document.createElement("div");
-  textEl.className = "msg-user-text";
-  textEl.textContent = text;
-  el.appendChild(textEl);
-  if (Array.isArray(attachments) && attachments.length > 0) {
-    var pills = document.createElement("div");
-    pills.className = "msg-user-attach";
-    attachments.forEach(function (a) {
-      var pill = document.createElement("span");
-      pill.className =
-        "msg-user-attach-pill msg-user-attach-pill-" + (a.kind || "other");
-      var icon = document.createElement("span");
-      icon.className = "msg-user-attach-icon";
-      icon.setAttribute("aria-hidden", "true");
-      icon.textContent = a.kind === "image" ? "\ud83d\uddbc" : "\ud83d\udcc4";
-      pill.appendChild(icon);
-      var nameEl = document.createElement("span");
-      nameEl.className = "msg-user-attach-name";
-      nameEl.textContent =
-        a.filename || (a.kind === "image" ? "image" : "document");
-      pill.appendChild(nameEl);
-      pills.appendChild(pill);
-    });
-    el.appendChild(pills);
-  }
-  this._addUserMsgActions(el, text);
-  this.messagesEl.appendChild(el);
-  this.scrollToBottom(true);
 };
 
 Pane.prototype._addUserMsgActions = function (el, text) {
@@ -1702,58 +1926,6 @@ Pane.prototype.resolveApproval = function (
   this.scrollToBottom();
 };
 
-Pane.prototype.getFeedback = function () {
-  if (!this.approvalBlockEl) return null;
-  var inp = this.approvalBlockEl.querySelector(".ts-approval-feedback");
-  return inp && inp.value.trim() ? inp.value.trim() : null;
-};
-
-Pane.prototype.appendToolOutputChunk = function (callId, chunk) {
-  if (!chunk) return;
-  var stripped = stripAnsi(chunk);
-  if (!stripped) return;
-
-  var escapedId = callId ? CSS.escape(callId) : "";
-  var el = escapedId
-    ? this.messagesEl.querySelector(
-        '.tool-output-stream[data-call-id="' + escapedId + '"]',
-      )
-    : null;
-  if (!el) {
-    var target = escapedId
-      ? this.messagesEl.querySelector(
-          '.ts-approval-tool[data-call-id="' + escapedId + '"]',
-        )
-      : null;
-    if (!target) {
-      var blocks = this.messagesEl.querySelectorAll(".ts-approval");
-      if (!blocks.length) return;
-      var block = blocks[blocks.length - 1];
-      var tools = block.querySelectorAll(
-        '.ts-approval-tool[data-func-name="bash"]',
-      );
-      target = tools.length ? tools[tools.length - 1] : null;
-      if (!target) {
-        var allTools = block.querySelectorAll(".ts-approval-tool");
-        target = allTools.length ? allTools[allTools.length - 1] : null;
-      }
-    }
-    if (!target) return;
-
-    el = document.createElement("pre");
-    el.className = "tool-output tool-output-stream";
-    el.dataset.callId = callId;
-    el.setAttribute("aria-label", "Streaming command output");
-    el.setAttribute("aria-live", "off");
-    el.textContent = "";
-    target.after(el);
-  }
-
-  el.appendChild(document.createTextNode(stripped));
-  el.scrollTop = el.scrollHeight;
-  this.scrollToBottom();
-};
-
 Pane.prototype.appendToolOutput = function (callId, name, output, isError) {
   var escapedId = callId ? CSS.escape(callId) : "";
   var target = escapedId
@@ -1847,176 +2019,6 @@ Pane.prototype.appendToolOutput = function (callId, name, output, isError) {
 
   target.after(out);
   this.scrollToBottom();
-};
-
-Pane.prototype.showOutputWarning = function (evt) {
-  if (!evt.call_id || evt.risk_level === "none") return;
-  var escapedId = CSS.escape(evt.call_id);
-  var toolDiv = this.messagesEl.querySelector(
-    '.ts-approval-tool[data-call-id="' + escapedId + '"]',
-  );
-  if (!toolDiv) return;
-  // Shared DOM-builder with replayHistory \u2014 single source of truth for
-  // role / class / escape semantics.  Argument shape mirrors the
-  // server-side output_assessment dict (risk_level / flags / redacted).
-  var warning = _buildOutputWarningEl({
-    risk_level: evt.risk_level,
-    flags: evt.flags,
-    redacted: evt.redacted,
-  });
-  var nextEl = toolDiv.nextElementSibling;
-  if (nextEl && nextEl.classList.contains("tool-output")) {
-    nextEl.insertAdjacentElement("afterend", warning);
-  } else {
-    toolDiv.insertAdjacentElement("afterend", warning);
-  }
-};
-
-Pane.prototype.updateVerdictBadge = function (verdict) {
-  if (!verdict || !verdict.call_id) return;
-  var escapedId = CSS.escape(verdict.call_id);
-  var badge = this.messagesEl.querySelector(
-    '.verdict-badge[data-call-id="' + escapedId + '"]',
-  );
-  if (!badge) {
-    // Badge no longer in DOM (tool block replaced by output) — show
-    // a toast so the user still sees the late-arriving verdict.
-    var conf = Math.round((verdict.confidence || 0) * 100);
-    var rec = verdict.recommendation || "review";
-    var func = verdict.func_name || "";
-    showToast(
-      "Judge verdict for " + func + ": " + rec + " (" + conf + "%)",
-      rec === "approve" ? "success" : rec === "deny" ? "error" : "warning",
-    );
-    return;
-  }
-
-  var risk = verdict.risk_level || "medium";
-  badge.className = "verdict-badge verdict-" + risk + " ts-verdict-badge";
-  badge.setAttribute("data-risk", risk);
-
-  var riskEl = badge.querySelector(".verdict-risk");
-  var recEl = badge.querySelector(".verdict-rec");
-  var confEl = badge.querySelector(".verdict-conf");
-  if (riskEl) riskEl.textContent = risk.toUpperCase();
-  if (recEl) recEl.textContent = verdict.recommendation || "review";
-  if (confEl)
-    confEl.textContent = Math.round((verdict.confidence || 0) * 100) + "%";
-
-  var spinner = badge.querySelector(".verdict-judge-spinner");
-  if (spinner) spinner.remove();
-
-  var detail = badge.nextElementSibling;
-  if (detail && detail.classList.contains("verdict-detail")) {
-    var summaryEl = detail.querySelector(".verdict-summary");
-    var reasonEl = detail.querySelector(".verdict-reasoning");
-    var tierEl = detail.querySelector(".verdict-tier");
-    if (summaryEl) summaryEl.textContent = verdict.intent_summary || "";
-    if (reasonEl) reasonEl.textContent = verdict.reasoning || "";
-    if (tierEl)
-      tierEl.textContent =
-        (verdict.tier || "llm") +
-        " tier" +
-        (verdict.judge_model ? " | " + verdict.judge_model : "");
-    var evidenceEl = detail.querySelector(".verdict-evidence");
-    if (verdict.evidence && verdict.evidence.length) {
-      if (!evidenceEl) {
-        evidenceEl = document.createElement("div");
-        evidenceEl.className = "verdict-evidence";
-        var tierDiv = detail.querySelector(".verdict-tier");
-        if (tierDiv) detail.insertBefore(evidenceEl, tierDiv);
-        else detail.appendChild(evidenceEl);
-      }
-      evidenceEl.replaceChildren(
-        ...verdict.evidence.map(function (e) {
-          var div = document.createElement("div");
-          div.textContent = "\u2022 " + e;
-          return div;
-        }),
-      );
-    } else if (evidenceEl) {
-      evidenceEl.remove();
-    }
-  }
-
-  this.updateVerdictGlow(verdict.recommendation);
-};
-
-Pane.prototype.updateVerdictGlow = function (recommendation) {
-  if (!this.approvalBlockEl) return;
-  var prompt = this.approvalBlockEl.querySelector(".ts-approval-body");
-  if (!prompt) return;
-
-  // Collect all verdict badges currently visible in this approval block
-  var badges = this.approvalBlockEl.querySelectorAll(".verdict-badge");
-  var worst = recommendation;
-  for (var i = 0; i < badges.length; i++) {
-    var recEl = badges[i].querySelector(".verdict-rec");
-    if (recEl) {
-      var r = recEl.textContent;
-      if (r === "deny") {
-        worst = "deny";
-        break;
-      }
-      if (r === "review" && worst !== "deny") worst = "review";
-    }
-  }
-
-  prompt.classList.remove(
-    "ts-verdict-glow--approve",
-    "ts-verdict-glow--deny",
-    "ts-verdict-glow--review",
-  );
-  if (worst === "approve") prompt.classList.add("ts-verdict-glow--approve");
-  else if (worst === "deny") prompt.classList.add("ts-verdict-glow--deny");
-  else prompt.classList.add("ts-verdict-glow--review");
-};
-
-Pane.prototype.addInfoMessage = function (text) {
-  var el = document.createElement("div");
-  el.className = "msg info";
-  el.textContent = stripAnsi(text);
-  this.messagesEl.appendChild(el);
-  this.scrollToBottom();
-};
-
-Pane.prototype.addErrorMessage = function (text) {
-  var el = document.createElement("div");
-  el.className = "msg error";
-  el.setAttribute("role", "alert");
-  el.textContent = stripAnsi(text);
-  this.messagesEl.appendChild(el);
-  this.scrollToBottom();
-};
-
-Pane.prototype.updateStatus = function (evt) {
-  StatusBar.paint(
-    {
-      rootEl: this.statusBarEl,
-      modelEl: this._sbModel,
-      tokensEl: this._sbTokens,
-      toolsEl: this._sbTools,
-      turnsEl: this._sbTurns,
-    },
-    evt,
-    { alias: this.modelAlias, model: this.model },
-  );
-  this._lastStatusEvt = evt;
-};
-
-Pane.prototype.isNearBottom = function () {
-  return (
-    this.messagesEl.scrollHeight -
-      this.messagesEl.scrollTop -
-      this.messagesEl.clientHeight <
-    80
-  );
-};
-
-Pane.prototype.scrollToBottom = function (force) {
-  if (force || this.isNearBottom()) {
-    this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
-  }
 };
 
 Pane.prototype.sendMessage = function () {
