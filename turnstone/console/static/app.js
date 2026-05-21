@@ -487,8 +487,9 @@ function loadOverview() {
       applySnapshot(data);
     })
     .catch(function () {
-      document.getElementById("node-table").innerHTML =
-        '<div class="dashboard-empty">Failed to load</div>';
+      document
+        .getElementById("node-table")
+        .replaceChildren(makeEmptyState("Failed to load"));
     });
 }
 
@@ -507,7 +508,7 @@ function renderStatusBar(overview) {
   var agg = overview.aggregate || {};
 
   var statesContainer = document.getElementById("csb-states");
-  statesContainer.innerHTML = "";
+  statesContainer.replaceChildren();
   STATE_ORDER.forEach(function (state) {
     var count = states[state] || 0;
     var sd = STATE_DISPLAY[state] || STATE_DISPLAY.idle;
@@ -517,18 +518,17 @@ function renderStatusBar(overview) {
       pill.classList.add("active");
     }
     pill.setAttribute("aria-label", sd.label + ": " + count + " workstreams");
-    pill.innerHTML =
-      '<span class="csb-state-dot" data-state="' +
-      escapeHtml(state) +
-      '" aria-hidden="true"></span>' +
-      '<span class="csb-state-count' +
-      (count === 0 ? " zero" : "") +
-      '">' +
-      formatCount(count) +
-      "</span>" +
-      '<span class="csb-state-label">' +
-      sd.label +
-      "</span>";
+    var stateDot = document.createElement("span");
+    stateDot.className = "csb-state-dot";
+    stateDot.setAttribute("data-state", state);
+    stateDot.setAttribute("aria-hidden", "true");
+    var stateCount = document.createElement("span");
+    stateCount.className = "csb-state-count" + (count === 0 ? " zero" : "");
+    stateCount.textContent = formatCount(count);
+    var stateLabel = document.createElement("span");
+    stateLabel.className = "csb-state-label";
+    stateLabel.textContent = sd.label;
+    pill.append(stateDot, stateCount, stateLabel);
     pill.onclick = function () {
       drillDownByState(state);
     };
@@ -536,7 +536,7 @@ function renderStatusBar(overview) {
   });
 
   var metricsContainer = document.getElementById("csb-metrics");
-  metricsContainer.innerHTML = "";
+  metricsContainer.replaceChildren();
   var metrics = [
     { value: overview.nodes || 0, label: "nodes", format: formatCount },
     { value: overview.workstreams || 0, label: "ws", format: formatCount },
@@ -691,6 +691,58 @@ function groupNodes(nodes) {
   return groups;
 }
 
+// 7-span node-table column header — used at the top of the table and
+// inside each multi-node group body.  Returns a DocumentFragment built
+// via createElement so the static label list is constructed once with
+// no HTML parsing / string interpolation per render.
+var _NODE_COLHEADER_LABELS = [
+  ["ncol ncol-node", "NODE"],
+  ["ncol ncol-ws", "WS"],
+  ["ncol ncol-run", "RUN"],
+  ["ncol ncol-attn", "ATTN"],
+  ["ncol ncol-tokens", "TOKENS"],
+  ["ncol ncol-version", "VER"],
+  ["ncol ncol-health", "LOAD"],
+];
+
+function buildColHeaders() {
+  var frag = document.createDocumentFragment();
+  for (var i = 0; i < _NODE_COLHEADER_LABELS.length; i++) {
+    var span = document.createElement("span");
+    span.className = _NODE_COLHEADER_LABELS[i][0];
+    span.textContent = _NODE_COLHEADER_LABELS[i][1];
+    frag.appendChild(span);
+  }
+  return frag;
+}
+
+// Build a numeric cell for the node table.  ``highlighted`` adds
+// ``has-value`` so non-zero counts get the CSS treatment.
+function _buildNodeNumCell(value, highlighted, cellClass) {
+  var cell = document.createElement("span");
+  cell.className = cellClass + (highlighted ? " has-value" : "");
+  cell.textContent = String(value);
+  return cell;
+}
+
+// Build the health-bar trailing cell ("[bar] [pct]%") for either a
+// node row or a group header — the structure is identical, only the
+// outer cell class differs.
+function _buildHealthCell(cellClass, healthPct, healthFillClass) {
+  var cell = document.createElement("span");
+  cell.className = cellClass;
+  var bar = document.createElement("span");
+  bar.className = "health-bar";
+  if (healthPct > 0) {
+    var fill = document.createElement("span");
+    fill.className = "health-bar-fill " + healthFillClass;
+    fill.style.width = healthPct + "%";
+    bar.appendChild(fill);
+  }
+  cell.append(bar, " " + healthPct + "%");
+  return cell;
+}
+
 function buildNodeRow(node) {
   var row = document.createElement("div");
   row.className = "node-row";
@@ -727,62 +779,70 @@ function buildNodeRow(node) {
     maxWs > 0 ? Math.min(Math.round((node.ws_total / maxWs) * 100), 100) : 0;
   var healthFillClass =
     healthPct < 50 ? "low" : healthPct < 80 ? "mid" : "high";
-  var healthFillHtml =
-    healthPct > 0
-      ? '<span class="health-bar-fill ' +
-        healthFillClass +
-        '" style="width:' +
-        healthPct +
-        '%"></span>'
-      : "";
 
   var healthTitle = "";
   if (node.health && node.health.backend) {
     healthTitle = "backend: " + node.health.backend.status;
   }
-  var degradedBadge = isDegraded
-    ? '<span class="node-degraded-badge" title="' +
-      escapeHtml(healthTitle) +
-      '" aria-label="' +
-      escapeHtml(healthTitle) +
-      '">degraded</span>'
-    : "";
 
-  row.innerHTML =
-    '<span class="node-cell node-cell-name"' +
-    (healthTitle ? ' title="' + escapeHtml(healthTitle) + '"' : "") +
-    '><span class="' +
-    dotClass +
-    '"></span>' +
-    escapeHtml(node.node_id) +
-    degradedBadge +
-    "</span>" +
-    '<span class="node-cell node-cell-num' +
-    (node.ws_total > 0 ? " has-value" : "") +
-    '">' +
-    node.ws_total +
-    "</span>" +
-    '<span class="node-cell node-cell-num' +
-    (node.ws_running > 0 ? " has-value" : "") +
-    '">' +
-    node.ws_running +
-    "</span>" +
-    '<span class="node-cell node-cell-num' +
-    (node.ws_attention > 0 ? " has-value" : "") +
-    '">' +
-    node.ws_attention +
-    "</span>" +
-    '<span class="node-cell node-cell-num">' +
-    formatTokens(displayTokens) +
-    "</span>" +
-    '<span class="node-cell node-cell-version">' +
-    escapeHtml(node.version || "") +
-    "</span>" +
-    '<span class="node-cell node-cell-health"><span class="health-bar">' +
-    healthFillHtml +
-    "</span> " +
-    healthPct +
-    "%</span>";
+  // Name cell — dot, node id, optional degraded badge.
+  var nameCell = document.createElement("span");
+  nameCell.className = "node-cell node-cell-name";
+  if (healthTitle) nameCell.setAttribute("title", healthTitle);
+  var dot = document.createElement("span");
+  dot.className = dotClass;
+  nameCell.append(dot, node.node_id);
+  if (isDegraded) {
+    var degradedEl = document.createElement("span");
+    degradedEl.className = "node-degraded-badge";
+    // Only attach the descriptive title / aria-label when there's a
+    // backend-status string to surface.  An empty aria-label would
+    // suppress the badge's textContent ("degraded") for screen
+    // readers — strictly worse than leaving the attribute off.
+    if (healthTitle) {
+      degradedEl.setAttribute("title", healthTitle);
+      degradedEl.setAttribute("aria-label", healthTitle);
+    }
+    degradedEl.textContent = "degraded";
+    nameCell.appendChild(degradedEl);
+  }
+  row.appendChild(nameCell);
+
+  row.appendChild(
+    _buildNodeNumCell(
+      node.ws_total,
+      node.ws_total > 0,
+      "node-cell node-cell-num",
+    ),
+  );
+  row.appendChild(
+    _buildNodeNumCell(
+      node.ws_running,
+      node.ws_running > 0,
+      "node-cell node-cell-num",
+    ),
+  );
+  row.appendChild(
+    _buildNodeNumCell(
+      node.ws_attention,
+      node.ws_attention > 0,
+      "node-cell node-cell-num",
+    ),
+  );
+
+  var tokensCell = document.createElement("span");
+  tokensCell.className = "node-cell node-cell-num";
+  tokensCell.textContent = formatTokens(displayTokens);
+  row.appendChild(tokensCell);
+
+  var versionCell = document.createElement("span");
+  versionCell.className = "node-cell node-cell-version";
+  versionCell.textContent = node.version || "";
+  row.appendChild(versionCell);
+
+  row.appendChild(
+    _buildHealthCell("node-cell node-cell-health", healthPct, healthFillClass),
+  );
 
   var nodeUrl = "/node/" + encodeURIComponent(node.node_id) + "/";
   row.onclick = function () {
@@ -823,23 +883,16 @@ function renderNodeGroups(nodes, total) {
   _lastNodesJson = json;
 
   var table = document.getElementById("node-table");
-  table.innerHTML = "";
+  table.replaceChildren();
   if (!nodes.length) {
-    table.innerHTML = '<div class="dashboard-empty">No nodes discovered</div>';
+    table.appendChild(makeEmptyState("No nodes discovered"));
     return;
   }
 
   var topHeaders = document.createElement("div");
   topHeaders.className = "node-colheaders";
   topHeaders.setAttribute("aria-hidden", "true");
-  topHeaders.innerHTML =
-    '<span class="ncol ncol-node">NODE</span>' +
-    '<span class="ncol ncol-ws">WS</span>' +
-    '<span class="ncol ncol-run">RUN</span>' +
-    '<span class="ncol ncol-attn">ATTN</span>' +
-    '<span class="ncol ncol-tokens">TOKENS</span>' +
-    '<span class="ncol ncol-version">VER</span>' +
-    '<span class="ncol ncol-health">LOAD</span>';
+  topHeaders.appendChild(buildColHeaders());
   table.appendChild(topHeaders);
 
   var groups = groupNodes(nodes);
@@ -897,18 +950,6 @@ function renderNodeGroups(nodes, total) {
         : 0;
     var healthFillClass =
       healthPct < 50 ? "low" : healthPct < 80 ? "mid" : "high";
-    var healthFillHtml =
-      healthPct > 0
-        ? '<span class="health-bar-fill ' +
-          healthFillClass +
-          '" style="width:' +
-          healthPct +
-          '%"></span>'
-        : "";
-
-    var groupDegradedBadge = group.any_degraded
-      ? '<span class="node-degraded-badge">degraded</span>'
-      : "";
     var groupVersionText = "";
     var groupVersionDrift = false;
     if (group.versions.size === 1) {
@@ -917,50 +958,72 @@ function renderNodeGroups(nodes, total) {
       groupVersionText = "mixed";
       groupVersionDrift = true;
     }
-    var versionDriftBadge = groupVersionDrift
-      ? '<span class="node-version-drift-badge">drift</span>'
-      : "";
 
-    header.innerHTML =
-      '<span class="node-group-name">' +
-      '<span class="' +
-      chevronClass +
-      '" aria-hidden="true">&#x25b8;</span>' +
-      escapeHtml(group.prefix) +
-      '<span class="node-group-badge">' +
-      group.nodes.length +
-      " nodes</span>" +
-      groupDegradedBadge +
-      "</span>" +
-      '<span class="node-group-cell num' +
-      (group.ws_total > 0 ? " has-value" : "") +
-      '">' +
-      group.ws_total +
-      "</span>" +
-      '<span class="node-group-cell num' +
-      (group.ws_running > 0 ? " has-value" : "") +
-      '">' +
-      group.ws_running +
-      "</span>" +
-      '<span class="node-group-cell num' +
-      (group.ws_attention > 0 ? " has-value" : "") +
-      '">' +
-      group.ws_attention +
-      "</span>" +
-      '<span class="node-group-cell num">' +
-      formatTokens(group.total_tokens) +
-      "</span>" +
-      '<span class="node-group-cell node-cell-version' +
-      (groupVersionDrift ? " drift" : "") +
-      '">' +
-      escapeHtml(groupVersionText) +
-      versionDriftBadge +
-      "</span>" +
-      '<span class="node-group-cell node-cell-health"><span class="health-bar">' +
-      healthFillHtml +
-      "</span> " +
-      healthPct +
-      "%</span>";
+    // Group-name cell: chevron + prefix + node count + optional degraded badge.
+    var nameCell = document.createElement("span");
+    nameCell.className = "node-group-name";
+    var chevron = document.createElement("span");
+    chevron.className = chevronClass;
+    chevron.setAttribute("aria-hidden", "true");
+    chevron.textContent = "▸";
+    var badge = document.createElement("span");
+    badge.className = "node-group-badge";
+    badge.textContent = group.nodes.length + " nodes";
+    nameCell.append(chevron, group.prefix, badge);
+    if (group.any_degraded) {
+      var degradedEl = document.createElement("span");
+      degradedEl.className = "node-degraded-badge";
+      degradedEl.textContent = "degraded";
+      nameCell.appendChild(degradedEl);
+    }
+    header.appendChild(nameCell);
+
+    header.appendChild(
+      _buildNodeNumCell(
+        group.ws_total,
+        group.ws_total > 0,
+        "node-group-cell num",
+      ),
+    );
+    header.appendChild(
+      _buildNodeNumCell(
+        group.ws_running,
+        group.ws_running > 0,
+        "node-group-cell num",
+      ),
+    );
+    header.appendChild(
+      _buildNodeNumCell(
+        group.ws_attention,
+        group.ws_attention > 0,
+        "node-group-cell num",
+      ),
+    );
+
+    var groupTokensCell = document.createElement("span");
+    groupTokensCell.className = "node-group-cell num";
+    groupTokensCell.textContent = formatTokens(group.total_tokens);
+    header.appendChild(groupTokensCell);
+
+    var groupVersionCell = document.createElement("span");
+    groupVersionCell.className =
+      "node-group-cell node-cell-version" + (groupVersionDrift ? " drift" : "");
+    groupVersionCell.textContent = groupVersionText;
+    if (groupVersionDrift) {
+      var driftBadge = document.createElement("span");
+      driftBadge.className = "node-version-drift-badge";
+      driftBadge.textContent = "drift";
+      groupVersionCell.appendChild(driftBadge);
+    }
+    header.appendChild(groupVersionCell);
+
+    header.appendChild(
+      _buildHealthCell(
+        "node-group-cell node-cell-health",
+        healthPct,
+        healthFillClass,
+      ),
+    );
 
     var prefix = group.prefix;
     header.onclick = function () {
@@ -982,14 +1045,7 @@ function renderNodeGroups(nodes, total) {
     var colHeaders = document.createElement("div");
     colHeaders.className = "node-colheaders";
     colHeaders.setAttribute("aria-hidden", "true");
-    colHeaders.innerHTML =
-      '<span class="ncol ncol-node">NODE</span>' +
-      '<span class="ncol ncol-ws">WS</span>' +
-      '<span class="ncol ncol-run">RUN</span>' +
-      '<span class="ncol ncol-attn">ATTN</span>' +
-      '<span class="ncol ncol-tokens">TOKENS</span>' +
-      '<span class="ncol ncol-version">VER</span>' +
-      '<span class="ncol ncol-health">LOAD</span>';
+    colHeaders.appendChild(buildColHeaders());
     body.appendChild(colHeaders);
 
     group.nodes.forEach(function (node) {
@@ -1059,13 +1115,14 @@ function loadFilteredWorkstreams() {
       applySnapshot(data);
     })
     .catch(function () {
-      document.getElementById("filtered-ws-table").innerHTML =
-        '<div class="dashboard-empty">Failed to load</div>';
+      document
+        .getElementById("filtered-ws-table")
+        .replaceChildren(makeEmptyState("Failed to load"));
     });
 }
 
 function renderPagination(container, page, pages) {
-  container.innerHTML = "";
+  container.replaceChildren();
   if (pages <= 1) return;
   var prev = document.createElement("button");
   prev.textContent = "\u25c4 Prev";
