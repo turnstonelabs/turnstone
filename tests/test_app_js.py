@@ -693,3 +693,371 @@ def test_phase8_consent_url_prefix_check_in_click_handler() -> None:
         '"javascript:" injection) would be passed straight to '
         "window.open."
     )
+
+
+# ---------------------------------------------------------------------------
+# Post-var-sweep invariants — added by chore/interactive-var-sweep
+# ---------------------------------------------------------------------------
+#
+# After the whole-file var → const/let sweep across these 7 bundles, three
+# guards keep the post-sweep state honest:
+#   1. ``node --check`` per bundle catches parse-level regressions on any
+#      future edit (mis-balanced braces, stray tokens) before they reach
+#      the browser.
+#   2. A var-free static assertion pins the keyword sweep — any future
+#      ``var`` declaration in these bundles fails CI loudly.
+#   3. A static const-reassign guard catches the specific bug class that
+#      shipped through the original sweep (``const X = …; … X = …``
+#      throws ``TypeError`` only at call-time, which ``node --check``
+#      does not surface).  This is the same paren/string/regex-aware
+#      reassignment check the sweep walker uses.
+#
+# A fourth guard runs ``_redactApiKeys`` via ``node -e`` as a runtime
+# smoke; the function is pure (no DOM dependency) so it transplants
+# cleanly into a standalone node invocation.
+
+import subprocess  # noqa: E402
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_SWEPT_BUNDLES = [
+    _REPO_ROOT / "turnstone/ui/static/app.js",
+    _REPO_ROOT / "turnstone/console/static/admin.js",
+    _REPO_ROOT / "turnstone/console/static/governance.js",
+    _REPO_ROOT / "turnstone/console/static/app.js",
+    _REPO_ROOT / "turnstone/shared_static/auth.js",
+    _REPO_ROOT / "turnstone/shared_static/kb.js",
+    _REPO_ROOT / "turnstone/shared_static/utils.js",
+]
+
+
+@pytest.mark.parametrize("bundle", _SWEPT_BUNDLES, ids=lambda p: p.name)
+def test_swept_bundle_parses(bundle: Path) -> None:
+    """``node --check`` each swept bundle.  Catches syntax-level
+    regressions (a future edit that drops a brace, mis-balances a
+    string, etc.) before they reach the browser.  Skipped silently if
+    ``node`` is not on PATH so local dev without Node still passes."""
+    node = "node"
+    try:
+        proc = subprocess.run(
+            [node, "--check", str(bundle)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except FileNotFoundError:
+        pytest.skip("node binary not available on PATH")
+    assert proc.returncode == 0, f"node --check failed for {bundle.name}:\n{proc.stderr}"
+
+
+@pytest.mark.parametrize("bundle", _SWEPT_BUNDLES, ids=lambda p: p.name)
+def test_swept_bundle_has_no_var_decl(bundle: Path) -> None:
+    """Pin the var-free post-sweep state across all 7 bundles.  A
+    future ``var`` declaration here fails CI loudly so the sweep
+    doesn't regress in patches."""
+    body = bundle.read_text(encoding="utf-8")
+    # Line-start ``var`` declarations.
+    line_start = re.findall(r"^\s*var\s+\w", body, re.MULTILINE)
+    # ``for (var i …)`` counters anywhere on a line.
+    for_init = re.findall(r"\bfor\s*\(\s*var\s+", body)
+    stray = line_start + for_init
+    assert not stray, (
+        f"{bundle.name}: {len(stray)} stray ``var`` declarations found "
+        f"after the var-sweep — the post-sweep invariant is broken.  "
+        f"Convert to ``const``/``let``."
+    )
+
+
+def _strip_strings_and_line_comments(line: str) -> str:
+    """Return ``line`` with string-literal contents and ``// …`` tails
+    removed, so simple regex-based scanning can't be tricked by an
+    identifier embedded in a CSS class name or HTML attribute.
+    Mirrors the sweep walker's helper of the same purpose."""
+    out: list[str] = []
+    i = 0
+    n = len(line)
+    in_str: str | None = None
+    while i < n:
+        ch = line[i]
+        if in_str:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch in ('"', "'", "`"):
+            in_str = ch
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and line[i + 1] == "/":
+            break
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+_REGEX_OK_KEYWORDS = frozenset(
+    {
+        "return",
+        "throw",
+        "typeof",
+        "instanceof",
+        "in",
+        "of",
+        "new",
+        "delete",
+        "void",
+        "do",
+        "yield",
+        "await",
+        "case",
+        "else",
+    }
+)
+
+
+def _is_regex_context_at(text: str, slash_pos: int) -> bool:
+    """``text[slash_pos]`` is ``/``.  Return ``True`` if it starts a regex
+    literal vs the division operator, by inspecting the previous significant
+    char (skipping whitespace and ``/* */`` block comments going backward)."""
+    i = slash_pos - 1
+    while i >= 0:
+        ch = text[i]
+        if ch.isspace():
+            i -= 1
+            continue
+        if ch == "/" and i >= 1 and text[i - 1] == "*":
+            open_i = text.rfind("/*", 0, i - 1)
+            if open_i == -1:
+                return True
+            i = open_i - 1
+            continue
+        if ch.isalnum() or ch in "_$":
+            k = i
+            while k >= 0 and (text[k].isalnum() or text[k] in "_$"):
+                k -= 1
+            ident = text[k + 1 : i + 1]
+            return ident in _REGEX_OK_KEYWORDS
+        if ch in ")]":
+            return False
+        return True
+    return True
+
+
+def _consume_regex_at(text: str, start: int) -> tuple[int, bool]:
+    """Consume regex literal starting at ``text[start] == '/'``.  Returns
+    ``(end_pos, ok)``.  Handles backslash escapes and ``[...]`` char classes
+    (a ``/`` inside a class doesn't end the regex)."""
+    n = len(text)
+    i = start + 1
+    in_class = False
+    while i < n:
+        ch = text[i]
+        if ch == "\n":
+            return start, False
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == "[":
+            in_class = True
+        elif ch == "]":
+            in_class = False
+        elif ch == "/" and not in_class:
+            i += 1
+            while i < n and text[i] in "gimsuyd":
+                i += 1
+            return i, True
+        i += 1
+    return start, False
+
+
+def _build_brace_map(
+    text: str,
+) -> tuple[dict[int, int], list[int]]:
+    """Walk ``text`` once.  Returns ``(open_to_close, line_starts)`` where
+    ``open_to_close[open_off] = close_off`` for matched braces, and
+    ``line_starts[i]`` is the char offset where line index ``i`` (0-based)
+    begins.  Robust to JS regex literals, strings, ``//`` and ``/* */``
+    comments."""
+    n = len(text)
+    line_starts = [0]
+    for i, ch in enumerate(text):
+        if ch == "\n":
+            line_starts.append(i + 1)
+    stack: list[int] = []
+    open_to_close: dict[int, int] = {}
+    in_str: str | None = None
+    in_comment: str | None = None
+    i = 0
+    while i < n:
+        ch = text[i]
+        if in_comment == "//":
+            if ch == "\n":
+                in_comment = None
+            i += 1
+            continue
+        if in_comment == "/*":
+            if ch == "*" and i + 1 < n and text[i + 1] == "/":
+                in_comment = None
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_str:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch in ('"', "'", "`"):
+            in_str = ch
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n:
+            if text[i + 1] == "/":
+                in_comment = "//"
+                i += 2
+                continue
+            if text[i + 1] == "*":
+                in_comment = "/*"
+                i += 2
+                continue
+            if _is_regex_context_at(text, i):
+                end, ok = _consume_regex_at(text, i)
+                if ok:
+                    i = end
+                    continue
+        if ch == "{":
+            stack.append(i)
+        elif ch == "}":
+            if stack:
+                open_to_close[stack.pop()] = i
+        i += 1
+    return open_to_close, line_starts
+
+
+def _offset_to_line(line_starts: list[int], off: int) -> int:
+    lo, hi = 0, len(line_starts)
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if line_starts[mid] <= off:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def _enclosing_block(
+    decl_offset: int,
+    open_to_close: dict[int, int],
+    line_starts: list[int],
+    total_lines: int,
+) -> tuple[int, int]:
+    """Innermost block containing ``decl_offset``.  ``(start_line, end_line)``
+    inclusive.  Returns ``(0, total_lines - 1)`` when at top-level."""
+    candidates = [(op, cl) for op, cl in open_to_close.items() if op < decl_offset < cl]
+    if not candidates:
+        return 0, total_lines - 1
+    op, cl = max(candidates, key=lambda x: x[0])
+    return (
+        _offset_to_line(line_starts, op),
+        _offset_to_line(line_starts, cl),
+    )
+
+
+@pytest.mark.parametrize("bundle", _SWEPT_BUNDLES, ids=lambda p: p.name)
+def test_swept_bundle_has_no_const_reassign(bundle: Path) -> None:
+    """For each ``const X = …`` declaration, fail if X is reassigned
+    *within the same block scope* (``X = …``, ``X +=``, ``X++`` etc., with
+    lookbehind to skip ``obj.X = …`` property writes).  Block scope is
+    found by brace-tracking with regex/string/comment awareness, so a
+    same-named ``let X`` in an unrelated function doesn't false-positive
+    against a ``const X`` in this one.  Caught the original
+    ``_redactApiKeys`` shipped bug — ``TypeError`` was invisible to
+    ``node --check`` and to whole-file keyword scans."""
+    body = bundle.read_text(encoding="utf-8")
+    lines = body.splitlines()
+    open_to_close, line_starts = _build_brace_map(body)
+    const_decl = re.compile(r"^(\s*)const\s+(\w+)\b")
+    bugs: list[tuple[int, str, int]] = []
+    for idx, line in enumerate(lines):
+        m = const_decl.match(line)
+        if not m:
+            continue
+        name = m.group(2)
+        decl_offset = line_starts[idx] + len(m.group(1))
+        start_line, end_line = _enclosing_block(decl_offset, open_to_close, line_starts, len(lines))
+        pat = re.compile(
+            r"(?<![A-Za-z0-9_$.])"
+            + re.escape(name)
+            + r"\s*(?:\+\+|--|"
+            + r"(?:\+|-|\*\*?|/|%|&&?|\|\|?|\^|<<|>>>?|\?\?)=|"
+            + r"=(?!=))"
+        )
+        decl_other = re.compile(
+            r"(?:^\s*(?:let|const|var)\s+|\bfor\s*\(\s*(?:let|const|var)\s+)"
+            + re.escape(name)
+            + r"\b"
+        )
+        param = re.compile(r"\((?:[^()]*?,\s*)?" + re.escape(name) + r"\s*[,)]")
+        for j in range(start_line, end_line + 1):
+            if j == idx:
+                continue
+            stripped = _strip_strings_and_line_comments(lines[j])
+            if not pat.search(stripped):
+                continue
+            if decl_other.search(stripped):
+                continue
+            if param.search(stripped):
+                cleaned = param.sub("(", stripped)
+                if not pat.search(cleaned):
+                    continue
+            bugs.append((idx + 1, name, j + 1))
+            break
+    assert not bugs, (
+        f"{bundle.name}: ``const`` declaration reassigned within its block "
+        f"scope — {bugs[:3]}{' …' if len(bugs) > 3 else ''}.  Change to "
+        f"``let`` or eliminate the reassignment."
+    )
+
+
+def test_redact_api_keys_runtime_smoke() -> None:
+    """Runtime smoke for ``_redactApiKeys``.  The function is pure — no
+    DOM dependency — so it transplants cleanly into a standalone
+    ``node -e`` invocation.  This is the bit that would have caught
+    the original ``const redacted`` bug (which ``node --check`` and a
+    pure-static keyword scan both miss; the ``TypeError`` only fires
+    at call-time)."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    m = re.search(
+        r"function _redactApiKeys\(text\) \{.*?\n\}\n",
+        body,
+        re.DOTALL,
+    )
+    assert m is not None, "_redactApiKeys not found in app.js"
+    fn = m.group(0)
+    script = (
+        fn
+        + "\nconst q = _redactApiKeys('https://x?api_key=abc&u=foo');\n"
+        + 'if (q !== "https://x?api_key=***&u=foo") '
+        + "throw new Error('query-string redact failed: ' + q);\n"
+        + 'const j = _redactApiKeys(\'{"api_key":"abc"}\');\n'
+        + 'if (j !== \'{"api_key":"***"}\') '
+        + "throw new Error('json-style redact failed: ' + j);\n"
+    )
+    try:
+        proc = subprocess.run(
+            ["node", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except FileNotFoundError:
+        pytest.skip("node binary not available on PATH")
+    assert proc.returncode == 0, "_redactApiKeys runtime smoke failed.  stdout=%r stderr=%r" % (
+        proc.stdout,
+        proc.stderr,
+    )
