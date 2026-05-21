@@ -156,7 +156,17 @@ jobs:
       - run: uv sync --frozen --all-extras
       - run: uv pip install pip-audit
       - name: Security audit (dependencies)
-        run: uv export --no-emit-project --frozen | uv run pip-audit --strict --desc -r /dev/stdin
+        # PYSEC-2025-183 (pyjwt): "weak encryption" — disputed by the
+        # supplier because the key length is chosen by the calling
+        # application, not the library.  Turnstone generates its JWT
+        # signing keys via the standard ``secrets`` module at
+        # operator-controlled strength (see ``turnstone/core/auth.py``),
+        # so the advisory does not apply.  pyjwt 2.12.1 is the current
+        # latest release; no fix version exists.
+        run: >-
+          uv export --no-emit-project --frozen
+          | uv run pip-audit --strict --desc -r /dev/stdin
+          --ignore-vuln PYSEC-2025-183
 
   security-ts:
     runs-on: ubuntu-latest
