@@ -328,16 +328,20 @@ function loadAdminUsers() {
       _populateTokenUserSelect();
     })
     .catch(function () {
-      document.getElementById("admin-users-table").innerHTML =
-        '<div class="dashboard-empty">Failed to load users</div>';
+      setSafeHtml(
+        document.getElementById("admin-users-table"),
+        '<div class="dashboard-empty">Failed to load users</div>',
+      );
     });
 }
 
 function _renderUsers(users) {
   var container = document.getElementById("admin-users-table");
   if (!users.length) {
-    container.innerHTML =
-      '<div class="dashboard-empty">No users yet. Create one to get started.</div>';
+    setSafeHtml(
+      container,
+      '<div class="dashboard-empty">No users yet. Create one to get started.</div>',
+    );
     return;
   }
   var html = "";
@@ -371,7 +375,7 @@ function _renderUsers(users) {
       "</span>" +
       "</div>";
   }
-  container.innerHTML = html;
+  setSafeHtml(container, html);
   // Bind roles buttons
   var roleBtns = container.querySelectorAll("[data-user-roles]");
   for (var rj = 0; rj < roleBtns.length; rj++) {
@@ -482,11 +486,13 @@ function _toggleOidcPanel(userId, username, rowEl) {
   var panel = document.createElement("div");
   panel.className = "oidc-detail-panel";
   panel.setAttribute("role", "none");
-  panel.innerHTML =
+  setSafeHtml(
+    panel,
     '<div class="oidc-detail-inner">' +
-    '<div class="oidc-detail-header">OIDC Identities</div>' +
-    '<div class="oidc-detail-body"><span class="oidc-detail-empty">Loading\u2026</span></div>' +
-    "</div>";
+      '<div class="oidc-detail-header">OIDC Identities</div>' +
+      '<div class="oidc-detail-body"><span class="oidc-detail-empty">Loading\u2026</span></div>' +
+      "</div>",
+  );
   rowEl.after(panel);
   // Animate open
   requestAnimationFrame(function () {
@@ -506,8 +512,10 @@ function _toggleOidcPanel(userId, username, rowEl) {
     .catch(function () {
       var body = panel.querySelector(".oidc-detail-body");
       if (body)
-        body.innerHTML =
-          '<span class="oidc-detail-empty">Failed to load</span>';
+        setSafeHtml(
+          body,
+          '<span class="oidc-detail-empty">Failed to load</span>',
+        );
     });
 }
 
@@ -558,8 +566,10 @@ function _renderOidcDetail(panel, identities, userId, username) {
   var body = panel.querySelector(".oidc-detail-body");
   if (!body) return;
   if (!identities.length) {
-    body.innerHTML =
-      '<span class="oidc-detail-empty">No OIDC identities linked</span>';
+    setSafeHtml(
+      body,
+      '<span class="oidc-detail-empty">No OIDC identities linked</span>',
+    );
     panel.style.maxHeight = panel.scrollHeight + "px";
     return;
   }
@@ -567,7 +577,7 @@ function _renderOidcDetail(panel, identities, userId, username) {
   for (var i = 0; i < identities.length; i++) {
     html += _buildOidcRow(identities[i], userId, username);
   }
-  body.innerHTML = html;
+  setSafeHtml(body, html);
   // Update panel height for animation
   panel.style.maxHeight = panel.scrollHeight + "px";
   // Bind unlink buttons
@@ -625,8 +635,10 @@ function _confirmUnlinkOidc(issuer, subject, username, userId) {
             if (panel && panel.classList.contains("oidc-detail-panel")) {
               var body = panel.querySelector(".oidc-detail-body");
               if (body)
-                body.innerHTML =
-                  '<span class="oidc-detail-empty">Loading\u2026</span>';
+                setSafeHtml(
+                  body,
+                  '<span class="oidc-detail-empty">Loading\u2026</span>',
+                );
               authFetch(
                 "/v1/api/admin/users/" +
                   encodeURIComponent(userId) +
@@ -646,8 +658,10 @@ function _confirmUnlinkOidc(issuer, subject, username, userId) {
                 })
                 .catch(function () {
                   if (body)
-                    body.innerHTML =
-                      '<span class="oidc-detail-empty">Failed to load</span>';
+                    setSafeHtml(
+                      body,
+                      '<span class="oidc-detail-empty">Failed to load</span>',
+                    );
                 });
             }
           }
@@ -697,7 +711,7 @@ function _relativeTime(isoStr) {
 function _populateTokenUserSelect() {
   var sel = document.getElementById("admin-token-user");
   var current = sel.value;
-  sel.innerHTML = '<option value="">Select user...</option>';
+  setSafeHtml(sel, '<option value="">Select user...</option>');
   for (var i = 0; i < _adminUsers.length; i++) {
     var u = _adminUsers[i];
     var opt = document.createElement("option");
@@ -712,8 +726,10 @@ function loadAdminTokens() {
   var userId = document.getElementById("admin-token-user").value;
   _adminTokenUserId = userId;
   if (!userId) {
-    document.getElementById("admin-tokens-table").innerHTML =
-      '<div class="dashboard-empty">Select a user to view tokens</div>';
+    setSafeHtml(
+      document.getElementById("admin-tokens-table"),
+      '<div class="dashboard-empty">Select a user to view tokens</div>',
+    );
     return;
   }
   authFetch("/v1/api/admin/users/" + encodeURIComponent(userId) + "/tokens")
@@ -725,16 +741,20 @@ function loadAdminTokens() {
       _renderTokens(data.tokens || []);
     })
     .catch(function () {
-      document.getElementById("admin-tokens-table").innerHTML =
-        '<div class="dashboard-empty">Failed to load tokens</div>';
+      setSafeHtml(
+        document.getElementById("admin-tokens-table"),
+        '<div class="dashboard-empty">Failed to load tokens</div>',
+      );
     });
 }
 
 function _renderTokens(tokens) {
   var container = document.getElementById("admin-tokens-table");
   if (!tokens.length) {
-    container.innerHTML =
-      '<div class="dashboard-empty">No tokens for this user</div>';
+    setSafeHtml(
+      container,
+      '<div class="dashboard-empty">No tokens for this user</div>',
+    );
     return;
   }
   var html = "";
@@ -765,7 +785,7 @@ function _renderTokens(tokens) {
       "</span>" +
       "</div>";
   }
-  container.innerHTML = html;
+  setSafeHtml(container, html);
   // Bind revoke buttons via delegation (avoids inline JS injection)
   var rbtns = container.querySelectorAll("[data-revoke-token]");
   for (var j = 0; j < rbtns.length; j++) {
@@ -818,7 +838,7 @@ function confirmRevokeToken(tokenId) {
 function _populateChannelUserSelect() {
   var sel = document.getElementById("admin-channel-user");
   var current = sel.value;
-  sel.innerHTML = '<option value="">Select user...</option>';
+  setSafeHtml(sel, '<option value="">Select user...</option>');
   for (var i = 0; i < _adminUsers.length; i++) {
     var u = _adminUsers[i];
     var opt = document.createElement("option");
@@ -833,12 +853,16 @@ function loadAdminChannels() {
   var userId = document.getElementById("admin-channel-user").value;
   _adminChannelUserId = userId;
   if (!userId) {
-    document.getElementById("admin-channels-table").innerHTML =
-      '<div class="dashboard-empty">Select a user to view channel links</div>';
+    setSafeHtml(
+      document.getElementById("admin-channels-table"),
+      '<div class="dashboard-empty">Select a user to view channel links</div>',
+    );
     return;
   }
-  document.getElementById("admin-channels-table").innerHTML =
-    '<div class="dashboard-empty">Loading channel links...</div>';
+  setSafeHtml(
+    document.getElementById("admin-channels-table"),
+    '<div class="dashboard-empty">Loading channel links...</div>',
+  );
   authFetch("/v1/api/admin/users/" + encodeURIComponent(userId) + "/channels")
     .then(function (r) {
       if (!r.ok) throw new Error("Failed to load channels");
@@ -848,16 +872,20 @@ function loadAdminChannels() {
       _renderChannels(data.channels || []);
     })
     .catch(function () {
-      document.getElementById("admin-channels-table").innerHTML =
-        '<div class="dashboard-empty">Failed to load channel links</div>';
+      setSafeHtml(
+        document.getElementById("admin-channels-table"),
+        '<div class="dashboard-empty">Failed to load channel links</div>',
+      );
     });
 }
 
 function _renderChannels(channels) {
   var container = document.getElementById("admin-channels-table");
   if (!channels.length) {
-    container.innerHTML =
-      '<div class="dashboard-empty">No channel links for this user</div>';
+    setSafeHtml(
+      container,
+      '<div class="dashboard-empty">No channel links for this user</div>',
+    );
     return;
   }
   var html = "";
@@ -894,7 +922,7 @@ function _renderChannels(channels) {
       "</span>" +
       "</div>";
   }
-  container.innerHTML = html;
+  setSafeHtml(container, html);
   var btns = container.querySelectorAll("[data-unlink-type]");
   for (var j = 0; j < btns.length; j++) {
     btns[j].addEventListener("click", function () {
@@ -955,16 +983,20 @@ function loadAdminSchedules() {
       _renderSchedules(data.schedules || []);
     })
     .catch(function () {
-      document.getElementById("admin-schedules-table").innerHTML =
-        '<div class="dashboard-empty">Failed to load schedules</div>';
+      setSafeHtml(
+        document.getElementById("admin-schedules-table"),
+        '<div class="dashboard-empty">Failed to load schedules</div>',
+      );
     });
 }
 
 function _renderSchedules(schedules) {
   var container = document.getElementById("admin-schedules-table");
   if (!schedules.length) {
-    container.innerHTML =
-      '<div class="dashboard-empty">No scheduled tasks. Create one to get started.</div>';
+    setSafeHtml(
+      container,
+      '<div class="dashboard-empty">No scheduled tasks. Create one to get started.</div>',
+    );
     return;
   }
   var html = "";
@@ -1037,7 +1069,7 @@ function _renderSchedules(schedules) {
       '" title="Delete">delete</button>' +
       "</span></div>";
   }
-  container.innerHTML = html;
+  setSafeHtml(container, html);
   // Bind buttons
   var editBtns = container.querySelectorAll("[data-edit-sched]");
   for (var j = 0; j < editBtns.length; j++) {
@@ -1663,7 +1695,10 @@ function showScheduleRuns(taskId) {
       var runs = data.runs || [];
       var container = document.getElementById("schedule-runs-table");
       if (!runs.length) {
-        container.innerHTML = '<div class="dashboard-empty">No runs yet</div>';
+        setSafeHtml(
+          container,
+          '<div class="dashboard-empty">No runs yet</div>',
+        );
       } else {
         var html =
           '<div class="admin-colheaders sched-runs-grid" aria-hidden="true">' +
@@ -1698,7 +1733,7 @@ function showScheduleRuns(taskId) {
             escapeHtml(r.error || "\u2014") +
             "</span></div>";
         }
-        container.innerHTML = html;
+        setSafeHtml(container, html);
       }
       var overlay = document.getElementById("schedule-runs-overlay");
       overlay.style.display = "flex";
@@ -1729,7 +1764,7 @@ function _populateWatchNodeSelect() {
   var sel = document.getElementById("admin-watch-node");
   var current = sel.value;
   var seen = {};
-  sel.innerHTML = '<option value="">All nodes</option>';
+  setSafeHtml(sel, '<option value="">All nodes</option>');
   for (var i = 0; i < _adminWatches.length; i++) {
     var nid = _adminWatches[i].node_id || "";
     if (nid && !seen[nid]) {
@@ -1762,8 +1797,10 @@ function loadAdminWatches() {
       _renderWatches(filtered);
     })
     .catch(function () {
-      document.getElementById("admin-watches-table").innerHTML =
-        '<div class="dashboard-empty">Failed to load watches</div>';
+      setSafeHtml(
+        document.getElementById("admin-watches-table"),
+        '<div class="dashboard-empty">Failed to load watches</div>',
+      );
     });
 }
 
@@ -1777,8 +1814,10 @@ function _formatInterval(secs) {
 function _renderWatches(watches) {
   var container = document.getElementById("admin-watches-table");
   if (!watches.length) {
-    container.innerHTML =
-      '<div class="dashboard-empty">No active watches. Watches are created when workstreams use the watch tool.</div>';
+    setSafeHtml(
+      container,
+      '<div class="dashboard-empty">No active watches. Watches are created when workstreams use the watch tool.</div>',
+    );
     return;
   }
   var html = "";
@@ -1842,7 +1881,7 @@ function _renderWatches(watches) {
       cancelBtn +
       "</span></div>";
   }
-  container.innerHTML = html;
+  setSafeHtml(container, html);
   // Bind cancel buttons
   var btns = container.querySelectorAll("[data-cancel-watch]");
   for (var j = 0; j < btns.length; j++) {
@@ -2745,10 +2784,12 @@ function loadSettings() {
     })
     .catch(function (err) {
       // NOTE: escapeHtml sanitises err.message before insertion.
-      el.innerHTML =
+      setSafeHtml(
+        el,
         '<div class="dashboard-empty">Failed to load settings: ' +
-        escapeHtml(err.message || String(err)) +
-        "</div>";
+          escapeHtml(err.message || String(err)) +
+          "</div>",
+      );
     });
 }
 
@@ -2806,7 +2847,7 @@ function _renderSettings(container, grouped) {
     }
   }
 
-  container.innerHTML = html;
+  setSafeHtml(container, html);
 
   // Store original values for dirty detection
   var inputs = container.querySelectorAll("[data-setting-key]");
@@ -3291,16 +3332,20 @@ function loadAdminMcp() {
       _renderMcpServers(_mcpServers);
     })
     .catch(function () {
-      document.getElementById("admin-mcp-table").innerHTML =
-        '<div class="dashboard-empty">Failed to load MCP servers</div>';
+      setSafeHtml(
+        document.getElementById("admin-mcp-table"),
+        '<div class="dashboard-empty">Failed to load MCP servers</div>',
+      );
     });
 }
 
 function _renderMcpServers(items) {
   var el = document.getElementById("admin-mcp-table");
   if (!items.length) {
-    el.innerHTML =
-      '<div class="dashboard-empty">No MCP servers configured</div>';
+    setSafeHtml(
+      el,
+      '<div class="dashboard-empty">No MCP servers configured</div>',
+    );
     return;
   }
   var html = "";
@@ -3501,7 +3546,7 @@ function _renderMcpServers(items) {
       actions +
       "</span></div>";
   }
-  el.innerHTML = html;
+  setSafeHtml(el, html);
 
   // Bind event handlers
   el.querySelectorAll("[data-mcp-detail]").forEach(function (a) {
@@ -4083,7 +4128,7 @@ function _openMcpDetail(s) {
   html += "</div></div></div>";
 
   document.getElementById("mcp-detail-title").textContent = s.name;
-  document.getElementById("mcp-detail-content").innerHTML = html;
+  setSafeHtml(document.getElementById("mcp-detail-content"), html);
   document.getElementById("mcp-detail-overlay").style.display = "flex";
   _mcpDetailTrap = _installTrap("mcp-detail-overlay", "mcp-detail-box");
 }
@@ -4209,7 +4254,7 @@ function searchMcpRegistry(append) {
 
   var resultsEl = document.getElementById("mcp-registry-results");
   if (!append) {
-    resultsEl.innerHTML = '<div class="dashboard-empty">Searching…</div>';
+    setSafeHtml(resultsEl, '<div class="dashboard-empty">Searching…</div>');
   }
   var searchBtn = document.getElementById("mcp-registry-search-btn");
   var moreBtn = document.getElementById("mcp-registry-more");
@@ -4233,8 +4278,10 @@ function searchMcpRegistry(append) {
     })
     .catch(function (e) {
       if (!append) {
-        resultsEl.innerHTML =
-          '<div class="dashboard-empty">' + escapeHtml(e.message) + "</div>";
+        setSafeHtml(
+          resultsEl,
+          '<div class="dashboard-empty">' + escapeHtml(e.message) + "</div>",
+        );
       }
     })
     .finally(function () {
@@ -4254,7 +4301,7 @@ function _applyRegistryFilter() {
 function _renderRegistryResults() {
   var el = document.getElementById("mcp-registry-results");
   if (!_registryResults.length) {
-    el.innerHTML = '<div class="dashboard-empty">No servers found</div>';
+    setSafeHtml(el, '<div class="dashboard-empty">No servers found</div>');
     document.getElementById("mcp-registry-pagination").style.display = "none";
     return;
   }
@@ -4351,10 +4398,12 @@ function _renderRegistryResults() {
   }
 
   if (!visibleCount && _registryResults.length) {
-    el.innerHTML =
-      '<div class="dashboard-empty">No servers match the selected filter</div>';
+    setSafeHtml(
+      el,
+      '<div class="dashboard-empty">No servers match the selected filter</div>',
+    );
   } else {
-    el.innerHTML = html;
+    setSafeHtml(el, html);
   }
 
   // Pagination
@@ -4441,15 +4490,17 @@ function _showInstallMcpModal(srv, hasRemote, hasPackage) {
   document.getElementById("mcp-install-error").classList.remove("is-visible");
 
   // Summary
-  document.getElementById("mcp-install-summary").innerHTML =
+  setSafeHtml(
+    document.getElementById("mcp-install-summary"),
     '<div class="mcp-install-summary-name">' +
-    escapeHtml(srv.title || srv.name) +
-    "</div>" +
-    (srv.description
-      ? '<div class="mcp-install-summary-desc">' +
-        escapeHtml(srv.description) +
-        "</div>"
-      : "");
+      escapeHtml(srv.title || srv.name) +
+      "</div>" +
+      (srv.description
+        ? '<div class="mcp-install-summary-desc">' +
+          escapeHtml(srv.description) +
+          "</div>"
+        : ""),
+  );
 
   // Source selector (only if both remote AND package)
   var srcEl = document.getElementById("mcp-install-source-select");
@@ -4474,9 +4525,9 @@ function _showInstallMcpModal(srv, hasRemote, hasPackage) {
         "</span></label>";
     }
     srcHtml += "</div>";
-    srcEl.innerHTML = srcHtml;
+    setSafeHtml(srcEl, srcHtml);
   } else {
-    srcEl.innerHTML = "";
+    srcEl.replaceChildren();
   }
 
   _updateInstallFields();
@@ -4623,7 +4674,7 @@ function _updateInstallFields() {
       '<p style="font-size:12px;color:var(--fg-dim);margin:8px 0">' +
       "No configuration required — click Install to proceed.</p>";
   }
-  fieldsEl.innerHTML = html;
+  setSafeHtml(fieldsEl, html);
   fieldsEl.setAttribute("data-source", source);
   fieldsEl.setAttribute("data-pkg-index", String(pkgIndex));
 }
@@ -6026,7 +6077,7 @@ var _nodeMetaCache = {};
 function loadAdminNodeMetadata() {
   var container = document.getElementById("admin-node-metadata-content");
   if (!container) return;
-  container.innerHTML = '<div class="dashboard-empty">Loading\u2026</div>';
+  setSafeHtml(container, '<div class="dashboard-empty">Loading\u2026</div>');
 
   // Single bulk fetch for all node metadata
   authFetch("/v1/api/admin/node-metadata")
@@ -6039,8 +6090,10 @@ function loadAdminNodeMetadata() {
       _renderNodeMetadata();
     })
     .catch(function () {
-      container.innerHTML =
-        '<div class="dashboard-empty">Failed to load node metadata</div>';
+      setSafeHtml(
+        container,
+        '<div class="dashboard-empty">Failed to load node metadata</div>',
+      );
     });
 }
 
@@ -6049,8 +6102,10 @@ function _renderNodeMetadata() {
   if (!container) return;
   var nodeIds = Object.keys(_nodeMetaCache).sort();
   if (!nodeIds.length) {
-    container.innerHTML =
-      '<div class="dashboard-empty">No nodes registered</div>';
+    setSafeHtml(
+      container,
+      '<div class="dashboard-empty">No nodes registered</div>',
+    );
     return;
   }
 
@@ -6147,7 +6202,7 @@ function _renderNodeMetadata() {
 
     html += "</div></div>";
   });
-  container.innerHTML = html;
+  setSafeHtml(container, html);
 
   // Bind button handlers (data-* attrs carry node/key context)
   var delBtns = container.querySelectorAll(".nm-del-btn");
