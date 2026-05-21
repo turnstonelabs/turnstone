@@ -71,6 +71,57 @@ function cssEscape(s) {
   return str.replace(/["\\]/g, "\\$&");
 }
 
+// Build a fragment that renders the "keyboard hint + label" pattern
+// used on approval, deny, always, and plan amend/reject buttons.  The
+// hint glyph (e.g. "y", "Esc") gets the .key class so CSS draws the
+// outlined keycap; the trailing label is a plain text node.  Returning
+// a DocumentFragment lets callers use either append() or
+// replaceChildren() depending on whether the button is fresh or
+// rebuilt in place.
+function makeKeyLabel(hint, label) {
+  const span = document.createElement("span");
+  span.className = "key";
+  span.textContent = hint;
+  const frag = document.createDocumentFragment();
+  frag.append(span, " " + label);
+  return frag;
+}
+
+// Build a placeholder card with the .dashboard-empty class, used for
+// "Loading…", "Failed to load", and "No active workstreams" states
+// across the dashboard surfaces.  Callers typically pass the result to
+// el.replaceChildren(...) so the empty card replaces existing content.
+function makeEmptyState(text) {
+  const div = document.createElement("div");
+  div.className = "dashboard-empty";
+  div.textContent = text;
+  return div;
+}
+
+// Parse a *trusted* HTML string into DOM nodes and install them as
+// the new children of ``el``.  Callers must guarantee the HTML was
+// produced by an escaping / sanitising pipeline (escapeHtml,
+// renderMarkdown, or static template literals with no caller-supplied
+// interpolation) — DOMParser will faithfully parse whatever it is
+// given.  The DOMParser path keeps the unsafe sink off the call site
+// without requiring every caller to construct DOM elements by hand.
+function setSafeHtml(el, html) {
+  const parsed = new DOMParser().parseFromString(html, "text/html");
+  el.replaceChildren(...Array.from(parsed.body.childNodes));
+}
+
+// Render markdown content into an element.  renderMarkdown produces
+// fully-escaped HTML (see renderer.js — every input runs through
+// escapeHtml before any markdown ops; URLs are gated by an allow-list
+// regex), so routing the result through setSafeHtml is safe as long
+// as renderer.js is trusted.  postRenderMarkdown finishes the job —
+// hljs highlighting + mermaid SVG rendering for any code blocks the
+// markdown emitted.
+function setMarkdown(el, content) {
+  setSafeHtml(el, renderMarkdown(content));
+  postRenderMarkdown(el);
+}
+
 // Replay the ``advisories`` array attached to a tool history message.
 // Queued user messages spliced into the last tool-result envelope of
 // a batch (Seam 1) persist on the tool DB row as a wrapped
