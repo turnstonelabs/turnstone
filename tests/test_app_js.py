@@ -263,9 +263,9 @@ _STYLE_CSS = Path(__file__).resolve().parent.parent / "turnstone/ui/static/style
 # ``el.innerHTML\n  = X``.
 #
 # ``insertAdjacent`` + HTML is *not* covered here because two existing
-# call sites (``app.js:1287`` and ``app.js:1538``) consume
-# ``renderVerdictBadge`` HTML output; broadening the lint would require
-# cleaning that helper first.  Tracked as a follow-up.
+# call sites (``ui/static/app.js:1287`` and ``ui/static/app.js:1538``)
+# consume ``renderVerdictBadge`` HTML output; broadening the lint
+# would require cleaning that helper first.  Tracked as a follow-up.
 _UNSAFE_CODE_SINK_RE = re.compile(
     r"\.(?:inner|outer)"
     + r"HTML\s*\+?=(?!=)"
@@ -364,6 +364,7 @@ _CONSOLE_ADMIN_JS = Path(__file__).resolve().parent.parent / "turnstone/console/
 _CONSOLE_GOVERNANCE_JS = (
     Path(__file__).resolve().parent.parent / "turnstone/console/static/governance.js"
 )
+_CONSOLE_APP_JS = Path(__file__).resolve().parent.parent / "turnstone/console/static/app.js"
 
 
 _UNSAFE_CODE_SINK_LINT_TARGETS = [
@@ -374,6 +375,7 @@ _UNSAFE_CODE_SINK_LINT_TARGETS = [
     ("turnstone/console/static/coordinator/coordinator.js", _COORD_JS),
     ("turnstone/console/static/admin.js", _CONSOLE_ADMIN_JS),
     ("turnstone/console/static/governance.js", _CONSOLE_GOVERNANCE_JS),
+    ("turnstone/console/static/app.js", _CONSOLE_APP_JS),
 ]
 
 
@@ -392,33 +394,32 @@ def test_no_unsafe_code_sinks_in_static_assets(label: str, path: Path) -> None:
 
     Two distinct cleanup postures across the targets:
 
-    1. **Strict DOM-construction** (``app.js``, ``utils.js``,
-       ``auth.js``, ``kb.js``, ``coordinator.js`` chat entry):
-       renderer output routes through ``setMarkdown`` (or
-       ``setSafeHtml`` for pre-baked HTML strings); every other site
-       uses ``createElement`` + ``textContent`` + ``append`` /
-       ``replaceChildren``.  Missing escapes are structurally
-       impossible — no HTML string is ever interpolated.
-    2. **Sink-free string-concat** (``admin.js``, ``governance.js``):
-       operator-facing admin / governance pages still build HTML via
-       ``escapeHtml`` + string concat, but the unsafe sink is off the
-       call site (everything routes through ``setSafeHtml``).  XSS
-       defence still depends on every interpolated value going through
-       escapeHtml; the lint catches the sink but cannot catch a missing
-       escape.
+    1. **Strict DOM-construction** (``ui/static/app.js``,
+       ``shared_static/utils.js``, ``shared_static/auth.js``,
+       ``shared_static/kb.js``, ``coordinator.js`` chat entry,
+       ``console/static/app.js``): renderer output routes through
+       ``setMarkdown`` (or ``setSafeHtml`` for pre-baked HTML strings);
+       every other site uses ``createElement`` + ``textContent`` +
+       ``append`` / ``replaceChildren``.  Missing escapes are
+       structurally impossible — no HTML string is ever interpolated.
+    2. **Sink-free string-concat** (``console/static/admin.js``,
+       ``console/static/governance.js``): operator-facing admin /
+       governance pages still build HTML via ``escapeHtml`` + string
+       concat, but the unsafe sink is off the call site (everything
+       routes through ``setSafeHtml``).  XSS defence still depends on
+       every interpolated value going through escapeHtml; the lint
+       catches the sink but cannot catch a missing escape.
 
-    ``console/static/app.js`` (the cluster dashboard / node table
-    surface) is the last admin-side bundle still pending — same posture
-    as admin.js once cleaned.
+    All admin-side bundles are now covered.
 
     The regex covers inner/outer-HTML assignment (plain and
     concat-assignment), legacy doc-write, and the dynamic-code
     constructors (string-eval, dynamic-Function, string-first-arg
     timer scheduling).  ``insertAdjacent`` + HTML is deliberately
-    *not* covered yet; two existing app.js sites (the verdict-badge
-    writers at lines 1287 and 1538) consume the HTML-string output of
-    ``renderVerdictBadge``, so broadening the lint requires cleaning
-    that helper first.
+    *not* covered yet; two existing ``ui/static/app.js`` sites (the
+    verdict-badge writers at lines 1287 and 1538) consume the
+    HTML-string output of ``renderVerdictBadge``, so broadening the
+    lint requires cleaning that helper first.
 
     Parametrized so each target is its own pytest case — a failure on
     one file is attributed precisely without masking offenders in the
