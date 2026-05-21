@@ -12,6 +12,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 _APP_JS = Path(__file__).resolve().parent.parent / "turnstone/ui/static/app.js"
 
 
@@ -347,55 +349,76 @@ _KB_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/kb.js
 _COORD_JS = (
     Path(__file__).resolve().parent.parent / "turnstone/console/static/coordinator/coordinator.js"
 )
+_CONSOLE_ADMIN_JS = Path(__file__).resolve().parent.parent / "turnstone/console/static/admin.js"
 
 
-def test_no_unsafe_dom_writes_in_interactive_assets() -> None:
+_DOM_WRITE_LINT_TARGETS = [
+    ("turnstone/ui/static/app.js", _APP_JS),
+    ("turnstone/shared_static/utils.js", _UTILS_JS),
+    ("turnstone/shared_static/auth.js", _AUTH_JS),
+    ("turnstone/shared_static/kb.js", _KB_JS),
+    ("turnstone/console/static/coordinator/coordinator.js", _COORD_JS),
+    ("turnstone/console/static/admin.js", _CONSOLE_ADMIN_JS),
+]
+
+
+@pytest.mark.parametrize(
+    "label,path",
+    _DOM_WRITE_LINT_TARGETS,
+    ids=[label for label, _ in _DOM_WRITE_LINT_TARGETS],
+)
+def test_no_unsafe_dom_writes_in_static_assets(label: str, path: Path) -> None:
     """Whole-file pin: no direct DOM-write sinks
-    (``inner``/``outer``-HTML assignment, legacy doc-write) in the
-    interactive surface or the shared modules it loads.  Renderer
-    output routes through the ``setMarkdown`` helper in utils.js (or
-    ``setSafeHtml`` for pre-baked HTML strings), both of which parse
-    via ``DOMParser`` + ``replaceChildren``; every other site uses DOM
-    construction (``createElement`` + ``textContent`` + ``append`` /
-    ``replaceChildren``).
+    (``inner``/``outer``-HTML assignment, legacy doc-write) in any of
+    the static JS bundles that render LLM output, tool results,
+    operator-supplied data, or user input.
 
-    Coverage now spans the interactive entry point, the shared
-    helpers (utils / auth / kb), and the coord chat entry — the
-    surfaces that render LLM output, tool results, or user input.
-    The console admin / governance JS bundles remain outside this
-    scan (different threat model, admin-only behind auth gate);
-    cleaning them is a separate effort.
+    Two distinct cleanup postures across the targets:
+
+    1. **Strict DOM-construction** (``app.js``, ``utils.js``,
+       ``auth.js``, ``kb.js``, ``coordinator.js`` chat entry):
+       renderer output routes through ``setMarkdown`` (or
+       ``setSafeHtml`` for pre-baked HTML strings); every other site
+       uses ``createElement`` + ``textContent`` + ``append`` /
+       ``replaceChildren``.  Missing escapes are structurally
+       impossible — no HTML string is ever interpolated.
+    2. **Sink-free string-concat** (``admin.js``): operator-facing
+       admin pages still build HTML via ``escapeHtml`` + string concat,
+       but the unsafe sink is off the call site (everything routes
+       through ``setSafeHtml``).  XSS defence still depends on every
+       interpolated value going through escapeHtml; the lint catches
+       the sink but cannot catch a missing escape.
+
+    ``console/static/governance.js`` and ``console/static/app.js``
+    remain pending follow-ups — same posture as admin.js once cleaned.
 
     ``insertAdjacent`` + HTML is deliberately *not* covered yet; two
     existing app.js sites (the verdict-badge writers at lines 1287 and
     1538) consume the HTML-string output of ``renderVerdictBadge``, so
-    broadening the lint requires cleaning that helper first."""
-    targets = [
-        ("turnstone/ui/static/app.js", _APP_JS),
-        ("turnstone/shared_static/utils.js", _UTILS_JS),
-        ("turnstone/shared_static/auth.js", _AUTH_JS),
-        ("turnstone/shared_static/kb.js", _KB_JS),
-        ("turnstone/console/static/coordinator/coordinator.js", _COORD_JS),
-    ]
-    for label, path in targets:
-        body = path.read_text(encoding="utf-8")
-        # Scan whole-file (not line-by-line) so the regex's ``\s*``
-        # spans newlines and catches multi-line sinks like
-        # ``el.innerHTML\n  = X``.  Map match positions back to line
-        # numbers for the failure message.
-        lines = body.splitlines()
-        offenders: list[tuple[int, str]] = []
-        for m in _UNSAFE_DOM_WRITE_RE.finditer(body):
-            line_no = body.count("\n", 0, m.start()) + 1
-            offenders.append((line_no, lines[line_no - 1].rstrip()))
-        assert not offenders, (
-            f"Found {len(offenders)} unsafe DOM-write sink(s) in "
-            f"{label}:\n"
-            + "\n".join(f"  line {n}: {line}" for n, line in offenders[:10])
-            + "\nUse DOM construction (createElement + textContent + "
-            "append/replaceChildren) or route renderer output through "
-            "setMarkdown() in shared/utils.js."
-        )
+    broadening the lint requires cleaning that helper first.
+
+    Parametrized so each target is its own pytest case — a failure on
+    one file is attributed precisely without masking offenders in the
+    others.
+
+    Scans the whole file body (not line-by-line) so the regex's
+    ``\\s*`` can span newlines and catch multi-line sinks like
+    ``el.innerHTML\\n  = X``.  Match positions map back to line
+    numbers for the failure message."""
+    body = path.read_text(encoding="utf-8")
+    lines = body.splitlines()
+    offenders: list[tuple[int, str]] = []
+    for m in _UNSAFE_DOM_WRITE_RE.finditer(body):
+        line_no = body.count("\n", 0, m.start()) + 1
+        offenders.append((line_no, lines[line_no - 1].rstrip()))
+    assert not offenders, (
+        f"Found {len(offenders)} unsafe DOM-write sink(s) in "
+        f"{label}:\n"
+        + "\n".join(f"  line {n}: {line}" for n, line in offenders[:10])
+        + "\nUse DOM construction (createElement + textContent + "
+        "append/replaceChildren) or route renderer output through "
+        "setMarkdown() / setSafeHtml() in shared/utils.js."
+    )
 
 
 def test_shared_utils_defines_set_markdown_helper() -> None:
