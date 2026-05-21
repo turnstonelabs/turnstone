@@ -6627,15 +6627,23 @@ loadPendingConsents();
 // "interrupted while page was loading" and leaves the new page
 // stuck on "Loading…".  Best-effort close on unload frees the slots.
 //
-// This is a tactical mitigation — the real fix is the console SSE
-// fan-in (one connection per page regardless of pane count).  See
-// the [[sse-fanout-pending]] memory + ~/pr-c-sse-consolidation.md
-// briefing for the architectural work.
+// Per-pane teardown goes through `disconnectSSE()` instead of a bare
+// `evtSource.close()` so the pane's `_cancelTimeout` / `_forceTimeout`
+// timers also get cleared.  Otherwise — in the edge case where
+// beforeunload fires but navigation is then cancelled (see the
+// defensive-reconnect block below) — those timers can still fire on
+// a now-disconnected pane and mutate UI state.
+//
+// Tactical only — the canonical fix is console-side SSE fan-in
+// tracked at https://github.com/turnstonelabs/turnstone/issues/540.
 window.addEventListener("beforeunload", function () {
   try {
-    if (globalEvtSource) globalEvtSource.close();
+    if (globalEvtSource) {
+      globalEvtSource.close();
+      globalEvtSource = null;
+    }
     for (const id in panes) {
-      if (panes[id] && panes[id].evtSource) panes[id].evtSource.close();
+      if (panes[id]) panes[id].disconnectSSE();
     }
   } catch (_e) {
     /* best-effort — never block unload */
@@ -6645,30 +6653,32 @@ window.addEventListener("beforeunload", function () {
 // Defensive reconnect: covers the edge case where beforeunload fires but
 // navigation is then cancelled (e.g. another beforeunload listener — present
 // or future — sets returnValue and the user picks "Stay" in the dialog).
-// In that path, our handler already closed the SSEs but the page is still
-// alive with no automatic reconnect.  Both events are registered because
-// they catch different cancellation shapes: visibilitychange fires on
-// hide/show; focus fires when the window regains focus from a modal /
+// In that path, our handler already disconnected the SSEs but the page is
+// still alive with no automatic reconnect.  Both events are registered
+// because they catch different cancellation shapes: visibilitychange fires
+// on hide/show; focus fires when the window regains focus from a modal /
 // browser-UI / OS-level interruption.  Idempotent — when SSEs are alive
 // the check is a no-op, so this is also safe on every tab return.
 //
+// Reconnect condition handles both shapes the beforeunload handler can
+// leave behind: `disconnectSSE()` nulls `evtSource`; older non-handler
+// close paths may leave it non-null in CLOSED state.  Either way means
+// "not actively streaming for a pane that has a workstream attached".
+//
 // Out of scope here: visibility-based DISCONNECT (close-on-hidden to
-// support many tabs).  That belongs to the SSE fan-in design where the
-// connection lifecycle is being rethought — see ~/pr-c-sse-consolidation.md.
+// support many tabs).  That belongs to the fan-in design — issue #540.
 function _reconnectDeadSSEs() {
-  if (globalEvtSource && globalEvtSource.readyState === EventSource.CLOSED) {
+  if (!globalEvtSource || globalEvtSource.readyState === EventSource.CLOSED) {
     connectGlobalSSE();
   }
   for (const id in panes) {
     const p = panes[id];
-    if (
-      p &&
+    if (!p || !p.wsId) continue;
+    const live =
       p.evtSource &&
-      p.evtSource.readyState === EventSource.CLOSED &&
-      p.wsId
-    ) {
-      p.connectSSE(p.wsId);
-    }
+      (p.evtSource.readyState === EventSource.OPEN ||
+        p.evtSource.readyState === EventSource.CONNECTING);
+    if (!live) p.connectSSE(p.wsId);
   }
 }
 document.addEventListener("visibilitychange", function () {
