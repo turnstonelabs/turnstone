@@ -136,7 +136,6 @@ def test_coordinator_session_uses_coordinator_tools(coord_session):
         "delete_workstream",
         "list_workstreams",
         "list_nodes",
-        "list_skills",
         "tasks",
         "wait_for_workstream",
         # Memory is dual-kind (coordinator: true + interactive: true) so
@@ -146,6 +145,10 @@ def test_coordinator_session_uses_coordinator_tools(coord_session):
         # without this the model would see memories listed but no tool
         # to act on them.
         "memory",
+        # ``skills`` replaced ``list_skills`` in the 1.6.0 tool unification.
+        # Dual-kind (interactive + coordinator) — read actions auto-approve
+        # on both; writes gate on ``model.skills.write``.
+        "skills",
     }
     # Sub-agent tool sets are zeroed on coordinator sessions.
     assert sess._task_tools == []
@@ -626,6 +629,9 @@ def test_prepare_fails_cleanly_when_coord_client_missing(monkeypatch):
         kind="coordinator",
         coord_client=None,
     )
+    # ``skills`` is excluded here on purpose: it's dual-kind and talks
+    # directly to storage, so it has no coord_client dependency and
+    # legitimately prepares without erroring when coord_client is absent.
     for tool, args in (
         ("spawn_workstream", {"initial_message": "hi"}),
         ("inspect_workstream", {"ws_id": "x"}),
@@ -634,7 +640,6 @@ def test_prepare_fails_cleanly_when_coord_client_missing(monkeypatch):
         ("delete_workstream", {"ws_id": "x"}),
         ("list_workstreams", {}),
         ("list_nodes", {}),
-        ("list_skills", {}),
         ("tasks", {"action": "list"}),
     ):
         item = sess._prepare_tool(_tc(tool, args))
@@ -801,102 +806,6 @@ def test_list_nodes_exec_surfaces_truncated_sentinel(coord_session):
     item = sess._prepare_tool(_tc("list_nodes", {}))
     _, _ = sess._exec_list_nodes(item)
     # Summary reported to UI carries the "truncated" hint.
-    assert any("truncated" in r[2] for r in ui.tool_results)
-
-
-# ---------------------------------------------------------------------------
-# list_skills
-# ---------------------------------------------------------------------------
-
-
-def test_list_skills_prepare_is_auto_approved(coord_session):
-    sess, _coord, _ui = coord_session
-    item = sess._prepare_tool(_tc("list_skills", {}))
-    assert item["needs_approval"] is False
-    assert item["category"] is None
-    assert item["tag"] is None
-    assert item["risk_level"] is None
-    assert item["enabled_only"] is False
-    assert item["limit"] == 100
-
-
-def test_list_skills_prepare_accepts_filters(coord_session):
-    sess, _coord, _ui = coord_session
-    item = sess._prepare_tool(
-        _tc(
-            "list_skills",
-            {"category": "ops", "tag": "gpu", "risk_level": "clean", "enabled_only": True},
-        )
-    )
-    assert item["category"] == "ops"
-    assert item["tag"] == "gpu"
-    assert item["risk_level"] == "clean"
-    assert item["enabled_only"] is True
-
-
-def test_list_skills_prepare_tolerates_non_string_filters(coord_session):
-    """A malformed model call with non-string filter values must NOT
-    raise AttributeError during ``.strip()`` — the prepare path should
-    coerce non-strings to ``None`` and proceed."""
-    sess, _coord, _ui = coord_session
-    item = sess._prepare_tool(
-        _tc(
-            "list_skills",
-            {"category": 42, "tag": ["not", "a", "string"], "risk_level": {"bad": 1}},
-        )
-    )
-    assert "error" not in item
-    assert item["category"] is None
-    assert item["tag"] is None
-    assert item["risk_level"] is None
-
-
-def test_list_skills_prepare_parses_enabled_only_string_forms(coord_session):
-    """``bool("false")`` is True (non-empty string).  The prepare path
-    must interpret common string forms the way the model would expect."""
-    sess, _coord, _ui = coord_session
-    for raw, expected in (
-        ("true", True),
-        ("True", True),
-        ("1", True),
-        ("false", False),
-        ("False", False),
-        ("0", False),
-        ("", False),
-        (True, True),
-        (False, False),
-    ):
-        item = sess._prepare_tool(_tc("list_skills", {"enabled_only": raw}))
-        assert item.get("enabled_only") is expected, (
-            f"enabled_only={raw!r} → {item.get('enabled_only')!r}, expected {expected!r}"
-        )
-
-
-def test_list_skills_exec_dispatches_to_client(coord_session):
-    sess, coord, ui = coord_session
-    coord.list_skills.return_value = {
-        "skills": [{"name": "alpha", "tags": ["gpu"]}],
-        "truncated": False,
-    }
-    item = sess._prepare_tool(_tc("list_skills", {"category": "ops", "tag": "gpu"}))
-    call_id, output = sess._exec_list_skills(item)
-    assert call_id == "call-1"
-    parsed = json.loads(output)
-    assert parsed["skills"][0]["name"] == "alpha"
-    coord.list_skills.assert_called_once_with(
-        category="ops",
-        tag="gpu",
-        risk_level=None,
-        enabled_only=False,
-        limit=100,
-    )
-
-
-def test_list_skills_exec_surfaces_truncated_sentinel(coord_session):
-    sess, coord, ui = coord_session
-    coord.list_skills.return_value = {"skills": [], "truncated": True}
-    item = sess._prepare_tool(_tc("list_skills", {}))
-    _, _ = sess._exec_list_skills(item)
     assert any("truncated" in r[2] for r in ui.tool_results)
 
 

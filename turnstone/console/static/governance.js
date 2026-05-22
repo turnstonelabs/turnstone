@@ -180,6 +180,10 @@ const _PERMISSION_SECTIONS = [
     label: "Workstreams & Tools",
     permissions: ["workstreams.create", "workstreams.close", "tools.approve"],
   },
+  {
+    label: "Model",
+    permissions: ["model.skills.write"],
+  },
 ];
 
 // Flat list — kept for any caller that wants the full permission
@@ -1209,7 +1213,9 @@ function submitCreateTemplate() {
   const csTemp = document.getElementById("csk-temperature").value.trim();
   const csMaxTok = document.getElementById("csk-max-tokens").value.trim();
   const csBudget = document.getElementById("csk-token-budget").value.trim();
-  const csMaxTurns = document.getElementById("csk-agent-max-turns").value.trim();
+  const csMaxTurns = document
+    .getElementById("csk-agent-max-turns")
+    .value.trim();
   const csAllowed = (
     document.getElementById("csk-allowed-tools").value || ""
   ).trim();
@@ -1239,7 +1245,9 @@ function submitCreateTemplate() {
     }
   }
   document.getElementById("ctm-submit").disabled = true;
-  const csVersion = (document.getElementById("skill-version").value || "").trim();
+  const csVersion = (
+    document.getElementById("skill-version").value || ""
+  ).trim();
   const createBody = {
     name: name,
     category: document.getElementById("ctm-category").value,
@@ -1952,7 +1960,9 @@ function submitEditTemplate() {
   const esTemp = document.getElementById("esk-temperature").value.trim();
   const esMaxTok = document.getElementById("esk-max-tokens").value.trim();
   const esBudget = document.getElementById("esk-token-budget").value.trim();
-  const esMaxTurns = document.getElementById("esk-agent-max-turns").value.trim();
+  const esMaxTurns = document
+    .getElementById("esk-agent-max-turns")
+    .value.trim();
   const esAllowed = (
     document.getElementById("esk-allowed-tools").value || ""
   ).trim();
@@ -2052,7 +2062,8 @@ function loadGovUsage() {
   const sinceStr = since.toISOString().slice(0, 19);
 
   // Fetch summary + breakdown in parallel
-  const summaryUrl = "/v1/api/admin/usage?since=" + encodeURIComponent(sinceStr);
+  const summaryUrl =
+    "/v1/api/admin/usage?since=" + encodeURIComponent(sinceStr);
   const breakdownUrl = summaryUrl + "&group_by=" + _govUsageGroupBy;
 
   Promise.all([
@@ -2121,7 +2132,8 @@ function _renderGovUsage(summary, breakdown) {
   if (items.length) {
     let maxVal = 0;
     for (let i = 0; i < items.length; i++) {
-      const v = (items[i].prompt_tokens || 0) + (items[i].completion_tokens || 0);
+      const v =
+        (items[i].prompt_tokens || 0) + (items[i].completion_tokens || 0);
       if (v > maxVal) maxVal = v;
     }
     html += '<div class="usage-chart">';
@@ -2627,7 +2639,8 @@ function searchSkillDiscover() {
   const searchBtn = document.getElementById("skill-discover-search-btn");
   if (searchBtn) searchBtn.disabled = true;
 
-  const url = "/v1/api/admin/skills/discover?limit=20&q=" + encodeURIComponent(q);
+  const url =
+    "/v1/api/admin/skills/discover?limit=20&q=" + encodeURIComponent(q);
 
   authFetch(url)
     .then(function (r) {
@@ -3195,7 +3208,9 @@ let _eogpTriggerEl = null;
 function switchJudgeSection(section) {
   const sections = document.querySelectorAll(".judge-section");
   for (let i = 0; i < sections.length; i++) sections[i].style.display = "none";
-  const switcher = document.querySelector("#admin-judge .admin-subtab-switcher");
+  const switcher = document.querySelector(
+    "#admin-judge .admin-subtab-switcher",
+  );
   const btns = switcher ? switcher.querySelectorAll(".admin-subtab-btn") : [];
   for (let i = 0; i < btns.length; i++) {
     const isActive = btns[i].getAttribute("data-section") === section;
@@ -3209,7 +3224,9 @@ function switchJudgeSection(section) {
 
 // Arrow key navigation for judge sub-section tabs
 (function () {
-  const switcher = document.querySelector("#admin-judge .admin-subtab-switcher");
+  const switcher = document.querySelector(
+    "#admin-judge .admin-subtab-switcher",
+  );
   if (!switcher) return;
   switcher.addEventListener("keydown", function (e) {
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;

@@ -126,7 +126,7 @@ def compose_system_message(
         IC-focused ``tools.md`` with read_file / bash / write_file
         patterns; ``"coordinator"`` loads ``tools_coordinator.md``
         which documents spawn_workstream / send_to_workstream /
-        inspect_workstream / list_nodes / list_skills / tasks etc.
+        inspect_workstream / list_nodes / skills / tasks etc.
         A coordinator session has a disjoint tool schema (see
         COORDINATOR_TOOLS), so composing it with the IC tools block
         would instruct the model to hallucinate tool calls that fail.

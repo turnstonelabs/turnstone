@@ -277,8 +277,12 @@ def test_interactive_and_coordinator_tool_sets_overlap_only_on_dual_kind():
     interactive_names = {t["function"]["name"] for t in INTERACTIVE_TOOLS}
     coord_names = {t["function"]["name"] for t in COORDINATOR_TOOLS}
 
-    # Explicit dual-kind tools — deliberately in both sets.
-    dual_kind = {"memory"}
+    # Explicit dual-kind tools — deliberately in both sets.  ``skills``
+    # joined in 1.6.0 (replaces legacy ``skill`` + ``list_skills``) — read
+    # actions auto-approve on both kinds, write actions gate on
+    # ``model.skills.write`` permission, and ``load`` errors on coord
+    # sessions where it doesn't apply.
+    dual_kind = {"memory", "skills"}
 
     overlap = interactive_names & coord_names
     assert overlap == dual_kind, (

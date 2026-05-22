@@ -72,8 +72,10 @@ class TestToolsMetadata:
     """Validate the metadata extracted from JSON files."""
 
     def test_tool_count(self):
-        # 19 interactive tools + 13 coordinator tools
-        assert len(TOOLS) == 32
+        # 19 interactive tools + 12 coordinator tools (was 13 before the
+        # skills tool unification merged `skill` + `list_skills` and made
+        # the unified `skills` tool dual-kind).
+        assert len(TOOLS) == 31
 
     def test_agent_tools_count(self):
         assert len(AGENT_TOOLS) == 10
@@ -96,13 +98,19 @@ class TestToolsMetadata:
             "delete_workstream",
             "list_workstreams",
             "list_nodes",
-            "list_skills",
             "tasks",
             "wait_for_workstream",
-            # ``memory`` is dual-kind (coordinator: true + interactive: true)
-            # so coords can persist orchestration context for their children
+            # ``memory`` is dual-kind (coordinator + interactive) so
+            # coords can persist orchestration context for their children
             # via the new ``coordinator`` scope.
             "memory",
+            # ``skills`` is dual-kind (replaces legacy ``skill`` +
+            # ``list_skills``).  Read actions (find, get) auto-approve;
+            # write actions require operator approval + the
+            # ``model.skills.write`` permission.  ``load`` errors on
+            # coord sessions — coords delegate skill assignment via
+            # ``spawn_workstream(skill=...)``.
+            "skills",
         }
 
     def test_auto_approve_sets_match(self):
@@ -119,7 +127,6 @@ class TestToolsMetadata:
             "inspect_workstream",
             "list_workstreams",
             "list_nodes",
-            "list_skills",
             "wait_for_workstream",
         }
         assert expected == AGENT_AUTO_TOOLS
@@ -144,7 +151,7 @@ class TestToolsMetadata:
             "watch": "command",
             "read_resource": "uri",
             "use_prompt": "name",
-            "skill": "name",
+            "skills": "action",
             "diff_file": "path_a",
             # Coordinator tools:
             "spawn_workstream": "initial_message",

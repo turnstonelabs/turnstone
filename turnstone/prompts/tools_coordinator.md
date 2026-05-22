@@ -1,8 +1,9 @@
 TOOL PATTERNS:
 
-Discover available capacity → list_nodes / list_skills:
+Discover available capacity → list_nodes / skills(action='find'):
    list_nodes(filters={'capability': 'gpu'})
-   list_skills(category='engineering')
+   skills(action='find', category='engineering')
+   skills(action='find', query='code review')
 
 Delegate a task → spawn_workstream:
    spawn_workstream(initial_message='audit auth.py for CSRF handling', name='csrf-audit')

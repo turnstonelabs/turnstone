@@ -140,13 +140,6 @@ _TASK_TITLE_MAX = 200
 # enough to bound one stall per child per turn regardless of how many
 # inspect calls the model fires.
 _LIVE_CACHE_TTL_SECONDS = 2.0
-# Cap on the number of tool names projected per skill in list_skills.
-# A skill that whitelists a wide MCP surface (Slack/Gmail/Drive +
-# dozens of helpers) would otherwise bloat the per-row payload and
-# defeat the bounded-output contract.  Anything beyond the cap is
-# rolled into a "+N more" sentinel so the model knows to fetch the
-# full row if the inventory matters.
-_SKILL_TOOLS_PROJECTION_CAP = 20
 
 
 def _utc_now_iso() -> str:
@@ -1218,90 +1211,6 @@ class CoordinatorClient:
                 }
             )
         return {"nodes": nodes, "truncated": truncated}
-
-    def list_skills(
-        self,
-        *,
-        category: str | None = None,
-        tag: str | None = None,
-        risk_level: str | None = None,
-        enabled_only: bool = False,
-        limit: int = 100,
-    ) -> dict[str, Any]:
-        """Return ``{"skills": [...], "truncated": bool}``.
-
-        Coordinator-visible skills only: the storage filter narrows to
-        ``kind IN ('coordinator', 'any')``.  Skills tagged
-        ``interactive`` are hidden from the coordinator's
-        ``list_skills`` tool (they're meant for child workstreams, not
-        the orchestrator), while ``any``-tagged skills show up on both
-        sides for backwards compatibility with pre-tagging catalogs.
-
-        Filters pushed into SQL via ``list_skills_filtered`` — no per-row
-        lookups.  ``tag`` matches when the value appears in the
-        JSON-array ``tags`` column (quote-bracketed substring).
-        ``tags`` is decoded from JSON at the edge so the model sees a
-        list, not the escaped string.  Projection is intentionally narrow
-        — discovery metadata only, not full row.
-        """
-        page_size = max(1, min(int(limit), 500))
-        rows = self._storage.list_skills_filtered(
-            category=category,
-            tag=tag,
-            risk_level=risk_level,
-            kinds=["coordinator", "any"],
-            enabled_only=enabled_only,
-            limit=page_size + 1,  # +1 to detect truncation
-        )
-        truncated = len(rows) > page_size
-        rows = rows[:page_size]
-        skills: list[dict[str, Any]] = []
-        for r in rows:
-            tags_raw = r.get("tags") or "[]"
-            try:
-                tags = json.loads(tags_raw) if isinstance(tags_raw, str) else list(tags_raw)
-            except (TypeError, ValueError):
-                tags = []
-            allowed_raw = r.get("allowed_tools") or "[]"
-            try:
-                allowed_full = (
-                    json.loads(allowed_raw) if isinstance(allowed_raw, str) else list(allowed_raw)
-                )
-            except (TypeError, ValueError):
-                allowed_full = []
-            if not isinstance(allowed_full, list):
-                allowed_full = []
-            # Cap the projected tool list so a skill that whitelists a
-            # large MCP surface doesn't bloat the coordinator's
-            # list_skills payload.  Coordinators that need the full
-            # inventory can fetch the skill row directly.
-            allowed_tools: list[str] = [str(t) for t in allowed_full[:_SKILL_TOOLS_PROJECTION_CAP]]
-            if len(allowed_full) > _SKILL_TOOLS_PROJECTION_CAP:
-                allowed_tools.append(f"+{len(allowed_full) - _SKILL_TOOLS_PROJECTION_CAP} more")
-            skill_row: dict[str, Any] = {
-                "name": r.get("name") or "",
-                "category": r.get("category") or "",
-                "tags": tags,
-                "version": r.get("version") or "",
-                "description": r.get("description") or "",
-                "model": r.get("model") or "",
-                "enabled": bool(r.get("enabled")),
-                "risk_level": r.get("risk_level") or "",
-                "activation": r.get("activation") or "",
-                "kind": r["kind"],
-            }
-            # Omit ``allowed_tools`` when empty: an empty list reads as
-            # "no tools are usable by this skill" to a model that doesn't
-            # know the semantics, but the actual meaning is "no tools are
-            # pre-approved (auto-approve exemption list)".  Real
-            # misdiagnosis happened in testing when a code-review skill
-            # with no auto-approve allowlist looked like it had been
-            # spawned with zero tool access.  Dropping the key altogether
-            # when empty removes the ambiguity at the source.
-            if allowed_tools:
-                skill_row["allowed_tools"] = allowed_tools
-            skills.append(skill_row)
-        return {"skills": skills, "truncated": truncated}
 
     # ------------------------------------------------------------------
     # tasks — coordinator-local planning state persisted on workstream_config

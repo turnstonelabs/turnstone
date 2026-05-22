@@ -32,7 +32,7 @@ import time
 import uuid
 from datetime import UTC, datetime
 from html import escape as _html_escape
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
 import httpx
 
@@ -97,6 +97,7 @@ from turnstone.core.nudge_queue import TOOL_DRAIN, USER_DRAIN, NudgeQueue
 from turnstone.core.providers import create_provider
 from turnstone.core.safety import is_command_blocked, sanitize_command
 from turnstone.core.sandbox import execute_math_sandboxed
+from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS
 from turnstone.core.storage._registry import get_storage
 from turnstone.core.storage._utils import normalize_search_terms
 from turnstone.core.tool_advisory import escape_wrapper_tags, render_system_reminder
@@ -4663,8 +4664,33 @@ class ChatSession:
                 it["func_args"] = {"url": it.get("url", ""), "question": it.get("question", "")}
             elif name == "web_search":
                 it["func_args"] = {"query": it.get("query", ""), "topic": it.get("topic", "")}
-            elif name == "skill":
-                it["func_args"] = {"action": it.get("action", ""), "name": it.get("name", "")}
+            elif name == "skills":
+                # Projection for judge / audit on the model-facing skills
+                # tool. Mutating actions surface name + action + a snippet
+                # of the proposed content / fields so a heuristic rule can
+                # match on suspicious patterns (e.g. allowed_tools
+                # expansion).  Long fields are capped for verdict-row size.
+                action_val = it.get("action", "")
+                fa: dict[str, Any] = {"action": action_val, "name": it.get("name", "")}
+                if action_val in ("find", "get"):
+                    pass
+                elif action_val == "load":
+                    pass  # name only — covers the surface
+                elif action_val == "create":
+                    fa["category"] = it.get("category", "")
+                    fa["kind"] = it.get("kind", "")
+                    fa["description"] = (it.get("description") or "")[:200]
+                    fa["content"] = (it.get("content") or "")[:400]
+                    fa["projected_risk"] = it.get("projected_risk", "")
+                elif action_val == "update":
+                    upd = it.get("updates") or {}
+                    fa["updated_fields"] = sorted(upd.keys()) if isinstance(upd, dict) else []
+                    if isinstance(upd, dict) and "content" in upd:
+                        fa["content"] = (upd.get("content") or "")[:400]
+                    fa["projected_risk"] = it.get("projected_risk", "")
+                    fa["current_risk"] = it.get("current_risk", "")
+                elif action_val in ("enable", "disable"):
+                    pass  # name + action is the auditable surface
             elif name == "watch":
                 it["func_args"] = {
                     "action": it.get("action", ""),
@@ -5481,7 +5507,12 @@ class ChatSession:
             "watch": self._prepare_watch,
             "read_resource": self._prepare_read_resource,
             "use_prompt": self._prepare_use_prompt,
-            "skill": self._prepare_skill,
+            # ``skills`` is the unified read+write+activate tool replacing
+            # the legacy ``skill`` + ``list_skills`` pair.  Lives in the
+            # interactive block (not coordinator-only) because it serves
+            # both kinds: per-action gating inside _prepare_skills routes
+            # coord vs interactive — load is interactive-only.
+            "skills": self._prepare_skills,
             # Coordinator tools: only reachable when this session was
             # constructed with kind="coordinator" (COORDINATOR_TOOLS set).
             "spawn_workstream": self._prepare_spawn_workstream,
@@ -5494,7 +5525,6 @@ class ChatSession:
             "delete_workstream": self._prepare_delete_workstream,
             "list_workstreams": self._prepare_list_workstreams,
             "list_nodes": self._prepare_list_nodes,
-            "list_skills": self._prepare_list_skills,
             "tasks": self._prepare_tasks,
             "wait_for_workstream": self._prepare_wait_for_workstream,
         }
@@ -6330,11 +6360,11 @@ class ChatSession:
                     "needs_approval": False,
                     "error": (
                         f"Error: unknown skill '{skill_arg}'. "
-                        "Use skill(action='search') to find available names."
+                        "Use skills(action='find', query='...') to find available names."
                     ),
                 }
             # ``enabled=False`` is an admin's quarantine flag \u2014 mirror the
-            # gate that ``_exec_skill(action='load')`` and skill-search
+            # gate that ``_exec_skills_load`` and ``_exec_skills_find``
             # apply so task_agent can't sidestep it.  Distinct from the
             # not-found case so the LLM's recovery path can tell them apart.
             if not skill_data.get("enabled", True):
@@ -6346,7 +6376,7 @@ class ChatSession:
                     "needs_approval": False,
                     "error": (
                         f"Error: skill '{skill_arg}' is disabled and cannot be used. "
-                        "Use skill(action='search') to find available names."
+                        "Use skills(action='find', query='...') to find available names."
                     ),
                 }
             # ``get_skill_by_name`` returns the full prompt_templates row
@@ -7817,19 +7847,141 @@ class ChatSession:
         self._report_tool_result(call_id, "list_nodes", summary)
         return call_id, self._truncate_output(output)
 
-    def _prepare_list_skills(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
-        if self._coord_client is None:
-            return self._coord_tool_error(call_id, "list_skills", "coordinator client unavailable")
+    # -- skills tool ----------------------------------------------------------
+    #
+    # Single action-multiplexed tool replacing legacy ``skill`` +
+    # ``list_skills``.  Read actions (find, get) auto-approve.  Write
+    # actions (create, update, enable, disable) require approval AND the
+    # ``model.skills.write`` permission on the session user (default-
+    # ungranted; operators opt themselves in).  ``load`` mutates session
+    # state and is interactive-only.
+
+    # Projected ``allowed_tools`` count above which the scanner is likely
+    # to bump the risk tier.  Surfaced on the approval card via
+    # ``_scan_proposed_skill`` so the operator sees risk drift before
+    # approving.
+    _SKILLS_TOOLS_PROJECTION_CAP: ClassVar[int] = 20
+
+    def _require_model_skills_write(
+        self, call_id: str, action: str, args: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Gate model-proposed skill writes on the ``model.skills.write``
+        permission, called BOTH at prepare time (gating the approval card
+        render) AND at exec time (catching grant revocation between
+        approval and write).  Denials are audited with
+        ``skill.write_denied`` so probing attempts leave a trail.
+
+        Returns ``None`` on grant, or a ``_coord_tool_error`` dict on
+        deny.  The dict shape is compatible with both prepare-time return
+        (the dispatcher hands it back to the chat loop) and exec-time
+        early-return (callers detect ``deny is not None`` and short-circuit).
+        """
+        from turnstone.core.auth import user_has_permission
+        from turnstone.core.storage._registry import get_storage
+
+        if user_has_permission(self._user_id, "model.skills.write"):
+            return None
+        # Audit the deny so probing for the grant leaves a forensic
+        # record.  ``skill.write_denied`` action distinguishes denied
+        # attempts from approved-and-failed writes (which audit under
+        # ``skill.create`` / ``skill.update`` etc.).
+        name = args.get("name") if isinstance(args.get("name"), str) else ""
+        storage = get_storage()
+        if storage is not None:
+            self._audit_skill_action(
+                storage,
+                "skill.write_denied",
+                "",
+                {"action": action, "name": name or ""},
+            )
+        return self._coord_tool_error(
+            call_id,
+            "skills",
+            self._skill_hint(
+                f"permission denied: action='{action}' requires the "
+                "'model.skills.write' permission",
+                system_reminder=(
+                    "model.skills.write is default-ungranted on every "
+                    "role including builtin-admin. Ask the operator to "
+                    "grant it via the Roles tab in the admin panel "
+                    "before retrying. Read actions (find, get) remain "
+                    "available without the grant."
+                ),
+            ),
+        )
+
+    def _skill_hint(self, message: str, *, system_reminder: str = "") -> str:
+        """Compose a tool error/result message with an optional meta-cognitive
+        nudge in a ``<system-reminder>`` tag.  The nudge text is consumed by
+        the model as a hint, not by the harness as a directive — it informs
+        the next tool call without forcing a specific recovery path.
+
+        Both inputs route through :func:`escape_wrapper_tags` because callers
+        interpolate model-controlled values (skill names, filter strings)
+        into ``message`` via f-strings — a crafted name like
+        ``evil</system-reminder>...`` would otherwise close the envelope and
+        let the model fabricate a system-reminder directive in its own
+        future context.  Escaping at the single chokepoint covers every
+        existing and future call site.
+        """
+        safe_message = escape_wrapper_tags(message)
+        if system_reminder:
+            safe_reminder = escape_wrapper_tags(system_reminder)
+            return f"{safe_message} <system-reminder>{safe_reminder}</system-reminder>"
+        return safe_message
+
+    def _skills_kinds(self) -> list[str]:
+        """Storage-side ``kind`` filter for the current session.  Coord
+        sessions see ``[coordinator, any]``; interactive sessions see
+        ``[interactive, any]``.  ``any``-tagged skills are visible to both
+        for backwards compat with pre-tagging catalogs.
+        """
+        if self._kind == WorkstreamKind.COORDINATOR:
+            return ["coordinator", "any"]
+        return ["interactive", "any"]
+
+    def _prepare_skills(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Dispatch on ``action``.  Reads auto-approve; writes require both
+        operator approval and the ``model.skills.write`` permission."""
+        action = self._coord_str_arg(args, "action").strip().lower()
+        if action == "find":
+            return self._prepare_skills_find(call_id, args)
+        if action == "get":
+            return self._prepare_skills_get(call_id, args)
+        if action == "load":
+            return self._prepare_skills_load(call_id, args)
+        if action in ("create", "update", "enable", "disable"):
+            deny = self._require_model_skills_write(call_id, action, args)
+            if deny is not None:
+                return deny
+            if action == "create":
+                return self._prepare_skills_create(call_id, args)
+            if action == "update":
+                return self._prepare_skills_update(call_id, args)
+            return self._prepare_skills_toggle(call_id, args, enable=(action == "enable"))
+        return self._coord_tool_error(
+            call_id,
+            "skills",
+            f"action must be one of: find, get, load, create, update, enable, "
+            f"disable; got '{action}'",
+        )
+
+    # -- find ----------------------------------------------------------------
+
+    def _prepare_skills_find(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         category = self._coord_str_arg(args, "category").strip() or None
         tag = self._coord_str_arg(args, "tag").strip() or None
         risk_level = self._coord_str_arg(args, "risk_level").strip() or None
+        query = self._coord_str_arg(args, "query").strip() or None
         enabled_only = self._coord_bool_arg(args, "enabled_only")
         try:
             limit = int(args.get("limit") or 100)
         except (TypeError, ValueError):
             limit = 100
         limit = max(1, min(limit, 500))
-        header_bits = ["\u2699 list_skills"]
+        header_bits = ["⚙ skills find"]
+        if query:
+            header_bits.append(f'query="{query[:40]}"')
         if category:
             header_bits.append(f"category={category}")
         if tag:
@@ -7840,44 +7992,918 @@ class ChatSession:
             header_bits.append("enabled_only=true")
         return {
             "call_id": call_id,
-            "func_name": "list_skills",
+            "func_name": "skills",
             "header": " ".join(header_bits),
             "preview": "",
             "needs_approval": False,
-            "execute": self._exec_list_skills,
+            "execute": self._exec_skills,
+            "action": "find",
             "category": category,
             "tag": tag,
             "risk_level": risk_level,
+            "query": query,
             "enabled_only": enabled_only,
             "limit": limit,
         }
 
-    def _exec_list_skills(self, item: dict[str, Any]) -> tuple[str, str]:
+    def _exec_skills_find(self, item: dict[str, Any]) -> tuple[str, str]:
+        from turnstone.core.storage._registry import get_storage
+
         call_id = item["call_id"]
+        storage = get_storage()
+        if storage is None:
+            msg = "Error: storage unavailable"
+            self._report_tool_result(call_id, "skills", msg, is_error=True)
+            return call_id, msg
+        kinds = self._skills_kinds()
         try:
-            result = self._coord_client.list_skills(
+            rows = storage.list_skills_filtered(
                 category=item["category"],
                 tag=item["tag"],
                 risk_level=item["risk_level"],
+                kinds=kinds,
                 enabled_only=item["enabled_only"],
-                limit=item["limit"],
+                limit=item["limit"] + 1,  # +1 to detect truncation
             )
         except Exception as e:
-            msg = f"Error: list_skills failed: {e}"
-            self._report_tool_result(call_id, "list_skills", msg, is_error=True)
+            msg = f"Error: skills find failed: {e}"
+            self._report_tool_result(call_id, "skills", msg, is_error=True)
             return call_id, msg
-        skills = result.get("skills", [])
-        truncated = bool(result.get("truncated"))
-        output = json.dumps(
-            {"skills": skills, "truncated": truncated},
-            separators=(",", ":"),
-            default=str,
+        truncated = len(rows) > item["limit"]
+        rows = rows[: item["limit"]]
+        query = item.get("query")
+        if query and rows:
+            from turnstone.core.bm25 import BM25Index
+
+            corpus = [
+                " ".join(
+                    filter(
+                        None,
+                        [
+                            r.get("name", ""),
+                            r.get("description", ""),
+                            self._skills_tags_text(r.get("tags", "[]")),
+                            r.get("category", ""),
+                        ],
+                    )
+                )
+                for r in rows
+            ]
+            index = BM25Index(corpus)
+            top = index.search(query, k=min(len(rows), 50))
+            rows = [rows[i] for i in top]
+        skills = [self._skills_project_row(r) for r in rows]
+        result = {"skills": skills, "truncated": truncated}
+        any_filter = bool(
+            item.get("category")
+            or item.get("tag")
+            or item.get("risk_level")
+            or item.get("query")
+            or item.get("enabled_only")
         )
         summary = f"{len(skills)} skills"
         if truncated:
-            summary += " (truncated — narrow filters or raise limit)"
-        self._report_tool_result(call_id, "list_skills", summary)
+            summary += " (truncated; narrow filters or raise limit)"
+        output_msg: str | None = None
+        if not skills and any_filter:
+            try:
+                unfiltered = storage.list_skills_filtered(kinds=kinds, enabled_only=False, limit=10)
+            except Exception:
+                unfiltered = []
+            if unfiltered:
+                applied: list[str] = []
+                if item.get("query"):
+                    applied.append(f"query={item['query']!r}")
+                if item.get("category"):
+                    applied.append(f"category={item['category']!r}")
+                if item.get("tag"):
+                    applied.append(f"tag={item['tag']!r}")
+                if item.get("risk_level"):
+                    applied.append(f"risk_level={item['risk_level']!r}")
+                if item.get("enabled_only"):
+                    applied.append("enabled_only=true")
+                output_msg = self._skill_hint(
+                    "0 skills matched the supplied filters.",
+                    system_reminder=(
+                        f"Without these filters ({', '.join(applied)}) "
+                        f"there are at least {len(unfiltered)} skill(s) "
+                        "available for this session kind. Try omitting "
+                        "the most-restrictive filter or use a broader "
+                        "query."
+                    ),
+                )
+                summary = "0 skills (hint included)"
+        output = (
+            output_msg
+            if output_msg is not None
+            else json.dumps(result, separators=(",", ":"), default=str)
+        )
+        self._report_tool_result(call_id, "skills", summary)
         return call_id, self._truncate_output(output)
+
+    @staticmethod
+    def _skills_tags_text(raw: Any) -> str:
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else list(raw)
+            if isinstance(parsed, list):
+                return " ".join(str(t) for t in parsed)
+        except (ValueError, TypeError):
+            pass
+        return raw if isinstance(raw, str) else ""
+
+    def _skills_project_row(self, r: dict[str, Any]) -> dict[str, Any]:
+        """Narrow projection for ``find`` output.  Mirrors the previous
+        ``coord_client.list_skills`` shape so existing callers and the
+        model's mental model don't shift on the merge: full content
+        body is reserved for ``get``.
+        """
+        tags_raw = r.get("tags") or "[]"
+        try:
+            tags = json.loads(tags_raw) if isinstance(tags_raw, str) else list(tags_raw)
+        except (TypeError, ValueError):
+            tags = []
+        allowed_raw = r.get("allowed_tools") or "[]"
+        try:
+            allowed_full = (
+                json.loads(allowed_raw) if isinstance(allowed_raw, str) else list(allowed_raw)
+            )
+        except (TypeError, ValueError):
+            allowed_full = []
+        if not isinstance(allowed_full, list):
+            allowed_full = []
+        cap = self._SKILLS_TOOLS_PROJECTION_CAP
+        allowed_tools: list[str] = [str(t) for t in allowed_full[:cap]]
+        if len(allowed_full) > cap:
+            allowed_tools.append(f"+{len(allowed_full) - cap} more")
+        row: dict[str, Any] = {
+            "name": r.get("name") or "",
+            "category": r.get("category") or "",
+            "tags": tags,
+            "version": r.get("version") or "",
+            "description": r.get("description") or "",
+            "model": r.get("model") or "",
+            "enabled": bool(r.get("enabled")),
+            "risk_level": r.get("risk_level") or "",
+            "activation": r.get("activation") or "",
+            "kind": r.get("kind") or "any",
+        }
+        if allowed_tools:
+            row["allowed_tools"] = allowed_tools
+        return row
+
+    # -- get -----------------------------------------------------------------
+
+    def _prepare_skills_get(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        name = self._coord_str_arg(args, "name").strip()
+        if not name:
+            return self._coord_tool_error(call_id, "skills", "get: 'name' is required")
+        return {
+            "call_id": call_id,
+            "func_name": "skills",
+            "header": f"⚙ skills get: {name}",
+            "preview": "",
+            "needs_approval": False,
+            "execute": self._exec_skills,
+            "action": "get",
+            "name": name,
+        }
+
+    def _exec_skills_get(self, item: dict[str, Any]) -> tuple[str, str]:
+        from turnstone.core.storage._registry import get_storage
+
+        call_id = item["call_id"]
+        name = item["name"]
+        storage = get_storage()
+        if storage is None:
+            msg = "Error: storage unavailable"
+            self._report_tool_result(call_id, "skills", msg, is_error=True)
+            return call_id, msg
+        row = storage.get_prompt_template_by_name(name)
+        if row is None:
+            msg = self._skill_hint(
+                f"skill '{name}' not found",
+                system_reminder=(
+                    "Use skills(action='find', query='...') to discover "
+                    "available skill names. Names are exact-match and "
+                    "case-sensitive."
+                ),
+            )
+            self._report_tool_result(call_id, "skills", msg, is_error=True)
+            return call_id, msg
+        kind = row.get("kind") or "any"
+        if kind not in self._skills_kinds():
+            # Collapse cross-kind access into "not found" so the model
+            # cannot enumerate the other surface's skill names by
+            # name-probing.  Audit still distinguishes the case via
+            # the storage-side row presence for forensics, but the
+            # tool response is response-shape-identical to a true miss.
+            msg = self._skill_hint(
+                f"skill '{name}' not found",
+                system_reminder=(
+                    "Use skills(action='find', query='...') to discover "
+                    "available skill names. Names are exact-match and "
+                    "case-sensitive."
+                ),
+            )
+            self._report_tool_result(call_id, "skills", msg, is_error=True)
+            return call_id, msg
+        projected = self._skills_project_row(row)
+        projected["content"] = row.get("content") or ""
+        projected["scan_report"] = row.get("scan_report") or ""
+        projected["readonly"] = bool(row.get("readonly"))
+        output = json.dumps(projected, separators=(",", ":"), default=str)
+        self._report_tool_result(call_id, "skills", f"got {name}")
+        return call_id, self._truncate_output(output)
+
+    # -- load (interactive only) ----------------------------------------------
+
+    def _prepare_skills_load(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        if self._kind == WorkstreamKind.COORDINATOR:
+            return self._coord_tool_error(
+                call_id,
+                "skills",
+                self._skill_hint(
+                    "load: not available on coordinator sessions",
+                    system_reminder=(
+                        "Coordinators don't activate skills for themselves. "
+                        "To assign a skill to a child workstream, use "
+                        "spawn_workstream(skill='<name>', ...) - the skill "
+                        "is applied when the child session is constructed."
+                    ),
+                ),
+            )
+        name = self._coord_str_arg(args, "name").strip()
+        if not name:
+            return self._coord_tool_error(call_id, "skills", "load: 'name' is required")
+        return {
+            "call_id": call_id,
+            "func_name": "skills",
+            "header": f"⚙ skills load: {name}",
+            "preview": "",
+            "needs_approval": True,
+            "approval_label": f"skills__load__{name}",
+            "execute": self._exec_skills,
+            "action": "load",
+            "name": name,
+        }
+
+    def _exec_skills_load(self, item: dict[str, Any]) -> tuple[str, str]:
+        call_id = item["call_id"]
+        name = item["name"]
+        skill_data = get_skill_by_name(name)
+        if not skill_data or not skill_data.get("enabled", True):
+            msg = self._skill_hint(
+                f"skill '{name}' not found or disabled",
+                system_reminder=(
+                    "Use skills(action='find') to discover loadable "
+                    "skills, or skills(action='enable', name='...') if a "
+                    "disabled skill is the one you want."
+                ),
+            )
+            self._report_tool_result(call_id, "skills", msg, is_error=True)
+            return call_id, msg
+        if self._skill_name == name:
+            msg = f"Skill '{name}' is already active"
+            self._report_tool_result(call_id, "skills", msg)
+            return call_id, msg
+        self.set_skill(name)
+        desc = skill_data.get("description", "")
+        risk = skill_data.get("risk_level", "")
+        parts = [f"Loaded skill '{name}'"]
+        if desc:
+            parts.append(f"Description: {desc}")
+        if risk:
+            parts.append(f"Risk tier: {risk}")
+        msg = "\n".join(parts)
+        self._report_tool_result(call_id, "skills", msg)
+        return call_id, msg
+
+    # -- create --------------------------------------------------------------
+
+    def _prepare_skills_create(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        from turnstone.core.skill_field_validation import parse_skill_session_config
+        from turnstone.core.skill_kind import SkillKind
+
+        name = self._coord_str_arg(args, "name").strip()[:256]
+        content = self._coord_str_arg(args, "content").strip()[:32768]
+        description = self._coord_str_arg(args, "description").strip()[:1024]
+        category = self._coord_str_arg(args, "category").strip()[:64] or "general"
+        if not name:
+            return self._coord_tool_error(call_id, "skills", "create: 'name' is required")
+        if not content:
+            return self._coord_tool_error(call_id, "skills", "create: 'content' is required")
+        if not description:
+            return self._coord_tool_error(call_id, "skills", "create: 'description' is required")
+        raw_kind = self._coord_str_arg(args, "kind").strip().lower() or "any"
+        try:
+            kind = SkillKind(raw_kind).value
+        except ValueError:
+            return self._coord_tool_error(
+                call_id,
+                "skills",
+                f"create: kind must be one of: "
+                f"{', '.join(sorted(k.value for k in SkillKind))}; got {raw_kind!r}",
+            )
+        raw_tags = args.get("tags", [])
+        tags_str = json.dumps([str(t) for t in raw_tags]) if isinstance(raw_tags, list) else "[]"
+        session_fields, err_msg = parse_skill_session_config(args)
+        if err_msg is not None:
+            return self._coord_tool_error(call_id, "skills", f"create: {err_msg}")
+        projected_risk = self._scan_proposed_skill(content, session_fields.get("allowed_tools"))
+        preview_lines = [
+            f"    name: {name}",
+            f"    kind: {kind}",
+            f"    category: {category}",
+            f"    description: {description[:120]}",
+            f"    content length: {len(content)} chars",
+            f"    projected risk: {projected_risk or 'unknown'}",
+        ]
+        at_str = session_fields.get("allowed_tools")
+        has_allowed_tools = bool(at_str) and at_str != "[]"
+        if has_allowed_tools:
+            preview_lines.append(f"    allowed_tools: {at_str}")
+        if session_fields.get("auto_approve"):
+            preview_lines.append("    auto_approve: true")
+            if has_allowed_tools:
+                # Spell out the operational consequence: the combination
+                # of auto_approve + allowed_tools means each tool in the
+                # allowlist auto-fires when this skill is later loaded.
+                # Operator approving the create needs to see this, not
+                # just two innocuous-looking field values.
+                preview_lines.append(
+                    "    WARNING: auto_approve + allowed_tools means the "
+                    "tools above auto-fire when this skill is loaded"
+                )
+        header = f"⚙ skills create: {name}"
+        if projected_risk in ("high", "critical"):
+            header += f" (risk={projected_risk})"
+        return {
+            "call_id": call_id,
+            "func_name": "skills",
+            "header": header,
+            "preview": "\n".join(preview_lines),
+            "needs_approval": True,
+            "approval_label": f"skills__create__{name}",
+            "execute": self._exec_skills,
+            "action": "create",
+            "name": name,
+            "content": content,
+            "description": description,
+            "category": category,
+            "kind": kind,
+            "tags": tags_str,
+            "session_fields": session_fields,
+            "projected_risk": projected_risk,
+        }
+
+    def _exec_skills_create(self, item: dict[str, Any]) -> tuple[str, str]:
+        from turnstone.core.storage._registry import get_storage
+
+        call_id = item["call_id"]
+        name = item["name"]
+        # Re-check the permission at exec time — operator may have
+        # revoked ``model.skills.write`` between prepare and approval.
+        # See ``_require_model_skills_write`` for the deny-audit shape.
+        deny = self._require_model_skills_write(call_id, "create", {"name": name})
+        if deny is not None:
+            err = deny.get("error", "Error: permission denied")
+            self._report_tool_result(call_id, "skills", err, is_error=True)
+            return call_id, err
+        storage = get_storage()
+        if storage is None:
+            msg = "Error: storage unavailable"
+            self._report_tool_result(call_id, "skills", msg, is_error=True)
+            return call_id, msg
+        if storage.get_prompt_template_by_name(name) is not None:
+            msg = self._skill_hint(
+                f"skill name '{name}' already exists",
+                system_reminder=(
+                    "Use skills(action='update', name='...') to modify "
+                    "an existing skill, or pick a unique name."
+                ),
+            )
+            self._report_tool_result(call_id, "skills", msg, is_error=True)
+            return call_id, msg
+        skill_id = uuid.uuid4().hex
+        session_fields = dict(item.get("session_fields") or {})
+        activation = session_fields.pop("activation", "named")
+        is_default = activation == "default"
+        try:
+            storage.create_prompt_template(
+                template_id=skill_id,
+                name=name,
+                category=item["category"],
+                content=item["content"],
+                variables="[]",
+                is_default=is_default,
+                org_id="",
+                created_by=self._user_id,
+                origin="model",
+                description=item["description"],
+                tags=item["tags"],
+                activation=activation,
+                token_estimate=len(item["content"]) // 4,
+                kind=item["kind"],
+                **session_fields,
+            )
+        except Exception as e:
+            msg = f"Error: skills create failed: {e}"
+            self._report_tool_result(call_id, "skills", msg, is_error=True)
+            return call_id, msg
+        self._audit_skill_action(
+            storage,
+            "skill.create",
+            skill_id,
+            {"name": name, "kind": item["kind"], "category": item["category"]},
+        )
+        created = storage.get_prompt_template(skill_id) or {}
+        output = json.dumps(
+            {
+                "template_id": skill_id,
+                "name": name,
+                "risk_level": created.get("risk_level", ""),
+                "kind": item["kind"],
+            },
+            separators=(",", ":"),
+            default=str,
+        )
+        self._report_tool_result(call_id, "skills", f"created {name}")
+        return call_id, output
+
+    # -- update --------------------------------------------------------------
+
+    # Source of truth for readonly-skill update field set lives in
+    # ``turnstone.core.skill_field_validation`` so this and the admin
+    # HTTP path (``console/server.py``) read the same set — drift between
+    # them would let one surface accept a field the other rejects.
+    _SKILLS_READONLY_FIELDS: ClassVar[frozenset[str]] = SKILL_RUNTIME_CONFIG_FIELDS
+
+    def _prepare_skills_update(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        from turnstone.core.skill_field_validation import parse_skill_session_config
+        from turnstone.core.skill_kind import SkillKind
+        from turnstone.core.storage._registry import get_storage
+
+        name = self._coord_str_arg(args, "name").strip()
+        if not name:
+            return self._coord_tool_error(call_id, "skills", "update: 'name' is required")
+        storage = get_storage()
+        if storage is None:
+            return self._coord_tool_error(call_id, "skills", "storage unavailable")
+        existing = storage.get_prompt_template_by_name(name)
+        if existing is None:
+            return self._coord_tool_error(
+                call_id,
+                "skills",
+                self._skill_hint(
+                    f"update: skill '{name}' not found",
+                    system_reminder=(
+                        "Use skills(action='find') to discover existing "
+                        "skill names, or skills(action='create') to make "
+                        "a new one."
+                    ),
+                ),
+            )
+        session_fields, err_msg = parse_skill_session_config(args)
+        if err_msg is not None:
+            return self._coord_tool_error(call_id, "skills", f"update: {err_msg}")
+        updates: dict[str, Any] = dict(session_fields)
+        if "content" in args:
+            new_content = self._coord_str_arg(args, "content").strip()[:32768]
+            if not new_content:
+                # Reject hollow-out: an empty content body is a soft-delete
+                # the model isn't supposed to be able to perform.  Hard
+                # delete stays admin-UI exclusive; an empty-content update
+                # bypassed that invariant by hollowing rather than removing.
+                return self._coord_tool_error(
+                    call_id,
+                    "skills",
+                    self._skill_hint(
+                        "update: content must not be empty",
+                        system_reminder=(
+                            "Use skills(action='disable', name='...') to "
+                            "hide a skill without removing it.  Hard "
+                            "delete is admin-UI only by design."
+                        ),
+                    ),
+                )
+            updates["content"] = new_content
+            updates["token_estimate"] = len(new_content) // 4
+        if "description" in args:
+            new_desc = self._coord_str_arg(args, "description").strip()[:1024]
+            if not new_desc:
+                return self._coord_tool_error(
+                    call_id, "skills", "update: description must not be empty"
+                )
+            updates["description"] = new_desc
+        if "category" in args:
+            new_cat = self._coord_str_arg(args, "category").strip()[:64]
+            if not new_cat:
+                # Mirror description's empty-check.  Category is used for
+                # discovery filtering — silently accepting "" would hide
+                # the skill from category-filtered finds.
+                return self._coord_tool_error(
+                    call_id, "skills", "update: category must not be empty"
+                )
+            updates["category"] = new_cat
+        if "kind" in args:
+            raw_kind = self._coord_str_arg(args, "kind").strip().lower()
+            try:
+                updates["kind"] = SkillKind(raw_kind).value
+            except ValueError:
+                return self._coord_tool_error(
+                    call_id,
+                    "skills",
+                    f"update: kind must be one of: "
+                    f"{', '.join(sorted(k.value for k in SkillKind))}; got {raw_kind!r}",
+                )
+        if "tags" in args:
+            raw_tags = args["tags"]
+            if not isinstance(raw_tags, list):
+                # Non-list tags previously silently dropped, then surfaced
+                # as the misleading "no recognized fields" error when tags
+                # was the only field — fail loudly instead.
+                return self._coord_tool_error(
+                    call_id,
+                    "skills",
+                    "update: tags must be a JSON array of strings",
+                )
+            updates["tags"] = json.dumps([str(t) for t in raw_tags])
+        if not updates:
+            return self._coord_tool_error(
+                call_id, "skills", "update: no recognized fields to change"
+            )
+        if bool(existing.get("readonly")):
+            filtered = {k: v for k, v in updates.items() if k in self._SKILLS_READONLY_FIELDS}
+            if not filtered:
+                return self._coord_tool_error(
+                    call_id,
+                    "skills",
+                    self._skill_hint(
+                        f"update: skill '{name}' is readonly (externally "
+                        "installed); only runtime config fields may be "
+                        "changed",
+                        system_reminder=(
+                            "Readonly skills preserve external-source "
+                            "fidelity. Editable runtime fields: "
+                            + ", ".join(sorted(self._SKILLS_READONLY_FIELDS))
+                        ),
+                    ),
+                )
+            updates = filtered
+        current_risk = str(existing.get("risk_level") or "")
+        # Skip the scanner when no scan-relevant fields change.  Storage
+        # re-scans authoritatively on write; the prepare-time scan is
+        # purely to surface the projected tier on the approval card.
+        # A metadata-only update (kind/category/tags/description) can
+        # reuse current_risk without spending ~25 regex passes.
+        if "content" in updates or "allowed_tools" in updates:
+            final_content = updates.get("content", existing.get("content", ""))
+            final_at = updates.get("allowed_tools", existing.get("allowed_tools", "[]"))
+            projected_risk = self._scan_proposed_skill(final_content, final_at)
+        else:
+            projected_risk = current_risk
+        preview_lines = [f"    name: {name}"]
+        for k, v in updates.items():
+            if k == "content":
+                preview_lines.append(f"    content: <{len(v)} chars>")
+            elif k == "allowed_tools":
+                preview_lines.append(f"    allowed_tools: {v}")
+            else:
+                vstr = str(v)
+                preview_lines.append(f"    {k}: {vstr[:120]}")
+        # Self-escalation warning: if the update turns on auto_approve
+        # OR expands allowed_tools while a pre-existing auto_approve is
+        # set, spell out the operational consequence on the approval
+        # card.  Same shape as the create-side warning.
+        proposed_auto_approve = bool(updates.get("auto_approve"))
+        existing_auto_approve = bool(existing.get("auto_approve"))
+        at_changes = "allowed_tools" in updates and updates["allowed_tools"] not in (
+            "",
+            "[]",
+        )
+        if (proposed_auto_approve or existing_auto_approve) and at_changes:
+            preview_lines.append(
+                "    WARNING: auto_approve + allowed_tools means the listed "
+                "tools auto-fire when this skill is loaded"
+            )
+        if current_risk or projected_risk:
+            arrow = "->" if current_risk != projected_risk else "="
+            preview_lines.append(
+                f"    risk_level: {current_risk or 'unknown'} {arrow} {projected_risk or 'unknown'}"
+            )
+        header = f"⚙ skills update: {name}"
+        if (
+            projected_risk
+            and projected_risk != current_risk
+            and projected_risk in ("high", "critical")
+        ):
+            header += f" (risk {current_risk or 'unknown'}->{projected_risk})"
+        return {
+            "call_id": call_id,
+            "func_name": "skills",
+            "header": header,
+            "preview": "\n".join(preview_lines),
+            "needs_approval": True,
+            "approval_label": f"skills__update__{name}",
+            "execute": self._exec_skills,
+            "action": "update",
+            "name": name,
+            "template_id": existing["template_id"],
+            "updates": updates,
+            "projected_risk": projected_risk,
+            "current_risk": current_risk,
+            "readonly": bool(existing.get("readonly")),
+        }
+
+    def _exec_skills_update(self, item: dict[str, Any]) -> tuple[str, str]:
+        from turnstone.core.storage._registry import get_storage
+
+        call_id = item["call_id"]
+        name = item["name"]
+        template_id = item["template_id"]
+        # Re-check the write permission (see _require_model_skills_write).
+        deny = self._require_model_skills_write(call_id, "update", {"name": name})
+        if deny is not None:
+            err = deny.get("error", "Error: permission denied")
+            self._report_tool_result(call_id, "skills", err, is_error=True)
+            return call_id, err
+        storage = get_storage()
+        if storage is None:
+            msg = "Error: storage unavailable"
+            self._report_tool_result(call_id, "skills", msg, is_error=True)
+            return call_id, msg
+        # Re-fetch the row to catch a readonly flip between prepare and
+        # exec.  If the row went readonly since prepare, drop any updates
+        # that the prepare-time filter would no longer accept.  If it
+        # went unreadonly, the prepare-time filter was too restrictive
+        # but no harm — proceed with whatever fields survived prepare.
+        current_row = storage.get_prompt_template(template_id) or {}
+        if bool(current_row.get("readonly")) and not item.get("readonly"):
+            allowed = self._SKILLS_READONLY_FIELDS
+            filtered = {k: v for k, v in item["updates"].items() if k in allowed}
+            if not filtered:
+                msg = self._skill_hint(
+                    f"update: skill '{name}' became readonly between "
+                    "approval and exec; no fields applied",
+                    system_reminder=(
+                        "An admin flipped the readonly flag on this "
+                        "skill after the operator approved the update. "
+                        "Re-issue the update against only runtime fields "
+                        "(model, temperature, allowed_tools, etc.)."
+                    ),
+                )
+                self._report_tool_result(call_id, "skills", msg, is_error=True)
+                return call_id, msg
+            item["updates"] = filtered
+            item["readonly"] = True
+        # Snapshot existing row to skill_versions for rollback.  Uses
+        # count_skill_versions + 1 so concurrent updates don't collide on
+        # the (skill_id, version) unique key.
+        try:
+            next_version = storage.count_skill_versions(template_id) + 1
+            storage.create_skill_version(
+                skill_id=template_id,
+                version=next_version,
+                snapshot=json.dumps(storage.get_prompt_template(template_id) or {}, default=str),
+                changed_by=self._user_id,
+            )
+        except Exception:
+            log.warning("skills.update.snapshot_failed name=%s", name, exc_info=True)
+        try:
+            storage.update_prompt_template(template_id, **item["updates"])
+        except Exception as e:
+            msg = f"Error: skills update failed: {e}"
+            self._report_tool_result(call_id, "skills", msg, is_error=True)
+            return call_id, msg
+        action = "skill.update.config" if item.get("readonly") else "skill.update"
+        self._audit_skill_action(
+            storage,
+            action,
+            template_id,
+            {
+                "name": name,
+                "fields": sorted(item["updates"].keys()),
+                "projected_risk": item.get("projected_risk", ""),
+                "previous_risk": item.get("current_risk", ""),
+            },
+        )
+        updated = storage.get_prompt_template(template_id) or {}
+        output = json.dumps(
+            {
+                "template_id": template_id,
+                "name": name,
+                "risk_level": updated.get("risk_level", ""),
+                "updated_fields": sorted(item["updates"].keys()),
+            },
+            separators=(",", ":"),
+            default=str,
+        )
+        self._report_tool_result(call_id, "skills", f"updated {name}")
+        return call_id, output
+
+    # -- enable / disable ----------------------------------------------------
+
+    def _prepare_skills_toggle(
+        self, call_id: str, args: dict[str, Any], *, enable: bool
+    ) -> dict[str, Any]:
+        from turnstone.core.storage._registry import get_storage
+
+        verb = "enable" if enable else "disable"
+        name = self._coord_str_arg(args, "name").strip()
+        if not name:
+            return self._coord_tool_error(call_id, "skills", f"{verb}: 'name' is required")
+        storage = get_storage()
+        if storage is None:
+            return self._coord_tool_error(call_id, "skills", "storage unavailable")
+        existing = storage.get_prompt_template_by_name(name)
+        if existing is None:
+            return self._coord_tool_error(
+                call_id,
+                "skills",
+                self._skill_hint(
+                    f"{verb}: skill '{name}' not found",
+                    system_reminder=(
+                        "Use skills(action='find', enabled_only=false) "
+                        "to list every skill including currently-disabled "
+                        "ones."
+                    ),
+                ),
+            )
+        if bool(existing.get("enabled")) == enable:
+            return self._coord_tool_error(
+                call_id,
+                "skills",
+                f"{verb}: skill '{name}' is already {'enabled' if enable else 'disabled'}",
+            )
+        # Surface the existing skill's risk profile on the approval card
+        # so the operator sees *what* they're enabling before clicking
+        # approve — a model-planted critical-tier skill should never be
+        # re-enabled by an operator who saw only the name on the card.
+        existing_risk = str(existing.get("risk_level") or "")
+        try:
+            existing_allowed = json.loads(existing.get("allowed_tools") or "[]")
+            if not isinstance(existing_allowed, list):
+                existing_allowed = []
+        except (TypeError, ValueError):
+            existing_allowed = []
+        preview_lines = [
+            f"    name: {name}",
+            f"    enabled: {bool(existing.get('enabled'))} -> {enable}",
+        ]
+        if existing_risk:
+            preview_lines.append(f"    risk_level: {existing_risk}")
+        if existing_allowed:
+            preview_lines.append(f"    allowed_tools: {len(existing_allowed)} entries")
+        if bool(existing.get("auto_approve")) and enable:
+            preview_lines.append(
+                "    WARNING: this skill has auto_approve=True; re-enabling "
+                "lets its allowed_tools auto-fire when it loads"
+            )
+        header = f"⚙ skills {verb}: {name}"
+        if enable and existing_risk in ("high", "critical"):
+            header += f" (risk={existing_risk})"
+        return {
+            "call_id": call_id,
+            "func_name": "skills",
+            "header": header,
+            "preview": "\n".join(preview_lines),
+            "needs_approval": True,
+            "approval_label": f"skills__{verb}__{name}",
+            "execute": self._exec_skills,
+            "action": verb,
+            "name": name,
+            "template_id": existing["template_id"],
+        }
+
+    def _exec_skills_toggle(self, item: dict[str, Any], *, enable: bool) -> tuple[str, str]:
+        from turnstone.core.storage._registry import get_storage
+
+        call_id = item["call_id"]
+        name = item["name"]
+        template_id = item["template_id"]
+        verb = "enable" if enable else "disable"
+        # Re-check the write permission (see _require_model_skills_write).
+        deny = self._require_model_skills_write(call_id, verb, {"name": name})
+        if deny is not None:
+            err = deny.get("error", "Error: permission denied")
+            self._report_tool_result(call_id, "skills", err, is_error=True)
+            return call_id, err
+        storage = get_storage()
+        if storage is None:
+            msg = "Error: storage unavailable"
+            self._report_tool_result(call_id, "skills", msg, is_error=True)
+            return call_id, msg
+        try:
+            storage.update_prompt_template(template_id, enabled=enable)
+        except Exception as e:
+            msg = f"Error: skills {verb} failed: {e}"
+            self._report_tool_result(call_id, "skills", msg, is_error=True)
+            return call_id, msg
+        self._audit_skill_action(
+            storage,
+            f"skill.{verb}",
+            template_id,
+            {"name": name, "enabled": enable},
+        )
+        output = json.dumps(
+            {"template_id": template_id, "name": name, "enabled": enable},
+            separators=(",", ":"),
+        )
+        self._report_tool_result(call_id, "skills", f"{verb}d {name}")
+        return call_id, output
+
+    # -- shared dispatch + helpers -------------------------------------------
+
+    def _exec_skills(self, item: dict[str, Any]) -> tuple[str, str]:
+        action = item["action"]
+        if action == "find":
+            return self._exec_skills_find(item)
+        if action == "get":
+            return self._exec_skills_get(item)
+        if action == "load":
+            return self._exec_skills_load(item)
+        if action == "create":
+            return self._exec_skills_create(item)
+        if action == "update":
+            return self._exec_skills_update(item)
+        if action == "enable":
+            return self._exec_skills_toggle(item, enable=True)
+        if action == "disable":
+            return self._exec_skills_toggle(item, enable=False)
+        msg = f"Error: unknown skills action: {action}"
+        self._report_tool_result(item["call_id"], "skills", msg, is_error=True)
+        return item["call_id"], msg
+
+    def _scan_proposed_skill(self, content: str, allowed_tools: Any) -> str:
+        """Run the skill scanner against a proposed final state so the
+        operator approval card sees the projected risk tier.  Storage
+        re-scans authoritatively on write, but surfacing the projection
+        at approval time prevents "I didn't realize this would bump
+        risk" surprise post-merge.
+
+        ``allowed_tools`` may arrive as list (from args) or JSON string
+        (from existing row) - normalize to JSON string for the scanner.
+        Scanner errors fold to empty tier so an approval card never
+        fails to render.
+        """
+        from turnstone.core.storage._utils import scan_skill_content
+
+        if isinstance(allowed_tools, list):
+            at_str = json.dumps(allowed_tools)
+        elif isinstance(allowed_tools, str):
+            at_str = allowed_tools or "[]"
+        else:
+            at_str = "[]"
+        try:
+            tier, _, _ = scan_skill_content(content, at_str)
+        except Exception:
+            log.debug("skills.scan_proposed_failed", exc_info=True)
+            return ""
+        return tier
+
+    def _audit_skill_action(
+        self,
+        storage: Any,
+        action: str,
+        resource_id: str,
+        detail: dict[str, Any],
+    ) -> None:
+        """Record an audit row for a model-proposed skill mutation.
+
+        Stamps ``actor_source='model'`` and the spawning ``ws_id`` so
+        post-incident review can distinguish admin-UI writes from
+        approved model proposals.  ``record_audit`` already redacts
+        credentials inside ``detail`` strings by default.
+
+        Audit is the **authoritative actor-lineage trail** for skill
+        writes — the ``prompt_templates`` row itself does not stamp
+        ``actor_source`` on update, so a forensic reader looking at the
+        row alone cannot tell whether a model touched it.  Always
+        cross-reference the audit table for the full provenance story.
+
+        Audit failure is logged at ``error`` (not ``warning``) because a
+        successful write without a row is exactly the gap this trail
+        exists to close — surfacing the failure loudly lets monitoring
+        catch it rather than letting writes accumulate forensically dark.
+        """
+        from turnstone.core.audit import record_audit
+
+        full_detail = {**detail, "actor_source": "model", "ws_id": self._ws_id}
+        try:
+            record_audit(
+                storage,
+                self._user_id,
+                action,
+                "skill",
+                resource_id,
+                full_detail,
+                "",
+            )
+        except Exception:
+            # Critical: a write succeeded without an audit row is the
+            # exact gap this trail exists to prevent.  Surface as error
+            # (not warning) so monitoring catches it.
+            log.error("skills.audit_failed action=%s", action, exc_info=True)
 
     def _prepare_tasks(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Prepare a tasks action — list is auto-approved, mutations gated."""
@@ -8500,164 +9526,6 @@ class ChatSession:
         }
 
     # -- skill prepare/execute -------------------------------------------------
-
-    def _prepare_skill(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
-        """Prepare a skill action (load or search)."""
-        action = (args.get("action") or "").strip().lower()
-
-        if action == "load":
-            name = (args.get("name") or "").strip()
-            if not name:
-                return {
-                    "call_id": call_id,
-                    "func_name": "skill",
-                    "header": "\u2717 skill: name is required",
-                    "preview": "",
-                    "needs_approval": False,
-                    "error": "Error: 'name' is required for load action",
-                }
-            return {
-                "call_id": call_id,
-                "func_name": "skill",
-                "header": f"\u2699 skill: {name}",
-                "preview": "",
-                "needs_approval": True,
-                "approval_label": f"skill__{name}",
-                "execute": self._exec_skill,
-                "action": "load",
-                "name": name,
-            }
-
-        if action == "search":
-            query = (args.get("query") or "").strip()
-            return {
-                "call_id": call_id,
-                "func_name": "skill",
-                "header": f"\u2699 skill search{': ' + query[:80] if query else ''}",
-                "preview": "",
-                "needs_approval": False,
-                "execute": self._exec_skill,
-                "action": "search",
-                "query": query,
-            }
-
-        return {
-            "call_id": call_id,
-            "func_name": "skill",
-            "header": "\u2717 skill: invalid action",
-            "preview": "",
-            "needs_approval": False,
-            "error": f"Error: action must be 'load' or 'search', got '{action}'",
-        }
-
-    def _exec_skill(self, item: dict[str, Any]) -> tuple[str, str]:
-        """Execute a skill action."""
-        call_id = item["call_id"]
-        action = item["action"]
-
-        if action == "load":
-            name = item["name"]
-            skill_data = get_skill_by_name(name)
-            if not skill_data or not skill_data.get("enabled", True):
-                msg = f"Error: skill '{name}' not found"
-                self._report_tool_result(call_id, "skill", msg, is_error=True)
-                return call_id, msg
-
-            if self._skill_name == name:
-                msg = f"Skill '{name}' is already active"
-                self._report_tool_result(call_id, "skill", msg)
-                return call_id, msg
-
-            self.set_skill(name)
-
-            desc = skill_data.get("description", "")
-            scan = skill_data.get("risk_level", "")
-            parts = [f"Loaded skill '{name}'"]
-            if desc:
-                parts.append(f"Description: {desc}")
-            if scan:
-                parts.append(f"Security tier: {scan}")
-            msg = "\n".join(parts)
-            self._report_tool_result(call_id, "skill", msg)
-            return call_id, msg
-
-        # action == "search"
-        query = item.get("query", "")
-        try:
-            from turnstone.core.storage._registry import get_storage
-
-            rows = get_storage().list_prompt_templates(limit=50)
-        except Exception:
-            log.warning("skill.search_storage_error", exc_info=True)
-            rows = []
-
-        # Filter out disabled skills
-        rows = [r for r in rows if r.get("enabled", True)]
-
-        if query:
-            import json as _json
-
-            from turnstone.core.bm25 import BM25Index
-
-            def _tags_text(raw: str) -> str:
-                """Parse JSON tags string into space-separated text."""
-                try:
-                    parsed = _json.loads(raw)
-                    if isinstance(parsed, list):
-                        return " ".join(str(t) for t in parsed)
-                except (ValueError, TypeError):
-                    pass  # falls back to raw string
-                return raw
-
-            # Build corpus from name + description + tags + category
-            corpus = [
-                " ".join(
-                    filter(
-                        None,
-                        [
-                            r.get("name", ""),
-                            r.get("description", ""),
-                            _tags_text(r.get("tags", "[]")),
-                            r.get("category", ""),
-                        ],
-                    )
-                )
-                for r in rows
-            ]
-            index = BM25Index(corpus)
-            top_indices = index.search(query, k=10)
-            rows = [rows[i] for i in top_indices]
-        else:
-            rows = rows[:10]
-
-        if not rows:
-            msg = "No skills found" + (f" matching '{query}'" if query else "")
-            self._report_tool_result(call_id, "skill", msg)
-            return call_id, msg
-
-        lines = [f"Found {len(rows)} skill(s):", ""]
-        for r in rows:
-            name_val = r.get("name", "")
-            desc_val = r.get("description", "")
-            cat_val = r.get("category", "")
-            scan_val = r.get("risk_level", "")
-            activation = r.get("activation", "named")
-            line = f"- {name_val}"
-            if cat_val:
-                line += f" [{cat_val}]"
-            if scan_val:
-                line += f" ({scan_val})"
-            if activation != "named":
-                line += f" activation={activation}"
-            if desc_val:
-                line += f" — {desc_val[:120]}"
-            lines.append(line)
-
-        msg = "\n".join(lines)
-        self._report_tool_result(call_id, "skill", msg)
-        return call_id, msg
-
-    # -- MCP tool prepare/execute ----------------------------------------------
 
     def _prepare_mcp_tool(
         self, call_id: str, func_name: str, args: dict[str, Any]

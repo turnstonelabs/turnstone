@@ -563,13 +563,13 @@ class TestTaskExec:
             item = session._prepare_task("c1", {"prompt": "do x", "skill": "ghost"})
         assert item.get("needs_approval") is False
         assert "unknown skill 'ghost'" in item["error"]
-        assert "skill(action='search')" in item["error"]
+        assert "skills(action='find'" in item["error"]
 
     def test_prepare_task_disabled_skill_returns_error(self, tmp_db) -> None:
         """Disabled skill → distinct error, mirrors the enabled gate that
-        ``_exec_skill(action='load')`` (session.py:8404) and skill-search
-        already apply.  Distinct from the unknown-skill phrasing so the
-        LLM's recovery path can tell 'not found' from 'quarantined'."""
+        ``_exec_skills_load`` and ``_exec_skills_find`` already apply.
+        Distinct from the unknown-skill phrasing so the LLM's recovery
+        path can tell 'not found' from 'quarantined'."""
         session = _make_session()
         disabled_skill = {
             "name": "retired",

@@ -77,6 +77,7 @@ from turnstone.core.session_routes import (
     register_coord_verbs,
     register_session_routes,
 )
+from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS
 from turnstone.core.skill_kind import SkillKind
 from turnstone.core.web_helpers import (
     read_json_or_400,
@@ -6430,149 +6431,27 @@ async def admin_delete_policy(request: Request) -> JSONResponse:
 # Admin: Skills (thin layer over prompt templates with extended fields)
 # ---------------------------------------------------------------------------
 
-_VALID_ACTIVATIONS = {"named", "default", "search"}
-
-# Fields that may be updated on installed (readonly) skills.
-# These are local runtime configuration — not part of the SKILL.md spec —
-# so they don't compromise the fidelity of an externally-sourced skill.
-_SKILL_RUNTIME_CONFIG_FIELDS = frozenset(
-    {
-        "model",
-        "temperature",
-        "reasoning_effort",
-        "max_tokens",
-        "token_budget",
-        "agent_max_turns",
-        "auto_approve",
-        "allowed_tools",
-        "enabled",
-        "notify_on_complete",
-        "priority",
-    }
-)
+# Re-exported from the shared validator module (top-of-file import) so
+# both this HTTP path and the model-tool path
+# (``ChatSession._exec_skills_update``) read the same source of truth
+# for runtime-field membership.  Drift between the two would let one
+# surface accept a field the other rejects.
+_SKILL_RUNTIME_CONFIG_FIELDS = SKILL_RUNTIME_CONFIG_FIELDS
 
 
 def _parse_skill_session_config(body: dict[str, Any]) -> tuple[dict[str, Any], JSONResponse | None]:
-    """Parse and validate session config fields from a skill request body.
+    """HTTP adapter over :func:`parse_skill_session_config`.
 
-    Returns (fields_dict, error_response). error_response is None on success.
-    Only includes fields that are present in the body (for partial updates).
+    Validation lives in ``turnstone.core.skill_field_validation`` so the
+    in-process model-tool path (``_exec_skills_*``) shares the exact same
+    rules — neither side can drift.  This wrapper translates a non-None
+    string error into a 400 JSONResponse for the admin endpoint.
     """
-    import json as _json
+    from turnstone.core.skill_field_validation import parse_skill_session_config
 
-    fields: dict[str, Any] = {}
-
-    if "model" in body:
-        fields["model"] = str(body["model"] or "").strip()
-
-    if "temperature" in body:
-        temp = body["temperature"]
-        if temp is not None and temp != "":
-            try:
-                temp = float(temp)
-                if not (0.0 <= temp <= 2.0):
-                    return {}, JSONResponse(
-                        {"error": "temperature must be between 0 and 2"}, status_code=400
-                    )
-                fields["temperature"] = temp
-            except (ValueError, TypeError):
-                fields["temperature"] = None
-        else:
-            fields["temperature"] = None
-
-    if "token_budget" in body:
-        try:
-            tb = int(body.get("token_budget", 0) or 0)
-        except (ValueError, TypeError):
-            return {}, JSONResponse({"error": "token_budget must be an integer"}, status_code=400)
-        if tb < 0:
-            return {}, JSONResponse({"error": "token_budget must be non-negative"}, status_code=400)
-        fields["token_budget"] = tb
-
-    if "max_tokens" in body:
-        mt = body["max_tokens"]
-        if mt is not None and mt != "":
-            try:
-                mt = int(mt)
-            except (ValueError, TypeError):
-                return {}, JSONResponse({"error": "max_tokens must be an integer"}, status_code=400)
-            if mt < 1:
-                return {}, JSONResponse({"error": "max_tokens must be positive"}, status_code=400)
-            fields["max_tokens"] = mt
-        else:
-            fields["max_tokens"] = None
-
-    if "agent_max_turns" in body:
-        amt = body["agent_max_turns"]
-        if amt is not None and amt != "":
-            try:
-                amt = int(amt)
-            except (ValueError, TypeError):
-                return {}, JSONResponse(
-                    {"error": "agent_max_turns must be an integer"}, status_code=400
-                )
-            if amt < 1:
-                return {}, JSONResponse(
-                    {"error": "agent_max_turns must be positive"}, status_code=400
-                )
-            fields["agent_max_turns"] = amt
-        else:
-            fields["agent_max_turns"] = None
-
-    if "reasoning_effort" in body:
-        fields["reasoning_effort"] = str(body["reasoning_effort"] or "").strip()
-
-    if "auto_approve" in body:
-        fields["auto_approve"] = bool(body.get("auto_approve", False))
-
-    if "enabled" in body:
-        fields["enabled"] = bool(body.get("enabled", True))
-
-    if "activation" in body:
-        activation = str(body["activation"] or "named").strip()
-        if activation not in _VALID_ACTIVATIONS:
-            return {}, JSONResponse(
-                {"error": f"activation must be one of: {', '.join(sorted(_VALID_ACTIVATIONS))}"},
-                status_code=400,
-            )
-        fields["activation"] = activation
-
-    if "notify_on_complete" in body:
-        nc = str(body.get("notify_on_complete", "[]")).strip()
-        # Normalise empty/whitespace and the legacy ``"{}"`` sentinel
-        # (inherited from migrations 011/021's server_default — older rows
-        # that haven't been touched by migration 051 may still carry it)
-        # to the canonical empty-array literal so a blank field can never
-        # bypass validation and persist a non-JSON value.
-        if not nc or nc == "{}":
-            nc = "[]"
-        if nc != "[]":
-            try:
-                parsed = _json.loads(nc)
-            except (_json.JSONDecodeError, TypeError):
-                return {}, JSONResponse(
-                    {"error": "notify_on_complete must be valid JSON"}, status_code=400
-                )
-            if not isinstance(parsed, list):
-                return {}, JSONResponse(
-                    {"error": "notify_on_complete must be a JSON array"}, status_code=400
-                )
-        fields["notify_on_complete"] = nc
-
-    if "allowed_tools" in body:
-        at_raw = body.get("allowed_tools", "[]")
-        if isinstance(at_raw, list):
-            fields["allowed_tools"] = _json.dumps(at_raw)
-        else:
-            at_str = str(at_raw).strip()
-            if at_str and not at_str.startswith("["):
-                at_str = _json.dumps([t.strip() for t in at_str.split(",") if t.strip()])
-            try:
-                _json.loads(at_str or "[]")
-            except (ValueError, TypeError):
-                at_str = "[]"
-            fields["allowed_tools"] = at_str or "[]"
-
+    fields, err = parse_skill_session_config(body)
+    if err:
+        return {}, JSONResponse({"error": err}, status_code=400)
     return fields, None
 
 
