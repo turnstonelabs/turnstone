@@ -24,15 +24,19 @@ function inlineMarkdown(text) {
   );
   // Strikethrough
   text = text.replace(/~~(.+?)~~/g, "<del>$1</del>");
-  // Images (must come before links — render as click-to-load placeholder)
+  // Images (must come before links — render as click-to-load placeholder).
+  // Every interpolated value is locally escaped: defence-in-depth against
+  // future refactors that might call this regex from a context that
+  // bypasses inlineMarkdown's leading escapeHtml.
   text = text.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, function (m, alt, url) {
     if (!/^\s*(https?:\/\/|data:image\/)/i.test(url)) return m;
-    var safeAlt = alt || "Image";
-    var domain = "";
+    var safeAlt = escapeHtml(alt || "Image");
+    var safeUrl = escapeHtml(url);
+    var domain;
     try {
       domain = escapeHtml(new URL(url).hostname);
     } catch (e) {
-      domain = url.length > 40 ? url.slice(0, 40) + "…" : url;
+      domain = escapeHtml(url.length > 40 ? url.slice(0, 40) + "…" : url);
     }
     return (
       '<span class="img-placeholder" tabindex="0" role="button" ' +
@@ -40,7 +44,7 @@ function inlineMarkdown(text) {
       safeAlt +
       '" ' +
       'data-src="' +
-      url +
+      safeUrl +
       '" data-alt="' +
       safeAlt +
       '">' +
@@ -54,14 +58,15 @@ function inlineMarkdown(text) {
       "</span>"
     );
   });
-  // Links (allow http, https, and same-origin relative URLs only)
+  // Links (allow http, https, and same-origin relative URLs only).
+  // Same defence-in-depth posture as images above.
   text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, function (m, label, url) {
     if (!/^\s*(https?:\/\/|\/(?!\/))/i.test(url)) return m;
     return (
       '<a href="' +
-      url +
+      escapeHtml(url) +
       '" target="_blank" rel="noopener noreferrer">' +
-      label +
+      escapeHtml(label) +
       "</a>"
     );
   });

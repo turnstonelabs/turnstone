@@ -16,6 +16,7 @@ placeholder and not the raw delimiter.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -1273,3 +1274,152 @@ def test_streaming_render_invokes_hljs() -> None:
         "_streamingRenderApply must call postRenderHljs for progressive "
         "syntax highlighting during streaming"
     )
+
+
+# ---------------------------------------------------------------------------
+# Attribute-context interpolation lint + pin tests
+# ---------------------------------------------------------------------------
+
+# The JS source uses `'...attr="' + var + '"...'` — so the literal text
+# between `=` and `+` is `"` (the HTML-attribute opener inside the
+# JS string) followed by `'` (the JS-string closer). Match that pair,
+# then optional whitespace + `+` + whitespace + an identifier.
+_RENDERER_ATTR_INTERP_RE = re.compile(
+    r"=[\"'][\"']\s*\+\s*(?!escapeHtml\b)([a-zA-Z_][a-zA-Z0-9_]*)"
+)
+
+# Identifiers exempted from the lint. Each entry is reviewer-approved
+# as known-safe; adding a new one requires a comment explaining why.
+_RENDERER_KNOWN_SAFE_IDENTIFIERS = {
+    # CALLOUT_TYPES enum lookup ({label, icon} of fixed strings — Note,
+    # Tip, Important, Warning, Caution). `alertType` matched by regex
+    # /(NOTE|TIP|IMPORTANT|WARNING|CAUTION)/, so .toLowerCase() output
+    # is also a fixed set; flows through `info`.
+    "info",
+}
+
+
+def test_renderer_attribute_context_interpolation_is_safe() -> None:
+    """Pin: every `attr="' + var` string-concat interpolation in
+    renderer.js must use one of:
+
+    * `escapeHtml(...)` at the call site (allowed by the negative
+      lookahead in the regex),
+    * an identifier matching `safe[A-Z_]…` (convention: the value is
+      pre-escaped at assignment), or
+    * an identifier in :data:`_RENDERER_KNOWN_SAFE_IDENTIFIERS`
+      (reviewer-approved enum lookups / counters).
+
+    Defence-in-depth lint per issue #553. The current call sites are
+    already safe today via ``inlineMarkdown``'s leading ``escapeHtml``
+    pass, but that invariant is non-local — a refactor moving image
+    or link rendering out of ``inlineMarkdown`` would silently
+    regress it. The lint locks in the local-escape posture so the
+    safety property is structural rather than emergent.
+    """
+    body = _RENDERER_JS.read_text(encoding="utf-8")
+    lines = body.splitlines()
+    offenders: list[tuple[int, str, str]] = []
+    for m in _RENDERER_ATTR_INTERP_RE.finditer(body):
+        ident = m.group(1)
+        if len(ident) > 4 and ident.startswith("safe") and ident[4].isupper():
+            continue
+        if ident in _RENDERER_KNOWN_SAFE_IDENTIFIERS:
+            continue
+        line_no = body.count("\n", 0, m.start()) + 1
+        offenders.append((line_no, ident, lines[line_no - 1].rstrip()))
+    assert not offenders, (
+        f"Found {len(offenders)} unsafe attribute-context "
+        f"interpolation(s) in renderer.js:\n"
+        + "\n".join(
+            f"  line {n}: {ident!r}  in  {line.strip()[:100]}" for n, ident, line in offenders[:10]
+        )
+        + "\nEither wrap with escapeHtml() at the call site, rename "
+        "the variable to safeXxx (after verifying it is pre-escaped "
+        "at assignment), or add the identifier to "
+        "_RENDERER_KNOWN_SAFE_IDENTIFIERS with a comment explaining "
+        "why it is known-safe (e.g. enum lookup, integer counter)."
+    )
+
+
+_HANDLER_ATTRS = frozenset(
+    {
+        "onerror",
+        "onload",
+        "onmouseover",
+        "onclick",
+        "onmouseout",
+        "onfocus",
+        "onblur",
+        "onchange",
+        "onsubmit",
+        "onkeydown",
+        "onkeyup",
+        "onkeypress",
+    }
+)
+
+
+def _all_attr_names(html: str) -> list[tuple[str, str]]:
+    """Parse ``html`` and return a flat list of ``(tag, attr_name)`` for
+    every attribute on every element. Used by the attacker-URL pin
+    tests to assert no event-handler attribute ever materializes —
+    substring checks on the raw output are too noisy because the
+    literal text ``onerror=&amp;quot;`` is safe when it sits inside
+    a parsed attribute value, but the substring still matches."""
+    from html.parser import HTMLParser
+
+    class _Collector(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attrs: list[tuple[str, str]] = []
+
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            for name, _value in attrs:
+                self.attrs.append((tag, name))
+
+    p = _Collector()
+    p.feed(html)
+    return p.attrs
+
+
+def _assert_no_handler_attrs(html: str) -> None:
+    handlers = [(tag, name) for tag, name in _all_attr_names(html) if name in _HANDLER_ATTRS]
+    assert not handlers, (
+        f"Renderer output materialized event-handler attribute(s) "
+        f"{handlers!r} — attribute-boundary escape regression. "
+        f"Full output:\n{html}"
+    )
+
+
+def test_attacker_image_url_with_quote_does_not_break_attribute() -> None:
+    """Pin: an image URL containing embedded double-quote characters
+    must NOT escape the ``data-src``/``data-alt`` attribute boundary.
+    The injected text remains inside the attribute value; no extra
+    attributes (``onerror``, etc.) materialize on the rendered span."""
+    out = _render('![alt](https://x/y.png" onerror="alert(1))')
+    _assert_no_handler_attrs(out)
+
+
+def test_attacker_image_alt_with_quote_does_not_break_attribute() -> None:
+    """Pin: an image alt text containing embedded double-quote
+    characters must not break the ``data-alt`` / ``aria-label``
+    attribute boundaries."""
+    out = _render('![alt" onerror="alert(1)](https://x/y.png)')
+    _assert_no_handler_attrs(out)
+
+
+def test_attacker_link_url_with_quote_does_not_break_attribute() -> None:
+    """Pin: a link URL containing embedded double-quote characters
+    must not escape the ``href`` attribute boundary."""
+    out = _render('[click](https://x/y" onmouseover="alert(1))')
+    _assert_no_handler_attrs(out)
+
+
+def test_attacker_link_label_with_quote_renders_as_text() -> None:
+    """Pin: a link label containing embedded ``<`` characters must
+    render as escaped text inside the anchor, not as a real tag."""
+    out = _render("[<script>alert(1)</script>](https://x/y)")
+    # No <script> tag should appear in the parsed output.
+    tags = {tag for tag, _ in _all_attr_names(out)}
+    assert "script" not in tags, "Link label leaked a real <script> element:\n" + out
