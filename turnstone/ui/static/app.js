@@ -1437,10 +1437,7 @@ class Pane {
               // judgePending=false because any verdict on replay is
               // final — no spinner.
               if (tc.verdict) {
-                div.insertAdjacentHTML(
-                  "beforeend",
-                  renderVerdictBadge(tc.verdict, false),
-                );
+                div.appendChild(renderVerdictBadge(tc.verdict, false));
               }
               block.appendChild(div);
               // Output-guard finding — defer insertion until the tool
@@ -1652,10 +1649,7 @@ class Pane {
       // key in case a stale SSE payload arrives mid-deploy.
       const heuristic = item.heuristic_verdict || item.verdict;
       if (heuristic) {
-        block.insertAdjacentHTML(
-          "beforeend",
-          renderVerdictBadge(heuristic, judgePending),
-        );
+        block.appendChild(renderVerdictBadge(heuristic, judgePending));
         const rec = heuristic.recommendation || "review";
         if (
           !glowRec ||
@@ -4838,61 +4832,83 @@ function buildToolDiv(item) {
 }
 
 function renderVerdictBadge(verdict, judgePending) {
-  if (!verdict) return "";
+  if (!verdict) return document.createDocumentFragment();
   const risk = verdict.risk_level || "medium";
   const rec = verdict.recommendation || "review";
   const conf = Math.round((verdict.confidence || 0) * 100);
-  const summary = verdict.intent_summary || "";
-  let spinnerHtml = "";
+
+  const badge = document.createElement("div");
+  badge.className = "verdict-badge verdict-" + risk + " ts-verdict-badge";
+  badge.setAttribute("data-risk", risk);
+  if (verdict.call_id) badge.setAttribute("data-call-id", verdict.call_id);
+
+  const riskSpan = document.createElement("span");
+  riskSpan.className = "verdict-risk";
+  riskSpan.textContent = risk.toUpperCase();
+
+  const recSpan = document.createElement("span");
+  recSpan.className = "verdict-rec";
+  recSpan.textContent = rec;
+
+  const confSpan = document.createElement("span");
+  confSpan.className = "verdict-conf";
+  confSpan.textContent = conf + "%";
+
+  badge.append(riskSpan, recSpan, confSpan);
+
   if (judgePending) {
-    spinnerHtml =
-      '<span class="verdict-judge-spinner">' +
-      '<span class="judge-spinner-dot"></span> judge analyzing\u2026</span>';
+    const spinner = document.createElement("span");
+    spinner.className = "verdict-judge-spinner";
+    const dot = document.createElement("span");
+    dot.className = "judge-spinner-dot";
+    spinner.append(dot, " judge analyzing\u2026");
+    badge.appendChild(spinner);
   }
-  const callId = escapeHtml(verdict.call_id || "");
-  return (
-    '<div class="verdict-badge verdict-' +
-    escapeHtml(risk) +
-    ' ts-verdict-badge" data-risk="' +
-    escapeHtml(risk) +
-    '" data-call-id="' +
-    callId +
-    '">' +
-    '<span class="verdict-risk">' +
-    escapeHtml(risk.toUpperCase()) +
-    "</span>" +
-    '<span class="verdict-rec">' +
-    escapeHtml(rec) +
-    "</span>" +
-    '<span class="verdict-conf">' +
-    conf +
-    "%</span>" +
-    spinnerHtml +
-    '<button class="verdict-expand" onclick="toggleVerdictDetail(this)">details</button>' +
-    "</div>" +
-    '<div class="verdict-detail" style="display:none">' +
-    '<div class="verdict-summary">' +
-    escapeHtml(summary) +
-    "</div>" +
-    '<div class="verdict-reasoning">' +
-    escapeHtml(verdict.reasoning || "") +
-    "</div>" +
-    ((verdict.evidence || []).length
-      ? '<div class="verdict-evidence">' +
-        (verdict.evidence || [])
-          .map(function (e) {
-            return "<div>\u2022 " + escapeHtml(e) + "</div>";
-          })
-          .join("") +
-        "</div>"
-      : "") +
-    '<div class="verdict-tier">' +
-    escapeHtml(verdict.tier || "heuristic") +
-    " tier" +
-    (verdict.judge_model ? " | " + escapeHtml(verdict.judge_model) : "") +
-    "</div>" +
-    "</div>"
-  );
+
+  const expand = document.createElement("button");
+  expand.className = "verdict-expand";
+  expand.textContent = "details";
+  expand.addEventListener("click", function () {
+    toggleVerdictDetail(this);
+  });
+  badge.appendChild(expand);
+
+  const detail = document.createElement("div");
+  detail.className = "verdict-detail";
+  detail.style.display = "none";
+
+  const summaryEl = document.createElement("div");
+  summaryEl.className = "verdict-summary";
+  summaryEl.textContent = verdict.intent_summary || "";
+
+  const reasoningEl = document.createElement("div");
+  reasoningEl.className = "verdict-reasoning";
+  reasoningEl.textContent = verdict.reasoning || "";
+
+  detail.append(summaryEl, reasoningEl);
+
+  const evidence = verdict.evidence || [];
+  if (evidence.length) {
+    const evEl = document.createElement("div");
+    evEl.className = "verdict-evidence";
+    for (const ev of evidence) {
+      const row = document.createElement("div");
+      row.textContent = "\u2022 " + ev;
+      evEl.appendChild(row);
+    }
+    detail.appendChild(evEl);
+  }
+
+  const tierEl = document.createElement("div");
+  tierEl.className = "verdict-tier";
+  let tierText = (verdict.tier || "heuristic") + " tier";
+  if (verdict.judge_model) tierText += " | " + verdict.judge_model;
+  tierEl.textContent = tierText;
+  detail.appendChild(tierEl);
+
+  const frag = document.createDocumentFragment();
+  frag.append(badge, detail);
+  return frag;
 }
 
 function toggleVerdictDetail(btn) {
