@@ -50,8 +50,13 @@ def test_enqueue_fans_out_to_all_listeners() -> None:
     lq1 = ui._register_listener()
     lq2 = ui._register_listener()
     ui._enqueue({"type": "hello"})
-    assert lq1.get_nowait() == {"type": "hello", "ws_id": "ws-1"}
-    assert lq2.get_nowait() == {"type": "hello", "ws_id": "ws-1"}
+    # ``_enqueue`` stamps ``_event_id`` on every event so the ring
+    # buffer can key replay against ``Last-Event-ID``; non-token
+    # events (``hello`` isn't ``content`` / ``reasoning``) skip
+    # ``_seq``.  Both listeners observe the SAME dict reference
+    # (covered by ``test_listeners_share_dict_reference_warning``).
+    assert lq1.get_nowait() == {"type": "hello", "ws_id": "ws-1", "_event_id": 1}
+    assert lq2.get_nowait() == {"type": "hello", "ws_id": "ws-1", "_event_id": 1}
 
 
 def test_enqueue_preserves_existing_ws_id() -> None:
@@ -124,7 +129,12 @@ def test_resolve_plan_with_pending_broadcasts_plan_resolved() -> None:
     lq = ui._register_listener()
     ui.resolve_plan("accept")
     event = lq.get_nowait()
-    assert event == {"type": "plan_resolved", "feedback": "accept", "ws_id": "ws-1"}
+    assert event == {
+        "type": "plan_resolved",
+        "feedback": "accept",
+        "ws_id": "ws-1",
+        "_event_id": 1,
+    }
     assert ui._pending_plan_review is None
     assert ui._plan_event.is_set()
 
@@ -1072,7 +1082,7 @@ def test_on_content_token_writes_to_both_buffers() -> None:
     ui.on_content_token("hello")
     assert ui._ws_turn_content == ["hello"]
     assert ui._ws_inflight_content == ["hello"]
-    assert ui._ws_inflight_seq == 1
+    assert ui._event_id == 1
 
 
 def test_on_reasoning_token_writes_to_inflight_buffer_only() -> None:
@@ -1081,13 +1091,13 @@ def test_on_reasoning_token_writes_to_inflight_buffer_only() -> None:
     ui = _make_ui()
     ui.on_reasoning_token("thinking...")
     assert ui._ws_inflight_reasoning == ["thinking..."]
-    assert ui._ws_inflight_seq == 1
+    assert ui._event_id == 1
     # Multi-turn buffer is content-only and untouched by reasoning.
     assert ui._ws_turn_content == []
 
 
 def test_inflight_seq_advances_on_every_emit_even_at_cap() -> None:
-    """Cap-hit content tokens MUST advance ``_ws_inflight_seq``,
+    """Cap-hit content tokens MUST advance ``_event_id``,
     even though the buffer rejected the append. If seq stalled at
     high-water-pre-cap, a subscriber registering AFTER the cap is
     hit would capture ``snap_seq == stalled_seq`` and every
@@ -1101,12 +1111,12 @@ def test_inflight_seq_advances_on_every_emit_even_at_cap() -> None:
     chunk = "x" * 1024
     while ui._ws_inflight_content_size < _MAX_TURN_CONTENT_CHARS:
         ui.on_content_token(chunk)
-    seq_at_cap = ui._ws_inflight_seq
+    seq_at_cap = ui._event_id
 
     # Cap-hit token: seq MUST advance (no buffer append, but the
     # event still gets a fresh seq for the dedup filter).
     ui.on_content_token(chunk)
-    assert ui._ws_inflight_seq == seq_at_cap + 1
+    assert ui._event_id == seq_at_cap + 1
     # Buffer remains bounded — the cap-hit token is NOT in inflight.
     assert ui._ws_inflight_content_size <= _MAX_TURN_CONTENT_CHARS + len(chunk)
 
@@ -1198,7 +1208,7 @@ def test_inflight_snapshot_empty_during_post_commit_tool_window() -> None:
     monotonic (carries the high-water mark across turn boundaries)."""
     ui = _make_ui()
     ui.on_content_token("Calling tool with these args: ")
-    seq_pre_commit = ui._ws_inflight_seq
+    seq_pre_commit = ui._event_id
     ui.on_turn_committed()  # session.py fires this after messages.append
     # We're now in the tool-execution window. A reconnecting client
     # would call register_listener_with_in_progress_snapshot.
@@ -1394,13 +1404,13 @@ def test_snapshot_and_consume_does_not_reset_seq_at_idle_or_error() -> None:
     ui = _make_ui()
     ui.on_content_token("a")
     ui.on_content_token("b")
-    assert ui._ws_inflight_seq == 2
+    assert ui._event_id == 2
 
     ui.snapshot_and_consume_state_payload("idle")
-    assert ui._ws_inflight_seq == 2
+    assert ui._event_id == 2
 
     ui.snapshot_and_consume_state_payload("error")
-    assert ui._ws_inflight_seq == 2
+    assert ui._event_id == 2
 
 
 def test_listeners_share_dict_reference_warning() -> None:

@@ -1439,24 +1439,72 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
             # half-built shape.
             return JSONResponse({"error": "session has no UI"}, status_code=409)
 
-        # Register the listener AND snapshot the per-turn inflight
-        # buffers in one atomic-against-writers step. The snapshot
-        # (content / reasoning text-so-far for the current turn) is
-        # yielded as a one-shot ``in_progress_snapshot`` event after
-        # the replay phase; it lets a mid-stream page refresh restore
-        # the partial assistant text without waiting for the response
-        # to complete. ``snap.seq`` is captured to dedup live events
-        # whose ``_seq`` is already in the snapshot payload (race-
-        # free composition with ``on_content_token`` /
-        # ``on_reasoning_token`` writers across the two-lock surface
-        # — see ``register_listener_with_in_progress_snapshot``).
+        # ``Last-Event-ID`` resume: native EventSource auto-reconnect
+        # sends the header; the manual-reconnect path (which uses
+        # ``new EventSource(url)`` and can't set custom headers) sends
+        # ``?last_event_id=N``.  Accept both; malformed values fall
+        # back to fresh-connect semantics so a broken intermediary
+        # can't break replay for a client that genuinely lost no
+        # events.
+        last_event_id_raw = request.headers.get("Last-Event-ID") or request.query_params.get(
+            "last_event_id"
+        )
+        last_event_id: int | None
+        try:
+            last_event_id = int(last_event_id_raw) if last_event_id_raw else None
+        except (TypeError, ValueError):
+            last_event_id = None
+
+        # Three replay shapes:
+        #   - ``last_event_id is None`` → ``"fresh"`` (today's behaviour):
+        #     replay_cb + state_change + in_progress_snapshot + live.
+        #   - ``last_event_id`` + buffer covers gap → ``"replay_ok"``:
+        #     emit buffered events past the id, SKIP replay_cb /
+        #     state_change / in_progress_snapshot (the buffered stream
+        #     already contains them), then live drain.
+        #   - ``last_event_id`` + buffer too short → ``"truncated"``:
+        #     emit a ``replay_truncated`` envelope so the client knows
+        #     it lost live ticks, then fall through to the fresh
+        #     replay (history / state_change / in_progress_snapshot)
+        #     as the recovery floor.
         # The placeholder-UI guard above (which 409s when
         # ``_register_listener`` is missing) already proves that
         # ``ui`` is a ``SessionUIBase`` subclass, so the cast is
         # tightening the type, not weakening it.
         ui_base = cast("SessionUIBase", ui)
-        client_queue, in_progress_snap = ui_base.register_listener_with_in_progress_snapshot()
-        snap_seq: int = in_progress_snap["seq"]
+        replay_status: str
+        replay_events: list[dict[str, Any]] = []
+        lost_count = 0
+        earliest_available_id = 0
+        in_progress_snap: dict[str, Any]
+        snap_seq: int = 0
+        if last_event_id is None:
+            replay_status = "fresh"
+            client_queue, in_progress_snap = ui_base.register_listener_with_in_progress_snapshot()
+            snap_seq = in_progress_snap["seq"]
+        else:
+            (
+                client_queue,
+                replay_events,
+                replay_status,
+                lost_count,
+                earliest_available_id,
+            ) = ui_base.register_listener_with_replay(last_event_id)
+            if replay_status == "truncated":
+                # Capture the snapshot too — it's the recovery floor
+                # when the buffer can't fill the gap.  Listener is
+                # already registered by ``register_listener_with_replay``;
+                # take the snapshot bits only.
+                with ui_base._ws_lock:  # noqa: SLF001 — same-module-level access pattern
+                    captured_content = "".join(ui_base._ws_inflight_content)  # noqa: SLF001
+                    captured_reasoning = "".join(ui_base._ws_inflight_reasoning)  # noqa: SLF001
+                in_progress_snap = {
+                    "content": captured_content,
+                    "reasoning": captured_reasoning,
+                    "seq": 0,  # not used on truncated path; fresh-style yields don't filter
+                }
+            else:
+                in_progress_snap = {"content": "", "reasoning": "", "seq": 0}
 
         # Per-kind executor for the blocking ``client_queue.get``
         # wait. Interactive returns its dedicated 200-thread
@@ -1475,101 +1523,165 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
 
         async def event_generator() -> Any:
             import functools
+            import random
 
             _metrics.record_sse_connect()
             loop = asyncio.get_running_loop()
+
+            def _format_event(event: dict[str, Any]) -> dict[str, str]:
+                """Strip internal plumbing fields, attach SSE ``id:`` if present.
+
+                Shallow-copies the dict before any mutation because
+                ``_enqueue`` puts ONE reference into every listener
+                queue (no per-listener copy) and stores the SAME
+                reference in the per-ws ring buffer.  Without a
+                shallow copy here, listener A's pop of ``_event_id``
+                would silently strip the field from listener B's view
+                AND from the buffer's view, breaking the replay
+                guarantee for a later-arriving subscriber.
+                """
+                ev_copy = dict(event)
+                eid = ev_copy.pop("_event_id", None)
+                # Strip ``_seq`` here too — it's internal plumbing for
+                # the snapshot dedup; clients never need to see it on
+                # the wire.  The fresh-path live drain filters on
+                # ``_seq`` BEFORE calling this helper.
+                ev_copy.pop("_seq", None)
+                out: dict[str, str] = {"data": json.dumps(ev_copy)}
+                if eid is not None:
+                    out["id"] = str(eid)
+                return out
+
             try:
-                # Replay phase — stream the kind-specific initial
-                # payload one event at a time so the client sees the
-                # first byte immediately (interactive's ``connected``
-                # event is the very first yield, before the heavier
-                # ``status`` / ``history`` work runs). Pre-building
-                # the replay into a list would block time-to-first-
-                # byte until the entire replay materialized AND let
-                # the listener queue accumulate (potentially over its
-                # 500-slot cap on a chatty mid-generation workstream)
-                # while replay was being built.
-                if replay_cb is not None:
-                    # Kind-specific async prep — runs before the sync
-                    # replay generator iterates so blocking storage
-                    # I/O lands in the executor pool rather than the
-                    # event loop's hot path. Interactive uses this
-                    # to pre-load verdict indexes; coord skips.
-                    if cfg.events_replay_prepare is not None:
-                        try:
-                            await cfg.events_replay_prepare(ws, ui, request)
-                        except Exception:
-                            log.debug(
-                                "ws.events.replay_prepare_failed ws=%s",
-                                ws_id[:8],
-                                exc_info=True,
-                            )
-                    try:
-                        for ev in replay_cb(ws, ui, request):
-                            yield {"data": json.dumps(ev)}
-                    except Exception:
-                        # Replay is observational — never let a
-                        # snapshot bug block the live stream. Log
-                        # and continue with whatever partial replay
-                        # was already yielded.
-                        log.debug(
-                            "ws.events.replay_failed ws=%s",
-                            ws_id[:8],
-                            exc_info=True,
-                        )
-                # Refresh-resume tail: emit the current workstream
-                # state (so the composer flips to stop-mode on a mid-
-                # stream refresh — ``state_change`` is the only event
-                # the JS busy machine listens to, and the kind-specific
-                # replay above doesn't yield it) and the in-progress
-                # snapshot (so partial content / reasoning re-renders
-                # immediately, instead of waiting for the next live
-                # token). Both are best-effort — a ws.state read
-                # failure or empty buffers just yields nothing extra.
-                try:
-                    cur_state = getattr(ws.state, "value", None)
-                    if isinstance(cur_state, str) and cur_state:
+                # Per-stream reconnect interval jitter.  Without this,
+                # all panes on a workstream disconnect together and
+                # reconnect in lockstep at the same backoff intervals
+                # (EventSource's default ~3 s with no jitter, or
+                # whatever ``retry:`` value the server last sent).
+                # 2.5 – 4.5 s spread keeps the average reconnect rate
+                # below today's ping cadence while staggering peaks.
+                yield {"retry": random.randint(2500, 4500)}
+
+                if replay_status == "replay_ok":
+                    # Buffered events already cover everything since
+                    # the client's ``Last-Event-ID`` — skip the
+                    # synthetic replay (history / state_change /
+                    # in_progress_snapshot) which would otherwise
+                    # double-render content the buffer already
+                    # contains.  Yield buffered events in order with
+                    # their ``_event_id`` as SSE ``id:`` so a
+                    # disconnect mid-replay resumes from the latest
+                    # buffered id, not the original ``last_event_id``.
+                    for ev in replay_events:
+                        yield _format_event(ev)
+                else:
+                    # ``fresh`` or ``truncated`` — both run the
+                    # synthetic replay (kind-specific replay_cb +
+                    # state_change + in_progress_snapshot).  On
+                    # ``truncated`` we emit the explicit envelope
+                    # first so the client knows the buffer couldn't
+                    # cover the gap and treats the snapshot below as
+                    # the recovery floor.
+                    if replay_status == "truncated":
                         yield {
                             "data": json.dumps(
                                 {
-                                    "type": "state_change",
-                                    "state": cur_state,
+                                    "type": "replay_truncated",
+                                    "ws_id": ws_id,
+                                    "lost_count": lost_count,
+                                    "earliest_available_id": earliest_available_id,
+                                }
+                            )
+                        }
+
+                    # Replay phase — stream the kind-specific initial
+                    # payload one event at a time so the client sees
+                    # the first byte immediately.  Pre-building into
+                    # a list would block time-to-first-byte until the
+                    # entire replay materialized AND let the listener
+                    # queue accumulate (potentially over its 500-slot
+                    # cap on a chatty mid-generation workstream)
+                    # while replay was being built.  Synthetic
+                    # events carry no ``_event_id`` — they intentionally
+                    # don't advance the client's ``lastEventId``, so
+                    # a mid-replay disconnect reconnects with the
+                    # last BUFFERED id (or none on truly-fresh
+                    # connect), which is what the server can replay.
+                    if replay_cb is not None:
+                        # Kind-specific async prep — runs before the
+                        # sync replay generator iterates so blocking
+                        # storage I/O lands in the executor pool
+                        # rather than the event loop's hot path.
+                        if cfg.events_replay_prepare is not None:
+                            try:
+                                await cfg.events_replay_prepare(ws, ui, request)
+                            except Exception:
+                                log.debug(
+                                    "ws.events.replay_prepare_failed ws=%s",
+                                    ws_id[:8],
+                                    exc_info=True,
+                                )
+                        try:
+                            for ev in replay_cb(ws, ui, request):
+                                yield {"data": json.dumps(ev)}
+                        except Exception:
+                            # Replay is observational — never let a
+                            # snapshot bug block the live stream.
+                            log.debug(
+                                "ws.events.replay_failed ws=%s",
+                                ws_id[:8],
+                                exc_info=True,
+                            )
+                    # Refresh-resume tail: emit the current
+                    # workstream state and the in-progress snapshot.
+                    # Both are best-effort — a ws.state read failure
+                    # or empty buffers just yields nothing extra.
+                    try:
+                        cur_state = getattr(ws.state, "value", None)
+                        if isinstance(cur_state, str) and cur_state:
+                            yield {
+                                "data": json.dumps(
+                                    {
+                                        "type": "state_change",
+                                        "state": cur_state,
+                                        "ws_id": ws_id,
+                                    }
+                                )
+                            }
+                    except Exception:
+                        log.debug(
+                            "ws.events.state_change_replay_failed ws=%s",
+                            ws_id[:8],
+                            exc_info=True,
+                        )
+                    if in_progress_snap["content"] or in_progress_snap["reasoning"]:
+                        yield {
+                            "data": json.dumps(
+                                {
+                                    "type": "in_progress_snapshot",
+                                    "content": in_progress_snap["content"],
+                                    "reasoning": in_progress_snap["reasoning"],
                                     "ws_id": ws_id,
                                 }
                             )
                         }
-                except Exception:
-                    log.debug(
-                        "ws.events.state_change_replay_failed ws=%s",
-                        ws_id[:8],
-                        exc_info=True,
-                    )
-                if in_progress_snap["content"] or in_progress_snap["reasoning"]:
-                    yield {
-                        "data": json.dumps(
-                            {
-                                "type": "in_progress_snapshot",
-                                "content": in_progress_snap["content"],
-                                "reasoning": in_progress_snap["reasoning"],
-                                "ws_id": ws_id,
-                            }
-                        )
-                    }
                 # Live phase — drain the per-UI listener queue
                 # until either the workstream closes or the client
                 # disconnects. 5s poll matches pre-lift interactive
                 # (the ``is_disconnected`` probe between polls covers
-                # cancel-detection latency the timeout would otherwise
-                # gate; shortening to 1s 5x'd the wakeup rate without
-                # any client-observable benefit).
+                # cancel-detection latency the timeout would
+                # otherwise gate; shortening to 1s 5x'd the wakeup
+                # rate without any client-observable benefit).
                 #
                 # ``_seq`` filter: ``on_content_token`` /
                 # ``on_reasoning_token`` tag each emit with the
-                # per-turn inflight seq counter. Events whose seq is
-                # already covered by the snapshot we just yielded get
-                # dropped to avoid double-rendering. ``_seq`` is
-                # internal plumbing — strip before yielding so the
-                # SDK / JS clients never see it.
+                # per-ws event counter.  On the ``fresh`` path,
+                # events whose seq is already covered by the
+                # snapshot we just yielded get dropped to avoid
+                # double-rendering.  On ``replay_ok`` / ``truncated``
+                # paths, ``snap_seq`` is 0 so no live event is
+                # filtered — the replay buffer (or replay_truncated
+                # envelope) has already established the cutoff.
                 while True:
                     if await request.is_disconnected():
                         return
@@ -1582,21 +1694,10 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                         continue  # ping keeps the connection alive
                     if event.get("type") == "ws_closed":
                         return
-                    # ``_enqueue`` puts ONE dict reference into every
-                    # listener queue (no per-listener copy). Multiple
-                    # SSE coroutines on the same workstream observe the
-                    # same dict; ``yield`` is an await point, so one
-                    # listener's ``del event["_seq"]`` would race
-                    # another listener's seq-filter read. Shallow-copy
-                    # before any mutation so each listener can filter
-                    # / strip ``_seq`` without disturbing peers.
-                    event = dict(event)
                     seq = event.get("_seq")
-                    if seq is not None:
-                        if seq <= snap_seq:
-                            continue
-                        del event["_seq"]
-                    yield {"data": json.dumps(event)}
+                    if seq is not None and seq <= snap_seq:
+                        continue
+                    yield _format_event(event)
             finally:
                 _metrics.record_sse_disconnect()
                 unregister(client_queue)

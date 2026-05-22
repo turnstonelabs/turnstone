@@ -23,9 +23,11 @@ storage/transport routing is kind-specific.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import copy
 import json
+import os
 import queue
 import threading
 import time
@@ -40,6 +42,37 @@ log = get_logger(__name__)
 # UI's ``_LISTENER_QUEUE_MAX``. Per-queue cap keeps a slow SSE consumer
 # from bloating memory.
 _DEFAULT_LISTENER_QUEUE_MAX = 500
+
+
+def _resolve_event_buffer_max() -> int:
+    """Read ``TURNSTONE_SSE_EVENT_BUFFER_MAX`` env override at import time.
+
+    Default 2000 events covers ~10-40 seconds of cloud-provider streaming
+    (50-200 events/sec per active stream) — enough to make any typical
+    network blip or intermediary timeout transparent to the browser.
+    Local-inference deployments (vLLM, llama.cpp at 500-2000 tok/s) can
+    burn through the cap in under a second; operators on those workloads
+    can raise the bound knowing the tradeoff (linear memory growth ×
+    100-workstream design ceiling).  Below-cap reconnects always hit the
+    replay path; above-cap reconnects fall back to the snapshot recovery
+    floor with an explicit ``replay_truncated`` envelope so the client
+    knows it lost live ticks.
+    """
+    raw = os.environ.get("TURNSTONE_SSE_EVENT_BUFFER_MAX", "").strip()
+    if not raw:
+        return 2000
+    try:
+        n = int(raw)
+    except ValueError:
+        return 2000
+    return n if n > 0 else 2000
+
+
+# Per-ws ring buffer for ``Last-Event-ID`` SSE replay.  Holds the most
+# recent events keyed by monotonic ``_event_id``; deque ``maxlen`` evicts
+# oldest automatically.  See :func:`_resolve_event_buffer_max` for the
+# sizing rationale.
+_EVENT_BUFFER_MAX = _resolve_event_buffer_max()
 
 
 # Cap on the assistant content / reasoning accumulators. Used by two
@@ -140,6 +173,36 @@ class SessionUIBase:
         # SSE listener fan-out — one queue per connected browser tab.
         self._listeners: list[queue.Queue[dict[str, Any]]] = []
         self._listeners_lock = threading.Lock()
+        # Per-ws event ring buffer for ``Last-Event-ID`` SSE replay.
+        # Holds ``(event_id, event_dict)`` tuples; deque ``maxlen``
+        # evicts the oldest automatically when the cap is hit.  The
+        # listener fan-out path stamps every event with a monotonic
+        # ``_event_id`` (see :meth:`_enqueue`) and appends here under
+        # the same ``_listeners_lock`` that gates the per-listener
+        # queues — keeps the buffer and the live fan-out in lockstep.
+        # A reconnecting client with a ``Last-Event-ID`` header (or
+        # ``?last_event_id=N`` query-param fallback for manual reconnect
+        # paths that can't set custom headers) is served the slice of
+        # the buffer past that id; clients whose ``Last-Event-ID``
+        # predates the buffer's earliest retained id get a
+        # ``replay_truncated`` envelope plus the in-progress snapshot
+        # as the recovery floor.  Guarded by ``_listeners_lock`` (NOT
+        # ``_ws_lock``) so a writer holding ``_ws_lock`` for the
+        # inflight-buffer append doesn't serialize the buffer write
+        # against unrelated readers.
+        self._event_buffer: collections.deque[tuple[int, dict[str, Any]]] = collections.deque(
+            maxlen=_EVENT_BUFFER_MAX
+        )
+        # Monotonic per-ws event counter.  Stamps every fan-out event
+        # (every ``_enqueue`` call) and also drives the existing
+        # ``_seq`` snapshot-dedup tag on token events (``content`` /
+        # ``reasoning``) — one counter, two consumers.  Renamed from
+        # the pre-replay ``_ws_inflight_seq`` because the counter now
+        # spans every event, not just the inflight token stream.
+        # Guarded by ``_listeners_lock`` (incremented under that lock
+        # in :meth:`_enqueue`); the snapshot helper for the in-progress
+        # replay path captures it under ``_listeners_lock`` too.
+        self._event_id: int = 0
         # Approval blocking — the worker thread calls approve_tools
         # which waits on _approval_event; the /approve endpoint sets
         # it via resolve_approval.
@@ -238,18 +301,16 @@ class SessionUIBase:
         # each turn by :meth:`on_turn_start` (separate from the multi-
         # turn IDLE-piggyback buffer above so prior committed turns
         # don't leak into the snapshot and double-render against the
-        # replayed history). ``_ws_inflight_seq`` is a monotonic
-        # counter incremented on EVERY emit (even when the cap
-        # rejected the buffer append) so a subscriber registering
-        # after the cap is hit doesn't have subsequent live tokens
-        # filter-dropped against a stalled ``snap_seq`` — the events
-        # handler dedups live events whose ``_seq`` is at-or-below
-        # the snapshot's seq (already in the snapshot payload).
+        # replayed history).  The per-turn dedup-tag counter
+        # (``_event_id``) is initialised above alongside the per-ws
+        # event ring buffer — one monotonic counter drives both the
+        # ``Last-Event-ID`` replay slice AND the existing snapshot
+        # ``_seq <= snap_seq`` filter; see :meth:`_enqueue` for the
+        # stamping pattern.
         self._ws_inflight_content: list[str] = []
         self._ws_inflight_content_size: int = 0
         self._ws_inflight_reasoning: list[str] = []
         self._ws_inflight_reasoning_size: int = 0
-        self._ws_inflight_seq: int = 0
         # Last broadcast (activity, activity_state) tuple — used by
         # :meth:`_broadcast_activity` overrides to dedup back-to-back
         # identical activity ticks. Tool-heavy turns can fire many
@@ -287,12 +348,35 @@ class SessionUIBase:
 
         Stamps ``ws_id`` on the payload if not already present so the
         browser can validate it belongs to the pane's current
-        workstream. Shallow-copies on stamp to avoid mutating a
-        caller-owned dict.
+        workstream.  Stamps a monotonic ``_event_id`` on every event
+        (drives the ``Last-Event-ID`` replay buffer) and additionally
+        stamps the per-turn snapshot dedup tag ``_seq`` on token
+        events (``content`` / ``reasoning``) so the existing
+        in-progress snapshot dedup at the events handler stays
+        byte-identical.  Shallow-copies before each stamp so a
+        caller-owned dict is never mutated.
+
+        The counter increment, the buffer append, AND the listener
+        snapshot all run under ``_listeners_lock`` so a concurrent
+        :meth:`register_listener_with_in_progress_snapshot` or
+        :meth:`register_listener_with_replay` sees a consistent
+        ``(event_id, listeners, buffer)`` tuple — no event is
+        fanned out to a not-yet-registered listener AND missing from
+        the replay buffer.
         """
         if "ws_id" not in data:
             data = {**data, "ws_id": self.ws_id}
         with self._listeners_lock:
+            self._event_id += 1
+            event_id = self._event_id
+            data = {**data, "_event_id": event_id}
+            if data.get("type") in ("content", "reasoning"):
+                # Preserve the existing dedup contract: only token
+                # events carry the ``_seq`` tag.  Non-token events
+                # (``tool_started``, ``state_change``, …) keep
+                # bypassing the snapshot filter by absence of ``_seq``.
+                data = {**data, "_seq": event_id}
+            self._event_buffer.append((event_id, data))
             snapshot = list(self._listeners)
         for lq in snapshot:
             with contextlib.suppress(queue.Full):
@@ -317,27 +401,29 @@ class SessionUIBase:
     ) -> tuple[queue.Queue[dict[str, Any]], dict[str, Any]]:
         """Register a listener AND snapshot the per-turn inflight buffers.
 
-        Used by :func:`make_events_handler` so a fresh SSE subscriber
+        Used by :func:`make_events_handler` (the fresh-connect path,
+        and the ``replay_truncated`` fallback path) so a SSE subscriber
         connecting mid-stream can be told the in-progress turn's content
         and reasoning text-so-far in a one-shot ``in_progress_snapshot``
         event, on top of the kind-specific replay (history / pending).
+        The ``Last-Event-ID`` replay path (see
+        :meth:`register_listener_with_replay`) bypasses this — the
+        buffered events already carry the partial token stream.
 
-        Race-free composition with the on-token writers, even though
-        ``on_content_token`` / ``on_reasoning_token`` cross two locks
-        (``_ws_lock`` for the buffer append, ``_listeners_lock`` for
-        the fan-out enqueue). The trick is the seq counter —
-        ``_ws_inflight_seq`` is incremented under ``_ws_lock`` on
-        every emit (even when the cap rejected the append, so a
-        subscriber that registers after the cap is hit doesn't have
-        subsequent live tokens filter-dropped against a stalled
-        snap_seq). This method captures it alongside the buffer
-        contents under the same ``_ws_lock``, and the events handler's
-        live drain drops any incoming event whose ``_seq`` is at-or-
-        below the captured ``snap.seq`` (already in the snapshot
-        payload). Lock acquisition order: ``_listeners_lock`` (inside
-        :meth:`_register_listener`) is taken and released first, THEN
-        ``_ws_lock`` for the snapshot copy. Sequential — no nesting,
-        no deadlock with the writer's reverse order.
+        Lock acquisition order: ``_ws_lock`` (outer) → ``_listeners_lock``
+        (inner) — matches the writer's order in :meth:`on_content_token`
+        / :meth:`on_reasoning_token` (``_ws_lock`` then ``_enqueue``'s
+        ``_listeners_lock``).  Nested under both locks we read
+        ``inflight_content``, ``inflight_reasoning``, AND the
+        ``_event_id`` counter as a consistent triple, plus register
+        the listener.  Writers calling :meth:`_enqueue` block on
+        ``_listeners_lock`` for the snapshot's duration so no event is
+        fanned out between counter-read and listener-registration —
+        every event with ``_event_id > snap_seq`` lands in the
+        registered listener's queue, every event with
+        ``_event_id <= snap_seq`` is already covered by the snapshot's
+        ``content`` / ``reasoning`` text or by token events that the
+        events handler's ``_seq <= snap_seq`` filter drops.
 
         Returns ``(client_queue, snapshot_dict)`` where ``snapshot_dict``
         has keys ``content`` (str), ``reasoning`` (str), ``seq`` (int).
@@ -345,22 +431,95 @@ class SessionUIBase:
         whether to yield the event at all (empty snapshots are common
         between turns and on freshly-opened workstreams).
 
-        Joins the captured fragments OUTSIDE the lock — bounded at
+        Joins the captured fragments OUTSIDE the locks — bounded at
         ``_MAX_TURN_CONTENT_CHARS`` but still O(n) over fragments, so
         worth not blocking concurrent on-token writers for the
-        duration. The shallow ``list(...)`` copy under the lock means
-        subsequent appends to the live buffer don't mutate our view.
+        duration. The shallow ``list(...)`` copies under the lock mean
+        subsequent appends to the live buffers don't mutate our view.
         """
-        client_queue = self._register_listener(maxsize=maxsize)
+        client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=maxsize)
         with self._ws_lock:
             captured_content = list(self._ws_inflight_content)
             captured_reasoning = list(self._ws_inflight_reasoning)
-            snap_seq = self._ws_inflight_seq
+            with self._listeners_lock:
+                self._listeners.append(client_queue)
+                snap_seq = self._event_id
         return client_queue, {
             "content": "".join(captured_content),
             "reasoning": "".join(captured_reasoning),
             "seq": snap_seq,
         }
+
+    def register_listener_with_replay(
+        self,
+        last_event_id: int,
+        maxsize: int = _DEFAULT_LISTENER_QUEUE_MAX,
+    ) -> tuple[queue.Queue[dict[str, Any]], list[dict[str, Any]], str, int, int]:
+        """Register a listener AND capture buffered events for replay.
+
+        Used by :func:`make_events_handler` when the client sends
+        ``Last-Event-ID`` (header or ``?last_event_id=`` query-param
+        fallback for the manual-reconnect path).  Returns
+
+            ``(client_queue, replay_events, status, lost_count,
+            earliest_available_id)``
+
+        where ``status`` is one of ``"replay_ok"`` (caller emits the
+        replay events then drops into live drain, skipping
+        ``replay_cb`` / ``state_change`` / ``in_progress_snapshot``)
+        or ``"truncated"`` (caller emits a ``replay_truncated``
+        envelope then falls through to the fresh-connect replay path
+        as the recovery floor — the snapshot picks up the partial
+        content/reasoning that the evicted events would have carried).
+
+        Atomicity contract: under ``_listeners_lock`` we both snapshot
+        the buffer AND register the listener.  A writer's
+        :meth:`_enqueue` takes the same lock, so events either
+          - land in the buffer snapshot but NOT the listener queue
+            (writer ran before our lock acquire — caught by the
+            replay slice), or
+          - land in the listener queue but NOT the buffer snapshot
+            (writer ran after our lock release — live drain handles
+            them, ``_event_id`` is strictly above
+            ``earliest_available_id``).
+        No event is double-delivered, none is lost across the
+        registration boundary.
+
+        ``last_event_id`` semantics:
+          - ``< earliest_available_id - 1`` → ``"truncated"``.
+            ``lost_count`` is the minimum gap (the buffer may have
+            evicted strictly more than this — we only know the
+            lower bound from what's still retained).
+          - ``>= earliest_available_id - 1`` → ``"replay_ok"``.  Replay
+            events are those with id strictly greater than
+            ``last_event_id`` (the client has already seen everything
+            up to and including ``last_event_id``).
+
+        Empty buffer: returned ``status="replay_ok"`` with empty
+        ``replay_events`` regardless of ``last_event_id``.  This is
+        the cold-start case (the ws just bootstrapped with no events
+        ever) and the all-quiet case (a long-idle ws past which all
+        events fall out of the buffer cap, but in practice the buffer
+        starts evicting only after 2000 events have been enqueued —
+        which means the counter is >= 2000 and the client's
+        last_event_id is below earliest, so they get ``truncated``
+        instead).  We can't distinguish the two without a separate
+        ``highest_evicted_id`` tracker; treating empty as ``replay_ok``
+        is the safe choice for the genuine cold-start case (no false
+        ``replay_truncated`` envelopes on freshly-opened workstreams).
+        """
+        client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=maxsize)
+        with self._listeners_lock:
+            buffered = list(self._event_buffer)
+            self._listeners.append(client_queue)
+        if not buffered:
+            return client_queue, [], "replay_ok", 0, 0
+        earliest_id = buffered[0][0]
+        if last_event_id < earliest_id - 1:
+            lost_count = (earliest_id - 1) - last_event_id
+            return client_queue, [], "truncated", lost_count, earliest_id
+        replay_events = [ev for eid, ev in buffered if eid > last_event_id]
+        return client_queue, replay_events, "replay_ok", 0, earliest_id
 
     # ------------------------------------------------------------------
     # Approval / plan blocking gates
@@ -1429,16 +1588,19 @@ class SessionUIBase:
     def _reset_inflight_buffers_locked(self) -> None:
         """Clear the per-turn inflight content + reasoning. Caller holds ``_ws_lock``.
 
-        ``_ws_inflight_seq`` is INTENTIONALLY not reset — it must
-        remain monotonically increasing for the lifetime of the UI so
-        a long-lived SSE subscriber's ``snap_seq`` cutoff stays a
-        valid high-water mark across turn boundaries. If we reset
-        seq=0 at every turn, turn N+1's first M tokens (M = the
-        snap_seq the subscriber captured mid-turn-N) would all carry
-        ``_seq <= snap_seq`` and get silently dropped by the dedup
-        filter in :func:`make_events_handler`. Seq is just a wire-
-        format dedup tag — its absolute value doesn't matter, only
-        that it's monotonic.
+        ``_event_id`` is INTENTIONALLY not reset — it must remain
+        monotonically increasing for the lifetime of the UI so a
+        long-lived SSE subscriber's ``snap_seq`` cutoff stays a valid
+        high-water mark across turn boundaries AND a ``Last-Event-ID``
+        replay can still slice the buffer correctly across resets.
+        If we reset to 0 at every turn, turn N+1's first M tokens
+        (M = the snap_seq the subscriber captured mid-turn-N) would
+        all carry ``_seq <= snap_seq`` and get silently dropped by
+        the dedup filter in :func:`make_events_handler`; and a
+        ``Last-Event-ID`` from before the reset would point into the
+        OLD numbering and silently mis-replay.  ``_event_id`` is just
+        an opaque monotonic tag — its absolute value doesn't matter,
+        only that it never decreases for the lifetime of the UI.
         """
         self._ws_inflight_content = []
         self._ws_inflight_content_size = 0
@@ -1490,16 +1652,17 @@ class SessionUIBase:
     def on_reasoning_token(self, text: str) -> None:
         """Append to the inflight reasoning buffer (capped) + enqueue.
 
-        Mirrors :meth:`on_content_token`'s shape. ``_ws_inflight_seq``
-        advances on EVERY emit — even when the buffer cap rejected
-        the append — so the dedup filter in :func:`make_events_handler`
-        stays correct for subscribers that register after the cap is
-        hit. If seq stalled at the high-water-pre-cap, those late
-        subscribers would capture ``snap_seq == high-water`` and
-        every subsequent live token (with the same stalled seq)
-        would be filter-dropped as "already in your snapshot",
-        silently losing the rest of the stream. The cap is a
-        buffer-size limit, NOT a "stop streaming" signal.
+        Mirrors :meth:`on_content_token`'s shape.  The ``_seq`` dedup
+        tag is stamped by :meth:`_enqueue` against the per-ws
+        ``_event_id`` counter, which advances on EVERY emit
+        regardless of whether the inflight cap rejected the append.
+        If the seq stalled at high-water-pre-cap, subscribers
+        registering after the cap is hit would capture
+        ``snap_seq == high-water`` and every subsequent live token
+        (with the same stalled seq) would be filter-dropped as
+        "already in your snapshot" — silently losing the rest of
+        the stream. The cap is a buffer-size limit, NOT a "stop
+        streaming" signal.
 
         Tokens past the cap are absent from ``snap.reasoning`` (the
         snapshot text was truncated at cap) but the live stream
@@ -1512,9 +1675,7 @@ class SessionUIBase:
             if self._ws_inflight_reasoning_size < _MAX_TURN_CONTENT_CHARS:
                 self._ws_inflight_reasoning.append(text)
                 self._ws_inflight_reasoning_size += len(text)
-            self._ws_inflight_seq += 1
-            seq = self._ws_inflight_seq
-        self._enqueue({"type": "reasoning", "text": text, "_seq": seq})
+        self._enqueue({"type": "reasoning", "text": text})
 
     def on_content_token(self, text: str) -> None:
         """Append to both turn-content buffers (capped) + enqueue.
@@ -1526,15 +1687,14 @@ class SessionUIBase:
            :meth:`on_turn_start`) — fuels the SSE ``in_progress_snapshot``
            event a reconnecting client sees on mid-stream refresh.
 
-        Both caps are checked independently. ``_ws_inflight_seq``
-        advances on EVERY emit — even when the inflight cap rejected
-        the append — so a subscriber that registers after the cap is
-        hit doesn't have every subsequent live token filter-dropped
-        against a stalled ``snap_seq``. See
-        :meth:`on_reasoning_token` for the full rationale.
+        Both caps are checked independently.  The ``_seq`` dedup tag
+        is stamped by :meth:`_enqueue` against the per-ws
+        ``_event_id`` counter, which advances on EVERY emit
+        regardless of cap state — see :meth:`on_reasoning_token` for
+        the full rationale.
 
-        The cap-check + append + size-update + seq-bump run under
-        ``_ws_lock`` so a concurrent
+        The cap-check + append + size-update run under ``_ws_lock``
+        so a concurrent
         :meth:`snapshot_and_consume_state_payload` IDLE/ERROR drain or
         a concurrent :meth:`register_listener_with_in_progress_snapshot`
         can't see a torn list mid-append. In production this is
@@ -1551,9 +1711,7 @@ class SessionUIBase:
             if self._ws_inflight_content_size < _MAX_TURN_CONTENT_CHARS:
                 self._ws_inflight_content.append(text)
                 self._ws_inflight_content_size += len(text)
-            self._ws_inflight_seq += 1
-            seq = self._ws_inflight_seq
-        self._enqueue({"type": "content", "text": text, "_seq": seq})
+        self._enqueue({"type": "content", "text": text})
 
     def on_stream_end(self) -> None:
         with self._ws_lock:
