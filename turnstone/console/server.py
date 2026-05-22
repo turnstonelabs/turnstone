@@ -2866,12 +2866,31 @@ async def _proxy_sse(
     else:
         sse_auth = _proxy_auth_headers(request)
 
+    # Forward ``Last-Event-ID`` from the browser to the upstream node so
+    # the per-ws / global SSE handlers can serve the reconnect-with-replay
+    # buffer slice.  Without this, multi-node deployments lose replay
+    # entirely (the proxy is the only inbound SSE path in that shape);
+    # the per-ws handler would treat every reconnect as a fresh connect
+    # and silently drop events emitted during the disconnect window.
+    # The query-param fallback (``?last_event_id=N``) is already
+    # forwarded via the existing ``request.url.query`` propagation at
+    # the top of this function — only the header needs an explicit
+    # carry-over.  Header lookups in Starlette are case-insensitive.
+    upstream_headers: dict[str, str] = {
+        **sse_auth,
+        "Accept": "text/event-stream",
+        "Cache-Control": "no-store",
+    }
+    last_event_id_hdr = request.headers.get("last-event-id")
+    if last_event_id_hdr is not None:
+        upstream_headers["Last-Event-ID"] = last_event_id_hdr
+
     async def raw_stream() -> AsyncGenerator[bytes, None]:
         try:
             async with sse_client.stream(
                 "GET",
                 target,
-                headers={**sse_auth, "Accept": "text/event-stream", "Cache-Control": "no-store"},
+                headers=upstream_headers,
                 timeout=httpx.Timeout(connect=10, read=None, write=5, pool=None),
             ) as response:
                 if response.status_code != 200:
