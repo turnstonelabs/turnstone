@@ -264,7 +264,10 @@ _STYLE_CSS = Path(__file__).resolve().parent.parent / "turnstone/ui/static/style
 #   * concat HTML-assignment  — inner/outer-HTML += value (the
 #     ``\+?`` makes the ``+`` optional so a regression switching the
 #     sink to concat-assignment doesn't bypass the lint)
-#   * legacy doc-write        — ``document.write(...)``
+#   * insertAdjacent HTML     — ``insertAdjacentHTML(...)`` (the
+#     ``HTML\(`` suffix excludes ``insertAdjacentElement``, which
+#     takes a DOM node and is not an XSS sink)
+#   * legacy doc-write        — ``document`` + ``.write(...)``
 #   * string-to-code helpers  — the JS ``ev`` + ``al`` builtin, the
 #     dynamic-Function constructor (``new`` + ``Function(...)``), and
 #     ``setTimeout``/``setInterval`` whose first arg is a string
@@ -277,15 +280,16 @@ _STYLE_CSS = Path(__file__).resolve().parent.parent / "turnstone/ui/static/style
 # regex over the *entire file body* (not line-by-line) so that ``\s*``
 # can span newlines and catch multi-line sinks like
 # ``el.innerHTML\n  = X``.
-#
-# ``insertAdjacent`` + HTML is *not* covered here because two existing
-# call sites in ``ui/static/app.js`` consume ``renderVerdictBadge``
-# HTML output; broadening the lint would require cleaning that
-# helper first.  Tracked as a follow-up.
 _UNSAFE_CODE_SINK_RE = re.compile(
     r"\.(?:inner|outer)"
     + r"HTML\s*\+?=(?!=)"
-    + r"|document\.write\("
+    + r"|\.insertAdjacent"
+    + r"HTML\("
+    + r"|"
+    + r"document"
+    + r"\."
+    + r"write"
+    + r"\("
     + r"|\b"
     + r"eval\s*\("
     + r"|\bnew\s+"
@@ -404,9 +408,9 @@ def test_no_unsafe_code_sinks_in_static_assets(label: str, path: Path) -> None:
     """Whole-file pin: no direct DOM-write *or* dynamic-code sinks
     in any of the static JS bundles that render LLM output, tool
     results, operator-supplied data, or user input.  Covers
-    inner/outer-HTML assignment (plain and concat), legacy doc-write,
-    string-eval, dynamic-Function constructor, and string-first-arg
-    timer scheduling.
+    inner/outer-HTML assignment (plain and concat), insertAdjacentHTML,
+    legacy doc-write, string-eval, dynamic-Function constructor, and
+    string-first-arg timer scheduling.
 
     Two distinct cleanup postures across the targets:
 
@@ -429,13 +433,10 @@ def test_no_unsafe_code_sinks_in_static_assets(label: str, path: Path) -> None:
     All admin-side bundles are now covered.
 
     The regex covers inner/outer-HTML assignment (plain and
-    concat-assignment), legacy doc-write, and the dynamic-code
-    constructors (string-eval, dynamic-Function, string-first-arg
-    timer scheduling).  ``insertAdjacent`` + HTML is deliberately
-    *not* covered yet; two existing ``ui/static/app.js`` sites — the
-    verdict-badge writers — consume the HTML-string output of
-    ``renderVerdictBadge``, so broadening the lint requires cleaning
-    that helper first.
+    concat-assignment), ``insertAdjacentHTML``, legacy doc-write, and
+    the dynamic-code constructors (string-eval, dynamic-Function,
+    string-first-arg timer scheduling).  ``insertAdjacentElement`` is
+    intentionally not flagged — it takes a DOM node, not a string.
 
     Parametrized so each target is its own pytest case — a failure on
     one file is attributed precisely without masking offenders in the
