@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import contextlib
 import functools
 import hashlib
 import json
 import os
 import queue
+import random
 import re
 import sys
 import textwrap
@@ -1243,24 +1245,101 @@ async def global_events_sse(request: Request) -> Response:
             status_code=409,
         )
 
-    # -- Atomic snapshot + listener registration ------------------------------
+    # -- Last-Event-ID resume parsing -----------------------------------------
+    # Native EventSource sets the header on auto-reconnect; the
+    # manual-reconnect path (which can't set custom headers on
+    # ``new EventSource(url)``) uses the query-param fallback.
+    last_event_id_raw = request.headers.get("Last-Event-ID") or request.query_params.get(
+        "last_event_id"
+    )
+    last_event_id: int | None
+    try:
+        last_event_id = int(last_event_id_raw) if last_event_id_raw else None
+    except (TypeError, ValueError):
+        last_event_id = None
+
+    # -- Atomic snapshot / replay-slice + listener registration ---------------
     client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1000)
     listeners = request.app.state.global_listeners
     listeners_lock = request.app.state.global_listeners_lock
+    event_buffer: collections.deque[tuple[int, dict[str, Any]]] = (
+        request.app.state.global_event_buffer
+    )
 
-    # Hold the listeners lock while building the snapshot AND registering.
-    # The fanout thread also acquires this lock when snapshotting the listener
-    # list, so events that land on global_queue during snapshot build will be
-    # distributed to our queue after we release — gap-free.
+    # Three replay shapes, matching :func:`make_events_handler`:
+    #   - ``last_event_id is None`` → ``"fresh"``: emit node_snapshot
+    #     then live.
+    #   - ``last_event_id`` + buffer covers gap → ``"replay_ok"``:
+    #     emit buffered events past the id, SKIP node_snapshot, then
+    #     live.
+    #   - ``last_event_id`` + buffer too short → ``"truncated"``: emit
+    #     a ``replay_truncated`` envelope then fall through to
+    #     ``"fresh"`` (node_snapshot is the recovery floor).
+    replay_status: str
+    replay_events: list[dict[str, Any]] = []
+    lost_count = 0
+    earliest_available_id = 0
+    snapshot: dict[str, Any] | None = None
+
     with listeners_lock:
-        snapshot = _build_node_snapshot(request.app.state)
+        if last_event_id is None:
+            replay_status = "fresh"
+            snapshot = _build_node_snapshot(request.app.state)
+        else:
+            buffered = list(event_buffer)
+            if not buffered:
+                replay_status = "replay_ok"
+            else:
+                earliest_available_id = buffered[0][0]
+                if last_event_id < earliest_available_id - 1:
+                    replay_status = "truncated"
+                    lost_count = (earliest_available_id - 1) - last_event_id
+                    snapshot = _build_node_snapshot(request.app.state)
+                else:
+                    replay_status = "replay_ok"
+                    replay_events = [ev for eid, ev in buffered if eid > last_event_id]
         listeners.append(client_queue)
 
-    async def event_generator() -> AsyncGenerator[dict[str, str], None]:
+    async def event_generator() -> AsyncGenerator[dict[str, Any], None]:
         _metrics.record_sse_connect()
+
+        def _format_event(event: dict[str, Any]) -> dict[str, str]:
+            """Strip ``_event_id`` from the wire dict, attach SSE ``id:``."""
+            ev_copy = dict(event)
+            eid = ev_copy.pop("_event_id", None)
+            out: dict[str, str] = {"data": json.dumps(ev_copy)}
+            if eid is not None:
+                out["id"] = str(eid)
+            return out
+
         try:
-            # Emit snapshot as first event
-            yield {"data": json.dumps(snapshot)}
+            # Per-stream reconnect jitter (see per-ws handler for
+            # rationale) — staggers reconnect of many panes / many
+            # global subscribers after a shared blip.
+            yield {"retry": random.randint(2500, 4500)}
+
+            if replay_status == "truncated":
+                yield {
+                    "data": json.dumps(
+                        {
+                            "type": "replay_truncated",
+                            "lost_count": lost_count,
+                            "earliest_available_id": earliest_available_id,
+                        }
+                    )
+                }
+            if replay_status == "replay_ok":
+                for ev in replay_events:
+                    yield _format_event(ev)
+            else:
+                # Fresh or truncated: emit the node_snapshot as the
+                # recovery floor.  Snapshot is synthetic (built from
+                # current ws state) and carries no ``_event_id`` —
+                # the client's ``lastEventId`` stays at whatever the
+                # last buffered event was (or empty on fresh).
+                if snapshot is not None:
+                    yield {"data": json.dumps(snapshot)}
+
             loop = asyncio.get_running_loop()
             executor = request.app.state.sse_executor
             while True:
@@ -1268,7 +1347,7 @@ async def global_events_sse(request: Request) -> Response:
                     event = await loop.run_in_executor(
                         executor, functools.partial(client_queue.get, timeout=5)
                     )
-                    yield {"data": json.dumps(event)}
+                    yield _format_event(event)
                 except queue.Empty:
                     pass  # poll timeout, retry
         finally:
@@ -3568,16 +3647,33 @@ def _global_fanout_thread(
     source_queue: queue.Queue[dict[str, Any]],
     listeners: list[queue.Queue[dict[str, Any]]],
     lock: threading.Lock,
+    event_buffer: collections.deque[tuple[int, dict[str, Any]]],
+    counter_holder: list[int],
 ) -> None:
-    """Reads events from the source queue and copies them to all listener queues."""
+    """Read events from ``source_queue``, stamp + buffer + fan out.
+
+    Stamps every event with a monotonic ``_event_id`` (the holder list
+    is a single-element mutable int — Python idiom for a shared int
+    under a lock), appends ``(event_id, event)`` to the global ring
+    buffer, snapshots the listener list, and fans out — all under
+    ``lock`` so a concurrent reader registering itself as a listener
+    sees a consistent ``(counter, listeners, buffer)`` triple and no
+    event lands in ONLY the buffer or ONLY the listener queue across
+    the registration boundary.  Mirrors :meth:`SessionUIBase._enqueue`'s
+    contract for the global lane.
+    """
     while True:
         try:
             event = source_queue.get()
             with lock:
+                counter_holder[0] += 1
+                event_id = counter_holder[0]
+                stamped = {**event, "_event_id": event_id}
+                event_buffer.append((event_id, stamped))
                 snapshot = list(listeners)
             for lq in snapshot:
                 with contextlib.suppress(queue.Full):
-                    lq.put_nowait(event)  # drop if a listener is backed up
+                    lq.put_nowait(stamped)  # drop if a listener is backed up
         except Exception:
             log.debug("Global fan-out error", exc_info=True)
 
@@ -3600,6 +3696,8 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
             app.state.global_queue,
             app.state.global_listeners,
             app.state.global_listeners_lock,
+            app.state.global_event_buffer,
+            app.state.global_event_id_holder,
         ),
         daemon=True,
     )
@@ -4146,6 +4244,20 @@ def create_app(
     app.state.global_queue = global_queue
     app.state.global_listeners = global_listeners
     app.state.global_listeners_lock = global_listeners_lock
+    # Per-node global SSE replay ring buffer + monotonic event counter.
+    # Mirrors :attr:`SessionUIBase._event_buffer` / ``._event_id`` for
+    # the global lane; ``_global_fanout_thread`` stamps every event
+    # with ``_event_id`` under ``global_listeners_lock`` and appends
+    # to this buffer.  Cap sized to cover ~20 seconds of typical
+    # cluster broadcast rate (state changes + activity ticks across
+    # ~100 ws = up to a few hundred events/sec); operators can raise
+    # via ``TURNSTONE_SSE_EVENT_BUFFER_MAX`` (shared with per-ws cap).
+    from turnstone.core.session_ui_base import _EVENT_BUFFER_MAX
+
+    app.state.global_event_buffer = collections.deque(maxlen=_EVENT_BUFFER_MAX)
+    # Single-element list as a mutable int holder so the fanout
+    # thread can ``counter_holder[0] += 1`` under the lock.
+    app.state.global_event_id_holder = [0]
     app.state.skip_permissions = skip_permissions
     app.state.jwt_secret = jwt_secret
     app.state.auth_storage = auth_storage

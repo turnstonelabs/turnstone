@@ -441,6 +441,108 @@ class TestProxySseNon200LogLevel:
 
 
 # ---------------------------------------------------------------------------
+# _proxy_sse — Last-Event-ID forwarding (PR-D reconnect-with-replay)
+# ---------------------------------------------------------------------------
+
+
+class TestProxySseLastEventIdForwarding:
+    """The console SSE proxy is the inbound SSE path for multi-node
+    deployments — every browser EventSource traverses it.  Without
+    forwarding ``Last-Event-ID``, the per-ws / global SSE handlers on
+    the node would treat every reconnect as a fresh connect and silently
+    drop events emitted during the disconnect window.  PR-D's whole
+    reconnect-with-replay foundation depends on these tests passing."""
+
+    @pytest.mark.anyio
+    async def test_forwards_last_event_id_header_to_upstream(self):
+        """Browser sends ``Last-Event-ID``; upstream node must receive it."""
+        from starlette.requests import Request
+
+        from turnstone.console.server import _proxy_sse
+
+        captured_headers: dict[str, str] = {}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            # httpx headers are case-insensitive; capture lowercased.
+            captured_headers.update({k.lower(): v for k, v in req.headers.items()})
+            return httpx.Response(
+                200, text="data: {}\n\n", headers={"content-type": "text/event-stream"}
+            )
+
+        sse_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        proxy_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/node/n/api/workstreams/ws-1/events",
+            "headers": [(b"last-event-id", b"42")],
+            "query_string": b"",
+            "app": MagicMock(
+                state=SimpleNamespace(proxy_sse_client=sse_client, proxy_client=proxy_client)
+            ),
+        }
+
+        async def _receive():
+            return {"type": "http.request", "body": b""}
+
+        request = Request(scope, receive=_receive)
+        response = await _proxy_sse(
+            request, "http://node-1:8001", "workstreams/ws-1/events", api_prefix="api"
+        )
+        # Drain so the upstream call actually fires.
+        async for _ in response.body_iterator:  # type: ignore[attr-defined]
+            pass
+
+        assert captured_headers.get("last-event-id") == "42", (
+            f"Last-Event-ID not forwarded to upstream; got headers={captured_headers!r}"
+        )
+
+    @pytest.mark.anyio
+    async def test_omits_last_event_id_when_client_did_not_send_one(self):
+        """Fresh connect (no header on the browser side) → no header
+        added on the upstream side either.  Guards against
+        accidentally injecting a stale or fabricated value."""
+        from starlette.requests import Request
+
+        from turnstone.console.server import _proxy_sse
+
+        captured_headers: dict[str, str] = {}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            captured_headers.update({k.lower(): v for k, v in req.headers.items()})
+            return httpx.Response(
+                200, text="data: {}\n\n", headers={"content-type": "text/event-stream"}
+            )
+
+        sse_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        proxy_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/node/n/api/workstreams/ws-1/events",
+            "headers": [],
+            "query_string": b"",
+            "app": MagicMock(
+                state=SimpleNamespace(proxy_sse_client=sse_client, proxy_client=proxy_client)
+            ),
+        }
+
+        async def _receive():
+            return {"type": "http.request", "body": b""}
+
+        request = Request(scope, receive=_receive)
+        response = await _proxy_sse(
+            request, "http://node-1:8001", "workstreams/ws-1/events", api_prefix="api"
+        )
+        async for _ in response.body_iterator:  # type: ignore[attr-defined]
+            pass
+
+        assert "last-event-id" not in captured_headers, (
+            f"upstream got an unexpected Last-Event-ID; headers={captured_headers!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Gated cluster_events_sse — 503 on scope error (0a)
 # ---------------------------------------------------------------------------
 

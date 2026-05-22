@@ -674,9 +674,17 @@ class Pane {
       this.attachments.rehydrate();
     }
 
-    this.evtSource = new EventSource(
-      "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/events",
-    );
+    // Build the events URL with a ``?last_event_id=N`` query param
+    // if we have a saved high-water mark from a prior connection.
+    // The EventSource constructor can't set custom headers, so the
+    // browser-native ``Last-Event-ID`` header isn't available here;
+    // the server accepts both forms.  ``_lastEventId`` is captured
+    // from the prior source's onmessage handler.
+    let evtUrl = "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/events";
+    if (this._lastEventId) {
+      evtUrl += "?last_event_id=" + encodeURIComponent(this._lastEventId);
+    }
+    this.evtSource = new EventSource(evtUrl);
 
     this.evtSource.onopen = () => {
       this.retryDelay = 1000;
@@ -685,100 +693,145 @@ class Pane {
     };
 
     this.evtSource.onmessage = (e) => {
+      // Capture lastEventId BEFORE JSON.parse so a (rare) malformed
+      // event doesn't desync the manual-reconnect fallback from
+      // native auto-reconnect (which advances lastEventId regardless
+      // of whether we successfully process the data).  Server's
+      // stamping contract: ``id:`` only on events sourced from the
+      // per-ws ring buffer — synthetic replay events (history /
+      // state_change / in_progress_snapshot) don't advance the
+      // counter, so reconnect resumes from the last BUFFERED id (or
+      // none on a truly-fresh connect that never received one).
+      if (this.evtSource && this.evtSource.lastEventId) {
+        this._lastEventId = this.evtSource.lastEventId;
+      }
       const data = JSON.parse(e.data);
       this.handleEvent(data);
     };
 
     this.evtSource.onerror = () => {
-      this.evtSource.close();
-      this.evtSource = null;
+      // Do NOT close evtSource for transient network errors — native
+      // EventSource auto-reconnect handles them with the
+      // ``Last-Event-ID`` header automatically (now that the server
+      // emits ``id:`` on every buffered event).  Closing here would
+      // force a CONNECTING -> CLOSED transition that defeats native
+      // reconnect, which is exactly the reconnect-with-replay defect
+      // PR-D ships to fix.  See
+      // tests/test_app_js.py::test_pane_connectsse_onerror_preserves_native_reconnect.
       const loginOverlay = document.getElementById("login-overlay");
       if (loginOverlay && loginOverlay.style.display !== "none") return;
       this.statusBarEl.classList.add("ws-sb-disconnected");
       this._sbTokens.textContent = "Reconnecting\u2026";
-      // Only the focused pane refreshes the global workstream list to avoid
-      // race conditions when multiple panes disconnect simultaneously.
+      // Focused-pane orthogonal trigger: refetch the global
+      // workstream list so a workstream evicted while we were
+      // disconnected gets reassigned across panes.  The reassignment
+      // branch's explicit disconnectSSE + connectSSE on the new
+      // wsId is correct (a different workstream genuinely needs a
+      // fresh stream, not a same-stream replay).
       if (this.id === focusedPaneId) {
-        fetch("/v1/api/workstreams")
-          .then((r) => {
-            if (r.status === 401) {
-              showLogin();
-              return;
-            }
-            return r.json().then((data) => {
-              workstreams = {};
-              (data.workstreams || []).forEach((ws) => {
-                workstreams[ws.ws_id] = { name: ws.name, state: ws.state };
-              });
-              renderTabBar();
-              // Reconnect all disconnected panes, reassigning stale ws_ids.
-              // Two passes: (1) reassign stale panes, (2) reconnect all.
-              // Track assigned ws_ids to avoid multiple panes on the same ws.
-              const remaining = Object.keys(workstreams);
-              if (!remaining.length) {
-                showDashboard();
-                return;
-              }
-              const usedWsIds = {};
-              for (let pid in panes) {
-                if (panes[pid].wsId && workstreams[panes[pid].wsId])
-                  usedWsIds[panes[pid].wsId] = true;
-              }
-              for (let pid2 in panes) {
-                const p2 = panes[pid2];
-                if (p2.wsId && !workstreams[p2.wsId]) {
-                  let newWsId = null;
-                  for (let ri = 0; ri < remaining.length; ri++) {
-                    if (!usedWsIds[remaining[ri]]) {
-                      newWsId = remaining[ri];
-                      break;
-                    }
-                  }
-                  if (newWsId) {
-                    p2.disconnectSSE();
-                    p2.wsId = newWsId;
-                    usedWsIds[newWsId] = true;
-                    while (p2.messagesEl.firstChild)
-                      p2.messagesEl.removeChild(p2.messagesEl.firstChild);
-                    p2.showEmptyState();
-                    p2.updateWsName();
-                  }
-                  // else: more panes than workstreams — leave pane stale,
-                  // connectSSE below will pick it up or it stays disconnected.
-                }
-              }
-              // Pass 2: reconnect all panes and sync focused pane
-              for (let pid3 in panes) {
-                const p3 = panes[pid3];
-                if (pid3 === focusedPaneId) currentWsId = p3.wsId;
-                if (!p3.evtSource && p3.wsId && workstreams[p3.wsId]) {
-                  setTimeout(
-                    ((pp) => {
-                      return () => {
-                        pp.connectSSE(pp.wsId);
-                      };
-                    })(p3),
-                    this.retryDelay,
-                  );
-                }
-              }
-              this.retryDelay = Math.min(this.retryDelay * 2, 30000);
-            });
-          })
-          .catch(() => {
-            setTimeout(() => {
-              this.connectSSE(this.wsId);
-            }, this.retryDelay);
-            this.retryDelay = Math.min(this.retryDelay * 2, 30000);
+        this._refetchWorkstreamsAndReassign();
+      }
+      // Non-focused panes: native EventSource reconnect handles them
+      // transparently — no per-pane retry needed.  The 30 s exp-backoff
+      // ceiling on retryDelay is preserved inside
+      // _refetchWorkstreamsAndReassign for the focused-pane path.
+    };
+  }
+
+  _refetchWorkstreamsAndReassign() {
+    // Lifted from the pre-PR-D ``onerror`` body.  Triggered when the
+    // focused pane sees its EventSource enter the error state — pulls
+    // the authoritative workstream list and reassigns stale wsIds.
+    // Survives the onerror refactor as a separate concern from the
+    // SSE reconnect mechanics: native EventSource handles the same-
+    // workstream reconnect; this handles the workstream-evicted-
+    // during-disconnect recovery.
+    fetch("/v1/api/workstreams")
+      .then((r) => {
+        if (r.status === 401) {
+          showLogin();
+          return;
+        }
+        return r.json().then((data) => {
+          workstreams = {};
+          (data.workstreams || []).forEach((ws) => {
+            workstreams[ws.ws_id] = { name: ws.name, state: ws.state };
           });
-      } else {
-        // Non-focused pane: just retry own connection after delay
+          renderTabBar();
+          // Two passes: (1) reassign stale panes, (2) reconnect any
+          // that ended up in CLOSED state.  Native reconnect covers
+          // CONNECTING -> OPEN transitions transparently.
+          const remaining = Object.keys(workstreams);
+          if (!remaining.length) {
+            showDashboard();
+            return;
+          }
+          const usedWsIds = {};
+          for (let pid in panes) {
+            if (panes[pid].wsId && workstreams[panes[pid].wsId])
+              usedWsIds[panes[pid].wsId] = true;
+          }
+          for (let pid2 in panes) {
+            const p2 = panes[pid2];
+            if (p2.wsId && !workstreams[p2.wsId]) {
+              let newWsId = null;
+              for (let ri = 0; ri < remaining.length; ri++) {
+                if (!usedWsIds[remaining[ri]]) {
+                  newWsId = remaining[ri];
+                  break;
+                }
+              }
+              if (newWsId) {
+                p2.disconnectSSE();
+                // Different workstream → drop saved id; replay is
+                // per-ws so an id from ws-A is meaningless on ws-B.
+                p2._lastEventId = null;
+                p2.wsId = newWsId;
+                usedWsIds[newWsId] = true;
+                while (p2.messagesEl.firstChild)
+                  p2.messagesEl.removeChild(p2.messagesEl.firstChild);
+                p2.showEmptyState();
+                p2.updateWsName();
+              }
+              // else: more panes than workstreams — leave pane stale,
+              // connectSSE below picks it up or stays disconnected.
+            }
+          }
+          // Pass 2: reconnect any pane whose EventSource ended up
+          // truly CLOSED (not just transient — native reconnect
+          // handles CONNECTING / OPEN).
+          for (let pid3 in panes) {
+            const p3 = panes[pid3];
+            if (pid3 === focusedPaneId) currentWsId = p3.wsId;
+            const dead =
+              !p3.evtSource || p3.evtSource.readyState === EventSource.CLOSED;
+            if (dead && p3.wsId && workstreams[p3.wsId]) {
+              setTimeout(
+                ((pp) => {
+                  return () => {
+                    pp.connectSSE(pp.wsId);
+                  };
+                })(p3),
+                this.retryDelay,
+              );
+            }
+          }
+          this.retryDelay = Math.min(this.retryDelay * 2, 30000);
+        });
+      })
+      .catch(() => {
+        // Fetch failed (network) — schedule a same-pane reconnect
+        // fallback in case the EventSource is genuinely dead.
         setTimeout(() => {
-          this.connectSSE(this.wsId);
+          if (
+            !this.evtSource ||
+            this.evtSource.readyState === EventSource.CLOSED
+          ) {
+            this.connectSSE(this.wsId);
+          }
         }, this.retryDelay);
         this.retryDelay = Math.min(this.retryDelay * 2, 30000);
-      }
-    };
+      });
   }
 
   handleEvent(evt) {
@@ -2905,6 +2958,13 @@ let workstreams = {};
 let currentWsId = null;
 let globalEvtSource = null;
 let globalRetryDelay = 1000;
+// Saved high-water mark for the manual-reconnect path (the
+// EventSource constructor can't set custom headers, so the
+// browser-native ``Last-Event-ID`` header is unavailable on
+// reconnect — we thread it via ``?last_event_id=N`` instead).  Updated
+// from ``globalEvtSource.lastEventId`` on every onmessage; native
+// auto-reconnect uses the header directly on the same source object.
+let globalLastEventId = null;
 let dashboardVisible = false;
 let _historyNavigation = false;
 let _lastHealth = null;
@@ -4663,11 +4723,23 @@ function connectGlobalSSE() {
     globalEvtSource.close();
     globalEvtSource = null;
   }
-  globalEvtSource = new EventSource("/v1/api/events/global");
+  // Manual-reconnect path threads ``?last_event_id=N`` because the
+  // EventSource constructor can't set headers; native auto-reconnect
+  // on the same source uses the header directly.
+  let globalUrl = "/v1/api/events/global";
+  if (globalLastEventId) {
+    globalUrl += "?last_event_id=" + encodeURIComponent(globalLastEventId);
+  }
+  globalEvtSource = new EventSource(globalUrl);
   globalEvtSource.onopen = function () {
     globalRetryDelay = 1000;
   };
   globalEvtSource.onmessage = function (e) {
+    // Capture lastEventId BEFORE JSON.parse (see Pane.connectSSE
+    // onmessage for full rationale).
+    if (globalEvtSource && globalEvtSource.lastEventId) {
+      globalLastEventId = globalEvtSource.lastEventId;
+    }
     const data = JSON.parse(e.data);
     if (data.type === "ws_state") {
       updateTabIndicator(data.ws_id, data.state, {
@@ -4735,21 +4807,26 @@ function connectGlobalSSE() {
     }
   };
   globalEvtSource.onerror = function () {
-    globalEvtSource.close();
-    globalEvtSource = null;
-    fetch("/v1/api/workstreams")
-      .then(function (r) {
-        if (r.status === 401) {
-          showLogin();
-          return;
+    // Do NOT close globalEvtSource for transient errors — native
+    // EventSource auto-reconnect handles them with the
+    // ``Last-Event-ID`` header automatically (now that the global
+    // SSE handler emits ``id:`` on every buffered event).  Closing
+    // here would defeat native reconnect.  See PR-D briefing § 3.3
+    // and the per-pane handler above for the same pattern.
+    //
+    // The 401 probe stays — an authentication failure is a terminal
+    // condition (the user must log in) and merits an explicit
+    // close + showLogin.  ``_reconnectDeadSSEs`` (visibilitychange /
+    // focus listener) covers the truly-CLOSED case.
+    fetch("/v1/api/workstreams").then(function (r) {
+      if (r.status === 401) {
+        if (globalEvtSource) {
+          globalEvtSource.close();
+          globalEvtSource = null;
         }
-        setTimeout(connectGlobalSSE, globalRetryDelay);
-        globalRetryDelay = Math.min(globalRetryDelay * 2, 30000);
-      })
-      .catch(function () {
-        setTimeout(connectGlobalSSE, globalRetryDelay);
-        globalRetryDelay = Math.min(globalRetryDelay * 2, 30000);
-      });
+        showLogin();
+      }
+    });
   };
 }
 
