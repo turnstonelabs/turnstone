@@ -47,31 +47,59 @@ _DEFAULT_LISTENER_QUEUE_MAX = 500
 def _resolve_event_buffer_max() -> int:
     """Read ``TURNSTONE_SSE_EVENT_BUFFER_MAX`` env override at import time.
 
-    Default 2000 events covers ~10-40 seconds of cloud-provider streaming
-    (50-200 events/sec per active stream) — enough to make any typical
-    network blip or intermediary timeout transparent to the browser.
-    Local-inference deployments (vLLM, llama.cpp at 500-2000 tok/s) can
-    burn through the cap in under a second; operators on those workloads
-    can raise the bound knowing the tradeoff (linear memory growth ×
-    100-workstream design ceiling).  Below-cap reconnects always hit the
-    replay path; above-cap reconnects fall back to the snapshot recovery
-    floor with an explicit ``replay_truncated`` envelope so the client
-    knows it lost live ticks.
+    Default 50000 events.  Two pressures push the cap larger than a
+    casual reading of "how many events does an SSE stream see":
+
+    1. Local-inference deployments stream at 500–2000 tok/s per
+       active model.  Each token is an ``_enqueue`` call, so a single
+       active workstream can fire ~2000 events/sec sustained.  At
+       the 50000 cap that buys ~25 s of pure token streaming before
+       truncation; at typical cloud-provider rates (50–200 events/sec
+       per stream) it's minutes of coverage.
+    2. Browsers throttle the SSE-drain microtask aggressively when
+       the tab isn't visible (Chrome's background-tab budget drops
+       to ~1 wake/min after ~5 min hidden).  A backgrounded tab can
+       legitimately go tens of seconds without draining its
+       EventSource buffer — and PR-G (drop-pings-let-it-die)
+       deliberately closes those connections on hide.  Reconnect-with-
+       replay is the recovery path; if the buffer evicted in the
+       interim, the snapshot floor is all that's left.
+
+    Why not coalesce consecutive content/reasoning tokens?  A naive
+    text-merge breaks the replay-slice semantic: a coalesced entry
+    has the latest ``_event_id`` but text that includes content the
+    client already received under an earlier id, so any consumer
+    with ``last_event_id`` falling INSIDE the coalesced span would
+    double-render.  A correctness-preserving coalesce would need a
+    per-consumer high-water tracker we deliberately don't maintain
+    (consumers register and disconnect independently).  Bigger cap
+    + simple per-event storage avoids the trap.
+
+    Memory cost is ~200–500 bytes per event (deque node + dict
+    overhead + payload), so 50000 × 100-ws design ceiling caps at
+    roughly 2.5 GB worst-case — and practically never anywhere
+    close because the cap is the per-ws ceiling, not per-ws steady-
+    state.  Operators on heavier workloads can raise via
+    ``TURNSTONE_SSE_EVENT_BUFFER_MAX``; below-cap reconnects always
+    hit the replay path, above-cap reconnects fall back to the
+    snapshot recovery floor with an explicit ``replay_truncated``
+    envelope.
     """
     raw = os.environ.get("TURNSTONE_SSE_EVENT_BUFFER_MAX", "").strip()
+    default = 50000
     if not raw:
-        return 2000
+        return default
     try:
         n = int(raw)
     except ValueError:
-        return 2000
-    return n if n > 0 else 2000
+        return default
+    return n if n > 0 else default
 
 
 # Per-ws ring buffer for ``Last-Event-ID`` SSE replay.  Holds the most
 # recent events keyed by monotonic ``_event_id``; deque ``maxlen`` evicts
 # oldest automatically.  See :func:`_resolve_event_buffer_max` for the
-# sizing rationale.
+# sizing rationale (why 50000 and not 2000; why no in-buffer coalescing).
 _EVENT_BUFFER_MAX = _resolve_event_buffer_max()
 
 
