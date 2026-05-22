@@ -147,13 +147,19 @@ class TestPrepareSkillsLoad:
         assert item["needs_approval"] is True
         assert item["approval_label"] == "skills__load__x"
 
-    def test_load_on_coord_session_errors(self) -> None:
+    def test_load_works_on_coord_session(self) -> None:
+        """Coord sessions can ``load`` for themselves — parity with the
+        admin / HTTP create path that already accepts ``skill`` in the
+        coord-create body.  Visibility is still kind-scoped at exec
+        (a coord can only load ``{coordinator, any}``-tagged skills via
+        ``_lookup_visible_skill``); the rejection at prepare-time that
+        used to point at ``spawn_workstream`` is gone."""
         session = _make_session(kind="coordinator")
         item = session._prepare_skills("c", {"action": "load", "name": "x"})
-        assert "load: not available on coordinator sessions" in item.get("error", "")
-        # Hint guides the model to the correct delegation pattern.
-        assert "<system-reminder>" in item.get("error", "")
-        assert "spawn_workstream(skill=" in item.get("error", "")
+        # Prepare succeeds — no error item, approval-gated like interactive.
+        assert "error" not in item, item
+        assert item["needs_approval"] is True
+        assert item["approval_label"] == "skills__load__x"
 
     def test_load_missing_name(self) -> None:
         session = _make_session()
@@ -465,6 +471,172 @@ class TestExecSkillsGet:
         # the other surface.
         assert "not found" in output
         assert "not visible to this session kind" not in output
+
+
+# ---------------------------------------------------------------------------
+# Tests — _lookup_visible_skill (the unified single-row kind-scoped helper)
+# ---------------------------------------------------------------------------
+
+
+class TestLookupVisibleSkill:
+    """The kind-scoped single-row lookup that both ``_exec_skills_get`` and
+    ``_exec_skills_load`` consume.  Closes the prior bypass where ``load``
+    used the unscoped ``get_skill_by_name`` while ``find`` / ``get``
+    enforced kind filtering — same shape across all single-row lookups
+    means a future caller can't reintroduce the bypass by picking the
+    wrong helper."""
+
+    def test_returns_row_when_kind_matches(self) -> None:
+        session = _make_session(kind="interactive")
+        storage = MagicMock()
+        storage.get_prompt_template_by_name.return_value = {
+            "name": "ic-skill",
+            "kind": "interactive",
+        }
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
+            row = session._lookup_visible_skill("ic-skill")
+        assert row is not None
+        assert row["name"] == "ic-skill"
+
+    def test_returns_row_for_any_kind_in_both_session_kinds(self) -> None:
+        """``kind='any'`` rows are visible to both surfaces."""
+        storage = MagicMock()
+        storage.get_prompt_template_by_name.return_value = {
+            "name": "universal",
+            "kind": "any",
+        }
+        for kind in ("interactive", "coordinator"):
+            session = _make_session(kind=kind)
+            with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
+                row = session._lookup_visible_skill("universal")
+            assert row is not None, f"kind={kind!r} couldn't see kind='any' row"
+
+    def test_returns_none_when_row_missing(self) -> None:
+        session = _make_session()
+        storage = MagicMock()
+        storage.get_prompt_template_by_name.return_value = None
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
+            assert session._lookup_visible_skill("ghost") is None
+
+    def test_returns_none_when_kind_does_not_match(self) -> None:
+        """Out-of-kind rows get the same ``None`` response as missing rows —
+        collapses the enumeration sidechannel."""
+        session = _make_session(kind="interactive")
+        storage = MagicMock()
+        storage.get_prompt_template_by_name.return_value = {
+            "name": "coord-only",
+            "kind": "coordinator",
+        }
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
+            assert session._lookup_visible_skill("coord-only") is None
+
+    def test_returns_none_when_storage_unavailable(self) -> None:
+        session = _make_session()
+        with patch("turnstone.core.storage._registry.get_storage", return_value=None):
+            assert session._lookup_visible_skill("anything") is None
+
+
+class TestExecSkillsLoadKindScoping:
+    """Regression lock: ``_exec_skills_load`` respects kind scoping via
+    ``_lookup_visible_skill`` regardless of session kind.  Pre-unification
+    the load path used unscoped ``get_skill_by_name`` and would happily
+    activate any skill by name, bypassing the kind contract that
+    ``find`` / ``get`` enforced.  Now both interactive AND coordinator
+    sessions can ``load`` for themselves, but each is still bounded to
+    the skills it can see via ``find`` / ``get``."""
+
+    def test_load_rejects_cross_kind_skill_interactive(self) -> None:
+        """Interactive session trying to load a coord-only skill —
+        same "not found" shape as a true miss.  No enumeration signal."""
+        session = _make_session(kind="interactive")
+        storage = MagicMock()
+        storage.get_prompt_template_by_name.return_value = {
+            "name": "coord-only",
+            "kind": "coordinator",
+            "enabled": True,
+            "content": "should not be reachable",
+        }
+        item = session._prepare_skills("c", {"action": "load", "name": "coord-only"})
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
+            _, output = session._exec_skills(item)
+        assert "not found or disabled" in output
+        assert session._skill_name is None  # never activated
+
+    def test_load_rejects_cross_kind_skill_coordinator(self) -> None:
+        """Symmetric case: coord session trying to load an interactive-only
+        skill.  Same response shape — the kind filter applies on both sides."""
+        session = _make_session(kind="coordinator")
+        storage = MagicMock()
+        storage.get_prompt_template_by_name.return_value = {
+            "name": "ic-only",
+            "kind": "interactive",
+            "enabled": True,
+            "content": "should not be reachable",
+        }
+        item = session._prepare_skills("c", {"action": "load", "name": "ic-only"})
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
+            _, output = session._exec_skills(item)
+        assert "not found or disabled" in output
+        assert session._skill_name is None
+
+    def test_load_rejects_disabled_skill(self) -> None:
+        """The caller-side ``enabled`` gate at the top of ``_exec_skills_load``
+        is distinct from the helper's missing/cross-kind branch — both
+        collapse into the same "not found or disabled" hint by design,
+        but the disabled case has its own code path that needs a
+        regression test (caught by /review as a coverage gap)."""
+        session = _make_session(kind="interactive")
+        storage = MagicMock()
+        storage.get_prompt_template_by_name.return_value = {
+            "name": "quarantined",
+            "kind": "interactive",
+            "enabled": False,  # admin disabled this skill
+            "content": "do not load",
+        }
+        item = session._prepare_skills("c", {"action": "load", "name": "quarantined"})
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
+            _, output = session._exec_skills(item)
+        assert "not found or disabled" in output
+        assert session._skill_name is None  # never activated
+
+    def test_load_works_for_coord_on_visible_skill(self) -> None:
+        """Coord session loads a coord-visible skill — exec succeeds and
+        ``set_skill`` fires.  This is the new capability the PR adds:
+        coord-side parity with interactive's load semantics."""
+        session = _make_session(kind="coordinator")
+        storage = MagicMock()
+        storage.get_prompt_template_by_name.return_value = {
+            "name": "coord-persona",
+            "kind": "coordinator",
+            "enabled": True,
+            "content": "You are a coordinator.",
+            "description": "Coord orchestrator persona.",
+            "risk_level": "low",
+        }
+        item = session._prepare_skills("c", {"action": "load", "name": "coord-persona"})
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
+            _, output = session._exec_skills(item)
+        assert "Loaded skill 'coord-persona'" in output
+        assert session._set_skill_called == ["coord-persona"]
+
+    def test_load_works_for_coord_on_any_kind_skill(self) -> None:
+        """A ``kind=any`` skill is loadable from a coord session too —
+        ``any`` is visible on both surfaces by design."""
+        session = _make_session(kind="coordinator")
+        storage = MagicMock()
+        storage.get_prompt_template_by_name.return_value = {
+            "name": "universal",
+            "kind": "any",
+            "enabled": True,
+            "content": "...",
+            "description": "Universal skill.",
+            "risk_level": "low",
+        }
+        item = session._prepare_skills("c", {"action": "load", "name": "universal"})
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
+            _, output = session._exec_skills(item)
+        assert "Loaded skill 'universal'" in output
+        assert session._set_skill_called == ["universal"]
 
 
 # ---------------------------------------------------------------------------

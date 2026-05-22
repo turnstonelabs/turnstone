@@ -7940,6 +7940,45 @@ class ChatSession:
             return ["coordinator", "any"]
         return ["interactive", "any"]
 
+    def _lookup_visible_skill(self, name: str) -> dict[str, Any] | None:
+        """Single source of truth for "find me a skill by name, if it's
+        visible to this session".  Returns the storage row when the named
+        skill exists AND its ``kind`` is in :meth:`_skills_kinds`; returns
+        ``None`` for both the missing-row and out-of-kind cases so callers
+        don't have to branch on the reason.
+
+        Collapsing missing-vs-cross-kind into a single ``None`` response
+        is also what closes the enumeration sidechannel — an interactive
+        session can't tell whether a name corresponds to a coord-only
+        skill it can't see, vs a name that doesn't exist at all.
+
+        Every model-tool single-row lookup goes through this helper.  The
+        unscoped ``get_skill_by_name`` / ``get_prompt_template_by_name``
+        helpers stay available for admin / sub-agent paths that need
+        full-catalog visibility — those are deliberate cross-kind callers,
+        not bypass surfaces.
+
+        Storage exceptions propagate by design — distinct from the
+        legacy ``memory.get_skill_by_name`` path which swallowed them
+        and returned ``None``.  A transient DB hiccup now surfaces as
+        an explicit tool-call error rather than a misleading "skill
+        not found", matching the fail-fast preference for tool-layer
+        errors (model recovery is the same shape either way; the
+        operator gets a clearer signal).
+        """
+        from turnstone.core.storage._registry import get_storage
+
+        storage = get_storage()
+        if storage is None:
+            return None
+        row = storage.get_prompt_template_by_name(name)
+        if row is None:
+            return None
+        kind = row.get("kind") or "any"
+        if kind not in self._skills_kinds():
+            return None
+        return row
+
     def _prepare_skills(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Dispatch on ``action``.  Reads auto-approve; writes require both
         operator approval and the ``model.skills.write`` permission."""
@@ -8169,34 +8208,14 @@ class ChatSession:
         }
 
     def _exec_skills_get(self, item: dict[str, Any]) -> tuple[str, str]:
-        from turnstone.core.storage._registry import get_storage
-
         call_id = item["call_id"]
         name = item["name"]
-        storage = get_storage()
-        if storage is None:
-            msg = "Error: storage unavailable"
-            self._report_tool_result(call_id, "skills", msg, is_error=True)
-            return call_id, msg
-        row = storage.get_prompt_template_by_name(name)
+        row = self._lookup_visible_skill(name)
         if row is None:
-            msg = self._skill_hint(
-                f"skill '{name}' not found",
-                system_reminder=(
-                    "Use skills(action='find', query='...') to discover "
-                    "available skill names. Names are exact-match and "
-                    "case-sensitive."
-                ),
-            )
-            self._report_tool_result(call_id, "skills", msg, is_error=True)
-            return call_id, msg
-        kind = row.get("kind") or "any"
-        if kind not in self._skills_kinds():
-            # Collapse cross-kind access into "not found" so the model
-            # cannot enumerate the other surface's skill names by
-            # name-probing.  Audit still distinguishes the case via
-            # the storage-side row presence for forensics, but the
-            # tool response is response-shape-identical to a true miss.
+            # ``_lookup_visible_skill`` returns ``None`` for both the
+            # missing-row and out-of-kind cases — same response shape
+            # for both so the model can't enumerate the other surface's
+            # skill names by name-probing.
             msg = self._skill_hint(
                 f"skill '{name}' not found",
                 system_reminder=(
@@ -8218,20 +8237,18 @@ class ChatSession:
     # -- load (interactive only) ----------------------------------------------
 
     def _prepare_skills_load(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
-        if self._kind == WorkstreamKind.COORDINATOR:
-            return self._coord_tool_error(
-                call_id,
-                "skills",
-                self._skill_hint(
-                    "load: not available on coordinator sessions",
-                    system_reminder=(
-                        "Coordinators don't activate skills for themselves. "
-                        "To assign a skill to a child workstream, use "
-                        "spawn_workstream(skill='<name>', ...) - the skill "
-                        "is applied when the child session is constructed."
-                    ),
-                ),
-            )
+        # Both kinds can ``load`` — interactive sessions replace their own
+        # persona, coordinator sessions do the same for their orchestrator.
+        # Parity with the admin / HTTP create path that already accepts a
+        # ``skill`` body field on coord workstreams: anything an operator
+        # can do at create time, the model can do at runtime through this
+        # same action.  Visibility is still kind-scoped via
+        # ``_lookup_visible_skill`` at exec — a coord can only load
+        # ``{coordinator, any}``-tagged skills, interactive can only load
+        # ``{interactive, any}``, matching the discoverability filter that
+        # ``find`` / ``get`` enforce.  Use ``spawn_workstream(skill=...)``
+        # for assigning to children; ``load`` activates on the *current*
+        # session regardless of kind.
         name = self._coord_str_arg(args, "name").strip()
         if not name:
             return self._coord_tool_error(call_id, "skills", "load: 'name' is required")
@@ -8250,7 +8267,14 @@ class ChatSession:
     def _exec_skills_load(self, item: dict[str, Any]) -> tuple[str, str]:
         call_id = item["call_id"]
         name = item["name"]
-        skill_data = get_skill_by_name(name)
+        # Single source of truth for "find me a visible skill" — closes
+        # the prior kind-scoping bypass that let ``_exec_skills_load`` use
+        # an unscoped ``get_skill_by_name`` while ``find`` / ``get``
+        # enforced kind filtering.  The helper returns ``None`` for
+        # missing-row AND cross-kind cases; the ``enabled`` check below
+        # collapses the disabled case into the same hint so the model
+        # gets one consistent recovery path.
+        skill_data = self._lookup_visible_skill(name)
         if not skill_data or not skill_data.get("enabled", True):
             msg = self._skill_hint(
                 f"skill '{name}' not found or disabled",
