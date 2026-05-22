@@ -284,7 +284,7 @@ _UNSAFE_CODE_SINK_RE = re.compile(
     r"\.(?:inner|outer)"
     + r"HTML\s*\+?=(?!=)"
     + r"|\.insertAdjacent"
-    + r"HTML\("
+    + r"HTML\s*\("
     + r"|"
     + r"document"
     + r"\."
