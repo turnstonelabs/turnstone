@@ -205,6 +205,29 @@ class TestRoles:
         assert resp.status_code == 400
         assert "name" in resp.json()["error"].lower()
 
+    def test_create_role_with_model_skills_write_permission(self, client):
+        """``model.skills.write`` is enumerated in ``_VALID_PERMISSIONS`` and
+        passes role-create validation.  Catches the case where the constant
+        is added on the server but missed by the validator or the constant
+        list."""
+        resp = client.post(
+            "/v1/api/admin/roles",
+            json=_role_payload(name="skillwriter", permissions="read,model.skills.write"),
+        )
+        assert resp.status_code == 200, resp.json()
+        assert "model.skills.write" in resp.json()["permissions"]
+
+    def test_create_role_rejects_unknown_permission(self, client):
+        """Unknown permission strings are rejected — guards the validator
+        against typos in the constant list and would-be capability inflation
+        via the admin API."""
+        resp = client.post(
+            "/v1/api/admin/roles",
+            json=_role_payload(name="bogus", permissions="read,model.does.not.exist"),
+        )
+        assert resp.status_code == 400
+        assert "invalid" in resp.json()["error"].lower()
+
     def test_create_role_default_display_name(self, client):
         resp = client.post(
             "/v1/api/admin/roles",

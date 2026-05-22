@@ -5894,6 +5894,14 @@ _VALID_PERMISSIONS = frozenset(
         # surface for GET /v1/api/cluster/ws/{ws_id}/detail.  Granted
         # to builtin-admin via migration 040.
         "admin.cluster.inspect",
+        # Model-facing write capability over the skill catalog.  Gates
+        # the ``skills(action=create|update|enable|disable)`` tool path
+        # (in-process, not HTTP — distinct from ``admin.skills`` which
+        # gates admin-UI traffic).  Default-ungranted on every role
+        # including builtin-admin — operators must opt themselves in
+        # explicitly before their coordinator sessions can mutate the
+        # catalog.
+        "model.skills.write",
         "tools.approve",
         "workstreams.create",
         "workstreams.close",
