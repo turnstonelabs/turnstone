@@ -81,26 +81,6 @@ def _fake_request(
     return Request(scope, receive=_recv)
 
 
-async def _drain_until(
-    gen: Any,
-    *,
-    max_events: int = 200,
-    stop_predicate=lambda _ev: False,
-) -> list[dict[str, Any]]:
-    """Pull up to ``max_events`` from an async generator, then close.
-
-    The events handler runs forever once it enters the live drain;
-    tests must explicitly stop after the events of interest land.
-    """
-    collected: list[dict[str, Any]] = []
-    async for ev in gen:
-        collected.append(ev)
-        if stop_predicate(ev) or len(collected) >= max_events:
-            break
-    await gen.aclose()
-    return collected
-
-
 # ---------------------------------------------------------------------------
 # register_listener_with_replay — per-ws ring buffer slice semantics
 # ---------------------------------------------------------------------------

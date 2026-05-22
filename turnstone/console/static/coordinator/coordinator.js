@@ -139,6 +139,15 @@
 
   let evtSource = null;
   let reconnectAttempts = 0;
+  // Saved high-water mark for the manual-reconnect path.  The
+  // EventSource constructor can't set custom headers, so when we
+  // construct a fresh source we thread ``?last_event_id=N`` instead
+  // of the browser-native ``Last-Event-ID`` header.  Native
+  // auto-reconnect on the SAME source object uses the header
+  // automatically; this fallback covers the cases where we open a
+  // brand-new EventSource (initial connect, scheduleReconnect after
+  // close).
+  let lastEventId = null;
   let reconnectTimer = null;
 
   // Cache of judge verdicts keyed by call_id.  intent_verdict and
@@ -1902,7 +1911,10 @@
     // we were disconnected aren't replayed by the events SSE handler,
     // so the client has to pull authoritative state after any gap.
     const wasReconnecting = reconnectAttempts > 0;
-    const url = "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/events";
+    let url = "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/events";
+    if (lastEventId) {
+      url += "?last_event_id=" + encodeURIComponent(lastEventId);
+    }
     evtSource = new EventSource(url, { withCredentials: true });
     evtSource.onopen = function () {
       reconnectAttempts = 0;
@@ -1951,35 +1963,47 @@
       }
     };
     evtSource.onerror = function () {
+      // Do NOT close evtSource for transient errors — native
+      // EventSource auto-reconnect handles them with the
+      // ``Last-Event-ID`` header automatically (now that the server
+      // emits ``id:`` on every buffered event).  Closing here would
+      // force a CONNECTING -> CLOSED transition that defeats native
+      // reconnect, which is exactly the reconnect-with-replay defect
+      // PR-D ships to fix.  See
+      // tests/test_app_js.py::test_coord_connectsse_onerror_preserves_native_reconnect.
       setSseStatus("disconnected", "err");
       // Dim the status bar so a stale reading doesn't read as live.
       statusBarEl.classList.add("ws-sb-disconnected");
       sbTokensEl.textContent = "Reconnecting…";
-      try {
-        evtSource.close();
-      } catch (_) {
-        /* noop */
-      }
-      // Probe the authed detail endpoint to distinguish an expired
-      // session (401) from a transient network error.  On 401, prompt
-      // for login via the shared auth.js overlay instead of spinning
-      // in backoff forever — match the console / server-UI pattern.
-      // On any other outcome, fall through to the normal reconnect
-      // schedule.
+      // 401 probe: expired session is a terminal condition (user
+      // must log in), so we DO close + showLogin in that branch.
+      // Transient errors (network blips, intermediary timeouts) just
+      // let native reconnect run — no scheduleReconnect needed
+      // because the source isn't dead.  scheduleReconnect remains
+      // available as the final fallback for the truly-CLOSED case
+      // (covered by the auth.js callback path).
       var probe = typeof authFetch === "function" ? authFetch : fetch;
-      probe("/v1/api/workstreams/" + encodeURIComponent(wsId))
-        .then(function (r) {
+      probe("/v1/api/workstreams/" + encodeURIComponent(wsId)).then(
+        function (r) {
           if (r.status === 401 && typeof showLogin === "function") {
+            try {
+              if (evtSource) evtSource.close();
+            } catch (_) {
+              /* noop */
+            }
+            evtSource = null;
             showLogin("Session expired. Please sign in to reconnect.");
-            return;
           }
-          scheduleReconnect();
-        })
-        .catch(function () {
-          scheduleReconnect();
-        });
+        },
+      );
     };
     evtSource.onmessage = function (event) {
+      // Capture lastEventId BEFORE JSON.parse so a malformed event
+      // doesn't desync the manual-reconnect fallback from native
+      // auto-reconnect.
+      if (evtSource && evtSource.lastEventId) {
+        lastEventId = evtSource.lastEventId;
+      }
       let data = null;
       try {
         data = JSON.parse(event.data);

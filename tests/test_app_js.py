@@ -1205,3 +1205,185 @@ def test_dead_sse_defensive_reconnect_registered() -> None:
         "_reconnectDeadSSEs must reconnect the global SSE when closed."
     )
     assert "connectSSE(" in helper_body, "_reconnectDeadSSEs must reconnect dead per-pane SSEs."
+
+
+# ---------------------------------------------------------------------------
+# PR-D reconnect-with-replay: onerror must preserve native EventSource
+# auto-reconnect for transient errors
+# ---------------------------------------------------------------------------
+#
+# PR-D adds a server-side per-ws ring buffer + ``Last-Event-ID`` replay so
+# a brief disconnect transparently replays the missed events.  That whole
+# foundation is defeated if the browser's ``onerror`` handler explicitly
+# closes the EventSource on a transient network error — closing forces a
+# CONNECTING -> CLOSED state transition that prevents native auto-reconnect
+# from firing.  The post-PR-D contract is: never call ``.close()`` on a
+# transient error; let native reconnect run with the ``Last-Event-ID``
+# header.  Explicit closes survive only on terminal branches (401 expired
+# session, workstream-reassignment to a different ws).  These guards pin
+# the contract so a future refactor can't silently regress it.
+
+
+def _strip_js_comments(src: str) -> str:
+    """Strip ``//`` and ``/* */`` comments while preserving string/regex
+    literals and keeping byte length identical (comments replaced with
+    spaces).  ``_slice_balanced_body`` doesn't skip comments, so an
+    apostrophe inside a comment (``can't``, ``don't``) opens a fake
+    string state that swallows braces until the next ``'``.  The new
+    onerror handlers carry these comments routinely; stripping comments
+    before brace-walking removes the hazard without re-architecting
+    the existing slice helper.
+    """
+    out: list[str] = []
+    n = len(src)
+    i = 0
+    in_str: str | None = None
+    while i < n:
+        ch = src[i]
+        if in_str:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(src[i + 1])
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        # Line comment: replace with spaces up to newline (preserve
+        # length so downstream offset math still works).
+        if ch == "/" and i + 1 < n and src[i + 1] == "/":
+            j = src.find("\n", i)
+            if j == -1:
+                j = n
+            out.append(" " * (j - i))
+            i = j
+            continue
+        # Block comment: replace with spaces up to closing */.
+        if ch == "/" and i + 1 < n and src[i + 1] == "*":
+            j = src.find("*/", i + 2)
+            if j == -1:
+                out.append(" " * (n - i))
+                i = n
+                continue
+            out.append(" " * (j + 2 - i))
+            i = j + 2
+            continue
+        if ch in ('"', "'", "`"):
+            in_str = ch
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _onerror_block(body: str, anchor_substring: str) -> str | None:
+    """Slice an ``X.onerror = ...`` handler body by matching braces.
+
+    ``anchor_substring`` is something that uniquely identifies the
+    enclosing function so we don't accidentally pick the wrong
+    ``.onerror = function ...`` (the file has several).  Returns the
+    body between the matching braces, or ``None`` if not found.
+    Strips comments first so apostrophes in comment prose can't
+    desync the brace walker.
+    """
+    stripped = _strip_js_comments(body)
+    anchor = stripped.find(anchor_substring)
+    if anchor == -1:
+        return None
+    onerror = stripped.find(".onerror", anchor)
+    if onerror == -1:
+        return None
+    return _slice_balanced_body(stripped, onerror)
+
+
+def _onerror_preserves_native_reconnect(body: str, source_var: str) -> tuple[bool, str]:
+    """Return (passed, reason).
+
+    ``source_var`` is the EventSource handle (e.g. ``this.evtSource``,
+    ``globalEvtSource``, ``evtSource``).  An onerror handler passes if:
+      1. Either it never calls ``source_var.close()`` directly OR every
+         such close is inside a 401-detection branch / login-overlay
+         early-return / wsId-reassignment branch (allowed terminal
+         exits).
+      2. OR the handler explicitly references ``last_event_id`` —
+         escape hatch for a future redesign that abandons native
+         reconnect entirely but takes explicit responsibility for the
+         replay header.
+    """
+    # If the body threads last_event_id, the implementer has taken
+    # explicit responsibility for the replay header — escape hatch.
+    if "last_event_id" in body or "lastEventId" in body:
+        # Caller still has to ensure the body doesn't ALSO have a
+        # naked close() outside a terminal branch; rely on the regex
+        # search below as well.
+        pass
+    # Walk lines, track depth of common terminal branches.  Simple
+    # heuristic: any ``source_var.close()`` line that isn't preceded by
+    # ``status === 401`` or ``loginOverlay`` or ``disconnectSSE()`` in
+    # the surrounding line window is a defect.
+    pattern = re.compile(
+        re.escape(source_var) + r"\.close\(\s*\)",
+    )
+    matches = list(pattern.finditer(body))
+    if not matches:
+        return True, "no close() calls — native reconnect preserved"
+    for m in matches:
+        start = m.start()
+        # Look back ~400 chars for a terminal-branch marker on the
+        # same conditional path.  ``r.status === 401`` is the canonical
+        # 401-detection guard; ``loginOverlay`` is the login-modal
+        # early-return; ``disconnectSSE()`` immediately followed by
+        # setting a new wsId is the reassignment path.
+        window = body[max(0, start - 400) : start]
+        is_401_branch = "status === 401" in window or "r.status === 401" in window
+        is_login_branch = "loginOverlay" in window
+        is_reassign_branch = "disconnectSSE()" in window
+        if not (is_401_branch or is_login_branch or is_reassign_branch):
+            snippet = body[max(0, start - 80) : min(len(body), start + 80)]
+            return False, (
+                f"naked {source_var}.close() at offset {start} — would "
+                f"defeat native auto-reconnect for transient errors. "
+                f"Context: ...{snippet}..."
+            )
+    return True, "all close() calls are in terminal branches (401 / login / reassign)"
+
+
+def test_pane_connectsse_onerror_preserves_native_reconnect() -> None:
+    """``Pane.connectSSE``'s onerror must not close evtSource on
+    transient errors — PR-D's reconnect-with-replay depends on native
+    EventSource auto-reconnect firing with the ``Last-Event-ID`` header."""
+    body = _strip_js_comments(_APP_JS.read_text(encoding="utf-8"))
+    # Slice the Pane.connectSSE method body, then the onerror handler
+    # inside it.  Reuse the indent-agnostic class-method finder.
+    method_start = _pane_method_offset(body, "connectSSE")
+    method = _slice_balanced_body(body, method_start)
+    assert method is not None, "Pane.connectSSE method body not found"
+    # ``_onerror_block`` re-strips internally; passing the already-
+    # stripped method body is idempotent (no comments left to strip).
+    onerror = _onerror_block(method, "this.evtSource.onerror")
+    assert onerror is not None, "Pane.connectSSE.onerror not found"
+    passed, reason = _onerror_preserves_native_reconnect(onerror, "this.evtSource")
+    assert passed, f"Pane.connectSSE.onerror regressed: {reason}"
+
+
+def test_connectglobalsse_onerror_preserves_native_reconnect() -> None:
+    """``connectGlobalSSE`` is the global-SSE counterpart of
+    Pane.connectSSE — same close-defeats-reconnect contract."""
+    body = _strip_js_comments(_APP_JS.read_text(encoding="utf-8"))
+    fn = _slice_function_body(body, "connectGlobalSSE")
+    assert fn is not None, "connectGlobalSSE not found"
+    onerror = _onerror_block(fn, "globalEvtSource.onerror")
+    assert onerror is not None, "globalEvtSource.onerror not found"
+    passed, reason = _onerror_preserves_native_reconnect(onerror, "globalEvtSource")
+    assert passed, f"connectGlobalSSE.onerror regressed: {reason}"
+
+
+def test_coord_connectsse_onerror_preserves_native_reconnect() -> None:
+    """Coordinator's connectSSE has the same contract — without the
+    guard the coord's per-ws SSE silently drops events on any blip."""
+    coord_js = _REPO_ROOT / "turnstone/console/static/coordinator/coordinator.js"
+    body = _strip_js_comments(coord_js.read_text(encoding="utf-8"))
+    onerror = _onerror_block(body, "evtSource.onerror")
+    assert onerror is not None, "coordinator.js evtSource.onerror not found"
+    passed, reason = _onerror_preserves_native_reconnect(onerror, "evtSource")
+    assert passed, f"coordinator.js connectSSE.onerror regressed: {reason}"
