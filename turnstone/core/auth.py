@@ -116,6 +116,45 @@ def _load_user_permissions(storage: Any, user_id: str) -> set[str]:
         return set()
 
 
+def user_has_permission(user_id: str, permission: str, *, storage: Any = None) -> bool:
+    """Return True if *user_id* holds *permission*.
+
+    For in-process callers — specifically the model-facing tool exec
+    path — that need to gate a write capability without an HTTP
+    middleware in the loop.  HTTP handlers stay on
+    :func:`require_permission`, which carries the JSONResponse-shaped
+    denial.  This helper returns a plain bool so the tool layer can
+    surface the denial in whatever shape it already uses (typically a
+    ``_coord_tool_error`` row).
+
+    Empty ``user_id`` returns False without a storage lookup — there's
+    no anonymous holder of any permission.  Storage lookup failures
+    are swallowed (logged at warning by ``_load_user_permissions``) and
+    return False — fail-closed on the permission check rather than
+    fail-open if the roles backend is briefly unavailable.
+
+    No service-scope bypass.  ``require_permission`` lets a service-
+    scoped JWT skip the check by default; this helper has no equivalent
+    because the in-process model-tool path doesn't carry an
+    :class:`AuthResult` (scopes are an HTTP-layer concept).  A service
+    token reaching here either resolves to a real ``user_id`` with the
+    grant or has no ``user_id`` and short-circuits to False.  If a
+    legitimate service-scope caller ever needs to bypass, expose
+    ``allow_service_bypass`` here mirroring ``require_permission`` and
+    thread the originating scope through the call site — don't try to
+    infer it from the lone ``user_id``.
+    """
+    if not user_id:
+        return False
+    if storage is None:
+        from turnstone.core.storage._registry import get_storage
+
+        storage = get_storage()
+    if storage is None:
+        return False
+    return permission in _load_user_permissions(storage, user_id)
+
+
 def _permissions_to_scopes(permissions: set[str]) -> frozenset[str]:
     """Derive legacy scopes from a granular permission set."""
     scopes: set[str] = set()

@@ -1901,3 +1901,144 @@ class TestRequirePermissionServiceScope:
         result = require_permission(request, "admin.users")
         assert result is not None
         assert result.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# TestUserHasPermission — in-process permission check for tool exec paths
+# ---------------------------------------------------------------------------
+
+
+class TestUserHasPermission:
+    """In-process permission helper for model-facing tool exec paths.
+
+    Distinct from ``require_permission`` (HTTP-only, returns JSONResponse);
+    this helper returns a plain bool so tool callers can shape the denial
+    themselves.  Loads permissions through storage on every call — there's
+    no per-session cache, by design: a permission revocation should take
+    effect on the next tool call, not require a session restart.
+    """
+
+    def test_returns_true_when_user_holds_permission(self):
+        from turnstone.core.auth import user_has_permission
+
+        storage = MagicMock()
+        storage.get_user_permissions.return_value = {"model.skills.write", "read"}
+        assert user_has_permission("alice", "model.skills.write", storage=storage) is True
+
+    def test_returns_false_when_user_lacks_permission(self):
+        from turnstone.core.auth import user_has_permission
+
+        storage = MagicMock()
+        storage.get_user_permissions.return_value = {"read", "write"}
+        assert user_has_permission("alice", "model.skills.write", storage=storage) is False
+
+    def test_empty_user_id_returns_false_without_storage_lookup(self):
+        """Empty user_id short-circuits — no anonymous permission holder."""
+        from turnstone.core.auth import user_has_permission
+
+        storage = MagicMock()
+        assert user_has_permission("", "model.skills.write", storage=storage) is False
+        storage.get_user_permissions.assert_not_called()
+
+    def test_storage_failure_returns_false_fail_closed(self):
+        """Roles backend hiccups must deny, not allow (fail-closed)."""
+        from turnstone.core.auth import user_has_permission
+
+        storage = MagicMock()
+        storage.get_user_permissions.side_effect = RuntimeError("DB down")
+        assert user_has_permission("alice", "model.skills.write", storage=storage) is False
+
+    def test_unregistered_storage_returns_false(self, monkeypatch):
+        """Storage registry returning None (pre-init) denies without raising.
+
+        Only the model-tool path can land here — HTTP handlers run after
+        the auth middleware which already requires storage.
+        """
+        from turnstone.core import auth as _auth_mod
+
+        monkeypatch.setattr(
+            "turnstone.core.storage._registry.get_storage", lambda: None, raising=True
+        )
+        assert _auth_mod.user_has_permission("alice", "model.skills.write") is False
+
+    def test_each_call_hits_storage_no_implicit_cache(self):
+        """Pin the load-bearing 'no caching' contract from the class docstring.
+
+        Future refactor that adds an ``lru_cache`` decorator, a per-session
+        cache, or any process-wide memoization would silently break
+        revocation latency (an admin revoking ``model.skills.write`` from a
+        role would see the model still able to write skills until cache
+        expiry / session restart).  If a cache is added intentionally, this
+        test should be rewritten to assert the invalidation contract — not
+        deleted.
+        """
+        from turnstone.core.auth import user_has_permission
+
+        storage = MagicMock()
+        storage.get_user_permissions.return_value = {"model.skills.write"}
+        user_has_permission("alice", "model.skills.write", storage=storage)
+        user_has_permission("alice", "model.skills.write", storage=storage)
+        assert storage.get_user_permissions.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# TestBuiltinAdminDefaultPermissions — lock the "ungranted by default" invariant
+# ---------------------------------------------------------------------------
+
+
+class TestBuiltinAdminDefaultPermissions:
+    """Regression guards on what builtin-admin gets out of the box.
+
+    The migration chain (008 seed + 017 catch-up + later additive
+    migrations) is the source of truth for builtin-admin's permission
+    set.  Permissions intentionally ungranted by default — currently
+    ``model.skills.write`` — must stay absent from that chain, or
+    operators upgrading from older versions silently inherit a
+    capability they never consented to.  Mirrors the
+    ``tests/test_migration_049.py`` pattern: drive Alembic forward
+    against an isolated SQLite DB and inspect the resulting row.
+    """
+
+    def _alembic_cfg(self, db_path):
+        from pathlib import Path
+
+        from alembic.config import Config
+
+        migrations_dir = str(
+            Path(__file__).resolve().parent.parent / "turnstone" / "core" / "storage" / "migrations"
+        )
+        cfg = Config()
+        cfg.set_main_option("script_location", migrations_dir)
+        cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
+        return cfg
+
+    def test_model_skills_write_not_in_builtin_admin_after_full_migration(self, tmp_path):
+        """After every shipped migration, ``builtin-admin.permissions`` must
+        not contain ``model.skills.write``.  A migration that grants it
+        breaks the explicit-opt-in security contract documented in the
+        ``_VALID_PERMISSIONS`` block in ``console/server.py``.
+        """
+        import sqlalchemy as sa
+        from alembic import command
+
+        db_path = tmp_path / "perm.db"
+        cfg = self._alembic_cfg(db_path)
+        command.upgrade(cfg, "head")
+
+        engine = sa.create_engine(f"sqlite:///{db_path}")
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    sa.text("SELECT permissions FROM roles WHERE role_id = 'builtin-admin'")
+                ).fetchone()
+        finally:
+            engine.dispose()
+
+        assert row is not None, "builtin-admin role not seeded by migration chain"
+        perms = {p.strip() for p in (row[0] or "").split(",") if p.strip()}
+        assert "model.skills.write" not in perms, (
+            "builtin-admin must NOT hold model.skills.write by default — "
+            f"got perms={sorted(perms)}.  If a migration intentionally "
+            "added this grant, update the security contract in "
+            "``console/server.py`` _VALID_PERMISSIONS docstring first."
+        )
