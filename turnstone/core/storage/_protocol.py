@@ -1376,11 +1376,14 @@ class StorageBackend(Protocol):
         convention ever needs to expand.
 
         ``kinds`` (when non-empty) narrows the result to rows whose
-        ``kind`` column is in the supplied list.  Coordinator-side
-        callers typically pass ``["coordinator", "any"]`` and
-        interactive-side callers pass ``["interactive", "any"]`` so
-        skills tagged ``any`` remain visible to both.  ``None`` means
-        no kind filter — all rows regardless of kind.
+        ``kind`` column is in the supplied list.  After the SkillKind
+        enforcement flatten (#557), ``kind`` is passive audience metadata
+        rather than a runtime visibility gate — the model-tool ``find``
+        path no longer threads ``kinds=`` by default and supplies it only
+        when the caller opts in via the tool's ``kind`` argument.  The
+        parameter remains available for admin filtering and explicit
+        scope narrowing.  ``None`` means no kind filter — all rows
+        regardless of kind.
         """
         ...
 

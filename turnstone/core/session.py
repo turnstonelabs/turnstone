@@ -7930,55 +7930,6 @@ class ChatSession:
             return f"{safe_message} <system-reminder>{safe_reminder}</system-reminder>"
         return safe_message
 
-    def _skills_kinds(self) -> list[str]:
-        """Storage-side ``kind`` filter for the current session.  Coord
-        sessions see ``[coordinator, any]``; interactive sessions see
-        ``[interactive, any]``.  ``any``-tagged skills are visible to both
-        for backwards compat with pre-tagging catalogs.
-        """
-        if self._kind == WorkstreamKind.COORDINATOR:
-            return ["coordinator", "any"]
-        return ["interactive", "any"]
-
-    def _lookup_visible_skill(self, name: str) -> dict[str, Any] | None:
-        """Single source of truth for "find me a skill by name, if it's
-        visible to this session".  Returns the storage row when the named
-        skill exists AND its ``kind`` is in :meth:`_skills_kinds`; returns
-        ``None`` for both the missing-row and out-of-kind cases so callers
-        don't have to branch on the reason.
-
-        Collapsing missing-vs-cross-kind into a single ``None`` response
-        is also what closes the enumeration sidechannel — an interactive
-        session can't tell whether a name corresponds to a coord-only
-        skill it can't see, vs a name that doesn't exist at all.
-
-        Every model-tool single-row lookup goes through this helper.  The
-        unscoped ``get_skill_by_name`` / ``get_prompt_template_by_name``
-        helpers stay available for admin / sub-agent paths that need
-        full-catalog visibility — those are deliberate cross-kind callers,
-        not bypass surfaces.
-
-        Storage exceptions propagate by design — distinct from the
-        legacy ``memory.get_skill_by_name`` path which swallowed them
-        and returned ``None``.  A transient DB hiccup now surfaces as
-        an explicit tool-call error rather than a misleading "skill
-        not found", matching the fail-fast preference for tool-layer
-        errors (model recovery is the same shape either way; the
-        operator gets a clearer signal).
-        """
-        from turnstone.core.storage._registry import get_storage
-
-        storage = get_storage()
-        if storage is None:
-            return None
-        row = storage.get_prompt_template_by_name(name)
-        if row is None:
-            return None
-        kind = row.get("kind") or "any"
-        if kind not in self._skills_kinds():
-            return None
-        return row
-
     def _prepare_skills(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Dispatch on ``action``.  Reads auto-approve; writes require both
         operator approval and the ``model.skills.write`` permission."""
@@ -8012,6 +7963,13 @@ class ChatSession:
         tag = self._coord_str_arg(args, "tag").strip() or None
         risk_level = self._coord_str_arg(args, "risk_level").strip() or None
         query = self._coord_str_arg(args, "query").strip() or None
+        # ``kind`` is now an opt-in discoverability filter — metadata-only
+        # after the flatten (no code path branches on it), but useful to
+        # the model for narrowing a catalog browse to skills authored for
+        # a specific audience.  When supplied, threads ``[<kind>, 'any']``
+        # to the storage filter so ``any``-tagged skills remain visible
+        # regardless of the chosen narrowing.
+        kind = self._coord_str_arg(args, "kind").strip().lower() or None
         enabled_only = self._coord_bool_arg(args, "enabled_only")
         try:
             limit = int(args.get("limit") or 100)
@@ -8027,6 +7985,8 @@ class ChatSession:
             header_bits.append(f"tag={tag}")
         if risk_level:
             header_bits.append(f"risk_level={risk_level}")
+        if kind:
+            header_bits.append(f"kind={kind}")
         if enabled_only:
             header_bits.append("enabled_only=true")
         return {
@@ -8041,6 +8001,7 @@ class ChatSession:
             "tag": tag,
             "risk_level": risk_level,
             "query": query,
+            "kind": kind,
             "enabled_only": enabled_only,
             "limit": limit,
         }
@@ -8054,7 +8015,13 @@ class ChatSession:
             msg = "Error: storage unavailable"
             self._report_tool_result(call_id, "skills", msg, is_error=True)
             return call_id, msg
-        kinds = self._skills_kinds()
+        # ``kind`` is opt-in only — the default catalog browse returns all
+        # kinds and the model sorts/groups client-side on the ``kind`` field
+        # in the projection.  Passing ``kind=interactive`` (etc.) widens the
+        # filter to include ``any``-tagged rows so the audience-neutral
+        # entries don't drop out of the narrowed view.
+        kind_filter = item.get("kind")
+        kinds = [kind_filter, "any"] if kind_filter else None
         try:
             rows = storage.list_skills_filtered(
                 category=item["category"],
@@ -8098,6 +8065,7 @@ class ChatSession:
             or item.get("tag")
             or item.get("risk_level")
             or item.get("query")
+            or item.get("kind")
             or item.get("enabled_only")
         )
         summary = f"{len(skills)} skills"
@@ -8106,7 +8074,7 @@ class ChatSession:
         output_msg: str | None = None
         if not skills and any_filter:
             try:
-                unfiltered = storage.list_skills_filtered(kinds=kinds, enabled_only=False, limit=10)
+                unfiltered = storage.list_skills_filtered(enabled_only=False, limit=10)
             except Exception:
                 unfiltered = []
             if unfiltered:
@@ -8119,6 +8087,8 @@ class ChatSession:
                     applied.append(f"tag={item['tag']!r}")
                 if item.get("risk_level"):
                     applied.append(f"risk_level={item['risk_level']!r}")
+                if item.get("kind"):
+                    applied.append(f"kind={item['kind']!r}")
                 if item.get("enabled_only"):
                     applied.append("enabled_only=true")
                 output_msg = self._skill_hint(
@@ -8126,7 +8096,7 @@ class ChatSession:
                     system_reminder=(
                         f"Without these filters ({', '.join(applied)}) "
                         f"there are at least {len(unfiltered)} skill(s) "
-                        "available for this session kind. Try omitting "
+                        "available in the catalog. Try omitting "
                         "the most-restrictive filter or use a broader "
                         "query."
                     ),
@@ -8208,14 +8178,17 @@ class ChatSession:
         }
 
     def _exec_skills_get(self, item: dict[str, Any]) -> tuple[str, str]:
+        from turnstone.core.storage._registry import get_storage
+
         call_id = item["call_id"]
         name = item["name"]
-        row = self._lookup_visible_skill(name)
+        storage = get_storage()
+        if storage is None:
+            msg = "Error: storage unavailable"
+            self._report_tool_result(call_id, "skills", msg, is_error=True)
+            return call_id, msg
+        row = storage.get_prompt_template_by_name(name)
         if row is None:
-            # ``_lookup_visible_skill`` returns ``None`` for both the
-            # missing-row and out-of-kind cases — same response shape
-            # for both so the model can't enumerate the other surface's
-            # skill names by name-probing.
             msg = self._skill_hint(
                 f"skill '{name}' not found",
                 system_reminder=(
@@ -8242,13 +8215,13 @@ class ChatSession:
         # Parity with the admin / HTTP create path that already accepts a
         # ``skill`` body field on coord workstreams: anything an operator
         # can do at create time, the model can do at runtime through this
-        # same action.  Visibility is still kind-scoped via
-        # ``_lookup_visible_skill`` at exec — a coord can only load
-        # ``{coordinator, any}``-tagged skills, interactive can only load
-        # ``{interactive, any}``, matching the discoverability filter that
-        # ``find`` / ``get`` enforce.  Use ``spawn_workstream(skill=...)``
+        # same action.  Any skill in the catalog is loadable regardless of
+        # the row's ``kind`` marker — ``kind`` is authored audience
+        # metadata, not an enforcement boundary.  Real access control
+        # remains the ``allowed_tools`` + ``auto_approve`` pair, which
+        # applies identically across kinds.  Use ``spawn_workstream(skill=...)``
         # for assigning to children; ``load`` activates on the *current*
-        # session regardless of kind.
+        # session.
         name = self._coord_str_arg(args, "name").strip()
         if not name:
             return self._coord_tool_error(call_id, "skills", "load: 'name' is required")
@@ -8265,16 +8238,20 @@ class ChatSession:
         }
 
     def _exec_skills_load(self, item: dict[str, Any]) -> tuple[str, str]:
+        from turnstone.core.storage._registry import get_storage
+
         call_id = item["call_id"]
         name = item["name"]
-        # Single source of truth for "find me a visible skill" — closes
-        # the prior kind-scoping bypass that let ``_exec_skills_load`` use
-        # an unscoped ``get_skill_by_name`` while ``find`` / ``get``
-        # enforced kind filtering.  The helper returns ``None`` for
-        # missing-row AND cross-kind cases; the ``enabled`` check below
-        # collapses the disabled case into the same hint so the model
-        # gets one consistent recovery path.
-        skill_data = self._lookup_visible_skill(name)
+        storage = get_storage()
+        if storage is None:
+            msg = "Error: storage unavailable"
+            self._report_tool_result(call_id, "skills", msg, is_error=True)
+            return call_id, msg
+        # ``enabled=False`` is the admin's quarantine flag — collapse the
+        # missing-row and disabled cases into a single recovery hint so
+        # the model has one consistent next step.  The ``kind`` column is
+        # passive metadata after the flatten — no visibility gate here.
+        skill_data = storage.get_prompt_template_by_name(name)
         if not skill_data or not skill_data.get("enabled", True):
             msg = self._skill_hint(
                 f"skill '{name}' not found or disabled",

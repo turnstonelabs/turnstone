@@ -342,10 +342,11 @@ class CreateSkillRequest(BaseModel):
         min_length=1,
         max_length=1024,
         description=(
-            "Human-readable description surfaced by ``list_skills`` and "
-            "the admin UI.  Must be non-empty — catches skills registered "
-            "without thinking about discoverability before they reach a "
-            "model's tool-selection prompt."
+            "Human-readable description surfaced by the ``skills`` "
+            "find/get tool and the admin UI.  Must be non-empty — "
+            "catches skills registered without thinking about "
+            "discoverability before they reach a model's tool-selection "
+            "prompt."
         ),
     )
     tags: str = "[]"
@@ -371,12 +372,16 @@ class CreateSkillRequest(BaseModel):
     kind: SkillKind = Field(
         default=SkillKind.ANY,
         description=(
-            "Classifier routing the skill to ``list_skills`` calls.  "
-            "``interactive`` is visible only to the interactive-session "
-            "activation path; ``coordinator`` is visible only to the "
-            "coordinator's ``list_skills`` tool; ``any`` (default) is "
-            "visible on both sides, which preserves pre-upgrade "
-            "behaviour for legacy rows."
+            "Authored audience metadata — passive marker for "
+            "sorting/grouping and discoverability narrowing.  "
+            "``interactive`` marks the skill as authored for "
+            "interactive sessions; ``coordinator`` marks it for "
+            "coordinator delegation; ``any`` (default) signals no "
+            "preferred audience.  Not a runtime visibility gate after "
+            "the SkillKind enforcement flatten (#557) — every session "
+            "kind can find, get, and load every skill regardless of "
+            "this field; real access control remains "
+            "``allowed_tools`` + ``auto_approve``."
         ),
     )
 
