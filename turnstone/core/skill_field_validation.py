@@ -50,7 +50,10 @@ def parse_skill_session_config(body: dict[str, Any]) -> tuple[dict[str, Any], st
 
     Field rules:
 
-    - ``temperature``: float in [0.0, 2.0] or None / "" → None
+    - ``temperature``: float in [0.0, 2.0] or None / "" → None.
+      Non-numeric input (string that doesn't parse, dict, list) errors
+      out — matches ``max_tokens`` / ``token_budget`` for numeric-field
+      consistency.
     - ``max_tokens``: int >= 1 or None / "" → None
     - ``token_budget``: int >= 0 (defaults to 0 if missing-but-empty)
     - ``agent_max_turns``: int >= 1 or None / "" → None
@@ -70,16 +73,16 @@ def parse_skill_session_config(body: dict[str, Any]) -> tuple[dict[str, Any], st
 
     if "temperature" in body:
         temp = body["temperature"]
-        if temp is not None and temp != "":
+        if temp is None or temp == "":
+            fields["temperature"] = None
+        else:
             try:
                 temp = float(temp)
-                if not (0.0 <= temp <= 2.0):
-                    return {}, "temperature must be between 0 and 2"
-                fields["temperature"] = temp
             except (ValueError, TypeError):
-                fields["temperature"] = None
-        else:
-            fields["temperature"] = None
+                return {}, "temperature must be a number between 0 and 2"
+            if not (0.0 <= temp <= 2.0):
+                return {}, "temperature must be between 0 and 2"
+            fields["temperature"] = temp
 
     if "token_budget" in body:
         try:

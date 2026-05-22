@@ -8595,17 +8595,20 @@ class ChatSession:
             else:
                 vstr = str(v)
                 preview_lines.append(f"    {k}: {vstr[:120]}")
-        # Self-escalation warning: if the update turns on auto_approve
-        # OR expands allowed_tools while a pre-existing auto_approve is
-        # set, spell out the operational consequence on the approval
-        # card.  Same shape as the create-side warning.
-        proposed_auto_approve = bool(updates.get("auto_approve"))
-        existing_auto_approve = bool(existing.get("auto_approve"))
-        at_changes = "allowed_tools" in updates and updates["allowed_tools"] not in (
-            "",
-            "[]",
+        # Self-escalation warning: if the *final* state has both
+        # auto_approve=True AND non-empty allowed_tools, spell out the
+        # operational consequence on the approval card.  Compute against
+        # the resolved final state — not just the existing row — so an
+        # update that explicitly turns auto_approve OFF doesn't false-
+        # positive the warning, and an update that turns it ON without
+        # touching allowed_tools still fires it against the inherited
+        # allowlist.
+        final_auto_approve = bool(
+            updates["auto_approve"] if "auto_approve" in updates else existing.get("auto_approve")
         )
-        if (proposed_auto_approve or existing_auto_approve) and at_changes:
+        final_allowed_tools = updates.get("allowed_tools", existing.get("allowed_tools", "[]"))
+        final_has_allowed_tools = bool(final_allowed_tools) and final_allowed_tools != "[]"
+        if final_auto_approve and final_has_allowed_tools:
             preview_lines.append(
                 "    WARNING: auto_approve + allowed_tools means the listed "
                 "tools auto-fire when this skill is loaded"
@@ -8681,10 +8684,18 @@ class ChatSession:
             item["updates"] = filtered
             item["readonly"] = True
         # Snapshot existing row to skill_versions for rollback.  Uses
-        # count_skill_versions + 1 so concurrent updates don't collide on
-        # the (skill_id, version) unique key.
+        # max(version) + 1 (via list_skill_versions, which returns rows
+        # ordered by version DESC so [0] is the max) instead of
+        # count + 1 — ``count`` re-uses numbers when versions have been
+        # deleted via storage.delete_skill_versions, and the schema has
+        # no (skill_id, version) unique constraint to catch collisions.
+        # Matches the storage-level pattern in storage.unlock_skill.
+        # A storage-side allocator (atomic max+1 with a unique index)
+        # is the right architectural fix and is tracked separately.
         try:
-            next_version = storage.count_skill_versions(template_id) + 1
+            existing_versions = storage.list_skill_versions(template_id)
+            current_max = max((int(v.get("version") or 0) for v in existing_versions), default=0)
+            next_version = current_max + 1
             storage.create_skill_version(
                 skill_id=template_id,
                 version=next_version,

@@ -739,6 +739,26 @@ class TestExecSkillsCreate:
             )
         assert "'content' is required" in item.get("error", "")
 
+    def test_create_invalid_temperature_errors(self) -> None:
+        """Non-numeric temperature input now returns an explicit error
+        rather than silently coercing to None.  Matches the max_tokens /
+        token_budget shape — every numeric field on the validator errors
+        loudly on bad input, no silent coerce."""
+        session = _make_session()
+        with patch("turnstone.core.auth.user_has_permission", return_value=True):
+            item = session._prepare_skills(
+                "c",
+                {
+                    "action": "create",
+                    "name": "x",
+                    "content": "b",
+                    "description": "d",
+                    "temperature": "not-a-number",
+                },
+            )
+        err = item.get("error", "")
+        assert "temperature must be a number" in err, err
+
     def test_create_invalid_kind_errors(self) -> None:
         """SkillKind ValueError branch — model passes unknown kind, gets
         explicit listing of valid values rather than a stack trace."""
@@ -812,6 +832,54 @@ class TestExecSkillsUpdate:
             "readonly": False,
         }
 
+    def test_update_auto_approve_warning_uses_final_state(self) -> None:
+        """The auto_approve+allowed_tools self-escalation warning must fire
+        against the *final* state (post-update), not the existing row alone.
+        Previously: ``existing_auto_approve=True`` triggered the warning
+        even when the update explicitly turned auto_approve OFF.
+        """
+        # Case A: existing auto_approve=True, update turns it OFF.
+        # Allowed_tools change present.  Warning must NOT fire (final
+        # state is auto_approve=False).
+        row = self._existing_row()
+        row["auto_approve"] = True
+        session = _make_session()
+        storage = MagicMock()
+        storage.get_prompt_template_by_name.return_value = row
+        with (
+            patch("turnstone.core.auth.user_has_permission", return_value=True),
+            patch("turnstone.core.storage._registry.get_storage", return_value=storage),
+        ):
+            item = session._prepare_skills(
+                "c",
+                {
+                    "action": "update",
+                    "name": "existing",
+                    "auto_approve": False,
+                    "allowed_tools": ["bash"],
+                },
+            )
+        assert "WARNING: auto_approve" not in item["preview"], item["preview"]
+
+        # Case B: existing auto_approve=False, update turns it ON.
+        # Allowed_tools inherited (not in updates).  Warning MUST fire
+        # (final state is auto_approve=True with inherited allowlist).
+        row_b = self._existing_row()
+        row_b["auto_approve"] = False
+        row_b["allowed_tools"] = '["bash"]'
+        storage_b = MagicMock()
+        storage_b.get_prompt_template_by_name.return_value = row_b
+        session_b = _make_session()
+        with (
+            patch("turnstone.core.auth.user_has_permission", return_value=True),
+            patch("turnstone.core.storage._registry.get_storage", return_value=storage_b),
+        ):
+            item_b = session_b._prepare_skills(
+                "c",
+                {"action": "update", "name": "existing", "auto_approve": True},
+            )
+        assert "WARNING: auto_approve" in item_b["preview"], item_b["preview"]
+
     def test_update_includes_projected_risk_on_preview(self) -> None:
         session = _make_session()
         storage = MagicMock()
@@ -854,11 +922,22 @@ class TestExecSkillsUpdate:
         assert "runtime config" in item.get("error", "")
 
     def test_update_snapshots_to_skill_versions(self) -> None:
+        """Snapshot version uses max(existing version) + 1 — NOT count+1.
+        Count-based numbering re-uses version numbers after a
+        ``delete_skill_versions`` call (which is a real storage method),
+        leading to ``(skill_id, version)`` collisions on the next insert.
+        Matches the ``storage.unlock_skill`` pattern.
+        """
         session = _make_session()
         storage = MagicMock()
         storage.get_prompt_template_by_name.return_value = self._existing_row()
         storage.get_prompt_template.return_value = self._existing_row()
-        storage.count_skill_versions.return_value = 2
+        # Simulate a row whose history had v1, v2, v3 — then v1 + v2 were
+        # deleted (e.g. retention policy).  Count is 1; max is 3.  Next
+        # version must be 4, not 2.
+        storage.list_skill_versions.return_value = [
+            {"version": 3, "changed_by": "admin", "created": "..."},
+        ]
         with (
             patch("turnstone.core.auth.user_has_permission", return_value=True),
             patch("turnstone.core.storage._registry.get_storage", return_value=storage),
@@ -867,13 +946,28 @@ class TestExecSkillsUpdate:
                 "c", {"action": "update", "name": "existing", "description": "new"}
             )
             session._exec_skills(item)
-        # Pre-update snapshot uses count+1 (the linear-version convention)
-        # rather than len(list)+1, avoiding the (skill_id, version)
-        # collision risk on concurrent updates noted in the boundary spike.
         storage.create_skill_version.assert_called_once()
         kwargs = storage.create_skill_version.call_args.kwargs
-        assert kwargs["version"] == 3
+        assert kwargs["version"] == 4, "max+1 must use max(existing version), not count+1"
         assert kwargs["changed_by"] == session._user_id
+
+    def test_update_snapshots_starts_at_v1_on_empty_history(self) -> None:
+        """Edge case: no existing versions → next version is 1."""
+        session = _make_session()
+        storage = MagicMock()
+        storage.get_prompt_template_by_name.return_value = self._existing_row()
+        storage.get_prompt_template.return_value = self._existing_row()
+        storage.list_skill_versions.return_value = []
+        with (
+            patch("turnstone.core.auth.user_has_permission", return_value=True),
+            patch("turnstone.core.storage._registry.get_storage", return_value=storage),
+        ):
+            item = session._prepare_skills(
+                "c", {"action": "update", "name": "existing", "description": "new"}
+            )
+            session._exec_skills(item)
+        kwargs = storage.create_skill_version.call_args.kwargs
+        assert kwargs["version"] == 1
 
 
 class TestExecSkillsToggle:
