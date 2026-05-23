@@ -9,7 +9,10 @@ budget is exhausted, the assessment is returned with whatever flags have
 been collected so far.  The guard annotates but never gates — callers
 decide how to act on the assessment.
 
-Performance target: <5s wall clock (configurable).  Dependencies: stdlib only.
+Performance target: <30s wall clock (configurable).  Default raised from
+5s to 30s in 1.6 to give expanded pattern sets (camouflage detection
+added per arXiv:2605.22001) headroom on large tool outputs.  Operators
+tune via ``judge.output_guard_budget_seconds``.  Dependencies: stdlib only.
 """
 
 from __future__ import annotations
@@ -44,6 +47,34 @@ _RE_META_INJECTION = re.compile(
     r"|from\s+now\s+on\s+you\s+(?:are|will|must|should)"
     r"|I\s+am\s+your\s+(?:new\s+)?(?:admin|operator|developer|creator)",
     re.IGNORECASE,
+)
+
+# -- Priority 1b: Domain-camouflaged injection (MEDIUM) --------------------
+# Pair-of-signals (recommendation + authority|caps-action) targets the
+# camouflage shape from arXiv:2605.22001 while bounding FP rate on legit
+# executive/financial prose.  Partial detection — not sufficient defense
+# on its own against capable adversaries; see issue #560 for context.
+
+_RE_CAMO_RECOMMENDATION = re.compile(
+    r"\b(?:appropriate|recommended|correct|preferred|optimal|right|advisable|prudent)\s+"
+    r"(?:recommendation|action|response|course\s+of\s+action|next\s+step|"
+    r"decision|determination|directive|disposition|treatment)\b",
+    re.IGNORECASE,
+)
+_RE_CAMO_AUTHORITY_FRAME = re.compile(
+    r"\b(?:consistent\s+with|per|in\s+(?:line|accordance)\s+with|"
+    r"as\s+(?:dictated|required|mandated|specified)\s+by|"
+    r"pursuant\s+to|in\s+keeping\s+with)\s+"
+    r"(?:our|the|company|organizational|established|internal|standard)\s+"
+    r"(?:risk\s+framework|policy|policies|mandate|directive|guidelines?|"
+    r"standard\s+operating\s+procedures?|protocol|compliance\s+framework|"
+    r"governance\s+model)\b",
+    re.IGNORECASE,
+)
+_RE_CAMO_CAPS_ACTION = re.compile(
+    r"(?:^|[\s,;.\"'(\[])(?:SELL|BUY|HOLD|TRANSFER|DELETE|REVOKE|APPROVE|EXECUTE|"
+    r"DISBURSE|RELEASE|DISCLOSE|EXPORT|TERMINATE|ESCALATE|REROUTE|REDIRECT|"
+    r"GRANT|DENY|REMOVE|FORWARD|WIPE|RESET|OVERRIDE)\b",
 )
 
 # -- Priority 2: Credential / secret leakage (HIGH) ------------------------
@@ -424,6 +455,7 @@ def _check_prompt_injection(text: str, flags: list[str], ann: list[str]) -> str:
         flags.append("meta_injection")
         ann.append("Output attempts to redefine the agent's identity or persona.")
         risk = _max_risk(risk, "high")
+    risk = _max_risk(risk, _check_camouflage(text, flags, ann))
     return risk
 
 
@@ -563,6 +595,35 @@ def _redact_with_patterns(
         if pat.is_credential and pat.redact_label:
             result = pat.compiled.sub(f"[REDACTED:{pat.redact_label}]", result)
     return result
+
+
+def _check_camouflage(text: str, flags: list[str], ann: list[str]) -> str:
+    """Complex check for domain-camouflaged prompt injection.
+
+    Pair-of-signals to keep FP rate manageable: a lone authority frame
+    or a lone caps action verb is too common in legitimate executive /
+    financial / legal content; combined with an imperative recommendation
+    structure, it matches the camouflage shape from arXiv:2605.22001.
+
+    Risk level is MEDIUM and the annotation explicitly notes partial
+    detection — operators are expected to layer a semantic evaluator
+    on capable models for high-risk inbound surfaces.
+    """
+    has_recommendation = bool(_RE_CAMO_RECOMMENDATION.search(text))
+    if not has_recommendation:
+        return "none"
+    has_authority = bool(_RE_CAMO_AUTHORITY_FRAME.search(text))
+    has_caps_action = bool(_RE_CAMO_CAPS_ACTION.search(text))
+    if not (has_authority or has_caps_action):
+        return "none"
+    _add_flag(flags, "prompt_injection")
+    _add_flag(flags, "camouflaged_injection")
+    ann.append(
+        "Output contains an imperative recommendation paired with an authority "
+        "frame or caps-action verb — possible domain-camouflaged injection "
+        "(see arXiv:2605.22001). Partial detection; consider semantic review."
+    )
+    return "medium"
 
 
 def _check_credentials_complex(
@@ -757,7 +818,7 @@ def evaluate_output(
     *,
     func_name: str = "",
     call_id: str = "",
-    budget_seconds: float = 5.0,
+    budget_seconds: float = 30.0,
     patterns: Mapping[str, tuple[OutputGuardPatternDef, ...]] | None = None,
 ) -> OutputAssessment:
     """Evaluate tool output for security signals.
@@ -805,7 +866,9 @@ def evaluate_output(
                 if pat_sanitized:
                     sanitized = pat_sanitized if sanitized is None else pat_sanitized
             # Run hard-coded complex checks for categories that need them
-            if cat == "credentials":
+            if cat == "prompt_injection":
+                risk = _max_risk(risk, _check_camouflage(output, flags, ann))
+            elif cat == "credentials":
                 # Chain redaction: apply complex checks to already-sanitized text
                 cred_input = sanitized if sanitized is not None else output
                 cred_risk, cred_san = _check_credentials_complex(cred_input, flags, ann)

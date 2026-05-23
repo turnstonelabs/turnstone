@@ -87,6 +87,7 @@ class JudgeConfig:
     timeout: float = 60.0  # per-turn timeout in seconds (see class docstring)
     read_only_tools: bool = True
     output_guard: bool = True
+    output_guard_budget_seconds: float = 30.0  # wall-clock budget for output_guard regex scan
     redact_secrets: bool = True
     cancel_on_approval: bool = False  # True = abort remaining items on user approval
 

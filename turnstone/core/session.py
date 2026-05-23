@@ -1106,6 +1106,7 @@ class ChatSession:
             timeout=cs.get("judge.timeout"),
             read_only_tools=cs.get("judge.read_only_tools"),
             output_guard=cs.get("judge.output_guard"),
+            output_guard_budget_seconds=cs.get("judge.output_guard_budget_seconds"),
             redact_secrets=cs.get("judge.redact_secrets"),
             cancel_on_approval=cs.get("judge.cancel_on_approval"),
         )
@@ -4823,8 +4824,14 @@ class ChatSession:
         rule_reg = self._rule_registry
         if rule_reg is not None:
             og_patterns = rule_reg.output_patterns
+        jc = self._judge_cfg
+        budget = jc.output_guard_budget_seconds if jc is not None else 30.0
         assessment = evaluate_output(
-            output, func_name=func_name, call_id=call_id, patterns=og_patterns
+            output,
+            func_name=func_name,
+            call_id=call_id,
+            budget_seconds=budget,
+            patterns=og_patterns,
         )
         if assessment.risk_level == "none":
             return output, None
@@ -4845,9 +4852,31 @@ class ChatSession:
         except Exception:
             log.debug("output_guard.callback_failed", exc_info=True)
 
-        if assessment.sanitized is not None and self._judge_cfg and self._judge_cfg.redact_secrets:
+        if assessment.sanitized is not None and jc is not None and jc.redact_secrets:
             return assessment.sanitized, assessment
         return output, assessment
+
+    def _guard_subagent_synthesis(self, content: str, label: str) -> str:
+        """Run output_guard on a sub-agent's final synthesis text.
+
+        Sub-agent intermediate tool results are guarded inside ``_run_agent``,
+        but the synthesized response a sub-agent returns to its parent is
+        another laundering surface — the sub-agent may quote or paraphrase
+        a domain-camouflaged injection from one of its tool results (see
+        issue #560).  Guarding the synthesis here gives us a dedicated
+        scan point at the sub-agent boundary; the parent's tool-result
+        loop runs the same guard a second time when the synthesis lands
+        as that call's result — accepted defense-in-depth duplication
+        (~10-40ms per 5-16KB synthesis, bounded by ``output_guard_budget_seconds``).
+        """
+        jc = self._judge_cfg
+        if jc is None or not jc.output_guard:
+            return content
+        if not isinstance(content, str):
+            return content
+        synth_id = f"agent_synth_{label}_{uuid.uuid4().hex[:8]}"
+        guarded, _ = self._evaluate_output(synth_id, content, f"{label}_agent_synthesis")
+        return guarded
 
     # -- User message queue -----------------------------------------------------
 
@@ -10404,14 +10433,14 @@ class ChatSession:
                     # Find the last assistant content we have
                     for msg in reversed(agent_messages):
                         if msg.get("role") == "assistant" and msg.get("content"):
-                            return str(msg["content"])
+                            return self._guard_subagent_synthesis(str(msg["content"]), label)
                     return f"({label} stopped: context limit exceeded)"
                 raise
 
             # Handle truncation or content filter — stop agent early
             if result.finish_reason == "length":
                 self.ui.on_info(f"[{label}] response truncated, stopping early")
-                return result.content or "(truncated)"
+                return self._guard_subagent_synthesis(result.content or "(truncated)", label)
             if result.finish_reason == "content_filter":
                 self.ui.on_info(f"[{label}] blocked by content filter")
                 return "(content filter)"
@@ -10429,7 +10458,7 @@ class ChatSession:
             if not result.tool_calls:
                 content = result.content or "(no output)"
                 self.ui.on_info(f"[{label} done] {len(content)} chars")
-                return content
+                return self._guard_subagent_synthesis(content, label)
 
             # Execute tools sequentially (not parallel) to avoid
             # concurrent _read_files mutation from worker threads.
@@ -10508,7 +10537,7 @@ class ChatSession:
         result = _api_call(agent_messages, _tools=[])
         content = result.content or "(no output)"
         self.ui.on_info(f"[{label} done] {len(content)} chars")
-        return content
+        return self._guard_subagent_synthesis(content, label)
 
     _TASK_DEFAULT_IDENTITY = (
         "# Task Agent\n\n"

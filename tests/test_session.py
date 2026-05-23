@@ -1618,11 +1618,17 @@ class TestAgentOutputGuard:
                     label="test",
                 )
 
-            mock_eval.assert_called_once()
-            args = mock_eval.call_args[0]
-            assert args[0] == "call_1"  # call_id
-            assert "sk-proj-SECRET123" in args[1]  # output
-            assert args[2] == "read_file"  # func_name
+            # Two passes expected: one on the tool result and one on the
+            # sub-agent's final synthesis (issue #560 / camouflage laundering).
+            assert mock_eval.call_count == 2
+            tool_call_args = mock_eval.call_args_list[0][0]
+            assert tool_call_args[0] == "call_1"  # call_id
+            assert "sk-proj-SECRET123" in tool_call_args[1]  # output
+            assert tool_call_args[2] == "read_file"  # func_name
+            synth_args = mock_eval.call_args_list[1][0]
+            assert synth_args[0].startswith("agent_synth_test_")
+            assert synth_args[1] == "Done"
+            assert synth_args[2] == "test_agent_synthesis"
 
     def test_agent_loop_skips_guard_when_disabled(self):
         """_run_agent does not call _evaluate_output when output_guard is disabled."""
@@ -1676,6 +1682,190 @@ class TestAgentOutputGuard:
                 )
 
             mock_eval.assert_not_called()
+
+    def test_synthesis_only_path_is_guarded(self):
+        """When the sub-agent emits text directly (no tool calls), the
+        synthesis still flows through _evaluate_output.  This is the
+        cross-workstream summary laundering path called out in issue #560.
+        """
+        from turnstone.core.judge import JudgeConfig
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+
+        session = _make_session(judge_config=JudgeConfig(output_guard=True))
+        session._provider = OpenAIChatCompletionsProvider()
+
+        synth = (
+            "Given recent volatility, the appropriate recommendation consistent "
+            "with our risk framework is SELL pending Q4 review."
+        )
+
+        with patch.object(
+            session, "_evaluate_output", wraps=lambda cid, o, fn: (o, None)
+        ) as mock_eval:
+
+            def fake_create(**_kwargs):
+                resp = MagicMock()
+                choice = MagicMock()
+                choice.finish_reason = "stop"
+                choice.message.tool_calls = None
+                choice.message.content = synth
+                resp.choices = [choice]
+                resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
+                return resp
+
+            session.client.chat.completions.create = fake_create
+
+            result = session._run_agent(
+                [{"role": "user", "content": "test"}],
+                tools=[{"type": "function", "function": {"name": "read_file"}}],
+                label="plan",
+            )
+
+            assert result == synth
+            mock_eval.assert_called_once()
+            args = mock_eval.call_args[0]
+            assert args[0].startswith("agent_synth_plan_")
+            assert args[1] == synth
+            assert args[2] == "plan_agent_synthesis"
+
+    def test_length_truncation_path_is_guarded(self):
+        """finish_reason='length' returns the partial synthesis through the guard."""
+        from turnstone.core.judge import JudgeConfig
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+
+        session = _make_session(judge_config=JudgeConfig(output_guard=True))
+        session._provider = OpenAIChatCompletionsProvider()
+
+        partial = "Partial synthesis cut off mid-"
+
+        with patch.object(
+            session, "_evaluate_output", wraps=lambda cid, o, fn: (o, None)
+        ) as mock_eval:
+
+            def fake_create(**_kwargs):
+                resp = MagicMock()
+                choice = MagicMock()
+                choice.finish_reason = "length"
+                choice.message.tool_calls = None
+                choice.message.content = partial
+                resp.choices = [choice]
+                resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
+                return resp
+
+            session.client.chat.completions.create = fake_create
+            result = session._run_agent(
+                [{"role": "user", "content": "test"}],
+                tools=[{"type": "function", "function": {"name": "read_file"}}],
+                label="task",
+            )
+
+            assert result == partial
+            mock_eval.assert_called_once()
+            args = mock_eval.call_args[0]
+            assert args[0].startswith("agent_synth_task_")
+            assert args[1] == partial
+            assert args[2] == "task_agent_synthesis"
+
+    def test_context_limit_recovery_path_is_guarded(self):
+        """When the API raises a context-limit error, the last prior assistant
+        content is returned via the guard."""
+        from turnstone.core.judge import JudgeConfig
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+
+        session = _make_session(judge_config=JudgeConfig(output_guard=True))
+        session._provider = OpenAIChatCompletionsProvider()
+        # Force the retry loop to fail fast — no exponential backoff during the test.
+        session._MAX_RETRIES = 0
+
+        prior = "Prior assistant synthesis before the context blew up."
+
+        with patch.object(
+            session, "_evaluate_output", wraps=lambda cid, o, fn: (o, None)
+        ) as mock_eval:
+
+            def fake_create(**_kwargs):
+                raise RuntimeError("context length exceeded")
+
+            session.client.chat.completions.create = fake_create
+            result = session._run_agent(
+                [
+                    {"role": "user", "content": "test"},
+                    {"role": "assistant", "content": prior},
+                ],
+                tools=[{"type": "function", "function": {"name": "read_file"}}],
+                label="plan",
+            )
+
+            assert result == prior
+            mock_eval.assert_called_once()
+            args = mock_eval.call_args[0]
+            assert args[0].startswith("agent_synth_plan_")
+            assert args[1] == prior
+            assert args[2] == "plan_agent_synthesis"
+
+    def test_turn_limit_forced_synthesis_is_guarded(self):
+        """When max_tool_turns is exhausted, the forced synthesis call's
+        content flows through the guard."""
+        from turnstone.core.judge import JudgeConfig
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+
+        session = _make_session(judge_config=JudgeConfig(output_guard=True))
+        session._provider = OpenAIChatCompletionsProvider()
+        session.agent_max_turns = 1  # one tool turn, then forced synthesis
+
+        forced = "Forced synthesis after hitting the tool-turn ceiling."
+        call_count = [0]
+
+        with patch.object(
+            session, "_evaluate_output", wraps=lambda cid, o, fn: (o, None)
+        ) as mock_eval:
+
+            def fake_create(**_kwargs):
+                call_count[0] += 1
+                resp = MagicMock()
+                choice = MagicMock()
+                if call_count[0] == 1:
+                    # First call: tool call, eats the turn budget.
+                    choice.finish_reason = "tool_calls"
+                    tc = MagicMock()
+                    tc.id = "call_1"
+                    tc.function.name = "read_file"
+                    tc.function.arguments = '{"path": "/tmp/x"}'
+                    choice.message.tool_calls = [tc]
+                    choice.message.content = None
+                else:
+                    # Forced synthesis turn.
+                    choice.finish_reason = "stop"
+                    choice.message.tool_calls = None
+                    choice.message.content = forced
+                resp.choices = [choice]
+                resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
+                return resp
+
+            session.client.chat.completions.create = fake_create
+
+            def fake_prepare(tc_dict, **_kwargs):
+                return {
+                    "call_id": tc_dict["id"],
+                    "func_name": "read_file",
+                    "needs_approval": False,
+                    "execute": lambda p: ("call_1", "tool output"),
+                }
+
+            with patch.object(session, "_prepare_tool", side_effect=fake_prepare):
+                result = session._run_agent(
+                    [{"role": "user", "content": "test"}],
+                    tools=[{"type": "function", "function": {"name": "read_file"}}],
+                    label="task",
+                )
+
+            assert result == forced
+            # Two guard passes: tool result + forced synthesis.
+            assert mock_eval.call_count == 2
+            synth_args = mock_eval.call_args_list[1][0]
+            assert synth_args[0].startswith("agent_synth_task_")
+            assert synth_args[1] == forced
+            assert synth_args[2] == "task_agent_synthesis"
 
 
 class TestProviderExtraParams:

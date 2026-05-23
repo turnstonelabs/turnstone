@@ -68,6 +68,7 @@ def build_console_session_factory(
             timeout=config_store.get("judge.timeout"),
             read_only_tools=config_store.get("judge.read_only_tools"),
             output_guard=config_store.get("judge.output_guard"),
+            output_guard_budget_seconds=config_store.get("judge.output_guard_budget_seconds"),
             redact_secrets=config_store.get("judge.redact_secrets"),
         )
 

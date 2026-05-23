@@ -478,6 +478,18 @@ def _build_registry() -> dict[str, SettingDef]:
             "conversation context. Warnings are surfaced via the UI.",
         ),
         SettingDef(
+            "judge.output_guard_budget_seconds",
+            "float",
+            30.0,
+            "Wall-clock budget for output guard regex scan",
+            "judge",
+            min_value=1.0,
+            help="Maximum seconds the output_guard spends scanning a single tool result. "
+            "Bumped from 5s in 1.6 to accommodate expanded camouflage patterns "
+            "(arXiv:2605.22001). Raise if you see incomplete scans on large outputs; "
+            "lower if guard overhead becomes noticeable on fast tool loops.",
+        ),
+        SettingDef(
             "judge.redact_secrets",
             "bool",
             True,
