@@ -138,6 +138,43 @@ class TestPrepareSkillsFind:
         item = session._prepare_skills("c", {"action": "find", "limit": 0})
         assert item["limit"] == 100
 
+    def test_find_kind_invalid_errors(self) -> None:
+        """Typos / unknown values on the `kind` filter return an explicit
+        error rather than silently degrading to `kinds=['typo','any']`
+        (which would filter to literal-`any` rows only and masquerade as
+        a narrowed catalog).  Matches the validation symmetry with
+        create/update which already validate against ``SkillKind``."""
+        session = _make_session()
+        item = session._prepare_skills(
+            "c",
+            {"action": "find", "kind": "interactivee"},  # typo
+        )
+        err = item.get("error", "")
+        assert "find: kind must be one of" in err
+        assert "'interactivee'" in err
+
+    def test_find_kind_any_means_no_filter(self) -> None:
+        """`kind='any'` (the documented enum value) means "no filter / all
+        kinds" — matches the JSON-schema description that says default
+        returns every kind.  Previously degenerated to ``kinds=['any','any']``
+        which narrowed to literal-`any` rows only; now collapses to ``None``
+        at prepare time so the storage call gets no kind filter at all.
+        """
+        session = _make_session()
+        item = session._prepare_skills("c", {"action": "find", "kind": "any"})
+        assert "error" not in item, item
+        # Item carries None for kind — exec's ``[kind, 'any'] if kind else None``
+        # then yields None as the storage kinds filter.
+        assert item.get("kind") is None
+
+    def test_find_kind_narrow_passes_through(self) -> None:
+        """Valid narrowing values reach exec as their enum string."""
+        session = _make_session()
+        for narrow in ("interactive", "coordinator"):
+            item = session._prepare_skills("c", {"action": "find", "kind": narrow})
+            assert "error" not in item, item
+            assert item.get("kind") == narrow
+
 
 class TestPrepareSkillsLoad:
     """``load`` mutates session state; works on both interactive and

@@ -5511,7 +5511,7 @@ class ChatSession:
             # the legacy ``skill`` + ``list_skills`` pair.  Lives in the
             # interactive block (not coordinator-only) because it serves
             # both kinds: per-action gating inside _prepare_skills routes
-            # coord vs interactive — load is interactive-only.
+            # coord vs interactive where the actions differ.
             "skills": self._prepare_skills,
             # Coordinator tools: only reachable when this session was
             # constructed with kind="coordinator" (COORDINATOR_TOOLS set).
@@ -7854,7 +7854,7 @@ class ChatSession:
     # actions (create, update, enable, disable) require approval AND the
     # ``model.skills.write`` permission on the session user (default-
     # ungranted; operators opt themselves in).  ``load`` mutates session
-    # state and is interactive-only.
+    # state — works on both interactive and coordinator sessions.
 
     # Projected ``allowed_tools`` count above which the scanner is likely
     # to bump the risk tier.  Surfaced on the approval card via
@@ -7959,17 +7959,37 @@ class ChatSession:
     # -- find ----------------------------------------------------------------
 
     def _prepare_skills_find(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        from turnstone.core.skill_kind import SkillKind
+
         category = self._coord_str_arg(args, "category").strip() or None
         tag = self._coord_str_arg(args, "tag").strip() or None
         risk_level = self._coord_str_arg(args, "risk_level").strip() or None
         query = self._coord_str_arg(args, "query").strip() or None
-        # ``kind`` is now an opt-in discoverability filter — metadata-only
+        # ``kind`` is an opt-in discoverability filter — metadata-only
         # after the flatten (no code path branches on it), but useful to
         # the model for narrowing a catalog browse to skills authored for
-        # a specific audience.  When supplied, threads ``[<kind>, 'any']``
-        # to the storage filter so ``any``-tagged skills remain visible
-        # regardless of the chosen narrowing.
-        kind = self._coord_str_arg(args, "kind").strip().lower() or None
+        # a specific audience.  Validated against the ``SkillKind`` enum
+        # the same way create/update validate (matches the consistency
+        # contract the model expects on the same field across actions);
+        # ``SkillKind.ANY`` collapses to ``None`` so the documented
+        # "default returns every kind" semantic holds when the model
+        # passes the enum value explicitly.  When the narrower kinds
+        # are supplied the storage filter threads ``[<kind>, 'any']``
+        # so ``any``-tagged rows remain visible.
+        raw_kind = self._coord_str_arg(args, "kind").strip().lower() or None
+        if raw_kind is None:
+            kind: str | None = None
+        else:
+            try:
+                parsed = SkillKind(raw_kind)
+            except ValueError:
+                return self._coord_tool_error(
+                    call_id,
+                    "skills",
+                    f"find: kind must be one of: "
+                    f"{', '.join(sorted(k.value for k in SkillKind))}; got {raw_kind!r}",
+                )
+            kind = None if parsed is SkillKind.ANY else parsed.value
         enabled_only = self._coord_bool_arg(args, "enabled_only")
         try:
             limit = int(args.get("limit") or 100)
@@ -8207,7 +8227,7 @@ class ChatSession:
         self._report_tool_result(call_id, "skills", f"got {name}")
         return call_id, self._truncate_output(output)
 
-    # -- load (interactive only) ----------------------------------------------
+    # -- load -------------------------------------------------------------------
 
     def _prepare_skills_load(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         # Both kinds can ``load`` — interactive sessions replace their own

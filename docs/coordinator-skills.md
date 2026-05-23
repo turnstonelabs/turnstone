@@ -14,34 +14,46 @@ care about.
 
 ---
 
-## The two-surface model
+## `kind` — authored audience metadata
 
 A row in `prompt_templates` carries a `kind` column (see
 [`turnstone/core/skill_kind.py`](../turnstone/core/skill_kind.py);
 migration 044 added the column).  Three values:
 
-| `SkillKind` enum     | Stored as                   | Visible in                                                                |
-|----------------------|-----------------------------|---------------------------------------------------------------------------|
-| `SkillKind.INTERACTIVE` | `"interactive"`          | Only the interactive-session activation path.  `list_skills` on a coord won't show it. |
-| `SkillKind.COORDINATOR` | `"coordinator"`          | Only the coordinator's `list_skills` tool.  Hidden from interactive activation pickers. |
-| `SkillKind.ANY`         | `"any"`                  | Both surfaces.  Default for legacy rows predating the classifier.        |
+| `SkillKind` enum        | Stored as       | Meaning                                                                    |
+|-------------------------|-----------------|----------------------------------------------------------------------------|
+| `SkillKind.INTERACTIVE` | `"interactive"` | Authored for the interactive maker persona (single-workstream "do this"). |
+| `SkillKind.COORDINATOR` | `"coordinator"` | Authored for the orchestrator persona (delegate, monitor, synthesise).    |
+| `SkillKind.ANY`         | `"any"`         | Either surface (or audience-neutral).  Default on create.                 |
 
-The `kind` field is a `StrEnum` — drop-in ``str`` compatible — so
-DB rows, JSON payloads, and `==` comparisons all work without
-translation at the edge.
+The `kind` field is a `StrEnum` — drop-in `str` compatible — so DB
+rows, JSON payloads, and `==` comparisons all work without translation
+at the edge.
 
-When a coordinator calls `list_skills`, the SQL filter narrows to
-`kind IN ('coordinator', 'any')`.  When an interactive session picks
-a skill at activation, the filter narrows to
-`kind IN ('interactive', 'any')`.  A skill author tags once at
-creation; the two surfaces stay partitioned without any
-per-call filtering on the LLM side.
+**`kind` is metadata, not an enforcement boundary.**  The model can
+`skills(action='find')` across every kind from any session, `get` any
+row by name, and `load` any visible skill regardless of session kind.
+Actual runtime capability is gated by `allowed_tools` + `auto_approve`
+on the skill and the operator's approval card on every `load` /
+`spawn_workstream(skill=...)` decision — `kind` doesn't add or remove
+any of that.  It's a sorting / grouping / search-narrowing hint.
 
-**Tagging a new skill as coordinator-only** — set `kind` to
-`SkillKind.COORDINATOR` (or the literal string `"coordinator"`) when
-you POST to `/v1/api/admin/skills`.  Existing rows default to
-`SkillKind.ANY`; bump them to `COORDINATOR` if you've rewritten the
-prompt around the orchestrator toolset.
+The opt-in filter is on `skills(action='find', kind='coordinator')`
+(or `'interactive'`) — pass it when you want to narrow a catalog
+browse to a specific authored audience.  Omitting it (or passing
+`kind='any'`) returns the full catalog.  When supplied, the storage
+filter widens to `[<kind>, 'any']` so audience-neutral rows remain
+visible inside the narrowed view.
+
+**Tagging a new skill as coordinator-targeted** — set `kind` to
+`SkillKind.COORDINATOR` (or the literal `"coordinator"`) when you
+`skills(action='create', kind='coordinator', ...)` or POST to
+`/v1/api/admin/skills`.  Use this to signal intent to other skill
+authors and to make the orchestrator-targeted catalog easy to
+browse — not to hide the skill from interactive sessions.  Existing
+rows default to `SkillKind.ANY`; bump them to `COORDINATOR` if
+you've rewritten the prompt around the orchestrator toolset and
+want the kind filter to surface them as such.
 
 ---
 
@@ -64,7 +76,7 @@ or MCP config can do adds to it.  Current members:
 | `cancel_workstream`       | wind-down       | Drop the in-flight generation; leaves child idle for a fresh send.  |
 | `delete_workstream`       | wind-down       | Hard-delete one child.  Requires approval.                          |
 | `list_nodes`              | discover        | Enumerate live cluster nodes + capabilities.                        |
-| `list_skills`             | discover        | Coordinator-visible skills only (SkillKind filter above).           |
+| `skills` (action=find)    | discover        | Browse the skill catalog; opt-in `kind` filter narrows by audience. |
 | `tasks`                   | plan            | Orchestrator-only scratchpad.  Children don't see it.               |
 
 Explicitly **not** in the coordinator set:
