@@ -1107,6 +1107,9 @@ class ChatSession:
             read_only_tools=cs.get("judge.read_only_tools"),
             output_guard=cs.get("judge.output_guard"),
             output_guard_budget_seconds=cs.get("judge.output_guard_budget_seconds"),
+            output_guard_llm=cs.get("judge.output_guard_llm"),
+            output_guard_model=cs.get("judge.output_guard_model"),
+            output_guard_llm_timeout=cs.get("judge.output_guard_llm_timeout"),
             redact_secrets=cs.get("judge.redact_secrets"),
             cancel_on_approval=cs.get("judge.cancel_on_approval"),
         )

@@ -88,6 +88,9 @@ class JudgeConfig:
     read_only_tools: bool = True
     output_guard: bool = True
     output_guard_budget_seconds: float = 30.0  # wall-clock budget for output_guard regex scan
+    output_guard_llm: bool = False  # enable LLM stage on tool output (issue #560 mitigation #1)
+    output_guard_model: str = ""  # alias for the LLM stage; empty = inherit session model
+    output_guard_llm_timeout: float = 30.0  # wall-clock budget for the LLM stage
     redact_secrets: bool = True
     cancel_on_approval: bool = False  # True = abort remaining items on user approval
 

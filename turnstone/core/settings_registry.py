@@ -490,6 +490,41 @@ def _build_registry() -> dict[str, SettingDef]:
             "lower if guard overhead becomes noticeable on fast tool loops.",
         ),
         SettingDef(
+            "judge.output_guard_llm",
+            "bool",
+            False,
+            "Enable LLM-judge stage on tool output",
+            "judge",
+            help="When enabled, an LLM is invoked AFTER the regex stage to semantically "
+            "evaluate tool output for camouflaged prompt injection (issue #560 mitigation #1, "
+            "arXiv:2605.22001). On success the LLM verdict overrides the regex verdict; "
+            "on disable/error/timeout the regex verdict stands. Capability-gated rollout — "
+            "default off so operators opt in once a judge-capable model is pointed at "
+            "output_guard_model.",
+        ),
+        SettingDef(
+            "judge.output_guard_model",
+            "str",
+            "",
+            "Model alias for the output-guard LLM judge",
+            "judge",
+            help="Model alias used for the LLM stage when output_guard_llm is enabled. "
+            "Empty inherits the session model (same fallback shape as judge.model). "
+            "Point at a small/fast alias (e.g. gpt-5-mini, claude-haiku-4-5) so the "
+            "per-tool-result latency stays bounded.",
+        ),
+        SettingDef(
+            "judge.output_guard_llm_timeout",
+            "float",
+            30.0,
+            "Wall-clock budget for the output-guard LLM judge call",
+            "judge",
+            min_value=1.0,
+            help="Maximum seconds the LLM judge is given for a single tool-result "
+            "evaluation. On timeout the regex verdict stands. Tune against your "
+            "chosen output_guard_model's typical latency at the configured effort.",
+        ),
+        SettingDef(
             "judge.redact_secrets",
             "bool",
             True,

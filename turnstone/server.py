@@ -4556,6 +4556,9 @@ def main() -> None:
             read_only_tools=config_store.get("judge.read_only_tools"),
             output_guard=config_store.get("judge.output_guard"),
             output_guard_budget_seconds=config_store.get("judge.output_guard_budget_seconds"),
+            output_guard_llm=config_store.get("judge.output_guard_llm"),
+            output_guard_model=config_store.get("judge.output_guard_model"),
+            output_guard_llm_timeout=config_store.get("judge.output_guard_llm_timeout"),
             redact_secrets=config_store.get("judge.redact_secrets"),
         )
 
