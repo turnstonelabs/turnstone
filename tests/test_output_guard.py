@@ -377,15 +377,12 @@ class TestBudget:
     def test_budget_kwarg_is_honored(self, monkeypatch) -> None:
         # A tiny budget with time already expired should trigger early return
         # via the deadline path, proving budget_seconds is wired through.
-        import time as _time
-
         from turnstone.core import output_guard
         from turnstone.core.output_guard import evaluate_output
 
         # Make monotonic() return a value past the deadline immediately
         # after the first call (which sets the deadline).
         call_count = 0
-        orig = _time.monotonic
 
         def fake_monotonic():
             nonlocal call_count
