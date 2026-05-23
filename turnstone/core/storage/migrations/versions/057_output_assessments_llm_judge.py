@@ -15,21 +15,22 @@ issue #560 mitigation #1:
   microseconds-scale and not separately tracked).
 
 Revision ID: 057
-Revises: 056
+Revises: 055
 Create Date: 2026-05-23
 
 Originally drafted as 056 alongside PR #574 (skill spec uplift); bumped
-to 057 to keep the Alembic chain linear after the conflict.  There is
-no ordering dependency between the two — output_assessments and
-prompt_templates are independent tables — but Alembic requires a
-single head, and the skills uplift was opened first.
+to 057 (and re-pointed at 055, the current branch head) to keep the
+Alembic chain linear and migrateable standalone.  There is no ordering
+dependency between this migration and PR #574's 056 — output_assessments
+and prompt_templates are independent tables.  When #574 lands first,
+re-link down_revision to its actual revision number.
 """
 
 import sqlalchemy as sa
 from alembic import op
 
 revision = "057"
-down_revision = "056"
+down_revision = "055"
 branch_labels = None
 depends_on = None
 
