@@ -432,18 +432,21 @@ function renderMarkdown(text) {
     return "\x00MB" + (mathBlocks.length - 1) + "\x00";
   });
 
-  // Protect inline math — both delimiter styles ($...$ and \(...\)).
-  // Both regexes explicitly forbid newlines inside the captured
-  // group: an unterminated \(...\) (or $...$) on one line would
-  // otherwise eat the next paragraph until it found a closing
-  // delimiter, which is jarring on streaming markdown where the
-  // closer hasn't arrived yet. Display math (\[...\] / $$...$$)
-  // is the multi-line form by design.
+  // Protect inline math — LaTeX-style \(...\) only.
+  //
+  // Single-$ delimiters were dropped because $ is overloaded in
+  // prose: currency ("$5 and $10"), env vars ("$HOME and $PATH"),
+  // and shell prompts all produced false-positive math spans.
+  // \(...\) is unambiguous and is what GPT-5 / o-series / Claude
+  // with reasoning effort emit by default anyway. Display math
+  // ($$...$$ and \[...\]) is unchanged; it has enough delimiter
+  // mass that ambiguity is not a practical problem.
+  //
+  // Newlines inside the captured group are forbidden: an
+  // unterminated \(...\) on one line would otherwise eat the next
+  // paragraph until it found a closing \), which is jarring on
+  // streaming markdown where the closer hasn't arrived yet.
   var inlineMaths = [];
-  text = text.replace(/\$([^\$\n]+?)\$/g, function (m, tex) {
-    inlineMaths.push(renderLatex(tex, false));
-    return "\x00IM" + (inlineMaths.length - 1) + "\x00";
-  });
   text = text.replace(/\\\(([^\n]+?)\\\)/g, function (m, tex) {
     inlineMaths.push(renderLatex(tex.trim(), false));
     return "\x00IM" + (inlineMaths.length - 1) + "\x00";

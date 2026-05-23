@@ -89,11 +89,30 @@ def _render(markdown: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def test_tex_inline_math_renders() -> None:
+def test_single_dollar_inline_math_is_not_supported() -> None:
+    """Single-$ inline math is intentionally disabled — $ collides
+    with currency, env vars, and shell prompts in prose. Inline math
+    must use the unambiguous \\(...\\) form. This test pins the
+    behavior so a regex regression doesn't quietly resurrect it."""
     out = _render("The formula $E = mc^2$ is famous.")
-    assert '<span class="katex">' in out
-    assert "[KATEX:E = mc^2:inline]" in out
-    assert "$E = mc^2$" not in out  # raw delimiters consumed
+    assert '<span class="katex">' not in out
+    assert "$E = mc^2$" in out  # raw delimiters preserved
+
+
+def test_dollar_currency_does_not_trigger_math() -> None:
+    """The actual bug single-$ removal fixes: prose mentioning
+    multiple currency amounts on one line used to get the span
+    between two dollar signs eaten as a math expression."""
+    out = _render("It costs $5 and the other is $10 each.")
+    assert '<span class="katex">' not in out
+    assert "$5" in out and "$10" in out
+
+
+def test_dollar_env_vars_do_not_trigger_math() -> None:
+    """Same class of bug as currency, with shell-style variables."""
+    out = _render("Set $HOME and $PATH before running.")
+    assert '<span class="katex">' not in out
+    assert "$HOME" in out and "$PATH" in out
 
 
 def test_tex_display_math_renders() -> None:
@@ -145,10 +164,12 @@ def test_latex_math_in_bold_renders() -> None:
 
 
 def test_mixed_tex_and_latex_styles() -> None:
+    """Only \\(...\\) renders; the $...$ form is left as raw prose
+    (see test_single_dollar_inline_math_is_not_supported)."""
     out = _render(r"Here $x$ then \(y\) end.")
-    assert out.count('<span class="katex">') == 2
-    assert "[KATEX:x:inline]" in out
+    assert out.count('<span class="katex">') == 1
     assert "[KATEX:y:inline]" in out
+    assert "$x$" in out  # untouched
 
 
 def test_latex_math_inside_inline_code_preserved() -> None:
@@ -224,12 +245,15 @@ def test_inline_latex_math_does_not_span_paragraphs() -> None:
     assert "unterminated" in out
 
 
-def test_inline_tex_math_does_not_span_newlines() -> None:
-    """Existing $...$ behavior — regression guard."""
+def test_dollar_signs_never_render_as_math_across_paragraphs() -> None:
+    """Pre-removal regression covered the cross-paragraph eating bug
+    for $...$. With single-$ inline math gone, the stronger guarantee
+    is simply that no arrangement of $ signs ever produces math."""
     src = "Open $unterminated\n\nNext paragraph $x$ here."
     out = _render(src)
-    assert out.count('<span class="katex">') == 1
-    assert "[KATEX:x:inline]" in out
+    assert '<span class="katex">' not in out
+    assert "$unterminated" in out
+    assert "$x$" in out
 
 
 # ---------------------------------------------------------------------------
