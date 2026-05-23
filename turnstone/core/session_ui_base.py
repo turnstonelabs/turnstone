@@ -482,15 +482,24 @@ class SessionUIBase:
         self,
         last_event_id: int,
         maxsize: int = _DEFAULT_LISTENER_QUEUE_MAX,
-    ) -> tuple[queue.Queue[dict[str, Any]], list[dict[str, Any]], str, int, int]:
-        """Register a listener AND capture buffered events for replay.
+    ) -> tuple[
+        queue.Queue[dict[str, Any]],
+        list[dict[str, Any]],
+        str,
+        int,
+        int,
+        dict[str, Any],
+    ]:
+        """Register a listener AND capture buffered events for replay
+        AND snapshot the per-turn inflight content/reasoning + snap_seq
+        in one atomic-against-writers step.
 
         Used by :func:`make_events_handler` when the client sends
         ``Last-Event-ID`` (header or ``?last_event_id=`` query-param
         fallback for the manual-reconnect path).  Returns
 
             ``(client_queue, replay_events, status, lost_count,
-            earliest_available_id)``
+            earliest_available_id, snapshot)``
 
         where ``status`` is one of ``"replay_ok"`` (caller emits the
         replay events then drops into live drain, skipping
@@ -499,19 +508,32 @@ class SessionUIBase:
         envelope then falls through to the fresh-connect replay path
         as the recovery floor — the snapshot picks up the partial
         content/reasoning that the evicted events would have carried).
+        ``snapshot`` has the same shape as
+        :meth:`register_listener_with_in_progress_snapshot`'s second
+        return value: ``{"content": str, "reasoning": str, "seq": int}``.
 
-        Atomicity contract: under ``_listeners_lock`` we both snapshot
-        the buffer AND register the listener.  A writer's
-        :meth:`_enqueue` takes the same lock, so events either
+        Atomicity contract: under ``_ws_lock`` (outer) + ``_listeners_lock``
+        (inner) — matches writer order in :meth:`on_content_token` —
+        we snapshot the buffer, the listener registration, the
+        inflight content/reasoning, AND the ``_event_id`` counter as
+        a consistent tuple.  Writers' :meth:`_enqueue` blocks on
+        ``_listeners_lock`` for the duration, so events either
           - land in the buffer snapshot but NOT the listener queue
             (writer ran before our lock acquire — caught by the
-            replay slice), or
+            replay slice on the ``replay_ok`` path, or by the
+            content snapshot on the ``truncated`` path), or
           - land in the listener queue but NOT the buffer snapshot
             (writer ran after our lock release — live drain handles
             them, ``_event_id`` is strictly above
-            ``earliest_available_id``).
+            ``earliest_available_id`` AND strictly above
+            ``snapshot["seq"]``).
         No event is double-delivered, none is lost across the
-        registration boundary.
+        registration boundary.  Crucially, the truncated path can
+        now use ``snapshot["seq"]`` as the live-drain ``snap_seq``
+        filter — the events handler's existing ``_seq <= snap_seq``
+        dedup catches any token event that landed in the listener
+        queue AND was covered by the snapshot's content/reasoning
+        text (prevents double-rendering after a truncated emit).
 
         ``last_event_id`` semantics:
           - ``< earliest_available_id - 1`` → ``"truncated"``.
@@ -528,26 +550,43 @@ class SessionUIBase:
         the cold-start case (the ws just bootstrapped with no events
         ever) and the all-quiet case (a long-idle ws past which all
         events fall out of the buffer cap, but in practice the buffer
-        starts evicting only after 2000 events have been enqueued —
-        which means the counter is >= 2000 and the client's
-        last_event_id is below earliest, so they get ``truncated``
-        instead).  We can't distinguish the two without a separate
-        ``highest_evicted_id`` tracker; treating empty as ``replay_ok``
-        is the safe choice for the genuine cold-start case (no false
-        ``replay_truncated`` envelopes on freshly-opened workstreams).
+        starts evicting only after the cap is hit — which means the
+        counter is at the cap and the client's last_event_id is below
+        earliest, so they get ``truncated`` instead).  We can't
+        distinguish the two without a separate ``highest_evicted_id``
+        tracker; treating empty as ``replay_ok`` is the safe choice
+        for the genuine cold-start case (no false ``replay_truncated``
+        envelopes on freshly-opened workstreams).
         """
         client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=maxsize)
-        with self._listeners_lock:
-            buffered = list(self._event_buffer)
-            self._listeners.append(client_queue)
+        # Lock order matches writer: ``_ws_lock`` outer, ``_listeners_lock``
+        # inner.  Both inflight buffers AND the buffer slice AND the
+        # ``_event_id`` counter AND the listener registration captured
+        # as one atomic against any concurrent ``_enqueue``.  The string
+        # joins for content/reasoning happen OUTSIDE the locks (bounded
+        # at ``_MAX_TURN_CONTENT_CHARS`` but O(n) over fragments — not
+        # worth blocking on-token writers for the duration).  See
+        # the per-fresh-path helper for the same rationale.
+        with self._ws_lock:
+            captured_content = list(self._ws_inflight_content)
+            captured_reasoning = list(self._ws_inflight_reasoning)
+            with self._listeners_lock:
+                buffered = list(self._event_buffer)
+                self._listeners.append(client_queue)
+                snap_seq = self._event_id
+        snapshot: dict[str, Any] = {
+            "content": "".join(captured_content),
+            "reasoning": "".join(captured_reasoning),
+            "seq": snap_seq,
+        }
         if not buffered:
-            return client_queue, [], "replay_ok", 0, 0
+            return client_queue, [], "replay_ok", 0, 0, snapshot
         earliest_id = buffered[0][0]
         if last_event_id < earliest_id - 1:
             lost_count = (earliest_id - 1) - last_event_id
-            return client_queue, [], "truncated", lost_count, earliest_id
+            return client_queue, [], "truncated", lost_count, earliest_id, snapshot
         replay_events = [ev for eid, ev in buffered if eid > last_event_id]
-        return client_queue, replay_events, "replay_ok", 0, earliest_id
+        return client_queue, replay_events, "replay_ok", 0, earliest_id, snapshot
 
     # ------------------------------------------------------------------
     # Approval / plan blocking gates

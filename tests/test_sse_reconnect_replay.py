@@ -98,7 +98,7 @@ def test_replay_holds_events_through_empty_listeners_period() -> None:
     for i in range(10):
         ui._enqueue({"type": "tool_started", "name": f"t{i}"})
     # Reconnect-style register with Last-Event-ID=0 (client saw nothing).
-    lq, replay, status, lost, earliest = ui.register_listener_with_replay(0)
+    lq, replay, status, lost, earliest, _ = ui.register_listener_with_replay(0)
     assert status == "replay_ok"
     assert lost == 0
     assert earliest == 1
@@ -115,7 +115,7 @@ def test_replay_with_last_event_id_skips_already_seen_events() -> None:
     ui = _make_ui()
     for i in range(8):
         ui._enqueue({"type": "tool_started", "name": f"t{i}"})
-    lq, replay, status, lost, earliest = ui.register_listener_with_replay(5)
+    lq, replay, status, lost, earliest, _ = ui.register_listener_with_replay(5)
     assert status == "replay_ok"
     assert lost == 0
     assert [ev["_event_id"] for ev in replay] == [6, 7, 8]
@@ -134,7 +134,7 @@ def test_replay_truncated_when_last_event_id_predates_buffer() -> None:
     for i in range(20):
         ui._enqueue({"type": "tool_started", "name": f"t{i}"})
     # Buffer now holds ids 16..20 (5 most recent of 20 emitted).
-    lq, replay, status, lost, earliest = ui.register_listener_with_replay(3)
+    lq, replay, status, lost, earliest, _ = ui.register_listener_with_replay(3)
     assert status == "truncated"
     assert earliest == 16
     assert lost == 12  # earliest-1 - last_event_id = 15 - 3
@@ -146,7 +146,7 @@ def test_replay_empty_buffer_returns_replay_ok_empty() -> None:
     A spurious ``replay_truncated`` envelope on a freshly-opened
     workstream would be confusing and incorrect."""
     ui = _make_ui()
-    lq, replay, status, lost, earliest = ui.register_listener_with_replay(0)
+    lq, replay, status, lost, earliest, _ = ui.register_listener_with_replay(0)
     assert status == "replay_ok"
     assert replay == []
     assert lost == 0
@@ -161,7 +161,7 @@ def test_replay_registers_listener_atomically_with_buffer_snapshot() -> None:
     and the live queue, and never in NEITHER."""
     ui = _make_ui()
     ui._enqueue({"type": "tool_started", "name": "before"})
-    lq, replay, _, _, _ = ui.register_listener_with_replay(0)
+    lq, replay, _, _, _, _ = ui.register_listener_with_replay(0)
     # Now fire after registration — must arrive live, NOT in replay.
     ui._enqueue({"type": "tool_started", "name": "after"})
     assert [ev["name"] for ev in replay] == ["before"]
@@ -213,7 +213,7 @@ def test_event_id_does_not_skip_when_listener_queue_full() -> None:
     for i in range(10):
         ui._enqueue({"type": "tool_started", "name": f"t{i}"})
     # Replay from id=0 — fresh listener gets all 10, ids 1..10 dense.
-    _, replay, status, _, _ = ui.register_listener_with_replay(0)
+    _, replay, status, _, _, _ = ui.register_listener_with_replay(0)
     assert status == "replay_ok"
     assert [ev["_event_id"] for ev in replay] == list(range(1, 11))
 
@@ -239,7 +239,7 @@ def test_cross_thread_writer_and_replay_observer_consistent() -> None:
     def _reader() -> None:
         # Wait briefly so the writer is mid-flight.
         threading.Event().wait(0.001)
-        _, replay, status, _, earliest = ui.register_listener_with_replay(0)
+        _, replay, status, _, earliest, _ = ui.register_listener_with_replay(0)
         snap_box["replay"] = replay
         snap_box["status"] = status
         snap_box["earliest"] = earliest
@@ -277,7 +277,7 @@ def test_event_id_persists_across_turn_boundaries() -> None:
     seq_after = ui._event_id
     assert seq_after > seq_before, "counter regressed across turn boundary"
     # Replay from mid-turn-N must still serve turn-N+1's content.
-    _, replay, status, _, _ = ui.register_listener_with_replay(seq_before)
+    _, replay, status, _, _, _ = ui.register_listener_with_replay(seq_before)
     assert status == "replay_ok"
     assert len(replay) == 1
     assert replay[0]["text"] == "turn-N+1 tok1"
@@ -294,10 +294,83 @@ def test_replay_ok_skips_in_progress_snapshot_path() -> None:
     ui.on_content_token("partial ")
     # Replay path: returns replay_ok and a synthetic snap is NOT taken
     # (we test the handler-side behavior in the handler tests below).
-    lq, replay, status, _, _ = ui.register_listener_with_replay(0)
+    lq, replay, status, _, _, snap = ui.register_listener_with_replay(0)
     assert status == "replay_ok"
     # The buffered event carries the partial content as a content event.
     assert any(ev.get("type") == "content" for ev in replay)
+    # Snapshot is captured atomically too (used on truncated path to
+    # drive live-drain ``_seq <= snap_seq`` dedup); for replay_ok the
+    # caller ignores it but the contract returns one regardless.
+    assert isinstance(snap, dict)
+    assert snap["seq"] >= 1
+
+
+def test_truncated_path_snapshot_captures_real_snap_seq() -> None:
+    """Regression for PR #542 review comment 1 (Copilot, low-confidence).
+
+    On the truncated path the caller used to set ``snap_seq=0``, which
+    disabled the events handler's live-drain ``_seq <= snap_seq``
+    dedup.  A token writer racing between
+    ``register_listener_with_replay`` returning and the live drain's
+    first read would land in the listener queue AND in the captured
+    snapshot text, causing the client to render the token twice
+    (once via the ``in_progress_snapshot`` content text, once via the
+    live event delivery).
+
+    The fix lifts the snapshot capture INTO
+    ``register_listener_with_replay`` under the same nested-lock
+    acquire as the listener registration + buffer slice + counter
+    read, so ``snap_seq`` returned in the snapshot is the exact
+    high-water mark the snapshot text corresponds to."""
+    import collections
+
+    ui = _make_ui()
+    ui._event_buffer = collections.deque(maxlen=3)
+    # Fire enough events to trigger truncation on reconnect with a
+    # stale ``Last-Event-ID``.
+    for i in range(10):
+        ui.on_content_token(f"t{i}")
+    _, _, status, _, _, snap = ui.register_listener_with_replay(1)
+    assert status == "truncated"
+    # The snapshot's seq must be the LATEST event_id, not 0 — that's
+    # what gates the live-drain dedup filter in the events handler.
+    assert snap["seq"] == ui._event_id
+    assert snap["seq"] >= 10
+    # And the content is captured (not empty).
+    assert "t0" in snap["content"]
+    assert "t9" in snap["content"]
+
+
+def test_truncated_path_filters_already_in_snapshot_tokens() -> None:
+    """End-to-end: a token landing in the listener queue between
+    ``register_listener_with_replay`` returning and the live drain's
+    first read must be filtered by the handler's
+    ``_seq <= snap_seq`` dedup, because its text is ALSO in the
+    snapshot we just emitted.  Without the snap_seq fix this test
+    would observe a duplicate live token after the snapshot."""
+    import collections
+
+    ui = _make_ui()
+    ui._event_buffer = collections.deque(maxlen=3)
+    for i in range(10):
+        ui.on_content_token(f"t{i}")
+    lq, _, status, _, _, snap = ui.register_listener_with_replay(1)
+    assert status == "truncated"
+    captured_seq = snap["seq"]
+    # Simulate the race: at this point the listener queue already
+    # holds the buffered token events.  Drain them and confirm
+    # every one has ``_seq <= snap_seq`` — i.e. the handler's filter
+    # would correctly drop them.
+    while True:
+        try:
+            ev = lq.get_nowait()
+        except Exception:
+            break
+        if ev.get("type") == "content":
+            assert ev["_seq"] <= captured_seq, (
+                f"token _seq={ev['_seq']} > snap_seq={captured_seq}; "
+                "would slip past the live-drain dedup and double-render"
+            )
 
 
 # ---------------------------------------------------------------------------

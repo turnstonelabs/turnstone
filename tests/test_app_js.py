@@ -1225,14 +1225,24 @@ def test_dead_sse_defensive_reconnect_registered() -> None:
 
 
 def _strip_js_comments(src: str) -> str:
-    """Strip ``//`` and ``/* */`` comments while preserving string/regex
-    literals and keeping byte length identical (comments replaced with
-    spaces).  ``_slice_balanced_body`` doesn't skip comments, so an
+    """Strip ``//`` and ``/* */`` comments while preserving string
+    literal contents (``"..."``, ``'...'``, `` `...` ``) and keeping
+    byte length identical (comments replaced with spaces).
+
+    Limitation — does NOT detect regex literals (``/pattern/flags``).
+    A ``//`` inside a regex like ``/abc//`` would be misread as the
+    start of a line comment.  Safe today because the regions we scan
+    (SSE-handler ``onerror`` bodies, ``connectSSE`` /
+    ``connectGlobalSSE`` function bodies) don't contain regex
+    literals; if a future caller wants to scan a region with regex
+    literals, extend the tracker first.
+
+    Motivation: ``_slice_balanced_body`` doesn't skip comments, so an
     apostrophe inside a comment (``can't``, ``don't``) opens a fake
     string state that swallows braces until the next ``'``.  The new
-    onerror handlers carry these comments routinely; stripping comments
-    before brace-walking removes the hazard without re-architecting
-    the existing slice helper.
+    onerror handlers carry these comments routinely; stripping
+    comments before brace-walking removes the hazard without
+    re-architecting the existing slice helper.
     """
     out: list[str] = []
     n = len(src)

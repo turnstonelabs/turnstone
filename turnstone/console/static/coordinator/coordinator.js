@@ -139,6 +139,15 @@
 
   let evtSource = null;
   let reconnectAttempts = 0;
+  // Flag set in onerror, cleared in onopen.  Drives the "did we
+  // just recover from a gap?" decision in onopen so the replace-
+  // mode refresh of children/tasks/wait/badge caches fires on
+  // every reconnect — including the common case where native
+  // EventSource auto-reconnect handles the underlying SSE transition
+  // without scheduleReconnect running (which used to be the only
+  // place reconnectAttempts incremented; that path is rarely hit
+  // now that native reconnect handles transient errors).
+  let disconnectedSinceLastOpen = false;
   // Saved high-water mark for the manual-reconnect path.  The
   // EventSource constructor can't set custom headers, so when we
   // construct a fresh source we thread ``?last_event_id=N`` instead
@@ -1910,7 +1919,15 @@
     // reconnectAttempts in onopen — child_ws_* events dispatched while
     // we were disconnected aren't replayed by the events SSE handler,
     // so the client has to pull authoritative state after any gap.
-    const wasReconnecting = reconnectAttempts > 0;
+    // Snapshot whether this connect attempt follows a prior
+    // disconnect.  Native EventSource auto-reconnect no longer
+    // routes through scheduleReconnect on the transient-error path,
+    // so the legacy ``reconnectAttempts > 0`` check is always false
+    // after PR-D — use ``disconnectedSinceLastOpen`` (set by onerror,
+    // cleared by onopen below) as the authoritative "was-gap" flag.
+    // Falls back to the legacy semantic for the genuinely manual
+    // case (scheduleReconnect-driven reconnect after CLOSED state).
+    const wasReconnecting = disconnectedSinceLastOpen || reconnectAttempts > 0;
     let url = "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/events";
     if (lastEventId) {
       url += "?last_event_id=" + encodeURIComponent(lastEventId);
@@ -1918,6 +1935,9 @@
     evtSource = new EventSource(url, { withCredentials: true });
     evtSource.onopen = function () {
       reconnectAttempts = 0;
+      // Clear the "was disconnected" flag now that the gap is
+      // closed.  Future onerror fires will set it again.
+      disconnectedSinceLastOpen = false;
       setSseStatus("live", "ok");
       // Lift the disconnected dim treatment + restore the last known
       // counters; the replay phase will overwrite with authoritative
@@ -1971,6 +1991,7 @@
       // reconnect, which is exactly the reconnect-with-replay defect
       // PR-D ships to fix.  See
       // tests/test_app_js.py::test_coord_connectsse_onerror_preserves_native_reconnect.
+      disconnectedSinceLastOpen = true;
       setSseStatus("disconnected", "err");
       // Dim the status bar so a stale reading doesn't read as live.
       statusBarEl.classList.add("ws-sb-disconnected");
@@ -1979,9 +2000,7 @@
       // must log in), so we DO close + showLogin in that branch.
       // Transient errors (network blips, intermediary timeouts) just
       // let native reconnect run — no scheduleReconnect needed
-      // because the source isn't dead.  scheduleReconnect remains
-      // available as the final fallback for the truly-CLOSED case
-      // (covered by the auth.js callback path).
+      // because the source isn't dead.
       var probe = typeof authFetch === "function" ? authFetch : fetch;
       probe("/v1/api/workstreams/" + encodeURIComponent(wsId)).then(
         function (r) {
@@ -1996,6 +2015,26 @@
           }
         },
       );
+      // CLOSED-state recovery: native auto-reconnect covers the
+      // transient case (source stays in CONNECTING and eventually
+      // re-opens).  But if the browser gives up — hard 4xx after
+      // retries, intermediary tearing the connection down with
+      // prejudice, etc. — the source transitions to CLOSED and
+      // there is no further native recovery.  Schedule a delayed
+      // check that calls scheduleReconnect if the source is still
+      // CLOSED at that point; scheduleReconnect's exp-backoff +
+      // jitter then opens a new EventSource (threading the saved
+      // lastEventId via the URL query param, so replay still
+      // works across the manual reconnect).  Cancel/replace the
+      // existing timer so successive onerror fires don't pile up
+      // multiple checks for the same source.
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(function () {
+        reconnectTimer = null;
+        if (!evtSource || evtSource.readyState === EventSource.CLOSED) {
+          scheduleReconnect();
+        }
+      }, 5000);
     };
     evtSource.onmessage = function (event) {
       // Capture lastEventId BEFORE JSON.parse so a malformed event

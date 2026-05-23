@@ -1489,21 +1489,35 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                 replay_status,
                 lost_count,
                 earliest_available_id,
+                snapshot,
             ) = ui_base.register_listener_with_replay(last_event_id)
             if replay_status == "truncated":
-                # Capture the snapshot too — it's the recovery floor
-                # when the buffer can't fill the gap.  Listener is
-                # already registered by ``register_listener_with_replay``;
-                # take the snapshot bits only.
-                with ui_base._ws_lock:  # noqa: SLF001 — same-module-level access pattern
-                    captured_content = "".join(ui_base._ws_inflight_content)  # noqa: SLF001
-                    captured_reasoning = "".join(ui_base._ws_inflight_reasoning)  # noqa: SLF001
-                in_progress_snap = {
-                    "content": captured_content,
-                    "reasoning": captured_reasoning,
-                    "seq": 0,  # not used on truncated path; fresh-style yields don't filter
-                }
+                # Truncated → emit ``replay_truncated`` envelope, then
+                # the snapshot is the recovery floor.  ``snap_seq``
+                # MUST come from the snapshot capture (not 0), because
+                # writers can race between
+                # ``register_listener_with_replay`` returning and our
+                # first live-drain read: any token event landing in
+                # the listener queue between registration and the
+                # captured ``_event_id`` is ALSO covered by the
+                # snapshot's content/reasoning text, and would
+                # double-render without the ``_seq <= snap_seq`` dedup
+                # filter on the live path.  The helper captured both
+                # under the same nested-lock acquire, so this
+                # ``snap_seq`` is exactly the high-water mark
+                # corresponding to the snapshot text.
+                in_progress_snap = snapshot
+                snap_seq = snapshot["seq"]
             else:
+                # ``replay_ok``: the buffered events ARE the partial
+                # token stream (no separate snapshot needed); the
+                # synthetic snapshot/state_change/history emission is
+                # skipped by the events handler.  No live-dedup
+                # filtering required because the buffered events
+                # themselves are the cutoff — anything past
+                # ``buffered[-1]._event_id`` is genuinely new live
+                # traffic that lands in the listener queue after the
+                # buffer snapshot.
                 in_progress_snap = {"content": "", "reasoning": "", "seq": 0}
 
         # Per-kind executor for the blocking ``client_queue.get``
