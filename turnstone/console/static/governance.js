@@ -929,6 +929,7 @@ const _SKILL_FIELD_MAP = {
   license: "skill-license",
   compatibility: "skill-compatibility",
   allowed_tools: "csk-allowed-tools",
+  paths: "skill-paths",
 };
 
 // Inflight paste-parse fetch — referenced from hideCreateTemplateModal so a
@@ -989,6 +990,8 @@ function _applyParsedSkill(parsed, contentTextarea, fieldMap) {
     _apply(fieldMap.compatibility, parsed.compatibility);
   if (parsed.allowed_tools && parsed.allowed_tools.length)
     _apply(fieldMap.allowed_tools, parsed.allowed_tools.join(", "));
+  if (parsed.paths && parsed.paths.length)
+    _apply(fieldMap.paths, parsed.paths.join(", "));
 
   return { filled: filled, skipped: skipped };
 }
@@ -1116,6 +1119,7 @@ function showCreateTemplateModal() {
   document.getElementById("skill-version").value = "";
   document.getElementById("skill-license").value = "";
   document.getElementById("skill-compatibility").value = "";
+  document.getElementById("skill-paths").value = "";
   document.getElementById("skill-activation").value = "named";
   const ctmContent = document.getElementById("ctm-content");
   ctmContent.value = "";
@@ -1248,6 +1252,12 @@ function submitCreateTemplate() {
   const csVersion = (
     document.getElementById("skill-version").value || ""
   ).trim();
+  const csPathsArr = (document.getElementById("skill-paths").value || "")
+    .split(",")
+    .map(function (p) {
+      return p.trim();
+    })
+    .filter(Boolean);
   const createBody = {
     name: name,
     category: document.getElementById("ctm-category").value,
@@ -1272,6 +1282,7 @@ function submitCreateTemplate() {
     token_budget: csBudget ? parseInt(csBudget, 10) : 0,
     agent_max_turns: csMaxTurns ? parseInt(csMaxTurns, 10) : null,
     allowed_tools: JSON.stringify(csAllowedArr),
+    paths: JSON.stringify(csPathsArr),
     notify_on_complete: csNotifyVal,
     enabled: document.getElementById("csk-enabled").checked,
   };
@@ -1367,6 +1378,14 @@ function showEditTemplateModal(tmplId) {
   document.getElementById("etm-version").value = tmpl.version || "";
   document.getElementById("etm-license").value = tmpl.license || "";
   document.getElementById("etm-compatibility").value = tmpl.compatibility || "";
+  let pathsDisplay = "";
+  try {
+    const pathsList = JSON.parse(tmpl.paths || "[]");
+    pathsDisplay = pathsList.join(", ");
+  } catch (e) {
+    pathsDisplay = tmpl.paths || "";
+  }
+  document.getElementById("etm-paths").value = pathsDisplay;
   document.getElementById("etm-activation").value = tmpl.activation || "named";
   document.getElementById("etm-content").value = tmpl.content;
   _updateVarsDisplay("etm-content", "etm-variables");
@@ -1563,6 +1582,7 @@ function showEditTemplateModal(tmplId) {
     "etm-version",
     "etm-license",
     "etm-compatibility",
+    "etm-paths",
     "etm-activation",
     "etm-content",
     "etm-default",
@@ -1993,6 +2013,12 @@ function submitEditTemplate() {
   }
   document.getElementById("etm-submit").disabled = true;
   const esVersion = (document.getElementById("etm-version").value || "").trim();
+  const esPathsArr = (document.getElementById("etm-paths").value || "")
+    .split(",")
+    .map(function (p) {
+      return p.trim();
+    })
+    .filter(Boolean);
   const updateBody = {
     name: document.getElementById("etm-name").value.trim(),
     category: document.getElementById("etm-category").value,
@@ -2005,6 +2031,7 @@ function submitEditTemplate() {
     compatibility: (
       document.getElementById("etm-compatibility").value || ""
     ).trim(),
+    paths: JSON.stringify(esPathsArr),
     activation: document.getElementById("etm-activation").value,
     content: content,
     variables: JSON.stringify(varList),

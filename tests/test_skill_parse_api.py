@@ -85,6 +85,7 @@ author: Test Author
 version: 2.0.0
 tags: [python, review, quality]
 allowed-tools: [read_file, list_directory]
+paths: ["**/*.py", "src/api/**"]
 license: MIT
 compatibility: ">=0.7"
 ---
@@ -114,6 +115,7 @@ class TestParseSkill:
         assert data["version"] == "2.0.0"
         assert data["tags"] == ["python", "review", "quality"]
         assert data["allowed_tools"] == ["read_file", "list_directory"]
+        assert data["paths"] == ["**/*.py", "src/api/**"]
         assert data["license"] == "MIT"
         assert data["compatibility"] == ">=0.7"
         assert "# Code Review" in data["content"]
@@ -134,6 +136,7 @@ class TestParseSkill:
         assert data["version"] == "1.0.0"
         assert data["tags"] == []
         assert data["allowed_tools"] == []
+        assert data["paths"] == []
         assert data["license"] == ""
 
     def test_anthropic_nested_metadata_tags(self, client: TestClient) -> None:

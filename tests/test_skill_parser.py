@@ -239,6 +239,62 @@ Content.
         assert result.allowed_tools == []
 
 
+class TestPaths:
+    """Anthropic Claude Code spec ``paths:`` — glob patterns gating autoload."""
+
+    def test_list_format(self) -> None:
+        raw = """\
+---
+name: paths-list
+paths: ["**/*.py", "packages/api/**"]
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.paths == ["**/*.py", "packages/api/**"]
+
+    def test_comma_separated_string(self) -> None:
+        """Spec accepts comma-separated string OR YAML list."""
+        raw = """\
+---
+name: paths-csv
+paths: "**/*.py, packages/api/**"
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.paths == ["**/*.py", "packages/api/**"]
+
+    def test_empty_paths(self) -> None:
+        raw = """\
+---
+name: no-paths
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.paths == []
+
+    def test_paths_with_full_frontmatter(self) -> None:
+        """``paths`` round-trips alongside the other spec fields."""
+        raw = """\
+---
+name: full
+description: Has every field
+allowed-tools: [bash]
+paths: ["**/*.md"]
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.allowed_tools == ["bash"]
+        assert result.paths == ["**/*.md"]
+
+
 class TestValidateSkillName:
     """Name validation edge cases."""
 

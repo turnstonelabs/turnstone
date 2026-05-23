@@ -181,6 +181,11 @@ SKILL_MUTABLE = frozenset(
         "scan_report",
         "priority",
         "kind",
+        # Anthropic spec uplift (migration 056)
+        "paths",
+        "hidden_from_menu",
+        "arguments",
+        "argument_hint",
     }
 )
 STRUCTURED_MEMORY_MUTABLE = frozenset({"content", "description", "type"})

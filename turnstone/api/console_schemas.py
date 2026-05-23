@@ -329,6 +329,15 @@ class SkillInfo(BaseModel):
     risk_level: str = ""
     scan_report: str = "{}"
     scan_version: str = ""
+    # Anthropic spec uplift (migration 056).  JSON-array strings on
+    # the wire to match the shape of ``allowed_tools`` /
+    # ``notify_on_complete``; admin UI parses client-side.  Consumer
+    # PRs (#569 filter, #571 menu hide, #572 substitution) will wire
+    # each of these to runtime behaviour.
+    paths: str = "[]"
+    hidden_from_menu: bool = False
+    arguments: str = "[]"
+    argument_hint: str = ""
     resource_count: int = 0
     created: str
     updated: str
@@ -369,6 +378,18 @@ class CreateSkillRequest(BaseModel):
     allowed_tools: str = "[]"
     license: str = ""
     compatibility: str = ""
+    # Anthropic spec ``paths:`` — glob patterns gating autoload.
+    # Accepts either a JSON-array string or a list; the admin handler
+    # canonicalizes via ``_canonicalize_skill_string_list``.  The
+    # filter consumer lands in a follow-up PR (#569).
+    #
+    # ``hidden_from_menu`` / ``arguments`` / ``argument_hint`` columns
+    # exist on the row (migration 056) and surface in ``SkillInfo`` for
+    # read, but the create/update handlers don't read them yet — the
+    # consumer PRs (#571, #572) will add their input branches.  Keeping
+    # them off the request schemas avoids advertising a writable field
+    # the handler silently ignores.
+    paths: str | list[str] = "[]"
     kind: SkillKind = Field(
         default=SkillKind.ANY,
         description=(
@@ -418,6 +439,11 @@ class UpdateSkillRequest(BaseModel):
     allowed_tools: str | None = None
     license: str | None = None
     compatibility: str | None = None
+    # Anthropic spec ``paths:``.  ``hidden_from_menu`` / ``arguments``
+    # / ``argument_hint`` are deliberately absent from the update
+    # schema until their consumer PRs (#571, #572) wire input branches
+    # — see ``CreateSkillRequest`` for the rationale.
+    paths: str | list[str] | None = None
     kind: SkillKind | None = Field(
         default=None,
         description=(
@@ -823,6 +849,7 @@ class ParseSkillResponse(BaseModel):
     allowed_tools: list[str] = Field(default_factory=list)
     license: str = ""
     compatibility: str = ""
+    paths: list[str] = Field(default_factory=list)
 
 
 class SkillInstallRequest(BaseModel):

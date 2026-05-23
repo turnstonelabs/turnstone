@@ -50,6 +50,11 @@ class ParsedSkill:
     allowed_tools: list[str] = field(default_factory=list)
     license: str = ""
     compatibility: str = ""
+    # Anthropic Claude Code spec ``paths:`` — glob patterns gating
+    # model-initiated autoload.  Filter consumer lands in a follow-up
+    # PR (issue #569); parsed here so the value round-trips through
+    # install / admin edit / export without loss.
+    paths: list[str] = field(default_factory=list)
     raw_frontmatter: dict[str, Any] = field(default_factory=dict)
 
 
@@ -242,5 +247,8 @@ def parse_skill_md(raw: str, *, lenient: bool = False) -> ParsedSkill | None:
         allowed_tools=_extract_list(meta, "allowed-tools"),
         license=_extract_str(meta, "license"),
         compatibility=compatibility,
+        # Spec accepts ``paths:`` as a comma-separated string or YAML
+        # list; ``_extract_list`` handles both shapes via ``_LIST_SPLIT_RE``.
+        paths=_extract_list(meta, "paths"),
         raw_frontmatter=meta,
     )
