@@ -19,18 +19,16 @@ Revises: 055
 Create Date: 2026-05-23
 
 Originally drafted as 056 alongside PR #574 (skill spec uplift); bumped
-to 057 (and re-pointed at 055, the current branch head) to keep the
-Alembic chain linear and migrateable standalone.  There is no ordering
-dependency between this migration and PR #574's 056 — output_assessments
-and prompt_templates are independent tables.  When #574 lands first,
-re-link down_revision to its actual revision number.
+to 057 after #574 landed first.  No ordering dependency between this
+migration and #574's 056 — output_assessments and prompt_templates are
+independent tables — but the chain must be linear.
 """
 
 import sqlalchemy as sa
 from alembic import op
 
 revision = "057"
-down_revision = "055"
+down_revision = "056"
 branch_labels = None
 depends_on = None
 
