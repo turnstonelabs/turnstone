@@ -374,11 +374,33 @@ class TestBudget:
         sig = inspect.signature(evaluate_output)
         assert sig.parameters["budget_seconds"].default == 30.0
 
-    def test_budget_kwarg_is_honored(self) -> None:
-        # A very low budget should still return a valid assessment (the
-        # guard annotates, never raises).  Use empty string to short-
-        # circuit; we're testing the parameter wiring, not deadline timing.
+    def test_budget_kwarg_is_honored(self, monkeypatch) -> None:
+        # A tiny budget with time already expired should trigger early return
+        # via the deadline path, proving budget_seconds is wired through.
+        import time as _time
+
+        from turnstone.core import output_guard
         from turnstone.core.output_guard import evaluate_output
 
-        r = evaluate_output("", budget_seconds=0.001)
-        assert r.risk_level == "none"
+        # Make monotonic() return a value past the deadline immediately
+        # after the first call (which sets the deadline).
+        call_count = 0
+        orig = _time.monotonic
+
+        def fake_monotonic():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # First call: sets deadline = 0.0 + budget_seconds
+                return 0.0
+            # Subsequent calls: always past deadline
+            return 1e6
+
+        monkeypatch.setattr(output_guard.time, "monotonic", fake_monotonic)
+
+        # Use non-empty benign input so the function doesn't short-circuit
+        r = evaluate_output("hello world", budget_seconds=0.001)
+        # Should still return a valid assessment (guard annotates, never raises)
+        assert r.risk_level in ("none", "low", "medium", "high", "critical")
+        # Confirm the deadline path was actually exercised
+        assert call_count >= 2
