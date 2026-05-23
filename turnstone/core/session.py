@@ -135,6 +135,7 @@ if TYPE_CHECKING:
     from turnstone.core.mcp_client import MCPClientManager
     from turnstone.core.model_registry import ModelConfig, ModelRegistry
     from turnstone.core.output_guard import OutputAssessment
+    from turnstone.core.output_guard_judge import OutputGuardJudge
     from turnstone.core.providers import (
         CompletionResult,
         LLMProvider,
@@ -683,6 +684,19 @@ class SessionUI(Protocol):
         """Called when the output guard detects risk signals in tool output."""
         ...
 
+    def record_output_assessment(
+        self,
+        call_id: str,
+        assessment: dict[str, Any],
+        *,
+        tier: str = "heuristic",
+        reasoning: str = "",
+        judge_model: str = "",
+        latency_ms: int = 0,
+    ) -> None:
+        """Persist one output-guard assessment row (one per ``(call_id, tier)``)."""
+        ...
+
 
 # ---------------------------------------------------------------------------
 # MCP dispatch helpers
@@ -971,6 +985,11 @@ class ChatSession:
         self._judge_config: JudgeConfig | None = judge_config
         self._judge: IntentJudge | None = None
         self._judge_cancel_event: threading.Event | None = None
+        # Output-guard LLM judge (lazy-initialized, issue #560 mitigation #1).
+        # Lives alongside ``_judge`` and is reset by the same client/model
+        # swap paths so both judges pick up new credentials.
+        self._output_guard_judge: OutputGuardJudge | None = None
+        self._output_guard_judge_cancel: threading.Event | None = None
         # MCP tool integration: merge external tools with built-in
         self._mcp_client = mcp_client
         self._mcp_refresh_cb: Any = None  # Callable | None (avoid import)
@@ -1708,9 +1727,11 @@ class ChatSession:
             # Recompute auto tool truncation for new context window
             if not self._manual_tool_truncation:
                 self.tool_truncation = int(new_cfg.context_window * self._chars_per_token * 0.5)
-        # Reset judge so it picks up the new model/provider
+        # Reset judges so they pick up the new model/provider
         if self._judge is not None:
             self._judge = None
+        if self._output_guard_judge is not None:
+            self._output_guard_judge = None
         self._init_system_messages()
         log.info(
             "session.model_updated ws=%s model=%s ctx=%d",
@@ -2112,6 +2133,7 @@ class ChatSession:
                 self._provider = self._registry.get_provider(saved_alias)
                 self._cached_capabilities = None
                 self._judge = None  # re-create with new client/model
+                self._output_guard_judge = None  # same — re-create
                 self.context_window = cfg.context_window
                 if not self._manual_tool_truncation:
                     self.tool_truncation = int(cfg.context_window * self._chars_per_token * 0.5)
@@ -4634,6 +4656,35 @@ class ChatSession:
             log.warning("judge.init_failed", exc_info=True)
         return self._judge
 
+    def _ensure_output_guard_judge(self) -> OutputGuardJudge | None:
+        """Lazily initialize the output-guard LLM judge if configured.
+
+        Re-checks the live ``output_guard_llm`` flag every call so toggling
+        the LLM stage via admin settings takes immediate effect on
+        existing sessions — same hot-reload semantics as
+        :meth:`_ensure_judge`.
+        """
+        jc = self._judge_cfg
+        if jc is None or not jc.output_guard_llm:
+            return None
+        if self._output_guard_judge is not None:
+            return self._output_guard_judge
+        if self._judge_config is None:
+            return None
+        try:
+            from turnstone.core.output_guard_judge import OutputGuardJudge
+
+            self._output_guard_judge = OutputGuardJudge(
+                config=jc,
+                session_provider=self._provider,
+                session_client=self.client,
+                session_model=self.model,
+                model_registry=self._registry,
+            )
+        except Exception:
+            log.warning("output_guard_judge.init_failed", exc_info=True)
+        return self._output_guard_judge
+
     def _evaluate_intent(
         self,
         items: list[dict[str, Any]],
@@ -4817,11 +4868,17 @@ class ChatSession:
     ) -> tuple[str, OutputAssessment | None]:
         """Run the output guard on tool result text.
 
-        Returns ``(possibly_sanitized_output, assessment)``.  The assessment
-        is ``None`` when risk_level is ``"none"``.  Surfaces warnings via
-        ``ui.on_output_warning`` and logs at debug level.
+        Two stages.  The heuristic regex stage always runs; the LLM judge
+        (issue #560 mitigation #1) runs when ``judge.output_guard_llm``
+        is enabled.  When both run and the LLM succeeds, the LLM verdict
+        is the *acted* assessment (informs redaction + UI + return);
+        otherwise the heuristic stands.  Both tier rows are persisted
+        whenever the LLM ran, for audit completeness.
+
+        Returns ``(possibly_sanitized_output, acted_assessment)``.  The
+        acted assessment is ``None`` when its risk_level is ``"none"``.
         """
-        from turnstone.core.output_guard import evaluate_output
+        from turnstone.core.output_guard import OutputAssessment, evaluate_output
 
         og_patterns = None
         rule_reg = self._rule_registry
@@ -4829,35 +4886,125 @@ class ChatSession:
             og_patterns = rule_reg.output_patterns
         jc = self._judge_cfg
         budget = jc.output_guard_budget_seconds if jc is not None else 30.0
-        assessment = evaluate_output(
+        heuristic = evaluate_output(
             output,
             func_name=func_name,
             call_id=call_id,
             budget_seconds=budget,
             patterns=og_patterns,
         )
-        if assessment.risk_level == "none":
+
+        # Stage 2: LLM judge (opt-in, capability-gated).  When it runs
+        # successfully the LLM verdict overrides the regex verdict; on
+        # disable/error/timeout the heuristic stands.
+        llm_judge = self._ensure_output_guard_judge()
+        llm_verdict = None
+        if llm_judge is not None:
+            cancel = self._output_guard_judge_cancel
+            try:
+                llm_verdict = llm_judge.evaluate(
+                    output,
+                    func_name=func_name,
+                    call_id=call_id,
+                    cancel_event=cancel,
+                )
+            except Exception:
+                log.warning("output_guard_judge.evaluate_raised", exc_info=True)
+                llm_verdict = None
+
+        output_len = len(output)
+
+        # Acted assessment: LLM verdict when usable, else heuristic.
+        # The LLM's flags + reasoning become the acted assessment's
+        # flags + annotations; sanitized stays from the regex stage
+        # because secret redaction is a regex-only concern.
+        if llm_verdict is not None and llm_verdict.succeeded:
+            acted = OutputAssessment(
+                flags=list(llm_verdict.flags),
+                risk_level=llm_verdict.risk_level,
+                annotations=[llm_verdict.reasoning] if llm_verdict.reasoning else [],
+                sanitized=heuristic.sanitized,
+            )
+        else:
+            acted = heuristic
+
+        # Persistence: when the LLM ran (regardless of success), record
+        # both rows so audit can see when verdicts diverged.  When the
+        # LLM was disabled / not configured, only the heuristic row is
+        # recorded (and only when risk!="none", to keep the table from
+        # filling with clean evaluations).
+        if llm_judge is not None:
+            self._record_output_tier(call_id, func_name, output_len, heuristic, tier="heuristic")
+            if llm_verdict is not None and llm_verdict.succeeded:
+                self._record_output_tier(
+                    call_id,
+                    func_name,
+                    output_len,
+                    acted,
+                    tier="llm",
+                    reasoning=llm_verdict.reasoning,
+                    judge_model=llm_verdict.judge_model,
+                    latency_ms=llm_verdict.latency_ms,
+                )
+
+        if acted.risk_level == "none":
             return output, None
 
         log.debug(
             "output_guard.flagged",
             call_id=call_id,
             func_name=func_name,
-            risk=assessment.risk_level,
-            flags=assessment.flags,
+            risk=acted.risk_level,
+            flags=acted.flags,
+            tier="llm" if (llm_verdict is not None and llm_verdict.succeeded) else "heuristic",
         )
         try:
-            d = assessment.to_dict()  # excludes sanitized by default
+            d = acted.to_dict()  # excludes sanitized by default
             d["func_name"] = func_name
-            d["output_length"] = len(output)
-            d["redacted"] = assessment.sanitized is not None
+            d["output_length"] = output_len
+            d["redacted"] = acted.sanitized is not None
             self.ui.on_output_warning(call_id, d)
+            # Legacy persistence path: when the LLM stage did NOT run,
+            # nothing has been recorded yet — fire the storage write
+            # here so the heuristic row still lands (parity with
+            # pre-LLM behavior).
+            if llm_judge is None:
+                self.ui.record_output_assessment(call_id, d, tier="heuristic")
         except Exception:
             log.debug("output_guard.callback_failed", exc_info=True)
 
-        if assessment.sanitized is not None and jc is not None and jc.redact_secrets:
-            return assessment.sanitized, assessment
-        return output, assessment
+        if acted.sanitized is not None and jc is not None and jc.redact_secrets:
+            return acted.sanitized, acted
+        return output, acted
+
+    def _record_output_tier(
+        self,
+        call_id: str,
+        func_name: str,
+        output_length: int,
+        assessment: OutputAssessment,
+        *,
+        tier: str,
+        reasoning: str = "",
+        judge_model: str = "",
+        latency_ms: int = 0,
+    ) -> None:
+        """Persist one ``(call_id, tier)`` row via the UI's storage hook."""
+        try:
+            d = assessment.to_dict()
+            d["func_name"] = func_name
+            d["output_length"] = output_length
+            d["redacted"] = assessment.sanitized is not None
+            self.ui.record_output_assessment(
+                call_id,
+                d,
+                tier=tier,
+                reasoning=reasoning,
+                judge_model=judge_model,
+                latency_ms=latency_ms,
+            )
+        except Exception:
+            log.debug("output_guard.record_failed", exc_info=True)
 
     def _guard_subagent_synthesis(self, content: str, label: str) -> str:
         """Run output_guard on a sub-agent's final synthesis text.
