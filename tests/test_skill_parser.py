@@ -295,6 +295,114 @@ Content.
         assert result.paths == ["**/*.md"]
 
 
+class TestWhenToUse:
+    """Anthropic spec ``when_to_use:`` — appended to description at parse time."""
+
+    def test_appended_to_description(self) -> None:
+        raw = """\
+---
+name: with-when
+description: Base description.
+when_to_use: when the user asks about X
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.when_to_use == "when the user asks about X"
+        assert result.description == (
+            "Base description.\n\nWhen to use: when the user asks about X"
+        )
+
+    def test_when_to_use_appends_to_body_fallback_description(self) -> None:
+        """Without an explicit ``description``, the parser falls back to the
+        first body line, then ``when_to_use`` appends to that.  Documents
+        the layering — when_to_use is *additional* trigger context, never
+        a replacement for description."""
+        raw = """\
+---
+name: when-only
+when_to_use: trigger phrase
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.when_to_use == "trigger phrase"
+        assert result.description == "Content.\n\nWhen to use: trigger phrase"
+
+    def test_missing_when_to_use(self) -> None:
+        raw = """\
+---
+name: no-when
+description: Just a description.
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.when_to_use == ""
+        assert result.description == "Just a description."
+
+    def test_concat_truncated_at_1536(self) -> None:
+        """Combined description + when_to_use is capped at the spec's 1536-char budget."""
+        long_desc = "A" * 1000
+        long_when = "B" * 1000
+        raw = f"""\
+---
+name: long
+description: {long_desc}
+when_to_use: {long_when}
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert len(result.description) == 1536
+        # The truncation keeps the description prefix; when_to_use is what gets clipped.
+        assert result.description.startswith("A" * 1000)
+
+
+class TestModelAndEffort:
+    """Anthropic spec ``model:`` / ``effort:`` — per-skill overrides."""
+
+    def test_model_extracted(self) -> None:
+        raw = """\
+---
+name: with-model
+model: claude-opus-4-7
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.model == "claude-opus-4-7"
+
+    def test_effort_extracted(self) -> None:
+        raw = """\
+---
+name: with-effort
+effort: high
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.effort == "high"
+
+    def test_both_default_empty(self) -> None:
+        raw = """\
+---
+name: bare
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.model == ""
+        assert result.effort == ""
+
+
 class TestValidateSkillName:
     """Name validation edge cases."""
 
@@ -482,10 +590,10 @@ Content.
 
 
 class TestStandardFieldLengths:
-    """Spec caps: description <= 1024, compatibility <= 500."""
+    """Spec caps: description <= 1536 (combined w/ when_to_use), compatibility <= 500."""
 
-    def test_description_truncated_at_1024(self) -> None:
-        long_desc = "x" * 1200
+    def test_description_truncated_at_1536(self) -> None:
+        long_desc = "x" * 1700
         raw = f"""\
 ---
 name: long-desc
@@ -495,7 +603,7 @@ description: "{long_desc}"
 Content.
 """
         result = parse_skill_md(raw)
-        assert len(result.description) == 1024
+        assert len(result.description) == 1536
 
     def test_compatibility_truncated_at_500(self) -> None:
         long_compat = "y" * 600

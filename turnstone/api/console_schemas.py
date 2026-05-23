@@ -7,6 +7,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from turnstone.core.skill_kind import SkillKind
+from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
 
 # ---------------------------------------------------------------------------
 # Cluster overview
@@ -349,7 +350,7 @@ class CreateSkillRequest(BaseModel):
     category: str = "general"
     description: str = Field(
         min_length=1,
-        max_length=1024,
+        max_length=MAX_SKILL_DESCRIPTION_LEN,
         description=(
             "Human-readable description surfaced by the ``skills`` "
             "find/get tool and the admin UI.  Must be non-empty — "
@@ -414,7 +415,7 @@ class UpdateSkillRequest(BaseModel):
     description: str | None = Field(
         default=None,
         min_length=1,
-        max_length=1024,
+        max_length=MAX_SKILL_DESCRIPTION_LEN,
         description=(
             "When present, replaces the skill description.  Must be "
             "non-empty — the admin endpoint rejects a blanking update."
@@ -850,6 +851,13 @@ class ParseSkillResponse(BaseModel):
     license: str = ""
     compatibility: str = ""
     paths: list[str] = Field(default_factory=list)
+    # Anthropic spec extras (#570).  ``when_to_use`` is already
+    # concatenated into ``description``; surfaced separately so the
+    # admin parse-preview UI can show what the source SKILL.md
+    # provided in each field.
+    when_to_use: str = ""
+    model: str = ""
+    effort: str = ""
 
 
 class SkillInstallRequest(BaseModel):

@@ -86,6 +86,9 @@ version: 2.0.0
 tags: [python, review, quality]
 allowed-tools: [read_file, list_directory]
 paths: ["**/*.py", "src/api/**"]
+when_to_use: when the user asks to review code
+model: claude-opus-4-7
+effort: high
 license: MIT
 compatibility: ">=0.7"
 ---
@@ -110,12 +113,19 @@ class TestParseSkill:
         assert resp.status_code == 200
         data = resp.json()
         assert data["name"] == "code-review"
-        assert data["description"] == "Automated code review skill"
+        # ``when_to_use`` is concatenated into description by the parser;
+        # the separate ``when_to_use`` field below shows the raw source.
+        assert data["description"] == (
+            "Automated code review skill\n\nWhen to use: when the user asks to review code"
+        )
         assert data["author"] == "Test Author"
         assert data["version"] == "2.0.0"
         assert data["tags"] == ["python", "review", "quality"]
         assert data["allowed_tools"] == ["read_file", "list_directory"]
         assert data["paths"] == ["**/*.py", "src/api/**"]
+        assert data["when_to_use"] == "when the user asks to review code"
+        assert data["model"] == "claude-opus-4-7"
+        assert data["effort"] == "high"
         assert data["license"] == "MIT"
         assert data["compatibility"] == ">=0.7"
         assert "# Code Review" in data["content"]
@@ -137,6 +147,9 @@ class TestParseSkill:
         assert data["tags"] == []
         assert data["allowed_tools"] == []
         assert data["paths"] == []
+        assert data["when_to_use"] == ""
+        assert data["model"] == ""
+        assert data["effort"] == ""
         assert data["license"] == ""
 
     def test_anthropic_nested_metadata_tags(self, client: TestClient) -> None:

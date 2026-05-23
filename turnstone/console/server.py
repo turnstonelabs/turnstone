@@ -79,6 +79,7 @@ from turnstone.core.session_routes import (
 )
 from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS
 from turnstone.core.skill_kind import SkillKind
+from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
 from turnstone.core.web_helpers import (
     read_json_or_400,
     require_storage_or_503,
@@ -6649,7 +6650,7 @@ async def admin_create_skill(request: Request) -> JSONResponse:
     name = str(body.get("name") or "").strip()[:256]
     content = str(body.get("content") or "").strip()[:32768]
     category = str(body.get("category") or "general").strip()[:64]
-    description = str(body.get("description") or "").strip()[:1024]
+    description = str(body.get("description") or "").strip()[:MAX_SKILL_DESCRIPTION_LEN]
     try:
         kind = SkillKind(str(body.get("kind") or "any").strip().lower()).value
     except ValueError:
@@ -6801,7 +6802,7 @@ async def admin_update_skill(request: Request) -> JSONResponse:
         # cannot blank it out — and ``null`` is treated the same as
         # blank so it can't coerce to the literal string "None".
         raw_description = body["description"]
-        new_description = str(raw_description or "").strip()[:1024]
+        new_description = str(raw_description or "").strip()[:MAX_SKILL_DESCRIPTION_LEN]
         if not new_description:
             return JSONResponse({"error": "description must not be empty"}, status_code=400)
         updates["description"] = new_description
@@ -7545,6 +7546,12 @@ async def admin_parse_skill(request: Request) -> JSONResponse:
             "license": parsed.license,
             "compatibility": parsed.compatibility,
             "paths": list(parsed.paths),
+            # ``when_to_use`` is already concatenated into
+            # ``description``; surface it separately too so the admin
+            # parse-preview UI can show what came from where.
+            "when_to_use": parsed.when_to_use,
+            "model": parsed.model,
+            "effort": parsed.effort,
         }
     )
 
@@ -7776,6 +7783,14 @@ async def admin_skill_install(request: Request) -> JSONResponse:
                 token_estimate=token_estimate,
                 allowed_tools=allowed_tools_str,
                 paths=paths_str,
+                # Anthropic spec ``model:`` + ``effort:`` — seed the
+                # corresponding ``model`` / ``reasoning_effort`` columns
+                # at install time so the SKILL.md author's intent
+                # survives the import.  Only fires on initial create —
+                # the same-name / same-source duplicate checks above
+                # protect admin-set values on re-install.
+                model=parsed.model,
+                reasoning_effort=parsed.effort,
             )
         except StorageConflictError as exc:
             # Genuine uniqueness/constraint violation racing past the

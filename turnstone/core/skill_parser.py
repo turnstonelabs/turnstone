@@ -32,8 +32,14 @@ _LIST_SPLIT_RE = re.compile(r"[\s,]+")
 # value contains an unquoted colon (the most common cross-client issue).
 _BARE_DESC_RE = re.compile(r"^(description:\s*)(.+)$", re.MULTILINE)
 
-# Field length caps from the Agent Skills specification.
-_MAX_DESCRIPTION_LEN = 1024
+# Field length caps.  ``MAX_SKILL_DESCRIPTION_LEN`` matches the
+# Anthropic Claude Code skill spec's combined ``description`` +
+# ``when_to_use`` listing budget (1,536 chars).  Exported (no leading
+# underscore) because the same cap must be enforced at every write
+# surface — Pydantic schemas, the admin HTTP handlers, and the
+# coordinator ``skills`` tool — and a magic number repeated in five
+# places is a desync waiting to happen.
+MAX_SKILL_DESCRIPTION_LEN = 1536
 _MAX_COMPATIBILITY_LEN = 500
 
 
@@ -55,6 +61,20 @@ class ParsedSkill:
     # PR (issue #569); parsed here so the value round-trips through
     # install / admin edit / export without loss.
     paths: list[str] = field(default_factory=list)
+    # Anthropic spec ``when_to_use:`` — additional trigger context for
+    # when the skill should be invoked.  Concatenated into
+    # ``description`` (capped at ``MAX_SKILL_DESCRIPTION_LEN``) so the model
+    # sees both in the listing; kept here separately for the admin
+    # parse-preview UI which surfaces it as its own field.
+    when_to_use: str = ""
+    # Anthropic spec ``model:`` and ``effort:`` — per-skill model
+    # override + reasoning effort.  Fields keep their spec names here
+    # for fidelity at the parser layer; the install handler translates
+    # ``effort`` → ``prompt_templates.reasoning_effort`` at the storage
+    # boundary.  Seeding fires only on initial create — re-install
+    # short-circuits at the source_url dedup so admin overrides survive.
+    model: str = ""
+    effort: str = ""
     raw_frontmatter: dict[str, Any] = field(default_factory=dict)
 
 
@@ -213,18 +233,36 @@ def parse_skill_md(raw: str, *, lenient: bool = False) -> ParsedSkill | None:
             first_line = first_line.lstrip("# ").strip()
         description = first_line[:256]
 
+    # Anthropic spec ``when_to_use:`` — appended to description so the
+    # model sees both signals on the listing.  Separated by a blank
+    # line + "When to use:" prefix; budgeted against the combined cap
+    # below so the truncation never lands inside the separator and
+    # leaves a dangling "When " or similar partial label.
+    when_to_use = _extract_str(meta, "when_to_use")
+    if when_to_use:
+        if description:
+            separator = "\n\nWhen to use: "
+            # Reserve room for at least one character of ``when_to_use``
+            # past the separator; below that, dropping the addition is
+            # cleaner than emitting a trailing-separator description.
+            available = MAX_SKILL_DESCRIPTION_LEN - len(description) - len(separator)
+            if available > 0:
+                description = f"{description}{separator}{when_to_use[:available]}"
+        else:
+            description = f"When to use: {when_to_use}"
+
     if not description and lenient:
         log.warning("skill_parser.no_description", name=name)
         return None
 
-    # Spec caps
-    if len(description) > _MAX_DESCRIPTION_LEN:
+    # Spec caps (description + when_to_use combined)
+    if len(description) > MAX_SKILL_DESCRIPTION_LEN:
         log.warning(
             "skill_parser.description_truncated",
             name=name,
             length=len(description),
         )
-        description = description[:_MAX_DESCRIPTION_LEN]
+        description = description[:MAX_SKILL_DESCRIPTION_LEN]
 
     raw_compat = meta.get("compatibility")
     compatibility = str(raw_compat).strip() if raw_compat is not None else ""
@@ -250,5 +288,8 @@ def parse_skill_md(raw: str, *, lenient: bool = False) -> ParsedSkill | None:
         # Spec accepts ``paths:`` as a comma-separated string or YAML
         # list; ``_extract_list`` handles both shapes via ``_LIST_SPLIT_RE``.
         paths=_extract_list(meta, "paths"),
+        when_to_use=when_to_use,
+        model=_extract_str(meta, "model"),
+        effort=_extract_str(meta, "effort"),
         raw_frontmatter=meta,
     )
