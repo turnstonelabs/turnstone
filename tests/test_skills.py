@@ -996,6 +996,44 @@ class TestSkillAPI:
         # Spec fields must remain unchanged
         assert data["content"] == "external content"
 
+    def test_update_skill_readonly_hidden_from_menu_allowed(self, api_client, api_storage):
+        """``hidden_from_menu`` is in SKILL_RUNTIME_CONFIG_FIELDS so an admin
+        can hide/unhide an installed (readonly) skill from the user picker
+        without unlocking the row.  Pins the load-bearing invariant the
+        ``skill_field_validation`` comment depends on — a future refactor
+        that drops the field from runtime-config would silently break
+        admin's ability to toggle this on installed skills."""
+        _create_template(
+            api_storage,
+            "s1",
+            "installed-skill",
+            "external content",
+            origin="source",
+            readonly=True,
+        )
+        # Default after install: visible.  Verified via direct storage
+        # read rather than a GET — the api_client fixture doesn't wire
+        # the GET-by-id route.
+        assert api_storage.get_prompt_template("s1")["hidden_from_menu"] is False
+
+        # Hide.
+        resp = api_client.put(
+            "/v1/api/admin/skills/s1",
+            json={"hidden_from_menu": True},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["hidden_from_menu"] is True
+        # Spec/content fields untouched.
+        assert resp.json()["content"] == "external content"
+
+        # Unhide round-trips back.
+        resp = api_client.put(
+            "/v1/api/admin/skills/s1",
+            json={"hidden_from_menu": False},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["hidden_from_menu"] is False
+
     def test_update_skill_readonly_mixed_body_filters_spec(self, api_client, api_storage):
         """When JS sends all fields for a readonly skill, spec fields are silently dropped."""
         _create_template(
@@ -1789,6 +1827,39 @@ class TestSkillAdminEndpoints:
         names = [s["name"] for s in resp.json()["skills"]]
         assert "enabled-skill" in names
         assert "disabled-skill" not in names
+
+    def test_list_skills_summary_excludes_hidden_from_menu(self, full_api_client, full_api_storage):
+        """GET /v1/api/skills excludes skills with ``hidden_from_menu=true``.
+
+        The admin Skills tab (``/v1/api/admin/skills``) still returns them
+        — the filter only applies to the user-facing picker.
+        """
+        full_api_client.post(
+            "/v1/api/admin/skills",
+            json={"name": "visible-skill", "content": "content", "description": "v"},
+        )
+        full_api_client.post(
+            "/v1/api/admin/skills",
+            json={
+                "name": "hidden-skill",
+                "content": "content",
+                "description": "h",
+                "hidden_from_menu": True,
+            },
+        )
+
+        # Picker filters out the hidden one.
+        resp = full_api_client.get("/v1/api/skills")
+        assert resp.status_code == 200
+        names = [s["name"] for s in resp.json()["skills"]]
+        assert "visible-skill" in names
+        assert "hidden-skill" not in names
+
+        # Admin tab still surfaces it.
+        admin_resp = full_api_client.get("/v1/api/admin/skills")
+        assert admin_resp.status_code == 200
+        admin_names = [s["name"] for s in admin_resp.json()["skills"]]
+        assert "hidden-skill" in admin_names
 
     def test_skill_version_history_via_api(self, full_api_client):
         """GET /v1/api/admin/skills/{id}/versions returns version history."""

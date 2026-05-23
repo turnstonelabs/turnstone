@@ -1430,36 +1430,14 @@ async def dashboard(request: Request) -> JSONResponse:
 
 async def list_skills_summary(request: Request) -> JSONResponse:
     """GET /v1/api/skills — list available skills (summary)."""
-    import json as _json
-
     from turnstone.core.storage._registry import get_storage
+    from turnstone.core.web_helpers import skill_summary_rows
 
     try:
         storage = get_storage()
     except Exception:
         return JSONResponse({"error": "Storage not available"}, status_code=503)
-    rows = storage.list_prompt_templates()
-    skills = []
-    for r in rows:
-        if not r.get("enabled", True):
-            continue
-        tags: list[str] = []
-        with contextlib.suppress(ValueError, TypeError):
-            tags = _json.loads(r.get("tags", "[]"))
-        skills.append(
-            {
-                "name": r["name"],
-                "category": r.get("category", ""),
-                "description": r.get("description", ""),
-                "tags": tags,
-                "is_default": r.get("is_default", False),
-                "activation": r.get("activation", "named"),
-                "origin": r.get("origin", "manual"),
-                "author": r.get("author", ""),
-                "version": r.get("version", "1.0.0"),
-            }
-        )
-    return JSONResponse({"skills": skills})
+    return JSONResponse({"skills": skill_summary_rows(storage)})
 
 
 async def list_available_models(request: Request) -> JSONResponse:

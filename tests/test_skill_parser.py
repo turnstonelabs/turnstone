@@ -403,6 +403,101 @@ Content.
         assert result.effort == ""
 
 
+class TestInvocationControl:
+    """Anthropic spec ``disable-model-invocation:`` + ``user-invocable:``."""
+
+    def test_disable_model_invocation_true(self) -> None:
+        raw = """\
+---
+name: model-blocked
+disable-model-invocation: true
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.disable_model_invocation is True
+        # ``user_invocable`` defaults to True (spec default).
+        assert result.user_invocable is True
+
+    def test_user_invocable_false(self) -> None:
+        raw = """\
+---
+name: hidden
+user-invocable: false
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.user_invocable is False
+        # ``disable_model_invocation`` defaults to False.
+        assert result.disable_model_invocation is False
+
+    def test_both_unset_uses_spec_defaults(self) -> None:
+        """Spec default: both invokers can use the skill."""
+        raw = """\
+---
+name: bare
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.disable_model_invocation is False
+        assert result.user_invocable is True
+
+    def test_string_true_false_accepted(self) -> None:
+        """YAML can quote bools; the parser accepts ``"true"``/``"false"``."""
+        raw = """\
+---
+name: quoted-bools
+disable-model-invocation: "true"
+user-invocable: "false"
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.disable_model_invocation is True
+        assert result.user_invocable is False
+
+    def test_yaml_int_accepted(self) -> None:
+        """YAML safe_load returns ``int`` for unquoted ``0``/``1``.  Without
+        explicit handling these silently fall back to defaults, dropping the
+        author's intent."""
+        raw = """\
+---
+name: int-bools
+disable-model-invocation: 1
+user-invocable: 0
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.disable_model_invocation is True
+        assert result.user_invocable is False
+
+    def test_quoted_yaml_1_1_variants(self) -> None:
+        """YAML 1.1 spellings — ``yes``/``no``/``on``/``off`` — survive
+        quoting.  Unquoted forms get coerced to bool by safe_load (covered
+        by ``test_disable_model_invocation_true``), but a quoted variant
+        is a plain string that needs the broader match table."""
+        raw = """\
+---
+name: yaml-11-quoted
+disable-model-invocation: "yes"
+user-invocable: "OFF"
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.disable_model_invocation is True
+        assert result.user_invocable is False
+
+
 class TestValidateSkillName:
     """Name validation edge cases."""
 

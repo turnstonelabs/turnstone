@@ -6687,6 +6687,12 @@ async def admin_create_skill(request: Request) -> JSONResponse:
     # ``arguments`` once #572 lands its consumer.
     paths_str = _canonicalize_skill_string_list(body.get("paths"))
 
+    # Anthropic spec ``user-invocable: false`` lands here as
+    # ``hidden_from_menu=true`` — the user-facing picker
+    # (``/v1/api/skills``) filters these out while the model still
+    # sees them.
+    hidden_from_menu = bool(body.get("hidden_from_menu", False))
+
     token_estimate = len(content) // 4 if content else 0
 
     # Session config fields via shared helper
@@ -6738,6 +6744,7 @@ async def admin_create_skill(request: Request) -> JSONResponse:
         priority=priority,
         kind=kind,
         paths=paths_str,
+        hidden_from_menu=hidden_from_menu,
         **session_fields,
     )
 
@@ -6849,6 +6856,8 @@ async def admin_update_skill(request: Request) -> JSONResponse:
         # UpdateSkillRequest's optional-None semantics.  See
         # ``_canonicalize_skill_string_list``.
         updates["paths"] = _canonicalize_skill_string_list(body["paths"])
+    if "hidden_from_menu" in body and body["hidden_from_menu"] is not None:
+        updates["hidden_from_menu"] = bool(body["hidden_from_menu"])
     if "priority" in body:
         try:
             updates["priority"] = max(-1000, min(1000, int(body["priority"] or 0)))
@@ -6946,35 +6955,12 @@ async def admin_list_skill_versions(request: Request) -> JSONResponse:
 
 async def list_skills_summary(request: Request) -> JSONResponse:
     """GET /v1/api/skills — list available skills (summary)."""
-    import json as _json
-
-    from turnstone.core.web_helpers import require_storage_or_503
+    from turnstone.core.web_helpers import require_storage_or_503, skill_summary_rows
 
     storage, err = require_storage_or_503(request)
     if err:
         return err
-    rows = storage.list_prompt_templates()
-    skills = []
-    for r in rows:
-        if not r.get("enabled", True):
-            continue
-        tags: list[str] = []
-        with contextlib.suppress(ValueError, TypeError):
-            tags = _json.loads(r.get("tags", "[]"))
-        skills.append(
-            {
-                "name": r["name"],
-                "category": r.get("category", ""),
-                "description": r.get("description", ""),
-                "tags": tags,
-                "is_default": r.get("is_default", False),
-                "activation": r.get("activation", "named"),
-                "origin": r.get("origin", "manual"),
-                "author": r.get("author", ""),
-                "version": r.get("version", "1.0.0"),
-            }
-        )
-    return JSONResponse({"skills": skills})
+    return JSONResponse({"skills": skill_summary_rows(storage)})
 
 
 async def admin_usage(request: Request) -> JSONResponse:
@@ -7552,6 +7538,12 @@ async def admin_parse_skill(request: Request) -> JSONResponse:
             "when_to_use": parsed.when_to_use,
             "model": parsed.model,
             "effort": parsed.effort,
+            # Invocation-control axes (#571).  Echoed back to the admin
+            # UI so the parse-preview can show what the source SKILL.md
+            # gated; the UI also uses ``user_invocable`` to pre-fill
+            # the ``hidden-from-menu`` checkbox on the create modal.
+            "disable_model_invocation": parsed.disable_model_invocation,
+            "user_invocable": parsed.user_invocable,
         }
     )
 
@@ -7760,6 +7752,15 @@ async def admin_skill_install(request: Request) -> JSONResponse:
         # operator doesn't control.
         skill_description = parsed.description.strip() or f"Skill: {parsed.name}"
 
+        # Anthropic invocation-control axes (#571).  The install
+        # default is ``activation="named"`` already (user invokes by
+        # name); ``disable-model-invocation: true`` reinforces that
+        # but doesn't change the install-time value.  The interesting
+        # axis is ``user-invocable: false`` which sets
+        # ``hidden_from_menu`` so the skill doesn't show up in the
+        # user-facing picker but stays available to the model.
+        install_hidden_from_menu = not parsed.user_invocable
+
         try:
             storage.create_prompt_template(
                 template_id=skill_id,
@@ -7783,6 +7784,7 @@ async def admin_skill_install(request: Request) -> JSONResponse:
                 token_estimate=token_estimate,
                 allowed_tools=allowed_tools_str,
                 paths=paths_str,
+                hidden_from_menu=install_hidden_from_menu,
                 # Anthropic spec ``model:`` + ``effort:`` — seed the
                 # corresponding ``model`` / ``reasoning_effort`` columns
                 # at install time so the SKILL.md author's intent

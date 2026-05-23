@@ -75,6 +75,26 @@ class ParsedSkill:
     # short-circuits at the source_url dedup so admin overrides survive.
     model: str = ""
     effort: str = ""
+    # Anthropic spec ``disable-model-invocation:`` and ``user-invocable:``
+    # — invocation-control axes.  Stored in raw spec shape on the
+    # dataclass; defaults match spec (both invokers can use the skill
+    # unless gated).
+    #
+    # ``user_invocable=False`` is the load-bearing one: the install
+    # handler derives ``hidden_from_menu=True`` from it, and
+    # ``list_skills_summary`` filters those rows out of the
+    # user-facing picker.  Round-trip works end to end.
+    #
+    # ``disable_model_invocation=True`` has NO install consumer today —
+    # Turnstone's install path hardcodes ``activation="named"`` already,
+    # so the spec field's intended translation is a no-op at create
+    # time.  We still parse it for fidelity (surface on the
+    # parse-preview UI, preserve in ``raw_frontmatter``) so an admin
+    # reviewing a SKILL.md sees what the author wrote.  If install
+    # ever supports a non-"named" default activation, this is the
+    # field that gates flipping back.
+    disable_model_invocation: bool = False
+    user_invocable: bool = True
     raw_frontmatter: dict[str, Any] = field(default_factory=dict)
 
 
@@ -118,6 +138,49 @@ def _extract_str(meta: dict[str, Any], key: str, default: str = "") -> str:
         val = str(raw).strip() if raw is not None else ""
         if val:
             return val
+    return default
+
+
+_YAML_BOOL_TRUE = frozenset({"true", "yes", "on", "1"})
+_YAML_BOOL_FALSE = frozenset({"false", "no", "off", "0"})
+
+
+def _extract_bool(meta: dict[str, Any], key: str, *, default: bool) -> bool:
+    """Extract a boolean field from frontmatter.
+
+    Accepts every shape a YAML 1.1 author or YAML library can plausibly
+    produce for a boolean value:
+
+    * Python ``bool`` — the natural unquoted ``true``/``false``/``yes``/
+      ``no``/``on``/``off`` (case-insensitive) coerced by ``safe_load``.
+    * Python ``int`` — unquoted ``1`` or ``0`` (``safe_load`` returns
+      ``int`` for these, not ``bool``).
+    * Python ``str`` — quoted variants (e.g. ``"true"``, ``"YES"``,
+      ``"off"``, ``"0"``) where the author wrapped the value to dodge
+      YAML interpretation.
+
+    Anything else (lists, dicts, unknown strings, ``None``) falls
+    back to *default*.  The asymmetry between quoted and unquoted
+    would silently drop the author's intent if we only matched the
+    canonical ``"true"`` / ``"false"`` pair (case study: ``/review``
+    on PR #571 caught this gap).
+    """
+    raw = meta.get(key)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, int):
+        # ``isinstance(True, int)`` is also True, but the bool branch
+        # above already handled that — anything reaching here is an
+        # actual int.  0 → False, anything else → True (mirrors YAML's
+        # broader "any non-zero is truthy" intuition, though strictly
+        # the spec accepts only 0/1).
+        return bool(raw)
+    if isinstance(raw, str):
+        lowered = raw.strip().lower()
+        if lowered in _YAML_BOOL_TRUE:
+            return True
+        if lowered in _YAML_BOOL_FALSE:
+            return False
     return default
 
 
@@ -291,5 +354,10 @@ def parse_skill_md(raw: str, *, lenient: bool = False) -> ParsedSkill | None:
         when_to_use=when_to_use,
         model=_extract_str(meta, "model"),
         effort=_extract_str(meta, "effort"),
+        # Anthropic invocation-control axes — spec defaults: model can
+        # autoload (disable-model-invocation=False) AND user can pick
+        # from the menu (user-invocable=True).
+        disable_model_invocation=_extract_bool(meta, "disable-model-invocation", default=False),
+        user_invocable=_extract_bool(meta, "user-invocable", default=True),
         raw_frontmatter=meta,
     )

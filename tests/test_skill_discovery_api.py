@@ -128,6 +128,8 @@ def _sample_package(
     source_url: str = "https://github.com/owner/repo",
     model: str = "",
     effort: str = "",
+    user_invocable: bool = True,
+    disable_model_invocation: bool = False,
 ) -> SkillPackage:
     return SkillPackage(
         listing=SkillListing(
@@ -148,6 +150,8 @@ def _sample_package(
             version="1.0.0",
             model=model,
             effort=effort,
+            user_invocable=user_invocable,
+            disable_model_invocation=disable_model_invocation,
         ),
         resources={"scripts/setup.sh": "#!/bin/bash\necho hello"},
     )
@@ -295,6 +299,42 @@ class TestSkillInstall:
         skill = resp.json()["installed"][0]
         assert skill["model"] == "claude-opus-4-7"
         assert skill["reasoning_effort"] == "high"
+
+    def test_install_user_invocable_false_sets_hidden_from_menu(self, client: TestClient) -> None:
+        """Anthropic spec ``user-invocable: false`` lands as
+        ``hidden_from_menu=true`` on the row.  The skill stays available
+        to the model but disappears from the user-facing picker."""
+        package = _sample_package(user_invocable=False)
+
+        with patch(
+            "turnstone.core.skill_sources.fetch_skill_from_github", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = package
+            resp = client.post(
+                "/v1/api/admin/skills/install",
+                json={"source": "github", "url": "https://github.com/owner/repo"},
+            )
+
+        assert resp.status_code == 200
+        skill = resp.json()["installed"][0]
+        assert skill["hidden_from_menu"] is True
+
+    def test_install_user_invocable_default_unhidden(self, client: TestClient) -> None:
+        """Spec default ``user-invocable: true`` leaves ``hidden_from_menu`` off."""
+        package = _sample_package()  # user_invocable=True (default)
+
+        with patch(
+            "turnstone.core.skill_sources.fetch_skill_from_github", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = package
+            resp = client.post(
+                "/v1/api/admin/skills/install",
+                json={"source": "github", "url": "https://github.com/owner/repo"},
+            )
+
+        assert resp.status_code == 200
+        skill = resp.json()["installed"][0]
+        assert skill["hidden_from_menu"] is False
 
     def test_install_no_model_or_effort_leaves_columns_empty(self, client: TestClient) -> None:
         """When the source SKILL.md has no model/effort, the columns

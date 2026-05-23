@@ -35,6 +35,12 @@ SKILL_RUNTIME_CONFIG_FIELDS: frozenset[str] = frozenset(
         "enabled",
         "notify_on_complete",
         "priority",
+        # ``hidden_from_menu`` is technically a SKILL.md spec field
+        # (mapped from ``user-invocable: false``) but admin override
+        # is a local UX preference — operators should be able to
+        # hide / unhide an installed skill in the picker without
+        # unlocking the row.  Same precedent as ``model`` / ``effort``.
+        "hidden_from_menu",
     }
 )
 

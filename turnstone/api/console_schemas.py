@@ -383,14 +383,16 @@ class CreateSkillRequest(BaseModel):
     # Accepts either a JSON-array string or a list; the admin handler
     # canonicalizes via ``_canonicalize_skill_string_list``.  The
     # filter consumer lands in a follow-up PR (#569).
-    #
-    # ``hidden_from_menu`` / ``arguments`` / ``argument_hint`` columns
-    # exist on the row (migration 056) and surface in ``SkillInfo`` for
-    # read, but the create/update handlers don't read them yet — the
-    # consumer PRs (#571, #572) will add their input branches.  Keeping
-    # them off the request schemas avoids advertising a writable field
-    # the handler silently ignores.
     paths: str | list[str] = "[]"
+    # Anthropic spec ``user-invocable: false`` lands here as
+    # ``hidden_from_menu=true`` (#571).  Hides the skill from the
+    # user-facing picker (``/v1/api/skills``) while keeping it
+    # available to the model.
+    hidden_from_menu: bool = False
+    # ``arguments`` / ``argument_hint`` columns still exist on the
+    # row (migration 056) and surface in ``SkillInfo`` for read, but
+    # the create/update handlers don't read them yet — #572 wires
+    # those input branches when its consumer lands.
     kind: SkillKind = Field(
         default=SkillKind.ANY,
         description=(
@@ -440,11 +442,12 @@ class UpdateSkillRequest(BaseModel):
     allowed_tools: str | None = None
     license: str | None = None
     compatibility: str | None = None
-    # Anthropic spec ``paths:``.  ``hidden_from_menu`` / ``arguments``
-    # / ``argument_hint`` are deliberately absent from the update
-    # schema until their consumer PRs (#571, #572) wire input branches
-    # — see ``CreateSkillRequest`` for the rationale.
+    # Anthropic spec ``paths:`` (#569 — filter consumer pending) and
+    # ``user-invocable: false`` mapped to ``hidden_from_menu=true``
+    # (#571).  ``arguments`` / ``argument_hint`` remain absent until
+    # #572 wires their consumer.
     paths: str | list[str] | None = None
+    hidden_from_menu: bool | None = None
     kind: SkillKind | None = Field(
         default=None,
         description=(
@@ -858,6 +861,12 @@ class ParseSkillResponse(BaseModel):
     when_to_use: str = ""
     model: str = ""
     effort: str = ""
+    # Invocation-control axes (#571).  The install handler derives
+    # ``hidden_from_menu`` from ``user_invocable`` at the storage
+    # boundary; these raw spec fields surface here so the admin UI
+    # can echo them on the parse-preview.
+    disable_model_invocation: bool = False
+    user_invocable: bool = True
 
 
 class SkillInstallRequest(BaseModel):

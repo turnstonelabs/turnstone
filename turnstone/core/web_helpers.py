@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -11,6 +12,53 @@ if TYPE_CHECKING:
     from starlette.middleware import Middleware
     from starlette.requests import Request
     from starlette.responses import JSONResponse
+
+
+def skill_summary_rows(storage: Any) -> list[dict[str, Any]]:
+    """Build the public picker payload for ``/v1/api/skills``.
+
+    Shared between ``turnstone/server.py`` (standalone node) and
+    ``turnstone/console/server.py`` (console-managed cluster), both of
+    which expose ``/v1/api/skills`` to user-facing UI.  Bodies were
+    character-identical before #571 added the ``hidden_from_menu``
+    filter — extraction here keeps the two surfaces from drifting on
+    every future spec-uplift field (#572's ``argument_hint`` for
+    autocomplete is the next likely caller).
+
+    Filters:
+    * ``enabled=False`` rows are dropped.
+    * ``hidden_from_menu=True`` rows are dropped (Anthropic spec
+      ``user-invocable: false`` — model still sees the skill via the
+      ``skills`` tool, but the user picker hides it).
+
+    Filtering happens in Python rather than SQL to match the
+    pre-existing ``enabled`` pattern; pushing to SQL would be a
+    separate change to ``list_prompt_templates``.
+    """
+    rows = storage.list_prompt_templates()
+    skills: list[dict[str, Any]] = []
+    for r in rows:
+        if not r.get("enabled", True):
+            continue
+        if r.get("hidden_from_menu"):
+            continue
+        tags: list[str] = []
+        with contextlib.suppress(ValueError, TypeError):
+            tags = json.loads(r.get("tags", "[]"))
+        skills.append(
+            {
+                "name": r["name"],
+                "category": r.get("category", ""),
+                "description": r.get("description", ""),
+                "tags": tags,
+                "is_default": r.get("is_default", False),
+                "activation": r.get("activation", "named"),
+                "origin": r.get("origin", "manual"),
+                "author": r.get("author", ""),
+                "version": r.get("version", "1.0.0"),
+            }
+        )
+    return skills
 
 
 async def read_json_or_400(request: Request) -> dict[str, Any] | JSONResponse:

@@ -89,6 +89,8 @@ paths: ["**/*.py", "src/api/**"]
 when_to_use: when the user asks to review code
 model: claude-opus-4-7
 effort: high
+disable-model-invocation: true
+user-invocable: false
 license: MIT
 compatibility: ">=0.7"
 ---
@@ -126,6 +128,8 @@ class TestParseSkill:
         assert data["when_to_use"] == "when the user asks to review code"
         assert data["model"] == "claude-opus-4-7"
         assert data["effort"] == "high"
+        assert data["disable_model_invocation"] is True
+        assert data["user_invocable"] is False
         assert data["license"] == "MIT"
         assert data["compatibility"] == ">=0.7"
         assert "# Code Review" in data["content"]
@@ -150,6 +154,9 @@ class TestParseSkill:
         assert data["when_to_use"] == ""
         assert data["model"] == ""
         assert data["effort"] == ""
+        # Spec defaults: model can autoload, user can pick.
+        assert data["disable_model_invocation"] is False
+        assert data["user_invocable"] is True
         assert data["license"] == ""
 
     def test_anthropic_nested_metadata_tags(self, client: TestClient) -> None:

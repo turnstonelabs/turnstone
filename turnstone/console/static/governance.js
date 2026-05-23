@@ -992,6 +992,19 @@ function _applyParsedSkill(parsed, contentTextarea, fieldMap) {
     _apply(fieldMap.allowed_tools, parsed.allowed_tools.join(", "));
   if (parsed.paths && parsed.paths.length)
     _apply(fieldMap.paths, parsed.paths.join(", "));
+  // ``user-invocable: false`` from the parsed SKILL.md flips the
+  // hidden-from-menu checkbox.  Boolean coercion — the parse response
+  // can return either ``true``/``false`` or omit the field.  Mirrors
+  // the apply rule for other fields: only fill, never override an
+  // existing user choice (a checkbox the admin already ticked stays
+  // ticked even if the parsed value disagrees).
+  if (parsed.user_invocable === false) {
+    const hidden = document.getElementById("skill-hidden-from-menu");
+    if (hidden && !hidden.checked) {
+      hidden.checked = true;
+      filled++;
+    }
+  }
 
   return { filled: filled, skipped: skipped };
 }
@@ -1120,6 +1133,7 @@ function showCreateTemplateModal() {
   document.getElementById("skill-license").value = "";
   document.getElementById("skill-compatibility").value = "";
   document.getElementById("skill-paths").value = "";
+  document.getElementById("skill-hidden-from-menu").checked = false;
   document.getElementById("skill-activation").value = "named";
   const ctmContent = document.getElementById("ctm-content");
   ctmContent.value = "";
@@ -1283,6 +1297,7 @@ function submitCreateTemplate() {
     agent_max_turns: csMaxTurns ? parseInt(csMaxTurns, 10) : null,
     allowed_tools: JSON.stringify(csAllowedArr),
     paths: JSON.stringify(csPathsArr),
+    hidden_from_menu: document.getElementById("skill-hidden-from-menu").checked,
     notify_on_complete: csNotifyVal,
     enabled: document.getElementById("csk-enabled").checked,
   };
@@ -1386,6 +1401,9 @@ function showEditTemplateModal(tmplId) {
     pathsDisplay = tmpl.paths || "";
   }
   document.getElementById("etm-paths").value = pathsDisplay;
+  document.getElementById("etm-hidden-from-menu").checked = Boolean(
+    tmpl.hidden_from_menu,
+  );
   document.getElementById("etm-activation").value = tmpl.activation || "named";
   document.getElementById("etm-content").value = tmpl.content;
   _updateVarsDisplay("etm-content", "etm-variables");
@@ -1596,7 +1614,11 @@ function showEditTemplateModal(tmplId) {
       el.removeAttribute("aria-describedby");
     }
   });
-  // Runtime config fields: always editable (local settings, not part of SKILL.md spec)
+  // Runtime config fields: always editable, even for readonly skills.
+  // Admins should be able to override these local-UX-ish values
+  // (model, effort, hidden-from-menu, ...) on installed skills
+  // without unlocking the row.  Must match SKILL_RUNTIME_CONFIG_FIELDS
+  // in turnstone/core/skill_field_validation.py.
   [
     "esk-model",
     "esk-temperature",
@@ -1606,6 +1628,7 @@ function showEditTemplateModal(tmplId) {
     "esk-agent-max-turns",
     "esk-auto-approve",
     "esk-enabled",
+    "etm-hidden-from-menu",
   ].forEach(function (id) {
     const el = document.getElementById(id);
     if (el) el.disabled = false;
@@ -2032,6 +2055,7 @@ function submitEditTemplate() {
       document.getElementById("etm-compatibility").value || ""
     ).trim(),
     paths: JSON.stringify(esPathsArr),
+    hidden_from_menu: document.getElementById("etm-hidden-from-menu").checked,
     activation: document.getElementById("etm-activation").value,
     content: content,
     variables: JSON.stringify(varList),
