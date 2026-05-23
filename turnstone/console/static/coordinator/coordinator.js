@@ -2011,6 +2011,17 @@
               /* noop */
             }
             evtSource = null;
+            // Cancel the pending CLOSED-state recovery timer (set
+            // below).  Without this, 5 s later the timer would
+            // observe ``!evtSource`` and call ``scheduleReconnect``,
+            // which would open a new EventSource that gets 401 again
+            // → infinite reconnect loop while the login overlay is
+            // up.  The login flow re-arms ``connectSSE`` after a
+            // successful sign-in via its own callback path.
+            if (reconnectTimer) {
+              clearTimeout(reconnectTimer);
+              reconnectTimer = null;
+            }
             showLogin("Session expired. Please sign in to reconnect.");
           }
         },
@@ -2027,7 +2038,8 @@
       // lastEventId via the URL query param, so replay still
       // works across the manual reconnect).  Cancel/replace the
       // existing timer so successive onerror fires don't pile up
-      // multiple checks for the same source.
+      // multiple checks for the same source.  The 401 branch above
+      // ALSO cancels this timer when it fires — see comment there.
       if (reconnectTimer) clearTimeout(reconnectTimer);
       reconnectTimer = setTimeout(function () {
         reconnectTimer = null;

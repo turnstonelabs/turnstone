@@ -1737,12 +1737,25 @@ class SessionUIBase:
         snapshot text up to the cap and then live tokens past it,
         with a visual gap equal to the past-cap chunk. No silent
         drop of subsequent tokens.
+
+        **Lock coupling**: ``_enqueue`` is called WHILE still
+        holding ``_ws_lock`` so the inflight append AND the
+        ``_event_id`` advancement happen atomically against a
+        snapshot reader.  Without this coupling a reader could
+        capture the inflight (with the new text) and read
+        ``_event_id`` BEFORE the writer's ``_enqueue`` bumped it,
+        producing a ``snap_seq`` lower than the new event's
+        ``_event_id``.  The new event would then slip past the
+        ``_seq <= snap_seq`` live-drain dedup and double-render
+        the text the snapshot already contained.  Acquisition
+        order ``_ws_lock`` (outer) → ``_listeners_lock`` (inner via
+        ``_enqueue``) matches the snapshot helpers, so no deadlock.
         """
         with self._ws_lock:
             if self._ws_inflight_reasoning_size < _MAX_TURN_CONTENT_CHARS:
                 self._ws_inflight_reasoning.append(text)
                 self._ws_inflight_reasoning_size += len(text)
-        self._enqueue({"type": "reasoning", "text": text})
+            self._enqueue({"type": "reasoning", "text": text})
 
     def on_content_token(self, text: str) -> None:
         """Append to both turn-content buffers (capped) + enqueue.
@@ -1758,18 +1771,23 @@ class SessionUIBase:
         is stamped by :meth:`_enqueue` against the per-ws
         ``_event_id`` counter, which advances on EVERY emit
         regardless of cap state — see :meth:`on_reasoning_token` for
-        the full rationale.
+        the full rationale, including why ``_enqueue`` runs while
+        still holding ``_ws_lock`` (the lock coupling that makes
+        ``snap_seq`` a true high-water mark for the snapshot text).
 
-        The cap-check + append + size-update run under ``_ws_lock``
-        so a concurrent
+        The cap-check + append + size-update + enqueue all run under
+        ``_ws_lock`` so a concurrent
         :meth:`snapshot_and_consume_state_payload` IDLE/ERROR drain or
         a concurrent :meth:`register_listener_with_in_progress_snapshot`
-        can't see a torn list mid-append. In production this is
-        single-writer-per-ws (the worker thread) but the snapshot
+        / :meth:`register_listener_with_replay` sees a consistent
+        ``(inflight_content, _event_id)`` pair.  In production this
+        is single-writer-per-ws (the worker thread) but the snapshot
         reader runs from coord's adapter via ``mgr.set_state``;
         without the lock the writer's append could land in an
-        orphaned list reference the snapshot just swapped out. Lock
-        hold is microseconds.
+        orphaned list reference the snapshot just swapped out, AND
+        the inflight/counter pair could de-sync.  Lock hold is
+        microseconds (the fan-out's ``put_nowait`` calls are O(N
+        listeners) but each is a single non-blocking enqueue).
         """
         with self._ws_lock:
             if self._ws_turn_content_size < _MAX_TURN_CONTENT_CHARS:
@@ -1778,7 +1796,7 @@ class SessionUIBase:
             if self._ws_inflight_content_size < _MAX_TURN_CONTENT_CHARS:
                 self._ws_inflight_content.append(text)
                 self._ws_inflight_content_size += len(text)
-        self._enqueue({"type": "content", "text": text})
+            self._enqueue({"type": "content", "text": text})
 
     def on_stream_end(self) -> None:
         with self._ws_lock:

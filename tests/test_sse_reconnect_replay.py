@@ -341,36 +341,129 @@ def test_truncated_path_snapshot_captures_real_snap_seq() -> None:
     assert "t9" in snap["content"]
 
 
-def test_truncated_path_filters_already_in_snapshot_tokens() -> None:
-    """End-to-end: a token landing in the listener queue between
-    ``register_listener_with_replay`` returning and the live drain's
-    first read must be filtered by the handler's
-    ``_seq <= snap_seq`` dedup, because its text is ALSO in the
-    snapshot we just emitted.  Without the snap_seq fix this test
-    would observe a duplicate live token after the snapshot."""
-    import collections
+def test_snap_seq_high_water_mark_holds_under_writer_race() -> None:
+    """Regression for PR #561 review comment 1.
+
+    The invariant: every token whose text appears in
+    ``snapshot["content"]`` (or ``"reasoning"``) must have its
+    ``_event_id`` <= ``snapshot["seq"]``.  Equivalently, any token
+    that fires AFTER the snapshot was captured must have
+    ``_event_id > snap_seq``.  Otherwise the events handler's
+    ``_seq <= snap_seq`` live-drain filter would let the new token
+    through AND its text would already be in the snapshot text →
+    double-render.
+
+    The pre-fix race: ``on_content_token`` took ``_ws_lock``,
+    appended to inflight, released ``_ws_lock``, then called
+    ``_enqueue`` (which bumps ``_event_id``).  A snapshot reader
+    interleaving between the release and the ``_enqueue`` would
+    capture inflight (with the new text) and read a STALE
+    ``_event_id``.  Snap_seq below new event's id → filter slips →
+    double-render.
+
+    The race window in plain Python is narrow (a few bytecodes
+    between lock release and the ``_enqueue`` call), so a pure
+    barrier-based race rarely hits it.  This test injects a
+    deterministic sleep into ``_enqueue`` via monkey-patch to
+    widen the window enough to be reliably observed under the
+    pre-fix code path — AND to be reliably AVOIDED under the
+    post-fix code path (because the post-fix
+    ``on_content_token`` calls ``_enqueue`` while still holding
+    ``_ws_lock``, so the snapshot reader can't acquire
+    ``_ws_lock`` until the writer is fully done).
+    """
+    import queue
+    import threading
+    import time
 
     ui = _make_ui()
-    ui._event_buffer = collections.deque(maxlen=3)
-    for i in range(10):
-        ui.on_content_token(f"t{i}")
-    lq, _, status, _, _, snap = ui.register_listener_with_replay(1)
-    assert status == "truncated"
-    captured_seq = snap["seq"]
-    # Simulate the race: at this point the listener queue already
-    # holds the buffered token events.  Drain them and confirm
-    # every one has ``_seq <= snap_seq`` — i.e. the handler's filter
-    # would correctly drop them.
+    marker = "RACE-MARKER"
+    original_enqueue = ui._enqueue
+
+    # Widen the race window: sleep just BEFORE the original
+    # ``_enqueue`` runs (which is where ``_event_id`` would advance).
+    # Post-fix this sleep happens while the writer still holds
+    # ``_ws_lock`` — readers block.  Pre-fix the writer has
+    # released ``_ws_lock`` before reaching this monkey-patch, so
+    # the reader gets a clean window to capture an inconsistent
+    # ``(inflight, _event_id)`` pair.
+    def slow_enqueue(data: dict[str, Any]) -> None:
+        time.sleep(0.05)  # 50 ms — orders of magnitude wider than the GIL switch interval
+        return original_enqueue(data)
+
+    ui._enqueue = slow_enqueue  # type: ignore[method-assign]
+
+    snap_box: dict[str, Any] = {}
+    writer_done = threading.Event()
+
+    def _writer() -> None:
+        ui.on_content_token(marker)
+        writer_done.set()
+
+    def _reader() -> None:
+        # Give the writer time to enter ``on_content_token`` and
+        # (pre-fix) release ``_ws_lock`` before the snapshot.  50 ms
+        # is conservative; 5 ms would also work in practice.
+        time.sleep(0.025)
+        _, _, _, _, _, snap = ui.register_listener_with_replay(0)
+        snap_box["snap"] = snap
+        snap_box["event_id_at_snapshot_return"] = ui._event_id
+
+    wt = threading.Thread(target=_writer)
+    rt = threading.Thread(target=_reader)
+    wt.start()
+    rt.start()
+    wt.join(timeout=5)
+    rt.join(timeout=5)
+    assert writer_done.is_set(), "writer thread did not complete"
+
+    snap = snap_box["snap"]
+    final_event_id = ui._event_id
+
+    # Core invariant: if the snapshot's content includes the marker
+    # text, snap.seq must be >= the writer's final _event_id.
+    # Pre-fix this fails (snap.seq=0 while final_event_id=1 and
+    # snap.content="RACE-MARKER"); post-fix the reader can't acquire
+    # ``_ws_lock`` until the writer completes, so snap is either
+    # (content="", seq=0) — reader won first — or
+    # (content="RACE-MARKER", seq=1) — writer won first.
+    assert marker in snap["content"] or snap["content"] == "", (
+        f"unexpected snap content: {snap['content']!r}"
+    )
+    if marker in snap["content"]:
+        assert snap["seq"] >= final_event_id, (
+            f"snap captured '{marker}' but snap.seq={snap['seq']} < "
+            f"final _event_id={final_event_id}; the live emission of "
+            f"this token would slip past the events handler's "
+            f"_seq <= snap_seq filter and double-render text the "
+            f"snapshot already contained.  Pre-fix race window "
+            f"opened by ``_enqueue`` running outside ``_ws_lock``."
+        )
+
+    # Sanity: also exercise the post-truncated drain shape so the
+    # test file pins both the contract AND the no-backfill behaviour
+    # (a future change that adds backfill into the listener queue
+    # must keep the dedup invariant above true).
+    ui2 = _make_ui()
+    for j in range(5):
+        ui2.on_content_token(f"x{j}")
+    lq, _, status, _, _, snap2 = ui2.register_listener_with_replay(0)
+    captured_seq = snap2["seq"]
+    drained = 0
     while True:
         try:
             ev = lq.get_nowait()
-        except Exception:
+        except queue.Empty:
             break
+        drained += 1
         if ev.get("type") == "content":
-            assert ev["_seq"] <= captured_seq, (
-                f"token _seq={ev['_seq']} > snap_seq={captured_seq}; "
-                "would slip past the live-drain dedup and double-render"
-            )
+            assert ev["_seq"] <= captured_seq, f"token _seq={ev['_seq']} > snap_seq={captured_seq}"
+    assert drained == 0, (
+        f"register_listener_with_replay backfilled {drained} events "
+        f"into the listener queue; if intentional, the dedup "
+        f"invariant above must still hold and this assertion should "
+        f"be updated."
+    )
 
 
 # ---------------------------------------------------------------------------

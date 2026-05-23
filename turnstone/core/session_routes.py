@@ -1514,10 +1514,11 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                 # synthetic snapshot/state_change/history emission is
                 # skipped by the events handler.  No live-dedup
                 # filtering required because the buffered events
-                # themselves are the cutoff — anything past
-                # ``buffered[-1]._event_id`` is genuinely new live
-                # traffic that lands in the listener queue after the
-                # buffer snapshot.
+                # themselves are the cutoff — anything past the last
+                # replayed event id is genuinely new live traffic
+                # that lands in the listener queue after the buffer
+                # snapshot was taken (atomic-against-writers under
+                # the registration's nested locks).
                 in_progress_snap = {"content": "", "reasoning": "", "seq": 0}
 
         # Per-kind executor for the blocking ``client_queue.get``
