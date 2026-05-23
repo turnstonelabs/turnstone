@@ -126,6 +126,8 @@ def _sample_listing(
 def _sample_package(
     name: str = "test-skill",
     source_url: str = "https://github.com/owner/repo",
+    model: str = "",
+    effort: str = "",
 ) -> SkillPackage:
     return SkillPackage(
         listing=SkillListing(
@@ -144,6 +146,8 @@ def _sample_package(
             tags=["test"],
             author="Test Author",
             version="1.0.0",
+            model=model,
+            effort=effort,
         ),
         resources={"scripts/setup.sh": "#!/bin/bash\necho hello"},
     )
@@ -267,6 +271,95 @@ class TestSkillInstall:
 
         assert resp.status_code == 200
         assert resp.json()["installed"][0]["name"] == "test-skill"
+
+    def test_install_seeds_model_and_effort_from_frontmatter(self, client: TestClient) -> None:
+        """Anthropic spec ``model:`` + ``effort:`` survive into the row.
+
+        The SKILL.md author's per-skill model and reasoning_effort
+        intent must round-trip through install — they were dropped
+        silently before #570.  Asserts both columns end up populated.
+        """
+        package = _sample_package(model="claude-opus-4-7", effort="high")
+
+        with patch(
+            "turnstone.core.skill_sources.fetch_skill_from_github", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = package
+
+            resp = client.post(
+                "/v1/api/admin/skills/install",
+                json={"source": "github", "url": "https://github.com/owner/repo"},
+            )
+
+        assert resp.status_code == 200
+        skill = resp.json()["installed"][0]
+        assert skill["model"] == "claude-opus-4-7"
+        assert skill["reasoning_effort"] == "high"
+
+    def test_install_no_model_or_effort_leaves_columns_empty(self, client: TestClient) -> None:
+        """When the source SKILL.md has no model/effort, the columns
+        stay at their server defaults (empty string) — the install
+        path must not invent values."""
+        package = _sample_package()  # model="", effort=""
+
+        with patch(
+            "turnstone.core.skill_sources.fetch_skill_from_github", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = package
+
+            resp = client.post(
+                "/v1/api/admin/skills/install",
+                json={"source": "github", "url": "https://github.com/owner/repo"},
+            )
+
+        assert resp.status_code == 200
+        skill = resp.json()["installed"][0]
+        assert skill["model"] == ""
+        assert skill["reasoning_effort"] == ""
+
+    def test_reinstall_preserves_admin_model_override(
+        self, client: TestClient, storage: SQLiteBackend
+    ) -> None:
+        """Once a skill is installed, an admin's later edit to ``model`` (or
+        any column) must survive a re-install of the same upstream — the
+        duplicate-source_url check skips the second create entirely, so
+        admin-set values aren't clobbered by the upstream package's
+        frontmatter.  Pins the load-bearing invariant the install
+        handler's comment depends on."""
+        # First install seeds model="upstream-model" from frontmatter.
+        first_package = _sample_package(model="upstream-model", effort="high")
+        with patch(
+            "turnstone.core.skill_sources.fetch_skill_from_github", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = first_package
+            resp = client.post(
+                "/v1/api/admin/skills/install",
+                json={"source": "github", "url": "https://github.com/owner/repo"},
+            )
+        assert resp.status_code == 200
+        skill_id = resp.json()["installed"][0]["template_id"]
+
+        # Admin overrides the model post-install (e.g. via the Skills tab).
+        storage.update_prompt_template(skill_id, model="admin-override-model")
+        assert storage.get_prompt_template(skill_id)["model"] == "admin-override-model"
+
+        # Upstream releases a new SKILL.md with a different model.  Re-install
+        # of the same source_url is rejected — same shape as
+        # ``test_install_duplicate_source_url``.  The admin's value stays
+        # because the second create never fires.
+        second_package = _sample_package(model="upstream-different-model", effort="low")
+        with patch(
+            "turnstone.core.skill_sources.fetch_skill_from_github", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = second_package
+            resp = client.post(
+                "/v1/api/admin/skills/install",
+                json={"source": "github", "url": "https://github.com/owner/repo"},
+            )
+        assert resp.status_code == 409
+        # Admin override survives — the dedup short-circuits before any
+        # create_prompt_template call.
+        assert storage.get_prompt_template(skill_id)["model"] == "admin-override-model"
 
     def test_install_invalid_source(self, client: TestClient) -> None:
         resp = client.post(

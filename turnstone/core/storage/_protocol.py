@@ -1291,6 +1291,10 @@ class StorageBackend(Protocol):
         compatibility: str = "",
         priority: int = 0,
         kind: str = "any",
+        paths: str = "[]",
+        hidden_from_menu: bool = False,
+        arguments: str = "[]",
+        argument_hint: str = "",
     ) -> None:
         """Create a prompt template (skill)."""
         ...

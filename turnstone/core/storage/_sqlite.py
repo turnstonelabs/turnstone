@@ -2737,6 +2737,10 @@ class SQLiteBackend:
         compatibility: str = "",
         priority: int = 0,
         kind: str = "any",
+        paths: str = "[]",
+        hidden_from_menu: bool = False,
+        arguments: str = "[]",
+        argument_hint: str = "",
     ) -> None:
         # Sync is_default from activation when activation is explicitly set
         if activation == "default":
@@ -2788,6 +2792,10 @@ class SQLiteBackend:
                         "notify_on_complete": notify_on_complete,
                         "enabled": 1 if enabled else 0,
                         "priority": priority,
+                        "paths": paths,
+                        "hidden_from_menu": 1 if hidden_from_menu else 0,
+                        "arguments": arguments,
+                        "argument_hint": argument_hint,
                         "created": now,
                         "updated": now,
                     },
@@ -2806,7 +2814,9 @@ class SQLiteBackend:
                 sa.select(prompt_templates).where(prompt_templates.c.template_id == template_id)
             ).fetchone()
             if row:
-                return _row_to_dict(row, "is_default", "readonly", "auto_approve", "enabled")
+                return _row_to_dict(
+                    row, "is_default", "readonly", "auto_approve", "enabled", "hidden_from_menu"
+                )
             return None
 
     def get_prompt_template_by_name(self, name: str) -> dict[str, Any] | None:
@@ -2815,7 +2825,9 @@ class SQLiteBackend:
                 sa.select(prompt_templates).where(prompt_templates.c.name == name)
             ).fetchone()
             if row:
-                return _row_to_dict(row, "is_default", "readonly", "auto_approve", "enabled")
+                return _row_to_dict(
+                    row, "is_default", "readonly", "auto_approve", "enabled", "hidden_from_menu"
+                )
             return None
 
     def list_prompt_templates(
@@ -2831,7 +2843,10 @@ class SQLiteBackend:
                 q = q.limit(limit)
             rows = conn.execute(q).fetchall()
             return [
-                _row_to_dict(r, "is_default", "readonly", "auto_approve", "enabled") for r in rows
+                _row_to_dict(
+                    r, "is_default", "readonly", "auto_approve", "enabled", "hidden_from_menu"
+                )
+                for r in rows
             ]
 
     def count_prompt_templates(self, org_id: str = "") -> int:
@@ -2853,7 +2868,10 @@ class SQLiteBackend:
                 q = q.where(prompt_templates.c.org_id == org_id)
             rows = conn.execute(q).fetchall()
             return [
-                _row_to_dict(r, "is_default", "readonly", "auto_approve", "enabled") for r in rows
+                _row_to_dict(
+                    r, "is_default", "readonly", "auto_approve", "enabled", "hidden_from_menu"
+                )
+                for r in rows
             ]
 
     def list_prompt_templates_by_origin(self, origin: str) -> list[dict[str, Any]]:
@@ -2864,7 +2882,10 @@ class SQLiteBackend:
                 .order_by(prompt_templates.c.name)
             ).fetchall()
             return [
-                _row_to_dict(r, "is_default", "readonly", "auto_approve", "enabled") for r in rows
+                _row_to_dict(
+                    r, "is_default", "readonly", "auto_approve", "enabled", "hidden_from_menu"
+                )
+                for r in rows
             ]
 
     def update_prompt_template(self, template_id: str, **fields: Any) -> bool:
@@ -2884,6 +2905,8 @@ class SQLiteBackend:
             fields["auto_approve"] = int(fields["auto_approve"])
         if "enabled" in fields:
             fields["enabled"] = int(fields["enabled"])
+        if "hidden_from_menu" in fields:
+            fields["hidden_from_menu"] = int(fields["hidden_from_menu"])
         # Re-scan if content or allowed_tools changed
         if "content" in fields or "allowed_tools" in fields:
             content = fields.get("content")
@@ -2974,7 +2997,10 @@ class SQLiteBackend:
                 q = q.limit(limit)
             rows = conn.execute(q).fetchall()
             return [
-                _row_to_dict(r, "is_default", "readonly", "auto_approve", "enabled") for r in rows
+                _row_to_dict(
+                    r, "is_default", "readonly", "auto_approve", "enabled", "hidden_from_menu"
+                )
+                for r in rows
             ]
 
     def list_skills_filtered(
@@ -3021,7 +3047,10 @@ class SQLiteBackend:
                 q = q.limit(limit)
             rows = conn.execute(q).fetchall()
             return [
-                _row_to_dict(r, "is_default", "readonly", "auto_approve", "enabled") for r in rows
+                _row_to_dict(
+                    r, "is_default", "readonly", "auto_approve", "enabled", "hidden_from_menu"
+                )
+                for r in rows
             ]
 
     def get_skill_by_name(self, name: str) -> dict[str, Any] | None:
@@ -3033,7 +3062,9 @@ class SQLiteBackend:
                 sa.select(prompt_templates).where(prompt_templates.c.source_url == source_url)
             ).fetchone()
             if row:
-                return _row_to_dict(row, "is_default", "readonly", "auto_approve", "enabled")
+                return _row_to_dict(
+                    row, "is_default", "readonly", "auto_approve", "enabled", "hidden_from_menu"
+                )
             return None
 
     def list_installed_skill_urls(self) -> list[dict[str, str]]:

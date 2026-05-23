@@ -79,6 +79,7 @@ from turnstone.core.session_routes import (
 )
 from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS
 from turnstone.core.skill_kind import SkillKind
+from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
 from turnstone.core.web_helpers import (
     read_json_or_400,
     require_storage_or_503,
@@ -6474,6 +6475,49 @@ def _parse_skill_session_config(body: dict[str, Any]) -> tuple[dict[str, Any], J
     return fields, None
 
 
+def _canonicalize_skill_string_list(raw: Any) -> str:
+    """Normalize the wire shape of a JSON-array-string skill field.
+
+    Accepts a Python list, a JSON-array string, a comma-separated
+    string, ``None``, or an empty value, and returns the canonical
+    JSON-array string ready for storage.  Used for ``paths`` today;
+    follow-up PRs (#572) reuse this for ``arguments`` once the wire
+    contract on that field stabilises.
+
+    ``None`` and unparseable JSON both collapse to ``"[]"`` — a client
+    that sends ``{"paths": null}`` deliberately intends "no value", not
+    a CSV-split corruption of the literal string ``"None"``.  Empty
+    list elements are trimmed out so the stored array never carries
+    blank strings.
+
+    Note: this helper's ``None``-to-``"[]"`` rule is the **normalization**
+    contract.  The update endpoint (`admin_update_skill`) intercepts
+    ``body["paths"] is None`` *before* calling this helper and treats
+    it as "leave unchanged" — that's the update-semantics contract,
+    layered on top of normalization rather than baked in here.  Both
+    contracts coexist intentionally: create defaults to empty, update
+    skips no-ops.
+    """
+    import json as _json
+
+    if raw is None:
+        return "[]"
+    if isinstance(raw, list):
+        return _json.dumps([str(p).strip() for p in raw if str(p).strip()])
+    candidate = str(raw).strip()
+    if not candidate:
+        return "[]"
+    if candidate.startswith("["):
+        try:
+            parsed = _json.loads(candidate)
+        except (ValueError, TypeError):
+            return "[]"
+        if not isinstance(parsed, list):
+            return "[]"
+        return _json.dumps([str(p).strip() for p in parsed if str(p).strip()])
+    return _json.dumps([p.strip() for p in candidate.split(",") if p.strip()])
+
+
 def _skill_to_response(r: dict[str, Any], resource_count: int = 0) -> dict[str, Any]:
     """Convert a storage skill dict to a JSON-safe response dict."""
     import json as _json
@@ -6524,6 +6568,14 @@ def _skill_to_response(r: dict[str, Any], resource_count: int = 0) -> dict[str, 
         "risk_level": r.get("risk_level", ""),
         "scan_report": r.get("scan_report", "{}"),
         "scan_version": r.get("scan_version", ""),
+        # Anthropic spec uplift (migration 056).  ``paths`` and
+        # ``arguments`` are JSON-array strings on the wire to match
+        # ``allowed_tools`` / ``notify_on_complete``; the admin UI
+        # parses them client-side.
+        "paths": r.get("paths", "[]"),
+        "hidden_from_menu": r.get("hidden_from_menu", False),
+        "arguments": r.get("arguments", "[]"),
+        "argument_hint": r.get("argument_hint", ""),
         "resource_count": resource_count,
         "created": r.get("created", ""),
         "updated": r.get("updated", ""),
@@ -6598,7 +6650,7 @@ async def admin_create_skill(request: Request) -> JSONResponse:
     name = str(body.get("name") or "").strip()[:256]
     content = str(body.get("content") or "").strip()[:32768]
     category = str(body.get("category") or "general").strip()[:64]
-    description = str(body.get("description") or "").strip()[:1024]
+    description = str(body.get("description") or "").strip()[:MAX_SKILL_DESCRIPTION_LEN]
     try:
         kind = SkillKind(str(body.get("kind") or "any").strip().lower()).value
     except ValueError:
@@ -6627,6 +6679,13 @@ async def admin_create_skill(request: Request) -> JSONResponse:
             _json.loads(tags_str)
         except (ValueError, TypeError):
             tags_str = "[]"
+
+    # Anthropic spec ``paths:`` — glob patterns gating autoload.
+    # ``_canonicalize_skill_string_list`` accepts a list, a JSON-array
+    # string, a comma-separated string, or ``None``, and returns the
+    # canonical JSON-array string for storage.  Same helper will back
+    # ``arguments`` once #572 lands its consumer.
+    paths_str = _canonicalize_skill_string_list(body.get("paths"))
 
     token_estimate = len(content) // 4 if content else 0
 
@@ -6678,6 +6737,7 @@ async def admin_create_skill(request: Request) -> JSONResponse:
         token_estimate=token_estimate,
         priority=priority,
         kind=kind,
+        paths=paths_str,
         **session_fields,
     )
 
@@ -6742,7 +6802,7 @@ async def admin_update_skill(request: Request) -> JSONResponse:
         # cannot blank it out — and ``null`` is treated the same as
         # blank so it can't coerce to the literal string "None".
         raw_description = body["description"]
-        new_description = str(raw_description or "").strip()[:1024]
+        new_description = str(raw_description or "").strip()[:MAX_SKILL_DESCRIPTION_LEN]
         if not new_description:
             return JSONResponse({"error": "description must not be empty"}, status_code=400)
         updates["description"] = new_description
@@ -6784,6 +6844,11 @@ async def admin_update_skill(request: Request) -> JSONResponse:
             except (ValueError, TypeError):
                 tag_str = "[]"
             updates["tags"] = tag_str
+    if "paths" in body and body["paths"] is not None:
+        # ``None`` is treated as "leave unchanged" to match
+        # UpdateSkillRequest's optional-None semantics.  See
+        # ``_canonicalize_skill_string_list``.
+        updates["paths"] = _canonicalize_skill_string_list(body["paths"])
     if "priority" in body:
         try:
             updates["priority"] = max(-1000, min(1000, int(body["priority"] or 0)))
@@ -7480,6 +7545,13 @@ async def admin_parse_skill(request: Request) -> JSONResponse:
             "allowed_tools": list(parsed.allowed_tools),
             "license": parsed.license,
             "compatibility": parsed.compatibility,
+            "paths": list(parsed.paths),
+            # ``when_to_use`` is already concatenated into
+            # ``description``; surface it separately too so the admin
+            # parse-preview UI can show what came from where.
+            "when_to_use": parsed.when_to_use,
+            "model": parsed.model,
+            "effort": parsed.effort,
         }
     )
 
@@ -7678,6 +7750,7 @@ async def admin_skill_install(request: Request) -> JSONResponse:
         parsed = package.parsed
         tags_str = _json.dumps(parsed.tags)
         allowed_tools_str = _json.dumps(parsed.allowed_tools)
+        paths_str = _json.dumps(parsed.paths)
         content = parsed.content[:32768]
         token_estimate = len(content) // 4 if content else 0
 
@@ -7709,6 +7782,15 @@ async def admin_skill_install(request: Request) -> JSONResponse:
                 activation="named",
                 token_estimate=token_estimate,
                 allowed_tools=allowed_tools_str,
+                paths=paths_str,
+                # Anthropic spec ``model:`` + ``effort:`` — seed the
+                # corresponding ``model`` / ``reasoning_effort`` columns
+                # at install time so the SKILL.md author's intent
+                # survives the import.  Only fires on initial create —
+                # the same-name / same-source duplicate checks above
+                # protect admin-set values on re-install.
+                model=parsed.model,
+                reasoning_effort=parsed.effort,
             )
         except StorageConflictError as exc:
             # Genuine uniqueness/constraint violation racing past the

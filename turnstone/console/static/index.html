@@ -3073,6 +3073,18 @@
                 placeholder="Requires git, docker, etc."
                 maxlength="500"
               />
+              <label for="skill-paths"
+                >Paths
+                <span class="label-hint"
+                  >glob patterns (comma-separated) — Anthropic spec
+                  <code>paths:</code>; filter consumer pending</span
+                ></label
+              >
+              <input
+                id="skill-paths"
+                type="text"
+                placeholder="**/*.py, packages/api/**"
+              />
             </div>
             <div class="skill-spec-section">
               <h3 class="skill-spec-heading">Deployment</h3>
@@ -3388,6 +3400,18 @@
                 type="text"
                 placeholder="Requires git, docker, etc."
                 maxlength="500"
+              />
+              <label for="etm-paths"
+                >Paths
+                <span class="label-hint"
+                  >glob patterns (comma-separated) — Anthropic spec
+                  <code>paths:</code>; filter consumer pending</span
+                ></label
+              >
+              <input
+                id="etm-paths"
+                type="text"
+                placeholder="**/*.py, packages/api/**"
               />
             </div>
             <div class="skill-spec-section">

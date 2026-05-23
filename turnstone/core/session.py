@@ -99,6 +99,7 @@ from turnstone.core.ratelimit import TokenBucket
 from turnstone.core.safety import is_command_blocked, sanitize_command
 from turnstone.core.sandbox import execute_math_sandboxed
 from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS
+from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
 from turnstone.core.storage._registry import get_storage
 from turnstone.core.storage._utils import normalize_search_terms
 from turnstone.core.tool_advisory import escape_wrapper_tags, render_system_reminder
@@ -8661,7 +8662,7 @@ class ChatSession:
 
         name = self._coord_str_arg(args, "name").strip()[:256]
         content = self._coord_str_arg(args, "content").strip()[:32768]
-        description = self._coord_str_arg(args, "description").strip()[:1024]
+        description = self._coord_str_arg(args, "description").strip()[:MAX_SKILL_DESCRIPTION_LEN]
         category = self._coord_str_arg(args, "category").strip()[:64] or "general"
         if not name:
             return self._coord_tool_error(call_id, "skills", "create: 'name' is required")
@@ -8864,7 +8865,7 @@ class ChatSession:
             updates["content"] = new_content
             updates["token_estimate"] = len(new_content) // 4
         if "description" in args:
-            new_desc = self._coord_str_arg(args, "description").strip()[:1024]
+            new_desc = self._coord_str_arg(args, "description").strip()[:MAX_SKILL_DESCRIPTION_LEN]
             if not new_desc:
                 return self._coord_tool_error(
                     call_id, "skills", "update: description must not be empty"
