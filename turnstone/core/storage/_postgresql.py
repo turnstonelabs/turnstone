@@ -3553,6 +3553,11 @@ class PostgreSQLBackend:
         annotations: str,
         output_length: int,
         redacted: bool,
+        *,
+        tier: str = "heuristic",
+        reasoning: str = "",
+        judge_model: str = "",
+        latency_ms: int = 0,
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
@@ -3569,6 +3574,10 @@ class PostgreSQLBackend:
                     "output_length": output_length,
                     "redacted": int(redacted),
                     "created": now,
+                    "tier": tier,
+                    "reasoning": reasoning,
+                    "judge_model": judge_model,
+                    "latency_ms": latency_ms,
                 },
             )
             conn.commit()
