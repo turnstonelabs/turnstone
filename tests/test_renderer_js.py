@@ -1305,8 +1305,8 @@ def test_renderer_attribute_context_interpolation_is_safe() -> None:
 
     * `escapeHtml(...)` at the call site (allowed by the negative
       lookahead in the regex),
-    * an identifier matching `safe[A-Z_]…` (convention: the value is
-      pre-escaped at assignment), or
+    * an identifier matching `safe[A-Z]…` (camelCase convention: the
+      value is pre-escaped at assignment), or
     * an identifier in :data:`_RENDERER_KNOWN_SAFE_IDENTIFIERS`
       (reviewer-approved enum lookups / counters).
 
@@ -1360,31 +1360,41 @@ _HANDLER_ATTRS = frozenset(
 )
 
 
-def _all_attr_names(html: str) -> list[tuple[str, str]]:
-    """Parse ``html`` and return a flat list of ``(tag, attr_name)`` for
-    every attribute on every element. Used by the attacker-URL pin
-    tests to assert no event-handler attribute ever materializes —
-    substring checks on the raw output are too noisy because the
-    literal text ``onerror=&amp;quot;`` is safe when it sits inside
-    a parsed attribute value, but the substring still matches."""
+def _parse_renderer_html(html: str) -> tuple[list[str], list[tuple[str, str]]]:
+    """Parse ``html`` and return ``(start_tags, (tag, attr_name) pairs)``.
+
+    Two return values because:
+
+    * ``start_tags`` records every start tag regardless of whether it
+      carries attributes, so a bare ``<script>`` injection (no attrs)
+      cannot slip past a tag-presence check.
+    * ``attr_pairs`` records every attribute-bearing tag for the
+      event-handler-attribute assertion.
+
+    Substring checks on the raw output are too noisy: the literal text
+    ``onerror=&amp;quot;`` is safe when it sits inside a parsed
+    attribute value, but the substring still matches."""
     from html.parser import HTMLParser
 
     class _Collector(HTMLParser):
         def __init__(self) -> None:
             super().__init__()
+            self.tags: list[str] = []
             self.attrs: list[tuple[str, str]] = []
 
         def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            self.tags.append(tag)
             for name, _value in attrs:
                 self.attrs.append((tag, name))
 
     p = _Collector()
     p.feed(html)
-    return p.attrs
+    return p.tags, p.attrs
 
 
 def _assert_no_handler_attrs(html: str) -> None:
-    handlers = [(tag, name) for tag, name in _all_attr_names(html) if name in _HANDLER_ATTRS]
+    _tags, attrs = _parse_renderer_html(html)
+    handlers = [(tag, name) for tag, name in attrs if name in _HANDLER_ATTRS]
     assert not handlers, (
         f"Renderer output materialized event-handler attribute(s) "
         f"{handlers!r} — attribute-boundary escape regression. "
@@ -1418,8 +1428,38 @@ def test_attacker_link_url_with_quote_does_not_break_attribute() -> None:
 
 def test_attacker_link_label_with_quote_renders_as_text() -> None:
     """Pin: a link label containing embedded ``<`` characters must
-    render as escaped text inside the anchor, not as a real tag."""
+    render as escaped text inside the anchor, not as a real tag.
+
+    Uses :func:`_parse_renderer_html` (not the attr-pairs accessor)
+    because a bare ``<script>`` injection has no attributes and would
+    be invisible to a (tag, attr) pair listing."""
     out = _render("[<script>alert(1)</script>](https://x/y)")
-    # No <script> tag should appear in the parsed output.
-    tags = {tag for tag, _ in _all_attr_names(out)}
+    tags, _attrs = _parse_renderer_html(out)
     assert "script" not in tags, "Link label leaked a real <script> element:\n" + out
+
+
+def test_image_url_with_ampersand_not_double_escaped() -> None:
+    """Pin: a query-string URL must not double-escape ``&``.
+
+    inlineMarkdown's leading ``escapeHtml(text)`` turns ``&`` into
+    ``&amp;`` once. Any local re-escape on the captured ``url`` would
+    produce ``&amp;amp;`` in the attribute — which decodes to literal
+    ``&amp;`` at attribute-parse time, breaks ``getAttribute`` +
+    ``new URL`` round-trip, and silently corrupts query strings."""
+    out = _render("![alt](https://x/y?a=1&b=2)")
+    assert 'data-src="https://x/y?a=1&amp;b=2"' in out, (
+        "Expected single &amp; encoding for `&`; got:\n" + out
+    )
+    assert "&amp;amp;" not in out, (
+        "URL was double-escaped (`&` → `&amp;amp;`); breaks getAttribute "
+        "+ new URL round-trip. Full output:\n" + out
+    )
+
+
+def test_link_url_with_ampersand_not_double_escaped() -> None:
+    """Same as the image case, for link ``href``."""
+    out = _render("[docs](https://example.com/p?a=1&b=2)")
+    assert 'href="https://example.com/p?a=1&amp;b=2"' in out, (
+        "Expected single &amp; encoding for `&`; got:\n" + out
+    )
+    assert "&amp;amp;" not in out

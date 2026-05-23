@@ -25,51 +25,63 @@ function inlineMarkdown(text) {
   // Strikethrough
   text = text.replace(/~~(.+?)~~/g, "<del>$1</del>");
   // Images (must come before links — render as click-to-load placeholder).
-  // Every interpolated value is locally escaped: defence-in-depth against
-  // future refactors that might call this regex from a context that
-  // bypasses inlineMarkdown's leading escapeHtml.
-  text = text.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, function (m, alt, url) {
-    if (!/^\s*(https?:\/\/|data:image\/)/i.test(url)) return m;
-    var safeAlt = escapeHtml(alt || "Image");
-    var safeUrl = escapeHtml(url);
-    var domain;
-    try {
-      domain = escapeHtml(new URL(url).hostname);
-    } catch (e) {
-      domain = escapeHtml(url.length > 40 ? url.slice(0, 40) + "…" : url);
-    }
-    return (
-      '<span class="img-placeholder" tabindex="0" role="button" ' +
-      'aria-label="Load image: ' +
-      safeAlt +
-      '" ' +
-      'data-src="' +
-      safeUrl +
-      '" data-alt="' +
-      safeAlt +
-      '">' +
-      '<span class="img-placeholder-icon">&#x1F5BC;</span> ' +
-      '<span class="img-placeholder-label">' +
-      safeAlt +
-      "</span>" +
-      '<span class="img-placeholder-domain">' +
-      domain +
-      "</span>" +
-      "</span>"
-    );
-  });
-  // Links (allow http, https, and same-origin relative URLs only).
-  // Same defence-in-depth posture as images above.
-  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, function (m, label, url) {
-    if (!/^\s*(https?:\/\/|\/(?!\/))/i.test(url)) return m;
-    return (
-      '<a href="' +
-      escapeHtml(url) +
-      '" target="_blank" rel="noopener noreferrer">' +
-      escapeHtml(label) +
-      "</a>"
-    );
-  });
+  // Captured groups inherit inlineMarkdown's leading escapeHtml(text) —
+  // they are already entity-encoded by the time this regex runs. Don't
+  // re-escape them: double-encoding turns `&` into `&amp;amp;`, which
+  // breaks query-string URLs after browser parse + getAttribute. The
+  // `safe*` rename signals the pre-escape invariant; the attribute-
+  // context lint in tests/test_renderer_js.py enforces that future
+  // attribute-context concat sites maintain the convention or call
+  // escapeHtml explicitly.
+  text = text.replace(
+    /!\[([^\]]*)\]\(([^)]+)\)/g,
+    function (m, safeAlt, safeUrl) {
+      if (!/^\s*(https?:\/\/|data:image\/)/i.test(safeUrl)) return m;
+      if (!safeAlt) safeAlt = "Image";
+      var safeDomain;
+      try {
+        // hostname is freshly extracted, not from the regex capture,
+        // so it does NOT carry the upstream escape — escape locally.
+        safeDomain = escapeHtml(new URL(safeUrl).hostname);
+      } catch (e) {
+        safeDomain = safeUrl.length > 40 ? safeUrl.slice(0, 40) + "…" : safeUrl;
+      }
+      return (
+        '<span class="img-placeholder" tabindex="0" role="button" ' +
+        'aria-label="Load image: ' +
+        safeAlt +
+        '" ' +
+        'data-src="' +
+        safeUrl +
+        '" data-alt="' +
+        safeAlt +
+        '">' +
+        '<span class="img-placeholder-icon">&#x1F5BC;</span> ' +
+        '<span class="img-placeholder-label">' +
+        safeAlt +
+        "</span>" +
+        '<span class="img-placeholder-domain">' +
+        safeDomain +
+        "</span>" +
+        "</span>"
+      );
+    },
+  );
+  // Links — same upstream-escape invariant as images. `safeLabel` and
+  // `safeUrl` are entity-encoded via inlineMarkdown's leading pass.
+  text = text.replace(
+    /\[([^\]]+)\]\(([^)]+)\)/g,
+    function (m, safeLabel, safeUrl) {
+      if (!/^\s*(https?:\/\/|\/(?!\/))/i.test(safeUrl)) return m;
+      return (
+        '<a href="' +
+        safeUrl +
+        '" target="_blank" rel="noopener noreferrer">' +
+        safeLabel +
+        "</a>"
+      );
+    },
+  );
   // Footnote references [^id] — after links (link regex requires (url), so no conflict)
   text = text.replace(/\[\^([^\]]+)\]/g, function (m, fnId) {
     var safeFnId = escapeHtml(fnId);
