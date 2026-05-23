@@ -95,6 +95,7 @@ from turnstone.core.metacognition import (
 )
 from turnstone.core.nudge_queue import TOOL_DRAIN, USER_DRAIN, NudgeQueue
 from turnstone.core.providers import create_provider
+from turnstone.core.ratelimit import TokenBucket
 from turnstone.core.safety import is_command_blocked, sanitize_command
 from turnstone.core.sandbox import execute_math_sandboxed
 from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS
@@ -135,7 +136,7 @@ if TYPE_CHECKING:
     from turnstone.core.mcp_client import MCPClientManager
     from turnstone.core.model_registry import ModelConfig, ModelRegistry
     from turnstone.core.output_guard import OutputAssessment
-    from turnstone.core.output_guard_judge import OutputGuardJudge
+    from turnstone.core.output_guard_judge import OutputGuardJudge, OutputJudgeVerdict
     from turnstone.core.providers import (
         CompletionResult,
         LLMProvider,
@@ -559,6 +560,12 @@ _TEMPLATE_VAR_RE = re.compile(r"\{\{(\w+)\}\}")
 # drop-OLDEST: a drowning watch is most useful with its latest output,
 # not its earliest.
 _WATCH_QUEUE_SOFT_CAP = 50
+
+# Max entries in the output-guard LLM-judge verdict cache.  Keyed by
+# SHA-256(func_name + output), bounded with FIFO eviction.  256 is enough
+# for a typical session's distinct outputs while bounding worst-case
+# memory at ~256 * sizeof(OutputJudgeVerdict).
+_OUTPUT_GUARD_CACHE_MAX = 256
 
 # Per-reminder ``text`` field clamp on the persisted ``_reminders``
 # JSON column.  Bounds row width and the FTS5 index against pathological
@@ -990,6 +997,20 @@ class ChatSession:
         # swap paths so both judges pick up new credentials.
         self._output_guard_judge: OutputGuardJudge | None = None
         self._output_guard_judge_cancel: threading.Event | None = None
+        # Verdict cache + rate limiter for the LLM-judge stage (issue #560
+        # mitigation #1 hardening, PR #575 review sec-4).  Cache is keyed by
+        # SHA-256(func_name + output) so identical tool outputs in a session
+        # reuse a verdict.  Rate limit caps cost-amplification when a tool
+        # loop emits many results.  Both reset alongside the judge instance
+        # below at the model-swap paths.
+        self._output_guard_judge_cache: dict[str, OutputJudgeVerdict] = {}
+        self._output_guard_judge_cache_order: collections.deque[str] = collections.deque(
+            maxlen=_OUTPUT_GUARD_CACHE_MAX
+        )
+        # 60 calls/minute by default — enough for normal tool loops, caps
+        # adversarial fan-out.  Token bucket starts full so a single turn
+        # with many tools doesn't get throttled.
+        self._output_guard_judge_rl = TokenBucket(rate=1.0, burst=60)
         # MCP tool integration: merge external tools with built-in
         self._mcp_client = mcp_client
         self._mcp_refresh_cb: Any = None  # Callable | None (avoid import)
@@ -1732,6 +1753,11 @@ class ChatSession:
             self._judge = None
         if self._output_guard_judge is not None:
             self._output_guard_judge = None
+            # Cache + rate limiter are tied to the judge model; a swap
+            # invalidates both.
+            self._output_guard_judge_cache.clear()
+            self._output_guard_judge_cache_order.clear()
+            self._output_guard_judge_rl = TokenBucket(rate=1.0, burst=60)
         self._init_system_messages()
         log.info(
             "session.model_updated ws=%s model=%s ctx=%d",
@@ -2134,6 +2160,9 @@ class ChatSession:
                 self._cached_capabilities = None
                 self._judge = None  # re-create with new client/model
                 self._output_guard_judge = None  # same — re-create
+                self._output_guard_judge_cache.clear()
+                self._output_guard_judge_cache_order.clear()
+                self._output_guard_judge_rl = TokenBucket(rate=1.0, burst=60)
                 self.context_window = cfg.context_window
                 if not self._manual_tool_truncation:
                     self.tool_truncation = int(cfg.context_window * self._chars_per_token * 0.5)
@@ -3521,14 +3550,58 @@ class ChatSession:
 
                 _tc_names = {c["id"]: c.get("function", {}).get("name", "") for c in tool_calls}
                 _last_idx = len(results) - 1
+
+                # Pre-truncate (cp-2): the LLM judge stage must see the
+                # same text that lands in the assistant's context, not the
+                # full pre-truncation blob.  Otherwise a fat web_fetch can
+                # OOM the judge model or burn tokens on content that won't
+                # even reach the assistant.  Truncation is a safety
+                # invariant that runs regardless of the guard stage.
+                truncation_budget = self._remaining_token_budget()
+                _truncated: dict[str, str] = {}
+                for tc_id, output in results:
+                    if isinstance(output, str):
+                        _truncated[tc_id] = self._truncate_output(
+                            output, remaining_budget_tokens=truncation_budget
+                        )
+                results = [(tc_id, _truncated.get(tc_id, output)) for tc_id, output in results]
+
+                # Pre-evaluate the guard stage concurrently when LLM is
+                # enabled and there are multiple string outputs (perf-2).
+                # The judge stage is the dominant per-turn latency at
+                # 5-20 tool calls; running them in parallel collapses
+                # N×LLM-latency to ⌈N/max_workers⌉×latency.  Limited to
+                # str outputs — structured (list) outputs stay sequential
+                # (per-part recursion below).  Single-result turns also
+                # skip the parallel path since there's no parallelism to
+                # gain and the overhead isn't worth it.
+                _batch_guard: dict[str, tuple[str, OutputAssessment | None]] = {}
+                _judge_cfg = self._judge_cfg
+                if (
+                    _judge_cfg
+                    and _judge_cfg.output_guard
+                    and _judge_cfg.output_guard_llm
+                    and sum(1 for _, o in results if isinstance(o, str)) > 1
+                ):
+                    _batch_guard = self._batch_evaluate_outputs(
+                        [
+                            (tc_id, o, _tc_names.get(tc_id, ""))
+                            for tc_id, o in results
+                            if isinstance(o, str)
+                        ]
+                    )
+
                 for _ri, (tc_id, output) in enumerate(results):
                     # Output guard: evaluate tool result before it enters context
                     assessment: OutputAssessment | None = None
                     if self._judge_cfg and self._judge_cfg.output_guard:
                         if isinstance(output, str):
-                            output, assessment = self._evaluate_output(
-                                tc_id, output, _tc_names.get(tc_id, "")
-                            )
+                            if tc_id in _batch_guard:
+                                output, assessment = _batch_guard[tc_id]
+                            else:
+                                output, assessment = self._evaluate_output(
+                                    tc_id, output, _tc_names.get(tc_id, "")
+                                )
                         elif isinstance(output, list):
                             # Image/structured output — evaluate each text part
                             # independently so credentials in any part get redacted.
@@ -3543,12 +3616,6 @@ class ChatSession:
                                     )
                                     if _part_assess is not None:
                                         assessment = _part_assess
-
-                    # Safety truncation: clamp output to remaining context budget
-                    # so a single large result cannot overflow the context window.
-                    if isinstance(output, str):
-                        budget = self._remaining_token_budget()
-                        output = self._truncate_output(output, remaining_budget_tokens=budget)
 
                     # Advisory injection: persistent advisories — output
                     # guard findings AND queued user messages (Seam 1)
@@ -4894,60 +4961,88 @@ class ChatSession:
             patterns=og_patterns,
         )
 
-        # Stage 2: LLM judge (opt-in, capability-gated).  When it runs
-        # successfully the LLM verdict overrides the regex verdict; on
-        # disable/error/timeout the heuristic stands.
-        llm_judge = self._ensure_output_guard_judge()
-        llm_verdict = None
-        if llm_judge is not None:
-            cancel = self._output_guard_judge_cancel
-            try:
-                llm_verdict = llm_judge.evaluate(
-                    output,
-                    func_name=func_name,
-                    call_id=call_id,
-                    cancel_event=cancel,
-                )
-            except Exception:
-                log.warning("output_guard_judge.evaluate_raised", exc_info=True)
-                llm_verdict = None
+        # Stage 2: LLM judge (opt-in, capability-gated).  With the cache
+        # and rate limiter, identical outputs in a session pay once and
+        # an attacker driving fan-out can't burn unbounded LLM budget.
+        # On disable / rate-limit / error / timeout the heuristic stands.
+        llm_verdict = self._invoke_output_guard_judge(call_id, output, func_name)
 
         output_len = len(output)
 
-        # Acted assessment: LLM verdict when usable, else heuristic.
-        # The LLM's flags + reasoning become the acted assessment's
-        # flags + annotations; sanitized stays from the regex stage
-        # because secret redaction is a regex-only concern.
-        if llm_verdict is not None and llm_verdict.succeeded:
+        # Acted assessment.  Credential redaction is a regex-only signal
+        # that the LLM cannot override (bug-1 / sec-1 from the PR review):
+        # an LLM asked about prompt-injection can correctly label a
+        # credential-bearing tool output as "none" risk for injection, but
+        # the secret still needs to be redacted before it lands in the
+        # assistant's context.  When the heuristic populated ``sanitized``
+        # we keep the heuristic's verdict as acted regardless of the LLM.
+        if heuristic.sanitized is not None:
+            acted = heuristic
+        elif llm_verdict is not None and llm_verdict.succeeded:
             acted = OutputAssessment(
                 flags=list(llm_verdict.flags),
                 risk_level=llm_verdict.risk_level,
                 annotations=[llm_verdict.reasoning] if llm_verdict.reasoning else [],
-                sanitized=heuristic.sanitized,
+                sanitized=heuristic.sanitized,  # always None on this branch; explicit
             )
         else:
             acted = heuristic
 
-        # Persistence: when the LLM ran (regardless of success), record
-        # both rows so audit can see when verdicts diverged.  When the
-        # LLM was disabled / not configured, only the heuristic row is
-        # recorded (and only when risk!="none", to keep the table from
-        # filling with clean evaluations).
-        if llm_judge is not None:
+        # Persistence (single call path now — q-4):
+        # * Heuristic row: write when it has signal (risk != none OR flags)
+        #   OR when verdicts disagree.  Matched-clean evaluations are
+        #   skipped to keep the audit table focused on disagreements
+        #   and non-clean events.  This is the perf-4 trade-off — pre-PR
+        #   wrote heuristic rows only on risk != none; we now ALSO record
+        #   them when the LLM ran and the two judges disagreed.
+        # * LLM row: write whenever the LLM ran, regardless of success.
+        #   On failure (cp-3) the row's ``reasoning`` carries the error
+        #   reason so audit can distinguish "LLM was attempted but
+        #   failed" from "LLM was never enabled".
+        heuristic_has_signal = heuristic.risk_level != "none" or bool(heuristic.flags)
+        verdicts_disagree = (
+            llm_verdict is not None
+            and llm_verdict.succeeded
+            and (
+                llm_verdict.risk_level != heuristic.risk_level
+                or sorted(llm_verdict.flags) != sorted(heuristic.flags)
+            )
+        )
+        if heuristic_has_signal or verdicts_disagree:
             self._record_output_tier(call_id, func_name, output_len, heuristic, tier="heuristic")
-            if llm_verdict is not None and llm_verdict.succeeded:
+        if llm_verdict is not None:
+            if llm_verdict.succeeded:
                 self._record_output_tier(
                     call_id,
                     func_name,
                     output_len,
-                    acted,
+                    acted if acted is not heuristic else heuristic,
                     tier="llm",
                     reasoning=llm_verdict.reasoning,
                     judge_model=llm_verdict.judge_model,
                     latency_ms=llm_verdict.latency_ms,
                 )
+            else:
+                # Failure row — empty assessment + error reason for audit.
+                self._record_output_tier(
+                    call_id,
+                    func_name,
+                    output_len,
+                    OutputAssessment(risk_level="none"),
+                    tier="llm",
+                    reasoning=llm_verdict.error,
+                    judge_model=llm_verdict.judge_model,
+                    latency_ms=llm_verdict.latency_ms,
+                )
 
-        if acted.risk_level == "none":
+        # Redaction — fires whenever the heuristic detected secrets and
+        # the operator wants them redacted, regardless of acted.risk_level.
+        # This is the bug-1 fix: the prior code's ``risk_level == "none"``
+        # short-circuit returned the un-redacted output when the LLM
+        # downgraded a credential-bearing result to "none".
+        wants_redaction = heuristic.sanitized is not None and jc is not None and jc.redact_secrets
+
+        if acted.risk_level == "none" and not wants_redaction:
             return output, None
 
         log.debug(
@@ -4957,25 +5052,105 @@ class ChatSession:
             risk=acted.risk_level,
             flags=acted.flags,
             tier="llm" if (llm_verdict is not None and llm_verdict.succeeded) else "heuristic",
+            redacted=wants_redaction,
         )
         try:
             d = acted.to_dict()  # excludes sanitized by default
             d["func_name"] = func_name
             d["output_length"] = output_len
-            d["redacted"] = acted.sanitized is not None
+            d["redacted"] = wants_redaction
             self.ui.on_output_warning(call_id, d)
-            # Legacy persistence path: when the LLM stage did NOT run,
-            # nothing has been recorded yet — fire the storage write
-            # here so the heuristic row still lands (parity with
-            # pre-LLM behavior).
-            if llm_judge is None:
-                self.ui.record_output_assessment(call_id, d, tier="heuristic")
         except Exception:
             log.debug("output_guard.callback_failed", exc_info=True)
 
-        if acted.sanitized is not None and jc is not None and jc.redact_secrets:
-            return acted.sanitized, acted
+        if wants_redaction:
+            # heuristic.sanitized is guaranteed non-None inside this branch
+            # (wants_redaction's first clause), narrow for the type checker.
+            sanitized = heuristic.sanitized
+            assert sanitized is not None
+            return sanitized, acted
         return output, acted
+
+    def _batch_evaluate_outputs(
+        self,
+        items: list[tuple[str, str, str]],
+    ) -> dict[str, tuple[str, OutputAssessment | None]]:
+        """Run ``_evaluate_output`` for each ``(call_id, output, func_name)``
+        triple concurrently, return a dict keyed by ``call_id`` (perf-2).
+
+        Bounded thread pool (4 workers) — high enough to parallelise the
+        common 5-20 tool-calls-per-turn case, low enough to avoid blowing
+        the provider's rate limit.  The per-call LLM timeout enforced
+        inside ``OutputGuardJudge.evaluate`` bounds the worst case.
+
+        Failures inside a worker are wrapped so the dict always contains
+        an entry — the caller can fall back to the sequential path if
+        an entry is missing.
+        """
+        out: dict[str, tuple[str, OutputAssessment | None]] = {}
+        if not items:
+            return out
+        max_workers = min(4, len(items))
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="output-guard-batch",
+        ) as ex:
+            futures = {
+                ex.submit(self._evaluate_output, tc_id, output, func_name): tc_id
+                for tc_id, output, func_name in items
+            }
+            for fut in concurrent.futures.as_completed(futures):
+                tc_id = futures[fut]
+                try:
+                    out[tc_id] = fut.result()
+                except Exception:
+                    log.warning("output_guard.batch_eval_failed", tc_id=tc_id, exc_info=True)
+        return out
+
+    def _invoke_output_guard_judge(
+        self, call_id: str, output: str, func_name: str
+    ) -> OutputJudgeVerdict | None:
+        """Run the LLM judge with caching + rate limiting (sec-4).
+
+        Returns the verdict (success or failure flavour) when the LLM
+        stage ran, or ``None`` when LLM was disabled / rate-limited /
+        the call itself raised.  Cache stores successful verdicts only;
+        failures retry on subsequent calls so a transient timeout
+        doesn't permanently mark an output as failed.
+        """
+        llm_judge = self._ensure_output_guard_judge()
+        if llm_judge is None:
+            return None
+        cache_key = hashlib.sha256(
+            f"{func_name}\0{output}".encode("utf-8", errors="replace")
+        ).hexdigest()
+        cached = self._output_guard_judge_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if not self._output_guard_judge_rl.consume():
+            log.info(
+                "output_guard_judge.rate_limited",
+                call_id=call_id,
+                func_name=func_name,
+            )
+            return None
+        try:
+            verdict = llm_judge.evaluate(
+                output,
+                func_name=func_name,
+                call_id=call_id,
+                cancel_event=self._output_guard_judge_cancel,
+            )
+        except Exception:
+            log.warning("output_guard_judge.evaluate_raised", exc_info=True)
+            return None
+        if verdict.succeeded:
+            if len(self._output_guard_judge_cache) >= _OUTPUT_GUARD_CACHE_MAX:
+                oldest = self._output_guard_judge_cache_order.popleft()
+                self._output_guard_judge_cache.pop(oldest, None)
+            self._output_guard_judge_cache[cache_key] = verdict
+            self._output_guard_judge_cache_order.append(cache_key)
+        return verdict
 
     def _record_output_tier(
         self,
