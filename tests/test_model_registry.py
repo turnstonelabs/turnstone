@@ -969,6 +969,16 @@ class _FakeUI:
     def on_state_change(self, state: str) -> None: ...
     def on_rename(self, name: str) -> None: ...
     def on_output_warning(self, call_id, assessment): ...
+    def record_output_assessment(
+        self,
+        call_id,
+        assessment,
+        *,
+        tier="heuristic",
+        reasoning="",
+        judge_model="",
+        latency_ms=0,
+    ): ...
 
 
 def _make_session(
