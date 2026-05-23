@@ -2744,6 +2744,8 @@ class PostgreSQLBackend:
             fields["auto_approve"] = int(fields["auto_approve"])
         if "enabled" in fields:
             fields["enabled"] = int(fields["enabled"])
+        if "hidden_from_menu" in fields:
+            fields["hidden_from_menu"] = int(fields["hidden_from_menu"])
         # Re-scan if content or allowed_tools changed
         if "content" in fields or "allowed_tools" in fields:
             content = fields.get("content")

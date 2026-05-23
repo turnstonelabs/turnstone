@@ -71,6 +71,25 @@ class TestHiddenFromMenu:
         assert row is not None
         assert row["hidden_from_menu"] is True
 
+    def test_update_hidden_with_bool(self, storage: Any) -> None:
+        """``hidden_from_menu`` lives on an INTEGER column but the wire type
+        from JSON / Pydantic is ``bool``.  ``update_prompt_template`` must
+        coerce explicitly — without coercion, a PG INSERT of ``True`` into
+        an Integer column is driver-dependent and was the gap Copilot
+        review on PR #574 flagged."""
+        _create(storage)
+        ok = storage.update_prompt_template("spec1", hidden_from_menu=True)
+        assert ok is True
+        row = storage.get_prompt_template("spec1")
+        assert row is not None
+        assert row["hidden_from_menu"] is True
+        # Also round-trips the false transition.
+        ok = storage.update_prompt_template("spec1", hidden_from_menu=False)
+        assert ok is True
+        row = storage.get_prompt_template("spec1")
+        assert row is not None
+        assert row["hidden_from_menu"] is False
+
 
 class TestArguments:
     def test_default_empty_array(self, storage: Any) -> None:

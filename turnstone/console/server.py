@@ -6488,6 +6488,14 @@ def _canonicalize_skill_string_list(raw: Any) -> str:
     a CSV-split corruption of the literal string ``"None"``.  Empty
     list elements are trimmed out so the stored array never carries
     blank strings.
+
+    Note: this helper's ``None``-to-``"[]"`` rule is the **normalization**
+    contract.  The update endpoint (`admin_update_skill`) intercepts
+    ``body["paths"] is None`` *before* calling this helper and treats
+    it as "leave unchanged" — that's the update-semantics contract,
+    layered on top of normalization rather than baked in here.  Both
+    contracts coexist intentionally: create defaults to empty, update
+    skips no-ops.
     """
     import json as _json
 
