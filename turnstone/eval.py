@@ -163,6 +163,18 @@ class NullUI:
     def on_output_warning(self, call_id: str, assessment: dict[str, Any]) -> None:
         pass
 
+    def record_output_assessment(
+        self,
+        call_id: str,
+        assessment: dict[str, Any],
+        *,
+        tier: str = "heuristic",
+        reasoning: str = "",
+        judge_model: str = "",
+        latency_ms: int = 0,
+    ) -> None:
+        pass
+
 
 def _log(msg: str, dim: bool = False) -> None:
     """Print a log line with optional dim styling."""

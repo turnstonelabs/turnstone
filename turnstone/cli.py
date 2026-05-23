@@ -363,6 +363,19 @@ class TerminalUI(SessionUI):
         if summary:
             print(f"    {summary}")
 
+    def record_output_assessment(
+        self,
+        call_id: str,
+        assessment: dict[str, Any],
+        *,
+        tier: str = "heuristic",
+        reasoning: str = "",
+        judge_model: str = "",
+        latency_ms: int = 0,
+    ) -> None:
+        """Terminal UI doesn't persist; SessionUIBase subclasses do."""
+        return
+
     def on_output_warning(self, call_id: str, assessment: dict[str, Any]) -> None:
         """Display output guard warning when risk signals are detected."""
         risk = assessment.get("risk_level", "none")
