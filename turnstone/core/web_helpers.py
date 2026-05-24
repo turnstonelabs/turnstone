@@ -27,7 +27,7 @@ def skill_summary_rows(storage: Any) -> list[dict[str, Any]]:
 
     Filters:
     * ``enabled=False`` rows are dropped.
-    * ``hidden_from_menu=True`` rows are dropped (Anthropic spec
+    * ``hidden_from_menu=True`` rows are dropped (SKILL.md spec
       ``user-invocable: false`` — model still sees the skill via the
       ``skills`` tool, but the user picker hides it).
 

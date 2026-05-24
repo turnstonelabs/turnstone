@@ -433,15 +433,15 @@ prompt_templates = sa.Table(
     sa.Column("version", sa.Text, nullable=False, server_default="1.0.0"),
     sa.Column("author", sa.Text, nullable=False, server_default=""),
     sa.Column("activation", sa.Text, nullable=False, server_default="named"),
-    # Anthropic skill spec ``user-invocable: false`` — hide from /-menu picker.
+    # SKILL.md spec ``user-invocable: false`` — hide from /-menu picker.
     sa.Column("hidden_from_menu", sa.Integer, nullable=False, server_default="0"),
     sa.Column("token_estimate", sa.Integer, nullable=False, server_default="0"),
     sa.Column("allowed_tools", sa.Text, nullable=False, server_default="[]"),  # JSON array
-    # Anthropic skill spec ``paths:`` — glob patterns gating autoload.
+    # SKILL.md spec ``paths:`` — glob patterns gating autoload.
     # Consumer (filter logic) lands in a follow-up PR; field is
     # parsed/stored/editable but not yet acted on.
     sa.Column("paths", sa.Text, nullable=False, server_default="[]"),  # JSON array
-    # Anthropic skill spec ``arguments:`` + ``argument-hint:`` —
+    # SKILL.md spec ``arguments:`` + ``argument-hint:`` —
     # named positional slots and autocomplete display string.  Consumed
     # by the $N / $<name> substitution PR (issue #572).
     sa.Column("arguments", sa.Text, nullable=False, server_default="[]"),  # JSON array

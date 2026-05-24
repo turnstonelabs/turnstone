@@ -33,7 +33,7 @@ _LIST_SPLIT_RE = re.compile(r"[\s,]+")
 _BARE_DESC_RE = re.compile(r"^(description:\s*)(.+)$", re.MULTILINE)
 
 # Field length caps.  ``MAX_SKILL_DESCRIPTION_LEN`` matches the
-# Anthropic Claude Code skill spec's combined ``description`` +
+# SKILL.md spec's combined ``description`` +
 # ``when_to_use`` listing budget (1,536 chars).  Exported (no leading
 # underscore) because the same cap must be enforced at every write
 # surface — Pydantic schemas, the admin HTTP handlers, and the
@@ -56,18 +56,18 @@ class ParsedSkill:
     allowed_tools: list[str] = field(default_factory=list)
     license: str = ""
     compatibility: str = ""
-    # Anthropic Claude Code spec ``paths:`` — glob patterns gating
+    # SKILL.md spec ``paths:`` — glob patterns gating
     # model-initiated autoload.  Filter consumer lands in a follow-up
     # PR (issue #569); parsed here so the value round-trips through
     # install / admin edit / export without loss.
     paths: list[str] = field(default_factory=list)
-    # Anthropic spec ``when_to_use:`` — additional trigger context for
+    # SKILL.md spec ``when_to_use:`` — additional trigger context for
     # when the skill should be invoked.  Concatenated into
     # ``description`` (capped at ``MAX_SKILL_DESCRIPTION_LEN``) so the model
     # sees both in the listing; kept here separately for the admin
     # parse-preview UI which surfaces it as its own field.
     when_to_use: str = ""
-    # Anthropic spec ``model:`` and ``effort:`` — per-skill model
+    # SKILL.md spec ``model:`` and ``effort:`` — per-skill model
     # override + reasoning effort.  Fields keep their spec names here
     # for fidelity at the parser layer; the install handler translates
     # ``effort`` → ``prompt_templates.reasoning_effort`` at the storage
@@ -75,7 +75,7 @@ class ParsedSkill:
     # short-circuits at the source_url dedup so admin overrides survive.
     model: str = ""
     effort: str = ""
-    # Anthropic spec ``disable-model-invocation:`` and ``user-invocable:``
+    # SKILL.md spec ``disable-model-invocation:`` and ``user-invocable:``
     # — invocation-control axes.  Stored in raw spec shape on the
     # dataclass; defaults match spec (both invokers can use the skill
     # unless gated).
@@ -95,14 +95,14 @@ class ParsedSkill:
     # field that gates flipping back.
     disable_model_invocation: bool = False
     user_invocable: bool = True
-    # Anthropic spec ``arguments:`` — named positional argument slots
+    # SKILL.md spec ``arguments:`` — named positional argument slots
     # that pair with ``$<name>`` substitution in the skill body.
     # Accepts the spec's space-separated string or YAML list shape.
     # Stored as a JSON-array column on ``prompt_templates`` (added by
     # migration 056); the renderer in ``session._substitute_skill_args``
     # binds positional args to these names at skill-load time.
     arguments: list[str] = field(default_factory=list)
-    # Anthropic spec ``argument-hint:`` — display string for slash-
+    # SKILL.md spec ``argument-hint:`` — display string for slash-
     # command autocomplete, e.g. ``"[issue-number]"``.  Surfaced in
     # the admin UI and round-tripped through install; no runtime
     # behaviour today since Turnstone doesn't have a slash-command
@@ -112,13 +112,13 @@ class ParsedSkill:
 
 
 def _extract_tags(meta: dict[str, Any]) -> list[str]:
-    """Extract tags from frontmatter, handling both Anthropic and Hermes formats."""
+    """Extract tags from frontmatter, handling both nested-metadata and Hermes formats."""
     # Direct tags field
     tags = meta.get("tags")
     if isinstance(tags, list):
         return [str(t) for t in tags if t]
 
-    # Nested metadata.tags (Anthropic format)
+    # Nested metadata.tags (SKILL.md spec format)
     metadata = meta.get("metadata")
     if isinstance(metadata, dict):
         nested = metadata.get("tags")
@@ -317,7 +317,7 @@ def parse_skill_md(raw: str, *, lenient: bool = False) -> ParsedSkill | None:
             first_line = first_line.lstrip("# ").strip()
         description = first_line[:256]
 
-    # Anthropic spec ``when_to_use:`` — appended to description so the
+    # SKILL.md spec ``when_to_use:`` — appended to description so the
     # model sees both signals on the listing.  Separated by a blank
     # line + "When to use:" prefix; budgeted against the combined cap
     # below so the truncation never lands inside the separator and
@@ -375,7 +375,7 @@ def parse_skill_md(raw: str, *, lenient: bool = False) -> ParsedSkill | None:
         when_to_use=when_to_use,
         model=_extract_str(meta, "model"),
         effort=_extract_str(meta, "effort"),
-        # Anthropic invocation-control axes — spec defaults: model can
+        # Invocation-control axes — spec defaults: model can
         # autoload (disable-model-invocation=False) AND user can pick
         # from the menu (user-invocable=True).
         disable_model_invocation=_extract_bool(meta, "disable-model-invocation", default=False),

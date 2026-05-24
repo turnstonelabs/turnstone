@@ -158,10 +158,10 @@ Content.
         result = parse_skill_md(raw)
         assert result.tags == ["ai", "assistant"]
 
-    def test_anthropic_tags(self) -> None:
+    def test_nested_metadata_tags(self) -> None:
         raw = """\
 ---
-name: anthropic-skill
+name: nested-tags-skill
 metadata:
   tags: [claude, coding]
 ---
@@ -240,7 +240,7 @@ Content.
 
 
 class TestPaths:
-    """Anthropic Claude Code spec ``paths:`` — glob patterns gating autoload."""
+    """SKILL.md spec ``paths:`` — glob patterns gating autoload."""
 
     def test_list_format(self) -> None:
         raw = """\
@@ -296,7 +296,7 @@ Content.
 
 
 class TestWhenToUse:
-    """Anthropic spec ``when_to_use:`` — appended to description at parse time."""
+    """SKILL.md spec ``when_to_use:`` — appended to description at parse time."""
 
     def test_appended_to_description(self) -> None:
         raw = """\
@@ -364,7 +364,7 @@ Content.
 
 
 class TestModelAndEffort:
-    """Anthropic spec ``model:`` / ``effort:`` — per-skill overrides."""
+    """SKILL.md spec ``model:`` / ``effort:`` — per-skill overrides."""
 
     def test_model_extracted(self) -> None:
         raw = """\
@@ -404,7 +404,7 @@ Content.
 
 
 class TestInvocationControl:
-    """Anthropic spec ``disable-model-invocation:`` + ``user-invocable:``."""
+    """SKILL.md spec ``disable-model-invocation:`` + ``user-invocable:``."""
 
     def test_disable_model_invocation_true(self) -> None:
         raw = """\
@@ -518,7 +518,7 @@ Content.
 
 
 class TestArgumentsAndHint:
-    """Anthropic spec ``arguments:`` (named positional slots) +
+    """SKILL.md spec ``arguments:`` (named positional slots) +
     ``argument-hint:`` (autocomplete display)."""
 
     def test_yaml_list_format(self) -> None:

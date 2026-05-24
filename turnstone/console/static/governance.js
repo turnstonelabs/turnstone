@@ -912,7 +912,7 @@ function _renderGovSkills(items) {
 // ---------------------------------------------------------------------------
 // SKILL.md paste auto-fill — sniff frontmatter on paste, hit the parse
 // endpoint, and populate the form so users don't have to retype name /
-// description / tags / etc. when importing an Anthropic-style skill.
+// description / tags / etc. when importing a SKILL.md-style skill.
 // ---------------------------------------------------------------------------
 
 // Trigger on any paste whose first non-whitespace bytes look like an opening

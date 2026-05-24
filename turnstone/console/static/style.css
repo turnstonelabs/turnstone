@@ -3393,7 +3393,13 @@ textarea.skill-content-area {
   background: var(--yellow-glow);
 }
 
-/* Help tooltip */
+/* Help tooltip.  The glyph is painted by ``::after`` rather than HTML
+   text content so the button renders identically whether the markup
+   has literal ``>?</button>`` text (settings-tab buttons assembled in
+   admin.js) or prettier-introduced whitespace around the glyph (skill
+   modal buttons in index.html).  Any literal text content is hidden
+   via ``font-size: 0`` on the button; the pseudo restores its own
+   size so the glyph centers cleanly via flex. */
 .settings-help-btn {
   display: inline-flex;
   align-items: center;
@@ -3404,7 +3410,7 @@ textarea.skill-content-area {
   border: 1px solid var(--accent);
   background: var(--accent-dim);
   color: var(--accent);
-  font-size: 10px;
+  font-size: 0;
   font-weight: 600;
   font-family: var(--font-ui);
   cursor: pointer;
@@ -3416,6 +3422,11 @@ textarea.skill-content-area {
   transition:
     background 0.15s,
     color 0.15s;
+}
+.settings-help-btn::after {
+  content: "?";
+  font-size: 10px;
+  line-height: 1;
 }
 /* Expand tap target to ~26px without changing visual size */
 .settings-help-btn::before {
@@ -3434,6 +3445,7 @@ textarea.skill-content-area {
 
 .settings-help-popover {
   margin-top: 4px;
+  margin-bottom: 4px;
   padding: 6px 8px;
   background: var(--bg-surface);
   border: 1px solid var(--border);
@@ -3441,6 +3453,21 @@ textarea.skill-content-area {
   border-radius: 3px;
   font-size: 11px;
   line-height: 1.4;
+  color: var(--fg);
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 400;
+}
+.settings-help-popover code {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  padding: 0 4px;
+  background: var(--code-bg);
+  border-radius: 2px;
+  color: var(--fg);
+}
+.settings-help-popover strong {
+  font-weight: 600;
   color: var(--fg);
 }
 .settings-help-text {

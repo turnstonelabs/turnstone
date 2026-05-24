@@ -548,7 +548,7 @@ _RESOURCE_PATH_RE = re.compile(
 _TEMPLATE_VAR_RE = re.compile(r"\{\{(\w+)\}\}")
 
 
-# Anthropic Claude Code skill spec placeholders.  Single combined
+# SKILL.md spec placeholders.  Single combined
 # regex so substitution is one-pass — a positional arg whose VALUE
 # happens to contain ``$ARGUMENTS`` (etc.) doesn't get re-expanded
 # on a second sweep.  The verbose form keeps the alternation
@@ -631,7 +631,7 @@ def _substitute_skill_args(
     ws_id: str,
     effort: str,
 ) -> str:
-    """Apply Anthropic Claude Code skill-spec placeholder substitution.
+    """Apply SKILL.md spec placeholder substitution.
 
     Handles every spec form except ``${CLAUDE_SKILL_DIR}`` (which
     requires a filesystem-shaped skill layout Turnstone doesn't have
@@ -1517,7 +1517,7 @@ class ChatSession:
                 "instructions": self.instructions or "",
                 "creative_mode": str(self.creative_mode),
                 "skill": self._skill_name or "",
-                # Anthropic spec ``$ARGUMENTS`` payload (#572).  Stored
+                # SKILL.md spec ``$ARGUMENTS`` payload (#572).  Stored
                 # so a resumed workstream re-renders the skill with the
                 # same args the original load supplied — otherwise the
                 # rehydrate path would silently swap to empty args.
@@ -8488,7 +8488,7 @@ class ChatSession:
         name = self._coord_str_arg(args, "name").strip()
         if not name:
             return self._coord_tool_error(call_id, "skills", "load: 'name' is required")
-        # Anthropic spec ``$ARGUMENTS`` payload — optional.  Mirror
+        # SKILL.md spec ``$ARGUMENTS`` payload — optional.  Mirror
         # the spec's free-form string shape (``/skill-name a b "c d"``)
         # rather than a list, so the model can pass quoted positional
         # args and have ``shlex.split`` at substitution time produce

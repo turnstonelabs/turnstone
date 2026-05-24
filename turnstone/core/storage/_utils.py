@@ -181,7 +181,7 @@ SKILL_MUTABLE = frozenset(
         "scan_report",
         "priority",
         "kind",
-        # Anthropic spec uplift (migration 056)
+        # SKILL.md spec uplift (migration 056)
         "paths",
         "hidden_from_menu",
         "arguments",

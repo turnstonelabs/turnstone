@@ -330,7 +330,7 @@ class SkillInfo(BaseModel):
     risk_level: str = ""
     scan_report: str = "{}"
     scan_version: str = ""
-    # Anthropic spec uplift (migration 056).  JSON-array strings on
+    # SKILL.md spec uplift (migration 056).  JSON-array strings on
     # the wire to match the shape of ``allowed_tools`` /
     # ``notify_on_complete``; admin UI parses client-side.  Consumer
     # PRs (#569 filter, #571 menu hide, #572 substitution) will wire
@@ -379,17 +379,17 @@ class CreateSkillRequest(BaseModel):
     allowed_tools: str = "[]"
     license: str = ""
     compatibility: str = ""
-    # Anthropic spec ``paths:`` — glob patterns gating autoload.
+    # SKILL.md spec ``paths:`` — glob patterns gating autoload.
     # Accepts either a JSON-array string or a list; the admin handler
     # canonicalizes via ``_canonicalize_skill_string_list``.  The
     # filter consumer lands in a follow-up PR (#569).
     paths: str | list[str] = "[]"
-    # Anthropic spec ``user-invocable: false`` lands here as
+    # SKILL.md spec ``user-invocable: false`` lands here as
     # ``hidden_from_menu=true`` (#571).  Hides the skill from the
     # user-facing picker (``/v1/api/skills``) while keeping it
     # available to the model.
     hidden_from_menu: bool = False
-    # Anthropic spec ``arguments:`` + ``argument-hint:`` — named
+    # SKILL.md spec ``arguments:`` + ``argument-hint:`` — named
     # positional slots for ``$<name>`` substitution + autocomplete
     # display.  Consumer is ``session._substitute_skill_args`` at skill
     # render time (#572).  ``arguments`` uses the same wire shape as
@@ -445,7 +445,7 @@ class UpdateSkillRequest(BaseModel):
     allowed_tools: str | None = None
     license: str | None = None
     compatibility: str | None = None
-    # Anthropic spec ``paths:`` (#569 — filter consumer pending),
+    # SKILL.md spec ``paths:`` (#569 — filter consumer pending),
     # ``user-invocable: false`` mapped to ``hidden_from_menu=true``
     # (#571), and ``arguments:`` / ``argument-hint:`` (#572 —
     # substitution consumer).
@@ -859,7 +859,7 @@ class ParseSkillResponse(BaseModel):
     license: str = ""
     compatibility: str = ""
     paths: list[str] = Field(default_factory=list)
-    # Anthropic spec extras (#570).  ``when_to_use`` is already
+    # SKILL.md spec extras (#570).  ``when_to_use`` is already
     # concatenated into ``description``; surfaced separately so the
     # admin parse-preview UI can show what the source SKILL.md
     # provided in each field.
@@ -872,7 +872,7 @@ class ParseSkillResponse(BaseModel):
     # can echo them on the parse-preview.
     disable_model_invocation: bool = False
     user_invocable: bool = True
-    # Anthropic spec ``arguments:`` + ``argument-hint:`` (#572).
+    # SKILL.md spec ``arguments:`` + ``argument-hint:`` (#572).
     # Named positional slots + autocomplete display string; surfaced
     # so the admin parse-preview UI can echo what came from the source
     # SKILL.md.

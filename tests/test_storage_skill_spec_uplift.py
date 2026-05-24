@@ -1,4 +1,4 @@
-"""Storage round-trip for the Anthropic spec-uplift columns (migration 056).
+"""Storage round-trip for the SKILL.md spec-uplift columns (migration 056).
 
 Each column is parsed/stored/editable in PR1 (#569); the consumers
 (autoload filter / menu hide / argument substitution) land in

@@ -289,7 +289,9 @@ function switchAdminTab(tab) {
   if (tab === "judge") loadJudgeTab();
 
   // Update breadcrumb with active tab label
-  const activeNav = document.querySelector('.admin-nav[data-tab="' + tab + '"]');
+  const activeNav = document.querySelector(
+    '.admin-nav[data-tab="' + tab + '"]',
+  );
   const label = activeNav ? activeNav.textContent : tab;
   const bcLabel = document.getElementById("breadcrumb-label");
   if (bcLabel) bcLabel.textContent = "Admin / " + label;
@@ -895,7 +897,9 @@ function _renderChannels(channels) {
     // adapters render with their own color.  Falls back to the generic
     // scope-channel for unknown platforms; the per-platform class wins
     // by being the only class set, not by source order.
-    const ctSlug = (c.channel_type || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    const ctSlug = (c.channel_type || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, "");
     const ctClass =
       ctSlug && (ctSlug === "discord" || ctSlug === "slack")
         ? "scope-badge scope-" + ctSlug
@@ -1003,7 +1007,8 @@ function _renderSchedules(schedules) {
   for (let i = 0; i < schedules.length; i++) {
     const s = schedules[i];
     const typeLabel = s.schedule_type === "cron" ? "cron" : "at";
-    const typeCls = s.schedule_type === "cron" ? "scope-write" : "scope-approve";
+    const typeCls =
+      s.schedule_type === "cron" ? "scope-write" : "scope-approve";
     const schedule =
       s.schedule_type === "cron"
         ? s.cron_expr
@@ -1313,7 +1318,8 @@ function _collectNotifyTargets(prefix) {
     .querySelectorAll(".notify-row");
   const targets = [];
   for (let i = 0; i < rows.length; i++) {
-    const ct = (rows[i].querySelector(".notify-row-ct") || {}).value || "discord";
+    const ct =
+      (rows[i].querySelector(".notify-row-ct") || {}).value || "discord";
     const type =
       (rows[i].querySelector(".notify-row-target") || {}).value || "channel_id";
     const idEl = rows[i].querySelector(".notify-row-id");
@@ -3064,29 +3070,62 @@ function _renderSettingRow(item) {
 }
 
 function _toggleSettingsHelp(e, btn) {
+  // Stop both flavours of cascade: bubble to label/checkbox parents (would
+  // toggle the form control behind the button) AND any default action on
+  // the button click itself (irrelevant for type="button" but cheap insurance).
   e.stopPropagation();
-  const popover = btn
-    .closest(".settings-label-col")
-    .querySelector(".settings-help-popover");
+  e.preventDefault();
+  // Two lookup paths:
+  //   (a) data-help-target="popover-id" — used by the skill modals where
+  //       the popover is a sibling of the label, not wrapped in a column.
+  //   (b) Ancestor .settings-label-col → child .settings-help-popover —
+  //       the original Settings-tab structure.
+  const targetId = btn.getAttribute("data-help-target");
+  let popover = null;
+  if (targetId) {
+    popover = document.getElementById(targetId);
+  } else {
+    const col = btn.closest(".settings-label-col");
+    if (col) popover = col.querySelector(".settings-help-popover");
+  }
   if (!popover) return;
   const isVisible = popover.style.display !== "none";
-  // Close any other open popovers and reset their buttons
   _closeAllSettingsHelp(popover);
   popover.style.display = isVisible ? "none" : "";
   btn.setAttribute("aria-expanded", isVisible ? "false" : "true");
 }
 
+// Document-delegated click handler for help buttons that opt in via
+// ``data-help-target``.  Settings-tab buttons keep their per-button
+// listeners (bound at render time) so this only fires for the static-HTML
+// buttons in the skill modals.  Bound once at module load.
+document.addEventListener("click", function (e) {
+  const btn = e.target.closest(".settings-help-btn[data-help-target]");
+  if (btn) _toggleSettingsHelp(e, btn);
+});
+
 function _closeAllSettingsHelp(except) {
   const allOpen = document.querySelectorAll('.settings-help-popover[style=""]');
   for (let i = 0; i < allOpen.length; i++) {
-    if (allOpen[i] !== except) {
-      allOpen[i].style.display = "none";
-      const col = allOpen[i].closest(".settings-label-col");
-      if (col) {
-        const helpBtn = col.querySelector(".settings-help-btn");
-        if (helpBtn) helpBtn.setAttribute("aria-expanded", "false");
-      }
+    if (allOpen[i] === except) continue;
+    const popover = allOpen[i];
+    popover.style.display = "none";
+    // Reverse-resolve the button so we can clear aria-expanded.  Two paths,
+    // mirroring _toggleSettingsHelp's lookup:
+    //   (a) Skill modals — button sits outside .settings-label-col but its
+    //       data-help-target attribute points at this popover's id.
+    //   (b) Settings tab — button is a sibling inside .settings-label-col.
+    let helpBtn = null;
+    if (popover.id) {
+      helpBtn = document.querySelector(
+        '.settings-help-btn[data-help-target="' + popover.id + '"]',
+      );
     }
+    if (!helpBtn) {
+      const col = popover.closest(".settings-label-col");
+      if (col) helpBtn = col.querySelector(".settings-help-btn");
+    }
+    if (helpBtn) helpBtn.setAttribute("aria-expanded", "false");
   }
 }
 
@@ -4976,7 +5015,9 @@ function loadAdminModels() {
 function switchModelsSection(section) {
   const sections = document.querySelectorAll("#admin-models .models-section");
   for (let i = 0; i < sections.length; i++) sections[i].style.display = "none";
-  const switcher = document.querySelector("#admin-models .admin-subtab-switcher");
+  const switcher = document.querySelector(
+    "#admin-models .admin-subtab-switcher",
+  );
   const btns = switcher ? switcher.querySelectorAll(".admin-subtab-btn") : [];
   for (let k = 0; k < btns.length; k++) {
     const isActive = btns[k].getAttribute("data-section") === section;
@@ -4990,7 +5031,9 @@ function switchModelsSection(section) {
 
 // Arrow key navigation for Models sub-tabs (matches the Judge tab).
 (function () {
-  const switcher = document.querySelector("#admin-models .admin-subtab-switcher");
+  const switcher = document.querySelector(
+    "#admin-models .admin-subtab-switcher",
+  );
   if (!switcher) return;
   switcher.addEventListener("keydown", function (e) {
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;

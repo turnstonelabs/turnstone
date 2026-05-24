@@ -1,4 +1,4 @@
-"""Unit tests for ``_substitute_skill_args`` — Anthropic spec placeholder
+"""Unit tests for ``_substitute_skill_args`` — SKILL.md spec placeholder
 substitution applied to skill bodies at load time.
 
 Covers every placeholder form Turnstone implements (``${CLAUDE_SKILL_DIR}``

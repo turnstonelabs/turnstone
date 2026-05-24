@@ -165,8 +165,8 @@ class TestParseSkill:
         assert data["argument_hint"] == ""
         assert data["license"] == ""
 
-    def test_anthropic_nested_metadata_tags(self, client: TestClient) -> None:
-        # Anthropic-style skill puts tags under metadata.tags rather than
+    def test_nested_metadata_tags(self, client: TestClient) -> None:
+        # Some SKILL.md authors put tags under metadata.tags rather than
         # at the top level — the parser must handle both layouts.
         raw = """\
 ---
@@ -174,7 +174,7 @@ name: nested-meta
 description: A skill using nested metadata
 metadata:
   tags: [alpha, beta]
-  author: Anthropic
+  author: Acme
   version: 3.1.4
 ---
 
@@ -184,7 +184,7 @@ Body.
         assert resp.status_code == 200
         data = resp.json()
         assert data["tags"] == ["alpha", "beta"]
-        assert data["author"] == "Anthropic"
+        assert data["author"] == "Acme"
         assert data["version"] == "3.1.4"
 
     def test_unquoted_colon_in_description(self, client: TestClient) -> None:

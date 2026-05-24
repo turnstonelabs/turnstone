@@ -3062,11 +3062,24 @@
                 <option value="Proprietary">Proprietary</option>
               </select>
               <label for="skill-compatibility"
-                >Compatibility
-                <span class="label-hint"
-                  >environment requirements, max 500 chars</span
+                >Compatibility<button
+                  type="button"
+                  class="settings-help-btn"
+                  data-help-target="skill-compatibility-help"
+                  aria-label="Help for Compatibility"
+                  aria-expanded="false"
+                >
+                  ?</button
                 ></label
               >
+              <div
+                id="skill-compatibility-help"
+                class="settings-help-popover"
+                style="display: none"
+              >
+                Environment requirements like other tools, services, or
+                runtimes the skill expects. Max 500 chars.
+              </div>
               <input
                 id="skill-compatibility"
                 type="text"
@@ -3074,12 +3087,25 @@
                 maxlength="500"
               />
               <label for="skill-paths"
-                >Paths
-                <span class="label-hint"
-                  >glob patterns (comma-separated) — Anthropic spec
-                  <code>paths:</code>; filter consumer pending</span
+                >Paths<button
+                  type="button"
+                  class="settings-help-btn"
+                  data-help-target="skill-paths-help"
+                  aria-label="Help for Paths"
+                  aria-expanded="false"
+                >
+                  ?</button
                 ></label
               >
+              <div
+                id="skill-paths-help"
+                class="settings-help-popover"
+                style="display: none"
+              >
+                Glob patterns gating model-initiated autoload, e.g.
+                <code>**/*.py</code>. Comma-separated. Maps to SKILL.md
+                <code>paths:</code>. Filter consumer pending.
+              </div>
               <input
                 id="skill-paths"
                 type="text"
@@ -3089,35 +3115,72 @@
                 <input id="skill-hidden-from-menu" type="checkbox" />
                 <span class="toggle-track" aria-hidden="true"></span>
                 <span class="toggle-label"
-                  >Hide from skill picker
-                  <span class="label-hint"
-                    >Anthropic spec <code>user-invocable: false</code> — skill
-                    stays available to the model but disappears from the
-                    user-facing picker.</span
+                  >Hide from skill picker<button
+                    type="button"
+                    class="settings-help-btn"
+                    data-help-target="skill-hidden-from-menu-help"
+                    aria-label="Help for Hide from skill picker"
+                    aria-expanded="false"
+                  >
+                    ?</button
                   ></span
                 >
               </label>
+              <div
+                id="skill-hidden-from-menu-help"
+                class="settings-help-popover"
+                style="display: none"
+              >
+                Hides the skill from the user-facing <code>/skill</code>
+                picker. The model can still load it via the
+                <code>skills</code> tool. Maps to SKILL.md
+                <code>user-invocable: false</code>.
+              </div>
               <label for="skill-arguments"
-                >Arguments
-                <span class="label-hint"
-                  >named positional slots (comma-separated) — Anthropic
-                  spec <code>arguments:</code>; substituted as
-                  <code>$&lt;name&gt;</code> in the skill body</span
+                >Arguments<button
+                  type="button"
+                  class="settings-help-btn"
+                  data-help-target="skill-arguments-help"
+                  aria-label="Help for Arguments"
+                  aria-expanded="false"
+                >
+                  ?</button
                 ></label
               >
+              <div
+                id="skill-arguments-help"
+                class="settings-help-popover"
+                style="display: none"
+              >
+                Named positional slots substituted as
+                <code>$&lt;name&gt;</code> in the skill body.
+                Comma-separated. Maps to SKILL.md <code>arguments:</code>.
+              </div>
               <input
                 id="skill-arguments"
                 type="text"
                 placeholder="issue, branch"
               />
               <label for="skill-argument-hint"
-                >Argument hint
-                <span class="label-hint"
-                  >autocomplete display string — Anthropic spec
-                  <code>argument-hint:</code>, e.g.
-                  <code>[issue-number]</code></span
+                >Argument hint<button
+                  type="button"
+                  class="settings-help-btn"
+                  data-help-target="skill-argument-hint-help"
+                  aria-label="Help for Argument hint"
+                  aria-expanded="false"
+                >
+                  ?</button
                 ></label
               >
+              <div
+                id="skill-argument-hint-help"
+                class="settings-help-popover"
+                style="display: none"
+              >
+                Display string shown next to slash-command autocomplete,
+                e.g. <code>[issue-number]</code>. Maps to SKILL.md
+                <code>argument-hint:</code>.
+              </div>
               <input
                 id="skill-argument-hint"
                 type="text"
@@ -3128,11 +3191,26 @@
             <div class="skill-spec-section">
               <h3 class="skill-spec-heading">Deployment</h3>
               <label for="skill-activation"
-                >Activation
-                <span class="label-hint"
-                  >how models discover this skill</span
+                >Activation<button
+                  type="button"
+                  class="settings-help-btn"
+                  data-help-target="skill-activation-help"
+                  aria-label="Help for Activation"
+                  aria-expanded="false"
+                >
+                  ?</button
                 ></label
               >
+              <div
+                id="skill-activation-help"
+                class="settings-help-popover"
+                style="display: none"
+              >
+                How models discover this skill. <strong>Named</strong>
+                requires explicit <code>/skill</code> invocation;
+                <strong>Default</strong> is applied to every session;
+                <strong>Search</strong> is BM25-discoverable.
+              </div>
               <select id="skill-activation">
                 <option value="named">
                   Named — explicit /skill invocation
@@ -3429,11 +3507,24 @@
                 <option value="Proprietary">Proprietary</option>
               </select>
               <label for="etm-compatibility"
-                >Compatibility
-                <span class="label-hint"
-                  >environment requirements, max 500 chars</span
+                >Compatibility<button
+                  type="button"
+                  class="settings-help-btn"
+                  data-help-target="etm-compatibility-help"
+                  aria-label="Help for Compatibility"
+                  aria-expanded="false"
+                >
+                  ?</button
                 ></label
               >
+              <div
+                id="etm-compatibility-help"
+                class="settings-help-popover"
+                style="display: none"
+              >
+                Environment requirements like other tools, services, or
+                runtimes the skill expects. Max 500 chars.
+              </div>
               <input
                 id="etm-compatibility"
                 type="text"
@@ -3441,12 +3532,25 @@
                 maxlength="500"
               />
               <label for="etm-paths"
-                >Paths
-                <span class="label-hint"
-                  >glob patterns (comma-separated) — Anthropic spec
-                  <code>paths:</code>; filter consumer pending</span
+                >Paths<button
+                  type="button"
+                  class="settings-help-btn"
+                  data-help-target="etm-paths-help"
+                  aria-label="Help for Paths"
+                  aria-expanded="false"
+                >
+                  ?</button
                 ></label
               >
+              <div
+                id="etm-paths-help"
+                class="settings-help-popover"
+                style="display: none"
+              >
+                Glob patterns gating model-initiated autoload, e.g.
+                <code>**/*.py</code>. Comma-separated. Maps to SKILL.md
+                <code>paths:</code>. Filter consumer pending.
+              </div>
               <input
                 id="etm-paths"
                 type="text"
@@ -3456,34 +3560,72 @@
                 <input id="etm-hidden-from-menu" type="checkbox" />
                 <span class="toggle-track" aria-hidden="true"></span>
                 <span class="toggle-label"
-                  >Hide from skill picker
-                  <span class="label-hint"
-                    >Anthropic spec <code>user-invocable: false</code> — skill
-                    stays available to the model but disappears from the
-                    user-facing picker.</span
+                  >Hide from skill picker<button
+                    type="button"
+                    class="settings-help-btn"
+                    data-help-target="etm-hidden-from-menu-help"
+                    aria-label="Help for Hide from skill picker"
+                    aria-expanded="false"
+                  >
+                    ?</button
                   ></span
                 >
               </label>
+              <div
+                id="etm-hidden-from-menu-help"
+                class="settings-help-popover"
+                style="display: none"
+              >
+                Hides the skill from the user-facing <code>/skill</code>
+                picker. The model can still load it via the
+                <code>skills</code> tool. Maps to SKILL.md
+                <code>user-invocable: false</code>.
+              </div>
               <label for="etm-arguments"
-                >Arguments
-                <span class="label-hint"
-                  >named positional slots (comma-separated) — Anthropic
-                  spec <code>arguments:</code>; substituted as
-                  <code>$&lt;name&gt;</code> in the skill body</span
+                >Arguments<button
+                  type="button"
+                  class="settings-help-btn"
+                  data-help-target="etm-arguments-help"
+                  aria-label="Help for Arguments"
+                  aria-expanded="false"
+                >
+                  ?</button
                 ></label
               >
+              <div
+                id="etm-arguments-help"
+                class="settings-help-popover"
+                style="display: none"
+              >
+                Named positional slots substituted as
+                <code>$&lt;name&gt;</code> in the skill body.
+                Comma-separated. Maps to SKILL.md <code>arguments:</code>.
+              </div>
               <input
                 id="etm-arguments"
                 type="text"
                 placeholder="issue, branch"
               />
               <label for="etm-argument-hint"
-                >Argument hint
-                <span class="label-hint"
-                  >autocomplete display string — Anthropic spec
-                  <code>argument-hint:</code></span
+                >Argument hint<button
+                  type="button"
+                  class="settings-help-btn"
+                  data-help-target="etm-argument-hint-help"
+                  aria-label="Help for Argument hint"
+                  aria-expanded="false"
+                >
+                  ?</button
                 ></label
               >
+              <div
+                id="etm-argument-hint-help"
+                class="settings-help-popover"
+                style="display: none"
+              >
+                Display string shown next to slash-command autocomplete,
+                e.g. <code>[issue-number]</code>. Maps to SKILL.md
+                <code>argument-hint:</code>.
+              </div>
               <input
                 id="etm-argument-hint"
                 type="text"
@@ -3494,11 +3636,26 @@
             <div class="skill-spec-section">
               <h3 class="skill-spec-heading">Deployment</h3>
               <label for="etm-activation"
-                >Activation
-                <span class="label-hint"
-                  >how models discover this skill</span
+                >Activation<button
+                  type="button"
+                  class="settings-help-btn"
+                  data-help-target="etm-activation-help"
+                  aria-label="Help for Activation"
+                  aria-expanded="false"
+                >
+                  ?</button
                 ></label
               >
+              <div
+                id="etm-activation-help"
+                class="settings-help-popover"
+                style="display: none"
+              >
+                How models discover this skill. <strong>Named</strong>
+                requires explicit <code>/skill</code> invocation;
+                <strong>Default</strong> is applied to every session;
+                <strong>Search</strong> is BM25-discoverable.
+              </div>
               <select id="etm-activation">
                 <option value="named">
                   Named — explicit /skill invocation

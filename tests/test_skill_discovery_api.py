@@ -281,7 +281,7 @@ class TestSkillInstall:
         assert resp.json()["installed"][0]["name"] == "test-skill"
 
     def test_install_seeds_model_and_effort_from_frontmatter(self, client: TestClient) -> None:
-        """Anthropic spec ``model:`` + ``effort:`` survive into the row.
+        """SKILL.md spec ``model:`` + ``effort:`` survive into the row.
 
         The SKILL.md author's per-skill model and reasoning_effort
         intent must round-trip through install — they were dropped
@@ -305,7 +305,7 @@ class TestSkillInstall:
         assert skill["reasoning_effort"] == "high"
 
     def test_install_user_invocable_false_sets_hidden_from_menu(self, client: TestClient) -> None:
-        """Anthropic spec ``user-invocable: false`` lands as
+        """SKILL.md spec ``user-invocable: false`` lands as
         ``hidden_from_menu=true`` on the row.  The skill stays available
         to the model but disappears from the user-facing picker."""
         package = _sample_package(user_invocable=False)
@@ -341,7 +341,7 @@ class TestSkillInstall:
         assert skill["hidden_from_menu"] is False
 
     def test_install_seeds_arguments_and_argument_hint(self, client: TestClient) -> None:
-        """Anthropic spec ``arguments:`` + ``argument-hint:`` round-trip
+        """SKILL.md spec ``arguments:`` + ``argument-hint:`` round-trip
         through install onto the row.  Verified end-to-end: parser
         extracted them, install handler persisted them, the response
         echoes the stored value."""

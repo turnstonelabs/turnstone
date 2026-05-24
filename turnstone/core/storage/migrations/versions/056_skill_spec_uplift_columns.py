@@ -1,6 +1,6 @@
-"""Add Anthropic spec-uplift columns to prompt_templates.
+"""Add SKILL.md spec-uplift columns to prompt_templates.
 
-The Anthropic Claude Code skill spec defines four frontmatter fields
+The SKILL.md frontmatter spec defines four fields
 that map to new columns on ``prompt_templates``:
 
 * ``paths`` — JSON list of glob patterns that gate model-initiated

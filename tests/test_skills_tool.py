@@ -712,7 +712,7 @@ class TestExecSkillsLoad:
         assert session._set_skill_called == [("universal", "")]
 
     def test_load_forwards_arguments_to_set_skill(self) -> None:
-        """Anthropic spec ``$ARGUMENTS`` payload (#572) — the model
+        """SKILL.md spec ``$ARGUMENTS`` payload (#572) — the model
         passes an ``arguments`` string in the load call, prepare carries
         it on the approval item, exec forwards it to ``set_skill`` for
         the renderer to consume.  Pins the wire path end-to-end."""

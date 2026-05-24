@@ -6596,7 +6596,7 @@ def _skill_to_response(r: dict[str, Any], resource_count: int = 0) -> dict[str, 
         "risk_level": r.get("risk_level", ""),
         "scan_report": r.get("scan_report", "{}"),
         "scan_version": r.get("scan_version", ""),
-        # Anthropic spec uplift (migration 056).  ``paths`` and
+        # SKILL.md spec uplift (migration 056).  ``paths`` and
         # ``arguments`` are JSON-array strings on the wire to match
         # ``allowed_tools`` / ``notify_on_complete``; the admin UI
         # parses them client-side.
@@ -6708,13 +6708,13 @@ async def admin_create_skill(request: Request) -> JSONResponse:
         except (ValueError, TypeError):
             tags_str = "[]"
 
-    # Anthropic spec ``paths:`` — glob patterns gating autoload.
+    # SKILL.md spec ``paths:`` — glob patterns gating autoload.
     # ``_canonicalize_skill_string_list`` accepts a list, a JSON-array
     # string, a comma-separated string, or ``None``, and returns the
     # canonical JSON-array string for storage.
     paths_str = _canonicalize_skill_string_list(body.get("paths"))
 
-    # Anthropic spec ``user-invocable: false`` lands here as
+    # SKILL.md spec ``user-invocable: false`` lands here as
     # ``hidden_from_menu=true`` — the user-facing picker
     # (``/v1/api/skills``) filters these out while the model still
     # sees them.  Strict-bool parse so a string like ``"false"`` (which
@@ -6723,7 +6723,7 @@ async def admin_create_skill(request: Request) -> JSONResponse:
     if hidden_err is not None:
         return hidden_err
 
-    # Anthropic spec ``arguments:`` — named positional slots for
+    # SKILL.md spec ``arguments:`` — named positional slots for
     # $<name> substitution.  Same wire shape as ``paths:`` — JSON-array
     # string in storage, list-or-CSV-or-JSON-string on the wire.
     arguments_str = _canonicalize_skill_string_list(body.get("arguments"))
@@ -7803,7 +7803,7 @@ async def admin_skill_install(request: Request) -> JSONResponse:
         # operator doesn't control.
         skill_description = parsed.description.strip() or f"Skill: {parsed.name}"
 
-        # Anthropic invocation-control axes (#571).  The install
+        # Invocation-control axes (#571).  The install
         # default is ``activation="named"`` already (user invokes by
         # name); ``disable-model-invocation: true`` reinforces that
         # but doesn't change the install-time value.  The interesting
@@ -7836,7 +7836,7 @@ async def admin_skill_install(request: Request) -> JSONResponse:
                 allowed_tools=allowed_tools_str,
                 paths=paths_str,
                 hidden_from_menu=install_hidden_from_menu,
-                # Anthropic spec ``model:`` + ``effort:`` — seed the
+                # SKILL.md spec ``model:`` + ``effort:`` — seed the
                 # corresponding ``model`` / ``reasoning_effort`` columns
                 # at install time so the SKILL.md author's intent
                 # survives the import.  Only fires on initial create —
@@ -7844,7 +7844,7 @@ async def admin_skill_install(request: Request) -> JSONResponse:
                 # protect admin-set values on re-install.
                 model=parsed.model,
                 reasoning_effort=parsed.effort,
-                # Anthropic spec ``arguments:`` + ``argument-hint:`` —
+                # SKILL.md spec ``arguments:`` + ``argument-hint:`` —
                 # named positional slots + autocomplete display.  Round-
                 # trip through install so the renderer's $<name>
                 # substitution finds the slot map at load time.
