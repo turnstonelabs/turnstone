@@ -22,6 +22,7 @@ import mimetypes
 import os
 import queue
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -547,6 +548,39 @@ _RESOURCE_PATH_RE = re.compile(
 _TEMPLATE_VAR_RE = re.compile(r"\{\{(\w+)\}\}")
 
 
+# Anthropic Claude Code skill spec placeholders.  Single combined
+# regex so substitution is one-pass — a positional arg whose VALUE
+# happens to contain ``$ARGUMENTS`` (etc.) doesn't get re-expanded
+# on a second sweep.  The verbose form keeps the alternation
+# readable; precedence is left-to-right, so the bracketed
+# ``$ARGUMENTS[N]`` form is tried before the bare ``$ARGUMENTS``.
+_SPEC_PLACEHOLDER_RE = re.compile(
+    r"""
+    \$ARGUMENTS\[(?P<idx_bracket>\d+)\]            # $ARGUMENTS[N]
+    | \$ARGUMENTS\b(?!\[)                             # $ARGUMENTS (bare)
+    | \$\{(?P<env>CLAUDE_[A-Z_]+)\}                   # ${CLAUDE_*}
+    | \$(?P<idx_short>\d+)\b                          # $N
+    | \$(?P<named>[A-Za-z_][A-Za-z0-9_]*)\b           # $name
+    """,
+    re.VERBOSE,
+)
+
+# Argument names sourced from SKILL.md frontmatter ``arguments:`` must
+# match this same identifier pattern so the substitution regex can find
+# them.  ``/review`` on PR #578 caught the mismatch where the parser
+# accepted hyphenated names like ``issue-number`` that the regex would
+# only partially match (``$issue`` consumes the prefix, leaving
+# ``-number`` as literal text).  Parser validates at extraction time
+# and drops non-conforming names with a warning.
+_SKILL_ARG_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Detector for "did the original body include the bare ``$ARGUMENTS``
+# placeholder?" — used to decide whether to append ``ARGUMENTS: ...``
+# at the end per spec when the user passed args.  Negative lookahead
+# excludes the ``$ARGUMENTS[N]`` form which is a different placeholder.
+_SPEC_ARGUMENTS_LITERAL_RE = re.compile(r"\$ARGUMENTS\b(?!\[)")
+
+
 # Soft cap on ``"watch_triggered"`` entries in the per-session NudgeQueue.
 # The pull-model path batches N watch fires into ONE envelope splice on
 # the next drain seam (vs N successive ``send`` turns under the old
@@ -587,6 +621,86 @@ def _render_template(content: str, context: dict[str, str]) -> str:
         return context.get(m.group(1), m.group(0))
 
     return _TEMPLATE_VAR_RE.sub(_replace, content)
+
+
+def _substitute_skill_args(
+    content: str,
+    *,
+    arguments_str: str,
+    arg_names: list[str],
+    ws_id: str,
+    effort: str,
+) -> str:
+    """Apply Anthropic Claude Code skill-spec placeholder substitution.
+
+    Handles every spec form except ``${CLAUDE_SKILL_DIR}`` (which
+    requires a filesystem-shaped skill layout Turnstone doesn't have
+    yet — see #572 for the deferral note):
+
+    * ``$ARGUMENTS`` — full argument string as the user typed it
+    * ``$ARGUMENTS[N]`` / ``$N`` — Nth positional arg (0-indexed),
+      shell-quoted at parse time so ``"hello world" second`` yields
+      ``$0='hello world'``, ``$1='second'``
+    * ``$<name>`` — named arg from the SKILL.md ``arguments:``
+      frontmatter list, paired with the positional arg at the same
+      index
+    * ``${CLAUDE_SESSION_ID}`` — current workstream id
+    * ``${CLAUDE_EFFORT}`` — current reasoning_effort
+
+    Single-pass: a value containing a placeholder token (e.g.
+    ``$0='$ARGUMENTS'``) does not get re-expanded.  Matches the
+    spec's "Substitution runs once over the original file" rule.
+
+    Spec rule: when *arguments_str* is non-empty and the body has
+    no bare ``$ARGUMENTS`` placeholder, the full string is appended
+    at the end as ``ARGUMENTS: ...`` so the model still sees what
+    the user typed.  Indexed forms (``$ARGUMENTS[N]``) don't count
+    as the bare placeholder for this purpose.
+
+    Unresolvable placeholders (e.g. ``$unknown`` when ``unknown``
+    isn't in *arg_names*, or ``${CLAUDE_FOO}`` when ``CLAUDE_FOO``
+    isn't a known env key) are left as literals — matches the
+    forgiving behaviour of :func:`_render_template`.
+    """
+    try:
+        positional = shlex.split(arguments_str) if arguments_str else []
+    except ValueError:
+        # Unbalanced quotes — fall back to whitespace split so a
+        # typo in user-supplied args doesn't make the entire
+        # substitution a no-op (and silently leave ``$ARGUMENTS``
+        # placeholders in the prompt).
+        positional = arguments_str.split() if arguments_str else []
+
+    name_to_idx = {name: i for i, name in enumerate(arg_names)}
+    env = {"CLAUDE_SESSION_ID": ws_id, "CLAUDE_EFFORT": effort}
+
+    def _at(idx_str: str) -> str:
+        idx = int(idx_str)  # regex guarantees digits
+        return positional[idx] if 0 <= idx < len(positional) else ""
+
+    def _replace(m: re.Match[str]) -> str:
+        if m.group("idx_bracket") is not None:
+            return _at(m.group("idx_bracket"))
+        if m.group("env") is not None:
+            return env.get(m.group("env"), m.group(0))
+        if m.group("idx_short") is not None:
+            return _at(m.group("idx_short"))
+        if m.group("named") is not None:
+            name = m.group("named")
+            idx = name_to_idx.get(name)
+            if idx is None:
+                return m.group(0)
+            return positional[idx] if idx < len(positional) else ""
+        # Match is the bare $ARGUMENTS literal (no named groups).
+        return arguments_str or ""
+
+    had_literal_arguments = bool(_SPEC_ARGUMENTS_LITERAL_RE.search(content))
+    rendered = _SPEC_PLACEHOLDER_RE.sub(_replace, content)
+
+    if arguments_str and not had_literal_arguments:
+        rendered = f"{rendered}\n\nARGUMENTS: {arguments_str}"
+
+    return rendered
 
 
 # Block types that carry reasoning content across providers.  Used by
@@ -788,6 +902,7 @@ class ChatSession:
         tool_search_threshold: int = 20,
         tool_search_max_results: int = 5,
         skill: str | None = None,
+        skill_arguments: str = "",
         judge_config: JudgeConfig | None = None,
         user_id: str = "",
         memory_config: MemoryConfig | None = None,
@@ -1044,8 +1159,11 @@ class ChatSession:
                 always_on_names=builtin_in_session,
                 max_results=tool_search_max_results,
             )
-        # Skill: explicit name overrides is_default skills
+        # Skill: explicit name overrides is_default skills.  ``skill_arguments``
+        # carries the spec's $ARGUMENTS payload — set at create/load time,
+        # substituted into the skill body by ``_load_skills``.
         self._skill_name: str | None = skill
+        self._skill_arguments: str = skill_arguments
         self._skill_content: str | None = None
         self._skill_resources: dict[str, str] = {}
         self._skill_resources_dir: str | None = None
@@ -1399,6 +1517,11 @@ class ChatSession:
                 "instructions": self.instructions or "",
                 "creative_mode": str(self.creative_mode),
                 "skill": self._skill_name or "",
+                # Anthropic spec ``$ARGUMENTS`` payload (#572).  Stored
+                # so a resumed workstream re-renders the skill with the
+                # same args the original load supplied — otherwise the
+                # rehydrate path would silently swap to empty args.
+                "skill_arguments": self._skill_arguments,
                 "token_budget": str(self._token_budget),
                 "applied_skill_id": self._applied_skill_id,
                 "applied_skill_version": str(self._applied_skill_version),
@@ -1417,10 +1540,31 @@ class ChatSession:
             "ws_id": self._ws_id,
             "node_id": self._node_id or "",
         }
+        effort = getattr(self, "reasoning_effort", "") or ""
         if self._skill_name:
             skill_data = get_skill_by_name(self._skill_name)
             if skill_data:
-                self._skill_content = _render_template(skill_data["content"], context)
+                # Two-pass render — legacy ``{{model}}`` first, spec
+                # ``$ARGUMENTS`` second.  Order is load-bearing: user-
+                # supplied arg values may legitimately contain
+                # ``{{...}}`` patterns (literal text the model wanted to
+                # quote), and running ``_render_template`` AFTER the
+                # spec substitution would silently re-expand them
+                # against the live context.  Running it FIRST resolves
+                # the curly-brace placeholders against the immutable
+                # skill source, then the spec pass writes substituted
+                # values in last — those values can't be re-expanded
+                # because the curly-brace renderer has already
+                # finished.
+                arg_names = self._skill_arg_names(skill_data)
+                content = _render_template(skill_data["content"], context)
+                self._skill_content = _substitute_skill_args(
+                    content,
+                    arguments_str=self._skill_arguments,
+                    arg_names=arg_names,
+                    ws_id=self._ws_id,
+                    effort=effort,
+                )
                 self._check_skill_budget(skill_data)
                 self._skill_resources = self._load_skill_resources(
                     skill_data.get("template_id", "")
@@ -1443,7 +1587,22 @@ class ChatSession:
         else:
             defaults = list_default_skills()
             if defaults:
-                parts = [_render_template(t["content"], context) for t in defaults]
+                # ``arg_names`` and ``arguments_str`` are empty for the
+                # default-skill path — defaults are always-on and don't
+                # take user-supplied invocation args — but env subs
+                # (``${CLAUDE_SESSION_ID}`` / ``${CLAUDE_EFFORT}``)
+                # still resolve.  Same render-then-substitute order as
+                # the explicit-skill branch (see comment above).
+                parts = [
+                    _substitute_skill_args(
+                        _render_template(t["content"], context),
+                        arguments_str="",
+                        arg_names=[],
+                        ws_id=self._ws_id,
+                        effort=effort,
+                    )
+                    for t in defaults
+                ]
                 self._skill_content = "\n\n".join(parts)
             else:
                 self._skill_content = None
@@ -1451,9 +1610,59 @@ class ChatSession:
         self._materialize_skill_resources()
         self._validate_skill_resources()
 
-    def set_skill(self, name: str | None) -> None:
-        """Set or clear the active skill."""
+    @staticmethod
+    def _skill_arg_names(skill_data: dict[str, Any]) -> list[str]:
+        """Extract the named-argument list from a stored skill row.
+
+        Storage shape is a JSON-array TEXT column (``arguments`` —
+        added by migration 056).  Malformed JSON falls back to an
+        empty list rather than blowing up the load — the
+        substitution pass treats missing names as unresolved and
+        leaves the ``$<name>`` placeholder as a literal, which is
+        the spec's "graceful degradation" behaviour.
+
+        Names are filtered against ``_SKILL_ARG_NAME_RE`` so the
+        substitution regex can actually match them.  A SKILL.md
+        author writing ``arguments: [issue-number]`` would otherwise
+        produce a stored name the ``$<name>`` regex can't reach
+        cleanly (``$issue-number`` matches only the ``$issue`` prefix,
+        leaving ``-number`` as stray text); the parser-time filter
+        drops those names with a warning so the rendered output is
+        predictable.
+        """
+        raw = skill_data.get("arguments") or "[]"
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            return []
+        if not isinstance(parsed, list):
+            return []
+        valid: list[str] = []
+        dropped: list[str] = []
+        for n in parsed:
+            if not isinstance(n, str):
+                continue
+            if _SKILL_ARG_NAME_RE.match(n):
+                valid.append(n)
+            else:
+                dropped.append(n)
+        if dropped:
+            log.warning(
+                "skill.arguments.invalid_names_dropped",
+                name=skill_data.get("name", ""),
+                dropped=dropped,
+            )
+        return valid
+
+    def set_skill(self, name: str | None, arguments: str = "") -> None:
+        """Set or clear the active skill, optionally with invocation args.
+
+        ``arguments`` carries the spec's $ARGUMENTS payload — re-set
+        each time ``set_skill`` is called so a reload doesn't smuggle
+        stale args.  Empty string clears them.
+        """
         self._skill_name = name
+        self._skill_arguments = arguments
         self._load_skills()
         self._init_system_messages()
         self._save_config()
@@ -2150,6 +2359,10 @@ class ChatSession:
                 self.creative_mode = config["creative_mode"] == "True"
             if "skill" in config or "template" in config:
                 self._skill_name = config.get("skill") or config.get("template") or None
+                # Restore #572's invocation-args payload BEFORE
+                # ``_load_skills`` so the substitution pass renders with
+                # the original args instead of an empty default.
+                self._skill_arguments = config.get("skill_arguments", "") or ""
                 self._load_skills()
             if "token_budget" in config:
                 self._token_budget = int(config["token_budget"] or "0")
@@ -8275,16 +8488,33 @@ class ChatSession:
         name = self._coord_str_arg(args, "name").strip()
         if not name:
             return self._coord_tool_error(call_id, "skills", "load: 'name' is required")
+        # Anthropic spec ``$ARGUMENTS`` payload — optional.  Mirror
+        # the spec's free-form string shape (``/skill-name a b "c d"``)
+        # rather than a list, so the model can pass quoted positional
+        # args and have ``shlex.split`` at substitution time produce
+        # the same result a CLI user would type.
+        arguments = self._coord_str_arg(args, "arguments")
+        # Approval surfaces the args so the operator can see what the
+        # model is about to substitute into the system message — and
+        # so a once-approved skill name can't grant cover for a future
+        # invocation with a different (potentially injected) payload.
+        # ``approval_label`` includes a digest of the args so each
+        # distinct payload is a distinct approval decision.
+        approval_args_digest = (
+            hashlib.sha256(arguments.encode("utf-8")).hexdigest()[:8] if arguments else "no-args"
+        )
+        preview = f"arguments: {arguments}" if arguments else "(no arguments)"
         return {
             "call_id": call_id,
             "func_name": "skills",
             "header": f"⚙ skills load: {name}",
-            "preview": "",
+            "preview": preview,
             "needs_approval": True,
-            "approval_label": f"skills__load__{name}",
+            "approval_label": f"skills__load__{name}__{approval_args_digest}",
             "execute": self._exec_skills,
             "action": "load",
             "name": name,
+            "arguments": arguments,
         }
 
     def _exec_skills_load(self, item: dict[str, Any]) -> tuple[str, str]:
@@ -8292,6 +8522,7 @@ class ChatSession:
 
         call_id = item["call_id"]
         name = item["name"]
+        arguments = item.get("arguments", "")
         storage = get_storage()
         if storage is None:
             msg = "Error: storage unavailable"
@@ -8313,11 +8544,14 @@ class ChatSession:
             )
             self._report_tool_result(call_id, "skills", msg, is_error=True)
             return call_id, msg
-        if self._skill_name == name:
+        if self._skill_name == name and self._skill_arguments == arguments:
+            # ``arguments`` is load-bearing for the spec's substitution —
+            # an existing load with a DIFFERENT args payload should
+            # re-render, not no-op.  Only short-circuit on full identity.
             msg = f"Skill '{name}' is already active"
             self._report_tool_result(call_id, "skills", msg)
             return call_id, msg
-        self.set_skill(name)
+        self.set_skill(name, arguments=arguments)
         desc = skill_data.get("description", "")
         risk = skill_data.get("risk_level", "")
         parts = [f"Loaded skill '{name}'"]

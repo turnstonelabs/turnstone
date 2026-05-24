@@ -3097,6 +3097,33 @@
                   ></span
                 >
               </label>
+              <label for="skill-arguments"
+                >Arguments
+                <span class="label-hint"
+                  >named positional slots (comma-separated) — Anthropic
+                  spec <code>arguments:</code>; substituted as
+                  <code>$&lt;name&gt;</code> in the skill body</span
+                ></label
+              >
+              <input
+                id="skill-arguments"
+                type="text"
+                placeholder="issue, branch"
+              />
+              <label for="skill-argument-hint"
+                >Argument hint
+                <span class="label-hint"
+                  >autocomplete display string — Anthropic spec
+                  <code>argument-hint:</code>, e.g.
+                  <code>[issue-number]</code></span
+                ></label
+              >
+              <input
+                id="skill-argument-hint"
+                type="text"
+                placeholder="[issue-number]"
+                maxlength="128"
+              />
             </div>
             <div class="skill-spec-section">
               <h3 class="skill-spec-heading">Deployment</h3>
@@ -3437,6 +3464,32 @@
                   ></span
                 >
               </label>
+              <label for="etm-arguments"
+                >Arguments
+                <span class="label-hint"
+                  >named positional slots (comma-separated) — Anthropic
+                  spec <code>arguments:</code>; substituted as
+                  <code>$&lt;name&gt;</code> in the skill body</span
+                ></label
+              >
+              <input
+                id="etm-arguments"
+                type="text"
+                placeholder="issue, branch"
+              />
+              <label for="etm-argument-hint"
+                >Argument hint
+                <span class="label-hint"
+                  >autocomplete display string — Anthropic spec
+                  <code>argument-hint:</code></span
+                ></label
+              >
+              <input
+                id="etm-argument-hint"
+                type="text"
+                placeholder="[issue-number]"
+                maxlength="128"
+              />
             </div>
             <div class="skill-spec-section">
               <h3 class="skill-spec-heading">Deployment</h3>

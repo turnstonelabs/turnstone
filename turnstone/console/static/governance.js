@@ -930,6 +930,8 @@ const _SKILL_FIELD_MAP = {
   compatibility: "skill-compatibility",
   allowed_tools: "csk-allowed-tools",
   paths: "skill-paths",
+  arguments: "skill-arguments",
+  argument_hint: "skill-argument-hint",
 };
 
 // Inflight paste-parse fetch — referenced from hideCreateTemplateModal so a
@@ -1005,6 +1007,10 @@ function _applyParsedSkill(parsed, contentTextarea, fieldMap) {
       filled++;
     }
   }
+  if (parsed.arguments && parsed.arguments.length)
+    _apply(fieldMap.arguments, parsed.arguments.join(", "));
+  if (parsed.argument_hint)
+    _apply(fieldMap.argument_hint, parsed.argument_hint);
 
   return { filled: filled, skipped: skipped };
 }
@@ -1134,6 +1140,8 @@ function showCreateTemplateModal() {
   document.getElementById("skill-compatibility").value = "";
   document.getElementById("skill-paths").value = "";
   document.getElementById("skill-hidden-from-menu").checked = false;
+  document.getElementById("skill-arguments").value = "";
+  document.getElementById("skill-argument-hint").value = "";
   document.getElementById("skill-activation").value = "named";
   const ctmContent = document.getElementById("ctm-content");
   ctmContent.value = "";
@@ -1272,6 +1280,15 @@ function submitCreateTemplate() {
       return p.trim();
     })
     .filter(Boolean);
+  const csArgsArr = (document.getElementById("skill-arguments").value || "")
+    .split(",")
+    .map(function (a) {
+      return a.trim();
+    })
+    .filter(Boolean);
+  const csArgumentHint = (
+    document.getElementById("skill-argument-hint").value || ""
+  ).trim();
   const createBody = {
     name: name,
     category: document.getElementById("ctm-category").value,
@@ -1298,6 +1315,8 @@ function submitCreateTemplate() {
     allowed_tools: JSON.stringify(csAllowedArr),
     paths: JSON.stringify(csPathsArr),
     hidden_from_menu: document.getElementById("skill-hidden-from-menu").checked,
+    arguments: JSON.stringify(csArgsArr),
+    argument_hint: csArgumentHint,
     notify_on_complete: csNotifyVal,
     enabled: document.getElementById("csk-enabled").checked,
   };
@@ -1404,6 +1423,15 @@ function showEditTemplateModal(tmplId) {
   document.getElementById("etm-hidden-from-menu").checked = Boolean(
     tmpl.hidden_from_menu,
   );
+  let argumentsDisplay = "";
+  try {
+    const argumentsList = JSON.parse(tmpl.arguments || "[]");
+    argumentsDisplay = argumentsList.join(", ");
+  } catch (e) {
+    argumentsDisplay = tmpl.arguments || "";
+  }
+  document.getElementById("etm-arguments").value = argumentsDisplay;
+  document.getElementById("etm-argument-hint").value = tmpl.argument_hint || "";
   document.getElementById("etm-activation").value = tmpl.activation || "named";
   document.getElementById("etm-content").value = tmpl.content;
   _updateVarsDisplay("etm-content", "etm-variables");
@@ -1601,6 +1629,8 @@ function showEditTemplateModal(tmplId) {
     "etm-license",
     "etm-compatibility",
     "etm-paths",
+    "etm-arguments",
+    "etm-argument-hint",
     "etm-activation",
     "etm-content",
     "etm-default",
@@ -2042,6 +2072,15 @@ function submitEditTemplate() {
       return p.trim();
     })
     .filter(Boolean);
+  const esArgsArr = (document.getElementById("etm-arguments").value || "")
+    .split(",")
+    .map(function (a) {
+      return a.trim();
+    })
+    .filter(Boolean);
+  const esArgumentHint = (
+    document.getElementById("etm-argument-hint").value || ""
+  ).trim();
   const updateBody = {
     name: document.getElementById("etm-name").value.trim(),
     category: document.getElementById("etm-category").value,
@@ -2056,6 +2095,8 @@ function submitEditTemplate() {
     ).trim(),
     paths: JSON.stringify(esPathsArr),
     hidden_from_menu: document.getElementById("etm-hidden-from-menu").checked,
+    arguments: JSON.stringify(esArgsArr),
+    argument_hint: esArgumentHint,
     activation: document.getElementById("etm-activation").value,
     content: content,
     variables: JSON.stringify(varList),

@@ -517,6 +517,60 @@ Content.
         assert result.user_invocable is False
 
 
+class TestArgumentsAndHint:
+    """Anthropic spec ``arguments:`` (named positional slots) +
+    ``argument-hint:`` (autocomplete display)."""
+
+    def test_yaml_list_format(self) -> None:
+        raw = """\
+---
+name: with-args
+arguments: [issue, branch]
+---
+
+Fix issue $issue on $branch.
+"""
+        result = parse_skill_md(raw)
+        assert result.arguments == ["issue", "branch"]
+
+    def test_space_delimited_format(self) -> None:
+        """Spec accepts space-separated string per the docs sample."""
+        raw = """\
+---
+name: with-args-space
+arguments: "issue branch"
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.arguments == ["issue", "branch"]
+
+    def test_argument_hint_extracted(self) -> None:
+        raw = """\
+---
+name: with-hint
+argument-hint: "[issue-number]"
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.argument_hint == "[issue-number]"
+
+    def test_empty_defaults(self) -> None:
+        raw = """\
+---
+name: bare
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.arguments == []
+        assert result.argument_hint == ""
+
+
 class TestValidateSkillName:
     """Name validation edge cases."""
 

@@ -6711,8 +6711,7 @@ async def admin_create_skill(request: Request) -> JSONResponse:
     # Anthropic spec ``paths:`` — glob patterns gating autoload.
     # ``_canonicalize_skill_string_list`` accepts a list, a JSON-array
     # string, a comma-separated string, or ``None``, and returns the
-    # canonical JSON-array string for storage.  Same helper will back
-    # ``arguments`` once #572 lands its consumer.
+    # canonical JSON-array string for storage.
     paths_str = _canonicalize_skill_string_list(body.get("paths"))
 
     # Anthropic spec ``user-invocable: false`` lands here as
@@ -6723,6 +6722,12 @@ async def admin_create_skill(request: Request) -> JSONResponse:
     hidden_from_menu, hidden_err = _parse_strict_bool(body.get("hidden_from_menu"), default=False)
     if hidden_err is not None:
         return hidden_err
+
+    # Anthropic spec ``arguments:`` — named positional slots for
+    # $<name> substitution.  Same wire shape as ``paths:`` — JSON-array
+    # string in storage, list-or-CSV-or-JSON-string on the wire.
+    arguments_str = _canonicalize_skill_string_list(body.get("arguments"))
+    argument_hint = str(body.get("argument_hint") or "").strip()[:128]
 
     token_estimate = len(content) // 4 if content else 0
 
@@ -6776,6 +6781,8 @@ async def admin_create_skill(request: Request) -> JSONResponse:
         kind=kind,
         paths=paths_str,
         hidden_from_menu=hidden_from_menu,
+        arguments=arguments_str,
+        argument_hint=argument_hint,
         **session_fields,
     )
 
@@ -6895,6 +6902,10 @@ async def admin_update_skill(request: Request) -> JSONResponse:
         if hidden_err is not None:
             return hidden_err
         updates["hidden_from_menu"] = hidden_value
+    if "arguments" in body and body["arguments"] is not None:
+        updates["arguments"] = _canonicalize_skill_string_list(body["arguments"])
+    if "argument_hint" in body and body["argument_hint"] is not None:
+        updates["argument_hint"] = str(body["argument_hint"]).strip()[:128]
     if "priority" in body:
         try:
             updates["priority"] = max(-1000, min(1000, int(body["priority"] or 0)))
@@ -7581,6 +7592,8 @@ async def admin_parse_skill(request: Request) -> JSONResponse:
             # the ``hidden-from-menu`` checkbox on the create modal.
             "disable_model_invocation": parsed.disable_model_invocation,
             "user_invocable": parsed.user_invocable,
+            "arguments": list(parsed.arguments),
+            "argument_hint": parsed.argument_hint,
         }
     )
 
@@ -7780,6 +7793,7 @@ async def admin_skill_install(request: Request) -> JSONResponse:
         tags_str = _json.dumps(parsed.tags)
         allowed_tools_str = _json.dumps(parsed.allowed_tools)
         paths_str = _json.dumps(parsed.paths)
+        arguments_str = _json.dumps(parsed.arguments)
         content = parsed.content[:32768]
         token_estimate = len(content) // 4 if content else 0
 
@@ -7830,6 +7844,17 @@ async def admin_skill_install(request: Request) -> JSONResponse:
                 # protect admin-set values on re-install.
                 model=parsed.model,
                 reasoning_effort=parsed.effort,
+                # Anthropic spec ``arguments:`` + ``argument-hint:`` —
+                # named positional slots + autocomplete display.  Round-
+                # trip through install so the renderer's $<name>
+                # substitution finds the slot map at load time.
+                # ``argument_hint`` is bounded here to match the
+                # admin-create-time cap (.strip()[:128]); upstream
+                # SKILL.md sources are untrusted on the install path so
+                # length-clamping at the storage boundary is the right
+                # place to enforce.
+                arguments=arguments_str,
+                argument_hint=parsed.argument_hint.strip()[:128],
             )
         except StorageConflictError as exc:
             # Genuine uniqueness/constraint violation racing past the

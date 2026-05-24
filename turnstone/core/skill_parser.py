@@ -95,6 +95,19 @@ class ParsedSkill:
     # field that gates flipping back.
     disable_model_invocation: bool = False
     user_invocable: bool = True
+    # Anthropic spec ``arguments:`` — named positional argument slots
+    # that pair with ``$<name>`` substitution in the skill body.
+    # Accepts the spec's space-separated string or YAML list shape.
+    # Stored as a JSON-array column on ``prompt_templates`` (added by
+    # migration 056); the renderer in ``session._substitute_skill_args``
+    # binds positional args to these names at skill-load time.
+    arguments: list[str] = field(default_factory=list)
+    # Anthropic spec ``argument-hint:`` — display string for slash-
+    # command autocomplete, e.g. ``"[issue-number]"``.  Surfaced in
+    # the admin UI and round-tripped through install; no runtime
+    # behaviour today since Turnstone doesn't have a slash-command
+    # autocomplete surface yet.
+    argument_hint: str = ""
     raw_frontmatter: dict[str, Any] = field(default_factory=dict)
 
 
@@ -367,5 +380,11 @@ def parse_skill_md(raw: str, *, lenient: bool = False) -> ParsedSkill | None:
         # from the menu (user-invocable=True).
         disable_model_invocation=_extract_bool(meta, "disable-model-invocation", default=False),
         user_invocable=_extract_bool(meta, "user-invocable", default=True),
+        # Spec accepts ``arguments:`` as a space-separated string or
+        # YAML list; ``_extract_list`` handles both via ``_LIST_SPLIT_RE``.
+        arguments=_extract_list(meta, "arguments"),
+        # ``argument-hint`` (hyphenated per spec) — display string for
+        # slash-command autocomplete.
+        argument_hint=_extract_str(meta, "argument-hint"),
         raw_frontmatter=meta,
     )

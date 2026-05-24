@@ -91,6 +91,8 @@ model: claude-opus-4-7
 effort: high
 disable-model-invocation: true
 user-invocable: false
+arguments: [pr_number, focus]
+argument-hint: "[pr-number] [focus-area]"
 license: MIT
 compatibility: ">=0.7"
 ---
@@ -130,6 +132,8 @@ class TestParseSkill:
         assert data["effort"] == "high"
         assert data["disable_model_invocation"] is True
         assert data["user_invocable"] is False
+        assert data["arguments"] == ["pr_number", "focus"]
+        assert data["argument_hint"] == "[pr-number] [focus-area]"
         assert data["license"] == "MIT"
         assert data["compatibility"] == ">=0.7"
         assert "# Code Review" in data["content"]
@@ -157,6 +161,8 @@ class TestParseSkill:
         # Spec defaults: model can autoload, user can pick.
         assert data["disable_model_invocation"] is False
         assert data["user_invocable"] is True
+        assert data["arguments"] == []
+        assert data["argument_hint"] == ""
         assert data["license"] == ""
 
     def test_anthropic_nested_metadata_tags(self, client: TestClient) -> None:

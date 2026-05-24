@@ -130,6 +130,8 @@ def _sample_package(
     effort: str = "",
     user_invocable: bool = True,
     disable_model_invocation: bool = False,
+    arguments: list[str] | None = None,
+    argument_hint: str = "",
 ) -> SkillPackage:
     return SkillPackage(
         listing=SkillListing(
@@ -152,6 +154,8 @@ def _sample_package(
             effort=effort,
             user_invocable=user_invocable,
             disable_model_invocation=disable_model_invocation,
+            arguments=arguments or [],
+            argument_hint=argument_hint,
         ),
         resources={"scripts/setup.sh": "#!/bin/bash\necho hello"},
     )
@@ -335,6 +339,29 @@ class TestSkillInstall:
         assert resp.status_code == 200
         skill = resp.json()["installed"][0]
         assert skill["hidden_from_menu"] is False
+
+    def test_install_seeds_arguments_and_argument_hint(self, client: TestClient) -> None:
+        """Anthropic spec ``arguments:`` + ``argument-hint:`` round-trip
+        through install onto the row.  Verified end-to-end: parser
+        extracted them, install handler persisted them, the response
+        echoes the stored value."""
+        package = _sample_package(arguments=["issue", "branch"], argument_hint="[issue-number]")
+
+        with patch(
+            "turnstone.core.skill_sources.fetch_skill_from_github", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = package
+            resp = client.post(
+                "/v1/api/admin/skills/install",
+                json={"source": "github", "url": "https://github.com/owner/repo"},
+            )
+
+        assert resp.status_code == 200
+        skill = resp.json()["installed"][0]
+        # ``arguments`` is stored as a JSON-array string per the column
+        # contract; the response surfaces it raw.
+        assert skill["arguments"] == '["issue", "branch"]'
+        assert skill["argument_hint"] == "[issue-number]"
 
     def test_install_no_model_or_effort_leaves_columns_empty(self, client: TestClient) -> None:
         """When the source SKILL.md has no model/effort, the columns

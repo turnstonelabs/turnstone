@@ -389,10 +389,13 @@ class CreateSkillRequest(BaseModel):
     # user-facing picker (``/v1/api/skills``) while keeping it
     # available to the model.
     hidden_from_menu: bool = False
-    # ``arguments`` / ``argument_hint`` columns still exist on the
-    # row (migration 056) and surface in ``SkillInfo`` for read, but
-    # the create/update handlers don't read them yet — #572 wires
-    # those input branches when its consumer lands.
+    # Anthropic spec ``arguments:`` + ``argument-hint:`` — named
+    # positional slots for ``$<name>`` substitution + autocomplete
+    # display.  Consumer is ``session._substitute_skill_args`` at skill
+    # render time (#572).  ``arguments`` uses the same wire shape as
+    # ``paths`` — list, JSON-array string, or CSV.
+    arguments: str | list[str] = "[]"
+    argument_hint: str = ""
     kind: SkillKind = Field(
         default=SkillKind.ANY,
         description=(
@@ -442,12 +445,14 @@ class UpdateSkillRequest(BaseModel):
     allowed_tools: str | None = None
     license: str | None = None
     compatibility: str | None = None
-    # Anthropic spec ``paths:`` (#569 — filter consumer pending) and
+    # Anthropic spec ``paths:`` (#569 — filter consumer pending),
     # ``user-invocable: false`` mapped to ``hidden_from_menu=true``
-    # (#571).  ``arguments`` / ``argument_hint`` remain absent until
-    # #572 wires their consumer.
+    # (#571), and ``arguments:`` / ``argument-hint:`` (#572 —
+    # substitution consumer).
     paths: str | list[str] | None = None
     hidden_from_menu: bool | None = None
+    arguments: str | list[str] | None = None
+    argument_hint: str | None = None
     kind: SkillKind | None = Field(
         default=None,
         description=(
@@ -867,6 +872,12 @@ class ParseSkillResponse(BaseModel):
     # can echo them on the parse-preview.
     disable_model_invocation: bool = False
     user_invocable: bool = True
+    # Anthropic spec ``arguments:`` + ``argument-hint:`` (#572).
+    # Named positional slots + autocomplete display string; surfaced
+    # so the admin parse-preview UI can echo what came from the source
+    # SKILL.md.
+    arguments: list[str] = Field(default_factory=list)
+    argument_hint: str = ""
 
 
 class SkillInstallRequest(BaseModel):

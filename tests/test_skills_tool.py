@@ -76,12 +76,16 @@ def _make_session(*, kind: str = "interactive", user_id: str = "test-user") -> A
     # Truncation budget — required by _truncate_output on every exec.
     session.tool_truncation = 100_000
 
-    # set_skill stub for load action.
-    session._set_skill_called: list[str | None] = []
+    # set_skill stub for load action.  Records both the name and the
+    # arguments-string so tests can assert that #572's invocation-args
+    # payload survives through prepare → exec → set_skill.
+    session._set_skill_called: list[tuple[str | None, str]] = []
+    session._skill_arguments = ""
 
-    def fake_set_skill(name):
-        session._set_skill_called.append(name)
+    def fake_set_skill(name, arguments: str = ""):
+        session._set_skill_called.append((name, arguments))
         session._skill_name = name
+        session._skill_arguments = arguments
 
     session.set_skill = fake_set_skill
     return session
@@ -185,7 +189,10 @@ class TestPrepareSkillsLoad:
         session = _make_session()
         item = session._prepare_skills("c", {"action": "load", "name": "x"})
         assert item["needs_approval"] is True
-        assert item["approval_label"] == "skills__load__x"
+        # No-args path: approval label has the ``no-args`` sentinel
+        # so each distinct arg payload (including absent) is its own
+        # approval decision.  See ``_prepare_skills_load`` digest logic.
+        assert item["approval_label"] == "skills__load__x__no-args"
 
     def test_load_works_on_coord_session(self) -> None:
         """Coord sessions can ``load`` for themselves — parity with the
@@ -199,7 +206,10 @@ class TestPrepareSkillsLoad:
         # Prepare succeeds — no error item, approval-gated like interactive.
         assert "error" not in item, item
         assert item["needs_approval"] is True
-        assert item["approval_label"] == "skills__load__x"
+        # No-args path: approval label has the ``no-args`` sentinel
+        # so each distinct arg payload (including absent) is its own
+        # approval decision.  See ``_prepare_skills_load`` digest logic.
+        assert item["approval_label"] == "skills__load__x__no-args"
 
     def test_load_missing_name(self) -> None:
         session = _make_session()
@@ -661,7 +671,7 @@ class TestExecSkillsLoad:
                 f"session kind={sess_kind!r} couldn't load row kind={row_kind!r}; "
                 f"flatten regression"
             )
-            assert session._set_skill_called == [skill_name]
+            assert session._set_skill_called == [(skill_name, "")]
 
     def test_load_works_for_coord_on_visible_skill(self) -> None:
         """Coord session loads a coord-tagged skill — exec succeeds and
@@ -680,7 +690,7 @@ class TestExecSkillsLoad:
         with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
             _, output = session._exec_skills(item)
         assert "Loaded skill 'coord-persona'" in output
-        assert session._set_skill_called == ["coord-persona"]
+        assert session._set_skill_called == [("coord-persona", "")]
 
     def test_load_works_for_coord_on_any_kind_skill(self) -> None:
         """A ``kind=any`` skill is loadable from a coord session too —
@@ -699,7 +709,164 @@ class TestExecSkillsLoad:
         with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
             _, output = session._exec_skills(item)
         assert "Loaded skill 'universal'" in output
-        assert session._set_skill_called == ["universal"]
+        assert session._set_skill_called == [("universal", "")]
+
+    def test_load_forwards_arguments_to_set_skill(self) -> None:
+        """Anthropic spec ``$ARGUMENTS`` payload (#572) — the model
+        passes an ``arguments`` string in the load call, prepare carries
+        it on the approval item, exec forwards it to ``set_skill`` for
+        the renderer to consume.  Pins the wire path end-to-end."""
+        session = _make_session()
+        storage = MagicMock()
+        storage.get_prompt_template_by_name.return_value = {
+            "name": "fix-issue",
+            "kind": "any",
+            "enabled": True,
+            "content": "Fix issue $ARGUMENTS",
+            "description": "Issue-fix skill.",
+            "risk_level": "low",
+        }
+        item = session._prepare_skills(
+            "c",
+            {"action": "load", "name": "fix-issue", "arguments": "123 main"},
+        )
+        # Prepare carries the args through onto the approval item so the
+        # exec phase has them when the operator approves.
+        assert item.get("arguments") == "123 main"
+        # Approval label includes a digest of the args so each distinct
+        # payload is a distinct approval decision (#572 security review).
+        assert item["approval_label"].startswith("skills__load__fix-issue__")
+        assert item["approval_label"] != "skills__load__fix-issue__no-args"
+        # Preview surfaces the args to the operator card.
+        assert "arguments: 123 main" in item["preview"]
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
+            _, output = session._exec_skills(item)
+        assert "Loaded skill 'fix-issue'" in output
+        # set_skill received the args verbatim — the renderer (covered
+        # in test_substitute_skill_args.py) handles the actual
+        # substitution at _load_skills time.
+        assert session._set_skill_called == [("fix-issue", "123 main")]
+
+    def test_load_same_skill_different_args_triggers_resub(self) -> None:
+        """A second load with the same skill name but different args
+        must NOT hit the "already active" short-circuit — the renderer
+        needs to re-render with the new payload.  Pins the load-bearing
+        ``_skill_arguments`` clause in the equality check at
+        ``_exec_skills_load``."""
+        session = _make_session()
+        storage = MagicMock()
+        storage.get_prompt_template_by_name.return_value = {
+            "name": "fix-issue",
+            "kind": "any",
+            "enabled": True,
+            "content": "Fix issue $ARGUMENTS",
+            "description": "Issue-fix skill.",
+            "risk_level": "low",
+        }
+        # First load.
+        item1 = session._prepare_skills(
+            "c", {"action": "load", "name": "fix-issue", "arguments": "123 main"}
+        )
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
+            session._exec_skills(item1)
+
+        # Second load — same name, DIFFERENT args.  The fake set_skill
+        # updates ``_skill_name`` and ``_skill_arguments`` to mirror the
+        # real path, so the equality check sees the new args differ.
+        item2 = session._prepare_skills(
+            "c", {"action": "load", "name": "fix-issue", "arguments": "456 dev"}
+        )
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
+            _, output2 = session._exec_skills(item2)
+        # Second invocation re-renders rather than short-circuiting.
+        assert "Loaded skill 'fix-issue'" in output2
+        assert "already active" not in output2
+        # set_skill was called twice with each respective arg payload.
+        assert session._set_skill_called == [
+            ("fix-issue", "123 main"),
+            ("fix-issue", "456 dev"),
+        ]
+
+
+class TestSkillArgNames:
+    """``_skill_arg_names`` decodes the JSON-array ``arguments`` storage
+    column into the named-slot list the renderer consumes.  Pinned
+    here because the renderer tests pass ``names`` directly, bypassing
+    this decode step — a storage shape change would silently produce
+    empty ``arg_names`` without breaking any other test."""
+
+    def test_valid_json_array(self) -> None:
+        from turnstone.core.session import ChatSession
+
+        assert ChatSession._skill_arg_names({"arguments": '["issue", "branch"]'}) == [
+            "issue",
+            "branch",
+        ]
+
+    def test_malformed_json_returns_empty(self) -> None:
+        from turnstone.core.session import ChatSession
+
+        assert ChatSession._skill_arg_names({"arguments": "[not-json"}) == []
+
+    def test_non_list_json_returns_empty(self) -> None:
+        """A row whose ``arguments`` column got corrupted to a JSON
+        object (rather than array) shouldn't blow up the load — fall
+        back to the empty list so $<name> placeholders stay literal."""
+        from turnstone.core.session import ChatSession
+
+        assert ChatSession._skill_arg_names({"arguments": '{"k": "v"}'}) == []
+
+    def test_list_filters_non_strings(self) -> None:
+        """Element-level resilience — a JSON list with mixed types
+        keeps only the strings (the spec's ``arguments:`` field is
+        list-of-strings)."""
+        from turnstone.core.session import ChatSession
+
+        assert ChatSession._skill_arg_names({"arguments": '["good", 42, null, "ok"]'}) == [
+            "good",
+            "ok",
+        ]
+
+    def test_missing_column_returns_empty(self) -> None:
+        """Legacy row written before migration 056 has no ``arguments``
+        key at all — must not raise."""
+        from turnstone.core.session import ChatSession
+
+        assert ChatSession._skill_arg_names({"name": "legacy"}) == []
+
+    def test_invalid_identifier_names_dropped(self) -> None:
+        """Names containing hyphens, dots, leading digits, etc. can't be
+        matched by the ``$<name>`` substitution regex without ambiguity
+        (``$issue-number`` matches only the ``$issue`` prefix, leaving
+        ``-number`` as stray text).  Filtered out at decode so the
+        renderer's invariant holds: every name in arg_names IS
+        matchable.  Copilot review on PR #578 caught the mismatch."""
+        from turnstone.core.session import ChatSession
+
+        result = ChatSession._skill_arg_names(
+            {
+                "name": "test",
+                "arguments": ('["issue", "issue-number", "1bad", "with.dot", "Good_Name"]'),
+            }
+        )
+        # ``Good_Name`` is a valid identifier (uppercase + underscore);
+        # the broadened regex accepts it.  The other three are dropped.
+        assert result == ["issue", "Good_Name"]
+
+    def test_uppercase_and_underscore_names_accepted(self) -> None:
+        """Valid Python-identifier names — uppercase, underscore-start,
+        mixed case — all match the broadened ``$<name>`` regex.  Pinned
+        so a future regex tightening doesn't silently re-narrow."""
+        from turnstone.core.session import ChatSession
+
+        assert ChatSession._skill_arg_names(
+            {"arguments": '["lowercase", "UPPER", "_leading", "Mixed_Case_42"]'}
+        ) == [
+            "lowercase",
+            "UPPER",
+            "_leading",
+            "Mixed_Case_42",
+        ]
 
 
 # ---------------------------------------------------------------------------
