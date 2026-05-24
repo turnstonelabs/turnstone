@@ -319,7 +319,6 @@ def test_inspect_exec_dispatches_to_client(coord_session):
         "ws_id": "child-x",
         "state": "idle",
         "messages": [],
-        "verdicts": [],
     }
     item = sess._prepare_tool(_tc("inspect_workstream", {"ws_id": "child-x"}))
     _call_id, output = sess._exec_inspect_workstream(item)

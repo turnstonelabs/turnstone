@@ -1479,7 +1479,7 @@ class CoordinatorClient:
         message_limit: int = 20,
         include_provider_content: bool = False,
     ) -> dict[str, Any]:
-        """Return persisted workstream state + tail-N messages + recent verdicts.
+        """Return persisted workstream state + tail-N messages.
 
         Cross-tenant guard: the coordinator's LLM input is untrusted, so
         the inspectable scope is restricted to (a) the coordinator
@@ -1526,19 +1526,20 @@ class CoordinatorClient:
                 messages = all_msgs
         except Exception:
             log.debug("coord_client.load_messages.failed ws=%s", ws_id, exc_info=True)
-        # Recent intent-judge verdicts — useful for "did this child go off
-        # the rails?" inspection.  Capped at 10; advisory, so swallow failures.
-        verdicts: list[Any] = []
-        try:
-            verdicts = self._storage.list_intent_verdicts(ws_id=ws_id, limit=10)
-        except Exception:
-            log.debug("coord_client.list_verdicts.failed ws=%s", ws_id, exc_info=True)
+        # Intent-judge verdicts are deliberately NOT surfaced here.
+        # Their fields (``recommendation="review"``, ``user_decision="policy"``
+        # for auto-approved-by-policy, etc.) read as workflow status to
+        # coordinator LLMs and produced repeated misreads of healthy
+        # children as "stuck on policy review".  The child's actual
+        # blocking status lives on the ``state`` field (``"attention"``)
+        # and the ``live.pending_approval`` block — both still present
+        # in the result below.  Verdict history remains queryable
+        # through the admin / audit surfaces.
         result: dict[str, Any] = {
             **full,
             "messages": _serialize_messages(
                 messages, include_provider_content=include_provider_content
             ),
-            "verdicts": _serialize_verdicts(verdicts),
         }
         # Surface the operator-supplied close reason (persisted via
         # workstream_config by the server's close handler) and any
@@ -1695,19 +1696,6 @@ def _serialize_messages(
     return out
 
 
-def _serialize_verdicts(rows: list[Any]) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for r in rows:
-        if isinstance(r, dict):
-            out.append(r)
-        else:
-            try:
-                out.append(dict(r._mapping))  # SQLAlchemy Row
-            except Exception:
-                out.append({"raw": str(r)})
-    return out
-
-
 # ---------------------------------------------------------------------------
 # inspect_workstream — tiered output compression
 # ---------------------------------------------------------------------------
@@ -1851,24 +1839,18 @@ def _inspect_skeleton(result: dict[str, Any]) -> dict[str, Any]:
     """Tier-3 fallback: state + counts + last assistant preview + terminal info.
 
     Drops every message, keeping only aggregate signal: state, message
-    count, role distribution, verdict count + risk distribution, and a
-    short preview of the most recent assistant turn (the "what did this
-    child last say" signal).  Terminal-state fields (``close_reason``,
-    ``last_error``) and the ``live`` block pass through unchanged
-    because they're already small and load-bearing.
+    count, role distribution, and a short preview of the most recent
+    assistant turn (the "what did this child last say" signal).
+    Terminal-state fields (``close_reason``, ``last_error``) and the
+    ``live`` block pass through unchanged because they're already small
+    and load-bearing.
     """
     messages = result.get("messages") or []
-    verdicts = result.get("verdicts") or []
     role_counts: dict[str, int] = {}
     for m in messages:
         role = m.get("role") if isinstance(m, dict) else None
         if role:
             role_counts[role] = role_counts.get(role, 0) + 1
-    verdicts_by_risk: dict[str, int] = {}
-    for v in verdicts:
-        if isinstance(v, dict):
-            risk = v.get("risk_level") or "unknown"
-            verdicts_by_risk[risk] = verdicts_by_risk.get(risk, 0) + 1
     last_preview = ""
     for m in reversed(messages):
         if not isinstance(m, dict) or m.get("role") != "assistant":
@@ -1891,8 +1873,6 @@ def _inspect_skeleton(result: dict[str, Any]) -> dict[str, Any]:
         "skill": result["skill_id"],
         "message_count": len(messages),
         "roles": role_counts,
-        "verdict_count": len(verdicts),
-        "verdicts_by_risk": verdicts_by_risk,
         "last_assistant_preview": last_preview,
         "_tier": "skeleton",
         "_tier_note": (

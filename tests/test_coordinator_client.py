@@ -635,7 +635,8 @@ def test_inspect_returns_persisted_fields(populated_storage):
         assert key in result
     assert result["parent_ws_id"] == "coord-1"
     assert isinstance(result["messages"], list)
-    assert isinstance(result["verdicts"], list)
+    # Verdicts deliberately not surfaced — see inspect() docstring.
+    assert "verdicts" not in result
 
 
 def test_inspect_refuses_workstreams_outside_coordinator_subtree(populated_storage):
@@ -2462,7 +2463,6 @@ def _make_inspect_result(
             {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i} content"}
             for i in range(n_messages)
         ],
-        "verdicts": [],
     }
 
 
@@ -2495,7 +2495,6 @@ def test_format_inspect_tiered_compact_when_full_exceeds_budget():
         "id": "ws-fat",
         "state": "running",
         "messages": [{"role": "assistant", "content": fat} for _ in range(20)],
-        "verdicts": [],
     }
     out = _format_inspect_tiered(result)
     parsed = json.loads(out)
@@ -2541,7 +2540,6 @@ def test_format_inspect_tiered_compact_when_content_below_snip_threshold():
         "messages": [
             {"role": "assistant" if i % 2 == 0 else "user", "content": smallish} for i in range(400)
         ],
-        "verdicts": [],
     }
     out = _format_inspect_tiered(result)
     parsed = json.loads(out)
@@ -2586,7 +2584,6 @@ def test_format_inspect_tiered_skeleton_when_compact_also_exceeds_budget():
             }
             for i in range(50)
         ],
-        "verdicts": [],
     }
     out = _format_inspect_tiered(result)
     parsed = json.loads(out)
@@ -2620,7 +2617,6 @@ def test_format_inspect_tiered_skeleton_keeps_terminal_state_fields():
         "title": "done",
         "skill_id": "researcher",
         "messages": [{"role": "user", "content": [fat_block] * 10} for _ in range(50)],
-        "verdicts": [],
         "close_reason": "task complete: report attached",
         "live": None,  # filtered by truthy check
     }
@@ -2666,7 +2662,6 @@ def test_format_inspect_tiered_compact_preserves_tool_call_linkage():
             }
             for _ in range(20)
         ],
-        "verdicts": [],
     }
     out = _format_inspect_tiered(result)
     parsed = json.loads(out)
@@ -2715,7 +2710,6 @@ def test_format_inspect_tiered_compact_preserves_assistant_tool_calls():
             {"role": "assistant", "content": fat_content, "tool_calls": tool_calls}
             for _ in range(20)
         ],
-        "verdicts": [],
     }
     out = _format_inspect_tiered(result)
     parsed = json.loads(out)
@@ -2751,7 +2745,6 @@ def test_format_inspect_tiered_compact_passes_small_messages_through_unsnipped()
         "state": "running",
         "messages": [{"role": "assistant", "content": big} for _ in range(15)]
         + [{"role": "user", "content": small}],
-        "verdicts": [],
     }
     out = _format_inspect_tiered(result)
     parsed = json.loads(out)
@@ -2771,7 +2764,6 @@ def test_format_inspect_tiered_emits_tier_note_when_compressed():
         "id": "ws-noted",
         "state": "running",
         "messages": [{"role": "assistant", "content": fat} for _ in range(20)],
-        "verdicts": [],
     }
     out = _format_inspect_tiered(result)
     parsed = json.loads(out)
