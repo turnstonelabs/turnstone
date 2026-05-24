@@ -189,6 +189,13 @@ class RoleInfo(BaseModel):
     org_id: str
     created: str
     updated: str
+    # Overlay fields (populated by list/get endpoints for builtin roles;
+    # ``effective`` always reflects the post-overlay set, ``grants``/
+    # ``revokes`` are the user-applied deltas — both empty for custom roles
+    # since overrides apply only to builtins).
+    effective: list[str] = []
+    grants: list[str] = []
+    revokes: list[str] = []
 
 
 class CreateRoleRequest(BaseModel):
@@ -204,6 +211,18 @@ class UpdateRoleRequest(BaseModel):
 
 class ListRolesResponse(BaseModel):
     roles: list[RoleInfo]
+
+
+class RoleOverridesRequest(BaseModel):
+    grant: list[str] = []
+    revoke: list[str] = []
+
+
+class RoleEffectiveResponse(BaseModel):
+    baseline: list[str]
+    grants: list[str]
+    revokes: list[str]
+    effective: list[str]
 
 
 class AssignRoleRequest(BaseModel):

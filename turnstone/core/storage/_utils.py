@@ -143,6 +143,13 @@ def row_to_dict(row: Any, *bool_fields: str) -> dict[str, Any]:
     return d
 
 
+def split_perms(value: str | None) -> set[str]:
+    """Split the comma-separated ``roles.permissions`` column into a set."""
+    if not value:
+        return set()
+    return {p.strip() for p in value.split(",") if p.strip()}
+
+
 # ---------------------------------------------------------------------------
 # Field allowlists for governance update methods
 # ---------------------------------------------------------------------------

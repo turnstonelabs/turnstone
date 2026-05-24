@@ -395,6 +395,19 @@ user_roles = sa.Table(
 
 sa.Index("idx_user_roles_role_id", user_roles.c.role_id)
 
+role_permission_overrides = sa.Table(
+    "role_permission_overrides",
+    metadata,
+    sa.Column("role_id", sa.Text, nullable=False),
+    sa.Column("permission", sa.Text, nullable=False),
+    sa.Column("action", sa.Text, nullable=False),  # 'grant' | 'revoke'
+    sa.Column("created", sa.Text, nullable=False),
+    sa.Column("created_by", sa.Text, nullable=False, server_default=""),
+    sa.PrimaryKeyConstraint("role_id", "permission"),
+)
+
+sa.Index("idx_role_permission_overrides_role", role_permission_overrides.c.role_id)
+
 tool_policies = sa.Table(
     "tool_policies",
     metadata,

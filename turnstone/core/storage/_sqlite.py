@@ -45,6 +45,7 @@ from turnstone.core.storage._schema import (
     output_assessments,
     output_guard_patterns,
     prompt_templates,
+    role_permission_overrides,
     roles,
     scheduled_task_runs,
     scheduled_tasks,
@@ -120,6 +121,9 @@ from turnstone.core.storage._utils import (
 from turnstone.core.storage._utils import sanitize_text
 from turnstone.core.storage._utils import (
     scan_skill_content as _scan_skill_content,
+)
+from turnstone.core.storage._utils import (
+    split_perms as _split_perms,
 )
 from turnstone.core.workstream import BULK_CLOSE_STATE_VALUES, WorkstreamKind
 
@@ -2547,19 +2551,126 @@ class SQLiteBackend:
 
     def get_user_permissions(self, user_id: str) -> set[str]:
         with self._conn() as conn:
-            rows = conn.execute(
-                sa.select(roles.c.permissions)
+            role_rows = conn.execute(
+                sa.select(roles.c.role_id, roles.c.permissions, roles.c.builtin)
                 .select_from(user_roles.join(roles, user_roles.c.role_id == roles.c.role_id))
                 .where(user_roles.c.user_id == user_id)
             ).fetchall()
+            if not role_rows:
+                return set()
+            builtin_role_ids = [r[0] for r in role_rows if r[2]]
+            grants: dict[str, set[str]] = {}
+            revokes: dict[str, set[str]] = {}
+            if builtin_role_ids:
+                ov_rows = conn.execute(
+                    sa.select(
+                        role_permission_overrides.c.role_id,
+                        role_permission_overrides.c.permission,
+                        role_permission_overrides.c.action,
+                    ).where(role_permission_overrides.c.role_id.in_(builtin_role_ids))
+                ).fetchall()
+                for rid, perm, action in ov_rows:
+                    if action == "grant":
+                        grants.setdefault(rid, set()).add(perm)
+                    elif action == "revoke":
+                        revokes.setdefault(rid, set()).add(perm)
             perms: set[str] = set()
-            for r in rows:
-                if r[0]:
-                    for p in r[0].split(","):
-                        p = p.strip()
-                        if p:
-                            perms.add(p)
+            for rid, perms_str, builtin in role_rows:
+                role_perms = _split_perms(perms_str)
+                if builtin:
+                    role_perms = (role_perms | grants.get(rid, set())) - revokes.get(rid, set())
+                perms |= role_perms
             return perms
+
+    def list_role_overrides(self, role_id: str) -> list[dict[str, str]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                sa.select(role_permission_overrides)
+                .where(role_permission_overrides.c.role_id == role_id)
+                .order_by(
+                    role_permission_overrides.c.action,
+                    role_permission_overrides.c.permission,
+                )
+            ).fetchall()
+            return [dict(r._mapping) for r in rows]
+
+    def set_role_overrides(
+        self,
+        role_id: str,
+        grants: set[str],
+        revokes: set[str],
+        created_by: str = "",
+    ) -> None:
+        if grants & revokes:
+            raise ValueError("grants and revokes must be disjoint")
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            conn.execute(
+                sa.delete(role_permission_overrides).where(
+                    role_permission_overrides.c.role_id == role_id
+                )
+            )
+            rows = [
+                {
+                    "role_id": role_id,
+                    "permission": p,
+                    "action": "grant",
+                    "created": now,
+                    "created_by": created_by,
+                }
+                for p in sorted(grants)
+            ] + [
+                {
+                    "role_id": role_id,
+                    "permission": p,
+                    "action": "revoke",
+                    "created": now,
+                    "created_by": created_by,
+                }
+                for p in sorted(revokes)
+            ]
+            if rows:
+                conn.execute(sa.insert(role_permission_overrides), rows)
+            conn.commit()
+
+    def clear_role_overrides(self, role_id: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                sa.delete(role_permission_overrides).where(
+                    role_permission_overrides.c.role_id == role_id
+                )
+            )
+            conn.commit()
+
+    def effective_role_permissions(self, role_id: str) -> dict[str, list[str]]:
+        with self._conn() as conn:
+            role_row = conn.execute(
+                sa.select(roles.c.permissions, roles.c.builtin).where(roles.c.role_id == role_id)
+            ).fetchone()
+            if role_row is None:
+                return {"baseline": [], "grants": [], "revokes": [], "effective": []}
+            baseline = _split_perms(role_row[0])
+            grants: set[str] = set()
+            revokes: set[str] = set()
+            if role_row[1]:
+                ov_rows = conn.execute(
+                    sa.select(
+                        role_permission_overrides.c.permission,
+                        role_permission_overrides.c.action,
+                    ).where(role_permission_overrides.c.role_id == role_id)
+                ).fetchall()
+                for perm, action in ov_rows:
+                    if action == "grant":
+                        grants.add(perm)
+                    elif action == "revoke":
+                        revokes.add(perm)
+            effective = (baseline | grants) - revokes
+            return {
+                "baseline": sorted(baseline),
+                "grants": sorted(grants),
+                "revokes": sorted(revokes),
+                "effective": sorted(effective),
+            }
 
     # -- Organizations ---------------------------------------------------------
 

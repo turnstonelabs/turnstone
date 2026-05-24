@@ -5904,6 +5904,11 @@ _VALID_PERMISSIONS = frozenset(
         # explicitly before their coordinator sessions can mutate the
         # catalog.
         "model.skills.write",
+        # Coordinator out-of-band send capability — granted to
+        # ``builtin-admin`` by migration 042 but previously absent
+        # from this validator, which made it impossible to add to a
+        # custom role or restore via the overrides editor.
+        "coordinator.trust.send",
         "tools.approve",
         "workstreams.create",
         "workstreams.close",
@@ -5912,8 +5917,25 @@ _VALID_PERMISSIONS = frozenset(
 )
 
 
+def _enrich_role(storage: Any, row: dict[str, Any]) -> dict[str, Any]:
+    """Add overlay fields (effective / grants / revokes) to a role dict.
+
+    For builtin rows, ``effective`` is the post-overlay set; for custom
+    rows it's just the parsed ``permissions`` column with empty deltas.
+    Keeps a single round-trip shape so the admin UI can render chips +
+    "modified" indicators without per-row fetches.
+    """
+    eff = storage.effective_role_permissions(row["role_id"])
+    return {
+        **row,
+        "effective": eff["effective"],
+        "grants": eff["grants"] if row.get("builtin") else [],
+        "revokes": eff["revokes"] if row.get("builtin") else [],
+    }
+
+
 async def admin_list_roles(request: Request) -> JSONResponse:
-    """GET /v1/api/admin/roles — list all roles."""
+    """GET /v1/api/admin/roles — list all roles with overlay info."""
     from turnstone.core.auth import require_permission
     from turnstone.core.web_helpers import require_storage_or_503
 
@@ -5923,7 +5945,7 @@ async def admin_list_roles(request: Request) -> JSONResponse:
     err = require_permission(request, "admin.roles")
     if err:
         return err
-    return JSONResponse({"roles": storage.list_roles()})
+    return JSONResponse({"roles": [_enrich_role(storage, r) for r in storage.list_roles()]})
 
 
 async def admin_create_role(request: Request) -> JSONResponse:
@@ -6072,6 +6094,132 @@ async def admin_delete_role(request: Request) -> JSONResponse:
     )
 
     return JSONResponse({"status": "ok"})
+
+
+async def admin_role_effective(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/roles/{role_id}/effective — baseline + overrides."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.roles")
+    if err:
+        return err
+
+    role_id = request.path_params["role_id"]
+    if storage.get_role(role_id) is None:
+        return JSONResponse({"error": "Role not found"}, status_code=404)
+    return JSONResponse(storage.effective_role_permissions(role_id))
+
+
+def _check_admin_lockout(
+    storage: Any,
+    role_id: str,
+    grants: set[str],
+    revokes: set[str],
+) -> JSONResponse | None:
+    """Refuse override changes that would leave nobody with admin.roles.
+
+    ``admin.roles`` is the only permission whose loss is self-locking — without
+    it, no user can reach the Roles tab to undo the change. Other revoked
+    permissions (``model.skills.write``, ``admin.skills``, etc.) can always be
+    restored by an admin, so they don't get this guard.
+    """
+    if "admin.roles" not in revokes:
+        return None  # not revoking the load-bearing permission
+    # Walk every user and check whether at least one would retain admin.roles.
+    for user in storage.list_users():
+        user_roles = storage.list_user_roles(user["user_id"])
+        for ur in user_roles:
+            if ur["role_id"] == role_id:
+                eff = (
+                    {p.strip() for p in (ur.get("permissions") or "").split(",") if p.strip()}
+                    | grants
+                ) - revokes
+                if "admin.roles" in eff:
+                    return None
+            else:
+                other_eff = storage.effective_role_permissions(ur["role_id"])
+                if "admin.roles" in other_eff["effective"]:
+                    return None
+    return JSONResponse(
+        {"error": "Refusing change: would leave no user with admin.roles"},
+        status_code=409,
+    )
+
+
+async def admin_role_overrides(request: Request) -> JSONResponse:
+    """PUT /v1/api/admin/roles/{role_id}/overrides — replace grant/revoke set."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.roles")
+    if err:
+        return err
+
+    role_id = request.path_params["role_id"]
+    existing = storage.get_role(role_id)
+    if existing is None:
+        return JSONResponse({"error": "Role not found"}, status_code=404)
+    if not existing.get("builtin"):
+        return JSONResponse(
+            {"error": "Overrides apply only to builtin roles; edit custom roles directly"},
+            status_code=400,
+        )
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    grant_list = body.get("grant", []) or []
+    revoke_list = body.get("revoke", []) or []
+    if not isinstance(grant_list, list) or not isinstance(revoke_list, list):
+        return JSONResponse({"error": "grant and revoke must be arrays"}, status_code=400)
+    grants = {str(p) for p in grant_list}
+    revokes = {str(p) for p in revoke_list}
+
+    invalid = sorted((grants | revokes) - _VALID_PERMISSIONS)
+    if invalid:
+        return JSONResponse(
+            {"error": f"Invalid permissions: {', '.join(invalid)}"},
+            status_code=400,
+        )
+    if grants & revokes:
+        return JSONResponse(
+            {"error": "A permission cannot appear in both grant and revoke"},
+            status_code=400,
+        )
+
+    # Strip no-ops: grants already in baseline and revokes not in baseline both
+    # have zero effect on the merged set. Storing them wastes rows and clutters
+    # the audit detail without changing behavior.
+    baseline = {p.strip() for p in (existing.get("permissions") or "").split(",") if p.strip()}
+    grants = grants - baseline
+    revokes = revokes & baseline
+
+    lockout = _check_admin_lockout(storage, role_id, grants, revokes)
+    if lockout is not None:
+        return lockout
+
+    audit_uid, ip = _audit_context(request)
+    storage.set_role_overrides(role_id, grants, revokes, created_by=audit_uid)
+    record_audit(
+        storage,
+        audit_uid,
+        "role.overrides.set",
+        "role",
+        role_id,
+        {"grants": sorted(grants), "revokes": sorted(revokes)},
+        ip,
+    )
+
+    return JSONResponse(storage.effective_role_permissions(role_id))
 
 
 async def admin_list_user_roles(request: Request) -> JSONResponse:
@@ -12507,6 +12655,12 @@ def create_app(
                     Route("/api/admin/roles", admin_create_role, methods=["POST"]),
                     Route("/api/admin/roles/{role_id}", admin_update_role, methods=["PUT"]),
                     Route("/api/admin/roles/{role_id}", admin_delete_role, methods=["DELETE"]),
+                    Route("/api/admin/roles/{role_id}/effective", admin_role_effective),
+                    Route(
+                        "/api/admin/roles/{role_id}/overrides",
+                        admin_role_overrides,
+                        methods=["PUT"],
+                    ),
                     Route("/api/admin/users/{user_id}/roles", admin_list_user_roles),
                     Route(
                         "/api/admin/users/{user_id}/roles",

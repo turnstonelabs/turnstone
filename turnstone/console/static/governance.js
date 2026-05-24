@@ -58,6 +58,97 @@ function loadGovRoles() {
     });
 }
 
+// Set of role_ids whose drawer is open. Persists across re-renders so a
+// reload (e.g. after edit) doesn't collapse the inspector the user was
+// looking at.
+const _govRoleExpanded = new Set();
+
+function _effectivePerms(role) {
+  // Server returns ``effective`` as the post-overlay set. Fall back to
+  // splitting the raw column for resilience against older payloads
+  // (e.g. tests that mock the endpoint without the new fields).
+  if (Array.isArray(role.effective) && role.effective.length > 0)
+    return role.effective;
+  return (role.permissions || "")
+    .split(",")
+    .map(function (p) {
+      return p.trim();
+    })
+    .filter(Boolean);
+}
+
+function _renderRoleDrawer(role) {
+  const effective = _effectivePerms(role);
+  const effectiveSet = {};
+  for (let i = 0; i < effective.length; i++) effectiveSet[effective[i]] = true;
+  const baseline = role.builtin
+    ? (role.permissions || "")
+        .split(",")
+        .map(function (p) {
+          return p.trim();
+        })
+        .filter(Boolean)
+    : effective;
+  const baselineSet = {};
+  for (let i = 0; i < baseline.length; i++) baselineSet[baseline[i]] = true;
+  const grants = role.grants || [];
+  const revokes = role.revokes || [];
+  const grantSet = {};
+  for (let i = 0; i < grants.length; i++) grantSet[grants[i]] = true;
+  const revokeSet = {};
+  for (let i = 0; i < revokes.length; i++) revokeSet[revokes[i]] = true;
+
+  let body = "";
+  for (let s = 0; s < _PERMISSION_SECTIONS.length; s++) {
+    const section = _PERMISSION_SECTIONS[s];
+    let chips = "";
+    let sectionHasAny = false;
+    for (let i = 0; i < section.permissions.length; i++) {
+      const p = section.permissions[i];
+      const inBase = !!baselineSet[p];
+      const inEff = !!effectiveSet[p];
+      const isGrant = !!grantSet[p];
+      const isRevoke = !!revokeSet[p];
+      if (!inEff && !isRevoke && !isGrant) continue; // hide perms not relevant to this role
+      sectionHasAny = true;
+      let cls = "perm-inspect-chip";
+      if (isGrant) cls += " is-grant";
+      else if (isRevoke) cls += " is-revoke";
+      else if (inBase) cls += " is-baseline";
+      let suffix = "";
+      if (isGrant) suffix = ' <span class="perm-delta-mark">+</span>';
+      else if (isRevoke) suffix = ' <span class="perm-delta-mark">−</span>';
+      chips +=
+        '<span class="' + cls + '">' + escapeHtml(p) + suffix + "</span>";
+    }
+    if (!sectionHasAny) continue;
+    body +=
+      '<div class="role-drawer-section">' +
+      '<div class="role-drawer-section-label">' +
+      escapeHtml(section.label) +
+      "</div>" +
+      '<div class="role-drawer-chips">' +
+      chips +
+      "</div></div>";
+  }
+  const drawerActions =
+    role.builtin && (grants.length || revokes.length)
+      ? '<button class="admin-btn-action" data-reset-role="' +
+        escapeHtml(role.role_id) +
+        '">Reset to default</button>'
+      : "";
+  return (
+    '<div class="admin-role-drawer" data-drawer-role="' +
+    escapeHtml(role.role_id) +
+    '">' +
+    body +
+    (drawerActions
+      ? '<div class="role-drawer-actions">' + drawerActions + "</div>"
+      : "") +
+    "</div>"
+  );
+}
+
 function _renderGovRoles(items) {
   const el = document.getElementById("admin-roles-table");
   if (!items.length) {
@@ -67,57 +158,101 @@ function _renderGovRoles(items) {
   let html = "";
   for (let i = 0; i < items.length; i++) {
     const r = items[i];
-    // Render permissions as badges
-    const perms = (r.permissions || "").split(",");
-    let badges = "";
-    for (let j = 0; j < perms.length; j++) {
-      const p = perms[j].trim();
-      if (!p) continue;
-      let cls = "scope-badge";
-      if (p === "approve" || p.indexOf("admin.") === 0) cls += " scope-approve";
-      else if (p === "write" || p.indexOf("workstreams.") === 0)
-        cls += " scope-write";
-      badges += '<span class="' + cls + '">' + escapeHtml(p) + "</span>";
+    const effective = _effectivePerms(r);
+    const grants = r.grants || [];
+    const revokes = r.revokes || [];
+    const modified = grants.length > 0 || revokes.length > 0;
+    const expanded = _govRoleExpanded.has(r.role_id);
+
+    let pills = "";
+    if (r.builtin)
+      pills += '<span class="scope-badge scope-channel">builtin</span>';
+    if (modified) {
+      const deltaLabel =
+        "modified " +
+        (grants.length ? "+" + grants.length : "") +
+        (grants.length && revokes.length ? " / " : "") +
+        (revokes.length ? "−" + revokes.length : "");
+      pills +=
+        '<span class="scope-badge scope-write" title="' +
+        escapeHtml(deltaLabel) +
+        '">' +
+        escapeHtml(deltaLabel) +
+        "</span>";
     }
-    const typeLabel = r.builtin
-      ? '<span class="scope-badge scope-channel">builtin</span>'
-      : "";
-    const actions = r.builtin
-      ? ""
-      : '<button class="admin-btn-action" data-edit-role="' +
-        escapeHtml(r.role_id) +
-        '">edit</button>' +
+
+    const countChip =
+      '<span class="perm-count-chip">' +
+      effective.length +
+      (effective.length === 1 ? " permission" : " permissions") +
+      "</span>";
+
+    // Builtin rows always get Edit (lands in the overrides editor).
+    // Custom rows get Edit + Delete (existing behavior).
+    let actions =
+      '<button class="admin-btn-action" data-edit-role="' +
+      escapeHtml(r.role_id) +
+      '">edit</button>';
+    if (!r.builtin) {
+      actions +=
         '<button class="admin-btn-danger" data-delete-role="' +
         escapeHtml(r.role_id) +
         '" data-role-name="' +
         escapeHtml(r.name) +
         '">delete</button>';
+    }
+
+    const chevron = expanded ? "▾" : "▸";
     html +=
-      '<div class="admin-row" role="listitem">' +
+      '<div class="admin-row admin-role-row" role="listitem" data-role-id="' +
+      escapeHtml(r.role_id) +
+      '" data-expanded="' +
+      (expanded ? "true" : "false") +
+      '">' +
       '<span class="admin-col admin-col-rname">' +
+      '<button type="button" class="role-expand-btn" aria-label="Toggle details" data-expand-role="' +
+      escapeHtml(r.role_id) +
+      '">' +
+      chevron +
+      "</button>" +
       escapeHtml(r.display_name) +
       " " +
-      typeLabel +
+      pills +
       "</span>" +
       '<span class="admin-col admin-col-rperms">' +
-      badges +
+      countChip +
       "</span>" +
       '<span class="admin-col admin-col-actions">' +
       actions +
       "</span></div>";
+    if (expanded) html += _renderRoleDrawer(r);
   }
   setSafeHtml(el, html);
+
+  // Bind expand toggle (row + chevron both work)
+  const expandBtns = el.querySelectorAll("[data-expand-role]");
+  for (let k = 0; k < expandBtns.length; k++) {
+    expandBtns[k].addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      const rid = this.getAttribute("data-expand-role");
+      if (_govRoleExpanded.has(rid)) _govRoleExpanded.delete(rid);
+      else _govRoleExpanded.add(rid);
+      _renderGovRoles(_govRoles);
+    });
+  }
   // Bind edit
   const editBtns = el.querySelectorAll("[data-edit-role]");
   for (let k = 0; k < editBtns.length; k++) {
-    editBtns[k].addEventListener("click", function () {
+    editBtns[k].addEventListener("click", function (ev) {
+      ev.stopPropagation();
       showEditRoleModal(this.getAttribute("data-edit-role"));
     });
   }
   // Bind delete
   const delBtns = el.querySelectorAll("[data-delete-role]");
   for (let k = 0; k < delBtns.length; k++) {
-    delBtns[k].addEventListener("click", function () {
+    delBtns[k].addEventListener("click", function (ev) {
+      ev.stopPropagation();
       const rid = this.getAttribute("data-delete-role");
       const rname = this.getAttribute("data-role-name");
       showConfirmModal(
@@ -138,6 +273,37 @@ function _renderGovRoles(items) {
             })
             .catch(function () {
               showToast("Failed to delete role");
+            });
+        },
+      );
+    });
+  }
+  // Bind reset-to-default (drawer action; builtin + overridden only)
+  const resetBtns = el.querySelectorAll("[data-reset-role]");
+  for (let k = 0; k < resetBtns.length; k++) {
+    resetBtns[k].addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      const rid = this.getAttribute("data-reset-role");
+      showConfirmModal(
+        "Reset overrides",
+        "Drop all overrides on this builtin role? Effective permissions return to the shipped baseline.",
+        "Reset",
+        function () {
+          authFetch("/v1/api/admin/roles/" + rid + "/overrides", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ grant: [], revoke: [] }),
+          })
+            .then(function (r) {
+              if (!r.ok) throw new Error();
+              return r.json();
+            })
+            .then(function () {
+              showToast("Overrides cleared");
+              loadGovRoles();
+            })
+            .catch(function () {
+              showToast("Failed to reset overrides");
             });
         },
       );
@@ -165,6 +331,7 @@ const _PERMISSION_SECTIONS = [
       "admin.roles",
       "admin.orgs",
       "admin.policies",
+      "admin.prompt_policies",
       "admin.skills",
       "admin.audit",
       "admin.usage",
@@ -174,11 +341,24 @@ const _PERMISSION_SECTIONS = [
       "admin.memories",
       "admin.settings",
       "admin.mcp",
+      "admin.models",
+      "admin.nodes",
+      "admin.coordinator",
+      "admin.cluster.inspect",
     ],
   },
   {
     label: "Workstreams & Tools",
-    permissions: ["workstreams.create", "workstreams.close", "tools.approve"],
+    permissions: [
+      "workstreams.create",
+      "workstreams.close",
+      "conversation.modify",
+      "tools.approve",
+    ],
+  },
+  {
+    label: "Coordinator",
+    permissions: ["coordinator.trust.send"],
   },
   {
     label: "Model",
@@ -196,7 +376,7 @@ const _ALL_PERMISSIONS = (function () {
   return flat;
 })();
 
-function _buildPermCheckboxes(prefix, selected) {
+function _buildPermCheckboxes(prefix, selected, baseline) {
   // Emits the toggle-switch component used elsewhere in the admin
   // modals so each permission reads as a deliberate on/off rather
   // than a generic checkbox.  Sections are wrapped in a
@@ -206,6 +386,18 @@ function _buildPermCheckboxes(prefix, selected) {
   // The underlying ``<input type="checkbox" name="{prefix}-perm">``
   // shape is preserved so ``_collectPermCheckboxes`` still picks
   // them up regardless of section.
+  //
+  // ``baseline`` is optional — when provided (builtin-role edits) each
+  // toggle gets a small visual mark showing whether the perm is on by
+  // default and whether the current state is an override (added or
+  // removed).  ``submitEditRole`` diffs the toggle state against the
+  // baseline to produce the {grant, revoke} payload for /overrides.
+  const baselineSet = {};
+  if (baseline)
+    for (let i = 0; i < baseline.length; i++) baselineSet[baseline[i]] = true;
+  const selectedSet = {};
+  if (selected)
+    for (let i = 0; i < selected.length; i++) selectedSet[selected[i]] = true;
   let html = "";
   for (let s = 0; s < _PERMISSION_SECTIONS.length; s++) {
     const section = _PERMISSION_SECTIONS[s];
@@ -217,9 +409,28 @@ function _buildPermCheckboxes(prefix, selected) {
       '<div class="perm-grid">';
     for (let i = 0; i < section.permissions.length; i++) {
       const p = section.permissions[i];
-      const checked = selected && selected.indexOf(p) >= 0 ? " checked" : "";
+      const isChecked = !!selectedSet[p];
+      const inBase = !!baselineSet[p];
+      const checked = isChecked ? " checked" : "";
+      let extraCls = "";
+      let badge = "";
+      if (baseline) {
+        if (inBase && !isChecked) {
+          extraCls = " is-revoke";
+          badge = '<span class="perm-baseline-mark" title="Revoked">−</span>';
+        } else if (!inBase && isChecked) {
+          extraCls = " is-grant";
+          badge = '<span class="perm-baseline-mark" title="Granted">+</span>';
+        } else if (inBase) {
+          extraCls = " is-baseline";
+          badge =
+            '<span class="perm-baseline-mark is-default" title="Default">•</span>';
+        }
+      }
       html +=
-        '<label class="toggle-switch perm-toggle">' +
+        '<label class="toggle-switch perm-toggle' +
+        extraCls +
+        '">' +
         '<input type="checkbox" value="' +
         p +
         '" name="' +
@@ -230,6 +441,7 @@ function _buildPermCheckboxes(prefix, selected) {
         '<span class="toggle-track" aria-hidden="true"></span>' +
         '<span class="toggle-label">' +
         escapeHtml(p) +
+        badge +
         "</span></label>";
     }
     html += "</div></div>";
@@ -326,11 +538,41 @@ function showEditRoleModal(roleId) {
   const ov = document.getElementById("edit-role-overlay");
   ov.style.display = "flex";
   document.getElementById("er-id").value = roleId;
-  document.getElementById("er-name").value = role.display_name;
-  const selected = (role.permissions || "").split(",");
+  // Builtin rows expose the name field read-only — only display_name and
+  // permissions are mutable on customs; for builtins, only permissions
+  // (via the override layer).  The display_name input is kept visible on
+  // builtin rows but disabled to reduce surprise.
+  const nameInput = document.getElementById("er-name");
+  nameInput.value = role.display_name;
+  nameInput.disabled = !!role.builtin;
+
+  const titleEl = document.getElementById("edit-role-title");
+  if (titleEl)
+    titleEl.textContent = role.builtin
+      ? "Customize Built-in Role"
+      : "Edit Role";
+
+  const baseline = role.builtin
+    ? (role.permissions || "")
+        .split(",")
+        .map(function (p) {
+          return p.trim();
+        })
+        .filter(Boolean)
+    : null;
+  const selected = _effectivePerms(role);
+
+  // Persist the baseline + builtin flag on the form so submit can diff
+  // without re-walking _govRoles (which could have been refreshed mid-edit).
+  const form = document.getElementById("edit-role-box");
+  if (form) {
+    form.dataset.builtin = role.builtin ? "1" : "0";
+    form.dataset.baseline = baseline ? baseline.join(",") : "";
+  }
+
   setSafeHtml(
     document.getElementById("er-perms-container"),
-    _buildPermCheckboxes("er", selected),
+    _buildPermCheckboxes("er", selected, baseline),
   );
   document.getElementById("edit-role-error").classList.remove("is-visible");
   _erTrapHandler = _installTrap("edit-role-overlay", "edit-role-box");
@@ -348,13 +590,61 @@ function hideEditRoleModal() {
 function submitEditRole() {
   const roleId = document.getElementById("er-id").value;
   const dname = document.getElementById("er-name").value.trim();
-  const perms = _collectPermCheckboxes("er");
+  const form = document.getElementById("edit-role-box");
+  const isBuiltin = form && form.dataset.builtin === "1";
   document.getElementById("er-submit").disabled = true;
-  authFetch("/v1/api/admin/roles/" + roleId, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ display_name: dname, permissions: perms }),
-  })
+
+  let fetchOpts;
+  let url;
+  if (isBuiltin) {
+    // Diff against baseline → {grant, revoke}. Display name is immutable.
+    //
+    // Crucial safety property: the diff universe is the set of permissions
+    // we actually RENDERED as toggles, not the full baseline.  If the
+    // permission taxonomy in `_PERMISSION_SECTIONS` ever falls behind a
+    // new server-side perm (e.g. migration adds it to builtin-admin
+    // before this file ships the toggle), naïve baseline-vs-selected
+    // diffing would treat every unrendered perm as "user wants this
+    // revoked" and silently strip it.  Limiting the universe to rendered
+    // toggles makes the editor a NO-OP for unknown perms — they pass
+    // through untouched.
+    const renderedNodes = document.querySelectorAll('input[name="er-perm"]');
+    const renderedSet = {};
+    for (let i = 0; i < renderedNodes.length; i++)
+      renderedSet[renderedNodes[i].value] = true;
+    const baseline = (form.dataset.baseline || "").split(",").filter(Boolean);
+    const baselineSet = {};
+    for (let i = 0; i < baseline.length; i++) baselineSet[baseline[i]] = true;
+    const selectedStr = _collectPermCheckboxes("er");
+    const selected = selectedStr.split(",").filter(Boolean);
+    const selectedSet = {};
+    for (let i = 0; i < selected.length; i++) selectedSet[selected[i]] = true;
+    const grant = [];
+    const revoke = [];
+    for (const p in selectedSet) {
+      if (!baselineSet[p]) grant.push(p);
+    }
+    for (const p in baselineSet) {
+      // Only revoke perms the user could actually see — unrendered ones
+      // are out of scope for this edit and must round-trip unchanged.
+      if (renderedSet[p] && !selectedSet[p]) revoke.push(p);
+    }
+    url = "/v1/api/admin/roles/" + roleId + "/overrides";
+    fetchOpts = {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ grant: grant, revoke: revoke }),
+    };
+  } else {
+    const perms = _collectPermCheckboxes("er");
+    url = "/v1/api/admin/roles/" + roleId;
+    fetchOpts = {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ display_name: dname, permissions: perms }),
+    };
+  }
+  authFetch(url, fetchOpts)
     .then(function (r) {
       if (!r.ok)
         return r.json().then(function (d) {

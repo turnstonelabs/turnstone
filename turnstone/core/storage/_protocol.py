@@ -1202,7 +1202,43 @@ class StorageBackend(Protocol):
         ...
 
     def get_user_permissions(self, user_id: str) -> set[str]:
-        """Return the union of all permissions from the user's assigned roles."""
+        """Return the union of all permissions from the user's assigned roles.
+
+        For builtin roles, applies any rows in ``role_permission_overrides``
+        on top of ``roles.permissions`` as ``baseline ∪ grants − revokes``.
+        """
+        ...
+
+    def list_role_overrides(self, role_id: str) -> list[dict[str, str]]:
+        """Return override rows for ``role_id`` (action in {'grant','revoke'})."""
+        ...
+
+    def set_role_overrides(
+        self,
+        role_id: str,
+        grants: set[str],
+        revokes: set[str],
+        created_by: str = "",
+    ) -> None:
+        """Transactionally replace the override set for ``role_id``.
+
+        Deletes any existing rows for the role and inserts one row per
+        (permission, action) in ``grants`` / ``revokes``.  Empty inputs
+        clear all overrides (equivalent to ``clear_role_overrides``).
+        ``grants`` and ``revokes`` MUST be disjoint — the caller is
+        responsible for ensuring no permission appears in both.
+        """
+        ...
+
+    def clear_role_overrides(self, role_id: str) -> None:
+        """Delete every override row for ``role_id`` (reset-to-default)."""
+        ...
+
+    def effective_role_permissions(self, role_id: str) -> dict[str, list[str]]:
+        """Return ``{'baseline': [...], 'grants': [...], 'revokes': [...],
+        'effective': [...]}`` for a single role, with overrides applied.
+        Each list is sorted for stable rendering.
+        """
         ...
 
     # -- Organizations ---------------------------------------------------------
