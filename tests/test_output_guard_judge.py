@@ -268,36 +268,6 @@ class TestAliasResolution:
 class TestClientReuse:
     """Lazy-init client is cached for the lifetime of the judge instance."""
 
-    def test_client_created_once_across_evaluations(self) -> None:
-        # Stub the providers.create_client factory via a monkeypatched
-        # _create_client that counts calls.  Three back-to-back
-        # evaluations must hit the factory exactly once.
-        provider = _make_provider('{"risk_level": "none", "flags": []}')
-        config = JudgeConfig(output_guard_llm=True, output_guard_llm_timeout=5.0)
-        client = MagicMock(base_url="http://x", api_key="k")
-        judge = OutputGuardJudge(
-            config=config,
-            session_provider=provider,
-            session_client=client,
-            session_model="test-model",
-        )
-        call_count = [0]
-
-        def fake_create() -> Any:
-            call_count[0] += 1
-            return client
-
-        judge._create_client = fake_create  # type: ignore[method-assign]
-
-        for _ in range(3):
-            v = judge.evaluate("payload")
-            assert v.succeeded
-        assert call_count[0] == 3, (
-            "Expected one factory call per evaluate — the lazy-init lives "
-            "inside _create_client; this test confirms the test harness's "
-            "fake doesn't accidentally short-circuit the lazy path."
-        )
-
     def test_real_lazy_init_caches_real_client(self) -> None:
         # Use the production _create_client path with create_client
         # itself monkeypatched at the module boundary.

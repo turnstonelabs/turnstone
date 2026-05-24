@@ -3542,12 +3542,22 @@ class ChatSession:
                 # OOM the judge model or burn tokens on content that won't
                 # even reach the assistant.  Truncation is a safety
                 # invariant that runs regardless of the guard stage.
+                #
+                # The remaining-token budget shrinks as each output is sized;
+                # without per-output bookkeeping, N parallel tool results
+                # could each claim the full remaining budget and collectively
+                # overflow the prompt.
                 truncation_budget = self._remaining_token_budget()
                 _truncated: dict[str, str] = {}
                 for tc_id, output in results:
                     if isinstance(output, str):
-                        _truncated[tc_id] = self._truncate_output(
+                        truncated = self._truncate_output(
                             output, remaining_budget_tokens=truncation_budget
+                        )
+                        _truncated[tc_id] = truncated
+                        truncation_budget = max(
+                            0,
+                            truncation_budget - int(len(truncated) / self._chars_per_token),
                         )
                 results = [(tc_id, _truncated.get(tc_id, output)) for tc_id, output in results]
 

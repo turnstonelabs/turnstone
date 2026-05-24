@@ -19,7 +19,7 @@ issue #560 mitigation #1:
   by ``tier='llm' AND confidence > 0`` to exclude both.
 
 Revision ID: 057
-Revises: 055
+Revises: 056
 Create Date: 2026-05-23
 
 Originally drafted as 056 alongside PR #574 (skill spec uplift); bumped

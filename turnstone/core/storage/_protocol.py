@@ -1758,7 +1758,7 @@ class StorageBackend(Protocol):
         ``tier`` is ``"heuristic"`` (regex stage, default) or ``"llm"``
         (capability-gated semantic evaluator, issue #560 mitigation #1).
         One row per ``(call_id, tier)`` so a single tool call can produce
-        up to two rows; mirrors :func:`intent_verdicts` row model.
+        up to two rows; mirrors the ``intent_verdicts`` table's row model.
         ``reasoning`` / ``judge_model`` / ``latency_ms`` / ``confidence``
         are LLM-tier fields and stay empty / zero on heuristic rows.
         """

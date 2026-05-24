@@ -18,31 +18,42 @@ _NetworkType = ipaddress.IPv4Network | ipaddress.IPv6Network
 
 
 class TokenBucket:
-    """Single token bucket for one client."""
+    """Single token bucket for one client.
+
+    ``consume()`` and ``retry_after`` are thread-safe via an internal
+    lock — multiple workers (e.g. ``ChatSession._batch_evaluate_outputs``'s
+    pool) can call ``consume()`` concurrently without racing on
+    ``tokens`` / ``last_refill``.  ``RateLimiter`` holds its own outer
+    lock for the bucket-dict it owns; the per-bucket lock here protects
+    direct consumers that bypass ``RateLimiter``.
+    """
 
     def __init__(self, rate: float, burst: int) -> None:
         self.rate = rate  # tokens per second
         self.burst = burst  # max tokens
         self.tokens = float(burst)
         self.last_refill = time.monotonic()
+        self._lock = threading.Lock()
 
     def consume(self) -> bool:
         """Try to consume one token. Returns True if allowed."""
-        now = time.monotonic()
-        elapsed = now - self.last_refill
-        self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
-        self.last_refill = now
-        if self.tokens >= 1.0:
-            self.tokens -= 1.0
-            return True
-        return False
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self.last_refill
+            self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
+            self.last_refill = now
+            if self.tokens >= 1.0:
+                self.tokens -= 1.0
+                return True
+            return False
 
     @property
     def retry_after(self) -> float:
         """Seconds until next token is available."""
-        if self.tokens >= 1.0:
-            return 0.0
-        return (1.0 - self.tokens) / self.rate
+        with self._lock:
+            if self.tokens >= 1.0:
+                return 0.0
+            return (1.0 - self.tokens) / self.rate
 
 
 def parse_trusted_proxies(raw: str) -> frozenset[_NetworkType]:

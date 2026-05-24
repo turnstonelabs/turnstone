@@ -1641,9 +1641,14 @@ class SessionUIBase:
     ) -> None:
         """Persist one output-guard assessment row.
 
-        Called by the session once per tier (``"heuristic"`` always when
-        the regex stage runs at risk!="none" or the LLM stage also ran;
-        ``"llm"`` when the LLM stage produced a successful verdict).
+        Called by the session once per tier.  A ``"heuristic"`` row is
+        written when the regex stage produced signal (risk!="none" or
+        flags) OR when the heuristic and LLM verdicts disagreed.  An
+        ``"llm"`` row is written whenever the LLM stage ran — on
+        success ``reasoning`` carries the model's explanation; on
+        failure (timeout / parse error / provider error) ``reasoning``
+        carries the error reason so audit can distinguish "LLM
+        attempted but failed" from "LLM was never enabled".
         """
         try:
             from turnstone.core.storage._registry import get_storage

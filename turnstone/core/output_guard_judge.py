@@ -186,7 +186,7 @@ def _extract_json(text: str) -> dict[str, Any] | None:
         if isinstance(data, dict):
             return data
     except (json.JSONDecodeError, ValueError):
-        pass
+        pass  # expected when the LLM prefixed prose or wrapped in a fence; fall through
 
     # Strategy 2: markdown code block
     md_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
@@ -196,7 +196,7 @@ def _extract_json(text: str) -> dict[str, Any] | None:
             if isinstance(data, dict):
                 return data
         except (json.JSONDecodeError, ValueError):
-            pass
+            pass  # fence captured malformed JSON; fall through to brace scan
 
     # Strategy 3: find first { and matching }
     start = text.find("{")
@@ -213,7 +213,7 @@ def _extract_json(text: str) -> dict[str, Any] | None:
                         if isinstance(data, dict):
                             return data
                     except (json.JSONDecodeError, ValueError):
-                        pass
+                        pass  # balanced braces but invalid JSON inside; treat as unparseable
                     break
 
     return None
