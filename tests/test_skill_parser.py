@@ -479,6 +479,25 @@ Content.
         assert result.disable_model_invocation is True
         assert result.user_invocable is False
 
+    def test_other_ints_fall_back_to_default(self) -> None:
+        """Spec recognises only ``0``/``1`` as integer boolean forms.
+        ``2`` is ambiguous — silently coercing via Python truthiness
+        would disable model invocation on a typo without warning.  Copilot
+        review on PR #577 caught the too-permissive original."""
+        raw = """\
+---
+name: ambiguous-int
+disable-model-invocation: 2
+user-invocable: -1
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        # Both fall back to spec defaults (model can autoload, user can pick).
+        assert result.disable_model_invocation is False
+        assert result.user_invocable is True
+
     def test_quoted_yaml_1_1_variants(self) -> None:
         """YAML 1.1 spellings — ``yes``/``no``/``on``/``off`` — survive
         quoting.  Unquoted forms get coerced to bool by safe_load (covered

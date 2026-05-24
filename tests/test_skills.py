@@ -1034,6 +1034,66 @@ class TestSkillAPI:
         assert resp.status_code == 200
         assert resp.json()["hidden_from_menu"] is False
 
+    def test_create_skill_hidden_from_menu_string_rejected(self, api_client):
+        """``hidden_from_menu`` is bool-typed at the API boundary —
+        a malformed client sending the string ``"false"`` (which Python
+        truthiness would silently coerce to ``True``, flipping the flag
+        opposite to intent) must be rejected with a 400.  Copilot review
+        on PR #577 caught the loose ``bool()`` cast."""
+        resp = api_client.post(
+            "/v1/api/admin/skills",
+            json={
+                "name": "loose-bool",
+                "content": "...",
+                "description": "x",
+                "hidden_from_menu": "false",
+            },
+        )
+        assert resp.status_code == 400
+        assert "boolean" in resp.json()["error"].lower()
+
+    def test_create_skill_hidden_from_menu_int_zero_and_one_accepted(self, api_client, api_storage):
+        """Strict-bool parse accepts canonical JSON ``true``/``false``
+        AND integer ``0``/``1`` — the latter for clients that serialise
+        Postgres-style.  Other integers fall to 400."""
+        # int 1 → True
+        resp = api_client.post(
+            "/v1/api/admin/skills",
+            json={
+                "name": "intbool-true",
+                "content": "...",
+                "description": "x",
+                "hidden_from_menu": 1,
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["hidden_from_menu"] is True
+
+        # int 0 → False (defaults check).
+        resp = api_client.post(
+            "/v1/api/admin/skills",
+            json={
+                "name": "intbool-false",
+                "content": "...",
+                "description": "x",
+                "hidden_from_menu": 0,
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["hidden_from_menu"] is False
+
+        # int 2 → 400.
+        resp = api_client.post(
+            "/v1/api/admin/skills",
+            json={
+                "name": "intbool-ambiguous",
+                "content": "...",
+                "description": "x",
+                "hidden_from_menu": 2,
+            },
+        )
+        assert resp.status_code == 400
+
     def test_update_skill_readonly_mixed_body_filters_spec(self, api_client, api_storage):
         """When JS sends all fields for a readonly skill, spec fields are silently dropped."""
         _create_template(
