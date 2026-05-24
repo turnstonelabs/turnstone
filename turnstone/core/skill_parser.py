@@ -171,10 +171,18 @@ def _extract_bool(meta: dict[str, Any], key: str, *, default: bool) -> bool:
     if isinstance(raw, int):
         # ``isinstance(True, int)`` is also True, but the bool branch
         # above already handled that — anything reaching here is an
-        # actual int.  0 → False, anything else → True (mirrors YAML's
-        # broader "any non-zero is truthy" intuition, though strictly
-        # the spec accepts only 0/1).
-        return bool(raw)
+        # actual int.  Spec mentions only ``0`` / ``1`` as the integer
+        # boolean forms; other ints (``2``, ``-1``, ...) are ambiguous
+        # and fall back to *default* rather than silently coercing via
+        # Python truthiness.  ``/review`` on PR #577 caught the
+        # too-permissive coerce — a SKILL.md with ``disable-model-
+        # invocation: 2`` would otherwise silently disable model
+        # invocation without warning the author about the typo.
+        if raw == 0:
+            return False
+        if raw == 1:
+            return True
+        return default
     if isinstance(raw, str):
         lowered = raw.strip().lower()
         if lowered in _YAML_BOOL_TRUE:

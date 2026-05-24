@@ -6518,6 +6518,34 @@ def _canonicalize_skill_string_list(raw: Any) -> str:
     return _json.dumps([p.strip() for p in candidate.split(",") if p.strip()])
 
 
+def _parse_strict_bool(raw: Any, *, default: bool) -> tuple[bool, JSONResponse | None]:
+    """Strictly parse a boolean-shaped admin body field.
+
+    Accepts:
+    * Python ``bool`` (canonical JSON ``true``/``false``)
+    * ``int`` ``0`` or ``1``
+
+    Anything else returns a 400 ``JSONResponse`` — admin clients on
+    this surface speak typed JSON, and silently coercing the string
+    ``"false"`` (which Python truthiness reads as ``True``) would flip
+    a field opposite to the obvious intent.  Caught by ``/review`` on
+    PR #577: ``bool(body.get(..., False))`` accepted strings unsafely.
+
+    Returns ``(value, None)`` on success or ``(default, response_400)``
+    on failure — callers return the 400 early.
+    """
+    if isinstance(raw, bool):
+        return raw, None
+    if isinstance(raw, int) and raw in (0, 1):
+        return bool(raw), None
+    if raw is None:
+        return default, None
+    return default, JSONResponse(
+        {"error": "boolean field expects true/false (or 0/1)"},
+        status_code=400,
+    )
+
+
 def _skill_to_response(r: dict[str, Any], resource_count: int = 0) -> dict[str, Any]:
     """Convert a storage skill dict to a JSON-safe response dict."""
     import json as _json
@@ -6690,8 +6718,11 @@ async def admin_create_skill(request: Request) -> JSONResponse:
     # Anthropic spec ``user-invocable: false`` lands here as
     # ``hidden_from_menu=true`` — the user-facing picker
     # (``/v1/api/skills``) filters these out while the model still
-    # sees them.
-    hidden_from_menu = bool(body.get("hidden_from_menu", False))
+    # sees them.  Strict-bool parse so a string like ``"false"`` (which
+    # ``bool()`` would silently flip True) returns a 400 instead.
+    hidden_from_menu, hidden_err = _parse_strict_bool(body.get("hidden_from_menu"), default=False)
+    if hidden_err is not None:
+        return hidden_err
 
     token_estimate = len(content) // 4 if content else 0
 
@@ -6857,7 +6888,13 @@ async def admin_update_skill(request: Request) -> JSONResponse:
         # ``_canonicalize_skill_string_list``.
         updates["paths"] = _canonicalize_skill_string_list(body["paths"])
     if "hidden_from_menu" in body and body["hidden_from_menu"] is not None:
-        updates["hidden_from_menu"] = bool(body["hidden_from_menu"])
+        # Strict-bool parse — see ``_parse_strict_bool``.  A malformed
+        # client sending ``"false"`` would flip the flag the wrong way
+        # under plain ``bool()`` truthiness; 400 instead.
+        hidden_value, hidden_err = _parse_strict_bool(body["hidden_from_menu"], default=False)
+        if hidden_err is not None:
+            return hidden_err
+        updates["hidden_from_menu"] = hidden_value
     if "priority" in body:
         try:
             updates["priority"] = max(-1000, min(1000, int(body["priority"] or 0)))
