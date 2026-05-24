@@ -82,6 +82,19 @@ class _FakeUI:
     def on_output_warning(self, call_id: Any, assessment: Any) -> None:
         pass
 
+    def record_output_assessment(
+        self,
+        call_id: Any,
+        assessment: Any,
+        *,
+        tier: str = "heuristic",
+        reasoning: str = "",
+        judge_model: str = "",
+        latency_ms: int = 0,
+        confidence: float = 0.0,
+    ) -> None:
+        pass
+
     def __getattr__(self, name: str) -> Any:
         # Catch-all for any UI hook not enumerated above so the chat
         # loop's ``self.ui.<something>()`` call doesn't blow up.
