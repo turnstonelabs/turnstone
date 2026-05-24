@@ -635,7 +635,8 @@ def test_inspect_returns_persisted_fields(populated_storage):
         assert key in result
     assert result["parent_ws_id"] == "coord-1"
     assert isinstance(result["messages"], list)
-    # Verdicts deliberately not surfaced — see inspect() docstring.
+    # Verdicts deliberately not surfaced — see the inline comment in
+    # CoordinatorClient.inspect().
     assert "verdicts" not in result
 
 
