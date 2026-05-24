@@ -1761,7 +1761,18 @@ async def create_workstream(request: Request) -> JSONResponse:
     - ``node_id`` omitted or ``"auto"`` → console picks the node with most headroom
     - ``node_id`` set to ``"pool"`` → console picks any available node
     """
+    from turnstone.core.auth import require_any_permission
     from turnstone.core.web_helpers import read_json_or_400
+
+    # Gate on workstreams.create OR admin.coordinator before proxying —
+    # keeps the 403 attributed at the console (audit clarity) and avoids
+    # a cluster round-trip on a forbidden request.  The node-side lift
+    # gates again as defense in depth.  See ``interactive_endpoint_config``
+    # in ``turnstone/server.py`` for the OR rationale (coord sessions
+    # spawning interactive children).
+    err = require_any_permission(request, ("workstreams.create", "admin.coordinator"))
+    if err is not None:
+        return err
 
     body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
@@ -1892,7 +1903,17 @@ async def route_create(request: Request) -> Response:
     console can hash to the owning node before the multipart body lands —
     we do not parse the body just to peek at the metadata.
     """
+    from turnstone.core.auth import require_any_permission
+
     t0 = time.monotonic()
+    # Fail fast on forbidden requests — the upstream node's lift gates
+    # too (see ``make_create_handler`` in session_routes.py).
+    # ``admin.coordinator`` is accepted so coord sessions can spawn
+    # interactive children via the route proxy without holding
+    # ``workstreams.create``.
+    err = require_any_permission(request, ("workstreams.create", "admin.coordinator"))
+    if err is not None:
+        return _record_route(request, "create", 403, t0, err)
     router: ConsoleRouter | None = request.app.state.router
     ring_ready = router is not None and router.is_ready()
     if not ring_ready:
@@ -2267,12 +2288,32 @@ async def route_proxy(request: Request) -> Response:
     legacies still in scope). ``verb`` drives the audit action lookup;
     DELETE on ``/send`` is treated as dequeue for audit attribution.
     """
+    from turnstone.core.auth import require_any_permission
+
     t0 = time.monotonic()
     # Extract verb name from URL tail: /v1/api/route/.../send -> "send".
     # DELETE on /send is the dequeue path — audit attribution diverges.
     verb = request.url.path.rsplit("/", 1)[-1]
     if verb == "send" and request.method == "DELETE":
         verb = "dequeue"
+
+    # Verb-scoped permission gate.  Redundant with the node-side lift's
+    # check (the upstream server gates again), but failing fast at the
+    # proxy avoids a cluster round-trip on a forbidden request and keeps
+    # the 403 attributed to the proxy in audit logs.  Only the two verbs
+    # whose perms exist; other verbs (send/cancel/dequeue/command/plan)
+    # remain authenticated-only and pre-existing — leaving them alone
+    # rather than expanding scope.  ``admin.coordinator`` accepted as
+    # an alternative on each so coord sessions driving interactive
+    # children pass through without the operator-style perms.
+    _verb_perms: dict[str, tuple[str, ...]] = {
+        "approve": ("tools.approve", "admin.coordinator"),
+        "close": ("workstreams.close", "admin.coordinator"),
+    }
+    if verb in _verb_perms:
+        err = require_any_permission(request, _verb_perms[verb])
+        if err is not None:
+            return _record_route(request, verb, 403, t0, err)
     router: ConsoleRouter | None = request.app.state.router
     ring_ready = router is not None and router.is_ready()
     if not ring_ready:

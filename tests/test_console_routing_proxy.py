@@ -354,6 +354,89 @@ class TestRouteProxy:
         assert resp.status_code == 200
 
 
+class TestRouteProxyPermissionGates:
+    """``route_proxy`` was pre-existing infra that forwarded blindly —
+    any authenticated caller could send/approve/cancel/close.  PR
+    adding 057_role_permission_overrides added verb-scoped gates on
+    approve + close (the verbs that had vestigial perms in
+    ``_VALID_PERMISSIONS`` with no enforcement site).  These tests
+    pin the new shape and the OR fallback to ``admin.coordinator``."""
+
+    @pytest.fixture()
+    def client(self):
+        router = _make_mock_router()
+        app = _make_app(router=router)
+        _wire_proxy(app, _make_proxy_post(json_data={"status": "ok"}))
+        client = TestClient(app, raise_server_exceptions=False)
+        yield client
+        client.close()
+
+    @staticmethod
+    def _hdr(*, perms: frozenset[str] = frozenset()) -> dict[str, str]:
+        # Plain user — no service scope, so the bypass doesn't kick in;
+        # just the perms passed by the test.
+        from turnstone.core.auth import JWT_AUD_CONSOLE, create_jwt
+
+        return {
+            "Authorization": (
+                "Bearer "
+                + create_jwt(
+                    user_id="test-user",
+                    scopes=frozenset({"read", "write", "approve"}),
+                    source="test",
+                    secret=_TEST_JWT_SECRET,
+                    audience=JWT_AUD_CONSOLE,
+                    permissions=perms,
+                )
+            )
+        }
+
+    def test_approve_without_perm_returns_403(self, client):
+        resp = client.post(
+            "/v1/api/route/workstreams/abc123/approve",
+            json={"approved": True},
+            headers=self._hdr(),
+        )
+        assert resp.status_code == 403
+        assert "tools.approve" in resp.json()["error"]
+
+    def test_close_without_perm_returns_403(self, client):
+        resp = client.post(
+            "/v1/api/route/workstreams/abc123/close",
+            json={},
+            headers=self._hdr(),
+        )
+        assert resp.status_code == 403
+        assert "workstreams.close" in resp.json()["error"]
+
+    def test_approve_with_tools_approve_passes(self, client):
+        resp = client.post(
+            "/v1/api/route/workstreams/abc123/approve",
+            json={"approved": True},
+            headers=self._hdr(perms=frozenset({"tools.approve"})),
+        )
+        assert resp.status_code == 200
+
+    def test_close_with_admin_coordinator_passes(self, client):
+        # The OR fallback: coord sessions can drive close on
+        # interactive children without holding workstreams.close.
+        resp = client.post(
+            "/v1/api/route/workstreams/abc123/close",
+            json={},
+            headers=self._hdr(perms=frozenset({"admin.coordinator"})),
+        )
+        assert resp.status_code == 200
+
+    def test_send_remains_authenticated_only(self, client):
+        # send/cancel/dequeue/command/plan are unchanged — no new gate.
+        resp = client.post(
+            "/v1/api/route/workstreams/abc123/send",
+            json={"message": "hi"},
+            headers=self._hdr(),
+        )
+        assert resp.status_code == 200
+
+
 # ---------------------------------------------------------------------------
 # Tests — route_lookup
 # ---------------------------------------------------------------------------

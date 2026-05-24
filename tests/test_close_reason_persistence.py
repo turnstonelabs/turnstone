@@ -23,9 +23,12 @@ _JWT_SECRET = "test-jwt-secret-minimum-32-chars!"
 
 
 def _full_hdr() -> dict[str, str]:
+    # ``workstreams.close`` is now a real gate on the close handler
+    # (was a vestigial perm, see PR adding 057_role_permission_overrides);
+    # tests that drive close need it embedded in the JWT.
     return {
         "Authorization": (
-            f"Bearer {create_jwt('u1', frozenset({'read', 'write', 'approve'}), 'test', _JWT_SECRET, audience=JWT_AUD_SERVER)}"
+            f"Bearer {create_jwt('u1', frozenset({'read', 'write', 'approve'}), 'test', _JWT_SECRET, audience=JWT_AUD_SERVER, permissions=frozenset({'workstreams.close'}))}"
         )
     }
 

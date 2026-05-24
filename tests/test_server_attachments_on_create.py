@@ -36,6 +36,11 @@ def _make_jwt(user_id: str) -> str:
         source="test",
         secret=_TEST_JWT_SECRET,
         audience=JWT_AUD_SERVER,
+        # ``workstreams.create`` is now a real gate on POST /workstreams/new
+        # — see PR adding 057_role_permission_overrides.  Embed the perm so
+        # the multipart-create flow under test stays exercising the create
+        # path and not the new 403.
+        permissions=frozenset({"workstreams.create"}),
     )
 
 

@@ -138,7 +138,7 @@ model and behavioral settings after deployment through the admin panel.
 
 ## Built-in Roles
 - **Admin** (`builtin-admin`): Full access — read, write, approve, all admin.* permissions
-- **Operator** (`builtin-operator`): read, write, workstreams.create, workstreams.close
+- **Operator** (`builtin-operator`): create / close workstreams, approve tools, modify conversations (read, write, workstreams.create, workstreams.close, tools.approve, conversation.modify)
 - **Viewer** (`builtin-viewer`): read only
 
 ## Tool Policies

@@ -21,7 +21,21 @@ from starlette.testclient import TestClient
 _TEST_JWT_SECRET = "test-jwt-secret-minimum-32-chars!"
 
 
-def _make_jwt(user_id: str, *, scopes: frozenset[str] | None = None) -> str:
+# Default permission set for test JWTs.  Mirrors what builtin-operator
+# carries: enough perms to exercise create/close/approve gates without
+# turning every existing test into a re-authorization round.  Tests
+# negating these gates pass ``permissions=frozenset()`` explicitly.
+_DEFAULT_TEST_PERMS = frozenset(
+    {"workstreams.create", "workstreams.close", "tools.approve", "conversation.modify"}
+)
+
+
+def _make_jwt(
+    user_id: str,
+    *,
+    scopes: frozenset[str] | None = None,
+    permissions: frozenset[str] | None = None,
+) -> str:
     from turnstone.core.auth import JWT_AUD_SERVER, create_jwt
 
     return create_jwt(
@@ -30,11 +44,17 @@ def _make_jwt(user_id: str, *, scopes: frozenset[str] | None = None) -> str:
         source="test",
         secret=_TEST_JWT_SECRET,
         audience=JWT_AUD_SERVER,
+        permissions=_DEFAULT_TEST_PERMS if permissions is None else permissions,
     )
 
 
-def _auth(user: str, *, scopes: frozenset[str] | None = None) -> dict[str, str]:
-    return {"Authorization": f"Bearer {_make_jwt(user, scopes=scopes)}"}
+def _auth(
+    user: str,
+    *,
+    scopes: frozenset[str] | None = None,
+    permissions: frozenset[str] | None = None,
+) -> dict[str, str]:
+    return {"Authorization": f"Bearer {_make_jwt(user, scopes=scopes, permissions=permissions)}"}
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +429,67 @@ class TestCrossTenantClose:
             headers=_auth("attacker-user"),
         )
         assert resp.status_code == 404
+
+
+class TestPermissionGatesOnLifecycle:
+    """Gates that previously didn't exist — ``workstreams.create``,
+    ``workstreams.close``, ``tools.approve`` were declared, seeded into
+    builtin-operator, surfaced in the admin Roles UI, and never wired
+    to a single ``require_permission`` site. PR added the gates; these
+    tests confirm a JWT without each perm gets 403."""
+
+    def test_create_without_perm_returns_403(self, app_client):
+        client, _mgr = app_client
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "no-perm"},
+            headers=_auth("user-1", permissions=frozenset()),
+        )
+        assert resp.status_code == 403
+        assert "workstreams.create" in resp.json()["error"]
+
+    def test_close_without_perm_returns_403(self, app_client):
+        from turnstone.core.storage import get_storage
+
+        client, _mgr = app_client
+        storage = get_storage()
+        assert storage is not None
+        _register_ws(storage, "ws-1", "user-1")
+        resp = client.post(
+            "/v1/api/workstreams/ws-1/close",
+            json={},
+            headers=_auth("user-1", permissions=frozenset()),
+        )
+        assert resp.status_code == 403
+        assert "workstreams.close" in resp.json()["error"]
+
+    def test_approve_without_perm_returns_403(self, app_client):
+        from turnstone.core.storage import get_storage
+
+        client, _mgr = app_client
+        storage = get_storage()
+        assert storage is not None
+        _register_ws(storage, "ws-1", "user-1")
+        resp = client.post(
+            "/v1/api/workstreams/ws-1/approve",
+            json={"approved": True},
+            headers=_auth("user-1", permissions=frozenset()),
+        )
+        assert resp.status_code == 403
+        assert "tools.approve" in resp.json()["error"]
+
+    def test_create_with_perm_passes_gate(self, app_client):
+        # Sanity: same call WITH the perm reaches the post-gate logic
+        # (whatever its outcome — a successful create or a non-403
+        # validation/state error is fine; only the gate behaviour is
+        # under test here).
+        client, _mgr = app_client
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "with-perm"},
+            headers=_auth("user-1", permissions=frozenset({"workstreams.create"})),
+        )
+        assert resp.status_code != 403, resp.json()
 
 
 class TestCrossTenantTitle:

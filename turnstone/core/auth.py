@@ -206,6 +206,81 @@ def require_permission(
     )
 
 
+def require_any_permission(
+    request: Request,
+    permissions: tuple[str, ...],
+    *,
+    allow_service_bypass: bool = True,
+) -> JSONResponse | None:
+    """OR-semantics variant of :func:`require_permission`.
+
+    Returns ``None`` if the caller holds at least one of ``permissions``;
+    otherwise a 403 naming the full set so operators know which roles
+    would satisfy the gate.  Used where multiple roles legitimately
+    reach the same endpoint — e.g. workstream-create accepts both
+    ``workstreams.create`` (operator) and ``admin.coordinator`` (coord
+    sessions spawning interactive children).  ``permissions`` is
+    required and must be non-empty; the empty tuple is almost certainly
+    a programmer error and would produce an always-403 gate.
+
+    This function is the OR-equivalent of the security choke point in
+    :func:`require_permission` — every branch is intentional and the
+    per-branch comments below should stay accurate as the policy
+    evolves.  If a future change adds or reorders a branch, the comment
+    must move with it; a stale comment on a security gate is worse than
+    no comment.
+    """
+    from starlette.responses import JSONResponse
+
+    # Defensive: an empty tuple here means a caller mis-wired the gate
+    # and would silently 403 every request — fail loud at import-adjacent
+    # time so the breakage shows up in tests, not under load.
+    if not permissions:
+        raise ValueError("require_any_permission needs at least one permission")
+
+    # Pull the AuthResult attached by the auth middleware.  Using
+    # ``getattr`` twice survives both "no state attribute" (Starlette
+    # request not yet wrapped) and "state present but auth_result
+    # unset" (middleware skipped the request) — both manifest as the
+    # same "no identity" outcome and route to 401, never silently
+    # admitting the call.
+    auth_result: AuthResult | None = getattr(getattr(request, "state", None), "auth_result", None)
+    if auth_result is None:
+        # Distinguishing 401 from 403 here matters: 401 tells the client
+        # "we don't know who you are, retry with credentials" while a
+        # 403 would suggest the identity is known but lacks the perm,
+        # which would mislead operators chasing an auth bug.
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    # Service-scope bypass: inter-cluster calls (collector → node,
+    # console → upstream) carry a service token and must not be blocked
+    # by per-user permission grants — the service scope itself is the
+    # cluster-side trust boundary.  Callers that protect a capability-
+    # escalation gate (e.g. ``coordinator.trust.send``) pass
+    # ``allow_service_bypass=False`` to opt out.
+    if allow_service_bypass and auth_result.has_scope("service"):
+        return None
+
+    # OR-semantics happy path: any single permission in the set is
+    # enough.  ``any()`` short-circuits so the linear scan is cheap
+    # even on a long permissions tuple.  Note: this is a pure set
+    # membership check against the AuthResult — DB role lookups
+    # already happened at middleware time, so the gate stays in-process.
+    if any(auth_result.has_permission(p) for p in permissions):
+        return None
+
+    # Final fallthrough: identity present, not a service, no matching
+    # perm.  Listing every accepted perm in the error body gives the
+    # operator an actionable remediation — "grant one of {workstreams.create,
+    # admin.coordinator}" — instead of guessing which role would
+    # satisfy a generic 403.
+    perm_list = ", ".join(f"'{p}'" for p in permissions)
+    return JSONResponse(
+        {"error": f"Forbidden: missing one of {perm_list} permissions"},
+        status_code=403,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Path classification
 # ---------------------------------------------------------------------------
