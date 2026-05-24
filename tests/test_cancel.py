@@ -70,6 +70,19 @@ class NullUI:
     def on_output_warning(self, call_id, assessment):
         pass
 
+    def record_output_assessment(
+        self,
+        call_id,
+        assessment,
+        *,
+        tier="heuristic",
+        reasoning="",
+        judge_model="",
+        latency_ms=0,
+        confidence=0.0,
+    ):
+        pass
+
 
 def _make_session(ui=None, **kwargs):
     """Helper to construct a ChatSession with minimal setup."""

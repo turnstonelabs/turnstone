@@ -1619,8 +1619,32 @@ class SessionUIBase:
             return [dict(entry) for entry in self._recent_auto_approvals]
 
     def on_output_warning(self, call_id: str, assessment: dict[str, Any]) -> None:
-        """Deliver an output-guard warning + persist its assessment row."""
+        """Deliver an output-guard warning to the live UI stream.
+
+        Persistence is decoupled: the session calls
+        :meth:`record_output_assessment` directly for each tier
+        (heuristic / llm) so a single tool call's two-tier evaluation
+        produces two rows.  This method only fires the UI event.
+        """
         self._enqueue({"type": "output_warning", "call_id": call_id, **assessment})
+
+    def record_output_assessment(
+        self,
+        call_id: str,
+        assessment: dict[str, Any],
+        *,
+        tier: str = "heuristic",
+        reasoning: str = "",
+        judge_model: str = "",
+        latency_ms: int = 0,
+        confidence: float = 0.0,
+    ) -> None:
+        """Persist one output-guard assessment row.
+
+        Called by the session once per tier (``"heuristic"`` always when
+        the regex stage runs at risk!="none" or the LLM stage also ran;
+        ``"llm"`` when the LLM stage produced a successful verdict).
+        """
         try:
             from turnstone.core.storage._registry import get_storage
 
@@ -1637,6 +1661,11 @@ class SessionUIBase:
                 annotations=json.dumps(assessment.get("annotations", [])),
                 output_length=assessment.get("output_length", 0),
                 redacted=assessment.get("redacted", False),
+                tier=tier,
+                reasoning=reasoning,
+                judge_model=judge_model,
+                latency_ms=latency_ms,
+                confidence=confidence,
             )
         except Exception:
             log.debug("Failed to persist output assessment", exc_info=True)
