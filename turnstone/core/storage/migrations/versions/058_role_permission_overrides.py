@@ -22,16 +22,16 @@ same permission onto one row.  No FK to ``roles`` — matches the rest of
 the governance schema (migration 008 does not declare FKs either) and
 keeps the postgres dialect aligned with sqlite.
 
-Revision ID: 057
-Revises: 056
+Revision ID: 058
+Revises: 057
 Create Date: 2026-05-24
 """
 
 import sqlalchemy as sa
 from alembic import op
 
-revision = "057"
-down_revision = "056"
+revision = "058"
+down_revision = "057"
 branch_labels = None
 depends_on = None
 
