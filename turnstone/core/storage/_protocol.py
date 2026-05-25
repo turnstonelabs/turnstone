@@ -1261,6 +1261,20 @@ class StorageBackend(Protocol):
         """
         ...
 
+    def effective_role_permissions_bulk(
+        self, role_ids: list[str]
+    ) -> dict[str, dict[str, list[str]]]:
+        """Bulk variant of :meth:`effective_role_permissions`.
+
+        Returns ``{role_id: {baseline, grants, revokes, effective}}``
+        for every role_id in ``role_ids``.  Issues at most two queries
+        regardless of list size (one over ``roles``, one IN-filter over
+        ``role_permission_overrides``).  Missing role_ids are omitted
+        from the result rather than mapped to an empty dict — caller
+        can detect absence directly.
+        """
+        ...
+
     # -- Organizations ---------------------------------------------------------
 
     def create_org(self, org_id: str, name: str, display_name: str, settings: str = "{}") -> None:

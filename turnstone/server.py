@@ -4078,9 +4078,10 @@ def create_app(
         # both saved AND loaded is a normal display state.
         saved_loaded_lookup=None,
     )
-    # ``fallback_permissions`` gates the lifted body on any one of the
+    # ``accepted_permissions`` gates the lifted body on any one of the
     # named perms when ``cfg.permission_gate`` is ``None`` (interactive
-    # case).  Coord's ``permission_gate`` (admin.coordinator) takes
+    # case) — for the interactive kind it IS the primary gate, not a
+    # fallback.  Coord's ``permission_gate`` (admin.coordinator) takes
     # precedence on the coord-config side; here we accept ``admin.
     # coordinator`` as a parallel allow so a coord session spawning an
     # interactive child workstream isn't blocked by the operator-style
@@ -4092,13 +4093,13 @@ def create_app(
     # permission_overrides for the audit that surfaced this.
     approve_handler = make_approve_handler(
         interactive_endpoint_config,
-        fallback_permissions=("tools.approve", "admin.coordinator"),
+        accepted_permissions=("tools.approve", "admin.coordinator"),
     )
     close_handler = make_close_handler(
         interactive_endpoint_config,
         audit_emit=_audit_close_workstream,
         supports_close_reason=True,
-        fallback_permissions=("workstreams.close", "admin.coordinator"),
+        accepted_permissions=("workstreams.close", "admin.coordinator"),
     )
     cancel_handler = make_cancel_handler(interactive_endpoint_config)
     open_handler = make_open_handler(
@@ -4112,7 +4113,7 @@ def create_app(
     create_handler = make_create_handler(
         interactive_endpoint_config,
         audit_emit=_audit_workstream_created,
-        fallback_permissions=("workstreams.create", "admin.coordinator"),
+        accepted_permissions=("workstreams.create", "admin.coordinator"),
     )
     list_handler = make_list_handler(interactive_endpoint_config)
     saved_handler = make_saved_handler(interactive_endpoint_config)

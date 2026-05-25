@@ -2725,6 +2725,49 @@ class SQLiteBackend:
                 "effective": sorted(effective),
             }
 
+    def effective_role_permissions_bulk(
+        self, role_ids: list[str]
+    ) -> dict[str, dict[str, list[str]]]:
+        if not role_ids:
+            return {}
+        with self._conn() as conn:
+            role_rows = conn.execute(
+                sa.select(roles.c.role_id, roles.c.permissions, roles.c.builtin).where(
+                    roles.c.role_id.in_(role_ids)
+                )
+            ).fetchall()
+            if not role_rows:
+                return {}
+            builtin_role_ids = [r[0] for r in role_rows if r[2]]
+            grants: dict[str, set[str]] = {}
+            revokes: dict[str, set[str]] = {}
+            if builtin_role_ids:
+                ov_rows = conn.execute(
+                    sa.select(
+                        role_permission_overrides.c.role_id,
+                        role_permission_overrides.c.permission,
+                        role_permission_overrides.c.action,
+                    ).where(role_permission_overrides.c.role_id.in_(builtin_role_ids))
+                ).fetchall()
+                for rid, perm, action in ov_rows:
+                    if action == "grant":
+                        grants.setdefault(rid, set()).add(perm)
+                    elif action == "revoke":
+                        revokes.setdefault(rid, set()).add(perm)
+            out: dict[str, dict[str, list[str]]] = {}
+            for rid, perms_str, builtin in role_rows:
+                baseline = _split_perms(perms_str)
+                role_grants = grants.get(rid, set()) if builtin else set()
+                role_revokes = revokes.get(rid, set()) if builtin else set()
+                effective = (baseline | role_grants) - role_revokes
+                out[rid] = {
+                    "baseline": sorted(baseline),
+                    "grants": sorted(role_grants),
+                    "revokes": sorted(role_revokes),
+                    "effective": sorted(effective),
+                }
+            return out
+
     # -- Organizations ---------------------------------------------------------
 
     def create_org(self, org_id: str, name: str, display_name: str, settings: str = "{}") -> None:

@@ -491,6 +491,49 @@ class TestPermissionGatesOnLifecycle:
         )
         assert resp.status_code != 403, resp.json()
 
+    # Positive coverage for the admin.coordinator OR-fallback on each
+    # of the three lifted verbs.  Without these, a future refactor
+    # that dropped admin.coordinator from the accepted_permissions
+    # tuple would regress coord-session children silently — the proxy
+    # tests only exercise the route_proxy verb dict, not the lift.
+
+    def test_create_with_admin_coordinator_passes_gate(self, app_client):
+        client, _mgr = app_client
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "coord-child"},
+            headers=_auth("user-1", permissions=frozenset({"admin.coordinator"})),
+        )
+        assert resp.status_code != 403, resp.json()
+
+    def test_close_with_admin_coordinator_passes_gate(self, app_client):
+        from turnstone.core.storage import get_storage
+
+        client, _mgr = app_client
+        storage = get_storage()
+        assert storage is not None
+        _register_ws(storage, "ws-1", "user-1")
+        resp = client.post(
+            "/v1/api/workstreams/ws-1/close",
+            json={},
+            headers=_auth("user-1", permissions=frozenset({"admin.coordinator"})),
+        )
+        assert resp.status_code != 403, resp.json()
+
+    def test_approve_with_admin_coordinator_passes_gate(self, app_client):
+        from turnstone.core.storage import get_storage
+
+        client, _mgr = app_client
+        storage = get_storage()
+        assert storage is not None
+        _register_ws(storage, "ws-1", "user-1")
+        resp = client.post(
+            "/v1/api/workstreams/ws-1/approve",
+            json={"approved": True},
+            headers=_auth("user-1", permissions=frozenset({"admin.coordinator"})),
+        )
+        assert resp.status_code != 403, resp.json()
+
 
 class TestCrossTenantTitle:
     def test_refresh_title_requires_live_session(self, app_client):

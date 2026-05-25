@@ -64,11 +64,14 @@ function loadGovRoles() {
 const _govRoleExpanded = new Set();
 
 function _effectivePerms(role) {
-  // Server returns ``effective`` as the post-overlay set. Fall back to
-  // splitting the raw column for resilience against older payloads
-  // (e.g. tests that mock the endpoint without the new fields).
-  if (Array.isArray(role.effective) && role.effective.length > 0)
-    return role.effective;
+  // Server's _enrich_role always sets ``effective`` (empty array when
+  // the role legitimately has no perms — e.g. a builtin whose overrides
+  // revoke every baseline entry).  Presence is the right sentinel, NOT
+  // length: a length check would silently fall through to the baseline
+  // column for a fully-revoked role, lying to the inspector about what
+  // the role can do.  Only the raw-column fallback is for callers that
+  // hit older /v1/api/admin/roles payloads (e.g. mocked tests).
+  if (Array.isArray(role.effective)) return role.effective;
   return (role.permissions || "")
     .split(",")
     .map(function (p) {

@@ -225,6 +225,47 @@ class TestRoles:
         assert resp.status_code == 200, resp.json()
         assert "model.skills.write" in resp.json()["permissions"]
 
+    def test_permission_sections_js_covers_valid_permissions(self):
+        """F-5: ``_PERMISSION_SECTIONS`` in governance.js mirrors
+        ``_VALID_PERMISSIONS`` in console/server.py.  A new perm added
+        to the Python validator without a matching JS toggle becomes
+        silently un-customizable through the admin Roles UI — the only
+        documented path for granting/revoking perms on a builtin.
+        Catches the same shape that surfaced ``coordinator.trust.send``
+        missing from the validator during manual verification of the
+        overlay editor (a similar drift, in the opposite direction)."""
+        import re
+        from pathlib import Path
+
+        from turnstone.console.server import _VALID_PERMISSIONS
+
+        src = Path("turnstone/console/static/governance.js").read_text()
+        # _PERMISSION_SECTIONS is a `const X = [...]` containing nested
+        # `permissions: ["a", "b", ...]` arrays.  Pull every quoted
+        # string out of every permissions: [...] block; we don't need
+        # a full JS parser to enumerate the perm names.
+        m = re.search(
+            r"const _PERMISSION_SECTIONS\s*=\s*\[(.*?)\];",
+            src,
+            re.DOTALL,
+        )
+        assert m, "could not locate _PERMISSION_SECTIONS in governance.js"
+        body = m.group(1)
+        in_ui = set(re.findall(r'"([a-z][a-z._]*)"', body))
+        # Exclude the section labels themselves (they're sentence-case
+        # like "Scopes", "Admin"; the regex above already excludes them
+        # by anchoring on lowercase, but be explicit about intent).
+        missing_in_ui = sorted(_VALID_PERMISSIONS - in_ui)
+        extra_in_ui = sorted(in_ui - _VALID_PERMISSIONS)
+        assert not missing_in_ui, (
+            f"perms in _VALID_PERMISSIONS but not _PERMISSION_SECTIONS "
+            f"(silently un-customizable in admin UI): {missing_in_ui}"
+        )
+        assert not extra_in_ui, (
+            f"perms in _PERMISSION_SECTIONS but not _VALID_PERMISSIONS "
+            f"(toggle would 400 on save): {extra_in_ui}"
+        )
+
     def test_valid_permissions_covers_all_seeded_builtin_perms(self):
         """Every permission migration 008/011/014/015/029/032/033/035/040/042
         adds to a builtin role must be in ``_VALID_PERMISSIONS`` — otherwise

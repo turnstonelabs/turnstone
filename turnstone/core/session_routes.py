@@ -698,7 +698,7 @@ def register_coord_verbs(
 def make_approve_handler(
     cfg: SessionEndpointConfig,
     *,
-    fallback_permissions: tuple[str, ...] = (),
+    accepted_permissions: tuple[str, ...] = (),
 ) -> Handler:
     """Lifted body for ``POST {prefix}/{ws_id}/approve``.
 
@@ -709,9 +709,10 @@ def make_approve_handler(
     ``__budget_override__`` filter (interactive-only — coord workstreams
     don't have the budget-override pseudo-tool).
 
-    ``fallback_permissions`` is OR-checked via :func:`require_any_permission`
+    ``accepted_permissions`` is OR-checked via :func:`require_any_permission`
     only when ``cfg.permission_gate`` is ``None`` — i.e. for the
-    interactive kind. Coord's ``permission_gate`` already takes
+    interactive kind, where it IS the primary gate (not a fallback to
+    something else). Coord's ``permission_gate`` already takes
     precedence so admin-coordinator users don't also need
     ``tools.approve`` to act on their own coord workstreams. Pass
     ``admin.coordinator`` alongside ``tools.approve`` for endpoints
@@ -727,8 +728,8 @@ def make_approve_handler(
             err = cfg.permission_gate(request)
             if err is not None:
                 return err
-        elif fallback_permissions:
-            err = require_any_permission(request, fallback_permissions)
+        elif accepted_permissions:
+            err = require_any_permission(request, accepted_permissions)
             if err is not None:
                 return err
         mgr_opt, err503 = cfg.manager_lookup(request)
@@ -843,7 +844,7 @@ def make_close_handler(
     *,
     audit_emit: CloseAuditEmitter | None = None,
     supports_close_reason: bool = False,
-    fallback_permissions: tuple[str, ...] = (),
+    accepted_permissions: tuple[str, ...] = (),
 ) -> Handler:
     """Lifted body for ``POST {prefix}/{ws_id}/close``.
 
@@ -894,8 +895,8 @@ def make_close_handler(
             err = cfg.permission_gate(request)
             if err is not None:
                 return err
-        elif fallback_permissions:
-            err = require_any_permission(request, fallback_permissions)
+        elif accepted_permissions:
+            err = require_any_permission(request, accepted_permissions)
             if err is not None:
                 return err
         mgr_opt, err503 = cfg.manager_lookup(request)
@@ -1750,7 +1751,7 @@ def make_create_handler(
     cfg: SessionEndpointConfig,
     *,
     audit_emit: CreateAuditEmitter | None = None,
-    fallback_permissions: tuple[str, ...] = (),
+    accepted_permissions: tuple[str, ...] = (),
 ) -> Handler:
     """Lifted body for ``POST {prefix}/new`` — workstream creation.
 
@@ -1896,8 +1897,8 @@ def make_create_handler(
             err = cfg.permission_gate(request)
             if err is not None:
                 return err
-        elif fallback_permissions:
-            err = require_any_permission(request, fallback_permissions)
+        elif accepted_permissions:
+            err = require_any_permission(request, accepted_permissions)
             if err is not None:
                 return err
         mgr_opt, err503 = cfg.manager_lookup(request)

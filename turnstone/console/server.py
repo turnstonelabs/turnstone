@@ -5958,15 +5958,18 @@ _VALID_PERMISSIONS = frozenset(
 )
 
 
-def _enrich_role(storage: Any, row: dict[str, Any]) -> dict[str, Any]:
+def _enrich_role(row: dict[str, Any], eff: dict[str, list[str]]) -> dict[str, Any]:
     """Add overlay fields (effective / grants / revokes) to a role dict.
 
     For builtin rows, ``effective`` is the post-overlay set; for custom
     rows it's just the parsed ``permissions`` column with empty deltas.
     Keeps a single round-trip shape so the admin UI can render chips +
     "modified" indicators without per-row fetches.
+
+    Caller supplies the prefetched ``eff`` dict from
+    :meth:`effective_role_permissions_bulk` so admin_list_roles needs
+    one storage round-trip total instead of 1 + 2*builtin_count.
     """
-    eff = storage.effective_role_permissions(row["role_id"])
     return {
         **row,
         "effective": eff["effective"],
@@ -5986,7 +5989,18 @@ async def admin_list_roles(request: Request) -> JSONResponse:
     err = require_permission(request, "admin.roles")
     if err:
         return err
-    return JSONResponse({"roles": [_enrich_role(storage, r) for r in storage.list_roles()]})
+    rows = storage.list_roles()
+    eff_map = storage.effective_role_permissions_bulk([r["role_id"] for r in rows])
+    return JSONResponse(
+        {
+            "roles": [
+                _enrich_role(
+                    r, eff_map.get(r["role_id"], {"effective": [], "grants": [], "revokes": []})
+                )
+                for r in rows
+            ]
+        }
+    )
 
 
 async def admin_create_role(request: Request) -> JSONResponse:
