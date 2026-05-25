@@ -121,6 +121,19 @@ class RecordingUI:
     def on_output_warning(self, call_id, assessment):
         pass
 
+    def record_output_assessment(
+        self,
+        call_id,
+        assessment,
+        *,
+        tier="heuristic",
+        reasoning="",
+        judge_model="",
+        latency_ms=0,
+        confidence=0.0,
+    ):
+        pass
+
     @property
     def full_content(self) -> str:
         return "".join(self.content_tokens)

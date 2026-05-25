@@ -1816,8 +1816,22 @@ class StorageBackend(Protocol):
         annotations: str,
         output_length: int,
         redacted: bool,
+        *,
+        tier: str = "heuristic",
+        reasoning: str = "",
+        judge_model: str = "",
+        latency_ms: int = 0,
+        confidence: float = 0.0,
     ) -> None:
-        """Record an output guard assessment."""
+        """Record an output guard assessment.
+
+        ``tier`` is ``"heuristic"`` (regex stage, default) or ``"llm"``
+        (capability-gated semantic evaluator, issue #560 mitigation #1).
+        One row per ``(call_id, tier)`` so a single tool call can produce
+        up to two rows; mirrors the ``intent_verdicts`` table's row model.
+        ``reasoning`` / ``judge_model`` / ``latency_ms`` / ``confidence``
+        are LLM-tier fields and stay empty / zero on heuristic rows.
+        """
         ...
 
     def list_output_assessments(

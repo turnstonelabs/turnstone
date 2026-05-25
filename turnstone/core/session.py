@@ -96,6 +96,7 @@ from turnstone.core.metacognition import (
 )
 from turnstone.core.nudge_queue import TOOL_DRAIN, USER_DRAIN, NudgeQueue
 from turnstone.core.providers import create_provider
+from turnstone.core.ratelimit import TokenBucket
 from turnstone.core.safety import is_command_blocked, sanitize_command
 from turnstone.core.sandbox import execute_math_sandboxed
 from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS
@@ -137,6 +138,7 @@ if TYPE_CHECKING:
     from turnstone.core.mcp_client import MCPClientManager
     from turnstone.core.model_registry import ModelConfig, ModelRegistry
     from turnstone.core.output_guard import OutputAssessment
+    from turnstone.core.output_guard_judge import OutputGuardJudge, OutputJudgeVerdict
     from turnstone.core.providers import (
         CompletionResult,
         LLMProvider,
@@ -798,6 +800,20 @@ class SessionUI(Protocol):
         """Called when the output guard detects risk signals in tool output."""
         ...
 
+    def record_output_assessment(
+        self,
+        call_id: str,
+        assessment: dict[str, Any],
+        *,
+        tier: str = "heuristic",
+        reasoning: str = "",
+        judge_model: str = "",
+        latency_ms: int = 0,
+        confidence: float = 0.0,
+    ) -> None:
+        """Persist one output-guard assessment row (one per ``(call_id, tier)``)."""
+        ...
+
 
 # ---------------------------------------------------------------------------
 # MCP dispatch helpers
@@ -1087,6 +1103,16 @@ class ChatSession:
         self._judge_config: JudgeConfig | None = judge_config
         self._judge: IntentJudge | None = None
         self._judge_cancel_event: threading.Event | None = None
+        # Output-guard LLM judge (lazy-initialized, issue #560 mitigation #1).
+        # Lives alongside ``_judge`` and is reset by the same client/model
+        # swap paths so both judges pick up new credentials.
+        self._output_guard_judge: OutputGuardJudge | None = None
+        self._output_guard_judge_cancel: threading.Event | None = None
+        # Rate limiter for the LLM-judge stage — 60 calls/minute caps
+        # adversarial fan-out cost.  Bucket starts full so a single turn
+        # with many tools is not throttled.  Reset alongside the judge
+        # instance at the model-swap paths.
+        self._output_guard_judge_rl = TokenBucket(rate=1.0, burst=60)
         # MCP tool integration: merge external tools with built-in
         self._mcp_client = mcp_client
         self._mcp_refresh_cb: Any = None  # Callable | None (avoid import)
@@ -1226,6 +1252,9 @@ class ChatSession:
             read_only_tools=cs.get("judge.read_only_tools"),
             output_guard=cs.get("judge.output_guard"),
             output_guard_budget_seconds=cs.get("judge.output_guard_budget_seconds"),
+            output_guard_llm=cs.get("judge.output_guard_llm"),
+            output_guard_model=cs.get("judge.output_guard_model"),
+            output_guard_llm_timeout=cs.get("judge.output_guard_llm_timeout"),
             redact_secrets=cs.get("judge.redact_secrets"),
             cancel_on_approval=cs.get("judge.cancel_on_approval"),
         )
@@ -1915,9 +1944,13 @@ class ChatSession:
             # Recompute auto tool truncation for new context window
             if not self._manual_tool_truncation:
                 self.tool_truncation = int(new_cfg.context_window * self._chars_per_token * 0.5)
-        # Reset judge so it picks up the new model/provider
+        # Reset judges so they pick up the new model/provider
         if self._judge is not None:
             self._judge = None
+        if self._output_guard_judge is not None:
+            self._output_guard_judge = None
+            # Rate limiter is tied to the judge model; a swap invalidates it.
+            self._output_guard_judge_rl = TokenBucket(rate=1.0, burst=60)
         self._init_system_messages()
         log.info(
             "session.model_updated ws=%s model=%s ctx=%d",
@@ -2319,6 +2352,8 @@ class ChatSession:
                 self._provider = self._registry.get_provider(saved_alias)
                 self._cached_capabilities = None
                 self._judge = None  # re-create with new client/model
+                self._output_guard_judge = None  # same — re-create
+                self._output_guard_judge_rl = TokenBucket(rate=1.0, burst=60)
                 self.context_window = cfg.context_window
                 if not self._manual_tool_truncation:
                     self.tool_truncation = int(cfg.context_window * self._chars_per_token * 0.5)
@@ -3709,15 +3744,75 @@ class ChatSession:
                 from turnstone.core.tool_advisory import wrap_tool_result
 
                 _tc_names = {c["id"]: c.get("function", {}).get("name", "") for c in tool_calls}
+                # Tool arguments (JSON string) per call_id — threaded into the
+                # LLM judge so it can reason about output-vs-request plausibility.
+                _tc_args = {c["id"]: c.get("function", {}).get("arguments", "") for c in tool_calls}
                 _last_idx = len(results) - 1
+
+                # Pre-truncate (cp-2): the LLM judge stage must see the
+                # same text that lands in the assistant's context, not the
+                # full pre-truncation blob.  Otherwise a fat web_fetch can
+                # OOM the judge model or burn tokens on content that won't
+                # even reach the assistant.  Truncation is a safety
+                # invariant that runs regardless of the guard stage.
+                #
+                # The remaining-token budget shrinks as each output is sized;
+                # without per-output bookkeeping, N parallel tool results
+                # could each claim the full remaining budget and collectively
+                # overflow the prompt.
+                truncation_budget = self._remaining_token_budget()
+                _truncated: dict[str, str] = {}
+                for tc_id, output in results:
+                    if isinstance(output, str):
+                        truncated = self._truncate_output(
+                            output, remaining_budget_tokens=truncation_budget
+                        )
+                        _truncated[tc_id] = truncated
+                        truncation_budget = max(
+                            0,
+                            truncation_budget - int(len(truncated) / self._chars_per_token),
+                        )
+                results = [(tc_id, _truncated.get(tc_id, output)) for tc_id, output in results]
+
+                # Pre-evaluate the guard stage concurrently when LLM is
+                # enabled and there are multiple string outputs (perf-2).
+                # The judge stage is the dominant per-turn latency at
+                # 5-20 tool calls; running them in parallel collapses
+                # N×LLM-latency to ⌈N/max_workers⌉×latency.  Limited to
+                # str outputs — structured (list) outputs stay sequential
+                # (per-part recursion below).  Single-result turns also
+                # skip the parallel path since there's no parallelism to
+                # gain and the overhead isn't worth it.
+                _batch_guard: dict[str, tuple[str, OutputAssessment | None]] = {}
+                _judge_cfg = self._judge_cfg
+                if (
+                    _judge_cfg
+                    and _judge_cfg.output_guard
+                    and _judge_cfg.output_guard_llm
+                    and sum(1 for _, o in results if isinstance(o, str)) > 1
+                ):
+                    _batch_guard = self._batch_evaluate_outputs(
+                        [
+                            (tc_id, o, _tc_names.get(tc_id, ""), _tc_args.get(tc_id, ""))
+                            for tc_id, o in results
+                            if isinstance(o, str)
+                        ]
+                    )
+
                 for _ri, (tc_id, output) in enumerate(results):
                     # Output guard: evaluate tool result before it enters context
                     assessment: OutputAssessment | None = None
                     if self._judge_cfg and self._judge_cfg.output_guard:
                         if isinstance(output, str):
-                            output, assessment = self._evaluate_output(
-                                tc_id, output, _tc_names.get(tc_id, "")
-                            )
+                            if tc_id in _batch_guard:
+                                output, assessment = _batch_guard[tc_id]
+                            else:
+                                output, assessment = self._evaluate_output(
+                                    tc_id,
+                                    output,
+                                    _tc_names.get(tc_id, ""),
+                                    tool_args=_tc_args.get(tc_id, ""),
+                                )
                         elif isinstance(output, list):
                             # Image/structured output — evaluate each text part
                             # independently so credentials in any part get redacted.
@@ -3728,16 +3823,13 @@ class ChatSession:
                                     and p.get("text")
                                 ):
                                     p["text"], _part_assess = self._evaluate_output(
-                                        tc_id, p["text"], _tc_names.get(tc_id, "")
+                                        tc_id,
+                                        p["text"],
+                                        _tc_names.get(tc_id, ""),
+                                        tool_args=_tc_args.get(tc_id, ""),
                                     )
                                     if _part_assess is not None:
                                         assessment = _part_assess
-
-                    # Safety truncation: clamp output to remaining context budget
-                    # so a single large result cannot overflow the context window.
-                    if isinstance(output, str):
-                        budget = self._remaining_token_budget()
-                        output = self._truncate_output(output, remaining_budget_tokens=budget)
 
                     # Advisory injection: persistent advisories — output
                     # guard findings AND queued user messages (Seam 1)
@@ -4845,6 +4937,50 @@ class ChatSession:
             log.warning("judge.init_failed", exc_info=True)
         return self._judge
 
+    def _ensure_output_guard_judge(self) -> OutputGuardJudge | None:
+        """Lazily initialize the output-guard LLM judge if configured.
+
+        Re-checks the live ``output_guard_llm`` flag every call so toggling
+        the LLM stage via admin settings takes immediate effect on
+        existing sessions — same hot-reload semantics as
+        :meth:`_ensure_judge`.
+        """
+        jc = self._judge_cfg
+        if jc is None or not jc.output_guard_llm:
+            return None
+        if self._output_guard_judge is not None:
+            return self._output_guard_judge
+        if self._judge_config is None:
+            return None
+        try:
+            from turnstone.core.output_guard_judge import OutputGuardJudge
+
+            self._output_guard_judge = OutputGuardJudge(
+                config=jc,
+                session_provider=self._provider,
+                session_client=self.client,
+                session_model=self.model,
+                model_registry=self._registry,
+            )
+        except Exception:
+            log.warning("output_guard_judge.init_failed", exc_info=True)
+        return self._output_guard_judge
+
+    def _lookup_tool_description(self, name: str) -> str:
+        """Look up a tool's description from the session's tools registry.
+
+        Returns empty string when the name is unknown — the output-guard
+        judge prompt skips empty sections, so an unknown tool simply
+        loses the description line.  O(N) over ``self._tools`` (small
+        list, ~20 tools).
+        """
+        for t in self._tools:
+            fn = t.get("function") if isinstance(t, dict) else None
+            if isinstance(fn, dict) and fn.get("name") == name:
+                desc = fn.get("description", "")
+                return desc if isinstance(desc, str) else ""
+        return ""
+
     def _evaluate_intent(
         self,
         items: list[dict[str, Any]],
@@ -5024,15 +5160,33 @@ class ChatSession:
         return cancel_event
 
     def _evaluate_output(
-        self, call_id: str, output: str, func_name: str
+        self,
+        call_id: str,
+        output: str,
+        func_name: str,
+        *,
+        tool_args: str = "",
     ) -> tuple[str, OutputAssessment | None]:
         """Run the output guard on tool result text.
 
-        Returns ``(possibly_sanitized_output, assessment)``.  The assessment
-        is ``None`` when risk_level is ``"none"``.  Surfaces warnings via
-        ``ui.on_output_warning`` and logs at debug level.
+        Two stages.  The heuristic regex stage always runs; the LLM judge
+        (issue #560 mitigation #1) runs when ``judge.output_guard_llm``
+        is enabled.  When both run and the LLM succeeds, the LLM verdict
+        is the *acted* assessment (informs redaction + UI + return);
+        otherwise the heuristic stands.  Both tier rows are persisted
+        whenever the LLM ran, for audit completeness.
+
+        ``tool_args`` is the JSON-string args the tool was called with
+        — passed through to the LLM judge so it can reason about
+        output-vs-request plausibility (e.g. ``read_file("/etc/passwd")``
+        returning password-shaped content is plausible; ``read_file
+        ("README.md")`` returning the same is suspicious).  Empty for
+        agent-synthesis call sites where no tool call exists.
+
+        Returns ``(possibly_sanitized_output, acted_assessment)``.  The
+        acted assessment is ``None`` when its risk_level is ``"none"``.
         """
-        from turnstone.core.output_guard import evaluate_output
+        from turnstone.core.output_guard import OutputAssessment, evaluate_output
 
         og_patterns = None
         rule_reg = self._rule_registry
@@ -5040,35 +5194,261 @@ class ChatSession:
             og_patterns = rule_reg.output_patterns
         jc = self._judge_cfg
         budget = jc.output_guard_budget_seconds if jc is not None else 30.0
-        assessment = evaluate_output(
+        heuristic = evaluate_output(
             output,
             func_name=func_name,
             call_id=call_id,
             budget_seconds=budget,
             patterns=og_patterns,
         )
-        if assessment.risk_level == "none":
+
+        # Stage 2: LLM judge (opt-in, capability-gated).  The rate limiter
+        # bounds adversarial fan-out cost (60 calls/min/session).  The
+        # judge sees the heuristic verdict + tool args so it can defer to
+        # the regex on credential_leak and focus on prompt-injection
+        # signals the regex set misses.  On disable / rate-limit / error /
+        # timeout the heuristic stands.
+        tool_description = self._lookup_tool_description(func_name) if func_name else ""
+        llm_verdict = self._invoke_output_guard_judge(
+            call_id,
+            output,
+            func_name,
+            tool_description=tool_description,
+            tool_args=tool_args,
+            heuristic_risk=heuristic.risk_level,
+            heuristic_flags=tuple(heuristic.flags),
+            heuristic_annotations=tuple(heuristic.annotations),
+        )
+
+        output_len = len(output)
+
+        # Acted assessment.  Credential redaction is a regex-only signal
+        # that the LLM cannot override (bug-1 / sec-1 from the PR review):
+        # an LLM asked about prompt-injection can correctly label a
+        # credential-bearing tool output as "none" risk for injection, but
+        # the secret still needs to be redacted before it lands in the
+        # assistant's context.  When the heuristic populated ``sanitized``
+        # we keep the heuristic's verdict as acted regardless of the LLM.
+        if heuristic.sanitized is not None:
+            acted = heuristic
+        elif llm_verdict is not None and llm_verdict.succeeded:
+            acted = OutputAssessment(
+                flags=list(llm_verdict.flags),
+                risk_level=llm_verdict.risk_level,
+                annotations=[llm_verdict.reasoning] if llm_verdict.reasoning else [],
+                sanitized=heuristic.sanitized,  # always None on this branch; explicit
+            )
+        else:
+            acted = heuristic
+
+        # Persistence (single call path now — q-4):
+        # * Heuristic row: write when it has signal (risk != none OR flags)
+        #   OR when verdicts disagree.  Matched-clean evaluations are
+        #   skipped to keep the audit table focused on disagreements
+        #   and non-clean events.  This is the perf-4 trade-off — pre-PR
+        #   wrote heuristic rows only on risk != none; we now ALSO record
+        #   them when the LLM ran and the two judges disagreed.
+        # * LLM row: write whenever the LLM ran, regardless of success.
+        #   On failure (cp-3) the row's ``reasoning`` carries the error
+        #   reason so audit can distinguish "LLM was attempted but
+        #   failed" from "LLM was never enabled".
+        heuristic_has_signal = heuristic.risk_level != "none" or bool(heuristic.flags)
+        verdicts_disagree = (
+            llm_verdict is not None
+            and llm_verdict.succeeded
+            and (
+                llm_verdict.risk_level != heuristic.risk_level
+                or set(llm_verdict.flags) != set(heuristic.flags)
+            )
+        )
+        if heuristic_has_signal or verdicts_disagree:
+            self._record_output_tier(call_id, func_name, output_len, heuristic, tier="heuristic")
+        if llm_verdict is not None:
+            if llm_verdict.succeeded:
+                self._record_output_tier(
+                    call_id,
+                    func_name,
+                    output_len,
+                    acted,
+                    tier="llm",
+                    reasoning=llm_verdict.reasoning,
+                    judge_model=llm_verdict.judge_model,
+                    latency_ms=llm_verdict.latency_ms,
+                    confidence=llm_verdict.confidence,
+                )
+            else:
+                # Failure row — empty assessment + error reason for audit.
+                # confidence stays 0.0 since the LLM never produced a verdict.
+                self._record_output_tier(
+                    call_id,
+                    func_name,
+                    output_len,
+                    OutputAssessment(risk_level="none"),
+                    tier="llm",
+                    reasoning=llm_verdict.error,
+                    judge_model=llm_verdict.judge_model,
+                    latency_ms=llm_verdict.latency_ms,
+                )
+
+        # Redaction — fires whenever the heuristic detected secrets and
+        # the operator wants them redacted, regardless of acted.risk_level.
+        # This is the bug-1 fix: the prior code's ``risk_level == "none"``
+        # short-circuit returned the un-redacted output when the LLM
+        # downgraded a credential-bearing result to "none".
+        wants_redaction = heuristic.sanitized is not None and jc is not None and jc.redact_secrets
+
+        if acted.risk_level == "none" and not wants_redaction:
             return output, None
 
         log.debug(
             "output_guard.flagged",
             call_id=call_id,
             func_name=func_name,
-            risk=assessment.risk_level,
-            flags=assessment.flags,
+            risk=acted.risk_level,
+            flags=acted.flags,
+            tier="llm" if (llm_verdict is not None and llm_verdict.succeeded) else "heuristic",
+            redacted=wants_redaction,
         )
         try:
-            d = assessment.to_dict()  # excludes sanitized by default
+            d = acted.to_dict()  # excludes sanitized by default
             d["func_name"] = func_name
-            d["output_length"] = len(output)
-            d["redacted"] = assessment.sanitized is not None
+            d["output_length"] = output_len
+            d["redacted"] = wants_redaction
+            # Surface the LLM's confidence when the LLM stage was the one
+            # that produced ``acted`` — the operator/UI can sort flagged
+            # outputs by how certain the judge was.
+            if llm_verdict is not None and llm_verdict.succeeded and acted is not heuristic:
+                d["confidence"] = llm_verdict.confidence
             self.ui.on_output_warning(call_id, d)
         except Exception:
             log.debug("output_guard.callback_failed", exc_info=True)
 
-        if assessment.sanitized is not None and jc is not None and jc.redact_secrets:
-            return assessment.sanitized, assessment
-        return output, assessment
+        if wants_redaction:
+            # heuristic.sanitized is guaranteed non-None inside this branch
+            # (wants_redaction's first clause), narrow for the type checker.
+            sanitized = heuristic.sanitized
+            assert sanitized is not None
+            return sanitized, acted
+        return output, acted
+
+    def _batch_evaluate_outputs(
+        self,
+        items: list[tuple[str, str, str, str]],
+    ) -> dict[str, tuple[str, OutputAssessment | None]]:
+        """Run ``_evaluate_output`` for each ``(call_id, output, func_name,
+        tool_args)`` 4-tuple concurrently, return a dict keyed by
+        ``call_id`` (perf-2).
+
+        Bounded thread pool (4 workers) — high enough to parallelise the
+        common 5-20 tool-calls-per-turn case, low enough to avoid blowing
+        the provider's rate limit.  The per-call LLM timeout enforced
+        inside ``OutputGuardJudge.evaluate`` bounds the worst case.
+
+        Failures inside a worker are wrapped so the dict always contains
+        an entry — the caller can fall back to the sequential path if
+        an entry is missing.
+        """
+        out: dict[str, tuple[str, OutputAssessment | None]] = {}
+        if not items:
+            return out
+        max_workers = min(4, len(items))
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="output-guard-batch",
+        ) as ex:
+            futures = {
+                ex.submit(
+                    self._evaluate_output, tc_id, output, func_name, tool_args=tool_args
+                ): tc_id
+                for tc_id, output, func_name, tool_args in items
+            }
+            for fut in concurrent.futures.as_completed(futures):
+                tc_id = futures[fut]
+                try:
+                    out[tc_id] = fut.result()
+                except Exception:
+                    log.warning("output_guard.batch_eval_failed", tc_id=tc_id, exc_info=True)
+        return out
+
+    def _invoke_output_guard_judge(
+        self,
+        call_id: str,
+        output: str,
+        func_name: str,
+        *,
+        tool_description: str = "",
+        tool_args: str = "",
+        heuristic_risk: str = "none",
+        heuristic_flags: tuple[str, ...] = (),
+        heuristic_annotations: tuple[str, ...] = (),
+    ) -> OutputJudgeVerdict | None:
+        """Run the LLM judge with per-session rate limiting.
+
+        Returns the verdict (success or failure flavour) when the LLM
+        stage ran, or ``None`` when LLM was disabled / rate-limited /
+        the call itself raised.  The TokenBucket caps adversarial
+        fan-out at 60 calls/minute per session.
+
+        Framing context (tool description, args, heuristic verdict +
+        annotations) is forwarded to the judge so its user-message
+        prompt can carry the full signal.
+        """
+        llm_judge = self._ensure_output_guard_judge()
+        if llm_judge is None:
+            return None
+        if not self._output_guard_judge_rl.consume():
+            log.info(
+                "output_guard_judge.rate_limited",
+                call_id=call_id,
+                func_name=func_name,
+            )
+            return None
+        try:
+            return llm_judge.evaluate(
+                output,
+                func_name=func_name,
+                call_id=call_id,
+                tool_description=tool_description,
+                tool_args=tool_args,
+                heuristic_risk=heuristic_risk,
+                heuristic_flags=heuristic_flags,
+                heuristic_annotations=heuristic_annotations,
+                cancel_event=self._output_guard_judge_cancel,
+            )
+        except Exception:
+            log.warning("output_guard_judge.evaluate_raised", exc_info=True)
+            return None
+
+    def _record_output_tier(
+        self,
+        call_id: str,
+        func_name: str,
+        output_length: int,
+        assessment: OutputAssessment,
+        *,
+        tier: str,
+        reasoning: str = "",
+        judge_model: str = "",
+        latency_ms: int = 0,
+        confidence: float = 0.0,
+    ) -> None:
+        """Persist one ``(call_id, tier)`` row via the UI's storage hook."""
+        try:
+            d = assessment.to_dict()
+            d["func_name"] = func_name
+            d["output_length"] = output_length
+            d["redacted"] = assessment.sanitized is not None
+            self.ui.record_output_assessment(
+                call_id,
+                d,
+                tier=tier,
+                reasoning=reasoning,
+                judge_model=judge_model,
+                latency_ms=latency_ms,
+                confidence=confidence,
+            )
+        except Exception:
+            log.debug("output_guard.record_failed", exc_info=True)
 
     def _guard_subagent_synthesis(self, content: str, label: str) -> str:
         """Run output_guard on a sub-agent's final synthesis text.
@@ -10740,7 +11120,12 @@ class ChatSession:
                 # sees full output (credentials split by truncation would
                 # evade detection).  Agent outputs are always str.
                 if self._judge_cfg and self._judge_cfg.output_guard and isinstance(output, str):
-                    output, _ = self._evaluate_output(tc_dict["id"], output, tool_name)
+                    output, _ = self._evaluate_output(
+                        tc_dict["id"],
+                        output,
+                        tool_name,
+                        tool_args=tc_dict.get("function", {}).get("arguments", ""),
+                    )
 
                 # Truncate large tool outputs to avoid blowing context limits.
                 # Agents operate autonomously; they can refine their queries

@@ -553,7 +553,10 @@ def test_auto_approve_reasons_ttl_prune_drops_stale_entries() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_on_output_warning_enqueues_and_persists() -> None:
+def test_on_output_warning_enqueues_only() -> None:
+    # Persistence was decoupled from on_output_warning when the LLM
+    # judge stage landed — the session now calls record_output_assessment
+    # directly per tier.  on_output_warning is UI-dispatch only.
     storage = MagicMock()
     ui = _make_ui()
     lq = ui._register_listener()
@@ -569,7 +572,52 @@ def test_on_output_warning_enqueues_and_persists() -> None:
     assert event["type"] == "output_warning"
     assert event["call_id"] == "call-1"
     assert event["risk_level"] == "high"
+    storage.record_output_assessment.assert_not_called()
+
+
+def test_record_output_assessment_persists_with_tier() -> None:
+    storage = MagicMock()
+    ui = _make_ui()
+    assessment = {
+        "func_name": "web_fetch",
+        "flags": ["camouflaged_injection"],
+        "risk_level": "medium",
+        "output_length": 4096,
+    }
+    with _patch_get_storage(storage):
+        ui.record_output_assessment(
+            "call-2",
+            assessment,
+            tier="llm",
+            reasoning="LLM saw a camouflaged directive",
+            judge_model="gpt-5-mini",
+            latency_ms=142,
+        )
     storage.record_output_assessment.assert_called_once()
+    kwargs = storage.record_output_assessment.call_args.kwargs
+    assert kwargs["tier"] == "llm"
+    assert kwargs["reasoning"] == "LLM saw a camouflaged directive"
+    assert kwargs["judge_model"] == "gpt-5-mini"
+    assert kwargs["latency_ms"] == 142
+    assert kwargs["risk_level"] == "medium"
+
+
+def test_record_output_assessment_defaults_to_heuristic_tier() -> None:
+    storage = MagicMock()
+    ui = _make_ui()
+    assessment = {
+        "func_name": "bash",
+        "flags": [],
+        "risk_level": "none",
+        "output_length": 0,
+    }
+    with _patch_get_storage(storage):
+        ui.record_output_assessment("call-3", assessment)
+    kwargs = storage.record_output_assessment.call_args.kwargs
+    assert kwargs["tier"] == "heuristic"
+    assert kwargs["reasoning"] == ""
+    assert kwargs["judge_model"] == ""
+    assert kwargs["latency_ms"] == 0
 
 
 # ---------------------------------------------------------------------------

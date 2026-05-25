@@ -3791,6 +3791,12 @@ class PostgreSQLBackend:
         annotations: str,
         output_length: int,
         redacted: bool,
+        *,
+        tier: str = "heuristic",
+        reasoning: str = "",
+        judge_model: str = "",
+        latency_ms: int = 0,
+        confidence: float = 0.0,
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
@@ -3807,6 +3813,11 @@ class PostgreSQLBackend:
                     "output_length": output_length,
                     "redacted": int(redacted),
                     "created": now,
+                    "tier": tier,
+                    "reasoning": reasoning,
+                    "judge_model": judge_model,
+                    "latency_ms": latency_ms,
+                    "confidence": confidence,
                 },
             )
             conn.commit()
@@ -3821,8 +3832,14 @@ class PostgreSQLBackend:
         offset: int = 0,
     ) -> list[dict[str, Any]]:
         with self._conn() as conn:
+            # ``created`` is second-resolution, so the heuristic and llm rows
+            # for the same call_id (written within ms of each other) commonly
+            # tie.  The ``tier`` tie-breaker encodes the design intent — LLM
+            # wins when it ran — so downstream consumers like history
+            # decoration see the acted verdict first on identical timestamps.
             q = sa.select(output_assessments).order_by(
                 output_assessments.c.created.desc(),
+                sa.case((output_assessments.c.tier == "llm", 0), else_=1),
                 output_assessments.c.assessment_id.desc(),
             )
             if ws_id:

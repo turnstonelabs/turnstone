@@ -663,6 +663,11 @@ output_assessments = sa.Table(
     sa.Column("output_length", sa.Integer, nullable=False, server_default="0"),
     sa.Column("redacted", sa.Integer, nullable=False, server_default="0"),
     sa.Column("created", sa.Text, nullable=False),
+    sa.Column("tier", sa.Text, nullable=False, server_default="heuristic"),
+    sa.Column("reasoning", sa.Text, nullable=False, server_default=""),
+    sa.Column("judge_model", sa.Text, nullable=False, server_default=""),
+    sa.Column("latency_ms", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("confidence", sa.Float, nullable=False, server_default="0.0"),
 )
 
 sa.Index("ix_oa_ws_id", output_assessments.c.ws_id)
