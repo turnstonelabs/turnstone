@@ -728,6 +728,7 @@ class AnthropicProvider:
         cancel_ref: list[Any] | None = None,
         capabilities: ModelCapabilities | None = None,
         replay_reasoning_to_model: bool = True,
+        extra_headers: dict[str, str] | None = None,
     ) -> Iterator[StreamChunk]:
         _ensure_anthropic()
         caps = capabilities or self.get_capabilities(model)
@@ -746,6 +747,8 @@ class AnthropicProvider:
             tools,
             deferred_names,
         )
+        if extra_headers:
+            kwargs["extra_headers"] = extra_headers
 
         manager = client.messages.stream(**kwargs)
         try:
@@ -935,6 +938,7 @@ class AnthropicProvider:
         deferred_names: frozenset[str] | None = None,
         capabilities: ModelCapabilities | None = None,
         replay_reasoning_to_model: bool = True,
+        extra_headers: dict[str, str] | None = None,
     ) -> CompletionResult:
         _ensure_anthropic()
         caps = capabilities or self.get_capabilities(model)
@@ -953,6 +957,8 @@ class AnthropicProvider:
             tools,
             deferred_names,
         )
+        if extra_headers:
+            kwargs["extra_headers"] = extra_headers
 
         # Use streaming internally to avoid the Anthropic SDK's 10-minute
         # timeout on non-streaming requests.  get_final_message() returns the

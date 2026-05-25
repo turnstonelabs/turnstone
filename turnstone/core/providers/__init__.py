@@ -16,6 +16,7 @@ from turnstone.core.providers._protocol import (
     ToolCallDelta,
     UsageInfo,
 )
+from turnstone.core.providers._xai import XAI_DEFAULT_BASE_URL, XAIProvider
 
 __all__ = [
     "CompletionResult",
@@ -27,6 +28,7 @@ __all__ = [
     "StreamChunk",
     "ToolCallDelta",
     "UsageInfo",
+    "XAIProvider",
     "create_client",
     "create_provider",
     "list_known_models",
@@ -36,9 +38,13 @@ __all__ = [
 # Singleton instances (stateless, safe to share).  ``_openai_provider``
 # is reused for both cloud OpenAI and ``openai-compatible`` with
 # ``api_surface="responses"`` — see the ``create_provider`` docstring.
+# ``_xai_provider`` is its own singleton because it overrides
+# ``_build_kwargs`` to add ``*_call_output`` includes for xAI's hidden
+# server-tool outputs.
 _provider_lock = threading.Lock()
 _openai_provider = OpenAIResponsesProvider()
 _openai_compat_provider = OpenAIChatCompletionsProvider()
+_xai_provider = XAIProvider()
 _anthropic_provider: LLMProvider | None = None
 _google_provider: LLMProvider | None = None
 
@@ -83,6 +89,8 @@ def create_provider(
         if normalised == "responses":
             return _openai_provider
         return _openai_compat_provider
+    if provider_name == "xai":
+        return _xai_provider
     if provider_name == "anthropic":
         with _provider_lock:
             if _anthropic_provider is None:
@@ -99,19 +107,21 @@ def create_provider(
             return _google_provider
     raise ValueError(
         f"Unknown provider: {provider_name!r}. "
-        "Supported: openai, anthropic, google, openai-compatible"
+        "Supported: openai, anthropic, google, openai-compatible, xai"
     )
 
 
 def create_client(provider_name: str, *, base_url: str, api_key: str) -> Any:
     """Create an SDK client for the given provider."""
-    if provider_name in ("openai", "openai-compatible", "google"):
+    if provider_name in ("openai", "openai-compatible", "google", "xai"):
         from openai import OpenAI
 
         if not base_url and provider_name == "google":
             from turnstone.core.providers._google import GOOGLE_DEFAULT_BASE_URL
 
             base_url = GOOGLE_DEFAULT_BASE_URL
+        elif not base_url and provider_name == "xai":
+            base_url = XAI_DEFAULT_BASE_URL
         if base_url:
             return OpenAI(base_url=base_url, api_key=api_key)
         return OpenAI(api_key=api_key)
@@ -125,7 +135,7 @@ def create_client(provider_name: str, *, base_url: str, api_key: str) -> Any:
         return anthropic.Anthropic(**kwargs)
     raise ValueError(
         f"Unknown provider: {provider_name!r}. "
-        "Supported: openai, anthropic, google, openai-compatible"
+        "Supported: openai, anthropic, google, openai-compatible, xai"
     )
 
 
@@ -162,5 +172,9 @@ def list_known_models(provider: str) -> list[str]:
         from turnstone.core.providers._anthropic import _ANTHROPIC_CAPABILITIES
 
         return sorted(_ANTHROPIC_CAPABILITIES.keys())
+    if provider == "xai":
+        from turnstone.core.providers._xai import GROK_CAPABILITIES
+
+        return sorted(GROK_CAPABILITIES.keys())
     # Google models change frequently — no static table.
     return []

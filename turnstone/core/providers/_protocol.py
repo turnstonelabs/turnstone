@@ -86,6 +86,13 @@ class ModelCapabilities:
     supports_web_search: bool = False
     supports_tool_search: bool = False
     supports_vision: bool = False
+    # Server-side tool types to auto-inject into Responses-API ``tools[]``
+    # for this model (e.g. ``("web_search",)`` for OpenAI search models,
+    # ``("web_search", "x_search")`` for Grok variants).  The
+    # OpenAI-facing flag ``supports_web_search`` is implicitly merged in
+    # by ``resolve_server_side_tools`` so legacy capability rows
+    # continue to work without an explicit entry here.
+    server_side_tools: tuple[str, ...] = ()
     thinking_display: str = ""  # "summarized" for models that omit thinking by default
     # Phase 3 reasoning-persistence: gate the per-model
     # ``replay_reasoning_to_model`` flag.  When False, the wire-build
@@ -181,6 +188,7 @@ class LLMProvider(Protocol):
         cancel_ref: list[Any] | None = None,
         capabilities: ModelCapabilities | None = None,
         replay_reasoning_to_model: bool = True,
+        extra_headers: dict[str, str] | None = None,
     ) -> Iterator[StreamChunk]:
         """Create a streaming request, yielding normalized StreamChunks.
 
@@ -226,6 +234,7 @@ class LLMProvider(Protocol):
         deferred_names: frozenset[str] | None = None,
         capabilities: ModelCapabilities | None = None,
         replay_reasoning_to_model: bool = True,
+        extra_headers: dict[str, str] | None = None,
     ) -> CompletionResult:
         """Create a non-streaming request, returning a normalized result.
 

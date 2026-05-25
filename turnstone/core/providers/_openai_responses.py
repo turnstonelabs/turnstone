@@ -25,6 +25,7 @@ from turnstone.core.providers._openai_common import (
     format_document_wrapper,
     lookup_openai_capabilities,
     resolve_reasoning_effort,
+    resolve_server_side_tools,
     sanitize_messages,
 )
 from turnstone.core.providers._protocol import (
@@ -336,12 +337,17 @@ class OpenAIResponsesProvider:
         tools = apply_tool_search(caps, tools, deferred_names)
         converted_tools = self._convert_tools(tools, caps)
 
-        # Ensure web search is always injected for search-capable models,
-        # even when no function tools are registered (e.g. creative mode).
-        if caps.supports_web_search:
+        # Auto-inject server-side tools declared on the capability row.
+        # ``resolve_server_side_tools`` merges the legacy
+        # ``supports_web_search`` flag, so search-capable models that
+        # haven't been migrated to the explicit tuple still get
+        # ``{"type": "web_search"}`` appended.  Subclasses (e.g.
+        # ``XAIProvider``) opt their own provider-specific server tools
+        # into ``caps.server_side_tools`` and inherit this injection.
+        for tool_type in resolve_server_side_tools(caps):
             converted_tools = converted_tools or []
-            if not any(t.get("type") == "web_search" for t in converted_tools):
-                converted_tools.append({"type": "web_search"})
+            if not any(t.get("type") == tool_type for t in converted_tools):
+                converted_tools.append({"type": tool_type})
 
         kwargs: dict[str, Any] = {
             "model": model,
@@ -397,6 +403,7 @@ class OpenAIResponsesProvider:
         # ``ChatSession._resolve_replay_reasoning_to_model`` — single
         # source of truth across providers.
         replay_reasoning_to_model: bool = True,
+        extra_headers: dict[str, str] | None = None,
     ) -> Iterator[StreamChunk]:
         if extra_params:
             log.debug("openai.responses: extra_params ignored (not supported by Responses API)")
@@ -412,6 +419,8 @@ class OpenAIResponsesProvider:
             replay_reasoning_to_model=replay_reasoning_to_model,
         )
         kwargs["stream"] = True
+        if extra_headers:
+            kwargs["extra_headers"] = extra_headers
 
         log.debug(
             "openai.responses.request",
@@ -581,6 +590,7 @@ class OpenAIResponsesProvider:
         capabilities: ModelCapabilities | None = None,
         # See create_streaming above for the Phase 3 reasoning-persistence rationale.
         replay_reasoning_to_model: bool = True,
+        extra_headers: dict[str, str] | None = None,
     ) -> CompletionResult:
         if extra_params:
             log.debug("openai.responses: extra_params ignored (not supported by Responses API)")
@@ -595,6 +605,8 @@ class OpenAIResponsesProvider:
             capabilities=capabilities,
             replay_reasoning_to_model=replay_reasoning_to_model,
         )
+        if extra_headers:
+            kwargs["extra_headers"] = extra_headers
 
         log.debug(
             "openai.responses.request",

@@ -285,6 +285,22 @@ def apply_cache_retention(kwargs: dict[str, Any], model: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def resolve_server_side_tools(caps: ModelCapabilities) -> list[str]:
+    """Return the effective server-side tool list for *caps*.
+
+    Merges the explicit ``server_side_tools`` tuple with the legacy
+    ``supports_web_search`` boolean so existing capability rows that
+    only set the flag continue to inject ``{"type": "web_search"}``
+    on the Responses surface without an explicit tuple entry.
+
+    Returns a fresh list; callers are free to mutate it.
+    """
+    effective: list[str] = list(caps.server_side_tools)
+    if caps.supports_web_search and "web_search" not in effective:
+        effective.append("web_search")
+    return effective
+
+
 def apply_tool_search(
     caps: ModelCapabilities,
     tools: list[dict[str, Any]] | None,

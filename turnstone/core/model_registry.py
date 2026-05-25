@@ -629,6 +629,22 @@ def _select_best_model(model_ids: list[str], provider: str) -> str:
             return sonnet[0]
         return model_ids[0]
 
+    if provider == "xai":
+        # Prefer base grok-N.N reasoning models (skip image/voice/video
+        # variants and dated multi-agent snapshots when a base flagship
+        # is available).
+        grok_base_pattern = re.compile(r"^grok-(\d+(?:\.\d+)?)$")
+        grok_base_models: list[tuple[float, str]] = []
+        for m in model_ids:
+            match = grok_base_pattern.match(m)
+            if match:
+                version = float(match.group(1))
+                grok_base_models.append((version, m))
+        if grok_base_models:
+            grok_base_models.sort(key=lambda x: x[0], reverse=True)
+            return grok_base_models[0][1]
+        return model_ids[0]
+
     if provider == "openai":
         # Prefer base gpt-N.N (not mini/nano/pro/codex/chat variants)
         base_pattern = re.compile(r"^gpt-(\d+(?:\.\d+)?)(?:-\d+)?$")
@@ -649,13 +665,18 @@ def _select_best_model(model_ids: list[str], provider: str) -> str:
 def _extract_context_window(model_obj: Any, provider: str) -> int | None:
     """Extract context window from a model object returned by ``/v1/models``.
 
-    Handles Anthropic (static capability table), vLLM (``max_model_len``),
-    and llama.cpp (``meta.n_ctx_train``).  Returns ``None`` when not available.
+    Handles Anthropic and xAI (static capability tables), vLLM
+    (``max_model_len``), and llama.cpp (``meta.n_ctx_train``).
+    Returns ``None`` when not available.
     """
     if provider == "anthropic":
         from turnstone.core.providers._anthropic import AnthropicProvider
 
         return AnthropicProvider().get_capabilities(model_obj.id).context_window
+    if provider == "xai":
+        from turnstone.core.providers._xai import lookup_grok_capabilities
+
+        return lookup_grok_capabilities(model_obj.id).context_window
     model_data = model_obj.model_dump()
     max_len = model_data.get("max_model_len")
     if isinstance(max_len, int) and max_len > 0:
@@ -781,6 +802,13 @@ def probe_model_endpoint(
             if known is not None:
                 result["context_window"] = known["context_window"]
             result["server_type"] = "anthropic"
+        elif provider == "xai":
+            from turnstone.core.providers import lookup_model_capabilities
+
+            known = lookup_model_capabilities("xai", inspect_id)
+            if known is not None:
+                result["context_window"] = known["context_window"]
+            result["server_type"] = "xai"
         else:
             # OpenAI-compatible path
             _detect_openai_compat(result, inspect_obj, inspect_id, base_url)
@@ -832,6 +860,8 @@ def _detect_openai_compat(
     _hostname = urlparse(_normalized).hostname or "" if _normalized else ""
     if base_url and (_hostname == "api.openai.com" or _hostname.endswith(".openai.com")):
         result["server_type"] = "openai"
+    elif base_url and (_hostname == "api.x.ai" or _hostname.endswith(".x.ai")):
+        result["server_type"] = "xai"
     elif meta is not None and "n_ctx_train" in meta:
         result["server_type"] = "llama.cpp"
     elif "sglang" in owned_by.lower():
