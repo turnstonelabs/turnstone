@@ -31,7 +31,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from turnstone.core.model_registry import _detect_openai_compat
+from turnstone.core.model_registry import _detect_openai_compat, _select_best_model
 from turnstone.core.providers import (
     create_client,
     create_provider,
@@ -348,3 +348,40 @@ class TestProviderRegistration:
 
     def test_lookup_model_capabilities_returns_none_for_unknown(self) -> None:
         assert lookup_model_capabilities("xai", "grok-x-unreleased") is None
+
+
+# ---------------------------------------------------------------------------
+# _select_best_model — version-tuple ordering
+# ---------------------------------------------------------------------------
+
+
+class TestSelectBestModel:
+    """Verify dotted-version sorting uses tuple-of-ints, not float.
+
+    ``float("4.20") == 4.2``, so the float-based sort would route
+    ``grok-4.20`` (newer dated-snapshot line) under ``grok-4.3``.  The
+    fix parses each segment as an int so ``(4, 20) > (4, 3)`` as
+    intended.  Same fix applied symmetrically to the openai branch
+    guards against a future ``gpt-5.10`` regression."""
+
+    def test_xai_prefers_higher_minor_version(self) -> None:
+        # The bug: float("4.20") == 4.2 < 4.3, so the broken sort
+        # picked grok-4.3 over grok-4.20.  The fix routes correctly.
+        assert _select_best_model(["grok-4", "grok-4.3", "grok-4.20"], "xai") == "grok-4.20"
+
+    def test_xai_bare_major_below_dotted(self) -> None:
+        # (4,) < (4, 3) under tuple comparison, so a bare-major alias
+        # is correctly ordered below any minor-versioned sibling.
+        assert _select_best_model(["grok-4", "grok-4.3"], "xai") == "grok-4.3"
+
+    def test_xai_falls_back_when_no_base_match(self) -> None:
+        # No base-versioned entry → first model returned.  Mirrors the
+        # openai/anthropic fallback at end of _select_best_model.
+        assert (
+            _select_best_model(["grok-4.20-0309-reasoning", "grok-build-0.1"], "xai")
+            == "grok-4.20-0309-reasoning"
+        )
+
+    def test_openai_prefers_higher_minor_version(self) -> None:
+        # Symmetric guard against future gpt-5.10 vs gpt-5.2 confusion.
+        assert _select_best_model(["gpt-5", "gpt-5.2", "gpt-5.10"], "openai") == "gpt-5.10"

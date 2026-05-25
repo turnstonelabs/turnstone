@@ -632,34 +632,48 @@ def _select_best_model(model_ids: list[str], provider: str) -> str:
     if provider == "xai":
         # Prefer base grok-N.N reasoning models (skip image/voice/video
         # variants and dated multi-agent snapshots when a base flagship
-        # is available).
+        # is available).  Use tuple-of-ints version ordering so
+        # ``grok-4.20`` sorts after ``grok-4.3`` — ``float`` would
+        # mis-order them (``float("4.20") == 4.2``).
         grok_base_pattern = re.compile(r"^grok-(\d+(?:\.\d+)?)$")
-        grok_base_models: list[tuple[float, str]] = []
+        grok_base_models: list[tuple[tuple[int, ...], str]] = []
         for m in model_ids:
             match = grok_base_pattern.match(m)
             if match:
-                version = float(match.group(1))
-                grok_base_models.append((version, m))
+                grok_base_models.append((_version_tuple(match.group(1)), m))
         if grok_base_models:
             grok_base_models.sort(key=lambda x: x[0], reverse=True)
             return grok_base_models[0][1]
         return model_ids[0]
 
     if provider == "openai":
-        # Prefer base gpt-N.N (not mini/nano/pro/codex/chat variants)
+        # Prefer base gpt-N.N (not mini/nano/pro/codex/chat variants).
+        # Same tuple-of-ints rationale as the xai branch — guards
+        # against future ``gpt-5.10`` mis-sorting under ``gpt-5.2``.
         base_pattern = re.compile(r"^gpt-(\d+(?:\.\d+)?)(?:-\d+)?$")
-        base_models: list[tuple[float, str]] = []
+        base_models: list[tuple[tuple[int, ...], str]] = []
         for m in model_ids:
             match = base_pattern.match(m)
             if match:
-                version = float(match.group(1))
-                base_models.append((version, m))
+                base_models.append((_version_tuple(match.group(1)), m))
         if base_models:
             base_models.sort(key=lambda x: x[0], reverse=True)
             return base_models[0][1]
         return model_ids[0]
 
     return model_ids[0]
+
+
+def _version_tuple(version_str: str) -> tuple[int, ...]:
+    """Parse a dotted version like ``"4.20"`` into ``(4, 20)`` for
+    correct numeric ordering.
+
+    ``float`` parsing collapses ``"4.20"`` and ``"4.2"`` to the same
+    value, mis-ordering minor-version-20 releases under minor-version-3.
+    Tuple comparison treats each component as an integer so
+    ``(4, 20) > (4, 3)`` as intended.
+    """
+    return tuple(int(p) for p in version_str.split("."))
 
 
 def _extract_context_window(model_obj: Any, provider: str) -> int | None:
