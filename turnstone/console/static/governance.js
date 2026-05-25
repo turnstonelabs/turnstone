@@ -211,9 +211,13 @@ function _renderGovRoles(items) {
       escapeHtml(r.role_id) +
       '" data-expanded="' +
       (expanded ? "true" : "false") +
+      '" data-expand-role="' +
+      escapeHtml(r.role_id) +
       '">' +
       '<span class="admin-col admin-col-rname">' +
-      '<button type="button" class="role-expand-btn" aria-label="Toggle details" data-expand-role="' +
+      '<button type="button" class="role-expand-btn" aria-label="Toggle details" aria-expanded="' +
+      (expanded ? "true" : "false") +
+      '" data-expand-role="' +
       escapeHtml(r.role_id) +
       '">' +
       chevron +
