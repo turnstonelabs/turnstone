@@ -219,6 +219,44 @@ class TestRolePermissionOverrides:
         # Effective perms come from the role row only — overlay is dropped.
         assert db.get_user_permissions("u1") == {"read"}
 
+    def test_users_with_permission_bulk(self, db):
+        # Two roles, three users; only users whose EFFECTIVE perm set
+        # includes the queried perm appear.  Drives the lockout-guard
+        # rewrite in admin_role_overrides — one bulk SELECT replaces
+        # the prior per-user/per-role loop.
+        db.create_role("r-adm", "adm", "Adm", "admin.roles,read", builtin=True, org_id="")
+        db.create_role("r-op", "op", "Op", "read,write", builtin=True, org_id="")
+        db.create_user("u1", "alice", "Alice", "$2b$hash")
+        db.create_user("u2", "bob", "Bob", "$2b$hash")
+        db.create_user("u3", "cara", "Cara", "$2b$hash")
+        db.assign_role("u1", "r-adm")
+        db.assign_role("u2", "r-op")
+        db.assign_role("u3", "r-op")
+        # Baseline state
+        assert db.users_with_permission("admin.roles") == {"u1"}
+        # Overlay-grant admin.roles to r-op → u2 + u3 now hold it too
+        db.set_role_overrides("r-op", {"admin.roles"}, set())
+        assert db.users_with_permission("admin.roles") == {"u1", "u2", "u3"}
+        # exclude_role_id = r-adm → u1 drops; u2/u3 still hold via r-op
+        assert db.users_with_permission("admin.roles", exclude_role_id="r-adm") == {
+            "u2",
+            "u3",
+        }
+        # Overlay-revoke admin.roles from r-adm → u1 no longer holds via that role
+        db.set_role_overrides("r-adm", set(), {"admin.roles"})
+        assert db.users_with_permission("admin.roles") == {"u2", "u3"}
+
+    def test_delete_role_cleans_up_overrides(self, db):
+        # F-7: no FK on role_permission_overrides.  Storage layer must
+        # clean up by hand so a re-seeded role_id (deterministic for
+        # builtins on schema reseed) doesn't silently inherit stale
+        # overrides from the prior occupant.
+        db.create_role("r1", "custom", "Custom", "read", builtin=False, org_id="")
+        db.set_role_overrides("r1", {"approve"}, set())
+        assert len(db.list_role_overrides("r1")) == 1
+        assert db.delete_role("r1") is True
+        assert db.list_role_overrides("r1") == []
+
 
 # ---------------------------------------------------------------------------
 # Organizations

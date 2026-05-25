@@ -521,6 +521,86 @@ class TestRoleOverrides:
         assert row["revokes"] == []
         assert "model.skills.write" in row["effective"]
 
+    def test_overrides_lockout_guard_blocks_grant_removal(self, client, storage):
+        # F-1: PUT-replace semantics mean an existing grant of admin.roles
+        # on a role whose baseline lacks it is silently dropped when the
+        # new payload omits it.  Old guard only fired on explicit revokes
+        # and missed this path entirely — concrete cluster-bricking scenario.
+        # Setup: only builtin-operator users hold admin.roles, via overlay grant.
+        storage.create_role(
+            role_id="builtin-operator",
+            name="operator",
+            display_name="Operator",
+            permissions="read,write",  # baseline lacks admin.roles
+            builtin=True,
+        )
+        # Grant admin.roles to operator via overlay, then unassign builtin-admin
+        # from the test user so operator is the only path to admin.roles.
+        storage.set_role_overrides("builtin-operator", {"admin.roles"}, set())
+        storage.assign_role("test-admin", "builtin-operator")
+        # The test-admin user keeps builtin-admin assigned by _seed_builtin_admin
+        # which would normally hold admin.roles — but we seed without it so the
+        # only source is the overlay on builtin-operator.
+        if storage.get_role("builtin-admin") is None:
+            storage.create_role(
+                role_id="builtin-admin",
+                name="admin",
+                display_name="Admin",
+                permissions="read,write",  # baseline lacks admin.roles
+                builtin=True,
+            )
+            storage.assign_role("test-admin", "builtin-admin")
+        # Sanity: admin.roles only reachable via operator's overlay
+        assert "admin.roles" in storage.get_user_permissions("test-admin")
+        # The lockout-triggering call: Reset operator's overrides (drops
+        # the admin.roles grant).  Old guard short-circuited because
+        # revoke=[] doesn't contain "admin.roles"; new guard simulates
+        # the post-PUT effective set on the target role.
+        resp = client.put(
+            "/v1/api/admin/roles/builtin-operator/overrides",
+            json={"grant": [], "revoke": []},
+        )
+        assert resp.status_code == 409, resp.json()
+        assert "admin.roles" in resp.json()["error"]
+        # Override was NOT applied — admin.roles still reachable.
+        assert "admin.roles" in storage.get_user_permissions("test-admin")
+
+    def test_assign_role_blocks_escalation_via_overlay_grant(self, storage, client):
+        # F-2 reframed.  Simulates the attack path where a previous
+        # admin.roles holder injected an overlay grant on a builtin
+        # role, then a separate admin.users holder (who does NOT hold
+        # the granted perm) tries to assign that role to a new user.
+        # Without this fix the assign-time subset check would read the
+        # baseline column and miss the overlay, silently escalating
+        # the assignee.
+        #
+        # Operator's baseline is unchanged production default
+        # ("read,write" — no model.skills.write).  The overlay grant
+        # below is the simulated attack step, not the system default.
+        _seed_builtin_admin(storage, "read,write,admin.roles,admin.users")
+        storage.create_role(
+            role_id="builtin-operator",
+            name="operator",
+            display_name="Operator",
+            permissions="read,write",  # production default
+            builtin=True,
+        )
+        storage.set_role_overrides(
+            "builtin-operator", {"model.skills.write"}, set()
+        )  # simulated prior poisoning by an admin.roles holder
+
+        # The harness AuthResult holds admin.roles + admin.users + many
+        # admin.* perms but NOT model.skills.write.  Assigning operator
+        # — whose POST-OVERLAY effective set in this test scenario
+        # contains model.skills.write — must 403, because the assignee
+        # would otherwise gain a perm the assigner doesn't hold.
+        resp = client.post(
+            "/v1/api/admin/users/user-1/roles",
+            json={"role_id": "builtin-operator"},
+        )
+        assert resp.status_code == 403
+        assert "permissions you do not hold" in resp.json()["error"]
+
 
 # ---------------------------------------------------------------------------
 # Tests — Role assignments

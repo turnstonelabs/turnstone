@@ -6163,28 +6163,41 @@ def _check_admin_lockout(
 ) -> JSONResponse | None:
     """Refuse override changes that would leave nobody with admin.roles.
 
-    ``admin.roles`` is the only permission whose loss is self-locking — without
-    it, no user can reach the Roles tab to undo the change. Other revoked
-    permissions (``model.skills.write``, ``admin.skills``, etc.) can always be
-    restored by an admin, so they don't get this guard.
+    ``admin.roles`` is the only permission whose loss is self-locking —
+    without it, no user can reach the Roles tab to undo the change.  Other
+    revoked permissions (``model.skills.write``, ``admin.skills``, etc.)
+    can always be restored by an admin, so they don't get this guard.
+
+    PUT-replace semantics on ``set_role_overrides`` mean the lockout
+    surface isn't just "did the new payload revoke admin.roles" — it's
+    also "did the new payload omit a previously-granted admin.roles
+    override."  Either path lands at the same effective state, so the
+    check computes the post-PUT effective set on the target role and
+    falls through to a bulk users_with_permission query for any user
+    who retains the perm via another role.
+
+    Two queries total (one ``get_role`` for the target's baseline, one
+    join over ``user_roles ⋈ roles`` plus IN-fetch on overrides for the
+    builtin role ids), regardless of cluster user/role count.  Caller
+    is expected to wrap this in ``asyncio.to_thread`` since both
+    SQLite and asyncpg-via-sync-wrapper open new connections.
     """
-    if "admin.roles" not in revokes:
-        return None  # not revoking the load-bearing permission
-    # Walk every user and check whether at least one would retain admin.roles.
-    for user in storage.list_users():
-        user_roles = storage.list_user_roles(user["user_id"])
-        for ur in user_roles:
-            if ur["role_id"] == role_id:
-                eff = (
-                    {p.strip() for p in (ur.get("permissions") or "").split(",") if p.strip()}
-                    | grants
-                ) - revokes
-                if "admin.roles" in eff:
-                    return None
-            else:
-                other_eff = storage.effective_role_permissions(ur["role_id"])
-                if "admin.roles" in other_eff["effective"]:
-                    return None
+    role = storage.get_role(role_id)
+    if role is None:
+        return None  # caller already validated existence; defensive no-op
+    baseline = {p.strip() for p in (role.get("permissions") or "").split(",") if p.strip()}
+    # Simulate the proposed PUT on the target role.  If admin.roles
+    # survives there, every user assigned to the target keeps it; we're
+    # done.
+    target_effective = (baseline | grants) - revokes
+    if "admin.roles" in target_effective:
+        return None
+    # admin.roles is leaving the target role.  Only need a single user
+    # who still holds it through some OTHER role to keep the cluster
+    # recoverable.  ``exclude_role_id`` makes that one SQL question
+    # instead of N+M round-trips.
+    if storage.users_with_permission("admin.roles", exclude_role_id=role_id):
+        return None
     return JSONResponse(
         {"error": "Refusing change: would leave no user with admin.roles"},
         status_code=409,
@@ -6244,7 +6257,10 @@ async def admin_role_overrides(request: Request) -> JSONResponse:
     grants = grants - baseline
     revokes = revokes & baseline
 
-    lockout = _check_admin_lockout(storage, role_id, grants, revokes)
+    # Block in a worker thread — even bulk-querying the lockout state
+    # touches sync DB connections (SQLite open, asyncpg sync wrapper)
+    # and should never run inline on the asyncio event loop.
+    lockout = await asyncio.to_thread(_check_admin_lockout, storage, role_id, grants, revokes)
     if lockout is not None:
         return lockout
 
@@ -6318,10 +6334,14 @@ async def admin_assign_role(request: Request) -> JSONResponse:
     if auth_result and auth_result.user_id == user_id:
         return JSONResponse({"error": "Cannot modify own role assignments"}, status_code=403)
 
-    # Ensure caller holds all permissions present in the target role
-    target_perms = set(
-        p.strip() for p in target_role.get("permissions", "").split(",") if p.strip()
-    )
+    # Ensure caller holds all permissions present in the target role.
+    # Read the EFFECTIVE perm set (post-overlay) rather than the raw
+    # ``permissions`` baseline column — builtin roles can carry an
+    # override layer added via PUT ``/v1/api/admin/roles/{id}/overrides``,
+    # and skipping the overlay here would let an admin.roles holder
+    # silently bypass the subset gate by granting a perm to e.g.
+    # builtin-operator before assigning that role to a new user.
+    target_perms = set(storage.effective_role_permissions(role_id)["effective"])
     if (
         auth_result
         and auth_result.permissions

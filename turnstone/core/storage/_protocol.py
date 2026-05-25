@@ -1209,6 +1209,26 @@ class StorageBackend(Protocol):
         """
         ...
 
+    def users_with_permission(
+        self,
+        permission: str,
+        *,
+        exclude_role_id: str | None = None,
+    ) -> set[str]:
+        """Return ``user_id``s whose effective perms include ``permission``.
+
+        Walks every ``(user, assigned_role)`` pair in two bulk queries
+        (one over ``user_roles ⋈ roles``, one over
+        ``role_permission_overrides`` for the builtin role ids in the
+        first query's result) instead of N round-trips, then folds the
+        overlay in-process.  ``exclude_role_id``, when set, ignores any
+        contribution from that role — used by the lockout guard to
+        answer "would anyone still hold ``admin.roles`` via SOME OTHER
+        role if we modified this one?" without first having to apply
+        the proposed override.
+        """
+        ...
+
     def list_role_overrides(self, role_id: str) -> list[dict[str, str]]:
         """Return override rows for ``role_id`` (action in {'grant','revoke'})."""
         ...

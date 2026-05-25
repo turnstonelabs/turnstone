@@ -2271,6 +2271,16 @@ class PostgreSQLBackend:
     def delete_role(self, role_id: str) -> bool:
         with self._conn() as conn:
             conn.execute(sa.delete(user_roles).where(user_roles.c.role_id == role_id))
+            # No FK on role_permission_overrides (migration 057 omitted
+            # to match the rest of the governance schema), so clean up
+            # by hand.  Orphan rows would otherwise apply silently if
+            # a role_id were ever reused — deterministic for builtins
+            # on schema reseed.
+            conn.execute(
+                sa.delete(role_permission_overrides).where(
+                    role_permission_overrides.c.role_id == role_id
+                )
+            )
             result = conn.execute(sa.delete(roles).where(roles.c.role_id == role_id))
             conn.commit()
             return result.rowcount > 0
@@ -2419,6 +2429,49 @@ class PostgreSQLBackend:
                     role_perms = (role_perms | grants.get(rid, set())) - revokes.get(rid, set())
                 perms |= role_perms
             return perms
+
+    def users_with_permission(
+        self,
+        permission: str,
+        *,
+        exclude_role_id: str | None = None,
+    ) -> set[str]:
+        with self._conn() as conn:
+            q = sa.select(
+                user_roles.c.user_id,
+                user_roles.c.role_id,
+                roles.c.permissions,
+                roles.c.builtin,
+            ).select_from(user_roles.join(roles, user_roles.c.role_id == roles.c.role_id))
+            if exclude_role_id:
+                q = q.where(user_roles.c.role_id != exclude_role_id)
+            rows = conn.execute(q).fetchall()
+            if not rows:
+                return set()
+            builtin_role_ids = {r[1] for r in rows if r[3]}
+            grants: dict[str, set[str]] = {}
+            revokes: dict[str, set[str]] = {}
+            if builtin_role_ids:
+                ov_rows = conn.execute(
+                    sa.select(
+                        role_permission_overrides.c.role_id,
+                        role_permission_overrides.c.permission,
+                        role_permission_overrides.c.action,
+                    ).where(role_permission_overrides.c.role_id.in_(builtin_role_ids))
+                ).fetchall()
+                for rid, perm, action in ov_rows:
+                    if action == "grant":
+                        grants.setdefault(rid, set()).add(perm)
+                    elif action == "revoke":
+                        revokes.setdefault(rid, set()).add(perm)
+            holders: set[str] = set()
+            for user_id, role_id, perms_str, builtin in rows:
+                eff = _split_perms(perms_str)
+                if builtin:
+                    eff = (eff | grants.get(role_id, set())) - revokes.get(role_id, set())
+                if permission in eff:
+                    holders.add(user_id)
+            return holders
 
     def list_role_overrides(self, role_id: str) -> list[dict[str, str]]:
         with self._conn() as conn:
