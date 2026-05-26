@@ -1049,11 +1049,21 @@
                   </div>
                 </div>
                 <label for="hr-tool"
-                  >Tool Pattern
-                  <span class="label-hint"
-                    >fnmatch syntax: bash, write_file, mcp__*</span
-                  ></label
+                  >Tool Pattern<button
+                    type="button"
+                    class="settings-help-btn"
+                    data-help-target="hr-tool-help"
+                    aria-label="Help for Tool Pattern"
+                    aria-expanded="false"
+                  ></button
+                ></label>
+                <div
+                  id="hr-tool-help"
+                  class="settings-help-popover"
+                  style="display: none"
                 >
+                  fnmatch syntax: bash, write_file, mcp__*
+                </div>
                 <input
                   id="hr-tool"
                   type="text"
@@ -1062,17 +1072,44 @@
                   spellcheck="false"
                 />
                 <label for="hr-args"
-                  >Arg Patterns
-                  <span class="label-hint">one regex per line</span></label
+                  >Arg Patterns<button
+                    type="button"
+                    class="settings-help-btn"
+                    data-help-target="hr-args-help"
+                    aria-label="Help for Arg Patterns"
+                    aria-expanded="false"
+                  ></button
+                ></label>
+                <div
+                  id="hr-args-help"
+                  class="settings-help-popover"
+                  style="display: none"
                 >
+                  One regex per line. Each pattern is matched against the
+                  serialized tool arguments.
+                </div>
                 <textarea
                   id="hr-args"
                   rows="3"
                   style="font-family: var(--font-mono); font-size: 12px"
                 ></textarea>
                 <label for="hr-conf"
-                  >Confidence <span class="label-hint">0.0 – 1.0</span></label
+                  >Confidence<button
+                    type="button"
+                    class="settings-help-btn"
+                    data-help-target="hr-conf-help"
+                    aria-label="Help for Confidence"
+                    aria-expanded="false"
+                  ></button
+                ></label>
+                <div
+                  id="hr-conf-help"
+                  class="settings-help-popover"
+                  style="display: none"
                 >
+                  Rule confidence between 0.0 and 1.0. Higher values mean the
+                  rule is more certain when it matches.
+                </div>
                 <input
                   id="hr-conf"
                   type="number"
@@ -1191,11 +1228,22 @@
                   autocomplete="off"
                 />
                 <label for="ogp-flags"
-                  >Pattern Flags
-                  <span class="label-hint"
-                    >comma-separated: IGNORECASE, MULTILINE, DOTALL</span
-                  ></label
+                  >Pattern Flags<button
+                    type="button"
+                    class="settings-help-btn"
+                    data-help-target="ogp-flags-help"
+                    aria-label="Help for Pattern Flags"
+                    aria-expanded="false"
+                  ></button
+                ></label>
+                <div
+                  id="ogp-flags-help"
+                  class="settings-help-popover"
+                  style="display: none"
                 >
+                  Comma-separated regex compilation flags: IGNORECASE,
+                  MULTILINE, DOTALL.
+                </div>
                 <input id="ogp-flags" type="text" autocomplete="off" />
                 <div style="display: flex; gap: 16px; margin: 8px 0">
                   <label
@@ -1286,11 +1334,21 @@
                   </div>
                 </div>
                 <label for="ehr-tool"
-                  >Tool Pattern
-                  <span class="label-hint"
-                    >fnmatch syntax: bash, write_file, mcp__*</span
-                  ></label
+                  >Tool Pattern<button
+                    type="button"
+                    class="settings-help-btn"
+                    data-help-target="ehr-tool-help"
+                    aria-label="Help for Tool Pattern"
+                    aria-expanded="false"
+                  ></button
+                ></label>
+                <div
+                  id="ehr-tool-help"
+                  class="settings-help-popover"
+                  style="display: none"
                 >
+                  fnmatch syntax: bash, write_file, mcp__*
+                </div>
                 <input
                   id="ehr-tool"
                   type="text"
@@ -1298,17 +1356,44 @@
                   spellcheck="false"
                 />
                 <label for="ehr-args"
-                  >Arg Patterns
-                  <span class="label-hint">one regex per line</span></label
+                  >Arg Patterns<button
+                    type="button"
+                    class="settings-help-btn"
+                    data-help-target="ehr-args-help"
+                    aria-label="Help for Arg Patterns"
+                    aria-expanded="false"
+                  ></button
+                ></label>
+                <div
+                  id="ehr-args-help"
+                  class="settings-help-popover"
+                  style="display: none"
                 >
+                  One regex per line. Each pattern is matched against the
+                  serialized tool arguments.
+                </div>
                 <textarea
                   id="ehr-args"
                   rows="3"
                   style="font-family: var(--font-mono); font-size: 12px"
                 ></textarea>
                 <label for="ehr-conf"
-                  >Confidence <span class="label-hint">0.0 – 1.0</span></label
+                  >Confidence<button
+                    type="button"
+                    class="settings-help-btn"
+                    data-help-target="ehr-conf-help"
+                    aria-label="Help for Confidence"
+                    aria-expanded="false"
+                  ></button
+                ></label>
+                <div
+                  id="ehr-conf-help"
+                  class="settings-help-popover"
+                  style="display: none"
                 >
+                  Rule confidence between 0.0 and 1.0. Higher values mean the
+                  rule is more certain when it matches.
+                </div>
                 <input
                   id="ehr-conf"
                   type="number"
@@ -1412,11 +1497,22 @@
                 <label for="eogp-ann">Annotation</label>
                 <input id="eogp-ann" type="text" autocomplete="off" />
                 <label for="eogp-flags"
-                  >Pattern Flags
-                  <span class="label-hint"
-                    >comma-separated: IGNORECASE, MULTILINE, DOTALL</span
-                  ></label
+                  >Pattern Flags<button
+                    type="button"
+                    class="settings-help-btn"
+                    data-help-target="eogp-flags-help"
+                    aria-label="Help for Pattern Flags"
+                    aria-expanded="false"
+                  ></button
+                ></label>
+                <div
+                  id="eogp-flags-help"
+                  class="settings-help-popover"
+                  style="display: none"
                 >
+                  Comma-separated regex compilation flags: IGNORECASE,
+                  MULTILINE, DOTALL.
+                </div>
                 <input id="eogp-flags" type="text" autocomplete="off" />
                 <div style="display: flex; gap: 16px; margin: 8px 0">
                   <label
@@ -3068,8 +3164,7 @@
                   data-help-target="skill-compatibility-help"
                   aria-label="Help for Compatibility"
                   aria-expanded="false"
-                >
-                  ?</button
+                ></button
                 ></label
               >
               <div
@@ -3093,8 +3188,7 @@
                   data-help-target="skill-paths-help"
                   aria-label="Help for Paths"
                   aria-expanded="false"
-                >
-                  ?</button
+                ></button
                 ></label
               >
               <div
@@ -3121,8 +3215,7 @@
                     data-help-target="skill-hidden-from-menu-help"
                     aria-label="Help for Hide from skill picker"
                     aria-expanded="false"
-                  >
-                    ?</button
+                  ></button
                   ></span
                 >
               </label>
@@ -3143,8 +3236,7 @@
                   data-help-target="skill-arguments-help"
                   aria-label="Help for Arguments"
                   aria-expanded="false"
-                >
-                  ?</button
+                ></button
                 ></label
               >
               <div
@@ -3168,8 +3260,7 @@
                   data-help-target="skill-argument-hint-help"
                   aria-label="Help for Argument hint"
                   aria-expanded="false"
-                >
-                  ?</button
+                ></button
                 ></label
               >
               <div
@@ -3197,8 +3288,7 @@
                   data-help-target="skill-activation-help"
                   aria-label="Help for Activation"
                   aria-expanded="false"
-                >
-                  ?</button
+                ></button
                 ></label
               >
               <div
@@ -3513,8 +3603,7 @@
                   data-help-target="etm-compatibility-help"
                   aria-label="Help for Compatibility"
                   aria-expanded="false"
-                >
-                  ?</button
+                ></button
                 ></label
               >
               <div
@@ -3538,8 +3627,7 @@
                   data-help-target="etm-paths-help"
                   aria-label="Help for Paths"
                   aria-expanded="false"
-                >
-                  ?</button
+                ></button
                 ></label
               >
               <div
@@ -3566,8 +3654,7 @@
                     data-help-target="etm-hidden-from-menu-help"
                     aria-label="Help for Hide from skill picker"
                     aria-expanded="false"
-                  >
-                    ?</button
+                  ></button
                   ></span
                 >
               </label>
@@ -3588,8 +3675,7 @@
                   data-help-target="etm-arguments-help"
                   aria-label="Help for Arguments"
                   aria-expanded="false"
-                >
-                  ?</button
+                ></button
                 ></label
               >
               <div
@@ -3613,8 +3699,7 @@
                   data-help-target="etm-argument-hint-help"
                   aria-label="Help for Argument hint"
                   aria-expanded="false"
-                >
-                  ?</button
+                ></button
                 ></label
               >
               <div
@@ -3642,8 +3727,7 @@
                   data-help-target="etm-activation-help"
                   aria-label="Help for Activation"
                   aria-expanded="false"
-                >
-                  ?</button
+                ></button
                 ></label
               >
               <div

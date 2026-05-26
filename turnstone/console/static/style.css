@@ -3548,13 +3548,7 @@ textarea.skill-content-area {
   background: var(--yellow-glow);
 }
 
-/* Help tooltip.  The glyph is painted by ``::after`` rather than HTML
-   text content so the button renders identically whether the markup
-   has literal ``>?</button>`` text (settings-tab buttons assembled in
-   admin.js) or prettier-introduced whitespace around the glyph (skill
-   modal buttons in index.html).  Any literal text content is hidden
-   via ``font-size: 0`` on the button; the pseudo restores its own
-   size so the glyph centers cleanly via flex. */
+/* Help tooltip.  Glyph painted via ``::after``; button content stays empty. */
 .settings-help-btn {
   display: inline-flex;
   align-items: center;
@@ -3565,7 +3559,6 @@ textarea.skill-content-area {
   border: 1px solid var(--accent);
   background: var(--accent-dim);
   color: var(--accent);
-  font-size: 0;
   font-weight: 600;
   font-family: var(--font-ui);
   cursor: pointer;

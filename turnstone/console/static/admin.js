@@ -2867,12 +2867,9 @@ function _renderSettings(container, grouped) {
       _onSettingsHeaderKey(e, this);
     });
   }
-  const helpBtns = container.querySelectorAll(".settings-help-btn");
-  for (let hb = 0; hb < helpBtns.length; hb++) {
-    helpBtns[hb].addEventListener("click", function (e) {
-      _toggleSettingsHelp(e, this);
-    });
-  }
+  // Help-button clicks are handled by the document-delegated listener
+  // below; no per-button binding is needed here (and re-binding on each
+  // render would leak listeners onto reused DOM).
 
   // Store original values for dirty detection + wire per-key change
   // handlers off data-setting-key (no key interpolation into JS).
@@ -2914,27 +2911,39 @@ function _renderSettingRow(item) {
   const escapedShort = escapeHtml(shortKey);
   const escapedDesc = escapeHtml(item.description);
 
+  // Description (short TLDR) renders inline below the key.  The ? button
+  // gates the long-form help paragraph + any reference_url link.
+  const hasHelp = !!(item.help || item.reference_url);
+  const helpId = escapedKey + "-help";
+
   let html = '<div class="settings-row" data-row-key="' + escapedKey + '">';
 
   // Label column
   html += '<div class="settings-label-col">';
   html += '<div class="settings-label">';
   html += escapeHtml(shortKey);
-  if (item.help) {
+  if (hasHelp) {
     html +=
-      ' <button class="settings-help-btn" ' +
-      'aria-label="Help for ' +
+      ' <button type="button" class="settings-help-btn" ' +
+      'data-help-target="' +
+      helpId +
+      '" aria-label="Help for ' +
       escapedShort +
-      '" aria-expanded="false" title="More info">?</button>';
+      '" aria-expanded="false" title="More info"></button>';
   }
   html += "</div>";
   if (item.description) {
     html += '<div class="settings-desc">' + escapedDesc + "</div>";
   }
-  if (item.help) {
-    html += '<div class="settings-help-popover" style="display:none">';
+  if (hasHelp) {
     html +=
-      '<span class="settings-help-text">' + escapeHtml(item.help) + "</span>";
+      '<div id="' +
+      helpId +
+      '" class="settings-help-popover" style="display:none">';
+    if (item.help) {
+      html +=
+        '<span class="settings-help-text">' + escapeHtml(item.help) + "</span>";
+    }
     if (item.reference_url) {
       html +=
         ' <a href="' +
@@ -3075,19 +3084,9 @@ function _toggleSettingsHelp(e, btn) {
   // the button click itself (irrelevant for type="button" but cheap insurance).
   e.stopPropagation();
   e.preventDefault();
-  // Two lookup paths:
-  //   (a) data-help-target="popover-id" — used by the skill modals where
-  //       the popover is a sibling of the label, not wrapped in a column.
-  //   (b) Ancestor .settings-label-col → child .settings-help-popover —
-  //       the original Settings-tab structure.
   const targetId = btn.getAttribute("data-help-target");
-  let popover = null;
-  if (targetId) {
-    popover = document.getElementById(targetId);
-  } else {
-    const col = btn.closest(".settings-label-col");
-    if (col) popover = col.querySelector(".settings-help-popover");
-  }
+  if (!targetId) return;
+  const popover = document.getElementById(targetId);
   if (!popover) return;
   const isVisible = popover.style.display !== "none";
   _closeAllSettingsHelp(popover);
@@ -3095,10 +3094,9 @@ function _toggleSettingsHelp(e, btn) {
   btn.setAttribute("aria-expanded", isVisible ? "false" : "true");
 }
 
-// Document-delegated click handler for help buttons that opt in via
-// ``data-help-target``.  Settings-tab buttons keep their per-button
-// listeners (bound at render time) so this only fires for the static-HTML
-// buttons in the skill modals.  Bound once at module load.
+// Single document-delegated handler for every .settings-help-btn — both the
+// settings-tab buttons emitted by _renderSettingRow and the static skill-modal
+// buttons in index.html.  Bound once at module load.
 document.addEventListener("click", function (e) {
   const btn = e.target.closest(".settings-help-btn[data-help-target]");
   if (btn) _toggleSettingsHelp(e, btn);
@@ -3110,21 +3108,10 @@ function _closeAllSettingsHelp(except) {
     if (allOpen[i] === except) continue;
     const popover = allOpen[i];
     popover.style.display = "none";
-    // Reverse-resolve the button so we can clear aria-expanded.  Two paths,
-    // mirroring _toggleSettingsHelp's lookup:
-    //   (a) Skill modals — button sits outside .settings-label-col but its
-    //       data-help-target attribute points at this popover's id.
-    //   (b) Settings tab — button is a sibling inside .settings-label-col.
-    let helpBtn = null;
-    if (popover.id) {
-      helpBtn = document.querySelector(
-        '.settings-help-btn[data-help-target="' + popover.id + '"]',
-      );
-    }
-    if (!helpBtn) {
-      const col = popover.closest(".settings-label-col");
-      if (col) helpBtn = col.querySelector(".settings-help-btn");
-    }
+    if (!popover.id) continue;
+    const helpBtn = document.querySelector(
+      '.settings-help-btn[data-help-target="' + popover.id + '"]',
+    );
     if (helpBtn) helpBtn.setAttribute("aria-expanded", "false");
   }
 }
