@@ -77,6 +77,8 @@ or MCP config can do adds to it.  Current members:
 | `delete_workstream`       | wind-down       | Hard-delete one child.  Requires approval.                          |
 | `list_nodes`              | discover        | Enumerate live cluster nodes + capabilities.                        |
 | `skills` (action=find)    | discover        | Browse the skill catalog; opt-in `kind` filter narrows by audience. |
+| `memory`                  | persist         | Orchestration scratchpad keyed by the `coordinator` scope.          |
+| `notify`                  | broadcast       | Post a status update to a human channel at a narrative beat.        |
 | `tasks`                   | plan            | Orchestrator-only scratchpad.  Children don't see it.               |
 
 Explicitly **not** in the coordinator set:
@@ -85,7 +87,7 @@ Explicitly **not** in the coordinator set:
 - `read_file` / `search` — no local FS reads.
 - `web_fetch` / `web_search` — no direct web access.
 - `task_agent` / `plan_agent` — sub-agent tools are zeroed on coord sessions.
-- `memory` / `recall` / `notify` / `watch` / `read_resource` / `use_prompt` / `skill` — the orchestrator's "memory" is its children's outputs; these UX / persistence tools belong to interactive sessions.
+- `recall` / `watch` / `read_resource` / `use_prompt` — UX / persistence tools that belong to interactive sessions.  The dual-kind `memory` / `skills` / `notify` tools are available on both kinds (see the table above).
 
 If your skill needs a coordinator to "run a command" or "read a
 file", write the delegate pattern instead: spawn a child with an

@@ -281,8 +281,10 @@ def test_interactive_and_coordinator_tool_sets_overlap_only_on_dual_kind():
     # joined in 1.6.0 (replaces legacy ``skill`` + ``list_skills``) — read
     # actions auto-approve on both kinds, write actions gate on
     # ``model.skills.write`` permission, and ``load`` errors on coord
-    # sessions where it doesn't apply.
-    dual_kind = {"memory", "skills"}
+    # sessions where it doesn't apply.  ``notify`` joined in 1.6.0 so
+    # coords can post status updates at narrative beats without spawning
+    # a child purely to ship a message.
+    dual_kind = {"memory", "skills", "notify"}
 
     overlap = interactive_names & coord_names
     assert overlap == dual_kind, (

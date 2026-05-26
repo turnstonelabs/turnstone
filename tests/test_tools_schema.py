@@ -86,7 +86,7 @@ class TestToolsMetadata:
     def test_coordinator_tools_count(self):
         from turnstone.core.tools import COORDINATOR_TOOLS
 
-        assert len(COORDINATOR_TOOLS) == 14
+        assert len(COORDINATOR_TOOLS) == 15
         assert {t["function"]["name"] for t in COORDINATOR_TOOLS} == {
             "spawn_workstream",
             "spawn_batch",
@@ -111,6 +111,11 @@ class TestToolsMetadata:
             # coord sessions — coords delegate skill assignment via
             # ``spawn_workstream(skill=...)``.
             "skills",
+            # ``notify`` is dual-kind so coordinators can post status
+            # updates at narrative beats (fan-out complete, batch
+            # failed, phase done) without spawning a child purely to
+            # ship a message.  Routing logic is session-kind-agnostic.
+            "notify",
         }
 
     def test_auto_approve_sets_match(self):

@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import json
 from typing import Any
-from unittest.mock import ANY, MagicMock
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
 from turnstone.core.session import ChatSession
+from turnstone.core.storage._sqlite import SQLiteBackend
 from turnstone.prompts import ClientType
 
 
@@ -149,6 +150,11 @@ def test_coordinator_session_uses_coordinator_tools(coord_session):
         # Dual-kind (interactive + coordinator) — read actions auto-approve
         # on both; writes gate on ``model.skills.write``.
         "skills",
+        # ``notify`` joined the coord set in 1.6.0 — orchestrators have
+        # natural "fan-out complete" / "batch failed" beats worth
+        # surfacing to a human channel without spawning a child purely
+        # to ship the message.  Routing is session-kind-agnostic.
+        "notify",
     }
     # Sub-agent tool sets are zeroed on coordinator sessions.
     assert sess._task_tools == []
@@ -1683,3 +1689,68 @@ def test_close_all_children_prepare_errors_when_coord_client_unavailable(coord_s
     item = sess._prepare_tool(_tc("close_all_children", {}))
     assert "error" in item
     assert "unavailable" in item["error"]
+
+
+# ---------------------------------------------------------------------------
+# notify — dual-kind invocability on coordinator sessions
+# ---------------------------------------------------------------------------
+#
+# notify joined the coord toolset so orchestrators can post status updates
+# at narrative beats (fan-out complete, batch failed, phase done) without
+# spawning a child purely to ship a message. _prepare_notify / _exec_notify
+# are session-kind-agnostic — the routing logic is identical to interactive
+# sessions; these tests pin the coord-side dispatch wiring.
+
+
+def test_notify_prepare_on_coord_session_dispatches_cleanly(coord_session):
+    """A coord session can reach _prepare_notify via the standard
+    dispatcher and produce a well-formed execute item."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc(
+            "notify",
+            {"message": "fan-out of 3 children complete", "username": "admin"},
+        )
+    )
+    assert "error" not in item
+    assert item["func_name"] == "notify"
+    assert item["execute"].__func__ is ChatSession._exec_notify
+    assert item["message"] == "fan-out of 3 children complete"
+    assert item["username"] == "admin"
+    # notify carries ``auto_approve: true`` in notify.json and
+    # ``_prepare_notify`` hardcodes ``needs_approval: False`` — pin the
+    # auto-approve contract on the coord surface so a future change that
+    # tightens approval semantics has to update this test deliberately.
+    assert item["needs_approval"] is False
+
+
+def test_notify_exec_on_coord_session_sends_via_channel_gateway(coord_session, tmp_path):
+    """End-to-end: coord-session notify reaches the channel gateway path
+    with the same payload shape an interactive session would emit."""
+    sess, _coord, _ui = coord_session
+    storage = SQLiteBackend(str(tmp_path / "test.db"))
+    storage.register_service("channel", "ch-1", "http://localhost:8091")
+
+    item = sess._prepare_tool(
+        _tc(
+            "notify",
+            {"message": "batch failed on child-x", "username": "admin"},
+        )
+    )
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "results": [{"channel_type": "discord", "channel_id": "123", "status": "sent"}]
+    }
+    with (
+        patch("turnstone.core.session.get_storage", return_value=storage),
+        patch("turnstone.core.session.httpx.post", return_value=mock_resp) as mock_post,
+    ):
+        call_id, msg = sess._exec_notify(item)
+
+    assert call_id == "call-1"
+    assert "sent successfully" in msg.lower()
+    post_kwargs = mock_post.call_args.kwargs
+    assert post_kwargs["json"]["target"] == {"username": "admin"}
+    assert post_kwargs["json"]["message"] == "batch failed on child-x"
+    assert post_kwargs["json"]["ws_id"] == "coord-1"
