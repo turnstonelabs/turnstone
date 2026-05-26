@@ -3770,20 +3770,47 @@ function renderJudgeSettings() {
         '">Reset</button>'
       : "";
 
+    // Short description (TLDR) renders inline below the key.  The ? button
+    // gates the long-form help paragraph — mirrors the pattern in
+    // admin.js:_renderSettingRow so the document-delegated click handler
+    // picks it up automatically.
+    const helpId = eKey + "-help";
+    const helpBtn = s.help
+      ? ' <button type="button" class="settings-help-btn"' +
+        ' data-help-target="' +
+        helpId +
+        '" aria-label="Help for ' +
+        escapeHtml(shortKey) +
+        '" aria-expanded="false" title="More info"></button>'
+      : "";
+    const descBlock = s.description
+      ? '<div style="font-size:11px;color:var(--fg-dim);margin-bottom:5px">' +
+        escapeHtml(s.description) +
+        "</div>"
+      : "";
+    const helpPopover = s.help
+      ? '<div id="' +
+        helpId +
+        '" class="settings-help-popover" style="display:none;margin-bottom:5px">' +
+        '<span class="settings-help-text">' +
+        escapeHtml(s.help) +
+        "</span></div>"
+      : "";
+
     html +=
       '<div style="margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid var(--border-strong)">' +
       '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">' +
       '<code style="font-size:12px;font-weight:600;color:var(--fg)">' +
       shortKey +
       "</code>" +
+      helpBtn +
       (isDefault
         ? '<span style="font-size:11px;color:var(--fg-dim)">default</span>'
         : '<span style="font-size:11px;color:var(--green)">customized</span>') +
       resetBtn +
       "</div>" +
-      '<div style="font-size:11px;color:var(--fg-dim);margin-bottom:5px">' +
-      escapeHtml(s.help || s.description || "") +
-      "</div>" +
+      descBlock +
+      helpPopover +
       inputHtml +
       "</div>";
   }
