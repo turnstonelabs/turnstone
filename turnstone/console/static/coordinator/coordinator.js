@@ -4042,43 +4042,22 @@
       // for case c.  Without this neutral state, painting Approve
       // buttons on a non-pending orphan was misleading and could
       // 409-on-submit because the call_id wasn't in pending_items.
-      // Pre-scan classifies each tool message's content as
-      // "denied" (server emits "Denied by user[: feedback]" /
-      // "Blocked by tool policy ..." for any deny path), "error"
-      // (Error: prefix from the standard tool error envelope), or
-      // "ok" (anything else).  Map keys are call_ids; the assistant
-      // tool_calls render below reads these to mark the resulting
-      // batch as resolved-denied (vs the default resolved-approved)
-      // and the tool-result render below propagates the error flag
-      // to appendToolResult so the row gets the .error class /
-      // --error stripe / "✗ error:" lead.  Without this both denied
-      // and errored tools rendered as plain "✓ approved" successes
-      // on every reload.
       const callOutcomes = new Map();
       (hist.messages || []).forEach((m) => {
         if ((m.role || "tool") !== "tool" || !m.tool_call_id) return;
-        // Tool message content is usually a string but the multipart
-        // shape (text + image_url parts) is technically allowed.
-        let txt = "";
-        if (typeof m.content === "string") {
-          txt = m.content;
-        } else if (Array.isArray(m.content)) {
-          for (const part of m.content) {
-            if (part && typeof part === "object" && part.type === "text") {
-              txt += String(part.text || "");
-            }
-          }
-        }
-        // Server signals override prefix detection when present.
+        // The server-side /history projection derives denied / is_error on
+        // each tool message (content-prefix heuristic + persisted flags),
+        // so we read those fields directly rather than re-sniffing content
+        // here.  "Denied by user" / "Blocked" -> denied; the error-prefix
+        // set (Error, Command timed out, ...) -> is_error.  The
+        // assistant.tool_calls render below reads this map to mark a batch
+        // resolved-denied (vs the default resolved-approved) and to
+        // propagate the error flag to appendToolResult; a call_id absent
+        // from the map is an orphan (no result yet) -> --running.
         let outcome = "ok";
-        if (m.is_error) {
-          outcome = "error";
-        } else if (
-          txt.startsWith("Denied by user") ||
-          txt.startsWith("Blocked by tool policy")
-        ) {
+        if (m.denied) {
           outcome = "denied";
-        } else if (txt.startsWith("Error:")) {
+        } else if (m.is_error) {
           outcome = "error";
         }
         callOutcomes.set(m.tool_call_id, outcome);
@@ -4094,10 +4073,11 @@
       // place when it knows more.
       function renderAssistantToolBatch(m) {
         const items = m.tool_calls.map((tc) => {
-          const fn = (tc && tc.function) || {};
-          const name = String(fn.name || "tool");
+          // tool_calls arrive flattened by the server /history projection:
+          // {id, name, arguments} (no nested `function` wrapper).
+          const name = String((tc && tc.name) || "tool");
           const callId = String((tc && tc.id) || "");
-          const argsRaw = String(fn.arguments || "");
+          const argsRaw = String((tc && tc.arguments) || "");
           let parsedArgs = null;
           try {
             parsedArgs = JSON.parse(argsRaw || "{}");
@@ -4186,45 +4166,16 @@
       (hist.messages || []).forEach((m) => {
         const role = m.role || "tool";
 
-        // User messages with attachments arrive as multipart list
-        // content (text + image_url/document parts) and may carry an
-        // ``_attachments_meta`` side-channel with display metadata
-        // (kind + filename + mime_type).  Extract the text portion and
-        // build a structured attachment list so the user bubble can
-        // render the same pill cluster the interactive pane shows.
-        let content;
+        // The server /history projection collapses multipart user content
+        // to a plain string and surfaces a structured ``attachments`` list
+        // ({kind, filename, mime_type}); coord renders the same pill
+        // cluster the interactive pane shows from those fields.  (Content
+        // is a string for every role post-projection; the guard is purely
+        // defensive.)
+        const content = typeof m.content === "string" ? m.content : "";
         const userAttachments = [];
-        if (typeof m.content === "string") {
-          content = m.content;
-        } else if (Array.isArray(m.content)) {
-          const textParts = [];
-          for (const part of m.content) {
-            if (!part || typeof part !== "object") continue;
-            if (part.type === "text") {
-              textParts.push(String(part.text || ""));
-            } else if (part.type === "image_url") {
-              userAttachments.push({ kind: "image", filename: "" });
-            } else if (part.type === "document") {
-              const doc = part.document || {};
-              userAttachments.push({
-                kind: "text",
-                filename: String(doc.name || ""),
-              });
-            }
-          }
-          content = textParts.join("\n");
-        } else {
-          content = JSON.stringify(m.content || "");
-        }
-        const meta = Array.isArray(m._attachments_meta)
-          ? m._attachments_meta
-          : null;
-        if (meta && meta.length) {
-          // Side-channel is authoritative — it carries filenames that
-          // image_url data URIs can't express, and covers attachments
-          // whose multipart parts couldn't be reconstructed.
-          userAttachments.length = 0;
-          for (const a of meta) {
+        if (Array.isArray(m.attachments)) {
+          for (const a of m.attachments) {
             if (!a || typeof a !== "object") continue;
             userAttachments.push({
               kind: String(a.kind || "other"),

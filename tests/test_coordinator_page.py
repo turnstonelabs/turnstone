@@ -155,7 +155,12 @@ def test_coordinator_js_exposes_inline_approval_helpers():
     # turns must render with the correct batch state on reload, not
     # the contradictory "✓ approved" pill that pre-fix showed for
     # any prior denial.  bug-1 / bug-3 from the second /review pass.
-    assert "Denied by user" in body
+    # Post wire-shape unification the deny/error classification moved
+    # server-side into ``project_history_messages``; coord reads the
+    # derived ``m.denied`` / ``m.is_error`` flags (pin the live read,
+    # not the comment prose the old content-prefix sniffing left behind).
+    assert "m.denied" in body
+    assert "m.is_error" in body
     assert "callOutcomes" in body
     # User-message attachment pills — both live send (coordSend) and
     # history replay route through appendUserMessageWithAttachments.
