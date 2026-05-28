@@ -31,6 +31,7 @@ class Pane {
     this.model = "";
     this.modelAlias = "";
     this._lastStatusEvt = null;
+    this._historyLoadToken = 0;
     this._cancelTimeout = null;
     this._forceTimeout = null;
     this._pendingEditSend = null;
@@ -747,10 +748,24 @@ class Pane {
     // in_progress_snapshot still covers a generation that lands between
     // the fetch and the stream opening.
     this.disconnectSSE();
-    this._refetchHistory(wsId).finally(() => this.connectSSE(wsId));
+    // (Re)load of a (possibly different) ws: drop the per-ws SSE replay
+    // cursor + cached status. Sending the previous ws's last_event_id to a
+    // new ws mis-triggers the server's replay_ok path and skips the synthetic
+    // replay (connected / status / in_progress_snapshot); the fresh connect
+    // below gets the new ws's full initial state instead.
+    this._lastEventId = null;
+    this._lastStatusEvt = null;
+    // Generation token — a slow refetch (e.g. a large resumed session) must
+    // not render its history, reconnect its stream, or fire its resend after
+    // the pane has switched to another ws. Newest load wins; older ones drop.
+    const token = (this._historyLoadToken || 0) + 1;
+    this._historyLoadToken = token;
+    this._refetchHistory(wsId, token).finally(() => {
+      if (token === this._historyLoadToken) this.connectSSE(wsId);
+    });
   }
 
-  async _refetchHistory(wsId) {
+  async _refetchHistory(wsId, token) {
     // Fetch conversation history over REST. Used for first paint (before
     // connecting SSE) and to re-render after a clear_ui signal (rewind /
     // retry / resume / open). The FETCH is wrapped (network/parse failure
@@ -766,6 +781,10 @@ class Pane {
     } catch (err) {
       data = null;
     }
+    // Drop a superseded load: a newer _loadHistoryThenConnect (ws switch)
+    // bumped the token while this fetch was in flight, so rendering now would
+    // paint the wrong ws's history into the pane.
+    if (token !== undefined && token !== this._historyLoadToken) return;
     if (data) {
       // The REST /history payload is provider-native (nested tool_calls,
       // `_source`/`_reminders`/`_attachments_meta` side-channels, multipart
@@ -1174,15 +1193,19 @@ class Pane {
         }
         break;
 
-      case "clear_ui":
+      case "clear_ui": {
         // Conversation was structurally reset (rewind / retry / resume /
         // open / fork). Empty the pane for immediate feedback, then
         // re-render from REST and dispatch any queued edit-and-resend
         // once the (possibly truncated) history lands. The resend keys
-        // off this signal rather than an inline history SSE event.
+        // off this signal rather than an inline history SSE event. Capture
+        // the load token so a ws switch mid-flight discards both the
+        // re-render and the resend (no cross-ws send).
+        const token = this._historyLoadToken;
         this.messagesEl.replaceChildren();
-        this._refetchHistory(this.wsId)
+        this._refetchHistory(this.wsId, token)
           .then(() => {
+            if (token !== this._historyLoadToken) return;
             if (!this._pendingEditSend) return;
             const editText = this._pendingEditSend;
             this._pendingEditSend = null;
@@ -1209,6 +1232,7 @@ class Pane {
             this.addErrorMessage("Failed to reload history: " + err.message);
           });
         break;
+      }
 
       case "replay_truncated":
         // Reconnect buffer evicted past our last-seen event id — the
@@ -1218,7 +1242,8 @@ class Pane {
         // refetch's replaceChildren() would detach the live bubble so
         // content deltas render nowhere. Re-syncs on the next clean
         // (re)connect.
-        if (!this.currentAssistantEl) this._refetchHistory(this.wsId);
+        if (!this.currentAssistantEl)
+          this._refetchHistory(this.wsId, this._historyLoadToken);
         break;
     }
   }

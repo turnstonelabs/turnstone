@@ -1417,6 +1417,13 @@ def test_interactive_history_is_rest_first_not_sse() -> None:
         "history via GET /history before connecting SSE (coord's model)."
     )
     assert "_refetchHistory" in body
+    # Race/identity guard (PR #595 review follow-up): a load-generation token
+    # must discard a superseded refetch so a slow ws-A load cannot render over
+    # ws-B after a tab switch / child open.
+    assert "_historyLoadToken" in body, (
+        "missing the load-generation guard — a stale history refetch can "
+        "render the wrong workstream's history"
+    )
     # Pre-PR-A interactive had no REST /history fetch; the quoted URL
     # segment only appears in the new fetch concatenation.
     assert '"/history"' in body
