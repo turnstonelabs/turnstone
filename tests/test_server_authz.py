@@ -13,7 +13,7 @@ import json
 import queue
 import threading
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from starlette.testclient import TestClient
@@ -1062,6 +1062,22 @@ class TestInteractiveEventsLifted:
         request = MagicMock()
         out = list(_interactive_events_replay(ws, ui, request))
         assert out == []
+
+    def test_events_replay_omits_conversation_history(self):
+        """PR A: conversation history is no longer replayed over SSE.
+        The frontend fetches it via ``GET /history`` (REST) on page
+        load and re-fetches on ``clear_ui``; the replay must neither
+        build nor yield a ``history`` event (which previously shipped a
+        multi-MB message list on every (re)connect)."""
+        from turnstone.server import _interactive_events_replay
+
+        ws, ui, request = _make_interactive_replay_mocks(
+            _pending_approval={"type": "approve_request", "items": []},
+        )
+        with patch("turnstone.server._build_history") as mock_build_history:
+            out = list(_interactive_events_replay(ws, ui, request))
+        mock_build_history.assert_not_called()
+        assert "history" not in {ev["type"] for ev in out}
 
     def test_events_path_keyed_url_resolves_to_404_for_unknown_ws(self, app_client):
         """``GET /v1/api/workstreams/{ws_id}/events`` returns 404 for an

@@ -738,6 +738,45 @@ class Pane {
     };
   }
 
+  _loadHistoryThenConnect(wsId) {
+    // Mirror coord's init() ordering: render history from REST first,
+    // THEN open the live stream. Disconnect any existing stream up
+    // front so stray events from the previously-assigned ws don't paint
+    // into the pane mid-fetch. History is no longer replayed over SSE,
+    // so this REST fetch is the sole first-paint source; connectSSE's
+    // in_progress_snapshot still covers a generation that lands between
+    // the fetch and the stream opening.
+    this.disconnectSSE();
+    this._refetchHistory(wsId).finally(() => this.connectSSE(wsId));
+  }
+
+  async _refetchHistory(wsId) {
+    // Fetch conversation history over REST. Used for first paint (before
+    // connecting SSE) and to re-render after a clear_ui signal (rewind /
+    // retry / resume / open). The FETCH is wrapped (network/parse failure
+    // → empty pane); the render is deliberately OUTSIDE the catch so a
+    // render bug surfaces loudly instead of being masked as an empty pane.
+    const id = wsId || this.wsId;
+    let data = null;
+    try {
+      const r = await authFetch(
+        "/v1/api/workstreams/" + encodeURIComponent(id) + "/history",
+      );
+      if (r && r.ok) data = await r.json();
+    } catch (err) {
+      data = null;
+    }
+    if (data) {
+      // The REST /history payload is provider-native (nested tool_calls,
+      // `_source`/`_reminders`/`_attachments_meta` side-channels, multipart
+      // content, no derived denied/is_error/pending). Normalize it to the
+      // projected shape replayHistory renders — see history_normalize.js.
+      this.replayHistory(normalizeHistoryMessages(data.messages || []));
+    } else {
+      this.showEmptyState();
+    }
+  }
+
   _refetchWorkstreamsAndReassign() {
     // Lifted from the pre-PR-D ``onerror`` body.  Triggered when the
     // focused pane sees its EventSource enter the error state — pulls
@@ -809,7 +848,7 @@ class Pane {
               setTimeout(
                 ((pp) => {
                   return () => {
-                    pp.connectSSE(pp.wsId);
+                    pp._loadHistoryThenConnect(pp.wsId);
                   };
                 })(p3),
                 this.retryDelay,
@@ -1135,30 +1174,51 @@ class Pane {
         }
         break;
 
-      case "history":
-        this.replayHistory(evt.messages);
-        // Dispatch pending edit-and-resend after rewind history arrives
-        if (this._pendingEditSend) {
-          const editText = this._pendingEditSend;
-          this._pendingEditSend = null;
-          this.setBusy(true);
-          this.addUserMessage(editText);
-          authFetch(
-            "/v1/api/workstreams/" + encodeURIComponent(this.wsId) + "/send",
-            {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ message: editText }),
-            },
-          ).catch((err) => {
-            this.addErrorMessage("Connection error: " + err.message);
+      case "clear_ui":
+        // Conversation was structurally reset (rewind / retry / resume /
+        // open / fork). Empty the pane for immediate feedback, then
+        // re-render from REST and dispatch any queued edit-and-resend
+        // once the (possibly truncated) history lands. The resend keys
+        // off this signal rather than an inline history SSE event.
+        this.messagesEl.replaceChildren();
+        this._refetchHistory(this.wsId)
+          .then(() => {
+            if (!this._pendingEditSend) return;
+            const editText = this._pendingEditSend;
+            this._pendingEditSend = null;
+            this.setBusy(true);
+            this.addUserMessage(editText);
+            authFetch(
+              "/v1/api/workstreams/" + encodeURIComponent(this.wsId) + "/send",
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ message: editText }),
+              },
+            ).catch((err) => {
+              this.addErrorMessage("Connection error: " + err.message);
+              this.setBusy(false);
+            });
+          })
+          .catch((err) => {
+            // The render runs outside _refetchHistory's try/catch by design;
+            // if it throws, don't strand the queued edit-and-resend — clear
+            // the latch + busy so the composer recovers.
+            this._pendingEditSend = null;
             this.setBusy(false);
+            this.addErrorMessage("Failed to reload history: " + err.message);
           });
-        }
         break;
 
-      case "clear_ui":
-        this.messagesEl.replaceChildren();
+      case "replay_truncated":
+        // Reconnect buffer evicted past our last-seen event id — the
+        // live recovery replay no longer carries history, so re-sync
+        // from REST. Skip while a turn is mid-stream: the recovery
+        // floor's in_progress_snapshot already paints it, and an async
+        // refetch's replaceChildren() would detach the live bubble so
+        // content deltas render nowhere. Re-syncs on the next clean
+        // (re)connect.
+        if (!this.currentAssistantEl) this._refetchHistory(this.wsId);
         break;
     }
   }
@@ -1328,7 +1388,8 @@ class Pane {
     const turnsToRewind = userMsgs.length - idx;
 
     this.setBusy(true);
-    // Store pending send — dispatched when the rewind history event arrives
+    // Store pending send — dispatched from the clear_ui handler once
+    // the rewind's truncated history is re-fetched over REST.
     this._pendingEditSend = newText;
     authFetch("/v1/api/command", {
       method: "POST",
@@ -1480,7 +1541,9 @@ class Pane {
                   cmd.textContent = parts.join("\n");
                 }
               } catch (e) {
-                cmd.textContent = tc.arguments.substring(0, 100);
+                // Defensive: never let a non-string `arguments` (or a
+                // parse failure) escalate into a render-aborting throw.
+                cmd.textContent = String(tc.arguments || "").substring(0, 100);
               }
               div.appendChild(cmd);
               // Verdict badge — anchor to THIS tool's row (div) rather
@@ -2332,7 +2395,7 @@ function splitPane(paneId, direction) {
   renderLayout();
   setFocusedPane(newPane.id);
   newPane.showEmptyState();
-  newPane.connectSSE(newWsId);
+  newPane._loadHistoryThenConnect(newWsId);
 }
 
 function closePane(paneId) {
@@ -3270,7 +3333,7 @@ function switchTab(wsId) {
   pane.showEmptyState();
   pane.updateWsName();
   renderTabBar();
-  pane.connectSSE(wsId);
+  pane._loadHistoryThenConnect(wsId);
 
   if (!_historyNavigation) {
     history.pushState({ turnstone: "workstream", wsId: wsId }, "");
@@ -3702,7 +3765,7 @@ function _reassignPanesForClosedWs(closedWsId, tabIdsBeforeClose) {
         dp.messagesEl.replaceChildren();
         dp.showEmptyState();
         dp.updateWsName();
-        dp.connectSSE(remaining[0]);
+        dp._loadHistoryThenConnect(remaining[0]);
       }
     }
     if (focusedPaneId && panes[focusedPaneId]) {
@@ -3790,7 +3853,7 @@ function _reassignPanesForClosedWs(closedWsId, tabIdsBeforeClose) {
       p.messagesEl.replaceChildren();
       p.showEmptyState();
       p.updateWsName();
-      p.connectSSE(newWsId);
+      p._loadHistoryThenConnect(newWsId);
       usedWsIds[newWsId] = true;
     } else if (countLeaves(splitRoot) > 1) {
       // No unused workstream available — close redundant pane
@@ -3803,7 +3866,7 @@ function _reassignPanesForClosedWs(closedWsId, tabIdsBeforeClose) {
         p.messagesEl.replaceChildren();
         p.showEmptyState();
         p.updateWsName();
-        p.connectSSE(remaining[0]);
+        p._loadHistoryThenConnect(remaining[0]);
       }
     }
   }
@@ -6682,7 +6745,7 @@ function initWorkstreams() {
       for (let id in panes) {
         if (!panes[id].evtSource) {
           panes[id].showEmptyState();
-          panes[id].connectSSE(panes[id].wsId);
+          panes[id]._loadHistoryThenConnect(panes[id].wsId);
         }
       }
       const params = new URLSearchParams(location.search);

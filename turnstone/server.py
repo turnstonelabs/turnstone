@@ -428,6 +428,15 @@ class WebUI(SessionUIBase):
 # :func:`make_history_handler` (the /history REST endpoint coord uses
 # as its primary history loader) share them so the two surfaces don't
 # drift on the wire shape they emit.
+#
+# NB: ``_build_history`` has NO production callers post-convergence — the
+# live interactive + coord history projection is ``make_history_handler``
+# (``reconstruct_messages`` + ``decorate_history_messages``), and the
+# browser mirrors that shape in ``shared_static/history_normalize.js``.
+# This function is retained as the canonical wire-shape REFERENCE that the
+# decoration / parity tests assert against; if the projected wire shape
+# changes, update ``history_normalize.js`` (and ``decorate_history_messages``)
+# to match — editing this builder alone touches test-only code.
 
 
 def _build_history(
@@ -466,10 +475,9 @@ def _build_history(
     # ``ChatSession._apply_reminders_for_provider``.
     #
     # Verdict + output-assessment lookup tables — populated either
-    # inline (sync call sites) or pre-loaded by an async caller via
-    # asyncio.to_thread (see _load_verdict_indexes).  Pre-loading is
-    # what keeps _build_history off the event loop's hot path on the
-    # SSE replay generator path.
+    # inline (default) or from pre-loaded dicts passed by an async
+    # caller via asyncio.to_thread (see _load_verdict_indexes), which
+    # keeps the storage I/O off the event loop when called from one.
     if verdicts is not None and assessments is not None:
         verdicts_by_call_id = verdicts
         assessments_by_call_id = assessments
@@ -953,45 +961,23 @@ def _audit_close_workstream(
     )
 
 
-async def _interactive_events_replay_prepare(ws: Workstream, ui: Any, request: Request) -> None:
-    """Async pre-step run before ``_interactive_events_replay`` iterates.
-
-    Loads ``intent_verdicts`` + ``output_assessments`` for the
-    workstream off the event loop (via ``asyncio.to_thread``) and
-    stashes the result on ``request.state.verdict_indexes``. The sync
-    replay generator reads from there and passes the dicts into
-    ``_build_history`` so the storage I/O never blocks the event loop
-    on the SSE replay path.
-
-    Best-effort: if the workstream has no session or no ws_id, leaves
-    ``request.state.verdict_indexes`` unset and ``_build_history``
-    falls back to the inline storage call (sync path).
-    """
-    del ui  # not needed; lookup is keyed on ws.session._ws_id
-    session = ws.session
-    if session is None:
-        return
-    ws_id = getattr(session, "_ws_id", "") or ""
-    if not ws_id:
-        return
-    indexes = await asyncio.to_thread(_load_verdict_indexes, ws_id)
-    request.state.verdict_indexes = indexes
-
-
 def _interactive_events_replay(
     ws: Workstream, ui: Any, request: Request
 ) -> Iterable[dict[str, Any]]:
     """Initial SSE replay payload for interactive ``events`` connections.
 
-    Pre-lift ``events_sse`` yielded five things on connect: a
-    ``connected`` event with model + skip_permissions; a ``status``
-    event with the workstream's last token usage + context %; the
-    full conversation ``history`` (with pending-approval flagging on
-    the last assistant entry's tool calls); the pending approval
-    prompt + cached intent verdicts (if a prompt is pending); the
-    pending plan-review (if a review is pending). The lifted
-    ``make_events_handler`` body delegates that yield sequence to
-    this callback so the kind-specific shape stays in this module.
+    Yields a ``connected`` event (model + skip_permissions), a
+    ``status`` event with the workstream's last token usage + context %
+    (when a turn has completed), the pending approval prompt + cached
+    intent verdicts (if a prompt is pending), and the pending
+    plan-review (if a review is pending). The lifted
+    ``make_events_handler`` body delegates that yield sequence to this
+    callback so the kind-specific shape stays in this module.
+
+    Conversation history is NOT replayed over SSE: the frontend fetches
+    it via ``GET /history`` on page load and re-fetches on the
+    ``clear_ui`` signal (coord's REST-first model), keeping a multi-MB
+    message list off every (re)connect.
 
     Pure read — never mutates ``ws`` / ``ui`` / ``session``.
     """
@@ -1007,29 +993,9 @@ def _interactive_events_replay(
     # field add.
     yield from session_replay_preamble(session, ui)
 
-    # History replay — pending-approval flag rides on the last
-    # assistant entry's tool_calls so the client renders them as
-    # awaiting approval rather than already approved.  Verdict /
-    # assessment indexes were pre-loaded off the event loop by
-    # _interactive_events_replay_prepare; passing them in here keeps
-    # _build_history's storage I/O out of the sync generator path.
-    pending_approval = getattr(ui, "_pending_approval", None)
-    cached_indexes = getattr(request.state, "verdict_indexes", None)
-    if isinstance(cached_indexes, tuple) and len(cached_indexes) == 2:
-        verdicts, assessments = cached_indexes
-    else:
-        verdicts, assessments = None, None
-    history = _build_history(
-        session,
-        has_pending_approval=pending_approval is not None,
-        verdicts=verdicts,
-        assessments=assessments,
-    )
-    if history:
-        yield {"type": "history", "messages": history}
-
     # Pending approval re-injection (so a reconnecting tab sees the
     # prompt) + cached LLM verdicts received since the prompt fired.
+    pending_approval = getattr(ui, "_pending_approval", None)
     if pending_approval is not None:
         yield pending_approval
         with ui._ws_lock:
@@ -1055,10 +1021,11 @@ def _interactive_open_post_load(request: Request, ws: Workstream) -> None:
     1. Sync the workstream's name to the persisted display alias
        (a user-renamed workstream stores its alias separately from
        the manager's in-memory name).
-    2. Replay clear_ui + history onto the per-workstream UI listener
-       queue so a freshly-connected browser tab sees the conversation
-       state. Only fires when ``ws.session.messages`` is non-empty
-       (resume succeeded and there's history to show).
+    2. Emit ``clear_ui`` onto the per-workstream UI listener queue so a
+       connected browser tab re-fetches conversation state over REST
+       ``GET /history`` (the REST-first model — history is no longer
+       replayed inline over SSE). Only fires when ``ws.session.messages``
+       is non-empty (resume succeeded and there's history to show).
     3. Enqueue ``ws_created`` onto the global SSE queue so dashboards
        and other multi-workstream consumers see the rehydrate. The
        handler-side emission is the load-bearing path on interactive;
@@ -1072,9 +1039,6 @@ def _interactive_open_post_load(request: Request, ws: Workstream) -> None:
     session = ws.session
     if isinstance(ui, WebUI) and session is not None and session.messages:
         ui._enqueue({"type": "clear_ui"})
-        history = _build_history(session)
-        if history:
-            ui._enqueue({"type": "history", "messages": history})
 
     gq: queue.Queue[dict[str, Any]] | None = getattr(request.app.state, "global_queue", None)
     if gq is not None:
@@ -1704,20 +1668,15 @@ async def command(request: Request) -> JSONResponse:
         if cmd_word in ("/clear", "/new"):
             ui._enqueue({"type": "clear_ui"})
         elif cmd_word == "/resume":
+            # clear_ui signals the frontend to re-fetch history via REST.
             ui._enqueue({"type": "clear_ui"})
-            history = await asyncio.to_thread(_build_history, ws.session)
-            if history:
-                ui._enqueue({"type": "history", "messages": history})
         elif cmd_word in ("/rewind", "/retry"):
-            # Refresh frontend with truncated history. Always emit the
-            # history event even when empty: editing the first message
-            # rewinds to zero messages, and the frontend dispatches the
-            # queued edit-and-resend from the history handler — skipping
-            # the event on an empty list orphans `_pendingEditSend` and
-            # leaves the composer stuck in busy.
+            # clear_ui signals the frontend to re-fetch the (now
+            # truncated) history via REST and dispatch any queued
+            # edit-and-resend once it lands. Fires even on a rewind to
+            # zero messages: the frontend keys the resend off this
+            # signal, not an inline history payload.
             ui._enqueue({"type": "clear_ui"})
-            history = await asyncio.to_thread(_build_history, ws.session)
-            ui._enqueue({"type": "history", "messages": history})
             # Audit trail
             storage = getattr(request.app.state, "auth_storage", None)
             if storage:
@@ -2189,10 +2148,8 @@ async def _interactive_create_post_install(
                 ws.name = user_name
             ui = ws.ui
             if isinstance(ui, WebUI):
+                # clear_ui signals the frontend to re-fetch history via REST.
                 ui._enqueue({"type": "clear_ui"})
-                history = await asyncio.to_thread(_build_history, ws.session)
-                if history:
-                    ui._enqueue({"type": "history", "messages": history})
             with contextlib.suppress(queue.Full):
                 gq.put_nowait({"type": "ws_rename", "ws_id": ws.id, "name": ws.name})
 
@@ -4047,7 +4004,6 @@ def create_app(
         open_resolve_alias=_resolve_workstream_alias,
         open_post_load=_interactive_open_post_load,
         events_replay=_interactive_events_replay,
-        events_replay_prepare=_interactive_events_replay_prepare,
         # Pre-lift ``events_sse`` used the dedicated 200-thread
         # ``sse_executor`` so SSE polling stayed isolated from
         # every other ``asyncio.to_thread`` caller in the process

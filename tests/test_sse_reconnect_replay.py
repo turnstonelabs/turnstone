@@ -489,7 +489,6 @@ def _wire_events_handler(ui: _ConcreteUI) -> Any:
         not_found_label="Workstream not found",
         audit_action_prefix="workstream",
         events_replay=None,
-        events_replay_prepare=None,
     )
     return make_events_handler(cfg)
 

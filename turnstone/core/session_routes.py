@@ -395,15 +395,6 @@ class SessionEndpointConfig:
     # separate ``/history`` endpoint and doesn't render the per-tab
     # status bar). Kinds that don't need pre-replay wire ``None``.
     events_replay: EventsReplay | None = None
-    # async (ws, ui, request) -> None. Kind-specific async pre-step
-    # the lifted ``events`` body awaits BEFORE iterating
-    # ``events_replay``. Lets a kind move blocking storage I/O off
-    # the event loop (via ``asyncio.to_thread``) and stash results
-    # on ``request.state`` for the sync replay generator to read.
-    # Interactive uses it to pre-load intent_verdicts +
-    # output_assessments so ``_build_history``'s decoration stays
-    # off the hot path. Coord wires ``None``.
-    events_replay_prepare: Callable[..., Any] | None = None
     # (request) -> Executor for the SSE live-loop's blocking
     # ``queue.get`` wait. Interactive returns the dedicated
     # ``request.app.state.sse_executor`` (200-thread pool) so SSE
@@ -1341,13 +1332,10 @@ def make_open_handler(
         # emit_rehydrated path).
         if cfg.open_post_load is not None:
             try:
-                # Off-loop: interactive's post_load runs the sync
-                # ``_build_history`` (storage I/O for verdict
-                # indexes + message reconstruction) — without the
-                # to_thread wrap this blocks the event loop on every
-                # workstream open, mirroring the SSE replay path
-                # that's already protected via
-                # ``events_replay_prepare``.
+                # Off-loop: interactive's post_load does blocking
+                # storage I/O (a workstream display-name lookup) that
+                # would otherwise stall the event loop on every
+                # workstream open.
                 await asyncio.to_thread(cfg.open_post_load, request, ws)
             except Exception:
                 # Post-load is observational — never let a hook bug
@@ -1648,19 +1636,6 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                     # last BUFFERED id (or none on truly-fresh
                     # connect), which is what the server can replay.
                     if replay_cb is not None:
-                        # Kind-specific async prep — runs before the
-                        # sync replay generator iterates so blocking
-                        # storage I/O lands in the executor pool
-                        # rather than the event loop's hot path.
-                        if cfg.events_replay_prepare is not None:
-                            try:
-                                await cfg.events_replay_prepare(ws, ui, request)
-                            except Exception:
-                                log.debug(
-                                    "ws.events.replay_prepare_failed ws=%s",
-                                    ws_id[:8],
-                                    exc_info=True,
-                                )
                         try:
                             for ev in replay_cb(ws, ui, request):
                                 yield {"data": json.dumps(ev)}
