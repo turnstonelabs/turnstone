@@ -21,6 +21,10 @@ if TYPE_CHECKING:
     from starlette.responses import Response
 
 from turnstone.core.auth import AuthResult
+from turnstone.core.history_decoration import (
+    decorate_history_messages,
+    project_history_messages,
+)
 from turnstone.core.session_routes import (
     SessionEndpointConfig,
     make_detail_handler,
@@ -993,21 +997,14 @@ class TestHistoryInteractive:
 
 
 class TestBuildHistoryReminderPropagation:
-    """``_build_history`` must surface the ``_reminders`` side-channel on
-    each entry so a tab reconnecting via ``/history`` renders the same
-    metacognitive nudge bubble the originating tab saw via the live
-    ``user_reminder`` SSE event.
+    """``project_history_messages`` must surface the ``_reminders``
+    side-channel on each entry so a tab reconnecting via ``/history``
+    renders the same metacognitive nudge bubble the originating tab saw
+    via the live ``user_reminder`` SSE event.
     """
 
-    def _session_with_messages(self, messages: list[dict]) -> MagicMock:
-        session = MagicMock()
-        session.messages = messages
-        return session
-
     def test_reminders_sidechannel_surfaces_on_entry(self):
-        from turnstone.server import _build_history
-
-        session = self._session_with_messages(
+        history = project_history_messages(
             [
                 {
                     "role": "user",
@@ -1016,28 +1013,19 @@ class TestBuildHistoryReminderPropagation:
                 }
             ]
         )
-        history = _build_history(session)
         assert history[0]["content"] == "ah no"
         assert history[0]["reminders"] == [{"type": "correction", "text": "watch out"}]
 
     def test_no_reminders_key_when_sidechannel_absent(self):
-        from turnstone.server import _build_history
-
-        session = self._session_with_messages([{"role": "user", "content": "just a message"}])
-        history = _build_history(session)
+        history = project_history_messages([{"role": "user", "content": "just a message"}])
         assert "reminders" not in history[0]
 
     def test_no_reminders_key_when_sidechannel_empty(self):
-        from turnstone.server import _build_history
-
-        session = self._session_with_messages([{"role": "user", "content": "hi", "_reminders": []}])
-        history = _build_history(session)
+        history = project_history_messages([{"role": "user", "content": "hi", "_reminders": []}])
         assert "reminders" not in history[0]
 
     def test_multiple_reminders_preserved_in_order(self):
-        from turnstone.server import _build_history
-
-        session = self._session_with_messages(
+        history = project_history_messages(
             [
                 {
                     "role": "user",
@@ -1049,16 +1037,13 @@ class TestBuildHistoryReminderPropagation:
                 }
             ]
         )
-        history = _build_history(session)
         assert history[0]["reminders"] == [
             {"type": "denial", "text": "FIRST"},
             {"type": "correction", "text": "SECOND"},
         ]
 
     def test_reminders_coexist_with_attachments(self):
-        from turnstone.server import _build_history
-
-        session = self._session_with_messages(
+        history = project_history_messages(
             [
                 {
                     "role": "user",
@@ -1070,17 +1055,14 @@ class TestBuildHistoryReminderPropagation:
                 }
             ]
         )
-        history = _build_history(session)
         assert history[0]["content"] == "look"
         assert history[0]["attachments"] == [{"kind": "image", "filename": "", "mime_type": ""}]
         assert history[0]["reminders"] == [{"type": "correction", "text": "watch"}]
 
     def test_malformed_reminders_filtered_out(self):
-        """Defensive: a non-dict element in the list (corruption / bug)
-        is dropped rather than crashing the history serialisation."""
-        from turnstone.server import _build_history
-
-        session = self._session_with_messages(
+        """Defensive: a non-dict element in the list (corruption / bug) is
+        dropped rather than crashing the history serialisation."""
+        history = project_history_messages(
             [
                 {
                     "role": "user",
@@ -1093,7 +1075,6 @@ class TestBuildHistoryReminderPropagation:
                 }
             ]
         )
-        history = _build_history(session)
         # Non-dicts dropped; missing-text fills with empty string.
         assert history[0]["reminders"] == [
             {"type": "correction", "text": "ok"},
@@ -1101,14 +1082,9 @@ class TestBuildHistoryReminderPropagation:
         ]
 
     def test_clean_message_passes_through_unchanged(self):
-        """No reminders, plain content — _build_history is a no-op for the
+        """No reminders, plain content — the projection is a no-op for the
         reminder field and ``content`` rides through verbatim."""
-        from turnstone.server import _build_history
-
-        session = self._session_with_messages(
-            [{"role": "user", "content": "just a normal message"}]
-        )
-        history = _build_history(session)
+        history = project_history_messages([{"role": "user", "content": "just a normal message"}])
         assert history[0]["content"] == "just a normal message"
         assert "reminders" not in history[0]
 
@@ -1116,160 +1092,87 @@ class TestBuildHistoryReminderPropagation:
         """Assistant output may legitimately reference the tag (e.g. when
         the model is explaining the reminder system itself).  No
         transformation should ever apply to assistant content."""
-        from turnstone.server import _build_history
-
         content = "Here is a <system-reminder> tag in assistant output."
-        session = self._session_with_messages([{"role": "assistant", "content": content}])
-        history = _build_history(session)
+        history = project_history_messages([{"role": "assistant", "content": content}])
         assert history[0]["content"] == content
 
 
 class TestBuildHistoryAdvisoryRoundTrip:
-    """``_build_history`` must round-trip the persisted
-    ``<tool_output>`` envelope (Seam 1 queued-message splice) to
-    cleaned content + a wire-shape ``advisories`` array.
+    """The ``/history`` projection must round-trip the persisted
+    ``<tool_output>`` envelope (Seam 1 queued-message splice) to cleaned
+    content + a wire-shape ``advisories`` array.
 
-    Production realism note: ``session.messages`` never carries an
-    ``advisories`` key — only ``decorate_history_messages`` mutates
-    dicts to add it for the REST ``/history`` path, and the SSE replay
-    surface bypasses that decoration entirely.  The earlier
-    ``TestBuildHistoryAdvisoryPropagation`` class pre-populated
-    ``advisories`` directly on the session messages, which tested a
-    passthrough that doesn't exist in production — the SSE replay code
-    path silently dropped queued messages despite the green tests.
-    These round-trip tests exercise the production shape (wrapped
-    envelope on the tool row's ``content``) so a regression in the
-    inline ``extract_advisories_from_tool_envelope`` call inside
-    ``_build_history`` surfaces here.
+    STRING-content envelopes are stripped by ``decorate_history_messages``
+    (the first pipeline stage); LIST-content envelopes are stripped by
+    ``project_history_messages`` (the final stage, which also coerces list
+    content to a string).  These tests drive the relevant stage(s) so a
+    regression in either surfaces here.
     """
 
-    def _session_with_messages(self, messages: list[dict]) -> MagicMock:
-        session = MagicMock()
-        session.messages = messages
-        return session
-
-    def test_build_history_round_trips_envelope_to_advisories(self):
-        """The production-realistic shape: a tool row whose ``content``
-        is the wrapped ``<tool_output>`` envelope (no ``advisories``
-        key set — that's the bug-1 footprint).  ``_build_history``
-        must extract the advisory back out and ship it on the wire as
-        cleaned content + ``advisories``.
-
-        Reverting the inline ``extract_advisories_from_tool_envelope``
-        call in ``server._build_history``'s tool-message branch breaks
-        this test.
-        """
+    def test_round_trips_string_envelope_to_advisories(self):
+        """A tool row whose ``content`` is a wrapped ``<tool_output>``
+        string envelope: ``decorate_history_messages`` strips it + surfaces
+        the advisory, then ``project_history_messages`` passes both through
+        to the wire shape."""
         from turnstone.core.tool_advisory import UserInterjection, wrap_tool_result
-        from turnstone.server import _build_history
 
         wrapped = wrap_tool_result(
             "tool body",
             [UserInterjection(message="check logs", priority="notice")],
         )
-        session = self._session_with_messages(
-            [
-                {
-                    "role": "tool",
-                    "tool_call_id": "call_a",
-                    "content": wrapped,
-                }
-            ]
-        )
-        history = _build_history(session)
+        msgs: list[dict] = [{"role": "tool", "tool_call_id": "call_a", "content": wrapped}]
+        decorate_history_messages(msgs, {}, {})
+        history = project_history_messages(msgs)
         # Cleaned content rides on the wire — envelope stripped.
         assert history[0]["content"] == "tool body"
-        # Advisory survives as a wire-shape entry the JS can render
-        # as a user bubble after the tool block.
+        # Advisory survives as a wire-shape entry the JS renders as a user
+        # bubble after the tool block.
         assert history[0]["advisories"] == [
             {"type": "user_interjection", "text": "check logs", "priority": "notice"}
         ]
 
-    def test_build_history_round_trips_important_priority(self):
-        """The ``important`` priority preamble round-trips — pin both
-        the priority detection in the parser and the projection through
-        to the wire shape."""
+    def test_round_trips_important_priority(self):
+        """The ``important`` priority preamble round-trips — pin both the
+        priority detection in the parser and the projection through to the
+        wire shape."""
         from turnstone.core.tool_advisory import UserInterjection, wrap_tool_result
-        from turnstone.server import _build_history
 
         wrapped = wrap_tool_result(
             "out",
             [UserInterjection(message="urgent", priority="important")],
         )
-        session = self._session_with_messages(
-            [{"role": "tool", "tool_call_id": "call_a", "content": wrapped}]
-        )
-        history = _build_history(session)
+        msgs: list[dict] = [{"role": "tool", "tool_call_id": "call_a", "content": wrapped}]
+        decorate_history_messages(msgs, {}, {})
+        history = project_history_messages(msgs)
         assert history[0]["content"] == "out"
         assert history[0]["advisories"] == [
             {"type": "user_interjection", "text": "urgent", "priority": "important"}
         ]
 
-    def test_build_history_no_envelope_passes_through_unchanged(self):
-        """Plain tool content (no ``<tool_output>`` prefix) — no
-        advisories field, content unchanged."""
-        from turnstone.server import _build_history
-
-        session = self._session_with_messages(
-            [{"role": "tool", "tool_call_id": "call_a", "content": "plain output"}]
-        )
-        history = _build_history(session)
+    def test_no_envelope_passes_through_unchanged(self):
+        """Plain tool content (no ``<tool_output>`` prefix) — no advisories
+        field, content unchanged."""
+        msgs: list[dict] = [{"role": "tool", "tool_call_id": "call_a", "content": "plain output"}]
+        decorate_history_messages(msgs, {}, {})
+        history = project_history_messages(msgs)
         assert history[0]["content"] == "plain output"
         assert "advisories" not in history[0]
 
-    def test_build_history_round_trip_through_full_decoration_chain(self):
-        """End-to-end pin: persist a wrapped envelope into ``messages``,
-        run the full decoration chain (``decorate_history_messages``
-        followed by ``_build_history``), assert the wire shape carries
-        the advisory.  This pins the contract every component in the
-        chain participates in — REST ``/history`` callers go through
-        ``decorate_history_messages``, and SSE replay goes through
-        ``_build_history`` — both must produce the same wire shape.
-        """
-        from turnstone.core.history_decoration import decorate_history_messages
-        from turnstone.core.tool_advisory import UserInterjection, wrap_tool_result
-        from turnstone.server import _build_history
+    def test_extracts_advisories_from_list_content_text_part(self):
+        """List-typed tool output (image / structured MCP results) with a
+        Seam 1 splice carries the wrap envelope as a separate text part
+        (``session.py``'s tool-result loop appends
+        ``{"type": "text", "text": wrap_tool_result("", advisories)}`` when
+        ``output`` is a list).  ``decorate_history_messages`` skips non-
+        string content, so ``project_history_messages`` owns this: it
+        extracts the advisory from the carrier part, drops it, and joins
+        the remaining text parts to a string (non-text parts like
+        image_url are dropped — the renderers consume a string).
 
-        wrapped = wrap_tool_result(
-            "raw",
-            [UserInterjection(message="hi", priority="notice")],
-        )
-        # Decorate first — REST /history shape.
-        rest_messages: list[dict] = [{"role": "tool", "tool_call_id": "call_a", "content": wrapped}]
-        decorate_history_messages(rest_messages, {}, {})
-        # And separately drive _build_history with a fresh undecorated
-        # message — SSE replay shape.
-        session = self._session_with_messages(
-            [{"role": "tool", "tool_call_id": "call_a", "content": wrapped}]
-        )
-        sse_history = _build_history(session)
-        # Both surfaces produce the same advisory + cleaned content.
-        assert rest_messages[0]["content"] == "raw"
-        assert rest_messages[0]["advisories"] == [
-            {"type": "user_interjection", "text": "hi", "priority": "notice"}
-        ]
-        assert sse_history[0]["content"] == "raw"
-        assert sse_history[0]["advisories"] == [
-            {"type": "user_interjection", "text": "hi", "priority": "notice"}
-        ]
-
-    def test_build_history_extracts_advisories_from_list_content_text_part(self):
-        """List-typed tool output (image / structured MCP results)
-        with a Seam 1 splice carries the wrap envelope as a separate
-        text part (``session.py``'s tool-result loop appends
-        ``{"type": "text", "text": wrap_tool_result("", advisories)}``
-        when ``output`` is a list).  ``_build_history`` must walk the
-        list parts, extract advisories from any wrap-envelope text
-        part, and DROP that text part from the projected list — the
-        cleaned inner content is empty by construction, and leaving
-        the part would cause the JS replay to render the literal
-        envelope text as a chunk inside the tool block AND fail to
-        render the queued message as a user bubble.
-
-        Removing the list-content branch in ``_build_history``'s tool-
-        message advisory extraction breaks this test.
+        Removing the list-content branch in ``project_history_messages``
+        breaks this test.
         """
         from turnstone.core.tool_advisory import UserInterjection, wrap_tool_result
-        from turnstone.server import _build_history
 
         wrap_text = wrap_tool_result(
             "",
@@ -1280,47 +1183,30 @@ class TestBuildHistoryAdvisoryRoundTrip:
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,xxx"}},
             {"type": "text", "text": wrap_text},
         ]
-        session = self._session_with_messages(
+        history = project_history_messages(
             [{"role": "tool", "tool_call_id": "call_a", "content": list_content}]
         )
-        history = _build_history(session)
-        # Wire-shape content keeps the original text + image parts but
-        # has the wrap text-part dropped.
-        wire_content = history[0]["content"]
-        assert isinstance(wire_content, list)
-        assert len(wire_content) == 2
-        assert wire_content[0] == {"type": "text", "text": "the chart shows X"}
-        assert wire_content[1] == {
-            "type": "image_url",
-            "image_url": {"url": "data:image/png;base64,xxx"},
-        }
-        # Advisory rides on the wire so JS replay renders the user
-        # bubble after the tool block — same contract as the string-
-        # content path.
+        # Content coerced to a string: text parts joined, carrier + non-text
+        # (image_url) parts dropped — matches the live renderer contract.
+        assert history[0]["content"] == "the chart shows X"
+        # Advisory rides on the wire so JS replay renders the user bubble
+        # after the tool block — same contract as the string-content path.
         assert history[0]["advisories"] == [
-            {
-                "type": "user_interjection",
-                "text": "inspect histogram",
-                "priority": "notice",
-            }
+            {"type": "user_interjection", "text": "inspect histogram", "priority": "notice"}
         ]
 
-    def test_build_history_keeps_legitimate_envelope_text_part_with_body(self):
-        """A tool that legitimately produces output containing a
-        well-formed ``<tool_output>`` envelope as a text part (e.g.
-        documentation viewer, code analyzer demoing the wrapper, an
-        echo tool) must NOT have that part dropped on replay.  The
-        list-content drop heuristic must require both an empty cleaned
-        inner body AND at least one extracted advisory — the
-        signature of the injected ``wrap_tool_result("", advisories)``
-        carrier.  A legitimate tool envelope has non-empty inner body
-        OR no advisories, and stays in the projected list verbatim.
+    def test_keeps_legitimate_envelope_text_part_with_body(self):
+        """A tool that legitimately produces output containing a well-formed
+        ``<tool_output>`` envelope as a text part (e.g. documentation
+        viewer, code analyzer) must NOT have that part dropped on replay.
+        The drop heuristic requires both an empty cleaned inner body AND at
+        least one extracted advisory — the signature of the injected
+        ``wrap_tool_result("", advisories)`` carrier.  A legitimate
+        envelope has a non-empty inner body OR no advisories, so it stays
+        in the joined content verbatim.
 
-        Removing the ``not cleaned_text and advisories_from_part``
-        guard breaks this test (the legitimate envelope gets dropped
-        from the wire content)."""
-        from turnstone.server import _build_history
-
+        Removing the ``not cleaned_text and advisories_from_part`` guard
+        breaks this test (the legitimate envelope gets dropped)."""
         legit_envelope_text = (
             "<tool_output>\nThis is what a tool_output envelope looks like.\n</tool_output>"
         )
@@ -1328,17 +1214,12 @@ class TestBuildHistoryAdvisoryRoundTrip:
             {"type": "text", "text": "doc preview:"},
             {"type": "text", "text": legit_envelope_text},
         ]
-        session = self._session_with_messages(
+        history = project_history_messages(
             [{"role": "tool", "tool_call_id": "call_a", "content": list_content}]
         )
-        history = _build_history(session)
-        # All parts survive — none dropped.
-        wire_content = history[0]["content"]
-        assert isinstance(wire_content, list)
-        assert len(wire_content) == 2
-        assert wire_content[1]["text"] == legit_envelope_text
-        # No advisories surfaced (no system-reminder blocks were
-        # extracted from the legitimate envelope).
+        # Both text parts survive (joined to a string) — none dropped.
+        assert history[0]["content"] == "doc preview:\n" + legit_envelope_text
+        # No advisories surfaced (no system-reminder blocks were extracted).
         assert "advisories" not in history[0]
 
 

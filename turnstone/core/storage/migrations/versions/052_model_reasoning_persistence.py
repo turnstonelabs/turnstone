@@ -7,8 +7,8 @@ Adds two boolean (integer-coded) operator knobs:
   ``provider_data`` and surfaces it on each assistant message dict so a
   page refresh re-renders the reasoning bubble. **Storage of the
   reasoning bytes happens regardless of this flag** — it only controls
-  the extract-and-include step in ``_build_history`` /
-  ``decorate_history_messages``.  The pre-rename column was
+  the extract-and-include step in ``extract_reasoning_for_history``
+  (the REST ``/history`` reasoning surfacing).  The pre-rename column was
   ``persist_reasoning``; the rename to ``surface_persisted_reasoning``
   happened in the review-fix wave because the original name implied a
   storage-control switch when the flag is purely about UI rehydration.

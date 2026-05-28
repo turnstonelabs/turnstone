@@ -2,9 +2,8 @@
 
 Phase 1 of optional reasoning persistence surfaces stored thinking
 blocks on the ``/history`` payload (UI rehydration). The bytes ride
-through the helper (``extract_reasoning_for_history``), through the
-provider extractor (``AnthropicProvider.extract_reasoning_text``), and
-through the server build path (``_build_history``).
+through the helper (``extract_reasoning_for_history``) and the provider
+extractor (``AnthropicProvider.extract_reasoning_text``).
 
 This test pins the security-sensitive contract:
 
@@ -37,7 +36,6 @@ from turnstone.core.providers._anthropic import AnthropicProvider
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
 from turnstone.core.providers._protocol import StreamChunk, UsageInfo
-from turnstone.server import _build_history
 
 _MARKER = "SECRET_REASONING_MARKER_xyz123_unlikely_collision"
 
@@ -168,36 +166,6 @@ class TestReasoningAuditLogDiscipline:
         assert offending == [], (
             f"extract_reasoning_for_history leaked reasoning text into INFO+ logs: {offending}"
         )
-
-    def test_build_history_does_not_log_reasoning(self) -> None:
-        registry = SimpleNamespace(
-            get_config=lambda alias: SimpleNamespace(surface_persisted_reasoning=True)
-        )
-        session = SimpleNamespace(
-            messages=[self._thinking_msg(_MARKER)],
-            _ws_id="ws-audit",
-            _registry=registry,
-            _model_alias="claude-opus-4-7",
-        )
-        captured, patchers = _capture_log_calls()
-        for p in patchers:
-            p.start()
-        try:
-            with patch(
-                "turnstone.server._load_verdict_indexes",
-                return_value=({}, {}),
-            ):
-                history = _build_history(session)
-            assert history[0]["reasoning"] == _MARKER  # UI-bound is allowed
-        finally:
-            for p in patchers:
-                p.stop()
-        offending = [
-            (lvl, args, kwargs)
-            for lvl, args, kwargs in captured
-            if _payload_contains_marker(args, kwargs)
-        ]
-        assert offending == [], f"_build_history leaked reasoning text into INFO+ logs: {offending}"
 
     # ------------------------------------------------------------------
     # Phase 2 + Phase 3 surfaces — added in response to a code-review

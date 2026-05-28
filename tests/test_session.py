@@ -3847,7 +3847,7 @@ class TestMetacognitiveBuffers:
         session._queue_user_advisory("correction", "watch out")
         msg = {"role": "user", "content": "noted"}
         session._attach_pending_user_reminders(msg)
-        # on_user_reminder called with the same shape as _build_history
+        # on_user_reminder called with the same shape project_history_messages
         # surfaces — list of {type, text} dicts.  ``source`` rides as
         # a kwarg (None for non-wake correction nudges); inspect via
         # ``call_args.args`` for the positional reminders payload only.
@@ -4275,7 +4275,7 @@ class TestApplyRemindersForProvider:
         """Defensive: a non-dict element in ``_reminders`` (corruption,
         partial state, future-shape rollback) must be silently skipped
         rather than aborting ``send`` via ``AttributeError`` on the
-        ``.get`` call.  Mirrors the filter in ``_build_history``."""
+        ``.get`` call.  Mirrors the filter in ``project_history_messages``."""
         session = _make_session()
         msg = {
             "role": "user",
@@ -5193,7 +5193,7 @@ class TestReminderSidechannelIsolation:
 
 class TestSessionUIBaseUserReminderHook:
     """``on_user_reminder`` enqueues a ``user_reminder`` SSE event with
-    the same shape ``_build_history`` surfaces, so live tabs and
+    the same shape ``project_history_messages`` surfaces, so live tabs and
     reconnecting tabs render the same reminder payload."""
 
     def test_on_user_reminder_enqueues_sse_event(self):

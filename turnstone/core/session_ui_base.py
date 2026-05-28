@@ -1964,8 +1964,8 @@ class SessionUIBase:
         SSE consumer (other browser tabs, CLI mirrors, future channel
         adapters) render the reminder bubble in lockstep with the
         originating tab.  The history-replay path surfaces the same
-        shape via ``_build_history`` so a tab reconnecting later
-        renders the same bubble.
+        shape via ``project_history_messages`` (the REST ``/history``
+        projection) so a tab reconnecting later renders the same bubble.
 
         ``source`` mirrors the user-message dict's ``_source`` field
         (today only ``"system_nudge"`` for wake-driven reminders).  The

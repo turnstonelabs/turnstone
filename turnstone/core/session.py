@@ -2788,7 +2788,8 @@ class ChatSession:
             # Defensive filter — only dict entries are valid; a string /
             # None / other shape from corruption or partial state must
             # not abort the whole send via an AttributeError on .get().
-            # Mirrors the same filter ``_build_history`` applies on the
+            # Mirrors the same filter ``project_history_messages``
+            # (turnstone.core.history_decoration) applies on the
             # wire-out side.
             reminders = [r for r in raw_reminders if isinstance(r, dict)]
             if not reminders:
@@ -2878,8 +2879,8 @@ class ChatSession:
         skip messages with this flag, so the model sees each reminder
         exactly once (the turn it advised).  The flag is a sibling key
         like ``_reminders`` itself; ``sanitize_messages`` strips both
-        before the wire and ``_build_history`` ignores the delivered
-        flag entirely so UI replay parity is preserved across
+        before the wire and ``project_history_messages`` ignores the
+        delivered flag entirely so UI replay parity is preserved across
         reconnects.
         """
         for msg in self.messages:

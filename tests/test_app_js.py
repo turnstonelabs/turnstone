@@ -9,18 +9,13 @@ manual testing.
 
 from __future__ import annotations
 
-import json
 import re
-import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
 _APP_JS = Path(__file__).resolve().parent.parent / "turnstone/ui/static/app.js"
-_NORMALIZE_JS = (
-    Path(__file__).resolve().parent.parent / "turnstone/shared_static/history_normalize.js"
-)
 
 
 def _pane_method_offset(body: str, name: str) -> int:
@@ -1430,116 +1425,20 @@ def test_interactive_history_is_rest_first_not_sse() -> None:
     # The inline SSE ``history`` event is no longer emitted server-side,
     # so the client must not handle it (history is REST-only now).
     assert 'case "history":' not in body
-    # The raw REST /history shape is provider-native and differs from the
-    # projected shape replayHistory renders — interactive must normalize it
-    # and must load the shared normalizer script.
-    assert "normalizeHistoryMessages" in body, (
-        "interactive must normalize the raw REST /history shape before "
-        "replayHistory (see history_normalize.js)"
+    # The server now projects the canonical wire shape at /history
+    # (make_history_handler → project_history_messages), so interactive
+    # feeds the payload straight to replayHistory — the client-side
+    # normaliser (history_normalize.js) was retired.
+    assert "normalizeHistoryMessages" not in body, (
+        "the client-side history normaliser was retired — interactive must "
+        "consume the server-projected /history shape directly"
+    )
+    assert "this.replayHistory(data.messages" in body, (
+        "interactive must feed the projected REST /history payload straight to replayHistory"
     )
     idx = (Path(__file__).resolve().parent.parent / "turnstone/ui/static/index.html").read_text(
         encoding="utf-8"
     )
-    assert "/shared/history_normalize.js" in idx, (
-        "index.html must load the shared history normalizer"
+    assert "/shared/history_normalize.js" not in idx, (
+        "the retired history_normalize.js script tag must be removed from index.html"
     )
-
-
-@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
-def test_normalize_history_projects_rest_shape_to_wire_shape() -> None:
-    """``normalizeHistoryMessages`` (history_normalize.js) must convert the
-    raw provider-native REST ``/history`` payload into the projected shape
-    ``replayHistory`` renders. This pins the JS projection SHAPE — it runs
-    only the JS under node and does NOT execute the Python projection, so
-    it is a shape-regression guard, not a cross-language parity check (a
-    true parity assertion against ``decorate_history_messages`` is left to
-    the planned server-side unification). Run under node (the function is
-    pure / DOM-free) so the projection logic is actually exercised, not
-    just string-present. Guards the interactive render bug:
-    the REST shape nests tool_calls under ``function`` and uses
-    ``_source`` / ``_reminders`` / ``_attachments_meta`` side-channels, which
-    the pre-normalizer renderer choked on (``JSON.parse(undefined)`` →
-    ``TypeError`` → render abort masked as an empty pane)."""
-    raw = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "hi"},
-                {"type": "image_url", "image_url": {}},
-            ],
-            "_source": "system_nudge",
-            "_reminders": [
-                {"type": "correction", "text": "fix", "secret": "x"},
-                {"type": "", "text": ""},
-            ],
-            "_attachments_meta": [{"kind": "image", "filename": "p.png", "mime_type": "image/png"}],
-        },
-        {
-            "role": "assistant",
-            "content": "ok",
-            "reasoning": "think",
-            "tool_calls": [
-                {
-                    "id": "c1",
-                    "type": "function",
-                    "function": {"name": "web_search", "arguments": '{"q":1}'},
-                    "verdict": {"tier": "judge"},
-                }
-            ],
-        },
-        {"role": "tool", "tool_call_id": "c1", "content": "res"},
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": "c2", "function": {"name": "bash", "arguments": "{}"}}],
-        },
-        {"role": "tool", "tool_call_id": "c2", "content": "Denied by user: no"},
-        {"role": "tool", "tool_call_id": "cx", "content": "Error: boom"},
-        # mid-conversation orphan: tool_call with no result that is NOT the
-        # last tool turn → must still render (not vanish), so NOT pending.
-        {
-            "role": "assistant",
-            "tool_calls": [{"id": "c_mid", "function": {"name": "g", "arguments": "{}"}}],
-        },
-        # trailing orphan: last tool turn with no result → pending (awaiting).
-        {
-            "role": "assistant",
-            "tool_calls": [{"id": "c3", "function": {"name": "f", "arguments": "{}"}}],
-        },
-    ]
-    node_script = (
-        "const {normalizeHistoryMessages} = require("
-        + json.dumps(str(_NORMALIZE_JS))
-        + "); process.stdout.write(JSON.stringify(normalizeHistoryMessages("
-        + json.dumps(raw)
-        + ")));"
-    )
-    proc = subprocess.run(
-        ["node", "-e", node_script],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert proc.returncode == 0, proc.stderr
-    out = json.loads(proc.stdout)
-
-    # tool_calls flattened (the crash fix): name/arguments/verdict top-level
-    assert out[1]["tool_calls"][0]["name"] == "web_search"
-    assert out[1]["tool_calls"][0]["arguments"] == '{"q":1}'
-    assert out[1]["tool_calls"][0]["verdict"]["tier"] == "judge"
-    # multipart user content collapsed; side-channels surfaced top-level
-    assert out[0]["content"] == "hi"
-    assert out[0]["attachments"][0]["filename"] == "p.png"
-    assert out[0]["source"] == "system_nudge"
-    reminder_types = [r["type"] for r in out[0]["reminders"]]
-    assert reminder_types == ["correction"]  # empty entry filtered
-    assert "secret" not in out[0]["reminders"][0]  # unknown key stripped
-    # derived + propagated flags (the REST shape pre-sets none of these)
-    assert out[4]["denied"] is True  # tool deny derived from content prefix
-    assert out[3]["denied"] is True  # propagated to the parent assistant turn
-    assert out[5]["is_error"] is True  # tool error derived from content prefix
-    # pending: ONLY the last tool turn with an orphan (proxy for awaiting);
-    # a mid-conversation orphan still renders its tool block (bug-2 fix).
-    assert out[7].get("pending") is True  # trailing orphan = last tool turn → pending
-    assert "pending" not in out[6]  # mid-conversation orphan → renders, NOT pending
-    assert "pending" not in out[1]  # completed tool_call is not pending

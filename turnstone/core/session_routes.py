@@ -2489,6 +2489,7 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
                     decorate_history_messages,
                     extract_reasoning_for_history,
                     load_verdict_indexes,
+                    project_history_messages,
                 )
 
                 indexes = await asyncio.to_thread(load_verdict_indexes, ws_id)
@@ -2552,6 +2553,17 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
                 await asyncio.to_thread(
                     extract_reasoning_for_history, messages, surface_persisted_reasoning
                 )
+                # Final structural projection: flatten nested tool_calls,
+                # collapse multipart content, surface the
+                # ``_source`` / ``_reminders`` / ``_attachments_meta``
+                # side-channels top-level, and derive
+                # ``denied`` / ``is_error`` / ``pending``.  Runs last (reads
+                # decorate's in-place verdict/advisory mutations + the
+                # stamped ``reasoning``) and returns a fresh list, so the
+                # wire payload is the canonical render shape both the
+                # interactive ``replayHistory`` and the coordinator history
+                # rebuild consume directly — no client-side normaliser.
+                messages = await asyncio.to_thread(project_history_messages, messages)
             except Exception:
                 # Operationally interesting: a persistent decoration
                 # failure (missing migration, driver mismatch, schema

@@ -1058,11 +1058,12 @@ warns if the summary was truncated.
   unhandled promise rejections
 - **Pending approval across tab switches**: `WebUI._pending_approval` stores
   the `approve_request` event payload while the session is blocked waiting
-  for user response. On SSE reconnect (e.g., switching back to the tab),
-  the event is re-injected after history replay. `_build_history` marks the
-  pending tool call as `"pending": true` so `replayHistory` skips the
-  false `✓ approved` badge; the live approval UI is rendered by the
-  re-injected event instead.
+  for user response. On tab switch / reconnect the pane reloads history via
+  REST `GET /history` and then reconnects SSE; the live approval event is
+  re-injected. The server-side `project_history_messages` projection marks
+  the trailing orphan tool-call turn `"pending": true` so `replayHistory`
+  skips the false `✓ approved` badge; the live approval UI is rendered by
+  the re-injected event instead.
 - **Browser history integration**: `history.pushState` is called in
   `switchTab()` with `{turnstone: 'workstream', wsId}`. The initial state is
   seeded with `history.replaceState({turnstone: 'dashboard'})` on load. The

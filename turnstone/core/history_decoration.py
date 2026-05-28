@@ -1,16 +1,20 @@
-"""Shared history-replay decoration helpers.
+"""Shared history-replay projection + decoration helpers.
 
-Both surfaces that build a history wire payload — interactive's SSE
-``_build_history`` and the lifted ``make_history_handler`` REST
-endpoint — need the same audit-trail data attached to each
-``tool_calls`` entry: the persisted intent verdict (``intent_verdicts``
-table) and the output-guard assessment (``output_assessments`` table).
+The REST ``make_history_handler`` (``GET /history``) endpoint is the
+single surface that builds the history wire payload for both kinds. Its
+pipeline composes the helpers in this module: load the audit-trail
+indexes, :func:`decorate_history_messages` (attach the persisted intent
+verdict from ``intent_verdicts`` + output-guard assessment from
+``output_assessments`` to each ``tool_calls`` entry, strip string
+``<tool_output>`` envelopes), :func:`extract_reasoning_for_history`
+(surface stored reasoning), then :func:`project_history_messages` (the
+final structural projection both UIs — interactive ``replayHistory``
+and the coordinator dashboard — consume directly).
 
-Centralising the lookup + decoration here keeps the two surfaces from
-drifting on which fields ship to the client and how they're shaped.
-The shared helpers also let us project only the fields the UI actually
-renders, dropping redundant ones (``call_id``/``func_name`` already
-carried on ``tc.id``/``tc.name``) so the wire payload stays tight.
+Centralising the projection here is what keeps the wire shape single-
+sourced: the helpers project only the fields the UI renders, dropping
+redundant ones (``call_id``/``func_name`` already carried on
+``tc.id``/``tc.name``) so the wire payload stays tight.
 
 All functions are pure I/O or pure transforms — safe to call from
 either an async caller (via ``asyncio.to_thread``) or a sync hook.
@@ -27,6 +31,7 @@ from turnstone.core.tool_advisory import (
     _USER_INTERJECTION_IMPORTANT_PREAMBLE,
     _USER_INTERJECTION_NOTICE_PREAMBLE,
 )
+from turnstone.core.watch import WATCH_REMINDER_OPTIONAL_KEYS
 
 log = get_logger(__name__)
 
@@ -140,14 +145,12 @@ def decorate_tool_call(
 ) -> None:
     """Mutate ``tc`` in place, attaching ``verdict`` / ``output_assessment``.
 
-    Works on either tool_call shape:
-    - OpenAI format (``{id, function: {name, arguments}}``) — used by
-      ``/history`` REST.
-    - Flattened format (``{id, name, arguments}``) — used by SSE replay.
-
-    Both carry ``id`` at the top level, which is the only field this
-    helper reads.  No-ops cleanly when the call_id has no matching
-    row (unflagged tools stay clean).
+    Reads only ``id`` (top-level on every tool_call shape), so it works on
+    either the OpenAI-nested ``{id, function: {name, arguments}}`` shape —
+    what ``decorate_history_messages`` passes from the REST ``/history``
+    pipeline — or a flattened ``{id, name, arguments}`` shape.  No-ops
+    cleanly when the call_id has no matching row (unflagged tools stay
+    clean).
     """
     call_id = tc.get("id", "") or ""
     if not call_id:
@@ -362,10 +365,10 @@ def extract_reasoning_text_from_provider_content(provider_content: Any) -> str:
     drop the reasoning under an index-only check.  Same robustness
     point for Anthropic's hypothetical mixed-order outputs.
 
-    Pure transform — safe from any thread.  Both history surfaces
-    (interactive ``_build_history`` and lifted ``make_history_handler``)
-    call this directly.  See ``_BLOCK_TYPE_PROVIDER_FACTORY`` above
-    for the recognised block types and the providers that own them.
+    Pure transform — safe from any thread.  The REST ``/history``
+    reasoning surfacing (:func:`extract_reasoning_for_history`) calls
+    this directly.  See ``_BLOCK_TYPE_PROVIDER_FACTORY`` above for the
+    recognised block types and the providers that own them.
     """
     if not isinstance(provider_content, list) or not provider_content:
         return ""
@@ -397,12 +400,11 @@ def extract_reasoning_for_history(
     dispatcher returned non-empty text.  Strips ``_provider_content``
     unconditionally — the field is internal and never read by either UI.
 
-    The interactive ``_build_history`` surface DOES NOT call this
-    helper; it builds new entry dicts from scratch and calls
-    :func:`extract_reasoning_text_from_provider_content` directly per
-    assistant message, stamping ``entry["reasoning"]`` inline.  The two
-    surfaces converge on the same dispatcher; only the mutation shape
-    differs.
+    Runs before :func:`project_history_messages` in the ``/history``
+    pipeline: this helper stamps ``msg["reasoning"]`` (and strips
+    ``_provider_content``), then the projection passes that ``reasoning``
+    field through to the wire payload — the projection never re-reads
+    ``_provider_content`` (it is gone by then).
 
     Pure transform.  Safe to call from ``asyncio.to_thread``.
     """
@@ -514,3 +516,286 @@ def decorate_history_messages(
             msg["content"] = cleaned
             if advisories:
                 msg["advisories"] = advisories
+
+
+def project_history_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Project decorated storage messages into the canonical wire shape.
+
+    This is the SINGLE server-side projection that both the interactive
+    ``replayHistory`` renderer and the coordinator dashboard's history
+    rebuild consume.  It runs LAST in the ``make_history_handler``
+    pipeline — after :func:`decorate_history_messages` (verdict /
+    output_assessment + STRING ``<tool_output>`` advisory stripping) and
+    :func:`extract_reasoning_for_history` (``reasoning`` stamping +
+    ``_provider_content`` strip) — and reshapes the provider-native
+    ``reconstruct_messages`` storage shape into the flat render shape:
+
+    - multipart user ``content`` → plain string + derived ``attachments``
+      (the ``_attachments_meta`` side-channel wins when present);
+    - ``_source`` → ``source``; ``_reminders`` → filtered ``reminders``;
+    - nested ``tool_calls[].function.{name,arguments}`` → flat
+      ``{id, name, arguments}`` carrying the decoration (``verdict`` /
+      ``output_assessment``) already placed on the call by
+      :func:`decorate_tool_call`;
+    - ``reasoning`` passes through (already stamped upstream — this
+      projection NEVER reads ``_provider_content``, which is gone by now);
+    - tool results: surface ``advisories``, coerce list content to a
+      string, derive ``denied`` / ``is_error`` from the content prefix;
+    - ``denied`` propagates from a tool result to its parent assistant
+      turn; ``pending`` marks ONLY the last assistant tool-call turn that
+      still has an orphan (a tool_call with no result in the window).
+
+    Two projection responsibilities live HERE and nowhere else:
+
+    * **List-content advisory extraction.**  A queued ``UserInterjection``
+      spliced into a LIST-typed tool result (image / structured MCP
+      output) rides as an appended ``wrap_tool_result("", advisories)``
+      carrier part.  :func:`decorate_history_messages` only handles
+      STRING content, so the carrier survives to here; this projection
+      extracts the advisories and drops the carrier part.  STRING
+      envelopes are already stripped upstream, so their ``advisories``
+      pass through untouched — we never double-extract.
+    * **List → string coercion** of tool content: the renderers require a
+      string (``replayHistory`` calls ``stripAnsi(content).trim()``;
+      coord joins text parts), so a LIST tool ``content`` is reduced to
+      its joined text parts here.
+
+    Returns a NEW list of NEW entry dicts (strict 1:1 with *messages*) —
+    never mutates the input.  Pure transform; safe from any thread.
+    """
+    # Pre-scan: which tool_call_ids have a result message?  An assistant
+    # tool_call with no result is an orphan; only the LAST such turn is
+    # marked "pending" (see the reversed single-turn marking below) —
+    # a mid-conversation orphan (cancelled / interrupted) must still
+    # render its tool block, so it is deliberately left unmarked.
+    resulted_call_ids: set[str] = set()
+    for msg in messages:
+        if msg.get("role") == "tool":
+            cid = msg.get("tool_call_id")
+            if cid:
+                resulted_call_ids.add(str(cid))
+
+    history: list[dict[str, Any]] = []
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content")
+        attachments_meta: list[dict[str, Any]] = []
+
+        # (1) Collapse multipart user content (text + image_url / document
+        #     parts) to a plain string + a derived attachment list.
+        if role == "user" and isinstance(content, list):
+            text_parts: list[str] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                ptype = part.get("type")
+                if ptype == "text":
+                    text_parts.append(str(part.get("text", "")))
+                elif ptype == "image_url":
+                    attachments_meta.append({"kind": "image", "filename": "", "mime_type": ""})
+                elif ptype == "document":
+                    d = part.get("document", {})
+                    attachments_meta.append(
+                        {
+                            "kind": "text",
+                            "filename": str(d.get("name", "")),
+                            "mime_type": str(d.get("media_type", "")),
+                        }
+                    )
+            content = "\n".join(text_parts)
+
+        # (2) The authoritative ``_attachments_meta`` side-channel wins
+        #     when present (carries image filenames the image_url part
+        #     itself can't express).
+        side_meta = msg.get("_attachments_meta")
+        if isinstance(side_meta, list) and side_meta:
+            attachments_meta = [
+                {
+                    "kind": str(m.get("kind") or ""),
+                    "filename": str(m.get("filename") or ""),
+                    "mime_type": str(m.get("mime_type") or ""),
+                }
+                for m in side_meta
+                if isinstance(m, dict)
+            ]
+
+        entry: dict[str, Any] = {"role": role, "content": content}
+        if attachments_meta:
+            entry["attachments"] = attachments_meta
+
+        # (3) ``_source`` side-channel → top-level ``source`` (drives the
+        #     ``.msg.user.system-nudge`` marker on replay).
+        if msg.get("_source"):
+            entry["source"] = str(msg["_source"])
+
+        # (4) ``_reminders`` side-channel → top-level ``reminders``,
+        #     filtered + key-projected.  Filter first so an all-malformed
+        #     list doesn't set the field to ``[]`` (absent vs empty mean
+        #     the same on the wire); project on a known key set to narrow
+        #     the blast radius if a producer stuffs extra fields.
+        reminders = msg.get("_reminders")
+        if isinstance(reminders, list):
+            clean_reminders: list[dict[str, Any]] = []
+            for r in reminders:
+                if not isinstance(r, dict):
+                    continue
+                rtype = str(r.get("type") or "")
+                rtext = str(r.get("text") or "")
+                if not rtype and not rtext:
+                    continue
+                clean: dict[str, Any] = {"type": rtype, "text": rtext}
+                for opt_key in WATCH_REMINDER_OPTIONAL_KEYS:
+                    if opt_key in r:
+                        clean[opt_key] = r[opt_key]
+                clean_reminders.append(clean)
+            if clean_reminders:
+                entry["reminders"] = clean_reminders
+
+        # (5) Reasoning is already stamped by ``extract_reasoning_for_history``
+        #     (gated on the active model's surface_persisted_reasoning flag) —
+        #     pass it through.  This projection never re-extracts from
+        #     ``_provider_content`` (already stripped upstream).
+        if msg.get("reasoning"):
+            entry["reasoning"] = msg["reasoning"]
+
+        # (6) Flatten OpenAI-nested tool_calls ``{id, function:{name,
+        #     arguments}}`` → ``{id, name, arguments}`` that the renderers
+        #     read, carrying the decoration (``verdict`` /
+        #     ``output_assessment``) ``decorate_tool_call`` placed on the
+        #     nested call.
+        tool_calls = msg.get("tool_calls")
+        if tool_calls:
+            tc_entries: list[dict[str, Any]] = []
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                arguments = fn.get("arguments")
+                if arguments is None:
+                    arguments = tc.get("arguments")
+                if arguments is None:
+                    arguments = ""
+                tc_entry: dict[str, Any] = {
+                    "id": tc.get("id", "") or "",
+                    "name": fn.get("name") or tc.get("name") or "",
+                    "arguments": arguments,
+                }
+                if tc.get("verdict"):
+                    tc_entry["verdict"] = tc["verdict"]
+                if tc.get("output_assessment"):
+                    tc_entry["output_assessment"] = tc["output_assessment"]
+                tc_entries.append(tc_entry)
+            entry["tool_calls"] = tc_entries
+
+        # (7) Tool results: carry ``tool_call_id`` + ``advisories``, coerce
+        #     list content to text (extracting list-envelope advisories
+        #     along the way), and derive ``denied`` / ``is_error`` from the
+        #     content prefix — the storage shape pre-sets none of these.
+        if role == "tool":
+            result_call_id = msg.get("tool_call_id")
+            if result_call_id:
+                entry["tool_call_id"] = str(result_call_id)
+            # STRING-content advisories were already surfaced by
+            # ``decorate_history_messages`` (on ``msg["advisories"]``);
+            # pass them through.  LIST-content envelopes are extracted
+            # here (decorate skips non-string content).
+            existing_advisories = msg.get("advisories")
+            extracted_advisories: list[dict[str, str]] = []
+            if isinstance(content, list):
+                # The Seam 1 splice rides as an appended
+                # ``wrap_tool_result("", advisories)`` carrier part — the
+                # inner cleaned content is empty by construction.  Drop the
+                # carrier part ONLY when the parser accepted the envelope
+                # AND the cleaned inner is empty AND at least one advisory
+                # survived; a tool legitimately emitting an envelope with a
+                # non-empty body is left in place.
+                kept_text: list[str] = []
+                for part in content:
+                    text = (
+                        part.get("text")
+                        if isinstance(part, dict) and part.get("type") == "text"
+                        else None
+                    )
+                    if isinstance(text, str) and text.startswith("<tool_output>\n"):
+                        try:
+                            extracted = extract_advisories_from_tool_envelope(text)
+                        except Exception:
+                            extracted = None
+                        if extracted is not None:
+                            cleaned_text, advisories_from_part = extracted
+                            if not cleaned_text and advisories_from_part:
+                                extracted_advisories.extend(advisories_from_part)
+                                continue
+                    if isinstance(text, str):
+                        kept_text.append(text)
+                content = "\n".join(kept_text)
+                entry["content"] = content
+            if isinstance(content, str):
+                if content.startswith("Denied by user") or content.startswith("Blocked"):
+                    entry["denied"] = True
+                # Persisted flag wins; fall back to the text heuristic for
+                # historical data that predates ``is_error``.
+                if (
+                    msg.get("is_error")
+                    or content.startswith("Error")
+                    or content.startswith("Command timed out")
+                    or content.startswith("Search timed out")
+                    or content.startswith("Unknown tool:")
+                    or content.startswith("JSON parse error:")
+                    or content.startswith("MCP prompt timed out")
+                    or content.startswith("MCP prompt error")
+                ):
+                    entry["is_error"] = True
+            # Surface advisories on the wire (string: passed through from
+            # decorate; list: extracted just above).  Project on a known
+            # key set, mirroring the ``reminders`` filter.
+            advisories_src: list[dict[str, Any]] = (
+                extracted_advisories
+                if extracted_advisories
+                else (existing_advisories if isinstance(existing_advisories, list) else [])
+            )
+            if advisories_src:
+                clean_advisories: list[dict[str, Any]] = []
+                for a in advisories_src:
+                    if not isinstance(a, dict):
+                        continue
+                    atype = str(a.get("type") or "")
+                    atext = str(a.get("text") or "")
+                    if not atype or not atext:
+                        continue
+                    clean_advisories.append(
+                        {
+                            "type": atype,
+                            "text": atext,
+                            "priority": str(a.get("priority") or "notice"),
+                        }
+                    )
+                if clean_advisories:
+                    entry["advisories"] = clean_advisories
+
+        history.append(entry)
+
+    # (8) Propagate denial from a tool result to its parent assistant turn
+    #     so the tool block renders the denied (not approved) badge.
+    last_assistant_idx: int | None = None
+    for idx, entry in enumerate(history):
+        if entry.get("tool_calls"):
+            last_assistant_idx = idx
+        elif entry.get("role") == "tool" and entry.get("denied") and last_assistant_idx is not None:
+            history[last_assistant_idx]["denied"] = True
+
+    # (9) Mark ``pending`` ONLY on the LAST assistant tool-call turn, and
+    #     only when it has an orphan (a tool_call with no result in the
+    #     loaded window) — the proxy for "awaiting approval".  A
+    #     mid-conversation cancelled/interrupted tool call is also an
+    #     orphan but must still render its tool block (not vanish), so it
+    #     is NOT marked pending.
+    for entry in reversed(history):
+        tcs = entry.get("tool_calls")
+        if tcs:
+            has_orphan = any(tc.get("id") and str(tc["id"]) not in resulted_call_ids for tc in tcs)
+            if has_orphan:
+                entry["pending"] = True
+            break
+
+    return history

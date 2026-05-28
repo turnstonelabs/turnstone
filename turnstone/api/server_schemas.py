@@ -450,19 +450,21 @@ class WorkstreamHistoryResponse(BaseModel):
     """Response body for ``GET /v1/api/workstreams/{ws_id}/history``.
 
     Renamed and relocated from ``CoordinatorHistoryResponse`` in the
-    Stage 2 history/detail verb lift. Same OpenAI-like message-row
-    shape on both kinds; the lift adds the endpoint to interactive as
-    a feature gain (pre-lift interactive only exposed history through
-    the SSE replay on ``/events``).
+    Stage 2 history/detail verb lift. Same projected render shape on
+    both kinds; the lift adds the endpoint to interactive as a feature
+    gain (pre-lift interactive only exposed history through the SSE
+    replay on ``/events``).
     """
 
     ws_id: str
     messages: list[dict[str, Any]] = Field(
         default_factory=list,
         description=(
-            "Tail of the workstream's reconstructed message history "
-            "(provider-fidelity OpenAI-like shape). Bounded by the "
-            "``limit`` query parameter (default 100, max 500)."
+            "Tail of the workstream's message history, projected to the "
+            "canonical render shape (flat tool_calls with verdict / "
+            "output_assessment, top-level source / reminders / "
+            "attachments, derived denied / is_error / pending). Bounded "
+            "by the ``limit`` query parameter (default 100, max 500)."
         ),
     )
 

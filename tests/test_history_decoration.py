@@ -1,10 +1,10 @@
 """Unit tests for ``turnstone.core.history_decoration``.
 
-The decoration helpers are shared between two surfaces — interactive's
-SSE replay (``_build_history``) and the lifted ``/history`` REST
-endpoint (``make_history_handler``, used by both interactive and
-coord). Pinning the wire shape here lets a future schema/projection
-change land in one file rather than spread across the two surfaces.
+The decoration helpers compose the single ``/history`` REST projection
+pipeline (``make_history_handler``, used by both interactive and coord):
+``decorate_history_messages`` + ``extract_reasoning_for_history`` +
+``project_history_messages``. Pinning the wire shape here lets a future
+schema/projection change land in one file.
 """
 
 from __future__ import annotations

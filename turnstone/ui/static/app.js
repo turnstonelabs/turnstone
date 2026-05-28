@@ -786,11 +786,12 @@ class Pane {
     // paint the wrong ws's history into the pane.
     if (token !== undefined && token !== this._historyLoadToken) return;
     if (data) {
-      // The REST /history payload is provider-native (nested tool_calls,
-      // `_source`/`_reminders`/`_attachments_meta` side-channels, multipart
-      // content, no derived denied/is_error/pending). Normalize it to the
-      // projected shape replayHistory renders — see history_normalize.js.
-      this.replayHistory(normalizeHistoryMessages(data.messages || []));
+      // The REST /history payload is already the canonical projected wire
+      // shape (server-side projection in make_history_handler:
+      // flat tool_calls, top-level source/reminders/attachments, collapsed
+      // content, derived denied/is_error/pending) — feed it straight to
+      // replayHistory. No client-side normalisation.
+      this.replayHistory(data.messages || []);
     } else {
       this.showEmptyState();
     }
