@@ -1339,6 +1339,24 @@ class TestProviderFactory:
         )
         assert client is mock_openai_cls.return_value
 
+    @patch("openai.OpenAI")
+    def test_create_client_empty_api_key_passes_none(self, mock_openai_cls: MagicMock) -> None:
+        from turnstone.core.providers import create_client
+
+        mock_openai_cls.return_value = MagicMock()
+        create_client("openai", base_url="http://localhost:8000/v1", api_key="")
+        mock_openai_cls.assert_called_once_with(
+            base_url="http://localhost:8000/v1", api_key=None
+        )
+
+    @patch("openai.OpenAI")
+    def test_create_client_empty_api_key_no_base_url(self, mock_openai_cls: MagicMock) -> None:
+        from turnstone.core.providers import create_client
+
+        mock_openai_cls.return_value = MagicMock()
+        create_client("openai", base_url="", api_key="")
+        mock_openai_cls.assert_called_once_with(api_key=None)
+
     def test_create_client_unknown(self) -> None:
         from turnstone.core.providers import create_client
 
