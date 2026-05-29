@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from turnstone.core.output_guard import evaluate_output
+from turnstone.core.output_guard import evaluate_output, merge_guard_display_payload
 
 
 class TestBenignOutput:
@@ -401,3 +401,101 @@ class TestBudget:
         assert r.risk_level in ("none", "low", "medium", "high", "critical")
         # Confirm the deadline path was actually exercised
         assert call_count >= 2
+
+
+class TestMergeGuardDisplayPayload:
+    """The single chip-payload projection shared by the live and replay
+    paths (issue #560, "show, annotated").  Rule: risk = max(heuristic, llm),
+    flags = union; an LLM negative/absent never lowers a heuristic positive."""
+
+    def test_clean_both_returns_none(self) -> None:
+        assert (
+            merge_guard_display_payload(
+                heuristic_risk="none", heuristic_flags=[], redacted=False, llm_succeeded=False
+            )
+            is None
+        )
+
+    def test_redaction_alone_surfaces_even_at_none_risk(self) -> None:
+        out = merge_guard_display_payload(
+            heuristic_risk="none", heuristic_flags=[], redacted=True, llm_succeeded=False
+        )
+        assert out is not None
+        assert out["redacted"] is True
+        assert out["tier"] == "heuristic"
+
+    def test_llm_escalates_over_clean_heuristic(self) -> None:
+        out = merge_guard_display_payload(
+            heuristic_risk="none",
+            heuristic_flags=[],
+            redacted=False,
+            llm_succeeded=True,
+            llm_risk="high",
+            llm_flags=["prompt_injection"],
+            llm_reasoning="Overt override attempt.",
+            llm_confidence=0.95,
+            llm_model="gpt-5-mini",
+        )
+        assert out is not None
+        assert out["risk_level"] == "high"
+        assert out["flags"] == ["prompt_injection"]
+        assert out["tier"] == "llm"
+        assert out["judge_risk"] == "high"
+        assert out["confidence"] == 0.95
+
+    def test_llm_none_never_lowers_heuristic(self) -> None:
+        """The core fix: an LLM "none" leaves the heuristic positive intact,
+        annotated with the judge's dissenting verdict."""
+        out = merge_guard_display_payload(
+            heuristic_risk="high",
+            heuristic_flags=["credential_leak"],
+            redacted=True,
+            llm_succeeded=True,
+            llm_risk="none",
+            llm_flags=[],
+            llm_reasoning="No injection detected.",
+            llm_confidence=0.9,
+            llm_model="gpt-5-mini",
+        )
+        assert out is not None
+        assert out["risk_level"] == "high"  # heuristic survives
+        assert out["flags"] == ["credential_leak"]
+        assert out["tier"] == "llm"
+        assert out["judge_risk"] == "none"  # dissent, for the badge
+        assert out["redacted"] is True
+
+    def test_failed_or_absent_llm_is_heuristic_only(self) -> None:
+        out = merge_guard_display_payload(
+            heuristic_risk="medium",
+            heuristic_flags=["camouflaged_injection"],
+            redacted=False,
+            llm_succeeded=False,
+        )
+        assert out is not None
+        assert out["risk_level"] == "medium"
+        assert out["tier"] == "heuristic"
+        assert "judge_risk" not in out
+        assert "confidence" not in out
+        assert "reasoning" not in out
+
+    def test_heuristic_annotations_ride_through(self) -> None:
+        """The heuristic's human-readable messages surface as `annotations`
+        (the only prose a regex-only finding carries); omitted when empty."""
+        out = merge_guard_display_payload(
+            heuristic_risk="high",
+            heuristic_flags=["credential_leak"],
+            heuristic_annotations=["Output contains a PEM-encoded private key block."],
+            redacted=True,
+            llm_succeeded=False,
+        )
+        assert out is not None
+        assert out["annotations"] == ["Output contains a PEM-encoded private key block."]
+        # No heuristic annotations → key omitted (SDK defaults to []).
+        bare = merge_guard_display_payload(
+            heuristic_risk="high",
+            heuristic_flags=["credential_leak"],
+            redacted=True,
+            llm_succeeded=False,
+        )
+        assert bare is not None
+        assert "annotations" not in bare

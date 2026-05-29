@@ -602,7 +602,16 @@ class ListVerdictsResponse(BaseModel):
 
 
 class OutputAssessmentInfo(BaseModel):
-    """Output guard assessment."""
+    """Output guard assessment (one row per ``(call_id, tier)``).
+
+    ``tier`` is one of ``"heuristic"`` (regex stage), ``"llm"`` (the judge's
+    own successful verdict), or ``"llm_error"`` (the judge ran but failed —
+    audit-only; ``reasoning`` carries the error). ``reasoning`` /
+    ``judge_model`` / ``latency_ms`` / ``confidence`` are populated on the
+    LLM tiers (migration 057) and carry their defaults on heuristic rows.
+    The inline UI chip MERGES the heuristic + ``llm`` rows; this list
+    endpoint exposes the raw rows for audit/calibration.
+    """
 
     assessment_id: str
     ws_id: str
@@ -613,6 +622,11 @@ class OutputAssessmentInfo(BaseModel):
     annotations: str = "[]"
     output_length: int = 0
     redacted: int = 0
+    tier: str = "heuristic"
+    reasoning: str = ""
+    judge_model: str = ""
+    latency_ms: int = 0
+    confidence: float = 0.0
     created: str
 
 

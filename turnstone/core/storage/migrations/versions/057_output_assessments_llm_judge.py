@@ -4,11 +4,12 @@ Adds five columns to ``output_assessments`` so the same table holds both
 heuristic (regex) verdicts and the new LLM-judge verdicts introduced for
 issue #560 mitigation #1:
 
-* ``tier`` — ``'heuristic'`` (the regex stage) or ``'llm'`` (the new
-  capability-gated semantic evaluator). Existing rows backfill to
-  ``'heuristic'`` because that is what the table held before this
-  migration. One row per ``(call_id, tier)`` from this point on, mirroring
-  the ``intent_verdicts`` table's row model (migration 012).
+* ``tier`` — ``'heuristic'`` (the regex stage), ``'llm'`` (the new
+  capability-gated semantic evaluator's successful verdict), or
+  ``'llm_error'`` (the evaluator ran but failed — audit-only). Existing
+  rows backfill to ``'heuristic'`` because that is what the table held
+  before this migration. One row per ``(call_id, tier)`` from this point
+  on, mirroring the ``intent_verdicts`` table's row model (migration 012).
 * ``reasoning`` — the LLM's free-form explanation. Empty for heuristic rows.
 * ``judge_model`` — the model alias used. Empty for heuristic rows.
 * ``latency_ms`` — wall-clock cost. ``0`` for heuristic rows (regex is

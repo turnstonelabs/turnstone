@@ -234,11 +234,33 @@ class IntentVerdictEvent(ServerEvent):
 
 @dataclass
 class OutputWarningEvent(ServerEvent):
+    """Output-guard finding for a tool result (Facet 2 of intent validation).
+
+    The chip is a MERGE of the regex heuristic and the LLM judge (issue
+    #560, "show, annotated"): ``risk_level`` is max(heuristic, llm) and
+    ``flags`` is their union — a positive from either detector surfaces and
+    an LLM "none" never lowers a heuristic positive.  ``tier`` is ``"llm"``
+    when the judge returned a verdict (then ``judge_risk`` / ``confidence``
+    / ``reasoning`` / ``judge_model`` carry its OWN opinion, which may
+    differ from the displayed ``risk_level``), else ``"heuristic"``.
+    Mirrors ``ChatSession._evaluate_output`` and the replay projection
+    ``build_merged_output_assessment_payload`` — all three share
+    ``output_guard.merge_guard_display_payload``.
+    """
+
     type: str = "output_warning"
     call_id: str = ""
+    func_name: str = ""
     risk_level: str = ""
-    categories: list[str] = field(default_factory=list)
-    explanation: str = ""
+    flags: list[str] = field(default_factory=list)
+    annotations: list[str] = field(default_factory=list)
+    redacted: bool = False
+    output_length: int = 0
+    tier: str = "heuristic"
+    judge_risk: str = ""
+    confidence: float = 0.0
+    reasoning: str = ""
+    judge_model: str = ""
 
 
 # ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@ from turnstone.sdk.events import (
     InfoEvent,
     NodeJoinedEvent,
     NodeLostEvent,
+    OutputWarningEvent,
     PlanResolvedEvent,
     PlanReviewEvent,
     ReasoningEvent,
@@ -117,6 +118,71 @@ def test_tool_output_chunk_event():
     e = ServerEvent.from_dict({"type": "tool_output_chunk", "call_id": "c1", "chunk": "line1\n"})
     assert isinstance(e, ToolOutputChunkEvent)
     assert e.chunk == "line1\n"
+
+
+def test_output_warning_event_llm_tier():
+    """LLM-tier finding carries confidence + reasoning + judge_model so SDK
+    consumers see the same attribution the UI chip renders."""
+    e = ServerEvent.from_dict(
+        {
+            "type": "output_warning",
+            "call_id": "c1",
+            "func_name": "web_fetch",
+            "risk_level": "medium",
+            "flags": ["camouflaged_injection"],
+            "redacted": False,
+            "tier": "llm",
+            "judge_risk": "none",
+            "confidence": 0.82,
+            "reasoning": "Authority-framed directive embedded in the doc.",
+            "judge_model": "gpt-5-mini",
+        }
+    )
+    assert isinstance(e, OutputWarningEvent)
+    assert e.tier == "llm"
+    assert e.judge_risk == "none"  # the judge's OWN verdict (may differ from risk_level)
+    assert e.confidence == 0.82
+    assert e.flags == ["camouflaged_injection"]
+    assert e.reasoning == "Authority-framed directive embedded in the doc."
+    assert e.judge_model == "gpt-5-mini"
+
+
+def test_output_warning_event_heuristic_defaults():
+    """A regex-only finding defaults tier=heuristic with no confidence."""
+    e = ServerEvent.from_dict(
+        {"type": "output_warning", "call_id": "c1", "risk_level": "high", "redacted": True}
+    )
+    assert isinstance(e, OutputWarningEvent)
+    assert e.tier == "heuristic"
+    assert e.confidence == 0.0
+    assert e.redacted is True
+
+
+def test_output_warning_event_covers_every_merge_payload_key():
+    """Drift guard: every key the server-side merge can emit must be a declared
+    OutputWarningEvent field, else from_dict silently drops it (the bug that let
+    `annotations` go stale). Builds the maximal payload and checks the field-set."""
+    import dataclasses
+
+    from turnstone.core.output_guard import merge_guard_display_payload
+
+    # Maximal payload — every optional field populated.
+    payload = merge_guard_display_payload(
+        heuristic_risk="high",
+        heuristic_flags=["credential_leak"],
+        heuristic_annotations=["API key detected."],
+        redacted=True,
+        llm_succeeded=True,
+        llm_risk="none",
+        llm_flags=["camouflaged_injection"],
+        llm_reasoning="Benign.",
+        llm_confidence=0.9,
+        llm_model="gpt-5-mini",
+    )
+    assert payload is not None
+    declared = {f.name for f in dataclasses.fields(OutputWarningEvent)}
+    missing = set(payload) - declared
+    assert not missing, f"OutputWarningEvent is missing merge-payload fields: {missing}"
 
 
 def test_status_event():

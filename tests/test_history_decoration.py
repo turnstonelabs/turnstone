@@ -9,11 +9,14 @@ schema/projection change land in one file.
 
 from __future__ import annotations
 
+import json
+
 from turnstone.core.history_decoration import (
-    build_output_assessment_payload,
+    build_merged_output_assessment_payload,
     build_verdict_payload,
     decorate_history_messages,
     decorate_tool_call,
+    load_verdict_indexes,
 )
 
 
@@ -93,30 +96,124 @@ class TestBuildVerdictPayload:
         assert "judge_model" not in out
 
 
-class TestBuildOutputAssessmentPayload:
-    """Output-guard wire shape — flags decoded from JSON string at
-    this layer so the client never has to parse twice."""
+class TestBuildMergedOutputAssessmentPayload:
+    """Replay-side merge of the heuristic + LLM rows into one chip payload.
+
+    Delegates to ``output_guard.merge_guard_display_payload`` — the same
+    projection the live ``on_output_warning`` path calls — so the inline
+    finding chip renders identically live and on reconnect.  ``slot`` is
+    ``{"heuristic": row|None, "llm": row|None}`` from ``load_verdict_indexes``.
+    """
 
     def test_skips_unflagged_baseline(self) -> None:
-        row = {"risk_level": "none", "flags": "[]"}
-        assert build_output_assessment_payload(row) is None
+        slot = {"heuristic": {"risk_level": "none", "flags": "[]"}, "llm": None}
+        assert build_merged_output_assessment_payload(slot) is None
 
-    def test_decodes_flags_from_json(self) -> None:
-        row = {"risk_level": "high", "flags": '["api_key","email"]', "redacted": 1}
-        out = build_output_assessment_payload(row)
+    def test_decodes_heuristic_flags_from_json(self) -> None:
+        slot = {
+            "heuristic": {"risk_level": "high", "flags": '["api_key","email"]', "redacted": 1},
+            "llm": None,
+        }
+        out = build_merged_output_assessment_payload(slot)
         assert out is not None
         assert out["flags"] == ["api_key", "email"]
         assert out["redacted"] is True
         assert out["risk_level"] == "high"
+        assert out["tier"] == "heuristic"
 
     def test_handles_malformed_flags_json(self) -> None:
         """Bad JSON in ``flags`` must not block the rest of the
         assessment from rendering — degrade to empty list."""
-        row = {"risk_level": "medium", "flags": "not-json", "redacted": 0}
-        out = build_output_assessment_payload(row)
+        slot = {
+            "heuristic": {"risk_level": "medium", "flags": "not-json", "redacted": 0},
+            "llm": None,
+        }
+        out = build_merged_output_assessment_payload(slot)
         assert out is not None
         assert out["flags"] == []
         assert out["redacted"] is False
+
+    def test_llm_escalates_over_clean_heuristic(self) -> None:
+        """LLM positive on a clean heuristic surfaces under tier='llm' with
+        the judge's own risk/confidence/reasoning/model as annotation."""
+        slot = {
+            "heuristic": {"risk_level": "none", "flags": "[]", "redacted": 0},
+            "llm": {
+                "risk_level": "medium",
+                "flags": '["camouflaged_injection"]',
+                "reasoning": "Authority-framed directive embedded in the doc.",
+                "confidence": 0.82,
+                "judge_model": "gpt-5-mini",
+            },
+        }
+        out = build_merged_output_assessment_payload(slot)
+        assert out is not None
+        assert out["risk_level"] == "medium"
+        assert out["flags"] == ["camouflaged_injection"]
+        assert out["tier"] == "llm"
+        assert out["judge_risk"] == "medium"
+        assert out["confidence"] == 0.82
+        assert out["reasoning"] == "Authority-framed directive embedded in the doc."
+        assert out["judge_model"] == "gpt-5-mini"
+
+    def test_llm_none_does_not_lower_heuristic_positive(self) -> None:
+        """Core merge rule + the vanishing-chip fix: a successful LLM "none"
+        never lowers a heuristic positive — it surfaces, annotated with the
+        judge's dissent (judge_risk="none" differs from the displayed risk)."""
+        slot = {
+            "heuristic": {
+                "risk_level": "medium",
+                "flags": '["camouflaged_injection"]',
+                "redacted": 0,
+            },
+            "llm": {
+                "risk_level": "none",
+                "flags": "[]",
+                "reasoning": "Benign analyst commentary.",
+                "confidence": 0.9,
+                "judge_model": "gpt-5-mini",
+            },
+        }
+        out = build_merged_output_assessment_payload(slot)
+        assert out is not None
+        assert out["risk_level"] == "medium"  # heuristic survives
+        assert out["flags"] == ["camouflaged_injection"]
+        assert out["tier"] == "llm"
+        assert out["judge_risk"] == "none"  # judge's dissent, drives the badge
+        assert out["reasoning"] == "Benign analyst commentary."
+
+    def test_flags_are_unioned_and_deduped(self) -> None:
+        slot = {
+            "heuristic": {
+                "risk_level": "high",
+                "flags": '["prompt_injection","credential_leak"]',
+                "redacted": 0,
+            },
+            "llm": {
+                "risk_level": "high",
+                "flags": '["prompt_injection","data_exfiltration"]',
+                "reasoning": "x",
+                "confidence": 0.9,
+                "judge_model": "m",
+            },
+        }
+        out = build_merged_output_assessment_payload(slot)
+        assert out is not None
+        assert out["flags"] == ["prompt_injection", "credential_leak", "data_exfiltration"]
+
+    def test_heuristic_only_has_no_llm_badge(self) -> None:
+        """A regex-only finding (no LLM slot) carries no LLM attribution."""
+        slot = {
+            "heuristic": {"risk_level": "high", "flags": '["credential_leak"]', "redacted": 1},
+            "llm": None,
+        }
+        out = build_merged_output_assessment_payload(slot)
+        assert out is not None
+        assert out["tier"] == "heuristic"
+        assert "judge_risk" not in out
+        assert "confidence" not in out
+        assert "reasoning" not in out
+        assert "judge_model" not in out
 
 
 class TestDecorateToolCall:
@@ -179,7 +276,10 @@ class TestDecorateHistoryMessages:
             }
         }
         assessments = {
-            "call_a": {"risk_level": "high", "flags": '["secret"]', "redacted": 1},
+            "call_a": {
+                "heuristic": {"risk_level": "high", "flags": '["secret"]', "redacted": 1},
+                "llm": None,
+            },
         }
         messages: list[dict[str, object]] = [
             {"role": "user", "content": "hi"},
@@ -850,3 +950,87 @@ class TestAttachVllmChatReasoningField:
         assert out[3] is plain_assistant
         assert "reasoning" not in out[3]
         assert out[4] is msgs[4]
+
+
+class TestLoadVerdictIndexesMerge:
+    """load_verdict_indexes + the merge, against real storage — pins the
+    vanishing-chip fix (failed-judge row must not hide a heuristic finding)
+    and the de-escalation annotate behavior end to end."""
+
+    def _record(self, storage, **kw) -> None:
+        base = {
+            "func_name": "read_file",
+            "flags": "[]",
+            "annotations": "[]",
+            "output_length": 900,
+            "redacted": False,
+        }
+        base.update(kw)
+        storage.record_output_assessment(**base)
+
+    def test_llm_error_row_does_not_shadow_heuristic(self, storage_backend) -> None:
+        """A failed-judge row (tier='llm_error', risk='none') is audit-only and
+        must NOT win the replay merge over a real heuristic finding — the bug
+        behind the chip that showed live but vanished on reconnect."""
+        ws_id, call_id = "ws-merge-err", "call-env"
+        self._record(
+            storage_backend,
+            assessment_id="a-h",
+            ws_id=ws_id,
+            call_id=call_id,
+            flags=json.dumps(["credential_leak", "env_file_leak"]),
+            risk_level="high",
+            redacted=True,
+            tier="heuristic",
+        )
+        self._record(
+            storage_backend,
+            assessment_id="a-e",
+            ws_id=ws_id,
+            call_id=call_id,
+            risk_level="none",
+            tier="llm_error",
+            reasoning="timeout",
+        )
+        _verdicts, assessments = load_verdict_indexes(ws_id)
+        # The llm_error row is dropped at load — slot has only the heuristic.
+        assert assessments[call_id]["llm"] is None
+        out = build_merged_output_assessment_payload(assessments[call_id])
+        assert out is not None
+        assert out["risk_level"] == "high"
+        assert "credential_leak" in out["flags"]
+        assert out["tier"] == "heuristic"  # failed judge → no LLM badge
+
+    def test_llm_clear_annotates_heuristic_on_replay(self, storage_backend) -> None:
+        """A successful LLM "none" on a heuristic positive surfaces the
+        heuristic finding on reconnect, annotated with the judge's dissent."""
+        ws_id, call_id = "ws-merge-clear", "call-doc"
+        self._record(
+            storage_backend,
+            assessment_id="b-h",
+            ws_id=ws_id,
+            call_id=call_id,
+            func_name="web_fetch",
+            flags=json.dumps(["camouflaged_injection"]),
+            risk_level="medium",
+            tier="heuristic",
+        )
+        self._record(
+            storage_backend,
+            assessment_id="b-l",
+            ws_id=ws_id,
+            call_id=call_id,
+            func_name="web_fetch",
+            risk_level="none",
+            tier="llm",
+            reasoning="Benign analyst commentary.",
+            confidence=0.9,
+            judge_model="gpt-5-mini",
+        )
+        _verdicts, assessments = load_verdict_indexes(ws_id)
+        out = build_merged_output_assessment_payload(assessments[call_id])
+        assert out is not None
+        assert out["risk_level"] == "medium"  # heuristic survives
+        assert out["tier"] == "llm"
+        assert out["judge_risk"] == "none"
+        assert out["reasoning"] == "Benign analyst commentary."

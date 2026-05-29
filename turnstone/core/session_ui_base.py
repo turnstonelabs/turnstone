@@ -1643,12 +1643,14 @@ class SessionUIBase:
 
         Called by the session once per tier.  A ``"heuristic"`` row is
         written when the regex stage produced signal (risk!="none" or
-        flags) OR when the heuristic and LLM verdicts disagreed.  An
-        ``"llm"`` row is written whenever the LLM stage ran — on
-        success ``reasoning`` carries the model's explanation; on
-        failure (timeout / parse error / provider error) ``reasoning``
-        carries the error reason so audit can distinguish "LLM
-        attempted but failed" from "LLM was never enabled".
+        flags) OR when the heuristic and LLM verdicts disagreed.  When the
+        LLM stage ran it writes one row: ``"llm"`` on success (``reasoning``
+        carries the model's explanation), or ``"llm_error"`` on failure
+        (timeout / parse error / provider error — ``reasoning`` carries the
+        error reason).  The distinct ``"llm_error"`` tier lets audit tell
+        "LLM attempted but failed" from "LLM was never enabled" AND keeps the
+        replay merge from treating a risk="none" failure row as a verdict
+        that could shadow the heuristic finding.
         """
         try:
             from turnstone.core.storage._registry import get_storage

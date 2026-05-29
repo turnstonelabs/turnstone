@@ -41,10 +41,19 @@ def load_verdict_indexes(
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     """Bulk-load intent verdicts and output assessments for a workstream.
 
-    Returns ``(verdicts_by_call_id, assessments_by_call_id)``.  Both
-    tables are indexed by ws_id so the queries are O(rows-for-ws); the
-    DESC ordering plus first-seen-wins dedupe leaves the newest
-    verdict per call_id (LLM upgrade beats heuristic when both exist).
+    Returns ``(verdicts_by_call_id, assessments_by_call_id)``.
+
+    ``verdicts_by_call_id`` keeps the newest intent verdict per call_id
+    (DESC ordering + first-seen-wins; LLM upgrade beats heuristic).
+
+    ``assessments_by_call_id`` maps call_id → a SLOT
+    ``{"heuristic": row|None, "llm": row|None}`` holding the newest row of
+    each tier, because the output-guard chip is a MERGE of the two
+    detectors (issue #560, "show, annotated").  Failed-judge rows
+    (``tier="llm_error"``) are dropped here so a risk="none" failure row
+    can never shadow a real heuristic finding on reconnect — they are
+    audit-only and surface via the ``/v1/api/admin/output-assessments``
+    list, not the inline chip.
 
     Pure storage I/O — safe to run in ``asyncio.to_thread`` from an
     async caller.  Returns empty dicts when storage is unavailable or
@@ -67,8 +76,24 @@ def load_verdict_indexes(
                 verdicts_by_call_id[cid] = v
         for a in storage.list_output_assessments(ws_id=ws_id, limit=10000):
             cid = a.get("call_id") or ""
-            if cid and cid not in assessments_by_call_id:
-                assessments_by_call_id[cid] = a
+            if not cid:
+                continue
+            tier = a.get("tier", "heuristic")
+            if tier == "llm_error":
+                continue  # audit-only failure row — never the acted UI finding
+            # KNOWN LIMITATION (historical data only): rows written BEFORE the
+            # llm_error split recorded judge FAILURES as tier="llm" risk="none"
+            # too, so on replay of pre-split workstreams such a row lands in the
+            # "llm" slot and the chip mis-renders it as a successful "none"
+            # verdict (spurious "⚖ LLM: none" + the error string as rationale).
+            # The heuristic finding still SURVIVES the max-merge — the chip
+            # never vanishes — so this is cosmetic.  We can't fingerprint it
+            # safely (a legitimate benign verdict is also tier="llm" risk="none"),
+            # and new failures self-heal under "llm_error".
+            slot = assessments_by_call_id.setdefault(cid, {"heuristic": None, "llm": None})
+            key = "llm" if tier == "llm" else "heuristic"
+            if slot.get(key) is None:  # first-seen wins (rows arrive newest-first)
+                slot[key] = a
     except Exception:
         # Missing storage / migration drift / driver error must not
         # block replay — degrade to an unannotated history.
@@ -113,29 +138,51 @@ def build_verdict_payload(vrow: dict[str, Any]) -> dict[str, Any] | None:
     return payload
 
 
-def build_output_assessment_payload(arow: dict[str, Any]) -> dict[str, Any] | None:
-    """Project a stored ``output_assessments`` row into the wire shape.
+def _decode_json_list(raw: Any) -> list[str]:
+    """Decode a stored JSON-string list (``flags`` / ``annotations``) into a list.
 
-    Returns ``None`` when the assessment is the unflagged baseline
-    (``risk_level == "none"``) — same skip-on-clean pattern as
-    :func:`build_verdict_payload`.
-
-    Decodes ``flags`` from its JSON string form here so the client
-    never has to parse twice.  Falls back to an empty list on bad JSON
-    rather than raising — the rest of the assessment is still useful.
+    Falls back to an empty list on bad JSON rather than raising — the rest
+    of the assessment is still useful.
     """
-    if (arow.get("risk_level") or "none") == "none":
-        return None
-    flags_raw = arow.get("flags") or "[]"
+    if raw is None:
+        return []
     try:
-        flags = json.loads(flags_raw) if isinstance(flags_raw, str) else flags_raw
+        decoded = json.loads(raw) if isinstance(raw, str) else raw
     except (ValueError, TypeError):
-        flags = []
-    return {
-        "risk_level": arow.get("risk_level", "none"),
-        "flags": flags if isinstance(flags, list) else [],
-        "redacted": bool(arow.get("redacted", 0)),
-    }
+        return []
+    return decoded if isinstance(decoded, list) else []
+
+
+def build_merged_output_assessment_payload(slot: dict[str, Any]) -> dict[str, Any] | None:
+    """Project a stored heuristic+LLM assessment pair into the chip payload.
+
+    ``slot`` is ``{"heuristic": row|None, "llm": row|None}`` from
+    :func:`load_verdict_indexes` — the ``llm`` slot holds the judge's OWN
+    successful verdict; failed-judge rows were dropped upstream so they
+    cannot shadow a heuristic finding.
+
+    Delegates the actual merge to
+    :func:`output_guard.merge_guard_display_payload` — the SAME projection
+    the live ``on_output_warning`` path calls — so the inline finding chip
+    renders identically live and on reconnect.  Returns ``None`` (skip on
+    clean) when neither detector flagged and nothing was redacted.
+    """
+    from turnstone.core.output_guard import merge_guard_display_payload
+
+    heuristic = slot.get("heuristic") or {}
+    llm = slot.get("llm")
+    return merge_guard_display_payload(
+        heuristic_risk=heuristic.get("risk_level", "none") or "none",
+        heuristic_flags=_decode_json_list(heuristic.get("flags")),
+        heuristic_annotations=_decode_json_list(heuristic.get("annotations")),
+        redacted=bool(heuristic.get("redacted", 0)),
+        llm_succeeded=llm is not None,
+        llm_risk=(llm or {}).get("risk_level", "none") or "none",
+        llm_flags=_decode_json_list((llm or {}).get("flags")),
+        llm_reasoning=(llm or {}).get("reasoning", "") or "",
+        llm_confidence=(llm or {}).get("confidence", 0.0) or 0.0,
+        llm_model=(llm or {}).get("judge_model", "") or "",
+    )
 
 
 def decorate_tool_call(
@@ -160,9 +207,9 @@ def decorate_tool_call(
         verdict = build_verdict_payload(vrow)
         if verdict is not None:
             tc["verdict"] = verdict
-    arow = assessments_by_call_id.get(call_id)
-    if arow is not None:
-        assessment = build_output_assessment_payload(arow)
+    slot = assessments_by_call_id.get(call_id)
+    if slot is not None:
+        assessment = build_merged_output_assessment_payload(slot)
         if assessment is not None:
             tc["output_assessment"] = assessment
 

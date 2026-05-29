@@ -5187,7 +5187,11 @@ class ChatSession:
         Returns ``(possibly_sanitized_output, acted_assessment)``.  The
         acted assessment is ``None`` when its risk_level is ``"none"``.
         """
-        from turnstone.core.output_guard import OutputAssessment, evaluate_output
+        from turnstone.core.output_guard import (
+            OutputAssessment,
+            evaluate_output,
+            merge_guard_display_payload,
+        )
 
         og_patterns = None
         rule_reg = self._rule_registry
@@ -5223,44 +5227,30 @@ class ChatSession:
 
         output_len = len(output)
 
-        # Acted assessment.  Credential redaction is a regex-only signal
-        # that the LLM cannot override (bug-1 / sec-1 from the PR review):
-        # an LLM asked about prompt-injection can correctly label a
-        # credential-bearing tool output as "none" risk for injection, but
-        # the secret still needs to be redacted before it lands in the
-        # assistant's context.  When the heuristic populated ``sanitized``
-        # we keep the heuristic's verdict as acted regardless of the LLM.
-        if heuristic.sanitized is not None:
-            acted = heuristic
-        elif llm_verdict is not None and llm_verdict.succeeded:
-            acted = OutputAssessment(
-                flags=list(llm_verdict.flags),
-                risk_level=llm_verdict.risk_level,
-                annotations=[llm_verdict.reasoning] if llm_verdict.reasoning else [],
-                sanitized=heuristic.sanitized,  # always None on this branch; explicit
-            )
-        else:
-            acted = heuristic
+        # Merge the two detectors into one acted finding (issue #560,
+        # "show, annotated").  Risk = max(heuristic, llm); flags = union.
+        # An LLM "none" — or a failed/absent LLM — never LOWERS a heuristic
+        # positive: the judge evaluates adversarial tool output, so it may
+        # escalate but must not be able to hide a deterministic regex
+        # finding.  Credential redaction stays a heuristic-only signal the
+        # LLM cannot override (bug-1 / sec-1): a secret is redacted whether
+        # or not the judge sees injection.
+        # ``llm`` is the narrowed, succeeded-only verdict (None on
+        # disable / rate-limit / error / timeout) — lets the type checker
+        # follow attribute access below without re-asserting succeeded.
+        llm = llm_verdict if (llm_verdict is not None and llm_verdict.succeeded) else None
+        wants_redaction = heuristic.sanitized is not None and jc is not None and jc.redact_secrets
 
-        # Persistence (single call path now — q-4):
-        # * Heuristic row: write when it has signal (risk != none OR flags)
-        #   OR when verdicts disagree.  Matched-clean evaluations are
-        #   skipped to keep the audit table focused on disagreements
-        #   and non-clean events.  This is the perf-4 trade-off — pre-PR
-        #   wrote heuristic rows only on risk != none; we now ALSO record
-        #   them when the LLM ran and the two judges disagreed.
-        # * LLM row: write whenever the LLM ran, regardless of success.
-        #   On failure (cp-3) the row's ``reasoning`` carries the error
-        #   reason so audit can distinguish "LLM was attempted but
-        #   failed" from "LLM was never enabled".
+        # Persistence — one row per (call_id, tier).  Heuristic row when it
+        # has signal; the LLM row carries the judge's OWN verdict on success
+        # so the replay merge can recombine the two.  A failed judge is
+        # recorded under tier="llm_error" (NOT "llm") so audit can tell
+        # "attempted but failed" from "never enabled" AND the replay merge
+        # treats it as absent — a risk="none" failure row must never shadow
+        # a real heuristic finding on reconnect (the vanishing-chip bug).
         heuristic_has_signal = heuristic.risk_level != "none" or bool(heuristic.flags)
-        verdicts_disagree = (
-            llm_verdict is not None
-            and llm_verdict.succeeded
-            and (
-                llm_verdict.risk_level != heuristic.risk_level
-                or set(llm_verdict.flags) != set(heuristic.flags)
-            )
+        verdicts_disagree = llm is not None and (
+            llm.risk_level != heuristic.risk_level or set(llm.flags) != set(heuristic.flags)
         )
         if heuristic_has_signal or verdicts_disagree:
             self._record_output_tier(call_id, func_name, output_len, heuristic, tier="heuristic")
@@ -5270,7 +5260,11 @@ class ChatSession:
                     call_id,
                     func_name,
                     output_len,
-                    acted,
+                    OutputAssessment(
+                        flags=list(llm_verdict.flags),
+                        risk_level=llm_verdict.risk_level,
+                        annotations=[llm_verdict.reasoning] if llm_verdict.reasoning else [],
+                    ),
                     tier="llm",
                     reasoning=llm_verdict.reasoning,
                     judge_model=llm_verdict.judge_model,
@@ -5278,48 +5272,69 @@ class ChatSession:
                     confidence=llm_verdict.confidence,
                 )
             else:
-                # Failure row — empty assessment + error reason for audit.
-                # confidence stays 0.0 since the LLM never produced a verdict.
+                # Failure row — empty assessment + error reason for audit,
+                # under the distinct "llm_error" tier (see comment above).
                 self._record_output_tier(
                     call_id,
                     func_name,
                     output_len,
                     OutputAssessment(risk_level="none"),
-                    tier="llm",
+                    tier="llm_error",
                     reasoning=llm_verdict.error,
                     judge_model=llm_verdict.judge_model,
                     latency_ms=llm_verdict.latency_ms,
                 )
 
-        # Redaction — fires whenever the heuristic detected secrets and
-        # the operator wants them redacted, regardless of acted.risk_level.
-        # This is the bug-1 fix: the prior code's ``risk_level == "none"``
-        # short-circuit returned the un-redacted output when the LLM
-        # downgraded a credential-bearing result to "none".
-        wants_redaction = heuristic.sanitized is not None and jc is not None and jc.redact_secrets
-
-        if acted.risk_level == "none" and not wants_redaction:
+        # Chip payload — built through the SAME merge the replay path uses
+        # (build_merged_output_assessment_payload) so the live SSE chip and
+        # the reconnect chip render identically.  ``None`` means nothing to
+        # show (merged risk "none", no redaction).
+        d = merge_guard_display_payload(
+            heuristic_risk=heuristic.risk_level,
+            heuristic_flags=list(heuristic.flags),
+            heuristic_annotations=list(heuristic.annotations),
+            redacted=wants_redaction,
+            llm_succeeded=llm is not None,
+            llm_risk=llm.risk_level if llm else "none",
+            llm_flags=list(llm.flags) if llm else [],
+            llm_reasoning=llm.reasoning if llm else "",
+            llm_confidence=llm.confidence if llm else 0.0,
+            llm_model=llm.judge_model if llm else "",
+        )
+        if d is None:
             return output, None
 
+        # Context-facing annotations (what the MODEL sees via GuardAdvisory):
+        # the heuristic findings, plus the LLM's reasoning ONLY when the LLM
+        # ESCALATED (flagged something itself).  We deliberately never inject
+        # the judge's "benign" reasoning into the model context — a judge
+        # fooled into "none" on a real heuristic finding must not get to tell
+        # the model the output is safe.  The operator UI still shows the full
+        # LLM verdict via the chip payload below.
+        context_annotations = list(heuristic.annotations)
+        if llm is not None and llm.risk_level != "none" and llm.reasoning:
+            context_annotations.append(llm.reasoning)
+        # acted's risk/flags come straight from the merge payload so the
+        # context advisory can't drift from the chip.
+        acted = OutputAssessment(
+            flags=list(d["flags"]),
+            risk_level=str(d["risk_level"]),
+            annotations=context_annotations,
+            sanitized=heuristic.sanitized,
+        )
+
+        d["func_name"] = func_name
+        d["output_length"] = output_len
         log.debug(
             "output_guard.flagged",
             call_id=call_id,
             func_name=func_name,
-            risk=acted.risk_level,
-            flags=acted.flags,
-            tier="llm" if (llm_verdict is not None and llm_verdict.succeeded) else "heuristic",
+            risk=d["risk_level"],
+            flags=d["flags"],
+            tier=d["tier"],
             redacted=wants_redaction,
         )
         try:
-            d = acted.to_dict()  # excludes sanitized by default
-            d["func_name"] = func_name
-            d["output_length"] = output_len
-            d["redacted"] = wants_redaction
-            # Surface the LLM's confidence when the LLM stage was the one
-            # that produced ``acted`` — the operator/UI can sort flagged
-            # outputs by how certain the judge was.
-            if llm_verdict is not None and llm_verdict.succeeded and acted is not heuristic:
-                d["confidence"] = llm_verdict.confidence
             self.ui.on_output_warning(call_id, d)
         except Exception:
             log.debug("output_guard.callback_failed", exc_info=True)

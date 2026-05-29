@@ -862,7 +862,45 @@
       redacted.textContent = " (credentials redacted)";
       chip.appendChild(redacted);
     }
+    // LLM-judge attribution — mirrors the intent-verdict chip's tier
+    // badge so the operator can tell a regex match from a model
+    // judgement and read the model's confidence inline.
+    if (oa.tier === "llm") {
+      const tier = document.createElement("span");
+      tier.className = "coord-tool-row-warning-tier";
+      let t = "⚖ LLM";
+      // Surface the judge's own verdict when it differs from the displayed
+      // (merged) risk — e.g. regex MEDIUM but the judge cleared it as none.
+      if (oa.judge_risk && oa.judge_risk !== risk) t += ": " + oa.judge_risk;
+      if (oa.confidence > 0) {
+        t += " · " + Math.round(oa.confidence * 100) + "%";
+      }
+      if (oa.judge_model) t += " · " + oa.judge_model;
+      tier.textContent = t;
+      chip.appendChild(tier);
+    }
     if (!existing) row.appendChild(chip);
+
+    // Rationale — collapsible disclosure mirroring the verdict rationale
+    // (reuses .coord-tool-row-rationale styling) so the judge's reasoning
+    // is inspectable without bloating the tree. Idempotent: drop any prior
+    // warning rationale before re-adding so a late SSE upgrade doesn't
+    // stack duplicates next to the one seeded on replay.
+    const oldRationale = row.querySelector(".coord-tool-row-warning-rationale");
+    if (oldRationale) oldRationale.remove();
+    if (oa.reasoning) {
+      const det = document.createElement("details");
+      det.className =
+        "coord-tool-row-rationale coord-tool-row-warning-rationale";
+      const sum = document.createElement("summary");
+      sum.textContent = "guard rationale";
+      det.appendChild(sum);
+      const body = document.createElement("div");
+      body.className = "coord-tool-row-rationale-body";
+      body.textContent = oa.reasoning;
+      det.appendChild(body);
+      chip.insertAdjacentElement("afterend", det);
+    }
   }
 
   // Stable signature for a verdict — used to skip the DOM rebuild when
@@ -2254,6 +2292,11 @@
             risk_level: ev.risk_level,
             flags: ev.flags,
             redacted: ev.redacted,
+            tier: ev.tier,
+            judge_risk: ev.judge_risk,
+            confidence: ev.confidence,
+            reasoning: ev.reasoning,
+            judge_model: ev.judge_model,
           });
         } else {
           appendText(

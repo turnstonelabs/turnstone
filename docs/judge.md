@@ -372,10 +372,36 @@ redact_secrets = true  # auto-redact detected credentials (default)
 
 Configurable at runtime via the admin Settings tab.
 
+### Merge semantics (heuristic + LLM judge)
+
+The chip is a **merge** of the two detectors (issue #560, "show, annotated"),
+not a winner-take-all:
+
+- `risk_level` = **max**(heuristic, llm) and `flags` = **union**. A positive
+  from either detector surfaces; a negative ("none") or failed/absent LLM
+  **never lowers** a heuristic positive. The judge reads adversarial tool
+  output, so it may raise the alarm but must not be able to hide a
+  deterministic regex finding — defeating the judge can't erase the tripwire.
+- Credential **redaction** is a heuristic-only signal the LLM cannot override.
+- When the judge returned a verdict, its OWN verdict rides along as
+  annotation (`judge_risk` / `confidence` / `reasoning` / `judge_model`) so
+  the operator sees the judge's opinion even when it disagrees with the
+  displayed (merged) risk.
+
+The same merge runs live and on reconnect (both call
+`output_guard.merge_guard_display_payload`), so the chip can't drift between
+the two surfaces.
+
+The MODEL on the other side of the conversation is shown the merged
+`risk_level` + `flags` (via the `GuardAdvisory` spliced into the tool-result
+envelope), but is **never** told the judge cleared a finding — a judge fooled
+into "none" must not get to talk the model out of caution. The judge's
+"benign" verdict is operator-facing only.
+
 ### SSE event: `output_warning`
 
-When the output guard detects risk signals, an `output_warning` SSE event is
-emitted to the frontend:
+When the merged finding is non-clean (or credentials were redacted), an
+`output_warning` SSE event is emitted to the frontend. A regex-only finding:
 
 ```json
 {
@@ -386,17 +412,50 @@ emitted to the frontend:
   "flags": ["credential_leak"],
   "annotations": ["API key detected (sk-proj-...)"],
   "output_length": 1024,
-  "redacted": true
+  "redacted": true,
+  "tier": "heuristic"
 }
 ```
 
-The web UI renders this as an inline warning after the tool result. The CLI
-shows a colored terminal warning. The server forwards it as an
-`OutputWarningEvent` for console subscribers.
+When the LLM judge returned a verdict, `tier` is `"llm"` and the event carries
+the judge's own verdict as annotation. Here the regex flagged MEDIUM but the
+judge assessed the output benign — the finding still surfaces (`risk_level`
+stays MEDIUM), annotated with the judge's dissent (`judge_risk: "none"`):
 
-Assessments are persisted to the `output_assessments` table for v2
-calibration. Raw tool output is never stored — only metadata (flags, risk
-level, annotations, output length, redaction status).
+```json
+{
+  "type": "output_warning",
+  "call_id": "call_def456",
+  "func_name": "web_fetch",
+  "risk_level": "medium",
+  "flags": ["camouflaged_injection"],
+  "annotations": ["Authority-framed directive embedded in the document."],
+  "output_length": 8192,
+  "redacted": false,
+  "tier": "llm",
+  "judge_risk": "none",
+  "confidence": 0.92,
+  "reasoning": "Legitimate analyst commentary; no injection.",
+  "judge_model": "gpt-5-mini"
+}
+```
+
+`judge_risk` (the judge's OWN risk verdict, which may differ from the merged
+`risk_level`), `confidence` (0.0–1.0), `reasoning`, and `judge_model` are
+present only on the `"llm"` tier. The identical shape is projected onto
+history replay by `build_merged_output_assessment_payload`, so the inline chip
+renders the same live and on refresh.
+
+The web UI renders this as an inline warning after the tool result — the
+`"llm"` tier adds a `⚖ LLM · NN%` badge (showing the judge's verdict when it
+differs from the displayed risk, e.g. `⚖ LLM: none · 92%`) and the judge's
+rationale. The CLI shows a colored terminal warning. The server forwards it as
+an `OutputWarningEvent` for console subscribers.
+
+Assessments are persisted to the `output_assessments` table (one row per
+`(call_id, tier)`) for calibration. Raw tool output is never stored — only
+metadata: flags, risk level, annotations, output length, redaction status,
+and — for the LLM tier — confidence, reasoning, judge model, and latency.
 
 ### Session-level skill scan warning
 

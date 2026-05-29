@@ -318,11 +318,19 @@ class Pane {
     if (!toolDiv) return;
     // Shared DOM-builder with replayHistory \u2014 single source of truth for
     // role / class / escape semantics.  Argument shape mirrors the
-    // server-side output_assessment dict (risk_level / flags / redacted).
+    // server-side output_assessment dict AND the replay payload built by
+    // build_merged_output_assessment_payload (both via the shared
+    // merge_guard_display_payload), so the live chip and the refresh chip
+    // render identically (tier / judge_risk / confidence / reasoning).
     const warning = _buildOutputWarningEl({
       risk_level: evt.risk_level,
       flags: evt.flags,
       redacted: evt.redacted,
+      tier: evt.tier,
+      judge_risk: evt.judge_risk,
+      confidence: evt.confidence,
+      reasoning: evt.reasoning,
+      judge_model: evt.judge_model,
     });
     const nextEl = toolDiv.nextElementSibling;
     if (nextEl && nextEl.classList.contains("tool-output")) {
@@ -2314,6 +2322,36 @@ function _buildOutputWarningEl(assessment) {
     redacted.className = "output-warning-redacted";
     redacted.textContent = " (credentials redacted)";
     warning.appendChild(redacted);
+  }
+  // LLM-judge attribution — when the semantic stage owned this finding,
+  // mark the tier + the model's self-reported confidence so the operator
+  // can tell a regex match from a model judgement and weight it. Mirrors
+  // the intent-verdict badge's tier/confidence vocabulary.
+  if (assessment && assessment.tier === "llm") {
+    const tierEl = document.createElement("span");
+    tierEl.className = "output-warning-tier";
+    let t = "⚖ LLM";
+    // Show the judge's OWN verdict when it differs from the displayed
+    // (merged) risk — e.g. regex flagged MEDIUM but the judge said none.
+    // Same-verdict cases stay terse ("⚖ LLM · 88%").
+    if (assessment.judge_risk && assessment.judge_risk !== risk) {
+      t += ": " + assessment.judge_risk;
+    }
+    if (assessment.confidence > 0) {
+      t += " · " + Math.round(assessment.confidence * 100) + "%";
+    }
+    if (assessment.judge_model) t += " · " + assessment.judge_model;
+    tierEl.textContent = t;
+    warning.appendChild(tierEl);
+  }
+  // Rationale — the judge's one-line reasoning, surfaced as a muted second
+  // line so the finding explains itself instead of showing a bare flag
+  // list. Block element wraps below the header row.
+  if (assessment && assessment.reasoning) {
+    const reasonEl = document.createElement("div");
+    reasonEl.className = "output-warning-reasoning";
+    reasonEl.textContent = assessment.reasoning;
+    warning.appendChild(reasonEl);
   }
   return warning;
 }

@@ -211,6 +211,78 @@ def _clean() -> OutputAssessment:
     return OutputAssessment()
 
 
+def merge_guard_display_payload(
+    *,
+    heuristic_risk: str,
+    heuristic_flags: list[str] | tuple[str, ...],
+    redacted: bool,
+    llm_succeeded: bool,
+    heuristic_annotations: list[str] | tuple[str, ...] = (),
+    llm_risk: str = "none",
+    llm_flags: list[str] | tuple[str, ...] = (),
+    llm_reasoning: str = "",
+    llm_confidence: float = 0.0,
+    llm_model: str = "",
+) -> dict[str, Any] | None:
+    """Merge the heuristic + LLM-judge findings into the single chip payload.
+
+    This is the ONE projection both the live path
+    (``ChatSession._evaluate_output`` → ``on_output_warning``) and the
+    replay path (``history_decoration``) call, so the inline finding chip
+    renders identically live and on reconnect — the wire-shape parity the
+    output guard needs.
+
+    Merge rule (issue #560, "show, annotated"):
+
+    * ``risk_level`` = max(heuristic, llm) — a positive from EITHER detector
+      surfaces.  A negative ("none") or failed/absent LLM never *lowers* a
+      heuristic positive: the judge reads adversarial tool output, so it may
+      raise an alarm but must not be able to suppress a deterministic regex
+      finding.  Credential redaction is a heuristic-only signal handled by
+      the caller via ``redacted`` and is likewise never overridden.
+    * ``flags`` = union(heuristic, llm).
+    * ``annotations`` = the heuristic's human-readable messages (the only
+      prose a regex-only finding carries — the LLM's prose lives in the
+      separate ``reasoning`` field).  Emitted only when non-empty.
+    * When the LLM produced a verdict (``llm_succeeded``) its own risk
+      (``judge_risk``), confidence, reasoning, and model ride along as
+      annotation under ``tier="llm"`` — so the operator sees the judge's
+      opinion even when it disagrees with the displayed (merged) risk.  A
+      failed / disabled LLM leaves ``tier="heuristic"`` and no badge.
+
+    Returns ``None`` when there is nothing to show — merged risk ``"none"``
+    and no redaction — the skip-on-clean contract both surfaces rely on.
+    """
+    risk = _max_risk(heuristic_risk or "none", llm_risk if llm_succeeded else "none")
+    flags: list[str] = []
+    candidate_flags = list(heuristic_flags) + (list(llm_flags) if llm_succeeded else [])
+    for f in candidate_flags:
+        if f and f not in flags:
+            flags.append(f)
+
+    if risk == "none" and not redacted:
+        return None
+
+    payload: dict[str, Any] = {
+        "risk_level": risk,
+        "flags": flags,
+        "redacted": bool(redacted),
+    }
+    if heuristic_annotations:
+        payload["annotations"] = list(heuristic_annotations)
+    if llm_succeeded:
+        payload["tier"] = "llm"
+        payload["judge_risk"] = llm_risk
+        payload["confidence"] = llm_confidence
+        if llm_reasoning:
+            payload["reasoning"] = llm_reasoning
+        if llm_model:
+            payload["judge_model"] = llm_model
+    else:
+        payload["tier"] = "heuristic"
+    return payload
+
+
 @dataclass(frozen=True)
 class OutputGuardPatternDef:
     """A pattern definition for output guard scanning."""

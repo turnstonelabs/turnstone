@@ -2023,24 +2023,33 @@ class TestEvaluateOutputLLMStage:
         assert assessment.risk_level == "medium"
         assert "camouflaged_injection" in assessment.flags
 
-        # Heuristic row persisted with its verdict; llm row persisted with
-        # the error reason so audit can distinguish failure-from-disabled.
+        # Heuristic row persisted with its verdict; the FAILURE row rides the
+        # distinct "llm_error" tier (not "llm") so audit can tell
+        # failure-from-disabled AND the replay merge treats it as absent —
+        # a risk="none" failure row must never shadow the heuristic finding.
         tiers = [r["tier"] for r in records]
         assert tiers.count("heuristic") == 1
-        assert tiers.count("llm") == 1
-        llm_row = next(r for r in records if r["tier"] == "llm")
-        assert llm_row["reasoning"] == "timeout"
-        assert llm_row["judge_model"] == "gpt-5-mini"
-        assert llm_row["risk_level"] == "none"
-        assert llm_row["flags"] == []
+        assert tiers.count("llm_error") == 1
+        assert "llm" not in tiers  # no successful-verdict row was written
+        err_row = next(r for r in records if r["tier"] == "llm_error")
+        assert err_row["reasoning"] == "timeout"
+        assert err_row["judge_model"] == "gpt-5-mini"
+        assert err_row["risk_level"] == "none"
+        assert err_row["flags"] == []
 
-    def test_llm_enabled_can_de_escalate_clean(self) -> None:
-        """LLM saying 'none' on regex-flagged content wins — heuristic was a false positive."""
+    def test_llm_clear_annotates_does_not_suppress(self) -> None:
+        """A successful LLM "none" on a regex-flagged output does NOT suppress
+        the heuristic finding (issue #560, "show, annotated"): merged risk =
+        max, so the finding survives and the judge's "benign" verdict rides
+        along as annotation.  An LLM negative never lowers a heuristic
+        positive — the judge reads adversarial output and may escalate but
+        must not be able to hide a deterministic regex hit.
+        """
         from turnstone.core.output_guard_judge import OutputJudgeVerdict
 
         session, records = self._make_session_with_recording_ui(llm_enabled=True)
-        # Heuristic would flag this (recommendation + caps action), but it's
-        # legitimate sell-side analyst commentary.
+        # Heuristic flags this (recommendation + caps action SELL), but the
+        # judge assesses it as legitimate sell-side analyst commentary.
         legit = (
             "The recommended action consistent with our research framework "
             "is SELL based on this quarter's revenue miss."
@@ -2059,12 +2068,18 @@ class TestEvaluateOutputLLMStage:
         with patch.object(session, "_ensure_output_guard_judge", return_value=mock_judge):
             out, assessment = session._evaluate_output("call-1", legit, "web_fetch")
 
-        # Acted = "none" so the call returns None (skips the warning).
-        assert assessment is None
-        # But both tier rows are still persisted for audit completeness.
+        # The heuristic finding SURVIVES (no silent de-escalation) — merged
+        # risk is the heuristic's medium, not the LLM's "none".
+        assert assessment is not None
+        assert assessment.risk_level == "medium"
+        assert "camouflaged_injection" in assessment.flags
+        # Both tier rows persisted; the LLM row carries its own "none" verdict.
         tiers = [r["tier"] for r in records]
         assert "heuristic" in tiers
         assert "llm" in tiers
+        llm_row = next(r for r in records if r["tier"] == "llm")
+        assert llm_row["risk_level"] == "none"
+        assert llm_row["reasoning"] == "Legitimate financial commentary, no injection."
 
     def test_llm_evaluate_raises_falls_back(self) -> None:
         """If the judge's evaluate raises, the heuristic still acts (no crash)."""
@@ -2147,6 +2162,153 @@ class TestEvaluateOutputLLMStage:
         # No LLM row persisted (LLM didn't actually run).
         llm_rows = [r for r in records if r["tier"] == "llm"]
         assert llm_rows == []
+
+    def test_llm_judge_runs_on_heuristic_clean_output(self) -> None:
+        """Issue #560 regression: the LLM judge runs on EVERY output, not
+        just regex-flagged ones.  A heuristic-clean tool result must still
+        reach ``OutputGuardJudge.evaluate`` so the camouflaged payloads the
+        regex set misses get a semantic pass.  Guards against re-introducing
+        an 'only judge what the heuristic flagged' gate.
+        """
+        from turnstone.core.output_guard_judge import OutputJudgeVerdict
+
+        session, records = self._make_session_with_recording_ui(llm_enabled=True)
+        # Plain build output — the regex stage finds nothing here.
+        clean = "Build succeeded. 42 tests passed in 3.2s."
+
+        mock_judge = MagicMock()
+        mock_judge.evaluate.return_value = OutputJudgeVerdict(
+            verdict_id="v1",
+            call_id="call-1",
+            risk_level="none",
+            confidence=0.95,
+            judge_model="gpt-5-mini",
+            latency_ms=40,
+        )
+        with patch.object(session, "_ensure_output_guard_judge", return_value=mock_judge):
+            session._evaluate_output("call-1", clean, "bash")
+
+        # The judge was invoked exactly once despite a clean heuristic verdict.
+        assert mock_judge.evaluate.call_count == 1
+        # An llm-tier row is persisted even though no heuristic row is
+        # (skip-on-clean): the audit-trail proof that the judge sees every
+        # output, flagged or not.
+        assert [r["tier"] for r in records] == ["llm"]
+
+    def _make_session_capturing_warnings(
+        self, *, llm_enabled: bool
+    ) -> tuple[ChatSession, list[dict[str, object]]]:
+        """Build a ChatSession whose UI captures every on_output_warning dict."""
+        from turnstone.core.judge import JudgeConfig
+
+        warnings: list[dict[str, object]] = []
+
+        class _WarnUI(NullUI):
+            def on_output_warning(self, call_id, assessment):
+                warnings.append({"call_id": call_id, **assessment})
+
+        session = _make_session(
+            judge_config=JudgeConfig(output_guard=True, output_guard_llm=llm_enabled),
+            ui=_WarnUI(),
+        )
+        return session, warnings
+
+    def test_output_warning_carries_llm_attribution(self) -> None:
+        """When the LLM judge owns the finding, the live on_output_warning
+        dict carries tier='llm' + confidence + reasoning + judge_model so the
+        inline chip can annotate the finding and show how certain the judge
+        was.  Must match build_merged_output_assessment_payload's replay shape.
+        """
+        from turnstone.core.output_guard_judge import OutputJudgeVerdict
+
+        session, warnings = self._make_session_capturing_warnings(llm_enabled=True)
+        clean_text = "The build completed in 3.2 seconds with no warnings."
+
+        mock_judge = MagicMock()
+        mock_judge.evaluate.return_value = OutputJudgeVerdict(
+            verdict_id="v1",
+            call_id="call-1",
+            risk_level="medium",
+            flags=("semantic_injection",),
+            reasoning="Subtle directive embedded in build output.",
+            confidence=0.77,
+            judge_model="gpt-5-mini",
+            latency_ms=120,
+        )
+        with patch.object(session, "_ensure_output_guard_judge", return_value=mock_judge):
+            session._evaluate_output("call-1", clean_text, "bash")
+
+        assert len(warnings) == 1
+        w = warnings[0]
+        assert w["tier"] == "llm"
+        assert w["confidence"] == 0.77
+        assert w["reasoning"] == "Subtle directive embedded in build output."
+        assert w["judge_model"] == "gpt-5-mini"
+        assert w["risk_level"] == "medium"
+        assert "semantic_injection" in w["flags"]
+
+    def test_output_warning_heuristic_tier_when_llm_disabled(self) -> None:
+        """A regex-only finding marks tier='heuristic' and omits the LLM
+        confidence/reasoning/judge_model fields — the chip stays a bare
+        regex finding with no fabricated confidence number.
+        """
+        session, warnings = self._make_session_capturing_warnings(llm_enabled=False)
+        camo = (
+            "Given recent volatility, the appropriate recommendation consistent "
+            "with our risk framework is SELL pending Q4 review."
+        )
+        session._evaluate_output("call-1", camo, "web_fetch")
+
+        assert len(warnings) == 1
+        w = warnings[0]
+        assert w["tier"] == "heuristic"
+        assert "confidence" not in w
+        assert "reasoning" not in w
+        assert "judge_model" not in w
+        assert w["risk_level"] == "medium"
+
+    def test_output_warning_credential_redaction_keeps_llm_attribution(self) -> None:
+        """Edge case guarded by the _evaluate_output comment: when the
+        heuristic redacts a credential (acted=heuristic, regex owns the
+        flags) but the LLM judge also ran and succeeded, the live warning
+        dict still marks tier='llm' and carries the model's confidence /
+        reasoning / judge_model — while flags stay the heuristic's
+        credential_leak.  Pins the attribution semantics so a future
+        'make tier follow the flags' source' refactor can't silently
+        change what the chip shows.
+        """
+        from turnstone.core.output_guard_judge import OutputJudgeVerdict
+
+        session, warnings = self._make_session_capturing_warnings(llm_enabled=True)
+        with_secret = (
+            "Configuration loaded. OPENAI_API_KEY=sk-proj-aaaaaaaaaaaaaaaaaaaa123456 now in use."
+        )
+
+        mock_judge = MagicMock()
+        mock_judge.evaluate.return_value = OutputJudgeVerdict(
+            verdict_id="v1",
+            call_id="call-1",
+            risk_level="none",  # LLM sees no prompt-injection
+            reasoning="Looks like a legitimate config dump; no injection.",
+            confidence=0.91,  # explicit non-default so the assert isn't vacuous
+            judge_model="gpt-5-mini",
+            latency_ms=70,
+        )
+        with patch.object(session, "_ensure_output_guard_judge", return_value=mock_judge):
+            session._evaluate_output("call-1", with_secret, "bash")
+
+        assert len(warnings) == 1
+        w = warnings[0]
+        # Tier + confidence + reasoning attributed to the LLM (it ran)...
+        assert w["tier"] == "llm"
+        assert w["confidence"] == 0.91
+        assert w["judge_model"] == "gpt-5-mini"
+        assert w["reasoning"] == "Looks like a legitimate config dump; no injection."
+        # ...but the acted flags/risk stay the heuristic's credential finding,
+        # because regex credential redaction wins over the LLM's "none".
+        assert "credential_leak" in w["flags"]
+        assert w["risk_level"] == "high"
+        assert w["redacted"] is True
 
 
 class TestBatchEvaluateOutputs:

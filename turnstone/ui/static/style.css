@@ -2480,6 +2480,21 @@ audio.media-player {
   color: var(--fg-dim);
   font-style: italic;
 }
+/* LLM-judge attribution badge — set in slightly dimmer ink than the
+   risk-coloured flag text so it reads as metadata, not another flag. */
+.output-warning-tier {
+  margin-left: 6px;
+  font-weight: 600;
+  opacity: 0.85;
+}
+/* Judge rationale — muted second line under the flag row. */
+.output-warning-reasoning {
+  margin-top: 2px;
+  color: var(--fg-dim);
+  font-style: italic;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 
 /* ==========================================================================
    New workstream modal

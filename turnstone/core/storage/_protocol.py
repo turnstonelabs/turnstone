@@ -1825,8 +1825,10 @@ class StorageBackend(Protocol):
     ) -> None:
         """Record an output guard assessment.
 
-        ``tier`` is ``"heuristic"`` (regex stage, default) or ``"llm"``
-        (capability-gated semantic evaluator, issue #560 mitigation #1).
+        ``tier`` is ``"heuristic"`` (regex stage, default), ``"llm"`` (the
+        judge's own successful verdict, issue #560 mitigation #1), or
+        ``"llm_error"`` (the judge ran but failed — audit-only, excluded
+        from the replay display merge; ``reasoning`` carries the error).
         One row per ``(call_id, tier)`` so a single tool call can produce
         up to two rows; mirrors the ``intent_verdicts`` table's row model.
         ``reasoning`` / ``judge_model`` / ``latency_ms`` / ``confidence``
