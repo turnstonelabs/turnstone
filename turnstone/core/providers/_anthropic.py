@@ -85,6 +85,20 @@ _ANTHROPIC_DEFAULT = ModelCapabilities(
 )
 
 _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
+    "claude-opus-4-8": ModelCapabilities(
+        context_window=1000000,
+        max_output_tokens=128000,
+        token_param="max_tokens",
+        thinking_mode="adaptive",
+        supports_effort=True,
+        effort_levels=("low", "medium", "high", "xhigh", "max"),
+        supports_web_search=True,
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_temperature=False,
+        thinking_display="summarized",
+        supports_reasoning_replay=True,
+    ),
     "claude-opus-4-7": ModelCapabilities(
         context_window=1000000,
         max_output_tokens=128000,
@@ -311,7 +325,7 @@ class AnthropicProvider:
             kwargs["tools"] = anthropic_tools
         kwargs.update(thinking_params)
 
-        # Effort param for models that support it (Opus 4.7, Opus 4.6, Sonnet 4.6, Opus 4.5)
+        # Effort param for models that support it (Opus 4.8, Opus 4.7, Opus 4.6, Sonnet 4.6, Opus 4.5)
         if caps.supports_effort and reasoning_effort:
             effort = _map_reasoning_to_effort(reasoning_effort, caps.effort_levels)
             if effort:
