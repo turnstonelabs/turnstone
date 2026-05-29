@@ -4071,12 +4071,23 @@ function toggleDashboard() {
   else showDashboard();
 }
 
+// Paint a transient message (loading / error) into the saved-workstreams
+// area.  Clears any cards AND hides the pagination control \u2014 it's a sibling
+// of the cards container, so a bare replaceChildren on the cards alone would
+// leave stale Prev/Next visible and still wired to the previous list cache.
+// A successful load re-shows both via renderSavedWorkstreams.
+function _setSavedWsMessage(text) {
+  document
+    .getElementById("dashboard-saved-cards")
+    .replaceChildren(makeEmptyState(text));
+  const pag = document.getElementById("ws-pagination");
+  if (pag) pag.style.display = "none";
+}
+
 function loadDashboard() {
   const tableEl = document.getElementById("dash-ws-table");
   tableEl.replaceChildren(makeEmptyState("Loading\u2026"));
-  document
-    .getElementById("dashboard-saved-cards")
-    .replaceChildren(makeEmptyState("Loading\u2026"));
+  _setSavedWsMessage("Loading\u2026");
   const dashP = authFetch("/v1/api/dashboard").then(function (r) {
     return r.json();
   });
@@ -4100,9 +4111,7 @@ function loadDashboard() {
     })
     .catch(function () {
       tableEl.replaceChildren(makeEmptyState("Failed to load"));
-      document
-        .getElementById("dashboard-saved-cards")
-        .replaceChildren(makeEmptyState("Failed to load"));
+      _setSavedWsMessage("Failed to load");
     });
 }
 
