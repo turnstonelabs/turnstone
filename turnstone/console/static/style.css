@@ -1507,6 +1507,141 @@
   outline-offset: 2px;
 }
 
+/* Row action overflow menu (kebab) — shared affordance for every admin
+   table's ACTIONS column.  Replaces the inline button strips that
+   overflowed narrow action tracks and rendered a misleading
+   text-overflow "…".  The actions cell inherits `.admin-col`'s
+   `overflow: hidden`, which would re-clip a dropdown, so we override it
+   to `visible` and anchor an absolutely-positioned menu to the kebab
+   container.  `.admin-content` does not scroll (the document does), so
+   the menu — glued to its cell — overlays the page without being
+   clipped by any ancestor. */
+.admin-col-actions,
+.admin-col-mactions {
+  overflow: visible;
+  /* Pin the trigger to the right of its (over-wide) track so it shares an
+     edge with the right-anchored menu — and right-align the "ACTIONS"
+     header label to match. */
+  text-align: right;
+}
+
+.admin-kebab {
+  position: relative;
+  display: inline-block;
+}
+.admin-kebab.is-open {
+  z-index: 60;
+}
+
+.admin-kebab-btn {
+  background: none;
+  border: 1px solid var(--border-strong);
+  color: var(--fg-dim);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 3px 7px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  opacity: 0.8;
+  transition:
+    opacity 0.15s,
+    background 0.15s,
+    color 0.15s;
+}
+.admin-kebab-btn:hover,
+.admin-kebab.is-open .admin-kebab-btn {
+  opacity: 1;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--fg);
+}
+.admin-kebab-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.admin-kebab-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 1;
+  min-width: 148px;
+  /* Never exceed the viewport on either axis (narrow screens / tall menus);
+     _openKebab() flips side/up when an edge would be crossed. */
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+  padding: 4px;
+  display: none;
+  flex-direction: column;
+  gap: 1px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+.admin-kebab.is-open .admin-kebab-menu {
+  display: flex;
+}
+.admin-kebab-menu.flip-up {
+  top: auto;
+  bottom: calc(100% + 4px);
+}
+.admin-kebab-menu.flip-left {
+  right: auto;
+  left: 0;
+}
+
+.admin-kebab-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--fg);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 5px 10px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.1s;
+}
+.admin-kebab-item:hover {
+  background: var(--bg-highlight);
+}
+.admin-kebab-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.admin-kebab-item--danger {
+  color: var(--red);
+}
+/* Pair the colour with a glyph so destructive/caution items don't rely on
+   hue alone.  \FE0E forces the text (non-emoji) presentation of the sign. */
+.admin-kebab-item--danger::before {
+  content: "⚠\FE0E";
+  margin-right: 7px;
+  opacity: 0.9;
+}
+.admin-kebab-item--danger:hover {
+  background: var(--red-glow);
+}
+.admin-kebab-item--caution {
+  color: var(--yellow);
+}
+.admin-kebab-item--caution::before {
+  content: "△";
+  margin-right: 7px;
+  opacity: 0.9;
+}
+.admin-kebab-item--caution:hover {
+  background: var(--yellow-glow);
+}
+
 /* Schedules grid: NAME | TYPE | SCHEDULE | TARGET | NEXT RUN | STATUS | ACTIONS */
 #admin-schedules .admin-colheaders,
 #admin-schedules .admin-row {
@@ -4511,6 +4646,8 @@ textarea.skill-content-area {
   .admin-btn-danger,
   .admin-btn-caution,
   .admin-btn-action,
+  .admin-kebab-btn,
+  .admin-kebab-item,
   .admin-subtab-btn {
     transition: none;
   }

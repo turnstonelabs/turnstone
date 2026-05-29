@@ -192,18 +192,19 @@ function _renderGovRoles(items) {
 
     // Builtin rows always get Edit (lands in the overrides editor).
     // Custom rows get Edit + Delete (existing behavior).
-    let actions =
-      '<button class="admin-btn-action" data-edit-role="' +
-      escapeHtml(r.role_id) +
-      '">edit</button>';
-    if (!r.builtin) {
-      actions +=
-        '<button class="admin-btn-danger" data-delete-role="' +
-        escapeHtml(r.role_id) +
-        '" data-role-name="' +
-        escapeHtml(r.name) +
-        '">delete</button>';
-    }
+    const actions = _kebabMenu([
+      { label: "edit", attrs: { "data-edit-role": r.role_id } },
+      r.builtin
+        ? null
+        : {
+            label: "delete",
+            kind: "danger",
+            attrs: {
+              "data-delete-role": r.role_id,
+              "data-role-name": r.name,
+            },
+          },
+    ]);
 
     const chevron = expanded ? "▾" : "▸";
     html +=
@@ -240,6 +241,9 @@ function _renderGovRoles(items) {
   const expandBtns = el.querySelectorAll("[data-expand-role]");
   for (let k = 0; k < expandBtns.length; k++) {
     expandBtns[k].addEventListener("click", function (ev) {
+      // The row carries data-expand-role too, so a click on its action menu
+      // would otherwise toggle the drawer — let the kebab handle its own.
+      if (ev.target.closest(".admin-kebab")) return;
       ev.stopPropagation();
       const rid = this.getAttribute("data-expand-role");
       if (_govRoleExpanded.has(rid)) _govRoleExpanded.delete(rid);
@@ -251,7 +255,11 @@ function _renderGovRoles(items) {
   const editBtns = el.querySelectorAll("[data-edit-role]");
   for (let k = 0; k < editBtns.length; k++) {
     editBtns[k].addEventListener("click", function (ev) {
+      // stopPropagation keeps the builtin single-action inline button from
+      // toggling the row drawer; it also blocks the document-level kebab
+      // close, so dismiss the menu explicitly here.
       ev.stopPropagation();
+      _closeAllKebabs();
       showEditRoleModal(this.getAttribute("data-edit-role"));
     });
   }
@@ -259,7 +267,10 @@ function _renderGovRoles(items) {
   const delBtns = el.querySelectorAll("[data-delete-role]");
   for (let k = 0; k < delBtns.length; k++) {
     delBtns[k].addEventListener("click", function (ev) {
+      // See edit handler: stopPropagation also blocks the document-level
+      // kebab close, so dismiss the menu explicitly.
       ev.stopPropagation();
+      _closeAllKebabs();
       const rid = this.getAttribute("data-delete-role");
       const rname = this.getAttribute("data-role-name");
       showConfirmModal(
@@ -847,14 +858,17 @@ function _renderGovPolicies(items) {
       statusDot +
       "</span>" +
       '<span class="admin-col admin-col-actions">' +
-      '<button class="admin-btn-action" data-edit-policy="' +
-      escapeHtml(p.policy_id) +
-      '">edit</button>' +
-      '<button class="admin-btn-danger" data-delete-policy="' +
-      escapeHtml(p.policy_id) +
-      '" data-policy-name="' +
-      escapeHtml(p.name) +
-      '">delete</button>' +
+      _kebabMenu([
+        { label: "edit", attrs: { "data-edit-policy": p.policy_id } },
+        {
+          label: "delete",
+          kind: "danger",
+          attrs: {
+            "data-delete-policy": p.policy_id,
+            "data-policy-name": p.name,
+          },
+        },
+      ]) +
       "</span></div>";
   }
   setSafeHtml(el, html);
@@ -1136,7 +1150,6 @@ function _renderGovSkills(items) {
         " res</span>";
     }
     const editLabel = t.readonly ? "view" : "edit";
-    const deleteDisabled = "";
     html +=
       '<div class="admin-row" role="listitem">' +
       '<span class="admin-col admin-col-tmcat">' +
@@ -1159,18 +1172,17 @@ function _renderGovSkills(items) {
       riskCell +
       "</span>" +
       '<span class="admin-col admin-col-actions">' +
-      '<button class="admin-btn-action" data-edit-tmpl="' +
-      escapeHtml(t.template_id) +
-      '">' +
-      editLabel +
-      "</button>" +
-      '<button class="admin-btn-danger" data-delete-tmpl="' +
-      escapeHtml(t.template_id) +
-      '" data-tmpl-name="' +
-      escapeHtml(t.name) +
-      '"' +
-      deleteDisabled +
-      ">delete</button>" +
+      _kebabMenu([
+        { label: editLabel, attrs: { "data-edit-tmpl": t.template_id } },
+        {
+          label: "delete",
+          kind: "danger",
+          attrs: {
+            "data-delete-tmpl": t.template_id,
+            "data-tmpl-name": t.name,
+          },
+        },
+      ]) +
       "</span></div>";
   }
   setSafeHtml(el, html);
@@ -2835,14 +2847,17 @@ function _renderAdminMemories(items, total) {
       _relativeTime(m.updated) +
       "</span>" +
       '<span class="admin-col admin-col-actions">' +
-      '<button class="admin-btn-action" data-view-memory="' +
-      escapeHtml(m.memory_id) +
-      '">view</button>' +
-      '<button class="admin-btn-danger" data-delete-memory="' +
-      escapeHtml(m.memory_id) +
-      '" data-delete-name="' +
-      escapeHtml(m.name) +
-      '">delete</button>' +
+      _kebabMenu([
+        { label: "view", attrs: { "data-view-memory": m.memory_id } },
+        {
+          label: "delete",
+          kind: "danger",
+          attrs: {
+            "data-delete-memory": m.memory_id,
+            "data-delete-name": m.name,
+          },
+        },
+      ]) +
       "</span>" +
       "</div>";
   }
@@ -3376,19 +3391,25 @@ function _renderPromptPolicies(items) {
 
     const colActions = document.createElement("span");
     colActions.className = "admin-col admin-col-actions";
-    const editBtn = document.createElement("button");
-    editBtn.className = "admin-btn-action";
-    editBtn.textContent = "edit";
-    editBtn.setAttribute("data-edit-ppolicy", p.policy_id);
-    editBtn.setAttribute("aria-label", "Edit prompt " + p.name);
-    colActions.appendChild(editBtn);
-    const delBtn = document.createElement("button");
-    delBtn.className = "admin-btn-danger";
-    delBtn.textContent = "delete";
-    delBtn.setAttribute("data-delete-ppolicy", p.policy_id);
-    delBtn.setAttribute("data-ppolicy-name", p.name);
-    delBtn.setAttribute("aria-label", "Delete prompt " + p.name);
-    colActions.appendChild(delBtn);
+    const ppKebab = _kebabMenuEl([
+      {
+        label: "edit",
+        attrs: {
+          "data-edit-ppolicy": p.policy_id,
+          "aria-label": "Edit prompt " + p.name,
+        },
+      },
+      {
+        label: "delete",
+        kind: "danger",
+        attrs: {
+          "data-delete-ppolicy": p.policy_id,
+          "data-ppolicy-name": p.name,
+          "aria-label": "Delete prompt " + p.name,
+        },
+      },
+    ]);
+    if (ppKebab) colActions.appendChild(ppKebab);
     row.appendChild(colActions);
 
     el.appendChild(row);
@@ -3942,70 +3963,71 @@ function renderHeuristicRules() {
     const statusBadge = r.enabled
       ? '<span class="scope-badge scope-scan-safe">active</span>'
       : '<span class="scope-badge scope-deny">disabled</span>';
-    let actions = "";
-    const eName = escapeHtml(r.name);
+    // Enable/Disable toggle, shared by the two DB-backed branches.  The
+    // data-enabled attr carries the NEXT state (!r.enabled).
+    const toggleHrItem = {
+      label: r.enabled ? "Disable" : "Enable",
+      attrs: {
+        "data-toggle-hr": r.rule_id,
+        "data-enabled": !r.enabled,
+        "aria-label": (r.enabled ? "Disable " : "Enable ") + r.name,
+      },
+    };
+    let actionItems;
     if (!r.rule_id) {
       // Pure built-in: Disable + Edit
-      actions =
-        '<button class="admin-btn-action" data-disable-builtin-hr="' +
-        eName +
-        '" aria-label="Disable ' +
-        eName +
-        '">Disable</button> ' +
-        '<button class="admin-btn-action" data-edit-hr-builtin="' +
-        eName +
-        '" aria-label="Edit ' +
-        eName +
-        '">Edit</button>';
+      actionItems = [
+        {
+          label: "Disable",
+          attrs: {
+            "data-disable-builtin-hr": r.name,
+            "aria-label": "Disable " + r.name,
+          },
+        },
+        {
+          label: "Edit",
+          attrs: {
+            "data-edit-hr-builtin": r.name,
+            "aria-label": "Edit " + r.name,
+          },
+        },
+      ];
     } else if (r.builtin) {
       // Overridden or disabled built-in: Enable/Disable + Edit + Reset
-      actions =
-        '<button class="admin-btn-action" data-toggle-hr="' +
-        r.rule_id +
-        '" data-enabled="' +
-        !r.enabled +
-        '" aria-label="' +
-        (r.enabled ? "Disable" : "Enable") +
-        " " +
-        eName +
-        '">' +
-        (r.enabled ? "Disable" : "Enable") +
-        "</button> " +
-        '<button class="admin-btn-action" data-edit-hr="' +
-        r.rule_id +
-        '" aria-label="Edit ' +
-        eName +
-        '">Edit</button> ' +
-        '<button class="admin-btn-caution" data-reset-hr="' +
-        r.rule_id +
-        '" aria-label="Reset ' +
-        eName +
-        '">Reset</button>';
+      actionItems = [
+        toggleHrItem,
+        {
+          label: "Edit",
+          attrs: { "data-edit-hr": r.rule_id, "aria-label": "Edit " + r.name },
+        },
+        {
+          label: "Reset",
+          kind: "caution",
+          attrs: {
+            "data-reset-hr": r.rule_id,
+            "aria-label": "Reset " + r.name,
+          },
+        },
+      ];
     } else {
       // Custom rule: Enable/Disable + Edit + Delete
-      actions =
-        '<button class="admin-btn-action" data-toggle-hr="' +
-        r.rule_id +
-        '" data-enabled="' +
-        !r.enabled +
-        '" aria-label="' +
-        (r.enabled ? "Disable" : "Enable") +
-        " " +
-        eName +
-        '">' +
-        (r.enabled ? "Disable" : "Enable") +
-        "</button> " +
-        '<button class="admin-btn-action" data-edit-hr="' +
-        r.rule_id +
-        '" aria-label="Edit ' +
-        eName +
-        '">Edit</button> ' +
-        '<button class="admin-btn-danger" data-delete-hr="' +
-        r.rule_id +
-        '" aria-label="Delete ' +
-        eName +
-        '">Delete</button>';
+      actionItems = [
+        toggleHrItem,
+        {
+          label: "Edit",
+          attrs: { "data-edit-hr": r.rule_id, "aria-label": "Edit " + r.name },
+        },
+        {
+          label: "Delete",
+          kind: "danger",
+          attrs: {
+            "data-delete-hr": r.rule_id,
+            "aria-label": "Delete " + r.name,
+          },
+        },
+      ];
     }
+    const actions = _kebabMenu(actionItems);
     html +=
       '<div class="admin-row" role="listitem">' +
       '<span class="admin-col"><code>' +
@@ -4029,7 +4051,7 @@ function renderHeuristicRules() {
       '<span class="admin-col">' +
       statusBadge +
       "</span>" +
-      '<span class="admin-col">' +
+      '<span class="admin-col admin-col-actions">' +
       actions +
       "</span></div>";
   }
@@ -4459,70 +4481,77 @@ function renderOGPatterns() {
     const statusBadge = p.enabled
       ? '<span class="scope-badge scope-scan-safe">active</span>'
       : '<span class="scope-badge scope-deny">disabled</span>';
-    let actions = "";
-    const eName = escapeHtml(p.name);
+    // Enable/Disable toggle, shared by the two DB-backed branches.  The
+    // data-enabled attr carries the NEXT state (!p.enabled).
+    const toggleOgpItem = {
+      label: p.enabled ? "Disable" : "Enable",
+      attrs: {
+        "data-toggle-ogp": p.pattern_id,
+        "data-enabled": !p.enabled,
+        "aria-label": (p.enabled ? "Disable " : "Enable ") + p.name,
+      },
+    };
+    let actionItems;
     if (!p.pattern_id) {
       // Pure built-in: Disable + Edit
-      actions =
-        '<button class="admin-btn-action" data-disable-builtin-ogp="' +
-        eName +
-        '" aria-label="Disable ' +
-        eName +
-        '">Disable</button> ' +
-        '<button class="admin-btn-action" data-edit-ogp-builtin="' +
-        eName +
-        '" aria-label="Edit ' +
-        eName +
-        '">Edit</button>';
+      actionItems = [
+        {
+          label: "Disable",
+          attrs: {
+            "data-disable-builtin-ogp": p.name,
+            "aria-label": "Disable " + p.name,
+          },
+        },
+        {
+          label: "Edit",
+          attrs: {
+            "data-edit-ogp-builtin": p.name,
+            "aria-label": "Edit " + p.name,
+          },
+        },
+      ];
     } else if (p.builtin) {
       // Overridden or disabled built-in: Enable/Disable + Edit + Reset
-      actions =
-        '<button class="admin-btn-action" data-toggle-ogp="' +
-        p.pattern_id +
-        '" data-enabled="' +
-        !p.enabled +
-        '" aria-label="' +
-        (p.enabled ? "Disable" : "Enable") +
-        " " +
-        eName +
-        '">' +
-        (p.enabled ? "Disable" : "Enable") +
-        "</button> " +
-        '<button class="admin-btn-action" data-edit-ogp="' +
-        p.pattern_id +
-        '" aria-label="Edit ' +
-        eName +
-        '">Edit</button> ' +
-        '<button class="admin-btn-caution" data-reset-ogp="' +
-        p.pattern_id +
-        '" aria-label="Reset ' +
-        eName +
-        '">Reset</button>';
+      actionItems = [
+        toggleOgpItem,
+        {
+          label: "Edit",
+          attrs: {
+            "data-edit-ogp": p.pattern_id,
+            "aria-label": "Edit " + p.name,
+          },
+        },
+        {
+          label: "Reset",
+          kind: "caution",
+          attrs: {
+            "data-reset-ogp": p.pattern_id,
+            "aria-label": "Reset " + p.name,
+          },
+        },
+      ];
     } else {
       // Custom rule: Enable/Disable + Edit + Delete
-      actions =
-        '<button class="admin-btn-action" data-toggle-ogp="' +
-        p.pattern_id +
-        '" data-enabled="' +
-        !p.enabled +
-        '" aria-label="' +
-        (p.enabled ? "Disable" : "Enable") +
-        " " +
-        eName +
-        '">' +
-        (p.enabled ? "Disable" : "Enable") +
-        "</button> " +
-        '<button class="admin-btn-action" data-edit-ogp="' +
-        p.pattern_id +
-        '" aria-label="Edit ' +
-        eName +
-        '">Edit</button> ' +
-        '<button class="admin-btn-danger" data-delete-ogp="' +
-        p.pattern_id +
-        '" aria-label="Delete ' +
-        eName +
-        '">Delete</button>';
+      actionItems = [
+        toggleOgpItem,
+        {
+          label: "Edit",
+          attrs: {
+            "data-edit-ogp": p.pattern_id,
+            "aria-label": "Edit " + p.name,
+          },
+        },
+        {
+          label: "Delete",
+          kind: "danger",
+          attrs: {
+            "data-delete-ogp": p.pattern_id,
+            "aria-label": "Delete " + p.name,
+          },
+        },
+      ];
     }
+    const actions = _kebabMenu(actionItems);
     html +=
       '<div class="admin-row" role="listitem">' +
       '<span class="admin-col"><code>' +
@@ -4543,7 +4572,7 @@ function renderOGPatterns() {
       '<span class="admin-col">' +
       statusBadge +
       "</span>" +
-      '<span class="admin-col">' +
+      '<span class="admin-col admin-col-actions">' +
       actions +
       "</span></div>";
   }

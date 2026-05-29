@@ -315,6 +315,200 @@ function switchAdminTab(tab) {
 }
 
 // ---------------------------------------------------------------------------
+// Row action overflow menu (kebab)
+// ---------------------------------------------------------------------------
+// Shared affordance for every admin table's ACTIONS column.  _kebabMenu()
+// returns the markup string; _kebabMenuEl() the equivalent DOM node for the
+// few tables that build rows with createElement.  Each menu item carries the
+// SAME data-* attribute its inline-button predecessor had, so every existing
+// click binding (querySelectorAll('[data-...]')) keeps working untouched —
+// only the markup generation changes.  _initKebabMenus() wires open/close,
+// outside-click, Escape, scroll/resize dismissal, viewport-aware flip-up, and
+// arrow-key navigation once, via document-level delegation, so it covers rows
+// rendered by both admin.js and governance.js.
+
+let _kebabInit = false;
+// Tracks whether any menu is open, so the high-frequency scroll/resize
+// dismiss listeners can skip the DOM query in the common (nothing-open) case.
+let _anyKebabOpen = false;
+
+function _kebabBtnClass(kind) {
+  if (kind === "danger") return "admin-btn-danger";
+  if (kind === "caution") return "admin-btn-caution";
+  return "admin-btn-action";
+}
+
+function _kebabAttrString(attrs) {
+  let out = "";
+  if (attrs) {
+    const keys = Object.keys(attrs);
+    for (let k = 0; k < keys.length; k++) {
+      out += " " + keys[k] + '="' + escapeHtml(String(attrs[keys[k]])) + '"';
+    }
+  }
+  return out;
+}
+
+function _kebabMenu(items) {
+  // items: array of { label, kind?: "danger" | "caution", title?, attrs? }.
+  // Falsy entries are dropped so callers can inline conditionals; an empty
+  // list yields "" so a row with no applicable actions renders no kebab.
+  const real = (items || []).filter(Boolean);
+  if (!real.length) return "";
+  if (real.length === 1) {
+    // A lone action doesn't earn the open-the-menu click — render it as a
+    // direct inline button.  Keeps the same data-* attrs (so existing
+    // bindings still match) and the familiar bordered button look.
+    const it = real[0];
+    const title = it.title ? ' title="' + escapeHtml(it.title) + '"' : "";
+    return (
+      '<button type="button" class="' +
+      _kebabBtnClass(it.kind) +
+      '"' +
+      _kebabAttrString(it.attrs) +
+      title +
+      ">" +
+      escapeHtml(it.label) +
+      "</button>"
+    );
+  }
+  let inner = "";
+  for (let i = 0; i < real.length; i++) {
+    const it = real[i];
+    let cls = "admin-kebab-item";
+    if (it.kind === "danger") cls += " admin-kebab-item--danger";
+    else if (it.kind === "caution") cls += " admin-kebab-item--caution";
+    const title = it.title ? ' title="' + escapeHtml(it.title) + '"' : "";
+    inner +=
+      '<button type="button" class="' +
+      cls +
+      '" role="menuitem"' +
+      _kebabAttrString(it.attrs) +
+      title +
+      ">" +
+      escapeHtml(it.label) +
+      "</button>";
+  }
+  return (
+    '<div class="admin-kebab">' +
+    '<button type="button" class="admin-kebab-btn" aria-haspopup="true" ' +
+    'aria-expanded="false" aria-label="Row actions" title="Row actions">' +
+    "⋯" +
+    "</button>" +
+    '<div class="admin-kebab-menu" role="menu">' +
+    inner +
+    "</div>" +
+    "</div>"
+  );
+}
+
+function _kebabMenuEl(items) {
+  // DOM-node variant for createElement-built rows.  Parsed via DOMParser
+  // (same as setSafeHtml) rather than innerHTML; _kebabMenu() has already
+  // escaped every interpolated value.
+  const html = _kebabMenu(items);
+  if (!html) return null;
+  const parsed = new DOMParser().parseFromString(html, "text/html");
+  return parsed.body.firstElementChild;
+}
+
+function _closeAllKebabs() {
+  if (!_anyKebabOpen) return;
+  _anyKebabOpen = false;
+  const open = document.querySelectorAll(".admin-kebab.is-open");
+  for (let i = 0; i < open.length; i++) {
+    open[i].classList.remove("is-open");
+    const menu = open[i].querySelector(".admin-kebab-menu");
+    if (menu) menu.classList.remove("flip-up", "flip-left");
+    const btn = open[i].querySelector(".admin-kebab-btn");
+    if (btn) btn.setAttribute("aria-expanded", "false");
+  }
+}
+
+function _openKebab(kebab) {
+  _closeAllKebabs();
+  kebab.classList.add("is-open");
+  _anyKebabOpen = true;
+  const btn = kebab.querySelector(".admin-kebab-btn");
+  const menu = kebab.querySelector(".admin-kebab-menu");
+  if (btn) btn.setAttribute("aria-expanded", "true");
+  if (!menu) return;
+  // Steer the menu back into the viewport: flip above the trigger if a
+  // downward menu would pass the bottom edge, and open rightward if a
+  // right-anchored menu would run off the left edge (narrow viewports where
+  // the actions column isn't flush against the right of the screen).
+  menu.classList.remove("flip-up", "flip-left");
+  const rect = menu.getBoundingClientRect();
+  if (rect.bottom > window.innerHeight - 8) menu.classList.add("flip-up");
+  if (rect.left < 8) menu.classList.add("flip-left");
+  // Move focus into the menu (WAI-ARIA menu-button pattern).  preventScroll
+  // stops the scroll-dismiss listener from firing as the menu opens.
+  const first = menu.querySelector(".admin-kebab-item");
+  if (first) first.focus({ preventScroll: true });
+}
+
+function _initKebabMenus() {
+  if (_kebabInit) return;
+  _kebabInit = true;
+
+  document.addEventListener("click", function (e) {
+    const trigger = e.target.closest(".admin-kebab-btn");
+    if (trigger) {
+      const kebab = trigger.closest(".admin-kebab");
+      if (kebab.classList.contains("is-open")) _closeAllKebabs();
+      else _openKebab(kebab);
+      return;
+    }
+    // A menu item's own data-* handler runs first (target phase); we just
+    // dismiss the menu afterwards as the click bubbles to the document.
+    if (e.target.closest(".admin-kebab-item")) {
+      _closeAllKebabs();
+      return;
+    }
+    // Any other click closes an open menu.
+    _closeAllKebabs();
+  });
+
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") {
+      const open = document.querySelector(".admin-kebab.is-open");
+      if (open) {
+        const btn = open.querySelector(".admin-kebab-btn");
+        _closeAllKebabs();
+        if (btn) btn.focus();
+      }
+      return;
+    }
+    const trigger = e.target.closest(".admin-kebab-btn");
+    if (trigger && e.key === "ArrowDown") {
+      e.preventDefault();
+      _openKebab(trigger.closest(".admin-kebab"));
+      return;
+    }
+    const menu = e.target.closest(".admin-kebab-menu");
+    if (!menu) return;
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const items = Array.prototype.slice.call(
+        menu.querySelectorAll(".admin-kebab-item"),
+      );
+      const cur = items.indexOf(document.activeElement);
+      const delta = e.key === "ArrowDown" ? 1 : -1;
+      const next = items[(cur + delta + items.length) % items.length];
+      if (next) next.focus();
+    } else if (e.key === "Tab") {
+      // Don't let Tab walk focus into the page behind an open menu.
+      _closeAllKebabs();
+    }
+  });
+
+  // The menu is anchored to its cell and rides document scroll, but an
+  // independent scroll or a resize can leave it mispositioned — dismiss.
+  window.addEventListener("scroll", _closeAllKebabs, true);
+  window.addEventListener("resize", _closeAllKebabs);
+}
+
+// ---------------------------------------------------------------------------
 // Users
 // ---------------------------------------------------------------------------
 
@@ -366,14 +560,19 @@ function _renderUsers(users) {
       escapeHtml(u.created || "").slice(0, 10) +
       "</span>" +
       '<span class="admin-col admin-col-actions">' +
-      '<button class="admin-btn-action" data-user-roles="' +
-      escapeHtml(u.user_id) +
-      '" title="Manage roles">roles</button>' +
-      '<button class="admin-btn-danger" data-delete-user="' +
-      escapeHtml(u.user_id) +
-      '" data-username="' +
-      escapeHtml(u.username) +
-      '" title="Delete user">delete</button>' +
+      _kebabMenu([
+        {
+          label: "roles",
+          title: "Manage roles",
+          attrs: { "data-user-roles": u.user_id },
+        },
+        {
+          label: "delete",
+          kind: "danger",
+          title: "Delete user",
+          attrs: { "data-delete-user": u.user_id, "data-username": u.username },
+        },
+      ]) +
       "</span>" +
       "</div>";
   }
@@ -405,7 +604,10 @@ function _renderUsers(users) {
         _toggleOidcPanel(uid, uname, row);
       };
       row.addEventListener("click", function (e) {
+        // Clicks on the row's action menu (kebab trigger or any item) must
+        // not also toggle the OIDC detail panel.
         if (
+          e.target.closest(".admin-kebab") ||
           e.target.closest(".admin-btn-danger") ||
           e.target.closest(".admin-btn-action")
         )
@@ -781,9 +983,14 @@ function _renderTokens(tokens) {
       expires +
       "</span>" +
       '<span class="admin-col admin-col-actions">' +
-      '<button class="admin-btn-danger" data-revoke-token="' +
-      escapeHtml(t.token_id) +
-      '" title="Revoke token">revoke</button>' +
+      _kebabMenu([
+        {
+          label: "revoke",
+          kind: "danger",
+          title: "Revoke token",
+          attrs: { "data-revoke-token": t.token_id },
+        },
+      ]) +
       "</span>" +
       "</div>";
   }
@@ -918,11 +1125,17 @@ function _renderChannels(channels) {
       escapeHtml(c.created || "").slice(0, 10) +
       "</span>" +
       '<span class="admin-col admin-col-actions">' +
-      '<button class="admin-btn-danger" data-unlink-type="' +
-      escapeHtml(c.channel_type) +
-      '" data-unlink-uid="' +
-      escapeHtml(c.channel_user_id) +
-      '" title="Unlink channel account">unlink</button>' +
+      _kebabMenu([
+        {
+          label: "unlink",
+          kind: "danger",
+          title: "Unlink channel account",
+          attrs: {
+            "data-unlink-type": c.channel_type,
+            "data-unlink-uid": c.channel_user_id,
+          },
+        },
+      ]) +
       "</span>" +
       "</div>";
   }
@@ -1052,26 +1265,32 @@ function _renderSchedules(schedules) {
       statusLabel +
       "</span></span>" +
       '<span class="admin-col admin-col-actions">' +
-      '<button class="admin-btn-action" data-edit-sched="' +
-      escapeHtml(s.task_id) +
-      '" title="Edit">edit</button>' +
-      '<button class="admin-btn-action" data-runs-sched="' +
-      escapeHtml(s.task_id) +
-      '" title="Run history">runs</button>' +
-      '<button class="admin-btn-action" data-toggle-sched="' +
-      escapeHtml(s.task_id) +
-      '" data-enabled="' +
-      (enabled ? "1" : "0") +
-      '" title="' +
-      (enabled ? "Disable" : "Enable") +
-      '">' +
-      (enabled ? "disable" : "enable") +
-      "</button>" +
-      '<button class="admin-btn-danger" data-delete-sched="' +
-      escapeHtml(s.task_id) +
-      '" data-sname="' +
-      escapeHtml(s.name) +
-      '" title="Delete">delete</button>' +
+      _kebabMenu([
+        {
+          label: "edit",
+          title: "Edit",
+          attrs: { "data-edit-sched": s.task_id },
+        },
+        {
+          label: "runs",
+          title: "Run history",
+          attrs: { "data-runs-sched": s.task_id },
+        },
+        {
+          label: enabled ? "disable" : "enable",
+          title: enabled ? "Disable" : "Enable",
+          attrs: {
+            "data-toggle-sched": s.task_id,
+            "data-enabled": enabled ? "1" : "0",
+          },
+        },
+        {
+          label: "delete",
+          kind: "danger",
+          title: "Delete",
+          attrs: { "data-delete-sched": s.task_id, "data-sname": s.name },
+        },
+      ]) +
       "</span></div>";
   }
   setSafeHtml(container, html);
@@ -1842,15 +2061,21 @@ function _renderWatches(watches) {
     const statusCls = active ? "watch-active" : "watch-completed";
     const statusLabel = active ? "active" : "done";
     const statusDot = active ? "\u25cf " : "\u25cb ";
-    const cancelBtn = active
-      ? '<button class="admin-btn-danger" data-cancel-watch="' +
-        escapeHtml(w.watch_id) +
-        '" data-watch-node="' +
-        escapeHtml(w.node_id || "") +
-        '" data-watch-name="' +
-        escapeHtml(name) +
-        '" title="Cancel watch">cancel</button>'
-      : "";
+    // Only active watches can be cancelled; completed rows render no menu.
+    const cancelBtn = _kebabMenu([
+      active
+        ? {
+            label: "cancel",
+            kind: "danger",
+            title: "Cancel watch",
+            attrs: {
+              "data-cancel-watch": w.watch_id,
+              "data-watch-node": w.node_id || "",
+              "data-watch-name": name,
+            },
+          }
+        : null,
+    ]);
     html +=
       '<div class="admin-row" role="listitem">' +
       '<span class="admin-col admin-col-wname">' +
@@ -2607,28 +2832,24 @@ function loadTlsCerts() {
 
         const colActions = document.createElement("span");
         colActions.className = "admin-col admin-col-actions";
-        const renewBtn = document.createElement("button");
-        renewBtn.className = "admin-btn-action";
-        renewBtn.textContent = "Renew";
-        renewBtn.setAttribute(
-          "aria-label",
-          "Renew certificate for " + c.domain,
-        );
-        renewBtn.onclick = function () {
-          tlsRenewCert(c.domain);
-        };
-        const deleteBtn = document.createElement("button");
-        deleteBtn.className = "admin-btn-danger";
-        deleteBtn.textContent = "Delete";
-        deleteBtn.setAttribute(
-          "aria-label",
-          "Delete certificate for " + c.domain,
-        );
-        deleteBtn.onclick = function () {
-          tlsDeleteCert(c.domain);
-        };
-        colActions.appendChild(renewBtn);
-        colActions.appendChild(deleteBtn);
+        const kebab = _kebabMenuEl([
+          {
+            label: "Renew",
+            attrs: {
+              "data-tls-renew": c.domain,
+              "aria-label": "Renew certificate for " + c.domain,
+            },
+          },
+          {
+            label: "Delete",
+            kind: "danger",
+            attrs: {
+              "data-tls-delete": c.domain,
+              "aria-label": "Delete certificate for " + c.domain,
+            },
+          },
+        ]);
+        colActions.appendChild(kebab);
 
         row.appendChild(colDomain);
         row.appendChild(colSans);
@@ -2636,6 +2857,19 @@ function loadTlsCerts() {
         row.appendChild(colExpires);
         row.appendChild(colActions);
         listEl.appendChild(row);
+      });
+      // Bind by attribute (matching the Models call site) rather than by
+      // positional index into the kebab items, so this survives any future
+      // single-item degrade (where _kebabMenu returns a bare button).
+      listEl.querySelectorAll("[data-tls-renew]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          tlsRenewCert(this.getAttribute("data-tls-renew"));
+        });
+      });
+      listEl.querySelectorAll("[data-tls-delete]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          tlsDeleteCert(this.getAttribute("data-tls-delete"));
+        });
       });
     })
     .catch(function () {
@@ -3522,48 +3756,44 @@ function _renderMcpServers(items) {
     const detailAttr = isConfig
       ? 'data-mcp-detail-name="' + escapeHtml(s.name) + '"'
       : 'data-mcp-detail="' + escapeHtml(s.server_id) + '"';
-    let actionBtns =
-      '<button class="admin-btn-action" data-mcp-refresh="' +
-      escapeHtml(s.name) +
-      '">refresh</button>' +
-      '<button class="admin-btn-action" data-mcp-reconnect="' +
-      escapeHtml(s.name) +
-      '">reconnect</button>';
-    if (s.auth_type === "oauth_user") {
-      actionBtns +=
-        '<button class="admin-btn-action" data-mcp-oauth-connect="' +
-        escapeHtml(s.name) +
-        '">connect</button>';
-      // Phase 9: surface the consented-users count + bulk-revoke
-      // affordance only when at least one user has consented.
-      const consentCount =
-        typeof s.consented_users_count === "number"
-          ? s.consented_users_count
-          : 0;
-      if (consentCount > 0) {
-        actionBtns +=
-          '<button class="admin-btn-danger" data-mcp-bulk-revoke="' +
-          escapeHtml(s.name) +
-          '" data-mcp-consent-count="' +
-          consentCount +
-          '" title="Drop all ' +
-          consentCount +
-          ' user consents for this server">bulk-revoke (' +
-          consentCount +
-          ")</button>";
-      }
-    }
-    const actions = isConfig
-      ? actionBtns
-      : actionBtns +
-        '<button class="admin-btn-action" data-mcp-edit="' +
-        escapeHtml(s.server_id) +
-        '">edit</button>' +
-        '<button class="admin-btn-danger" data-mcp-delete="' +
-        escapeHtml(s.server_id) +
-        '" data-mcp-name="' +
-        escapeHtml(s.name) +
-        '">del</button>';
+    // Phase 9: surface the connect/bulk-revoke affordances only for
+    // user-OAuth servers, and bulk-revoke only once a user has consented.
+    const isOauth = s.auth_type === "oauth_user";
+    const consentCount =
+      typeof s.consented_users_count === "number" ? s.consented_users_count : 0;
+    const actions = _kebabMenu([
+      { label: "refresh", attrs: { "data-mcp-refresh": s.name } },
+      { label: "reconnect", attrs: { "data-mcp-reconnect": s.name } },
+      isOauth
+        ? { label: "connect", attrs: { "data-mcp-oauth-connect": s.name } }
+        : null,
+      isOauth && consentCount > 0
+        ? {
+            label: "bulk-revoke (" + consentCount + ")",
+            kind: "danger",
+            title:
+              "Drop all " + consentCount + " user consents for this server",
+            attrs: {
+              "data-mcp-bulk-revoke": s.name,
+              "data-mcp-consent-count": consentCount,
+            },
+          }
+        : null,
+      // Config-sourced servers are read-only here (edited via config.toml).
+      isConfig
+        ? null
+        : { label: "edit", attrs: { "data-mcp-edit": s.server_id } },
+      isConfig
+        ? null
+        : {
+            label: "delete",
+            kind: "danger",
+            attrs: {
+              "data-mcp-delete": s.server_id,
+              "data-mcp-name": s.name,
+            },
+          },
+    ]);
 
     html +=
       '<div class="admin-row mcp-grid ' +
@@ -5372,32 +5602,40 @@ function _renderModels(items) {
 
     // Actions
     const colActions = document.createElement("span");
-    colActions.className = "admin-col";
-    if (!isDefault && m.enabled) {
-      const defBtn = document.createElement("button");
-      defBtn.className = "admin-btn-action";
-      defBtn.textContent = "set default";
-      defBtn.setAttribute("data-model-set-default", m.alias);
-      defBtn.setAttribute("aria-label", "Set " + m.alias + " as default model");
-      defBtn.setAttribute("title", "Set " + m.alias + " as default model");
-      colActions.appendChild(defBtn);
-    }
-    if (!isConfig) {
-      const editBtn = document.createElement("button");
-      editBtn.className = "admin-btn-action";
-      editBtn.textContent = "edit";
-      editBtn.setAttribute("data-model-edit", m.definition_id);
-      editBtn.setAttribute("title", "Edit " + m.alias);
-      colActions.appendChild(editBtn);
-
-      const delBtn = document.createElement("button");
-      delBtn.className = "admin-btn-danger";
-      delBtn.textContent = "del";
-      delBtn.setAttribute("data-model-delete", m.definition_id);
-      delBtn.setAttribute("data-model-alias", m.alias);
-      delBtn.setAttribute("title", "Delete " + m.alias);
-      colActions.appendChild(delBtn);
-    }
+    colActions.className = "admin-col admin-col-actions";
+    const modelKebab = _kebabMenuEl([
+      // Config-sourced models are read-only here; only the live default may
+      // be changed.  Hide "set default" on the row that already is default.
+      !isDefault && m.enabled
+        ? {
+            label: "set default",
+            title: "Set " + m.alias + " as default model",
+            attrs: {
+              "data-model-set-default": m.alias,
+              "aria-label": "Set " + m.alias + " as default model",
+            },
+          }
+        : null,
+      isConfig
+        ? null
+        : {
+            label: "edit",
+            title: "Edit " + m.alias,
+            attrs: { "data-model-edit": m.definition_id },
+          },
+      isConfig
+        ? null
+        : {
+            label: "delete",
+            kind: "danger",
+            title: "Delete " + m.alias,
+            attrs: {
+              "data-model-delete": m.definition_id,
+              "data-model-alias": m.alias,
+            },
+          },
+    ]);
+    if (modelKebab) colActions.appendChild(modelKebab);
     row.appendChild(colActions);
 
     el.appendChild(row);
@@ -6377,3 +6615,8 @@ function _deleteNodeMeta(nodeId, key) {
     },
   );
 }
+
+// Wire the shared row-action menu once.  admin.js loads at the end of the
+// console <body>, so the document-level delegation below covers every admin
+// table (including those rendered by governance.js, which loads after).
+_initKebabMenus();
