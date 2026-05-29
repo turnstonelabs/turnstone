@@ -497,8 +497,9 @@ def _build_registry() -> dict[str, SettingDef]:
             "judge",
             help="When enabled, an LLM is invoked AFTER the regex stage to semantically "
             "evaluate tool output for camouflaged prompt injection (issue #560 mitigation #1, "
-            "arXiv:2605.22001). On success the LLM verdict overrides the regex verdict; "
-            "on disable/error/timeout the regex verdict stands. Capability-gated rollout — "
+            "arXiv:2605.22001). The LLM verdict is MERGED with the regex verdict — it can "
+            "raise the risk and add flags but never lower a regex finding; on "
+            "disable/error/timeout the regex verdict stands alone. Capability-gated rollout — "
             "default off so operators opt in once a judge-capable model is pointed at "
             "output_guard_model.",
         ),
