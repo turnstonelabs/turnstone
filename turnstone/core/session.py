@@ -5263,7 +5263,10 @@ class ChatSession:
                     OutputAssessment(
                         flags=list(llm_verdict.flags),
                         risk_level=llm_verdict.risk_level,
-                        annotations=[llm_verdict.reasoning] if llm_verdict.reasoning else [],
+                        # Reasoning rides the dedicated ``reasoning`` column
+                        # below; keep ``annotations`` heuristic-only so audit
+                        # consumers don't see the judge prose duplicated here.
+                        annotations=[],
                     ),
                     tier="llm",
                     reasoning=llm_verdict.reasoning,

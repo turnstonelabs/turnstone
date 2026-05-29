@@ -2323,10 +2323,12 @@ function _buildOutputWarningEl(assessment) {
     redacted.textContent = " (credentials redacted)";
     warning.appendChild(redacted);
   }
-  // LLM-judge attribution — when the semantic stage owned this finding,
-  // mark the tier + the model's self-reported confidence so the operator
-  // can tell a regex match from a model judgement and weight it. Mirrors
-  // the intent-verdict badge's tier/confidence vocabulary.
+  // LLM-judge attribution — tier "llm" means the judge returned a verdict
+  // for this output (it may have escalated, agreed with, or cleared a
+  // heuristic-positive), NOT that it owns the displayed risk. Show the
+  // judge's own verdict + confidence so the operator can tell a regex match
+  // from a model judgement and weigh any dissent. Mirrors the intent-verdict
+  // badge's tier/confidence vocabulary.
   if (assessment && assessment.tier === "llm") {
     const tierEl = document.createElement("span");
     tierEl.className = "output-warning-tier";
