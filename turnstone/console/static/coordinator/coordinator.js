@@ -4647,6 +4647,12 @@
         }
       }
     });
+    // Attach the retry affordance to the last assistant turn on every render
+    // (first paint + clear_ui / replay_truncated re-render), matching the
+    // interactive replayHistory() path. finishAssistantStream only covers the
+    // live-turn-ends case — without this a reloaded or rewound coordinator
+    // showed assistant turns with no retry button.
+    _refreshRetryButton();
   }
 
   init();
