@@ -5,8 +5,10 @@ composer + the channel gateway.  The dashboard's Options panel renders
 each one as a "Default — alias (model)" placeholder, so the resolution
 chain has to stay honest:
 
-* ``default_alias``        ← ``model.default_alias``, falling back to the
-  registry default; blanked when it points at a disabled/removed alias.
+* ``default_alias``        ← ``model.default_alias`` when it names an enabled
+  alias, otherwise ``registry.default`` (mirrors session_factory's
+  ``_effective_default_alias`` — the model a new workstream actually launches
+  on).  Only blanked when even ``registry.default`` is unresolvable.
 * ``channel_default_alias`` ← ``channels.default_model_alias``.
 * ``judge_default_alias``   ← ``judge.model``, but *only* when it names an
   enabled alias.  An unset / whitespace / unknown / disabled value stays
@@ -151,10 +153,30 @@ def test_model_default_falls_back_to_registry_default() -> None:
     assert body["judge_default_alias"] == ""
 
 
-def test_model_default_blanked_when_pointing_at_unknown_alias() -> None:
+def test_model_default_foreign_alias_falls_back_to_registry_default() -> None:
+    """``model.default_alias`` naming an alias absent from THIS server's
+    registry (e.g. a console-only alias leaking through a shared ConfigStore)
+    falls back to ``registry.default`` — the model creation actually uses —
+    rather than being blanked.  Blanking made the dashboard show a bare
+    "Default model" placeholder even though a workstream would launch on a
+    concrete model."""
     body = _get_models(
         _make_client(
             aliases={"primary": "vendor/primary"},
+            registry_default="primary",
+            settings={"model.default_alias": "ghost"},
+        )
+    )
+    assert body["default_alias"] == "primary"
+
+
+def test_model_default_blanks_only_when_registry_default_also_unresolvable() -> None:
+    """The defensive blank still applies when neither the configured alias
+    nor ``registry.default`` resolves to an enabled alias."""
+    body = _get_models(
+        _make_client(
+            aliases={"primary": "vendor/primary"},
+            registry_default="",
             settings={"model.default_alias": "ghost"},
         )
     )

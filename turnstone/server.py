@@ -1170,10 +1170,17 @@ async def list_available_models(request: Request) -> JSONResponse:
         default_alias = cs.get("model.default_alias") or ""
         channel_default_alias = cs.get("channels.default_model_alias") or ""
         judge_default_alias = (cs.get("judge.model") or "").strip()
-    if not default_alias:
-        default_alias = registry.default
-    # Clear defaults that point to unknown/disabled aliases.
+    # Mirror session_factory's ``_effective_default_alias`` (and
+    # ``_effective_routing``): a ``model.default_alias`` that's unset — or
+    # names an alias absent from THIS server's registry — falls back to
+    # ``registry.default``, which is the model a new workstream actually
+    # launches on.  Reporting "" here made the dashboard show a bare
+    # "Default model" placeholder even though creation has a concrete default
+    # (e.g. when the shared ConfigStore points at a console-only alias).
     enabled_aliases = set(registry.list_aliases())
+    if default_alias not in enabled_aliases:
+        default_alias = registry.default
+    # Defensive: only blank if even registry.default is unknown/disabled.
     if default_alias and default_alias not in enabled_aliases:
         default_alias = ""
     if channel_default_alias and channel_default_alias not in enabled_aliases:
