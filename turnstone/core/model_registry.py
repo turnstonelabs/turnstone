@@ -418,7 +418,7 @@ def load_model_registry(
                 configs[alias] = ModelConfig(
                     alias=alias,
                     base_url=row_base_url,
-                    api_key=_resolve_env_vars(row.get("api_key", "")),
+                    api_key=_resolve_env_vars(row.get("api_key") or api_key),
                     model=row_model,
                     context_window=row_ctx,
                     provider=row_provider,

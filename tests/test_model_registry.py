@@ -802,6 +802,52 @@ class TestLoadModelRegistryWithDB:
             reg = load_model_registry("http://x/v1", "x", "x", storage=storage)
         assert reg.has_alias("default")
 
+    def test_db_model_empty_api_key_falls_back_to_cli(self) -> None:
+        """DB model with empty api_key inherits the CLI/api_key fallback."""
+        storage = _MockStorage(
+            [
+                {
+                    "alias": "cloud",
+                    "model": "gpt-5",
+                    "provider": "openai",
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key": "",
+                    "context_window": 32768,
+                    "capabilities": "{}",
+                    "enabled": True,
+                }
+            ]
+        )
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry(
+                "http://x/v1", "cli-fallback-key", "x", storage=storage
+            )
+        cfg = reg.get_config("cloud")
+        assert cfg.api_key == "cli-fallback-key"
+
+    def test_db_model_explicit_api_key_overrides_cli(self) -> None:
+        """DB model with its own api_key uses it, not the CLI fallback."""
+        storage = _MockStorage(
+            [
+                {
+                    "alias": "cloud",
+                    "model": "gpt-5",
+                    "provider": "openai",
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key": "sk-db-specific",
+                    "context_window": 32768,
+                    "capabilities": "{}",
+                    "enabled": True,
+                }
+            ]
+        )
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry(
+                "http://x/v1", "cli-fallback-key", "x", storage=storage
+            )
+        cfg = reg.get_config("cloud")
+        assert cfg.api_key == "sk-db-specific"
+
 
 # ---------------------------------------------------------------------------
 # _resolve_env_vars

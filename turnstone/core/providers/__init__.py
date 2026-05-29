@@ -112,7 +112,15 @@ def create_provider(
 
 
 def create_client(provider_name: str, *, base_url: str, api_key: str) -> Any:
-    """Create an SDK client for the given provider."""
+    """Create an SDK client for the given provider.
+
+    An empty *api_key* is converted to ``None`` so that the underlying
+    SDK can fall back to its own environment-variable lookup (e.g.
+    ``OPENAI_API_KEY``, ``ANTHROPIC_API_KEY``).  Passing an empty
+    string would short-circuit the SDK's env-var check and raise a
+    "Missing credentials" error even when the env var is set.
+    """
+    resolved_key: str | None = api_key if api_key else None
     if provider_name in ("openai", "openai-compatible", "google", "xai"):
         from openai import OpenAI
 
@@ -123,13 +131,15 @@ def create_client(provider_name: str, *, base_url: str, api_key: str) -> Any:
         elif not base_url and provider_name == "xai":
             base_url = XAI_DEFAULT_BASE_URL
         if base_url:
-            return OpenAI(base_url=base_url, api_key=api_key)
-        return OpenAI(api_key=api_key)
+            return OpenAI(base_url=base_url, api_key=resolved_key)
+        return OpenAI(api_key=resolved_key)
     if provider_name == "anthropic":
         from turnstone.core.providers._anthropic import _ensure_anthropic
 
         anthropic = _ensure_anthropic()
-        kwargs: dict[str, str] = {"api_key": api_key}
+        kwargs: dict[str, str] = {}
+        if resolved_key is not None:
+            kwargs["api_key"] = resolved_key
         if base_url and base_url != "https://api.anthropic.com":
             kwargs["base_url"] = base_url
         return anthropic.Anthropic(**kwargs)
