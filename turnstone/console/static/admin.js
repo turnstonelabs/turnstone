@@ -503,8 +503,19 @@ function _initKebabMenus() {
   });
 
   // The menu is anchored to its cell and rides document scroll, but an
-  // independent scroll or a resize can leave it mispositioned — dismiss.
-  window.addEventListener("scroll", _closeAllKebabs, true);
+  // independent page/ancestor scroll or a resize can leave it mispositioned —
+  // dismiss.  Capture phase catches descendant scrolls too, so skip scrolls
+  // originating INSIDE the menu (it can overflow-y:auto at high zoom / short
+  // viewports) — those must scroll the menu, not close it.
+  window.addEventListener(
+    "scroll",
+    function (e) {
+      const t = e.target;
+      if (t && t.closest && t.closest(".admin-kebab-menu")) return;
+      _closeAllKebabs();
+    },
+    true,
+  );
   window.addEventListener("resize", _closeAllKebabs);
 }
 
