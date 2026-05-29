@@ -1251,6 +1251,175 @@
 }
 
 /* ==========================================================================
+   Per-message rewind / edit / retry affordance (#549)
+   Icon glyphs rendered inside the .msg-action-btn toolbar above, plus the
+   inline edit-in-place form. Shared by the interactive pane (ui/static) and
+   the coordinator dashboard (console/static/coordinator); both load this file
+   before their page stylesheet, so this is the single source of truth.
+   Vars resolve from shared/base.css (loaded by both panes).
+   ========================================================================== */
+
+/* Icon: retry (circular arrow) */
+.icon-retry {
+  width: 13px;
+  height: 13px;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+  border-bottom-color: transparent;
+  position: relative;
+}
+.icon-retry::after {
+  content: "";
+  position: absolute;
+  bottom: -1px;
+  right: -1px;
+  width: 0;
+  height: 0;
+  border-left: 2px solid transparent;
+  border-right: 2px solid transparent;
+  border-top: 3px solid currentColor;
+  transform: rotate(-30deg);
+}
+
+/* Icon: edit (pencil) */
+.icon-edit {
+  width: 12px;
+  height: 12px;
+  position: relative;
+  transform: rotate(-45deg);
+}
+.icon-edit::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 3px;
+  width: 6px;
+  height: 8px;
+  border: 1.5px solid currentColor;
+  border-radius: 1px 1px 0 0;
+  box-sizing: border-box;
+}
+.icon-edit::after {
+  content: "";
+  position: absolute;
+  bottom: 0;
+  left: 3px;
+  width: 0;
+  height: 0;
+  border-left: 3px solid transparent;
+  border-right: 3px solid transparent;
+  border-top: 3px solid currentColor;
+}
+
+/* Icon: rewind (chevrons pointing left) */
+.icon-rewind {
+  width: 14px;
+  height: 12px;
+  position: relative;
+}
+.icon-rewind::before,
+.icon-rewind::after {
+  content: "";
+  position: absolute;
+  top: 1px;
+  width: 6px;
+  height: 6px;
+  border-left: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(45deg);
+}
+.icon-rewind::before {
+  left: 1px;
+}
+.icon-rewind::after {
+  left: 6px;
+}
+
+/* Edit-in-place form */
+.msg-edit-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+.msg-edit-textarea {
+  width: 100%;
+  min-height: 40px;
+  max-height: 200px;
+  background: var(--bg);
+  color: var(--fg-bright);
+  border: 1px solid var(--accent-dim);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.5;
+  resize: vertical;
+  outline: none;
+  transition: border-color 0.12s ease;
+  box-sizing: border-box;
+}
+.msg-edit-textarea:focus {
+  border-color: var(--accent);
+}
+.msg-edit-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+.msg-edit-btn {
+  padding: 4px 14px;
+  font-size: 12px;
+  font-family: var(--font-ui);
+  font-weight: 500;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  border: 1px solid var(--border-strong);
+  background: var(--bg);
+  color: var(--fg);
+  transition:
+    background 0.1s ease,
+    border-color 0.1s ease,
+    color 0.1s ease;
+}
+.msg-edit-btn:hover {
+  background: var(--bg-highlight);
+}
+.msg-edit-btn-send {
+  background: var(--accent-dim);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.msg-edit-btn-send:hover {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* Edit-in-place active state */
+.msg-editing {
+  background: var(--bg-surface);
+  border-color: var(--accent-dim);
+}
+.msg-editing .msg-actions {
+  display: none;
+}
+
+/* Busy-state disables action buttons */
+[data-busy="true"] .msg-action-btn {
+  opacity: 0.3;
+  pointer-events: none;
+  cursor: not-allowed;
+}
+
+/* Reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  .msg-edit-textarea,
+  .msg-edit-btn {
+    transition: none;
+  }
+}
+
+/* ==========================================================================
    Per-workstream status bar — pinned above the composer.
    Rendered by both the interactive pane (ui/static/app.js) and the
    coordinator dashboard (console/static/coordinator/coordinator.js).
