@@ -97,6 +97,9 @@
     },
   });
   let busy = false;
+  // Edit-and-resend latch (#549): set by _editAndResend, consumed by the
+  // clear_ui SSE handler once the rewind's truncated history is re-fetched.
+  let _pendingEditSend = null;
   let cancelTimeoutId = null;
   let forceTimeoutId = null;
   const statusEl = document.getElementById("coord-status");
@@ -360,6 +363,10 @@
   // {kind, filename}; falsy/empty falls through to plain text.
   function appendUserMessageWithAttachments(text, attachments, opts) {
     const el = appendText("user", text, opts);
+    // Per-message edit + rewind affordance (#549) on every user turn,
+    // matching the interactive pane. Attached before the early-return so
+    // image-only sends (no attachments) still get the action bar.
+    _addUserMsgActions(el, text || "");
     if (!Array.isArray(attachments) || attachments.length === 0) return el;
     const pills = document.createElement("div");
     pills.className = "msg-user-attach";
@@ -1570,6 +1577,9 @@
     currentReasoningEl = null;
     currentReasoningBuf = "";
     messagesEl.setAttribute("aria-live", "polite");
+    // Move the retry affordance onto the just-completed last assistant turn
+    // (#549). No-op when the turn ended tool-only (see _refreshRetryButton).
+    _refreshRetryButton();
   }
 
   // ------------------------------------------------------------------
@@ -1635,6 +1645,9 @@
   function setBusy(b) {
     const next = !!b;
     composer.setBusy(next);
+    // Greys out the per-message edit/rewind/retry buttons while a generation
+    // is in flight (CSS: [data-busy="true"] .msg-action-btn).
+    messagesEl.setAttribute("data-busy", next ? "true" : "false");
     const edge = next !== busy;
     busy = next;
     if (edge && !next) queue.onIdleEdge();
@@ -2368,6 +2381,46 @@
             setBusy(false);
           }
         }, 10000);
+        break;
+      case "clear_ui": {
+        // Conversation was structurally reset (rewind / retry). Re-render
+        // from REST, then dispatch any queued edit-and-resend once the (now
+        // truncated) history lands. Coord is single-wsId per page, so no
+        // load-token guard is needed (unlike the interactive pane).
+        refetchHistory()
+          .then(() => {
+            if (!_pendingEditSend) return;
+            const editText = _pendingEditSend;
+            _pendingEditSend = null;
+            setBusy(true);
+            appendUserMessageWithAttachments(editText, [], { label: "you" });
+            authFetch(
+              "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/send",
+              {
+                method: "POST",
+                credentials: "include",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ message: editText }),
+              },
+            ).catch((err) => {
+              appendText("error", "Connection error: " + err.message);
+              setBusy(false);
+            });
+          })
+          .catch((err) => {
+            // Render runs outside refetchHistory's fetch try/catch by design;
+            // if it throws, don't strand the queued edit — clear latch + busy.
+            _pendingEditSend = null;
+            setBusy(false);
+            appendText("error", "Failed to reload history: " + err.message);
+          });
+        break;
+      }
+      case "replay_truncated":
+        // Reconnect buffer evicted past our last-seen id — re-sync from REST.
+        // Skip mid-stream: in_progress_snapshot already paints the live turn
+        // and a replaceChildren() would detach the streaming bubble.
+        if (!currentAssistantEl) refetchHistory();
         break;
       case "tool_info":
         // Renamed from ``tools_auto_approved`` when ``approve_tools``
@@ -4000,6 +4053,242 @@
   }
 
   // ------------------------------------------------------------------
+  // Per-message rewind / edit / retry affordance (#549)
+  //
+  // Mirrors the interactive pane (ui/static/app.js): edit + rewind buttons
+  // on every user bubble, a retry button on the last assistant turn. The
+  // bare ``.msg.user`` turn-count matches the server's _find_turn_boundaries
+  // (which counts system-nudge user turns), so the N we POST equals the N
+  // the server's rewind(n) cuts.
+  // ------------------------------------------------------------------
+
+  function _rewindToTurns(turns) {
+    if (busy) return;
+    if (!Number.isInteger(turns) || turns < 1) return;
+    authFetch("/v1/api/workstreams/" + encodeURIComponent(wsId) + "/rewind", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ turns }),
+    }).catch((err) => {
+      appendText("error", "Rewind failed: " + err.message);
+    });
+  }
+
+  function _rewindToMessage(msgEl) {
+    if (busy) return;
+    const userMsgs = messagesEl.querySelectorAll(".msg.user");
+    const idx = Array.prototype.indexOf.call(userMsgs, msgEl);
+    if (idx < 0) return;
+    const turnsToRewind = userMsgs.length - idx;
+    _rewindToTurns(turnsToRewind);
+  }
+
+  function _retryLast() {
+    if (busy) return;
+    authFetch("/v1/api/workstreams/" + encodeURIComponent(wsId) + "/retry", {
+      method: "POST",
+      credentials: "include",
+    }).catch((err) => {
+      appendText("error", "Retry failed: " + err.message);
+    });
+  }
+
+  function _editAndResend(msgEl, newText) {
+    if (busy) return;
+    const userMsgs = messagesEl.querySelectorAll(".msg.user");
+    const idx = Array.prototype.indexOf.call(userMsgs, msgEl);
+    if (idx < 0) return;
+    const turnsToRewind = userMsgs.length - idx;
+    setBusy(true);
+    // Latch the edited text — the clear_ui SSE handler dispatches it once the
+    // rewind's truncated history is re-fetched over REST.
+    _pendingEditSend = newText;
+    authFetch("/v1/api/workstreams/" + encodeURIComponent(wsId) + "/rewind", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ turns: turnsToRewind }),
+    })
+      .then(async (r) => {
+        if (r && !r.ok) {
+          _pendingEditSend = null;
+          setBusy(false);
+          appendText(
+            "error",
+            "Rewind failed (HTTP " + r.status + " " + r.statusText + ")",
+          );
+          return;
+        }
+        // A 200 {"status":"busy"} means the rewind was rejected (a
+        // generation is in flight) — no clear_ui fires, so clear the latch +
+        // busy here or the composer wedges and the latch fires on the next
+        // unrelated clear_ui.
+        let data = null;
+        try {
+          data = await r.json();
+        } catch {
+          data = null;
+        }
+        if (data && data.status === "busy") {
+          _pendingEditSend = null;
+          setBusy(false);
+          appendText(
+            "error",
+            "Cannot edit & resend while the coordinator is processing.",
+          );
+        }
+      })
+      .catch((err) => {
+        _pendingEditSend = null;
+        appendText("error", "Rewind failed: " + err.message);
+        setBusy(false);
+      });
+  }
+
+  function _startEdit(msgEl, originalText) {
+    if (busy) return;
+    // Save current child nodes so Cancel can restore them.
+    const savedNodes = [];
+    while (msgEl.firstChild) {
+      savedNodes.push(msgEl.removeChild(msgEl.firstChild));
+    }
+    msgEl.classList.add("msg-editing");
+
+    const form = document.createElement("div");
+    form.className = "msg-edit-form";
+
+    const textarea = document.createElement("textarea");
+    textarea.className = "msg-edit-textarea";
+    textarea.setAttribute("aria-label", "Edit message text");
+    textarea.value = originalText;
+    textarea.rows = Math.min(originalText.split("\n").length + 1, 8);
+    form.appendChild(textarea);
+
+    const actions = document.createElement("div");
+    actions.className = "msg-edit-actions";
+
+    const cancelBtn = document.createElement("button");
+    cancelBtn.className = "msg-edit-btn";
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.addEventListener("click", () => {
+      while (msgEl.firstChild) msgEl.removeChild(msgEl.firstChild);
+      savedNodes.forEach((n) => {
+        msgEl.appendChild(n);
+      });
+      msgEl.classList.remove("msg-editing");
+    });
+    actions.appendChild(cancelBtn);
+
+    const sendBtn = document.createElement("button");
+    sendBtn.className = "msg-edit-btn msg-edit-btn-send";
+    sendBtn.textContent = "Send";
+    sendBtn.addEventListener("click", () => {
+      const newText = textarea.value.trim();
+      if (!newText) return;
+      _editAndResend(msgEl, newText);
+    });
+    actions.appendChild(sendBtn);
+
+    textarea.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        sendBtn.click();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        cancelBtn.click();
+      }
+    });
+
+    form.appendChild(actions);
+    msgEl.appendChild(form);
+    textarea.focus();
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+  }
+
+  function _addUserMsgActions(el, text) {
+    const bar = document.createElement("div");
+    bar.className = "msg-actions";
+    bar.setAttribute("role", "toolbar");
+    bar.setAttribute("aria-label", "Message actions");
+    const editBtn = document.createElement("button");
+    editBtn.className = "msg-action-btn";
+    editBtn.title = "Edit & resend";
+    editBtn.setAttribute("aria-label", "Edit and resend this message");
+    const editIcon = document.createElement("span");
+    editIcon.className = "icon-edit";
+    editIcon.setAttribute("aria-hidden", "true");
+    editBtn.appendChild(editIcon);
+    editBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      _startEdit(el, text);
+    });
+    bar.appendChild(editBtn);
+    const rewindBtn = document.createElement("button");
+    rewindBtn.className = "msg-action-btn";
+    rewindBtn.title = "Rewind to before this message";
+    rewindBtn.setAttribute(
+      "aria-label",
+      "Rewind conversation to before this message",
+    );
+    const rewindIcon = document.createElement("span");
+    rewindIcon.className = "icon-rewind";
+    rewindIcon.setAttribute("aria-hidden", "true");
+    rewindBtn.appendChild(rewindIcon);
+    rewindBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      _rewindToMessage(el);
+    });
+    bar.appendChild(rewindBtn);
+    el.appendChild(bar);
+  }
+
+  function _addRetryAction(el) {
+    let bar = el.querySelector(".msg-actions");
+    if (!bar) {
+      bar = document.createElement("div");
+      bar.className = "msg-actions";
+      bar.setAttribute("role", "toolbar");
+      bar.setAttribute("aria-label", "Message actions");
+      el.appendChild(bar);
+    }
+    const btn = document.createElement("button");
+    btn.className = "msg-action-btn";
+    btn.title = "Retry (regenerate response)";
+    btn.setAttribute("aria-label", "Retry last response");
+    const icon = document.createElement("span");
+    icon.className = "icon-retry";
+    icon.setAttribute("aria-hidden", "true");
+    btn.appendChild(icon);
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      _retryLast();
+    });
+    bar.insertBefore(btn, bar.firstChild);
+  }
+
+  function _refreshRetryButton() {
+    const old = messagesEl.querySelectorAll(".msg.assistant .msg-actions");
+    for (let i = 0; i < old.length; i++) old[i].parentNode.removeChild(old[i]);
+    // Skip retry when the most recent semantic turn is tool-only (last DOM
+    // child is a .coord-tool-batch construct); walk back past .user-reminder
+    // bubbles first so the guard still fires when the tool turn carried a
+    // reminder. (Coord's batch class is .coord-tool-batch — the interactive
+    // pane uses .ts-approval, which does not exist in coord's DOM.)
+    let lastChild = messagesEl.lastElementChild;
+    while (lastChild && lastChild.classList.contains("user-reminder")) {
+      lastChild = lastChild.previousElementSibling;
+    }
+    if (lastChild && lastChild.classList.contains("coord-tool-batch")) {
+      return;
+    }
+    const assistants = messagesEl.querySelectorAll(".msg.assistant");
+    if (assistants.length) {
+      _addRetryAction(assistants[assistants.length - 1]);
+    }
+  }
+
+  // ------------------------------------------------------------------
   // Initial load — history then SSE
   // ------------------------------------------------------------------
 
@@ -4015,304 +4304,13 @@
       appendText("error", "Failed to load coordinator: " + e.message);
       return;
     }
+    await refetchHistory();
+    // History alone can't tell whether an orphaned assistant tool_calls turn
+    // is awaiting approval or merely still running; the live workstream
+    // snapshot can.  First-paint only — a mid-session clear_ui refetch does
+    // NOT re-run this (SSE re-delivers approve_request live, and replaying a
+    // stale pre-rewind pending batch would be wrong).
     try {
-      const hist = await getJSON(
-        "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/history",
-      );
-      // Map call_id → tool name resolved from the most recent
-      // assistant tool_calls.  Storage's `tool` rows carry only
-      // tool_call_id + content; the function name lives on the
-      // matching assistant entry — without this map every replayed
-      // tool result rendered with the literal label "tool", which
-      // looked like the tool calls had been replaced by raw JSON.
-      const toolNameByCallId = new Map();
-
-      // Pre-scan every tool message's tool_call_id so the
-      // assistant.tool_calls branch below knows whether each call_id
-      // already has a result persisted.  An assistant tool_calls turn
-      // with NO matching tool result for some call_ids = orphan: the
-      // tool was dispatched but didn't complete before the reload
-      // captured this history snapshot.  Orphans are ambiguous — the
-      // tool could have been (a) awaiting approval at reload, (b)
-      // auto-approved + still in flight, or (c) approved + still in
-      // flight.  We render orphans as a neutral --running shell with
-      // no actions; SSE then upgrades to --pending when it replays
-      // approve_request (case a) or to --auto when it replays
-      // tool_info (case b), and tool_result events land in the rows
-      // for case c.  Without this neutral state, painting Approve
-      // buttons on a non-pending orphan was misleading and could
-      // 409-on-submit because the call_id wasn't in pending_items.
-      const callOutcomes = new Map();
-      (hist.messages || []).forEach((m) => {
-        if ((m.role || "tool") !== "tool" || !m.tool_call_id) return;
-        // The server-side /history projection derives denied / is_error on
-        // each tool message (content-prefix heuristic + persisted flags),
-        // so we read those fields directly rather than re-sniffing content
-        // here.  "Denied by user" / "Blocked" -> denied; the error-prefix
-        // set (Error, Command timed out, ...) -> is_error.  The
-        // assistant.tool_calls render below reads this map to mark a batch
-        // resolved-denied (vs the default resolved-approved) and to
-        // propagate the error flag to appendToolResult; a call_id absent
-        // from the map is an orphan (no result yet) -> --running.
-        let outcome = "ok";
-        if (m.denied) {
-          outcome = "denied";
-        } else if (m.is_error) {
-          outcome = "error";
-        }
-        callOutcomes.set(m.tool_call_id, outcome);
-      });
-
-      // Render an assistant turn's tool_calls as a single batch
-      // construct.  Synthesises one batch per assistant turn so a
-      // parallel fan-out (tool_calls.length ≥ 2) reads as one cohesive
-      // dispatch, matching how live SSE renders the same flow via
-      // approve_request / tool_info.  Resolved when every call_id has
-      // a matching tool result; otherwise --running (see the
-      // resolvedCallIds rationale above).  SSE upgrades --running in
-      // place when it knows more.
-      function renderAssistantToolBatch(m) {
-        const items = m.tool_calls.map((tc) => {
-          // tool_calls arrive flattened by the server /history projection:
-          // {id, name, arguments} (no nested `function` wrapper).
-          const name = String((tc && tc.name) || "tool");
-          const callId = String((tc && tc.id) || "");
-          const argsRaw = String((tc && tc.arguments) || "");
-          let parsedArgs = null;
-          try {
-            parsedArgs = JSON.parse(argsRaw || "{}");
-          } catch (_) {
-            /* malformed — fall back to raw string in preview */
-          }
-          if (callId) toolNameByCallId.set(callId, name);
-          const item = synthesizeHistoricalToolCall(
-            name,
-            callId,
-            parsedArgs,
-            argsRaw,
-          );
-          // Server attaches the persisted intent_verdict to each
-          // tc on /history (newest-wins per call_id; LLM upgrade
-          // beats heuristic when both exist).  Stamp on the item
-          // under the field name the render path already consumes
-          // (judge_verdict for LLM tier, heuristic_verdict
-          // otherwise) so the verdict pill paints on history rows
-          // without a render-path fork.  Also seed the
-          // judgeVerdicts cache so a later live SSE event for the
-          // same call_id reads "already painted" and skips the
-          // rebuild.
-          if (tc && tc.verdict) {
-            if (tc.verdict.tier === "llm") {
-              item.judge_verdict = tc.verdict;
-            } else {
-              item.heuristic_verdict = tc.verdict;
-            }
-            if (callId) _cacheJudgeVerdict(callId, tc.verdict);
-          }
-          // Output-guard finding — surface as the same
-          // "[output guard] ..." chat line the live handler emits
-          // (case "output_warning" above).  Stamp on the item so
-          // the post-batch loop below can read + emit; rendering
-          // anchored next to the call gives the operator the same
-          // adjacency they'd see live.
-          if (tc && tc.output_assessment) {
-            item.output_assessment = tc.output_assessment;
-          }
-          // needs_approval is unknown at replay time (the
-          // assistant.tool_calls history payload doesn't persist
-          // the bit).  Leave it unset; the upgrade-in-place path
-          // refreshes per-row state via _refreshRowStatus from the
-          // authoritative SSE item when approve_request /
-          // tool_info actually arrives, so we never tag the wrong
-          // row as needing approval.
-          return item;
-        });
-        // Classify the batch as a whole:
-        //   - any call_id without an outcome at all → orphan,
-        //     render as --running (SSE will upgrade in place)
-        //   - any call_id outcome === "denied" → resolved-denied
-        //   - else → resolved-approved (a runtime error doesn't
-        //     change the approval verdict; the per-row .error class
-        //     comes from the tool_result branch below)
-        const outcomes = items.map((it) =>
-          it.call_id ? callOutcomes.get(it.call_id) : "ok",
-        );
-        const allResolved = outcomes.every((o) => o !== undefined);
-        if (!allResolved) {
-          appendToolBatch(items, { running: true });
-        } else if (outcomes.some((o) => o === "denied")) {
-          appendToolBatch(items, { resolved: { approved: false } });
-        } else {
-          appendToolBatch(items, { resolved: { approved: true } });
-        }
-        // Output-guard findings — render each one as a chip
-        // anchored to the .coord-tool-row that tripped the guard
-        // rather than a generic "[output guard]" chat line.
-        // Anchored placement preserves per-call adjacency on
-        // multi-tool batches (live + replay) and the chip's
-        // severity styling makes the visual weight match the
-        // verdict pill on the same row.
-        for (let oi = 0; oi < items.length; oi++) {
-          const oa = items[oi].output_assessment;
-          if (!oa || !oa.risk_level || oa.risk_level === "none") continue;
-          const cid = items[oi].call_id || "";
-          if (!cid) continue;
-          const entry = toolRows.get(cid);
-          if (!entry || !entry.row) continue;
-          _attachOutputWarningChip(entry.row, oa);
-        }
-      }
-
-      (hist.messages || []).forEach((m) => {
-        const role = m.role || "tool";
-
-        // The server /history projection collapses multipart user content
-        // to a plain string and surfaces a structured ``attachments`` list
-        // ({kind, filename, mime_type}); coord renders the same pill
-        // cluster the interactive pane shows from those fields.  (Content
-        // is a string for every role post-projection; the guard is purely
-        // defensive.)
-        const content = typeof m.content === "string" ? m.content : "";
-        const userAttachments = [];
-        if (Array.isArray(m.attachments)) {
-          for (const a of m.attachments) {
-            if (!a || typeof a !== "object") continue;
-            userAttachments.push({
-              kind: String(a.kind || "other"),
-              filename: String(a.filename || ""),
-            });
-          }
-        }
-        if (role === "tool") {
-          // Tool result content can legitimately be empty (e.g. a
-          // tool that returned ""); still render it so the call_id
-          // pairing stays visible.  Resolve the tool name from the
-          // matching assistant tool_call so the label reads e.g.
-          // "bash" instead of "tool".  Pass isError when the
-          // pre-scan classified this call_id as an error so the row
-          // gets the .error class / --error stripe / "✗ error:" lead
-          // — without it a failed tool reads on reload as a normal
-          // successful result.  Denials still get the deny-resolved
-          // batch state (no per-row error needed there; the row's
-          // content reads "Denied by user").
-          const callId = m.tool_call_id || "";
-          const toolName =
-            (callId && toolNameByCallId.get(callId)) || m.tool_name || "tool";
-          const isError = callOutcomes.get(callId) === "error";
-          appendToolResult(toolName, callId, content || "", isError);
-          // Tool-channel metacog reminders ride the same _reminders
-          // side-channel as the user channel; surface as a themed
-          // bubble below the .coord-tool-batch construct.
-          if (Array.isArray(m.reminders) && m.reminders.length) {
-            appendToolReminderLive(m.reminders, callId);
-          }
-          // Queued user messages spliced into the last tool-result
-          // envelope of a batch (Seam 1) replay as proper user bubbles
-          // after the tool block.  ``decorate_history_messages``
-          // extracts the user_interjection advisory from the persisted
-          // envelope and the wire layer projects it onto
-          // ``m.advisories``; rendering through
-          // ``appendUserMessageWithAttachments`` matches the live shape
-          // a Seam 2/3 message would produce.  The walk/filter is
-          // shared via ``replayAdvisoriesAfterTool`` in
-          // ``shared/utils.js`` so coord and interactive can never drift
-          // on advisory-shape filtering.
-          replayAdvisoriesAfterTool(m.advisories, function (text) {
-            appendUserMessageWithAttachments(text, [], { label: "user" });
-          });
-        } else if (role === "assistant") {
-          // Reasoning bubble (Phase 1 reasoning persistence) — render
-          // BEFORE the content card so the visual order matches the
-          // live SSE flow (reasoning_delta arrives before content_delta
-          // for thinking-enabled models). Mirrors the live ":1524" /
-          // snapshot ":2021" call sites — same appendMsg("reasoning")
-          // helper, just driven from history-render rather than the
-          // SSE handler. Only present when the active model's
-          // surface_persisted_reasoning flag is true and the message round-tripped
-          // a thinking lane.
-          if (typeof m.reasoning === "string" && m.reasoning.length) {
-            const rEl = appendMsg("reasoning", "", { label: "reasoning" });
-            const rBody = rEl && rEl.querySelector(".msg-body");
-            if (rBody) rBody.textContent = m.reasoning;
-          }
-          // Render content BEFORE the tool batch so DOM order matches
-          // chronological order (the model emits text first, then
-          // dispatches tools).  Whitespace-only content (e.g. "\n\n"
-          // from a reasoning-parser model that strips <think>…</think>
-          // and leaves only trailing newlines before the tool call) is
-          // treated as empty — without the .trim() guard it would
-          // render a visible-but-empty .msg.assistant card on replay,
-          // which the live stream never showed (the live path didn't
-          // accumulate the trailing whitespace as a visible bubble).
-          if (content && content.trim()) {
-            // Run assistant content through the markdown pipeline
-            // (renderMarkdown + post-render hljs / mermaid / KaTeX) so
-            // a reconnect / page-reload renders the same way a live
-            // stream does.  appendText would only escape and dump the
-            // raw text — markdown tables, code fences, math, and links
-            // would all render as literal characters.
-            const el = appendMsg(role, "", { label: role });
-            const body = el.querySelector(".msg-body");
-            if (body && typeof streamingRenderFinalize === "function") {
-              try {
-                streamingRenderFinalize(body, content);
-              } catch (e) {
-                console.warn("coordinator history render failed", e);
-                body.textContent = content;
-              }
-            } else if (body) {
-              body.textContent = content;
-            }
-          }
-          // Tool batch comes after the content card so the DOM matches
-          // the chronological order the model emitted (text → dispatch).
-          // Hoisting this out of the role-agnostic top of the loop —
-          // the prior shape rendered tool_calls before the assistant
-          // text that announced them, putting parallel batches
-          // visually above their narrating message on rehydrate.
-          if (Array.isArray(m.tool_calls) && m.tool_calls.length) {
-            renderAssistantToolBatch(m);
-          }
-        } else {
-          // user / reasoning / system / other roles render as plain
-          // text on history replay — matches the live-streaming paths
-          // (appendReasoningToken uses textContent; user/system are
-          // typed verbatim and don't carry markdown structure).  User
-          // bubbles additionally render the pill strip beneath the
-          // text when the message carried attachments — even when the
-          // text portion is empty (image-only sends).
-          if (role === "user") {
-            const isSystemNudge = m.source === "system_nudge";
-            if (isSystemNudge) {
-              // Wake-driven empty user turn: render the thin marker
-              // (replaces the previously-skipped synthetic empty
-              // bubble) and anchor reminder bubbles below it.
-              const marker = appendSystemNudgeMarker();
-              if (Array.isArray(m.reminders) && m.reminders.length) {
-                appendReminderBubble(m.reminders, marker);
-              }
-              return;
-            }
-            if (!content && userAttachments.length === 0) return;
-            appendUserMessageWithAttachments(content, userAttachments, {
-              label: role,
-            });
-            // User-channel metacog reminders attach to the just-appended
-            // user bubble (the most recent .msg.user in messagesEl).
-            if (Array.isArray(m.reminders) && m.reminders.length) {
-              appendUserReminderLive(m.reminders);
-            }
-          } else {
-            if (!content) return;
-            appendText(role, content, { label: role });
-          }
-        }
-      });
-      // History alone can't tell whether an orphaned assistant
-      // tool_calls turn is awaiting approval or merely still running.
-      // The live workstream snapshot can: if pending_approval_detail is
-      // present, upgrade the matching batch immediately so a reload
-      // still exposes Approve/Deny even before SSE reconnects.
       const pendingDetail =
         wsSnapshot &&
         wsSnapshot.pending_approval &&
@@ -4327,7 +4325,7 @@
         });
       }
     } catch (e) {
-      console.warn("history load failed", e);
+      console.warn("pending-approval replay failed", e);
     }
     // Load children + tasks in parallel — neither blocks SSE connection.
     loadChildren();
@@ -4336,6 +4334,319 @@
     // switch) so the chips reappear instead of silently orphaning rows.
     attachments.rehydrate();
     connectSSE();
+  }
+
+  // Fetch /history and (re)render the message column from scratch.  Used for
+  // first paint AND for the clear_ui / replay_truncated re-render after a
+  // rewind/retry truncates the conversation.  The fetch is wrapped; the
+  // render runs after the clear so a render bug surfaces loudly instead of
+  // masking as an empty pane.  The message column + tool-tracking state
+  // (toolRows / activeBatch, which the render rebuilds) reset up front so a
+  // mid-session re-render leaves no stale call_id→row mappings pointing at
+  // detached DOM.  On first paint they're already empty — harmless no-ops.
+  async function refetchHistory() {
+    let hist = null;
+    try {
+      hist = await getJSON(
+        "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/history",
+      );
+    } catch (e) {
+      console.warn("coord history fetch failed", e);
+      hist = null;
+    }
+    messagesEl.replaceChildren();
+    toolRows.clear();
+    activeBatch = null;
+    if (!hist) return;
+    // Map call_id → tool name resolved from the most recent
+    // assistant tool_calls.  Storage's `tool` rows carry only
+    // tool_call_id + content; the function name lives on the
+    // matching assistant entry — without this map every replayed
+    // tool result rendered with the literal label "tool", which
+    // looked like the tool calls had been replaced by raw JSON.
+    const toolNameByCallId = new Map();
+
+    // Pre-scan every tool message's tool_call_id so the
+    // assistant.tool_calls branch below knows whether each call_id
+    // already has a result persisted.  An assistant tool_calls turn
+    // with NO matching tool result for some call_ids = orphan: the
+    // tool was dispatched but didn't complete before the reload
+    // captured this history snapshot.  Orphans are ambiguous — the
+    // tool could have been (a) awaiting approval at reload, (b)
+    // auto-approved + still in flight, or (c) approved + still in
+    // flight.  We render orphans as a neutral --running shell with
+    // no actions; SSE then upgrades to --pending when it replays
+    // approve_request (case a) or to --auto when it replays
+    // tool_info (case b), and tool_result events land in the rows
+    // for case c.  Without this neutral state, painting Approve
+    // buttons on a non-pending orphan was misleading and could
+    // 409-on-submit because the call_id wasn't in pending_items.
+    const callOutcomes = new Map();
+    (hist.messages || []).forEach((m) => {
+      if ((m.role || "tool") !== "tool" || !m.tool_call_id) return;
+      // The server-side /history projection derives denied / is_error on
+      // each tool message (content-prefix heuristic + persisted flags),
+      // so we read those fields directly rather than re-sniffing content
+      // here.  "Denied by user" / "Blocked" -> denied; the error-prefix
+      // set (Error, Command timed out, ...) -> is_error.  The
+      // assistant.tool_calls render below reads this map to mark a batch
+      // resolved-denied (vs the default resolved-approved) and to
+      // propagate the error flag to appendToolResult; a call_id absent
+      // from the map is an orphan (no result yet) -> --running.
+      let outcome = "ok";
+      if (m.denied) {
+        outcome = "denied";
+      } else if (m.is_error) {
+        outcome = "error";
+      }
+      callOutcomes.set(m.tool_call_id, outcome);
+    });
+
+    // Render an assistant turn's tool_calls as a single batch
+    // construct.  Synthesises one batch per assistant turn so a
+    // parallel fan-out (tool_calls.length ≥ 2) reads as one cohesive
+    // dispatch, matching how live SSE renders the same flow via
+    // approve_request / tool_info.  Resolved when every call_id has
+    // a matching tool result; otherwise --running (see the
+    // resolvedCallIds rationale above).  SSE upgrades --running in
+    // place when it knows more.
+    function renderAssistantToolBatch(m) {
+      const items = m.tool_calls.map((tc) => {
+        // tool_calls arrive flattened by the server /history projection:
+        // {id, name, arguments} (no nested `function` wrapper).
+        const name = String((tc && tc.name) || "tool");
+        const callId = String((tc && tc.id) || "");
+        const argsRaw = String((tc && tc.arguments) || "");
+        let parsedArgs = null;
+        try {
+          parsedArgs = JSON.parse(argsRaw || "{}");
+        } catch (_) {
+          /* malformed — fall back to raw string in preview */
+        }
+        if (callId) toolNameByCallId.set(callId, name);
+        const item = synthesizeHistoricalToolCall(
+          name,
+          callId,
+          parsedArgs,
+          argsRaw,
+        );
+        // Server attaches the persisted intent_verdict to each
+        // tc on /history (newest-wins per call_id; LLM upgrade
+        // beats heuristic when both exist).  Stamp on the item
+        // under the field name the render path already consumes
+        // (judge_verdict for LLM tier, heuristic_verdict
+        // otherwise) so the verdict pill paints on history rows
+        // without a render-path fork.  Also seed the
+        // judgeVerdicts cache so a later live SSE event for the
+        // same call_id reads "already painted" and skips the
+        // rebuild.
+        if (tc && tc.verdict) {
+          if (tc.verdict.tier === "llm") {
+            item.judge_verdict = tc.verdict;
+          } else {
+            item.heuristic_verdict = tc.verdict;
+          }
+          if (callId) _cacheJudgeVerdict(callId, tc.verdict);
+        }
+        // Output-guard finding — surface as the same
+        // "[output guard] ..." chat line the live handler emits
+        // (case "output_warning" above).  Stamp on the item so
+        // the post-batch loop below can read + emit; rendering
+        // anchored next to the call gives the operator the same
+        // adjacency they'd see live.
+        if (tc && tc.output_assessment) {
+          item.output_assessment = tc.output_assessment;
+        }
+        // needs_approval is unknown at replay time (the
+        // assistant.tool_calls history payload doesn't persist
+        // the bit).  Leave it unset; the upgrade-in-place path
+        // refreshes per-row state via _refreshRowStatus from the
+        // authoritative SSE item when approve_request /
+        // tool_info actually arrives, so we never tag the wrong
+        // row as needing approval.
+        return item;
+      });
+      // Classify the batch as a whole:
+      //   - any call_id without an outcome at all → orphan,
+      //     render as --running (SSE will upgrade in place)
+      //   - any call_id outcome === "denied" → resolved-denied
+      //   - else → resolved-approved (a runtime error doesn't
+      //     change the approval verdict; the per-row .error class
+      //     comes from the tool_result branch below)
+      const outcomes = items.map((it) =>
+        it.call_id ? callOutcomes.get(it.call_id) : "ok",
+      );
+      const allResolved = outcomes.every((o) => o !== undefined);
+      if (!allResolved) {
+        appendToolBatch(items, { running: true });
+      } else if (outcomes.some((o) => o === "denied")) {
+        appendToolBatch(items, { resolved: { approved: false } });
+      } else {
+        appendToolBatch(items, { resolved: { approved: true } });
+      }
+      // Output-guard findings — render each one as a chip
+      // anchored to the .coord-tool-row that tripped the guard
+      // rather than a generic "[output guard]" chat line.
+      // Anchored placement preserves per-call adjacency on
+      // multi-tool batches (live + replay) and the chip's
+      // severity styling makes the visual weight match the
+      // verdict pill on the same row.
+      for (let oi = 0; oi < items.length; oi++) {
+        const oa = items[oi].output_assessment;
+        if (!oa || !oa.risk_level || oa.risk_level === "none") continue;
+        const cid = items[oi].call_id || "";
+        if (!cid) continue;
+        const entry = toolRows.get(cid);
+        if (!entry || !entry.row) continue;
+        _attachOutputWarningChip(entry.row, oa);
+      }
+    }
+
+    (hist.messages || []).forEach((m) => {
+      const role = m.role || "tool";
+
+      // The server /history projection collapses multipart user content
+      // to a plain string and surfaces a structured ``attachments`` list
+      // ({kind, filename, mime_type}); coord renders the same pill
+      // cluster the interactive pane shows from those fields.  (Content
+      // is a string for every role post-projection; the guard is purely
+      // defensive.)
+      const content = typeof m.content === "string" ? m.content : "";
+      const userAttachments = [];
+      if (Array.isArray(m.attachments)) {
+        for (const a of m.attachments) {
+          if (!a || typeof a !== "object") continue;
+          userAttachments.push({
+            kind: String(a.kind || "other"),
+            filename: String(a.filename || ""),
+          });
+        }
+      }
+      if (role === "tool") {
+        // Tool result content can legitimately be empty (e.g. a
+        // tool that returned ""); still render it so the call_id
+        // pairing stays visible.  Resolve the tool name from the
+        // matching assistant tool_call so the label reads e.g.
+        // "bash" instead of "tool".  Pass isError when the
+        // pre-scan classified this call_id as an error so the row
+        // gets the .error class / --error stripe / "✗ error:" lead
+        // — without it a failed tool reads on reload as a normal
+        // successful result.  Denials still get the deny-resolved
+        // batch state (no per-row error needed there; the row's
+        // content reads "Denied by user").
+        const callId = m.tool_call_id || "";
+        const toolName =
+          (callId && toolNameByCallId.get(callId)) || m.tool_name || "tool";
+        const isError = callOutcomes.get(callId) === "error";
+        appendToolResult(toolName, callId, content || "", isError);
+        // Tool-channel metacog reminders ride the same _reminders
+        // side-channel as the user channel; surface as a themed
+        // bubble below the .coord-tool-batch construct.
+        if (Array.isArray(m.reminders) && m.reminders.length) {
+          appendToolReminderLive(m.reminders, callId);
+        }
+        // Queued user messages spliced into the last tool-result
+        // envelope of a batch (Seam 1) replay as proper user bubbles
+        // after the tool block.  ``decorate_history_messages``
+        // extracts the user_interjection advisory from the persisted
+        // envelope and the wire layer projects it onto
+        // ``m.advisories``; rendering through
+        // ``appendUserMessageWithAttachments`` matches the live shape
+        // a Seam 2/3 message would produce.  The walk/filter is
+        // shared via ``replayAdvisoriesAfterTool`` in
+        // ``shared/utils.js`` so coord and interactive can never drift
+        // on advisory-shape filtering.
+        replayAdvisoriesAfterTool(m.advisories, function (text) {
+          appendUserMessageWithAttachments(text, [], { label: "user" });
+        });
+      } else if (role === "assistant") {
+        // Reasoning bubble (Phase 1 reasoning persistence) — render
+        // BEFORE the content card so the visual order matches the
+        // live SSE flow (reasoning_delta arrives before content_delta
+        // for thinking-enabled models). Mirrors the live ":1524" /
+        // snapshot ":2021" call sites — same appendMsg("reasoning")
+        // helper, just driven from history-render rather than the
+        // SSE handler. Only present when the active model's
+        // surface_persisted_reasoning flag is true and the message round-tripped
+        // a thinking lane.
+        if (typeof m.reasoning === "string" && m.reasoning.length) {
+          const rEl = appendMsg("reasoning", "", { label: "reasoning" });
+          const rBody = rEl && rEl.querySelector(".msg-body");
+          if (rBody) rBody.textContent = m.reasoning;
+        }
+        // Render content BEFORE the tool batch so DOM order matches
+        // chronological order (the model emits text first, then
+        // dispatches tools).  Whitespace-only content (e.g. "\n\n"
+        // from a reasoning-parser model that strips <think>…</think>
+        // and leaves only trailing newlines before the tool call) is
+        // treated as empty — without the .trim() guard it would
+        // render a visible-but-empty .msg.assistant card on replay,
+        // which the live stream never showed (the live path didn't
+        // accumulate the trailing whitespace as a visible bubble).
+        if (content && content.trim()) {
+          // Run assistant content through the markdown pipeline
+          // (renderMarkdown + post-render hljs / mermaid / KaTeX) so
+          // a reconnect / page-reload renders the same way a live
+          // stream does.  appendText would only escape and dump the
+          // raw text — markdown tables, code fences, math, and links
+          // would all render as literal characters.
+          const el = appendMsg(role, "", { label: role });
+          const body = el.querySelector(".msg-body");
+          if (body && typeof streamingRenderFinalize === "function") {
+            try {
+              streamingRenderFinalize(body, content);
+            } catch (e) {
+              console.warn("coordinator history render failed", e);
+              body.textContent = content;
+            }
+          } else if (body) {
+            body.textContent = content;
+          }
+        }
+        // Tool batch comes after the content card so the DOM matches
+        // the chronological order the model emitted (text → dispatch).
+        // Hoisting this out of the role-agnostic top of the loop —
+        // the prior shape rendered tool_calls before the assistant
+        // text that announced them, putting parallel batches
+        // visually above their narrating message on rehydrate.
+        if (Array.isArray(m.tool_calls) && m.tool_calls.length) {
+          renderAssistantToolBatch(m);
+        }
+      } else {
+        // user / reasoning / system / other roles render as plain
+        // text on history replay — matches the live-streaming paths
+        // (appendReasoningToken uses textContent; user/system are
+        // typed verbatim and don't carry markdown structure).  User
+        // bubbles additionally render the pill strip beneath the
+        // text when the message carried attachments — even when the
+        // text portion is empty (image-only sends).
+        if (role === "user") {
+          const isSystemNudge = m.source === "system_nudge";
+          if (isSystemNudge) {
+            // Wake-driven empty user turn: render the thin marker
+            // (replaces the previously-skipped synthetic empty
+            // bubble) and anchor reminder bubbles below it.
+            const marker = appendSystemNudgeMarker();
+            if (Array.isArray(m.reminders) && m.reminders.length) {
+              appendReminderBubble(m.reminders, marker);
+            }
+            return;
+          }
+          if (!content && userAttachments.length === 0) return;
+          appendUserMessageWithAttachments(content, userAttachments, {
+            label: role,
+          });
+          // User-channel metacog reminders attach to the just-appended
+          // user bubble (the most recent .msg.user in messagesEl).
+          if (Array.isArray(m.reminders) && m.reminders.length) {
+            appendUserReminderLive(m.reminders);
+          }
+        } else {
+          if (!content) return;
+          appendText(role, content, { label: role });
+        }
+      }
+    });
   }
 
   init();
