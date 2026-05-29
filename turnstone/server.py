@@ -1165,9 +1165,11 @@ async def list_available_models(request: Request) -> JSONResponse:
     cs = getattr(request.app.state, "config_store", None)
     default_alias = ""
     channel_default_alias = ""
+    judge_default_alias = ""
     if cs is not None:
         default_alias = cs.get("model.default_alias") or ""
         channel_default_alias = cs.get("channels.default_model_alias") or ""
+        judge_default_alias = (cs.get("judge.model") or "").strip()
     if not default_alias:
         default_alias = registry.default
     # Clear defaults that point to unknown/disabled aliases.
@@ -1176,11 +1178,20 @@ async def list_available_models(request: Request) -> JSONResponse:
         default_alias = ""
     if channel_default_alias and channel_default_alias not in enabled_aliases:
         channel_default_alias = ""
+    # ``judge.model`` is alias-only.  When unset — or pointing at a
+    # disabled/removed alias — the judge inherits the per-workstream agent
+    # model at runtime (see session_factory: ``judge_config.model or
+    # model``).  Leave the field blank in that case so the UI renders
+    # "Default (agent model)" rather than a misleading fixed alias; only
+    # an explicitly-configured, enabled alias surfaces a concrete default.
+    if judge_default_alias and judge_default_alias not in enabled_aliases:
+        judge_default_alias = ""
     return JSONResponse(
         {
             "models": models,
             "default_alias": default_alias,
             "channel_default_alias": channel_default_alias,
+            "judge_default_alias": judge_default_alias,
         }
     )
 

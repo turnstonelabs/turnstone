@@ -185,6 +185,9 @@
   .ws-delete-bar.visible {
     animation: none;
   }
+  .pagination button {
+    transition: none;
+  }
 }
 /* Below ~700px the four-pill bar's preferred width (~480-520px) starts
    eating into hit-targets and risking horizontal overflow.  Wrap onto
@@ -356,3 +359,44 @@
    `.ws-delete-modal-buttons button` rule above already provides the
    transparent / fg-bright / border styling.  The class itself is useful
    for DOM inspection and as a future hook. */
+
+/* ==========================================================================
+   Pagination — shared by the console (Saved Coordinators + the filtered
+   admin lists) and the server UI (Saved Workstreams).  Lives in /shared so
+   the two dashboards can't drift apart; the per-app render helpers
+   (_renderCoordPagination / _renderWsPagination) own the show/hide + page-
+   clamp logic.
+   ========================================================================== */
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 16px 0;
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+.pagination button {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  color: var(--fg-bright);
+  border-radius: var(--radius-sm);
+  padding: 5px 14px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  transition:
+    background 0.15s,
+    border-color 0.15s,
+    color 0.15s;
+  font-family: var(--font-ui);
+  font-weight: 500;
+}
+.pagination button:hover {
+  background: var(--bg-highlight);
+  border-color: var(--accent-dim);
+}
+.pagination button:disabled {
+  opacity: 0.25;
+  cursor: not-allowed;
+}

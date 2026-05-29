@@ -4250,7 +4250,12 @@ function updateDashFooter(agg) {
 // Saved Workstreams cache + multi-select delete controller.  The
 // controller (from /shared/cards.js) owns mode state, checkbox
 // decoration, the toolbar wiring, and the confirmation modal — see
-// createSavedCardsController for the shared bits.
+// createSavedCardsController for the shared bits.  Page size + clamp
+// logic mirror the coordinator launcher (console/static) so the two
+// dashboards stay consistent; the controller only ever sees the visible
+// page, bounding Select-All fan-out to WS_PAGE_SIZE.
+const WS_PAGE_SIZE = 24;
+let _wsPage = 0;
 let _wsSavedItems = [];
 const _wsDeleteController = createSavedCardsController({
   idPrefix: "ws-delete",
@@ -4275,17 +4280,42 @@ const _wsDeleteController = createSavedCardsController({
 
 function renderSavedWorkstreams(items) {
   _wsSavedItems = items;
-  _wsDeleteController.setItems(items);
   const c = document.getElementById("dashboard-saved-cards");
   c.replaceChildren();
   if (!items.length) {
+    _wsPage = 0;
+    // If the list empties while delete mode is open (e.g. external churn
+    // removes the last card), drop out of delete mode so the toolbar
+    // doesn't linger over an empty grid — matches the coordinator
+    // launcher.  cancel() re-renders via the controller's callback, which
+    // re-enters here with the mode off and paints the empty state, so
+    // return and let that pass own the DOM (re-appending here would
+    // double the empty-state row, since — unlike the console, which hides
+    // a section — this dashboard appends an empty node).
+    if (_wsDeleteController.inMode()) {
+      _wsDeleteController.cancel();
+      return;
+    }
+    _wsDeleteController.setItems(items);
     const empty = document.createElement("div");
     empty.className = "dashboard-empty";
     empty.textContent = "No saved workstreams";
     c.appendChild(empty);
+    _renderWsPagination();
     return;
   }
-  items.forEach(function (sess) {
+  // Clamp the page index after deletes (or upstream churn) shrink the list.
+  const pages = Math.max(1, Math.ceil(items.length / WS_PAGE_SIZE));
+  if (_wsPage > pages - 1) _wsPage = pages - 1;
+  if (_wsPage < 0) _wsPage = 0;
+  const visible = items.slice(
+    _wsPage * WS_PAGE_SIZE,
+    (_wsPage + 1) * WS_PAGE_SIZE,
+  );
+  // The controller only sees the visible page so its Select-All / count
+  // can't reach off-page cards that aren't in the DOM.
+  _wsDeleteController.setItems(visible);
+  visible.forEach(function (sess) {
     const card = renderSessionCard(sess, {
       ariaLabel: _wsDeleteController.ariaLabel,
       onActivate: function (s) {
@@ -4297,6 +4327,55 @@ function renderSavedWorkstreams(items) {
     c.appendChild(card);
   });
   if (_wsDeleteController.inMode()) _wsDeleteController.refreshBar();
+  _renderWsPagination();
+}
+
+// Twin of the console launcher's _renderCoordPagination / coordPagePrev /
+// coordPageNext (console/static/app.js) — keep the two in sync when the
+// paging behaviour changes.  Only the shared .pagination CSS is de-duped;
+// the render wiring stays per-app because it binds per-app DOM ids and
+// controller instances.
+function _renderWsPagination() {
+  const pag = document.getElementById("ws-pagination");
+  if (!pag) return;
+  const total = _wsSavedItems.length;
+  const pages = Math.max(1, Math.ceil(total / WS_PAGE_SIZE));
+  // Single-page lists and delete-mode hide the controls — paging would
+  // invalidate the user's checkbox selections, so we lock them out.
+  if (pages <= 1 || _wsDeleteController.inMode()) {
+    pag.style.display = "none";
+    return;
+  }
+  pag.style.display = "";
+  const label = document.getElementById("ws-page-label");
+  if (label) {
+    /* Visible text uses the terse "X / Y" form; the long form sits on the
+       parent's aria-label so screen readers get a full sentence. */
+    label.textContent = _wsPage + 1 + " / " + pages;
+    pag.setAttribute(
+      "aria-label",
+      "Saved workstreams pagination — page " + (_wsPage + 1) + " of " + pages,
+    );
+  }
+  const prev = document.getElementById("ws-page-prev");
+  if (prev) prev.disabled = _wsPage <= 0;
+  const next = document.getElementById("ws-page-next");
+  if (next) next.disabled = _wsPage >= pages - 1;
+}
+
+function wsPagePrev() {
+  if (_wsPage > 0) {
+    _wsPage--;
+    renderSavedWorkstreams(_wsSavedItems);
+  }
+}
+
+function wsPageNext() {
+  const pages = Math.max(1, Math.ceil(_wsSavedItems.length / WS_PAGE_SIZE));
+  if (_wsPage < pages - 1) {
+    _wsPage++;
+    renderSavedWorkstreams(_wsSavedItems);
+  }
 }
 
 // HTML inline-onclick wrappers — keep the global names the existing
@@ -4687,6 +4766,21 @@ function _refreshDashboardSubmitLabel() {
   btn.textContent = hasText || hasFiles ? "Send" : "Create";
 }
 
+// Format a resolved alias with its model suffix the same way as the
+// dropdown rows ("alias (model)", or just "alias" when they coincide).
+// Returns "" when alias is empty or unknown so callers fall back to a
+// neutral placeholder.
+function _resolveModelLabel(alias, models) {
+  if (!alias) return "";
+  for (let i = 0; i < (models || []).length; i++) {
+    const m = models[i];
+    if (m.alias === alias) {
+      return m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
+    }
+  }
+  return "";
+}
+
 function _loadDashboardOptionsLists() {
   // Models
   const modelSel = document.getElementById("dashboard-model");
@@ -4710,6 +4804,28 @@ function _loadDashboardOptionsLists() {
             judgeSel.appendChild(jOpt);
           }
         });
+        // Surface the resolved defaults in the placeholder rows so the
+        // panel shows which model actually runs when left untouched —
+        // mirrors the coordinator launcher.  The judge tracks the
+        // per-workstream agent model unless judge.model is explicitly
+        // configured, so keep the "(agent model)" wording in that case
+        // rather than advertising a fixed alias the judge won't use.
+        const modelDefault = _resolveModelLabel(
+          data.default_alias || "",
+          data.models || [],
+        );
+        modelSel.options[0].textContent = modelDefault
+          ? "Default — " + modelDefault
+          : "Default model";
+        if (judgeSel) {
+          const judgeDefault = _resolveModelLabel(
+            data.judge_default_alias || "",
+            data.models || [],
+          );
+          judgeSel.options[0].textContent = judgeDefault
+            ? "Default — " + judgeDefault
+            : "Default (agent model)";
+        }
       })
       .catch(function () {
         /* default model still works */

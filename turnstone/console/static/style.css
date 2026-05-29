@@ -157,11 +157,10 @@
   margin-left: auto;
 }
 
-/* Saved Coordinators reuses the existing .pagination control (see the
-   "Pagination" block below) — the visible page is capped at
-   COORD_PAGE_SIZE so Select-All fan-out is bounded.  Pagination is
-   hidden in delete mode and when there's only one page (see
-   _renderCoordPagination). */
+/* Saved Coordinators reuses the shared .pagination control (defined in
+   /shared/cards.css) — the visible page is capped at COORD_PAGE_SIZE so
+   Select-All fan-out is bounded.  Pagination is hidden in delete mode and
+   when there's only one page (see _renderCoordPagination). */
 
 .home-coord-list {
   border: 1px solid var(--border);
@@ -870,42 +869,9 @@
   border-radius: 2px;
 }
 
-/* ==========================================================================
-   Pagination
-   ========================================================================== */
-.pagination {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 12px;
-  padding: 16px 0;
-  font-size: 12px;
-  color: var(--fg-dim);
-}
-.pagination button {
-  background: var(--bg-surface);
-  border: 1px solid var(--border-strong);
-  color: var(--fg-bright);
-  border-radius: var(--radius-sm);
-  padding: 5px 14px;
-  font: inherit;
-  font-size: 11px;
-  cursor: pointer;
-  transition:
-    background 0.15s,
-    border-color 0.15s,
-    color 0.15s;
-  font-family: var(--font-ui);
-  font-weight: 500;
-}
-.pagination button:hover {
-  background: var(--bg-highlight);
-  border-color: var(--accent-dim);
-}
-.pagination button:disabled {
-  opacity: 0.25;
-  cursor: not-allowed;
-}
+/* The ``.pagination`` control (Saved Coordinators + the filtered admin
+   lists, and the server UI's Saved Workstreams) lives in /shared/cards.css
+   so the two dashboards share one source of truth. */
 
 /* ==========================================================================
    Toast override — position above cluster status bar AND above admin modal
@@ -4633,8 +4599,7 @@ textarea.skill-content-area {
   .node-group-header {
     transition: none;
   }
-  .dash-cell-node,
-  .pagination button {
+  .dash-cell-node {
     transition: none;
   }
   .dash-row.has-link::after,

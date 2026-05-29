@@ -215,6 +215,22 @@
             </button>
           </div>
           <div class="dashboard-cards" id="dashboard-saved-cards"></div>
+          <div
+            id="ws-pagination"
+            class="pagination"
+            style="display: none"
+            role="navigation"
+            aria-label="Saved workstreams pagination"
+          >
+            <button id="ws-page-prev" type="button" onclick="wsPagePrev()">
+              &#x25c4; Prev
+            </button>
+            <span id="ws-page-label" aria-live="polite" aria-atomic="true">
+            </span>
+            <button id="ws-page-next" type="button" onclick="wsPageNext()">
+              Next &#x25ba;
+            </button>
+          </div>
           <div id="ws-delete-bar" class="ws-delete-bar">
             <span
               class="ws-delete-count-label"
