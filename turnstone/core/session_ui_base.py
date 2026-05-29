@@ -1930,6 +1930,66 @@ class SessionUIBase:
                 "turn_count": turn_count,
             }
         )
+        self._write_usage_row(
+            model=usage.get("model", ""),
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            tool_calls_count=tool_count,
+            cache_creation_tokens=cache_creation,
+            cache_read_tokens=cache_read,
+        )
+
+    def on_aux_usage(self, usage: dict[str, Any]) -> None:
+        """Persist a ``usage_event`` for an auxiliary (non-main-loop) LLM call.
+
+        Title generation, conversation compaction, web-fetch
+        summarisation, and plan/task sub-agents all run through the
+        provider's non-streaming ``create_completion`` and never reach
+        :meth:`on_status` — so without this their tokens are invisible to
+        the governance usage dashboard, undercounting real consumption
+        (potentially by a large factor for agent-heavy workstreams).
+
+        Deliberately narrower than :meth:`on_status`: it records ONLY the
+        storage row.  It does NOT enqueue a ``status`` UI event, advance
+        ``_ws_prompt_tokens`` / ``_ws_context_ratio`` (an auxiliary
+        prompt is not the main conversation's live context — folding it
+        in would make the status-bar context gauge lie), or touch the
+        tool-call delta counter.  ``tool_calls_count`` is recorded as 0:
+        any tools a sub-agent or judge calls internally are its own
+        concern, not part of this workstream's surfaced tool tally.
+
+        ``WebUI`` overrides this to also feed the node Prometheus token
+        counters; call ``super().on_aux_usage(...)`` to keep the
+        ``usage_event`` row consistent.
+        """
+        self._write_usage_row(
+            model=usage.get("model", ""),
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+            tool_calls_count=0,
+            cache_creation_tokens=usage.get("cache_creation_tokens", 0),
+            cache_read_tokens=usage.get("cache_read_tokens", 0),
+        )
+
+    def _write_usage_row(
+        self,
+        *,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        tool_calls_count: int,
+        cache_creation_tokens: int,
+        cache_read_tokens: int,
+    ) -> None:
+        """Persist one ``usage_event`` row, swallowing + logging storage
+        errors so a reporting-sink failure never breaks a live turn.
+
+        Shared by :meth:`on_status` (main-loop turns, real tool-call
+        delta) and :meth:`on_aux_usage` (auxiliary calls, with
+        ``tool_calls_count=0``) so the get-storage / record / except-log
+        shape lives in one place and can't drift if the
+        ``record_usage_event`` signature changes.
+        """
         try:
             from turnstone.core.storage._registry import get_storage
 
@@ -1940,12 +2000,12 @@ class SessionUIBase:
                     user_id=self._user_id,
                     ws_id=self.ws_id,
                     node_id="",
-                    model=usage.get("model", ""),
+                    model=model,
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
-                    tool_calls_count=tool_count,
-                    cache_creation_tokens=cache_creation,
-                    cache_read_tokens=cache_read,
+                    tool_calls_count=tool_calls_count,
+                    cache_creation_tokens=cache_creation_tokens,
+                    cache_read_tokens=cache_read_tokens,
                 )
         except Exception:
             log.warning("Failed to record usage event", exc_info=True)

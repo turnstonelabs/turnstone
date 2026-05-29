@@ -5854,3 +5854,104 @@ class TestSearchCaptureStreaming:
         from turnstone.core.session import _SEARCH_STDERR_CAP
 
         assert len(stderr) <= _SEARCH_STDERR_CAP
+
+
+# ---------------------------------------------------------------------------
+# Auxiliary-usage accounting — non-streaming LLM calls (title gen,
+# compaction, web-fetch summarisation, plan/task sub-agents) bypass the
+# streaming on_status path; _record_aux_usage routes their usage to the
+# UI's on_aux_usage hook so it still reaches the governance dashboard.
+# ---------------------------------------------------------------------------
+
+
+class _AuxRecordingUI(NullUI):
+    """NullUI plus the on_aux_usage hook, capturing each recorded dict."""
+
+    def __init__(self) -> None:
+        self.aux_calls: list[dict[str, Any]] = []
+
+    def on_aux_usage(self, usage):
+        self.aux_calls.append(usage)
+
+
+def test_utility_completion_records_aux_usage():
+    """A utility completion's token usage is routed to on_aux_usage with the
+    fields mapped from the provider's UsageInfo and the session model."""
+    from turnstone.core.providers._protocol import (
+        CompletionResult,
+        ModelCapabilities,
+        UsageInfo,
+    )
+
+    ui = _AuxRecordingUI()
+    session = _make_session(ui=ui)
+    session._provider = MagicMock()
+    session._provider.get_capabilities.return_value = ModelCapabilities()
+    session._provider.create_completion.return_value = CompletionResult(
+        content="A Generated Title",
+        usage=UsageInfo(
+            prompt_tokens=120,
+            completion_tokens=8,
+            total_tokens=128,
+            cache_creation_tokens=4,
+            cache_read_tokens=16,
+        ),
+    )
+
+    session._utility_completion([{"role": "user", "content": "hi"}])
+
+    assert len(ui.aux_calls) == 1
+    rec = ui.aux_calls[0]
+    assert rec["prompt_tokens"] == 120
+    assert rec["completion_tokens"] == 8
+    assert rec["cache_creation_tokens"] == 4
+    assert rec["cache_read_tokens"] == 16
+    assert rec["model"] == "test-model"
+
+
+def test_record_aux_usage_skips_when_usage_missing():
+    """A provider that reports no usage object must not emit a phantom
+    zero-token row."""
+    from turnstone.core.providers._protocol import CompletionResult
+
+    ui = _AuxRecordingUI()
+    session = _make_session(ui=ui)
+    session._record_aux_usage(CompletionResult(content="x", usage=None))
+    assert ui.aux_calls == []
+
+
+def test_record_aux_usage_noop_without_ui_hook():
+    """Minimal UI stubs predating on_aux_usage (e.g. NullUI) must not crash
+    a title-gen or sub-agent turn — recording silently no-ops."""
+    from turnstone.core.providers._protocol import CompletionResult, UsageInfo
+
+    session = _make_session(ui=NullUI())  # NullUI has no on_aux_usage
+    session._record_aux_usage(
+        CompletionResult(
+            content="x",
+            usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+    )  # no exception raised == pass
+
+
+def test_record_aux_usage_attributes_explicit_model():
+    """Sub-agent turns record under the agent's OWN model — session.py's
+    _api_call passes model=agent_model so plan/task spend attributes to the
+    sub-agent's model, not the coordinating session's. Verify the override
+    reaches on_aux_usage rather than defaulting to self.model."""
+    from turnstone.core.providers._protocol import CompletionResult, UsageInfo
+
+    ui = _AuxRecordingUI()
+    session = _make_session(ui=ui)  # session model == "test-model"
+    session._record_aux_usage(
+        CompletionResult(
+            content="plan output",
+            usage=UsageInfo(prompt_tokens=900, completion_tokens=60, total_tokens=960),
+        ),
+        model="plan-model-xyz",
+    )
+
+    assert len(ui.aux_calls) == 1
+    # The explicit agent model wins over the session default.
+    assert ui.aux_calls[0]["model"] == "plan-model-xyz"
+    assert ui.aux_calls[0]["prompt_tokens"] == 900

@@ -354,6 +354,22 @@ class WebUI(SessionUIBase):
         _metrics.record_context_ratio(total_tok / context_window if context_window > 0 else 0.0)
         super().on_status(usage, context_window, effort)
 
+    def on_aux_usage(self, usage: dict[str, Any]) -> None:
+        """Feed node Prometheus token counters for auxiliary LLM calls.
+
+        Mirrors :meth:`on_status`' token-metric writes (minus
+        context-ratio — an auxiliary prompt is not the main context
+        window) so ``turnstone_tokens_total`` reflects sub-agent,
+        compaction, and utility spend, not just main-loop turns. The
+        ``usage_event`` storage row is inherited from
+        :meth:`SessionUIBase.on_aux_usage`.
+        """
+        _metrics.record_tokens(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+        _metrics.record_cache_tokens(
+            usage.get("cache_creation_tokens", 0), usage.get("cache_read_tokens", 0)
+        )
+        super().on_aux_usage(usage)
+
     def on_plan_review(self, content: str) -> str:
         self._plan_event.clear()
         self._pending_plan_review = {"type": "plan_review", "content": content}

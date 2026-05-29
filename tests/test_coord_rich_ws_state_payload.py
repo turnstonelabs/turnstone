@@ -73,6 +73,47 @@ def test_coord_on_status_persists_usage_event() -> None:
     assert kwargs["completion_tokens"] == 3
 
 
+def test_coord_on_aux_usage_persists_usage_event() -> None:
+    """Auxiliary LLM calls (plan/task sub-agents, compaction, web-fetch
+    summarisation, title gen) bypass ``on_status`` entirely. ``on_aux_usage``
+    is what gets their token spend onto the governance dashboard."""
+    storage = MagicMock()
+    ui = ConsoleCoordinatorUI(ws_id="coord-ws", user_id="u1")
+    with _patch_get_storage(storage):
+        ui.on_aux_usage(
+            {
+                "prompt_tokens": 500,
+                "completion_tokens": 40,
+                "cache_creation_tokens": 12,
+                "cache_read_tokens": 8,
+                "model": "plan-model",
+            }
+        )
+    storage.record_usage_event.assert_called_once()
+    kwargs = storage.record_usage_event.call_args.kwargs
+    assert kwargs["ws_id"] == "coord-ws"
+    assert kwargs["user_id"] == "u1"
+    assert kwargs["model"] == "plan-model"
+    assert kwargs["prompt_tokens"] == 500
+    assert kwargs["completion_tokens"] == 40
+    assert kwargs["cache_creation_tokens"] == 12
+    assert kwargs["cache_read_tokens"] == 8
+    # Tools a sub-agent calls internally are its own tally, not this ws's.
+    assert kwargs["tool_calls_count"] == 0
+
+
+def test_coord_on_aux_usage_leaves_live_counters_untouched() -> None:
+    """Unlike ``on_status``, ``on_aux_usage`` must NOT fold the auxiliary
+    prompt into the live per-ws context gauge — that tracks the main
+    conversation's window, and an agent/compaction prompt isn't it."""
+    ui = ConsoleCoordinatorUI(ws_id="coord-ws", user_id="u1")
+    with _patch_get_storage(MagicMock()):
+        ui.on_aux_usage({"prompt_tokens": 9999, "completion_tokens": 9999})
+    assert ui._ws_prompt_tokens == 0
+    assert ui._ws_completion_tokens == 0
+    assert ui._ws_context_ratio == 0.0
+
+
 def test_coord_on_content_token_accumulates() -> None:
     """Pre-lift coord ``on_content_token`` only enqueued; lift turns it
     into the same per-ws accumulator WebUI uses so the collector
@@ -576,6 +617,37 @@ def test_webui_on_status_still_records_prometheus_metrics() -> None:
         mock_metrics.record_tokens.assert_called_once_with(10, 5)
         mock_metrics.record_cache_tokens.assert_called_once()
         mock_metrics.record_context_ratio.assert_called_once()
+    finally:
+        WebUI._global_queue = None
+
+
+def test_webui_on_aux_usage_records_prometheus_metrics() -> None:
+    """WebUI.on_aux_usage must feed ``_metrics.record_*`` so auxiliary
+    (sub-agent / compaction / utility) tokens land in
+    ``turnstone_tokens_total``, not just main-loop turns. Regression guard
+    mirroring ``test_webui_on_status_still_records_prometheus_metrics`` —
+    without it, a refactor dropping the override would silently stop
+    counting aux tokens with nothing failing."""
+    import queue
+
+    from turnstone.server import WebUI
+
+    WebUI._global_queue = queue.Queue()
+    try:
+        ui = WebUI(ws_id="ws-int", user_id="u1")
+        with patch("turnstone.server._metrics") as mock_metrics, _patch_get_storage(MagicMock()):
+            ui.on_aux_usage(
+                {
+                    "prompt_tokens": 64,
+                    "completion_tokens": 8,
+                    "cache_creation_tokens": 3,
+                    "cache_read_tokens": 5,
+                }
+            )
+        mock_metrics.record_tokens.assert_called_once_with(64, 8)
+        mock_metrics.record_cache_tokens.assert_called_once_with(3, 5)
+        # Unlike on_status, aux usage must NOT touch the context-ratio gauge.
+        mock_metrics.record_context_ratio.assert_not_called()
     finally:
         WebUI._global_queue = None
 

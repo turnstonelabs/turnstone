@@ -3100,7 +3100,7 @@ class ChatSession:
         caps = self._get_capabilities()
         clamped = min(max_tokens, caps.max_output_tokens) if caps.max_output_tokens else max_tokens
         messages = self._maybe_attach_vllm_chat_reasoning(messages, self._provider)
-        return self._provider.create_completion(
+        result = self._provider.create_completion(
             client=self.client,
             model=self.model,
             messages=messages,
@@ -3110,6 +3110,44 @@ class ChatSession:
             extra_params=self._provider_extra_params(),
             capabilities=caps,
             replay_reasoning_to_model=self._resolve_replay_reasoning_to_model(caps=caps),
+        )
+        # Utility completions (title gen, compaction, web-fetch extraction)
+        # bypass the streaming on_status path — record their usage so the
+        # governance dashboard reflects this spend.
+        self._record_aux_usage(result)
+        return result
+
+    def _record_aux_usage(self, result: CompletionResult, *, model: str | None = None) -> None:
+        """Persist token usage for a non-streaming auxiliary completion.
+
+        Title generation, compaction, web-fetch summarisation, and
+        plan/task sub-agents all run via ``create_completion`` and bypass
+        the streaming ``on_status`` accounting path; without this their
+        spend never reaches the usage dashboard. Delegates to the UI's
+        ``on_aux_usage`` hook (which owns the storage write + any node
+        metrics), mirroring how ``_print_status_line`` routes main-loop
+        usage through ``on_status``.
+
+        ``model`` defaults to the session model (utility calls share it);
+        sub-agent callers pass the agent's own model so per-model
+        attribution stays accurate. The hook is looked up defensively —
+        minimal UI stubs (some tests, replay shims) predate it and should
+        skip recording rather than crash a title-gen or sub-agent turn.
+        """
+        u = result.usage
+        if u is None:
+            return
+        record = getattr(self.ui, "on_aux_usage", None)
+        if record is None:
+            return
+        record(
+            {
+                "prompt_tokens": u.prompt_tokens,
+                "completion_tokens": u.completion_tokens,
+                "cache_creation_tokens": u.cache_creation_tokens,
+                "cache_read_tokens": u.cache_read_tokens,
+                "model": model or self.model,
+            }
         )
 
     # -- tool search helpers --------------------------------------------------
@@ -11025,7 +11063,7 @@ class ChatSession:
             last_err: Exception | None = None
             for attempt in range(self._MAX_RETRIES + 1):
                 try:
-                    return agent_provider.create_completion(
+                    agent_result = agent_provider.create_completion(
                         client=agent_client,
                         model=agent_model,
                         messages=messages,
@@ -11039,6 +11077,11 @@ class ChatSession:
                             agent_alias, caps=agent_caps
                         ),
                     )
+                    # Sub-agent turns bypass on_status — record per-turn so
+                    # plan/task spend is visible in the dashboard, attributed
+                    # to the agent's own model.
+                    self._record_aux_usage(agent_result, model=agent_model)
+                    return agent_result
                 except Exception as e:
                     ename = type(e).__name__
                     if (

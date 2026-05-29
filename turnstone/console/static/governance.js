@@ -2462,21 +2462,21 @@ function loadGovUsage() {
   else since = new Date(now - 7 * 24 * 60 * 60 * 1000);
   const sinceStr = since.toISOString().slice(0, 19);
 
-  // Fetch summary + breakdown in parallel
-  const summaryUrl =
-    "/v1/api/admin/usage?since=" + encodeURIComponent(sinceStr);
-  const breakdownUrl = summaryUrl + "&group_by=" + _govUsageGroupBy;
+  // A single request returns both the window-total `summary` (one SUM
+  // row, computed independent of group_by) and the grouped `breakdown`
+  // rows — the readout cards read the former, the bar chart the latter.
+  const url =
+    "/v1/api/admin/usage?since=" +
+    encodeURIComponent(sinceStr) +
+    "&group_by=" +
+    _govUsageGroupBy;
 
-  Promise.all([
-    authFetch(summaryUrl).then(function (r) {
+  authFetch(url)
+    .then(function (r) {
       return r.json();
-    }),
-    authFetch(breakdownUrl).then(function (r) {
-      return r.json();
-    }),
-  ])
-    .then(function (results) {
-      _renderGovUsage(results[0], results[1]);
+    })
+    .then(function (data) {
+      _renderGovUsage(data);
     })
     .catch(function () {
       setSafeHtml(
@@ -2486,9 +2486,11 @@ function loadGovUsage() {
     });
 }
 
-function _renderGovUsage(summary, breakdown) {
+function _renderGovUsage(data) {
   const container = document.getElementById("admin-usage-content");
-  const s = (summary.breakdown && summary.breakdown[0]) || {};
+  // Cards show the window total (the SUM row), NOT breakdown[0] — the
+  // latter is the oldest bucket and silently understated every headline.
+  const s = (data.summary && data.summary[0]) || {};
   const prompt = s.prompt_tokens || 0;
   const completion = s.completion_tokens || 0;
   const total = prompt + completion;
@@ -2529,7 +2531,7 @@ function _renderGovUsage(summary, breakdown) {
     "</div>";
 
   // Bar chart breakdown
-  const items = breakdown.breakdown || [];
+  const items = data.breakdown || [];
   if (items.length) {
     let maxVal = 0;
     for (let i = 0; i < items.length; i++) {
