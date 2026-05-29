@@ -3708,7 +3708,10 @@ function renderJudgeSettings() {
   let html = "";
   for (let i = 0; i < _judgeSettings.length; i++) {
     const s = _judgeSettings[i];
-    if (s.key === "judge.model") continue;
+    // Model-role pickers live in Models → Roles, not here, so the judge
+    // model and the output-guard judge model are skipped on this tab.
+    if (s.key === "judge.model" || s.key === "judge.output_guard_model")
+      continue;
     const shortKey = s.key.replace("judge.", "");
     let inputHtml = "";
     const currentVal = s.value;

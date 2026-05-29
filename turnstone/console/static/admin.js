@@ -5163,6 +5163,13 @@ const MODEL_ROLES = [
     fallbackKind: "default",
   },
   {
+    label: "Output guard judge",
+    description:
+      "Output-guard judge that semantically evaluates tool results for camouflaged prompt injection (active when judge.output_guard_llm is enabled).",
+    aliasKey: "judge.output_guard_model",
+    fallbackKind: "default",
+  },
+  {
     label: "Plan agent",
     description:
       "plan_agent sub-agent — produces high-level plans before task dispatch.",
