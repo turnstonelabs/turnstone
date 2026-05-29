@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Console API",
-    "version": "1.5.0a4",
+    "version": "1.6.0a6",
     "description": "Cluster-wide visibility and control across all turnstone nodes."
   },
   "paths": {
@@ -1368,6 +1368,118 @@
         }
       }
     },
+    "/v1/api/admin/roles/{role_id}/effective": {
+      "get": {
+        "summary": "Get effective permissions for a role (baseline + overrides)",
+        "operationId": "v1_api_admin_roles_{role_id}_effective_get",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "role_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoleEffectiveResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/admin/roles/{role_id}/overrides": {
+      "put": {
+        "summary": "Replace the grant/revoke override set for a builtin role",
+        "operationId": "v1_api_admin_roles_{role_id}_overrides_put",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "role_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RoleOverridesRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoleEffectiveResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/api/admin/users/{user_id}/roles": {
       "get": {
         "summary": "List roles assigned to a user",
@@ -1879,6 +1991,57 @@
           },
           "502": {
             "description": "Error 502",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/admin/skills/parse": {
+      "post": {
+        "summary": "Parse a SKILL.md document and return its frontmatter fields and body",
+        "operationId": "v1_api_admin_skills_parse_post",
+        "tags": [
+          "Admin"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ParseSkillRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ParseSkillResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Error 413",
             "content": {
               "application/json": {
                 "schema": {
@@ -2487,6 +2650,50 @@
         "responses": {
           "200": {
             "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/api/admin/skills/{skill_id}/unlock": {
+      "post": {
+        "summary": "Unlock a readonly (installed) skill so spec fields and resources can be edited",
+        "operationId": "v1_api_admin_skills_{skill_id}_unlock_post",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "skill_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -4796,6 +5003,86 @@
       }
     },
     "/v1/api/workstreams/{ws_id}/send": {
+      "delete": {
+        "summary": "Cancel a queued coordinator message",
+        "operationId": "v1_api_workstreams_{ws_id}_send_delete",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Removes a previously-queued message identified by ``msg_id`` from the coordinator session's pending queue. Returns ``status: removed`` when the queue had the entry, ``status: not_found`` otherwise. Reservations attached to the dequeued message are released so the attachments can be reused \u2014 parity with the interactive surface.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DequeueRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
       "post": {
         "summary": "Queue a user message onto the coordinator session",
         "operationId": "v1_api_workstreams_{ws_id}_send_post",
@@ -5298,6 +5585,160 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/{ws_id}/rewind": {
+      "post": {
+        "summary": "Drop the last N conversation turns on the coordinator (emits clear_ui)",
+        "operationId": "v1_api_workstreams_{ws_id}_rewind_post",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Truncates the coordinator conversation by N turns via the shared rewind handler and emits ``clear_ui`` so the dashboard re-fetches the truncated history. Gated on ``admin.coordinator``.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RewindRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/{ws_id}/retry": {
+      "post": {
+        "summary": "Re-send the last user message on the coordinator for a fresh response",
+        "operationId": "v1_api_workstreams_{ws_id}_retry_post",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Drops the last response and re-sends the last user message via the shared worker dispatch, emitting ``clear_ui``. Gated on ``admin.coordinator``.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -8313,6 +8754,30 @@
           "updated": {
             "title": "Updated",
             "type": "string"
+          },
+          "effective": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Effective",
+            "type": "array"
+          },
+          "grants": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Grants",
+            "type": "array"
+          },
+          "revokes": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Revokes",
+            "type": "array"
           }
         },
         "required": [
@@ -8987,7 +9452,7 @@
         "type": "object"
       },
       "OutputAssessmentInfo": {
-        "description": "Output guard assessment.",
+        "description": "Output guard assessment (one row per ``(call_id, tier)``).\n\n``tier`` is one of ``\"heuristic\"`` (regex stage), ``\"llm\"`` (the judge's\nown successful verdict), or ``\"llm_error\"`` (the judge ran but failed \u2014\naudit-only; ``reasoning`` carries the error). ``reasoning`` /\n``judge_model`` / ``latency_ms`` / ``confidence`` are populated on the\nLLM tiers (migration 057) and carry their defaults on heuristic rows.\nThe inline UI chip MERGES the heuristic + ``llm`` rows; this list\nendpoint exposes the raw rows for audit/calibration.",
         "properties": {
           "assessment_id": {
             "title": "Assessment Id",
@@ -9029,6 +9494,31 @@
             "default": 0,
             "title": "Redacted",
             "type": "integer"
+          },
+          "tier": {
+            "default": "heuristic",
+            "title": "Tier",
+            "type": "string"
+          },
+          "reasoning": {
+            "default": "",
+            "title": "Reasoning",
+            "type": "string"
+          },
+          "judge_model": {
+            "default": "",
+            "title": "Judge Model",
+            "type": "string"
+          },
+          "latency_ms": {
+            "default": 0,
+            "title": "Latency Ms",
+            "type": "integer"
+          },
+          "confidence": {
+            "default": 0.0,
+            "title": "Confidence",
+            "type": "number"
           },
           "created": {
             "title": "Created",
@@ -9419,6 +9909,95 @@
             "title": "Registry Meta",
             "type": "string"
           },
+          "auth_type": {
+            "default": "static",
+            "title": "Auth Type",
+            "type": "string"
+          },
+          "oauth_client_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Oauth Client Id"
+          },
+          "oauth_scopes": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Oauth Scopes"
+          },
+          "oauth_audience": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Oauth Audience"
+          },
+          "oauth_registration_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Oauth Registration Mode"
+          },
+          "oauth_authorization_server_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Oauth Authorization Server Url"
+          },
+          "oauth_as_issuer_cached": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Oauth As Issuer Cached"
+          },
+          "oauth_client_secret_ct": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Oauth Client Secret Ct"
+          },
           "created": {
             "title": "Created",
             "type": "string"
@@ -9547,6 +10126,83 @@
             "default": true,
             "title": "Enabled",
             "type": "boolean"
+          },
+          "auth_type": {
+            "default": "static",
+            "title": "Auth Type",
+            "type": "string"
+          },
+          "oauth_client_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Oauth Client Id"
+          },
+          "oauth_client_secret": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Oauth Client Secret"
+          },
+          "oauth_scopes": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Oauth Scopes"
+          },
+          "oauth_audience": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Oauth Audience"
+          },
+          "oauth_registration_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Oauth Registration Mode"
+          },
+          "oauth_authorization_server_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Oauth Authorization Server Url"
           }
         },
         "required": [
@@ -9674,6 +10330,90 @@
             ],
             "default": null,
             "title": "Enabled"
+          },
+          "auth_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Auth Type"
+          },
+          "oauth_client_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Oauth Client Id"
+          },
+          "oauth_client_secret": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Oauth Client Secret"
+          },
+          "oauth_scopes": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Oauth Scopes"
+          },
+          "oauth_audience": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Oauth Audience"
+          },
+          "oauth_registration_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Oauth Registration Mode"
+          },
+          "oauth_authorization_server_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Oauth Authorization Server Url"
           }
         },
         "title": "UpdateMcpServerRequest",
@@ -9836,6 +10576,16 @@
             "default": null,
             "title": "Reasoning Effort"
           },
+          "surface_persisted_reasoning": {
+            "default": true,
+            "title": "Surface Persisted Reasoning",
+            "type": "boolean"
+          },
+          "replay_reasoning_to_model": {
+            "default": false,
+            "title": "Replay Reasoning To Model",
+            "type": "boolean"
+          },
           "source": {
             "default": "",
             "title": "Source",
@@ -9940,6 +10690,16 @@
             ],
             "default": null,
             "title": "Reasoning Effort"
+          },
+          "surface_persisted_reasoning": {
+            "default": true,
+            "title": "Surface Persisted Reasoning",
+            "type": "boolean"
+          },
+          "replay_reasoning_to_model": {
+            "default": false,
+            "title": "Replay Reasoning To Model",
+            "type": "boolean"
           }
         },
         "required": [
@@ -10083,6 +10843,30 @@
             ],
             "default": null,
             "title": "Reasoning Effort"
+          },
+          "surface_persisted_reasoning": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Surface Persisted Reasoning"
+          },
+          "replay_reasoning_to_model": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Replay Reasoning To Model"
           }
         },
         "title": "UpdateModelDefinitionRequest",
@@ -10305,6 +11089,16 @@
           "channel_default_alias": {
             "default": "",
             "title": "Channel Default Alias",
+            "type": "string"
+          },
+          "coordinator_default_alias": {
+            "default": "",
+            "title": "Coordinator Default Alias",
+            "type": "string"
+          },
+          "judge_default_alias": {
+            "default": "",
+            "title": "Judge Default Alias",
             "type": "string"
           }
         },
@@ -10826,7 +11620,7 @@
             "title": "Agent Max Turns"
           },
           "notify_on_complete": {
-            "default": "{}",
+            "default": "[]",
             "title": "Notify On Complete",
             "type": "string"
           },
@@ -10872,6 +11666,26 @@
           "scan_version": {
             "default": "",
             "title": "Scan Version",
+            "type": "string"
+          },
+          "paths": {
+            "default": "[]",
+            "title": "Paths",
+            "type": "string"
+          },
+          "hidden_from_menu": {
+            "default": false,
+            "title": "Hidden From Menu",
+            "type": "boolean"
+          },
+          "arguments": {
+            "default": "[]",
+            "title": "Arguments",
+            "type": "string"
+          },
+          "argument_hint": {
+            "default": "",
+            "title": "Argument Hint",
             "type": "string"
           },
           "resource_count": {
@@ -10968,6 +11782,123 @@
         "title": "SkillVersionInfo",
         "type": "object"
       },
+      "ParseSkillRequest": {
+        "properties": {
+          "raw": {
+            "description": "Raw SKILL.md text \u2014 YAML frontmatter delimited by ``---`` followed by the markdown body.  Capped at 32 KiB to match ``admin_create_skill``'s ``content`` ceiling and to bound the synchronous YAML parser's worst-case CPU cost.  The handler reuses the Python parser at ``turnstone.core.skill_parser`` so admin UIs and external import paths agree on field extraction.",
+            "maxLength": 32768,
+            "minLength": 1,
+            "title": "Raw",
+            "type": "string"
+          }
+        },
+        "required": [
+          "raw"
+        ],
+        "title": "ParseSkillRequest",
+        "type": "object"
+      },
+      "ParseSkillResponse": {
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Tags",
+            "type": "array"
+          },
+          "author": {
+            "default": "",
+            "title": "Author",
+            "type": "string"
+          },
+          "version": {
+            "default": "1.0.0",
+            "title": "Version",
+            "type": "string"
+          },
+          "allowed_tools": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Allowed Tools",
+            "type": "array"
+          },
+          "license": {
+            "default": "",
+            "title": "License",
+            "type": "string"
+          },
+          "compatibility": {
+            "default": "",
+            "title": "Compatibility",
+            "type": "string"
+          },
+          "paths": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Paths",
+            "type": "array"
+          },
+          "when_to_use": {
+            "default": "",
+            "title": "When To Use",
+            "type": "string"
+          },
+          "model": {
+            "default": "",
+            "title": "Model",
+            "type": "string"
+          },
+          "effort": {
+            "default": "",
+            "title": "Effort",
+            "type": "string"
+          },
+          "disable_model_invocation": {
+            "default": false,
+            "title": "Disable Model Invocation",
+            "type": "boolean"
+          },
+          "user_invocable": {
+            "default": true,
+            "title": "User Invocable",
+            "type": "boolean"
+          },
+          "arguments": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Arguments",
+            "type": "array"
+          },
+          "argument_hint": {
+            "default": "",
+            "title": "Argument Hint",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "content"
+        ],
+        "title": "ParseSkillResponse",
+        "type": "object"
+      },
       "CreateSkillRequest": {
         "properties": {
           "name": {
@@ -10984,8 +11915,8 @@
             "type": "string"
           },
           "description": {
-            "description": "Human-readable description surfaced by ``list_skills`` and the admin UI.  Must be non-empty \u2014 catches skills registered without thinking about discoverability before they reach a model's tool-selection prompt.",
-            "maxLength": 1024,
+            "description": "Human-readable description surfaced by the ``skills`` find/get tool and the admin UI.  Must be non-empty \u2014 catches skills registered without thinking about discoverability before they reach a model's tool-selection prompt.",
+            "maxLength": 1536,
             "minLength": 1,
             "title": "Description",
             "type": "string"
@@ -11082,7 +12013,7 @@
             "title": "Agent Max Turns"
           },
           "notify_on_complete": {
-            "default": "{}",
+            "default": "[]",
             "title": "Notify On Complete",
             "type": "string"
           },
@@ -11111,10 +12042,50 @@
             "title": "Compatibility",
             "type": "string"
           },
+          "paths": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ],
+            "default": "[]",
+            "title": "Paths"
+          },
+          "hidden_from_menu": {
+            "default": false,
+            "title": "Hidden From Menu",
+            "type": "boolean"
+          },
+          "arguments": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ],
+            "default": "[]",
+            "title": "Arguments"
+          },
+          "argument_hint": {
+            "default": "",
+            "title": "Argument Hint",
+            "type": "string"
+          },
           "kind": {
             "$ref": "#/components/schemas/SkillKind",
             "default": "any",
-            "description": "Classifier routing the skill to ``list_skills`` calls.  ``interactive`` is visible only to the interactive-session activation path; ``coordinator`` is visible only to the coordinator's ``list_skills`` tool; ``any`` (default) is visible on both sides, which preserves pre-upgrade behaviour for legacy rows."
+            "description": "Authored audience metadata \u2014 passive marker for sorting/grouping and discoverability narrowing.  ``interactive`` marks the skill as authored for interactive sessions; ``coordinator`` marks it for coordinator delegation; ``any`` (default) signals no preferred audience.  Not a runtime visibility gate after the SkillKind enforcement flatten (#557) \u2014 every session kind can find, get, and load every skill regardless of this field; real access control remains ``allowed_tools`` + ``auto_approve``."
           }
         },
         "required": [
@@ -11166,7 +12137,7 @@
           "description": {
             "anyOf": [
               {
-                "maxLength": 1024,
+                "maxLength": 1536,
                 "minLength": 1,
                 "type": "string"
               },
@@ -11405,6 +12376,66 @@
             ],
             "default": null,
             "title": "Compatibility"
+          },
+          "paths": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Paths"
+          },
+          "hidden_from_menu": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Hidden From Menu"
+          },
+          "arguments": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Arguments"
+          },
+          "argument_hint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Argument Hint"
           },
           "kind": {
             "anyOf": [
@@ -11679,6 +12710,24 @@
           "kind": {
             "$ref": "#/components/schemas/WorkstreamKind",
             "default": "interactive"
+          },
+          "pending_approval": {
+            "default": false,
+            "description": "True when the workstream is parked on ``_approval_event`` awaiting an operator approve/deny.  Mirrors the same field on ``DashboardWorkstream`` / cluster live projections so a freshly-loaded chat tab can render the inline approval gate from the detail snapshot before SSE replay arrives.",
+            "title": "Pending Approval",
+            "type": "boolean"
+          },
+          "pending_approval_detail": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PendingApprovalDetail"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Inline approval payload \u2014 same shape as ``DashboardWorkstream.pending_approval_detail``.  ``None`` when no approval is pending.  Lets a reload paint the action row + judge verdicts immediately instead of relying on the SSE approve_request replay timing window."
           }
         },
         "required": [
@@ -11688,6 +12737,107 @@
           "user_id"
         ],
         "title": "WorkstreamDetailResponse",
+        "type": "object"
+      },
+      "PendingApprovalDetail": {
+        "description": "Inline approval payload merged into ``DashboardWorkstream``.\n\nSet when a workstream's ``approve_tools`` is parked on\n``_approval_event``; ``None`` (omitted) otherwise. Cross-tenant\nexposure here follows the same trusted-team posture as\n``activity`` / ``tokens`` \u2014 see ``server.py``'s ``dashboard``\nhandler comment.",
+        "properties": {
+          "call_id": {
+            "default": "",
+            "description": "Primary call_id \u2014 first non-empty call_id in items list order. Matches the 409 ``current_call_id`` response from ``POST /v1/api/workstreams/{ws_id}/approve`` so the UI can render the same identifier the server reports as current.",
+            "title": "Call Id",
+            "type": "string"
+          },
+          "judge_pending": {
+            "default": false,
+            "description": "LLM judge tier still running; heuristic verdicts may already be present on items.",
+            "title": "Judge Pending",
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/PendingApprovalItem"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "title": "PendingApprovalDetail",
+        "type": "object"
+      },
+      "PendingApprovalItem": {
+        "description": "One pending tool-call inside a ``PendingApprovalDetail`` envelope.\n\nMirrors the dict ``SessionUIBase.serialize_pending_approval_detail``\nemits per item. ``heuristic_verdict`` / ``judge_verdict`` are kept\nloosely-typed because the underlying verdict shape varies by tier;\nconsumers that want the full structure can decode against\n:class:`turnstone.sdk.events.IntentVerdictEvent`.",
+        "properties": {
+          "call_id": {
+            "default": "",
+            "title": "Call Id",
+            "type": "string"
+          },
+          "header": {
+            "default": "",
+            "title": "Header",
+            "type": "string"
+          },
+          "preview": {
+            "default": "",
+            "title": "Preview",
+            "type": "string"
+          },
+          "func_name": {
+            "default": "",
+            "title": "Func Name",
+            "type": "string"
+          },
+          "approval_label": {
+            "default": "",
+            "title": "Approval Label",
+            "type": "string"
+          },
+          "needs_approval": {
+            "default": false,
+            "title": "Needs Approval",
+            "type": "boolean"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error"
+          },
+          "heuristic_verdict": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Heuristic Verdict"
+          },
+          "judge_verdict": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Judge Verdict"
+          }
+        },
+        "title": "PendingApprovalItem",
         "type": "object"
       },
       "WorkstreamKind": {
@@ -11700,14 +12850,14 @@
         "type": "string"
       },
       "WorkstreamHistoryResponse": {
-        "description": "Response body for ``GET /v1/api/workstreams/{ws_id}/history``.\n\nRenamed and relocated from ``CoordinatorHistoryResponse`` in the\nStage 2 history/detail verb lift. Same OpenAI-like message-row\nshape on both kinds; the lift adds the endpoint to interactive as\na feature gain (pre-lift interactive only exposed history through\nthe SSE replay on ``/events``).",
+        "description": "Response body for ``GET /v1/api/workstreams/{ws_id}/history``.\n\nRenamed and relocated from ``CoordinatorHistoryResponse`` in the\nStage 2 history/detail verb lift. Same projected render shape on\nboth kinds; the lift adds the endpoint to interactive as a feature\ngain (pre-lift interactive only exposed history through the SSE\nreplay on ``/events``).",
         "properties": {
           "ws_id": {
             "title": "Ws Id",
             "type": "string"
           },
           "messages": {
-            "description": "Tail of the workstream's reconstructed message history (provider-fidelity OpenAI-like shape). Bounded by the ``limit`` query parameter (default 100, max 500).",
+            "description": "Tail of the workstream's message history, projected to the canonical render shape (flat tool_calls with verdict / output_assessment, top-level source / reminders / attachments, derived denied / is_error / pending). Bounded by the ``limit`` query parameter (default 100, max 500).",
             "items": {
               "additionalProperties": true,
               "type": "object"
