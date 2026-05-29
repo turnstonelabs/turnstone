@@ -245,6 +245,16 @@ export interface SavedWorkstreamInfo {
   created: string;
   updated: string;
   message_count: number;
+  // Enriched fields — all optional (defaulted server-side, so an older
+  // server may omit them).
+  state?: string;
+  kind?: string;
+  node_id?: string;
+  model_alias?: string | null;
+  launch_skill?: string | null;
+  child_count?: number;
+  context_tokens?: number;
+  context_ratio?: number;
 }
 
 export interface ListSavedWorkstreamsResponse {

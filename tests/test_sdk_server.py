@@ -229,6 +229,14 @@ async def test_list_saved_workstreams():
                             "created": "2024-01-01",
                             "updated": "2024-01-02",
                             "message_count": 5,
+                            "state": "idle",
+                            "kind": "interactive",
+                            "node_id": "node-1",
+                            "model_alias": "m1",
+                            "launch_skill": "news",
+                            "child_count": 2,
+                            "context_tokens": 500,
+                            "context_ratio": 0.5,
                         }
                     ]
                 }
@@ -239,6 +247,15 @@ async def test_list_saved_workstreams():
         client = AsyncTurnstoneServer(httpx_client=hc)
         resp = await client.list_saved_workstreams()
         assert len(resp.workstreams) == 1
+        ws = resp.workstreams[0]
+        # enriched fields deserialize onto the model, incl. kind -> enum
+        from turnstone.core.workstream import WorkstreamKind
+
+        assert ws.model_alias == "m1"
+        assert ws.launch_skill == "news"
+        assert ws.context_ratio == 0.5
+        assert ws.child_count == 2
+        assert ws.kind == WorkstreamKind.INTERACTIVE
 
 
 # ---------------------------------------------------------------------------

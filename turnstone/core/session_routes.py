@@ -2571,24 +2571,59 @@ def make_saved_handler(cfg: SessionEndpointConfig) -> Handler:
                     exc_info=True,
                 )
 
-        # Column order from list_workstreams_with_history is
-        # (ws_id, alias, title, name, created, updated, count, node_id) —
-        # ``*_extra`` swallows the trailing node_id (and any future
-        # columns the SELECT may grow). Keep this comment in sync if
-        # the SELECT changes the prefix order.
-        result = [
-            {
-                "ws_id": wid,
-                "alias": alias,
-                "title": title,
-                "name": name,
-                "created": created,
-                "updated": updated,
-                "message_count": count,
-            }
-            for wid, alias, title, name, created, updated, count, *_extra in rows
-            if wid not in loaded
-        ]
+        # Column order from list_workstreams_with_history (keep in sync with
+        # the storage SELECT): ws_id, alias, title, name, created, updated,
+        # message_count, node_id, state, kind, model_alias, launch_skill,
+        # child_count, context_tokens, context_window.  The occupancy ratio
+        # is derived here (Python float division) rather than in SQL so the
+        # NULL / zero-window cases stay obvious and identical across backends.
+        # context_window is NULL for model aliases absent from
+        # model_definitions (e.g. config.toml-only models), so context_ratio
+        # degrades to 0.0 there rather than reporting a bogus occupancy.
+        result = []
+        for row in rows:
+            (
+                wid,
+                alias,
+                title,
+                name,
+                created,
+                updated,
+                count,
+                node_id,
+                state,
+                kind,
+                model_alias,
+                launch_skill,
+                child_count,
+                context_tokens,
+                context_window,
+            ) = row
+            if wid in loaded:
+                continue
+            ctx_tokens = context_tokens or 0
+            context_ratio = (
+                round(ctx_tokens / context_window, 3) if ctx_tokens and context_window else 0.0
+            )
+            result.append(
+                {
+                    "ws_id": wid,
+                    "alias": alias,
+                    "title": title,
+                    "name": name,
+                    "created": created,
+                    "updated": updated,
+                    "message_count": count,
+                    "node_id": node_id or "",
+                    "state": state,
+                    "kind": kind,
+                    "model_alias": model_alias or None,
+                    "launch_skill": launch_skill or None,
+                    "child_count": child_count or 0,
+                    "context_tokens": ctx_tokens,
+                    "context_ratio": context_ratio,
+                }
+            )
         return JSONResponse({"workstreams": result})
 
     return saved_workstreams_handler

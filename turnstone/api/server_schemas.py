@@ -406,6 +406,16 @@ class SavedWorkstreamInfo(BaseModel):
     created: str
     updated: str
     message_count: int
+    # Enriched fields — all already persisted, no migration. Defaults keep a
+    # newer SDK tolerant of an older server that predates these fields.
+    state: str = "idle"
+    kind: WorkstreamKind = WorkstreamKind.INTERACTIVE
+    node_id: str = ""
+    model_alias: str | None = None
+    launch_skill: str | None = None
+    child_count: int = 0
+    context_tokens: int = 0
+    context_ratio: float = 0.0
 
 
 class ListSavedWorkstreamsResponse(BaseModel):

@@ -768,6 +768,53 @@ class TestSavedWorkstreamsTrustedTeamVisibility:
         ids = {r["ws_id"] for r in resp.json()["workstreams"]}
         assert {"alice-saved", "bob-saved"}.issubset(ids)
 
+    def test_enriched_fields_in_response(self, app_client):
+        """Saved-list rows carry the enrichment fields, incl. the
+        Python-computed context_ratio (latest usage prompt_tokens / model
+        context window)."""
+        from turnstone.core.storage import get_storage
+
+        client, _mgr = app_client
+        storage = get_storage()
+        assert storage is not None
+        _register_ws(storage, "rich-ws", "alice")
+        storage.save_message("rich-ws", "user", "do a thing")
+        storage.save_workstream_config("rich-ws", {"model_alias": "m1", "skill": "news"})
+        storage.record_usage_event("ev-rich", ws_id="rich-ws", prompt_tokens=500)
+        storage.create_model_definition(
+            "def-rich", alias="m1", model="m1-model", context_window=1000
+        )
+
+        resp = client.get("/v1/api/workstreams/saved", headers=_auth("alice"))
+        assert resp.status_code == 200
+        row = next(r for r in resp.json()["workstreams"] if r["ws_id"] == "rich-ws")
+        assert row["model_alias"] == "m1"
+        assert row["launch_skill"] == "news"
+        assert row["context_tokens"] == 500
+        assert row["context_ratio"] == 0.5  # 500 / 1000
+        assert row["child_count"] == 0
+
+    def test_context_ratio_zero_when_window_unknown(self, app_client):
+        """A model_alias absent from model_definitions (e.g. config.toml-only)
+        leaves context_window NULL → context_ratio degrades to 0.0 instead of
+        erroring on the division."""
+        from turnstone.core.storage import get_storage
+
+        client, _mgr = app_client
+        storage = get_storage()
+        assert storage is not None
+        _register_ws(storage, "no-window-ws", "alice")
+        storage.save_message("no-window-ws", "user", "hi")
+        storage.save_workstream_config("no-window-ws", {"model_alias": "toml-only"})
+        storage.record_usage_event("ev-now", ws_id="no-window-ws", prompt_tokens=500)
+
+        resp = client.get("/v1/api/workstreams/saved", headers=_auth("alice"))
+        assert resp.status_code == 200
+        row = next(r for r in resp.json()["workstreams"] if r["ws_id"] == "no-window-ws")
+        assert row["context_tokens"] == 500
+        assert row["context_ratio"] == 0.0
+        assert row["model_alias"] == "toml-only"
+
     def test_orphan_rows_visible(self, app_client):
         """Ownerless rows (empty user_id from migrations / startup
         ``name="default"``) appear in the cluster-wide listing alongside

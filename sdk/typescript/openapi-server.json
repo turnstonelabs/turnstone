@@ -2898,6 +2898,59 @@
           "message_count": {
             "title": "Message Count",
             "type": "integer"
+          },
+          "state": {
+            "default": "idle",
+            "title": "State",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/WorkstreamKind",
+            "default": "interactive"
+          },
+          "node_id": {
+            "default": "",
+            "title": "Node Id",
+            "type": "string"
+          },
+          "model_alias": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Model Alias"
+          },
+          "launch_skill": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Launch Skill"
+          },
+          "child_count": {
+            "default": 0,
+            "title": "Child Count",
+            "type": "integer"
+          },
+          "context_tokens": {
+            "default": 0,
+            "title": "Context Tokens",
+            "type": "integer"
+          },
+          "context_ratio": {
+            "default": 0.0,
+            "title": "Context Ratio",
+            "type": "number"
           }
         },
         "required": [
@@ -3475,6 +3528,11 @@
           "channel_default_alias": {
             "default": "",
             "title": "Channel Default Alias",
+            "type": "string"
+          },
+          "judge_default_alias": {
+            "default": "",
+            "title": "Judge Default Alias",
             "type": "string"
           }
         },

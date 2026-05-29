@@ -350,6 +350,54 @@ class TestListWorkstreamsWithHistory:
         rows = backend.list_workstreams_with_history(kind="interactive")
         assert {r[0] for r in rows} == {"interactive-1"}
 
+    def test_enriched_columns(self, backend):
+        """The saved-list query carries the enrichment trailing columns:
+        node_id, state, model_alias + launch_skill (workstream_config),
+        child_count (parent_ws_id), context_tokens (latest usage_events row)
+        and context_window (model_definitions join)."""
+        from turnstone.core.workstream import WorkstreamKind
+
+        backend.register_workstream(
+            "parent", node_id="n1", state="error", kind=WorkstreamKind.COORDINATOR
+        )
+        backend.save_message("parent", "user", "orchestrate")
+        backend.save_workstream_config("parent", {"model_alias": "m1", "skill": "news"})
+        # child via parent_ws_id → child_count = 1 (no message needed; the
+        # child_count subquery doesn't gate on EXISTS conversation)
+        backend.register_workstream("child", kind=WorkstreamKind.INTERACTIVE, parent_ws_id="parent")
+        backend.record_usage_event("e-parent", ws_id="parent", prompt_tokens=250)
+        # a usage event on a different ws must not bleed into parent's tokens
+        backend.record_usage_event("e-other", ws_id="child", prompt_tokens=999)
+        backend.create_model_definition("d1", alias="m1", model="m1-model", context_window=1000)
+
+        rows = backend.list_workstreams_with_history()
+        row = next(r for r in rows if r[0] == "parent")
+        # (ws_id, alias, title, name, created, updated, message_count,
+        #  node_id, state, kind, model_alias, launch_skill, child_count,
+        #  context_tokens, context_window)
+        assert row[7] == "n1"  # node_id
+        assert row[8] == "error"  # state
+        assert row[10] == "m1"  # model_alias
+        assert row[11] == "news"  # launch_skill
+        assert row[12] == 1  # child_count
+        assert row[13] == 250  # context_tokens — parent's event, not child's 999
+        assert row[14] == 1000  # context_window from model_definitions
+
+    def test_enriched_columns_null_when_absent(self, backend):
+        """A bare workstream (no config / usage / model_def / children) leaves
+        the enrichment columns NULL / zero — the LEFT JOIN + subquery misses
+        degrade gracefully (the handler coerces these to defaults)."""
+        backend.register_workstream("bare")
+        backend.save_message("bare", "user", "hi")
+
+        rows = backend.list_workstreams_with_history()
+        row = next(r for r in rows if r[0] == "bare")
+        assert row[10] is None  # model_alias — no config row
+        assert row[11] is None  # launch_skill
+        assert row[12] == 0  # child_count
+        assert row[13] is None  # context_tokens — no usage events
+        assert row[14] is None  # context_window — no model def
+
 
 class TestDeleteWorkstream:
     def test_deletes_all_data(self, backend):

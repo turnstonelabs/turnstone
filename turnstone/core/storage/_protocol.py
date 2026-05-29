@@ -383,6 +383,15 @@ class StorageBackend(Protocol):
         currently-active rows.  Default ``None`` preserves all-states
         behaviour.  Accepts a string (rather than the WorkstreamState
         enum) to match the on-disk column type.
+
+        Returns rows of ``(ws_id, alias, title, name, created, updated,
+        message_count, node_id, state, kind, model_alias, launch_skill,
+        child_count, context_tokens, context_window)`` ordered by updated
+        DESC.  The trailing enrichment columns feed the saved-list DTO:
+        ``model_alias`` / ``launch_skill`` come from ``workstream_config``;
+        ``context_tokens`` is the most recent ``usage_events`` prompt size
+        and ``context_window`` the model's window (the caller divides them
+        for the occupancy ratio); ``child_count`` counts child workstreams.
         """
         ...
 
