@@ -30,6 +30,8 @@ from turnstone.core.session_routes import (
     make_detail_handler,
     make_history_handler,
     make_open_handler,
+    make_retry_handler,
+    make_rewind_handler,
 )
 from turnstone.core.storage._sqlite import SQLiteBackend
 from turnstone.core.workstream import WorkstreamKind
@@ -204,6 +206,172 @@ def settings_client(_inject_storage):
     app.state.config_store = None
     app.state.global_queue = queue.Queue()
     return TestClient(app)
+
+
+# ===========================================================================
+# Rewind / retry (#549 verb lift)
+# ===========================================================================
+
+
+def _rewind_retry_mocks(*, worker_running=False, rewind_return=4, retry_return="hi"):
+    """Mocked ``(manager, session, enqueued-events)`` for the lifted
+    rewind/retry handlers. ``ws._lock`` is a real lock so the handler's
+    busy-gate ``with ws._lock`` works; ``ui._enqueue`` records events."""
+    import threading
+
+    mock_session = MagicMock()
+    mock_session.rewind.return_value = rewind_return
+    mock_session.retry.return_value = retry_return
+    enqueued: list[dict[str, Any]] = []
+    mock_ui = MagicMock()
+    mock_ui._enqueue.side_effect = lambda ev: enqueued.append(ev)
+    mock_ws = MagicMock()
+    mock_ws.session = mock_session
+    mock_ws.ui = mock_ui
+    mock_ws._lock = threading.Lock()
+    mock_ws._worker_running = worker_running
+    mock_mgr = MagicMock()
+    mock_mgr.get.return_value = mock_ws
+    return mock_mgr, mock_session, enqueued
+
+
+def _verb_cfg(mock_mgr: Any) -> SessionEndpointConfig:
+    return SessionEndpointConfig(
+        permission_gate=None,
+        manager_lookup=lambda _r: (mock_mgr, None),
+        tenant_check=None,
+        not_found_label="Workstream not found",
+        audit_action_prefix="workstream",
+    )
+
+
+def _verb_client(route_path: str, handler: Any) -> TestClient:
+    app = Starlette(
+        routes=[Mount("/v1", routes=[Route(route_path, handler, methods=["POST"])])],
+        middleware=[Middleware(_InjectAuthMiddleware)],
+    )
+    return TestClient(app)
+
+
+def test_rewind_returns_removed_and_emits_clear_ui():
+    mock_mgr, mock_session, enqueued = _rewind_retry_mocks(rewind_return=4)
+    handler = make_rewind_handler(_verb_cfg(mock_mgr))
+    client = _verb_client("/api/workstreams/{ws_id}/rewind", handler)
+    resp = client.post("/v1/api/workstreams/ws1/rewind", json={"turns": 2})
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok", "removed": 4}
+    mock_session.rewind.assert_called_once_with(2)
+    assert {"type": "clear_ui"} in enqueued
+
+
+def test_rewind_rejects_non_positive_or_non_int_turns():
+    mock_mgr, mock_session, _ = _rewind_retry_mocks()
+    handler = make_rewind_handler(_verb_cfg(mock_mgr))
+    client = _verb_client("/api/workstreams/{ws_id}/rewind", handler)
+    # ``True`` is an int subclass — must be rejected too.
+    for bad in ({}, {"turns": 0}, {"turns": -1}, {"turns": "two"}, {"turns": True}):
+        resp = client.post("/v1/api/workstreams/ws1/rewind", json=bad)
+        assert resp.status_code == 400, bad
+    mock_session.rewind.assert_not_called()
+
+
+def test_rewind_while_busy_returns_busy_and_skips_mutation():
+    mock_mgr, mock_session, enqueued = _rewind_retry_mocks(worker_running=True)
+    handler = make_rewind_handler(_verb_cfg(mock_mgr))
+    client = _verb_client("/api/workstreams/{ws_id}/rewind", handler)
+    resp = client.post("/v1/api/workstreams/ws1/rewind", json={"turns": 1})
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "busy"
+    mock_session.rewind.assert_not_called()
+    assert any(e.get("type") == "busy_error" for e in enqueued)
+
+
+def test_retry_dispatches_and_emits_clear_ui():
+    mock_mgr, _session, enqueued = _rewind_retry_mocks(retry_return="hello")
+    dispatched: list[str] = []
+    handler = make_retry_handler(
+        _verb_cfg(mock_mgr), dispatch_retry=lambda _ws, msg: dispatched.append(msg)
+    )
+    client = _verb_client("/api/workstreams/{ws_id}/retry", handler)
+    resp = client.post("/v1/api/workstreams/ws1/retry")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok", "retried": True}
+    assert dispatched == ["hello"]
+    assert {"type": "clear_ui"} in enqueued
+
+
+def test_retry_nothing_to_retry_skips_dispatch():
+    mock_mgr, _session, enqueued = _rewind_retry_mocks(retry_return=None)
+    dispatched: list[str] = []
+    handler = make_retry_handler(
+        _verb_cfg(mock_mgr), dispatch_retry=lambda _ws, msg: dispatched.append(msg)
+    )
+    client = _verb_client("/api/workstreams/{ws_id}/retry", handler)
+    resp = client.post("/v1/api/workstreams/ws1/retry")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok", "retried": False}
+    assert dispatched == []
+    assert {"type": "clear_ui"} in enqueued
+
+
+def test_retry_while_busy_returns_busy_and_skips_dispatch():
+    mock_mgr, mock_session, enqueued = _rewind_retry_mocks(worker_running=True)
+    dispatched: list[str] = []
+    handler = make_retry_handler(
+        _verb_cfg(mock_mgr), dispatch_retry=lambda _ws, msg: dispatched.append(msg)
+    )
+    client = _verb_client("/api/workstreams/{ws_id}/retry", handler)
+    resp = client.post("/v1/api/workstreams/ws1/retry")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "busy"
+    mock_session.retry.assert_not_called()
+    assert dispatched == []
+    assert any(e.get("type") == "busy_error" for e in enqueued)
+
+
+def test_rewind_invokes_audit_emit_with_turns():
+    """The handler calls ``audit_emit(request, ws_id, ws, turns)`` — a
+    dropped ``audit_emit=`` wiring or a renamed arg would break this."""
+    mock_mgr, _session, _enqueued = _rewind_retry_mocks()
+    captured: list[tuple[str, int]] = []
+    handler = make_rewind_handler(
+        _verb_cfg(mock_mgr),
+        audit_emit=lambda _req, ws_id, _ws, turns: captured.append((ws_id, turns)),
+    )
+    client = _verb_client("/api/workstreams/{ws_id}/rewind", handler)
+    resp = client.post("/v1/api/workstreams/ws1/rewind", json={"turns": 3})
+    assert resp.status_code == 200
+    assert captured == [("ws1", 3)]
+
+
+def test_retry_invokes_audit_emit():
+    mock_mgr, _session, _enqueued = _rewind_retry_mocks(retry_return="hi")
+    captured: list[str] = []
+    handler = make_retry_handler(
+        _verb_cfg(mock_mgr),
+        dispatch_retry=lambda _ws, _msg: None,
+        audit_emit=lambda _req, ws_id, _ws: captured.append(ws_id),
+    )
+    client = _verb_client("/api/workstreams/{ws_id}/retry", handler)
+    resp = client.post("/v1/api/workstreams/ws1/retry")
+    assert resp.status_code == 200
+    assert captured == ["ws1"]
+
+
+def test_rewind_swallows_audit_emit_exception():
+    """A raising ``audit_emit`` is demoted to a warning — the handler still
+    returns 200 and the rewind still took effect (mirrors close/cancel)."""
+    mock_mgr, mock_session, _enqueued = _rewind_retry_mocks(rewind_return=2)
+
+    def _boom(_req, _ws_id, _ws, _turns):
+        raise RuntimeError("audit backend down")
+
+    handler = make_rewind_handler(_verb_cfg(mock_mgr), audit_emit=_boom)
+    client = _verb_client("/api/workstreams/{ws_id}/rewind", handler)
+    resp = client.post("/v1/api/workstreams/ws1/rewind", json={"turns": 1})
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok", "removed": 2}
+    mock_session.rewind.assert_called_once_with(1)
 
 
 # ===========================================================================

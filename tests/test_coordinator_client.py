@@ -177,6 +177,8 @@ def test_route_map_matches_console_routes():
     assert _ROUTE_PATHS["send"] == "/v1/api/route/workstreams/{ws_id}/send"
     assert _ROUTE_PATHS["approve"] == "/v1/api/route/workstreams/{ws_id}/approve"
     assert _ROUTE_PATHS["cancel"] == "/v1/api/route/workstreams/{ws_id}/cancel"
+    assert _ROUTE_PATHS["rewind"] == "/v1/api/route/workstreams/{ws_id}/rewind"
+    assert _ROUTE_PATHS["retry"] == "/v1/api/route/workstreams/{ws_id}/retry"
     assert _ROUTE_PATHS["close"] == "/v1/api/route/workstreams/{ws_id}/close"
     # ``delete`` keeps the body-keyed shape — it has its own
     # ``route_workstream_delete`` handler instead of going through

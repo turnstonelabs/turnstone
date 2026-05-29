@@ -211,6 +211,24 @@ export class TurnstoneServer extends BaseClient {
     );
   }
 
+  /** Drop the last `turns` conversation turns. Emits a `clear_ui` event. */
+  async rewind(wsId: string, turns: number): Promise<StatusResponse> {
+    return this.request(
+      "POST",
+      `/v1/api/workstreams/${encodeURIComponent(wsId)}/rewind`,
+      { json: { turns } },
+    );
+  }
+
+  /** Drop the last response and re-send the last user message. */
+  async retry(wsId: string): Promise<StatusResponse> {
+    return this.request(
+      "POST",
+      `/v1/api/workstreams/${encodeURIComponent(wsId)}/retry`,
+      { json: {} },
+    );
+  }
+
   // -- Streaming ------------------------------------------------------------
 
   async *streamEvents(wsId: string): AsyncIterableIterator<ServerEvent> {

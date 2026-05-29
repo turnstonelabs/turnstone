@@ -268,6 +268,8 @@ class TestRouteProxyAudit:
             ("/v1/api/route/workstreams/abc123/send", "route.workstream.send"),
             ("/v1/api/route/workstreams/abc123/approve", "route.approve"),
             ("/v1/api/route/workstreams/abc123/cancel", "route.cancel"),
+            ("/v1/api/route/workstreams/abc123/rewind", "route.rewind"),
+            ("/v1/api/route/workstreams/abc123/retry", "route.retry"),
             ("/v1/api/route/command", "route.command"),
             ("/v1/api/route/plan", "route.plan"),
             ("/v1/api/route/workstreams/abc123/close", "route.workstream.close"),

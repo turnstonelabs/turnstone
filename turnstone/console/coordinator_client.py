@@ -293,6 +293,8 @@ _ROUTE_PATHS: dict[str, str] = {
     "send": "/v1/api/route/workstreams/{ws_id}/send",
     "approve": "/v1/api/route/workstreams/{ws_id}/approve",
     "cancel": "/v1/api/route/workstreams/{ws_id}/cancel",
+    "rewind": "/v1/api/route/workstreams/{ws_id}/rewind",
+    "retry": "/v1/api/route/workstreams/{ws_id}/retry",
     "close": "/v1/api/route/workstreams/{ws_id}/close",
     # ``delete`` is the only surviving body-keyed routing proxy path
     # — it has its own ``route_workstream_delete`` handler instead of
@@ -588,6 +590,16 @@ class CoordinatorClient:
         if not self._is_own_subtree(ws_id):
             return {"error": f"workstream not in coordinator subtree: {ws_id}", "status": 404}
         return self._post("cancel", {}, ws_id=ws_id)
+
+    def rewind(self, ws_id: str, turns: int) -> dict[str, Any]:
+        if not self._is_own_subtree(ws_id):
+            return {"error": f"workstream not in coordinator subtree: {ws_id}", "status": 404}
+        return self._post("rewind", {"turns": turns}, ws_id=ws_id)
+
+    def retry(self, ws_id: str) -> dict[str, Any]:
+        if not self._is_own_subtree(ws_id):
+            return {"error": f"workstream not in coordinator subtree: {ws_id}", "status": 404}
+        return self._post("retry", {}, ws_id=ws_id)
 
     # -- model-invoked block-wait -----------------------------------------
 

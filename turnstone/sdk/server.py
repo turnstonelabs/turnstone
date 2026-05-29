@@ -310,6 +310,24 @@ class AsyncTurnstoneServer(_BaseClient):
             response_model=StatusResponse,
         )
 
+    async def rewind(self, ws_id: str, *, turns: int) -> StatusResponse:
+        """Drop the last ``turns`` conversation turns. Emits ``clear_ui``."""
+        return await self._request(
+            "POST",
+            f"/v1/api/workstreams/{ws_id}/rewind",
+            json_body={"turns": turns},
+            response_model=StatusResponse,
+        )
+
+    async def retry(self, ws_id: str) -> StatusResponse:
+        """Drop the last response and re-send the last user message."""
+        return await self._request(
+            "POST",
+            f"/v1/api/workstreams/{ws_id}/retry",
+            json_body={},
+            response_model=StatusResponse,
+        )
+
     # -- streaming -----------------------------------------------------------
 
     async def stream_events(self, ws_id: str) -> AsyncIterator[ServerEvent]:
@@ -679,6 +697,12 @@ class TurnstoneServer:
 
     def cancel(self, ws_id: str, *, force: bool = False) -> StatusResponse:
         return self._runner.run(self._async.cancel(ws_id, force=force))
+
+    def rewind(self, ws_id: str, *, turns: int) -> StatusResponse:
+        return self._runner.run(self._async.rewind(ws_id, turns=turns))
+
+    def retry(self, ws_id: str) -> StatusResponse:
+        return self._runner.run(self._async.retry(ws_id))
 
     # -- streaming -----------------------------------------------------------
 

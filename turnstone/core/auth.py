@@ -696,6 +696,8 @@ def required_scope(method: str, path: str) -> str:
             "attachments",
             "send",
             "cancel",
+            "rewind",
+            "retry",
             "close",
         }
     ):
@@ -744,6 +746,8 @@ def required_scope(method: str, path: str) -> str:
                 "attachments",
                 "send",
                 "cancel",
+                "rewind",
+                "retry",
                 "close",
             }:
                 return "write"

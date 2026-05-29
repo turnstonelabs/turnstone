@@ -133,6 +133,39 @@ async def test_close_workstream_sends_valid_json_body():
         assert captured["body"] == {"reason": "task complete"}
 
 
+@pytest.mark.anyio
+async def test_rewind_sends_turns_body():
+    """``rewind()`` must transmit ``{"turns": N}`` — the path-keyed
+    rewind handler reads the body via ``read_json_or_400``, so a no-body
+    send would 400. Inspect the body, not just that the path answered
+    (feedback_mock_transport_body_inspection)."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content) if request.content else None
+        return httpx.Response(200, json={"status": "ok", "removed": 4})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneServer(httpx_client=hc)
+        resp = await client.rewind("ws1", turns=2)
+        assert captured["path"] == "/v1/api/workstreams/ws1/rewind"
+        assert captured["body"] == {"turns": 2}
+        assert resp.status == "ok"
+
+
+@pytest.mark.anyio
+async def test_retry_posts_to_path_keyed_endpoint():
+    transport = _mock_transport(
+        {"POST /v1/api/workstreams/ws1/retry": _json_response({"status": "ok", "retried": True})}
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneServer(httpx_client=hc)
+        resp = await client.retry("ws1")
+        assert resp.status == "ok"
+
+
 # ---------------------------------------------------------------------------
 # Chat interaction
 # ---------------------------------------------------------------------------

@@ -518,6 +518,8 @@ class SharedSessionVerbHandlers:
     approve: Handler | None = None  # POST {prefix}/{ws_id}/approve
     plan: Handler | None = None  # POST {prefix}/{ws_id}/plan
     cancel: Handler | None = None  # POST {prefix}/{ws_id}/cancel
+    rewind: Handler | None = None  # POST {prefix}/{ws_id}/rewind
+    retry: Handler | None = None  # POST {prefix}/{ws_id}/retry
     events: Handler | None = None  # GET  {prefix}/{ws_id}/events (SSE)
     history: Handler | None = None  # GET  {prefix}/{ws_id}/history
 
@@ -605,6 +607,10 @@ def register_session_routes(
         routes.append(Route(f"{p}/{{ws_id}}/plan", handlers.plan, methods=["POST"]))
     if handlers.cancel is not None:
         routes.append(Route(f"{p}/{{ws_id}}/cancel", handlers.cancel, methods=["POST"]))
+    if handlers.rewind is not None:
+        routes.append(Route(f"{p}/{{ws_id}}/rewind", handlers.rewind, methods=["POST"]))
+    if handlers.retry is not None:
+        routes.append(Route(f"{p}/{{ws_id}}/retry", handlers.retry, methods=["POST"]))
     if handlers.events is not None:
         routes.append(Route(f"{p}/{{ws_id}}/events", handlers.events, methods=["GET"]))
     if handlers.history is not None:
@@ -1185,6 +1191,241 @@ def make_cancel_handler(
         return JSONResponse({"status": "ok", "dropped": dropped})
 
     return cancel
+
+
+RewindAuditEmitter = Callable[
+    ["Request", str, "Workstream", int],
+    None,
+]
+RetryAuditEmitter = Callable[
+    ["Request", str, "Workstream"],
+    None,
+]
+# (ws, user_msg) -> None. Re-sends ``user_msg`` on ``ws`` via the kind's
+# worker dispatch (driving :func:`turnstone.core.session_worker.send`
+# with the kind's own run / enqueue callbacks). The retry handler calls
+# it after :meth:`ChatSession.retry` truncates the last turn.
+RetryDispatcher = Callable[
+    ["Workstream", str],
+    None,
+]
+
+
+def make_rewind_handler(
+    cfg: SessionEndpointConfig,
+    *,
+    audit_emit: RewindAuditEmitter | None = None,
+    accepted_permissions: tuple[str, ...] = (),
+) -> Handler:
+    """Lifted body for ``POST {prefix}/{ws_id}/rewind`` (body ``{"turns": N}``).
+
+    Drops the last ``N`` conversation turns via :meth:`ChatSession.rewind`
+    (kind-agnostic: mutates ``messages`` + ``_msg_tokens`` + storage, with
+    attachment / FTS cleanup riding the app-level cascade inside
+    ``delete_messages_after`` — which is exactly why both kinds reuse
+    ``rewind()`` rather than bespoke SQL). Both kinds share the auth →
+    mgr → ws-lookup → busy-gate → ``rewind`` → ``clear_ui`` → audit
+    sequence.
+
+    Unlike :func:`make_close_handler`, the body emits a ``clear_ui`` event
+    after the mutation — **always, including a rewind to zero messages**.
+    The frontend keys its REST ``/history`` refetch (and any queued
+    edit-and-resend) off this signal, not an inline history payload; the
+    unconditional emit carries the PR #503 fix (an ``if history:`` guard
+    once froze the composer on rewind-to-zero).
+
+    Args:
+        cfg: per-kind policy bundle (auth, manager lookup, tenant check,
+            error labels). Captured by closure.
+        audit_emit: kind's audit emitter; receives
+            ``(request, ws_id, ws, turns)``. Wrapped in try/except — an
+            audit-write failure logs a warning, never an HTTP 500.
+            **Both kinds hardcode the ``conversation.rewind`` action**
+            (NOT ``cfg.audit_action_prefix`` — there is deliberately no
+            ``coordinator.rewind`` split).
+        accepted_permissions: fallback scope check used only when
+            ``cfg.permission_gate`` is ``None``. Interactive wires
+            ``("conversation.modify",)``; coord leaves it empty and
+            relies on its ``admin.coordinator`` ``permission_gate``.
+    """
+
+    async def rewind(request: Request) -> Response:
+        import asyncio
+
+        from turnstone.core.auth import require_any_permission
+        from turnstone.core.web_helpers import read_json_or_400
+
+        if cfg.permission_gate is not None:
+            err = cfg.permission_gate(request)
+            if err is not None:
+                return err
+        elif accepted_permissions:
+            err = require_any_permission(request, accepted_permissions)
+            if err is not None:
+                return err
+        mgr_opt, err503 = cfg.manager_lookup(request)
+        if err503 is not None:
+            return err503
+        # See ``make_approve_handler`` for the cast rationale.
+        mgr = cast("SessionManager", mgr_opt)
+        ws_id = request.path_params.get("ws_id", "")
+
+        body = await read_json_or_400(request)
+        if isinstance(body, JSONResponse):
+            return body
+        raw_turns = body.get("turns")
+        # ``bool`` is an ``int`` subclass — reject it explicitly so
+        # ``{"turns": true}`` can't sneak through as "rewind 1".
+        if not isinstance(raw_turns, int) or isinstance(raw_turns, bool) or raw_turns < 1:
+            return JSONResponse(
+                {"error": "turns must be a positive integer"},
+                status_code=400,
+            )
+
+        if cfg.tenant_check is not None:
+            err_tenant = await asyncio.to_thread(cfg.tenant_check, request, ws_id, mgr)
+            if err_tenant is not None:
+                return err_tenant
+
+        ws = mgr.get(ws_id)
+        if ws is None:
+            return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+        session = ws.session
+        ui = ws.ui
+        if session is None or ui is None:
+            return JSONResponse({"error": "No session"}, status_code=400)
+
+        # Reject rewind while a generation is in flight — mutating
+        # ``messages`` under a running worker corrupts history / cursors.
+        # Gate on ``_worker_running`` (not ``worker_thread.is_alive()``)
+        # for parity with session_worker.send.
+        with ws._lock:
+            if ws._worker_running:
+                if hasattr(ui, "_enqueue"):
+                    ui._enqueue(
+                        {"type": "busy_error", "message": "Cannot rewind while processing."}
+                    )
+                return JSONResponse({"status": "busy"})
+
+        removed = session.rewind(raw_turns)
+
+        if hasattr(ui, "_enqueue"):
+            ui._enqueue({"type": "clear_ui"})
+
+        if audit_emit is not None:
+            try:
+                audit_emit(request, ws_id, ws, raw_turns)
+            except Exception:
+                log.warning(
+                    "ws.rewind.audit_failed ws=%s",
+                    ws_id[:8] if ws_id else "",
+                    exc_info=True,
+                )
+
+        return JSONResponse({"status": "ok", "removed": removed})
+
+    return rewind
+
+
+def make_retry_handler(
+    cfg: SessionEndpointConfig,
+    *,
+    dispatch_retry: RetryDispatcher,
+    audit_emit: RetryAuditEmitter | None = None,
+    accepted_permissions: tuple[str, ...] = (),
+) -> Handler:
+    """Lifted body for ``POST {prefix}/{ws_id}/retry`` (no body).
+
+    Drops the last assistant response via :meth:`ChatSession.retry` and
+    re-sends the last user message for a fresh generation. Shares the
+    auth → mgr → ws-lookup → busy-gate → ``retry`` → ``clear_ui`` →
+    audit → re-dispatch sequence across kinds.
+
+    The re-send goes through ``dispatch_retry`` (a per-kind closure that
+    drives :func:`turnstone.core.session_worker.send` with the kind's own
+    ``run`` / ``enqueue`` callbacks) rather than a hand-rolled thread, so
+    both kinds converge on the shared worker-dispatch primitive instead
+    of open-coding a third copy. A retry issued while busy is rejected up
+    front by the busy-gate below; the dispatcher's ``enqueue`` callback
+    hard-rejects (rather than queues) so the rare check-then-dispatch
+    race can't silently defer the resend behind the in-flight turn.
+
+    ``clear_ui`` fires after ``retry()`` regardless of whether anything
+    was dropped (idempotent REST refetch on the frontend), matching the
+    pre-lift interactive handler.
+
+    Args:
+        cfg: per-kind policy bundle.
+        dispatch_retry: ``(ws, user_msg) -> None`` re-send closure.
+            Required — retry is meaningless without it.
+        audit_emit: kind's audit emitter; receives ``(request, ws_id,
+            ws)``. **Both kinds hardcode the ``conversation.retry``
+            action.** Wrapped in try/except.
+        accepted_permissions: fallback scope check used only when
+            ``cfg.permission_gate`` is ``None`` (interactive wires
+            ``("conversation.modify",)``).
+    """
+
+    async def retry(request: Request) -> Response:
+        import asyncio
+
+        from turnstone.core.auth import require_any_permission
+
+        if cfg.permission_gate is not None:
+            err = cfg.permission_gate(request)
+            if err is not None:
+                return err
+        elif accepted_permissions:
+            err = require_any_permission(request, accepted_permissions)
+            if err is not None:
+                return err
+        mgr_opt, err503 = cfg.manager_lookup(request)
+        if err503 is not None:
+            return err503
+        mgr = cast("SessionManager", mgr_opt)
+        ws_id = request.path_params.get("ws_id", "")
+
+        if cfg.tenant_check is not None:
+            err_tenant = await asyncio.to_thread(cfg.tenant_check, request, ws_id, mgr)
+            if err_tenant is not None:
+                return err_tenant
+
+        ws = mgr.get(ws_id)
+        if ws is None:
+            return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+        session = ws.session
+        ui = ws.ui
+        if session is None or ui is None:
+            return JSONResponse({"error": "No session"}, status_code=400)
+
+        with ws._lock:
+            if ws._worker_running:
+                if hasattr(ui, "_enqueue"):
+                    ui._enqueue({"type": "busy_error", "message": "Cannot retry while processing."})
+                return JSONResponse({"status": "busy"})
+
+        retry_msg = session.retry()
+
+        if hasattr(ui, "_enqueue"):
+            ui._enqueue({"type": "clear_ui"})
+
+        if audit_emit is not None:
+            try:
+                audit_emit(request, ws_id, ws)
+            except Exception:
+                log.warning(
+                    "ws.retry.audit_failed ws=%s",
+                    ws_id[:8] if ws_id else "",
+                    exc_info=True,
+                )
+
+        retried = retry_msg is not None
+        if retry_msg is not None:
+            dispatch_retry(ws, retry_msg)
+
+        return JSONResponse({"status": "ok", "retried": retried})
+
+    return retry
 
 
 def make_open_handler(

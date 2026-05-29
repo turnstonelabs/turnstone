@@ -96,6 +96,28 @@ def test_specific_verbs_register_before_bare_detail() -> None:
     assert paths.index("/api/workstreams/{ws_id}/events") < detail_idx
 
 
+def test_rewind_retry_register_before_bare_detail() -> None:
+    """``/rewind`` and ``/retry`` (issue #549) mount as POST verbs
+    before the bare ``{ws_id}`` GET, like the other interaction verbs."""
+    routes: list[Any] = []
+    register_session_routes(
+        routes,
+        prefix="/api/workstreams",
+        handlers=SharedSessionVerbHandlers(
+            detail=_stub,
+            rewind=_stub,
+            retry=_stub,
+        ),
+    )
+    paths = [r.path for r in routes if isinstance(r, Route)]
+    detail_idx = paths.index("/api/workstreams/{ws_id}")
+    assert paths.index("/api/workstreams/{ws_id}/rewind") < detail_idx
+    assert paths.index("/api/workstreams/{ws_id}/retry") < detail_idx
+    by_path = {p: m for p, m in _route_paths(routes)}
+    assert "POST" in by_path["/api/workstreams/{ws_id}/rewind"]
+    assert "POST" in by_path["/api/workstreams/{ws_id}/retry"]
+
+
 def test_attachment_routes_mount_when_quartet_provided() -> None:
     """All four attachment routes mount when ``handlers.attachments``
     is non-``None`` — the type system requires the four-handler

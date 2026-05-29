@@ -113,6 +113,14 @@ class CancelRequest(BaseModel):
     )
 
 
+class RewindRequest(BaseModel):
+    turns: int = Field(
+        description="Number of conversation turns (user message + its responses) "
+        "to drop from the end. Clamped to the available turn count.",
+        ge=1,
+    )
+
+
 class CreateWorkstreamRequest(BaseModel):
     name: str = Field(default="", description="Workstream display name (auto-generated if empty)")
     model: str = Field(default="", description="Model alias from registry")

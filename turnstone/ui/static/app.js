@@ -1314,33 +1314,44 @@ class Pane {
 
   _retryLast() {
     if (this.busy) return;
-    authFetch("/v1/api/command", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ command: "/retry", ws_id: this.wsId }),
-    }).catch((err) => {
+    // Path-keyed retry (#549). Truncation + re-dispatch happen
+    // server-side; the clear_ui event drives the history refetch.
+    authFetch(
+      "/v1/api/workstreams/" + encodeURIComponent(this.wsId) + "/retry",
+      { method: "POST" },
+    ).catch((err) => {
       this.addErrorMessage("Retry failed: " + err.message);
+    });
+  }
+
+  // Path-keyed rewind (#549) by absolute turn count. Shared by the
+  // per-message rewind button and the hand-typed /rewind reroute.
+  _rewindToTurns(turns) {
+    if (this.busy) return;
+    if (!Number.isInteger(turns) || turns < 1) return;
+    authFetch(
+      "/v1/api/workstreams/" + encodeURIComponent(this.wsId) + "/rewind",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ turns }),
+      },
+    ).catch((err) => {
+      this.addErrorMessage("Rewind failed: " + err.message);
     });
   }
 
   _rewindToMessage(msgEl) {
     if (this.busy) return;
-    // Count how many user messages come at or after this one
+    // Count how many user messages come at or after this one. Bare
+    // ``.msg.user`` is intentional: system-nudge markers carry that
+    // class and the server's _find_turn_boundaries counts them as
+    // turns too, so this matches the server's rewind-N semantics.
     const userMsgs = this.messagesEl.querySelectorAll(".msg.user");
     const idx = Array.prototype.indexOf.call(userMsgs, msgEl);
     if (idx < 0) return;
     const turnsToRewind = userMsgs.length - idx;
-    if (turnsToRewind < 1) return;
-    authFetch("/v1/api/command", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        command: "/rewind " + turnsToRewind,
-        ws_id: this.wsId,
-      }),
-    }).catch((err) => {
-      this.addErrorMessage("Rewind failed: " + err.message);
-    });
+    this._rewindToTurns(turnsToRewind);
   }
 
   _startEdit(msgEl, originalText) {
@@ -1407,7 +1418,9 @@ class Pane {
 
   _editAndResend(msgEl, newText) {
     if (this.busy) return;
-    // Count turns to rewind (from this message onward)
+    // Count turns to rewind (from this message onward). Bare
+    // ``.msg.user`` matches the server's turn semantics — see
+    // _rewindToMessage.
     const userMsgs = this.messagesEl.querySelectorAll(".msg.user");
     const idx = Array.prototype.indexOf.call(userMsgs, msgEl);
     if (idx < 0) return;
@@ -1417,20 +1430,38 @@ class Pane {
     // Store pending send — dispatched from the clear_ui handler once
     // the rewind's truncated history is re-fetched over REST.
     this._pendingEditSend = newText;
-    authFetch("/v1/api/command", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        command: "/rewind " + turnsToRewind,
-        ws_id: this.wsId,
-      }),
-    })
-      .then((r) => {
+    authFetch(
+      "/v1/api/workstreams/" + encodeURIComponent(this.wsId) + "/rewind",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ turns: turnsToRewind }),
+      },
+    )
+      .then(async (r) => {
         if (r && !r.ok) {
           this._pendingEditSend = null;
           this.setBusy(false);
           this.addErrorMessage(
             "Rewind failed (HTTP " + r.status + " " + r.statusText + ")",
+          );
+          return;
+        }
+        // A 200 {"status":"busy"} means the rewind was rejected because a
+        // generation is in flight — no clear_ui fires, so the pending-edit
+        // latch + busy state would otherwise stay stuck (and the latch
+        // would later resend into the next clear_ui). Clear them here.
+        let data = null;
+        try {
+          data = await r.json();
+        } catch {
+          data = null;
+        }
+        if (data && data.status === "busy") {
+          this._pendingEditSend = null;
+          this.setBusy(false);
+          this.addErrorMessage(
+            "Cannot edit & resend while the workstream is processing.",
           );
         }
       })
@@ -2050,6 +2081,28 @@ class Pane {
 
     if (text.startsWith("/")) {
       if (this.busy) return; // commands not allowed while busy
+      // /rewind and /retry were lifted to path-keyed endpoints (#549);
+      // reroute hand-typed ones so they don't 400 against /command.
+      const parts = text.split(/\s+/);
+      const cmdWord = parts[0].toLowerCase();
+      if (cmdWord === "/rewind") {
+        const n = parseInt(parts[1], 10);
+        if (!Number.isInteger(n) || n < 1) {
+          this.addErrorMessage(
+            "Usage: /rewind <N> — N must be a positive integer",
+          );
+          this.composer.clear();
+          return;
+        }
+        this._rewindToTurns(n);
+        this.composer.clear();
+        return;
+      }
+      if (cmdWord === "/retry") {
+        this._retryLast();
+        this.composer.clear();
+        return;
+      }
       authFetch("/v1/api/command", {
         method: "POST",
         headers: { "Content-Type": "application/json" },

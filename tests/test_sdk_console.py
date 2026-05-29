@@ -30,6 +30,45 @@ def _mock_transport(
 
 
 # ---------------------------------------------------------------------------
+# Routing proxy — rewind / retry (#549)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_route_rewind_sends_turns_body():
+    """``route_rewind`` forwards ``{"turns": N}`` through the proxy."""
+    captured_path: list[str] = []
+    captured_body: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_path.append(request.url.path)
+        captured_body.append(json.loads(request.content) if request.content else {})
+        return _json_response({"status": "ok", "removed": 3})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        await client.route_rewind("ws1", turns=3)
+        assert captured_path[0] == "/v1/api/route/workstreams/ws1/rewind"
+        assert captured_body[0] == {"turns": 3}
+
+
+@pytest.mark.anyio
+async def test_route_retry_posts_to_path_keyed_endpoint():
+    transport = _mock_transport(
+        {
+            "POST /v1/api/route/workstreams/ws1/retry": _json_response(
+                {"status": "ok", "retried": True}
+            )
+        }
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        resp = await client.route_retry("ws1")
+        assert resp["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
 # Cluster overview
 # ---------------------------------------------------------------------------
 

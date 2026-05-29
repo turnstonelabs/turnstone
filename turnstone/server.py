@@ -75,6 +75,8 @@ from turnstone.core.session_routes import (
     make_history_handler,
     make_list_handler,
     make_open_handler,
+    make_retry_handler,
+    make_rewind_handler,
     make_saved_handler,
     make_send_handler,
     register_session_routes,
@@ -607,6 +609,98 @@ def _audit_close_workstream(
         detail,
         ip,
     )
+
+
+def _audit_rewind_workstream(
+    request: Request,
+    ws_id: str,
+    ws_before: Workstream,  # noqa: ARG001 — detail keys off ws_id
+    turns: int,
+) -> None:
+    """Record the ``conversation.rewind`` audit event for interactive rewind.
+
+    Passed to :func:`make_rewind_handler` as ``audit_emit``. The action
+    is hardcoded ``conversation.rewind`` on both kinds (no
+    ``coordinator.rewind`` split).
+    """
+    from turnstone.core.audit import record_audit
+
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return
+    _, ip = _audit_context(request)
+    record_audit(
+        storage,
+        _auth_user_id(request),
+        "conversation.rewind",
+        "workstream",
+        ws_id,
+        {"turns": turns, "ws_id": ws_id},
+        ip,
+    )
+
+
+def _audit_retry_workstream(
+    request: Request,
+    ws_id: str,
+    ws_before: Workstream,  # noqa: ARG001 — detail keys off ws_id
+) -> None:
+    """Record the ``conversation.retry`` audit event for interactive retry."""
+    from turnstone.core.audit import record_audit
+
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return
+    _, ip = _audit_context(request)
+    record_audit(
+        storage,
+        _auth_user_id(request),
+        "conversation.retry",
+        "workstream",
+        ws_id,
+        {"ws_id": ws_id},
+        ip,
+    )
+
+
+def _interactive_dispatch_retry(ws: Workstream, user_msg: str) -> None:
+    """Re-send ``user_msg`` on an interactive workstream after ``/retry``.
+
+    Passed to :func:`make_retry_handler` as ``dispatch_retry``; called
+    once :meth:`ChatSession.retry` has truncated the last turn. Drives
+    the shared :func:`turnstone.core.session_worker.send` dispatcher with
+    an interactive ``run`` closure (surfaces ``GenerationCancelled`` /
+    errors through the WebUI hooks) and a hard-reject ``enqueue`` closure
+    (a retry must not silently queue behind an in-flight turn — preserves
+    the pre-lift inline behaviour). The shared dispatcher owns the
+    ``_worker_running`` lifecycle, so the ``run`` closure needs no
+    ``finally`` flag-clear of its own.
+    """
+    from turnstone.core import session_worker
+
+    session = ws.session
+    ui = ws.ui
+    if session is None or ui is None:
+        return
+
+    def _run() -> None:
+        me = threading.current_thread()
+        try:
+            session.send(user_msg)
+        except GenerationCancelled:
+            if ws.worker_thread is me:
+                ui.on_stream_end()
+                ui.on_state_change("idle")
+        except Exception as exc:
+            if ws.worker_thread is me:
+                ui.on_error(f"Error: {exc}")
+                ui.on_stream_end()
+                ui.on_state_change("error")
+
+    def _enqueue() -> None:
+        ui.on_error("Cannot retry: workstream is busy")
+
+    session_worker.send(ws, enqueue=_enqueue, run=_run, thread_name=f"retry-{ws.id[:8]}")
 
 
 def _interactive_events_replay(
@@ -1286,28 +1380,24 @@ async def command(request: Request) -> JSONResponse:
     try:
         # Permission gate for conversation-modifying commands
         cmd_word = cmd.strip().split(None, 1)[0].lower()
+        # ``/rewind`` and ``/retry`` were lifted to path-keyed endpoints
+        # (POST /v1/api/workstreams/{ws_id}/rewind|retry, issue #549).
+        # Reject them here so a stale web client gets a clear pointer
+        # instead of a half-applied mutation: ``handle_command`` below
+        # would still rewind/retry, but the web-specific clear_ui emit +
+        # retry re-dispatch no longer live in this handler. The terminal
+        # CLI keeps dispatching these through ``handle_command`` in-process.
         if cmd_word in ("/rewind", "/retry"):
-            from turnstone.core.auth import require_permission
-
-            err = require_permission(request, "conversation.modify")
-            if err:
-                ui.on_error("Permission denied: conversation.modify required")
-                return err
-            # Prevent rewind/retry while a generation is in progress.
-            # Gate on ``_worker_running`` (not ``worker_thread.is_alive()``)
-            # for parity with session_worker.send: spawn paths set the
-            # flag before assigning ws.worker_thread, so a reader using
-            # the old gate could see a stale dead thread while a new
-            # worker is in the middle of starting.
-            with ws._lock:
-                if ws._worker_running:
-                    ui._enqueue(
-                        {
-                            "type": "busy_error",
-                            "message": "Cannot rewind/retry while processing.",
-                        }
+            verb = cmd_word[1:]
+            return JSONResponse(
+                {
+                    "error": (
+                        f"{cmd_word} is no longer served by /command; "
+                        f"use POST /v1/api/workstreams/{{ws_id}}/{verb}"
                     )
-                    return JSONResponse({"status": "busy"})
+                },
+                status_code=400,
+            )
 
         should_exit = ws.session.handle_command(cmd)
         if should_exit:
@@ -1318,65 +1408,6 @@ async def command(request: Request) -> JSONResponse:
         elif cmd_word == "/resume":
             # clear_ui signals the frontend to re-fetch history via REST.
             ui._enqueue({"type": "clear_ui"})
-        elif cmd_word in ("/rewind", "/retry"):
-            # clear_ui signals the frontend to re-fetch the (now
-            # truncated) history via REST and dispatch any queued
-            # edit-and-resend once it lands. Fires even on a rewind to
-            # zero messages: the frontend keys the resend off this
-            # signal, not an inline history payload.
-            ui._enqueue({"type": "clear_ui"})
-            # Audit trail
-            storage = getattr(request.app.state, "auth_storage", None)
-            if storage:
-                from turnstone.core.audit import record_audit
-
-                audit_uid, ip = _audit_context(request)
-                record_audit(
-                    storage,
-                    audit_uid,
-                    f"conversation.{cmd_word[1:]}",
-                    "workstream",
-                    ws.id,
-                    {"command": cmd, "ws_id": ws.id},
-                    ip,
-                )
-            # Dispatch deferred retry in background thread
-            retry_msg = ws.session._pending_retry
-            if retry_msg:
-                ws.session._pending_retry = None
-                session = ws.session
-
-                def run_retry() -> None:
-                    me = threading.current_thread()
-                    try:
-                        session.send(retry_msg)
-                    except GenerationCancelled:
-                        if ws.worker_thread is me:
-                            ui.on_stream_end()
-                            ui.on_state_change("idle")
-                    except Exception as exc:
-                        if ws.worker_thread is me:
-                            ui.on_error(f"Error: {exc}")
-                            ui.on_stream_end()
-                            ui.on_state_change("error")
-                    finally:
-                        with ws._lock:
-                            ws._worker_running = False
-
-                # Inlined rather than via ``session_worker.send`` because
-                # retry-when-busy is a hard reject (UI error, no fallback
-                # queue) — the shared dispatcher's enqueue/spawn shape
-                # doesn't fit. We gate on ``_worker_running`` for parity
-                # with that dispatcher so the two paths can't race into
-                # parallel workers on the same ChatSession.
-                with ws._lock:
-                    if ws._worker_running:
-                        ui.on_error("Cannot retry: workstream is busy")
-                    else:
-                        ws._worker_running = True
-                        t = threading.Thread(target=run_retry, daemon=True)
-                        ws.worker_thread = t
-                        t.start()
         # Sync in-memory workstream name after any command that can change it.
         # This ensures /api/workstreams and future page loads see the right name.
         if cmd_word in ("/name", "/resume"):
@@ -3706,6 +3737,17 @@ def create_app(
         accepted_permissions=("workstreams.close", "admin.coordinator"),
     )
     cancel_handler = make_cancel_handler(interactive_endpoint_config)
+    rewind_handler = make_rewind_handler(
+        interactive_endpoint_config,
+        audit_emit=_audit_rewind_workstream,
+        accepted_permissions=("conversation.modify",),
+    )
+    retry_handler = make_retry_handler(
+        interactive_endpoint_config,
+        dispatch_retry=_interactive_dispatch_retry,
+        audit_emit=_audit_retry_workstream,
+        accepted_permissions=("conversation.modify",),
+    )
     open_handler = make_open_handler(
         interactive_endpoint_config,
         audit_emit=_audit_workstream_opened,
@@ -3743,6 +3785,8 @@ def create_app(
             dequeue=dequeue_handler,  # lifted (P1.5) — DELETE /send
             approve=approve_handler,  # lifted: shared body
             cancel=cancel_handler,  # lifted: shared body
+            rewind=rewind_handler,  # lifted: shared body (#549)
+            retry=retry_handler,  # lifted: shared body (#549)
             events=events_handler,  # lifted: shared body
             history=history_handler,  # lifted: shared body (interactive feature gain)
             attachments=attachment_handlers,  # lifted: shared body (P1.5)

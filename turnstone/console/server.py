@@ -72,6 +72,8 @@ from turnstone.core.session_routes import (
     make_history_handler,
     make_list_handler,
     make_open_handler,
+    make_retry_handler,
+    make_rewind_handler,
     make_saved_handler,
     make_send_handler,
     register_coord_verbs,
@@ -689,6 +691,8 @@ _ROUTE_PROXY_AUDIT_ACTIONS: dict[str, str] = {
     "dequeue": "route.workstream.dequeue",
     "approve": "route.approve",
     "cancel": "route.cancel",
+    "rewind": "route.rewind",
+    "retry": "route.retry",
     "command": "route.command",
     "plan": "route.plan",
     "close": "route.workstream.close",
@@ -3156,6 +3160,86 @@ def _audit_cancel_coordinator(
         {"coord_ws_id": ws_id, "src": "coordinator", "force": force},
         request.client.host if request.client else "",
     )
+
+
+def _audit_rewind_coordinator(
+    request: Request,
+    ws_id: str,
+    ws_before: Workstream,  # noqa: ARG001 — coord audit detail keys off ws_id
+    turns: int,
+) -> None:
+    """Record the ``conversation.rewind`` audit event for coord rewind.
+
+    Passed to :func:`make_rewind_handler` as ``audit_emit``. The action is
+    hardcoded ``conversation.rewind`` (matching interactive — there is
+    deliberately no ``coordinator.rewind`` split).
+    """
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return
+    record_audit(
+        storage,
+        _auth_user_id(request),
+        "conversation.rewind",
+        "workstream",
+        ws_id,
+        {"coord_ws_id": ws_id, "src": "coordinator", "turns": turns},
+        request.client.host if request.client else "",
+    )
+
+
+def _audit_retry_coordinator(
+    request: Request,
+    ws_id: str,
+    ws_before: Workstream,  # noqa: ARG001 — coord audit detail keys off ws_id
+) -> None:
+    """Record the ``conversation.retry`` audit event for coord retry."""
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return
+    record_audit(
+        storage,
+        _auth_user_id(request),
+        "conversation.retry",
+        "workstream",
+        ws_id,
+        {"coord_ws_id": ws_id, "src": "coordinator"},
+        request.client.host if request.client else "",
+    )
+
+
+def _coord_dispatch_retry(ws: Workstream, user_msg: str) -> None:
+    """Re-send ``user_msg`` on a coordinator workstream after ``/retry``.
+
+    Passed to :func:`make_retry_handler` as ``dispatch_retry``. Mirrors
+    :meth:`CoordinatorAdapter.send`'s worker shape — drives the shared
+    :func:`turnstone.core.session_worker.send` dispatcher — but without
+    attachment handling (a retry re-sends an existing text turn). The
+    ``run`` closure's error handling is intentionally light:
+    :meth:`ChatSession.send` already surfaces failures to SSE, persists
+    ``last_error`` and emits state=error via ``_record_fatal_error``, and
+    the shared dispatcher owns the ``_worker_running`` lifecycle — so the
+    worker only logs. The ``enqueue`` closure hard-rejects (a retry must
+    not silently queue behind an in-flight turn).
+    """
+    from turnstone.core import session_worker
+
+    session = ws.session
+    ui = ws.ui
+    if session is None:
+        return
+
+    def _run() -> None:
+        try:
+            session.send(user_msg)
+        except Exception:
+            log.exception("coord.retry.worker_failed ws=%s", ws.id[:8])
+
+    def _enqueue() -> None:
+        if ui is not None and hasattr(ui, "on_error"):
+            ui.on_error("Cannot retry: workstream is busy")
+
+    session_worker.send(ws, enqueue=_enqueue, run=_run, thread_name=f"coord-retry-{ws.id[:8]}")
 
 
 def _coord_events_replay(
@@ -12565,6 +12649,15 @@ def create_app(
                 coord_endpoint_config,
                 audit_emit=_audit_cancel_coordinator,
             ),
+            rewind=make_rewind_handler(  # lifted: shared body (#549)
+                coord_endpoint_config,
+                audit_emit=_audit_rewind_coordinator,
+            ),
+            retry=make_retry_handler(  # lifted: shared body (#549)
+                coord_endpoint_config,
+                dispatch_retry=_coord_dispatch_retry,
+                audit_emit=_audit_retry_coordinator,
+            ),
             events=make_events_handler(coord_endpoint_config),  # lifted: shared body
             history=make_history_handler(coord_endpoint_config),  # lifted: shared body
             attachments=make_attachment_handlers(
@@ -12616,6 +12709,16 @@ def create_app(
                     ),
                     Route(
                         "/api/route/workstreams/{ws_id}/cancel",
+                        route_proxy,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/route/workstreams/{ws_id}/rewind",
+                        route_proxy,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/route/workstreams/{ws_id}/retry",
                         route_proxy,
                         methods=["POST"],
                     ),

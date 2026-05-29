@@ -445,6 +445,16 @@ class AsyncTurnstoneConsole(_BaseClient):
             "POST", f"/v1/api/route/workstreams/{ws_id}/cancel", json_body=body
         )
 
+    async def route_rewind(self, ws_id: str, *, turns: int) -> dict[str, Any]:
+        """Drop the last ``turns`` conversation turns via the routing proxy."""
+        return await self._request(
+            "POST", f"/v1/api/route/workstreams/{ws_id}/rewind", json_body={"turns": turns}
+        )
+
+    async def route_retry(self, ws_id: str) -> dict[str, Any]:
+        """Re-send the last user message for a fresh response via the routing proxy."""
+        return await self._request("POST", f"/v1/api/route/workstreams/{ws_id}/retry", json_body={})
+
     async def route_command(self, *, ws_id: str, command: str) -> dict[str, Any]:
         """Send a slash command via the routing proxy."""
         return await self._request(
@@ -1358,6 +1368,12 @@ class TurnstoneConsole:
 
     def route_cancel(self, ws_id: str, *, force: bool = False) -> dict[str, Any]:
         return self._runner.run(self._async.route_cancel(ws_id, force=force))
+
+    def route_rewind(self, ws_id: str, *, turns: int) -> dict[str, Any]:
+        return self._runner.run(self._async.route_rewind(ws_id, turns=turns))
+
+    def route_retry(self, ws_id: str) -> dict[str, Any]:
+        return self._runner.run(self._async.route_retry(ws_id))
 
     def route_command(self, *, ws_id: str, command: str) -> dict[str, Any]:
         return self._runner.run(self._async.route_command(ws_id=ws_id, command=command))

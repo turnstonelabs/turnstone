@@ -136,6 +136,7 @@ from turnstone.api.server_schemas import (
     ListAttachmentsResponse,
     ListSkillSummaryResponse,
     ListWorkstreamsResponse,
+    RewindRequest,
     SkillSummary,
     UploadAttachmentResponse,
     WorkstreamDetailResponse,
@@ -1335,6 +1336,33 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         ),
         response_model=StatusResponse,
         error_codes=[403, 404, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/rewind",
+        "POST",
+        "Drop the last N conversation turns on the coordinator (emits clear_ui)",
+        description=(
+            "Truncates the coordinator conversation by N turns via the shared "
+            "rewind handler and emits ``clear_ui`` so the dashboard re-fetches "
+            "the truncated history. Gated on ``admin.coordinator``."
+        ),
+        request_model=RewindRequest,
+        response_model=StatusResponse,
+        error_codes=[400, 403, 404, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/retry",
+        "POST",
+        "Re-send the last user message on the coordinator for a fresh response",
+        description=(
+            "Drops the last response and re-sends the last user message via the "
+            "shared worker dispatch, emitting ``clear_ui``. Gated on "
+            "``admin.coordinator``."
+        ),
+        response_model=StatusResponse,
+        error_codes=[400, 403, 404, 503],
         tags=["Coordinator"],
     ),
     EndpointSpec(
