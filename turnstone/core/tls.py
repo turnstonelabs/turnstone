@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import ssl
+    from collections.abc import Callable
 
     from turnstone.core.storage._protocol import StorageBackend
 
@@ -36,6 +37,99 @@ def _require_lacme() -> Any:
             "lacme is required for TLS support. Install with: pip install turnstone[tls]",
         ) from None
     return lacme
+
+
+def build_cert_hostnames(
+    advertise_url: str = "",
+    *,
+    bind_host: str = "",
+    extra_sans: str = "",
+) -> list[str]:
+    """Build the ordered, de-duplicated SAN list for a service certificate.
+
+    The advertised host (the name peers dial) goes **first**, becoming the
+    cert's primary domain. That makes it (a) a SAN, so mTLS hostname checks
+    pass — deriving SANs from ``gethostname()`` alone (the container ID) omits
+    it — and (b) a stable store key, so the cert reuses one row across
+    container recreations instead of orphaning one each time. Falls back to
+    ``gethostname()`` as primary only when no advertise URL is given.
+    """
+    import socket
+    from urllib.parse import urlsplit
+
+    names: list[str] = []
+    if advertise_url:
+        host = urlsplit(advertise_url).hostname or ""
+        if host:
+            names.append(host)
+    # OS hostname (container ID under Docker) — keeps in-container self-dial
+    # working and provides a fallback primary on bare metal.
+    hostname = socket.gethostname()
+    names.append(hostname)
+    fqdn = socket.getfqdn()
+    if fqdn and fqdn != hostname:
+        names.append(fqdn)
+    names.extend(["localhost", "127.0.0.1"])
+    if bind_host and bind_host not in ("0.0.0.0", "::", ""):
+        names.append(bind_host)
+    # Reject wildcard / unspecified-address SANs so a stray TURNSTONE_TLS_SANS
+    # can't mint an over-broad cert the internal CA would have peers trust.
+    for raw in extra_sans.split(","):
+        san = raw.strip()
+        if san and san not in ("0.0.0.0", "::", "*"):
+            names.append(san)
+    # De-duplicate, preserving first-seen order so the advertised host stays
+    # primary.
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for name in names:
+        if name and name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    return ordered
+
+
+class _SingleDomainStore:
+    """Store view exposing only one domain's cert to a renewal sweep.
+
+    lacme's RenewalManager renews everything ``list_certs()`` returns. The
+    store is shared cluster-wide, so an unscoped manager on each node renews
+    every other node's (and every dead container's) cert — an N×M storm. This
+    wrapper limits the sweep to one domain; all other operations delegate to
+    the real store so renewed certs still persist to the shared database.
+    """
+
+    def __init__(self, inner: Any, domain: str) -> None:
+        self._inner = inner
+        self._domain = domain
+
+    def list_certs(self) -> list[Any]:
+        cert = self._inner.load_cert(self._domain)
+        return [cert] if cert is not None else []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def swap_context_cert(ctx: ssl.SSLContext, bundle: Any, *, ca_pem: bytes | None = None) -> None:
+    """Hot-swap a renewed bundle into a live :class:`ssl.SSLContext`.
+
+    Writes the bundle to short-lived PEM files, calls ``load_cert_chain`` (so
+    new handshakes use the renewed cert), then removes the temp dir — even on
+    failure, so a malformed bundle can't leave private-key material on disk.
+    Used by both the server listener context and the console client context.
+    """
+    import contextlib
+    import shutil
+
+    from lacme.mtls import write_pem_files
+
+    paths = write_pem_files(bundle, ca_pem=ca_pem)
+    try:
+        ctx.load_cert_chain(str(paths.cert), str(paths.key))
+    finally:
+        with contextlib.suppress(OSError):
+            shutil.rmtree(paths.cert.parent)
 
 
 class TLSClient:
@@ -72,6 +166,10 @@ class TLSClient:
         self._bundle: Any | None = None
         self._renewal_task: Any | None = None
         self._renewal_client: Any | None = None
+        # Optional hook invoked with each renewed bundle so the live HTTPS
+        # listener can swap in the new cert (uvicorn never reloads its SSL
+        # context on its own — see ``set_cert_reload_hook``).
+        self._cert_reload_hook: Callable[[Any], None] | None = None
 
         # Wire Prometheus metrics
         try:
@@ -85,6 +183,25 @@ class TLSClient:
                 log.debug("tls_metrics_already_registered")
             else:
                 raise
+
+    def set_cert_reload_hook(self, hook: Callable[[Any], None]) -> None:
+        """Register a callback that installs a renewed bundle into the listener.
+
+        Renewal updates the DB + ``self._bundle`` but not the running uvicorn
+        listener, which keeps serving its boot cert until this hook swaps the
+        renewed cert into the live SSL context.
+        """
+        self._cert_reload_hook = hook
+
+    def _handle_renewed(self, bundle: Any) -> None:
+        """Renewal callback: cache the new bundle and run the reload hook."""
+        self._bundle = bundle
+        log.info("tls.cert.renewed", domain=bundle.domain)
+        if self._cert_reload_hook is not None:
+            try:
+                self._cert_reload_hook(bundle)
+            except Exception:
+                log.warning("tls.cert.reload_hook_failed", exc_info=True)
 
     async def init(self) -> None:
         """Fetch CA root cert and request a service certificate.
@@ -169,10 +286,6 @@ class TLSClient:
         """Start background auto-renewal via the console's ACME endpoint."""
         lacme = _require_lacme()
 
-        def _on_renewed(bundle: Any) -> None:
-            self._bundle = bundle
-            log.info("tls.cert.renewed", domain=bundle.domain)
-
         from lacme.challenges.http01 import HTTP01Handler
 
         directory_url = f"{self._console_url}/acme/directory"
@@ -185,12 +298,19 @@ class TLSClient:
         )
         await client.__aenter__()
 
+        # Scope the renewal sweep to this node's own certificate.  The store
+        # is shared cluster-wide; an unscoped RenewalManager would renew every
+        # node's cert on every node (see :class:`_SingleDomainStore`).  An
+        # empty domain matches nothing, so a missing hostname renews nothing
+        # rather than falling back to re-signing the whole cluster.
+        own_domain = self._hostnames[0] if self._hostnames else ""
+        renewal_store = _SingleDomainStore(self._store, own_domain)
         manager = lacme.RenewalManager(
             client=client,
-            store=self._store,
+            store=renewal_store,
             interval_hours=_RENEW_INTERVAL_HOURS,
             days_before_expiry=_RENEW_BEFORE_EXPIRY_DAYS,
-            on_renewed=_on_renewed,
+            on_renewed=self._handle_renewed,
             event_dispatcher=self._event_dispatcher,
         )
         self._renewal_task = manager.start()

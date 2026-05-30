@@ -1,0 +1,17 @@
+# Browser TLS for the console dashboard (cluster/demo profile):
+#   browser --h2/HTTPS--> caddy:443 --h1.1/HTTP--> console:8090
+# The console serves HTTP (it's the ACME bootstrap endpoint), so browser TLS is
+# terminated here. `tls internal` uses Caddy's own local CA; trust its root once:
+#   docker compose exec caddy cat /data/caddy/pki/authorities/local/root.crt
+# See docs/tls.md (incl. the acme_ca→console alternative and why it's not default).
+
+:443 {
+	# on_demand: a port-only site has no fixed name to pre-issue for; safe here
+	# because the issuer is Caddy's local CA, not a public one.
+	tls internal {
+		on_demand
+	}
+	reverse_proxy console:8090 {
+		flush_interval -1 # stream the dashboard SSE without buffering
+	}
+}

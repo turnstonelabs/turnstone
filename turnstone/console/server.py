@@ -4949,21 +4949,34 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     # TLS: init CA, issue console certs, start renewal
     tls_mgr = getattr(app.state, "tls_manager", None)
     if tls_mgr is not None:
-        import socket
-
         try:
             if not tls_mgr.ca_initialized:
                 await tls_mgr.init_ca()
-            hostname = socket.gethostname()
-            fqdn = socket.getfqdn()
-            cert_hostnames = [hostname, "localhost", "127.0.0.1"]
-            if fqdn != hostname:
-                cert_hostnames.append(fqdn)
-            extra_sans = os.environ.get("TURNSTONE_TLS_SANS", "")
-            if extra_sans:
-                cert_hostnames.extend(s.strip() for s in extra_sans.split(",") if s.strip())
+            from turnstone.core.tls import build_cert_hostnames
+
+            # Primary SAN = the console's advertised host so the cert is keyed
+            # by a stable name (not the container ID) and covers the name peers
+            # use to reach it.
+            cert_hostnames = build_cert_hostnames(
+                console_url,
+                extra_sans=os.environ.get("TURNSTONE_TLS_SANS", ""),
+            )
             await tls_mgr.issue_console_certs(cert_hostnames)
             await tls_mgr.start_renewal()
+            # Reclaim cert rows for long-departed nodes; re-run periodically.
+            # Bind a stable non-None local so the closure keeps the narrowing.
+            gc_mgr = tls_mgr
+            gc_mgr.gc_expired_certs()
+
+            async def _tls_gc_loop() -> None:
+                while True:
+                    await asyncio.sleep(6 * 3600)
+                    try:
+                        gc_mgr.gc_expired_certs()
+                    except Exception:
+                        log.warning("tls.certs.gc_failed", exc_info=True)
+
+            app.state.tls_gc_task = asyncio.create_task(_tls_gc_loop())
             # Re-create proxy clients with mTLS context now that certs are ready
             client_ctx = tls_mgr.get_client_ssl_context()
             if client_ctx:
@@ -5020,6 +5033,9 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     tls_mgr = getattr(app.state, "tls_manager", None)
     if tls_mgr is not None:
         await tls_mgr.stop_renewal()
+    _tls_gc_task = getattr(app.state, "tls_gc_task", None)
+    if _tls_gc_task is not None:
+        _tls_gc_task.cancel()
     if scheduler is not None:
         scheduler.stop()
     from turnstone.core.idle_nudge_watcher import shutdown_idle_nudge_watchers
@@ -13420,9 +13436,11 @@ def main() -> None:
                 import asyncio
 
                 asyncio.run(tls_mgr.init_ca())
-                # Upgrade scheme to https if no explicit URL was provided
-                if not _console_url_env:
-                    console_url = console_url.replace("http://", "https://")
+                # console_url stays http://: the console serves HTTP (it's the
+                # ACME bootstrap endpoint nodes reach before trusting the CA).
+                # Browser HTTPS is terminated by a reverse proxy (caddy service
+                # / docs/tls.md); rewriting the scheme to https here would
+                # advertise an ACME URL nodes can't reach.
                 log.info("TLS enabled")
         except ImportError:
             log.warning("TLS enabled but lacme not installed — pip install turnstone[tls]")
