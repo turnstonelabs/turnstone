@@ -10,18 +10,82 @@ _RE_INVISIBLE = re.compile(
     r"<(script|style|template|noscript)\b[^>]*>.*?</\1\s*>",
     re.DOTALL | re.IGNORECASE,
 )
-_RE_TAGS = re.compile(r"<[^>]+>")
+# Tags whose boundary should become a newline: block-level elements plus <br>, so
+# paragraphs, headings, list items, and table cells don't glue together once the
+# tags are removed (e.g. "<p>a</p><p>b</p>" -> "a\n\nb", not "ab").
+_NEWLINE_TAGS = frozenset(
+    {
+        "address",
+        "article",
+        "aside",
+        "blockquote",
+        "br",
+        "dd",
+        "div",
+        "dl",
+        "dt",
+        "fieldset",
+        "figcaption",
+        "figure",
+        "footer",
+        "form",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "hr",
+        "li",
+        "main",
+        "nav",
+        "ol",
+        "p",
+        "pre",
+        "section",
+        "table",
+        "tbody",
+        "td",
+        "tfoot",
+        "th",
+        "thead",
+        "tr",
+        "ul",
+    }
+)
+# Single linear tag scan. The possessive quantifier ([^>]++) cannot backtrack, so
+# untrusted HTML cannot trigger catastrophic backtracking (ReDoS) here.
+_RE_TAG = re.compile(r"<[^>]++>")
+_RE_TAG_NAME = re.compile(r"</?\s*([a-zA-Z][a-zA-Z0-9]*)")
 _RE_WS = re.compile(r"[ \t]+")
+_RE_LINE_WS = re.compile(r" *\n *")
 _RE_BLANKLINES = re.compile(r"\n{3,}")
 
 
+def _tag_replacement(match: re.Match[str]) -> str:
+    """Map one HTML tag to a newline (block boundary / <br>) or to nothing (inline)."""
+    name = _RE_TAG_NAME.match(match.group())
+    if name is not None and name.group(1).lower() in _NEWLINE_TAGS:
+        return "\n"
+    return ""
+
+
 def strip_html(html: str) -> str:
-    """Convert HTML to plain text: strip invisible elements, tags, decode entities."""
+    """Convert HTML to plain text, preserving block structure as line breaks.
+
+    Block-level boundaries (and ``<br>``) become newlines while inline tags are
+    dropped, so paragraphs, headings, list items, and table cells stay separated
+    rather than concatenating into a structureless run of text. A single linear tag
+    scan is used so untrusted input cannot trigger catastrophic regex backtracking.
+    """
     # Remove elements whose content should never appear as text
     text = _RE_INVISIBLE.sub("", html)
-    text = _RE_TAGS.sub("", text)
+    # One pass over tags: block/<br> boundaries -> newline, inline tags -> removed
+    text = _RE_TAG.sub(_tag_replacement, text)
     text = _html_unescape(text)
     text = _RE_WS.sub(" ", text)
+    text = _RE_LINE_WS.sub("\n", text)
     text = _RE_BLANKLINES.sub("\n\n", text)
     return text.strip()
 
