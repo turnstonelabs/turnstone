@@ -383,6 +383,34 @@ def _cmd_delete_node_metadata(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def _cmd_export(args: argparse.Namespace) -> None:
+    """Export a workstream as an OpenAI messages envelope (JSON, or zip with --children)."""
+    from turnstone.core.export import WorkstreamNotFoundError, export_workstream
+
+    storage = _get_storage(args)
+    try:
+        result = export_workstream(storage, args.ws_id, children=args.children)
+    except WorkstreamNotFoundError:
+        print(f"Workstream not found: {args.ws_id}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.output == "-":
+        if result.content_type == "application/zip" and sys.stdout.isatty():
+            print(
+                "Refusing to write zip bytes to a terminal; use --output FILE or pipe.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if result.content_type == "application/zip":
+            sys.stdout.buffer.write(result.data)
+        else:
+            sys.stdout.write(result.data.decode("utf-8"))
+    else:
+        with open(args.output, "wb") as fh:
+            fh.write(result.data)
+        print(f"Wrote {len(result.data)} bytes to {args.output}", file=sys.stderr)
+
+
 def _discover_console_url() -> str:
     """Discover console URL from the services table."""
     from turnstone.core.storage import get_storage
@@ -485,6 +513,16 @@ def main() -> None:
     p_dnm.add_argument("node_id", help="Node ID")
     p_dnm.add_argument("key", help="Metadata key")
 
+    # Export
+    p_export = sub.add_parser("export", help="Export a workstream as OpenAI messages JSON")
+    p_export.add_argument("ws_id", help="Workstream id to export")
+    p_export.add_argument(
+        "--children",
+        action="store_true",
+        help="Bundle the coordinator parent + one JSON per child as a zip",
+    )
+    p_export.add_argument("--output", "-o", default="-", help="Output file path, or - for stdout")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -503,5 +541,6 @@ def main() -> None:
         "list-node-metadata": _cmd_list_node_metadata,
         "set-node-metadata": _cmd_set_node_metadata,
         "delete-node-metadata": _cmd_delete_node_metadata,
+        "export": _cmd_export,
     }
     dispatch[args.command](args)

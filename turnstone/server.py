@@ -72,6 +72,7 @@ from turnstone.core.session_routes import (
     make_dequeue_handler,
     make_detail_handler,
     make_events_handler,
+    make_export_handler,
     make_history_handler,
     make_list_handler,
     make_open_handler,
@@ -3798,6 +3799,7 @@ def create_app(
     list_handler = make_list_handler(interactive_endpoint_config)
     saved_handler = make_saved_handler(interactive_endpoint_config)
     history_handler = make_history_handler(interactive_endpoint_config)
+    export_handler = make_export_handler(interactive_endpoint_config)
     detail_handler = make_detail_handler(interactive_endpoint_config)
     v1_routes: list[Any] = [
         Route("/api/events/global", global_events_sse),
@@ -3823,6 +3825,7 @@ def create_app(
             retry=retry_handler,  # lifted: shared body (#549)
             events=events_handler,  # lifted: shared body
             history=history_handler,  # lifted: shared body (interactive feature gain)
+            export=export_handler,  # lifted: shared body (#613, conversation-only)
             attachments=attachment_handlers,  # lifted: shared body (P1.5)
         ),
     )

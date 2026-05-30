@@ -1416,6 +1416,20 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/export",
+        "GET",
+        "Export the coordinator's conversation as OpenAI messages JSON",
+        description=(
+            "Returns the coordinator's own conversation as an "
+            '``{"messages": [...]}`` OpenAI Chat Completions envelope, '
+            "served as a ``<ws_id>.json`` file download. Conversation-only "
+            "(children are not bundled over HTTP). Gated on "
+            "``admin.coordinator``."
+        ),
+        error_codes=[400, 403, 404, 500, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
         "/v1/api/workstreams/{ws_id}/children",
         "GET",
         "List the coordinator's spawned child workstreams",

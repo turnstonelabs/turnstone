@@ -69,6 +69,7 @@ from turnstone.core.session_routes import (
     make_dequeue_handler,
     make_detail_handler,
     make_events_handler,
+    make_export_handler,
     make_history_handler,
     make_list_handler,
     make_open_handler,
@@ -12660,6 +12661,9 @@ def create_app(
             ),
             events=make_events_handler(coord_endpoint_config),  # lifted: shared body
             history=make_history_handler(coord_endpoint_config),  # lifted: shared body
+            export=make_export_handler(  # lifted: shared body (#613, conversation-only)
+                coord_endpoint_config
+            ),
             attachments=make_attachment_handlers(
                 coord_endpoint_config
             ),  # lifted: shared body (P1.5)

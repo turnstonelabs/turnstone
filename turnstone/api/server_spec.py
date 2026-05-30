@@ -258,6 +258,22 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         error_codes=[400, 404, 500, 503],
         tags=["Workstreams"],
     ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/export",
+        "GET",
+        "Export the workstream's conversation as OpenAI messages JSON",
+        description=(
+            'Returns the full conversation as an ``{"messages": [...]}`` '
+            "OpenAI Chat Completions envelope, served as a ``<ws_id>.json`` "
+            "file download (``Content-Disposition: attachment``). Persisted "
+            "reasoning is surfaced on assistant messages as a "
+            "``reasoning_content`` field. Conversation-only — the parent + "
+            "per-child zip bundle is exposed only through the "
+            "``turnstone-admin export --children`` CLI."
+        ),
+        error_codes=[400, 404, 500, 503],
+        tags=["Workstreams"],
+    ),
     # --- Workstream attachments ---
     EndpointSpec(
         "/v1/api/workstreams/{ws_id}/attachments",

@@ -66,6 +66,7 @@ from turnstone.core.session_routes import (
     make_create_handler,
     make_dequeue_handler,
     make_detail_handler,
+    make_export_handler,
     make_history_handler,
     make_list_handler,
     make_open_handler,
@@ -198,6 +199,11 @@ def _make_client(
             Route(
                 "/v1/api/workstreams/{ws_id}/history",
                 make_history_handler(_coord_endpoint_config),
+                methods=["GET"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/export",
+                make_export_handler(_coord_endpoint_config),
                 methods=["GET"],
             ),
             Route(
@@ -1314,6 +1320,67 @@ def test_history_clamps_limit_query_param(storage):
     # We only have 6 messages but the response is still 200 — the cap
     # is enforced on the SQL LIMIT, not on the row count.
     assert len(resp.json()["messages"]) == 6
+
+
+# ---------------------------------------------------------------------------
+# Export (issue #613) — conversation-only, never a zip
+# ---------------------------------------------------------------------------
+
+
+def test_export_happy_path_returns_json_not_zip(storage):
+    """A seeded coordinator exports as a JSON conversation envelope —
+    never a zip. The HTTP surface is conversation-only; the children/zip
+    capability is admin-CLI-only."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    storage.save_message(ws.id, "user", "coordinate the work")
+    storage.save_message(ws.id, "assistant", "on it")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    resp = client.get(f"/v1/api/workstreams/{ws.id}/export", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("application/json")
+    assert resp.headers["content-disposition"] == f'attachment; filename="{ws.id}.json"'
+    # NOT a zip — zip archives start with the "PK" local-file magic.
+    assert not resp.content.startswith(b"PK")
+    # Body parses to the OpenAI envelope with the seeded turns.
+    body = resp.json()
+    role_contents = [(m.get("role"), m.get("content")) for m in body["messages"]]
+    assert ("user", "coordinate the work") in role_contents
+
+
+def test_export_serves_storage_only_coordinator(storage):
+    """Closed / evicted coordinators export from storage without
+    rehydrating, same ladder history uses."""
+    mgr = _build_mgr(storage)
+    storage.register_workstream("storage-only-coord", kind="coordinator", user_id="user-1")
+    storage.save_message("storage-only-coord", "user", "from cold storage")
+    assert mgr.get("storage-only-coord") is None
+
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(
+        "/v1/api/workstreams/storage-only-coord/export",
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200
+    contents = [m.get("content") for m in resp.json()["messages"]]
+    assert "from cold storage" in contents
+    # Export does NOT rehydrate — pool stays cold.
+    assert mgr.get("storage-only-coord") is None
+
+
+def test_export_404_when_kind_interactive(storage):
+    """Cross-kind isolation: an interactive ws_id in shared storage 404s
+    on the coordinator export endpoint (the handler is built with
+    ``list_kind=COORDINATOR``). Proves the kind gate the same way
+    :func:`test_history_404_when_kind_interactive` does."""
+    mgr = _build_mgr(storage)
+    storage.register_workstream("ws-int", kind="interactive", user_id="user-1")
+    storage.save_message("ws-int", "user", "interactive content")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get("/v1/api/workstreams/ws-int/export", headers=_COORD_HEADERS)
+    assert resp.status_code == 404
+    assert "interactive content" not in resp.text
 
 
 # ---------------------------------------------------------------------------

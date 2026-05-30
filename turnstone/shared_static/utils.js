@@ -140,3 +140,65 @@ function replayAdvisoriesAfterTool(advisories, renderUserText) {
     renderUserText(adv.text || "");
   }
 }
+
+// Download a workstream's conversation as OpenAI-shaped JSON.  Hits
+// GET /v1/api/workstreams/{ws_id}/export, which streams a
+// ``{"messages":[...]}`` body with a Content-Disposition attachment
+// filename.  Shared by the interactive appbar (app.js) and the
+// coordinator appbar (coordinator.js) so both export buttons behave
+// identically.  authFetch already handles the 401 (shows login) and
+// 429 (retry) paths and returns the raw Response, so we read .blob()
+// directly and synthesise an anchor click to trigger the browser save.
+async function exportWorkstreamDownload(wsId, btn) {
+  if (!wsId) {
+    showToast("No conversation to export", "error");
+    return;
+  }
+  // Re-entrancy guard: a double-click (or Enter+Enter) must not fire two
+  // concurrent exports / two downloads.  The optional triggering button
+  // is disabled for the duration as the in-progress affordance, matching
+  // the send/stop buttons' disable-during-async pattern.
+  if (exportWorkstreamDownload._busy) return;
+  exportWorkstreamDownload._busy = true;
+  if (btn) {
+    btn.disabled = true;
+    btn.setAttribute("aria-busy", "true");
+  }
+  try {
+    const url = "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/export";
+    let r;
+    try {
+      r = await authFetch(url);
+    } catch (e) {
+      // authFetch throws Error("auth") on 401 after showing the login
+      // modal — nothing more to do here.
+      return;
+    }
+    if (!r || !r.ok) {
+      showToast("Export failed", "error");
+      return;
+    }
+    let filename = wsId + ".json";
+    const cd = r.headers.get("Content-Disposition");
+    if (cd) {
+      const m = cd.match(/filename="([^"]+)"/);
+      if (m) filename = m[1];
+    }
+    const blob = await r.blob();
+    const objUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(objUrl);
+    showToast("Exported " + filename);
+  } finally {
+    exportWorkstreamDownload._busy = false;
+    if (btn) {
+      btn.disabled = false;
+      btn.removeAttribute("aria-busy");
+    }
+  }
+}

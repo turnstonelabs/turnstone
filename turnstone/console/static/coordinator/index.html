@@ -532,6 +532,7 @@
   <span class="appbar-spacer"></span>
   <span id="coord-sse-status" class="appbar-status" aria-live="polite">connecting…</span>
   <span class="appbar-actions">
+    <button id="coord-export-btn" class="btn" type="button" aria-label="Export conversation" title="Export conversation (OpenAI JSON)">&#10515;</button>
     <button id="coord-close-btn" class="btn" onclick="coordCloseSession()" title="End this coordinator session (terminates it on the server)">end</button>
     <button id="theme-toggle" class="btn" onclick="toggleTheme()" aria-label="Toggle light/dark theme">&#9790;</button>
   </span>
@@ -617,6 +618,8 @@
     </div>
   </aside>
 </div>
+
+<div id="toast" role="status" aria-live="polite"></div>
 
 <!-- Shared-static import order matches the console dashboard
      (console/static/index.html) so global shortcuts (kb.js) and helpers

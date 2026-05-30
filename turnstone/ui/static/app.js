@@ -2995,6 +2995,12 @@ function showTabDropdown(chevronEl, wsId) {
       },
     },
     {
+      label: "Export conversation",
+      action: function () {
+        exportWorkstreamDownload(wsId);
+      },
+    },
+    {
       label: "Close",
       key: "Ctrl+W",
       disabled: isLastWs,

@@ -4076,6 +4076,17 @@
     });
   }
 
+  // Appbar Export button — download this coordinator's conversation as
+  // OpenAI-shaped JSON via the shared helper in utils.js.  Wired here
+  // (rather than via an inline onclick like coord-close-btn) because the
+  // helper needs the IIFE-scoped ``wsId`` const captured at load time.
+  const exportBtn = document.getElementById("coord-export-btn");
+  if (exportBtn) {
+    exportBtn.addEventListener("click", () => {
+      exportWorkstreamDownload(wsId, exportBtn);
+    });
+  }
+
   // Mobile-only sidebar toggle — wires the accordion collapse below 700px.
   // On desktop the button is display:none so the handler is a no-op.
   const sidebarEl = document.getElementById("coord-sidebar");

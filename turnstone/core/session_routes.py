@@ -522,6 +522,7 @@ class SharedSessionVerbHandlers:
     retry: Handler | None = None  # POST {prefix}/{ws_id}/retry
     events: Handler | None = None  # GET  {prefix}/{ws_id}/events (SSE)
     history: Handler | None = None  # GET  {prefix}/{ws_id}/history
+    export: Handler | None = None  # GET  {prefix}/{ws_id}/export
 
     # Attachments — the four handlers come together or not at all.
     attachments: AttachmentHandlers | None = None
@@ -615,6 +616,8 @@ def register_session_routes(
         routes.append(Route(f"{p}/{{ws_id}}/events", handlers.events, methods=["GET"]))
     if handlers.history is not None:
         routes.append(Route(f"{p}/{{ws_id}}/history", handlers.history, methods=["GET"]))
+    if handlers.export is not None:
+        routes.append(Route(f"{p}/{{ws_id}}/export", handlers.export, methods=["GET"]))
 
     # --- Attachments (the quartet comes together or not at all) ---------
     if handlers.attachments is not None:
@@ -2922,6 +2925,134 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
         return JSONResponse({"ws_id": ws_id, "messages": messages})
 
     return history
+
+
+def make_export_handler(cfg: SessionEndpointConfig) -> Handler:
+    """Lifted body for ``GET {prefix}/{ws_id}/export`` — conversation download.
+
+    Serves the workstream's full conversation as an OpenAI-style
+    envelope (``{"messages": [...]}``) for download. Reuses the same
+    :class:`SessionEndpointConfig` (and therefore the same gate ladder)
+    as :func:`make_history_handler`, so ownership + cross-kind isolation
+    come for free.
+
+    The HTTP surface is **conversation-only**: it never bundles
+    children and always returns ``application/json``. The
+    children/zip capability of :func:`export_workstream` is reserved
+    for the admin CLI, so the handler calls it with the default
+    ``children=False``.
+
+    Per-kind divergence captured by the same fields history consults:
+
+    - ``cfg.permission_gate`` — coord's ``admin.coordinator`` check;
+      interactive ``None``.
+    - ``cfg.manager_lookup`` — the kind's manager.
+    - ``cfg.list_kind`` — required for the storage-fallback kind check
+      so an interactive ws_id can't be exported through the coord
+      process and vice versa. **Required when this handler is
+      mounted** — a missing value fails loud (500 + ``log.error``)
+      rather than silently leaking cross-kind history.
+    - ``cfg.tenant_check`` — per-``ws_id`` access gate.
+    - ``cfg.not_found_label`` — per-kind 404 wording.
+
+    Args:
+        cfg: per-kind policy bundle.
+    """
+
+    async def export(request: Request) -> Response:
+        import asyncio
+
+        if cfg.permission_gate is not None:
+            err = cfg.permission_gate(request)
+            if err is not None:
+                return err
+
+        # Fail-closed misconfig gate. Without ``cfg.list_kind`` the
+        # storage-fallback path below has no way to enforce cross-kind
+        # isolation — an interactive ws_id requested through a coord
+        # process would silently export coord history from storage (and
+        # vice versa). Mirrors :func:`make_history_handler`'s same gate.
+        if cfg.list_kind is None:
+            log.error("ws.export.misconfigured_no_list_kind")
+            return JSONResponse(
+                {"error": "export handler misconfigured"},
+                status_code=500,
+            )
+
+        mgr_opt, err503 = cfg.manager_lookup(request)
+        if err503 is not None:
+            return err503
+        mgr = cast("SessionManager", mgr_opt)
+
+        ws_id = request.path_params.get("ws_id", "")
+        if not ws_id:
+            return JSONResponse({"error": "ws_id is required"}, status_code=400)
+
+        # Cross-tenant gate — same posture as history (interactive wires
+        # ``_interactive_tenant_check``; coord wires ``None`` and relies
+        # on the ``admin.coordinator`` permission_gate above). Always
+        # offloaded via ``to_thread`` since the interactive resolver
+        # falls through to a synchronous storage read on a cache miss.
+        if cfg.tenant_check is not None:
+            err_tenant = await asyncio.to_thread(cfg.tenant_check, request, ws_id, mgr)
+            if err_tenant is not None:
+                return err_tenant
+
+        # Existence + kind check. The workstream may live only in
+        # storage (closed coordinators / persisted-but-not-loaded
+        # interactives are still exportable without rehydrating).
+        # Mirrors history's ladder: in-memory mgr.get → storage row +
+        # kind check → 404. Falling back to storage without the kind
+        # check would leak interactive rows through the coord endpoint
+        # (and vice versa) on a process that shares storage with the
+        # other kind. ``cfg.list_kind`` is guaranteed non-None above.
+        storage = getattr(request.app.state, "auth_storage", None)
+        live_session = mgr.get(ws_id)
+        if live_session is None:
+            if storage is None:
+                return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+            try:
+                row = await asyncio.to_thread(storage.get_workstream, ws_id)
+            except Exception:
+                log.debug("ws.export.lookup_failed ws=%s", ws_id[:8], exc_info=True)
+                return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+            if row is None or row.get("kind") != cfg.list_kind:
+                return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+
+        # Past the gate but no storage handle — the live-session branch
+        # above skips the storage requirement, but the serializer needs
+        # a real handle. Degrade to the same 404 the fallback uses for a
+        # missing storage rather than serving an empty / 500 export.
+        if storage is None:
+            return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+
+        from starlette.responses import Response as _Response
+
+        from turnstone.core.export import WorkstreamNotFoundError, export_workstream
+
+        # Conversation-only: never bundle children, always JSON.  A live
+        # session whose storage row was deleted skips the fallback
+        # existence gate above, so guard the serializer's own not-found
+        # raise and degrade to the same 404 rather than surfacing a 500.
+        try:
+            result = await asyncio.to_thread(export_workstream, storage, ws_id)
+        except WorkstreamNotFoundError:
+            return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+        # ws_ids are hex so the filename is already safe, but mirror the
+        # attachment download handler's defensive strip of quotes/CR/LF
+        # so a future non-hex id can't break the Content-Disposition.
+        safe_name = result.filename.replace('"', "").replace("\r", "").replace("\n", "")
+        return _Response(
+            result.data,
+            media_type=result.content_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{safe_name}"',
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "private, no-store",
+            },
+        )
+
+    return export
 
 
 def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:

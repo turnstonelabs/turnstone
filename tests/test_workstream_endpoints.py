@@ -28,6 +28,7 @@ from turnstone.core.history_decoration import (
 from turnstone.core.session_routes import (
     SessionEndpointConfig,
     make_detail_handler,
+    make_export_handler,
     make_history_handler,
     make_open_handler,
     make_retry_handler,
@@ -981,6 +982,127 @@ def _build_detail_app(
     )
     app.state.workstreams = mock_mgr
     return TestClient(app)
+
+
+def _build_export_app(
+    mock_mgr: Any,
+    storage: Any,
+    *,
+    cfg: SessionEndpointConfig | None = None,
+) -> TestClient:
+    """Mount the lifted ``export`` factory at ``/{ws_id}/export``.
+
+    Mirrors :func:`_build_history_app` — real factory, real storage on
+    ``app.state.auth_storage``, driven via ``TestClient``. The optional
+    ``cfg`` override lets the misconfig / cross-kind tests swap in a cfg
+    with a deliberately wrong (or ``None``) ``list_kind``.
+    """
+    if cfg is None:
+        cfg = _interactive_endpoint_cfg(mock_mgr)
+    handler = make_export_handler(cfg)
+    app = Starlette(
+        routes=[
+            Mount(
+                "/v1",
+                routes=[
+                    Route("/api/workstreams/{ws_id}/export", handler, methods=["GET"]),
+                ],
+            ),
+        ],
+        middleware=[Middleware(_InjectAuthMiddleware)],
+    )
+    app.state.workstreams = mock_mgr
+    app.state.auth_storage = storage
+    return TestClient(app)
+
+
+class TestExportInteractive:
+    """Interactive coverage for the lifted, conversation-only
+    ``GET /v1/api/workstreams/{ws_id}/export`` (issue #613)."""
+
+    def test_happy_path_returns_json_download(self, _inject_storage):
+        ws_id = "ws-export-1"
+        _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
+        _inject_storage.save_message(ws_id, "user", "export me")
+        _inject_storage.save_message(ws_id, "assistant", "exported")
+        mock_ws = MagicMock()
+        mock_ws.id = ws_id
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = mock_ws
+        client = _build_export_app(mock_mgr, _inject_storage)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}/export")
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("application/json")
+        assert r.headers["content-disposition"] == f'attachment; filename="{ws_id}.json"'
+        assert r.headers["x-content-type-options"] == "nosniff"
+        # Parse the actual bytes — conversation envelope with the seeded turns.
+        body = json.loads(r.content)
+        role_contents = [(m.get("role"), m.get("content")) for m in body["messages"]]
+        assert "messages" in body
+        assert ("user", "export me") in role_contents
+
+    def test_serves_storage_only_workstream(self, _inject_storage):
+        """A persisted-but-not-loaded interactive exports without
+        rehydrating — same storage-fallback ladder history uses."""
+        ws_id = "ws-export-cold"
+        _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
+        _inject_storage.save_message(ws_id, "assistant", "from cold storage")
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = None  # not loaded
+        client = _build_export_app(mock_mgr, _inject_storage)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}/export")
+        assert r.status_code == 200
+        body = json.loads(r.content)
+        contents = [m.get("content") for m in body["messages"]]
+        assert "from cold storage" in contents
+
+    def test_404_on_missing_ws_id(self, _inject_storage):
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = None
+        client = _build_export_app(mock_mgr, _inject_storage)
+
+        r = client.get("/v1/api/workstreams/no-such-ws/export")
+        assert r.status_code == 404
+        assert r.json()["error"] == "Workstream not found"
+
+    def test_404_on_cross_kind_coord_ws_id(self, _inject_storage):
+        """Cross-kind isolation on the storage fallback: a coord ws_id in
+        shared storage 404s on the interactive export endpoint."""
+        ws_id = "ws-export-coord"
+        _inject_storage.register_workstream(ws_id, kind="coordinator", user_id="test-user")
+        _inject_storage.save_message(ws_id, "user", "coord-only content")
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = None
+        client = _build_export_app(mock_mgr, _inject_storage)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}/export")
+        assert r.status_code == 404
+        assert "coord-only content" not in r.text
+
+    def test_500_when_list_kind_misconfigured(self, _inject_storage):
+        """A cfg mounted without ``list_kind`` fails loud (500) rather
+        than leaking cross-kind rows through the storage fallback."""
+        ws_id = "ws-export-misconfig"
+        _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
+        _inject_storage.save_message(ws_id, "user", "should not leak")
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = None
+        bad_cfg = SessionEndpointConfig(
+            permission_gate=None,
+            manager_lookup=lambda _r: (mock_mgr, None),
+            tenant_check=None,
+            not_found_label="Workstream not found",
+            audit_action_prefix="workstream",
+            list_kind=None,  # deliberately unset → fail loud
+        )
+        client = _build_export_app(mock_mgr, _inject_storage, cfg=bad_cfg)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}/export")
+        assert r.status_code == 500
+        assert r.json()["error"] == "export handler misconfigured"
+        assert "should not leak" not in r.text
 
 
 class TestHistoryInteractive:
