@@ -23,6 +23,8 @@ volumes:
   turnstone-data:
   workspace:
   postgres-data:
+  caddy-data:
+  caddy-config:
 
 services:
   # -------------------------------------------------------------------
@@ -142,6 +144,27 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------
+  # caddy — browser TLS for the console dashboard (cluster/demo).
+  # Terminates HTTPS (Caddy's local CA, see deploy/Caddyfile) → console:8090.
+  # Dashboard: https://localhost:${CONSOLE_HTTPS_PORT:-8443}
+  # -------------------------------------------------------------------
+  caddy:
+    image: caddy:2.11
+    profiles:
+      - cluster
+    depends_on:
+      - console
+    ports:
+      - "${CONSOLE_HTTPS_PORT:-8443}:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data # persist Caddy's local CA across restarts
+      - caddy-config:/config
+    networks:
+      - turnstone-net
     restart: unless-stopped
 
   # -------------------------------------------------------------------

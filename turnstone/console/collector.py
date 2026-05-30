@@ -361,13 +361,20 @@ class ClusterCollector:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                # Network / timeout / TLS errors — expected during brief
-                # node restarts.  Keep at debug so the log doesn't flood
-                # on every backoff cycle; the warning above already
-                # covers configuration-level failures operators need to
-                # see.
-                log.debug("SSE error for node %s: %r", node_id, exc, exc_info=True)
-                self._mark_unreachable(node_id, reason=type(exc).__name__)
+                # Network / timeout / TLS errors. The FIRST failure
+                # (reachable→unreachable) is operator-actionable — a persistent
+                # TLS verify failure, refused connection, or DNS miss would
+                # otherwise be invisible — so surface it at WARNING. Subsequent
+                # retry failures drop to DEBUG to avoid flooding the log on
+                # every backoff cycle while the node stays down.
+                first_failure = self._mark_unreachable(node_id, reason=type(exc).__name__)
+                (log.warning if first_failure else log.debug)(
+                    "SSE connection to node %s at %s failed: %r",
+                    node_id,
+                    url,
+                    exc,
+                    exc_info=first_failure,
+                )
                 await asyncio.sleep(min(backoff, 30) + random.random())
                 backoff = min(backoff * 2, 30)
 
@@ -377,19 +384,25 @@ class ClusterCollector:
             node = self._nodes.get(node_id)
             return node.server_url if node else ""
 
-    def _mark_unreachable(self, node_id: str, reason: str = "") -> None:
+    def _mark_unreachable(self, node_id: str, reason: str = "") -> bool:
         """Mark a node as unreachable (thread-safe).
 
         ``reason`` is a short human-readable diagnostic (e.g.
-        ``"HTTP 403"``, ``"ConnectError"``) surfaced via the snapshot
-        + node endpoints so operators can see WHY a node is down.
+        ``"HTTP 403"``, ``"ConnectError"``, ``"SSLCertVerificationError"``)
+        surfaced via the snapshot + node endpoints so operators can see WHY a
+        node is down.  Returns ``True`` when this is a reachable→unreachable
+        transition (the first failure), so callers can log it prominently and
+        stay quiet on subsequent retries.
         """
         with self._lock:
             node = self._nodes.get(node_id)
-            if node:
-                node.reachable = False
-                if reason:
-                    node.reachable_reason = reason
+            if not node:
+                return False
+            was_reachable = node.reachable
+            node.reachable = False
+            if reason:
+                node.reachable_reason = reason
+            return was_reachable
 
     # -- node discovery ------------------------------------------------------
 

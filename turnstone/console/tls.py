@@ -70,6 +70,10 @@ class TLSManager:
         self._renewal_manager: Any | None = None
         self._internal_bundle: Any | None = None
         self._frontend_bundle: Any | None = None
+        # Cached mTLS client context, mutated in place on renewal so the
+        # proxy/collector httpx clients pick up the renewed client cert
+        # without being rebuilt.
+        self._client_ctx: ssl.SSLContext | None = None
 
         # Wire structlog to lacme events
         self._subscribe_events()
@@ -278,17 +282,29 @@ class TLSManager:
         if self._ca is None:
             raise RuntimeError("CA not initialized")
         lacme = _require_lacme()
+        from turnstone.core.tls import _SingleDomainStore
 
         def _on_renewed(bundle: Any) -> None:
             # Update our cached bundles if the renewed domain matches
             if self._internal_bundle and bundle.domain == self._internal_bundle.domain:
                 self._internal_bundle = bundle
+                # Swap the renewed material into the live mTLS client context
+                # so proxy/collector connections present the new cert.
+                self._reload_client_ctx(bundle)
             if self._frontend_bundle and bundle.domain == self._frontend_bundle.domain:
                 self._frontend_bundle = bundle
 
+        # Scope the sweep to the console's own cert; the store is shared, so an
+        # unscoped CA-direct sweep would re-sign every node's cert. Empty domain
+        # → renew nothing (never the whole store). An external-ACME frontend
+        # cert has a different domain and is intentionally excluded (re-signing
+        # an externally-issued cert with the internal CA would break it).
+        own_domain = self._internal_bundle.domain if self._internal_bundle is not None else ""
+        renewal_store = _SingleDomainStore(self._store, own_domain)
+
         self._renewal_manager = lacme.RenewalManager(
             ca=self._ca,
-            store=self._store,
+            store=renewal_store,
             interval_hours=_RENEW_INTERVAL_HOURS,
             days_before_expiry=_RENEW_BEFORE_EXPIRY_DAYS,
             on_renewed=_on_renewed,
@@ -341,14 +357,47 @@ class TLSManager:
         """
         if self._internal_bundle is None:
             return None
-        _require_lacme()
-        from lacme.mtls import client_ssl_context
+        if self._client_ctx is None:
+            _require_lacme()
+            from lacme.mtls import client_ssl_context
 
-        return client_ssl_context(  # type: ignore[no-any-return,unused-ignore]
-            cert_pem=self._internal_bundle.cert_pem,
-            key_pem=self._internal_bundle.key_pem,
-            ca_cert_pem=self.get_root_cert_pem(),
-        )
+            self._client_ctx = client_ssl_context(
+                cert_pem=self._internal_bundle.cert_pem,
+                key_pem=self._internal_bundle.key_pem,
+                ca_cert_pem=self.get_root_cert_pem(),
+            )
+        return self._client_ctx
+
+    def _reload_client_ctx(self, bundle: Any) -> None:
+        """Load a renewed bundle into the cached mTLS client context in place.
+
+        httpx clients built with this context present the new client cert on
+        their next connection; existing keep-alive connections finish on the
+        old one.  No-op until the context has been built.
+        """
+        if self._client_ctx is None:
+            return
+        from turnstone.core.tls import swap_context_cert
+
+        swap_context_cert(self._client_ctx, bundle)
+
+    def gc_expired_certs(self, max_age_days: int = 7) -> int:
+        """Delete stored certs that expired more than ``max_age_days`` ago.
+
+        A live node keeps its cert's ``expires_at`` in the future, so only
+        decommissioned-node (or legacy container-ID) rows go stale; deleting
+        them well past expiry is safe. Returns the number of rows removed.
+        """
+        from datetime import UTC, datetime, timedelta
+
+        cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
+        removed = 0
+        for bundle in self._store.list_certs():
+            if bundle.expires_at < cutoff and self._store.delete_cert(bundle.domain):
+                removed += 1
+        if removed:
+            log.info("tls.certs.gc", removed=removed, max_age_days=max_age_days)
+        return removed
 
     # -- Properties ------------------------------------------------------------
 

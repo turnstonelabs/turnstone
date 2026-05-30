@@ -4734,20 +4734,18 @@ def main() -> None:
         try:
             import asyncio
 
-            from turnstone.core.tls import TLSClient
+            from turnstone.core.tls import TLSClient, build_cert_hostnames
 
-            hostname = socket.gethostname()
-            fqdn = socket.getfqdn()
-            hostnames = [hostname, "localhost", "127.0.0.1"]
-            if fqdn != hostname:
-                hostnames.append(fqdn)
-            # Only add bind host if it's a concrete address
-            if args.host not in ("0.0.0.0", "::", ""):
-                hostnames.append(args.host)
-            # Additional SANs from env (e.g. Docker service name)
-            extra_sans = os.environ.get("TURNSTONE_TLS_SANS", "")
-            if extra_sans:
-                hostnames.extend(s.strip() for s in extra_sans.split(",") if s.strip())
+            # The advertised host (the name the collector + routing proxy dial)
+            # is placed first so it becomes the cert's primary domain / SAN and
+            # a stable store key.  Deriving SANs from gethostname() alone (the
+            # container ID) omits the advertised name and breaks every mTLS
+            # handshake's hostname check.
+            hostnames = build_cert_hostnames(
+                _advertise_url,
+                bind_host=args.host,
+                extra_sans=os.environ.get("TURNSTONE_TLS_SANS", ""),
+            )
             tls_client = TLSClient(
                 storage=get_storage(),
                 hostnames=hostnames,
@@ -4769,6 +4767,24 @@ def main() -> None:
 
                 # Store client on app state for lifespan renewal
                 app.state.tls_client = tls_client
+
+                def _reload_server_cert(new_bundle: Any) -> None:
+                    """Swap a renewed cert into uvicorn's live SSL context.
+
+                    uvicorn loads its cert once at boot and never reloads, so
+                    without this the served cert would expire mid-process and
+                    break every mTLS peer.
+                    """
+                    from turnstone.core.tls import swap_context_cert
+
+                    cfg = getattr(app.state, "uvicorn_config", None)
+                    live_ctx = getattr(cfg, "ssl", None) if cfg is not None else None
+                    if live_ctx is None:
+                        return  # listener not started yet — boot cert still valid
+                    swap_context_cert(live_ctx, new_bundle, ca_pem=tls_client.ca_pem)
+                    log.info("TLS cert reloaded into listener: %s", new_bundle.domain)
+
+                tls_client.set_cert_reload_hook(_reload_server_cert)
                 # Update advertise URL to HTTPS now that TLS is active
                 if _advertise_url.startswith("http://"):
                     app.state.advertise_url = _advertise_url.replace("http://", "https://", 1)
@@ -4789,7 +4805,13 @@ def main() -> None:
 
     import uvicorn
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning", **ssl_kwargs)
+    uvicorn_config = uvicorn.Config(
+        app, host=args.host, port=args.port, log_level="warning", **ssl_kwargs
+    )
+    # Expose the config so the TLS renewal hook can hot-swap the cert on the
+    # live SSL context (``config.ssl``); uvicorn has no built-in SSL reload.
+    app.state.uvicorn_config = uvicorn_config
+    uvicorn.Server(uvicorn_config).run()
 
 
 if __name__ == "__main__":
