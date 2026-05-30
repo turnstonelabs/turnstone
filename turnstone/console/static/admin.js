@@ -5223,7 +5223,7 @@ const MODEL_ROLES = [
 // turnstone/core/audio.py (the canonical source). A substring match marks
 // eligibility. Keep these two lists in sync — the Python side is pinned by
 // tests/test_audio.py so any change there is deliberate.
-var AUDIO_MODEL_HINTS = {
+const AUDIO_MODEL_HINTS = {
   stt: ["transcribe", "whisper", "-asr"],
   tts: ["tts-", "-tts"],
 };
