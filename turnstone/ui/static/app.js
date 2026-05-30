@@ -4075,13 +4075,11 @@ function toggleDashboard() {
 // area.  Clears any cards AND hides the pagination control \u2014 it's a sibling
 // of the cards container, so a bare replaceChildren on the cards alone would
 // leave stale Prev/Next visible and still wired to the previous list cache.
-// A successful load re-shows both via renderSavedWorkstreams.
+// A successful load re-shows both via _wsTable.setItems.
 function _setSavedWsMessage(text) {
   document
     .getElementById("dashboard-saved-cards")
     .replaceChildren(makeEmptyState(text));
-  const pag = document.getElementById("ws-pagination");
-  if (pag) pag.style.display = "none";
 }
 
 function loadDashboard() {
@@ -4107,7 +4105,7 @@ function loadDashboard() {
       const savedList = (res[1].workstreams || []).filter(function (s) {
         return !activeWsIds[s.ws_id];
       });
-      renderSavedWorkstreams(savedList);
+      _wsTable.setItems(savedList);
     })
     .catch(function () {
       tableEl.replaceChildren(makeEmptyState("Failed to load"));
@@ -4256,157 +4254,68 @@ function updateDashFooter(agg) {
   }
 }
 
-// Saved Workstreams cache + multi-select delete controller.  The
-// controller (from /shared/cards.js) owns mode state, checkbox
-// decoration, the toolbar wiring, and the confirmation modal — see
-// createSavedCardsController for the shared bits.  Page size + clamp
-// logic mirror the coordinator launcher (console/static) so the two
-// dashboards stay consistent; the controller only ever sees the visible
-// page, bounding Select-All fan-out to WS_PAGE_SIZE.
-const WS_PAGE_SIZE = 24;
-let _wsPage = 0;
-let _wsSavedItems = [];
-const _wsDeleteController = createSavedCardsController({
-  idPrefix: "ws-delete",
-  buttonId: "ws-delete-btn",
+// Saved Workstreams table.  The shared createSavedTable (/shared/cards.js)
+// owns filter + sort + render and wraps the multi-select delete controller;
+// the per-app inputs are the column spec, the DOM refs, and the path-keyed
+// delete request.  Coordinators (console/static) use the same helper with a
+// CHILDREN column instead of MSGS.
+const WS_COLUMNS = [
+  SavedColumns.name(),
+  SavedColumns.model(),
+  SavedColumns.count("message_count", "MSGS"),
+  SavedColumns.ctx(),
+  SavedColumns.last(),
+  SavedColumns.id(),
+];
+const _wsTable = createSavedTable({
+  headerEl: document.getElementById("ws-saved-colheaders"),
+  bodyEl: document.getElementById("dashboard-saved-cards"),
+  filterEl: document.getElementById("ws-filter"),
+  footerEl: document.getElementById("ws-saved-footer"),
+  columns: WS_COLUMNS,
   noun: "workstream",
+  emptyText: "No saved workstreams",
   activateLabel: function (s) {
     return "Resume: " + (s.alias || s.title || s.ws_id);
   },
-  buildDeleteRequest: function (wsId) {
-    return {
-      url: "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/delete",
-      options: { method: "POST" },
-    };
+  onActivate: function (s) {
+    dashboardResumeSession(s.ws_id);
   },
-  render: function () {
-    renderSavedWorkstreams(_wsSavedItems);
-  },
-  onClose: function () {
-    loadDashboard();
+  delete: {
+    idPrefix: "ws-delete",
+    buttonId: "ws-delete-btn",
+    buildDeleteRequest: function (wsId) {
+      return {
+        url: "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/delete",
+        options: { method: "POST" },
+      };
+    },
+    onClose: function () {
+      loadDashboard();
+    },
   },
 });
 
-function renderSavedWorkstreams(items) {
-  _wsSavedItems = items;
-  const c = document.getElementById("dashboard-saved-cards");
-  c.replaceChildren();
-  if (!items.length) {
-    _wsPage = 0;
-    // If the list empties while delete mode is open (e.g. external churn
-    // removes the last card), drop out of delete mode so the toolbar
-    // doesn't linger over an empty grid — matches the coordinator
-    // launcher.  cancel() re-renders via the controller's callback, which
-    // re-enters here with the mode off and paints the empty state, so
-    // return and let that pass own the DOM (re-appending here would
-    // double the empty-state row, since — unlike the console, which hides
-    // a section — this dashboard appends an empty node).
-    if (_wsDeleteController.inMode()) {
-      _wsDeleteController.cancel();
-      return;
-    }
-    _wsDeleteController.setItems(items);
-    const empty = document.createElement("div");
-    empty.className = "dashboard-empty";
-    empty.textContent = "No saved workstreams";
-    c.appendChild(empty);
-    _renderWsPagination();
-    return;
-  }
-  // Clamp the page index after deletes (or upstream churn) shrink the list.
-  const pages = Math.max(1, Math.ceil(items.length / WS_PAGE_SIZE));
-  if (_wsPage > pages - 1) _wsPage = pages - 1;
-  if (_wsPage < 0) _wsPage = 0;
-  const visible = items.slice(
-    _wsPage * WS_PAGE_SIZE,
-    (_wsPage + 1) * WS_PAGE_SIZE,
-  );
-  // The controller only sees the visible page so its Select-All / count
-  // can't reach off-page cards that aren't in the DOM.
-  _wsDeleteController.setItems(visible);
-  visible.forEach(function (sess) {
-    const card = renderSessionCard(sess, {
-      ariaLabel: _wsDeleteController.ariaLabel,
-      onActivate: function (s) {
-        if (_wsDeleteController.blockActivate()) return;
-        dashboardResumeSession(s.ws_id);
-      },
-    });
-    _wsDeleteController.decorateCard(card, sess);
-    c.appendChild(card);
-  });
-  if (_wsDeleteController.inMode()) _wsDeleteController.refreshBar();
-  _renderWsPagination();
-}
-
-// Twin of the console launcher's _renderCoordPagination / coordPagePrev /
-// coordPageNext (console/static/app.js) — keep the two in sync when the
-// paging behaviour changes.  Only the shared .pagination CSS is de-duped;
-// the render wiring stays per-app because it binds per-app DOM ids and
-// controller instances.
-function _renderWsPagination() {
-  const pag = document.getElementById("ws-pagination");
-  if (!pag) return;
-  const total = _wsSavedItems.length;
-  const pages = Math.max(1, Math.ceil(total / WS_PAGE_SIZE));
-  // Single-page lists and delete-mode hide the controls — paging would
-  // invalidate the user's checkbox selections, so we lock them out.
-  if (pages <= 1 || _wsDeleteController.inMode()) {
-    pag.style.display = "none";
-    return;
-  }
-  pag.style.display = "";
-  const label = document.getElementById("ws-page-label");
-  if (label) {
-    /* Visible text uses the terse "X / Y" form; the long form sits on the
-       parent's aria-label so screen readers get a full sentence. */
-    label.textContent = _wsPage + 1 + " / " + pages;
-    pag.setAttribute(
-      "aria-label",
-      "Saved workstreams pagination — page " + (_wsPage + 1) + " of " + pages,
-    );
-  }
-  const prev = document.getElementById("ws-page-prev");
-  if (prev) prev.disabled = _wsPage <= 0;
-  const next = document.getElementById("ws-page-next");
-  if (next) next.disabled = _wsPage >= pages - 1;
-}
-
-function wsPagePrev() {
-  if (_wsPage > 0) {
-    _wsPage--;
-    renderSavedWorkstreams(_wsSavedItems);
-  }
-}
-
-function wsPageNext() {
-  const pages = Math.max(1, Math.ceil(_wsSavedItems.length / WS_PAGE_SIZE));
-  if (_wsPage < pages - 1) {
-    _wsPage++;
-    renderSavedWorkstreams(_wsSavedItems);
-  }
-}
-
-// HTML inline-onclick wrappers — keep the global names the existing
-// markup binds to (`onclick="startWsDeleteMode()"` etc.) and forward
-// to the controller.
+// HTML inline-onclick wrappers — keep the global names the existing markup
+// binds to (`onclick="startWsDeleteMode()"` etc.) and forward to the shared
+// table's delete controller.
 function startWsDeleteMode() {
-  _wsDeleteController.start();
+  _wsTable.controller.start();
 }
 function cancelWsDeleteMode() {
-  _wsDeleteController.cancel();
+  _wsTable.controller.cancel();
 }
 function toggleSelectAll() {
-  _wsDeleteController.toggleAll();
+  _wsTable.controller.toggleAll();
 }
 function confirmWsDeleteSelection() {
-  _wsDeleteController.confirmSelection();
+  _wsTable.controller.confirmSelection();
 }
 function cancelWsDelete() {
-  _wsDeleteController.closeModal();
+  _wsTable.controller.closeModal();
 }
 function confirmWsDelete() {
-  _wsDeleteController.confirm();
+  _wsTable.controller.confirm();
 }
 
 // --- Workstream title management ---

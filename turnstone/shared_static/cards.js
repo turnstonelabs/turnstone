@@ -1,81 +1,459 @@
-/* Shared session card primitive — used by ui/static (Saved Workstreams)
-   and console/static (Saved Coordinators).  Single source so the two
-   surfaces don't drift on field cascade, ARIA roles, keyboard handling,
-   or DOM shape.
+/* Shared saved-list primitives — used by ui/static (Saved Workstreams) and
+   console/static (Saved Coordinators).  Single source so the two surfaces
+   don't drift on row shape, ARIA, keyboard handling, filter/sort, or the
+   delete affordance:
 
-   Card structure (also see /shared/cards.css for styling):
+     - renderSessionRow(sess, opts)  — one .dash-row from a column spec
+     - SavedColumns                  — shared column descriptors
+     - createSavedTable(opts)        — filter + sort + render, wrapping the
+                                       multi-select delete controller
+     - createSavedCardsController    — the delete-mode controller (below)
 
-     .dashboard-card               role="button" tabindex="0"
-       .card-title                 sess.alias || title || name || ws_id[:12]
-       .card-meta                  "X msgs · Y ago "
-         .card-wsid                ws_id[:7]
-
-   Built with safe DOM APIs (createElement + textContent) — never
-   innerHTML — so user-supplied alias/title/name fields don't reach the
-   DOM as HTML.
-
-   Caller passes:
-     sess          — {ws_id, alias?, title?, name?, message_count?, updated?}
-     opts.onActivate(sess)  — fired on click + Enter/Space
-     opts.ariaLabel(sess)?  — optional aria-label override; default
-                              "Resume: {label}"
-     opts.busy?             — boolean; adds `is-busy` class (visual dim
-                              + cursor: progress) and suppresses re-entry
-                              into onActivate.
-
-   Returns the card DOM node.  Caller appends it.
-
-   Depends on: formatRelativeTime (from /shared/utils.js).
+   Built with safe DOM APIs (createElement + textContent), never innerHTML,
+   so user-supplied alias/title/name/skill fields never reach the DOM as
+   HTML.  Depends on formatRelativeTime (from /shared/utils.js).
 */
 
-function renderSessionCard(sess, opts) {
+/* ==========================================================================
+   Saved-list TABLE primitives — the row builder (renderSessionRow) plus a
+   shared filter / sort / render orchestrator (createSavedTable).  Both the
+   server UI (Saved Workstreams) and the console (Saved Coordinators) build
+   their saved list from these so the two surfaces can't drift.  The only
+   per-surface input is the column spec (MSGS vs CHILDREN), the DOM refs,
+   and the delete-request shape — everything generic lives here.
+   ========================================================================== */
+
+/* Map a 0..1 context-occupancy ratio to a coloured CTX cell using the
+   active table's bands (base.css .dash-cell-ctx.ctx-*).  0 / unknown
+   renders as a dim em-dash, not "0%": a saved row with no recorded usage
+   (or a model whose window isn't in model_definitions) has no occupancy to
+   report.  The value is a frozen snapshot from the last turn, not live. */
+function _ctxCell(sess) {
+  var ratio = typeof sess.context_ratio === "number" ? sess.context_ratio : 0;
+  var span = document.createElement("span");
+  span.className = "dash-cell-ctx";
+  if (ratio <= 0) {
+    span.classList.add("ctx-idle");
+    span.textContent = "—";
+    return span;
+  }
+  var level =
+    ratio > 0.95
+      ? "ctx-danger"
+      : ratio > 0.8
+        ? "ctx-high"
+        : ratio > 0.5
+          ? "ctx-mid"
+          : "ctx-low";
+  span.classList.add(level);
+  span.textContent = Math.round(ratio * 100) + "%";
+  return span;
+}
+
+/* NAME cell: ellipsised title + an optional skill chip when the workstream
+   launched with a non-default skill (empty for "Use defaults"). */
+function _nameCell(sess) {
+  var wrap = document.createElement("div");
+  wrap.className = "scell-name";
+  var nm = document.createElement("span");
+  nm.className = "scell-nm";
+  nm.textContent =
+    sess.alias || sess.title || sess.name || sess.ws_id.substring(0, 12);
+  wrap.appendChild(nm);
+  if (sess.launch_skill) {
+    var chip = document.createElement("span");
+    chip.className = "skill-chip";
+    var g = document.createElement("span");
+    g.className = "skill-chip-g";
+    g.setAttribute("aria-hidden", "true");
+    g.textContent = "◆";
+    chip.appendChild(g);
+    chip.appendChild(document.createTextNode(sess.launch_skill));
+    wrap.appendChild(chip);
+  }
+  return wrap;
+}
+
+/* Column factory — shared descriptors.  Each: {key, label, width, align,
+   cell(sess)->Node|string, sort(sess)->comparable}.  The only difference
+   between the two surfaces is count("message_count","MSGS") vs
+   count("child_count","CHILDREN"). */
+var SavedColumns = {
+  name: function () {
+    return {
+      key: "name",
+      label: "NAME",
+      width: "minmax(0,1fr)",
+      cell: _nameCell,
+      sort: function (s) {
+        return (s.alias || s.title || s.name || s.ws_id).toLowerCase();
+      },
+    };
+  },
+  model: function () {
+    return {
+      key: "model",
+      label: "MODEL",
+      width: "150px",
+      cls: "scell-model",
+      hideBelow: true,
+      cell: function (s) {
+        return s.model_alias || "—";
+      },
+      sort: function (s) {
+        return (s.model_alias || "").toLowerCase();
+      },
+    };
+  },
+  count: function (field, label, width) {
+    return {
+      key: field,
+      label: label,
+      width: width || "72px",
+      align: "right",
+      cell: function (s) {
+        return String(s[field] != null ? s[field] : 0);
+      },
+      sort: function (s) {
+        return s[field] != null ? s[field] : 0;
+      },
+    };
+  },
+  ctx: function () {
+    return {
+      key: "context_ratio",
+      label: "CTX",
+      width: "56px",
+      align: "right",
+      title: "Context window used as of last activity",
+      cell: _ctxCell,
+      sort: function (s) {
+        return typeof s.context_ratio === "number" ? s.context_ratio : 0;
+      },
+    };
+  },
+  last: function () {
+    return {
+      key: "updated",
+      label: "LAST",
+      width: "62px",
+      align: "right",
+      cell: function (s) {
+        return typeof formatRelativeTime === "function"
+          ? formatRelativeTime(s.updated)
+          : s.updated || "";
+      },
+      sort: function (s) {
+        return s.updated || "";
+      },
+    };
+  },
+  id: function () {
+    return {
+      key: "ws_id",
+      label: "ID",
+      width: "76px",
+      align: "right",
+      cls: "scell-id",
+      hideBelow: true,
+      cell: function (s) {
+        return s.ws_id.substring(0, 7);
+      },
+      sort: function (s) {
+        return s.ws_id;
+      },
+    };
+  },
+};
+
+/* Builds one saved-list .dash-row from a column spec.
+   Saved rows reuse the dash-table chrome but opt OUT of the active table's
+   live-state styling — only an `error` state is carried (for the red
+   left-edge); idle/running/etc. are not, so a terminal, mostly-idle saved
+   list isn't dimmed by base.css's `[data-state="idle"]` rule.  The grid
+   template comes from the `--saved-grid` CSS var that createSavedTable sets
+   once per render (not rebuilt per row). */
+function renderSessionRow(sess, opts) {
   opts = opts || {};
-  var card = document.createElement("div");
-  card.className = "dashboard-card" + (opts.busy ? " is-busy" : "");
-  card.dataset.wsId = sess.ws_id;
-  var label = sess.alias || sess.title || sess.name || sess.ws_id;
-  card.setAttribute("role", "button");
-  card.setAttribute("tabindex", "0");
-  card.setAttribute(
+  var columns = opts.columns || [];
+  var row = document.createElement("div");
+  row.className = "dash-row saved-row" + (opts.busy ? " is-busy" : "");
+  row.dataset.wsId = sess.ws_id;
+  if (sess.state === "error") row.dataset.state = "error";
+  row.setAttribute("role", "button");
+  row.setAttribute("tabindex", "0");
+  row.setAttribute(
     "aria-label",
     typeof opts.ariaLabel === "function"
       ? opts.ariaLabel(sess)
-      : "Resume: " + label,
+      : "Resume: " + (sess.alias || sess.title || sess.name || sess.ws_id),
   );
-
+  var main = document.createElement("div");
+  main.className = "dash-row-main";
+  columns.forEach(function (col) {
+    var cell = document.createElement("div");
+    cell.className = "scell" + (col.align === "right" ? " scell-r" : "");
+    if (col.cls) cell.classList.add(col.cls);
+    var content = col.cell(sess);
+    if (content instanceof Node) cell.appendChild(content);
+    else cell.textContent = content;
+    main.appendChild(cell);
+  });
+  row.appendChild(main);
   var activate = function () {
-    if (card.classList.contains("is-busy")) return;
-    if (typeof opts.onActivate === "function") opts.onActivate(sess, card);
+    if (row.classList.contains("is-busy")) return;
+    if (typeof opts.onActivate === "function") opts.onActivate(sess, row);
   };
-  card.onclick = activate;
-  card.onkeydown = function (e) {
+  row.onclick = activate;
+  row.onkeydown = function (e) {
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
       activate();
     }
   };
+  return row;
+}
 
-  var title =
-    sess.alias || sess.title || sess.name || sess.ws_id.substring(0, 12);
-  var titleEl = document.createElement("div");
-  titleEl.className = "card-title";
-  titleEl.textContent = title;
+/* Shared saved-list table: owns client-side filter + sort + render and
+   wraps the existing multi-select delete controller.  Apps pass DOM refs +
+   a column spec + the delete-request shape; the per-app delete-bar HTML
+   keeps wiring its inline onclick thunks to `table.controller.*`.
 
-  var metaEl = document.createElement("div");
-  metaEl.className = "card-meta";
-  var metaText = (sess.message_count || 0) + " msgs";
-  if (sess.updated && typeof formatRelativeTime === "function") {
-    metaText += " · " + formatRelativeTime(sess.updated);
+   opts:
+     headerEl, bodyEl  — the .dash-colheaders + .dash-table elements
+     filterEl          — optional <input> for the client-side name filter
+     footerEl          — optional element for the count line
+     columns           — array from SavedColumns
+     noun              — "workstream" / "coordinator"
+     onActivate        — sess => void (resume); gated by delete mode
+     activateLabel     — optional sess => string (aria when not deleting)
+     emptyText         — empty-state copy
+     delete            — {idPrefix, buttonId, buildDeleteRequest, onClose}
+   returns { setItems(items), render(), controller }. */
+function createSavedTable(opts) {
+  var state = {
+    items: [],
+    filter: "",
+    sortKey: "updated",
+    sortDir: -1,
+    compact: false,
+  };
+
+  var controller = createSavedCardsController({
+    idPrefix: opts.delete.idPrefix,
+    buttonId: opts.delete.buttonId,
+    noun: opts.noun,
+    activateLabel:
+      opts.activateLabel ||
+      function (s) {
+        return "Resume: " + (s.alias || s.title || s.name || s.ws_id);
+      },
+    buildDeleteRequest: opts.delete.buildDeleteRequest,
+    render: function () {
+      render();
+    },
+    onClose: opts.delete.onClose,
+  });
+
+  function matches(sess) {
+    if (!state.filter) return true;
+    var hay = (
+      (sess.alias || "") +
+      " " +
+      (sess.title || "") +
+      " " +
+      (sess.name || "") +
+      " " +
+      sess.ws_id
+    ).toLowerCase();
+    return hay.indexOf(state.filter) !== -1;
   }
-  metaEl.appendChild(document.createTextNode(metaText + " "));
-  var wsidEl = document.createElement("span");
-  wsidEl.className = "card-wsid";
-  wsidEl.textContent = sess.ws_id.substring(0, 7);
-  metaEl.appendChild(wsidEl);
 
-  card.appendChild(titleEl);
-  card.appendChild(metaEl);
-  return card;
+  function column(key) {
+    for (var i = 0; i < opts.columns.length; i++) {
+      if (opts.columns[i].key === key) return opts.columns[i];
+    }
+    return null;
+  }
+
+  /* On narrow viewports drop the lower-value columns (those flagged
+     hideBelow — model, id) so NAME, the column this redesign exists to keep
+     readable, never collapses to zero. */
+  function visibleColumns() {
+    return opts.columns.filter(function (c) {
+      return !(state.compact && c.hideBelow);
+    });
+  }
+
+  function gridTemplate(cols) {
+    return cols
+      .map(function (c) {
+        return c.width;
+      })
+      .join(" ");
+  }
+
+  function sorted() {
+    var col = column(state.sortKey) || column("updated");
+    var out = state.items.filter(matches);
+    if (col) {
+      out.sort(function (a, b) {
+        var av = col.sort(a);
+        var bv = col.sort(b);
+        if (av < bv) return -state.sortDir;
+        if (av > bv) return state.sortDir;
+        return 0;
+      });
+    }
+    return out;
+  }
+
+  function renderHeaders(cols) {
+    if (!opts.headerEl) return;
+    opts.headerEl.style.gridTemplateColumns = gridTemplate(cols);
+    /* Shift the headers in lockstep with the rows' checkbox gutter so the
+       columns stay registered while multi-selecting. */
+    opts.headerEl.classList.toggle("saved-cols-delete", controller.inMode());
+    opts.headerEl.replaceChildren();
+    cols.forEach(function (col) {
+      var active = col.key === state.sortKey;
+      var h = document.createElement("span");
+      h.className =
+        "scol" +
+        (col.align === "right" ? " scell-r" : "") +
+        (active ? " sorted" : "");
+      h.setAttribute("role", "button");
+      h.setAttribute("tabindex", "0");
+      h.setAttribute("aria-label", "Sort by " + col.label);
+      h.setAttribute(
+        "aria-sort",
+        active ? (state.sortDir < 0 ? "descending" : "ascending") : "none",
+      );
+      if (col.title) h.title = col.title;
+      h.appendChild(document.createTextNode(col.label));
+      /* Every sortable header carries a caret so the affordance is
+         discoverable at rest — inactive ones faint, the active one
+         directional. */
+      var car = document.createElement("span");
+      car.className = "caret" + (active ? "" : " caret-idle");
+      car.setAttribute("aria-hidden", "true");
+      car.textContent = active ? (state.sortDir < 0 ? "▼" : "▲") : "↕";
+      h.appendChild(car);
+      function doSort() {
+        if (state.sortKey === col.key) {
+          state.sortDir = -state.sortDir;
+        } else {
+          state.sortKey = col.key;
+          /* text columns default A→Z, everything else newest/highest-first */
+          state.sortDir = col.key === "name" || col.key === "model" ? 1 : -1;
+        }
+        render();
+      }
+      h.onclick = doSort;
+      h.onkeydown = function (e) {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          doSort();
+        }
+      };
+      opts.headerEl.appendChild(h);
+    });
+  }
+
+  function renderFooter(visibleCount) {
+    if (!opts.footerEl) return;
+    var total = state.items.length;
+    var noun = opts.noun + (total === 1 ? "" : "s");
+    /* The empty/filtered body message owns the "no match" copy; the footer
+       stays a plain total so the two don't say the same thing twice. */
+    if (state.filter && visibleCount > 0 && visibleCount !== total) {
+      opts.footerEl.textContent =
+        visibleCount +
+        " of " +
+        total +
+        " " +
+        noun +
+        " match “" +
+        state.filter +
+        "”";
+    } else {
+      opts.footerEl.textContent = total + " " + noun;
+    }
+  }
+
+  function render() {
+    var cols = visibleColumns();
+    var rows = sorted();
+    controller.setItems(rows);
+    /* One grid write per render: rows read it from the inherited CSS var. */
+    if (opts.bodyEl) {
+      opts.bodyEl.style.setProperty("--saved-grid", gridTemplate(cols));
+      opts.bodyEl.replaceChildren();
+    }
+    if (!rows.length) {
+      /* Empty state owns the space — hide the column headers so it doesn't
+         read as a broken grid. */
+      if (opts.headerEl) opts.headerEl.style.display = "none";
+      var empty = document.createElement("div");
+      empty.className = "dashboard-empty";
+      empty.textContent = state.filter
+        ? "No " + opts.noun + "s match “" + state.filter + "”"
+        : opts.emptyText || "No saved items";
+      if (opts.bodyEl) opts.bodyEl.appendChild(empty);
+    } else {
+      if (opts.headerEl) opts.headerEl.style.display = "";
+      renderHeaders(cols);
+      rows.forEach(function (sess) {
+        var row = renderSessionRow(sess, {
+          columns: cols,
+          ariaLabel: controller.ariaLabel,
+          onActivate: function (s, el) {
+            if (controller.blockActivate()) return;
+            if (typeof opts.onActivate === "function") opts.onActivate(s, el);
+          },
+        });
+        controller.decorateCard(row, sess);
+        opts.bodyEl.appendChild(row);
+      });
+    }
+    if (controller.inMode()) controller.refreshBar();
+    renderFooter(rows.length);
+  }
+
+  /* Debounce only the filter keystrokes; setItems / sort / delete render
+     immediately. */
+  var filterTimer = null;
+  if (opts.filterEl) {
+    opts.filterEl.addEventListener("input", function () {
+      if (filterTimer) clearTimeout(filterTimer);
+      filterTimer = setTimeout(function () {
+        state.filter = opts.filterEl.value.trim().toLowerCase();
+        render();
+      }, 120);
+    });
+  }
+
+  /* Saved table owns its responsive layout: below the breakpoint the
+     hideBelow columns drop and NAME reclaims the width. */
+  if (typeof window !== "undefined" && window.matchMedia) {
+    var mq = window.matchMedia("(max-width: 760px)");
+    state.compact = mq.matches;
+    var onMq = function (e) {
+      state.compact = e.matches;
+      render();
+    };
+    if (mq.addEventListener) mq.addEventListener("change", onMq);
+    else if (mq.addListener) mq.addListener(onMq);
+  }
+
+  return {
+    setItems: function (items) {
+      state.items = items || [];
+      render();
+    },
+    render: render,
+    controller: controller,
+  };
 }
 
 /* createSavedCardsController — shared multi-select-delete behaviour for
@@ -178,7 +556,7 @@ function createSavedCardsController(opts) {
       : "Activate: " + label;
   }
 
-  /* Decorate an already-rendered .dashboard-card with the checkbox +
+  /* Decorate an already-rendered saved row (.dash-row) with the checkbox +
      event overrides used in delete mode.  Idempotent guard: only acts
      when the controller is active. */
   function decorateCard(card, sess) {

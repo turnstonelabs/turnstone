@@ -1610,7 +1610,12 @@ let _homeStagedFiles = [];
 const _HOME_IMAGE_CAP = 4 * 1024 * 1024;
 const _HOME_TEXT_CAP = 512 * 1024;
 const _HOME_MAX_FILES = 10;
-const _HOME_IMAGE_MIMES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+const _HOME_IMAGE_MIMES = [
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+];
 const _HOME_TEXT_APP_MIMES = [
   "application/json",
   "application/xml",
@@ -2085,11 +2090,12 @@ function _renderHomeView() {
 
 // ---------------------------------------------------------------------------
 // Saved coordinators — closed sessions persisted on disk.  Mirrors the
-// interactive UI's "Saved Workstreams" card grid (same /shared/cards.css
-// primitives, same /shared/cards.js renderSessionCard helper, same
-// response item shape from /v1/api/workstreams/saved).  Click a card →
-// POST /open then /coordinator/{ws_id}; the lifted detail factory
-// lazily rehydrates from storage on the GET miss.
+// interactive UI's "Saved Workstreams" table (same /shared/cards.js
+// createSavedTable + /shared/cards.css, same response item shape from
+// /v1/api/workstreams/saved), differing only in the CHILDREN column and
+// the body-keyed delete.  Click a row → POST /open then
+// /coordinator/{ws_id}; the lifted detail factory lazily rehydrates from
+// storage on the GET miss.
 // ---------------------------------------------------------------------------
 
 // In-flight de-dup for loadSavedCoordinators.  ws_closed events can
@@ -2105,10 +2111,7 @@ function loadSavedCoordinators() {
   // Freeze the list while the user is multi-selecting — re-rendering
   // mid-mode would shuffle the visible page out from under them.  The
   // delete-mode wrapper drains the retry flag on cancel/onClose.
-  if (
-    typeof _coordDeleteController !== "undefined" &&
-    _coordDeleteController.inMode()
-  ) {
+  if (typeof _coordTable !== "undefined" && _coordTable.controller.inMode()) {
     _savedCoordsRetry = true;
     return;
   }
@@ -2126,13 +2129,16 @@ function loadSavedCoordinators() {
       // fetch was already in flight, defer the render — re-rendering
       // mid-selection would shuffle visible cards and reshape selections.
       if (
-        typeof _coordDeleteController !== "undefined" &&
-        _coordDeleteController.inMode()
+        typeof _coordTable !== "undefined" &&
+        _coordTable.controller.inMode()
       ) {
         _savedCoordsRetry = true;
         return;
       }
-      renderSavedCoordinators(data.workstreams || []);
+      const saved = data.workstreams || [];
+      const sec = document.getElementById("saved-coordinators");
+      if (sec) sec.style.display = saved.length ? "" : "none";
+      _coordTable.setItems(saved);
     })
     .catch(function () {
       /* silent — saved list is informational, not load-bearing */
@@ -2149,178 +2155,92 @@ function loadSavedCoordinators() {
     });
 }
 
-// Saved Coordinators: paginated card list + multi-select delete.
-// The shared controller (createSavedCardsController in /shared/cards.js)
-// owns mode state, checkbox decoration, the toolbar, and the modal.
-// Pagination caps Select-All fan-out at COORD_PAGE_SIZE — the controller
-// only ever sees the visible page, so a confirm-all batch is bounded to
-// COORD_PAGE_SIZE parallel POSTs against the routing proxy.
-const COORD_PAGE_SIZE = 24;
-let _coordPage = 0;
-let _coordSavedItems = [];
-const _coordDeleteController = createSavedCardsController({
-  idPrefix: "coord-delete",
-  buttonId: "coord-delete-btn",
+// Saved Coordinators table — same shared createSavedTable as the server UI
+// (/shared/cards.js), with a CHILDREN column instead of MSGS and the
+// body-keyed (router-proxied) delete.  Activation POSTs /open before
+// navigating so capacity limits surface as a toast, not a broken page.
+const COORD_COLUMNS = [
+  SavedColumns.name(),
+  SavedColumns.model(),
+  SavedColumns.count("child_count", "CHILDREN", "92px"),
+  SavedColumns.ctx(),
+  SavedColumns.last(),
+  SavedColumns.id(),
+];
+const _coordTable = createSavedTable({
+  headerEl: document.getElementById("coord-saved-colheaders"),
+  bodyEl: document.getElementById("saved-coord-cards"),
+  filterEl: document.getElementById("coord-filter"),
+  footerEl: document.getElementById("coord-saved-footer"),
+  columns: COORD_COLUMNS,
   noun: "coordinator",
+  emptyText: "No saved coordinators",
   activateLabel: function (s) {
     return "Resume coordinator: " + (s.alias || s.title || s.name || s.ws_id);
   },
-  // Coordinators live on whichever node owns the ws_id, so we can't fire
-  // a path-keyed delete the way ui/static does.  The router proxy reads
-  // ws_id from the body, resolves the owning node via the consistent-
-  // hash ring, and forwards to that node's POST workstreams/{ws_id}/delete.
-  buildDeleteRequest: function (wsId) {
-    return {
-      url: "/v1/api/route/workstreams/delete",
-      options: {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ws_id: wsId }),
-      },
-    };
+  onActivate: function (s, rowEl) {
+    // POST /open BEFORE navigating so capacity issues surface as a toast
+    // instead of a broken-looking detail page.
+    if (rowEl) rowEl.classList.add("is-busy");
+    authFetch("/v1/api/workstreams/" + encodeURIComponent(s.ws_id) + "/open", {
+      method: "POST",
+    })
+      .then(function (r) {
+        if (r.ok) {
+          window.location.href = "/coordinator/" + encodeURIComponent(s.ws_id);
+          return;
+        }
+        if (rowEl) rowEl.classList.remove("is-busy");
+        if (r.status === 429) {
+          showToast(
+            "All coordinator slots are active — close one first to restore this session",
+          );
+        } else if (r.status === 404) {
+          showToast("Coordinator no longer available");
+          loadSavedCoordinators();
+        } else if (r.status === 503) {
+          showToast("Coordinator subsystem not configured");
+        } else {
+          showToast("Failed to restore coordinator (" + r.status + ")");
+        }
+      })
+      .catch(function () {
+        if (rowEl) rowEl.classList.remove("is-busy");
+        showToast("Failed to restore coordinator");
+      });
   },
-  render: function () {
-    renderSavedCoordinators(_coordSavedItems);
-  },
-  onClose: function () {
-    // Drain queued retries before the explicit reload — without this,
-    // _savedCoordsRetry is still true from SSE events that arrived
-    // during the freeze, so loadSavedCoordinators's .finally() would
-    // re-fire a second fetch immediately after the first resolves.
-    // Same idiom as cancelCoordDeleteMode below.
-    _savedCoordsRetry = false;
-    loadSavedCoordinators();
+  delete: {
+    idPrefix: "coord-delete",
+    buttonId: "coord-delete-btn",
+    // Coordinators live on whichever node owns the ws_id; the router proxy
+    // reads ws_id from the body, resolves the owning node via rendezvous
+    // hashing, and forwards to that node's POST workstreams/{ws_id}/delete.
+    buildDeleteRequest: function (wsId) {
+      return {
+        url: "/v1/api/route/workstreams/delete",
+        options: {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ws_id: wsId }),
+        },
+      };
+    },
+    onClose: function () {
+      // Drain queued retries before the explicit reload (see the freeze
+      // gate in loadSavedCoordinators) so .finally() doesn't double-fetch.
+      _savedCoordsRetry = false;
+      loadSavedCoordinators();
+    },
   },
 });
-
-function renderSavedCoordinators(items) {
-  _coordSavedItems = items;
-  const section = document.getElementById("saved-coordinators");
-  const cards = document.getElementById("saved-coord-cards");
-  const countEl = document.getElementById("saved-coord-count");
-  if (!section || !cards) return;
-  if (!items.length) {
-    section.style.display = "none";
-    cards.replaceChildren();
-    if (countEl) countEl.textContent = "";
-    _coordPage = 0;
-    if (_coordDeleteController.inMode()) _coordDeleteController.cancel();
-    _renderCoordPagination();
-    return;
-  }
-  // Clamp the page index after deletes (or upstream churn) shrink the list.
-  const pages = Math.max(1, Math.ceil(items.length / COORD_PAGE_SIZE));
-  if (_coordPage > pages - 1) _coordPage = pages - 1;
-  if (_coordPage < 0) _coordPage = 0;
-  const visible = items.slice(
-    _coordPage * COORD_PAGE_SIZE,
-    (_coordPage + 1) * COORD_PAGE_SIZE,
-  );
-  _coordDeleteController.setItems(visible);
-
-  section.style.display = "";
-  if (countEl) countEl.textContent = "(" + items.length + ")";
-  cards.replaceChildren();
-  visible.forEach(function (sess) {
-    const card = renderSessionCard(sess, {
-      ariaLabel: _coordDeleteController.ariaLabel,
-      onActivate: function (s, cardEl) {
-        if (_coordDeleteController.blockActivate()) return;
-        // POST /open BEFORE navigating so capacity issues surface as a
-        // toast instead of a broken-looking detail page.
-        cardEl.classList.add("is-busy");
-        authFetch(
-          "/v1/api/workstreams/" + encodeURIComponent(s.ws_id) + "/open",
-          { method: "POST" },
-        )
-          .then(function (r) {
-            if (r.ok) {
-              window.location.href =
-                "/coordinator/" + encodeURIComponent(s.ws_id);
-              return;
-            }
-            cardEl.classList.remove("is-busy");
-            if (r.status === 429) {
-              showToast(
-                "All coordinator slots are active — close one first to restore this session",
-              );
-            } else if (r.status === 404) {
-              showToast("Coordinator no longer available");
-              loadSavedCoordinators();
-            } else if (r.status === 503) {
-              showToast("Coordinator subsystem not configured");
-            } else {
-              showToast("Failed to restore coordinator (" + r.status + ")");
-            }
-          })
-          .catch(function () {
-            cardEl.classList.remove("is-busy");
-            showToast("Failed to restore coordinator");
-          });
-      },
-    });
-    _coordDeleteController.decorateCard(card, sess);
-    cards.appendChild(card);
-  });
-  if (_coordDeleteController.inMode()) _coordDeleteController.refreshBar();
-  _renderCoordPagination();
-}
-
-function _renderCoordPagination() {
-  const pag = document.getElementById("coord-pagination");
-  if (!pag) return;
-  const total = _coordSavedItems.length;
-  const pages = Math.max(1, Math.ceil(total / COORD_PAGE_SIZE));
-  // Single-page lists and delete-mode hide the controls — page changes
-  // would invalidate the user's checkbox selections, so we lock them out.
-  if (pages <= 1 || _coordDeleteController.inMode()) {
-    pag.style.display = "none";
-    return;
-  }
-  pag.style.display = "";
-  const label = document.getElementById("coord-page-label");
-  if (label) {
-    /* Visible text uses the terse "X / Y" form to match the
-       filtered-pagination control elsewhere in the console; the long
-       form sits on the parent's aria-label so screen readers still get
-       a full sentence. */
-    label.textContent = _coordPage + 1 + " / " + pages;
-    pag.setAttribute(
-      "aria-label",
-      "Saved coordinators pagination — page " +
-        (_coordPage + 1) +
-        " of " +
-        pages,
-    );
-  }
-  const prev = document.getElementById("coord-page-prev");
-  if (prev) prev.disabled = _coordPage <= 0;
-  const next = document.getElementById("coord-page-next");
-  if (next) next.disabled = _coordPage >= pages - 1;
-}
-
-function coordPagePrev() {
-  if (_coordPage > 0) {
-    _coordPage--;
-    renderSavedCoordinators(_coordSavedItems);
-  }
-}
-
-function coordPageNext() {
-  const pages = Math.max(1, Math.ceil(_coordSavedItems.length / COORD_PAGE_SIZE));
-  if (_coordPage < pages - 1) {
-    _coordPage++;
-    renderSavedCoordinators(_coordSavedItems);
-  }
-}
 
 // HTML inline-onclick wrappers — keep the global names the markup binds
 // to and forward to the shared controller.
 function startCoordDeleteMode() {
-  _coordDeleteController.start();
+  _coordTable.controller.start();
 }
 function cancelCoordDeleteMode() {
-  _coordDeleteController.cancel();
+  _coordTable.controller.cancel();
   // The freeze gate (see loadSavedCoordinators) may have queued retries
   // while we were multi-selecting; drain them now that we're idle again.
   if (_savedCoordsRetry) {
@@ -2329,16 +2249,16 @@ function cancelCoordDeleteMode() {
   }
 }
 function toggleCoordSelectAll() {
-  _coordDeleteController.toggleAll();
+  _coordTable.controller.toggleAll();
 }
 function confirmCoordDeleteSelection() {
-  _coordDeleteController.confirmSelection();
+  _coordTable.controller.confirmSelection();
 }
 function cancelCoordDelete() {
-  _coordDeleteController.closeModal();
+  _coordTable.controller.closeModal();
 }
 function confirmCoordDelete() {
-  _coordDeleteController.confirm();
+  _coordTable.controller.confirm();
 }
 
 // --- Init ---

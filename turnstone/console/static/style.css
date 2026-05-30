@@ -157,10 +157,8 @@
   margin-left: auto;
 }
 
-/* Saved Coordinators reuses the shared .pagination control (defined in
-   /shared/cards.css) — the visible page is capped at COORD_PAGE_SIZE so
-   Select-All fan-out is bounded.  Pagination is hidden in delete mode and
-   when there's only one page (see _renderCoordPagination). */
+/* Saved Coordinators scroll-all (no pagination); the shared createSavedTable
+   in /shared/cards.js owns filter + sort + render. */
 
 .home-coord-list {
   border: 1px solid var(--border);

@@ -144,48 +144,41 @@
           style="display: none"
           aria-label="Saved coordinators"
         >
-          <h2 class="home-section-title">
-            <span>Saved Coordinators</span>
-            <span id="saved-coord-count" class="home-section-count"></span>
-            <button
-              id="coord-delete-btn"
-              class="ws-delete-btn home-section-action"
-              onclick="startCoordDeleteMode()"
-              title="Delete coordinators"
-            >
-              <span aria-hidden="true">&#x1f5d1;</span> Delete
-            </button>
-          </h2>
+          <div class="dash-header">
+            <span class="dash-header-title">SAVED COORDINATORS</span>
+            <div class="saved-toolbar">
+              <input
+                id="coord-filter"
+                class="saved-filter"
+                type="search"
+                placeholder="Filter by name&#x2026;"
+                aria-label="Filter saved coordinators"
+                autocomplete="off"
+              />
+              <button
+                id="coord-delete-btn"
+                class="ws-delete-btn"
+                onclick="startCoordDeleteMode()"
+                title="Delete coordinators"
+              >
+                <span aria-hidden="true">&#x1f5d1;</span> Delete
+              </button>
+            </div>
+          </div>
+          <div class="dash-colheaders" id="coord-saved-colheaders"></div>
           <div
+            class="dash-table"
             id="saved-coord-cards"
-            class="dashboard-cards"
-            role="list"
-            aria-live="polite"
+            role="group"
+            aria-label="Saved coordinators"
           ></div>
           <div
-            id="coord-pagination"
-            class="pagination"
-            style="display: none"
-            role="navigation"
-            aria-label="Saved coordinators pagination"
-          >
-            <button
-              id="coord-page-prev"
-              type="button"
-              onclick="coordPagePrev()"
-            >
-              &#x25c4; Prev
-            </button>
-            <span id="coord-page-label" aria-live="polite" aria-atomic="true">
-            </span>
-            <button
-              id="coord-page-next"
-              type="button"
-              onclick="coordPageNext()"
-            >
-              Next &#x25ba;
-            </button>
-          </div>
+            class="saved-footer"
+            id="coord-saved-footer"
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+          ></div>
           <div id="coord-delete-bar" class="ws-delete-bar">
             <span
               class="ws-delete-count-label"

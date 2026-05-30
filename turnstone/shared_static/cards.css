@@ -1,84 +1,10 @@
 /* ==========================================================================
-   Shared card primitives — used by ui/static (Saved Workstreams) and
-   console/static (Saved Coordinators).  Single source of truth so the two
-   surfaces don't drift on hover affordance, padding, or typography.
+   Shared saved-list styling.  The Delete UX + the pagination control below
+   are shared by ui/static (Saved Workstreams) and console/static (Saved
+   Coordinators); the table styling itself is in the "Saved-list TABLE"
+   section near the bottom of this file.
    ==========================================================================
-   Class names match the original ui/static rules they replaced.  Delete-mode
-   selectors live here too so console (Saved Coordinators) and ui/static
-   (Saved Workstreams) share one card + delete affordance.
-   ========================================================================== */
-
-.dashboard-cards {
-  display: grid;
-  /* Denser default than the original 200px floor — cards carry a short
-     title + one-line meta, so 160-180px fits 4 across at the 1140px
-     content cap and keeps the row from looking padded-out. */
-  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
-  gap: 8px;
-}
-
-.dashboard-card {
-  position: relative;
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 8px 10px;
-  cursor: pointer;
-  transition:
-    border-color 0.15s,
-    background 0.15s,
-    opacity 0.15s;
-}
-.dashboard-card.is-busy {
-  opacity: 0.6;
-  cursor: progress;
-}
-.dashboard-card:hover {
-  border-color: var(--accent);
-  background: var(--bg-highlight);
-}
-.dashboard-card:active {
-  background: var(--bg-highlight);
-  border-color: var(--accent);
-}
-.dashboard-card:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
-.dashboard-card .card-title {
-  font-size: 12px;
-  color: var(--fg-bright);
-  font-weight: 500;
-  margin-bottom: 2px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.dashboard-card .card-meta {
-  font-size: 10px;
-  color: var(--fg-dim);
-}
-
-/* Subtle ws_id badge on each card — also used inline in card-meta. */
-.card-wsid {
-  font-size: 9px;
-  color: var(--fg-dim);
-  opacity: 0.45;
-  margin-left: 6px;
-  font-family: var(--font-mono);
-  letter-spacing: 0.02em;
-  vertical-align: middle;
-}
-
-@media (max-width: 480px) {
-  .dashboard-cards {
-    grid-template-columns: 1fr;
-  }
-}
-
-/* ==========================================================================
-   Delete UX — section-level "Delete" toggle, per-card checkboxes, bottom
+   Delete UX — section-level "Delete" toggle, per-row checkboxes, bottom
    toolbar, and confirmation modal.  Moved out of ui/static/style.css when
    the console grew the same multi-select delete on Saved Coordinators.
    ========================================================================== */
@@ -100,27 +26,6 @@
   border-color: var(--red);
 }
 
-/* Delete mode */
-.dashboard-card.ws-delete-mode {
-  cursor: pointer;
-}
-.dashboard-card.ws-delete-mode:hover {
-  border-color: var(--red);
-  background: rgba(248, 113, 113, 0.04);
-}
-.dashboard-card.ws-delete-mode.ws-selected {
-  cursor: default;
-}
-.dashboard-card.ws-delete-mode.ws-selected:hover {
-  border-color: var(--red);
-  background: rgba(248, 113, 113, 0.08);
-}
-[data-theme="light"] .dashboard-card.ws-delete-mode:hover {
-  background: rgba(220, 38, 38, 0.04);
-}
-[data-theme="light"] .dashboard-card.ws-delete-mode.ws-selected:hover {
-  background: rgba(220, 38, 38, 0.08);
-}
 .ws-card-check {
   position: absolute;
   top: 8px;
@@ -145,13 +50,6 @@
   to {
     opacity: 1;
   }
-}
-.dashboard-card.ws-selected {
-  border-color: var(--red);
-  background: rgba(248, 113, 113, 0.08);
-}
-[data-theme="light"] .dashboard-card.ws-selected {
-  background: rgba(220, 38, 38, 0.08);
 }
 .ws-delete-bar {
   display: none;
@@ -361,11 +259,10 @@
    for DOM inspection and as a future hook. */
 
 /* ==========================================================================
-   Pagination — shared by the console (Saved Coordinators + the filtered
-   admin lists) and the server UI (Saved Workstreams).  Lives in /shared so
-   the two dashboards can't drift apart; the per-app render helpers
-   (_renderCoordPagination / _renderWsPagination) own the show/hide + page-
-   clamp logic.
+   Pagination — used by the console's filtered admin lists.  The saved
+   workstream / coordinator lists scroll-all now (see createSavedTable), so
+   this control is no longer wired to them; it lives in /shared so the
+   remaining admin surfaces can't drift apart.
    ========================================================================== */
 .pagination {
   display: flex;
@@ -399,4 +296,187 @@
 .pagination button:disabled {
   opacity: 0.25;
   cursor: not-allowed;
+}
+
+/* ==========================================================================
+   Saved-list TABLE — reuses base.css .dash-header / .dash-colheaders /
+   .dash-row / .dash-row-main (visual parity with the active dashboard
+   table above it).  These add the saved-specific cells, skill chip, header
+   sort affordance, filter toolbar, footer, and delete-mode on rows.  Shared
+   by ui/static (Saved Workstreams) and console/static (Saved Coordinators).
+   ========================================================================== */
+
+.saved-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.saved-filter {
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  padding: 4px 10px;
+  width: 200px;
+}
+.saved-filter::placeholder {
+  color: var(--fg-dim);
+  opacity: 0.7;
+}
+.saved-filter:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-dim);
+}
+
+/* Sortable column headers — saved table only (active uses .dash-col). */
+.dash-colheaders .scol {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  cursor: pointer;
+  user-select: none;
+}
+.dash-colheaders .scol.scell-r {
+  justify-content: flex-end;
+}
+.dash-colheaders .scol:hover {
+  color: var(--fg);
+}
+.dash-colheaders .scol.sorted {
+  color: var(--accent);
+}
+.dash-colheaders .scol .caret {
+  font-size: 8px;
+}
+/* Inactive columns show a faint neutral caret so every header reads as
+   sortable at rest (not just on hover / the active column). */
+.dash-colheaders .scol .caret.caret-idle {
+  opacity: 0.35;
+}
+
+/* Row cells.  Saved rows reuse the dash-table chrome but are a terminal,
+   mostly-idle, long list — so the styling that the active (live, short)
+   table tunes for is overridden deliberately here, in one place, rather
+   than fought property-by-property: a legible zebra (the active table's
+   near-zero --row-alt vanishes on a long list) and full-opacity muted text
+   (AA-legible colours, no opacity hacks).  Idle-dimming is avoided at the
+   source — renderSessionRow only sets data-state for `error`. */
+.saved-row .dash-row-main {
+  padding: 8px 16px;
+  /* one CSS var, set per render by createSavedTable (responsive-aware) */
+  grid-template-columns: var(--saved-grid);
+}
+.saved-row:nth-child(even) {
+  background: rgba(255, 255, 255, 0.025);
+}
+[data-theme="light"] .saved-row:nth-child(even) {
+  background: rgba(0, 0, 0, 0.03);
+}
+.scell {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+.scell-r {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--fg-dim);
+  font-size: 11px;
+}
+.scell-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-weight: 500;
+  color: var(--fg-bright);
+}
+.scell-name .scell-nm {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.scell-model {
+  color: var(--fg-dim);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.scell-id {
+  /* --fg-dim alone clears WCAG AA in both themes; the prior opacity:0.5
+     dragged it to ~2.4:1 — and ID is the near-duplicate-name disambiguator,
+     so it has to stay legible. */
+  color: var(--fg-dim);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+}
+/* CTX here is a frozen snapshot at last activity, not the live gauge the
+   active table shows — lighter weight so it doesn't read as the same
+   instrument (the column header carries a "context at last activity"
+   tooltip). */
+.saved-row .dash-cell-ctx {
+  font-weight: 400;
+}
+
+/* Skill chip — cool-slate lane, distinct from the amber accent + CTX
+   colours; glyph + >=0.15 tint keeps it legible at chip size. */
+.skill-chip {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: #aeb8db;
+  background: rgba(120, 140, 210, 0.16);
+  border: 1px solid rgba(120, 140, 210, 0.34);
+  border-radius: 10px;
+  padding: 1px 7px 1px 6px;
+}
+.skill-chip-g {
+  font-size: 8px;
+  opacity: 0.85;
+}
+[data-theme="light"] .skill-chip {
+  color: #44507a;
+  background: rgba(90, 110, 180, 0.14);
+  border-color: rgba(90, 110, 180, 0.4);
+}
+
+/* Footer count line — mirrors the active table's footer altitude. */
+.saved-footer {
+  padding: 9px 16px;
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+
+/* Delete mode on rows: the shared controller inserts an absolute checkbox
+   (positioned top-right for cards); reposition to the row's left edge and
+   shift the grid so it doesn't collide with NAME. */
+.dash-row .ws-card-check {
+  top: 50%;
+  left: 10px;
+  right: auto;
+  transform: translateY(-50%);
+}
+.dash-row.ws-delete-mode .dash-row-main {
+  padding-left: 34px;
+}
+/* Keep the column headers registered with the rows while multi-selecting:
+   rows reserve a 34px checkbox gutter, so the headers shift to match. */
+.dash-colheaders.saved-cols-delete {
+  padding-left: 34px;
+}
+.dash-row.ws-selected {
+  background: rgba(248, 113, 113, 0.08);
+}
+[data-theme="light"] .dash-row.ws-selected {
+  background: rgba(220, 38, 38, 0.08);
 }

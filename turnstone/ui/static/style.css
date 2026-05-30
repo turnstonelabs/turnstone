@@ -2257,10 +2257,9 @@ audio.media-player {
   color: var(--accent);
   margin: 0;
 }
-/* .dashboard-cards / .dashboard-card / .card-title / .card-meta and the
-   delete-mode + modal rules are owned by /shared/cards.css so console
-   (Saved Coordinators) and ui/static (Saved Workstreams) share one source
-   of truth. */
+/* The saved-list table styling + the multi-select delete/modal rules are
+   owned by /shared/cards.css so console (Saved Coordinators) and ui/static
+   (Saved Workstreams) share one source of truth. */
 
 /* Server dashboard row — clickable */
 .dash-row {
@@ -2343,7 +2342,6 @@ audio.media-player {
   .dashboard-content {
     padding: 24px 12px 16px;
   }
-  /* .dashboard-cards 1-col at 480px lives in /shared/cards.css */
   :root {
     --dash-grid: 50px 1fr 50px;
   }
@@ -2680,7 +2678,6 @@ audio.media-player {
   .ws-tab .tab-chevron,
   #new-tab-btn,
   #split-btn,
-  .dashboard-card,
   .ts-approval-btn,
   .ts-approval-feedback,
   #plan-buttons button,
