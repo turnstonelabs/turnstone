@@ -1980,7 +1980,11 @@
     // case (scheduleReconnect-driven reconnect after CLOSED state).
     const wasReconnecting = disconnectedSinceLastOpen || reconnectAttempts > 0;
     let url = "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/events";
-    if (lastEventId) {
+    // ``!= null`` (not truthiness): a resume cursor of 0 is valid (the
+    // ring buffer's first emitted event is id 1), and a brand-new ws's
+    // first-turn /history cursor can be 0 — a truthiness gate would drop
+    // it to the lossy fresh-snapshot path.  Mirrors ui/static/app.js.
+    if (lastEventId != null) {
       url += "?last_event_id=" + encodeURIComponent(lastEventId);
     }
     evtSource = new EventSource(url, { withCredentials: true });
@@ -4358,7 +4362,7 @@
       appendText("error", "Failed to load coordinator: " + e.message);
       return;
     }
-    await refetchHistory();
+    await refetchHistory(true);
     // History alone can't tell whether an orphaned assistant tool_calls turn
     // is awaiting approval or merely still running; the live workstream
     // snapshot can.  First-paint only — a mid-session clear_ui refetch does
@@ -4398,7 +4402,7 @@
   // (toolRows / activeBatch, which the render rebuilds) reset up front so a
   // mid-session re-render leaves no stale call_id→row mappings pointing at
   // detached DOM.  On first paint they're already empty — harmless no-ops.
-  async function refetchHistory() {
+  async function refetchHistory(seedCursor = false) {
     let hist = null;
     try {
       hist = await getJSON(
@@ -4412,6 +4416,16 @@
     toolRows.clear();
     activeBatch = null;
     if (!hist) return;
+    // Fresh-connect fast-forward: when the trailing turn is an executing
+    // in-flight tool batch the server can replay, /history returns a
+    // non-null ``cursor`` and OMITS that turn. Seed ``lastEventId`` so the
+    // connectSSE on the initial-connect path (seedCursor=true) opens with
+    // ?last_event_id= and the replay_ok delta rebuilds the in-flight turn
+    // — otherwise the trimmed turn would be neither in /history nor
+    // replayed. The clear_ui / replay_truncated re-render callers leave
+    // seedCursor false: they run on a live stream and must NOT rewind
+    // lastEventId off the live position. Mirrors ui/static/app.js.
+    if (seedCursor && hist.cursor != null) lastEventId = hist.cursor;
     // Map call_id → tool name resolved from the most recent
     // assistant tool_calls.  Storage's `tool` rows carry only
     // tool_call_id + content; the function name lives on the

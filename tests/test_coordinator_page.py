@@ -347,3 +347,45 @@ def test_coord_history_renders_user_interjection_advisory_after_tool_block():
         "advisory text through appendUserMessageWithAttachments so the "
         "rendered bubble matches a normal user-row replay."
     )
+
+
+def test_coordinator_js_seeds_resume_cursor_only_on_initial_connect():
+    """coordinator.js must consume the /history resume cursor the same way
+    ui/static/app.js does: the shared make_history_handler trims the
+    executing in-flight orphan turn and returns a cursor, so the coord
+    client MUST open its initial SSE with that cursor (?last_event_id=) or
+    the trimmed turn is neither in /history nor delta-replayed — it vanishes
+    from the dashboard (a regression vs the prior #610 in-flight render).
+
+    Pins three invariants mirroring the app.js guards:
+      1. ``refetchHistory`` takes a ``seedCursor`` flag (default false) and
+         seeds ``lastEventId`` from ``hist.cursor`` only when set + non-null,
+         so the clear_ui / replay_truncated re-render callers (live stream,
+         no reconnect) don't rewind the live cursor.
+      2. the initial-connect path opts in via ``refetchHistory(true)``.
+      3. ``connectSSE`` gates ``?last_event_id=`` on ``!= null`` so a cursor
+         of 0 (a brand-new ws's first-turn boundary) isn't dropped.
+    """
+    import re
+    from pathlib import Path
+
+    coord_js = Path(__file__).resolve().parent.parent / (
+        "turnstone/console/static/coordinator/coordinator.js"
+    )
+    body = coord_js.read_text(encoding="utf-8")
+    assert "async function refetchHistory(seedCursor = false)" in body, (
+        "refetchHistory must take a seedCursor flag (default false) so only "
+        "the initial-connect caller seeds the resume cursor."
+    )
+    assert re.search(
+        r"if\s*\(\s*seedCursor\s*&&\s*hist\.cursor\s*!=\s*null\s*\)\s*"
+        r"lastEventId\s*=\s*hist\.cursor",
+        body,
+    ), "refetchHistory must seed lastEventId from hist.cursor only when seedCursor && != null."
+    assert "await refetchHistory(true)" in body, (
+        "the initial-connect path must call refetchHistory(true) to seed the cursor."
+    )
+    assert re.search(
+        r"if\s*\(\s*lastEventId\s*!=\s*null\s*\)\s*\{\s*url\s*\+=\s*\"\?last_event_id=\"",
+        body,
+    ), "connectSSE must gate ?last_event_id= on lastEventId != null (so cursor 0 isn't dropped)."
