@@ -364,8 +364,115 @@
   border-color: var(--border-strong);
 }
 
+/* Voice I/O — mic dictation button (composer row) mirrors .composer-attach,
+   plus a recording-pulse state and the per-message TTS playback states. */
+.composer-mic-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--fg-dim);
+  cursor: pointer;
+  padding: 4px 8px;
+  line-height: 1;
+  height: 32px;
+  transition:
+    background 0.12s,
+    color 0.12s,
+    border-color 0.12s;
+}
+.composer-mic-btn:hover {
+  background: var(--bg-highlight);
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+.composer-mic-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.composer-mic-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.composer-mic-btn.is-recording {
+  color: var(--red, #f87171);
+  border-color: var(--red, #f87171);
+  animation: ts-mic-pulse 1.2s ease-in-out infinite;
+}
+@keyframes ts-mic-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+.msg-tts-btn.is-playing {
+  color: var(--accent);
+}
+.msg-tts-btn.is-busy {
+  opacity: 0.6;
+  cursor: progress;
+}
+@media (prefers-reduced-motion: reduce) {
+  .composer-mic-btn.is-recording {
+    /* No pulse — keep an unmistakable static cue instead of the only signal
+       being a subtle icon swap. */
+    animation: none;
+    background: var(--red-glow);
+  }
+}
+/* Coarse-pointer touch target (WCAG 2.5.5) — matches the .msg-action-btn rule. */
+@media (hover: none) and (pointer: coarse) {
+  .composer-mic-btn {
+    min-width: 36px;
+    min-height: 36px;
+  }
+}
+
+/* Monochrome currentColor glyphs for the voice controls (CSS-mask technique),
+   so they theme and sit beside the line-art .icon-retry set rather than reading
+   as full-color, OS-dependent emoji. */
+.composer-mic-icon,
+.icon-mic,
+.icon-speaker {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  background-color: currentColor;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  mask-position: center;
+  -webkit-mask-size: contain;
+  mask-size: contain;
+}
+.icon-mic {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z'/%3E%3Cpath d='M19 10v1a7 7 0 0 1-14 0v-1'/%3E%3Cline x1='12' y1='19' x2='12' y2='22'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z'/%3E%3Cpath d='M19 10v1a7 7 0 0 1-14 0v-1'/%3E%3Cline x1='12' y1='19' x2='12' y2='22'/%3E%3C/svg%3E");
+}
+.icon-speaker {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolygon points='11 5 6 9 2 9 2 15 6 15 11 19 11 5'/%3E%3Cpath d='M15.54 8.46a5 5 0 0 1 0 7.07'/%3E%3Cpath d='M19.07 4.93a10 10 0 0 1 0 14.14'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolygon points='11 5 6 9 2 9 2 15 6 15 11 19 11 5'/%3E%3Cpath d='M15.54 8.46a5 5 0 0 1 0 7.07'/%3E%3Cpath d='M19.07 4.93a10 10 0 0 1 0 14.14'/%3E%3C/svg%3E");
+}
+/* Recording: a solid stop square (no mask) in place of the mic glyph. */
+.composer-mic-icon.icon-stop {
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+  -webkit-mask-image: none;
+  mask-image: none;
+}
+
 .composer-input {
   flex: 1;
+  /* Allow the textarea to shrink below its content width so a long unbroken
+     token can't push the fixed-width row buttons (attach/mic/send) past the
+     edge of a narrow split pane. */
+  min-width: 0;
   min-height: 32px;
   max-height: 160px;
   font-family: var(--font-mono);

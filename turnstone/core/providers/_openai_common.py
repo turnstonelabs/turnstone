@@ -197,6 +197,39 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         reasoning_effort_values=(),
         supports_vision=True,
     ),
+    # Audio models — not chat/session models; used only as STT/TTS roles via
+    # the /v1/audio/transcriptions and /v1/audio/speech endpoints. Prefixes
+    # cover variants: "gpt-4o-transcribe" → "-diarize", "tts-1" → "tts-1-hd".
+    "whisper-1": ModelCapabilities(
+        supports_temperature=False,
+        supports_streaming=False,
+        supports_tools=False,
+        supports_transcription=True,
+    ),
+    "gpt-4o-transcribe": ModelCapabilities(
+        supports_temperature=False,
+        supports_streaming=False,
+        supports_tools=False,
+        supports_transcription=True,
+    ),
+    "gpt-4o-mini-transcribe": ModelCapabilities(
+        supports_temperature=False,
+        supports_streaming=False,
+        supports_tools=False,
+        supports_transcription=True,
+    ),
+    "tts-1": ModelCapabilities(
+        supports_temperature=False,
+        supports_streaming=False,
+        supports_tools=False,
+        supports_speech_synthesis=True,
+    ),
+    "gpt-4o-mini-tts": ModelCapabilities(
+        supports_temperature=False,
+        supports_streaming=False,
+        supports_tools=False,
+        supports_speech_synthesis=True,
+    ),
 }
 
 # Default for unknown models (local servers: vLLM, llama.cpp, etc.)

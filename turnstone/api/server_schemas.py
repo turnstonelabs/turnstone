@@ -87,6 +87,21 @@ class ListAttachmentsResponse(BaseModel):
     )
 
 
+class SpeechToTextResponse(BaseModel):
+    """Transcript returned for the browser to place into the composer."""
+
+    status: str = Field(default="ok", description="Request outcome")
+    transcript: str = Field(description="Transcribed text")
+    model_alias: str = Field(default="", description="STT role alias used")
+
+
+class TextToSpeechRequest(BaseModel):
+    text: str = Field(description="Text to synthesize")
+    voice: str = Field(
+        default="", description="Optional voice override (else audio.tts_voice setting)"
+    )
+
+
 class ApproveRequest(BaseModel):
     approved: bool = Field(description="True to approve, false to deny")
     feedback: str | None = Field(default=None, description="Optional denial reason")
@@ -628,6 +643,10 @@ class AvailableModelInfo(BaseModel):
     alias: str
     model: str
     provider: str
+    capabilities: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Operator-set capability flags for this alias (e.g. supports_transcription)",
+    )
 
 
 class ListAvailableModelsResponse(BaseModel):
@@ -635,3 +654,11 @@ class ListAvailableModelsResponse(BaseModel):
     default_alias: str = ""
     channel_default_alias: str = ""
     judge_default_alias: str = ""
+    stt_default_alias: str = Field(
+        default="",
+        description="Effective speech-to-text role alias (blank = voice input disabled)",
+    )
+    tts_default_alias: str = Field(
+        default="",
+        description="Effective text-to-speech role alias (blank = voice output disabled)",
+    )

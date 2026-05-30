@@ -177,6 +177,10 @@
       textRow = actionRow;
     }
 
+    // Supported surface for callers that need to add page-specific controls
+    // (e.g. a mic button) beside attach/send/stop.
+    this.actionsRowEl = actionRow;
+
     this._buildAttachButton(actionRow, opts);
     this._buildInput(textRow, opts);
     this._buildOptionsToggle(actionRow, opts);

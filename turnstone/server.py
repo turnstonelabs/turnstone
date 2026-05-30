@@ -1176,6 +1176,7 @@ async def list_available_models(request: Request) -> JSONResponse:
                 "alias": cfg.alias,
                 "model": cfg.model,
                 "provider": cfg.provider,
+                "capabilities": cfg.capabilities,
             }
         )
     # Include effective defaults for clients (web UI, channel gateway).
@@ -1210,13 +1211,162 @@ async def list_available_models(request: Request) -> JSONResponse:
     # an explicitly-configured, enabled alias surfaces a concrete default.
     if judge_default_alias and judge_default_alias not in enabled_aliases:
         judge_default_alias = ""
+    # STT/TTS are media roles: report a default only when the configured alias
+    # exists AND is capability-eligible (the same gate the endpoints apply), so
+    # the UI shows the mic / playback affordances only when they actually work.
+    from turnstone.core.audio import resolve_role_alias
+
+    stt_default_alias = resolve_role_alias(config_store=cs, registry=registry, role="stt") or ""
+    tts_default_alias = resolve_role_alias(config_store=cs, registry=registry, role="tts") or ""
     return JSONResponse(
         {
             "models": models,
             "default_alias": default_alias,
             "channel_default_alias": channel_default_alias,
             "judge_default_alias": judge_default_alias,
+            "stt_default_alias": stt_default_alias,
+            "tts_default_alias": tts_default_alias,
         }
+    )
+
+
+_STT_UPLOAD_CAP = 25 * 1024 * 1024  # 25 MiB — generous for short dictation clips
+_TTS_TEXT_CAP = 8000  # characters per synthesis request
+
+
+async def speech_to_text(request: Request) -> JSONResponse:
+    """POST /v1/api/workstreams/{ws_id}/speech-to-text — transcribe one audio clip.
+
+    Multipart body with a single ``audio`` field.  Returns the transcript for
+    the browser to place into the composer; this endpoint never sends on the
+    user's behalf (no auto-send, no request rewriting).
+    """
+    from turnstone.core.audio import (
+        AudioBackendError,
+        AudioUnavailableError,
+        resolve_role_alias,
+        transcribe,
+    )
+    from turnstone.core.web_helpers import read_multipart_file_or_400
+
+    ws_id = request.path_params.get("ws_id", "")
+    if not ws_id:
+        return JSONResponse({"error": "ws_id is required"}, status_code=400)
+    _user_id, err = _require_ws_access(request, ws_id)
+    if err:
+        return err
+
+    registry = getattr(request.app.state, "registry", None)
+    config_store = getattr(request.app.state, "config_store", None)
+    alias = resolve_role_alias(config_store=config_store, registry=registry, role="stt")
+    if not alias:
+        return JSONResponse(
+            {
+                "error": (
+                    "Speech-to-text is not configured. Assign an STT model role in Models → Roles."
+                )
+            },
+            status_code=503,
+        )
+
+    got = await read_multipart_file_or_400(request, field="audio", max_bytes=_STT_UPLOAD_CAP)
+    if isinstance(got, JSONResponse):
+        return got
+    filename, _claimed_mime, data = got
+    if not data:
+        return JSONResponse({"error": "Empty audio upload"}, status_code=400)
+
+    stt_prompt = ""
+    if config_store is not None:
+        stt_prompt = (config_store.get("audio.stt_prompt") or "").strip()
+    try:
+        # Blocking SDK round-trip — offload so the shared event loop (and SSE
+        # streaming) stays responsive.
+        result = await asyncio.to_thread(
+            transcribe,
+            registry=registry,
+            alias=alias,
+            data=data,
+            filename=filename or "speech.webm",
+            prompt=stt_prompt,
+        )
+    except AudioUnavailableError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=503)
+    except AudioBackendError as exc:
+        # str(exc) wraps the backend SDK error, which can carry upstream
+        # response detail — log it, but return a static body to the caller.
+        log.warning("speech_to_text.backend_failed", error=str(exc), exc_info=True)
+        return JSONResponse({"error": "Speech transcription backend failed"}, status_code=502)
+
+    if not result.transcript:
+        # Successful call that detected no speech (silence / non-speech audio)
+        # is not a backend failure — surface it as 422 so the UI can say so
+        # rather than treating a healthy backend as a bad gateway.
+        return JSONResponse({"error": "No speech detected"}, status_code=422)
+
+    return JSONResponse(
+        {
+            "status": "ok",
+            "transcript": result.transcript,
+            "model_alias": result.model_alias,
+        }
+    )
+
+
+async def text_to_speech(request: Request) -> Response:
+    """POST /v1/api/tts — synthesize assistant text into playable audio."""
+    from turnstone.core.audio import (
+        AudioBackendError,
+        AudioUnavailableError,
+        resolve_role_alias,
+        synthesize,
+    )
+    from turnstone.core.web_helpers import read_json_or_400
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+    text = str(body.get("text") or "").strip()
+    if not text:
+        return JSONResponse({"error": "text is required"}, status_code=400)
+    if len(text) > _TTS_TEXT_CAP:
+        return JSONResponse(
+            {"error": f"text too long (cap {_TTS_TEXT_CAP} chars)"}, status_code=400
+        )
+
+    registry = getattr(request.app.state, "registry", None)
+    config_store = getattr(request.app.state, "config_store", None)
+    alias = resolve_role_alias(config_store=config_store, registry=registry, role="tts")
+    if not alias:
+        return JSONResponse(
+            {
+                "error": (
+                    "Text-to-speech is not configured. Assign a TTS model role in Models → Roles."
+                )
+            },
+            status_code=503,
+        )
+
+    voice = str(body.get("voice") or "").strip()
+    if not voice and config_store is not None:
+        voice = (config_store.get("audio.tts_voice") or "").strip()
+
+    try:
+        # Blocking SDK round-trip — offload off the event loop.
+        speech = await asyncio.to_thread(
+            synthesize, registry=registry, alias=alias, text=text, voice=voice
+        )
+    except AudioUnavailableError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=503)
+    except AudioBackendError as exc:
+        # Static body to the caller; backend SDK detail stays in the log.
+        log.warning("text_to_speech.backend_failed", error=str(exc), exc_info=True)
+        return JSONResponse({"error": "Speech synthesis backend failed"}, status_code=502)
+
+    return Response(
+        speech.audio_bytes,
+        media_type=speech.media_type,
+        headers={"X-Model-Alias": speech.model_alias},
     )
 
 
@@ -3830,6 +3980,14 @@ def create_app(
         ),
     )
     v1_routes.append(Route("/api/dashboard", dashboard))
+    v1_routes.append(
+        Route(
+            "/api/workstreams/{ws_id}/speech-to-text",
+            speech_to_text,
+            methods=["POST"],
+        )
+    )
+    v1_routes.append(Route("/api/tts", text_to_speech, methods=["POST"]))
 
     app = Starlette(
         routes=[

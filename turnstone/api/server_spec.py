@@ -43,6 +43,8 @@ from turnstone.api.server_schemas import (
     SendRequest,
     SendResponse,
     SkillSummary,
+    SpeechToTextResponse,
+    TextToSpeechRequest,
     UploadAttachmentResponse,
     WorkstreamDetailResponse,
     WorkstreamHistoryResponse,
@@ -313,6 +315,28 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         error_codes=[403, 404],
         tags=["Attachments"],
     ),
+    # --- Voice I/O ---
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/speech-to-text",
+        "POST",
+        "Transcribe a short audio clip (multipart/form-data, field 'audio') "
+        "using the configured STT model role.  Returns the transcript for the "
+        "client to place into the composer; this endpoint never sends on the "
+        "user's behalf.  Returns 503 when no STT role is configured.",
+        response_model=SpeechToTextResponse,
+        error_codes=[400, 403, 404, 413, 502, 503],
+        tags=["Attachments"],
+    ),
+    EndpointSpec(
+        "/v1/api/tts",
+        "POST",
+        "Synthesize text to speech audio for browser playback using the "
+        "configured TTS model role.  Returns audio bytes; 503 when no TTS "
+        "role is configured.",
+        request_model=TextToSpeechRequest,
+        error_codes=[400, 502, 503],
+        tags=["Chat"],
+    ),
     # --- Saved workstreams ---
     EndpointSpec(
         "/v1/api/workstreams/saved",
@@ -495,6 +519,8 @@ _ALL_MODELS: list[type[BaseModel]] = [
     ListSavedWorkstreamsResponse,
     UploadAttachmentResponse,
     ListAttachmentsResponse,
+    SpeechToTextResponse,
+    TextToSpeechRequest,
     HealthResponse,
     SaveMemoryRequest,
     MemoryInfo,

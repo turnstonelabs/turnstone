@@ -22,6 +22,8 @@ const ALIAS_SETTING_KEYS = [
   "model.plan_alias",
   "model.task_alias",
   "channels.default_model_alias",
+  "audio.stt_model_alias",
+  "audio.tts_model_alias",
 ];
 
 // Settings whose empty option means "inherit from a fallback chain", as
@@ -2747,6 +2749,7 @@ function _settingsSectionLabel(section) {
     server: "Server",
     cluster: "Cluster",
     channels: "Channels",
+    audio: "Voice",
     mcp: "MCP",
     ratelimit: "Rate Limiting",
     health: "Health",
@@ -5192,7 +5195,57 @@ const MODEL_ROLES = [
     aliasKey: "channels.default_model_alias",
     fallbackKind: "default",
   },
+  {
+    label: "Speech-to-text",
+    description:
+      "Transcribes microphone audio in the workstream composer (voice input). Empty disables the mic affordance — there is no audio-capable session fallback.",
+    aliasKey: "audio.stt_model_alias",
+    fallbackKind: "disabled",
+    mediaCapability: "supports_transcription",
+    mediaRole: "stt",
+  },
+  {
+    label: "Text-to-speech",
+    description:
+      "Synthesizes assistant replies for playback (voice output). Empty disables the play affordance.",
+    aliasKey: "audio.tts_model_alias",
+    fallbackKind: "disabled",
+    mediaCapability: "supports_speech_synthesis",
+    mediaRole: "tts",
+  },
 ];
+
+// Whether a model definition is eligible for an audio role.  Mirrors
+// turnstone/core/audio.py model_supports_role: an explicit capability flag
+// wins; otherwise infer from well-known OpenAI audio model names so a stock
+// gpt-4o-mini-transcribe / -tts / whisper alias shows up without hand-ticking.
+// Known-model-name hints, mirrored VERBATIM from _AUDIO_MODEL_HINTS in
+// turnstone/core/audio.py (the canonical source). A substring match marks
+// eligibility. Keep these two lists in sync — the Python side is pinned by
+// tests/test_audio.py so any change there is deliberate.
+var AUDIO_MODEL_HINTS = {
+  stt: ["transcribe", "whisper", "-asr"],
+  tts: ["tts-", "-tts"],
+};
+
+function _audioModelEligible(md, capFlag, mediaRole) {
+  let caps = md && md.capabilities;
+  if (typeof caps === "string") {
+    try {
+      caps = JSON.parse(caps || "{}");
+    } catch (e) {
+      caps = {};
+    }
+  }
+  if (!caps || typeof caps !== "object") caps = {};
+  if (Object.prototype.hasOwnProperty.call(caps, capFlag))
+    return !!caps[capFlag];
+  const name = ((md && md.model) || "").toLowerCase();
+  const hints = AUDIO_MODEL_HINTS[mediaRole] || [];
+  return hints.some(function (h) {
+    return name.indexOf(h) !== -1;
+  });
+}
 
 // Roles sub-tab reads/writes via ``/v1/api/admin/settings`` which
 // requires ``admin.settings`` — different from the ``admin.models``
@@ -5387,7 +5440,9 @@ function _renderModelRoles(container, values, schema) {
     // "(default — <coordinator-alias>)".
     const blank = document.createElement("option");
     blank.value = "";
-    if (role.fallbackKind === "inherit") {
+    if (role.fallbackKind === "disabled") {
+      blank.textContent = "(disabled — voice off)";
+    } else if (role.fallbackKind === "inherit") {
       blank.textContent = "(inherit)";
     } else {
       let defaultDef = null;
@@ -5412,10 +5467,18 @@ function _renderModelRoles(container, values, schema) {
       }
     }
     aliasSel.appendChild(blank);
+    // Audio roles only list aliases capable of the role (capability flag or
+    // known-model inference); other roles list every enabled alias.
+    let roleAliases = enabledAliases;
+    if (role.mediaCapability) {
+      roleAliases = enabledAliases.filter(function (md) {
+        return _audioModelEligible(md, role.mediaCapability, role.mediaRole);
+      });
+    }
     const currentAlias = aliasInfo.value || "";
     let matched = false;
-    for (let m = 0; m < enabledAliases.length; m++) {
-      const md = enabledAliases[m];
+    for (let m = 0; m < roleAliases.length; m++) {
+      const md = roleAliases[m];
       const opt = document.createElement("option");
       opt.value = md.alias;
       opt.textContent =

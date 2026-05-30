@@ -28,6 +28,24 @@ class TestValidateKey:
         with pytest.raises(ValueError, match="Unknown setting"):
             validate_key("nonexistent.key")
 
+    def test_audio_role_settings_registered(self):
+        for key in (
+            "audio.stt_model_alias",
+            "audio.stt_prompt",
+            "audio.tts_model_alias",
+            "audio.tts_voice",
+        ):
+            defn = validate_key(key)
+            assert defn.key == key
+            assert defn.type == "str"
+            assert defn.section == "audio"
+            assert key in SETTINGS
+        # Voice has a concrete default; the role aliases + prompt default to empty.
+        assert validate_key("audio.stt_model_alias").default == ""
+        assert validate_key("audio.tts_model_alias").default == ""
+        assert validate_key("audio.stt_prompt").default == ""
+        assert validate_key("audio.tts_voice").default == "alloy"
+
 
 # ---------------------------------------------------------------------------
 # validate_value — type coercion

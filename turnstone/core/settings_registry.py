@@ -404,6 +404,54 @@ def _build_registry() -> dict[str, SettingDef]:
             "Degraded backends are deprioritised in the fallback chain but requests are never "
             "blocked. The backend recovers automatically when a request succeeds.",
         ),
+        # -- audio / voice roles -------------------------------------------
+        # Keys are section-prefixed (audio.*) with distinct leaves so the
+        # Settings tab (which labels by the key's last segment) doesn't render
+        # two identical "model_alias" rows.
+        SettingDef(
+            "audio.stt_model_alias",
+            "str",
+            "",
+            "Model alias for speech-to-text (empty = voice input disabled)",
+            "audio",
+            help="Which registered model alias transcribes microphone audio. Point it at an "
+            "audio-capable backend (e.g. an OpenAI gpt-4o-transcribe alias, or a local vLLM "
+            "whisper endpoint). Empty disables the microphone affordance — there is no "
+            "audio-capable session fallback, so this must name a transcription model. The "
+            "curated, capability-gated picker lives in Models -> Roles.",
+        ),
+        SettingDef(
+            "audio.stt_prompt",
+            "str",
+            "",
+            "Optional prompt sent with each transcription request",
+            "audio",
+            help="Optional text passed to the speech-to-text backend to bias the transcription "
+            "— useful for domain vocabulary, names, or acronyms, and required by some models "
+            "(e.g. Gemma-style ASR) that take an instruction prompt. Sent as the OpenAI "
+            "transcription `prompt` parameter; leave empty to omit it.",
+        ),
+        SettingDef(
+            "audio.tts_model_alias",
+            "str",
+            "",
+            "Model alias for text-to-speech (empty = voice output disabled)",
+            "audio",
+            help="Which registered model alias synthesizes assistant speech. Point it at an "
+            "audio-capable backend (e.g. an OpenAI gpt-4o-mini-tts alias, or a local "
+            "vLLM-Omni speech endpoint). Empty disables the playback affordance. The curated, "
+            "capability-gated picker lives in Models -> Roles.",
+        ),
+        SettingDef(
+            "audio.tts_voice",
+            "str",
+            "alloy",
+            "Voice identifier for text-to-speech",
+            "audio",
+            help="Voice passed to the TTS backend. OpenAI voices include alloy, echo, fable, "
+            "onyx, nova, shimmer; local backends (vLLM-Omni, Kokoro) define their own — set "
+            "this to a voice your configured TTS model backend supports.",
+        ),
         # -- judge ----------------------------------------------------------
         SettingDef(
             "judge.enabled",

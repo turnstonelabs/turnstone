@@ -52,6 +52,7 @@ class _StubRegistry:
             alias=alias,
             model=self._aliases[alias],
             provider="openai-compatible",
+            capabilities={},
         )
 
 

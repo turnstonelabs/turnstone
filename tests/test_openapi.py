@@ -41,11 +41,28 @@ class TestServerSpec:
             "/v1/api/command",
             "/v1/api/events/global",
             "/v1/api/workstreams/new",
+            "/v1/api/workstreams/{ws_id}/speech-to-text",
+            "/v1/api/tts",
             "/v1/api/auth/login",
             "/v1/api/auth/logout",
             "/health",
         }
         assert expected.issubset(paths), f"Missing: {expected - paths}"
+
+    def test_voice_endpoints_documented(self):
+        from turnstone.api.server_spec import build_server_spec
+
+        spec = build_server_spec()
+        stt = spec["paths"]["/v1/api/workstreams/{ws_id}/speech-to-text"]["post"]
+        tts = spec["paths"]["/v1/api/tts"]["post"]
+        assert "responses" in stt
+        assert "requestBody" in tts
+        assert "application/json" in tts["requestBody"]["content"]
+        schemas = spec["components"]["schemas"]
+        assert "capabilities" in schemas["AvailableModelInfo"]["properties"]
+        models_props = schemas["ListAvailableModelsResponse"]["properties"]
+        assert "stt_default_alias" in models_props
+        assert "tts_default_alias" in models_props
 
     def test_workstream_history_has_limit_query_param(self):
         """Mirror of the coord-side history limit param test — server now

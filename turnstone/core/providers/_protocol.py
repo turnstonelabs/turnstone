@@ -86,6 +86,10 @@ class ModelCapabilities:
     supports_web_search: bool = False
     supports_tool_search: bool = False
     supports_vision: bool = False
+    # Audio I/O roles (STT / TTS) — not chat behavior; consumed by the audio
+    # endpoints and the Models -> Roles capability gate (turnstone/core/audio.py).
+    supports_transcription: bool = False
+    supports_speech_synthesis: bool = False
     # Server-side tool types to auto-inject into Responses-API ``tools[]``
     # for this model (e.g. ``("web_search",)`` for OpenAI search models,
     # ``("web_search", "x_search")`` for Grok variants).  The

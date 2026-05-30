@@ -1082,3 +1082,210 @@ class TestServiceScopedActorFlow:
         atts = captured["attachments"]
         assert atts is not None and len(atts) == 1
         assert atts[0].attachment_id == aid
+
+
+# ---------------------------------------------------------------------------
+# Voice I/O (STT / TTS) endpoints
+# ---------------------------------------------------------------------------
+
+
+class _VoiceConfigStore:
+    def __init__(self, **values: str) -> None:
+        self._values = dict(values)
+
+    def get(self, key: str, default: str = "") -> str:
+        return self._values.get(key, default)
+
+
+@pytest.fixture
+def voice_app_client(tmp_path):
+    """App wired with an audio-capable registry alias + a mocked OpenAI client.
+
+    The mock is injected into ``registry._clients`` so the real endpoint →
+    resolve_role_alias → transcribe/synthesize path runs end-to-end with only
+    the SDK network call stubbed.
+    """
+    import sqlalchemy as sa
+
+    import turnstone.server as srv_mod
+    from turnstone.core.memory import register_workstream
+    from turnstone.core.metrics import MetricsCollector
+    from turnstone.core.model_registry import ModelConfig, ModelRegistry
+    from turnstone.core.storage import init_storage, reset_storage
+    from turnstone.core.storage._registry import get_storage
+    from turnstone.core.storage._schema import workstreams as ws_tbl
+
+    db_path = tmp_path / "voice.db"
+    reset_storage()
+    init_storage("sqlite", path=str(db_path), run_migrations=False)
+
+    srv_mod._metrics = MetricsCollector()
+    srv_mod._metrics.model = "test-model"
+
+    register_workstream("ws-A", name="A")
+    with get_storage()._conn() as conn:
+        conn.execute(sa.update(ws_tbl).where(ws_tbl.c.ws_id == "ws-A").values(user_id="userA"))
+        conn.commit()
+
+    registry = ModelRegistry(
+        models={
+            "voice": ModelConfig(
+                "voice",
+                "http://localhost:9/v1",
+                "none",
+                "gpt-4o-mini-tts",
+                capabilities={
+                    "supports_transcription": True,
+                    "supports_speech_synthesis": True,
+                },
+            ),
+        },
+        default="voice",
+    )
+    mock_client = MagicMock()
+    mock_client.audio.transcriptions.create.return_value = MagicMock(text="hello from speech")
+    speech = MagicMock()
+    speech.read.return_value = b"RIFF\x00\x00fakeaudio"
+    mock_client.audio.speech.create.return_value = speech
+    registry._clients["voice"] = mock_client  # bypass real SDK client construction
+
+    config_store = _VoiceConfigStore(
+        **{
+            "audio.stt_model_alias": "voice",
+            "audio.tts_model_alias": "voice",
+            "audio.tts_voice": "alloy",
+        }
+    )
+
+    mock_mgr = MagicMock()
+    mock_mgr.get.return_value = None
+    mock_mgr.list_all.return_value = []
+    mock_mgr.max_active = 10
+
+    app = srv_mod.create_app(
+        workstreams=mock_mgr,
+        global_queue=queue.Queue(),
+        global_listeners=[],
+        global_listeners_lock=threading.Lock(),
+        skip_permissions=False,
+        jwt_secret=_TEST_JWT_SECRET,
+        registry=registry,
+        config_store=config_store,
+    )
+    client = TestClient(app, raise_server_exceptions=False)
+    try:
+        yield client, mock_client
+    finally:
+        client.close()
+        reset_storage()
+
+
+class TestSpeechToText:
+    def test_unconfigured_returns_503(self, app_client):
+        client, _ = app_client
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/speech-to-text",
+            files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 503
+        assert "not configured" in resp.json()["error"]
+
+    def test_happy_path_returns_transcript(self, voice_app_client):
+        client, mock_client = voice_app_client
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/speech-to-text",
+            files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["transcript"] == "hello from speech"
+        assert body["model_alias"] == "voice"
+        assert mock_client.audio.transcriptions.create.called
+
+    def test_empty_upload_returns_400(self, voice_app_client):
+        client, _ = voice_app_client
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/speech-to-text",
+            files={"audio": ("speech.webm", b"", "audio/webm")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 400
+
+    def test_silence_returns_422(self, voice_app_client):
+        # A successful transcription with no speech is not a backend failure.
+        client, mock_client = voice_app_client
+        mock_client.audio.transcriptions.create.return_value = MagicMock(text="   ")
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/speech-to-text",
+            files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 422
+        assert "No speech detected" in resp.json()["error"]
+
+    def test_backend_failure_returns_masked_502(self, voice_app_client):
+        # Backend SDK error detail must not leak into the client-facing body.
+        client, mock_client = voice_app_client
+        mock_client.audio.transcriptions.create.side_effect = RuntimeError(
+            "Error code: 401 - internal-host:9 invalid_api_key"
+        )
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/speech-to-text",
+            files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 502
+        body = resp.json()
+        assert body["error"] == "Speech transcription backend failed"
+        assert "internal-host" not in body["error"]
+
+    def test_unknown_workstream_404(self, voice_app_client):
+        # Trusted-team semantics: ownership isn't row-enforced, but a
+        # nonexistent workstream is masked as 404 (no enumeration).
+        client, _ = voice_app_client
+        resp = client.post(
+            "/v1/api/workstreams/ws-DOES-NOT-EXIST/speech-to-text",
+            files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 404
+
+
+class TestTextToSpeech:
+    def test_unconfigured_returns_503(self, app_client):
+        client, _ = app_client
+        resp = client.post("/v1/api/tts", json={"text": "hello"}, headers=_auth("userA"))
+        assert resp.status_code == 503
+
+    def test_happy_path_returns_audio(self, voice_app_client):
+        client, mock_client = voice_app_client
+        resp = client.post("/v1/api/tts", json={"text": "hello"}, headers=_auth("userA"))
+        assert resp.status_code == 200, resp.text
+        assert resp.headers["content-type"].startswith("audio/")
+        assert resp.content == b"RIFF\x00\x00fakeaudio"
+        assert resp.headers.get("x-model-alias") == "voice"
+        # audio.tts_voice setting supplies the voice when the body omits one.
+        assert mock_client.audio.speech.create.call_args.kwargs["voice"] == "alloy"
+
+    def test_empty_text_returns_400(self, voice_app_client):
+        client, _ = voice_app_client
+        resp = client.post("/v1/api/tts", json={"text": "   "}, headers=_auth("userA"))
+        assert resp.status_code == 400
+
+    def test_too_long_text_returns_400(self, voice_app_client):
+        client, _ = voice_app_client
+        resp = client.post("/v1/api/tts", json={"text": "x" * 9000}, headers=_auth("userA"))
+        assert resp.status_code == 400
+
+    def test_backend_failure_returns_masked_502(self, voice_app_client):
+        client, mock_client = voice_app_client
+        mock_client.audio.speech.create.side_effect = RuntimeError(
+            "Error code: 500 - internal-host:9 boom"
+        )
+        resp = client.post("/v1/api/tts", json={"text": "hello"}, headers=_auth("userA"))
+        assert resp.status_code == 502
+        body = resp.json()
+        assert body["error"] == "Speech synthesis backend failed"
+        assert "internal-host" not in body["error"]

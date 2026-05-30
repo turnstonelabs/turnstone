@@ -309,6 +309,7 @@ WRITE_PATHS: frozenset[str] = frozenset(
         "/api/workstreams/new",
         "/api/cluster/workstreams/new",
         "/api/memories",
+        "/api/tts",
     }
 )
 
@@ -694,6 +695,7 @@ def required_scope(method: str, path: str) -> str:
             "refresh-title",
             "title",
             "attachments",
+            "speech-to-text",
             "send",
             "cancel",
             "rewind",
@@ -744,6 +746,7 @@ def required_scope(method: str, path: str) -> str:
                 "refresh-title",
                 "title",
                 "attachments",
+                "speech-to-text",
                 "send",
                 "cancel",
                 "rewind",

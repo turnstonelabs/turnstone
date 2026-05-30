@@ -9,6 +9,43 @@
 
 let _paneCounter = 0;
 
+// Voice-role availability comes from /v1/api/models (stt_default_alias /
+// tts_default_alias — present only when an audio-capable model role is
+// configured).  Memoized so all panes share a single fetch; affordances stay
+// hidden until it resolves.
+let _voiceRolesPromise = null;
+function getVoiceRoles() {
+  if (!_voiceRolesPromise) {
+    _voiceRolesPromise = authFetch("/v1/api/models")
+      .then((r) => (r.ok ? r.json() : {}))
+      .then((d) => ({
+        stt: !!(d && d.stt_default_alias),
+        tts: !!(d && d.tts_default_alias),
+      }))
+      .catch(() => ({ stt: false, tts: false }));
+  }
+  return _voiceRolesPromise;
+}
+
+// Visually-hidden polite live region for voice status (recording / playback)
+// so screen-reader users perceive state changes otherwise conveyed only by
+// color/icon. Errors go through showToast (already a live region). Single
+// shared node; clear-then-set so repeated identical messages re-announce.
+let _voiceStatusEl = null;
+function voiceAnnounce(msg) {
+  if (!_voiceStatusEl) {
+    _voiceStatusEl = document.createElement("div");
+    _voiceStatusEl.className = "sr-only";
+    _voiceStatusEl.setAttribute("role", "status");
+    _voiceStatusEl.setAttribute("aria-live", "polite");
+    document.body.appendChild(_voiceStatusEl);
+  }
+  _voiceStatusEl.textContent = "";
+  window.setTimeout(() => {
+    if (_voiceStatusEl) _voiceStatusEl.textContent = msg;
+  }, 30);
+}
+
 class Pane {
   constructor(wsId) {
     this.id = "p" + ++_paneCounter;
@@ -35,6 +72,21 @@ class Pane {
     this._cancelTimeout = null;
     this._forceTimeout = null;
     this._pendingEditSend = null;
+    // Voice I/O (mic STT + per-message TTS playback)
+    this._voiceRoles = { stt: false, tts: false };
+    this._micBtn = null;
+    this._micIcon = null;
+    this._micDenied = false;
+    this._recorder = null;
+    this._recordingStream = null;
+    this._isRecording = false;
+    this._discardRecording = false;
+    this._recordAborted = false;
+    this._recordTimer = null;
+    this._recordStartMs = 0;
+    this._ttsAudio = null;
+    this._ttsBtnActive = null;
+    this._ttsSeq = 0;
     this._createDOM();
   }
 
@@ -48,6 +100,8 @@ class Pane {
     this._pendingEditSend = null;
     this.inputEl.disabled = false;
     this.attachments.clearChips();
+    this._stopRecording(true);
+    this._stopTTS();
   }
 
   updateWsName() {
@@ -73,6 +127,8 @@ class Pane {
       this.evtSource.close();
       this.evtSource = null;
     }
+    this._stopRecording(true);
+    this._stopTTS();
   }
 
   // composer.setBusy runs unconditionally so the Stop button label /
@@ -88,6 +144,16 @@ class Pane {
     const edge = next !== this.busy;
     this.busy = next;
     if (edge && !next) this.queue.onIdleEdge();
+    // The mic produces composer input the user can only send when idle — keep
+    // it in lockstep with the send button (which composer.setBusy gates).
+    if (this._micBtn && !this._micDenied) {
+      if (next) {
+        this._stopRecording(true); // abandon any in-flight recording
+        this._micBtn.disabled = true;
+      } else if (!this._micBtn.classList.contains("is-busy")) {
+        this._micBtn.disabled = false;
+      }
+    }
   }
 
   showEmptyState() {
@@ -671,6 +737,14 @@ class Pane {
           this._forceTimeout = null;
         }
       },
+    });
+
+    // Voice input: mic button, hidden until the STT role is confirmed
+    // available (so it never appears when voice isn't configured).
+    this._buildMicButton();
+    getVoiceRoles().then((roles) => {
+      this._voiceRoles = roles;
+      if (this._micBtn) this._micBtn.style.display = roles.stt ? "" : "none";
     });
   }
 
@@ -1350,6 +1424,364 @@ class Pane {
     bar.insertBefore(btn, bar.firstChild);
   }
 
+  // -------------------------------------------------------------------------
+  // Voice I/O: microphone dictation (STT) + per-message playback (TTS)
+  // -------------------------------------------------------------------------
+
+  _buildMicButton() {
+    if (!this.composer || !this.composer.actionsRowEl) return;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "composer-mic-btn";
+    btn.style.display = "none"; // revealed once the STT role is confirmed
+    btn.title = "Record speech to text";
+    btn.setAttribute("aria-label", "Record speech to text");
+    btn.setAttribute("aria-pressed", "false");
+    const icon = document.createElement("span");
+    icon.className = "composer-mic-icon icon-mic";
+    icon.setAttribute("aria-hidden", "true");
+    btn.appendChild(icon);
+    this._micIcon = icon;
+    btn.addEventListener("click", () => this._toggleRecording());
+    this.composer.actionsRowEl.insertBefore(btn, this.sendBtn || null);
+    this._micBtn = btn;
+  }
+
+  _syncMicButton() {
+    if (!this._micBtn) return;
+    const rec = !!this._isRecording;
+    this._micBtn.classList.toggle("is-recording", rec);
+    this._micBtn.setAttribute("aria-pressed", rec ? "true" : "false");
+    if (this._micIcon) {
+      this._micIcon.classList.toggle("icon-stop", rec);
+      this._micIcon.classList.toggle("icon-mic", !rec);
+    }
+    const label = rec
+      ? "Stop recording and transcribe"
+      : "Record speech to text";
+    this._micBtn.title = label;
+    this._micBtn.setAttribute("aria-label", label);
+  }
+
+  _toggleRecording() {
+    if (this._isRecording) {
+      this._stopRecording(false);
+    } else {
+      this._startRecording();
+    }
+  }
+
+  _startRecording() {
+    if (this._isRecording || this.busy) return;
+    if (
+      !navigator.mediaDevices ||
+      !navigator.mediaDevices.getUserMedia ||
+      typeof MediaRecorder === "undefined"
+    ) {
+      showToast("Microphone capture is not supported in this browser", "error");
+      return;
+    }
+    // Synchronous abort latch: if teardown (reset / pane switch) runs while the
+    // permission prompt is open, the stream the promise later hands us must be
+    // stopped instead of going hot after teardown.
+    this._recordAborted = false;
+    navigator.mediaDevices
+      .getUserMedia({ audio: true })
+      .then((stream) => {
+        if (this._recordAborted) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        this._recordingStream = stream;
+        let mimeType = "";
+        const candidates = [
+          "audio/webm;codecs=opus",
+          "audio/webm",
+          "audio/ogg;codecs=opus",
+          "audio/mp4",
+        ];
+        for (let i = 0; i < candidates.length; i++) {
+          if (
+            MediaRecorder.isTypeSupported &&
+            MediaRecorder.isTypeSupported(candidates[i])
+          ) {
+            mimeType = candidates[i];
+            break;
+          }
+        }
+        const rec = mimeType
+          ? new MediaRecorder(stream, { mimeType })
+          : new MediaRecorder(stream);
+        const chunks = [];
+        rec.addEventListener("dataavailable", (e) => {
+          if (e.data && e.data.size) chunks.push(e.data);
+        });
+        rec.addEventListener("stop", () => {
+          this._teardownRecordingStream();
+          this._isRecording = false;
+          this._stopRecordTimer();
+          this._syncMicButton();
+          const discard = this._discardRecording;
+          this._discardRecording = false;
+          if (discard) return;
+          const blob = new Blob(chunks, {
+            type: rec.mimeType || mimeType || "audio/webm",
+          });
+          if (blob.size) this._uploadForTranscription(blob);
+        });
+        this._recorder = rec;
+        this._isRecording = true;
+        this._discardRecording = false;
+        this._startRecordTimer();
+        this._syncMicButton();
+        voiceAnnounce(
+          "Recording. Activate the microphone button again to stop.",
+        );
+        rec.start();
+      })
+      .catch(() => {
+        // Denied / hardware unavailable: leave a persistent disabled state with
+        // guidance — a hot button reads as dead once the browser blocks re-prompts.
+        this._teardownRecordingStream();
+        this._isRecording = false;
+        this._stopRecordTimer();
+        this._setMicDenied();
+      });
+  }
+
+  _setMicDenied() {
+    this._micDenied = true;
+    showToast("Microphone access was denied", "error");
+    this._syncMicButton();
+    if (this._micBtn) {
+      this._micBtn.disabled = true;
+      const msg =
+        "Microphone blocked — enable it in your browser's site settings";
+      this._micBtn.title = msg;
+      this._micBtn.setAttribute("aria-label", msg);
+    }
+  }
+
+  _startRecordTimer() {
+    this._recordStartMs = Date.now();
+    this._stopRecordTimer();
+    this._recordTimer = window.setInterval(() => this._tickRecordTimer(), 500);
+  }
+
+  _stopRecordTimer() {
+    if (this._recordTimer) {
+      window.clearInterval(this._recordTimer);
+      this._recordTimer = null;
+    }
+  }
+
+  _tickRecordTimer() {
+    if (!this._isRecording || !this._micBtn) return;
+    const secs = Math.max(
+      0,
+      Math.floor((Date.now() - this._recordStartMs) / 1000),
+    );
+    const mmss =
+      Math.floor(secs / 60) + ":" + String(secs % 60).padStart(2, "0");
+    this._micBtn.title = "Recording " + mmss + " — activate to stop";
+  }
+
+  _stopRecording(discard) {
+    this._discardRecording = !!discard;
+    this._recordAborted = true; // abort a getUserMedia still in flight
+    if (this._recorder && this._recorder.state !== "inactive") {
+      try {
+        this._recorder.stop();
+      } catch (e) {
+        /* already stopped */
+      }
+      return;
+    }
+    this._teardownRecordingStream();
+    this._stopRecordTimer();
+    if (this._isRecording) {
+      this._isRecording = false;
+      this._syncMicButton();
+    }
+  }
+
+  _teardownRecordingStream() {
+    if (this._recordingStream) {
+      this._recordingStream.getTracks().forEach((t) => t.stop());
+      this._recordingStream = null;
+    }
+    this._recorder = null;
+  }
+
+  _uploadForTranscription(blob) {
+    if (!this.wsId) return;
+    const ext =
+      blob.type.indexOf("ogg") !== -1
+        ? "ogg"
+        : blob.type.indexOf("mp4") !== -1
+          ? "mp4"
+          : "webm";
+    const fd = new FormData();
+    fd.append("audio", blob, "speech." + ext);
+    if (this._micBtn) {
+      this._micBtn.disabled = true;
+      this._micBtn.classList.add("is-busy");
+    }
+    voiceAnnounce("Transcribing…");
+    authFetch(
+      "/v1/api/workstreams/" +
+        encodeURIComponent(this.wsId) +
+        "/speech-to-text",
+      { method: "POST", body: fd },
+    )
+      .then((r) => r.json().then((body) => ({ ok: r.ok, body })))
+      .then((res) => {
+        if (!res.ok) {
+          showToast(
+            (res.body && res.body.error) || "Transcription failed",
+            "error",
+          );
+          return;
+        }
+        const text = (res.body && res.body.transcript) || "";
+        if (text && this.inputEl) {
+          const cur = this.inputEl.value || "";
+          this.inputEl.value = cur
+            ? cur.replace(/\s*$/, "") + " " + text
+            : text;
+          // Drive the composer's auto-resize + send-enable listeners.
+          this.inputEl.dispatchEvent(new Event("input", { bubbles: true }));
+          this.inputEl.focus();
+          voiceAnnounce("Transcript added to message.");
+        }
+      })
+      .catch((err) => {
+        showToast(
+          "Transcription failed: " + (err && err.message ? err.message : err),
+          "error",
+        );
+      })
+      .finally(() => {
+        if (this._micBtn && !this._micDenied) {
+          this._micBtn.disabled = !!this.busy;
+          this._micBtn.classList.remove("is-busy");
+        }
+      });
+  }
+
+  _addTtsAction(el) {
+    let bar = el.querySelector(".msg-actions");
+    if (!bar) {
+      bar = document.createElement("div");
+      bar.className = "msg-actions";
+      bar.setAttribute("role", "toolbar");
+      bar.setAttribute("aria-label", "Message actions");
+      el.appendChild(bar);
+    }
+    if (bar.querySelector(".msg-tts-btn")) return; // already added
+    const btn = document.createElement("button");
+    btn.className = "msg-action-btn msg-tts-btn";
+    btn.title = "Play response aloud";
+    btn.setAttribute("aria-label", "Play response aloud");
+    btn.setAttribute("aria-pressed", "false");
+    const icon = document.createElement("span");
+    icon.className = "icon-speaker";
+    icon.setAttribute("aria-hidden", "true");
+    btn.appendChild(icon);
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this._playMessageTTS(el, btn);
+    });
+    bar.appendChild(btn);
+  }
+
+  // Strip code blocks / inline code / rendered math so TTS doesn't read source
+  // or KaTeX accessibility text out character-by-character.
+  _extractSpeakableText(bodyEl) {
+    const clone = bodyEl.cloneNode(true);
+    clone
+      .querySelectorAll("pre, code, .katex, .katex-display")
+      .forEach((n) =>
+        n.replaceWith(document.createTextNode(" (code omitted) ")),
+      );
+    return (clone.textContent || "").replace(/\s+/g, " ").trim();
+  }
+
+  _playMessageTTS(el, btn) {
+    // Toggle: clicking the active button (or any while playing) stops first.
+    if (this._ttsAudio) {
+      const wasThis = this._ttsBtnActive === btn;
+      this._stopTTS();
+      if (wasThis) return;
+    }
+    const bodyEl = el.querySelector(".msg-body") || el;
+    const text = this._extractSpeakableText(bodyEl);
+    if (!text) return;
+    // Serialize: a monotonic token guards against an earlier (slower) request
+    // resolving after a newer one — which would double-play and leak the blob.
+    const token = ++this._ttsSeq;
+    btn.classList.add("is-busy");
+    btn.disabled = true;
+    authFetch("/v1/api/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    })
+      .then((r) => {
+        if (!r.ok) {
+          return r.json().then((b) => {
+            throw new Error((b && b.error) || "Speech synthesis failed");
+          });
+        }
+        return r.blob();
+      })
+      .then((audioBlob) => {
+        const url = URL.createObjectURL(audioBlob);
+        if (token !== this._ttsSeq) {
+          URL.revokeObjectURL(url); // superseded — don't play or leak
+          return;
+        }
+        const audio = new Audio(url);
+        this._ttsAudio = audio;
+        this._ttsBtnActive = btn;
+        btn.classList.add("is-playing");
+        btn.setAttribute("aria-pressed", "true");
+        voiceAnnounce("Playing response.");
+        audio.addEventListener("ended", () => this._stopTTS());
+        audio.addEventListener("error", () => this._stopTTS());
+        audio.play().catch(() => this._stopTTS());
+      })
+      .catch((err) => {
+        showToast(
+          err && err.message ? err.message : "Speech synthesis failed",
+          "error",
+        );
+      })
+      .finally(() => {
+        btn.classList.remove("is-busy");
+        btn.disabled = false;
+      });
+  }
+
+  _stopTTS() {
+    this._ttsSeq++; // invalidate any in-flight request
+    if (this._ttsAudio) {
+      try {
+        this._ttsAudio.pause();
+      } catch (e) {
+        /* ignore */
+      }
+      const src = this._ttsAudio.src || "";
+      if (src.indexOf("blob:") === 0) URL.revokeObjectURL(src);
+      this._ttsAudio = null;
+    }
+    if (this._ttsBtnActive) {
+      this._ttsBtnActive.classList.remove("is-playing");
+      this._ttsBtnActive.setAttribute("aria-pressed", "false");
+      this._ttsBtnActive = null;
+    }
+  }
+
   _retryLast() {
     if (this.busy) return;
     // Path-keyed retry (#549). Truncation + re-dispatch happen
@@ -1836,7 +2268,11 @@ class Pane {
     }
     const assistants = this.messagesEl.querySelectorAll(".msg.assistant");
     if (assistants.length) {
-      this._addRetryAction(assistants[assistants.length - 1]);
+      const lastAssistant = assistants[assistants.length - 1];
+      this._addRetryAction(lastAssistant);
+      if (this._voiceRoles && this._voiceRoles.tts) {
+        this._addTtsAction(lastAssistant);
+      }
     }
   }
 
