@@ -2134,12 +2134,15 @@ class ChatSession:
         """Current per-ws SSE ring-buffer high-water mark for stamping
         saved messages with the ``Last-Event-ID`` resume cursor.
 
-        Returns ``getattr(self.ui, "_event_id", None)`` — ``None`` for
-        UIs without the counter (CLI / eval / placeholder), whose rows
-        then stay NULL and are treated by ``/history`` as "no
-        fast-forward cursor available" (the synthetic-snapshot floor).
+        ``None`` for UIs without an integer counter — CLI / eval /
+        placeholder UIs (no ``_event_id``), and test doubles whose
+        ``self.ui`` is a ``MagicMock`` (a non-int ``_event_id`` would
+        otherwise reach the INSERT and fail to bind).  Those rows stay
+        NULL and are treated by ``/history`` as "no fast-forward cursor
+        available" (the synthetic-snapshot floor).
         """
-        return getattr(self.ui, "_event_id", None)
+        eid = getattr(self.ui, "_event_id", None)
+        return eid if isinstance(eid, int) else None
 
     def _remaining_token_budget(self) -> int:
         """Estimate how many tokens are available for new content.

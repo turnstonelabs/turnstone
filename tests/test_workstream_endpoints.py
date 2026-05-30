@@ -1304,8 +1304,6 @@ class TestHistoryInteractive:
         ``cursor`` = the resolved boundary's event_id.  The client opens
         its initial SSE with that cursor so the delta rebuilds the turn.
         """
-        import json
-
         ws_id = "ws-cursor"
         _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
         _inject_storage.save_message(ws_id, "user", "kick off", event_id=10)
@@ -1340,8 +1338,6 @@ class TestHistoryInteractive:
         rendered block) and returns ``cursor: null`` — the client connects
         fresh to the synthetic-snapshot floor, never leaving the turn
         unrenderable."""
-        import json
-
         ws_id = "ws-cursor-reload"
         _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
         _inject_storage.save_message(ws_id, "user", "kick off", event_id=10)
