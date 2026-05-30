@@ -471,14 +471,18 @@ def test_snap_seq_high_water_mark_holds_under_writer_race() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _wire_events_handler(ui: _ConcreteUI) -> Any:
+def _wire_events_handler(ui: _ConcreteUI, *, state: str = "idle") -> Any:
     """Build a minimal ``make_events_handler`` closure that returns
     yields suitable for the EventSourceResponse generator.
 
     Calls the closure with a fake request; returns the inner generator
     AFTER it has been started so the test can iterate yields directly.
+
+    ``state`` sets the workstream's ``ws.state.value`` so a test can
+    exercise the error-state branch (the persisted ``last_error``
+    surface) without a real session.
     """
-    ws = SimpleNS(id=ui.ws_id, ui=ui, state=SimpleNS(value="idle"))
+    ws = SimpleNS(id=ui.ws_id, ui=ui, state=SimpleNS(value=state))
     mgr = MagicMock()
     mgr.get.return_value = ws
 
@@ -499,6 +503,7 @@ def _drain_handler_yields(
     headers: dict[str, str] | None = None,
     query: dict[str, str] | None = None,
     max_yields: int = 10,
+    state: str = "idle",
 ) -> tuple[list[Any], str]:
     """Synchronous helper: spin up the handler, drain up to N yields,
     return ``(raw_yields, decoded_blob)``.  Uses ``asyncio.run`` so
@@ -509,7 +514,7 @@ def _drain_handler_yields(
     returned for shape-level assertions (e.g. the first-yield
     ``retry`` check).
     """
-    handler = _wire_events_handler(ui)
+    handler = _wire_events_handler(ui, state=state)
     req = _fake_request(headers=headers, query=query, path_params={"ws_id": ui.ws_id})
 
     async def _run() -> list[Any]:
@@ -648,3 +653,51 @@ def test_handler_query_param_fallback_is_honoured() -> None:
     # Replay path: in_progress_snapshot SKIPPED, id:1 present.
     assert "in_progress_snapshot" not in blob
     assert "id: 1" in blob
+
+
+# ---------------------------------------------------------------------------
+# Fresh-connect replay completeness — persisted last_error surface
+# (sibling to the tool-call ``pending`` fix; the fresh-connect synthetic
+# path must reconstruct the same render state a reconnect's ring-buffer
+# replay would carry).
+# ---------------------------------------------------------------------------
+
+
+def test_handler_fresh_connect_in_error_state_surfaces_last_error(monkeypatch: Any) -> None:
+    """Fresh connect to a workstream sitting in the error state must
+    surface the persisted ``last_error`` so the operator sees WHY it
+    failed (the ``error`` text bubble), not just the bare error state +
+    retry.  ``on_error`` is never persisted as a message, so ``/history``
+    can't rebuild it — the ``last_error`` config row is the only durable
+    source.  Gated on the error state: a healthy (idle) ws skips the
+    storage read and surfaces nothing (no stale error on every load).
+    """
+    import turnstone.core.memory as memory_mod
+
+    monkeypatch.setattr(memory_mod, "load_last_error", lambda _ws: "boom: kaboom")
+
+    # Error state → surfaced.
+    err_ui = _make_ui()
+    _, err_blob = _drain_handler_yields(err_ui, state="error", max_yields=8)
+    assert '"type": "error"' in err_blob
+    assert "boom: kaboom" in err_blob
+
+    # Idle state → the gate skips it.
+    idle_ui = _make_ui()
+    _, idle_blob = _drain_handler_yields(idle_ui, state="idle", max_yields=8)
+    assert "boom: kaboom" not in idle_blob
+
+
+def test_handler_replay_ok_does_not_resurface_last_error(monkeypatch: Any) -> None:
+    """On the ``replay_ok`` (reconnect) path the ring buffer already
+    carries the original ``error`` event, so the synthetic last_error
+    surface must NOT fire — otherwise a reconnect to an errored ws would
+    double the error bubble.  The surface is fresh/truncated-only."""
+    import turnstone.core.memory as memory_mod
+
+    monkeypatch.setattr(memory_mod, "load_last_error", lambda _ws: "boom")
+
+    ui = _make_ui()
+    ui.on_content_token("hi")  # one buffered event so Last-Event-ID=0 → replay_ok
+    _, blob = _drain_handler_yields(ui, headers={"Last-Event-ID": "0"}, state="error", max_yields=8)
+    assert "boom" not in blob

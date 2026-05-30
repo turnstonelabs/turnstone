@@ -1921,6 +1921,39 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                                 }
                             )
                         }
+                    # Surface the persisted ``last_error`` so a fresh
+                    # connect to a workstream sitting in the error state
+                    # shows WHY it failed (the ``error`` text bubble), not
+                    # just the bare error state + retry affordance.
+                    # ``on_error`` is never persisted as a message, so
+                    # ``/history`` can't rebuild it — the ``last_error``
+                    # config row (set by ``_record_fatal_error``, cleared
+                    # on recovery) is the only durable source.  Gated on
+                    # the error state so a healthy ws skips the storage
+                    # read, and confined to this fresh/truncated path —
+                    # the ``replay_ok`` branch's ring buffer already
+                    # carries the original ``error`` event.
+                    try:
+                        if getattr(ws.state, "value", None) == "error":
+                            from turnstone.core.memory import load_last_error
+
+                            last_err = await asyncio.to_thread(load_last_error, ws_id)
+                            if last_err:
+                                yield {
+                                    "data": json.dumps(
+                                        {
+                                            "type": "error",
+                                            "message": last_err,
+                                            "ws_id": ws_id,
+                                        }
+                                    )
+                                }
+                    except Exception:
+                        log.debug(
+                            "ws.events.last_error_replay_failed ws=%s",
+                            ws_id[:8],
+                            exc_info=True,
+                        )
                 # Live phase — drain the per-UI listener queue
                 # until either the workstream closes or the client
                 # disconnects. 5s poll matches pre-lift interactive
