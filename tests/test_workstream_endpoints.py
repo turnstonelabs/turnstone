@@ -1108,22 +1108,70 @@ class TestHistoryInteractive:
         # call_2 result not yet persisted — operator refreshes here.
         mock_ws = MagicMock()
         mock_ws.id = ws_id
+        # Mid-EXECUTION, not awaiting approval: any approval already
+        # resolved, so ``_pending_approval`` is None.  The trailing orphan
+        # tool turn must therefore RENDER (``pending`` absent) — marking it
+        # pending is the fresh-connect-during-execution bug (the renderer
+        # skips pending turns, so the tool call vanishes until a reconnect
+        # replays the buffered events).
+        mock_ws.ui._pending_approval = None
         mock_mgr = MagicMock()
         mock_mgr.get.return_value = mock_ws
         client = _build_history_app(mock_mgr, _inject_storage)
 
         r = client.get(f"/v1/api/workstreams/{ws_id}/history")
         assert r.status_code == 200
-        roles = [m.get("role") for m in r.json()["messages"]]
+        messages = r.json()["messages"]
+        roles = [m.get("role") for m in messages]
         # All three rows survive — the trailing assistant + partial
         # tool result are what the operator was watching live.  The
         # default-repair shape would have been just ``["user"]``.
         assert roles == ["user", "assistant", "tool"]
+        # And the trailing tool-call turn is NOT pending → renders.
+        assistant_turn = next(m for m in messages if m.get("role") == "assistant")
+        assert assistant_turn.get("pending") is not True
 
         # Confirm the default-repair path collapses this to just the
         # user message — locks in the regression contract.
         with_repair = _inject_storage.load_messages(ws_id, repair=True)
         assert [m.get("role") for m in with_repair] == ["user"]
+
+    def test_trailing_tool_turn_pending_when_awaiting_approval(self, _inject_storage):
+        """Counterpart to the execution case: when the live session IS
+        awaiting approval (``_pending_approval`` set), the trailing orphan
+        tool-call turn is marked ``pending`` so the renderer skips the static
+        block — the SSE replay re-emits the interactive approve_request prompt
+        to render it instead.  Keeps the ``/history`` ``pending`` flag in
+        lockstep with the live approval signal (``_interactive_events_replay``).
+        """
+        import json
+
+        ws_id = "ws-awaiting"
+        _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
+        _inject_storage.save_message(ws_id, "user", "kick off")
+        tc_json = json.dumps(
+            [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"command":"ls"}'},
+                }
+            ]
+        )
+        _inject_storage.save_message(ws_id, "assistant", "Working", tool_calls=tc_json)
+        # No tool result yet AND the session is parked awaiting approval.
+        mock_ws = MagicMock()
+        mock_ws.id = ws_id
+        mock_ws.ui._pending_approval = {"type": "approve_request", "items": []}
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = mock_ws
+        client = _build_history_app(mock_mgr, _inject_storage)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}/history")
+        assert r.status_code == 200
+        messages = r.json()["messages"]
+        assistant_turn = next(m for m in messages if m.get("role") == "assistant")
+        assert assistant_turn.get("pending") is True
 
     def test_history_does_not_synthesize_orphan_results(self, _inject_storage):
         """``repair=False`` via ``/history`` must NOT splice synthetic
@@ -1152,6 +1200,7 @@ class TestHistoryInteractive:
         _inject_storage.save_message(ws_id, "assistant", "ok")
         mock_ws = MagicMock()
         mock_ws.id = ws_id
+        mock_ws.ui._pending_approval = None  # cancelled, not awaiting approval
         mock_mgr = MagicMock()
         mock_mgr.get.return_value = mock_ws
         client = _build_history_app(mock_mgr, _inject_storage)

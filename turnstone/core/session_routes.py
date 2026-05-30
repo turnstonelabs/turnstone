@@ -2829,6 +2829,22 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
                 await asyncio.to_thread(
                     extract_reasoning_for_history, messages, surface_persisted_reasoning
                 )
+                # ``pending`` on the trailing tool-call turn must track the
+                # LIVE awaiting-approval signal, not orphan-detection — an
+                # executing or interrupted orphan is not awaiting approval
+                # and must render its tool block on a fresh connect (else it
+                # vanishes until a reconnect replays the buffered events).
+                # Read ``_pending_approval`` off the loaded session; a
+                # storage-only / closed ws has no live session → never
+                # pending.  Stays in lockstep with the approve_request
+                # re-emit in the SSE replay (``_interactive_events_replay``).
+                # Asserted as ``dict`` (its only real production shape) to
+                # match the detail handler below, so a MagicMock-based unit
+                # test's auto-vivified attribute doesn't trip the path.
+                awaiting_approval = isinstance(
+                    getattr(getattr(live_session, "ui", None), "_pending_approval", None),
+                    dict,
+                )
                 # Final structural projection: flatten nested tool_calls,
                 # collapse multipart content, surface the
                 # ``_source`` / ``_reminders`` / ``_attachments_meta``
@@ -2839,7 +2855,9 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
                 # wire payload is the canonical render shape both the
                 # interactive ``replayHistory`` and the coordinator history
                 # rebuild consume directly — no client-side normaliser.
-                messages = await asyncio.to_thread(project_history_messages, messages)
+                messages = await asyncio.to_thread(
+                    project_history_messages, messages, awaiting_approval
+                )
             except Exception:
                 # Operationally interesting: a persistent decoration
                 # failure (missing migration, driver mismatch, schema

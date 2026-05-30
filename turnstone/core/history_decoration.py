@@ -565,7 +565,9 @@ def decorate_history_messages(
                 msg["advisories"] = advisories
 
 
-def project_history_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def project_history_messages(
+    messages: list[dict[str, Any]], awaiting_approval: bool = False
+) -> list[dict[str, Any]]:
     """Project decorated storage messages into the canonical wire shape.
 
     This is the SINGLE server-side projection that both the interactive
@@ -589,8 +591,24 @@ def project_history_messages(messages: list[dict[str, Any]]) -> list[dict[str, A
     - tool results: surface ``advisories``, coerce list content to a
       string, derive ``denied`` / ``is_error`` from the content prefix;
     - ``denied`` propagates from a tool result to its parent assistant
-      turn; ``pending`` marks ONLY the last assistant tool-call turn that
-      still has an orphan (a tool_call with no result in the window).
+      turn; ``pending`` marks the last assistant tool-call turn ONLY when
+      the workstream is genuinely awaiting approval for it
+      (*awaiting_approval*) — driven by the live ``_pending_approval``
+      signal, NOT orphan-detection.  An orphan that is executing or was
+      interrupted is not awaiting approval and must still render its tool
+      block.
+
+    *awaiting_approval* is the caller's live read of the workstream's
+    ``_pending_approval`` (``make_history_handler`` reads it off the
+    loaded session; ``False`` for a storage-only / closed ws).  It must
+    track the SAME signal that the SSE replay uses to re-emit the
+    interactive approve_request prompt (``_interactive_events_replay`` /
+    the coord replay): ``pending=True`` tells the renderer to SKIP the
+    static tool block precisely because that live prompt will render it
+    instead.  Deriving ``pending`` from orphan-detection alone desynced
+    the two — a tool call mid-execution (orphan, but not awaiting) was
+    marked pending, so it rendered from neither source on a fresh connect
+    and only reappeared on reconnect (ring-buffer event replay).
 
     Two projection responsibilities live HERE and nowhere else:
 
@@ -832,17 +850,24 @@ def project_history_messages(messages: list[dict[str, Any]]) -> list[dict[str, A
             history[last_assistant_idx]["denied"] = True
 
     # (9) Mark ``pending`` ONLY on the LAST assistant tool-call turn, and
-    #     only when it has an orphan (a tool_call with no result in the
-    #     loaded window) — the proxy for "awaiting approval".  A
-    #     mid-conversation cancelled/interrupted tool call is also an
-    #     orphan but must still render its tool block (not vanish), so it
-    #     is NOT marked pending.
-    for entry in reversed(history):
-        tcs = entry.get("tool_calls")
-        if tcs:
-            has_orphan = any(tc.get("id") and str(tc["id"]) not in resulted_call_ids for tc in tcs)
-            if has_orphan:
-                entry["pending"] = True
-            break
+    #     only when the workstream is genuinely awaiting approval for it
+    #     (``awaiting_approval`` — the live ``_pending_approval`` read)
+    #     AND it still has an orphan (a tool_call with no result in the
+    #     loaded window).  ``pending`` tells the renderer to skip the
+    #     static tool block because the SSE replay re-emits the live
+    #     approve_request prompt instead, so this must track the same
+    #     signal as that re-emit.  An orphan that is executing or was
+    #     interrupted is NOT awaiting approval, so it stays unmarked and
+    #     renders its tool block (the fresh-connect-during-execution gap).
+    if awaiting_approval:
+        for entry in reversed(history):
+            tcs = entry.get("tool_calls")
+            if tcs:
+                has_orphan = any(
+                    tc.get("id") and str(tc["id"]) not in resulted_call_ids for tc in tcs
+                )
+                if has_orphan:
+                    entry["pending"] = True
+                break
 
     return history

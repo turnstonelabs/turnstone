@@ -285,7 +285,54 @@ class TestProjectHistoryMessages:
         assert out[4]["denied"] is True  # tool deny derived from content prefix
         assert out[3]["denied"] is True  # propagated to the parent assistant turn
         assert out[5]["is_error"] is True  # tool error derived from content prefix
-        # pending ONLY on the last orphan turn
-        assert out[7].get("pending") is True  # trailing orphan c3 awaiting
+        # ``pending`` is a LIVE-state decision gated on ``awaiting_approval``
+        # (default False here) — NOT orphan-detection.  So even the trailing
+        # orphan renders its tool block by default; see
+        # ``test_pending_gated_on_awaiting_approval`` for the gate.
+        assert out[7].get("pending") is not True  # trailing orphan c3 — not awaiting → renders
         assert out[6].get("pending") is not True  # mid-conversation orphan c_mid renders
         assert out[1].get("pending") is not True  # resolved c1
+
+    def test_pending_gated_on_awaiting_approval(self) -> None:
+        """``pending`` marks the LAST orphan tool-call turn only when the
+        caller passes ``awaiting_approval=True`` (the live ``_pending_approval``
+        read).  This is the regression guard for the fresh-connect bug: an
+        orphan tool call mid-execution is NOT awaiting approval, so it must
+        render its tool block (``pending`` absent) rather than vanish until a
+        reconnect replays the buffered events.
+        """
+        raw: list[dict[str, Any]] = [
+            # resolved turn (has a tool result)
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "res"},
+            # mid-conversation orphan (NOT the last tool turn)
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "c_mid", "function": {"name": "g", "arguments": "{}"}}],
+            },
+            {"role": "user", "content": "carry on"},
+            # trailing orphan (last tool turn, no result)
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "c_last", "function": {"name": "h", "arguments": "{}"}}],
+            },
+        ]
+
+        # Awaiting approval: ONLY the trailing orphan turn is pending.
+        awaiting = project_history_messages(raw, awaiting_approval=True)
+        assert awaiting[4].get("pending") is True  # trailing orphan → skip static, live prompt
+        assert awaiting[2].get("pending") is not True  # mid-conversation orphan still renders
+        assert awaiting[0].get("pending") is not True  # resolved turn
+
+        # Executing / not awaiting: NOTHING is pending — the trailing orphan
+        # (a tool mid-execution) renders its tool block on a fresh connect.
+        executing = project_history_messages(raw, awaiting_approval=False)
+        executing_pending = [entry.get("pending") for entry in executing]
+        assert executing_pending == [None, None, None, None, None]
+        # Default matches awaiting_approval=False.
+        default_pending = [entry.get("pending") for entry in project_history_messages(raw)]
+        assert default_pending == [None, None, None, None, None]
