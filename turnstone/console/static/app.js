@@ -2066,23 +2066,47 @@ function _renderHomeView() {
   }
   if (coordsFp !== _homeCoordsFingerprint) {
     _homeCoordsFingerprint = coordsFp;
-    const countEl = document.getElementById("active-coord-count");
-    if (countEl) {
-      countEl.textContent = coords.length ? "(" + coords.length + ")" : "";
+    // Header summary mirrors the server dashboard's wording exactly
+    // ("N active · M total"; active = non-idle) so the two surfaces read
+    // the same.
+    const total = coords.length;
+    let active = 0;
+    for (let i = 0; i < coords.length; i++) {
+      if ((coords[i].state || "idle") !== "idle") active++;
     }
-    const listEl = document.getElementById("active-coord-list");
-    if (listEl) {
-      listEl.replaceChildren();
-      if (!coords.length) {
+    const summaryEl = document.getElementById("active-coord-summary");
+    if (summaryEl) {
+      summaryEl.textContent = active + " active · " + total + " total";
+    }
+    const rowsEl = document.getElementById("active-coord-rows");
+    const colHeadersEl = document.getElementById("active-coord-colheaders");
+    const footerEl = document.getElementById("active-coord-footer");
+    const footerCountEl = document.getElementById("active-coord-footer-count");
+    if (rowsEl) {
+      if (!total) {
+        // Empty: hide the column-header band (no columns to label) but keep
+        // the footer so the card retains its rounded, bordered bottom edge
+        // rather than an open-bottomed header over the empty-state copy.
+        if (colHeadersEl) colHeadersEl.style.display = "none";
+        if (footerEl) footerEl.style.display = "";
+        if (footerCountEl) footerCountEl.textContent = "0 coordinators";
         const empty = document.createElement("div");
         empty.className = "dashboard-empty";
         empty.textContent = "No active coordinator sessions. Start one above.";
-        listEl.appendChild(empty);
+        rowsEl.replaceChildren(empty);
       } else {
-        // Reuse the shared tree-grouped renderer so coordinators on
-        // the landing page get the same glyphs, child-count badges,
-        // and row treatment as the legacy dashboard.
-        renderWsTable(listEl, coords);
+        // Reveal the column-header band + footer (static siblings of the
+        // rows container, so renderWsTable's replaceChildren leaves them
+        // intact), then reuse the shared tree-grouped renderer so the rows
+        // get the same labelled columns, glyphs, child-count badges, and
+        // treatment as the Nodes table and the server's Workstreams card.
+        if (colHeadersEl) colHeadersEl.style.display = "";
+        if (footerEl) footerEl.style.display = "";
+        if (footerCountEl) {
+          footerCountEl.textContent =
+            total + (total === 1 ? " coordinator" : " coordinators");
+        }
+        renderWsTable(rowsEl, coords);
       }
     }
   }
@@ -2172,6 +2196,7 @@ const _coordTable = createSavedTable({
   bodyEl: document.getElementById("saved-coord-cards"),
   filterEl: document.getElementById("coord-filter"),
   footerEl: document.getElementById("coord-saved-footer"),
+  paginationEl: document.getElementById("coord-pagination"),
   columns: COORD_COLUMNS,
   noun: "coordinator",
   emptyText: "No saved coordinators",

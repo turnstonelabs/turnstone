@@ -223,6 +223,10 @@ function renderSessionRow(sess, opts) {
      headerEl, bodyEl  — the .dash-colheaders + .dash-table elements
      filterEl          — optional <input> for the client-side name filter
      footerEl          — optional element for the count line
+     paginationEl      — optional .pagination container; the table fills it
+                         with Prev / “page X / Y” / Next and hides it when
+                         the list fits on one page or delete mode is active
+     pageSize          — rows per page (default 20)
      columns           — array from SavedColumns
      noun              — "workstream" / "coordinator"
      onActivate        — sess => void (resume); gated by delete mode
@@ -237,7 +241,12 @@ function createSavedTable(opts) {
     sortKey: "updated",
     sortDir: -1,
     compact: false,
+    page: 0,
   };
+  /* Client-side page size — the list is fetched whole and sliced here, so
+     the visible page (and therefore the delete controller's Select-All
+     fan-out) is capped at this many rows. */
+  var pageSize = opts.pageSize || 20;
 
   var controller = createSavedCardsController({
     idPrefix: opts.delete.idPrefix,
@@ -347,6 +356,9 @@ function createSavedTable(opts) {
           /* text columns default A→Z, everything else newest/highest-first */
           state.sortDir = col.key === "name" || col.key === "model" ? 1 : -1;
         }
+        /* Re-sorting reshuffles which rows land on which page; jump back to
+           the first page so the user isn't stranded mid-list. */
+        state.page = 0;
         render();
       }
       h.onclick = doSort;
@@ -360,15 +372,40 @@ function createSavedTable(opts) {
     });
   }
 
-  function renderFooter(visibleCount) {
+  /* footer copy:
+       filteredCount — rows after the name filter (the paginated population)
+       start         — index of the first visible row within filteredCount
+       shown         — rows actually painted this page
+       pages         — total page count for filteredCount
+     When the list spans more than one page the footer leads with the
+     visible range so the Prev/Next control reads as intentional paging, not
+     a silent truncation. */
+  function renderFooter(filteredCount, start, shown, pages) {
     if (!opts.footerEl) return;
     var total = state.items.length;
     var noun = opts.noun + (total === 1 ? "" : "s");
-    /* The empty/filtered body message owns the "no match" copy; the footer
-       stays a plain total so the two don't say the same thing twice. */
-    if (state.filter && visibleCount > 0 && visibleCount !== total) {
+    if (pages > 1 && filteredCount > 0) {
+      var rangeNoun = opts.noun + (filteredCount === 1 ? "" : "s");
+      var range =
+        "Showing " +
+        (start + 1) +
+        "–" +
+        (start + shown) +
+        " of " +
+        filteredCount +
+        " " +
+        rangeNoun;
+      opts.footerEl.textContent = state.filter
+        ? range + " matching “" + state.filter + "”"
+        : range;
+      return;
+    }
+    /* Single page: the empty/filtered body message owns the "no match" copy,
+       so the footer stays a plain total — the two don't say the same thing
+       twice. */
+    if (state.filter && filteredCount > 0 && filteredCount !== total) {
       opts.footerEl.textContent =
-        visibleCount +
+        filteredCount +
         " of " +
         total +
         " " +
@@ -381,16 +418,81 @@ function createSavedTable(opts) {
     }
   }
 
+  /* Fill the optional .pagination container with Prev / “page X / Y” / Next.
+     Hidden when the list fits on one page or while multi-selecting: paging
+     in delete mode would orphan the user's checkbox selections, which live
+     on the visible page only.  Buttons are rebuilt each render so their
+     onclick closures always page over the current filtered/sorted list.
+     The page label is intentionally NOT a live region — the footer (already
+     aria-live) announces the resulting "Showing X–Y of Z" range. */
+  function renderPagination(pages) {
+    if (!opts.paginationEl) return;
+    var pag = opts.paginationEl;
+    if (pages <= 1 || controller.inMode()) {
+      pag.style.display = "none";
+      pag.replaceChildren();
+      /* Don't leave an empty navigation landmark (or a stale label) behind
+         when the pager isn't shown — the visible branch re-applies both. */
+      pag.removeAttribute("role");
+      pag.removeAttribute("aria-label");
+      return;
+    }
+    pag.style.display = "";
+    pag.setAttribute("role", "navigation");
+    /* state.page is 0-based here; the legacy console pager
+       (console/static/app.js renderPagination) is 1-based.  The rendered
+       "X / Y" is identical — only the internal index differs — so don't
+       assume a shared base if the two are ever unified. */
+    var prev = document.createElement("button");
+    prev.type = "button";
+    prev.setAttribute("aria-label", "Previous page");
+    prev.textContent = "◄ Prev";
+    prev.disabled = state.page <= 0;
+    prev.onclick = function () {
+      if (state.page > 0) {
+        state.page--;
+        render();
+      }
+    };
+    var label = document.createElement("span");
+    label.textContent = state.page + 1 + " / " + pages;
+    var next = document.createElement("button");
+    next.type = "button";
+    next.setAttribute("aria-label", "Next page");
+    next.textContent = "Next ►";
+    next.disabled = state.page >= pages - 1;
+    next.onclick = function () {
+      if (state.page < pages - 1) {
+        state.page++;
+        render();
+      }
+    };
+    pag.replaceChildren(prev, label, next);
+    pag.setAttribute(
+      "aria-label",
+      "Saved " + opts.noun + "s — page " + (state.page + 1) + " of " + pages,
+    );
+  }
+
   function render() {
     var cols = visibleColumns();
-    var rows = sorted();
+    var all = sorted();
+    var filteredCount = all.length;
+    /* Clamp the page after a delete / filter / upstream churn shrinks the
+       list, then slice to it.  The delete controller only ever sees the
+       visible page, so its Select-All / count can't reach off-page rows. */
+    var pages = Math.max(1, Math.ceil(filteredCount / pageSize));
+    if (state.page > pages - 1) state.page = pages - 1;
+    if (state.page < 0) state.page = 0;
+    var start = state.page * pageSize;
+    var rows = all.slice(start, start + pageSize);
     controller.setItems(rows);
     /* One grid write per render: rows read it from the inherited CSS var. */
     if (opts.bodyEl) {
       opts.bodyEl.style.setProperty("--saved-grid", gridTemplate(cols));
       opts.bodyEl.replaceChildren();
     }
-    if (!rows.length) {
+    if (!filteredCount) {
       /* Empty state owns the space — hide the column headers so it doesn't
          read as a broken grid. */
       if (opts.headerEl) opts.headerEl.style.display = "none";
@@ -417,7 +519,8 @@ function createSavedTable(opts) {
       });
     }
     if (controller.inMode()) controller.refreshBar();
-    renderFooter(rows.length);
+    renderPagination(pages);
+    renderFooter(filteredCount, start, rows.length, pages);
   }
 
   /* Debounce only the filter keystrokes; setItems / sort / delete render
@@ -428,6 +531,9 @@ function createSavedTable(opts) {
       if (filterTimer) clearTimeout(filterTimer);
       filterTimer = setTimeout(function () {
         state.filter = opts.filterEl.value.trim().toLowerCase();
+        /* A narrower filter usually means fewer pages; restart at page 1 so
+           the user lands on matches rather than an out-of-range page. */
+        state.page = 0;
         render();
       }, 120);
     });

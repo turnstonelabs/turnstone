@@ -279,7 +279,24 @@ body {
   font-weight: 600;
   letter-spacing: 0.1em;
 }
-.dash-header-summary { color: var(--fg-dim); font-size: 11px; }
+.dash-header-summary { color: var(--fg-dim); font-size: 11px; font-variant-numeric: tabular-nums; }
+
+/* Footer bar — the bottom counterpart to .dash-header.  Shared so the
+   server's Workstreams card and the console's active-Coordinators card read
+   the same; per-surface spacing (e.g. the server's bottom margin) is layered
+   on in each app's stylesheet. */
+.dash-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 16px;
+  background: var(--code-bg);
+  border-top: 1px solid var(--border);
+  border-radius: 0 0 var(--radius) var(--radius);
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+.dash-footer-count { font-variant-numeric: tabular-nums; }
 
 .dash-colheaders {
   display: grid;

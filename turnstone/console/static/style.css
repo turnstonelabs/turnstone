@@ -127,48 +127,6 @@
   white-space: nowrap;
 }
 
-.home-section {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-/* Mirrors .section-header (the 'NODES' heading below) so coordinators
-   and nodes read as peer sections instead of one looking demoted. */
-.home-section-title {
-  margin: 0;
-  font-family: var(--font-ui);
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--accent);
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.home-section-count {
-  color: var(--fg-dim);
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-}
-/* Right-align action buttons (e.g. Saved Coordinators "Delete") inside
-   .home-section-title without breaking the count's natural left position. */
-.home-section-title .home-section-action {
-  margin-left: auto;
-}
-
-/* Saved Coordinators scroll-all (no pagination); the shared createSavedTable
-   in /shared/cards.js owns filter + sort + render. */
-
-.home-coord-list {
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  overflow: hidden;
-}
-.home-coord-list .dashboard-empty {
-  padding: 18px 0;
-}
-
 /* Sub-700px: collapse the composer row and tighten padding.  The
    phase-4 designer-review "composer wrap 340-699px" observation is
    fully covered by this full-stack rule — the flex math at ≥701px

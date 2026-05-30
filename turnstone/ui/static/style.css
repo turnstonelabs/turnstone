@@ -2266,16 +2266,10 @@ audio.media-player {
   cursor: pointer;
 }
 
-/* Dashboard footer */
+/* Dashboard footer — the bar styling now lives in /shared/base.css; the
+   server keeps its own bottom margin to space the footer from the saved-
+   workstreams section below. */
 .dash-footer {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 8px 16px;
-  background: var(--code-bg);
-  border-top: 1px solid var(--border);
-  border-radius: 0 0 var(--radius) var(--radius);
-  font-size: 11px;
   margin-bottom: 24px;
 }
 .dash-footer-nodes {

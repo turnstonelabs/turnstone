@@ -259,10 +259,10 @@
    for DOM inspection and as a future hook. */
 
 /* ==========================================================================
-   Pagination — used by the console's filtered admin lists.  The saved
-   workstream / coordinator lists scroll-all now (see createSavedTable), so
-   this control is no longer wired to them; it lives in /shared so the
-   remaining admin surfaces can't drift apart.
+   Pagination — shared by the console's filtered admin lists and the saved
+   workstream / coordinator tables (createSavedTable fills the container with
+   Prev / “page X / Y” / Next, 20 rows per page).  Lives in /shared so the
+   surfaces that use it can't drift apart.
    ========================================================================== */
 .pagination {
   display: flex;
@@ -364,6 +364,15 @@
    near-zero --row-alt vanishes on a long list) and full-opacity muted text
    (AA-legible colours, no opacity hacks).  Idle-dimming is avoided at the
    source — renderSessionRow only sets data-state for `error`. */
+/* Saved rows are always interactive — resume on click, or toggle a checkbox
+   in delete mode — so they own the pointer cursor here rather than relying on
+   each app's `.dash-row` convention.  The server sets `cursor: pointer` on
+   every `.dash-row`; the console scopes it to `.dash-row.has-link` (a class
+   the shared row builder doesn't set), so without this the console's saved
+   rows fell back to the base `cursor: default`. */
+.saved-row {
+  cursor: pointer;
+}
 .saved-row .dash-row-main {
   padding: 8px 16px;
   /* one CSS var, set per render by createSavedTable (responsive-aware) */
@@ -455,6 +464,32 @@
   padding: 9px 16px;
   font-size: 11px;
   color: var(--fg-dim);
+}
+
+/* Footer + pager share one justified row: the dim range readout anchors the
+   left edge, the Prev/Next control docks to the right gutter on the same
+   baseline, so the count and the navigation that moves it read as one region
+   instead of a left-aligned count floating above a centred pager.  Scoped to
+   the saved table — the standalone `.pagination` the console's filtered admin
+   lists use keeps its own centred block layout. */
+.saved-pager-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.saved-pager-row .pagination {
+  padding: 6px 16px;
+}
+@media (max-width: 760px) {
+  .saved-pager-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+  }
+  .saved-pager-row .pagination {
+    justify-content: center;
+  }
 }
 
 /* Delete mode on rows: the shared controller inserts an absolute checkbox

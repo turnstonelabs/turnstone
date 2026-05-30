@@ -231,13 +231,20 @@
             role="group"
             aria-label="Saved workstreams"
           ></div>
-          <div
-            class="saved-footer"
-            id="ws-saved-footer"
-            role="status"
-            aria-live="polite"
-            aria-atomic="true"
-          ></div>
+          <div class="saved-pager-row">
+            <div
+              class="saved-footer"
+              id="ws-saved-footer"
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+            ></div>
+            <div
+              class="pagination"
+              id="ws-pagination"
+              style="display: none"
+            ></div>
+          </div>
           <div id="ws-delete-bar" class="ws-delete-bar">
             <span
               class="ws-delete-count-label"

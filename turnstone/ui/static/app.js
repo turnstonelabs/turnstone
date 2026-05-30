@@ -4111,11 +4111,15 @@ function toggleDashboard() {
 // area.  Clears any cards AND hides the pagination control \u2014 it's a sibling
 // of the cards container, so a bare replaceChildren on the cards alone would
 // leave stale Prev/Next visible and still wired to the previous list cache.
-// A successful load re-shows both via _wsTable.setItems.
+// A successful load re-shows it (and the footer) via _wsTable.setItems.
 function _setSavedWsMessage(text) {
   document
     .getElementById("dashboard-saved-cards")
     .replaceChildren(makeEmptyState(text));
+  const pag = document.getElementById("ws-pagination");
+  if (pag) pag.style.display = "none";
+  const footer = document.getElementById("ws-saved-footer");
+  if (footer) footer.textContent = "";
 }
 
 function loadDashboard() {
@@ -4308,6 +4312,7 @@ const _wsTable = createSavedTable({
   bodyEl: document.getElementById("dashboard-saved-cards"),
   filterEl: document.getElementById("ws-filter"),
   footerEl: document.getElementById("ws-saved-footer"),
+  paginationEl: document.getElementById("ws-pagination"),
   columns: WS_COLUMNS,
   noun: "workstream",
   emptyText: "No saved workstreams",
