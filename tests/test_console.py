@@ -1105,15 +1105,20 @@ class TestConsoleHTTPEndpoints:
     def test_index_landing_surfaces(self, client):
         status, body, ct = self._get_raw(client, "/")
         assert status == 200
-        # Coordinator-first landing keeps the node list always-visible.
-        assert 'id="view-overview"' in body
-        assert 'id="node-table"' in body
+        # Nodes are reached through the bottom-bar node picker; the old
+        # always-visible NODES table was replaced by it.
+        assert 'id="csb-node-picker"' in body
+        assert 'id="csb-np-trigger"' in body
+        assert 'id="csb-np-menu"' in body
         # Removed in the 1.5.0 landing-page cleanup — guard against
         # accidental reintroduction.
         assert 'id="new-ws-overlay"' not in body
         assert 'id="new-ws-btn"' not in body
         assert 'id="cluster-summary-compact"' not in body
         assert 'id="view-node"' not in body
+        # Replaced by the node picker — guard against reintroduction.
+        assert 'id="view-overview"' not in body
+        assert 'id="node-table"' not in body
 
 
 # ---------------------------------------------------------------------------

@@ -353,6 +353,179 @@
   flex-shrink: 0;
 }
 
+/* ==========================================================================
+   Node picker — bottom-bar dropdown that replaced the NODES table
+   ========================================================================== */
+.csb-node-picker {
+  position: relative;
+  flex-shrink: 0;
+}
+.csb-np-trigger {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  background: none;
+  color: var(--fg-dim);
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background 0.15s,
+    border-color 0.15s,
+    color 0.15s;
+}
+.csb-np-trigger:hover {
+  background: var(--bg-highlight);
+  border-color: var(--border-strong);
+  color: var(--fg-bright);
+}
+.csb-np-trigger:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.csb-np-trigger[aria-expanded="true"] {
+  background: var(--bg-highlight);
+  border-color: var(--border-strong);
+}
+.csb-np-caret {
+  font-size: 9px;
+  color: var(--fg-dim);
+  transition: transform 0.18s ease;
+}
+.csb-np-trigger[aria-expanded="true"] .csb-np-caret {
+  transform: rotate(180deg);
+}
+.csb-np-ver {
+  color: var(--fg-dim);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  margin-left: 2px;
+}
+.csb-np-drift {
+  font-size: 9px;
+  font-family: var(--font-ui);
+  font-weight: 600;
+  /* Solid amber chip — dark text on fill so it reads as a true alert,
+     not a faint yellow-on-yellow smudge at 9px. */
+  color: var(--bg);
+  background: var(--yellow);
+  border: 1px solid var(--yellow);
+  border-radius: var(--radius-sm);
+  padding: 0 5px;
+  margin-left: 2px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+/* Popup list — anchored to the trigger, opens upward over the bar */
+.csb-np-menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  right: 0;
+  min-width: 220px;
+  /* Cap by viewport too so a tall list never touches the top edge on a
+     short window; the bar + a margin reserve the trailing 64px. */
+  max-height: min(60vh, calc(100vh - 64px), 420px);
+  overflow-y: auto;
+  scrollbar-width: thin;
+  padding: 4px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  box-shadow:
+    0 8px 28px -6px rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  z-index: 200;
+}
+.csb-np-menu[hidden] {
+  display: none;
+}
+.csb-np-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--fg-bright);
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+.csb-np-item:hover,
+.csb-np-item:focus-visible {
+  background: var(--bg-highlight);
+  outline: none;
+}
+.csb-np-item:focus-visible {
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+/* Status by shape AND colour (color-blind-safe) — mirrors the
+   .csb-state-dot vocabulary: round = healthy, diamond = degraded,
+   sharp square = unreachable. */
+.csb-np-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--green);
+  box-shadow: 0 0 4px var(--green-glow);
+}
+.csb-np-dot.degraded {
+  background: var(--accent);
+  box-shadow: 0 0 4px var(--accent-glow-strong);
+  border-radius: 1px;
+  transform: rotate(45deg);
+}
+.csb-np-dot.unreachable {
+  background: var(--red);
+  box-shadow: 0 0 4px var(--red-glow);
+  border-radius: 0;
+}
+.csb-np-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.csb-np-state {
+  font-size: 9px;
+  font-family: var(--font-ui);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+.csb-np-state.down {
+  color: var(--red);
+}
+.csb-np-ws {
+  color: var(--fg-dim);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+.csb-np-ws.has-value {
+  color: var(--fg-bright);
+}
+.csb-np-empty {
+  padding: 10px 12px;
+  color: var(--fg-dim);
+  font-size: 12px;
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+
 .csb-loading {
   color: var(--fg-dim);
   font-size: 11px;
@@ -390,335 +563,6 @@
   letter-spacing: 0.1em;
   margin-bottom: 12px;
   text-transform: uppercase;
-}
-
-/* ==========================================================================
-   Node table — column headers
-   ========================================================================== */
-.node-colheaders {
-  display: grid;
-  grid-template-columns: 1fr 50px 50px 50px 70px 60px 140px;
-  padding: 6px 16px;
-  background: var(--bg-surface);
-  border-bottom: 1px solid var(--border-strong);
-  font-size: 10px;
-  font-family: var(--font-ui);
-  font-weight: 600;
-  color: var(--fg-dim);
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  position: sticky;
-  top: 0;
-  z-index: 10;
-}
-.ncol-ws,
-.ncol-run,
-.ncol-attn,
-.ncol-tokens {
-  text-align: right;
-}
-.ncol-health,
-.node-cell-health {
-  padding-left: 10px;
-}
-
-/* ==========================================================================
-   Node rows — individual instrument readouts
-   ========================================================================== */
-.node-row {
-  display: grid;
-  grid-template-columns: 1fr 50px 50px 50px 70px 60px 140px;
-  padding: 9px 16px;
-  cursor: pointer;
-  transition:
-    background 0.12s ease,
-    border-color 0.12s ease,
-    box-shadow 0.12s ease;
-  border-left: 3px solid transparent;
-  position: relative;
-}
-.node-row:nth-child(odd) {
-  background: var(--bg);
-}
-.node-row:nth-child(even) {
-  background: var(--row-alt);
-}
-.node-row:hover {
-  background: var(--bg-highlight);
-  box-shadow: inset 0 0 0 1px var(--border);
-}
-.node-row:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-}
-.node-row.has-attention {
-  border-left-color: var(--yellow);
-  background: linear-gradient(90deg, var(--yellow-glow), transparent 30%);
-}
-.node-row.has-running {
-  border-left-color: var(--green);
-  background: linear-gradient(90deg, var(--green-glow), transparent 30%);
-}
-.node-row.has-thinking {
-  border-left-color: var(--cyan);
-  background: linear-gradient(90deg, var(--cyan-glow), transparent 30%);
-}
-.node-row.has-error {
-  border-left-color: var(--red);
-  background: linear-gradient(90deg, var(--red-glow), transparent 30%);
-}
-.node-row.has-attention:hover,
-.node-row.has-running:hover,
-.node-row.has-thinking:hover,
-.node-row.has-error:hover {
-  background: var(--bg-highlight);
-}
-
-.node-cell {
-  font-size: 12px;
-  display: flex;
-  align-items: center;
-}
-.node-cell-name {
-  color: var(--fg-bright);
-  font-weight: 500;
-  gap: 8px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.node-cell-name .node-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--green);
-  flex-shrink: 0;
-  box-shadow: 0 0 4px var(--green-glow);
-}
-.node-cell-name .node-dot.unreachable {
-  background: var(--red);
-  box-shadow: 0 0 4px var(--red-glow);
-}
-.node-cell-name .node-dot.degraded {
-  background: var(--accent);
-  box-shadow: 0 0 4px var(--accent-glow-strong);
-}
-.node-degraded-badge {
-  font-size: 9px;
-  font-family: var(--font-ui);
-  font-weight: 600;
-  color: var(--accent);
-  background: var(--accent-dim);
-  border: 1px solid var(--accent);
-  border-radius: var(--radius-sm);
-  padding: 0 5px;
-  margin-left: 6px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  line-height: 1.6;
-  flex-shrink: 0;
-}
-
-/* Version drift */
-.node-cell-version {
-  font-size: 11px;
-  color: var(--fg-dim);
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 4px;
-  font-variant-numeric: tabular-nums;
-}
-.node-cell-version.drift {
-  color: var(--yellow);
-}
-.ncol-version {
-  text-align: right;
-}
-.node-version-drift-badge {
-  font-size: 9px;
-  font-family: var(--font-ui);
-  font-weight: 600;
-  color: var(--yellow);
-  background: var(--yellow-glow);
-  border: 1px solid var(--yellow);
-  border-radius: var(--radius-sm);
-  padding: 0 5px;
-  margin-left: 4px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  line-height: 1.6;
-  flex-shrink: 0;
-}
-.csb-version-drift .drift-warn {
-  color: var(--yellow);
-  font-weight: 600;
-  font-size: 11px;
-  letter-spacing: 0.06em;
-}
-
-.node-cell-num {
-  color: var(--fg-dim);
-  font-size: 11px;
-  justify-content: flex-end;
-  font-variant-numeric: tabular-nums;
-}
-.node-cell-num.has-value {
-  color: var(--fg-bright);
-}
-.node-cell-health {
-  gap: 8px;
-  font-size: 11px;
-  color: var(--fg-dim);
-  font-variant-numeric: tabular-nums;
-}
-
-/* Health bar — precision gauge */
-.health-bar {
-  width: 80px;
-  height: 4px;
-  background: var(--bg-highlight);
-  border-radius: 2px;
-  overflow: hidden;
-  position: relative;
-}
-.health-bar-fill {
-  display: block;
-  height: 100%;
-  min-width: 3px;
-  border-radius: 2px;
-  transition: width 0.3s ease;
-}
-.health-bar-fill.low {
-  background: var(--green);
-  box-shadow: 0 0 4px var(--green-glow);
-}
-.health-bar-fill.mid {
-  background: var(--yellow);
-  box-shadow: 0 0 4px var(--yellow-glow);
-}
-.health-bar-fill.high {
-  background: var(--red);
-  box-shadow: 0 0 4px var(--red-glow);
-}
-
-/* ==========================================================================
-   Node groups — rack panel sections
-   ========================================================================== */
-.node-group {
-  margin-bottom: 1px;
-}
-
-.node-group-header {
-  display: grid;
-  grid-template-columns: 1fr 50px 50px 50px 70px 60px 140px;
-  padding: 10px 16px;
-  cursor: pointer;
-  transition:
-    background 0.12s ease,
-    border-color 0.12s ease,
-    box-shadow 0.12s ease;
-  background: var(--bg-surface);
-  border-left: 3px solid transparent;
-  border-bottom: 1px solid var(--border);
-  position: relative;
-}
-.node-group-header::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  opacity: 0;
-  transition: opacity 0.15s;
-  pointer-events: none;
-}
-.node-group-header:hover {
-  background: var(--bg-highlight);
-}
-.node-group-header:hover::before {
-  opacity: 1;
-}
-.node-group-header:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-}
-.node-group-header.has-attention {
-  border-left-color: var(--yellow);
-}
-.node-group-header.has-running {
-  border-left-color: var(--green);
-}
-.node-group-header.has-thinking {
-  border-left-color: var(--cyan);
-}
-.node-group-header.has-error {
-  border-left-color: var(--red);
-}
-
-.node-group-name {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 12px;
-  color: var(--fg-bright);
-  font-weight: 600;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.node-group-chevron {
-  font-size: 10px;
-  color: var(--fg);
-  transition: transform 0.2s ease;
-  flex-shrink: 0;
-  width: 14px;
-  display: inline-block;
-  text-align: center;
-}
-.node-group-chevron.expanded {
-  transform: rotate(90deg);
-}
-.node-group-badge {
-  font-size: 10px;
-  font-family: var(--font-ui);
-  color: var(--fg-dim);
-  background: var(--bg-highlight);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 1px 6px;
-  font-weight: 500;
-  letter-spacing: 0.02em;
-}
-.node-group-cell {
-  font-size: 12px;
-  display: flex;
-  align-items: center;
-}
-.node-group-cell.num {
-  color: var(--fg-dim);
-  font-size: 11px;
-  justify-content: flex-end;
-  font-variant-numeric: tabular-nums;
-}
-.node-group-cell.num.has-value {
-  color: var(--fg-bright);
-}
-
-.node-group-body {
-  overflow: hidden;
-}
-.node-group-body.collapsed {
-  display: none;
-}
-.node-group-body .node-colheaders {
-  position: static;
-  z-index: auto;
-  opacity: 0.85;
-}
-.node-group-body .node-row {
-  padding-left: 32px;
-}
-.node-group-single .node-row {
-  padding-left: 16px;
 }
 
 /* ==========================================================================
@@ -880,24 +724,6 @@
   .dash-cell-model,
   .dash-col-node,
   .dash-cell-node {
-    display: none;
-  }
-  .node-colheaders,
-  .node-row {
-    grid-template-columns: 1fr 40px 40px 40px 60px;
-  }
-  .node-group-header {
-    grid-template-columns: 1fr 40px 40px 40px 60px;
-  }
-  .node-group-header .node-group-cell:last-child {
-    display: none;
-  }
-  .ncol-version,
-  .node-cell-version {
-    display: none;
-  }
-  .ncol-health,
-  .node-cell-health {
     display: none;
   }
   #main {
@@ -4544,22 +4370,18 @@ textarea.skill-content-area {
    Reduced motion — console-specific
    ========================================================================== */
 @media (prefers-reduced-motion: reduce) {
-  .node-group-chevron {
-    transition: none;
-  }
-  .health-bar-fill {
+  .csb-np-caret {
     transition: none;
   }
   .csb-state,
-  .node-row,
-  .node-group-header {
+  .csb-np-trigger,
+  .csb-np-item {
     transition: none;
   }
   .dash-cell-node {
     transition: none;
   }
-  .dash-row.has-link::after,
-  .node-group-header::before {
+  .dash-row.has-link::after {
     transition: none;
   }
   .admin-nav,
