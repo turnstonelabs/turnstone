@@ -288,9 +288,15 @@ class TLSManager:
             # Update our cached bundles if the renewed domain matches
             if self._internal_bundle and bundle.domain == self._internal_bundle.domain:
                 self._internal_bundle = bundle
-                # Swap the renewed material into the live mTLS client context
-                # so proxy/collector connections present the new cert.
-                self._reload_client_ctx(bundle)
+                # Swap the renewed material into the live mTLS client context so
+                # proxy/collector connections present the new cert. Contain
+                # failures (matching the node-side reload hook) so a reload
+                # error can't abort the callback before the frontend-bundle
+                # update below or perturb the renewal sweep.
+                try:
+                    self._reload_client_ctx(bundle)
+                except Exception:
+                    log.warning("tls.client_ctx.reload_failed", exc_info=True)
             if self._frontend_bundle and bundle.domain == self._frontend_bundle.domain:
                 self._frontend_bundle = bundle
 

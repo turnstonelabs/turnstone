@@ -4966,7 +4966,13 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
             # Reclaim cert rows for long-departed nodes; re-run periodically.
             # Bind a stable non-None local so the closure keeps the narrowing.
             gc_mgr = tls_mgr
-            gc_mgr.gc_expired_certs()
+            # Contain the startup sweep (like the periodic one) so a malformed
+            # legacy cert row can't abort the TLS block and skip the mTLS
+            # proxy/collector client setup below.
+            try:
+                gc_mgr.gc_expired_certs()
+            except Exception:
+                log.warning("tls.certs.gc_failed", exc_info=True)
 
             async def _tls_gc_loop() -> None:
                 while True:
