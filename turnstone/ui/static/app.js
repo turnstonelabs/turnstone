@@ -690,7 +690,13 @@ class Pane {
     // the server accepts both forms.  ``_lastEventId`` is captured
     // from the prior source's onmessage handler.
     let evtUrl = "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/events";
-    if (this._lastEventId) {
+    // ``!= null`` (not truthiness): a resume cursor of 0 is valid — the
+    // ring buffer's first emitted event is id 1, so register_listener_with_replay(0)
+    // replays the whole in-flight turn. A brand-new ws seeds _event_id at 0,
+    // so its first user row (and thus a first-turn /history cursor) can be 0;
+    // a truthiness gate would silently drop it and fall back to the lossy
+    // fresh snapshot. Mirrors the ``data.cursor != null`` guard in _refetchHistory.
+    if (this._lastEventId != null) {
       evtUrl += "?last_event_id=" + encodeURIComponent(this._lastEventId);
     }
     this.evtSource = new EventSource(evtUrl);
@@ -768,17 +774,29 @@ class Pane {
     // the pane has switched to another ws. Newest load wins; older ones drop.
     const token = (this._historyLoadToken || 0) + 1;
     this._historyLoadToken = token;
-    this._refetchHistory(wsId, token).finally(() => {
+    // ``seedCursor=true``: this is the initial-connect path (the
+    // ``.finally`` reconnects), so a resume cursor from /history should
+    // seed _lastEventId for that connect. The clear_ui / replay_truncated
+    // re-render callers pass it false — they run on an already-live stream
+    // and must NOT rewind _lastEventId off the live position.
+    this._refetchHistory(wsId, token, true).finally(() => {
       if (token === this._historyLoadToken) this.connectSSE(wsId);
     });
   }
 
-  async _refetchHistory(wsId, token) {
+  async _refetchHistory(wsId, token, seedCursor = false) {
     // Fetch conversation history over REST. Used for first paint (before
     // connecting SSE) and to re-render after a clear_ui signal (rewind /
     // retry / resume / open). The FETCH is wrapped (network/parse failure
     // → empty pane); the render is deliberately OUTSIDE the catch so a
     // render bug surfaces loudly instead of being masked as an empty pane.
+    //
+    // ``seedCursor`` is true ONLY on the initial-connect path
+    // (_loadHistoryThenConnect, which reconnects via .finally). The
+    // re-render callers leave it false so a fast-forward cursor never
+    // rewinds the live stream's _lastEventId backward (which would
+    // double-render on a later transient reconnect, or — on a re-render
+    // that trims an orphan with no reconnect — strand the omitted turn).
     const id = wsId || this.wsId;
     let data = null;
     try {
@@ -794,6 +812,18 @@ class Pane {
     // paint the wrong ws's history into the pane.
     if (token !== undefined && token !== this._historyLoadToken) return;
     if (data) {
+      // Fresh-connect fast-forward: when the trailing turn is an
+      // executing in-flight tool batch the server can replay, /history
+      // returns a non-null ``cursor`` (a Last-Event-ID) and OMITS that
+      // turn from ``messages``. On the initial-connect path only
+      // (``seedCursor``), seed ``_lastEventId`` so the connectSSE below
+      // opens the initial stream with ?last_event_id=, taking the
+      // replay_ok delta path that rebuilds the in-flight turn (tool
+      // calls, results, prompts) through the live handlers — no synthetic
+      // snapshot, no /history-vs-delta double-render. Null cursor leaves
+      // _lastEventId untouched (fresh connect, already nulled by
+      // _loadHistoryThenConnect); the re-render callers never seed.
+      if (seedCursor && data.cursor != null) this._lastEventId = data.cursor;
       // The REST /history payload is already the canonical projected wire
       // shape (server-side projection in make_history_handler:
       // flat tool_calls, top-level source/reminders/attachments, collapsed

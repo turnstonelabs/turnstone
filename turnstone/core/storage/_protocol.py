@@ -159,6 +159,7 @@ class StorageBackend(Protocol):
         tool_calls: str | None = None,
         source: str | None = None,
         reminders: str | None = None,
+        event_id: int | None = None,
     ) -> int:
         """Log a message to the conversations table.
 
@@ -171,6 +172,11 @@ class StorageBackend(Protocol):
         empty user turns).  ``reminders`` is a JSON-encoded list mirroring
         ``_reminders``; both are NULL for the common case where a
         message carries no metacog payload.
+
+        ``event_id`` is the per-ws SSE ring-buffer high-water mark at save
+        time (``SessionUIBase._event_id``) — the ``Last-Event-ID`` resume
+        cursor space, distinct from the returned ``id`` PK.  NULL when the
+        caller has no live UI counter (offline / bulk / fork re-saves).
         """
         ...
 
@@ -206,6 +212,19 @@ class StorageBackend(Protocol):
         ``repair=False`` so the user sees the actual partial state
         instead of having the trailing turn silently stripped during
         live tool execution.
+        """
+        ...
+
+    def get_max_event_id(self, ws_id: str) -> int | None:
+        """Return the highest persisted ``event_id`` for ``ws_id``.
+
+        The SSE ``Last-Event-ID`` resume-cursor high-water mark across
+        the workstream's whole life.  ``None`` when no row carries one
+        (fresh ws, or only pre-migration-059 / bulk-saved NULL rows).
+        Used to reseed ``SessionUIBase._event_id`` on UI construction so
+        the per-ws event-id space stays monotonic across process
+        restarts / rehydrates (it resets to 0 otherwise, which would
+        re-issue ids the ring buffer already handed out).
         """
         ...
 

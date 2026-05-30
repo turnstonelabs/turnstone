@@ -485,6 +485,19 @@ class WorkstreamHistoryResponse(BaseModel):
             "by the ``limit`` query parameter (default 100, max 500)."
         ),
     )
+    cursor: int | None = Field(
+        default=None,
+        description=(
+            "SSE resume cursor (a ``Last-Event-ID`` value). Non-null only "
+            "when the trailing turn is an executing in-flight tool batch "
+            "that the live ring buffer can replay: ``messages`` then omits "
+            "that turn and the client opens its initial SSE with this "
+            "cursor so the existing delta replay fast-forwards the "
+            "in-flight turn (tool calls, results, prompts) instead of the "
+            "lossy synthetic snapshot. Null on every other read — the "
+            "client connects fresh."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

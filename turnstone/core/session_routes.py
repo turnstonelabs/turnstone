@@ -2681,6 +2681,74 @@ def make_saved_handler(cfg: SessionEndpointConfig) -> Handler:
     return saved_workstreams_handler
 
 
+def _resume_cursor_and_trim(
+    messages: list[dict[str, Any]],
+    ui: Any,
+    awaiting_approval: bool,
+) -> tuple[list[dict[str, Any]], int | None]:
+    """Decide the fresh-connect resume cursor and trim the in-flight turn.
+
+    Returns ``(messages_to_project, cursor)``.
+
+    When the trailing turn is an *executing* in-flight orphan — an
+    assistant ``tool_calls`` message whose results aren't all saved yet,
+    with the ws NOT awaiting approval — AND the live ring buffer can
+    replay the delta past the last resolved-turn boundary, this DROPS the
+    orphan turn from ``/history`` and returns ``cursor`` = the resolved
+    boundary's ``_event_id``.  The client opens its initial SSE with that
+    cursor and the existing ``replay_ok`` path fast-forwards the orphan
+    turn whole (content tokens, ``tool_info``, ``tool_result``, …), so the
+    committed snapshot and the live delta are disjoint — no double-render,
+    no lost siblings (the cursor sits *below* all the orphan's events, so
+    out-of-order result saves can't move it).
+
+    Otherwise returns ``(messages, None)`` unchanged, so the connect takes
+    the synthetic-snapshot floor:
+      - awaiting approval → the ``_pending_approval`` re-emit paints it;
+      - reloaded / evicted (empty or truncated buffer) → the orphan keeps
+        its #610 history-rendered block (never left unrenderable);
+      - quiescent / cursorless history → plain fresh connect.
+
+    Pure + defensive — reads only ``role`` / ``tool_calls`` /
+    ``tool_call_id`` / ``_event_id``.  The ``_event_id`` side-channel
+    survives reconstruct → decorate → extract_reasoning and is dropped by
+    ``project_history_messages`` (which runs on the returned list).
+    """
+    if awaiting_approval or not messages:
+        return messages, None
+    can_replay = getattr(ui, "can_replay_from", None)
+    if not callable(can_replay):
+        return messages, None
+    resulted: set[str] = {
+        str(m.get("tool_call_id"))
+        for m in messages
+        if m.get("role") == "tool" and m.get("tool_call_id")
+    }
+    # Locate the trailing assistant tool-call turn (break at the first
+    # one from the end — mirrors project_history_messages' #610 gate) and
+    # whether it still has an unresolved tool_call (an in-flight orphan).
+    orphan_idx: int | None = None
+    for i in range(len(messages) - 1, -1, -1):
+        tcs = messages[i].get("tool_calls")
+        if tcs:
+            has_orphan = any(
+                (tc.get("id") or "") and str(tc.get("id")) not in resulted for tc in tcs
+            )
+            orphan_idx = i if has_orphan else None
+            break
+    if not orphan_idx:  # None (no orphan) or 0 (no resolved boundary before it)
+        return messages, None
+    resolved_ids = [
+        m["_event_id"] for m in messages[:orphan_idx] if isinstance(m.get("_event_id"), int)
+    ]
+    if not resolved_ids:
+        return messages, None  # no committed cursor → snapshot floor
+    cursor = max(resolved_ids)
+    if not can_replay(cursor):
+        return messages, None  # buffer can't fast-forward → #610 floor
+    return messages[:orphan_idx], cursor
+
+
 def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
     """Lifted body for ``GET {prefix}/{ws_id}/history`` — message history.
 
@@ -2796,6 +2864,13 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
         limit = max(1, min(limit, 500))
 
         messages: list[dict[str, Any]] = []
+        # Fresh-connect resume cursor (the ``Last-Event-ID`` the client
+        # opens its initial SSE with).  Non-None only when the trailing
+        # turn is an executing in-flight orphan that the ring buffer can
+        # fast-forward — see :func:`_resume_cursor_and_trim`.  Stays None
+        # on every other path (and on any decoration failure below) so
+        # the client takes the synthetic-snapshot floor.
+        cursor: int | None = None
         if storage is not None:
             try:
                 # repair=False — display read; see reconstruct_messages docstring.
@@ -2897,6 +2972,17 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
                     getattr(getattr(live_session, "ui", None), "_pending_approval", None),
                     dict,
                 )
+                # Fresh-connect fast-forward: when the trailing turn is an
+                # executing in-flight orphan the ring buffer can replay,
+                # drop it from the committed snapshot and hand back a
+                # resume cursor so the client's initial SSE rebuilds it via
+                # the existing delta replay (disjoint from /history — no
+                # double-render).  No-op on every other path (returns the
+                # list unchanged + cursor=None).  Runs on the pre-project
+                # list while the ``_event_id`` side-channel is still present.
+                to_project, cursor = _resume_cursor_and_trim(
+                    messages, getattr(live_session, "ui", None), awaiting_approval
+                )
                 # Final structural projection: flatten nested tool_calls,
                 # collapse multipart content, surface the
                 # ``_source`` / ``_reminders`` / ``_attachments_meta``
@@ -2908,7 +2994,7 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
                 # interactive ``replayHistory`` and the coordinator history
                 # rebuild consume directly — no client-side normaliser.
                 messages = await asyncio.to_thread(
-                    project_history_messages, messages, awaiting_approval
+                    project_history_messages, to_project, awaiting_approval
                 )
             except Exception:
                 # Operationally interesting: a persistent decoration
@@ -2916,13 +3002,16 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
                 # drift) silently strips verdict pills + output
                 # warnings from every reload of every workstream.
                 # Log at warning so it surfaces in normal log review
-                # rather than only when DEBUG is on.
+                # rather than only when DEBUG is on.  Reset the cursor so a
+                # mid-pipeline failure can't pair an un-trimmed orphan with
+                # a fast-forward cursor (which would double-render it).
+                cursor = None
                 log.warning(
                     "ws.history.decoration_failed ws=%s",
                     ws_id[:8],
                     exc_info=True,
                 )
-        return JSONResponse({"ws_id": ws_id, "messages": messages})
+        return JSONResponse({"ws_id": ws_id, "messages": messages, "cursor": cursor})
 
     return history
 

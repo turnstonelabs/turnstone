@@ -43,6 +43,7 @@ def save_message(
     tool_calls: str | None = None,
     source: str | None = None,
     reminders: str | None = None,
+    event_id: int | None = None,
 ) -> int:
     """Log a message to the conversations table.
 
@@ -53,6 +54,11 @@ def save_message(
     ``_reminders`` side-channels (``reminders`` JSON-encoded).  Both
     default to ``None`` for the common case where no metacog payload
     rides the row.
+
+    ``event_id`` is the per-ws SSE ring-buffer high-water mark at save
+    time (``SessionUIBase._event_id``); the caller in ``session.py``
+    passes ``self.ui._event_id`` so ``/history`` can return it as the
+    ``Last-Event-ID`` resume cursor.  ``None`` for offline / bulk saves.
     """
     try:
         return get_storage().save_message(
@@ -65,6 +71,7 @@ def save_message(
             tool_calls=tool_calls,
             source=source,
             reminders=reminders,
+            event_id=event_id,
         )
     except Exception:
         log.warning("Failed to save message for ws=%s role=%s", ws_id, role, exc_info=True)

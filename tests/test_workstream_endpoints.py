@@ -1295,6 +1295,77 @@ class TestHistoryInteractive:
         assistant_turn = next(m for m in messages if m.get("role") == "assistant")
         assert assistant_turn.get("pending") is True
 
+    def test_history_returns_cursor_and_trims_inflight_orphan_when_replayable(
+        self, _inject_storage
+    ):
+        """Fresh-connect fast-forward, end to end: an executing in-flight
+        orphan (assistant tool_calls saved, no results) whose live ring
+        buffer can replay → /history OMITS that turn and returns
+        ``cursor`` = the resolved boundary's event_id.  The client opens
+        its initial SSE with that cursor so the delta rebuilds the turn.
+        """
+        import json
+
+        ws_id = "ws-cursor"
+        _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
+        _inject_storage.save_message(ws_id, "user", "kick off", event_id=10)
+        tc_json = json.dumps(
+            [{"id": "call_1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]
+        )
+        _inject_storage.save_message(ws_id, "assistant", "Working", tool_calls=tc_json, event_id=12)
+        # call_1 result not yet persisted — executing in-flight orphan.
+        mock_ws = MagicMock()
+        mock_ws.id = ws_id
+        mock_ws.ui._pending_approval = None  # executing, not awaiting
+        mock_ws.ui.can_replay_from.return_value = True  # buffer can fast-forward
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = mock_ws
+        client = _build_history_app(mock_mgr, _inject_storage)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}/history")
+        assert r.status_code == 200
+        body = r.json()
+        # Cursor = the resolved boundary (the user row's event_id), NOT the
+        # orphan assistant's stamp.
+        assert body["cursor"] == 10
+        # The executing orphan turn is OMITTED — it fast-forwards via the
+        # SSE delta, disjoint from this committed snapshot.
+        assert [m.get("role") for m in body["messages"]] == ["user"]
+        # The gate was consulted with the resolved-boundary cursor.
+        mock_ws.ui.can_replay_from.assert_called_once_with(10)
+
+    def test_history_keeps_orphan_and_nulls_cursor_when_not_replayable(self, _inject_storage):
+        """Counterpart: when the live buffer can't fast-forward (reloaded /
+        evicted), /history keeps the in-flight turn (the #610 history-
+        rendered block) and returns ``cursor: null`` — the client connects
+        fresh to the synthetic-snapshot floor, never leaving the turn
+        unrenderable."""
+        import json
+
+        ws_id = "ws-cursor-reload"
+        _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
+        _inject_storage.save_message(ws_id, "user", "kick off", event_id=10)
+        tc_json = json.dumps(
+            [{"id": "call_1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]
+        )
+        _inject_storage.save_message(ws_id, "assistant", "Working", tool_calls=tc_json, event_id=12)
+        mock_ws = MagicMock()
+        mock_ws.id = ws_id
+        mock_ws.ui._pending_approval = None
+        mock_ws.ui.can_replay_from.return_value = False  # empty/evicted buffer
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = mock_ws
+        client = _build_history_app(mock_mgr, _inject_storage)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}/history")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["cursor"] is None
+        # Orphan turn stays in /history (renders its #610 block); not pending.
+        assert [m.get("role") for m in body["messages"]] == ["user", "assistant"]
+        assistant_turn = next(m for m in body["messages"] if m.get("role") == "assistant")
+        assert assistant_turn.get("pending") is not True
+
     def test_history_does_not_synthesize_orphan_results(self, _inject_storage):
         """``repair=False`` via ``/history`` must NOT splice synthetic
         ``"Tool execution was cancelled."`` rows for mid-conversation

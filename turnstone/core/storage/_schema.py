@@ -46,9 +46,23 @@ conversations = sa.Table(
     # replay sees the same bubble shape the originating tab saw live.
     sa.Column("_source", sa.Text),
     sa.Column("_reminders", sa.Text),
+    # SSE ``Last-Event-ID`` resume cursor: the per-ws ``_event_id``
+    # ring-buffer high-water mark at the moment this row was saved (see
+    # ``SessionUIBase._enqueue``).  Distinct id-space from the ``id`` PK
+    # (counts SSE events, not messages; per-ws, not table-global).
+    # ``/history`` returns ``max(event_id)`` of the resolved turns as a
+    # cursor so the client's initial SSE fast-forwards the in-flight turn
+    # through the existing delta replay.  Nullable: historical/bulk rows
+    # stay NULL → cursor logic falls back to the snapshot floor.  See
+    # migration 059.
+    sa.Column("event_id", sa.BigInteger),
 )
 
 sa.Index("idx_conversations_timestamp", conversations.c.timestamp)
+# Composite index serving the per-ws ``MAX(event_id)`` reseed (an index
+# seek, not a row scan) and per-ws event-cursor range queries.  See
+# migration 059.
+sa.Index("idx_conversations_ws_event", conversations.c.ws_id, conversations.c.event_id)
 
 workstreams = sa.Table(
     "workstreams",

@@ -188,6 +188,61 @@ def test_replay_history_renders_persisted_verdict_badge() -> None:
     )
 
 
+def test_refetch_history_seeds_resume_cursor_only_on_initial_connect() -> None:
+    """``_refetchHistory`` must seed ``_lastEventId`` from a non-null
+    ``data.cursor`` so the initial ``connectSSE`` opens with
+    ``?last_event_id=`` and takes the ``replay_ok`` fast-forward —
+    rebuilding the executing in-flight turn that ``/history`` omitted
+    (the fresh-connect-during-parallel-batch fix).
+
+    Two load-bearing guards are pinned here:
+
+    1. The seed is gated on ``seedCursor`` so ONLY the initial-connect
+       caller (``_loadHistoryThenConnect``, which reconnects) seeds it;
+       the clear_ui / replay_truncated re-render callers (no reconnect)
+       must NOT rewind ``_lastEventId`` off the live stream position.
+    2. ``connectSSE`` gates the ``?last_event_id=`` param on
+       ``!= null`` (not truthiness) so a valid cursor of 0 — a brand-new
+       ws's first-turn boundary — isn't silently dropped to the fresh
+       snapshot path."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    # ``_refetchHistory`` is an ``async`` method, which the shared
+    # ``_pane_method_offset`` header regex doesn't match — anchor on the
+    # definition directly and bound at the next method.
+    start = body.index("async _refetchHistory(")
+    end = body.index("_refetchWorkstreamsAndReassign(", start)
+    fn = body[start:end]
+    # (1a) seed is gated on BOTH seedCursor AND a non-null cursor.
+    seed_re = re.compile(
+        r"if\s*\(\s*seedCursor\s*&&\s*data\.cursor\s*!=\s*null\s*\)\s*"
+        r"this\._lastEventId\s*=\s*data\.cursor"
+    )
+    assert seed_re.search(fn), (
+        "_refetchHistory must seed this._lastEventId only when "
+        "seedCursor AND data.cursor != null — so re-render callers don't "
+        "rewind the live stream and a 0 cursor still fast-forwards."
+    )
+    assert "seedCursor = false" in fn, (
+        "seedCursor must default false so the clear_ui / replay_truncated "
+        "re-render callers (which pass only 2 args) never seed the cursor."
+    )
+    # (1b) the initial-connect path opts in with seedCursor=true.
+    assert "_refetchHistory(wsId, token, true)" in body, (
+        "_loadHistoryThenConnect must call _refetchHistory(..., true) so "
+        "the reconnecting initial-connect path is the only seeder."
+    )
+    # (2) connectSSE gates the last_event_id param on != null, not truthiness.
+    assert re.search(
+        r"if\s*\(\s*this\._lastEventId\s*!=\s*null\s*\)\s*\{\s*"
+        r"evtUrl\s*\+=\s*\"\?last_event_id=\"",
+        body,
+    ), (
+        "connectSSE must gate the ?last_event_id= param on "
+        "this._lastEventId != null (not truthiness) — else a cursor of 0 "
+        "(brand-new ws first turn) is dropped to the fresh snapshot path."
+    )
+
+
 def test_shared_utils_defines_replay_advisories_after_tool() -> None:
     """The shared ``replayAdvisoriesAfterTool`` helper in
     ``shared_static/utils.js`` is the single source of advisory-walk +

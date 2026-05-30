@@ -291,6 +291,7 @@ class PostgreSQLBackend:
         tool_calls: str | None = None,
         source: str | None = None,
         reminders: str | None = None,
+        event_id: int | None = None,
     ) -> int:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         content = sanitize_text(content)
@@ -311,6 +312,7 @@ class PostgreSQLBackend:
                     tool_calls=tool_calls,
                     _source=source,
                     _reminders=reminders,
+                    event_id=event_id,
                 )
                 .returning(conversations.c.id)
             )
@@ -368,6 +370,7 @@ class PostgreSQLBackend:
                         conversations.c.tool_calls,
                         conversations.c._source,
                         conversations.c._reminders,
+                        conversations.c.event_id,
                     )
                     .where(conversations.c.ws_id == ws_id)
                     .order_by(conversations.c.id.desc())
@@ -386,6 +389,7 @@ class PostgreSQLBackend:
                         conversations.c.tool_calls,
                         conversations.c._source,
                         conversations.c._reminders,
+                        conversations.c.event_id,
                     )
                     .where(conversations.c.ws_id == ws_id)
                     .order_by(conversations.c.id)
@@ -399,6 +403,15 @@ class PostgreSQLBackend:
             message_ids = [r[0] for r in rows]
         attachments = self.load_attachments_for_messages(ws_id, message_ids=message_ids)
         return _reconstruct_messages(list(rows), ws_id, attachments or None, repair=repair)
+
+    def get_max_event_id(self, ws_id: str) -> int | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(sa.func.max(conversations.c.event_id)).where(
+                    conversations.c.ws_id == ws_id
+                )
+            ).fetchone()
+        return int(row[0]) if row is not None and row[0] is not None else None
 
     def delete_messages_after(self, ws_id: str, keep_count: int) -> int:
         with self._conn() as conn:

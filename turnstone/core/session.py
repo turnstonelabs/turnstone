@@ -2130,6 +2130,17 @@ class ChatSession:
             self._tool_error_flags[call_id] = True
         self.ui.on_tool_result(call_id, name, output, is_error=is_error)
 
+    def _ui_event_id(self) -> int | None:
+        """Current per-ws SSE ring-buffer high-water mark for stamping
+        saved messages with the ``Last-Event-ID`` resume cursor.
+
+        Returns ``getattr(self.ui, "_event_id", None)`` — ``None`` for
+        UIs without the counter (CLI / eval / placeholder), whose rows
+        then stay NULL and are treated by ``/history`` as "no
+        fast-forward cursor available" (the synthetic-snapshot floor).
+        """
+        return getattr(self.ui, "_event_id", None)
+
     def _remaining_token_budget(self) -> int:
         """Estimate how many tokens are available for new content.
 
@@ -3548,6 +3559,7 @@ class ChatSession:
             user_input,
             source=source if isinstance(source, str) and source else None,
             reminders=reminders_json,
+            event_id=self._ui_event_id(),
         )
         if attachments and message_id:
             mark_attachments_consumed(
@@ -3734,6 +3746,7 @@ class ChatSession:
                         content,
                         provider_data=provider_data,
                         tool_calls=tool_calls_json,
+                        event_id=self._ui_event_id(),
                     )
 
                 tool_calls = assistant_msg.get("tool_calls")
@@ -3980,6 +3993,7 @@ class ChatSession:
                         _tname,
                         tool_call_id=tc_id,
                         reminders=tool_reminders_json,
+                        event_id=self._ui_event_id(),
                     )
                 # Fold ``user_feedback`` (text typed alongside an approval,
                 # e.g. "y, use full path") and any queued messages that
@@ -4040,7 +4054,7 @@ class ChatSession:
                     msg["content"] = content + "\n\n[generation cancelled before completion]"
                 else:
                     msg["content"] = "[generation cancelled before completion]"
-                save_message(self._ws_id, "assistant", msg["content"])
+                save_message(self._ws_id, "assistant", msg["content"], event_id=self._ui_event_id())
                 self.messages.append(msg)
                 tok_est = max(
                     1,
@@ -4127,7 +4141,14 @@ class ChatSession:
                     }
                 )
                 self._msg_tokens.append(1)
-                save_message(self._ws_id, "tool", reason, func_name, tool_call_id=tc_id)
+                save_message(
+                    self._ws_id,
+                    "tool",
+                    reason,
+                    func_name,
+                    tool_call_id=tc_id,
+                    event_id=self._ui_event_id(),
+                )
                 # Emit synthetic tool_result so live SSE listeners can
                 # complete the in-DOM tool batch — without this the
                 # coord ``--running`` indicator (added by SSE

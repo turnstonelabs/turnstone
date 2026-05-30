@@ -366,6 +366,13 @@ class SessionUIBase:
         # populate it).  Runs last in __init__ so all the lock + state
         # fields the replay touches are already initialised.
         self.replay_recent_auto_approvals_from_audit()
+        # Reseed the monotonic event-id counter from the persisted
+        # high-water so the ``Last-Event-ID`` cursor space stays
+        # monotonic across UI rebuilds (process restart / rehydrate /
+        # coord→node click-through).  Without this it would restart at
+        # 0 and re-issue ids the prior process already stamped onto
+        # ``conversations.event_id`` rows, corrupting cursor ordering.
+        self._seed_event_id_from_storage()
 
     # ------------------------------------------------------------------
     # Listener plumbing (SSE)
@@ -587,6 +594,37 @@ class SessionUIBase:
             return client_queue, [], "truncated", lost_count, earliest_id, snapshot
         replay_events = [ev for eid, ev in buffered if eid > last_event_id]
         return client_queue, replay_events, "replay_ok", 0, earliest_id, snapshot
+
+    def can_replay_from(self, cursor: int) -> bool:
+        """Would an SSE connect with ``Last-Event-ID = cursor`` replay a
+        non-empty delta through the ``replay_ok`` path?
+
+        This is the ``/history`` gate for the fresh-connect fast-forward:
+        the handler returns a resume cursor (and drops the in-flight turn
+        from the committed snapshot) ONLY when this is true, so the
+        in-flight turn is rebuilt from the ring buffer via the existing
+        delta replay.  When it is false — empty buffer (cold reload /
+        process restart), an evicted/truncated cursor, or simply no
+        events past ``cursor`` — the handler keeps the in-flight turn in
+        ``/history`` and returns no cursor, so the connect takes the
+        synthetic-snapshot floor (preserving the #610 in-flight render
+        and never leaving a turn unrenderable).
+
+        Mirrors :meth:`register_listener_with_replay`'s slice semantics
+        without registering a listener:
+          - empty buffer → False (nothing buffered to fast-forward);
+          - ``cursor < earliest_id - 1`` → False (would be ``truncated``);
+          - no event id strictly greater than ``cursor`` → False (the
+            delta would be empty — nothing in-flight to replay).
+        """
+        with self._listeners_lock:
+            if not self._event_buffer:
+                return False
+            earliest_id = self._event_buffer[0][0]
+            latest_id = self._event_buffer[-1][0]
+        if cursor < earliest_id - 1:
+            return False
+        return latest_id > cursor
 
     # ------------------------------------------------------------------
     # Approval / plan blocking gates
@@ -1505,6 +1543,36 @@ class SessionUIBase:
             )
         except Exception:
             log.debug("auto_approve.audit_failed ws=%s", self.ws_id, exc_info=True)
+
+    def _seed_event_id_from_storage(self) -> None:
+        """Reseed :attr:`_event_id` from the persisted high-water mark.
+
+        The per-ws event-id counter (the ``Last-Event-ID`` replay cursor)
+        is in-memory and restarts at 0 on every UI construction — process
+        restart, saved-workstream rehydrate, coord→node click-through.
+        Without reseeding, the new process would re-issue ids the prior
+        one already stamped onto ``conversations.event_id`` rows, so a
+        ``/history`` cursor would point into the wrong generation and the
+        fresh-connect fast-forward would mis-slice the ring buffer.
+
+        Best-effort: any storage error (or no persisted event_id yet)
+        leaves the counter at 0.  No-op without a ``ws_id`` (test
+        fixture).  Called from ``__init__`` before any listener can
+        register, so no lock is needed around the counter write.
+        """
+        if not self.ws_id:
+            return
+        try:
+            from turnstone.core.storage._registry import get_storage
+
+            storage = get_storage()
+            if storage is None:
+                return
+            mx = storage.get_max_event_id(self.ws_id)
+            if mx is not None and mx > self._event_id:
+                self._event_id = int(mx)
+        except Exception:
+            log.debug("ui.seed_event_id_failed ws=%s", self.ws_id[:8], exc_info=True)
 
     def replay_recent_auto_approvals_from_audit(self) -> None:
         """Seed :attr:`_recent_auto_approvals` from the audit log.
