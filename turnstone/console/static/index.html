@@ -80,10 +80,9 @@
 
     <div id="main">
       <!-- HOME — coordinator-first landing.  The console's primary
-       workflow on page load is "start / continue a coordinator task";
-       the cluster node list sits below as a sibling section.
-       #view-overview / #view-filtered remain for deep-link
-       compatibility. -->
+       workflow on page load is "start / continue a coordinator task".
+       Nodes are reached via the bottom-bar node picker; #view-filtered
+       remains for state/node drill-down deep-links. -->
       <div id="view-home">
         <!-- Persistent "start a new coordinator task" composer.  Visibility is
          gated on the admin.coordinator permission (same rule the existing
@@ -240,21 +239,6 @@
           </div>
         </section>
 
-        <!-- Cluster details — node list, always visible.  The list is
-         self-collapsing (consecutive same-prefix nodes group into a
-         single expandable row) so a separate summary toggle would be
-         redundant. -->
-        <div id="view-overview">
-          <div class="section-header">NODES</div>
-          <div
-            id="node-table"
-            role="list"
-            aria-label="Nodes"
-            aria-live="polite"
-          >
-            <div class="dashboard-empty">Loading cluster data...</div>
-          </div>
-        </div>
       </div>
 
       <!-- FILTERED WORKSTREAMS -->
@@ -2240,6 +2224,24 @@
       </div>
       <div class="csb-divider" aria-hidden="true"></div>
       <div class="csb-metrics" id="csb-metrics"></div>
+      <div class="csb-divider" aria-hidden="true"></div>
+      <div class="csb-node-picker" id="csb-node-picker">
+        <button
+          type="button"
+          class="csb-np-trigger"
+          id="csb-np-trigger"
+          aria-haspopup="menu"
+          aria-expanded="false"
+          aria-controls="csb-np-menu"
+        ></button>
+        <div
+          class="csb-np-menu"
+          id="csb-np-menu"
+          role="menu"
+          aria-label="Switch node"
+          hidden
+        ></div>
+      </div>
     </div>
 
     <div id="toast" role="status" aria-live="polite"></div>

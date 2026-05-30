@@ -65,9 +65,8 @@ window.onThemeChange = function (next) {
 // --- State ---
 let currentView = "home"; // "home" | "overview" | "filtered" | "admin"
 let currentFilter = { state: null, node: null, page: 1, per_page: 50 };
-const expandedGroups = {};
 let _lastOverviewJson = "";
-let _lastNodesJson = "";
+let _lastNodePickerJson = "";
 let evtSource = null;
 let retryDelay = 1000;
 let clusterState = null;
@@ -293,24 +292,9 @@ function buildNodeInfoFromSnapshot(node) {
 function renderFromState() {
   if (!clusterState) return;
   renderStatusBar(clusterState.overview);
+  renderNodePicker();
   if (currentView === "home") {
     _renderHomeView();
-    // Home view also hosts the inline node-list (cluster details);
-    // render it so the next SSE tick doesn't leave it stale.
-    const nodesList = Object.keys(clusterState.nodes)
-      .filter(function (nid) {
-        // Exclude the "console" pseudo-node from the nodes list — it's
-        // a synthetic carrier for coordinators, not a compute node.
-        return nid !== "console";
-      })
-      .map(function (nid) {
-        return buildNodeInfoFromSnapshot(clusterState.nodes[nid]);
-      });
-    nodesList.sort(function (a, b) {
-      const d = b.ws_running + b.ws_attention - (a.ws_running + a.ws_attention);
-      return d !== 0 ? d : a.node_id.localeCompare(b.node_id);
-    });
-    renderNodeGroups(nodesList, nodesList.length);
   } else if (currentView === "filtered") {
     let allWs = [];
     Object.keys(clusterState.nodes).forEach(function (nid) {
@@ -487,9 +471,7 @@ function loadOverview() {
       applySnapshot(data);
     })
     .catch(function () {
-      document
-        .getElementById("node-table")
-        .replaceChildren(makeEmptyState("Failed to load"));
+      showToast("Failed to load cluster data");
     });
 }
 
@@ -538,13 +520,12 @@ function renderStatusBar(overview) {
   const metricsContainer = document.getElementById("csb-metrics");
   metricsContainer.replaceChildren();
   const metrics = [
-    { value: overview.nodes || 0, label: "nodes", format: formatCount },
     { value: overview.workstreams || 0, label: "ws", format: formatCount },
     { value: agg.total_tokens || 0, label: "tokens", format: formatTokens },
     { value: agg.total_tool_calls || 0, label: "calls", format: formatCount },
   ];
   metrics.forEach(function (m) {
-    if (m.value === 0 && m.label !== "nodes" && m.label !== "ws") return;
+    if (m.value === 0 && m.label !== "ws") return;
     const el = document.createElement("span");
     el.className = "csb-metric";
     const valSpan = document.createElement("span");
@@ -557,36 +538,6 @@ function renderStatusBar(overview) {
     el.appendChild(labelSpan);
     metricsContainer.appendChild(el);
   });
-  if (
-    overview.version_drift &&
-    overview.versions &&
-    overview.versions.length > 1
-  ) {
-    const driftEl = document.createElement("span");
-    driftEl.className = "csb-metric csb-version-drift";
-    driftEl.title = "Versions detected: " + overview.versions.join(", ");
-    const warnSpan = document.createElement("span");
-    warnSpan.className = "csb-metric-value drift-warn";
-    warnSpan.textContent = "DRIFT";
-    const verLabel = document.createElement("span");
-    verLabel.className = "csb-metric-label";
-    verLabel.textContent = overview.versions.join(" / ");
-    driftEl.appendChild(warnSpan);
-    driftEl.appendChild(verLabel);
-    metricsContainer.appendChild(driftEl);
-  } else if (overview.versions && overview.versions.length === 1) {
-    const verEl = document.createElement("span");
-    verEl.className = "csb-metric";
-    const valSpan = document.createElement("span");
-    valSpan.className = "csb-metric-value";
-    valSpan.textContent = overview.versions[0];
-    const verLbl = document.createElement("span");
-    verLbl.className = "csb-metric-label";
-    verLbl.textContent = "ver";
-    verEl.appendChild(valSpan);
-    verEl.appendChild(verLbl);
-    metricsContainer.appendChild(verEl);
-  }
   // MCP aggregate metrics
   if (overview.mcp_servers && overview.mcp_servers > 0) {
     const mcpDivider = document.createElement("span");
@@ -626,435 +577,214 @@ function renderStatusBar(overview) {
   }
 }
 
-// --- Node Grouping ---
-function extractNodePrefix(nodeId) {
-  let stripped = nodeId.replace(/[-_][a-z0-9]*\d[a-z0-9]*$/i, "");
-  if (!stripped || stripped === nodeId) {
-    stripped = nodeId.replace(/[-_]?\d+$/, "");
-  }
-  // Clean trailing separators (e.g., FQDN-style "node.prod.01" → "node.prod")
-  stripped = stripped.replace(/[-_.]$/, "");
-  return stripped || nodeId;
-}
-
-function groupNodes(nodes) {
-  const groupMap = {};
-  const groupOrder = [];
-  nodes.forEach(function (node) {
-    const prefix = extractNodePrefix(node.node_id);
-    if (!groupMap[prefix]) {
-      groupMap[prefix] = {
-        prefix: prefix,
-        nodes: [],
-        ws_total: 0,
-        ws_running: 0,
-        ws_thinking: 0,
-        ws_attention: 0,
-        ws_error: 0,
-        ws_idle: 0,
-        total_tokens: 0,
-        all_reachable: true,
-        any_degraded: false,
-        versions: new Set(),
-      };
-      groupOrder.push(prefix);
-    }
-    const g = groupMap[prefix];
-    g.nodes.push(node);
-    g.ws_total += node.ws_total || 0;
-    g.ws_running += node.ws_running || 0;
-    g.ws_thinking += node.ws_thinking || 0;
-    g.ws_attention += node.ws_attention || 0;
-    g.ws_error += node.ws_error || 0;
-    g.ws_idle += node.ws_idle || 0;
-    g.total_tokens += node.total_tokens || 0;
-    if (!node.reachable) g.all_reachable = false;
-    if (node.health && node.health.status === "degraded") g.any_degraded = true;
-    const nodeVer = node.version || "";
-    if (nodeVer) g.versions.add(nodeVer);
-  });
-  groupOrder.forEach(function (prefix) {
-    groupMap[prefix].nodes.sort(function (a, b) {
-      const d = b.ws_running + b.ws_attention - (a.ws_running + a.ws_attention);
-      return d !== 0 ? d : a.node_id.localeCompare(b.node_id);
+// --- Node Picker ---
+//
+// Replaces the old NODES table.  The bottom status bar carries a compact
+// trigger ("N NODES · <version>", or a DRIFT badge when the cluster runs
+// mixed versions); clicking it opens a popup list of every compute node
+// with its live workstream count.  Selecting a node navigates to that
+// node's own dashboard (/node/<id>/) — the same destination the table
+// rows used to link to.
+function _nodePickerList() {
+  // Real compute nodes only — the "console" pseudo-node is a synthetic
+  // carrier for coordinators, not a node you can open.
+  const list = Object.keys(clusterState.nodes)
+    .filter(function (nid) {
+      return nid !== "console";
+    })
+    .map(function (nid) {
+      return buildNodeInfoFromSnapshot(clusterState.nodes[nid]);
     });
+  list.sort(function (a, b) {
+    const d = b.ws_running + b.ws_attention - (a.ws_running + a.ws_attention);
+    return d !== 0 ? d : a.node_id.localeCompare(b.node_id);
   });
-  const groups = groupOrder.map(function (p) {
-    return groupMap[p];
+  return list;
+}
+
+function _nodeDotClass(node) {
+  if (!node.reachable) return "csb-np-dot unreachable";
+  if (node.health && node.health.status === "degraded")
+    return "csb-np-dot degraded";
+  return "csb-np-dot";
+}
+
+function renderNodePicker() {
+  if (!clusterState) return;
+  const overview = clusterState.overview || {};
+  const nodes = _nodePickerList();
+  const versions = overview.versions || [];
+  const drift = !!(overview.version_drift && versions.length > 1);
+
+  // Skip the rebuild when nothing the picker shows has changed — node
+  // count, per-node ws count/reachability/health, and the version set.
+  const sig = JSON.stringify({
+    n: nodes.map(function (x) {
+      return [x.node_id, x.ws_total, x.reachable, (x.health || {}).status];
+    }),
+    v: versions,
+    d: drift,
   });
-  groups.sort(function (a, b) {
-    const aAct = a.ws_running + a.ws_attention;
-    const bAct = b.ws_running + b.ws_attention;
-    if (bAct !== aAct) return bAct - aAct;
-    return a.prefix.localeCompare(b.prefix);
-  });
-  return groups;
-}
+  if (sig === _lastNodePickerJson) return;
+  _lastNodePickerJson = sig;
 
-// 7-span node-table column header — used at the top of the table and
-// inside each multi-node group body.  Returns a DocumentFragment built
-// via createElement so the static label list is constructed once with
-// no HTML parsing / string interpolation per render.
-const _NODE_COLHEADER_LABELS = [
-  ["ncol ncol-node", "NODE"],
-  ["ncol ncol-ws", "WS"],
-  ["ncol ncol-run", "RUN"],
-  ["ncol ncol-attn", "ATTN"],
-  ["ncol ncol-tokens", "TOKENS"],
-  ["ncol ncol-version", "VER"],
-  ["ncol ncol-health", "LOAD"],
-];
+  // --- Trigger ---
+  const trigger = document.getElementById("csb-np-trigger");
+  if (!trigger) return;
+  trigger.onclick = toggleNodePicker;
+  trigger.replaceChildren();
+  const caret = document.createElement("span");
+  caret.className = "csb-np-caret";
+  caret.setAttribute("aria-hidden", "true");
+  caret.textContent = "▾";
+  const countVal = document.createElement("span");
+  countVal.className = "csb-metric-value";
+  countVal.textContent = formatCount(nodes.length);
+  const countLbl = document.createElement("span");
+  countLbl.className = "csb-metric-label";
+  countLbl.textContent = nodes.length === 1 ? "node" : "nodes";
+  trigger.append(caret, countVal, countLbl);
 
-function buildColHeaders() {
-  const frag = document.createDocumentFragment();
-  for (let i = 0; i < _NODE_COLHEADER_LABELS.length; i++) {
-    const span = document.createElement("span");
-    span.className = _NODE_COLHEADER_LABELS[i][0];
-    span.textContent = _NODE_COLHEADER_LABELS[i][1];
-    frag.appendChild(span);
-  }
-  return frag;
-}
-
-// Build a numeric cell for the node table.  ``highlighted`` adds
-// ``has-value`` so non-zero counts get the CSS treatment.
-function _buildNodeNumCell(value, highlighted, cellClass) {
-  const cell = document.createElement("span");
-  cell.className = cellClass + (highlighted ? " has-value" : "");
-  cell.textContent = String(value);
-  return cell;
-}
-
-// Build the health-bar trailing cell ("[bar] [pct]%") for either a
-// node row or a group header — the structure is identical, only the
-// outer cell class differs.
-function _buildHealthCell(cellClass, healthPct, healthFillClass) {
-  const cell = document.createElement("span");
-  cell.className = cellClass;
-  const bar = document.createElement("span");
-  bar.className = "health-bar";
-  if (healthPct > 0) {
-    const fill = document.createElement("span");
-    fill.className = "health-bar-fill " + healthFillClass;
-    fill.style.width = healthPct + "%";
-    bar.appendChild(fill);
-  }
-  cell.append(bar, " " + healthPct + "%");
-  return cell;
-}
-
-function buildNodeRow(node) {
-  const row = document.createElement("div");
-  row.className = "node-row";
-  if (node.ws_attention > 0) row.classList.add("has-attention");
-  else if (node.ws_running > 0) row.classList.add("has-running");
-  else if (node.ws_thinking > 0) row.classList.add("has-thinking");
-  else if (node.ws_error > 0) row.classList.add("has-error");
-  row.setAttribute("role", "button");
-  row.setAttribute("tabindex", "0");
-  row.setAttribute(
-    "aria-label",
-    node.node_id +
-      ": " +
-      node.ws_total +
-      " workstreams, " +
-      node.ws_running +
-      " running, " +
-      node.ws_attention +
-      " attention, " +
-      formatTokens(node.total_tokens) +
-      " tokens" +
-      (node.version ? ", version " + node.version : ""),
-  );
-
-  const isDegraded = node.health && node.health.status === "degraded";
-  const dotClass = node.reachable
-    ? isDegraded
-      ? "node-dot degraded"
-      : "node-dot"
-    : "node-dot unreachable";
-  const displayTokens = node.total_tokens || node.ws_tokens || 0;
-  const maxWs = node.max_ws || 10;
-  const healthPct =
-    maxWs > 0 ? Math.min(Math.round((node.ws_total / maxWs) * 100), 100) : 0;
-  const healthFillClass =
-    healthPct < 50 ? "low" : healthPct < 80 ? "mid" : "high";
-
-  let healthTitle = "";
-  if (node.health && node.health.backend) {
-    healthTitle = "backend: " + node.health.backend.status;
+  if (drift) {
+    const driftBadge = document.createElement("span");
+    driftBadge.className = "csb-np-drift";
+    driftBadge.textContent = "DRIFT";
+    driftBadge.title = "Versions detected: " + versions.join(", ");
+    trigger.appendChild(driftBadge);
+    trigger.setAttribute(
+      "aria-label",
+      nodes.length + " nodes, version drift: " + versions.join(", "),
+    );
+  } else if (versions.length === 1) {
+    const verVal = document.createElement("span");
+    verVal.className = "csb-np-ver";
+    verVal.textContent = versions[0];
+    trigger.appendChild(verVal);
+    trigger.setAttribute(
+      "aria-label",
+      nodes.length + " nodes, version " + versions[0],
+    );
+  } else {
+    trigger.setAttribute("aria-label", nodes.length + " nodes");
   }
 
-  // Name cell — dot, node id, optional degraded badge.
-  const nameCell = document.createElement("span");
-  nameCell.className = "node-cell node-cell-name";
-  if (healthTitle) nameCell.setAttribute("title", healthTitle);
-  const dot = document.createElement("span");
-  dot.className = dotClass;
-  nameCell.append(dot, node.node_id);
-  if (isDegraded) {
-    const degradedEl = document.createElement("span");
-    degradedEl.className = "node-degraded-badge";
-    // Only attach the descriptive title / aria-label when there's a
-    // backend-status string to surface.  An empty aria-label would
-    // suppress the badge's textContent ("degraded") for screen
-    // readers — strictly worse than leaving the attribute off.
-    if (healthTitle) {
-      degradedEl.setAttribute("title", healthTitle);
-      degradedEl.setAttribute("aria-label", healthTitle);
-    }
-    degradedEl.textContent = "degraded";
-    nameCell.appendChild(degradedEl);
-  }
-  row.appendChild(nameCell);
-
-  row.appendChild(
-    _buildNodeNumCell(
-      node.ws_total,
-      node.ws_total > 0,
-      "node-cell node-cell-num",
-    ),
-  );
-  row.appendChild(
-    _buildNodeNumCell(
-      node.ws_running,
-      node.ws_running > 0,
-      "node-cell node-cell-num",
-    ),
-  );
-  row.appendChild(
-    _buildNodeNumCell(
-      node.ws_attention,
-      node.ws_attention > 0,
-      "node-cell node-cell-num",
-    ),
-  );
-
-  const tokensCell = document.createElement("span");
-  tokensCell.className = "node-cell node-cell-num";
-  tokensCell.textContent = formatTokens(displayTokens);
-  row.appendChild(tokensCell);
-
-  const versionCell = document.createElement("span");
-  versionCell.className = "node-cell node-cell-version";
-  versionCell.textContent = node.version || "";
-  row.appendChild(versionCell);
-
-  row.appendChild(
-    _buildHealthCell("node-cell node-cell-health", healthPct, healthFillClass),
-  );
-
-  const nodeUrl = "/node/" + encodeURIComponent(node.node_id) + "/";
-  row.onclick = function () {
-    window.location.href = nodeUrl;
-  };
-  row.onkeydown = function (e) {
-    if (e.key === "Enter" || e.key === " ") {
-      e.preventDefault();
-      window.location.href = nodeUrl;
-    }
-  };
-  return row;
-}
-
-function toggleGroup(prefix) {
-  expandedGroups[prefix] = !expandedGroups[prefix];
-  const body = document.querySelector(
-    '.node-group-body[data-prefix="' +
-      prefix.replace(/\\/g, "\\\\").replace(/"/g, '\\"') +
-      '"]',
-  );
-  if (!body) return;
-  const isExpanded = expandedGroups[prefix];
-  if (isExpanded) body.classList.remove("collapsed");
-  else body.classList.add("collapsed");
-  const groupEl = body.parentElement;
-  if (groupEl) groupEl.setAttribute("aria-expanded", String(isExpanded));
-  const chevron = groupEl ? groupEl.querySelector(".node-group-chevron") : null;
-  if (chevron) {
-    if (isExpanded) chevron.classList.add("expanded");
-    else chevron.classList.remove("expanded");
-  }
-}
-
-function renderNodeGroups(nodes, total) {
-  const json = JSON.stringify(nodes);
-  if (json === _lastNodesJson) return;
-  _lastNodesJson = json;
-
-  const table = document.getElementById("node-table");
-  table.replaceChildren();
+  // --- Menu ---
+  const menu = document.getElementById("csb-np-menu");
+  if (!menu) return;
+  menu.replaceChildren();
   if (!nodes.length) {
-    table.appendChild(makeEmptyState("No nodes discovered"));
+    const empty = document.createElement("div");
+    empty.className = "csb-np-empty";
+    empty.textContent = "No nodes discovered";
+    menu.appendChild(empty);
     return;
   }
-
-  const topHeaders = document.createElement("div");
-  topHeaders.className = "node-colheaders";
-  topHeaders.setAttribute("aria-hidden", "true");
-  topHeaders.appendChild(buildColHeaders());
-  table.appendChild(topHeaders);
-
-  const groups = groupNodes(nodes);
-
-  groups.forEach(function (group) {
-    // Single-node group — render as plain row
-    if (group.nodes.length === 1) {
-      const wrapper = document.createElement("div");
-      wrapper.className = "node-group node-group-single";
-      wrapper.appendChild(buildNodeRow(group.nodes[0]));
-      table.appendChild(wrapper);
-      return;
+  nodes.forEach(function (node) {
+    // Navigation popup, not a selection control — menuitem, not option.
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "csb-np-item";
+    item.setAttribute("role", "menuitem");
+    const dot = document.createElement("span");
+    dot.className = _nodeDotClass(node);
+    dot.setAttribute("aria-hidden", "true");
+    const name = document.createElement("span");
+    name.className = "csb-np-name";
+    name.textContent = node.node_id;
+    // Full id on hover for when the name ellipsizes.
+    name.title = node.node_id;
+    const ws = document.createElement("span");
+    ws.className = "csb-np-ws" + (node.ws_total > 0 ? " has-value" : "");
+    ws.textContent = formatCount(node.ws_total) + " ws";
+    // Status is dot colour + shape, but colour/shape alone fails for
+    // color-blind users at 7px — spell out the non-healthy states.
+    const degraded = !!(node.health && node.health.status === "degraded");
+    if (!node.reachable || degraded) {
+      const tag = document.createElement("span");
+      tag.className = "csb-np-state" + (node.reachable ? "" : " down");
+      tag.textContent = node.reachable ? "degraded" : "down";
+      item.append(dot, name, tag, ws);
+    } else {
+      item.append(dot, name, ws);
     }
-
-    const groupEl = document.createElement("div");
-    groupEl.className = "node-group";
-    const isExpanded = !!expandedGroups[group.prefix];
-    groupEl.setAttribute("role", "listitem");
-    groupEl.setAttribute("aria-expanded", String(isExpanded));
-
-    // Group header
-    const header = document.createElement("div");
-    header.className = "node-group-header";
-    if (group.ws_attention > 0) header.classList.add("has-attention");
-    else if (group.ws_running > 0) header.classList.add("has-running");
-    else if (group.ws_thinking > 0) header.classList.add("has-thinking");
-    else if (group.ws_error > 0) header.classList.add("has-error");
-    header.setAttribute("role", "button");
-    header.setAttribute("tabindex", "0");
-    header.setAttribute(
+    item.setAttribute(
       "aria-label",
-      group.prefix +
-        " group: " +
-        group.nodes.length +
-        " nodes, " +
-        group.ws_total +
-        " workstreams, " +
-        group.ws_running +
-        " running, " +
-        group.ws_attention +
-        " attention, " +
-        formatTokens(group.total_tokens) +
-        " tokens" +
-        (group.versions.size > 1 ? ", version drift detected" : ""),
+      node.node_id +
+        ", " +
+        node.ws_total +
+        " workstreams" +
+        (node.reachable ? "" : " (unreachable)"),
     );
-
-    const chevronClass = "node-group-chevron" + (isExpanded ? " expanded" : "");
-    let totalMaxWs = 0;
-    group.nodes.forEach(function (n) {
-      totalMaxWs += n.max_ws || 10;
-    });
-    const healthPct =
-      totalMaxWs > 0
-        ? Math.min(Math.round((group.ws_total / totalMaxWs) * 100), 100)
-        : 0;
-    const healthFillClass =
-      healthPct < 50 ? "low" : healthPct < 80 ? "mid" : "high";
-    let groupVersionText = "";
-    let groupVersionDrift = false;
-    if (group.versions.size === 1) {
-      groupVersionText = Array.from(group.versions)[0];
-    } else if (group.versions.size > 1) {
-      groupVersionText = "mixed";
-      groupVersionDrift = true;
-    }
-
-    // Group-name cell: chevron + prefix + node count + optional degraded badge.
-    const nameCell = document.createElement("span");
-    nameCell.className = "node-group-name";
-    const chevron = document.createElement("span");
-    chevron.className = chevronClass;
-    chevron.setAttribute("aria-hidden", "true");
-    chevron.textContent = "▸";
-    const badge = document.createElement("span");
-    badge.className = "node-group-badge";
-    badge.textContent = group.nodes.length + " nodes";
-    nameCell.append(chevron, group.prefix, badge);
-    if (group.any_degraded) {
-      const degradedEl = document.createElement("span");
-      degradedEl.className = "node-degraded-badge";
-      degradedEl.textContent = "degraded";
-      nameCell.appendChild(degradedEl);
-    }
-    header.appendChild(nameCell);
-
-    header.appendChild(
-      _buildNodeNumCell(
-        group.ws_total,
-        group.ws_total > 0,
-        "node-group-cell num",
-      ),
-    );
-    header.appendChild(
-      _buildNodeNumCell(
-        group.ws_running,
-        group.ws_running > 0,
-        "node-group-cell num",
-      ),
-    );
-    header.appendChild(
-      _buildNodeNumCell(
-        group.ws_attention,
-        group.ws_attention > 0,
-        "node-group-cell num",
-      ),
-    );
-
-    const groupTokensCell = document.createElement("span");
-    groupTokensCell.className = "node-group-cell num";
-    groupTokensCell.textContent = formatTokens(group.total_tokens);
-    header.appendChild(groupTokensCell);
-
-    const groupVersionCell = document.createElement("span");
-    groupVersionCell.className =
-      "node-group-cell node-cell-version" + (groupVersionDrift ? " drift" : "");
-    groupVersionCell.textContent = groupVersionText;
-    if (groupVersionDrift) {
-      const driftBadge = document.createElement("span");
-      driftBadge.className = "node-version-drift-badge";
-      driftBadge.textContent = "drift";
-      groupVersionCell.appendChild(driftBadge);
-    }
-    header.appendChild(groupVersionCell);
-
-    header.appendChild(
-      _buildHealthCell(
-        "node-group-cell node-cell-health",
-        healthPct,
-        healthFillClass,
-      ),
-    );
-
-    const prefix = group.prefix;
-    header.onclick = function () {
-      toggleGroup(prefix);
+    const nodeUrl = "/node/" + encodeURIComponent(node.node_id) + "/";
+    item.onclick = function () {
+      window.location.href = nodeUrl;
     };
-    header.onkeydown = function (e) {
-      if (e.key === "Enter" || e.key === " ") {
-        e.preventDefault();
-        toggleGroup(prefix);
-      }
-    };
-    groupEl.appendChild(header);
-
-    // Group body
-    const body = document.createElement("div");
-    body.className = "node-group-body" + (isExpanded ? "" : " collapsed");
-    body.dataset.prefix = group.prefix;
-
-    const colHeaders = document.createElement("div");
-    colHeaders.className = "node-colheaders";
-    colHeaders.setAttribute("aria-hidden", "true");
-    colHeaders.appendChild(buildColHeaders());
-    body.appendChild(colHeaders);
-
-    group.nodes.forEach(function (node) {
-      body.appendChild(buildNodeRow(node));
-    });
-
-    groupEl.appendChild(body);
-    table.appendChild(groupEl);
+    menu.appendChild(item);
   });
+}
+
+function _closeNodePicker() {
+  const menu = document.getElementById("csb-np-menu");
+  const trigger = document.getElementById("csb-np-trigger");
+  if (menu) menu.hidden = true;
+  if (trigger) trigger.setAttribute("aria-expanded", "false");
+  document.removeEventListener("click", _onNodePickerOutside, true);
+  document.removeEventListener("keydown", _onNodePickerKeydown, true);
+}
+
+function _onNodePickerOutside(e) {
+  const wrap = document.getElementById("csb-node-picker");
+  if (wrap && !wrap.contains(e.target)) _closeNodePicker();
+}
+
+function _onNodePickerKeydown(e) {
+  if (e.key === "Escape") {
+    e.preventDefault();
+    _closeNodePicker();
+    const trigger = document.getElementById("csb-np-trigger");
+    if (trigger) trigger.focus();
+    return;
+  }
+  const menu = document.getElementById("csb-np-menu");
+  if (!menu || menu.hidden) return;
+  const items = Array.prototype.slice.call(
+    menu.querySelectorAll(".csb-np-item"),
+  );
+  if (!items.length) return;
+  const idx = items.indexOf(document.activeElement);
+  if (e.key === "ArrowDown") {
+    e.preventDefault();
+    items[idx < 0 ? 0 : Math.min(idx + 1, items.length - 1)].focus();
+  } else if (e.key === "ArrowUp") {
+    e.preventDefault();
+    items[idx <= 0 ? 0 : idx - 1].focus();
+  } else if (e.key === "Home") {
+    e.preventDefault();
+    items[0].focus();
+  } else if (e.key === "End") {
+    e.preventDefault();
+    items[items.length - 1].focus();
+  }
+}
+
+function toggleNodePicker() {
+  const menu = document.getElementById("csb-np-menu");
+  const trigger = document.getElementById("csb-np-trigger");
+  if (!menu || !trigger) return;
+  if (menu.hidden) {
+    menu.hidden = false;
+    trigger.setAttribute("aria-expanded", "true");
+    // Capture-phase listeners so a click/keypress is caught before it
+    // bubbles back up.  Registering them here (during the trigger's own
+    // bubble-phase click) means this same click won't re-trigger them.
+    document.addEventListener("click", _onNodePickerOutside, true);
+    document.addEventListener("keydown", _onNodePickerKeydown, true);
+    const first = menu.querySelector(".csb-np-item");
+    if (first) first.focus();
+    else trigger.focus();
+  } else {
+    _closeNodePicker();
+  }
 }
 
 // --- Drill-down: Filtered ---
@@ -2303,6 +2033,10 @@ initLogin();
 // pipeline (#9); the console pseudo-node carries coordinator
 // ws_created / ws_closed / cluster_state events.
 loadOverview();
+(function () {
+  const npTrigger = document.getElementById("csb-np-trigger");
+  if (npTrigger) npTrigger.onclick = toggleNodePicker;
+})();
 _ensureHomeComposerInit();
 // Refresh the coord button visibility once auth.js has populated
 // sessionStorage from the initial whoami.  window.permissionsReady
