@@ -671,16 +671,32 @@ def test_handler_fresh_connect_in_error_state_surfaces_last_error(monkeypatch: A
     can't rebuild it — the ``last_error`` config row is the only durable
     source.  Gated on the error state: a healthy (idle) ws skips the
     storage read and surfaces nothing (no stale error on every load).
+
+    The surfaced event carries the SSE ``id:`` (registration-time buffer
+    cursor ``snap_seq``) so a native EventSource reconnect advances
+    ``lastEventId`` and resumes via ``replay_ok`` instead of re-running
+    this fresh path and APPENDING a duplicate bubble — the client's
+    ``error`` handler is append-only (not idempotent like
+    ``state_change`` / ``in_progress_snapshot``).  The reconnect half is
+    pinned by ``test_handler_replay_ok_does_not_resurface_last_error``.
     """
     import turnstone.core.memory as memory_mod
 
     monkeypatch.setattr(memory_mod, "load_last_error", lambda _ws: "boom: kaboom")
 
-    # Error state → surfaced.
+    # Error state → surfaced.  A prior buffered event gives a non-zero
+    # cursor (snap_seq == 1) for the id assertion below.
     err_ui = _make_ui()
-    _, err_blob = _drain_handler_yields(err_ui, state="error", max_yields=8)
+    err_ui.on_content_token("x")  # _event_id -> 1
+    err_yields, err_blob = _drain_handler_yields(err_ui, state="error", max_yields=8)
     assert '"type": "error"' in err_blob
     assert "boom: kaboom" in err_blob
+    # The surfaced error advances the reconnect cursor (carries id: snap_seq).
+    err_events = [
+        y for y in err_yields if isinstance(y, dict) and "boom: kaboom" in y.get("data", "")
+    ]
+    assert len(err_events) == 1
+    assert err_events[0].get("id") == "1"
 
     # Idle state → the gate skips it.
     idle_ui = _make_ui()

@@ -1939,14 +1939,30 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
 
                             last_err = await asyncio.to_thread(load_last_error, ws_id)
                             if last_err:
+                                # Carry the SSE ``id:`` (registration-time
+                                # buffer position) so the client's
+                                # ``lastEventId`` advances past this surface.
+                                # Unlike the idempotent ``state_change`` /
+                                # ``in_progress_snapshot`` above, the client
+                                # APPENDS this ``error`` bubble (non-idempotent),
+                                # and a terminal-errored idle ws emits no live
+                                # event to set a cursor — so without an ``id:``
+                                # a native EventSource reconnect would send no
+                                # ``Last-Event-ID``, re-run this fresh path, and
+                                # append a DUPLICATE bubble on every reconnect
+                                # cycle.  With it, the reconnect resumes via
+                                # ``replay_ok`` (nothing buffered past
+                                # ``snap_seq`` on an idle ws) and skips this
+                                # surface.
                                 yield {
+                                    "id": str(snap_seq),
                                     "data": json.dumps(
                                         {
                                             "type": "error",
                                             "message": last_err,
                                             "ws_id": ws_id,
                                         }
-                                    )
+                                    ),
                                 }
                     except Exception:
                         log.debug(
