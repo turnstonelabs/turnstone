@@ -54,9 +54,19 @@ def run_migrations(storage: Any, backend: str) -> None:
 def _run_with_pg_lock(engine: Any, cfg: Any) -> None:
     """Run Alembic upgrade under a PostgreSQL advisory lock.
 
-    Advisory lock ID 7_475_283 (arbitrary, derived from 'turnstone').
-    ``pg_advisory_lock`` blocks until the lock is available, so
-    concurrent containers wait in line rather than racing.
+    Advisory lock ID 7_475_283 (arbitrary, derived from 'turnstone') serializes
+    concurrent containers so only one applies migrations at a time.
+
+    The lock is held on an **autocommit** connection and acquired by *polling*
+    ``pg_try_advisory_lock`` rather than the blocking ``pg_advisory_lock``. Both
+    details are load-bearing. A migration that rebuilds an index with ``CREATE
+    INDEX CONCURRENTLY`` (migration 041) waits for every concurrent transaction
+    to drain before it can finish. If the lock-holder held the lock inside an
+    open transaction — or waiters blocked on ``pg_advisory_lock`` inside one —
+    those connections sit ``idle in transaction`` and never drain, so the
+    concurrent build deadlocks against the very lock meant to protect it.
+    Autocommit keeps the holder transaction-free; polling (with a sleep that
+    holds no snapshot) keeps waiters transaction-free between attempts.
 
     Retries with jittered backoff if PostgreSQL is temporarily at
     max_connections (common during large-cluster startup stampedes).
@@ -71,12 +81,15 @@ def _run_with_pg_lock(engine: Any, cfg: Any) -> None:
     for attempt in range(max_retries):
         try:
             with engine.connect() as conn:
-                conn.execute(sa.text("SELECT pg_advisory_lock(7475283)"))
+                conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+                # Poll, don't block: a waiter blocked inside pg_advisory_lock
+                # would pin a snapshot that CREATE INDEX CONCURRENTLY waits on.
+                while not conn.execute(sa.text("SELECT pg_try_advisory_lock(7475283)")).scalar():
+                    time.sleep(random.uniform(0.5, 1.5))  # noqa: S311
                 try:
                     command.upgrade(cfg, "head")
                 finally:
                     conn.execute(sa.text("SELECT pg_advisory_unlock(7475283)"))
-                    conn.commit()
             return
         except Exception as exc:
             err_str = str(exc).lower()
