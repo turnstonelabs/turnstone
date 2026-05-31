@@ -52,11 +52,15 @@ automatically — no operator prompt — when the intent judge's **LLM** verdict
 recommends `approve` with confidence at or above `confidence_threshold`. Every
 other outcome still reaches a human: `review` / `deny` recommendations,
 confidence below the threshold, judge errors or timeouts (`llm_fallback`), and
-any call the deterministic heuristic rules flagged `deny` / `critical` (the LLM
-may raise the heuristic's assessment but never lower it). Requires the judge to
-be enabled; auto-approved calls are tagged `smart_approval` in the dashboard and
-audit trail. Smart Approvals applies to the web and coordinator surfaces, not
-the interactive CLI.
+any call the deterministic heuristic rules explicitly flagged `deny` or
+`critical`. That heuristic floor blocks only those explicit danger verdicts — it
+is **not** a general "never lower the heuristic" rule: the heuristic's default
+for an unmatched tool is `review`, and letting a confident LLM `approve` upgrade
+a `review` is exactly what Smart Approvals is for. Only `deny` / `critical`
+findings are off-limits to auto-approval. Requires the judge to be enabled;
+auto-approved calls are tagged `smart_approval` in the dashboard and audit trail.
+Smart Approvals applies to the web and coordinator surfaces, not the interactive
+CLI.
 
 All fields are optional. The judge is enabled by default; use `enabled = false`
 (or `--no-judge` on the command line) to disable it.
