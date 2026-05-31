@@ -42,13 +42,13 @@ That's it — no flags, no arguments. The wizard prompts for everything.
 
 ## Deployment Modes
 
-The wizard supports two deployment modes:
+- **Single-node production** — `docker compose up` against the bundled
+  `turnstone/deploy/compose.yaml`: 1 server + console + channel + PostgreSQL,
+  pulled from ghcr.io. Good for most deployments.
+- **Local multi-node cluster** — clone the repo and run `docker compose up` at
+  the root for a 10-node fleet + console + Caddy + channel, built locally.
 
-- **Single-node production** (`docker compose --profile production up`) —
-  1 server + console + PostgreSQL. Good for most use cases.
-- **Multi-node cluster** (`docker compose --profile cluster up`) —
-  10-node server fleet + console + PostgreSQL. For high-throughput or
-  HA deployments.
+See [docs/docker.md](docs/docker.md) for both.
 
 ## Example Session
 

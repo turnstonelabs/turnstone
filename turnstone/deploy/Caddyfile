@@ -1,4 +1,4 @@
-# Browser TLS for the console dashboard (cluster/demo profile):
+# Browser TLS for the console dashboard:
 #   browser --h2/HTTPS--> caddy:443 --h1.1/HTTP--> console:8090
 # The console serves HTTP (it's the ACME bootstrap endpoint), so browser TLS is
 # terminated here. `tls internal` uses Caddy's own local CA; trust its root once:

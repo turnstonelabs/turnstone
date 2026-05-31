@@ -88,6 +88,7 @@ include = [
   "turnstone/shared_static/hls-1.6.16/**/*",
   "turnstone/sdk/py.typed",
   "turnstone/deploy/*.yaml",
+  "turnstone/deploy/Caddyfile",
 ]
 
 [tool.pytest.ini_options]

@@ -99,10 +99,10 @@ TURNSTONE_DISCORD_GUILD=123456789
 Then start the stack:
 
 ```bash
-docker compose --profile production up
+docker compose up
 ```
 
-The `channel` service starts automatically when
+The `channel` gateway runs by default; the Discord adapter activates once
 `TURNSTONE_DISCORD_TOKEN` is set.
 
 ### 3. Link User Accounts

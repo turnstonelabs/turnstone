@@ -1,165 +1,230 @@
 # Docker Deployment
 
-Docker Compose stack for running the full turnstone platform.
+Turnstone ships two Docker Compose stacks:
 
-## Quick Start
+| Stack | File | Use it for |
+|-------|------|------------|
+| **Dev cluster** | `compose.yaml` (repo root) | Clone-and-run. Builds locally, zero config, full 10-node cluster. |
+| **Production** | `turnstone/deploy/compose.yaml` | Pip/pipx installs. Pulls released images from ghcr.io, requires real secrets. |
+
+## Quick start — local cluster
 
 ```bash
-# Copy and edit environment config
-cp .env.example .env
-
-# Full stack (needs an LLM API on the host)
+git clone https://github.com/turnstonelabs/turnstone
+cd turnstone
 docker compose up
 ```
 
-Console dashboard: http://localhost:8090
+That builds one image and brings up the whole stack: PostgreSQL, the console,
+Caddy, the channel gateway, and **10 server nodes** (`node-1`…`node-10`). No
+`.env` is required — it ships with insecure dev defaults so it just works.
 
-> See also: [Deployment diagram](diagrams/png/12-deployment.png)
-
-## Services
-
-| Service | Port | Profile | Description |
-|---------|------|---------|-------------|
-| `server` | 8080 | default | Web UI + chat workstreams + LLM |
-| `console` | 8090 | default | Cluster dashboard |
-| `channel` | — | production | Channel gateway (Discord and/or Slack adapters) |
-| `server-1`…`server-10` | — | cluster | 10-node server fleet (PostgreSQL required) |
-
-## Profiles
-
-**Default** (no flag) — starts `server` and `console`. Requires an OpenAI-compatible LLM API running on the host (default: `http://localhost:8000/v1`).
+Open the dashboard at **https://localhost:8443**. It's served by Caddy with its
+own local CA, so trust the root certificate once (or click through the browser
+warning):
 
 ```bash
-docker compose up
+docker compose exec caddy cat /data/caddy/pki/authorities/local/root.crt
 ```
 
-**Production** — adds PostgreSQL and the channel gateway. Requires `POSTGRES_PASSWORD` and (for Discord) `TURNSTONE_DISCORD_TOKEN`:
+Create your first admin user (any node works — they share one database):
 
 ```bash
-docker compose --profile production up
+docker compose exec node-1 turnstone-admin create-user --username admin --name "Admin"
 ```
 
-**Cluster** — 10-node server fleet sharing PostgreSQL. Access all nodes via the console at `:8090`. Requires `POSTGRES_PASSWORD`:
+### Bring your own LLM
+
+Nodes boot **without** an LLM and appear in the console immediately. Add real
+model backends (OpenAI, Anthropic, or a local/vLLM endpoint) from the console
+UI's **Models** tab. To set a node's bootstrap default instead, point
+`LLM_BASE_URL` / `OPENAI_API_KEY` at an OpenAI-compatible endpoint in `.env`.
+
+### Fewer nodes
+
+Ten nodes is heavy on a laptop. Start a subset by naming the services (always
+include `postgres`, `console`, and `caddy`):
 
 ```bash
-docker compose --profile cluster up
+docker compose up postgres console caddy channel node-1 node-2 node-3
 ```
+
+## Why HTTPS-only?
+
+The console's plain-HTTP port (8090) is **not** published to the host. A plain
+HTTP/1.1 origin caps the browser at 6 connections, which starves the
+dashboard's per-pane SSE streams. Caddy serves the browser over HTTP/2
+(multiplexed) and proxies to `console:8090` on the internal network, so the cap
+is gone. Everything goes through `https://localhost:8443`.
+
+## Join a bare-metal host
+
+PostgreSQL is published on `127.0.0.1:5432`, so a `turnstone-server` running
+directly on the same machine — for example to use a local GPU — can join the
+same cluster and show up in the console alongside the containerized nodes.
+
+Put the secret and connection settings in `~/.config/turnstone/config.toml`
+(secrets belong in this file, not the process environment — keep it `0600`,
+the loader warns otherwise):
+
+```toml
+[auth]
+jwt_secret = "dev-only-insecure-jwt-secret-change-me-for-real-deployments"
+
+[database]
+backend = "postgresql"
+url = "postgresql+psycopg://turnstone:turnstone@localhost:5432/turnstone"
+
+[api]
+base_url = "http://localhost:8000/v1"   # your local model endpoint
+api_key = "dummy"
+```
+
+Then start the server. The node identity isn't a secret, so it stays on the
+command line:
+
+```bash
+chmod 600 ~/.config/turnstone/config.toml
+TURNSTONE_NODE_ID=host-1 TURNSTONE_ADVERTISE_URL=http://host.docker.internal:8080 \
+  turnstone-server --host 0.0.0.0 --port 8080
+```
+
+The host server registers itself in PostgreSQL; the console reaches it back via
+`host.docker.internal`. The `jwt_secret` and DB credentials above are the
+dev-stack defaults — match whatever you set in `.env` if you changed them. To
+let a **different** machine join, start the stack with `POSTGRES_BIND=0.0.0.0`
+and use the host's routable IP in the `url` and `TURNSTONE_ADVERTISE_URL` —
+but **set a strong `POSTGRES_PASSWORD` first**, or you'll expose a database with
+the insecure default password (and every user account + API-token hash in it) to
+your network.
+
+## Production stack
+
+For a real deployment use the bundled stack, which pulls released images
+instead of building:
+
+```bash
+docker compose -f turnstone/deploy/compose.yaml up
+```
+
+It's the same shape as the dev stack — Caddy-fronted console, channel, and a
+PostgreSQL all share one database so the console discovers the node — but it
+pulls released images, runs a single server node, and has **no baked-in
+secrets**. Set these in `.env` first (`turnstone-bootstrap` generates them):
+
+```bash
+TURNSTONE_JWT_SECRET=<python -c "import secrets; print(secrets.token_hex(32))">
+POSTGRES_PASSWORD=<a strong password>
+```
+
+The dashboard is at **https://localhost:8443** (Caddy, same as the dev stack);
+the console's HTTP port isn't published. For a real domain and a publicly
+trusted cert, edit `turnstone/deploy/Caddyfile` to point Caddy at Let's Encrypt
+(see [tls.md](tls.md)). Pin the image with `TURNSTONE_IMAGE_TAG` (default:
+`latest`).
+
+### mTLS
+
+Layer the TLS overlay on the production stack to enable mutual TLS between
+services. A bootstrap container creates a CA and every service auto-provisions
+certs via the console's ACME endpoint:
+
+```bash
+docker compose -f turnstone/deploy/compose.yaml -f deploy/docker-compose.tls.yml up
+```
+
+See [tls.md](tls.md) for details.
 
 ## Configuration
 
-All configuration is via environment variables in `.env` (copy from `.env.example`):
+Everything is configured with environment variables in `.env` (copy from
+[`.env.example`](../.env.example)). The dev stack needs none of them — they're
+overrides.
 
-### LLM Backend
+### LLM backend
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LLM_BASE_URL` | `http://host.docker.internal:8000/v1` | OpenAI-compatible API URL |
+| `LLM_BASE_URL` | `http://host.docker.internal:8000/v1` | Bootstrap OpenAI-compatible API URL (real backends go in the UI) |
 | `OPENAI_API_KEY` | `dummy` | API key (`dummy` for local servers) |
-| `TAVILY_API_KEY` | — | Web search API key (only needed for local/vLLM models; Anthropic and OpenAI search models use native search) |
+| `TAVILY_API_KEY` | — | Web-search fallback (only for local/vLLM models; Anthropic/OpenAI use native search) |
+| `MODEL` | — | Override the default model alias |
 
-### Server
+### Auth & database
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SERVER_PORT` | `8080` | Host port mapping |
-| `SKIP_PERMISSIONS` | — | Set to any value to auto-approve all tools |
+| Variable | Default (dev / prod) | Description |
+|----------|----------------------|-------------|
+| `TURNSTONE_JWT_SECRET` | insecure default / **required** | JWT signing secret. Every service must share one value. |
+| `TURNSTONE_DB_BACKEND` | `postgresql` | `sqlite` or `postgresql`. Multi-node discovery requires `postgresql`. |
+| `TURNSTONE_DB_URL` | bundled Postgres | SQLAlchemy URL. Override to use an external database. |
+| `POSTGRES_USER` | `turnstone` | PostgreSQL username |
+| `POSTGRES_PASSWORD` | `turnstone` / **required** | PostgreSQL password |
+| `POSTGRES_MAX_CONNECTIONS` | `300` | `max_connections` for the bundled Postgres |
 
-### Console
+> **Discovery needs a shared database.** Each server registers and heartbeats
+> into a `services` table that the console polls. All services in these stacks
+> point at the same PostgreSQL by default; SQLite-per-container can't see other
+> containers.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CONSOLE_PORT` | `8090` | Host port mapping |
+> **Large clusters:** each process keeps a small pool (5 max). Beyond ~50 nodes,
+> put [PgBouncer](pgbouncer.md) (transaction pooling) between turnstone and
+> PostgreSQL.
 
-### Auth
+### Ports
 
-Auth is always enabled. `TURNSTONE_JWT_SECRET` is required.
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `TURNSTONE_JWT_SECRET` | — | Secret key for signing JWTs (required) |
-
-### Database
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `TURNSTONE_DB_BACKEND` | `sqlite` | Storage backend: `sqlite` or `postgresql` |
-| `TURNSTONE_DB_URL` | — | Database URL (e.g. `postgresql+psycopg://user:pass@postgres:5432/turnstone`). For SQLite, defaults to `/data/.turnstone.db` |
-| `TURNSTONE_DB_LISTEN_URL` | (falls back to `TURNSTONE_DB_URL`) | Direct-to-PostgreSQL URL for the console's dedicated `LISTEN` connection. Set this when `TURNSTONE_DB_URL` points at PgBouncer in transaction pooling mode — LISTEN is session state and the transaction-pooled connection can't hold it. See [pgbouncer.md](pgbouncer.md). |
-| `TURNSTONE_DB_POOL_SIZE` | `2` | PostgreSQL connection pool size per process (default: 2 base + 3 overflow = 5 max) |
-| `POSTGRES_USER` | `turnstone` | PostgreSQL container username (used in default `TURNSTONE_DB_URL` for cluster/channel) |
-| `POSTGRES_PASSWORD` | — | PostgreSQL container password (required for production and cluster profiles) |
-
-The database stores workstream history, user accounts, and API tokens. When using JWT auth, a database backend is required for user storage.
-
-> **Upgrading from <1.3.0a4:** Earlier versions used `DB_BACKEND` and `DATABASE_URL` in `.env`, which `compose.yaml` mapped to the `TURNSTONE_`-prefixed names internally. These short aliases have been removed. Rename `DB_BACKEND` → `TURNSTONE_DB_BACKEND` and `DATABASE_URL` → `TURNSTONE_DB_URL` in your `.env` file.
-
-> **Large clusters:** Each turnstone process maintains a small connection pool (5 max). At hundreds of nodes this adds up — use [PgBouncer](pgbouncer.md) in transaction pooling mode between turnstone and PostgreSQL.
-
-> **First-time setup:** After deploying with auth enabled, create an initial admin user by running `turnstone-admin create-user` inside the container:
->
-> ```bash
-> docker compose exec server turnstone-admin create-user --username admin --name "Admin"
-> ```
->
-> You will be prompted to set a password. Use it to log in via the UI or SDK, then create additional users through the admin API. Pass `--token --scopes read,write,approve` to also generate an initial API token.
-
-### Channel Gateway
+Both stacks publish the same two host ports (everything else is reached through
+Caddy or proxied by the console):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TURNSTONE_DISCORD_TOKEN` | — | Discord bot token (required to enable Discord adapter) |
-| `TURNSTONE_DISCORD_GUILD` | `0` | Restrict to a single Discord guild (0 = all guilds) |
-| `TURNSTONE_SLACK_TOKEN` | — | Slack Bot User OAuth token `xoxb-…` (required to enable Slack adapter) |
-| `TURNSTONE_SLACK_APP_TOKEN` | — | Slack App-Level token `xapp-…` (required with `TURNSTONE_SLACK_TOKEN`) |
-| `TURNSTONE_SLACK_CHANNELS` | — | Comma-separated Slack channel IDs to allow (empty = all) |
-| `TURNSTONE_SLACK_SLASH_COMMAND` | `/turnstone` | Slash command registered in the Slack app |
+| `CONSOLE_HTTPS_PORT` | `8443` | Host port for Caddy (dashboard HTTPS) |
+| `POSTGRES_PORT` | `5432` | Host port for PostgreSQL (for bare-metal joins) |
+| `POSTGRES_BIND` | `127.0.0.1` | Interface PostgreSQL binds on; set `0.0.0.0` for LAN access |
 
-The channel service runs in the `production` profile. When
-`TURNSTONE_DISCORD_TOKEN` or the Slack pair is set the gateway starts the
-corresponding adapter; both can run in one process. See
-[Channel Integrations](channels.md) for platform app setup and user
-account linking.
+### Channel gateway
 
-## Scaling
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TURNSTONE_DISCORD_TOKEN` | — | Discord bot token (enables the Discord adapter) |
+| `TURNSTONE_DISCORD_GUILD` | `0` | Restrict to one guild (0 = all) |
+| `TURNSTONE_SLACK_TOKEN` | — | Slack Bot User OAuth token `xoxb-…` |
+| `TURNSTONE_SLACK_APP_TOKEN` | — | Slack App-Level token `xapp-…` (with the Slack token) |
 
-For multi-node testing, use the `cluster` profile which provides 10 server instances with unique node IDs (`node-1` through `node-10`), resource limits, and shared PostgreSQL:
+The channel runs HTTP-only with no adapters until a token is set, so it's safe
+to leave running. See [Channel Integrations](channels.md) for app setup.
 
-```bash
-POSTGRES_PASSWORD=secret docker compose --profile cluster up
-```
+### Other
 
-The default `server` also runs alongside the cluster nodes (11 total). All nodes are accessible via the console dashboard at `:8090`.
-
-For production clusters beyond ~50 nodes, add PgBouncer between turnstone services and PostgreSQL. See [PgBouncer Connection Pooling](pgbouncer.md) for Docker Compose and Helm configuration.
-
-## Volumes
-
-| Volume | Mount | Purpose |
-|--------|-------|---------|
-| `turnstone-data` | `/data` | SQLite database (`.turnstone.db`) |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WORKSPACE_MOUNT` | empty volume | Host directory bind-mounted at `/workspace` for the model to read/write |
+| `SKIP_PERMISSIONS` | — | Set to any value to auto-approve all tool calls (dev only) |
+| `MCP_CONFIG` | — | Path to an MCP server config file |
+| `TURNSTONE_IMAGE_TAG` | `latest` | ghcr.io image tag — production stack |
 
 ## Building
 
-The image uses a multi-stage Dockerfile:
+Both stacks install all entry points into a single image (`turnstone`,
+`turnstone-server`, `turnstone-console`, `turnstone-channel`, `turnstone-admin`,
+`turnstone-eval`, `turnstone-bootstrap`):
 
 ```bash
-# Build all services
-docker compose build
-
-# Rebuild without cache
-docker compose build --no-cache
+docker compose build            # build the dev image
+docker compose build --no-cache # rebuild from scratch
 ```
 
-All entry points are installed in a single image: `turnstone`,
-`turnstone-server`, `turnstone-console`, `turnstone-channel`,
-`turnstone-admin`, `turnstone-eval`, and `turnstone-bootstrap`.
+## Volumes
+
+| Volume | Purpose |
+|--------|---------|
+| `postgres-data` | PostgreSQL data directory |
+| `turnstone-data` | `/data` per node (SQLite fallback, local state) |
+| `workspace` | `/workspace` (unless `WORKSPACE_MOUNT` is set) |
+| `caddy-data` / `caddy-config` | Caddy's local CA and config (dev stack) |
 
 ## Cleanup
 
 ```bash
-# Stop and remove containers
-docker compose down
-
-# Stop, remove containers and volumes
-docker compose down -v
+docker compose down       # stop and remove containers
+docker compose down -v    # also remove volumes (database, certs)
 ```

@@ -1,7 +1,8 @@
-# TLS overlay — enables mTLS across the turnstone cluster.
+# TLS overlay — enables mTLS across the turnstone deployment.
 #
-# Usage (requires base compose.yaml with production profile):
-#   docker compose -f compose.yaml -f deploy/docker-compose.tls.yml --profile production up
+# Layers on the production stack (it patches the `server`, `console`, and
+# `channel` services that file defines):
+#   docker compose -f turnstone/deploy/compose.yaml -f deploy/docker-compose.tls.yml up
 #
 # The tls-init service bootstraps a CA and issues certs.
 # All turnstone services auto-provision their own certs via the
@@ -12,7 +13,7 @@ services:
   # Runs as root to create directories in the volume, then chowns
   # to turnstone:turnstone with restrictive perms (keys 0600).
   tls-init:
-    build: .
+    image: ghcr.io/turnstonelabs/turnstone:${TURNSTONE_IMAGE_TAG:-latest}
     user: root
     command:
       - sh

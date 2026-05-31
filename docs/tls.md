@@ -8,7 +8,7 @@ inter-service communication, powered by [lacme](https://pypi.org/project/lacme/)
 ## Quick Start (Docker Compose)
 
 ```bash
-docker compose -f compose.yaml -f deploy/docker-compose.tls.yml up
+docker compose -f turnstone/deploy/compose.yaml -f deploy/docker-compose.tls.yml up
 ```
 
 This:
@@ -28,19 +28,24 @@ must, because it is the cluster's ACME bootstrap endpoint: new nodes fetch
 to verify TLS. So the console cannot be HTTPS-only on its port.
 
 To put the **browser → console** hop on HTTPS, terminate TLS at a reverse proxy
-in front of the console. The `cluster` profile ships a `caddy` service that does
-this:
+in front of the console. The dev stack (root `compose.yaml`) ships a `caddy`
+service that does exactly this — and it's the only published entry point, so the
+dashboard is HTTPS by default:
 
 ```bash
-docker compose --profile cluster up
+docker compose up
 # dashboard: https://localhost:${CONSOLE_HTTPS_PORT:-8443}
 ```
+
+The production stack (`turnstone/deploy/compose.yaml`) bundles the same `caddy`
+service, so the dashboard is HTTPS there too. For a real domain and a publicly
+trusted cert, point Caddy at Let's Encrypt by editing `turnstone/deploy/Caddyfile`.
 
 ```
 browser  --h2 / HTTPS-->  caddy:443  --h1.1 / HTTP-->  console:8090
 ```
 
-Caddy uses its **own local CA** (`tls internal`, see `deploy/Caddyfile`), so the
+Caddy uses its **own local CA** (`tls internal`, see `turnstone/deploy/Caddyfile`), so the
 setup is self-contained with no dependency on the console's ACME path. Trust the
 local root once to silence the browser warning:
 
@@ -217,7 +222,7 @@ const client = new TurnstoneServer({
 3. Fetches CA root cert from `http://console/acme/ca.pem` (plain HTTP, TOFU)
 4. Requests a service cert via ACME (plain HTTP, JWS-signed). The cert's
    primary domain / SAN is the node's **advertised host** (the host of
-   `TURNSTONE_ADVERTISE_URL`, e.g. `server-1`) — the name peers actually dial,
+   `TURNSTONE_ADVERTISE_URL`, e.g. `node-1`) — the name peers actually dial,
    not the container hostname. This makes mTLS hostname verification succeed
    and keys the cert by a stable name that survives container recreation.
 5. Starts auto-renewal (24h interval, re-issues before expiry) **scoped to its

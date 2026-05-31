@@ -1,16 +1,50 @@
 # =============================================================================
-# Turnstone Docker Compose Stack — Development
+# Turnstone — local cluster stack (docker compose)
 #
-# This file is for local development from a git clone. It builds images
-# locally from the Dockerfile. If you installed via pip/pipx, run
-# `turnstone-bootstrap` instead — it writes a production compose.yaml
-# that pulls pre-built images from ghcr.io.
+# Clone the repo and run:
 #
-# Usage:
-#   Infra only:           docker compose up
-#   Single node:          docker compose --profile production up
-#   Production (PG):      TURNSTONE_DB_BACKEND=postgresql docker compose --profile production up
-#   10-node cluster:      docker compose --profile cluster up
+#     docker compose up
+#
+# That builds one image and brings up a complete, console-visible cluster:
+# PostgreSQL + console + Caddy + channel gateway + 10 server nodes (node-1…10).
+#
+#   Dashboard: https://localhost:8443   (Caddy's local CA — trust it once)
+#
+# Access is via Caddy only — the console's plain-HTTP port is intentionally not
+# published (HTTP/2 from Caddy avoids the browser's 6-connection cap on the
+# dashboard's SSE streams). Trust Caddy's root once:
+#     docker compose exec caddy cat /data/caddy/pki/authorities/local/root.crt
+#
+# It works out of the box with INSECURE dev defaults (see the secret/password
+# values below) so there's nothing to configure first. A .env file still
+# overrides any value. For a real deployment use the bundled production stack
+# at turnstone/deploy/compose.yaml — it pulls released images from ghcr.io and
+# requires you to set real secrets.
+#
+# Bring your own LLM: nodes boot without one and show up in the console
+# immediately. Add model backends (OpenAI / Anthropic / local vLLM) from the
+# console UI's Models tab, or point LLM_BASE_URL / OPENAI_API_KEY (below) at an
+# OpenAI-compatible endpoint.
+#
+# Fewer nodes (lighter machines):
+#     docker compose up postgres console caddy channel node-1 node-2 node-3
+#
+# Join a bare-metal host: Postgres is published on 127.0.0.1:5432, so a
+# turnstone-server running directly on this machine (e.g. to use a local GPU)
+# can join the same cluster. Keep the secret + connection settings in
+# ~/.config/turnstone/config.toml (chmod 0600 — the loader warns otherwise):
+#     [auth]
+#     jwt_secret = "dev-only-insecure-jwt-secret-change-me-for-real-deployments"
+#     [database]
+#     backend = "postgresql"
+#     url = "postgresql+psycopg://turnstone:turnstone@localhost:5432/turnstone"
+#     [api]
+#     base_url = "http://localhost:8000/v1"
+#     api_key = "dummy"
+# then run (node identity isn't a secret, so it stays on the command line):
+#     TURNSTONE_NODE_ID=host-1 TURNSTONE_ADVERTISE_URL=http://host.docker.internal:8080 \
+#       turnstone-server --host 0.0.0.0 --port 8080
+# It registers in Postgres and the console reaches it back via host.docker.internal.
 # =============================================================================
 
 name: turnstone
@@ -26,15 +60,26 @@ volumes:
   caddy-data:
   caddy-config:
 
+# -- Shared values (scalar anchors) -------------------------------------------
+# Defined once here, referenced (*alias) by every service so the dev defaults
+# can't drift. All `${VAR:-default}` values are still overridable via .env.
+x-shared:
+  # INSECURE dev default. Every service MUST share ONE secret — the console
+  # mints its own service token (signed with this) to reach the nodes. Override
+  # TURNSTONE_JWT_SECRET in .env for anything that isn't a local sandbox.
+  jwt-secret: &jwt-secret "${TURNSTONE_JWT_SECRET:-dev-only-insecure-jwt-secret-change-me-for-real-deployments}"
+  db-backend: &db-backend "${TURNSTONE_DB_BACKEND:-postgresql}"
+  # All services point at the same Postgres. Node discovery REQUIRES a shared
+  # DB: each server registers + heartbeats into a `services` table that the
+  # console polls. (SQLite-per-container can't see other containers.)
+  db-url: &db-url "${TURNSTONE_DB_URL:-postgresql+psycopg://${POSTGRES_USER:-turnstone}:${POSTGRES_PASSWORD:-turnstone}@postgres:5432/turnstone}"
+
 services:
   # -------------------------------------------------------------------
-  # PostgreSQL — production database (profile: production)
+  # PostgreSQL — the shared database that ties the cluster together.
   # -------------------------------------------------------------------
   postgres:
     image: pgautoupgrade/pgautoupgrade:18-alpine
-    profiles:
-      - production
-      - cluster
     command:
       - postgres
       - -c
@@ -44,8 +89,16 @@ services:
     environment:
       POSTGRES_DB: turnstone
       POSTGRES_USER: ${POSTGRES_USER:-turnstone}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required for production profile}
+      # INSECURE dev default — override POSTGRES_PASSWORD in .env for real use.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-turnstone}
       PGDATA: /var/lib/postgresql/data
+    # Published on localhost so a bare-metal turnstone-server running on THIS
+    # host can join the cluster (see "Join a bare-metal host" in the header).
+    # Bound to 127.0.0.1 by default; set POSTGRES_BIND=0.0.0.0 to let another
+    # machine connect — but set a real POSTGRES_PASSWORD first, or you'll expose
+    # a database with the insecure default password to your network.
+    ports:
+      - "${POSTGRES_BIND:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     networks:
@@ -59,65 +112,21 @@ services:
     deploy:
       resources:
         limits:
-          memory: 4G
-          cpus: '4.0'
+          memory: 2G
     restart: unless-stopped
 
   # -------------------------------------------------------------------
-  # turnstone-server — Web UI + chat workstreams + LLM interaction
-  # -------------------------------------------------------------------
-  server:
-    image: turnstone:local
-    profiles:
-      - production
-    command:
-      - sh
-      - -c
-      - >-
-        turnstone-server
-        --host 0.0.0.0
-        --port 8080
-        --base-url "$${LLM_BASE_URL}"
-        --api-key "$${OPENAI_API_KEY}"
-        $${MODEL:+--model $$MODEL}
-        $${SKIP_PERMISSIONS:+--skip-permissions}
-        $${MCP_CONFIG:+--mcp-config $$MCP_CONFIG}
-    ports:
-      - "${SERVER_PORT:-8080}:8080"
-    volumes:
-      - turnstone-data:/data
-      - ${WORKSPACE_MOUNT:-workspace}:/workspace
-    environment:
-      - LLM_BASE_URL=${LLM_BASE_URL:-http://host.docker.internal:8000/v1}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-dummy}
-      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
-      - SKIP_PERMISSIONS=${SKIP_PERMISSIONS:-}
-      # Generate with: python -c "import secrets; print(secrets.token_hex(32))"
-      - TURNSTONE_JWT_SECRET=${TURNSTONE_JWT_SECRET:?Set TURNSTONE_JWT_SECRET in .env}
-      - MODEL=${MODEL:-}
-      - MCP_CONFIG=${MCP_CONFIG:-}
-      - TURNSTONE_DB_BACKEND=${TURNSTONE_DB_BACKEND:-sqlite}
-      - TURNSTONE_DB_URL=${TURNSTONE_DB_URL:-}
-      - TURNSTONE_NODE_ID=${TURNSTONE_NODE_ID:-}
-      - TURNSTONE_ADVERTISE_URL=${TURNSTONE_ADVERTISE_URL:-http://server:8080}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    networks:
-      - turnstone-net
-    depends_on:
-      postgres:
-        condition: service_healthy
-        required: false
-    healthcheck:
-      test: ["CMD", "python", "/usr/local/bin/healthcheck.py", "http://127.0.0.1:8080/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 60s
-    restart: unless-stopped
-
-  # -------------------------------------------------------------------
-  # turnstone-console — Cluster dashboard
+  # turnstone-console — cluster dashboard. Reach it ONLY through Caddy at
+  # https://localhost:8443 (see the caddy service below).
+  #
+  # The console port (8090) is deliberately NOT published to the host: a plain
+  # HTTP/1.1 origin caps the browser at 6 connections, which starves the
+  # dashboard's per-pane SSE streams. Caddy serves the browser over HTTP/2
+  # (multiplexed) and proxies to console:8090 internally, so the cap is gone.
+  #
+  # The single `build:` here produces the turnstone:local image every other
+  # service reuses. extra_hosts lets the console reach a bare-metal server
+  # advertising http://host.docker.internal:8080 (see "Join a host" below).
   # -------------------------------------------------------------------
   console:
     image: turnstone:local
@@ -128,16 +137,18 @@ services:
       - turnstone-console
       - --host=0.0.0.0
       - --port=8090
-    ports:
-      - "${CONSOLE_PORT:-8090}:8090"
     environment:
-      # Generate with: python -c "import secrets; print(secrets.token_hex(32))"
-      - TURNSTONE_JWT_SECRET=${TURNSTONE_JWT_SECRET:?Set TURNSTONE_JWT_SECRET in .env}
-      - TURNSTONE_DB_BACKEND=${TURNSTONE_DB_BACKEND:-sqlite}
-      - TURNSTONE_DB_URL=${TURNSTONE_DB_URL:-}
-      - TURNSTONE_CONSOLE_URL=http://console:8090
+      TURNSTONE_JWT_SECRET: *jwt-secret
+      TURNSTONE_DB_BACKEND: *db-backend
+      TURNSTONE_DB_URL: *db-url
+      TURNSTONE_CONSOLE_URL: http://console:8090
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - turnstone-net
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "/usr/local/bin/healthcheck.py", "http://127.0.0.1:8090/health"]
       interval: 10s
@@ -147,20 +158,18 @@ services:
     restart: unless-stopped
 
   # -------------------------------------------------------------------
-  # caddy — browser TLS for the console dashboard (cluster/demo).
-  # Terminates HTTPS (Caddy's local CA, see deploy/Caddyfile) → console:8090.
-  # Dashboard: https://localhost:${CONSOLE_HTTPS_PORT:-8443}
+  # caddy — browser TLS for the console dashboard.
+  # Terminates HTTPS (Caddy's own local CA, see turnstone/deploy/Caddyfile) → console:8090.
+  # Dashboard over TLS: https://localhost:${CONSOLE_HTTPS_PORT:-8443}
   # -------------------------------------------------------------------
   caddy:
     image: caddy:2.11
-    profiles:
-      - cluster
     depends_on:
       - console
     ports:
       - "${CONSOLE_HTTPS_PORT:-8443}:443"
     volumes:
-      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./turnstone/deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data # persist Caddy's local CA across restarts
       - caddy-config:/config
     networks:
@@ -168,14 +177,12 @@ services:
     restart: unless-stopped
 
   # -------------------------------------------------------------------
-  # turnstone-channel — Channel gateway (Discord, Slack, etc.)
-  # Requires TURNSTONE_DISCORD_TOKEN to enable Discord adapter
+  # turnstone-channel — channel gateway (Discord and/or Slack).
+  # Runs HTTP-only with no adapters until you set a token, so it's safe
+  # to leave running. See docs/channels.md.
   # -------------------------------------------------------------------
   channel:
     image: turnstone:local
-    profiles:
-      - production
-      - cluster
     command:
       - sh
       - -c
@@ -184,36 +191,36 @@ services:
         --http-host=0.0.0.0
         $${TURNSTONE_DISCORD_GUILD:+--discord-guild $$TURNSTONE_DISCORD_GUILD}
     environment:
-      - TURNSTONE_DISCORD_TOKEN=${TURNSTONE_DISCORD_TOKEN:-}
-      - TURNSTONE_DISCORD_GUILD=${TURNSTONE_DISCORD_GUILD:-0}
-      # Generate with: python -c "import secrets; print(secrets.token_hex(32))"
-      - TURNSTONE_JWT_SECRET=${TURNSTONE_JWT_SECRET:?Set TURNSTONE_JWT_SECRET in .env}
-      - TURNSTONE_DB_BACKEND=${TURNSTONE_DB_BACKEND:-postgresql}
-      - TURNSTONE_DB_URL=${TURNSTONE_DB_URL:-postgresql+psycopg://${POSTGRES_USER:-turnstone}:${POSTGRES_PASSWORD:-turnstone}@postgres:5432/turnstone}
-      - TURNSTONE_CHANNEL_ADVERTISE_URL=http://channel:8091
+      TURNSTONE_JWT_SECRET: *jwt-secret
+      TURNSTONE_DB_BACKEND: *db-backend
+      TURNSTONE_DB_URL: *db-url
+      TURNSTONE_DISCORD_TOKEN: ${TURNSTONE_DISCORD_TOKEN:-}
+      TURNSTONE_DISCORD_GUILD: ${TURNSTONE_DISCORD_GUILD:-0}
+      TURNSTONE_SLACK_TOKEN: ${TURNSTONE_SLACK_TOKEN:-}
+      TURNSTONE_SLACK_APP_TOKEN: ${TURNSTONE_SLACK_APP_TOKEN:-}
+      TURNSTONE_CHANNEL_ADVERTISE_URL: http://channel:8091
     networks:
       - turnstone-net
     depends_on:
       postgres:
         condition: service_healthy
-        required: false
     restart: unless-stopped
 
   # ===================================================================
-  # 10-node cluster (profile: cluster)
+  # Server fleet — node-1 … node-10
   #
-  # All nodes share the same PostgreSQL instance.
-  # Access via console at :8090.
+  # Each node registers itself in Postgres on boot (unique
+  # TURNSTONE_NODE_ID + TURNSTONE_ADVERTISE_URL) and the console
+  # discovers it automatically — no static node list anywhere.
   #
-  # Start:  docker compose --profile cluster up
+  # node-1 carries the shared definition (&node / &node-env); node-2…10
+  # inherit it and override only their identity.
   # ===================================================================
-
-  # -- cluster servers ------------------------------------------------
-
-  server-1: &cluster-server
+  node-1: &node
     image: turnstone:local
-    build: { context: ., dockerfile: Dockerfile }
-    profiles: [cluster]
+    build:
+      context: .
+      dockerfile: Dockerfile
     command:
       - sh
       - -c
@@ -229,23 +236,26 @@ services:
     volumes:
       - turnstone-data:/data
       - ${WORKSPACE_MOUNT:-workspace}:/workspace
-    environment: &cluster-server-env
+    environment: &node-env
+      TURNSTONE_JWT_SECRET: *jwt-secret
+      TURNSTONE_DB_BACKEND: *db-backend
+      TURNSTONE_DB_URL: *db-url
+      # Bootstrap LLM defaults — real backends are configured in the console UI.
       LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:8000/v1}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-dummy}
       TAVILY_API_KEY: ${TAVILY_API_KEY:-}
-      SKIP_PERMISSIONS: ${SKIP_PERMISSIONS:-}
-      # Generate with: python -c "import secrets; print(secrets.token_hex(32))"
-      TURNSTONE_JWT_SECRET: ${TURNSTONE_JWT_SECRET:?Set TURNSTONE_JWT_SECRET in .env}
       MODEL: ${MODEL:-}
       MCP_CONFIG: ${MCP_CONFIG:-}
-      TURNSTONE_DB_BACKEND: ${TURNSTONE_DB_BACKEND:-postgresql}
-      TURNSTONE_DB_URL: ${TURNSTONE_DB_URL:-postgresql+psycopg://${POSTGRES_USER:-turnstone}:${POSTGRES_PASSWORD:?}@postgres:5432/turnstone}
+      SKIP_PERMISSIONS: ${SKIP_PERMISSIONS:-}
       TURNSTONE_NODE_ID: node-1
-      TURNSTONE_ADVERTISE_URL: http://server-1:8080
-    extra_hosts: ["host.docker.internal:host-gateway"]
-    networks: [turnstone-net]
+      TURNSTONE_ADVERTISE_URL: http://node-1:8080
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - turnstone-net
     depends_on:
-      postgres: { condition: service_healthy }
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "/usr/local/bin/healthcheck.py", "http://127.0.0.1:8080/health"]
       interval: 10s
@@ -254,34 +264,34 @@ services:
       start_period: 60s
     deploy:
       resources:
-        limits: { memory: 4G, cpus: '4' }
+        limits:
+          memory: 4G
     restart: unless-stopped
 
-  server-2:
-    <<: *cluster-server
-    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: node-2, TURNSTONE_ADVERTISE_URL: "http://server-2:8080" }
-  server-3:
-    <<: *cluster-server
-    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: node-3, TURNSTONE_ADVERTISE_URL: "http://server-3:8080" }
-  server-4:
-    <<: *cluster-server
-    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: node-4, TURNSTONE_ADVERTISE_URL: "http://server-4:8080" }
-  server-5:
-    <<: *cluster-server
-    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: node-5, TURNSTONE_ADVERTISE_URL: "http://server-5:8080" }
-  server-6:
-    <<: *cluster-server
-    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: node-6, TURNSTONE_ADVERTISE_URL: "http://server-6:8080" }
-  server-7:
-    <<: *cluster-server
-    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: node-7, TURNSTONE_ADVERTISE_URL: "http://server-7:8080" }
-  server-8:
-    <<: *cluster-server
-    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: node-8, TURNSTONE_ADVERTISE_URL: "http://server-8:8080" }
-  server-9:
-    <<: *cluster-server
-    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: node-9, TURNSTONE_ADVERTISE_URL: "http://server-9:8080" }
-  server-10:
-    <<: *cluster-server
-    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: node-10, TURNSTONE_ADVERTISE_URL: "http://server-10:8080" }
-
+  node-2:
+    <<: *node
+    environment: { <<: *node-env, TURNSTONE_NODE_ID: node-2, TURNSTONE_ADVERTISE_URL: "http://node-2:8080" }
+  node-3:
+    <<: *node
+    environment: { <<: *node-env, TURNSTONE_NODE_ID: node-3, TURNSTONE_ADVERTISE_URL: "http://node-3:8080" }
+  node-4:
+    <<: *node
+    environment: { <<: *node-env, TURNSTONE_NODE_ID: node-4, TURNSTONE_ADVERTISE_URL: "http://node-4:8080" }
+  node-5:
+    <<: *node
+    environment: { <<: *node-env, TURNSTONE_NODE_ID: node-5, TURNSTONE_ADVERTISE_URL: "http://node-5:8080" }
+  node-6:
+    <<: *node
+    environment: { <<: *node-env, TURNSTONE_NODE_ID: node-6, TURNSTONE_ADVERTISE_URL: "http://node-6:8080" }
+  node-7:
+    <<: *node
+    environment: { <<: *node-env, TURNSTONE_NODE_ID: node-7, TURNSTONE_ADVERTISE_URL: "http://node-7:8080" }
+  node-8:
+    <<: *node
+    environment: { <<: *node-env, TURNSTONE_NODE_ID: node-8, TURNSTONE_ADVERTISE_URL: "http://node-8:8080" }
+  node-9:
+    <<: *node
+    environment: { <<: *node-env, TURNSTONE_NODE_ID: node-9, TURNSTONE_ADVERTISE_URL: "http://node-9:8080" }
+  node-10:
+    <<: *node
+    environment: { <<: *node-env, TURNSTONE_NODE_ID: node-10, TURNSTONE_ADVERTISE_URL: "http://node-10:8080" }
