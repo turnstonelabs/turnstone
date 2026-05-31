@@ -699,7 +699,10 @@ function renderNodePicker() {
     // Status is dot colour + shape, but colour/shape alone fails for
     // color-blind users at 7px — spell out the non-healthy states.
     const degraded = !!(node.health && node.health.status === "degraded");
-    if (!node.reachable || degraded) {
+    let stateSuffix = "";
+    if (!node.reachable) stateSuffix = " (unreachable)";
+    else if (degraded) stateSuffix = " (degraded)";
+    if (stateSuffix) {
       const tag = document.createElement("span");
       tag.className = "csb-np-state" + (node.reachable ? "" : " down");
       tag.textContent = node.reachable ? "degraded" : "down";
@@ -709,11 +712,7 @@ function renderNodePicker() {
     }
     item.setAttribute(
       "aria-label",
-      node.node_id +
-        ", " +
-        node.ws_total +
-        " workstreams" +
-        (node.reachable ? "" : " (unreachable)"),
+      node.node_id + ", " + node.ws_total + " workstreams" + stateSuffix,
     );
     const nodeUrl = "/node/" + encodeURIComponent(node.node_id) + "/";
     item.onclick = function () {
