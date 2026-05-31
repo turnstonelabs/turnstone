@@ -425,7 +425,7 @@ class Pane {
       return;
     }
 
-    const risk = verdict.risk_level || "medium";
+    const risk = normalizeRiskLevel(verdict.risk_level);
     badge.className = "verdict-badge verdict-" + risk + " ts-verdict-badge";
     badge.setAttribute("data-risk", risk);
 
@@ -2771,7 +2771,7 @@ function _buildDefaultReminderBubble(r) {
 // via showOutputWarning.  Single source of truth keeps the two
 // surfaces from drifting on role / class / escape semantics.
 function _buildOutputWarningEl(assessment) {
-  const risk = (assessment && assessment.risk_level) || "medium";
+  const risk = normalizeRiskLevel(assessment && assessment.risk_level);
   const flags = (assessment && assessment.flags) || [];
   const warning = document.createElement("div");
   warning.className = "output-warning output-warning-" + risk;
@@ -5605,9 +5605,23 @@ function buildToolDiv(item) {
   return div;
 }
 
+// Server-supplied ``risk_level`` is constrained to this enum, but it lands
+// in ``className`` / ``data-risk`` strings that the verdict + output-warning
+// CSS and the ``badge.nextElementSibling`` / ``data-risk`` selectors rely on.
+// Funnel every interpolation through one chokepoint so whitespace, a stray
+// case, or a future relaxed-validation server value can't break selector
+// targeting silently (issue #562) — unknown / blank → the neutral default.
+const VALID_RISK_LEVELS = new Set(["low", "medium", "high", "critical"]);
+function normalizeRiskLevel(raw) {
+  const s = String(raw || "")
+    .trim()
+    .toLowerCase();
+  return VALID_RISK_LEVELS.has(s) ? s : "medium";
+}
+
 function renderVerdictBadge(verdict, judgePending) {
   if (!verdict) return document.createDocumentFragment();
-  const risk = verdict.risk_level || "medium";
+  const risk = normalizeRiskLevel(verdict.risk_level);
   const rec = verdict.recommendation || "review";
   const conf = Math.round((verdict.confidence || 0) * 100);
 
