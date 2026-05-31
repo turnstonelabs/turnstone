@@ -3076,6 +3076,10 @@ def _apply_routing_overrides(registry: Any, cs: Any) -> bool:
     update fan-out) — both keep the existing model definitions and only
     rewrite routing fields.  Returns True when a reload happened.
     """
+    if not registry.models:
+        # Degraded (empty) registry — no aliases to route to yet. Routing
+        # overrides take effect once models are added (internal_model_reload).
+        return False
     eff = _effective_routing(
         cs,
         registry.models,
@@ -4320,6 +4324,10 @@ def main() -> None:
         context_window=context_window,
         provider=provider_name,
         storage=_get_storage(),
+        # A node boots even with no models configured yet: it registers and
+        # shows in the console, and models added in the admin panel hot-reload
+        # in (internal_model_reload). Requests fail cleanly until then.
+        allow_empty=True,
     )
 
     # Apply runtime overrides from ConfigStore for default alias plus the

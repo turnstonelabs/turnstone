@@ -260,9 +260,17 @@ class TestModelRegistry:
 
 
 class TestModelRegistryValidation:
-    def test_empty_models_raises(self) -> None:
-        with pytest.raises(ValueError, match="at least one"):
+    def test_empty_models_with_default_raises(self) -> None:
+        # A stray default that can't resolve is a bug, not a valid state.
+        with pytest.raises(ValueError, match="not found in empty registry"):
             ModelRegistry(models={}, default="x")
+
+    def test_empty_models_allowed_when_default_unset(self) -> None:
+        # Degraded "no models configured yet" state — a server boots into this
+        # and models are added live via the admin panel.
+        reg = ModelRegistry(models={}, default="")
+        assert reg.count == 0
+        assert reg.list_aliases() == []
 
     def test_invalid_default_raises(self) -> None:
         models = {"a": ModelConfig("a", "x", "x", "x")}
@@ -967,11 +975,20 @@ class TestRegistryReload:
         assert reg.has_alias("a")
         assert reg.default == "a"
 
-    def test_reload_validates_empty(self) -> None:
+    def test_reload_to_empty_with_default_raises(self) -> None:
         models_a = {"a": ModelConfig("a", "x", "x", "m")}
         reg = ModelRegistry(models=models_a, default="a")
-        with pytest.raises(ValueError, match="at least one"):
+        with pytest.raises(ValueError, match="not found in empty registry"):
             reg.reload({}, "a")
+
+    def test_reload_to_empty_degraded(self) -> None:
+        # Reloading down to zero models (default unset) is allowed: the
+        # registry drops to the degraded state and lookups raise until models
+        # return (e.g. an admin removes every model definition at runtime).
+        models_a = {"a": ModelConfig("a", "x", "x", "m")}
+        reg = ModelRegistry(models=models_a, default="a")
+        reg.reload({}, "")
+        assert reg.count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1718,6 +1735,18 @@ class TestLoadModelRegistryDBOnly:
             pytest.raises(ValueError, match="No model definitions found"),
         ):
             load_model_registry(model="")
+
+    def test_no_models_with_allow_empty_returns_empty_registry(self) -> None:
+        """allow_empty=True degrades to an empty registry instead of raising.
+
+        This is the boot-critical path turnstone-server uses: a node starts and
+        registers with no models, then picks them up live from the admin panel.
+        """
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry(model="", allow_empty=True)
+        assert reg.count == 0
+        assert reg.default == ""
+        assert reg.list_aliases() == []
 
     def test_no_default_entry_created_when_model_empty(self) -> None:
         """When model='', no 'default' alias is created from CLI args."""

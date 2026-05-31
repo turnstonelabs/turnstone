@@ -68,6 +68,41 @@ def _api_surface_of(cfg: ModelConfig) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+def _validate_registry_args(
+    models: dict[str, ModelConfig],
+    default: str,
+    fallback: list[str] | None,
+    agent_model: str | None,
+    plan_model: str | None,
+    task_model: str | None,
+) -> None:
+    """Validate ModelRegistry construction / reload arguments.
+
+    An empty ``models`` is permitted: it is the degraded "no models configured
+    yet" state a server boots into before any model definition exists (models
+    are added later via the admin panel and picked up by a hot reload — see
+    ``internal_model_reload``).  In that state ``default`` must be unset (``""``)
+    and every alias lookup raises until a model is added.  A non-empty registry
+    validates exactly as before: ``default`` and any routing alias must exist.
+    """
+    if not models:
+        if default:
+            raise ValueError(f"Default model '{default}' not found in empty registry")
+        return
+    if default not in models:
+        raise ValueError(f"Default model '{default}' not found in registry")
+    if fallback:
+        for alias in fallback:
+            if alias not in models:
+                raise ValueError(f"Fallback model '{alias}' not found in registry")
+    if agent_model and agent_model not in models:
+        raise ValueError(f"Agent model '{agent_model}' not found in registry")
+    if plan_model and plan_model not in models:
+        raise ValueError(f"Plan model '{plan_model}' not found in registry")
+    if task_model and task_model not in models:
+        raise ValueError(f"Task model '{task_model}' not found in registry")
+
+
 class ModelRegistry:
     """Holds named model configurations with thread-safe lazy client creation.
 
@@ -98,20 +133,7 @@ class ModelRegistry:
         plan_effort: str | None = None,
         task_effort: str | None = None,
     ) -> None:
-        if not models:
-            raise ValueError("ModelRegistry requires at least one model config")
-        if default not in models:
-            raise ValueError(f"Default model '{default}' not found in registry")
-        if fallback:
-            for alias in fallback:
-                if alias not in models:
-                    raise ValueError(f"Fallback model '{alias}' not found in registry")
-        if agent_model and agent_model not in models:
-            raise ValueError(f"Agent model '{agent_model}' not found in registry")
-        if plan_model and plan_model not in models:
-            raise ValueError(f"Plan model '{plan_model}' not found in registry")
-        if task_model and task_model not in models:
-            raise ValueError(f"Task model '{task_model}' not found in registry")
+        _validate_registry_args(models, default, fallback, agent_model, plan_model, task_model)
 
         self._models = dict(models)
         self.default = default
@@ -236,20 +258,7 @@ class ModelRegistry:
         Validates arguments before mutating state so a bad reload
         does not leave the registry in an inconsistent state.
         """
-        if not models:
-            raise ValueError("ModelRegistry requires at least one model config")
-        if default not in models:
-            raise ValueError(f"Default model '{default}' not found in registry")
-        if fallback:
-            for alias in fallback:
-                if alias not in models:
-                    raise ValueError(f"Fallback model '{alias}' not found in registry")
-        if agent_model and agent_model not in models:
-            raise ValueError(f"Agent model '{agent_model}' not found in registry")
-        if plan_model and plan_model not in models:
-            raise ValueError(f"Plan model '{plan_model}' not found in registry")
-        if task_model and task_model not in models:
-            raise ValueError(f"Task model '{task_model}' not found in registry")
+        _validate_registry_args(models, default, fallback, agent_model, plan_model, task_model)
         with self._client_lock:
             old_models = self._models
             self._models = dict(models)
@@ -349,6 +358,7 @@ def load_model_registry(
     provider: str = "openai",
     storage: Any | None = None,
     strict: bool = False,
+    allow_empty: bool = False,
 ) -> ModelRegistry:
     """Build a ModelRegistry from CLI args, ``config.toml``, and database.
 
@@ -375,6 +385,12 @@ def load_model_registry(
     that build a fresh registry from scratch (CLI, lifespan startup) want
     the default behaviour — boot succeeds with a config-only fallback
     rather than crashing on a flaky DB.
+
+    ``allow_empty``: when True, returns an empty registry instead of raising
+    when no models are defined anywhere.  Server entry points pass this so a
+    node boots and registers with no models yet, to be configured live via the
+    admin panel.  The CLI leaves it False — a REPL with no model is unusable
+    and there's no live panel to fix it.
     """
     import json as _json
 
@@ -518,10 +534,21 @@ def load_model_registry(
         )
 
     if not configs:
-        raise ValueError(
-            "No model definitions found. Provide --model, configure [models.*] "
-            "in config.toml, or add model definitions in the admin panel."
+        if not allow_empty:
+            raise ValueError(
+                "No model definitions found. Provide --model, configure [models.*] "
+                "in config.toml, or add model definitions in the admin panel."
+            )
+        # Degraded boot: the server starts with no models configured yet and
+        # registers normally. Models added via the admin panel hot-reload in
+        # without a restart (POST /v1/api/_internal/model-reload). Until then
+        # every model lookup raises, so requests fail cleanly rather than the
+        # process refusing to start.
+        log.warning(
+            "No model definitions found — starting with an empty registry. "
+            "Add models in the admin panel; they load without a restart."
         )
+        return ModelRegistry(models={}, default="")
 
     # Determine default alias
     default_alias = model_section.get("default", "default")
