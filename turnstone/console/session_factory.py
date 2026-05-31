@@ -63,6 +63,7 @@ def build_console_session_factory(
         return JudgeConfig(
             enabled=config_store.get("judge.enabled"),
             model=config_store.get("judge.model"),
+            smart_approvals=config_store.get("judge.smart_approvals"),
             confidence_threshold=config_store.get("judge.confidence_threshold"),
             max_context_ratio=config_store.get("judge.max_context_ratio"),
             timeout=config_store.get("judge.timeout"),

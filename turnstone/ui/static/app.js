@@ -2290,14 +2290,18 @@ class Pane {
 
     items.forEach((item) => {
       block.appendChild(buildToolDiv(item));
-      // Render verdict badge if present.  Server emits the heuristic
-      // verdict under ``heuristic_verdict`` (matches the api/server_schemas
-      // PendingApprovalItem shape).  Falls back to the legacy ``verdict``
-      // key in case a stale SSE payload arrives mid-deploy.
-      const heuristic = item.heuristic_verdict || item.verdict;
-      if (heuristic) {
-        block.appendChild(renderVerdictBadge(heuristic, judgePending));
-        const rec = heuristic.recommendation || "review";
+      // Render verdict badge if present.  Prefer the completed LLM verdict
+      // (``judge_verdict``, set by the server on a Smart-Approved item) so an
+      // auto-approved row shows the llm/approve verdict that cleared it rather
+      // than the cautious heuristic carry-over.  Otherwise the heuristic
+      // verdict (``heuristic_verdict``, matching the api/server_schemas
+      // PendingApprovalItem shape); ``verdict`` is the legacy fallback for a
+      // stale mid-deploy SSE payload.
+      const verdict =
+        item.judge_verdict || item.heuristic_verdict || item.verdict;
+      if (verdict) {
+        block.appendChild(renderVerdictBadge(verdict, judgePending));
+        const rec = verdict.recommendation || "review";
         if (
           !glowRec ||
           rec === "deny" ||

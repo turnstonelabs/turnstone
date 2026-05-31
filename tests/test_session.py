@@ -679,6 +679,36 @@ class TestTaskExec:
         assert fa["skill"] == ""
         assert fa["prompt"] == "do x"
 
+    def test_evaluate_intent_drops_superseded_generation_verdict(self, tmp_db, monkeypatch) -> None:
+        """A prior turn's judge daemon (still running because
+        cancel_on_approval defaults False) must NOT deliver verdicts once a
+        newer turn has superseded it — otherwise a model that reuses a
+        call_id across turns could ride a stale ``approve`` into a wrongful
+        Smart Approval of a different call."""
+        session = _make_session()
+        session.ui.on_intent_verdict = MagicMock()
+        fake_verdict = MagicMock()
+        fake_verdict.to_dict.return_value = {"verdict_id": "v0", "call_id": "c1", "tier": "llm"}
+        captured: list[Any] = []
+        fake_judge = MagicMock()
+        fake_judge.evaluate.side_effect = lambda items, *_a, **kw: (
+            captured.append(kw.get("callback")) or [fake_verdict] * len(items)
+        )
+        monkeypatch.setattr(session, "_ensure_judge", lambda: fake_judge)
+
+        item = {"call_id": "c1", "func_name": "bash", "needs_approval": True, "command": "ls"}
+        session._evaluate_intent([dict(item)])  # generation A
+        session._evaluate_intent([dict(item)])  # generation B supersedes A
+        callback_a, callback_b = captured[0], captured[1]
+
+        # A's late verdict (the superseded daemon) is dropped.
+        callback_a(fake_verdict)
+        session.ui.on_intent_verdict.assert_not_called()
+
+        # B's verdict (the current generation) is delivered normally.
+        callback_b(fake_verdict)
+        session.ui.on_intent_verdict.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # Per-call model override on plan_agent / task_agent

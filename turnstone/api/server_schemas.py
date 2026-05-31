@@ -307,8 +307,10 @@ class RecentAutoApproval(BaseModel):
             "Source that fired the bypass.  ``skill`` (skill template's "
             "``allowed_tools``), ``always`` (user 'Approve + Always' "
             "click), ``policy`` (admin tool-policy ``allow`` rule), "
-            "``blanket`` (workstream-level ``auto_approve=True``), or "
-            "``auto_approve_tools`` (legacy / unknown writer)."
+            "``blanket`` (workstream-level ``auto_approve=True``), "
+            "``smart_approval`` (Smart Approvals: high-confidence LLM "
+            "judge ``approve`` verdict), or ``auto_approve_tools`` "
+            "(legacy / unknown writer)."
         ),
     )
     ts: float = Field(

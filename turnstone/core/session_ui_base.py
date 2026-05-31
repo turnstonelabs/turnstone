@@ -27,6 +27,7 @@ import collections
 import contextlib
 import copy
 import json
+import math
 import os
 import queue
 import threading
@@ -151,7 +152,7 @@ class AutoApproveReason:
     ``.value`` dance at every emit site, and no surprise behaviour
     if a consumer compares against the literal).
 
-    The five reasons reflect the disjoint set of paths that bypass
+    The six reasons reflect the disjoint set of paths that bypass
     the operator approval gate:
 
     - :attr:`SKILL` — workstream's skill template populated
@@ -173,6 +174,12 @@ class AutoApproveReason:
       populated (legacy / pre-source-tracking instances).  Visible
       as a generic pill rather than a misleading ``skill`` /
       ``always`` claim.
+    - :attr:`SMART_APPROVAL` — Smart Approvals (``judge.smart_approvals``)
+      auto-approved the call because the intent judge's LLM verdict
+      recommended ``approve`` with confidence at or above
+      ``judge.confidence_threshold``.  Distinct pill so an operator
+      can see the judge — not a policy or a prior "Always" click —
+      cleared this call.
     """
 
     SKILL = "skill"
@@ -180,8 +187,11 @@ class AutoApproveReason:
     POLICY = "policy"
     BLANKET = "blanket"
     AUTO_APPROVE_TOOLS = "auto_approve_tools"
+    SMART_APPROVAL = "smart_approval"
 
-    ALL: frozenset[str] = frozenset({SKILL, ALWAYS, POLICY, BLANKET, AUTO_APPROVE_TOOLS})
+    ALL: frozenset[str] = frozenset(
+        {SKILL, ALWAYS, POLICY, BLANKET, AUTO_APPROVE_TOOLS, SMART_APPROVAL}
+    )
 
 
 class SessionUIBase:
@@ -244,6 +254,21 @@ class SessionUIBase:
         self._pending_plan_review: dict[str, Any] | None = None
         self.auto_approve = False
         self.auto_approve_tools: set[str] = set()
+        # Smart Approvals (``judge.smart_approvals``): when enabled, a
+        # tool call whose LLM intent verdict recommends ``approve`` with
+        # confidence ≥ ``smart_approval_threshold`` is auto-approved
+        # without an operator prompt.  ChatSession pushes these three
+        # values onto the UI from the live judge config each turn (just
+        # before ``approve_tools``) so a hot-reloaded settings change
+        # takes effect on the next batch.  Defaults keep the feature off
+        # for any UI the session doesn't configure (eval, fixtures).
+        self.smart_approvals_enabled = False
+        self.smart_approval_threshold = 0.95
+        # How long ``approve_tools`` waits for the async LLM verdict
+        # before falling back to a human prompt (fail-closed).  Bounded
+        # by the judge timeout; the wait returns early the moment every
+        # pending call has a verdict.
+        self.smart_approval_wait_seconds = 0.0
         # Per-tool source for ``auto_approve_tools`` membership.  Two
         # writers populate the set with semantically different intent:
         #
@@ -356,6 +381,12 @@ class SessionUIBase:
         # Verdict cache for SSE reconnect replay (tab switching
         # shouldn't lose the judge's final call on a just-run tool).
         self._llm_verdicts: dict[str, dict[str, Any]] = {}
+        # Signalled by ``on_intent_verdict`` whenever an LLM verdict
+        # lands in ``_llm_verdicts``; Smart Approvals (``approve_tools``)
+        # waits on it for the verdicts of the calls it's about to gate.
+        # Shares ``_ws_lock`` so the wait + the cache write are one
+        # critical section (no separate lock to order).
+        self._verdict_cond = threading.Condition(self._ws_lock)
         # Re-populate the recent-auto-approve ring buffer from the
         # audit log so the dashboard pill survives UI rebuilds —
         # saved-workstream rehydrate / coord→node click-through /
@@ -896,6 +927,23 @@ class SessionUIBase:
         # policy/auto-approve pass that drained the override from ``pending``
         # cannot disarm this gate.
         blanket_active = self.auto_approve and not has_budget_override
+
+        # -- Smart Approvals (judge.smart_approvals) -----------------------------
+        # Last automatic gate before the human prompt, after the explicit
+        # operator-configured ones (policy / "Always" / blanket): wait
+        # briefly for the async LLM intent verdict and auto-approve every
+        # still-pending call the judge cleared with a high-confidence
+        # ``approve``.  Skipped under blanket auto-approve (everything is
+        # approved already) and when a ``__budget_override__`` pseudo-tool
+        # is present (it must always reach a human).
+        if (
+            pending
+            and self.smart_approvals_enabled
+            and not blanket_active
+            and not has_budget_override
+        ):
+            pending = self._apply_smart_approvals(pending)
+
         if not pending or blanket_active:
             if blanket_active and pending:
                 # Blanket flag drained the rest of pending — tag so the
@@ -964,7 +1012,19 @@ class SessionUIBase:
         self._persist_intent_verdicts_bulk(heuristic_verdicts, default_tier="heuristic")
 
         with self._ws_lock:
-            self._pending_verdicts = pending_verdicts
+            # Normally a plain assignment: in the async flow the LLM judge
+            # is slower than this setup so ``_pending_verdicts`` is still
+            # the empty list ``_reset_approval_cycle`` left it.  But Smart
+            # Approvals deliberately waits for verdicts upstream, so by here
+            # ``on_intent_verdict`` has already parked the LLM verdicts of
+            # the human-pending siblings; carry them across the reassignment
+            # so ``resolve_approval`` can stamp their ``user_decision``
+            # (without this they'd be dropped and stuck at ``"pending"``).
+            # Smart-approved calls were pulled out + stamped already by
+            # ``_finalize_smart_verdicts``, so they don't reappear here.
+            pending_cids = {hv.get("call_id") for hv in pending_verdicts}
+            early_llm = [v for v in self._pending_verdicts if v.get("call_id") in pending_cids]
+            self._pending_verdicts = pending_verdicts + early_llm
 
         # Record any items the policy block already auto-approved
         # before falling through to the prompt — without this the
@@ -974,8 +1034,17 @@ class SessionUIBase:
         # No-op when no items are auto-approve-tagged.
         self._record_auto_approves(items)
 
-        # Send approval request and block
-        judge_pending = any(it.get("_heuristic_verdict") for it in items)
+        # Send approval request and block.  ``judge_pending`` tells the UI
+        # whether to expect LLM verdicts still in flight: true only when a
+        # judged item does NOT yet have its LLM verdict cached.  Under Smart
+        # Approvals the gate already waited for every verdict, so they are
+        # present and this is false (no spurious "judge working" spinner /
+        # poll); in the normal async flow they haven't arrived yet → true.
+        with self._ws_lock:
+            judge_pending = any(
+                it.get("_heuristic_verdict") and it.get("call_id", "") not in self._llm_verdicts
+                for it in items
+            )
         self._approval_event.clear()
         self._pending_approval = {
             "type": "approve_request",
@@ -997,6 +1066,16 @@ class SessionUIBase:
         # while parked on _approval_event.wait. The push path
         # eliminates the race.
         self._broadcast_approve_request(self._pending_approval)
+        # Smart Approvals waited for the LLM verdicts BEFORE this card was
+        # built, so on_intent_verdict already fanned out their
+        # ``intent_verdict`` events while no card existed — a live client
+        # dropped them and the chip would stay on the heuristic value until
+        # a reload re-merged the cache.  Re-emit them now, after the card,
+        # to restore the normal approve_request → intent_verdict ordering so
+        # the live chip updates.  No-op in the normal async flow (cache is
+        # empty here) and when the feature is off.
+        if self.smart_approvals_enabled:
+            self._replay_pending_verdicts(items)
         if not self._approval_event.wait(timeout=self._APPROVAL_WAIT_TIMEOUT):
             # Approval timed out (e.g., user disconnected). Deny via
             # resolve_approval so verdicts and state are updated consistently.
@@ -1020,6 +1099,186 @@ class SessionUIBase:
                 item["denial_msg"] = denial_msg
 
         return approved, feedback
+
+    # ------------------------------------------------------------------
+    # Smart Approvals (judge.smart_approvals)
+    # ------------------------------------------------------------------
+
+    def _apply_smart_approvals(self, pending: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Auto-approve a tool batch the LLM judge cleared confidently.
+
+        **Batch-atomic.**  Waits (bounded by ``smart_approval_wait_seconds``)
+        for the async LLM verdicts of EVERY pending call, then auto-approves
+        the whole batch only if EVERY call qualifies; a single non-qualifying
+        call sends the entire batch to a human.  Parallel tool calls are one
+        unit of intent — approving the safe-looking members while a sibling
+        is held would let a multi-step action through piecemeal — so it is
+        all-or-nothing.
+
+        A call qualifies when its LLM verdict is a *completed* ``approve`` —
+        tier ``"llm"`` (NOT the ``"llm_fallback"`` error tier) at confidence
+        ≥ ``smart_approval_threshold`` — AND the deterministic heuristic did
+        not *explicitly* flag it ``deny`` / ``critical``.  That heuristic
+        floor only blocks the explicit danger verdicts: the heuristic
+        DEFAULT for an unmatched tool is ``review``, and upgrading ``review``
+        → ``approve`` on a confident LLM verdict is exactly this feature's
+        job, so ``review`` is not a floor.  But a call the pattern rules
+        matched as ``deny`` / ``critical`` (e.g. ``rm -rf /``) is never
+        cleared by the (promptable) LLM — those always reach a human.
+
+        Returns ``[]`` when the whole batch is auto-approved, or *pending*
+        unchanged when anything is uncertain (review/deny/low-confidence/
+        error/timeout/heuristic-danger/no-verdict) — fails closed.
+        """
+        # Only calls the judge actually evaluated carry a heuristic verdict;
+        # the ``__budget_override__`` pseudo-tool is never smart-approved, so
+        # its presence makes ``candidates`` smaller than ``pending`` and the
+        # batch-completeness check below holds the whole batch for a human.
+        candidates = [
+            it
+            for it in pending
+            if it.get("_heuristic_verdict") and it.get("func_name") != "__budget_override__"
+        ]
+        needed = {it.get("call_id", "") for it in candidates if it.get("call_id")}
+        if not needed:
+            return pending
+        # The whole batch must be eligible before we pay the verdict wait:
+        #   - every pending call must be a judged candidate — an unjudged
+        #     sibling or the ``__budget_override__`` pseudo-tool makes
+        #     candidates < pending, AND
+        #   - call_ids must be unique — some local models emit duplicate
+        #     non-empty tool-call ids (``_ensure_tool_call_ids`` only fills
+        #     MISSING ones), which collapse in the ``needed`` set and would let
+        #     one verdict clear two distinct calls (their args differ).
+        # Either mismatch → hold the whole batch for a human.  Checked
+        # pre-wait so an ineligible batch never pays the (up-to-timeout) wait.
+        if len(candidates) != len(pending) or len(needed) != len(candidates):
+            return pending
+        # The per-round verdict cache is FIFO-capped; a batch with more calls
+        # than the cap can't hold every verdict at once, so the wait could
+        # never see them all and would stall to its full budget.  Hold such
+        # (pathological) batches for a human.
+        if len(needed) > self._LLM_VERDICT_CACHE_MAX:
+            log.info("judge.smart_approval.batch_too_large", ws_id=self.ws_id, count=len(needed))
+            return pending
+        self._await_llm_verdicts(needed, self.smart_approval_wait_seconds)
+
+        threshold = self.smart_approval_threshold
+        qualified: dict[str, dict[str, Any]] = {}
+        with self._ws_lock:
+            for it in candidates:
+                cid = it.get("call_id", "")
+                v = self._llm_verdicts.get(cid)
+                # Require a COMPLETED LLM verdict — tier "llm", not the
+                # "llm_fallback" error carry-over ("heuristic" never lands in
+                # this cache) — recommending "approve" at/above threshold.
+                if (
+                    v is None
+                    or v.get("tier") != "llm"
+                    or v.get("recommendation") != "approve"
+                    or self._verdict_confidence(v) < threshold
+                ):
+                    return pending  # one fails → none of the batch auto-approves
+                hv = it.get("_heuristic_verdict") or {}
+                if hv.get("recommendation") == "deny" or hv.get("risk_level") == "critical":
+                    return pending  # explicit deterministic danger flag → human
+                qualified[cid] = v
+
+        # Whole batch qualified.  Clear the gate flag (mirrors the policy
+        # ``allow`` branch) so each call is treated as resolved: the coord
+        # pill renders (``auto_approved && !needs_approval``) and the denial
+        # sweep in ChatSession._execute_tools leaves them to execute.  Attach
+        # the driving LLM verdict so the auto-approved tool row renders it
+        # (llm tier, approve) instead of the cautious heuristic carry-over,
+        # which would read contradictorily beside the SMART_APPROVAL pill.
+        for it in candidates:
+            it["needs_approval"] = False
+            it["_llm_verdict"] = qualified.get(it.get("call_id", ""))
+        self._tag_auto_approved(candidates, AutoApproveReason.SMART_APPROVAL)
+        self._finalize_smart_verdicts(needed)
+        log.info("judge.smart_approval", ws_id=self.ws_id, approved=len(candidates))
+        return []
+
+    @staticmethod
+    def _verdict_confidence(verdict: dict[str, Any]) -> float:
+        """Verdict confidence clamped to ``[0.0, 1.0]``; ``0.0`` if malformed.
+
+        Rejects non-finite values explicitly: ``min``/``max`` would let a NaN
+        through as ``1.0`` (every comparison with NaN is False), and
+        ``json.loads`` accepts ``NaN`` by default — so a verdict reporting
+        ``"confidence": NaN`` could otherwise clear the auto-approve bar.
+        """
+        try:
+            confidence = float(verdict.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(confidence):
+            return 0.0
+        return max(0.0, min(1.0, confidence))
+
+    def _await_llm_verdicts(self, needed: set[str], budget_seconds: float) -> None:
+        """Block until every call_id in *needed* has an LLM verdict cached.
+
+        Returns the instant the last verdict lands; otherwise gives up
+        after *budget_seconds* and leaves the missing calls for the human
+        gate (fail-closed).  ``on_intent_verdict`` notifies
+        ``_verdict_cond`` on every cache write, and the judge delivers
+        exactly one verdict (LLM or ``llm_fallback``) per call, so the
+        common case is an early return at real judge latency rather than a
+        full-budget wait.
+        """
+        if budget_seconds <= 0 or not needed:
+            return
+        deadline = time.monotonic() + budget_seconds
+        with self._verdict_cond:
+            while not needed.issubset(self._llm_verdicts.keys()):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                self._verdict_cond.wait(timeout=remaining)
+
+    def _finalize_smart_verdicts(self, smart_ids: set[str]) -> None:
+        """Stamp ``smart_approval`` on the LLM verdicts of auto-approved calls.
+
+        The verdicts arrived during ``_await_llm_verdicts`` — before the
+        call was tagged auto-approved — so ``on_intent_verdict`` parked
+        them in ``_pending_verdicts`` with ``user_decision="pending"``.
+        Pull them out (so a human-pending sibling's ``resolve_approval``
+        can't overwrite the reason), stamp the cached dict in place (the
+        reconnect-replay payload reflects the final decision), and UPDATE
+        the persisted rows.  The matching heuristic verdict is stamped by
+        ``approve_tools``'s own persistence path via the ``auto_approved``
+        tag set just before this call.
+        """
+        stamped: list[dict[str, Any]] = []
+        with self._ws_lock:
+            for cid in smart_ids:
+                v = self._llm_verdicts.get(cid)
+                if v is not None:
+                    v["user_decision"] = AutoApproveReason.SMART_APPROVAL
+                    stamped.append(v)
+            if self._pending_verdicts:
+                self._pending_verdicts = [
+                    v for v in self._pending_verdicts if v.get("call_id") not in smart_ids
+                ]
+        if stamped:
+            self._persist_verdict_decisions(stamped, AutoApproveReason.SMART_APPROVAL)
+
+    def _replay_pending_verdicts(self, items: list[dict[str, Any]]) -> None:
+        """Re-emit already-cached LLM verdicts for the human-pending calls.
+
+        Mirrors the reconnect-replay re-injection: after the
+        ``approve_request`` card exists, re-send each pending call's cached
+        ``intent_verdict`` so a live client (which dropped the events the
+        Smart Approvals wait fanned out before the card) applies them to the
+        chip.  Snapshots under the lock, fans out without it.
+        """
+        cids = {it.get("call_id", "") for it in items if it.get("call_id")}
+        with self._ws_lock:
+            verdicts = [dict(self._llm_verdicts[c]) for c in cids if c in self._llm_verdicts]
+        for verdict in verdicts:
+            self._enqueue({"type": "intent_verdict", **verdict})
+            self._broadcast_intent_verdict(verdict)
 
     # ------------------------------------------------------------------
     # Intent-judge + output-guard plumbing
@@ -1064,6 +1323,11 @@ class SessionUIBase:
                     oldest_key = next(iter(self._llm_verdicts))
                     del self._llm_verdicts[oldest_key]
                 self._llm_verdicts[call_id] = verdict
+                # Wake any Smart Approvals wait parked on this call's
+                # verdict (``_verdict_cond`` shares ``_ws_lock``, so the
+                # notify is valid here and the waiter re-checks its
+                # call-id set on wake).
+                self._verdict_cond.notify_all()
                 # Pop (not get) — once consumed the entry isn't useful
                 # again; TTL pruning at the writer side keeps the
                 # never-consumed case bounded too.
@@ -1103,7 +1367,19 @@ class SessionUIBase:
             return
         with self._ws_lock:
             decision = self._last_verdict_decision
-            if not decision:
+            # Skip the append when the verdict already carries a final
+            # ``user_decision``.  Smart Approvals' ``_finalize_smart_verdicts``
+            # runs on the worker thread the moment ``_await_llm_verdicts``
+            # wakes — which is this method's ``notify_all`` (above), fired
+            # BEFORE this append and with an unlocked ``_persist_intent_verdict``
+            # in between.  So finalize can stamp ``smart_approval`` on this
+            # same cached dict and clear ``_pending_verdicts`` before we get
+            # here; without this guard we'd re-park the already-final verdict,
+            # and the NEXT round's ``resolve_approval`` would overwrite its
+            # audit row with approved/denied/timeout.  (The reverse ordering —
+            # append before finalize — is handled by finalize's own
+            # ``_pending_verdicts`` filter.)
+            if not decision and verdict.get("user_decision", "pending") == "pending":
                 self._pending_verdicts.append(verdict)
         if decision:
             self._persist_verdict_decisions([verdict], decision)
@@ -1381,6 +1657,13 @@ class SessionUIBase:
             }
             if "_heuristic_verdict" in it:
                 entry["heuristic_verdict"] = it["_heuristic_verdict"]
+            if it.get("_llm_verdict"):
+                # The completed LLM verdict that drove a Smart Approval.
+                # Sent so the auto-approved tool row renders the llm-tier
+                # approve/risk that actually cleared the call, instead of the
+                # cautious heuristic carry-over — which reads contradictorily
+                # next to the SMART_APPROVAL pill (e.g. "review/medium" + ✓).
+                entry["judge_verdict"] = it["_llm_verdict"]
             if it.get("auto_approved"):
                 entry["auto_approved"] = True
                 entry["auto_approve_reason"] = it.get("auto_approve_reason", "")

@@ -37,12 +37,26 @@ model = ""                    # empty = same as session model
 provider = ""                 # empty = same as session provider
 base_url = ""
 api_key = ""
-confidence_threshold = 0.7   # reserved for v2 smart approvals (not used in v1)
+smart_approvals = false       # auto-approve high-confidence "approve" LLM verdicts (opt-in)
+confidence_threshold = 0.95   # Smart Approvals auto-approve bar (LLM recommendation=approve)
 max_context_ratio = 0.5       # max % of judge context window for history
 timeout = 60.0                # seconds (generous for local models)
 read_only_tools = true        # judge can use read_file/list_directory
 cancel_on_approval = false    # stop judging remaining tool calls once user decides
 ```
+
+### Smart Approvals
+
+With `smart_approvals = true` (off by default) a tool call is approved
+automatically — no operator prompt — when the intent judge's **LLM** verdict
+recommends `approve` with confidence at or above `confidence_threshold`. Every
+other outcome still reaches a human: `review` / `deny` recommendations,
+confidence below the threshold, judge errors or timeouts (`llm_fallback`), and
+any call the deterministic heuristic rules flagged `deny` / `critical` (the LLM
+may raise the heuristic's assessment but never lower it). Requires the judge to
+be enabled; auto-approved calls are tagged `smart_approval` in the dashboard and
+audit trail. Smart Approvals applies to the web and coordinator surfaces, not
+the interactive CLI.
 
 All fields are optional. The judge is enabled by default; use `enabled = false`
 (or `--no-judge` on the command line) to disable it.
@@ -54,8 +68,11 @@ All fields are optional. The judge is enabled by default; use `enabled = false`
 --judge-model MODEL            Model for judge
 --judge-provider PROVIDER      Provider for judge
 --judge-timeout SECONDS        LLM judge timeout (default: 60)
---judge-confidence FLOAT       Confidence threshold (default: 0.7)
+--judge-confidence FLOAT       Confidence threshold, 0-1 (default: 0.95)
 ```
+
+(Smart Approvals is configured via `[judge] smart_approvals` / the admin Judge
+settings, not a CLI flag — the interactive CLI prompts for approval directly.)
 
 CLI flags override `config.toml` values.
 

@@ -107,7 +107,8 @@
 
 [judge]
 # enabled = true               # Enable intent validation
-# confidence_threshold = 0.7   # Minimum confidence for heuristic verdicts
+# smart_approvals = false      # Auto-approve high-confidence "approve" LLM verdicts (opt-in)
+# confidence_threshold = 0.95  # Smart Approvals auto-approve bar (LLM recommendation=approve)
 # output_guard = true          # Scan tool output for security signals
 # redact_secrets = true        # Redact detected credentials in output
 

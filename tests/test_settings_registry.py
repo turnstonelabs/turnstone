@@ -46,6 +46,27 @@ class TestValidateKey:
         assert validate_key("audio.stt_prompt").default == ""
         assert validate_key("audio.tts_voice").default == "alloy"
 
+    def test_smart_approvals_setting_registered(self):
+        defn = validate_key("judge.smart_approvals")
+        assert defn.key == "judge.smart_approvals"
+        assert defn.type == "bool"
+        assert defn.default is False  # opt-in: off by default
+        assert defn.section == "judge"
+        assert "judge.smart_approvals" in SETTINGS
+
+    def test_confidence_threshold_is_smart_approval_bar(self):
+        """Default bumped to the Smart Approvals auto-approve bar (0.95),
+        still clamped to [0, 1]."""
+        defn = validate_key("judge.confidence_threshold")
+        assert defn.type == "float"
+        assert defn.default == 0.95
+        assert defn.min_value == 0.0
+        assert defn.max_value == 1.0
+
+    def test_smart_approvals_bool_coercion(self):
+        assert validate_value("judge.smart_approvals", "true") is True
+        assert validate_value("judge.smart_approvals", "false") is False
+
 
 # ---------------------------------------------------------------------------
 # validate_value — type coercion

@@ -230,6 +230,7 @@
     "policy",
     "blanket",
     "auto_approve_tools",
+    "smart_approval",
   ]);
   const UNKNOWN_AUTO_APPROVE_REASON = "unknown";
 

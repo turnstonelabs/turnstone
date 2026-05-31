@@ -1526,3 +1526,522 @@ def test_concurrent_writer_and_register_with_snapshot_no_loss_no_dup() -> None:
     assert reconstructed == expected, (
         f"reconstruction mismatch: len(rec)={len(reconstructed)}, len(exp)={len(expected)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Smart Approvals (judge.smart_approvals)
+# ---------------------------------------------------------------------------
+
+
+class _SeedingUI(_ConcreteUI):
+    """Re-delivers seeded LLM verdicts right after the approval-cycle
+    reset clears the cache — simulates the async judge daemon delivering
+    them via ``on_intent_verdict`` during the Smart Approvals wait, which
+    is the only point at which they can land and survive the reset."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.seed_verdicts: list[dict[str, Any]] = []
+
+    def _reset_approval_cycle(self) -> None:
+        super()._reset_approval_cycle()
+        for verdict in self.seed_verdicts:
+            self.on_intent_verdict(dict(verdict))
+
+
+def _patch_policies(verdicts: dict[str, str]):  # type: ignore[no-untyped-def]
+    """Neutralise the admin tool-policy stage so approve_tools tests
+    isolate the Smart Approvals gate."""
+    return patch(
+        "turnstone.core.policy.evaluate_tool_policies_batch",
+        return_value=verdicts,
+    )
+
+
+def _drain(lq: queue.Queue[Any]) -> list[dict[str, Any]]:
+    """Drain all currently-queued events off a listener queue."""
+    out: list[dict[str, Any]] = []
+    while True:
+        try:
+            out.append(lq.get_nowait())
+        except queue.Empty:
+            return out
+
+
+def _smart_ui() -> _ConcreteUI:
+    ui = _make_ui()
+    ui.smart_approvals_enabled = True
+    ui.smart_approval_threshold = 0.95
+    ui.smart_approval_wait_seconds = 1.0
+    return ui
+
+
+def _pending_item(call_id: str, func_name: str = "bash") -> dict[str, Any]:
+    """A still-pending tool call carrying a heuristic verdict, matching
+    what ``ChatSession._evaluate_intent`` attaches before the gate."""
+    return {
+        "call_id": call_id,
+        "func_name": func_name,
+        "approval_label": func_name,
+        "header": f"Tool: {func_name}",
+        "preview": "",
+        "needs_approval": True,
+        "_heuristic_verdict": {
+            "verdict_id": f"h-{call_id}",
+            "call_id": call_id,
+            "func_name": func_name,
+            "risk_level": "medium",
+            "confidence": 0.5,
+            "recommendation": "review",
+        },
+    }
+
+
+def _llm_verdict(
+    call_id: str,
+    *,
+    recommendation: str = "approve",
+    confidence: float = 0.99,
+    tier: str = "llm",
+) -> dict[str, Any]:
+    return {
+        "verdict_id": f"v-{call_id}",
+        "call_id": call_id,
+        "func_name": "bash",
+        "risk_level": "low",
+        "confidence": confidence,
+        "recommendation": recommendation,
+        "tier": tier,
+        "intent_summary": "",
+        "reasoning": "",
+        "evidence": [],
+    }
+
+
+def test_smart_approval_clears_high_confidence_llm_approve() -> None:
+    ui = _smart_ui()
+    item = _pending_item("c1")
+    ui._llm_verdicts["c1"] = _llm_verdict("c1", recommendation="approve", confidence=0.99)
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([item])
+    assert remaining == []  # nothing left for a human
+    assert item["needs_approval"] is False
+    assert item["auto_approved"] is True
+    assert item["auto_approve_reason"] == "smart_approval"
+
+
+def test_smart_approval_clears_at_exact_threshold() -> None:
+    """``confidence >= threshold`` — the boundary value auto-approves."""
+    ui = _smart_ui()
+    item = _pending_item("c1")
+    ui._llm_verdicts["c1"] = _llm_verdict("c1", recommendation="approve", confidence=0.95)
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([item])
+    assert remaining == []
+    assert item["auto_approved"] is True
+
+
+def test_smart_approval_holds_just_below_threshold() -> None:
+    ui = _smart_ui()
+    item = _pending_item("c1")
+    ui._llm_verdicts["c1"] = _llm_verdict("c1", recommendation="approve", confidence=0.94)
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([item])
+    assert remaining == [item]
+    assert item.get("auto_approved") is not True
+    assert item["needs_approval"] is True
+
+
+def test_smart_approval_holds_review_and_deny() -> None:
+    """Only ``approve`` auto-approves; ``review`` / ``deny`` reach a human
+    no matter how confident the judge is."""
+    ui = _smart_ui()
+    for rec in ("review", "deny"):
+        item = _pending_item("c1")
+        ui._llm_verdicts = {"c1": _llm_verdict("c1", recommendation=rec, confidence=1.0)}
+        with _patch_get_storage(MagicMock()):
+            remaining = ui._apply_smart_approvals([item])
+        assert remaining == [item], rec
+        assert item.get("auto_approved") is not True, rec
+
+
+def test_smart_approval_holds_llm_fallback_even_if_approve() -> None:
+    """A ``llm_fallback`` verdict means the LLM stage timed out / errored
+    and the row is the heuristic carry-over.  Even if it reads ``approve``
+    at full confidence it must reach a human — errors require attention."""
+    ui = _smart_ui()
+    item = _pending_item("c1")
+    ui._llm_verdicts["c1"] = _llm_verdict(
+        "c1", recommendation="approve", confidence=1.0, tier="llm_fallback"
+    )
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([item])
+    assert remaining == [item]
+    assert item.get("auto_approved") is not True
+
+
+def test_smart_approval_holds_when_no_verdict_arrives() -> None:
+    """Wait budget elapses with no verdict cached → fail closed to the
+    human gate."""
+    ui = _smart_ui()
+    ui.smart_approval_wait_seconds = 0.05  # nothing will be delivered
+    item = _pending_item("c1")
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([item])
+    assert remaining == [item]
+    assert item["needs_approval"] is True
+
+
+def test_smart_approval_batch_atomic_holds_whole_batch_on_one_failure() -> None:
+    """Batch-atomic: a single non-qualifying call (here a review) in a
+    parallel batch holds the ENTIRE batch for a human — including the call
+    that individually qualified.  Parallel calls are one unit of intent."""
+    ui = _smart_ui()
+    a = _pending_item("c1")
+    b = _pending_item("c2")
+    ui._llm_verdicts = {
+        "c1": _llm_verdict("c1", recommendation="approve", confidence=0.99),
+        "c2": _llm_verdict("c2", recommendation="review", confidence=0.99),
+    }
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([a, b])
+    assert remaining == [a, b]  # NONE auto-approved
+    assert a.get("auto_approved") is not True
+    assert b.get("auto_approved") is not True
+
+
+def test_smart_approval_approves_full_batch_when_all_qualify() -> None:
+    """When every call in a parallel batch qualifies, the whole batch is
+    auto-approved and nothing is left for a human."""
+    ui = _smart_ui()
+    a = _pending_item("c1")
+    b = _pending_item("c2")
+    ui._llm_verdicts = {
+        "c1": _llm_verdict("c1", recommendation="approve", confidence=0.99),
+        "c2": _llm_verdict("c2", recommendation="approve", confidence=0.96),
+    }
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([a, b])
+    assert remaining == []
+    assert a["auto_approved"] is True and b["auto_approved"] is True
+    assert a["needs_approval"] is False and b["needs_approval"] is False
+
+
+def test_smart_approved_item_serializes_llm_verdict_not_heuristic() -> None:
+    """The auto-approved tool row must carry the driving LLM verdict
+    (llm/approve) as judge_verdict so the UI doesn't render a contradictory
+    heuristic 'review/medium' chip beside the SMART_APPROVAL pill."""
+    ui = _smart_ui()
+    item = _pending_item("c1")  # heuristic verdict is review / medium
+    ui._llm_verdicts["c1"] = _llm_verdict("c1", recommendation="approve", confidence=0.99)
+    with _patch_get_storage(MagicMock()):
+        ui._apply_smart_approvals([item])
+    serialized = _ConcreteUI._serialize_approval_items([item])[0]
+    assert serialized["auto_approved"] is True
+    assert serialized["auto_approve_reason"] == "smart_approval"
+    judge_verdict = serialized["judge_verdict"]
+    assert judge_verdict["tier"] == "llm"
+    assert judge_verdict["recommendation"] == "approve"
+    # Heuristic still carried, but judge_verdict is what the row renders.
+    assert serialized["heuristic_verdict"]["recommendation"] == "review"
+
+
+def test_smart_approval_holds_batch_when_one_call_has_no_verdict() -> None:
+    """A parallel batch where one call never gets a verdict (timeout) holds
+    the whole batch, even though its sibling qualified."""
+    ui = _smart_ui()
+    ui.smart_approval_wait_seconds = 0.05
+    a = _pending_item("c1")
+    b = _pending_item("c2")
+    ui._llm_verdicts = {"c1": _llm_verdict("c1", recommendation="approve", confidence=0.99)}
+    # c2 has no verdict — the wait times out and the batch is held.
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([a, b])
+    assert remaining == [a, b]
+    assert a.get("auto_approved") is not True
+
+
+def test_smart_approval_skips_budget_override_pseudo_tool() -> None:
+    """The synthetic ``__budget_override__`` must always reach a human,
+    never smart-approved."""
+    ui = _smart_ui()
+    item = _pending_item("c1", func_name="__budget_override__")
+    ui._llm_verdicts["c1"] = _llm_verdict("c1", recommendation="approve", confidence=1.0)
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([item])
+    assert remaining == [item]
+    assert item.get("auto_approved") is not True
+
+
+def test_smart_approval_stamps_verdict_user_decision() -> None:
+    """The LLM verdict arrived during the wait (parked in
+    ``_pending_verdicts`` as pending); the smart stage pulls it out so a
+    sibling's resolve can't re-stamp it, and records ``smart_approval`` on
+    both the cached dict and the persisted row."""
+    storage = MagicMock()
+    ui = _smart_ui()
+    item = _pending_item("c1")
+    verdict = _llm_verdict("c1", recommendation="approve", confidence=0.99)
+    ui._llm_verdicts["c1"] = verdict
+    ui._pending_verdicts = [verdict]  # as on_intent_verdict would have parked it
+    with _patch_get_storage(storage):
+        ui._apply_smart_approvals([item])
+    assert ui._pending_verdicts == []
+    assert ui._llm_verdicts["c1"]["user_decision"] == "smart_approval"
+    storage.update_intent_verdict.assert_called_once_with("v-c1", user_decision="smart_approval")
+
+
+def test_approve_tools_smart_approves_whole_batch_without_prompt() -> None:
+    """End-to-end through approve_tools: the verdict is delivered after
+    the cache reset (via _SeedingUI), the gate auto-approves, and the
+    function returns approved without ever emitting an approval prompt."""
+    storage = MagicMock()
+    ui = _SeedingUI(ws_id="ws-1", user_id="u1")
+    ui.smart_approvals_enabled = True
+    ui.smart_approval_threshold = 0.95
+    ui.smart_approval_wait_seconds = 1.0
+    item = _pending_item("c1")
+    ui.seed_verdicts = [_llm_verdict("c1", recommendation="approve", confidence=0.99)]
+    lq = ui._register_listener()
+    with _patch_get_storage(storage), _patch_policies({}):
+        approved, feedback = ui.approve_tools([item])
+    assert approved is True
+    assert feedback is None
+    assert item["auto_approved"] is True
+    assert item["auto_approve_reason"] == "smart_approval"
+    assert item["needs_approval"] is False
+    assert ui._pending_approval is None  # operator was never prompted
+    assert ui._pending_verdicts == []  # smart verdict pulled out + stamped
+    # No approval prompt was fanned out to listeners.
+    events = []
+    while True:
+        try:
+            events.append(lq.get_nowait()["type"])
+        except queue.Empty:
+            break
+    assert "approve_request" not in events
+
+
+def test_approve_tools_skips_smart_stage_when_disabled() -> None:
+    """With Smart Approvals off (the default), a confident approve verdict
+    does NOT bypass the human — approve_tools blocks on the prompt as
+    before."""
+    storage = MagicMock()
+    ui = _SeedingUI(ws_id="ws-1", user_id="u1")
+    ui.smart_approvals_enabled = False
+    ui.smart_approval_wait_seconds = 1.0
+    item = _pending_item("c1")
+    ui.seed_verdicts = [_llm_verdict("c1", recommendation="approve", confidence=0.99)]
+    timer = threading.Timer(0.05, lambda: ui.resolve_approval(True, "ok"))
+    timer.start()
+    try:
+        with _patch_get_storage(storage), _patch_policies({}):
+            approved, _feedback = ui.approve_tools([item])
+    finally:
+        timer.cancel()
+    assert approved is True  # the human approved, not the judge
+    assert item.get("auto_approve_reason") != "smart_approval"
+    assert item.get("auto_approved") is not True
+
+
+def test_await_llm_verdicts_returns_when_verdict_delivered() -> None:
+    """The wait wakes as soon as the last needed verdict lands, well
+    before the budget elapses."""
+    ui = _smart_ui()
+
+    def _deliver() -> None:
+        with _patch_get_storage(MagicMock()):
+            ui.on_intent_verdict(_llm_verdict("c1"))
+
+    timer = threading.Timer(0.02, _deliver)
+    timer.start()
+    try:
+        # Generous budget; should return on the notify, not the timeout.
+        ui._await_llm_verdicts({"c1"}, 5.0)
+    finally:
+        timer.cancel()
+    assert "c1" in ui._llm_verdicts
+
+
+def test_smart_approval_respects_heuristic_deny_floor() -> None:
+    """A high-confidence LLM ``approve`` must NOT override a deterministic
+    heuristic ``deny`` — the LLM may escalate the heuristic but never lower
+    it.  The call reaches a human."""
+    ui = _smart_ui()
+    item = _pending_item("c1")
+    item["_heuristic_verdict"]["recommendation"] = "deny"
+    item["_heuristic_verdict"]["risk_level"] = "critical"
+    ui._llm_verdicts["c1"] = _llm_verdict("c1", recommendation="approve", confidence=1.0)
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([item])
+    assert remaining == [item]
+    assert item.get("auto_approved") is not True
+    assert item["needs_approval"] is True
+
+
+def test_smart_approval_respects_heuristic_critical_floor() -> None:
+    """A heuristic ``critical`` risk_level blocks smart approval even when
+    the heuristic recommendation itself isn't ``deny``."""
+    ui = _smart_ui()
+    item = _pending_item("c1")
+    item["_heuristic_verdict"]["recommendation"] = "review"
+    item["_heuristic_verdict"]["risk_level"] = "critical"
+    ui._llm_verdicts["c1"] = _llm_verdict("c1", recommendation="approve", confidence=1.0)
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([item])
+    assert remaining == [item]
+    assert item.get("auto_approved") is not True
+
+
+def test_smart_approval_skips_oversized_batch() -> None:
+    """A batch with more calls than the FIFO verdict-cache cap can't be
+    reliably awaited (older verdicts evict before the wait sees them all),
+    so the whole batch reaches a human rather than stalling on the wait."""
+    ui = _smart_ui()
+    n = ui._LLM_VERDICT_CACHE_MAX + 1
+    items = [_pending_item(f"c{i}") for i in range(n)]
+    for i in range(n):
+        ui._llm_verdicts[f"c{i}"] = _llm_verdict(f"c{i}", recommendation="approve", confidence=1.0)
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals(items)
+    assert remaining == items  # none auto-approved
+    assert all(it.get("auto_approved") is not True for it in items)
+
+
+def test_replay_pending_verdicts_reemits_cached_verdicts() -> None:
+    """The streaming-fix helper re-fans-out each pending call's cached LLM
+    verdict as an intent_verdict event."""
+    ui = _smart_ui()
+    item = _pending_item("c1")
+    ui._llm_verdicts["c1"] = _llm_verdict("c1", recommendation="review", confidence=0.9)
+    lq = ui._register_listener()
+    ui._replay_pending_verdicts([item])
+    intent_events = []
+    while True:
+        try:
+            ev = lq.get_nowait()
+        except queue.Empty:
+            break
+        if ev.get("type") == "intent_verdict":
+            intent_events.append(ev)
+    assert len(intent_events) == 1
+    assert intent_events[0]["call_id"] == "c1"
+    assert intent_events[0]["recommendation"] == "review"
+
+
+def test_approve_tools_reemits_verdict_after_card_on_held_batch() -> None:
+    """Streaming regression fix: when Smart Approvals holds a batch (e.g. a
+    review verdict), the approve_request card is FOLLOWED by a re-emitted
+    intent_verdict so the live chip updates without a browser reload."""
+    storage = MagicMock()
+    ui = _SeedingUI(ws_id="ws-1", user_id="u1")
+    ui.smart_approvals_enabled = True
+    ui.smart_approval_threshold = 0.95
+    ui.smart_approval_wait_seconds = 1.0
+    item = _pending_item("c1")
+    ui.seed_verdicts = [_llm_verdict("c1", recommendation="review", confidence=0.99)]
+    lq = ui._register_listener()
+    timer = threading.Timer(0.1, lambda: ui.resolve_approval(False, "no"))
+    timer.start()
+    try:
+        with _patch_get_storage(storage), _patch_policies({}):
+            ui.approve_tools([item])
+    finally:
+        timer.cancel()
+    events = []
+    while True:
+        try:
+            events.append(lq.get_nowait())
+        except queue.Empty:
+            break
+    types = [e.get("type") for e in events]
+    assert "approve_request" in types
+    # An intent_verdict is re-emitted AFTER the card (the live chip update).
+    ar = types.index("approve_request")
+    assert "intent_verdict" in types[ar + 1 :]
+    # The wait already collected the verdict, so the card must not claim the
+    # judge is still working — no spurious "judge pending" spinner / poll.
+    assert events[ar].get("judge_pending") is False
+
+
+def test_judge_pending_true_when_llm_verdict_not_yet_cached() -> None:
+    """Normal async flow (Smart Approvals off): a judged call whose LLM
+    verdict hasn't arrived yet → approve_request reports judge_pending=True."""
+    ui = _make_ui()  # smart_approvals_enabled defaults False
+    item = _pending_item("c1")  # carries _heuristic_verdict, no cached LLM verdict
+    lq = ui._register_listener()
+    timer = threading.Timer(0.1, lambda: ui.resolve_approval(True, "ok"))
+    timer.start()
+    try:
+        with _patch_get_storage(MagicMock()), _patch_policies({}):
+            ui.approve_tools([item])
+    finally:
+        timer.cancel()
+    reqs = [e for e in _drain(lq) if e.get("type") == "approve_request"]
+    assert reqs and reqs[0]["judge_pending"] is True
+
+
+def test_auto_approve_reason_vocabulary_matches_js() -> None:
+    """AutoApproveReason.ALL must stay in lockstep with the JS
+    KNOWN_AUTO_APPROVE_REASONS set — a server-sent reason missing from the JS
+    set degrades to the 'unknown' pill on the coordinator tree."""
+    import re
+    from pathlib import Path
+
+    from turnstone.core.session_ui_base import AutoApproveReason
+
+    js = Path(__file__).resolve().parents[1] / "turnstone/console/static/coordinator/coordinator.js"
+    m = re.search(
+        r"KNOWN_AUTO_APPROVE_REASONS\s*=\s*new Set\(\s*\[(.*?)\]",
+        js.read_text(),
+        re.S,
+    )
+    assert m, "KNOWN_AUTO_APPROVE_REASONS set not found in coordinator.js"
+    js_reasons = set(re.findall(r'"([^"]+)"', m.group(1)))
+    assert js_reasons == AutoApproveReason.ALL
+
+
+def test_verdict_confidence_rejects_non_finite() -> None:
+    """NaN/inf confidence is treated as malformed (0.0), not clamped to 1.0."""
+    assert _ConcreteUI._verdict_confidence({"confidence": float("nan")}) == 0.0
+    assert _ConcreteUI._verdict_confidence({"confidence": float("inf")}) == 0.0
+    assert _ConcreteUI._verdict_confidence({"confidence": 0.97}) == 0.97
+
+
+def test_smart_approval_holds_nan_confidence() -> None:
+    """A NaN confidence (json.loads accepts NaN) must NOT clear the
+    auto-approve bar even with recommendation=approve."""
+    ui = _smart_ui()
+    item = _pending_item("c1")
+    ui._llm_verdicts["c1"] = _llm_verdict("c1", recommendation="approve", confidence=float("nan"))
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([item])
+    assert remaining == [item]
+    assert item.get("auto_approved") is not True
+
+
+def test_smart_approval_holds_batch_with_duplicate_call_ids() -> None:
+    """Two pending calls sharing a call_id (some local models emit duplicate
+    non-empty ids) must not both be cleared by the single shared verdict —
+    hold the whole batch."""
+    ui = _smart_ui()
+    a = _pending_item("dup")
+    b = _pending_item("dup")  # same call_id, distinct call
+    ui._llm_verdicts["dup"] = _llm_verdict("dup", recommendation="approve", confidence=0.99)
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([a, b])
+    assert remaining == [a, b]
+    assert a.get("auto_approved") is not True
+
+
+def test_on_intent_verdict_skips_append_for_already_finalized_verdict() -> None:
+    """Guards the audit-corruption race: a verdict already stamped with a
+    final user_decision (e.g. ``_finalize_smart_verdicts`` ran between this
+    verdict's notify and its append) is NOT re-parked in _pending_verdicts,
+    so a later round's resolve_approval can't overwrite its audit row."""
+    ui = _make_ui()
+    verdict = {"verdict_id": "v1", "call_id": "c1", "user_decision": "smart_approval"}
+    with _patch_get_storage(MagicMock()):
+        ui.on_intent_verdict(verdict)
+    assert ui._pending_verdicts == []
+    assert ui._llm_verdicts["c1"]["user_decision"] == "smart_approval"

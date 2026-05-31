@@ -1070,8 +1070,8 @@ def main() -> None:
         "--judge-confidence",
         dest="judge_confidence",
         type=float,
-        default=0.7,
-        help="Confidence threshold for judge (default: 0.7)",
+        default=0.95,
+        help="Judge verdict confidence threshold, 0-1 (default: 0.95)",
     )
     from turnstone.core.config import add_config_arg, apply_config
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import math
 import os
 import re
 import threading
@@ -82,7 +83,8 @@ class JudgeConfig:
 
     enabled: bool = True
     model: str = ""  # empty = use session model
-    confidence_threshold: float = 0.7
+    smart_approvals: bool = False  # auto-approve high-confidence "approve" LLM verdicts
+    confidence_threshold: float = 0.95  # Smart Approvals auto-approve bar (recommendation=approve)
     max_context_ratio: float = 0.5
     timeout: float = 60.0  # per-turn timeout in seconds (see class docstring)
     read_only_tools: bool = True
@@ -1109,11 +1111,20 @@ class IntentJudge:
                 except _ExecutorPoisonedError:
                     executor.shutdown(wait=False, cancel_futures=True)
                     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="judge-api")
+                    # Deliver a fallback for the interrupted item so every
+                    # call still gets exactly one verdict. Smart Approvals
+                    # waits on the full set before gating; a silently-
+                    # skipped item would otherwise block that wait until
+                    # its timeout (and the advisory UI would miss a chip).
+                    self._deliver_fallbacks(
+                        [item], [h_verdict], callback, "judge executor restarted"
+                    )
                 except Exception:
                     log.exception(
                         "Judge evaluation failed for %s",
                         item.get("func_name", "?"),
                     )
+                    self._deliver_fallbacks([item], [h_verdict], callback, "judge evaluation error")
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
             try:
@@ -1573,8 +1584,13 @@ class IntentJudge:
 
         confidence = 0.5
         try:
-            confidence = float(data.get("confidence", 0.5))
-            confidence = max(0.0, min(1.0, confidence))
+            parsed = float(data.get("confidence", 0.5))
+            # Reject non-finite (NaN/inf): json.loads accepts NaN, and a NaN
+            # would survive max/min clamping as 1.0 (comparisons with NaN are
+            # all False) — keep the cautious 0.5 default instead so a NaN can't
+            # masquerade as maximum confidence downstream (e.g. Smart Approvals).
+            if math.isfinite(parsed):
+                confidence = max(0.0, min(1.0, parsed))
         except (ValueError, TypeError):
             pass  # keeps default 0.5
 

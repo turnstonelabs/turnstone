@@ -216,6 +216,47 @@ class TestErrorHandling:
         assert len(callback_results) == 1
         assert callback_results[0].tier == "llm_fallback"
 
+    def test_evaluate_single_raise_delivers_fallback(self):
+        """If ``_evaluate_single`` *raises* (not just returns None), the
+        daemon still delivers exactly one fallback verdict for that item.
+        Smart Approvals waits on the full verdict set before gating, so a
+        silently-skipped item would otherwise block that wait until its
+        timeout."""
+        judge = _make_judge()
+        judge._evaluate_single = MagicMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("boom")
+        )
+        callback_results: list[IntentVerdict] = []
+        judge.evaluate(
+            [_make_item()],
+            [{"role": "user", "content": "test"}],
+            callback_results.append,
+        )
+        time.sleep(0.5)
+        assert len(callback_results) == 1
+        assert callback_results[0].tier == "llm_fallback"
+
+    def test_executor_poison_delivers_fallback(self):
+        """An _ExecutorPoisonedError (a judge-call timeout poisoning the
+        single-worker executor) restarts the executor AND still delivers one
+        fallback for the interrupted item — the twin of the generic-exception
+        path, and load-bearing for Smart Approvals' batch-completeness wait."""
+        from turnstone.core.judge import _ExecutorPoisonedError
+
+        judge = _make_judge()
+        judge._evaluate_single = MagicMock(  # type: ignore[method-assign]
+            side_effect=_ExecutorPoisonedError()
+        )
+        callback_results: list[IntentVerdict] = []
+        judge.evaluate(
+            [_make_item()],
+            [{"role": "user", "content": "test"}],
+            callback_results.append,
+        )
+        time.sleep(0.5)
+        assert len(callback_results) == 1
+        assert callback_results[0].tier == "llm_fallback"
+
     def test_empty_content_returns_none(self):
         """Provider returns empty content, no tool calls."""
         provider = _make_mock_provider(response_content="")

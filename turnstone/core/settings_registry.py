@@ -476,16 +476,31 @@ def _build_registry() -> dict[str, SettingDef]:
             "register the model in the Models tab and reference it by alias.",
         ),
         SettingDef(
+            "judge.smart_approvals",
+            "bool",
+            False,
+            "Enable Smart Approvals",
+            "judge",
+            help="When enabled, a tool call is approved automatically \u2014 without waiting for a "
+            "human \u2014 if the intent-validation judge's LLM verdict recommends 'approve' with a "
+            "confidence at or above judge.confidence_threshold. 'review' and 'deny' "
+            "recommendations, low-confidence verdicts, and judge errors (timeouts / fallbacks) "
+            "always still require human approval. Requires judge.enabled and a working LLM judge. "
+            "Disabled by default \u2014 opt in once you trust the judge on your workload.",
+        ),
+        SettingDef(
             "judge.confidence_threshold",
             "float",
-            0.7,
-            "Min confidence for judge verdict",
+            0.95,
+            "Min judge confidence for Smart Approvals",
             "judge",
             min_value=0.0,
             max_value=1.0,
             help="The judge reports how confident it is in its safety assessment (0\u20131). "
-            "Verdicts below this threshold are flagged as low-confidence. Future versions "
-            "can use this for auto-approval of high-confidence safe verdicts.",
+            "When Smart Approvals (judge.smart_approvals) is enabled, a tool call is "
+            "auto-approved only if the LLM verdict recommends 'approve' with confidence at or "
+            "above this value. Lower it to auto-approve more aggressively; raise it toward 1.0 "
+            "to require near-certainty. Has no effect while judge.smart_approvals is off.",
         ),
         SettingDef(
             "judge.max_context_ratio",

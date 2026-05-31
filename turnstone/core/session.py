@@ -1246,6 +1246,7 @@ class ChatSession:
         return JudgeConfig(
             enabled=cs.get("judge.enabled"),
             model=jc.model,
+            smart_approvals=cs.get("judge.smart_approvals"),
             confidence_threshold=cs.get("judge.confidence_threshold"),
             max_context_ratio=cs.get("judge.max_context_ratio"),
             timeout=cs.get("judge.timeout"),
@@ -5201,14 +5202,36 @@ class ChatSession:
             elif it.get("mcp_args"):
                 it["func_args"] = it["mcp_args"]
 
+        # Publish this judge generation as the session's current cancel event
+        # BEFORE spawning the daemon, so the callback can detect when a later
+        # turn has superseded it (this turn always runs before its own
+        # approve_tools, so the assignment is in place before any verdict can
+        # land).  ``_execute_tools`` re-asserts the same value and handles the
+        # judge-disabled (None) case.
+        cancel_event = threading.Event()
+        self._judge_cancel_event = cancel_event
+
         def _on_verdict(verdict: object) -> None:
-            """Callback from the daemon judge thread."""
+            """Callback from the daemon judge thread.
+
+            Drop the verdict when a newer turn has replaced this judge
+            generation.  With ``cancel_on_approval=False`` (the default) the
+            prior turn's daemon runs to completion and would otherwise write a
+            stale verdict — keyed only by ``call_id`` — into the freshly-reset
+            ``_llm_verdicts`` cache; a model that reuses a ``call_id`` across
+            turns could then ride that stale ``approve`` to a wrongful Smart
+            Approval of a *different* call.  Identity-comparing the live
+            generation closes that without affecting same-turn late delivery
+            (``cancel_on_approval=False`` still streams this turn's verdicts,
+            since the session event still points at this ``cancel_event``).
+            """
+            if self._judge_cancel_event is not cancel_event:
+                return
             try:
                 self.ui.on_intent_verdict(verdict.to_dict())  # type: ignore[attr-defined]
             except Exception:
                 log.debug("judge.verdict_delivery_failed", exc_info=True)
 
-        cancel_event = threading.Event()
         heuristic_verdicts = judge.evaluate(
             pending,
             list(self.messages),  # snapshot — daemon thread must not see mutations
@@ -5823,6 +5846,23 @@ class ChatSession:
             self._judge_cancel_event.set()
         judge_cancel = self._evaluate_intent(items)
         self._judge_cancel_event = judge_cancel  # track for close()
+
+        # Push the live Smart Approvals config onto the UI just before the
+        # gate so a hot-reloaded ``judge.*`` change takes effect on this
+        # batch.  Only SessionUIBase carries the smart-approval gate (the
+        # CLI / eval UIs have their own ``approve_tools``); the isinstance
+        # check both skips those and narrows the type for the attribute
+        # writes.  ``approve_tools`` acts on these only when the judge is
+        # enabled AND ``judge.smart_approvals`` is on, so the feature stays
+        # inert (human-gated, as today) unless explicitly turned on.
+        from turnstone.core.session_ui_base import SessionUIBase
+
+        if isinstance(self.ui, SessionUIBase):
+            jc = self._judge_cfg
+            self.ui.smart_approvals_enabled = bool(jc and jc.enabled and jc.smart_approvals)
+            if jc is not None:
+                self.ui.smart_approval_threshold = jc.confidence_threshold
+                self.ui.smart_approval_wait_seconds = jc.timeout
 
         # Phase 2: approve via UI
         self._emit_state("attention")
