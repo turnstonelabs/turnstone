@@ -1550,9 +1550,7 @@ def test_announced_rail_outspecifies_inline_cyan_hold() -> None:
     This is a render-only failure no JS string-guard catches, so pin the
     high-specificity selector + the visible ``--accent`` (not the
     near-invisible 15%-alpha ``--accent-dim``)."""
-    css = (
-        _APP_JS.resolve().parent / "style.css"
-    ).read_text(encoding="utf-8")
+    css = (_APP_JS.resolve().parent / "style.css").read_text(encoding="utf-8")
     assert ".msg.ts-approval--inline.ts-approval--announced {" in css, (
         "announced rail selector must qualify with .msg.ts-approval--inline to "
         "beat the inline cyan-hold rule (0,2,0) — else it renders dashed cyan"
