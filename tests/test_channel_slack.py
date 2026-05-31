@@ -1079,19 +1079,31 @@ class TestDmContinuity:
 class TestChannelCLI:
     """Tests for the channel CLI entry point with Slack args."""
 
-    def test_exits_without_adapter_token(self) -> None:
+    def test_standby_without_adapter_token(self) -> None:
+        # No Discord/Slack token → standby: main() runs the gateway with zero
+        # adapters instead of exiting (which would crash-loop under
+        # `restart: unless-stopped`).
         import sys
 
+        from turnstone.channels import cli
         from turnstone.channels.cli import main
+
+        captured: dict[str, object] = {}
+
+        async def _fake_gateway(adapters, channel_app, storage, args):  # type: ignore[no-untyped-def]
+            captured["adapters"] = adapters
 
         with (
             patch.object(sys, "argv", ["turnstone-channel"]),
             patch.dict("os.environ", {}, clear=True),
-            pytest.raises(SystemExit) as exc_info,
+            patch("turnstone.core.storage._registry.init_storage"),
+            patch("turnstone.core.storage._registry.get_storage", return_value=MagicMock()),
+            patch("turnstone.channels._http.create_channel_app", return_value=MagicMock()),
+            patch.object(cli, "_run_gateway", _fake_gateway),
         ):
-            main()
+            main()  # must not raise SystemExit
 
-        assert exc_info.value.code == 1
+        assert captured["adapters"] == {}
 
     def test_slack_requires_both_tokens(self) -> None:
         import sys
