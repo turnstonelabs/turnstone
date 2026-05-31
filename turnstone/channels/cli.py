@@ -394,7 +394,14 @@ def main() -> None:
         args.server_url,
     )
 
-    if not console_url and not server_url:
+    # A Slack adapter needs both tokens; a mismatched pair is a config error.
+    if bool(args.slack_token) != bool(args.slack_app_token):
+        raise SystemExit("--slack-token and --slack-app-token must be provided together")
+
+    has_adapters = bool(args.discord_token or args.slack_token)
+
+    # Adapters need to reach the server/console; standby doesn't.
+    if has_adapters and not console_url and not server_url:
         print(
             "Error: no console or server URL available. Set --server-url, "
             "--console-url, or ensure the database is reachable and services "
@@ -403,26 +410,26 @@ def main() -> None:
         )
         sys.exit(1)
 
-    if not args.discord_token and not args.slack_token:
-        print(
-            "Error: no channel adapters configured. "
-            "Set --discord-token / $TURNSTONE_DISCORD_TOKEN "
-            "or --slack-token / $TURNSTONE_SLACK_TOKEN.",
-            file=sys.stderr,
+    if has_adapters:
+        adapters = _build_adapters(
+            args,
+            storage,
+            server_url=server_url,
+            console_url=console_url,
+            console_token_factory=console_token_factory,
+            server_token_factory=server_token_factory,
         )
-        sys.exit(1)
-
-    if bool(args.slack_token) != bool(args.slack_app_token):
-        raise SystemExit("--slack-token and --slack-app-token must be provided together")
-
-    adapters = _build_adapters(
-        args,
-        storage,
-        server_url=server_url,
-        console_url=console_url,
-        console_token_factory=console_token_factory,
-        server_token_factory=server_token_factory,
-    )
+    else:
+        # Standby: no Discord/Slack token configured. Rather than exit — which
+        # crash-loops under `restart: unless-stopped` — run the HTTP server and
+        # service heartbeat with no adapters, registered and idle. Set a token
+        # and restart to activate an adapter.
+        log.warning(
+            "channel.standby",
+            reason="no channel adapters configured",
+            hint="set $TURNSTONE_DISCORD_TOKEN or $TURNSTONE_SLACK_TOKEN and restart",
+        )
+        adapters = {}
 
     channel_app = create_channel_app(adapters, storage, jwt_secret=jwt_secret)
 
