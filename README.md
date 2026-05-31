@@ -4,8 +4,9 @@
 [![PyPI](https://img.shields.io/pypi/v/turnstone)](https://pypi.org/project/turnstone/)
 [![Python](https://img.shields.io/pypi/pyversions/turnstone)](https://pypi.org/project/turnstone/)
 [![License](https://img.shields.io/badge/license-BSL--1.1-blue)](LICENSE)
+[![Discord](https://img.shields.io/badge/Discord-join%20us-5865F2?logo=discord&logoColor=white)](https://discord.gg/Nh3bWMacaq)
 
-Multi-node AI orchestration platform. Deploy tool-using AI agents across a cluster of servers with direct HTTP routing, interactive interfaces, and enterprise governance.
+Self-hosted, local-first orchestration for tool-using AI agents. Give LLMs real tools — shell, files, search, web — and run them across your own cluster with direct HTTP routing and interactive interfaces. Your code, your models, your data stay on hardware you control: no telemetry, no phone-home.
 
 <p align="center">
   <img src="docs/assets/hero.png" alt="Turnstone coordinator — parallel tool batches with judge-graded approval and child workstream tracking" width="960"/>
@@ -26,12 +27,13 @@ See [docs/releasing.md](docs/releasing.md) for the full release process.
 
 Turnstone gives LLMs tools — shell, files, search, web, planning — and orchestrates multi-turn conversations where the model investigates, acts, and reports.
 
+- **Local-first & private** — runs entirely on hardware you control, with no telemetry and no phone-home. Point it at local models (vLLM, llama.cpp, Ollama) or commercial APIs you hold the keys to — your prompts and data never transit a third party you didn't choose.
+- **Bring your own models** — OpenAI-compatible APIs (vLLM, llama.cpp, NIM), the Anthropic Messages API, and Google Gemini, mixed freely per role
 - **Interactive sessions** — terminal CLI or browser UI with parallel workstreams
-- **Cluster dashboard** — real-time view of all nodes and workstreams with console routing proxy
-- **Intent validation** — LLM judge evaluates every tool call with risk assessments and evidence
-- **Governance** — RBAC, OIDC SSO, tool policies, skills, usage tracking, audit logs
-- **Multi-provider** — OpenAI-compatible APIs (vLLM, llama.cpp, NIM), Anthropic Messages API, and Google Gemini
+- **Cluster dashboard** — real-time view of every node and workstream, with a rendezvous routing proxy
+- **Intent validation** — an LLM judge (your model) grades every tool call with a risk assessment and evidence before it runs
 - **MCP support** — external tool servers with native deferred loading (Anthropic/OpenAI) or BM25 fallback
+- **Team controls when you need them** — optional RBAC, SSO, tool policies, and audit logs, all stored in your own database
 
 <p align="center">
   <img src="docs/diagrams/architecture-overview.svg" alt="Turnstone system architecture" width="960"/>
@@ -64,12 +66,29 @@ turnstone-server --port 8080 --base-url http://localhost:8000/v1
 
 ### Docker
 
+One-line install — autodetects Ubuntu/Debian, Fedora/RHEL, Arch, and WSL,
+installs git + Docker if missing, generates secrets, and starts the stack:
+
 ```bash
-cp .env.example .env  # edit LLM_BASE_URL, OPENAI_API_KEY, etc.
-docker compose --profile production up
+curl -fsSL https://raw.githubusercontent.com/turnstonelabs/turnstone/main/run.sh | bash
 ```
 
-See [QUICKSTART.md](QUICKSTART.md) for the bootstrap wizard and [docs/docker.md](docs/docker.md) for Docker configuration and profiles.
+Or, if you already have Docker, clone the repo and run it yourself:
+
+```bash
+docker compose up
+```
+
+That builds one image and brings up a full local cluster — PostgreSQL, console,
+Caddy, channel gateway, and 10 server nodes — with no `.env` required (it ships
+with insecure dev defaults). Open the dashboard at https://localhost:8443 (Caddy
+serves it over TLS with its own local CA — trust it once). Nodes boot without an
+LLM; add model backends from the console UI.
+
+For production (released images from ghcr.io, real secrets required), use the
+bundled stack: `docker compose -f turnstone/deploy/compose.yaml up`.
+
+See [QUICKSTART.md](QUICKSTART.md) for the bootstrap wizard and [docs/docker.md](docs/docker.md) for Docker configuration.
 
 ### Programmatic (SDK)
 
@@ -144,6 +163,11 @@ UML diagrams in [`docs/diagrams/`](docs/diagrams/):
 - An OpenAI-compatible API endpoint, Anthropic API key, or Google Gemini API key
 - Optional: PostgreSQL (`pip install turnstone[postgres]`), Anthropic (`pip install turnstone[anthropic]`)
 - [Git LFS](https://git-lfs.com/) for cloning (diagram PNGs)
+
+## Community
+
+Questions, ideas, or want to show what you're building? Join us on Discord:
+**[discord.gg/Nh3bWMacaq](https://discord.gg/Nh3bWMacaq)**.
 
 ## License
 
