@@ -819,9 +819,7 @@ class TestLoadModelRegistryWithDB:
             ]
         )
         with patch("turnstone.core.model_registry.load_config", return_value={}):
-            reg = load_model_registry(
-                "http://x/v1", "cli-fallback-key", "x", storage=storage
-            )
+            reg = load_model_registry("http://x/v1", "cli-fallback-key", "x", storage=storage)
         cfg = reg.get_config("cloud")
         assert cfg.api_key == "cli-fallback-key"
 
@@ -842,9 +840,7 @@ class TestLoadModelRegistryWithDB:
             ]
         )
         with patch("turnstone.core.model_registry.load_config", return_value={}):
-            reg = load_model_registry(
-                "http://x/v1", "cli-fallback-key", "x", storage=storage
-            )
+            reg = load_model_registry("http://x/v1", "cli-fallback-key", "x", storage=storage)
         cfg = reg.get_config("cloud")
         assert cfg.api_key == "sk-db-specific"
 
