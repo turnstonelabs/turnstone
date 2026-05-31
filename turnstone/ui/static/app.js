@@ -46,6 +46,46 @@ function voiceAnnounce(msg) {
   }, 30);
 }
 
+// Visually-hidden POLITE live region for the tool-call early paint
+// (tool_pending) so screen-reader users hear a committed call land — and that
+// they can Stop it — even though messagesEl is flipped to aria-live="off"
+// during the token streaming that immediately precedes the call.  Polite (not
+// assertive): a committed call is worth surfacing but isn't the action-required
+// human gate, which keeps its own assertive announcement.  Separate node from
+// the voice region so the two never clobber each other.  Single shared node;
+// clear-then-set so repeated identical messages re-announce.
+let _toolStatusEl = null;
+function toolAnnounce(msg) {
+  if (!msg) return;
+  if (!_toolStatusEl) {
+    _toolStatusEl = document.createElement("div");
+    _toolStatusEl.className = "sr-only";
+    _toolStatusEl.setAttribute("role", "status");
+    _toolStatusEl.setAttribute("aria-live", "polite");
+    document.body.appendChild(_toolStatusEl);
+  }
+  _toolStatusEl.textContent = "";
+  window.setTimeout(() => {
+    if (_toolStatusEl) _toolStatusEl.textContent = msg;
+  }, 30);
+}
+
+// Terse SR summary for a committed tool batch: tool name(s) (capped at 3) +
+// the fact it's being judged and can be stopped.  Empty string when there are
+// no named tools (toolAnnounce then no-ops).
+function _toolAnnounceText(items) {
+  const names = (items || []).map((it) => it && it.func_name).filter(Boolean);
+  if (!names.length) return "";
+  const n = names.length;
+  const shown = names.slice(0, 3).join(", ");
+  const list = n > 3 ? shown + ", and " + (n - 3) + " more" : shown;
+  const head =
+    n === 1 ? "Tool call pending: " + list : n + " tool calls pending: " + list;
+  // No "judge evaluating" claim — tool_pending fires unconditionally, so the
+  // intent judge may be disabled.  "Pending + you can stop it" is always true.
+  return head + ". You can stop " + (n === 1 ? "it" : "them") + ".";
+}
+
 class Pane {
   constructor(wsId) {
     this.id = "p" + ++_paneCounter;
@@ -64,6 +104,9 @@ class Pane {
     this.isThinking = false;
     this.pendingApproval = false;
     this.approvalBlockEl = null;
+    // Early-paint shell from a ``tool_pending`` event, awaiting its
+    // authoritative ``tool_info`` / ``approve_request`` upgrade.
+    this.announcedBlockEl = null;
     this.retryDelay = 1000;
     this.model = "";
     this.modelAlias = "";
@@ -97,6 +140,7 @@ class Pane {
     this.setBusy(false);
     this.pendingApproval = false;
     this.approvalBlockEl = null;
+    this.announcedBlockEl = null;
     this._pendingEditSend = null;
     this.inputEl.disabled = false;
     this.attachments.clearChips();
@@ -1134,6 +1178,15 @@ class Pane {
         ) {
           this.setBusy(true);
         }
+        break;
+
+      case "tool_pending":
+        // Early paint — render the pending call the instant the model
+        // commits to it, before the judge verdict + approval gate resolve,
+        // so the operator can Stop in an emergency.  The authoritative
+        // tool_info / approve_request that follows upgrades THIS block in
+        // place (matched by call_id) rather than appending a duplicate.
+        this.announceToolBlock(evt.items);
         break;
 
       case "tool_info":
@@ -2276,8 +2329,87 @@ class Pane {
     }
   }
 
-  showInlineToolBlock(items, autoApproved, judgePending) {
+  announceToolBlock(items) {
+    const list = (items || []).filter(Boolean);
+    if (!list.length) return;
+    // Drop a previous un-consumed announce (e.g. a turn that errored before
+    // its approve_request / tool_info ever arrived) so shells don't pile up.
+    if (this.announcedBlockEl) {
+      this.announcedBlockEl.remove();
+      this.announcedBlockEl = null;
+    }
     const block = document.createElement("div");
+    block.className =
+      "msg ts-approval ts-approval--inline ts-approval--announced";
+    // Indeterminate region until the judge/gate resolves; the tool_info /
+    // approve_request upgrade clears it (showInlineToolBlock), so AT treats
+    // the shell as loading rather than a finished card.
+    block.setAttribute("aria-busy", "true");
+    block.dataset.callIds = JSON.stringify(
+      list.map((it) => it.call_id).filter(Boolean),
+    );
+    list.forEach((item) => {
+      block.appendChild(buildToolDiv(item));
+      // The heuristic verdict is attached synchronously before the gate, so
+      // the badge (carrying its data-call-id) exists from the first frame;
+      // the async LLM ``intent_verdict`` updates it in place via
+      // updateVerdictBadge.  judgePending=true shows the "judge analysing"
+      // spinner until that lands.
+      const verdict =
+        item.judge_verdict || item.heuristic_verdict || item.verdict;
+      if (verdict) block.appendChild(renderVerdictBadge(verdict, true));
+    });
+    this.announcedBlockEl = block;
+    this.messagesEl.appendChild(block);
+    this.scrollToBottom();
+    // Polite SR announcement (messagesEl is aria-live="off" mid-stream, so the
+    // appended shell alone wouldn't be heard) — names the call + that it can
+    // be stopped, the whole point of painting it early.
+    toolAnnounce(_toolAnnounceText(list));
+  }
+
+  // Hand back the early-paint shell to upgrade in place if it matches this
+  // batch's call_ids, else null (caller builds fresh).  Clears the tracking
+  // ref so the shell is consumed exactly once.  Matching by id set is
+  // defensive — the interactive pane is strictly serial, so an announce is
+  // always followed by ITS approve_request / tool_info — but it guarantees a
+  // stale shell can never capture a different batch.
+  _takeAnnouncedBlock(items) {
+    const block = this.announcedBlockEl;
+    if (!block) return null;
+    this.announcedBlockEl = null;
+    const want = (items || [])
+      .map((it) => it.call_id)
+      .filter(Boolean)
+      .sort();
+    let have = [];
+    try {
+      have = JSON.parse(block.dataset.callIds || "[]");
+    } catch (_e) {
+      have = [];
+    }
+    have = have.slice().sort();
+    const matches =
+      want.length === have.length && want.every((id, i) => id === have[i]);
+    if (!matches) {
+      block.remove(); // stale orphan — discard, caller builds fresh
+      return null;
+    }
+    return block;
+  }
+
+  showInlineToolBlock(items, autoApproved, judgePending) {
+    // Reuse the early-paint shell (tool_pending) if it's for this batch so
+    // the card upgrades in place instead of duplicating; else build fresh.
+    // replaceChildren() rebuilds the rows from the now-complete items (which
+    // carry the auto-approve tag + completed LLM verdict), so the auto badge
+    // and llm-tier verdict render without per-node patching.
+    const announced = this._takeAnnouncedBlock(items);
+    const block = announced || document.createElement("div");
+    if (announced) announced.replaceChildren();
+    // The judge/gate has resolved — clear the announced shell's busy state
+    // (no-op on a freshly built block, which never had it).
+    block.removeAttribute("aria-busy");
     block.className =
       "msg ts-approval ts-approval--inline" + (autoApproved ? " approved" : "");
     if (!autoApproved) {
@@ -2397,7 +2529,9 @@ class Pane {
       });
     }
 
-    this.messagesEl.appendChild(block);
+    // A reused announce shell is already in the DOM — only append a freshly
+    // built block.
+    if (!announced) this.messagesEl.appendChild(block);
     this.scrollToBottom();
   }
 

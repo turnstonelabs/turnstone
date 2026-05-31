@@ -2045,3 +2045,49 @@ def test_on_intent_verdict_skips_append_for_already_finalized_verdict() -> None:
         ui.on_intent_verdict(verdict)
     assert ui._pending_verdicts == []
     assert ui._llm_verdicts["c1"]["user_decision"] == "smart_approval"
+
+
+# ---------------------------------------------------------------------------
+# Early-paint (tool_pending) — render the batch before the judge / gate
+# ---------------------------------------------------------------------------
+
+
+def test_tool_pending_is_first_event_and_precedes_tool_info() -> None:
+    """``approve_tools`` emits ``tool_pending`` as its very first event,
+    before the auto-approve fall-through emits ``tool_info`` — so the UI
+    paints the pending call the instant it lands, not only once the gate
+    resolves.  The payload carries the serialised items (keyed by call_id)
+    that the later ``tool_info`` / ``approve_request`` upgrades in place."""
+    ui = _make_ui()
+    lq = ui._register_listener()
+    with _patch_get_storage(MagicMock()):
+        # needs_approval=False → auto fall-through, no human block.
+        ui.approve_tools([{"call_id": "c1", "func_name": "ls", "needs_approval": False}])
+    events = _drain(lq)
+    types = [e["type"] for e in events]
+    assert types[0] == "tool_pending", types
+    assert "tool_info" in types
+    assert types.index("tool_pending") < types.index("tool_info")
+    assert events[0]["items"][0]["call_id"] == "c1"
+
+
+def test_tool_pending_precedes_smart_approval_gate() -> None:
+    """Regression for the #621 block: pre-fix the Smart Approvals verdict
+    wait sat AHEAD of the card emit, so nothing painted until the judge
+    ruled.  The announce now fires at the top of ``approve_tools`` — already
+    on the wire by the time the gate runs — and carries the heuristic
+    verdict attached before the gate."""
+    ui = _smart_ui()
+    lq = ui._register_listener()
+    captured: list[str] = []
+
+    def _spy(pending: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Snapshot what the UI has already been told at gate-entry.
+        captured.extend(e["type"] for e in _drain(lq))
+        return []  # simulate the gate clearing the whole batch (no human, no wait)
+
+    with patch.object(ui, "_apply_smart_approvals", side_effect=_spy), _patch_get_storage(None):
+        approved, _feedback = ui.approve_tools([_pending_item("c1")])
+
+    assert approved is True
+    assert captured and captured[0] == "tool_pending", captured

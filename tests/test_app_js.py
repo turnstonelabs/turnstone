@@ -1497,3 +1497,86 @@ def test_interactive_history_is_rest_first_not_sse() -> None:
     assert "/shared/history_normalize.js" not in idx, (
         "the retired history_normalize.js script tag must be removed from index.html"
     )
+
+
+def test_early_paint_tool_pending_wiring() -> None:
+    """The interactive UI must paint a committed tool call on ``tool_pending``
+    — before the judge verdict / approval gate resolve — and then UPGRADE
+    that same block in place on the authoritative ``tool_info`` /
+    ``approve_request`` rather than appending a duplicate.  Pre-fix (PR #621)
+    the card waited on the verdict; this guards the early-paint wiring against
+    a rename/deletion that would silently revert to post-verdict rendering."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    # Dispatch routes the early event to the announce painter.
+    assert 'case "tool_pending":' in body
+    assert "announceToolBlock(evt.items)" in body
+    # The announce painter + the idempotent take-or-build helper exist.
+    assert "announceToolBlock(items) {" in body
+    assert "_takeAnnouncedBlock(items) {" in body
+    # showInlineToolBlock reuses the announced shell rather than always
+    # creating + appending a fresh block (the duplicate-card bug).
+    assert "this._takeAnnouncedBlock(items)" in body
+    assert "if (!announced) this.messagesEl.appendChild(block);" in body
+
+
+def test_risk_level_normalized_before_dom_interpolation() -> None:
+    """Server-supplied ``risk_level`` lands in className / data-risk strings
+    the verdict + output-warning CSS and the ``data-risk`` / nextElementSibling
+    selectors depend on, so every interpolation must funnel through
+    ``normalizeRiskLevel`` (issue #562).  A raw ``risk_level || "medium"``
+    fallback would pass whitespace or a future relaxed-validation value
+    straight into the class string and silently break selector targeting —
+    guard that the chokepoint exists and no site skips it."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    assert "function normalizeRiskLevel(" in body
+    assert "VALID_RISK_LEVELS" in body
+    for level in ("low", "medium", "high", "critical"):
+        assert f'"{level}"' in body
+    # The raw fallback antipattern must be gone from every interpolation site.
+    assert 'risk_level || "medium"' not in body
+    assert 'risk_level) || "medium"' not in body
+    # The three known sites (updateVerdictBadge / _buildOutputWarningEl /
+    # renderVerdictBadge) all route through the chokepoint.
+    assert body.count("normalizeRiskLevel(") >= 4  # 1 def + 3 call sites
+
+
+def test_announced_rail_outspecifies_inline_cyan_hold() -> None:
+    """The early-paint announced card's left rail MUST out-specify
+    ``.msg.ts-approval--inline`` (specificity 0,2,0), which deliberately
+    sets ``border-left-color: var(--cyan)`` to hold resolved inline cards
+    cyan.  A bare ``.ts-approval--announced`` (0,1,0) loses that cascade and
+    silently renders the rail cyan — indistinguishable from a normal tool
+    card, defeating the whole "spot the committed call and Stop it" signal.
+    This is a render-only failure no JS string-guard catches, so pin the
+    high-specificity selector + the visible ``--accent`` (not the
+    near-invisible 15%-alpha ``--accent-dim``)."""
+    css = (
+        _APP_JS.resolve().parent / "style.css"
+    ).read_text(encoding="utf-8")
+    assert ".msg.ts-approval--inline.ts-approval--announced {" in css, (
+        "announced rail selector must qualify with .msg.ts-approval--inline to "
+        "beat the inline cyan-hold rule (0,2,0) — else it renders dashed cyan"
+    )
+    # The rule body uses the full --accent amber + dashed style.
+    block_start = css.index(".msg.ts-approval--inline.ts-approval--announced {")
+    block = css[block_start : block_start + 160]
+    assert "border-left-color: var(--accent)" in block
+    assert "border-left-style: dashed" in block
+    assert "--accent-dim" not in block  # 15%-alpha is invisible at 3px
+
+
+def test_early_paint_screen_reader_announce() -> None:
+    """Screen-reader parity for the early paint: a committed tool call must be
+    announced politely (messagesEl is flipped to aria-live="off" mid-stream, so
+    the appended shell alone is inaudible), and the announced shell must carry
+    aria-busy until the gate resolves.  All silent failures — no JS error, just
+    a blind operator who never hears the call land — so pin the wiring."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    # Dedicated polite SR region (separate from the voice one) + summary builder.
+    assert "function toolAnnounce(" in body
+    assert "function _toolAnnounceText(" in body
+    assert 'setAttribute("aria-live", "polite")' in body
+    # Early paint announces + marks the shell busy; the upgrade clears it.
+    assert "toolAnnounce(_toolAnnounceText(list))" in body
+    assert 'block.setAttribute("aria-busy", "true")' in body
+    assert 'block.removeAttribute("aria-busy")' in body

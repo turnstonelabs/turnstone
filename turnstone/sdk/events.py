@@ -123,6 +123,26 @@ class StreamEndEvent(ServerEvent):
 
 
 @dataclass
+class ToolPendingEvent(ServerEvent):
+    """Early paint of a tool batch the model just committed to.
+
+    Emitted at the top of ``approve_tools`` — before the tool-policy
+    lookup, the Smart Approvals verdict wait, and the human approval
+    gate — so a client can render the pending call (and offer Stop)
+    the instant it appears, rather than waiting for the judge verdict.
+    The authoritative :class:`ToolInfoEvent` (auto-approved) or
+    :class:`ApproveRequestEvent` (human gate) follows with the resolved
+    state; both carry the same ``call_id`` items so a client keys the
+    construct by ``call_id`` and upgrades it in place instead of
+    duplicating.  ``items`` carry the heuristic verdict but not yet the
+    auto-approve tag or completed LLM verdict.
+    """
+
+    type: str = "tool_pending"
+    items: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
 class ToolInfoEvent(ServerEvent):
     type: str = "tool_info"
     items: list[dict[str, Any]] = field(default_factory=list)
@@ -425,6 +445,7 @@ _SERVER_REGISTRY: dict[str, type[ServerEvent]] = {
         InProgressSnapshotEvent,
         StateChangeEvent,
         StreamEndEvent,
+        ToolPendingEvent,
         ToolInfoEvent,
         ApproveRequestEvent,
         ApprovalResolvedEvent,

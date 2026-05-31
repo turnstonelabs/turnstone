@@ -558,6 +558,18 @@
          aria-atomic="true"
          style="position:absolute;left:-10000px;width:1px;height:1px;overflow:hidden"></div>
 
+    <!-- Polite sibling of the assertive announcer above.  The tool-call
+         early paint (tool_pending) routes here: a committed call is worth
+         telling a screen-reader user about so they can Stop it, but it is
+         NOT the action-required gate the assertive region is reserved for,
+         so it waits for a pause instead of interrupting.  Same off-screen
+         technique; no layout impact. -->
+    <div id="coord-sr-announcer-polite"
+         role="status"
+         aria-live="polite"
+         aria-atomic="true"
+         style="position:absolute;left:-10000px;width:1px;height:1px;overflow:hidden"></div>
+
     <!-- Per-coordinator status bar — pinned above the composer.
          Mirrors the interactive pane's `.ws-status-bar`: model alias,
          token / context-window usage with effort suffix, tool calls

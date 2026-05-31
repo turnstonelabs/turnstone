@@ -128,6 +128,35 @@
     });
   }
 
+  // Off-screen aria-live="polite" sibling — the tool-call early paint
+  // (tool_pending) routes here so SR users hear a committed call land (and
+  // that they can Stop it) without the interrupt the assertive gate uses.
+  const srPoliteEl = document.getElementById("coord-sr-announcer-polite");
+  function _announcePolite(text) {
+    if (!srPoliteEl || !text) return;
+    srPoliteEl.textContent = "";
+    requestAnimationFrame(() => {
+      srPoliteEl.textContent = text;
+    });
+  }
+
+  // Terse SR summary for a committed tool batch: tool name(s) (capped at 3)
+  // + that it's being judged and can be stopped.  "" when nothing is named.
+  function _toolAnnounceText(items) {
+    const names = (items || []).map((it) => it && it.func_name).filter(Boolean);
+    if (!names.length) return "";
+    const n = names.length;
+    const shown = names.slice(0, 3).join(", ");
+    const list = n > 3 ? shown + ", and " + (n - 3) + " more" : shown;
+    const head =
+      n === 1
+        ? "Tool call pending: " + list
+        : n + " tool calls pending: " + list;
+    // No "judge evaluating" claim — tool_pending fires unconditionally, so the
+    // intent judge may be disabled.  "Pending + you can stop it" is always true.
+    return head + ". You can stop " + (n === 1 ? "it" : "them") + ".";
+  }
+
   // Status bar — model alias, token / context-window usage, tool calls
   // this turn, conversation turn.  Driven by the connected + status
   // SSE events; mirrors the interactive pane (ui/static/app.js).
@@ -1369,6 +1398,7 @@
           "coord-tool-batch--error",
         );
         existing.classList.add("coord-tool-batch--pending");
+        existing.removeAttribute("aria-busy"); // announce resolved → human gate
         existing.setAttribute("role", "region");
         existing.setAttribute("aria-label", _approvalAriaLabel(items));
         const kicker = existing.querySelector(".coord-tool-batch-kicker");
@@ -1395,6 +1425,18 @@
         // behaviour swapped --running out, which lost the running
         // indicator the moment tool_info clarified the approval state.
         existing.classList.add("coord-tool-batch--auto");
+        existing.removeAttribute("aria-busy"); // announce resolved → auto-running
+        // An early-paint (announce) batch's kicker reads "Evaluating";
+        // the tool is now actually in flight, so swap it to the running
+        // indicator.  No-op for a true replay orphan whose placeholder
+        // kicker already read "Running".
+        const runKicker = existing.querySelector(".coord-tool-batch-kicker");
+        if (runKicker) {
+          runKicker.textContent =
+            items.length >= 2
+              ? "Running · Parallel " + items.length
+              : "Running";
+        }
       } else if (opts.pending) {
         // Already pending — keep the action row, just refresh
         // activeBatch so kb shortcut + approval_resolved routing
@@ -1449,6 +1491,9 @@
     // :func:`_unsetBatchRunningIfAllResults` when every row in the
     // batch has a tool_result.
     if (opts.running) batch.classList.add("coord-tool-batch--running");
+    // Early-paint shell is an indeterminate region until the judge/gate
+    // resolves; the --pending / --auto upgrade clears it below.
+    if (opts.announce) batch.setAttribute("aria-busy", "true");
 
     const head = document.createElement("div");
     head.className = "coord-tool-batch-head";
@@ -1456,6 +1501,15 @@
     kicker.className = "coord-tool-batch-kicker";
     if (opts.pending) {
       kicker.textContent = _pendingKickerText(items);
+    } else if (opts.announce) {
+      // Early-paint placeholder: the call is committed but the judge
+      // verdict + approval state aren't in yet.  "Evaluating" reads
+      // truer than "Running" here (nothing is in flight); the auto /
+      // pending upgrade swaps it for the real state's kicker.
+      kicker.textContent =
+        items.length >= 2
+          ? "Evaluating · Parallel " + items.length
+          : "Evaluating";
     } else if (opts.running) {
       kicker.textContent =
         items.length >= 2 ? "Running · Parallel " + items.length : "Running";
@@ -2469,6 +2523,26 @@
         // Skip mid-stream: in_progress_snapshot already paints the live turn
         // and a replaceChildren() would detach the streaming bubble.
         if (!currentAssistantEl) refetchHistory();
+        break;
+      case "tool_pending":
+        // Early paint — render the batch the instant the model commits to
+        // a tool call, BEFORE the intent judge / Smart Approvals verdict and
+        // the approval gate resolve, so the operator can Stop in an emergency
+        // without waiting on the judge.  appendToolBatch is idempotent on
+        // call_ids: the authoritative approve_request (→ --pending) or
+        // tool_info (→ --auto) that follows morphs THIS construct in place.
+        // Reuses the --running placeholder (subtle accent rail, no actions)
+        // the replay path already knows how to upgrade; the ``announce`` flag
+        // only swaps the kicker to "Evaluating" while the judge runs.
+        appendToolBatch(ev.items || [], {
+          announce: true,
+          running: true,
+          judgePending: true,
+        });
+        // Polite SR announcement (the messages log is flipped to
+        // aria-live="off" during the streaming that precedes this, so the
+        // appended batch alone wouldn't be heard).
+        _announcePolite(_toolAnnounceText(ev.items || []));
         break;
       case "tool_info":
         // Renamed from ``tools_auto_approved`` when ``approve_tools``

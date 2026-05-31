@@ -1415,6 +1415,22 @@ body {
 .ts-approval.approved {
   border-left-color: var(--green);
 }
+/* Early-paint shell (tool_pending): the call is rendered the instant the
+   model commits to it, before the judge verdict + approval gate resolve.
+   Dashed amber rail = "in flight, you can still Stop it" — deliberately the
+   one visually-distinct card in a stream of cyan tool surfaces (it's the
+   feature's whole point: notice the committed call and intervene).  The
+   authoritative tool_info / approve_request upgrade then swaps it for the
+   solid approved / pending construct.
+   Selector MUST out-specify `.msg.ts-approval--inline` (0,2,0), which sets
+   `border-left-color: var(--cyan)` to hold resolved inline cards cyan — at
+   (0,1,0) the announced rail rendered as dashed *cyan* (indistinguishable
+   from a normal tool card).  Full `--accent`, not `--accent-dim`: a 15%-alpha
+   rail is invisible at 3px. */
+.msg.ts-approval--inline.ts-approval--announced {
+  border-left-style: dashed;
+  border-left-color: var(--accent);
+}
 .ts-approval.error {
   border-left-color: var(--red);
 }

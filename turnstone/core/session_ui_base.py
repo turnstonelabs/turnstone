@@ -806,6 +806,25 @@ class SessionUIBase:
         for free.
         """
         self._reset_approval_cycle()
+
+        # Early-paint the pending tool batch — BEFORE the tool-policy lookup,
+        # the Smart Approvals verdict wait (``judge.smart_approvals`` parks here
+        # for up to ``judge.timeout``), and the human gate — so the operator
+        # sees what the model just committed to and can hit Stop in an emergency
+        # the instant the call appears, not only once the judge has ruled.  This
+        # is a UI paint ONLY: the authoritative ``tool_info`` / ``approve_request``
+        # / ``tool_result`` events that follow carry the resolved state and
+        # upgrade THIS SAME construct in place — both UIs key the card by
+        # ``call_id`` and morph it rather than appending a duplicate — and on
+        # reconnect the replayed ``Last-Event-ID`` slice reconstructs it
+        # identically.  No persistence / audit / verdict bookkeeping happens
+        # here; those stay on the resolved-state events so this can't perturb
+        # the gate's accounting.  ``_heuristic_verdict`` is already attached
+        # (``_evaluate_intent`` runs before the gate), so the card paints with
+        # the heuristic verdict + a "judge analysing" cue from the first frame.
+        if items:
+            self._enqueue({"type": "tool_pending", "items": self._serialize_approval_items(items)})
+
         pending = [it for it in items if it.get("needs_approval") and not it.get("error")]
 
         # ``__budget_override__`` is a synthetic UI-only pseudo-tool injected

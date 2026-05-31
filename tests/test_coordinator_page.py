@@ -389,3 +389,48 @@ def test_coordinator_js_seeds_resume_cursor_only_on_initial_connect():
         r"if\s*\(\s*lastEventId\s*!=\s*null\s*\)\s*\{\s*url\s*\+=\s*\"\?last_event_id=\"",
         body,
     ), "connectSSE must gate ?last_event_id= on lastEventId != null (so cursor 0 isn't dropped)."
+
+
+def test_coordinator_js_early_paints_pending_tool_calls():
+    """The coord chat frontend must render a committed tool call on
+    ``tool_pending`` — before the intent judge verdict + approval gate
+    resolve — reusing the idempotent ``appendToolBatch`` upgrade path so the
+    authoritative ``approve_request`` / ``tool_info`` morphs the same
+    construct in place.  Guards the early-paint wiring (the #621 block) so a
+    refactor that drops the handler or the ``announce`` kicker branch surfaces
+    here instead of in production.  String presence only — coord.js has no JS
+    test framework today."""
+    from pathlib import Path
+
+    coord_js = Path(__file__).resolve().parent.parent / (
+        "turnstone/console/static/coordinator/coordinator.js"
+    )
+    body = coord_js.read_text(encoding="utf-8")
+    assert 'case "tool_pending":' in body
+    assert "announce: true" in body
+    # Distinct "Evaluating" placeholder kicker for the pre-verdict shell.
+    assert "opts.announce" in body
+    assert '"Evaluating"' in body
+
+
+def test_coordinator_js_early_paint_screen_reader_announce():
+    """Coord screen-reader parity for the early paint: a committed tool call
+    routes to a POLITE off-screen announcer (not the assertive gate region,
+    not the messages log which is aria-live="off" mid-stream), and the
+    announced batch carries aria-busy until upgraded.  Silent failures, so
+    pin both the JS wiring and the index.html region."""
+    from pathlib import Path
+
+    base = Path(__file__).resolve().parent.parent / "turnstone/console/static/coordinator"
+    coord_js = (base / "coordinator.js").read_text(encoding="utf-8")
+    index_html = (base / "index.html").read_text(encoding="utf-8")
+
+    # Dedicated polite announcer element + helper, distinct from the assertive one.
+    assert 'id="coord-sr-announcer-polite"' in index_html
+    pos = index_html.index('id="coord-sr-announcer-polite"')
+    assert 'aria-live="polite"' in index_html[pos : pos + 200]
+    assert "function _announcePolite(" in coord_js
+    assert 'getElementById("coord-sr-announcer-polite")' in coord_js
+    # tool_pending announces politely; the announce shell is marked busy.
+    assert "_announcePolite(_toolAnnounceText(ev.items" in coord_js
+    assert 'if (opts.announce) batch.setAttribute("aria-busy", "true")' in coord_js
