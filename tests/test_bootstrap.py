@@ -113,6 +113,10 @@ class TestWriteCompose:
         content = (tmp_path / "compose.yaml").read_text()
         assert "ghcr.io/turnstonelabs/turnstone" in content
         assert "TURNSTONE_IMAGE_TAG" in content
+        # The compose mounts ./Caddyfile, so the wizard must write it alongside —
+        # guards both the second write and the pyproject wheel-include.
+        caddyfile = (tmp_path / "Caddyfile").read_text()
+        assert "reverse_proxy console:8090" in caddyfile
 
     def test_user_declines(self, tmp_path: Path) -> None:
         with patch("builtins.input", return_value="n"):
@@ -126,7 +130,7 @@ class TestWriteCompose:
             _tool_write_compose(tmp_path, {})
         # Second call should skip
         result = _tool_write_compose(tmp_path, {})
-        assert "already exists" in result
+        assert "identical content" in result
 
     def test_no_build_blocks(self, tmp_path: Path) -> None:
         with patch("builtins.input", return_value="y"):

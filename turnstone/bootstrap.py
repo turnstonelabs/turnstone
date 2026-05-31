@@ -53,14 +53,19 @@ configure a Turnstone deployment interactively.
 
 ## About Turnstone
 Turnstone is a multi-node AI orchestration platform. A deployment consists of:
-- **Server** (turnstone-server): Web UI + chat workstreams + LLM interaction (port 8080)
-- **Console** (turnstone-console): Cluster dashboard + admin panel (port 8090)
-- **PostgreSQL** (production): Persistent database (dev can use SQLite)
+- **Server** (turnstone-server): Web UI + chat workstreams + LLM interaction
+- **Console** (turnstone-console): Cluster dashboard + admin panel
+- **Caddy**: fronts the console over HTTPS at https://localhost:8443 — the only
+  published web entry point (the console's plain-HTTP port is not exposed, which
+  avoids the browser's 6-connection cap on the dashboard's SSE streams)
+- **PostgreSQL**: persistent shared database — required so the console discovers nodes
 - **Channel** (optional): Discord/Slack gateway
 
-## Deployment Profiles (compose.yaml)
-- **Default** (no flag): console only (infrastructure, good for running external servers)
-- **Production** (`--profile production`): 1 server + console + PostgreSQL + channel (single node)
+## Compose stack (compose.yaml)
+`docker compose up` starts the whole single-node stack — server + console + Caddy +
+PostgreSQL + channel — using pre-built ghcr.io images. There are no profiles. The
+server boots even with no model configured yet and registers in the console; real
+model backends are added afterwards in the admin UI.
 
 ## Environment Variables (.env)
 The compose.yaml reads these from a `.env` file:
@@ -96,9 +101,10 @@ Generate with: `python -c "import secrets; print(secrets.token_hex(32))"`
 - `TURNSTONE_OIDC_ROLE_MAP` — Comma-separated claim_value:role_id pairs (e.g., "admin:builtin-admin,eng:builtin-operator")
 - `TURNSTONE_OIDC_PASSWORD_ENABLED` — Set to "false" to hide password login and force SSO-only
 
-### Ports
-- `SERVER_PORT` — Server port (default: 8080)
-- `CONSOLE_PORT` — Console port (default: 8090)
+### Ports / networking
+- `CONSOLE_HTTPS_PORT` — Caddy HTTPS port for the dashboard (default: 8443)
+- `POSTGRES_PORT` — PostgreSQL host port, for joining a bare-metal server (default: 5432)
+- `POSTGRES_BIND` — interface PostgreSQL binds on (default: 127.0.0.1; set 0.0.0.0 for LAN)
 
 ### Channel Gateway (optional)
 - `TURNSTONE_DISCORD_TOKEN` — Discord bot token
@@ -155,8 +161,8 @@ Walk the user through setting up their deployment step by step:
 
 1. **First**: Call `check_docker`, `read_file` on `.env`, and `read_file` on `compose.yaml` \
 to detect existing state. If `compose.yaml` does not exist, call `write_compose` to \
-extract the bundled production compose file. This is essential — without it, \
-`docker compose` will fail.
+extract the bundled compose.yaml and its companion Caddyfile. This is essential — \
+without it, `docker compose` will fail.
 2. **LLM provider for the deployment**: Which LLM backend their Turnstone will use \
 (may differ from this wizard's model). Ask for base URL, API key, model name.
 3. **Database**: SQLite (dev/simple) vs PostgreSQL (production). \
@@ -175,15 +181,17 @@ Include `TURNSTONE_IMAGE_TAG` set to the version matching the installed package.
 8. **Generate setup.sh**: Call `write_file` with a post-start script that creates the admin \
 user and any roles/policies/skills the user wants.
 9. **Finish**: Call the `finish` tool with a summary of what was configured and the \
-exact commands to run next (e.g., `docker compose --profile production up -d` then `./setup.sh`).
+exact commands to run next (e.g., `docker compose up -d` then `./setup.sh`) and the \
+dashboard URL, https://localhost:8443.
 
 ## Rules
 - Be concise. Ask 1-2 questions at a time, not a wall of options.
 - NEVER echo API keys or passwords back to the user in your text responses.
 - ALWAYS use `generate_secret` for passwords and secrets — never invent them.
 - When writing files, use `write_file` — the user will see a preview and confirm.
-- If `compose.yaml` is missing, call `write_compose` before anything else. \
-The compose file uses pre-built images from ghcr.io — no local Docker build is needed.
+- If `compose.yaml` is missing, call `write_compose` before anything else (it also \
+writes the Caddyfile the compose mounts). The compose uses pre-built ghcr.io images — \
+no local Docker build is needed.
 - If an existing .env is detected, summarize what's configured and ask what to change.
 - The `TURNSTONE_DB_URL` for docker compose internal networking uses the hostname `postgres` \
 (e.g., `postgresql+psycopg://turnstone:<password>@postgres:5432/turnstone`).
@@ -341,10 +349,11 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "write_compose",
             "description": (
-                "Write the production Docker Compose file to the project directory. "
-                "This extracts the compose.yaml bundled with Turnstone, which uses "
-                "pre-built images from ghcr.io (no local Docker build required). "
-                "The user will be shown a preview and asked to confirm."
+                "Write the production Docker Compose file (and its companion "
+                "Caddyfile) to the project directory. This extracts the compose.yaml "
+                "bundled with Turnstone, which uses pre-built images from ghcr.io "
+                "(no local Docker build required) and a Caddy reverse proxy that "
+                "fronts the console over HTTPS. The user will see a preview and confirm."
             ),
             "parameters": {
                 "type": "object",
@@ -573,29 +582,37 @@ def _tool_check_docker(args: dict[str, Any]) -> str:
 
 
 def _tool_write_compose(project_dir: Path, args: dict[str, Any]) -> str:
-    """Extract the bundled production compose.yaml to the project directory."""
+    """Extract the bundled production compose.yaml + Caddyfile to the project dir.
+
+    The compose file's ``caddy`` service bind-mounts ``./Caddyfile``, so the two
+    must land together — otherwise ``docker compose up`` fails to start Caddy.
+    """
     dest = project_dir / "compose.yaml"
+    caddy_dest = project_dir / "Caddyfile"
 
-    # Read the bundled template
+    # Read the bundled templates
     try:
-        ref = importlib.resources.files("turnstone.deploy").joinpath("compose.yaml")
-        content = ref.read_text(encoding="utf-8")
+        deploy = importlib.resources.files("turnstone.deploy")
+        content = deploy.joinpath("compose.yaml").read_text(encoding="utf-8")
+        caddy_content = deploy.joinpath("Caddyfile").read_text(encoding="utf-8")
     except Exception as exc:
-        return f"Error: could not read bundled compose template: {exc}"
+        return f"Error: could not read bundled compose templates: {exc}"
 
-    # Skip if identical
-    if dest.exists():
+    # Skip if both already identical
+    if dest.exists() and caddy_dest.exists():
         try:
-            existing = dest.read_text(encoding="utf-8")
-            if existing == content:
-                return "compose.yaml already exists with identical content."
+            if (
+                dest.read_text(encoding="utf-8") == content
+                and caddy_dest.read_text(encoding="utf-8") == caddy_content
+            ):
+                return "compose.yaml and Caddyfile already exist with identical content."
         except (OSError, UnicodeDecodeError):
             pass  # best-effort duplicate check
 
     line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
 
     # Show preview
-    print(f"\n{YELLOW} Writing compose.yaml ({line_count} lines){RESET}")
+    print(f"\n{YELLOW} Writing compose.yaml ({line_count} lines) + Caddyfile{RESET}")
     print(f"{DIM}{'─' * 50}{RESET}")
     for line in content.split("\n")[:30]:
         print(f"  {DIM}{line}{RESET}")
@@ -604,17 +621,19 @@ def _tool_write_compose(project_dir: Path, args: dict[str, Any]) -> str:
     print(f"{DIM}{'─' * 50}{RESET}")
 
     try:
-        choice = input(f"{BOLD}Write this file? [Y/n]{RESET} ").strip().lower()
+        choice = input(f"{BOLD}Write these files? [Y/n]{RESET} ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         return "User cancelled the write."
     if choice in ("n", "no"):
         return "User declined to write compose.yaml."
 
     dest.write_text(content, encoding="utf-8")
+    caddy_dest.write_text(caddy_content, encoding="utf-8")
 
     return (
-        f"compose.yaml written successfully. "
-        f"It uses ghcr.io/turnstonelabs/turnstone images. "
+        f"compose.yaml + Caddyfile written successfully. "
+        f"The compose uses ghcr.io/turnstonelabs/turnstone images; Caddy fronts the "
+        f"console dashboard over HTTPS at https://localhost:8443. "
         f"Add TURNSTONE_IMAGE_TAG={__version__} to .env to pin the image "
         f"to the currently installed version, or omit it to use 'latest'."
     )
