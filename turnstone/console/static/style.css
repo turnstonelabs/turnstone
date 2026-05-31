@@ -366,8 +366,10 @@
   gap: 6px;
   padding: 5px 10px;
   border-radius: var(--radius-sm);
-  border: 1px solid transparent;
-  background: none;
+  /* Persistent recessed box so the picker reads as clickable at rest —
+     the one interactive control on the metrics side of the bar. */
+  border: 1px solid var(--border-strong);
+  background: var(--bg);
   color: var(--fg-dim);
   font: inherit;
   font-family: var(--font-mono);
@@ -381,7 +383,7 @@
 }
 .csb-np-trigger:hover {
   background: var(--bg-highlight);
-  border-color: var(--border-strong);
+  border-color: var(--accent);
   color: var(--fg-bright);
 }
 .csb-np-trigger:focus-visible {
@@ -390,7 +392,8 @@
 }
 .csb-np-trigger[aria-expanded="true"] {
   background: var(--bg-highlight);
-  border-color: var(--border-strong);
+  border-color: var(--accent);
+  color: var(--fg-bright);
 }
 .csb-np-caret {
   font-size: 9px;
