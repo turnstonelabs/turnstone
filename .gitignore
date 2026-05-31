@@ -9,6 +9,11 @@ build/
 .venv/
 venv/
 .env
+# Local compose overrides (e.g. run.sh's node-count limiter, bootstrap output)
+compose.override.yaml
+compose.override.yml
+docker-compose.override.yaml
+docker-compose.override.yml
 *.so
 .mypy_cache/
 .ruff_cache/
