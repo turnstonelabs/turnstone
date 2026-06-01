@@ -21,6 +21,7 @@ default and no fall back to a local model.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -29,6 +30,22 @@ import httpx
 from turnstone.core.log import get_logger
 
 log = get_logger(__name__)
+
+# A reranker reorders candidate documents by relevance to the query, returning
+# their indices best-first. Defined here so bm25.py and web_search.py can share
+# the type without importing each other (rerank.py imports neither).
+Reranker = Callable[[str, list[str]], list[int]]
+
+
+class RerankError(RuntimeError):
+    """A rerank endpoint returned no usable scores for a non-empty input.
+
+    A conforming reranker scores every document, so an empty result for
+    non-empty input means the response was unparseable / non-conforming -- an
+    endpoint failure, distinct from a relevance floor dropping every candidate.
+    Callers raise this so retrieval falls back to BM25 order rather than
+    treating the failure as "nothing relevant".
+    """
 
 
 @dataclass(frozen=True)

@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from turnstone.core.bm25 import BM25Index, _tokenize  # noqa: F401
+
+if TYPE_CHECKING:
+    from turnstone.core.rerank import Reranker
 
 # ---------------------------------------------------------------------------
 # Tool search manager — partitions tools, tracks visibility
@@ -65,6 +68,7 @@ class ToolSearchManager:
         always_on_names: set[str],
         *,
         max_results: int = 5,
+        reranker: Reranker | None = None,
     ) -> None:
         self._always_on: list[dict[str, Any]] = []
         self._deferred: list[dict[str, Any]] = []
@@ -82,7 +86,7 @@ class ToolSearchManager:
 
         # BM25 index over deferred tools
         texts = [_tool_text(t) for t in self._deferred]
-        self._index = BM25Index(texts)
+        self._index = BM25Index(texts, reranker=reranker)
 
         # Pre-compute server summary for the search tool description
         self._server_hint = _mcp_server_summary(self._deferred)

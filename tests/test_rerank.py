@@ -301,3 +301,115 @@ class TestSessionRerankWiring:
             _registry=SimpleNamespace(get_config=lambda a: cfg),
         )
         assert ChatSession._resolve_rerank_client(stub) is None  # falls through, no rerank_url
+
+
+# ---------------------------------------------------------------------------
+# ChatSession BM25 reranker — the closure feeding tool/skill/memory retrieval
+# ---------------------------------------------------------------------------
+
+
+class _FakeRerankClient:
+    """In-process RerankClient stub returning fixed hits (no HTTP)."""
+
+    def __init__(self, hits: list[RerankHit]) -> None:
+        self._hits = hits
+
+    def rerank(
+        self, query: str, documents: list[str], *, top_n: int | None = None
+    ) -> list[RerankHit]:
+        return self._hits
+
+
+class TestSessionBM25Reranker:
+    """``_bm25_reranker`` / ``_bm25_rerank_threshold`` — the BM25 seam adapters.
+
+    Drives the real closure through a fake ``RerankClient`` (the in-process
+    callable seam), never by patching internal state. The HTTP boundary lives in
+    ``TestCohereJinaRerankClient`` above.
+    """
+
+    def test_none_when_disabled_for_bm25(self):
+        # Per-tool toggle off -> no reranker even with an endpoint configured.
+        stub = SimpleNamespace(
+            _rerank_enabled_for=lambda tool: False,
+            _resolve_rerank_client=lambda: _FakeRerankClient([]),
+        )
+        assert ChatSession._bm25_reranker(stub) is None
+
+    def test_none_when_no_client(self):
+        # Enabled, but no endpoint resolves -> None.
+        stub = SimpleNamespace(
+            _rerank_enabled_for=lambda tool: True,
+            _resolve_rerank_client=lambda: None,
+        )
+        assert ChatSession._bm25_reranker(stub) is None
+
+    def _enabled_stub(self, hits: list[RerankHit]) -> SimpleNamespace:
+        return SimpleNamespace(
+            _rerank_enabled_for=lambda tool: True,
+            _resolve_rerank_client=lambda: _FakeRerankClient(hits),
+        )
+
+    def test_no_threshold_returns_all_hit_indices(self):
+        hits = [RerankHit(index=0, score=0.9), RerankHit(index=1, score=0.1)]
+        rank = ChatSession._bm25_reranker(self._enabled_stub(hits), 0.0)
+        assert rank is not None
+        # threshold 0 disables the floor -> every hit index passes through.
+        assert rank("q", ["d0", "d1"]) == [0, 1]
+
+    def test_threshold_filters_below_floor(self):
+        hits = [RerankHit(index=0, score=0.9), RerankHit(index=1, score=0.1)]
+        rank = ChatSession._bm25_reranker(self._enabled_stub(hits), 0.5)
+        assert rank is not None
+        # Only the 0.9 hit clears the 0.5 floor. Guards the ``h.score >=
+        # threshold`` boundary (flip to ``>`` / ``<`` and idx1 leaks or idx0
+        # drops).
+        assert rank("q", ["d0", "d1"]) == [0]
+
+    def test_threshold_boundary_is_inclusive(self):
+        # A hit exactly at the floor is KEPT (>= , not >).
+        hits = [RerankHit(index=0, score=0.5)]
+        rank = ChatSession._bm25_reranker(self._enabled_stub(hits), 0.5)
+        assert rank is not None
+        assert rank("q", ["d0"]) == [0]
+
+    def test_empty_hits_raise_for_nonempty_docs(self):
+        # A conforming reranker scores every doc; [] for non-empty input is an
+        # endpoint/parse failure, NOT a floor result -> raise (a discrete branch
+        # from the threshold) so BM25Index falls back to BM25 order in BOTH
+        # modes. Holds regardless of threshold.
+        from turnstone.core.rerank import RerankError
+
+        for thr in (0.0, 0.5):
+            rank = ChatSession._bm25_reranker(self._enabled_stub([]), thr)
+            assert rank is not None
+            with pytest.raises(RerankError):
+                rank("q", ["d0", "d1"])
+
+    def test_floor_dropping_all_returns_empty_not_raise(self):
+        # Distinct from a parse failure: the reranker DID score the doc, the
+        # floor just dropped it -> clean empty (honored by filter mode), no raise.
+        hits = [RerankHit(index=0, score=0.1)]
+        rank = ChatSession._bm25_reranker(self._enabled_stub(hits), 0.5)
+        assert rank is not None
+        assert rank("q", ["d0"]) == []
+
+    def test_empty_docs_does_not_raise(self):
+        # Empty input legitimately yields empty output -- nothing to signal.
+        rank = ChatSession._bm25_reranker(self._enabled_stub([]), 0.0)
+        assert rank is not None
+        assert rank("q", []) == []
+
+    def test_threshold_reads_setting(self):
+        cs = _FakeConfigStore({"tools.rerank_bm25_threshold": 0.42})
+        stub = SimpleNamespace(_config_store=cs)
+        assert ChatSession._bm25_rerank_threshold(stub) == 0.42
+
+    def test_threshold_zero_without_config_store(self):
+        stub = SimpleNamespace(_config_store=None)
+        assert ChatSession._bm25_rerank_threshold(stub) == 0.0
+
+    def test_threshold_zero_on_garbage_value(self):
+        cs = _FakeConfigStore({"tools.rerank_bm25_threshold": "not-a-number"})
+        stub = SimpleNamespace(_config_store=cs)
+        assert ChatSession._bm25_rerank_threshold(stub) == 0.0

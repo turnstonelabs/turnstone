@@ -142,9 +142,9 @@ if TYPE_CHECKING:
         ModelCapabilities,
         StreamChunk,
     )
-    from turnstone.core.rerank import RerankClient
+    from turnstone.core.rerank import RerankClient, Reranker
     from turnstone.core.tool_advisory import ToolAdvisory
-    from turnstone.core.web_search import Reranker, WebSearchClient
+    from turnstone.core.web_search import WebSearchClient
 
 # ---------------------------------------------------------------------------
 # Cancellation support
@@ -603,6 +603,10 @@ _WATCH_QUEUE_SOFT_CAP = 50
 # (CJK, emoji) can't blow the byte ceiling 4x by living entirely under
 # the codepoint count.
 REMINDER_TEXT_STORAGE_CAP = 8192
+
+_RERANK_TIMEOUT_CAP_S = 15.0  # reranking <=50 short docs is fast; cap so a hung
+# endpoint falls back to BM25 in seconds, not up to tools.timeout (120s default).
+# Per-turn memory rerank makes the long timeout a turn-stall hazard.
 
 
 def _without_tool(tools: list[dict[str, Any]], name: str) -> list[dict[str, Any]]:
@@ -1178,6 +1182,7 @@ class ChatSession:
                 self._tools,
                 always_on_names=builtin_in_session,
                 max_results=tool_search_max_results,
+                reranker=self._bm25_reranker(),
             )
         # Skill: explicit name overrides is_default skills.  ``skill_arguments``
         # carries the spec's $ARGUMENTS payload — set at create/load time,
@@ -1339,7 +1344,7 @@ class ChatSession:
                         url=cfg.base_url,
                         model=cfg.model or "",
                         api_key=cfg.api_key,
-                        timeout=self.tool_timeout,
+                        timeout=min(self.tool_timeout, _RERANK_TIMEOUT_CAP_S),
                     )
 
         def _setting(key: str, env_value: str) -> str:
@@ -1355,11 +1360,11 @@ class ChatSession:
             url=_setting("tools.rerank_url", get_rerank_url()),
             model=_setting("tools.rerank_model", get_rerank_model()),
             api_key=_setting("tools.rerank_api_key", get_rerank_api_key()),
-            timeout=self.tool_timeout,
+            timeout=min(self.tool_timeout, _RERANK_TIMEOUT_CAP_S),
         )
 
     def _rerank_enabled_for(self, tool: str) -> bool:
-        """Whether reranking is enabled for ``tool`` (currently: 'web_search').
+        """Whether reranking is enabled for ``tool`` (currently: 'web_search', 'bm25').
 
         The per-tool toggles default on; the operative gate is whether an
         endpoint is configured (``_resolve_rerank_client`` returns None when
@@ -1386,6 +1391,51 @@ class ChatSession:
             return [hit.index for hit in rc.rerank(query, docs)]
 
         return _rank
+
+    def _bm25_reranker(self, threshold: float = 0.0) -> Reranker | None:
+        """Build a BM25 reranker callable, or None when disabled.
+
+        Mirrors ``_web_search_reranker``. ``threshold`` is a relevance FLOOR
+        applied in this closure (where scores still exist); the BM25Index seam
+        stays indices-only. ``threshold <= 0`` disables the floor. An empty
+        response for non-empty input is an endpoint failure (a conforming
+        reranker scores every doc), NOT a floor result, so it raises
+        ``RerankError`` -> BM25Index falls back to BM25 order regardless of
+        threshold. Only memory composition passes a configured threshold;
+        reactive surfaces pass 0.
+        """
+        if not self._rerank_enabled_for("bm25"):
+            return None
+        rc = self._resolve_rerank_client()
+        if rc is None:
+            return None
+
+        from turnstone.core.rerank import RerankError
+
+        def _rank(query: str, docs: list[str]) -> list[int]:
+            hits = rc.rerank(query, docs)
+            if docs and not hits:
+                # A conforming reranker scores every document; an empty result
+                # for non-empty input means the endpoint response was
+                # unparseable (rc.rerank -> _parse_hits returns [] without
+                # raising). That is an endpoint FAILURE -- a discrete branch
+                # from the relevance floor below -- so raise and let BM25Index
+                # fall back to BM25 order in BOTH modes, instead of the
+                # filter-mode floor honoring it as "nothing relevant".
+                raise RerankError("rerank endpoint returned no scores for non-empty input")
+            return [h.index for h in hits if threshold <= 0 or h.score >= threshold]
+
+        return _rank
+
+    def _bm25_rerank_threshold(self) -> float:
+        """Configured proactive-memory relevance floor (0.0 = disabled)."""
+        cs = getattr(self, "_config_store", None)
+        if cs is None:
+            return 0.0
+        try:
+            return float(cs.get("tools.rerank_bm25_threshold") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
 
     def _resolve_capabilities(
         self,
@@ -2064,6 +2114,7 @@ class ChatSession:
                 self._tools,
                 always_on_names=set(BUILTIN_TOOL_NAMES),
                 max_results=self._tool_search_max_results,
+                reranker=self._bm25_reranker(),
             )
             # Restore previously expanded tools that still exist
             if old_expanded:
@@ -2767,7 +2818,14 @@ class ChatSession:
         context = extract_recent_context(self.messages)
         visible_mems, candidate_source = self._select_memory_candidates(context)
         if visible_mems:
-            relevant = score_memories(visible_mems, context, k=self._mem_cfg.relevance_k)
+            thr = self._bm25_rerank_threshold()
+            relevant = score_memories(
+                visible_mems,
+                context,
+                k=self._mem_cfg.relevance_k,
+                reranker=self._bm25_reranker(thr),
+                rerank_filters=thr > 0,
+            )
             log.info(
                 "memory.composition",
                 source=candidate_source,
@@ -8735,7 +8793,7 @@ class ChatSession:
                 )
                 for r in rows
             ]
-            index = BM25Index(corpus)
+            index = BM25Index(corpus, reranker=self._bm25_reranker())
             top = index.search(query, k=min(len(rows), 50))
             rows = [rows[i] for i in top]
         skills = [self._skills_project_row(r) for r in rows]

@@ -5205,7 +5205,7 @@ const MODEL_ROLES = [
   {
     label: "Reranker",
     description:
-      "Reranks web_search results. Point at a model whose base_url is a Cohere/Jina-compatible /rerank endpoint and whose capabilities include supports_rerank. Empty falls back to the tools.rerank_url setting (if set).",
+      "Reranks web_search results. Point at a model whose base_url is a Cohere/Jina-compatible /rerank endpoint and whose capabilities include supports_rerank. Empty falls back to the tools.rerank_url setting (if set). Enabling a reranker sends web_search results AND BM25 retrieval candidates (tool/skill descriptions and memory content) to this endpoint; self-hosted endpoints keep it on your infrastructure.",
     aliasKey: "tools.reranker_alias",
     fallbackKind: "disabled",
     mediaCapability: "supports_rerank",

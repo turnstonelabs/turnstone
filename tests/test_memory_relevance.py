@@ -75,6 +75,73 @@ class TestScoreMemories:
         assert result[0]["name"] == "x"
 
 
+class TestScoreMemoriesReranking:
+    """``score_memories`` forwards a reranker into the BM25 recall pool.
+
+    The reranker is a deterministic callable over POSITIONS in the recall pool
+    (the matched memories, BM25-ordered); the result is the corresponding memory
+    dicts, best-first.  The existing 7 tests above pass no reranker (default
+    None) and exercise the unchanged BM25-only path.
+    """
+
+    _MEMS = [
+        {"name": "alpha", "description": "shared topic", "content": "shared topic alpha"},
+        {"name": "beta", "description": "shared topic", "content": "shared topic beta"},
+        {"name": "gamma", "description": "shared topic", "content": "shared topic gamma"},
+    ]
+
+    def test_reranker_reorders_memories(self):
+        # All three match "shared topic" -> pool covers them. The reranker
+        # reverses the pool positions, so the returned memory order is the
+        # BM25 order reversed.
+        baseline = score_memories(self._MEMS, "shared topic", k=3)
+        reranked = score_memories(
+            self._MEMS,
+            "shared topic",
+            k=3,
+            reranker=lambda q, d: list(range(len(d)))[::-1],
+        )
+        assert [m["name"] for m in reranked] == [m["name"] for m in baseline][::-1]
+        # Still the same set of memories, just reordered.
+        assert {m["name"] for m in reranked} == {m["name"] for m in baseline}
+
+    def test_floor_empties_returns_nothing(self):
+        # FILTER MODE (rerank_filters=True): a relevance floor that rejects
+        # everything (reranker returns []) means "inject no memory" ->
+        # score_memories returns []. This is the proactive memory floor the
+        # threshold setting drives (an active floor -> rerank_filters=True).
+        result = score_memories(
+            self._MEMS,
+            "shared topic",
+            k=3,
+            reranker=lambda q, d: [],
+            rerank_filters=True,
+        )
+        assert result == []
+
+    def test_reorder_mode_empty_does_not_suppress(self):
+        # REORDER MODE (rerank_filters=False, the disabled-floor default): an
+        # empty reranker result means the endpoint failed, NOT "suppress all".
+        # Memories fall back to BM25 top-k -- never silently dropped. Guards the
+        # threshold<=0 -> reorder-mode wiring in the memory call site.
+        result = score_memories(
+            self._MEMS,
+            "shared topic",
+            k=3,
+            reranker=lambda q, d: [],
+            rerank_filters=False,
+        )
+        baseline = score_memories(self._MEMS, "shared topic", k=3)
+        assert [m["name"] for m in result] == [m["name"] for m in baseline]
+        assert len(result) == 3
+
+    def test_default_none_unchanged(self):
+        # No reranker kwarg -> identical to passing reranker=None -> BM25-only.
+        assert score_memories(self._MEMS, "shared topic", k=2) == score_memories(
+            self._MEMS, "shared topic", k=2, reranker=None
+        )
+
+
 # ---------------------------------------------------------------------------
 # build_memory_context
 # ---------------------------------------------------------------------------
@@ -393,6 +460,47 @@ class TestCompositionCandidateSelection:
         search_mock.assert_called_once()
         # Second positional arg is the scopes list
         assert search_mock.call_args.args[1] == [("coordinator", "coord-1")]
+
+
+class TestCompositionRerankFiltersWiring:
+    """The memory composition call site maps ``threshold > 0`` to ``rerank_filters``.
+
+    A disabled floor (threshold <= 0) -> reorder mode (rerank_filters=False) so an
+    empty/failed reranker falls back to BM25 (memories not suppressed); an active
+    floor (threshold > 0) -> filter mode (rerank_filters=True) so the floor may
+    legitimately empty the injection. Drives the real ``_init_system_messages``
+    call site, capturing the kwarg ``score_memories`` actually receives.
+    """
+
+    def _capture_rerank_filters(self, session: object, threshold: float) -> bool:
+        captured: dict[str, bool] = {}
+
+        def _fake_score(*_args: object, rerank_filters: bool = False, **_kw: object):
+            captured["rerank_filters"] = rerank_filters
+            return []
+
+        mem = _make_mem("m_one", content="alpha")
+        with (
+            patch("turnstone.core.session.score_memories", _fake_score),
+            patch.object(session, "_bm25_rerank_threshold", return_value=threshold),
+            patch.object(session, "_bm25_reranker", return_value=None),
+            patch.object(session, "_select_memory_candidates", return_value=([mem], "list")),
+        ):
+            session._init_system_messages()
+        assert "rerank_filters" in captured, "score_memories was not reached"
+        return captured["rerank_filters"]
+
+    def test_threshold_zero_uses_reorder_mode(self, tmp_db):
+        session = _make_session()
+        session.messages = [{"role": "user", "content": "alpha"}]
+        # threshold 0 (disabled floor) -> reorder mode -> no suppression.
+        assert self._capture_rerank_filters(session, 0.0) is False
+
+    def test_positive_threshold_uses_filter_mode(self, tmp_db):
+        session = _make_session()
+        session.messages = [{"role": "user", "content": "alpha"}]
+        # An active floor -> filter mode -> the reranker may empty the injection.
+        assert self._capture_rerank_filters(session, 0.5) is True
 
 
 class TestMemorySearchToolExecution:

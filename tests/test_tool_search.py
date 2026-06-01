@@ -218,6 +218,39 @@ class TestToolSearchManager:
         assert "mcp__github__create_issue" in text
 
 
+class TestToolSearchManagerReranking:
+    """``ToolSearchManager`` forwards a reranker into its deferred-tool index."""
+
+    def _tools(self):
+        # All three deferred tools match "github" so the recall pool spans them;
+        # a reranker can then dictate their order.
+        return [
+            _make_tool("bash", "Execute shell commands"),
+            _make_tool("mcp__github__a", "github alpha helper"),
+            _make_tool("mcp__github__b", "github beta helper"),
+            _make_tool("mcp__github__c", "github gamma helper"),
+        ]
+
+    def test_search_reflects_reranker_order(self):
+        baseline = ToolSearchManager(self._tools(), always_on_names={"bash"})
+        base_names = [_tool_name(t) for t in baseline.search("github helper")]
+
+        # Reranker reverses the recall-pool order it is handed (positions
+        # n-1..0). The forwarded order must show up in search results.
+        reranked = ToolSearchManager(
+            self._tools(),
+            always_on_names={"bash"},
+            reranker=lambda q, d: list(range(len(d)))[::-1],
+        )
+        names = [_tool_name(t) for t in reranked.search("github helper")]
+        assert names == base_names[::-1]
+
+    def test_no_reranker_unchanged(self):
+        mgr = ToolSearchManager(self._tools(), always_on_names={"bash"}, reranker=None)
+        names = {_tool_name(t) for t in mgr.search("github helper")}
+        assert names == {"mcp__github__a", "mcp__github__b", "mcp__github__c"}
+
+
 # ---------------------------------------------------------------------------
 # Helper function tests
 # ---------------------------------------------------------------------------

@@ -16,7 +16,6 @@ clients.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
@@ -25,16 +24,13 @@ from turnstone.core.log import get_logger
 
 if TYPE_CHECKING:
     from turnstone.core.mcp_client import MCPClientManager
+    from turnstone.core.rerank import Reranker
 
 log = get_logger(__name__)
 
-# A reranker reorders candidate documents by relevance to the query, returning
-# their indices best-first. ``web_search`` accepts one so the session can plug
-# in an endpoint-backed reranker without this module depending on rerank.py.
-Reranker = Callable[[str, list[str]], list[int]]
-
 # Max SearxNG results sent to the reranker in one request — the pool re-ordered
-# before the caller's ``max_results`` slice.
+# before the caller's ``max_results`` slice. bm25.py defines the same cap
+# independently (kept separate so bm25 stays httpx-free) — keep the two in sync.
 _RERANK_POOL = 50
 
 

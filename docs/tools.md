@@ -321,6 +321,8 @@ Search the web using a text query.
 
 The `rerank_web_search` toggle defaults on once an endpoint is configured. If the endpoint is unreachable or errors, web_search falls back silently to the backend's native result order — reranking never makes a search fail.
 
+When `rerank_bm25` is enabled, the candidate text for memory, tool, and skill retrieval (memory name/description/content and tool/skill names + descriptions) is also sent to the rerank endpoint — a self-hosted endpoint (vLLM/TEI/llama.cpp) keeps it on your infrastructure, a hosted provider (Cohere/Jina/Voyage) sends it off-box.
+
 Example (vLLM serving a Qwen3 reranker):
 
 ```toml

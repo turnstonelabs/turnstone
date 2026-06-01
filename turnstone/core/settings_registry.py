@@ -307,6 +307,30 @@ def _build_registry() -> dict[str, SettingDef]:
             "compatible /rerank endpoint, then pick it under Models -> Roles -> Reranker. Takes "
             "precedence over tools.rerank_url; empty falls back to tools.rerank_url (if set).",
         ),
+        SettingDef(
+            "tools.rerank_bm25",
+            "bool",
+            True,
+            "Rerank BM25-backed retrieval (tool/skill search, memory) when configured",
+            "tools",
+            help="When a rerank endpoint is configured, rerank BM25-backed retrieval "
+            "(tool search, skill search, memory composition). Disable on low-power hosts "
+            "to keep web_search reranking without paying the per-turn memory-composition "
+            "rerank. Reranking sends the candidate text (tool/skill names + descriptions, "
+            "and memory name/description/content) to the configured rerank endpoint; "
+            "self-hosted (vLLM/llama.cpp/TEI) keeps it on your infrastructure, a hosted "
+            "provider (Cohere/Jina/Voyage) sends it off-box.",
+        ),
+        SettingDef(
+            "tools.rerank_bm25_threshold",
+            "float",
+            0.0,
+            "Relevance floor (0-1) for proactive memory surfacing; 0 disables",
+            "tools",
+            help="0-1 relevance floor for PROACTIVE memory surfacing; 0 disables it. On "
+            "your reranker's score scale -- calibrated 0-1 on Cohere/Jina/Qwen endpoints, "
+            "raw logits on bge/TEI.",
+        ),
         # -- server ---------------------------------------------------------
         SettingDef(
             "server.workstream_idle_timeout",
