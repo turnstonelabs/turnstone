@@ -286,6 +286,18 @@ def _build_registry() -> dict[str, SettingDef]:
             "it in config.toml [tools] rerank_api_key (secrets belong in config.toml, not env).",
         ),
         SettingDef(
+            "tools.rerank_instruction",
+            "str",
+            "",
+            "Query instruction for instruction-aware rerankers (e.g. Qwen3-Reranker)",
+            "tools",
+            help="Instruction-aware rerankers (the Qwen3-Reranker family) need a task "
+            "instruction; when set, the client wraps the query with the model's "
+            "<Instruct>:/<Query>: framing. Qwen3's own default is 'Given a web search query, "
+            "retrieve relevant passages that answer the query'. Empty = bare query, correct for "
+            "Cohere/Jina/bge cross-encoders.",
+        ),
+        SettingDef(
             "tools.rerank_web_search",
             "bool",
             True,
@@ -327,9 +339,9 @@ def _build_registry() -> dict[str, SettingDef]:
             0.0,
             "Relevance floor (0-1) for proactive memory surfacing; 0 disables",
             "tools",
-            help="0-1 relevance floor for PROACTIVE memory surfacing; 0 disables it. On "
-            "your reranker's score scale -- calibrated 0-1 on Cohere/Jina/Qwen endpoints, "
-            "raw logits on bge/TEI.",
+            help="0-1 relevance-probability floor for PROACTIVE memory surfacing; 0 disables "
+            "it. Reranker scores are normalised to 0-1 first (logit rerankers like bge/TEI are "
+            "sigmoid-mapped), so the scale is uniform across endpoints. Calibrate to pick a value.",
         ),
         # -- server ---------------------------------------------------------
         SettingDef(

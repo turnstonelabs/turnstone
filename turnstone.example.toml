@@ -125,6 +125,15 @@
 # rerank_api_key = ""          # bearer token for hosted providers; usually empty
                                # for self-hosted. config.toml only (never env)
 # rerank_web_search = true     # rerank web_search results (when an endpoint is set)
+# rerank_bm25 = true           # rerank BM25 retrieval: tool search, skill search, memory
+# rerank_bm25_threshold = 0.0  # 0-1 relevance floor for proactive memory; 0 = off (reorder
+                               # only). Per-model: set via `turnstone-admin rerank-calibrate`.
+# rerank_instruction = ""      # for instruction-aware rerankers (Qwen3) when the endpoint
+                               # does NOT apply the model's chat template, e.g. "Given a web
+                               # search query, retrieve relevant passages that answer the
+                               # query". Prefer vLLM's --chat-template; don't use both.
+                               # NB: serving Qwen3-Reranker via vLLM REQUIRES --chat-template
+                               # (the model's chat_template.jinja) or scores are near-random.
 
 # --- Judge (turnstone, node) ---
 

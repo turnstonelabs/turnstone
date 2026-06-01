@@ -237,6 +237,8 @@ _rerank_model: str | None = None
 _rerank_model_loaded: bool = False
 _rerank_api_key: str | None = None
 _rerank_api_key_loaded: bool = False
+_rerank_instruction: str | None = None
+_rerank_instruction_loaded: bool = False
 
 
 def get_rerank_url() -> str:
@@ -278,6 +280,22 @@ def get_rerank_api_key() -> str:
         _rerank_api_key_loaded = True
         _rerank_api_key = load_config("tools").get("rerank_api_key", "").strip()
     return _rerank_api_key or ""
+
+
+def get_rerank_instruction() -> str:
+    """Load the rerank query instruction (cached after first call).
+
+    Precedence: config.toml [tools] rerank_instruction -> $TURNSTONE_RERANK_INSTRUCTION
+    -> "" (no instruction; a bare query, correct for Cohere/Jina/bge cross-encoders).
+    Instruction-aware rerankers (the Qwen3-Reranker family) need it; the client
+    then wraps the query with the model's ``<Instruct>:`` / ``<Query>:`` framing.
+    """
+    global _rerank_instruction, _rerank_instruction_loaded
+    if not _rerank_instruction_loaded:
+        _rerank_instruction_loaded = True
+        cfg = load_config("tools").get("rerank_instruction", "").strip()
+        _rerank_instruction = cfg or os.environ.get("TURNSTONE_RERANK_INSTRUCTION", "").strip()
+    return _rerank_instruction or ""
 
 
 def nonneg_float(val: str) -> float:
