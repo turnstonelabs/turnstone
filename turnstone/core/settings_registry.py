@@ -259,9 +259,9 @@ def _build_registry() -> dict[str, SettingDef]:
             help="Full URL of a Cohere/Jina-compatible rerank endpoint, including the path "
             "(e.g. 'http://vllm:8000/rerank', 'http://tei:8080/rerank', or "
             "'https://api.cohere.com/v2/rerank'). Turnstone runs no rerank model itself: "
-            "web_search results and large web_fetch pages are reranked by POSTing to this "
-            "endpoint. Empty disables reranking entirely. Overrides config.toml [tools] "
-            "rerank_url and $TURNSTONE_RERANK_URL.",
+            "web_search results are reranked by POSTing to this endpoint. Empty disables "
+            "reranking entirely. Overrides config.toml [tools] rerank_url and "
+            "$TURNSTONE_RERANK_URL.",
         ),
         SettingDef(
             "tools.rerank_model",
@@ -291,9 +291,10 @@ def _build_registry() -> dict[str, SettingDef]:
             True,
             "Rerank web_search results when a rerank endpoint is configured",
             "tools",
-            help="When a rerank endpoint is set (tools.rerank_url), re-order web_search "
-            "results by query relevance before returning the top hits. No effect when no "
-            "endpoint is configured. Disable to keep the search backend's native ranking.",
+            help="When a rerank endpoint is configured (via tools.reranker_alias or "
+            "tools.rerank_url), re-order web_search results by query relevance before "
+            "returning the top hits. No effect when no endpoint is configured. Disable to "
+            "keep the search backend's native ranking.",
         ),
         SettingDef(
             "tools.reranker_alias",

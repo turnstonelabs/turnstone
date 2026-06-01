@@ -1359,7 +1359,7 @@ class ChatSession:
         )
 
     def _rerank_enabled_for(self, tool: str) -> bool:
-        """Whether reranking is enabled for ``tool`` ('web_search' | 'web_fetch').
+        """Whether reranking is enabled for ``tool`` (currently: 'web_search').
 
         The per-tool toggles default on; the operative gate is whether an
         endpoint is configured (``_resolve_rerank_client`` returns None when

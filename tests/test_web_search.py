@@ -359,6 +359,25 @@ class TestWebSearchReranking:
         out = _format_searxng(_results("A", "B"), "q", reranker=boom)
         assert out.index("[A]") < out.index("[B]")  # native order preserved
 
+    def test_none_order_falls_back_to_native_order(self):
+        # A reranker that returns None (or any non-iterable) must fall back, not
+        # raise — list() materializes it inside the guarded block.
+        out = _format_searxng(_results("A", "B"), "q", reranker=lambda q, d: None)
+        assert out.index("[A]") < out.index("[B]")  # native order preserved
+
+    def test_non_int_indices_ignored(self):
+        # bool is an int subclass; True/False must not be honored as indices 1/0.
+        # Junk entries are skipped while valid ints still apply: only 2 and 0 here.
+        out = _format_searxng(
+            _results("A", "B", "C"),
+            "q",
+            max_results=3,
+            reranker=lambda q, d: [True, "1", 2, 0],
+        )
+        # 2 -> C, 0 -> A; B (no valid index) is kept after. If True were honored
+        # as index 1, B would jump to the front — this pins it last.
+        assert out.index("[C]") < out.index("[A]") < out.index("[B]")
+
     def test_skipped_for_single_result(self):
         called = {"n": 0}
 

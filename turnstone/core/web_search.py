@@ -173,14 +173,22 @@ def _rerank_results(
     tail = results[_RERANK_POOL:]
     try:
         docs = [f"{r.get('title', '')}\n{r.get('content') or ''}".strip() for r in pool]
-        order = reranker(query, docs)
+        # Materialize inside the try so a None / non-iterable / lazily-raising
+        # reranker falls back here instead of exploding the splice loop below.
+        order = list(reranker(query, docs))
     except Exception as e:
         log.warning("rerank failed; using native result order: %s", e)
         return results
     seen: set[int] = set()
     reordered: list[dict[str, Any]] = []
     for idx in order:
-        if isinstance(idx, int) and 0 <= idx < len(pool) and idx not in seen:
+        # bool is an int subclass — reject a stray True/False posing as index 1/0.
+        if (
+            isinstance(idx, int)
+            and not isinstance(idx, bool)
+            and 0 <= idx < len(pool)
+            and idx not in seen
+        ):
             seen.add(idx)
             reordered.append(pool[idx])
     if not reordered:
