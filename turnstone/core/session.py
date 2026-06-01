@@ -5098,7 +5098,7 @@ class ChatSession:
             elif name == "web_fetch":
                 it["func_args"] = {"url": it.get("url", ""), "question": it.get("question", "")}
             elif name == "web_search":
-                it["func_args"] = {"query": it.get("query", ""), "topic": it.get("topic", "")}
+                it["func_args"] = {"query": it.get("query", ""), "category": it.get("category", "")}
             elif name == "skills":
                 # Projection for judge / audit on the model-facing skills
                 # tool. Mutating actions surface name + action + a snippet
@@ -6977,9 +6977,9 @@ class ChatSession:
             max_results = min(max(int(args.get("max_results") or 5), 1), 20)
         except (ValueError, TypeError):
             max_results = 5
-        topic = args.get("topic", "general") or "general"
-        if topic not in ("general", "news"):
-            topic = "general"
+        category = args.get("category", "general") or "general"
+        if category not in ("general", "news", "it", "science"):
+            category = "general"
         q_preview = query[:200] + ("..." if len(query) > 200 else "")
         preview = f"    {q_preview}"
         return {
@@ -6992,7 +6992,7 @@ class ChatSession:
             "execute": self._exec_web_search,
             "query": query,
             "max_results": max_results,
-            "topic": topic,
+            "category": category,
         }
 
     def _prepare_tool_search(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -12600,7 +12600,7 @@ class ChatSession:
         call_id = item["call_id"]
         query = item["query"]
         max_results = item.get("max_results", 5)
-        topic = item.get("topic", "general")
+        category = item.get("category", "general")
 
         client = self._resolve_search_client()
         if not client:
@@ -12609,7 +12609,7 @@ class ChatSession:
             return call_id, msg
 
         try:
-            output = client.search(query, max_results=max_results, topic=topic)
+            output = client.search(query, max_results=max_results, category=category)
         except Exception as e:
             msg = f"Error: web search failed: {e}"
             self._report_tool_result(call_id, "web_search", msg, is_error=True)

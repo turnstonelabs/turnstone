@@ -344,7 +344,7 @@ Search the web using a text query.
 |---------------|---------|----------|-------------|
 | `query`       | string  | yes      | The search query. |
 | `max_results` | integer | no       | Max results to return (default 5, max 20). |
-| `topic`       | string  | no       | Search topic: `general` or `news` (default `general`). |
+| `category`    | string  | no       | Search category: `general` (default), `news`, `it` (code/tech), or `science`. Maps to SearxNG categories; the model picks per query. |
 
 - **What it does**: Searches the web and returns ranked results with titles, URLs, and content snippets. Uses provider-native search when available:
   - **Anthropic**: Replaced at the API boundary with Anthropic's `web_search_20250305` server-side tool. Claude decides when to search; the API executes it and returns results with citations inline. No backend needed.

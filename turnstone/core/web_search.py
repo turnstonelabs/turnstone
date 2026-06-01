@@ -44,10 +44,10 @@ class SearXNGClient:
     config does this; a stock instance returns 403/HTML otherwise.
     """
 
-    # The web_search tool's ``topic`` arg → SearxNG ``categories``. ``"general"``
-    # is intentionally absent so the param is omitted and SearxNG uses its
-    # default category mix.
-    _TOPIC_CATEGORIES = {"news": "news"}
+    # The web_search tool's ``category`` arg → SearxNG ``categories``.
+    # ``"general"`` is intentionally absent so the param is omitted and SearxNG
+    # uses its default category mix.
+    _CATEGORIES = {"news": "news", "it": "it", "science": "science"}
 
     def __init__(self, base_url: str, engines: str = "", timeout: float = 120) -> None:
         self._base_url = base_url.rstrip("/")
@@ -56,7 +56,7 @@ class SearXNGClient:
 
     def search(self, query: str, max_results: int = 5, **kwargs: Any) -> str:
         params: dict[str, str] = {"q": query, "format": "json"}
-        category = self._TOPIC_CATEGORIES.get(str(kwargs.get("topic", "general")))
+        category = self._CATEGORIES.get(str(kwargs.get("category", "general")))
         if category:
             params["categories"] = category
         if self._engines:
@@ -84,9 +84,9 @@ class MCPSearchClient:
         args: dict[str, Any] = {"query": query}
         if max_results != 5:
             args["max_results"] = max_results
-        topic = kwargs.get("topic")
-        if topic:
-            args["topic"] = topic
+        category = kwargs.get("category")
+        if category:
+            args["category"] = category
         return self._mcp.call_tool_sync(self._tool, args, timeout=max(1, math.ceil(self._timeout)))
 
 

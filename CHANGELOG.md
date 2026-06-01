@@ -47,6 +47,10 @@ Three release tracks are maintained:
   values are gone; a config still set to either disables web search and logs a
   warning. Auto-detect resolves to SearxNG when `searxng_url` is set, otherwise
   no client (the `web_search` tool is dropped for models without native search).
+- **`web_search` tool: `topic` → `category`** *(BREAKING)* — the LLM-facing
+  parameter is renamed and its values are now `general` (default), `news`, `it`
+  (code/tech), or `science`, mapped to SearxNG categories so the model can target
+  the right corpus. The Tavily-era `finance` topic (no SearxNG equivalent) is gone.
 
 ### Removed
 

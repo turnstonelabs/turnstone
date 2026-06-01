@@ -131,16 +131,16 @@ class TestSearXNGClient:
             client = SearXNGClient(
                 "http://searxng:8080", engines="duckduckgo,wikipedia", timeout=10
             )
-            out = client.search("python", max_results=2, topic="news")
+            out = client.search("python", max_results=2, category="news")
 
         assert captured["url"].startswith("http://searxng:8080/search")
         assert captured["params"]["q"] == "python"
         assert captured["params"]["format"] == "json"
-        assert captured["params"]["categories"] == "news"  # topic -> categories
+        assert captured["params"]["categories"] == "news"  # category -> categories
         assert captured["params"]["engines"] == "duckduckgo,wikipedia"
         assert "[Python.org](https://python.org)" in out
 
-    def test_general_topic_omits_categories(self):
+    def test_category_it_maps_to_categories(self):
         captured: dict = {}
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -148,7 +148,19 @@ class TestSearXNGClient:
             return httpx.Response(200, json={"results": []})
 
         with patch("turnstone.core.web_search.httpx.get", _mock_httpx_get(handler)):
-            SearXNGClient("http://searxng:8080").search("q", topic="general")
+            SearXNGClient("http://searxng:8080").search("q", category="it")
+
+        assert captured["params"]["categories"] == "it"
+
+    def test_general_category_omits_categories(self):
+        captured: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["params"] = dict(request.url.params)
+            return httpx.Response(200, json={"results": []})
+
+        with patch("turnstone.core.web_search.httpx.get", _mock_httpx_get(handler)):
+            SearXNGClient("http://searxng:8080").search("q", category="general")
 
         assert "categories" not in captured["params"]
 
@@ -199,10 +211,10 @@ class TestMCPSearchClient:
         mcp = MagicMock()
         mcp.call_tool_sync.return_value = "MCP search results"
         client = MCPSearchClient(mcp, "mcp__ddg__search", timeout=30)
-        result = client.search("test", max_results=3, topic="news")
+        result = client.search("test", max_results=3, category="news")
         mcp.call_tool_sync.assert_called_once_with(
             "mcp__ddg__search",
-            {"query": "test", "max_results": 3, "topic": "news"},
+            {"query": "test", "max_results": 3, "category": "news"},
             timeout=30,
         )
         assert result == "MCP search results"

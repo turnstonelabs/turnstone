@@ -12,9 +12,10 @@
         "type": "integer",
         "description": "Max results to return (default 5, max 20)."
       },
-      "topic": {
+      "category": {
         "type": "string",
-        "description": "Search topic: general or news (default general)."
+        "enum": ["general", "news", "it", "science"],
+        "description": "Search category: general (default), news (current events), it (code/programming/tech), science (papers/research)."
       }
     },
     "required": ["query"]
