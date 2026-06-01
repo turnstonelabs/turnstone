@@ -113,10 +113,12 @@ class TestWriteCompose:
         content = (tmp_path / "compose.yaml").read_text()
         assert "ghcr.io/turnstonelabs/turnstone" in content
         assert "TURNSTONE_IMAGE_TAG" in content
-        # The compose mounts ./Caddyfile, so the wizard must write it alongside —
-        # guards both the second write and the pyproject wheel-include.
+        # The compose mounts ./Caddyfile and ./searxng, so the wizard must write
+        # both alongside — guards the extra writes and the pyproject wheel-include.
         caddyfile = (tmp_path / "Caddyfile").read_text()
         assert "reverse_proxy console:8090" in caddyfile
+        searxng_cfg = (tmp_path / "searxng" / "settings.yml").read_text()
+        assert "json" in searxng_cfg  # the bundled config enables the JSON API
 
     def test_user_declines(self, tmp_path: Path) -> None:
         with patch("builtins.input", return_value="n"):

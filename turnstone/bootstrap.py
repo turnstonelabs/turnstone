@@ -614,7 +614,10 @@ def _tool_write_compose(project_dir: Path, args: dict[str, Any]) -> str:
                 and caddy_dest.read_text(encoding="utf-8") == caddy_content
                 and searxng_dest.read_text(encoding="utf-8") == searxng_content
             ):
-                return "compose.yaml, Caddyfile and searxng/settings.yml already exist."
+                return (
+                    "compose.yaml, Caddyfile and searxng/settings.yml already exist "
+                    "with identical content."
+                )
         except (OSError, UnicodeDecodeError):
             pass  # best-effort duplicate check
 
