@@ -370,9 +370,8 @@ def test_chatsession_coordinator_kind_excludes_interactive_tools(tmp_db):
     assert "edit_file" not in names
     # Memory is intentionally exposed — see docstring.
     assert "memory" in names
-    # Sub-agent tool lists are zeroed for coordinators.
+    # Sub-agent tool list is zeroed for coordinators.
     assert sess._task_tools == []
-    assert sess._agent_tools == []
 
 
 def test_chatsession_coordinator_kind_does_not_merge_mcp_tools(tmp_db):

@@ -291,34 +291,6 @@
       ]
     },
     {
-      "id": "plan-when-asked",
-      "description": "Call the plan tool when the user asks to plan",
-      "user_prompt": "Plan how to add user authentication to this app.",
-      "setup": {
-        "files": {
-          "app.py": "from flask import Flask, jsonify\n\napp = Flask(__name__)\n\n@app.route('/users')\ndef list_users():\n    return jsonify([{'id': 1, 'name': 'Alice'}])\n\nif __name__ == '__main__':\n    app.run(port=8000)\n"
-        }
-      },
-      "expected_actions": [
-        {
-          "tool": "plan_agent"
-        }
-      ],
-      "match_mode": "subset",
-      "user_prompts": [
-        "Plan how to add user authentication to this app.",
-        "Make a plan for adding pagination to the API endpoints.",
-        "Plan out how to add error handling to this application.",
-        "I need a plan for adding logging to this codebase.",
-        "Plan the approach for adding unit tests to this app.",
-        "How would you approach adding user authentication to this app? Lay out a plan.",
-        "I'd like you to outline a strategy for implementing user authentication in this application.",
-        "Could you come up with a plan for integrating user authentication into this app?",
-        "Think through the steps needed to add user auth to this app and present a plan.",
-        "Draft a plan for incorporating user authentication functionality into this application."
-      ]
-    },
-    {
       "id": "edit-not-rewrite",
       "description": "Use edit_file for small changes, not write_file to rewrite the entire file",
       "user_prompt": "Add a docstring to the process_data function in utils.py",
@@ -410,58 +382,6 @@
         "Download the page at https://example.com and provide a brief summary",
         "I'd like a summary of whatever is at https://example.com \u2014 please fetch it first",
         "Hit https://example.com and let me know what's there in summary form"
-      ]
-    },
-    {
-      "id": "man-page-lookup",
-      "description": "Use man tool to look up command documentation",
-      "user_prompt": "Look up the man page for tar and tell me what the --xattrs flag does",
-      "expected_actions": [
-        {
-          "tool": "man",
-          "args_pattern": {
-            "page": "tar"
-          }
-        }
-      ],
-      "match_mode": "subset",
-      "user_prompts": [
-        "Look up the man page for tar and tell me what the --xattrs flag does",
-        "What does the --xattrs flag do in tar? Check the man page for me.",
-        "Could you pull up the man page for tar and explain the --xattrs option?",
-        "I need to know what --xattrs does in tar \u2014 can you check the man page?",
-        "Check tar's man page and let me know the purpose of the --xattrs flag.",
-        "Please consult the tar man page and describe what the --xattrs flag is for.",
-        "Hey, look at the tar man page real quick \u2014 what's --xattrs do?",
-        "I'd like you to read the tar man page and summarize the --xattrs option for me.",
-        "Would you mind checking the man page for tar to find out what --xattrs means?",
-        "Look into the tar manual and explain the --xattrs flag to me."
-      ]
-    },
-    {
-      "id": "math-calculation",
-      "description": "Use the math tool for precise calculations, not bash or mental math",
-      "user_prompt": "What is 2^64 - 1? Use the math tool to calculate it precisely.",
-      "expected_actions": [
-        {
-          "tool": "math",
-          "args_pattern": {
-            "code": "2.*64"
-          }
-        }
-      ],
-      "match_mode": "subset",
-      "user_prompts": [
-        "What is 2^64 - 1? Use the math tool to calculate it precisely.",
-        "Calculate 2^64 - 1 for me using the math tool, please.",
-        "I need the exact value of 2^64 - 1. Please use the math tool.",
-        "Could you use the math tool to compute 2^64 minus 1 precisely?",
-        "Use the math tool to tell me what 2^64 - 1 equals.",
-        "I'm curious: what's 2^64 - 1? Compute it with the math tool.",
-        "Please precisely determine 2^64 - 1 via the math tool.",
-        "Mind using the math tool to figure out 2^64 - 1 exactly?",
-        "I'd like to know the precise result of 2^64 - 1 \u2014 use the math tool for this.",
-        "Leverage the math tool to give me an exact answer for 2^64 - 1."
       ]
     },
     {

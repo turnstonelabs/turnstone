@@ -67,7 +67,7 @@ Scopes are hierarchical — higher scopes imply all lower ones.
 | Method | Path pattern | Required scope |
 |--------|-------------|----------------|
 | GET | Any protected path | `read` |
-| POST | `/api/plan`, `/api/command` | `write` |
+| POST | `/api/command` | `write` |
 | POST | `/api/workstreams/new`, `/api/cluster/workstreams/new` | `write` |
 | POST | `/api/workstreams/{ws_id}/{send,cancel,close,delete,open,refresh-title,title,attachments}` | `write` |
 | DELETE | `/api/workstreams/{ws_id}/send` (dequeue), `/api/workstreams/{ws_id}/attachments/{attachment_id}` | `write` |

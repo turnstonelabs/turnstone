@@ -77,7 +77,6 @@ Both `TurnstoneServer` (sync) and `AsyncTurnstoneServer` (async) expose:
 | | `delete_attachment(ws_id, attachment_id)` | `StatusResponse` |
 | **Chat** | `send(message, ws_id)` | `SendResponse` |
 | | `approve(*, ws_id, approved, feedback, always)` | `StatusResponse` |
-| | `plan_feedback(*, ws_id, feedback)` | `StatusResponse` |
 | | `command(*, ws_id, command)` | `StatusResponse` |
 | | `cancel(ws_id, *, force=False)` | `StatusResponse` |
 | **Streaming** | `stream_events(ws_id)` | `Iterator[ServerEvent]` |
@@ -134,7 +133,6 @@ SSE events are deserialized into typed dataclasses. Use `event.type` to discrimi
 | `tool_result` | `ToolResultEvent` | `call_id`, `name`, `output`, `is_error` |
 | `tool_output_chunk` | `ToolOutputChunkEvent` | `call_id`, `chunk` |
 | `status` | `StatusEvent` | `prompt_tokens`, `total_tokens`, `pct`, `effort`, `cache_creation_tokens`, `cache_read_tokens` |
-| `plan_review` | `PlanReviewEvent` | `content` |
 | `error` | `ErrorEvent` | `message` |
 | `info` | `InfoEvent` | `message` |
 | `stream_end` | `StreamEndEvent` | — |

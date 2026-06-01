@@ -73,7 +73,6 @@ def _validate_registry_args(
     default: str,
     fallback: list[str] | None,
     agent_model: str | None,
-    plan_model: str | None,
     task_model: str | None,
 ) -> None:
     """Validate ModelRegistry construction / reload arguments.
@@ -97,8 +96,6 @@ def _validate_registry_args(
                 raise ValueError(f"Fallback model '{alias}' not found in registry")
     if agent_model and agent_model not in models:
         raise ValueError(f"Agent model '{agent_model}' not found in registry")
-    if plan_model and plan_model not in models:
-        raise ValueError(f"Plan model '{plan_model}' not found in registry")
     if task_model and task_model not in models:
         raise ValueError(f"Task model '{task_model}' not found in registry")
 
@@ -110,14 +107,10 @@ class ModelRegistry:
         models: Mapping of alias → ModelConfig.
         default: Alias of the default model.
         fallback: Ordered list of aliases to try when the primary model fails.
-        agent_model: Optional alias for plan/task sub-agents (single-knob
-            fallback used when ``plan_model``/``task_model`` are unset).
-        plan_model: Optional alias for the plan_agent sub-agent.  Overrides
-            ``agent_model`` for plan calls; falls back to it when unset.
+        agent_model: Optional alias for the task_agent sub-agent (single-knob
+            fallback used when ``task_model`` is unset).
         task_model: Optional alias for the task_agent sub-agent.  Overrides
             ``agent_model`` for task calls; falls back to it when unset.
-        plan_effort: Reasoning effort for plan_agent.  ``None`` means use the
-            built-in default of ``"high"`` (preserves prior behaviour).
         task_effort: Reasoning effort for task_agent.  ``None`` means inherit
             the parent session's reasoning effort.
     """
@@ -128,20 +121,16 @@ class ModelRegistry:
         default: str,
         fallback: list[str] | None = None,
         agent_model: str | None = None,
-        plan_model: str | None = None,
         task_model: str | None = None,
-        plan_effort: str | None = None,
         task_effort: str | None = None,
     ) -> None:
-        _validate_registry_args(models, default, fallback, agent_model, plan_model, task_model)
+        _validate_registry_args(models, default, fallback, agent_model, task_model)
 
         self._models = dict(models)
         self.default = default
         self.fallback = list(fallback) if fallback else []
         self.agent_model = agent_model
-        self.plan_model = plan_model
         self.task_model = task_model
-        self.plan_effort = plan_effort
         self.task_effort = task_effort
         self._clients: dict[str, Any] = {}
         self._providers: dict[str, LLMProvider] = {}
@@ -199,33 +188,24 @@ class ModelRegistry:
     def resolve_agent_alias(self, kind: str) -> str | None:
         """Return the configured alias for a sub-agent ``kind``.
 
-        Per-kind overrides (``plan_model``/``task_model``) win over the
-        legacy single-knob ``agent_model``.  Returns ``None`` when nothing
-        is configured (caller should fall back to the session model).
+        The per-kind override (``task_model``) wins over the legacy
+        single-knob ``agent_model``.  Returns ``None`` when nothing is
+        configured (caller should fall back to the session model).
 
-        Recognised kinds: ``"plan"``, ``"task"``.  Any other value (e.g.
-        ``"agent"``, eval/utility paths) returns the legacy ``agent_model``
-        as-is — preserves prior behaviour for non-plan/task callers.
+        Recognised kind: ``"task"``.  Any other value (e.g. ``"agent"``,
+        eval/utility paths) returns the legacy ``agent_model`` as-is —
+        preserves prior behaviour for non-task callers.
         """
-        if kind == "plan":
-            return self.plan_model or self.agent_model
         if kind == "task":
             return self.task_model or self.agent_model
         return self.agent_model
 
-    # Built-in default effort for plan_agent — preserves the value the three
-    # plan call sites used to pass explicitly before the split.
-    PLAN_DEFAULT_EFFORT = "high"
-
     def resolve_agent_effort(self, kind: str) -> str | None:
         """Return the reasoning effort for a sub-agent ``kind``.
 
-        Plan defaults to :attr:`PLAN_DEFAULT_EFFORT` (back-compat with the
-        previously hardcoded ``"high"``).  Task returns ``None`` to indicate
-        the caller should fall through to the session default.
+        Task returns ``None`` to indicate the caller should fall through
+        to the session default.
         """
-        if kind == "plan":
-            return self.plan_effort or self.PLAN_DEFAULT_EFFORT
         if kind == "task":
             return self.task_effort
         return None
@@ -248,9 +228,7 @@ class ModelRegistry:
         default: str,
         fallback: list[str] | None = None,
         agent_model: str | None = None,
-        plan_model: str | None = None,
         task_model: str | None = None,
-        plan_effort: str | None = None,
         task_effort: str | None = None,
     ) -> None:
         """Hot-reload all model configs. Thread-safe; clears cached clients.
@@ -258,16 +236,14 @@ class ModelRegistry:
         Validates arguments before mutating state so a bad reload
         does not leave the registry in an inconsistent state.
         """
-        _validate_registry_args(models, default, fallback, agent_model, plan_model, task_model)
+        _validate_registry_args(models, default, fallback, agent_model, task_model)
         with self._client_lock:
             old_models = self._models
             self._models = dict(models)
             self.default = default
             self.fallback = list(fallback) if fallback else []
             self.agent_model = agent_model
-            self.plan_model = plan_model
             self.task_model = task_model
-            self.plan_effort = plan_effort
             self.task_effort = task_effort
             # Selective teardown — close + drop only clients whose
             # connection target actually changed (alias removed, or
@@ -372,10 +348,9 @@ def load_model_registry(
     3. CLI ``--base-url`` / ``--api-key`` / ``--model`` always create a
        ``"default"`` entry.
     4. ``[model].default``, ``[model].fallback``, ``[model].agent_model``,
-       ``[model].plan_model``, ``[model].task_model``,
-       ``[model].plan_effort``, ``[model].task_effort`` control routing.
-       ``plan_model``/``task_model`` override ``agent_model`` per sub-agent
-       role; both fall back to it when unset.
+       ``[model].task_model``, ``[model].task_effort`` control routing.
+       ``task_model`` overrides ``agent_model`` for the task sub-agent;
+       it falls back to ``agent_model`` when unset.
 
     ``strict``: when True, a storage read failure during the DB-rows step
     re-raises instead of degrading to a config.toml-only registry.
@@ -519,9 +494,9 @@ def load_model_registry(
     # 3. Back-compat shim: synthesize a "default" alias from CLI/auto-detected
     # ``--base-url`` + ``--model`` only when no DB or config.toml models exist.
     # Auto-creating "default" alongside DB models leaks a non-routing alias
-    # into the public list — the LLM picks it in plan_agent / task_agent
+    # into the public list — the LLM picks it in task_agent
     # ``model=`` and silently bypasses the operator's per-role
-    # plan_alias / task_alias overrides (the "default" alias points at
+    # task_alias override (the "default" alias points at
     # whatever LLM_BASE_URL was at boot, not at the configured default).
     if not configs and model:
         configs["default"] = ModelConfig(
@@ -573,24 +548,19 @@ def load_model_registry(
             else:
                 log.warning("Fallback alias '%s' not found in models, ignoring", alias)
 
-    # Agent model (legacy single-knob shared between plan_agent and task_agent)
+    # Agent model (legacy single-knob fallback for the task_agent sub-agent)
     agent_model = model_section.get("agent_model")
     if agent_model and agent_model not in configs:
         log.warning("Configured agent_model '%s' not found, ignoring", agent_model)
         agent_model = None
 
-    # Per-kind sub-agent models — override agent_model for each role
-    plan_model = model_section.get("plan_model")
-    if plan_model and plan_model not in configs:
-        log.warning("Configured plan_model '%s' not found, ignoring", plan_model)
-        plan_model = None
+    # Per-kind sub-agent model — overrides agent_model for the task role
     task_model = model_section.get("task_model")
     if task_model and task_model not in configs:
         log.warning("Configured task_model '%s' not found, ignoring", task_model)
         task_model = None
 
-    # Per-kind reasoning effort.  None means: plan defaults to "high" (back-
-    # compat with the previous hardcoded value); task inherits the session.
+    # Per-kind reasoning effort.  None means task inherits the session.
     # Typos in config.toml shouldn't silently flow to the provider — log and
     # drop unknown values, mirroring the model-not-found warning above.
     valid_efforts = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
@@ -599,7 +569,7 @@ def load_model_registry(
         if value is None:
             return None
         # Treat empty / whitespace as unset.  Operators commonly write
-        # `plan_effort = ""` to make "leave it default" explicit; warning
+        # `task_effort = ""` to make "leave it default" explicit; warning
         # on that benign case would just be noise.
         coerced = str(value).strip().lower()
         if not coerced:
@@ -615,7 +585,6 @@ def load_model_registry(
             return None
         return coerced
 
-    plan_effort = _validate_effort(model_section.get("plan_effort"), "plan_effort")
     task_effort = _validate_effort(model_section.get("task_effort"), "task_effort")
 
     return ModelRegistry(
@@ -623,9 +592,7 @@ def load_model_registry(
         default=default_alias,
         fallback=fallback,
         agent_model=agent_model,
-        plan_model=plan_model,
         task_model=task_model,
-        plan_effort=plan_effort,
         task_effort=task_effort,
     )
 

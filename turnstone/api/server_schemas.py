@@ -110,11 +110,6 @@ class ApproveRequest(BaseModel):
     )
 
 
-class PlanFeedbackRequest(BaseModel):
-    feedback: str = Field(description="Feedback text; empty string means approval")
-    ws_id: str = Field(description="Target workstream ID")
-
-
 class CommandRequest(BaseModel):
     command: str = Field(description="Slash command (e.g. /clear, /new, /resume)")
     ws_id: str = Field(description="Target workstream ID")

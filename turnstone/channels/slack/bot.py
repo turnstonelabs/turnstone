@@ -47,7 +47,6 @@ from turnstone.sdk.events import (
     ContentEvent,
     ErrorEvent,
     IntentVerdictEvent,
-    PlanReviewEvent,
     ServerEvent,
     StreamEndEvent,
     ThinkingStartEvent,
@@ -277,9 +276,6 @@ class TurnstoneSlackBot:
         self._streaming: dict[str, StreamingMessage] = {}
 
         self._pending_approval: dict[str, PendingApproval] = {}
-        # (channel, message_ts, owner_user_id) per pending plan review, so
-        # _on_plan_* handlers can reject clicks from non-owners.
-        self._pending_plan_review_ts: dict[str, tuple[str, str, str]] = {}
         self._notify_ws_map: dict[str, tuple[str, SlackRoute]] = {}
         # Per-workstream override used to route the next streamed assistant
         # response back into a Slack notification reply thread instead of the
@@ -319,9 +315,6 @@ class TurnstoneSlackBot:
 
         self._app.action("ts_approve")(_approve_cb)
         self._app.action("ts_deny")(_deny_cb)
-        self._app.action("ts_plan_approve")(self._on_plan_approve)
-        self._app.action("ts_plan_request_changes")(self._on_plan_request_changes)
-        self._app.view("ts_plan_feedback_modal")(self._on_plan_feedback_modal)
 
     async def start(self) -> None:
         from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -926,166 +919,6 @@ class TurnstoneSlackBot:
         except Exception:
             log.debug(f"slack.{event_key}_message_update_failed", exc_info=True)
 
-    async def _ensure_plan_review_owner(
-        self,
-        entry: tuple[str, str, str] | None,
-        actor_user_id: str,
-        channel: str,
-        verb: str,
-    ) -> bool:
-        """Return True when *actor_user_id* owns the pending plan review.
-
-        The gateway forwards ``/plan`` calls with its service-scoped JWT,
-        and the server bypasses ownership checks on service scope — so
-        every plan-review interaction needs an adapter-side owner gate.
-        """
-        if entry is None:
-            log.warning("slack.plan_review_missing_entry", actor_user_id=actor_user_id)
-            await self._client.chat_postEphemeral(
-                channel=channel,
-                user=actor_user_id,
-                text="This plan review can no longer be verified. Please retry from the active session.",
-            )
-            return False
-        _channel, _ts, owner_user_id = entry
-        if not owner_user_id or actor_user_id != owner_user_id:
-            await self._client.chat_postEphemeral(
-                channel=channel,
-                user=actor_user_id,
-                text=f"Only the session owner can {verb} this plan.",
-            )
-            return False
-        return True
-
-    async def _on_plan_approve(self, ack: Any, body: dict[str, Any]) -> None:
-        await ack()
-        ws_id = body["actions"][0].get("value", "")
-        log.info("slack.plan_approve_clicked", ws_id=ws_id)
-        if not ws_id:
-            return
-
-        actor_user_id = body.get("user", {}).get("id", "")
-        channel = body["container"]["channel_id"]
-        entry = self._pending_plan_review_ts.get(ws_id)
-        if not await self._ensure_plan_review_owner(entry, actor_user_id, channel, "approve"):
-            return
-
-        self._streaming.pop(ws_id, None)
-        await self.router.send_plan_feedback(ws_id, "", "")
-        log.info("slack.plan_feedback_sent", ws_id=ws_id, feedback="")
-
-        ts = body["container"]["message_ts"]
-
-        self._pending_plan_review_ts.pop(ws_id, None)
-
-        try:
-            await self._client.chat_update(
-                channel=channel,
-                ts=ts,
-                text="Plan approved",
-                blocks=[],
-            )
-        except Exception:
-            log.debug("slack.plan_review_approve_update_failed", exc_info=True)
-
-    async def _on_plan_request_changes(self, ack: Any, body: dict[str, Any], client: Any) -> None:
-        await ack()
-        ws_id = body["actions"][0].get("value", "")
-        if not ws_id:
-            return
-
-        actor_user_id = body.get("user", {}).get("id", "")
-        channel = body["container"]["channel_id"]
-        entry = self._pending_plan_review_ts.get(ws_id)
-        if not await self._ensure_plan_review_owner(
-            entry, actor_user_id, channel, "request changes on"
-        ):
-            return
-
-        trigger_id = body.get("trigger_id", "")
-        if not trigger_id:
-            return
-
-        await client.views_open(
-            trigger_id=trigger_id,
-            view={
-                "type": "modal",
-                "callback_id": "ts_plan_feedback_modal",
-                "private_metadata": ws_id,
-                "title": {"type": "plain_text", "text": "Plan feedback"},
-                "submit": {"type": "plain_text", "text": "Send"},
-                "close": {"type": "plain_text", "text": "Cancel"},
-                "blocks": [
-                    {
-                        "type": "input",
-                        "block_id": "feedback_block",
-                        "label": {"type": "plain_text", "text": "Requested changes"},
-                        "element": {
-                            "type": "plain_text_input",
-                            "action_id": "feedback_input",
-                            "multiline": True,
-                        },
-                    }
-                ],
-            },
-        )
-
-    async def _on_plan_feedback_modal(
-        self, ack: Any, body: dict[str, Any], view: dict[str, Any]
-    ) -> None:
-        await ack()
-
-        ws_id = view.get("private_metadata", "")
-        if not ws_id:
-            return
-
-        actor_user_id = body.get("user", {}).get("id", "")
-        entry = self._pending_plan_review_ts.get(ws_id)
-        if entry is None:
-            # No pending review (stale modal) — silently drop.
-            return
-        _ignored_channel, _ignored_ts, owner_user_id = entry
-        if not owner_user_id or actor_user_id != owner_user_id:
-            # Modal submit can't emit ephemeral; just log and drop.
-            log.warning(
-                "slack.plan_feedback_non_owner",
-                ws_id=ws_id,
-                actor_user_id=actor_user_id,
-                owner_user_id=owner_user_id,
-            )
-            return
-
-        feedback = (
-            view.get("state", {})
-            .get("values", {})
-            .get("feedback_block", {})
-            .get("feedback_input", {})
-            .get("value", "")
-            .strip()
-        )
-
-        if not feedback:
-            feedback = "Please revise the plan."
-
-        log.info("slack.plan_feedback_modal_submitted", ws_id=ws_id, feedback=feedback)
-
-        self._streaming.pop(ws_id, None)
-        await self.router.send_plan_feedback(ws_id, "", feedback)
-        log.info("slack.plan_feedback_sent", ws_id=ws_id, feedback=feedback)
-
-        entry = self._pending_plan_review_ts.pop(ws_id, None)
-        if entry is not None:
-            channel, ts, _owner = entry
-            try:
-                await self._client.chat_update(
-                    channel=channel,
-                    ts=ts,
-                    text="Plan changes requested",
-                    blocks=[],
-                )
-            except Exception:
-                log.debug("slack.plan_review_modal_update_failed", exc_info=True)
-
     async def subscribe_ws(self, ws_id: str, channel_id: str) -> None:
         # Recover from a dead SSE task before the early-return check.  If the
         # prior listener died with an unhandled exception, its ws_id is still
@@ -1118,7 +951,6 @@ class TurnstoneSlackBot:
         self._subscribed_ws.discard(ws_id)
         self._streaming.pop(ws_id, None)
         self._pending_approval.pop(ws_id, None)
-        self._pending_plan_review_ts.pop(ws_id, None)
         self._clear_notification_tracking_for_ws(ws_id)
 
     async def unsubscribe_ws(self, ws_id: str) -> None:
@@ -1191,8 +1023,6 @@ class TurnstoneSlackBot:
             await self._handle_approve_request(ws_id, route, event)
         elif isinstance(event, IntentVerdictEvent):
             await self._handle_intent_verdict(ws_id, event)
-        elif isinstance(event, PlanReviewEvent):
-            await self._handle_plan_review(ws_id, route, event)
         elif isinstance(event, ApprovalResolvedEvent):
             await self._handle_approval_resolved(ws_id, event)
         elif isinstance(event, StreamEndEvent):
@@ -1306,53 +1136,6 @@ class TurnstoneSlackBot:
             )
         except Exception:
             log.debug("slack.verdict_message_update_failed", ws_id=ws_id, exc_info=True)
-
-    async def _handle_plan_review(
-        self, ws_id: str, route: SlackRoute, event: PlanReviewEvent
-    ) -> None:
-        slack_channel = route.channel
-        thread_ts = route.thread_ts or ""
-        owner_user_id = route.user_id or ""
-
-        log.info("slack.plan_review_received", ws_id=ws_id)
-        plan_preview = _sanitize_slack_preview(event.content, max_length=2000)
-        blocks = [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*Plan Review*\n```{plan_preview}```",
-                },
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "Approve"},
-                        "style": "primary",
-                        "action_id": "ts_plan_approve",
-                        "value": ws_id,
-                    },
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "Request changes"},
-                        "style": "danger",
-                        "action_id": "ts_plan_request_changes",
-                        "value": ws_id,
-                    },
-                ],
-            },
-        ]
-
-        resp = await self._client.chat_postMessage(
-            channel=slack_channel,
-            thread_ts=thread_ts or None,
-            text="Plan review required",
-            blocks=cast("list[dict[str, Any]]", blocks),
-        )
-        if resp.get("ok"):
-            self._pending_plan_review_ts[ws_id] = (slack_channel, resp["ts"], owner_user_id)
 
     async def _handle_approval_resolved(self, ws_id: str, event: ApprovalResolvedEvent) -> None:
         entry = self._pending_approval.pop(ws_id, None)

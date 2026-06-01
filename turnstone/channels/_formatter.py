@@ -1,8 +1,8 @@
 """Message formatting utilities for channel adapters.
 
 Handles chunking long messages for platforms with character limits, formatting
-tool-approval requests, plan-review prompts, and rich media embeds for
-platforms that support them (e.g. Discord).
+tool-approval requests and rich media embeds for platforms that support them
+(e.g. Discord).
 """
 
 from __future__ import annotations

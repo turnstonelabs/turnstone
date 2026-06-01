@@ -34,7 +34,6 @@ package "turnstone/core/" <<Rectangle>> {
     component [metrics.py\nPrometheus metrics] as metrics <<core>>
     component [config.py\nTOML config] as config <<core>>
     component [safety.py\nPath validation] as safety <<core>>
-    component [sandbox.py\nCommand sandbox] as sandbox <<core>>
     component [edit.py\nFile editing] as edit <<core>>
     component [web.py\nWeb helpers] as web <<core>>
     component [auth.py\nAuthentication] as auth <<core>>
@@ -123,7 +122,6 @@ session --> tools
 session --> memory
 memory --> storage
 session --> safety
-session --> sandbox
 session --> edit
 session --> web
 session --> healthcheck

@@ -72,9 +72,7 @@ class _FakeUI:
         self._listeners: list[queue.Queue[dict[str, Any]]] = []
         self._listeners_lock = threading.Lock()
         self._pending_approval: dict[str, Any] | None = None
-        self._pending_plan_review: dict[str, Any] | None = None
         self._approval_event = threading.Event()
-        self._plan_event = threading.Event()
         self._fg_event = threading.Event()
         self._ws_lock = threading.Lock()
         # Dashboard handler reads these fields under _ws_lock to build
@@ -169,9 +167,6 @@ class _FakeUI:
 
     def resolve_approval(self, *_a: Any, **_kw: Any) -> None:
         self._approval_event.set()
-
-    def resolve_plan(self, *_a: Any, **_kw: Any) -> None:
-        self._plan_event.set()
 
 
 class _FakeSession:
@@ -1074,26 +1069,24 @@ class TestInteractiveEventsLifted:
         out = list(_interactive_events_replay(ws, ui, request))
         assert "status" not in {ev["type"] for ev in out}
 
-    def test_events_replay_yields_pending_approval_then_verdicts_then_plan(self):
-        """When both prompts are pending, the order is approval +
+    def test_events_replay_yields_pending_approval_then_verdicts(self):
+        """When an approval is pending, the order is approval +
         cached verdicts (so the client renders the prompt and then
-        the LLM-judge intent verdicts that fired during it), then
-        plan-review. Pre-lift ordering preserved."""
+        the LLM-judge intent verdicts that fired during it). Pre-lift
+        ordering preserved."""
         from turnstone.server import _interactive_events_replay
 
         ws, ui, request = _make_interactive_replay_mocks(
             _pending_approval={"type": "approve_request", "items": []},
-            _pending_plan_review={"type": "plan_review", "content": "..."},
             _llm_verdicts={"v1": {"verdict_id": "v1", "tier": "judge"}},
         )
 
         out = list(_interactive_events_replay(ws, ui, request))
         types = [ev["type"] for ev in out]
-        # The approve_request, then the intent_verdict, then the plan_review.
+        # The approve_request, then the intent_verdict.
         approve_idx = types.index("approve_request")
         verdict_idx = types.index("intent_verdict")
-        plan_idx = types.index("plan_review")
-        assert approve_idx < verdict_idx < plan_idx
+        assert approve_idx < verdict_idx
 
     def test_events_replay_skips_when_session_missing(self):
         """Defensive: a placeholder workstream whose session is

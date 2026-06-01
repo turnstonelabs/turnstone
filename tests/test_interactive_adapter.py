@@ -32,8 +32,6 @@ class _StubUI:
     def __init__(self) -> None:
         self._approval_event = threading.Event()
         self._approval_result: tuple[bool, str | None] = (True, "initial")
-        self._plan_event = threading.Event()
-        self._plan_result: str = "accept"
         self._fg_event = threading.Event()
         self._listeners_lock = threading.Lock()
         self._listeners: list[queue.Queue[dict[str, Any]]] = []
@@ -127,22 +125,19 @@ def test_emit_swallows_queue_full_without_raising() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_cleanup_ui_unblocks_pending_approval_plan_fg_events() -> None:
+def test_cleanup_ui_unblocks_pending_approval_fg_events() -> None:
     adapter, _ = _make_adapter()
     ws = _make_ws()
     # Simulate pending events
     ws.ui._approval_event.clear()  # type: ignore[attr-defined]
-    ws.ui._plan_event.clear()  # type: ignore[attr-defined]
     ws.ui._fg_event.clear()  # type: ignore[attr-defined]
 
     adapter.cleanup_ui(ws)
 
     assert ws.ui._approval_event.is_set()  # type: ignore[attr-defined]
-    assert ws.ui._plan_event.is_set()  # type: ignore[attr-defined]
     assert ws.ui._fg_event.is_set()  # type: ignore[attr-defined]
     # Approval result flipped to "deny" so the waiter sees a sensible value.
     assert ws.ui._approval_result == (False, None)  # type: ignore[attr-defined]
-    assert ws.ui._plan_result == "reject"  # type: ignore[attr-defined]
 
 
 def test_cleanup_ui_broadcasts_ws_closed_to_listener_queues() -> None:

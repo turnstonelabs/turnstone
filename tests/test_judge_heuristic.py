@@ -332,11 +332,6 @@ class TestLowRules:
         _assert_verdict(v, risk_level="low", recommendation="approve")
         assert "list-directory" in v.evidence[0]
 
-    def test_man_tool(self):
-        v = evaluate_heuristic("man", {"topic": "grep"}, "man")
-        _assert_verdict(v, risk_level="low", recommendation="approve")
-        assert "man-tool" in v.evidence[0]
-
     def test_use_prompt(self):
         v = evaluate_heuristic("use_prompt", {"name": "mcp__git__commit_msg"}, "use_prompt")
         _assert_verdict(v, risk_level="low", recommendation="approve")

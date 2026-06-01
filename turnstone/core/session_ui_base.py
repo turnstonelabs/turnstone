@@ -4,8 +4,8 @@ Both :class:`turnstone.server.WebUI` (interactive node UI) and
 :class:`turnstone.console.coordinator_ui.ConsoleCoordinatorUI` wrap a
 :class:`~turnstone.core.session.ChatSession` and fan events out over
 SSE to one or more connected browser tabs. They also block the worker
-thread on two pending-input gates (tool approval, plan review) that
-HTTP handlers resolve.
+thread on a pending-input gate (tool approval) that HTTP handlers
+resolve.
 
 That skeleton — plus per-workstream metrics tracking, intent-verdict
 bookkeeping, output-warning persistence, and the canonical
@@ -195,14 +195,14 @@ class AutoApproveReason:
 
 
 class SessionUIBase:
-    """SSE listener fan-out + approval/plan event machinery.
+    """SSE listener fan-out + approval event machinery.
 
     Thread-safety: the ChatSession worker thread calls the ``on_*``
-    methods (and the approval/plan blocking helpers that live on
+    methods (and the approval blocking helpers that live on
     subclasses); HTTP handlers drive ``_register_listener`` /
-    ``_unregister_listener`` / ``resolve_approval`` / ``resolve_plan``
-    from the event loop. All shared state is guarded by
-    ``_listeners_lock`` or ``threading.Event`` primitives.
+    ``_unregister_listener`` / ``resolve_approval`` from the event
+    loop. All shared state is guarded by ``_listeners_lock`` or
+    ``threading.Event`` primitives.
     """
 
     def __init__(self, ws_id: str = "", user_id: str = "") -> None:
@@ -249,9 +249,6 @@ class SessionUIBase:
         # Pending approval shape — re-sent on SSE reconnect so a user
         # switching tabs still sees the prompt.
         self._pending_approval: dict[str, Any] | None = None
-        self._plan_event = threading.Event()
-        self._plan_result: str = ""
-        self._pending_plan_review: dict[str, Any] | None = None
         self.auto_approve = False
         self.auto_approve_tools: set[str] = set()
         # Smart Approvals (``judge.smart_approvals``): when enabled, a
@@ -658,7 +655,7 @@ class SessionUIBase:
         return latest_id > cursor
 
     # ------------------------------------------------------------------
-    # Approval / plan blocking gates
+    # Approval blocking gates
     # ------------------------------------------------------------------
 
     def _reset_approval_cycle(self) -> None:
@@ -755,26 +752,6 @@ class SessionUIBase:
                     storage.update_intent_verdict(vid, user_decision=decision_str)
         except Exception:
             log.debug("Failed to update verdict user_decision", exc_info=True)
-
-    def resolve_plan(self, feedback: str) -> None:
-        """Unblock a pending plan review with the caller's verdict.
-
-        ``cancel_generation`` calls this unconditionally to unblock
-        any wait, so the path has to be safe when no plan is pending
-        (just signal and skip the broadcast).
-        """
-        self._plan_result = feedback
-        if self._pending_plan_review is None:
-            self._plan_event.set()
-            return
-        # Clear pending BEFORE broadcasting so a client reconnecting
-        # in the window between enqueue and clear cannot receive both
-        # the replayed plan_review (SSE re-injection at the connect
-        # handler) AND the live plan_resolved. Mirrors the
-        # approval_resolved pattern above.
-        self._pending_plan_review = None
-        self._enqueue({"type": "plan_resolved", "feedback": feedback})
-        self._plan_event.set()
 
     def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]:
         """Two-phase approval gate for a batch of tool calls.
@@ -1308,10 +1285,10 @@ class SessionUIBase:
     _LLM_VERDICT_CACHE_MAX = 50
 
     # Hard cap on how long a worker thread blocks waiting for an
-    # approval / plan-review decision. Subclasses' ``approve_tools`` and
-    # ``on_plan_review`` reference this rather than the literal so a
-    # future ``settings.approval_timeout_seconds`` knob can swap it in
-    # one place.
+    # approval decision. Subclasses' ``approve_tools`` references this
+    # rather than the literal so a future
+    # ``settings.approval_timeout_seconds`` knob can swap it in one
+    # place.
     _APPROVAL_WAIT_TIMEOUT = 3600
 
     def on_intent_verdict(self, verdict: dict[str, Any]) -> None:
@@ -2313,7 +2290,7 @@ class SessionUIBase:
         """Persist a ``usage_event`` for an auxiliary (non-main-loop) LLM call.
 
         Title generation, conversation compaction, web-fetch
-        summarisation, and plan/task sub-agents all run through the
+        summarisation, and task sub-agents all run through the
         provider's non-streaming ``create_completion`` and never reach
         :meth:`on_status` — so without this their tokens are invisible to
         the governance usage dashboard, undercounting real consumption

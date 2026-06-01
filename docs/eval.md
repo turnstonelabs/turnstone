@@ -274,8 +274,7 @@ for iteration in 0..max_iterations:
 
 ### Phase 1: Analyst (`_run_analyst`)
 
-A multi-turn agent with `math` (Python) and `bash` tools for computing
-statistics. It receives per-case results with failure classifications and
+A multi-turn agent with a `bash` tool for computing statistics. It receives per-case results with failure classifications and
 produces a structured diagnosis:
 
 - **Failure patterns**: Shared root causes across failing cases

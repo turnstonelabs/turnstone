@@ -23,7 +23,6 @@
     },
     "required": ["path_a"]
   },
-  "agent": true,
   "task_agent": true,
   "auto_approve": true,
   "primary_key": "path_a"

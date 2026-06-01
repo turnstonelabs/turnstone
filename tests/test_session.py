@@ -49,9 +49,6 @@ class NullUI:
     def on_status(self, usage, context_window, effort):
         pass
 
-    def on_plan_review(self, content):
-        return ""
-
     def on_info(self, message):
         pass
 
@@ -246,231 +243,6 @@ class TestChatSessionConstruction:
     def test_default_reasoning_effort(self, tmp_db):
         session = _make_session()
         assert session.reasoning_effort == "medium"
-
-
-# ---------------------------------------------------------------------------
-# Tests — _exec_plan (session-scoped plan files + existing-plan re-read)
-# ---------------------------------------------------------------------------
-
-
-class TestPlanExec:
-    """Tests for _exec_plan: unique session-scoped plan file and existing-plan injection."""
-
-    _VALID_PLAN = (
-        "## Goal\n\nDo the thing.\n\n"
-        "## Current State\n\nFile foo.py has bar().\n\n"
-        "## Plan\n\n1. Edit foo.py line 10.\n\n"
-        "## Risks\n\nNone."
-    )
-
-    def _run_plan(self, session, prompt, agent_return=None):
-        """Invoke _exec_plan with _run_agent patched to avoid LLM calls.
-
-        Returns (call_id_returned, content_returned, captured_messages) where
-        captured_messages is the agent_messages list passed to _run_agent.
-        """
-        if agent_return is None:
-            agent_return = self._VALID_PLAN
-        captured = {}
-
-        def fake_run_agent(messages, **kwargs):
-            captured["messages"] = list(messages)
-            return agent_return
-
-        item = {"call_id": "test-call-1", "prompt": prompt}
-        with patch.object(session, "_run_agent", side_effect=fake_run_agent):
-            call_id, content = session._exec_plan(item)
-
-        return call_id, content, captured.get("messages", [])
-
-    def test_plan_file_uses_ws_id(self, tmp_db, tmp_path, monkeypatch):
-        """Plan file is named .plan-<ws_id>.md, not .plan.md."""
-        monkeypatch.chdir(tmp_path)
-        session = _make_session()
-        self._run_plan(session, "add feature")
-        expected = tmp_path / f".plan-{session._ws_id}.md"
-        assert expected.exists(), f"Expected {expected} to be created"
-        assert not (tmp_path / ".plan.md").exists()
-
-    def test_plan_file_contains_agent_output(self, tmp_db, tmp_path, monkeypatch):
-        """Written plan file contains the agent's output verbatim."""
-        monkeypatch.chdir(tmp_path)
-        session = _make_session()
-        self._run_plan(session, "add endpoint")
-        plan_file = tmp_path / f".plan-{session._ws_id}.md"
-        assert plan_file.read_text() == self._VALID_PLAN
-
-    def test_two_sessions_produce_different_files(self, tmp_db, tmp_path, monkeypatch):
-        """Two ChatSession instances never collide on the same plan file."""
-        monkeypatch.chdir(tmp_path)
-        s1 = _make_session()
-        s2 = _make_session()
-        assert s1._ws_id != s2._ws_id
-        self._run_plan(s1, "feature A")
-        self._run_plan(s2, "feature B")
-        files = list(tmp_path.glob(".plan-*.md"))
-        assert len(files) == 2
-
-    def _seed_prior_plan(self, session, prior_prompt, prior_content):
-        """Simulate a completed plan tool call in session.messages."""
-        tc_id = "call_prior_plan"
-        session.messages.append(
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": tc_id,
-                        "type": "function",
-                        "function": {
-                            "name": "plan_agent",
-                            "arguments": json.dumps({"goal": prior_prompt}),
-                        },
-                    }
-                ],
-            }
-        )
-        session.messages.append(
-            {
-                "role": "tool",
-                "tool_call_id": tc_id,
-                "content": prior_content,
-            }
-        )
-
-    def test_no_prior_plan_no_extra_messages(self, tmp_db, tmp_path, monkeypatch):
-        """First invocation: no prior plan in history, agent gets no tool pair."""
-        monkeypatch.chdir(tmp_path)
-        session = _make_session()
-        _, _, messages = self._run_plan(session, "build something")
-        roles = [m["role"] for m in messages]
-        assert "tool" not in roles
-
-    def test_prior_plan_from_messages_injected(self, tmp_db, tmp_path, monkeypatch):
-        """Second invocation: prior plan from session.messages arrives as real tool result."""
-        monkeypatch.chdir(tmp_path)
-        session = _make_session()
-        self._seed_prior_plan(session, "build feature X", "## Goal\n\nOriginal plan.")
-
-        _, _, messages = self._run_plan(session, "also handle edge case Y")
-
-        # The real assistant tool_calls message is forwarded
-        assistant_with_tc = [
-            m for m in messages if m["role"] == "assistant" and m.get("tool_calls")
-        ]
-        assert len(assistant_with_tc) == 1
-        assert assistant_with_tc[0]["tool_calls"][0]["function"]["name"] == "plan_agent"
-
-        # The real tool result is forwarded with its original content
-        tool_msgs = [m for m in messages if m["role"] == "tool"]
-        assert len(tool_msgs) == 1
-        assert "Original plan." in tool_msgs[0]["content"]
-
-    def test_prior_plan_appears_before_user_prompt(self, tmp_db, tmp_path, monkeypatch):
-        """The prior plan tool pair appears before the new user prompt."""
-        monkeypatch.chdir(tmp_path)
-        session = _make_session()
-        self._seed_prior_plan(session, "original", "Old plan.")
-
-        _, _, messages = self._run_plan(session, "refinement prompt")
-
-        tool_idx = next(i for i, m in enumerate(messages) if m["role"] == "tool")
-        user_idx = next(i for i, m in enumerate(messages) if m["role"] == "user")
-        assert tool_idx < user_idx
-
-    def test_exec_plan_returns_content(self, tmp_db, tmp_path, monkeypatch):
-        """_exec_plan returns (call_id, agent_output)."""
-        monkeypatch.chdir(tmp_path)
-        session = _make_session()
-        call_id, content, _ = self._run_plan(session, "do stuff")
-        assert call_id == "test-call-1"
-        assert content == self._VALID_PLAN
-
-    def test_exec_plan_retries_on_garbage(self, tmp_db, tmp_path, monkeypatch):
-        """When _run_agent returns garbage, _exec_plan retries once."""
-        monkeypatch.chdir(tmp_path)
-        session = _make_session()
-        good_plan = (
-            "## Goal\n\nAdd feature X.\n\n"
-            "## Current State\n\nFile foo.py has bar().\n\n"
-            "## Plan\n\n1. Edit foo.py:bar()\n\n"
-            "## Risks\n\nNone."
-        )
-        call_count = 0
-
-        def fake_run_agent(messages, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return "Sure, do the thing."
-            return good_plan
-
-        item = {"call_id": "c1", "prompt": "add feature X"}
-        with patch.object(session, "_run_agent", side_effect=fake_run_agent):
-            _, content = session._exec_plan(item)
-
-        assert call_count == 2
-        assert "## Goal" in content
-
-    def test_exec_plan_warning_on_double_failure(self, tmp_db, tmp_path, monkeypatch):
-        """When both attempts produce garbage, content gets a warning prefix."""
-        monkeypatch.chdir(tmp_path)
-        session = _make_session()
-
-        def fake_run_agent(messages, **kwargs):
-            return "nope"
-
-        item = {"call_id": "c1", "prompt": "add feature X"}
-        with patch.object(session, "_run_agent", side_effect=fake_run_agent):
-            _, content = session._exec_plan(item)
-
-        assert content.startswith("[Warning:")
-
-    def test_retry_continues_agent_conversation(self, tmp_db, tmp_path, monkeypatch):
-        """Retry appends coaching to the same agent_messages list."""
-        monkeypatch.chdir(tmp_path)
-        session = _make_session()
-        captured_messages: list[list] = []
-
-        def fake_run_agent(messages, **kwargs):
-            captured_messages.append(list(messages))
-            if len(captured_messages) == 1:
-                return "garbage"
-            return (
-                "## Goal\n\nDone.\n\n## Current State\n\nx\n\n## Plan\n\n1. x\n\n## Risks\n\nNone."
-            )
-
-        item = {"call_id": "c1", "prompt": "add feature X"}
-        with patch.object(session, "_run_agent", side_effect=fake_run_agent):
-            session._exec_plan(item)
-
-        assert len(captured_messages) == 2
-        # Second call should have more messages (coaching appended)
-        assert len(captured_messages[1]) > len(captured_messages[0])
-        # Last user message in second call is the coaching message
-        assert "did not follow" in captured_messages[1][-1]["content"]
-
-    def test_plan_includes_skill_content(self, tmp_db, tmp_path, monkeypatch):
-        """Plan agent system message includes skill guardrails."""
-        monkeypatch.chdir(tmp_path)
-        session = _make_session()
-        session._skill_content = "SAFETY: Do not produce harmful plans."
-        _, _, messages = self._run_plan(session, "build something")
-        sys_content = messages[0]["content"]
-        assert "SAFETY: Do not produce harmful plans." in sys_content
-        assert ChatSession._PLAN_IDENTITY in sys_content
-        # Skill content appears before plan identity
-        tpl_pos = sys_content.index("SAFETY:")
-        identity_pos = sys_content.index(ChatSession._PLAN_IDENTITY)
-        assert tpl_pos < identity_pos
-
-    def test_plan_no_skill_is_identity_only(self, tmp_db, tmp_path, monkeypatch):
-        """Without skills, plan system message is exactly _PLAN_IDENTITY."""
-        monkeypatch.chdir(tmp_path)
-        session = _make_session()
-        assert session._skill_content is None
-        _, _, messages = self._run_plan(session, "build something")
-        assert messages[0]["content"] == ChatSession._PLAN_IDENTITY
 
 
 # ---------------------------------------------------------------------------
@@ -711,12 +483,12 @@ class TestTaskExec:
 
 
 # ---------------------------------------------------------------------------
-# Per-call model override on plan_agent / task_agent
+# Per-call model override on task_agent
 # ---------------------------------------------------------------------------
 
 
 class TestAgentModelOverride:
-    """Tests for the optional `model` arg on plan_agent / task_agent tools."""
+    """Tests for the optional `model` arg on the task_agent tool."""
 
     @staticmethod
     def _registry():
@@ -730,77 +502,6 @@ class TestAgentModelOverride:
             },
             default="default",
         )
-
-    # ---- _prepare_plan ----
-
-    def test_prepare_plan_extracts_model_override(self, tmp_db) -> None:
-        session = _make_session(registry=self._registry(), model_alias="default")
-        item = session._prepare_plan("c1", {"goal": "do x", "model": "smart"})
-        assert item["model_override"] == "smart"
-        assert "error" not in item
-
-    def test_prepare_plan_missing_model_arg_means_no_override(self, tmp_db) -> None:
-        session = _make_session(registry=self._registry(), model_alias="default")
-        item = session._prepare_plan("c1", {"goal": "do x"})
-        assert item["model_override"] is None
-
-    def test_prepare_plan_empty_string_model_means_no_override(self, tmp_db) -> None:
-        # LLMs sometimes echo "" rather than omit the field; treat as unset.
-        session = _make_session(registry=self._registry(), model_alias="default")
-        item = session._prepare_plan("c1", {"goal": "do x", "model": ""})
-        assert item["model_override"] is None
-
-    def test_prepare_plan_unknown_model_returns_error(self, tmp_db) -> None:
-        session = _make_session(registry=self._registry(), model_alias="default")
-        item = session._prepare_plan("c1", {"goal": "do x", "model": "bogus"})
-        assert item.get("needs_approval") is False
-        assert "error" in item
-        assert "unknown model alias 'bogus'" in item["error"]
-        # Error guidance lists the aliases the LLM may retry, intentionally
-        # excluding ``default`` — that alias is operator-only (see
-        # ``test_prepare_plan_default_model_rejected``).  Surfacing it here
-        # would re-enable the per-role-override bypass even though the
-        # tool description hides it.
-        for alias in ("smart", "fast"):
-            assert alias in item["error"]
-        assert "default" not in item["error"]
-
-    def test_prepare_plan_default_model_rejected(self, tmp_db) -> None:
-        """``model="default"`` is rejected even when the alias exists in
-        the registry — bypasses the operator-configured ``plan_alias``."""
-        session = _make_session(registry=self._registry(), model_alias="default")
-        item = session._prepare_plan("c1", {"goal": "do x", "model": "default"})
-        assert item.get("needs_approval") is False
-        assert "error" in item
-        assert "'default' is not a selectable model alias" in item["error"]
-        assert "Omit `model=`" in item["error"]
-
-    def test_prepare_plan_default_model_rejected_with_whitespace(self, tmp_db) -> None:
-        """The ``default`` rejection runs after ``strip()`` so leading/
-        trailing whitespace can't sneak the alias past the carve-out."""
-        session = _make_session(registry=self._registry(), model_alias="default")
-        item = session._prepare_plan("c1", {"goal": "do x", "model": "  default  "})
-        assert item.get("needs_approval") is False
-        assert "'default' is not a selectable model alias" in item["error"]
-
-    def test_prepare_plan_unknown_model_with_only_default_in_registry(self, tmp_db) -> None:
-        """When the registry holds only the reserved ``default`` alias
-        (single-CLI-model back-compat), the unknown-alias error must say
-        '(no alternative aliases configured — omit `model=`)' — not the
-        misleading '(no registry configured)' that suggests routing isn't
-        wired up at all."""
-        from turnstone.core.model_registry import ModelConfig, ModelRegistry
-
-        reg = ModelRegistry(
-            models={"default": ModelConfig("default", "x", "x", "m")},
-            default="default",
-        )
-        session = _make_session(registry=reg, model_alias="default")
-        item = session._prepare_plan("c1", {"goal": "do x", "model": "bogus"})
-        assert item.get("needs_approval") is False
-        assert "unknown model alias 'bogus'" in item["error"]
-        assert "no alternative aliases configured" in item["error"]
-        assert "no registry configured" not in item["error"]
 
     # ---- _prepare_task ----
 
@@ -823,8 +524,10 @@ class TestAgentModelOverride:
         assert "default" not in item["error"]
 
     def test_prepare_task_default_model_rejected(self, tmp_db) -> None:
-        """Symmetric carve-out for task_agent — see
-        ``test_prepare_plan_default_model_rejected``."""
+        """``model="default"`` is rejected even when the alias exists in the
+        registry — passing it explicitly would bypass the operator-configured
+        per-role ``task_alias``. The LLM should reach the default by omitting
+        ``model=`` instead."""
         session = _make_session(registry=self._registry(), model_alias="default")
         item = session._prepare_task("c1", {"prompt": "do x", "model": "default"})
         assert item.get("needs_approval") is False
@@ -834,7 +537,7 @@ class TestAgentModelOverride:
 
     @staticmethod
     def _agent_tool(session, name):
-        """Return the plan_agent / task_agent dict from the main tool set."""
+        """Return the task_agent dict from the main tool set."""
         for t in session._tools:
             fn = t.get("function") or {}
             if fn.get("name") == name:
@@ -843,22 +546,21 @@ class TestAgentModelOverride:
 
     def test_render_injects_alias_list_into_descriptions(self, tmp_db) -> None:
         session = _make_session(registry=self._registry(), model_alias="default")
-        for name in ("plan_agent", "task_agent"):
-            tool = self._agent_tool(session, name)
-            assert tool is not None, f"{name} missing from session tools"
-            desc = tool["function"]["parameters"]["properties"]["model"]["description"]
-            for alias in ("smart", "fast"):
-                assert f"`{alias}`" in desc, f"alias {alias} missing from {desc!r}"
-            # ``default`` is intentionally hidden — see
-            # ``test_render_omits_default_alias_from_description``.
-            assert "`default`" not in desc
+        tool = self._agent_tool(session, "task_agent")
+        assert tool is not None, "task_agent missing from session tools"
+        desc = tool["function"]["parameters"]["properties"]["model"]["description"]
+        for alias in ("smart", "fast"):
+            assert f"`{alias}`" in desc, f"alias {alias} missing from {desc!r}"
+        # ``default`` is intentionally hidden — see
+        # ``test_render_omits_default_alias_from_description``.
+        assert "`default`" not in desc
 
     def test_render_no_op_without_registry(self, tmp_db) -> None:
         """No registry → leave the placeholder description untouched."""
         session = _make_session()  # no registry
-        plan_tool = self._agent_tool(session, "plan_agent")
-        assert plan_tool is not None
-        desc = plan_tool["function"]["parameters"]["properties"]["model"]["description"]
+        task_tool = self._agent_tool(session, "task_agent")
+        assert task_tool is not None
+        desc = task_tool["function"]["parameters"]["properties"]["model"]["description"]
         assert "No alternative aliases configured" in desc
 
     def test_refresh_picks_up_new_aliases(self, tmp_db) -> None:
@@ -877,9 +579,9 @@ class TestAgentModelOverride:
 
         session.refresh_agent_tool_schemas()
 
-        plan_tool = self._agent_tool(session, "plan_agent")
-        assert plan_tool is not None
-        desc = plan_tool["function"]["parameters"]["properties"]["model"]["description"]
+        task_tool = self._agent_tool(session, "task_agent")
+        assert task_tool is not None
+        desc = task_tool["function"]["parameters"]["properties"]["model"]["description"]
         assert "`bigboi`" in desc
 
     def test_render_omits_default_alias_from_description(self, tmp_db) -> None:
@@ -901,13 +603,12 @@ class TestAgentModelOverride:
             default="default",
         )
         session = _make_session(registry=reg, model_alias="default")
-        for name in ("plan_agent", "task_agent"):
-            tool = self._agent_tool(session, name)
-            assert tool is not None
-            desc = tool["function"]["parameters"]["properties"]["model"]["description"]
-            assert "`gh200`" in desc
-            assert "`opus-4.7`" in desc
-            assert "`default`" not in desc
+        tool = self._agent_tool(session, "task_agent")
+        assert tool is not None
+        desc = tool["function"]["parameters"]["properties"]["model"]["description"]
+        assert "`gh200`" in desc
+        assert "`opus-4.7`" in desc
+        assert "`default`" not in desc
 
     def test_render_falls_back_to_base_when_only_default_alias(self, tmp_db) -> None:
         """Single-CLI-model registries (only ``default`` in registry) leave
@@ -920,9 +621,9 @@ class TestAgentModelOverride:
             default="default",
         )
         session = _make_session(registry=reg, model_alias="default")
-        plan_tool = self._agent_tool(session, "plan_agent")
-        assert plan_tool is not None
-        desc = plan_tool["function"]["parameters"]["properties"]["model"]["description"]
+        task_tool = self._agent_tool(session, "task_agent")
+        assert task_tool is not None
+        desc = task_tool["function"]["parameters"]["properties"]["model"]["description"]
         assert "No alternative aliases configured" in desc
 
     def test_refresh_into_only_default_resets_to_base(self, tmp_db) -> None:
@@ -941,9 +642,9 @@ class TestAgentModelOverride:
         )
         session = _make_session(registry=reg, model_alias="default")
         # Sanity: initial render carries the non-default aliases.
-        plan_tool = self._agent_tool(session, "plan_agent")
-        assert plan_tool is not None
-        desc = plan_tool["function"]["parameters"]["properties"]["model"]["description"]
+        task_tool = self._agent_tool(session, "task_agent")
+        assert task_tool is not None
+        desc = task_tool["function"]["parameters"]["properties"]["model"]["description"]
         assert "`smart`" in desc and "`fast`" in desc
 
         # Reload the registry down to only ``default`` (admin removed
@@ -951,9 +652,9 @@ class TestAgentModelOverride:
         reg.reload({"default": ModelConfig("default", "x", "x", "m")}, "default")
         session.refresh_agent_tool_schemas()
 
-        plan_tool = self._agent_tool(session, "plan_agent")
-        assert plan_tool is not None
-        desc = plan_tool["function"]["parameters"]["properties"]["model"]["description"]
+        task_tool = self._agent_tool(session, "task_agent")
+        assert task_tool is not None
+        desc = task_tool["function"]["parameters"]["properties"]["model"]["description"]
         assert "`smart`" not in desc, f"stale alias survived reload: {desc!r}"
         assert "`fast`" not in desc, f"stale alias survived reload: {desc!r}"
         assert "No alternative aliases configured" in desc
@@ -968,327 +669,12 @@ class TestAgentModelOverride:
 
         for t in TOOLS:
             fn = t.get("function") or {}
-            if fn.get("name") not in ("plan_agent", "task_agent"):
+            if fn.get("name") != "task_agent":
                 continue
             desc = fn["parameters"]["properties"]["model"]["description"]
             assert "No alternative aliases configured" in desc, (
                 f"module-level {fn['name']} description was mutated to: {desc!r}"
             )
-
-
-# ---------------------------------------------------------------------------
-# man tool
-# ---------------------------------------------------------------------------
-
-
-class TestPrepareMan:
-    """``ChatSession._prepare_man`` argument parsing."""
-
-    def test_plain_page(self, tmp_db) -> None:
-        session = _make_session()
-        item = session._prepare_man("c1", {"page": "grep"})
-        assert "error" not in item
-        assert item["page"] == "grep"
-        assert item["section"] == ""
-
-    def test_explicit_section_arg(self, tmp_db) -> None:
-        session = _make_session()
-        item = session._prepare_man("c1", {"page": "printf", "section": "3"})
-        assert "error" not in item
-        assert item["page"] == "printf"
-        assert item["section"] == "3"
-
-    def test_parenthesized_section_in_page(self, tmp_db) -> None:
-        # Models commonly emit canonical man-page notation; we should
-        # parse the section out instead of rejecting the call.
-        session = _make_session()
-        item = session._prepare_man("c1", {"page": "printf(3)"})
-        assert "error" not in item
-        assert item["page"] == "printf"
-        assert item["section"] == "3"
-        assert "printf(3)" in item["header"]
-
-    def test_parenthesized_section_with_letter_suffix(self, tmp_db) -> None:
-        session = _make_session()
-        item = session._prepare_man("c1", {"page": "perlfunc(3pm)"})
-        assert "error" not in item
-        assert item["page"] == "perlfunc"
-        assert item["section"] == "3pm"
-
-    def test_explicit_section_arg_wins_over_parsed(self, tmp_db) -> None:
-        session = _make_session()
-        item = session._prepare_man("c1", {"page": "open(2)", "section": "3"})
-        assert "error" not in item
-        assert item["page"] == "open"
-        assert item["section"] == "3"
-
-    def test_invalid_section_in_parens_falls_through_to_error(self, tmp_db) -> None:
-        # Parens that don't match the section pattern aren't parsed away,
-        # so the page-name sanitizer rejects the literal string.
-        session = _make_session()
-        item = session._prepare_man("c1", {"page": "grep(bogus)"})
-        assert "error" in item
-        assert "invalid page name" in item["error"]
-
-    def test_empty_page(self, tmp_db) -> None:
-        session = _make_session()
-        item = session._prepare_man("c1", {"page": ""})
-        assert "error" in item
-        assert "no page name" in item["error"]
-
-    def test_parsed_section_reaches_subprocess_argv(self, tmp_db) -> None:
-        # End-to-end check that page="printf(3)" produces the right
-        # ``man`` argv — guards against future drift between
-        # ``_prepare_man``'s output keys and ``_exec_man``'s reads.
-        session = _make_session()
-        item = session._prepare_man("c1", {"page": "printf(3)"})
-        completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="MAN PAGE TEXT", stderr=""
-        )
-        with patch("subprocess.run", return_value=completed) as mock_run:
-            session._exec_man(item)
-        argv = mock_run.call_args_list[0].args[0]
-        assert argv == ["man", "3", "printf"]
-
-
-# ---------------------------------------------------------------------------
-# Plan validation
-# ---------------------------------------------------------------------------
-
-
-class TestPlanValidation:
-    """Tests for ChatSession._validate_plan quality gate."""
-
-    GOOD_PLAN = (
-        "## Goal\n\nAdd authentication to the API.\n\n"
-        "## Current State\n\nFile server.py:45 has no auth middleware.\n\n"
-        "## Plan\n\n1. Add AuthMiddleware to server.py.\n"
-        "2. Create auth.py with JWT verification.\n\n"
-        "## Risks\n\nToken expiry handling may need tuning."
-    )
-
-    def test_valid_plan_passes(self):
-        valid, issues = ChatSession._validate_plan(self.GOOD_PLAN, "add auth")
-        assert valid
-        assert issues == []
-
-    def test_too_short_fails(self):
-        valid, issues = ChatSession._validate_plan("Do the thing.", "do stuff")
-        assert not valid
-        assert any("too short" in i for i in issues)
-
-    def test_no_sections_fails(self):
-        content = "A" * 150  # long enough but no sections
-        valid, issues = ChatSession._validate_plan(content, "build it")
-        assert not valid
-        assert any("missing plan sections" in i for i in issues)
-
-    def test_echo_detection(self):
-        goal = "deliver a simpsons quote from a specific episode"
-        content = "Deliver a Simpsons quote from a specific episode"
-        valid, issues = ChatSession._validate_plan(content, goal)
-        assert not valid
-        assert any("echo" in i for i in issues)
-
-    def test_refusal_detection(self):
-        content = "I cannot create a plan for this task because " + "x" * 100
-        valid, issues = ChatSession._validate_plan(content, "do stuff")
-        assert not valid
-        assert any("refusal" in i for i in issues)
-
-    def test_partial_sections_passes(self):
-        """2 out of 4 sections is enough to pass."""
-        content = (
-            "## Goal\n\nFix the bug in parsing.\n\n"
-            "## Plan\n\n1. Edit parser.py line 42.\n"
-            "2. Add boundary check.\n"
-            "This is enough detail to proceed with confidence."
-        )
-        valid, issues = ChatSession._validate_plan(content, "fix bug")
-        assert valid
-
-    def test_one_section_fails(self):
-        """Only 1 out of 4 sections is not enough."""
-        content = (
-            "## Goal\n\nFix the bug.\n\n"
-            "We should probably edit parser.py and add some checks "
-            "to the boundary handling code path for safety."
-        )
-        valid, issues = ChatSession._validate_plan(content, "fix bug")
-        assert not valid
-        assert any("missing plan sections" in i for i in issues)
-
-
-# ---------------------------------------------------------------------------
-# Plan refinement loop
-# ---------------------------------------------------------------------------
-
-
-class TestPlanRefinement:
-    """Tests for the iterative plan refinement loop in _execute_tools."""
-
-    GOOD_PLAN = TestPlanValidation.GOOD_PLAN
-
-    def test_feedback_triggers_refinement(self, tmp_db, tmp_path, monkeypatch):
-        """User feedback causes _refine_plan to run, then approval exits."""
-        monkeypatch.chdir(tmp_path)
-        session = _make_session()
-        refine_called = []
-
-        review_responses = iter(["add error handling", ""])
-        session.ui = MagicMock(spec_set=NullUI)
-        session.ui.on_plan_review.side_effect = lambda c: next(review_responses)
-        session.ui.on_info = MagicMock()
-        session.ui.on_state_change = MagicMock()
-
-        revised = self.GOOD_PLAN + "\n\n3. Add error handling."
-
-        def fake_refine(content, goal, feedback):
-            refine_called.append(feedback)
-            return revised
-
-        with patch.object(session, "_refine_plan", side_effect=fake_refine):
-            items = [
-                {
-                    "func_name": "plan_agent",
-                    "call_id": "c1",
-                    "prompt": "add auth",
-                }
-            ]
-            results = [("c1", self.GOOD_PLAN)]
-            # Manually invoke the post-plan gate portion of _execute_tools.
-            # We test the loop by calling the gate code directly.
-            session.auto_approve = False
-
-            original_goal = items[0].get("prompt", "")
-            output = results[0][1]
-            refinement_round = 0
-            while refinement_round < session._MAX_PLAN_REFINEMENTS:
-                resp = session.ui.on_plan_review(output)
-                if resp.lower() in ("n", "no", "reject"):
-                    break
-                elif resp:
-                    output = session._refine_plan(output, original_goal, resp)
-                    refinement_round += 1
-                else:
-                    break
-
-        assert len(refine_called) == 1
-        assert refine_called[0] == "add error handling"
-        assert "error handling" in output
-
-    def test_reject_skips_refinement(self, tmp_db, tmp_path, monkeypatch):
-        """Rejection exits immediately without calling _refine_plan."""
-        monkeypatch.chdir(tmp_path)
-        session = _make_session()
-        session.ui = MagicMock(spec_set=NullUI)
-        session.ui.on_plan_review.return_value = "reject"
-
-        with patch.object(session, "_refine_plan") as mock_refine:
-            output = self.GOOD_PLAN
-            resp = session.ui.on_plan_review(output)
-            if resp.lower() in ("n", "no", "reject"):
-                output += "\n\n---\nUser REJECTED"
-            elif resp:
-                output = session._refine_plan(output, "g", resp)
-
-        mock_refine.assert_not_called()
-        assert "REJECTED" in output
-
-    def test_approve_skips_refinement(self, tmp_db, tmp_path, monkeypatch):
-        """Empty response (enter) approves without refinement."""
-        monkeypatch.chdir(tmp_path)
-        session = _make_session()
-        session.ui = MagicMock(spec_set=NullUI)
-        session.ui.on_plan_review.return_value = ""
-
-        with patch.object(session, "_refine_plan") as mock_refine:
-            output = self.GOOD_PLAN
-            resp = session.ui.on_plan_review(output)
-            if resp.lower() in ("n", "no", "reject"):
-                output += "\n\n---\nUser REJECTED"
-            elif resp:
-                output = session._refine_plan(output, "g", resp)
-
-        mock_refine.assert_not_called()
-        assert "REJECTED" not in output
-
-    def test_max_refinement_rounds(self, tmp_db, tmp_path, monkeypatch):
-        """Loop stops after _MAX_PLAN_REFINEMENTS rounds with a final review."""
-        monkeypatch.chdir(tmp_path)
-        session = _make_session()
-        session.ui = MagicMock(spec_set=NullUI)
-        session.ui.on_plan_review.return_value = "more detail please"
-        session.ui.on_info = MagicMock()
-
-        refine_count = 0
-
-        def fake_refine(content, goal, feedback):
-            nonlocal refine_count
-            refine_count += 1
-            return content + f"\n(revision {refine_count})"
-
-        with patch.object(session, "_refine_plan", side_effect=fake_refine):
-            output = self.GOOD_PLAN
-            original_goal = "add auth"
-            refinement_round = 0
-            while True:
-                resp = session.ui.on_plan_review(output)
-                if (
-                    resp.lower() in ("n", "no", "reject")
-                    or not resp
-                    or refinement_round >= session._MAX_PLAN_REFINEMENTS
-                ):
-                    break
-                output = session._refine_plan(output, original_goal, resp)
-                refinement_round += 1
-
-        assert refine_count == session._MAX_PLAN_REFINEMENTS
-        # User gets one extra review call after max rounds (the final prompt)
-        assert session.ui.on_plan_review.call_count == session._MAX_PLAN_REFINEMENTS + 1
-
-    def test_refine_plan_message_structure(self, tmp_db, tmp_path, monkeypatch):
-        """_refine_plan passes system + prior plan + feedback to _run_agent."""
-        monkeypatch.chdir(tmp_path)
-        session = _make_session()
-        captured = {}
-
-        def fake_run_agent(messages, **kwargs):
-            captured["messages"] = list(messages)
-            return self.GOOD_PLAN
-
-        with patch.object(session, "_run_agent", side_effect=fake_run_agent):
-            session._refine_plan(self.GOOD_PLAN, "add auth", "add tests too")
-
-        msgs = captured["messages"]
-        assert msgs[0]["role"] == "system"
-        assert msgs[1]["role"] == "assistant"
-        assert msgs[1]["tool_calls"][0]["function"]["name"] == "plan_agent"
-        assert msgs[2]["role"] == "tool"
-        assert msgs[2]["content"] == self.GOOD_PLAN
-        assert msgs[3]["role"] == "user"
-        assert "add tests too" in msgs[3]["content"]
-
-    def test_refine_plan_includes_skill_content(self, tmp_db, tmp_path, monkeypatch):
-        """_refine_plan system message includes skill guardrails."""
-        monkeypatch.chdir(tmp_path)
-        session = _make_session()
-        session._skill_content = "SAFETY: guardrails here"
-        captured = {}
-
-        def fake_run_agent(messages, **kwargs):
-            captured["messages"] = list(messages)
-            return self.GOOD_PLAN
-
-        with patch.object(session, "_run_agent", side_effect=fake_run_agent):
-            session._refine_plan(self.GOOD_PLAN, "add auth", "add tests too")
-
-        sys_content = captured["messages"][0]["content"]
-        assert "SAFETY: guardrails here" in sys_content
-        assert ChatSession._PLAN_IDENTITY in sys_content
-        tpl_pos = sys_content.index("SAFETY:")
-        identity_pos = sys_content.index(ChatSession._PLAN_IDENTITY)
-        assert tpl_pos < identity_pos
 
 
 # ---------------------------------------------------------------------------

@@ -16,7 +16,6 @@
     },
     "required": ["name"]
   },
-  "agent": true,
   "task_agent": true,
   "auto_approve": false,
   "primary_key": "name"

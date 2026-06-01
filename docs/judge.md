@@ -125,7 +125,7 @@ last) and returns the first matching rule. Each rule has:
 | Critical | 0.90      | deny           | `rm -rf /`, `mkfs`, `dd if=`, pipe-to-shell, chmod 777 on root, write/edit to `/etc/` or `.ssh/`, download-then-execute chains (`curl -o file && chmod +x && bash`) |
 | High     | 0.80      | review         | `sudo`, `kill -9`, destructive git, DROP TABLE, write/edit secrets, HTTP mutations, `ssh`/`scp`, credential file access, browser automation + data export, transitive installs (`npx skills add`, `pip install git+`), control plane mutations (`crontab`, `systemctl enable/start/stop`) |
 | Medium   | 0.70      | review         | Content ingestion pipelines (`curl \| python3`), interpreter execution (`python3 script.py`, `node build.js`), cloud CLI mutations (`az/gcloud/aws/kubectl/terraform` with create/delete/destroy verbs), package installs, `write_file`, MCP tools, Docker operations |
-| Low      | 0.85      | approve        | `read_file`, `list_directory`, `search`, `recall`, `man`, `use_prompt`, `tool_search`, `read_resource`, `web_search`, read-only bash (`ls`, `cat`, `head`, `grep`, `find`, etc.) |
+| Low      | 0.85      | approve        | `read_file`, `list_directory`, `search`, `recall`, `use_prompt`, `tool_search`, `read_resource`, `web_search`, read-only bash (`ls`, `cat`, `head`, `grep`, `find`, etc.) |
 
 When no rule matches, the heuristic returns a default verdict: medium risk,
 0.50 confidence, "review" recommendation.

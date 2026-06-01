@@ -661,14 +661,6 @@ class TestSessionIntegration:
         session = self._make_session(mcp_client=mock_mcp)
         assert len(session._task_tools) == len(TASK_AGENT_TOOLS) + 1
 
-    def test_agent_tools_include_mcp(self, tmp_db):
-        from turnstone.core.tools import AGENT_TOOLS
-
-        mock_mcp = MagicMock()
-        mock_mcp.get_tools.return_value = [_fake_openai_tool()]
-        session = self._make_session(mcp_client=mock_mcp)
-        assert len(session._agent_tools) == len(AGENT_TOOLS) + 1
-
     def test_prepare_mcp_tool(self, tmp_db):
         mock_mcp = MagicMock()
         mock_mcp.get_tools.return_value = [_fake_openai_tool()]

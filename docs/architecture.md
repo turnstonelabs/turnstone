@@ -3,8 +3,8 @@
 Turnstone is an AI orchestration platform with tool use, parallel workstreams, and persistent
 memory. It connects to any OpenAI-compatible API (local vLLM, OpenAI, etc.) or
 Anthropic's native Messages API via pluggable provider adapters, and gives the
-model 19 built-in tools plus external tools via MCP (Model Context Protocol) for
-reading, writing, searching, planning, and executing code.
+model 16 built-in tools plus external tools via MCP (Model Context Protocol) for
+reading, writing, searching, and executing code.
 
 The core design principle is a **UI-agnostic engine with pluggable frontends**.
 The engine (`ChatSession`) drives the conversation loop -- streaming, tool
@@ -61,7 +61,6 @@ turnstone/
     ratelimit.py      Per-IP token-bucket rate limiter (RateLimiter, TokenBucket)
     edit.py           File edit utilities (find_occurrences, pick_nearest)
     safety.py         Command safety validation (blocked patterns, sanitization)
-    sandbox.py        Math code sandboxing (AST validation, subprocess execution)
     web.py            Web utilities (HTML stripping, SSRF prevention)
   api/
     schemas.py        Shared Pydantic v2 models (auth, errors, WorkstreamState)
@@ -102,7 +101,7 @@ turnstone/
       renderer.js     Markdown + LaTeX renderer (tables, nested lists, blockquotes, KaTeX math)
       app.js          Split-pane UI (Pane class, binary layout tree, SSE, tool approval)
   tools/
-    *.json            19 tool schemas (OpenAI function-calling format + turnstone metadata)
+    *.json            16 tool schemas (OpenAI function-calling format + turnstone metadata)
 ```
 
 Both UIs share a common design system extracted into `turnstone/shared_static/`: design tokens, login overlay, toast notifications, theme toggle, keyboard shortcuts, and utility functions. Each UI imports `base.css` and the shared JS modules at `/shared/`, then adds only page-specific code at `/static/`.
@@ -190,7 +189,6 @@ Phase 3: EXECUTE (parallel)
     (cancel_event also checked per line — kills process group on cancel)
   Final output (stdout + stderr) delivered via ui.on_tool_result(call_id, name, output)
   call_id links tool_info items → streaming chunks → final result
-  For plan tool: post-execution gate via ui.on_plan_review()
 ```
 
 ### State Transitions
@@ -209,7 +207,7 @@ The engine emits state changes via `_emit_state()` which calls
   "running"   --->  tool execution
       |
       v
-  "attention"  --->  waiting for user approval / plan review
+  "attention"  --->  waiting for user approval
       |
       v
   "running"   --->  executing approved tools
@@ -231,7 +229,7 @@ The engine emits state changes via `_emit_state()` which calls
 
 > See also: [Core Engine Classes diagram](diagrams/png/03-core-engine-classes.png)
 
-Defined in `turnstone.core.session.SessionUI` as a `typing.Protocol` with 16
+Defined in `turnstone.core.session.SessionUI` as a `typing.Protocol` with 15
 methods. Every frontend must implement all of them.
 
 ```python
@@ -247,7 +245,6 @@ class SessionUI(Protocol):
     def on_tool_result(self, call_id: str, name: str, output: str, *, is_error: bool = False) -> None: ...
     def on_tool_output_chunk(self, call_id: str, chunk: str) -> None: ...
     def on_status(self, usage: dict, context_window: int, effort: str) -> None: ...
-    def on_plan_review(self, content: str) -> str: ...
     def on_info(self, message: str) -> None: ...
     def on_error(self, message: str) -> None: ...
     def on_state_change(self, state: str) -> None: ...
@@ -269,7 +266,7 @@ the per-workstream events stream in
 | Class | Module | Notes |
 |-------|--------|-------|
 | `TerminalUI` | `turnstone.cli` | ANSI colors, `MarkdownRenderer`, `Spinner`, readline-based `input()` for approval |
-| `WebUI` | `turnstone.server` | SSE event queue per workstream + global broadcast, `threading.Event` for blocking on approval/plan. `on_state_change` sends to both per-workstream and global SSE (the browser UI uses per-workstream `state_change` events to manage busy/idle transitions; `stream_end` only finalizes markdown rendering). |
+| `WebUI` | `turnstone.server` | SSE event queue per workstream + global broadcast, `threading.Event` for blocking on approval. `on_state_change` sends to both per-workstream and global SSE (the browser UI uses per-workstream `state_change` events to manage busy/idle transitions; `stream_end` only finalizes markdown rendering). |
 | `NullUI` | `turnstone.eval` | Discards all output; `approve_tools` always returns `(True, None)` |
 
 ### WorkstreamTerminalUI
@@ -281,10 +278,9 @@ awareness:
   are appended to `_output_buffer` instead of written to stdout. When the user
   switches to this workstream, `flush_buffer()` replays them.
 
-- **Approval blocking**: `approve_tools()` and `on_plan_review()` call
-  `_fg_event.wait()` when in background, blocking the worker thread until the
-  workstream is foregrounded. This ensures the user sees the approval prompt
-  in the correct context.
+- **Approval blocking**: `approve_tools()` calls `_fg_event.wait()` when in
+  background, blocking the worker thread until the workstream is foregrounded.
+  This ensures the user sees the approval prompt in the correct context.
 
 - **Foreground/background toggle**: `set_foreground(bool)` sets or clears
   `_fg_event` (a `threading.Event`). The manager calls this during `/ws <N>`
@@ -421,7 +417,6 @@ turnstone metadata keys:
 
 | Metadata Key | Type | Meaning |
 |-------------|------|---------|
-| `agent` | `bool` | Include this tool when running as a plan/task sub-agent |
 | `task_agent` | `bool` | Include this tool when running as a task sub-agent |
 | `auto_approve` | `bool` | Tool is read-only; skip user approval |
 | `primary_key` | `str` | Fallback argument name for bare-string JSON recovery |
@@ -441,7 +436,6 @@ Example (`read_file.json`):
     },
     "required": ["path"]
   },
-  "agent": true,
   "task_agent": true,
   "auto_approve": true,
   "primary_key": "path"
@@ -452,19 +446,17 @@ At import time, `turnstone.core.tools._load_tools()` strips the metadata keys
 from each schema and builds:
 
 - `TOOLS` -- list of `{"type": "function", "function": {...}}` dicts for the API
-- `AGENT_TOOLS` -- subset with `agent: true`
 - `TASK_AGENT_TOOLS` -- subset with `task_agent: true`
-- `AGENT_AUTO_TOOLS` / `TASK_AUTO_TOOLS` -- sets of tool names with `auto_approve: true`
+- `TASK_AUTO_TOOLS` -- set of tool names with `auto_approve: true`
 - `PRIMARY_KEY_MAP` -- `{name: primary_key}` for JSON fallback recovery
 - `merge_mcp_tools(builtin, mcp_tools)` -- merges built-in + MCP tools at session init
 
-### 19 Tools by Category
+### 16 Tools by Category
 
 **Read-only (auto-approve)**:
 - `read_file` -- read file contents with optional offset/limit
 - `diff_file` -- show diff between two files / versions
 - `search` -- ripgrep-based codebase search
-- `man` -- read man pages
 - `recall` -- search conversation history
 - `read_resource` -- read an MCP resource by URI
 
@@ -472,7 +464,6 @@ from each schema and builds:
 - `bash` -- execute shell commands (with safety checks via `turnstone.core.safety`)
 - `write_file` -- create or overwrite a file
 - `edit_file` -- string replacement in an existing file (requires prior `read_file`)
-- `math` -- execute Python in sandboxed subprocess (via `turnstone.core.sandbox`)
 - `web_fetch` -- fetch a URL (with SSRF protection via `turnstone.core.web`)
 - `web_search` -- search the web (provider-native for Anthropic/OpenAI, self-hosted SearxNG fallback for local models)
 - `notify` -- send a user-facing notification (Discord/Slack, optional reply routing)
@@ -480,15 +471,14 @@ from each schema and builds:
 
 **Agent (delegated sub-sessions)**:
 - `task_agent` -- delegate to a sub-agent with full tool access (`TASK_AGENT_TOOLS`)
-- `plan_agent` -- explore codebase and write a structured plan (`AGENT_TOOLS`)
 
 **Memory / skills / prompts**:
 - `memory` -- save, search, delete, or list memories (typed and scoped)
 - `skill` -- invoke a skill (governed, versioned procedure)
 - `use_prompt` -- fetch and apply a prompt template
 
-Tool names are `plan_agent` / `task_agent` (not `plan` / `task`); bare words
-collide with chat-template channels on some local models.
+The tool name uses the `_agent` suffix — bare `task` collides with
+chat-template channels on some local models.
 
 ### Prepare / Execute Pattern
 
@@ -507,17 +497,11 @@ separation allows the UI to show previews before any side effects occur.
 
 ### Agent Tools
 
-`task_agent` and `plan_agent` invoke `_run_agent()`, which runs a multi-turn
-loop with a subset of tools and its own system prompt. The sub-agent runs
-independently, then returns the final content as the tool result.
+`task_agent` invokes `_run_agent()`, which runs a multi-turn loop with a
+subset of tools and its own system prompt. The sub-agent runs independently,
+then returns the final content as the tool result.
 
 - **task_agent**: uses `self._task_tools` (`TASK_AGENT_TOOLS` + MCP tools)
-- **plan_agent**: uses `self._agent_tools` (`AGENT_TOOLS` + MCP tools). Writes output
-  to `.plan-<ws_id>.md` — unique per `ChatSession` so concurrent workstreams
-  don't collide. On repeat invocations the prior `plan_agent` tool call and its result
-  are forwarded from `self.messages` so the agent refines the existing plan rather
-  than starting over. Planning instructions are injected as a developer message
-  prepended to the agent's conversation.
 - **Turn limit**: controlled by `agent_max_turns` (default: `-1`, unlimited).
   When a limit is set and reached, the agent is forced to synthesize a final
   response without tools. When unlimited, the loop only exits when the model
@@ -564,8 +548,8 @@ adds, removes, or reconnects servers as needed.
 
 When tools change, `_rebuild_tools()` creates new `_tools`/`_tool_map` objects
 (copy-on-write for thread safety) and notifies listener callbacks. Each `ChatSession`
-rebuilds its merged tool lists and reconstructs `ToolSearchManager` (preserving
-expanded tools).
+rebuilds its `_tools` and `_task_tools` lists and reconstructs `ToolSearchManager`
+(preserving expanded tools).
 
 **Tool naming:** `mcp__{server}__{tool}` — double underscore delimiter, validated
 at connection time (server names with `__` are rejected).
@@ -803,7 +787,7 @@ with the same alias in-memory (the DB rows are never modified).
    parameters
 6. `_create_stream_with_retry()` tries the primary model, then each fallback
    alias in order if the primary is unreachable
-7. `_run_agent()` resolves `registry.agent_model` (if set) for plan/task
+7. `_run_agent()` resolves `registry.agent_model` (if set) for task
    sub-agents, allowing a cheaper model for autonomous loops
 
 **Per-workstream selection:** `POST /v1/api/workstreams/new` accepts an optional
@@ -812,7 +796,7 @@ which can override the model before workstream creation.
 
 ### Tool Output Truncation
 
-Tool execution results (bash, read_file, search, math, man) are truncated by
+Tool execution results (bash, read_file, search) are truncated by
 `_truncate_output()` when they exceed `tool_truncation` characters. Truncation
 preserves the first half and last half of the output, with a message in
 between:
@@ -1240,7 +1224,6 @@ Starlette ASGI app (served by uvicorn)
   +-- Async request handlers (all under /v1/ prefix)
   |     POST /v1/api/workstreams/{ws_id}/send    -> starts worker thread per workstream
   |     POST /v1/api/workstreams/{ws_id}/approve -> unblocks WebUI._approval_event
-  |     POST /v1/api/plan                        -> unblocks WebUI._plan_event
   |     POST /v1/api/workstreams/new             -> creates workstream + worker
   |     GET  /v1/api/workstreams/{ws_id}/events  -> SSE via EventSourceResponse (per workstream)
   |     GET  /v1/api/events/global               -> SSE via EventSourceResponse (fan-out)
@@ -1250,7 +1233,7 @@ Starlette ASGI app (served by uvicorn)
   |
   +-- Worker thread per workstream (daemon)
   |     Runs session.send() synchronously -- ChatSession is fully blocking
-  |     Blocks on WebUI._approval_event / _plan_event (threading.Event)
+  |     Blocks on WebUI._approval_event (threading.Event)
   |
   +-- Background daemon threads
         Global SSE fan-out: reads global_queue, copies to per-client queues
@@ -1274,7 +1257,7 @@ registry).
 
 Each workstream's `WebUI` has:
 - `_listeners` (per-client SSE queues, fan-out on `_enqueue()`)
-- `_approval_event` / `_plan_event` (`threading.Event` for blocking)
+- `_approval_event` (`threading.Event` for blocking)
 - `_global_queue` (class variable, shared, for state broadcasts)
 
 The SSE handlers bridge these sync queues to async via
@@ -1530,8 +1513,7 @@ implemented in `turnstone/core/judge.py`:
 The judge is session-scoped (`IntentJudge`), lazy-initialized on first
 approval, and configured via the `[judge]` config section or `--judge` CLI
 flags. By default it uses self-consistency (same model), but supports
-cross-model and cross-provider configurations. Sub-agents (plan, task)
-are exempt. All verdicts are persisted to the `intent_verdicts` table
+cross-model and cross-provider configurations. Task sub-agents are exempt. All verdicts are persisted to the `intent_verdicts` table
 (migration 012) with the user's final decision, enabling future calibration.
 The console exposes `GET /v1/api/admin/verdicts` for audit queries
 (requires `admin.judge` permission).

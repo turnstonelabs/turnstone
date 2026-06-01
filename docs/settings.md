@@ -74,20 +74,17 @@ provider-side mechanics (Anthropic `thinking`, OpenAI Responses
 `reasoning` + `include=["reasoning.encrypted_content"]`, synthetic
 `reasoning_text` for Chat Completions / vLLM / llama.cpp / Gemini-compat).
 
-### Plan / task agent overrides
+### Task agent overrides
 
-`plan_agent` and `task_agent` sub-sessions resolve independently from the
-conversation model so operators can pick a cheaper/faster model for
-autonomous loops:
+`task_agent` sub-sessions resolve independently from the conversation model
+so operators can pick a cheaper/faster model for autonomous loops:
 
 | Setting | Purpose |
 |---------|---------|
-| `model.plan_alias` | Alias used for `plan_agent` sub-sessions. Falls back to `[model].plan_model` in config.toml, then `[model].agent_model`, then the session's active model. |
-| `model.task_alias` | Alias used for `task_agent` sub-sessions. Same fallback chain as `plan_alias`. |
-| `model.plan_effort` | Reasoning effort for `plan_agent` (`none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`). Defaults to `high`. |
+| `model.task_alias` | Alias used for `task_agent` sub-sessions. Falls back to `[model].agent_model` in config.toml, then the session's active model. |
 | `model.task_effort` | Reasoning effort for `task_agent`. Empty string means "inherit from the session". |
 
-All four are live-editable from the Settings tab and take effect on the
+Both are live-editable from the Settings tab and take effect on the
 next sub-agent invocation — no restart required.
 
 ---
@@ -110,7 +107,7 @@ initialization:
 
 | Section | Settings |
 |---------|----------|
-| `model` | default_alias, temperature, max_tokens, reasoning_effort, plan_alias, task_alias, plan_effort, task_effort |
+| `model` | default_alias, temperature, max_tokens, reasoning_effort, task_alias, task_effort |
 | `session` | instructions, retention_days, compact_max_tokens, auto_compact_pct |
 | `tools` | timeout, truncation, agent_max_turns, skip_permissions, search, search_threshold, search_max_results |
 | `server` | workstream_idle_timeout, max_workstreams |

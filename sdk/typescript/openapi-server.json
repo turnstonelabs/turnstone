@@ -10,9 +10,7 @@
       "get": {
         "summary": "List active workstreams",
         "operationId": "v1_api_workstreams_get",
-        "tags": [
-          "Workstreams"
-        ],
+        "tags": ["Workstreams"],
         "responses": {
           "200": {
             "description": "Success",
@@ -31,9 +29,7 @@
       "get": {
         "summary": "Dashboard with workstream details and aggregates",
         "operationId": "v1_api_dashboard_get",
-        "tags": [
-          "Workstreams"
-        ],
+        "tags": ["Workstreams"],
         "responses": {
           "200": {
             "description": "Success",
@@ -52,9 +48,7 @@
       "post": {
         "summary": "Create a new workstream",
         "operationId": "v1_api_workstreams_new_post",
-        "tags": [
-          "Workstreams"
-        ],
+        "tags": ["Workstreams"],
         "description": "Accepts two content types. Default is `application/json` with a `CreateWorkstreamRequest` body. Alternatively, `multipart/form-data` with one `meta` field (JSON-encoded `CreateWorkstreamRequest` shape) plus zero-or-more `file` parts saves each file as an attachment under the new workstream. When `initial_message` is also set, attachments are reserved onto that turn before the worker thread dispatches; otherwise they remain pending for a follow-up `POST /v1/api/workstreams/{ws_id}/send`.",
         "requestBody": {
           "required": true,
@@ -114,9 +108,7 @@
       "post": {
         "summary": "Close a workstream",
         "operationId": "v1_api_workstreams_{ws_id}_close_post",
-        "tags": [
-          "Workstreams"
-        ],
+        "tags": ["Workstreams"],
         "parameters": [
           {
             "name": "ws_id",
@@ -175,9 +167,7 @@
       "post": {
         "summary": "Send a user message",
         "operationId": "v1_api_workstreams_{ws_id}_send_post",
-        "tags": [
-          "Chat"
-        ],
+        "tags": ["Chat"],
         "parameters": [
           {
             "name": "ws_id",
@@ -234,9 +224,7 @@
       "delete": {
         "summary": "Cancel a queued message",
         "operationId": "v1_api_workstreams_{ws_id}_send_delete",
-        "tags": [
-          "Chat"
-        ],
+        "tags": ["Chat"],
         "description": "Removes a previously-queued message from the workstream's pending queue. Returns ``status: removed`` when the queue had the entry, ``status: not_found`` otherwise.",
         "parameters": [
           {
@@ -296,9 +284,7 @@
       "post": {
         "summary": "Approve or deny a tool call",
         "operationId": "v1_api_workstreams_{ws_id}_approve_post",
-        "tags": [
-          "Chat"
-        ],
+        "tags": ["Chat"],
         "parameters": [
           {
             "name": "ws_id",
@@ -343,54 +329,11 @@
         }
       }
     },
-    "/v1/api/plan": {
-      "post": {
-        "summary": "Respond to a plan review",
-        "operationId": "v1_api_plan_post",
-        "tags": [
-          "Chat"
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/PlanFeedbackRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StatusResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Error 404",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/v1/api/command": {
       "post": {
         "summary": "Execute a slash command",
         "operationId": "v1_api_command_post",
-        "tags": [
-          "Chat"
-        ],
+        "tags": ["Chat"],
         "requestBody": {
           "required": true,
           "content": {
@@ -439,9 +382,7 @@
       "post": {
         "summary": "Cancel the active generation in a workstream",
         "operationId": "v1_api_workstreams_{ws_id}_cancel_post",
-        "tags": [
-          "Chat"
-        ],
+        "tags": ["Chat"],
         "parameters": [
           {
             "name": "ws_id",
@@ -500,9 +441,7 @@
       "post": {
         "summary": "Drop the last N conversation turns (emits clear_ui)",
         "operationId": "v1_api_workstreams_{ws_id}_rewind_post",
-        "tags": [
-          "Chat"
-        ],
+        "tags": ["Chat"],
         "parameters": [
           {
             "name": "ws_id",
@@ -561,9 +500,7 @@
       "post": {
         "summary": "Drop the last response and re-send the last user message",
         "operationId": "v1_api_workstreams_{ws_id}_retry_post",
-        "tags": [
-          "Chat"
-        ],
+        "tags": ["Chat"],
         "parameters": [
           {
             "name": "ws_id",
@@ -612,9 +549,7 @@
       "get": {
         "summary": "Per-workstream SSE event stream",
         "operationId": "v1_api_workstreams_{ws_id}_events_get",
-        "tags": [
-          "Streaming"
-        ],
+        "tags": ["Streaming"],
         "description": "Opens a Server-Sent Events stream scoped to a single workstream. Returns text/event-stream. See API reference for event types.",
         "parameters": [
           {
@@ -647,9 +582,7 @@
       "get": {
         "summary": "Global SSE event stream",
         "operationId": "v1_api_events_global_get",
-        "tags": [
-          "Streaming"
-        ],
+        "tags": ["Streaming"],
         "description": "Server-Sent Events stream for node-level state broadcasts. Emits a node_snapshot event on connect (workstreams, health, aggregate), followed by real-time delta events (ws_state, ws_activity, ws_created, ws_closed, ws_rename, health_changed, aggregate). Pass ?expected_node_id=X for identity verification (returns 409 on mismatch).",
         "responses": {
           "200": {
@@ -662,9 +595,7 @@
       "post": {
         "summary": "Permanently delete a saved workstream",
         "operationId": "v1_api_workstreams_{ws_id}_delete_post",
-        "tags": [
-          "Workstreams"
-        ],
+        "tags": ["Workstreams"],
         "parameters": [
           {
             "name": "ws_id",
@@ -716,9 +647,7 @@
       "post": {
         "summary": "Load a saved workstream into memory",
         "operationId": "v1_api_workstreams_{ws_id}_open_post",
-        "tags": [
-          "Workstreams"
-        ],
+        "tags": ["Workstreams"],
         "parameters": [
           {
             "name": "ws_id",
@@ -770,9 +699,7 @@
       "post": {
         "summary": "Set workstream title manually",
         "operationId": "v1_api_workstreams_{ws_id}_title_post",
-        "tags": [
-          "Workstreams"
-        ],
+        "tags": ["Workstreams"],
         "parameters": [
           {
             "name": "ws_id",
@@ -814,9 +741,7 @@
       "post": {
         "summary": "Regenerate workstream title via LLM",
         "operationId": "v1_api_workstreams_{ws_id}_refresh-title_post",
-        "tags": [
-          "Workstreams"
-        ],
+        "tags": ["Workstreams"],
         "parameters": [
           {
             "name": "ws_id",
@@ -848,9 +773,7 @@
       "get": {
         "summary": "Get workstream detail (rehydrates lazily on miss)",
         "operationId": "v1_api_workstreams_{ws_id}_get",
-        "tags": [
-          "Workstreams"
-        ],
+        "tags": ["Workstreams"],
         "description": "Returns the persisted workstream's display fields. If the session isn't currently in memory the manager rehydrates it before responding; ``500`` on rehydrate failure carries a correlation id matching the server log line. Lifted from the coord-only surface in the Stage 2 history/detail verb lift \u2014 interactive previously had no detail endpoint.",
         "parameters": [
           {
@@ -920,9 +843,7 @@
       "get": {
         "summary": "Read the workstream's reconstructed message history",
         "operationId": "v1_api_workstreams_{ws_id}_history_get",
-        "tags": [
-          "Workstreams"
-        ],
+        "tags": ["Workstreams"],
         "description": "Returns the tail of the conversation in OpenAI-like message format. Persisted-but-not-loaded workstreams (closed / evicted) serve history without rehydrating. Lifted from the coord-only surface in the Stage 2 history/detail verb lift \u2014 interactive previously only exposed history through the SSE replay on ``/events``.",
         "parameters": [
           {
@@ -1002,9 +923,7 @@
       "post": {
         "summary": "Upload a file (multipart/form-data, field 'file') and attach it to the caller's next user turn on this workstream.  Validates size, MIME, and UTF-8 for text; magic-byte sniff for images.  Ownership failures are masked as 404 so non-owners cannot enumerate workstream existence; a 403 indicates a scope/auth failure from the middleware layer.",
         "operationId": "v1_api_workstreams_{ws_id}_attachments_post",
-        "tags": [
-          "Attachments"
-        ],
+        "tags": ["Attachments"],
         "parameters": [
           {
             "name": "ws_id",
@@ -1081,9 +1000,7 @@
       "get": {
         "summary": "List the caller's pending (unconsumed) attachments for this workstream.  Ownership failures are masked as 404.",
         "operationId": "v1_api_workstreams_{ws_id}_attachments_get",
-        "tags": [
-          "Attachments"
-        ],
+        "tags": ["Attachments"],
         "parameters": [
           {
             "name": "ws_id",
@@ -1132,9 +1049,7 @@
       "get": {
         "summary": "Return raw bytes of an attachment with its stored Content-Type.  Ownership failures are masked as 404.",
         "operationId": "v1_api_workstreams_{ws_id}_attachments_{attachment_id}_content_get",
-        "tags": [
-          "Attachments"
-        ],
+        "tags": ["Attachments"],
         "parameters": [
           {
             "name": "ws_id",
@@ -1184,9 +1099,7 @@
       "delete": {
         "summary": "Remove a pending attachment (consumed attachments return 404).  Ownership failures are also masked as 404.",
         "operationId": "v1_api_workstreams_{ws_id}_attachments_{attachment_id}_delete",
-        "tags": [
-          "Attachments"
-        ],
+        "tags": ["Attachments"],
         "parameters": [
           {
             "name": "ws_id",
@@ -1236,9 +1149,7 @@
       "get": {
         "summary": "List saved workstreams",
         "operationId": "v1_api_workstreams_saved_get",
-        "tags": [
-          "Workstreams"
-        ],
+        "tags": ["Workstreams"],
         "responses": {
           "200": {
             "description": "Success",
@@ -1257,9 +1168,7 @@
       "get": {
         "summary": "List available skills (summary)",
         "operationId": "v1_api_skills_get",
-        "tags": [
-          "Skills"
-        ],
+        "tags": ["Skills"],
         "responses": {
           "200": {
             "description": "Success",
@@ -1278,9 +1187,7 @@
       "get": {
         "summary": "List available model aliases",
         "operationId": "v1_api_models_get",
-        "tags": [
-          "Models"
-        ],
+        "tags": ["Models"],
         "responses": {
           "200": {
             "description": "Success",
@@ -1299,9 +1206,7 @@
       "post": {
         "summary": "Authenticate with a token",
         "operationId": "v1_api_auth_login_post",
-        "tags": [
-          "Auth"
-        ],
+        "tags": ["Auth"],
         "requestBody": {
           "required": true,
           "content": {
@@ -1340,9 +1245,7 @@
       "post": {
         "summary": "Create first admin user",
         "operationId": "v1_api_auth_setup_post",
-        "tags": [
-          "Auth"
-        ],
+        "tags": ["Auth"],
         "requestBody": {
           "required": true,
           "content": {
@@ -1401,9 +1304,7 @@
       "get": {
         "summary": "Return auth state",
         "operationId": "v1_api_auth_status_get",
-        "tags": [
-          "Auth"
-        ],
+        "tags": ["Auth"],
         "responses": {
           "200": {
             "description": "Success",
@@ -1422,9 +1323,7 @@
       "post": {
         "summary": "Clear auth cookie",
         "operationId": "v1_api_auth_logout_post",
-        "tags": [
-          "Auth"
-        ],
+        "tags": ["Auth"],
         "responses": {
           "200": {
             "description": "Success",
@@ -1443,9 +1342,7 @@
       "get": {
         "summary": "Redirect to OIDC provider for SSO login",
         "operationId": "v1_api_auth_oidc_authorize_get",
-        "tags": [
-          "Auth"
-        ],
+        "tags": ["Auth"],
         "responses": {
           "302": {
             "description": "Success"
@@ -1477,9 +1374,7 @@
       "get": {
         "summary": "OIDC callback \u2014 validates code, provisions user, sets JWT cookie, redirects to app",
         "operationId": "v1_api_auth_oidc_callback_get",
-        "tags": [
-          "Auth"
-        ],
+        "tags": ["Auth"],
         "responses": {
           "302": {
             "description": "Success"
@@ -1491,9 +1386,7 @@
       "get": {
         "summary": "Return authenticated user info and permissions",
         "operationId": "v1_api_auth_whoami_get",
-        "tags": [
-          "Auth"
-        ],
+        "tags": ["Auth"],
         "responses": {
           "200": {
             "description": "Success",
@@ -1522,9 +1415,7 @@
       "get": {
         "summary": "List structured memories",
         "operationId": "v1_api_memories_get",
-        "tags": [
-          "Memories"
-        ],
+        "tags": ["Memories"],
         "parameters": [
           {
             "name": "type",
@@ -1580,9 +1471,7 @@
       "post": {
         "summary": "Save (upsert) a structured memory",
         "operationId": "v1_api_memories_post",
-        "tags": [
-          "Memories"
-        ],
+        "tags": ["Memories"],
         "requestBody": {
           "required": true,
           "content": {
@@ -1621,9 +1510,7 @@
       "post": {
         "summary": "Search structured memories by query",
         "operationId": "v1_api_memories_search_post",
-        "tags": [
-          "Memories"
-        ],
+        "tags": ["Memories"],
         "requestBody": {
           "required": true,
           "content": {
@@ -1652,9 +1539,7 @@
       "delete": {
         "summary": "Delete a structured memory by name and scope",
         "operationId": "v1_api_memories_{name}_delete",
-        "tags": [
-          "Memories"
-        ],
+        "tags": ["Memories"],
         "parameters": [
           {
             "name": "name",
@@ -1711,9 +1596,7 @@
       "get": {
         "summary": "List interface.* settings with values and sources",
         "operationId": "v1_api_admin_settings_get",
-        "tags": [
-          "Admin"
-        ],
+        "tags": ["Admin"],
         "responses": {
           "200": {
             "description": "Success"
@@ -1725,9 +1608,7 @@
       "put": {
         "summary": "Update an interface.* setting",
         "operationId": "v1_api_admin_settings_{key}_put",
-        "tags": [
-          "Admin"
-        ],
+        "tags": ["Admin"],
         "parameters": [
           {
             "name": "key",
@@ -1767,9 +1648,7 @@
       "post": {
         "summary": "Update an interface.* setting (alias for PUT)",
         "operationId": "v1_api_admin_settings_{key}_post",
-        "tags": [
-          "Admin"
-        ],
+        "tags": ["Admin"],
         "parameters": [
           {
             "name": "key",
@@ -1811,9 +1690,7 @@
       "get": {
         "summary": "Server health check",
         "operationId": "health_get",
-        "tags": [
-          "Observability"
-        ],
+        "tags": ["Observability"],
         "responses": {
           "200": {
             "description": "Success",
@@ -1840,9 +1717,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "error"
-        ],
+        "required": ["error"],
         "title": "ErrorResponse",
         "type": "object"
       },
@@ -1851,9 +1726,7 @@
         "properties": {
           "status": {
             "default": "ok",
-            "examples": [
-              "ok"
-            ],
+            "examples": ["ok"],
             "title": "Status",
             "type": "string"
           }
@@ -1902,19 +1775,14 @@
           },
           "role": {
             "description": "Legacy role",
-            "examples": [
-              "full",
-              "read"
-            ],
+            "examples": ["full", "read"],
             "title": "Role",
             "type": "string"
           },
           "scopes": {
             "default": "",
             "description": "Comma-separated scopes",
-            "examples": [
-              "read,write,approve"
-            ],
+            "examples": ["read,write,approve"],
             "title": "Scopes",
             "type": "string"
           },
@@ -1925,9 +1793,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "role"
-        ],
+        "required": ["role"],
         "title": "AuthLoginResponse",
         "type": "object"
       },
@@ -1950,11 +1816,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "username",
-          "display_name",
-          "password"
-        ],
+        "required": ["username", "display_name", "password"],
         "title": "AuthSetupRequest",
         "type": "object"
       },
@@ -1991,10 +1853,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "user_id",
-          "username"
-        ],
+        "required": ["user_id", "username"],
         "title": "AuthSetupResponse",
         "type": "object"
       },
@@ -2029,11 +1888,7 @@
             "type": "boolean"
           }
         },
-        "required": [
-          "auth_enabled",
-          "has_users",
-          "setup_required"
-        ],
+        "required": ["auth_enabled", "has_users", "setup_required"],
         "title": "AuthStatusResponse",
         "type": "object"
       },
@@ -2061,9 +1916,7 @@
             "title": "Attachment Ids"
           }
         },
-        "required": [
-          "message"
-        ],
+        "required": ["message"],
         "title": "SendRequest",
         "type": "object"
       },
@@ -2071,12 +1924,7 @@
         "properties": {
           "status": {
             "description": "'ok', 'busy', 'queued', or 'queue_full'",
-            "examples": [
-              "ok",
-              "busy",
-              "queued",
-              "queue_full"
-            ],
+            "examples": ["ok", "busy", "queued", "queue_full"],
             "title": "Status",
             "type": "string"
           },
@@ -2123,9 +1971,7 @@
             "title": "Msg Id"
           }
         },
-        "required": [
-          "status"
-        ],
+        "required": ["status"],
         "title": "SendResponse",
         "type": "object"
       },
@@ -2138,9 +1984,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "msg_id"
-        ],
+        "required": ["msg_id"],
         "title": "DequeueRequest",
         "type": "object"
       },
@@ -2171,30 +2015,8 @@
             "type": "boolean"
           }
         },
-        "required": [
-          "approved"
-        ],
+        "required": ["approved"],
         "title": "ApproveRequest",
-        "type": "object"
-      },
-      "PlanFeedbackRequest": {
-        "properties": {
-          "feedback": {
-            "description": "Feedback text; empty string means approval",
-            "title": "Feedback",
-            "type": "string"
-          },
-          "ws_id": {
-            "description": "Target workstream ID",
-            "title": "Ws Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "feedback",
-          "ws_id"
-        ],
-        "title": "PlanFeedbackRequest",
         "type": "object"
       },
       "CommandRequest": {
@@ -2210,10 +2032,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "command",
-          "ws_id"
-        ],
+        "required": ["command", "ws_id"],
         "title": "CommandRequest",
         "type": "object"
       },
@@ -2238,9 +2057,7 @@
             "type": "integer"
           }
         },
-        "required": [
-          "turns"
-        ],
+        "required": ["turns"],
         "title": "RewindRequest",
         "type": "object"
       },
@@ -2337,10 +2154,7 @@
       },
       "WorkstreamKind": {
         "description": "Classifier for which manager hosts a workstream.\n\nStrEnum so members are drop-in ``str`` replacements for the DB column,\nJSON payloads, and existing ``==`` comparisons against raw strings.\nNarrow internal annotations to this type; wide boundaries (HTTP body,\nDB row) stay ``str`` and parse via ``WorkstreamKind(raw)`` / ``from_raw``\nat the edge.",
-        "enum": [
-          "interactive",
-          "coordinator"
-        ],
+        "enum": ["interactive", "coordinator"],
         "title": "WorkstreamKind",
         "type": "string"
       },
@@ -2377,10 +2191,7 @@
             "type": "array"
           }
         },
-        "required": [
-          "ws_id",
-          "name"
-        ],
+        "required": ["ws_id", "name"],
         "title": "CreateWorkstreamResponse",
         "type": "object"
       },
@@ -2415,9 +2226,7 @@
             "type": "array"
           }
         },
-        "required": [
-          "workstreams"
-        ],
+        "required": ["workstreams"],
         "title": "ListWorkstreamsResponse",
         "type": "object"
       },
@@ -2458,11 +2267,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "ws_id",
-          "name",
-          "state"
-        ],
+        "required": ["ws_id", "name", "state"],
         "title": "WorkstreamInfo",
         "type": "object"
       },
@@ -2508,12 +2313,7 @@
             "description": "Inline approval payload \u2014 same shape as ``DashboardWorkstream.pending_approval_detail``.  ``None`` when no approval is pending.  Lets a reload paint the action row + judge verdicts immediately instead of relying on the SSE approve_request replay timing window."
           }
         },
-        "required": [
-          "ws_id",
-          "name",
-          "state",
-          "user_id"
-        ],
+        "required": ["ws_id", "name", "state", "user_id"],
         "title": "WorkstreamDetailResponse",
         "type": "object"
       },
@@ -2635,9 +2435,7 @@
             "type": "array"
           }
         },
-        "required": [
-          "ws_id"
-        ],
+        "required": ["ws_id"],
         "title": "WorkstreamHistoryResponse",
         "type": "object"
       },
@@ -2654,10 +2452,7 @@
             "$ref": "#/components/schemas/DashboardAggregate"
           }
         },
-        "required": [
-          "workstreams",
-          "aggregate"
-        ],
+        "required": ["workstreams", "aggregate"],
         "title": "DashboardResponse",
         "type": "object"
       },
@@ -2799,11 +2594,7 @@
             "type": "array"
           }
         },
-        "required": [
-          "ws_id",
-          "name",
-          "state"
-        ],
+        "required": ["ws_id", "name", "state"],
         "title": "DashboardWorkstream",
         "type": "object"
       },
@@ -2851,9 +2642,7 @@
             "type": "array"
           }
         },
-        "required": [
-          "workstreams"
-        ],
+        "required": ["workstreams"],
         "title": "ListSavedWorkstreamsResponse",
         "type": "object"
       },
@@ -2953,12 +2742,7 @@
             "type": "number"
           }
         },
-        "required": [
-          "ws_id",
-          "created",
-          "updated",
-          "message_count"
-        ],
+        "required": ["ws_id", "created", "updated", "message_count"],
         "title": "SavedWorkstreamInfo",
         "type": "object"
       },
@@ -2987,10 +2771,7 @@
           },
           "kind": {
             "description": "'image' or 'text'",
-            "examples": [
-              "image",
-              "text"
-            ],
+            "examples": ["image", "text"],
             "title": "Kind",
             "type": "string"
           }
@@ -3016,9 +2797,7 @@
             "type": "array"
           }
         },
-        "required": [
-          "attachments"
-        ],
+        "required": ["attachments"],
         "title": "ListAttachmentsResponse",
         "type": "object"
       },
@@ -3046,10 +2825,7 @@
           },
           "kind": {
             "description": "'image' or 'text'",
-            "examples": [
-              "image",
-              "text"
-            ],
+            "examples": ["image", "text"],
             "title": "Kind",
             "type": "string"
           }
@@ -3067,10 +2843,7 @@
       "HealthResponse": {
         "properties": {
           "status": {
-            "examples": [
-              "ok",
-              "degraded"
-            ],
+            "examples": ["ok", "degraded"],
             "title": "Status",
             "type": "string"
           },
@@ -3134,26 +2907,19 @@
             "default": null
           }
         },
-        "required": [
-          "status"
-        ],
+        "required": ["status"],
         "title": "HealthResponse",
         "type": "object"
       },
       "BackendStatus": {
         "properties": {
           "status": {
-            "examples": [
-              "up",
-              "down"
-            ],
+            "examples": ["up", "down"],
             "title": "Status",
             "type": "string"
           }
         },
-        "required": [
-          "status"
-        ],
+        "required": ["status"],
         "title": "BackendStatus",
         "type": "object"
       },
@@ -3236,23 +3002,14 @@
           "type": {
             "default": "project",
             "description": "Memory type",
-            "enum": [
-              "user",
-              "project",
-              "feedback",
-              "reference"
-            ],
+            "enum": ["user", "project", "feedback", "reference"],
             "title": "Type",
             "type": "string"
           },
           "scope": {
             "default": "global",
             "description": "Memory scope",
-            "enum": [
-              "global",
-              "workstream",
-              "user"
-            ],
+            "enum": ["global", "workstream", "user"],
             "title": "Scope",
             "type": "string"
           },
@@ -3263,10 +3020,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "name",
-          "content"
-        ],
+        "required": ["name", "content"],
         "title": "SaveMemoryRequest",
         "type": "object"
       },
@@ -3286,21 +3040,12 @@
             "type": "string"
           },
           "type": {
-            "enum": [
-              "user",
-              "project",
-              "feedback",
-              "reference"
-            ],
+            "enum": ["user", "project", "feedback", "reference"],
             "title": "Type",
             "type": "string"
           },
           "scope": {
-            "enum": [
-              "global",
-              "workstream",
-              "user"
-            ],
+            "enum": ["global", "workstream", "user"],
             "title": "Scope",
             "type": "string"
           },
@@ -3349,9 +3094,7 @@
             "type": "integer"
           }
         },
-        "required": [
-          "memories"
-        ],
+        "required": ["memories"],
         "title": "ListMemoriesResponse",
         "type": "object"
       },
@@ -3365,25 +3108,14 @@
           "type": {
             "default": "",
             "description": "Filter by memory type",
-            "enum": [
-              "",
-              "user",
-              "project",
-              "feedback",
-              "reference"
-            ],
+            "enum": ["", "user", "project", "feedback", "reference"],
             "title": "Type",
             "type": "string"
           },
           "scope": {
             "default": "",
             "description": "Filter by scope",
-            "enum": [
-              "",
-              "global",
-              "workstream",
-              "user"
-            ],
+            "enum": ["", "global", "workstream", "user"],
             "title": "Scope",
             "type": "string"
           },
@@ -3402,9 +3134,7 @@
             "type": "integer"
           }
         },
-        "required": [
-          "query"
-        ],
+        "required": ["query"],
         "title": "SearchMemoriesRequest",
         "type": "object"
       },
@@ -3466,9 +3196,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "name"
-        ],
+        "required": ["name"],
         "title": "SkillSummary",
         "type": "object"
       },
@@ -3482,9 +3210,7 @@
             "type": "array"
           }
         },
-        "required": [
-          "skills"
-        ],
+        "required": ["skills"],
         "title": "ListSkillSummaryResponse",
         "type": "object"
       },
@@ -3503,11 +3229,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "alias",
-          "model",
-          "provider"
-        ],
+        "required": ["alias", "model", "provider"],
         "title": "AvailableModelInfo",
         "type": "object"
       },

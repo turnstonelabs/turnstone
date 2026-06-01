@@ -202,7 +202,7 @@ note over Session, Judge
   Cross-model: separate provider/client from [judge] config.
 
   **Sub-agent exemption:**
-  Plan agent and task agent skip intent validation entirely.
+  Task sub-agents skip intent validation entirely.
 
   **Output guard:**
   Runs when judge_config.output_guard is true (default).

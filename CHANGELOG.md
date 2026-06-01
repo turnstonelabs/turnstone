@@ -61,6 +61,19 @@ Three release tracks are maintained:
   dependency). Migration: use the bundled SearxNG (it ships in the compose stacks
   by default) or point `TURNSTONE_SEARXNG_URL` at an existing instance. No
   database migration required.
+- **`man`, `math`, and `plan_agent` built-in tools removed** — `man` and
+  `math` duplicated capabilities already available through `bash`; `plan_agent`
+  is better expressed as a `task_agent` running a planning skill.  Removing
+  them simplifies the tool surface and cuts per-call token cost.  This release
+  also removes: the `math` sandbox executor (`turnstone.core.sandbox`) and the
+  `[sandbox]` extra's role for it; the read-only `AGENT_TOOLS` sub-agent tool
+  set and the `agent` tool-metadata key; the plan-review protocol
+  (`/v1/api/plan` endpoint, `plan_review`/`plan_resolved` SSE events, the
+  `on_plan_review` SDK/UI hook); and the `model.plan_alias` /
+  `model.plan_effort` ConfigStore settings (and the corresponding
+  `[model].plan_model` / `[model].plan_effort` config.toml knobs).
+  **Breaking change** on the experimental 1.6 line.  Interactive built-in tool
+  count moves from 19 → 16; `TASK_AGENT_TOOLS` from 13 → 11.
 
 ### Security
 

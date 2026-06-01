@@ -30,7 +30,6 @@ package "turnstone/sdk/ (Python)" {
         + close_workstream()
         + send(message, ws_id)
         + approve()
-        + plan_feedback()
         + command()
         + cancel(ws_id)
         + stream_events(ws_id)

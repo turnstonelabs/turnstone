@@ -98,7 +98,6 @@ from turnstone.core.nudge_queue import TOOL_DRAIN, USER_DRAIN, NudgeQueue
 from turnstone.core.providers import create_provider
 from turnstone.core.ratelimit import TokenBucket
 from turnstone.core.safety import is_command_blocked, sanitize_command
-from turnstone.core.sandbox import execute_math_sandboxed
 from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS
 from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
 from turnstone.core.storage._registry import get_storage
@@ -106,8 +105,6 @@ from turnstone.core.storage._utils import normalize_search_terms
 from turnstone.core.tool_advisory import escape_wrapper_tags, render_system_reminder
 from turnstone.core.tool_search import ToolSearchManager
 from turnstone.core.tools import (
-    AGENT_AUTO_TOOLS,
-    AGENT_TOOLS,
     BUILTIN_TOOL_NAMES,
     COORDINATOR_TOOLS,
     INTERACTIVE_TOOLS,
@@ -783,7 +780,6 @@ class SessionUI(Protocol):
     ) -> None: ...
     def on_tool_output_chunk(self, call_id: str, chunk: str) -> None: ...
     def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None: ...
-    def on_plan_review(self, content: str) -> str: ...
     def on_info(self, message: str) -> None: ...
     def on_error(self, message: str) -> None: ...
     def on_user_reminder(
@@ -1132,12 +1128,10 @@ class ChatSession:
         if kind == WorkstreamKind.COORDINATOR:
             self._tools = list(COORDINATOR_TOOLS)
             self._task_tools = []
-            self._agent_tools = []
         elif mcp_client:
             mcp_tools = mcp_client.get_tools(user_id=self._mcp_user_id)
             self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)
             self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
-            self._agent_tools = merge_mcp_tools(AGENT_TOOLS, mcp_tools)
             # Register for tool-change notifications from MCP servers.
             # ``user_id`` is the listener identity component — pool-only
             # changes for OTHER users must not fire this callback.
@@ -1156,9 +1150,8 @@ class ChatSession:
         else:
             self._tools = INTERACTIVE_TOOLS
             self._task_tools = TASK_AGENT_TOOLS
-            self._agent_tools = AGENT_TOOLS
-        # Inject the live alias list into plan_agent / task_agent tool
-        # descriptions so the calling LLM sees its `model` parameter options.
+        # Inject the live alias list into the task_agent tool
+        # description so the calling LLM sees its `model` parameter options.
         # Replaces affected tool dicts with deep copies — module-level
         # constants are not mutated.
         self._render_agent_tool_descriptions()
@@ -1844,13 +1837,12 @@ class ChatSession:
         mcp_tools = self._mcp_client.get_tools(user_id=self._mcp_user_id)
         self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)
         self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
-        self._agent_tools = merge_mcp_tools(AGENT_TOOLS, mcp_tools)
         self._render_agent_tool_descriptions()
         self._rebuild_tool_search()
 
     def _render_agent_tool_descriptions(self) -> None:
         """Inject the live alias list into the ``model`` parameter description
-        on plan_agent / task_agent tools.
+        on the task_agent tool.
 
         Lets the calling LLM see which aliases are valid right now.
         Called on session init and on registry reload (via
@@ -1860,19 +1852,18 @@ class ChatSession:
         Replaces affected tool dicts with deep copies so the module-level
         tool-list constants stay untouched across sessions.
 
-        plan_agent and task_agent live in ``self._tools`` (the main session's
-        tool set) — not in ``self._agent_tools`` / ``self._task_tools``,
-        which are what *sub-agents* see (sub-agents don't get delegation
-        tools to avoid infinite recursion).
+        task_agent lives in ``self._tools`` (the main session's tool set) —
+        not in ``self._task_tools``, which is what *sub-agents* see
+        (sub-agents don't get delegation tools to avoid infinite recursion).
         """
         if self._registry is None:
             return
         # Hide ``default`` from the alias list — the LLM reads the English
         # word and picks it explicitly, which routes to whichever model
         # carries that alias rather than the operator-configured per-role
-        # default (plan_alias / task_alias).  Omitting ``model=`` already
-        # selects the per-role default; offering the literal name as an
-        # alternative invites the bypass.
+        # default (task_alias).  Omitting ``model=`` already selects the
+        # per-role default; offering the literal name as an alternative
+        # invites the bypass.
         aliases = sorted(a for a in self._registry.list_aliases() if a != "default")
         aliases_str = ", ".join(f"`{a}`" for a in aliases)
 
@@ -1880,10 +1871,9 @@ class ChatSession:
         for tool in self._tools:
             fn = tool.get("function") or {}
             name = fn.get("name", "")
-            if name not in ("plan_agent", "task_agent"):
+            if name != "task_agent":
                 new_tools.append(tool)
                 continue
-            kind = "plan model" if name == "plan_agent" else "task model"
             new_tool = copy.deepcopy(tool)
             props = new_tool.get("function", {}).get("parameters", {}).get("properties", {})
             if "model" in props:
@@ -1893,13 +1883,13 @@ class ChatSession:
                 # render, not return early and leave them in place.
                 if aliases:
                     props["model"]["description"] = (
-                        f"Optional model alias to run this {name} on. "
-                        f"Omit to use the operator-configured {kind}. "
+                        "Optional model alias to run this task_agent on. "
+                        "Omit to use the operator-configured task model. "
                         f"Available aliases: {aliases_str}."
                     )
                 else:
                     props["model"]["description"] = (
-                        f"Optional model alias to run this {name} on. "
+                        "Optional model alias to run this task_agent on. "
                         "Omit to use the current session model. "
                         "(No alternative aliases configured in this session.)"
                     )
@@ -1907,8 +1897,8 @@ class ChatSession:
         self._tools = new_tools
 
     def refresh_agent_tool_schemas(self) -> None:
-        """Public entry point: re-render plan_agent / task_agent tool
-        descriptions to reflect the current ModelRegistry state, and
+        """Public entry point: re-render the task_agent tool
+        description to reflect the current ModelRegistry state, and
         rebuild the BM25 tool-search index so its text matches.
 
         Called by the server after a registry reload (sync-to-nodes /
@@ -3156,7 +3146,7 @@ class ChatSession:
         """Persist token usage for a non-streaming auxiliary completion.
 
         Title generation, compaction, web-fetch summarisation, and
-        plan/task sub-agents all run via ``create_completion`` and bypass
+        task sub-agents all run via ``create_completion`` and bypass
         the streaming ``on_status`` accounting path; without this their
         spend never reaches the usage dashboard. Delegates to the UI's
         ``on_aux_usage`` hook (which owns the storage write + any node
@@ -5147,8 +5137,6 @@ class ChatSession:
                     "prompt": (it.get("prompt") or "")[:200],
                     "skill": skill_dict.get("name", "") if isinstance(skill_dict, dict) else "",
                 }
-            elif name == "plan_agent":
-                it["func_args"] = {"goal": (it.get("prompt") or "")[:200]}
             # Coordinator tool args — only the ``needs_approval=True`` set
             # reaches this point (read-only inspect / list_* / wait
             # tools are filtered above), so this matches the auditable
@@ -5993,78 +5981,6 @@ class ChatSession:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
                     results = list(pool.map(run_one, items))
 
-        # Post-plan gate: iterative review loop.  When the user gives
-        # feedback the plan agent re-runs and the revised plan is shown
-        # again, up to _MAX_PLAN_REFINEMENTS rounds.
-        for i, item in enumerate(items):
-            if item.get("func_name") != "plan_agent" or item.get("error") or item.get("denied"):
-                continue
-
-            cid, output = results[i]
-            if not isinstance(output, str):
-                raise TypeError(f"plan_agent must return str, got {type(output).__name__}")
-            plan_path = f".plan-{self._ws_id}.md"
-
-            if not self.auto_approve:
-                original_goal = item.get("prompt", "")
-
-                refinement_round = 0
-                while True:
-                    self._emit_state("attention")
-                    resp = self.ui.on_plan_review(output)
-                    self._emit_state("running")
-
-                    if resp.lower() in ("n", "no", "reject"):
-                        output += (
-                            "\n\n---\nUser REJECTED this plan. Do not "
-                            "proceed with implementation. Ask the user "
-                            "what they want instead."
-                        )
-                        break
-                    elif not resp:
-                        break  # empty response = approve
-                    elif refinement_round >= self._MAX_PLAN_REFINEMENTS:
-                        self.ui.on_info("[plan] max refinement rounds reached")
-                        break
-                    else:
-                        # Re-run plan agent with user feedback.
-                        # Strip any internal warning prefix so the
-                        # agent sees the raw plan content.
-                        raw = output
-                        _warn = "[Warning: plan may be incomplete or poorly structured]\n\n"
-                        if raw.startswith(_warn):
-                            raw = raw[len(_warn) :]
-                        try:
-                            output = self._refine_plan(
-                                raw,
-                                original_goal,
-                                resp,
-                            )
-                            refinement_round += 1
-                        except (KeyboardInterrupt, GenerationCancelled):
-                            output += "\n\n---\n(plan refinement interrupted)"
-                            break
-                        except Exception as e:
-                            self.ui.on_info(f"[plan refinement error] {e}")
-                            output += f"\n\n---\nUser feedback: {resp}"
-                            break
-                        # Loop continues → show revised plan to user
-
-                # Write final version to disk (overwrites initial write)
-                try:
-                    with open(plan_path, "w") as f:
-                        f.write(output)
-                except OSError:
-                    log.warning("Failed to write plan to %s", plan_path, exc_info=True)
-                    output += "\n\n---\nPlan could not be saved to disk."
-                    results[i] = (cid, output)
-                    continue
-
-            # Always include file path in the tool result so the
-            # outer model knows where the plan lives on disk.
-            output += f"\n\n---\nPlan saved to `{plan_path}`"
-            results[i] = (cid, output)
-
         return results, user_feedback
 
     @staticmethod
@@ -6258,13 +6174,10 @@ class ChatSession:
             "diff_file": self._prepare_diff,
             "write_file": self._prepare_write_file,
             "edit_file": self._prepare_edit_file,
-            "math": self._prepare_math,
-            "man": self._prepare_man,
             "web_fetch": self._prepare_web_fetch,
             "web_search": self._prepare_web_search,
             "tool_search": self._prepare_tool_search,
             "task_agent": self._prepare_task,
-            "plan_agent": self._prepare_plan,
             "memory": self._prepare_memory,
             "recall": self._prepare_recall,
             "notify": self._prepare_notify,
@@ -6820,79 +6733,6 @@ class ChatSession:
             "replace_all": replace_all,
         }
 
-    def _prepare_math(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
-        code = args.get("code", "")
-        if isinstance(code, list):
-            code = "\n".join(code)
-        if not code:
-            return {
-                "call_id": call_id,
-                "func_name": "math",
-                "header": "\u2717 math: empty code",
-                "preview": "",
-                "needs_approval": False,
-                "error": "Error: no code provided",
-            }
-        # Show code preview
-        preview = f"{DIM}{textwrap.indent(code, '    ')}{RESET}"
-        return {
-            "call_id": call_id,
-            "func_name": "math",
-            "header": f"\u2699 math: ({len(code)} chars)",
-            "preview": preview,
-            "needs_approval": True,
-            "approval_label": "math",
-            "execute": self._exec_math,
-            "code": code,
-        }
-
-    def _prepare_man(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
-        """Prepare a man/info page lookup."""
-        page = (args.get("page") or "").strip()
-        if not page:
-            return {
-                "call_id": call_id,
-                "func_name": "man",
-                "header": "\u2717 man: empty page",
-                "preview": "",
-                "needs_approval": False,
-                "error": "Error: no page name provided",
-            }
-        section = (args.get("section") or "").strip()
-        # Accept the canonical "name(section)" notation that the model often
-        # emits (e.g. printf(3), open(2), perlfunc(3pm)) \u2014 the parens are
-        # otherwise rejected by the page-name sanitizer below. An explicit
-        # ``section`` arg, if provided, takes precedence over the parsed one.
-        m = re.match(r"^([a-zA-Z0-9._-]+)\(([1-9][a-z]*)\)$", page)
-        if m:
-            page = m.group(1)
-            if not section:
-                section = m.group(2)
-        # Sanitize: only allow alphanumeric, dash, underscore, dot
-        if not re.match(r"^[a-zA-Z0-9._-]+$", page):
-            return {
-                "call_id": call_id,
-                "func_name": "man",
-                "header": "\u2717 man: invalid page name",
-                "preview": f"    {page}",
-                "needs_approval": False,
-                "error": f"Error: invalid page name {page!r}",
-            }
-        if section and not re.match(r"^[1-9][a-z]*$", section):
-            section = ""
-        label = f"{page}({section})" if section else page
-        preview = f"    {DIM}{label}{RESET}"
-        return {
-            "call_id": call_id,
-            "func_name": "man",
-            "header": f"\u2699 man: {label}",
-            "preview": preview,
-            "needs_approval": False,
-            "execute": self._exec_man,
-            "page": page,
-            "section": section,
-        }
-
     def _prepare_web_fetch(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         url = args.get("url", "").strip()
         question = args.get("question", "").strip()
@@ -7040,7 +6880,7 @@ class ChatSession:
     def _validate_agent_model_override(
         self, call_id: str, func_name: str, args: dict[str, Any]
     ) -> tuple[str | None, dict[str, Any] | None]:
-        """Pull and validate the optional `model` arg for plan/task agents.
+        """Pull and validate the optional `model` arg for the task agent.
 
         Returns (alias, error_item).  When the caller passed a `model` and
         it isn't in the registry, returns an error_item shaped like the
@@ -7056,7 +6896,7 @@ class ChatSession:
         # ``default`` is operator-only — the alias either back-compat-shims
         # a single-CLI-model registry or aliases a hand-named DB row, and
         # in both cases an LLM that explicitly routes here bypasses the
-        # operator-configured ``plan_alias`` / ``task_alias`` per-role
+        # operator-configured ``task_alias`` per-role
         # default.  Symmetric with the description filter at
         # ``_render_agent_tool_descriptions`` — closes the loophole where
         # an LLM that learned the alias name out-of-band (training data,
@@ -7182,34 +7022,6 @@ class ChatSession:
             "prompt": prompt,
             "model_override": model_override,
             "skill": skill_data,
-        }
-
-    def _prepare_plan(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
-        """Prepare a planning agent for approval."""
-        goal = args.get("goal", "").strip()
-        if not goal:
-            return {
-                "call_id": call_id,
-                "func_name": "plan_agent",
-                "header": "\u2717 plan_agent: empty goal",
-                "preview": "",
-                "needs_approval": False,
-                "error": "Error: empty goal",
-            }
-        model_override, err = self._validate_agent_model_override(call_id, "plan_agent", args)
-        if err is not None:
-            return err
-        preview_text = goal[:300] + ("..." if len(goal) > 300 else "")
-        return {
-            "call_id": call_id,
-            "func_name": "plan_agent",
-            "header": "\u2699 plan_agent (planning agent)",
-            "preview": f"    {preview_text}",
-            "needs_approval": True,
-            "approval_label": "plan_agent",
-            "execute": self._exec_plan,
-            "prompt": goal,
-            "model_override": model_override,
         }
 
     def _resolve_scope_id(self, scope: str) -> str:
@@ -11069,12 +10881,14 @@ class ChatSession:
 
         Args:
             agent_messages: Pre-built message list (system + developer + user).
-            label: Display prefix for progress lines ("agent" or "plan").
-            tools: Tool definitions to send to the API. Defaults to AGENT_TOOLS (read-only).
-            auto_tools: Set of tool names the agent may execute. Defaults to AGENT_AUTO_TOOLS.
+            label: Display prefix for progress lines (e.g. "task").
+            tools: Tool definitions to send to the API. Defaults to the
+                session's task tool set.
+            auto_tools: Set of tool names the agent may execute. Defaults to
+                TASK_AUTO_TOOLS.
             reasoning_effort: Override reasoning effort for this agent.
             agent_alias: Per-call model alias override (the LLM passed
-                ``model="<alias>"`` to plan_agent/task_agent).  Wins over
+                ``model="<alias>"`` to task_agent).  Wins over
                 the registry's per-kind resolution when set.  Caller is
                 expected to have validated the alias against the registry;
                 an unknown alias here raises ``ValueError``.
@@ -11083,13 +10897,13 @@ class ChatSession:
             Final content string from the agent.
         """
         if tools is None:
-            tools = self._agent_tools
+            tools = self._task_tools
         if auto_tools is None:
-            auto_tools = AGENT_AUTO_TOOLS
+            auto_tools = TASK_AUTO_TOOLS
         max_tool_turns = self.agent_max_turns
 
-        # Resolve agent model: explicit per-call override wins, then per-kind
-        # registry override (plan_model/task_model), then the legacy single-
+        # Resolve agent model: explicit per-call override wins, then the
+        # per-kind registry override (task_model), then the legacy single-
         # knob agent_model, then the session's primary model.
         if agent_alias is not None:
             if self._registry is None or not self._registry.has_alias(agent_alias):
@@ -11109,17 +10923,10 @@ class ChatSession:
             agent_alias = self._model_alias
 
         # Per-kind reasoning effort.  Explicit caller arg wins; otherwise
-        # delegate to the registry which knows the per-kind default (plan
-        # gets the back-compat "high", task returns None to inherit the
-        # session).  When no registry exists, apply the plan back-compat
-        # default directly so single-process callers keep prior behaviour.
-        if reasoning_effort is None:
-            if self._registry:
-                reasoning_effort = self._registry.resolve_agent_effort(label)
-            elif label == "plan":
-                from turnstone.core.model_registry import ModelRegistry
-
-                reasoning_effort = ModelRegistry.PLAN_DEFAULT_EFFORT
+        # delegate to the registry which knows the per-kind default (task
+        # returns None to inherit the session).
+        if reasoning_effort is None and self._registry:
+            reasoning_effort = self._registry.resolve_agent_effort(label)
 
         # Gate web_search: remove when no backend exists for the agent model
         agent_caps = self._resolve_capabilities(agent_provider, agent_model, agent_alias)
@@ -11141,7 +10948,7 @@ class ChatSession:
             # NOT wired here.  Agent assistant messages are built from
             # ``CompletionResult.content + tool_calls`` only (no
             # ``_provider_content`` carried), so the helper would no-op
-            # every turn anyway.  Plan/task agents are excluded from the
+            # every turn anyway.  Task agents are excluded from the
             # persistence/replay contract — their conversation history
             # is in-memory and rebuilt per ``_run_agent`` invocation.
             last_err: Exception | None = None
@@ -11162,7 +10969,7 @@ class ChatSession:
                         ),
                     )
                     # Sub-agent turns bypass on_status — record per-turn so
-                    # plan/task spend is visible in the dashboard, attributed
+                    # task-agent spend is visible in the dashboard, attributed
                     # to the agent's own model.
                     self._record_aux_usage(agent_result, model=agent_model)
                     return agent_result
@@ -11229,7 +11036,7 @@ class ChatSession:
                 tool_name = tc_dict["function"]["name"].strip()
 
                 # Guard 1: block recursive agent calls.
-                if tool_name in ("task_agent", "plan_agent"):
+                if tool_name == "task_agent":
                     output = "Error: agents cannot spawn further agents"
                 # Guard 2: tool not in this agent's API tool list.
                 elif tool_name not in tool_names:
@@ -11309,7 +11116,7 @@ class ChatSession:
         "# Task Agent\n\n"
         "You are an autonomous task agent with full tool access. "
         "You can use bash, read_file, write_file, edit_file, search, "
-        "math, web_fetch, and web_search."
+        "web_fetch, and web_search."
     )
     # Operating guidance always applies — these are sub-agent semantics
     # (one-shot, tool-use over narration, no follow-up questions) that a
@@ -11382,224 +11189,6 @@ class ChatSession:
         except Exception as e:
             self.ui.on_info(f"[task error] {e}")
             return call_id, f"Task error: {e}"
-
-    _PLAN_IDENTITY = (
-        "You are a planning agent. Explore the codebase with read_file and search, "
-        "then write a plan with these sections: "
-        "## Goal (1-2 sentences), "
-        "## Current State (files/line numbers found), "
-        "## Plan (numbered steps naming exact files and functions), "
-        "## Risks (edge cases and unknowns). "
-        "Never guess at structure — verify first. Be specific: name files, line numbers, "
-        "and functions in every step."
-    )
-
-    def _plan_system_content(self) -> str:
-        """Plan agent system message: skill guardrails + plan identity."""
-        if not self._skill_content:
-            return self._PLAN_IDENTITY
-        tpl = self._skill_content
-        if len(tpl) > _MAX_SKILL_CONTENT:
-            log.warning("skill_content.truncated", length=len(tpl), agent="plan")
-            tpl = tpl[:_MAX_SKILL_CONTENT]
-        return tpl + "\n\n" + self._PLAN_IDENTITY
-
-    _MIN_PLAN_LENGTH = 100
-    _PLAN_REQUIRED_SECTIONS = ("## goal", "## current state", "## plan", "## risks")
-    _MIN_PLAN_SECTIONS = 2
-    _MAX_PLAN_REFINEMENTS = 5
-
-    @staticmethod
-    def _validate_plan(content: str, goal: str) -> tuple[bool, list[str]]:
-        """Check if plan output meets minimum quality bar.
-
-        Returns ``(valid, issues)`` where *issues* is a list of
-        human-readable problem descriptions (empty when valid).
-        """
-        issues: list[str] = []
-        stripped = content.strip()
-        stripped_lower = stripped.lower()
-
-        # 1. Minimum length
-        if len(stripped) < ChatSession._MIN_PLAN_LENGTH:
-            issues.append(
-                f"too short ({len(stripped)} chars, minimum {ChatSession._MIN_PLAN_LENGTH})"
-            )
-
-        # 2. Section structure
-        found_sections = sum(
-            1 for section in ChatSession._PLAN_REQUIRED_SECTIONS if section in stripped_lower
-        )
-        if found_sections < ChatSession._MIN_PLAN_SECTIONS:
-            issues.append(
-                f"missing plan sections (found {found_sections}/"
-                f"{len(ChatSession._PLAN_REQUIRED_SECTIONS)}, "
-                f"need at least {ChatSession._MIN_PLAN_SECTIONS})"
-            )
-
-        # 3. Echo detection: plan is basically just the goal repeated
-        goal_stripped = goal.strip().lower()
-        if (
-            goal_stripped
-            and len(stripped) < len(goal_stripped) * 2
-            and goal_stripped in stripped_lower
-        ):
-            issues.append("plan appears to echo the goal without elaboration")
-
-        # 4. Refusal detection
-        refusal_starts = (
-            "i cannot",
-            "i'm sorry",
-            "i am sorry",
-            "error:",
-            "i can't",
-        )
-        if any(stripped_lower.startswith(r) for r in refusal_starts):
-            issues.append("plan appears to be a refusal or error")
-
-        return (len(issues) == 0, issues)
-
-    def _exec_plan(self, item: dict[str, Any]) -> tuple[str, str]:
-        """Run a planning agent and write the result to .plan-<ws_id>.md."""
-        call_id, prompt = item["call_id"], item["prompt"]
-        plan_path = f".plan-{self._ws_id}.md"
-
-        # If plan was called before in this session, the previous assistant
-        # tool_call + tool result are already in self.messages — pass them
-        # directly to the inner agent so it refines rather than restarts.
-        prior_plan_msgs: list[dict[str, Any]] = []
-        for i, msg in enumerate(self.messages):
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                for tc in msg["tool_calls"]:
-                    if tc.get("function", {}).get("name") == "plan_agent":
-                        tc_id = tc["id"]
-                        for j in range(i + 1, len(self.messages)):
-                            if (
-                                self.messages[j].get("role") == "tool"
-                                and self.messages[j].get("tool_call_id") == tc_id
-                            ):
-                                prior_plan_msgs = [msg, self.messages[j]]
-                                break
-
-        # Plan agent gets template guardrails + its own identity — no tool
-        # patterns, MCP resources, or general conversation history (only
-        # prior plan tool_call/result pairs are forwarded for refinement).
-        agent_messages: list[dict[str, Any]] = [
-            {"role": "system", "content": self._plan_system_content()},
-        ]
-        agent_messages.extend(prior_plan_msgs)
-        agent_messages.append({"role": "user", "content": prompt})
-
-        plan_alias = item.get("model_override")
-        try:
-            content = self._run_agent(
-                agent_messages,
-                label="plan",
-                agent_alias=plan_alias,
-            )
-        except (KeyboardInterrupt, GenerationCancelled):
-            return call_id, "(plan interrupted by user)"
-        except Exception as e:
-            self.ui.on_info(f"[plan error] {e}")
-            return call_id, f"Plan error: {e}"
-
-        # Validate plan quality — retry once with coaching on failure
-        valid, issues = self._validate_plan(content, prompt)
-        if not valid:
-            self.ui.on_info(f"[plan] quality issues: {', '.join(issues)}")
-            preview = content[:200] + ("..." if len(content) > 200 else "")
-            coaching = (
-                "Your previous response did not follow the required plan "
-                "format. A valid plan should include at least two of "
-                "these markdown sections:\n"
-                "## Goal (1-2 sentences)\n"
-                "## Current State (files/line numbers found)\n"
-                "## Plan (numbered steps with file names and functions)\n"
-                "## Risks (edge cases and unknowns)\n\n"
-                f'Your previous response was: "{preview}"\n\n'
-                "Please try again. Explore the codebase first, then write "
-                "the plan."
-            )
-            agent_messages.append({"role": "user", "content": coaching})
-            try:
-                content = self._run_agent(
-                    agent_messages,
-                    label="plan",
-                    agent_alias=plan_alias,
-                )
-            except (KeyboardInterrupt, GenerationCancelled):
-                return call_id, "(plan interrupted by user)"
-            except Exception as e:
-                self.ui.on_info(f"[plan retry error] {e}")
-                return call_id, f"Plan error: {e}"
-
-            valid2, issues2 = self._validate_plan(content, prompt)
-            if not valid2:
-                self.ui.on_info(f"[plan] still has issues after retry: {', '.join(issues2)}")
-                content = "[Warning: plan may be incomplete or poorly structured]\n\n" + content
-
-        # Write to file separately — always return content even if write fails
-        try:
-            with open(plan_path, "w") as f:
-                f.write(content)
-            self.ui.on_info(f"Plan written to {plan_path}")
-        except OSError as e:
-            self.ui.on_info(f"[plan] could not write {plan_path}: {e}")
-
-        return call_id, content
-
-    def _refine_plan(
-        self,
-        original_content: str,
-        original_goal: str,
-        feedback: str,
-    ) -> str:
-        """Re-run the plan agent incorporating user feedback."""
-        tc_id = f"plan_refine_{uuid.uuid4().hex[:8]}"
-        agent_messages: list[dict[str, Any]] = [
-            {"role": "system", "content": self._plan_system_content()},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "id": tc_id,
-                        "type": "function",
-                        "function": {
-                            "name": "plan_agent",
-                            "arguments": json.dumps({"goal": original_goal}),
-                        },
-                    }
-                ],
-            },
-            {
-                "role": "tool",
-                "tool_call_id": tc_id,
-                "content": original_content,
-            },
-            {
-                "role": "user",
-                "content": (
-                    "The user reviewed this plan and provided feedback:\n\n"
-                    f"{feedback}\n\n"
-                    "Please revise the plan accordingly. Keep the same "
-                    "format (## Goal, ## Current State, ## Plan, ## Risks) "
-                    "and address the feedback."
-                ),
-            },
-        ]
-
-        self.ui.on_info("[plan] revising based on feedback...")
-        content = self._run_agent(
-            agent_messages,
-            label="plan",
-        )
-
-        valid, issues = self._validate_plan(content, original_goal)
-        if not valid:
-            self.ui.on_info(f"[plan] revised plan has issues: {', '.join(issues)}")
-
-        return content
 
     def _audit_memory_event(
         self,
@@ -12427,74 +12016,6 @@ class ChatSession:
             msg = f"Error writing {path}: {e}"
             self._report_tool_result(call_id, "edit_file", msg, is_error=True)
             return call_id, msg
-
-    def _exec_math(self, item: dict[str, Any]) -> tuple[str, str]:
-        """Execute Python code in sandboxed subprocess."""
-        call_id, code = item["call_id"], item["code"]
-        output, is_error = execute_math_sandboxed(code, timeout=self.tool_timeout)
-        output = self._truncate_output(output)
-
-        result_msg = f"Error:\n{output}" if is_error else output if output else "(no output)"
-        self._report_tool_result(call_id, "math", result_msg, is_error=is_error)
-        return call_id, result_msg
-
-    def _exec_man(self, item: dict[str, Any]) -> tuple[str, str]:
-        """Look up a man or info page."""
-        self._check_cancelled()
-        call_id = item["call_id"]
-        page = item["page"]
-        section = item.get("section", "")
-
-        # Try man first, fall back to info
-        cmd = ["man"]
-        if section:
-            cmd.append(section)
-        cmd.append(page)
-
-        text = ""
-        try:
-            from turnstone.core.env import scrubbed_env
-
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=10,
-                env=scrubbed_env(extra={"MANWIDTH": "80", "MAN_KEEP_FORMATTING": "0"}),
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                # Strip formatting: backspace overstrikes and ANSI escapes
-                text = re.sub(r".\x08", "", result.stdout)
-                text = re.sub(r"\x1b\[[0-9;]*m", "", text)
-            else:
-                # Fall back to info
-                result = subprocess.run(
-                    ["info", page],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                    env=scrubbed_env(),
-                )
-                if result.returncode == 0 and result.stdout.strip():
-                    text = result.stdout
-                else:
-                    msg = f"No man or info page found for '{page}'"
-                    self._report_tool_result(call_id, "man", msg)
-                    return call_id, msg
-        except FileNotFoundError:
-            msg = "Error: man command not available"
-            self._report_tool_result(call_id, "man", msg, is_error=True)
-            return call_id, msg
-        except subprocess.TimeoutExpired:
-            msg = "Error: man page lookup timed out"
-            self._report_tool_result(call_id, "man", msg, is_error=True)
-            return call_id, msg
-
-        text = self._truncate_output(text)
-
-        self._report_tool_result(call_id, "man", f"{len(text)} chars")
-
-        return call_id, text
 
     def _exec_web_fetch(self, item: dict[str, Any]) -> tuple[str, str]:
         """Fetch a URL, then summarize/extract using an API call."""

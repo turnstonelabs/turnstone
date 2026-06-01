@@ -24,20 +24,16 @@
 # context_window = 0           # 0 = auto-detect from provider capabilities
 # max_tokens = 0               # 0 = provider default
 #
-# Sub-agent routing (plan_agent, task_agent tools).  Each falls back to
-# agent_model when unset, then to the session model.  Use this to point
-# the rare-but-expensive plan agent at a stronger model than the
-# frequent task agent.
-# agent_model = ""             # legacy single-knob: both plan and task share this
-# plan_model = ""              # plan_agent override (e.g. "claude" for a smart planner)
+# Sub-agent routing (task_agent tool).  Falls back to agent_model when
+# unset, then to the session model.
+# agent_model = ""             # legacy single-knob alias used as fallback
 # task_model = ""              # task_agent override (e.g. "local" for cheap subtasks)
-# plan_effort = ""             # reasoning effort for plan_agent (default: "high")
 # task_effort = ""             # reasoning effort for task_agent (default: inherit session)
 #
 # At call time, the calling LLM may also pass `model="<alias>"` to
-# plan_agent / task_agent to override these per-invocation.  Tool
-# descriptions list available aliases dynamically; bad aliases return
-# an error so the model retries with a valid choice.
+# task_agent to override these per-invocation.  Tool descriptions list
+# available aliases dynamically; bad aliases return an error so the
+# model retries with a valid choice.
 
 # --- Named Models (turnstone, node, eval) ---
 # Define model aliases with per-model overrides. Useful for local model

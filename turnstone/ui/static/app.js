@@ -1226,18 +1226,6 @@ class Pane {
         this.updateStatus(evt);
         break;
 
-      case "plan_review":
-        showPlanDialog(evt.content);
-        break;
-
-      case "plan_resolved":
-        // Plan was resolved on another client (or by server-initiated cancel).
-        // Only act if our modal is for this pane's workstream.
-        if (_planWsId === this.wsId) {
-          dismissPlanDialog(evt.feedback);
-        }
-        break;
-
       case "info":
         this.addInfoMessage(evt.message);
         break;
@@ -6522,148 +6510,6 @@ document.addEventListener("keydown", function (e) {
   btn.click();
 });
 
-// ===========================================================================
-//  13. Plan review dialog
-// ===========================================================================
-
-let _planContent = "";
-let _planPaneId = null;
-let _planWsId = null;
-
-function showPlanDialog(content) {
-  _planContent = content;
-  _planPaneId = focusedPaneId;
-  const paneNow = panes[_planPaneId];
-  _planWsId = paneNow ? paneNow.wsId : currentWsId;
-  document.getElementById("plan-content").textContent = content;
-  const feedbackEl = document.getElementById("plan-feedback");
-  feedbackEl.value = "";
-  _updatePlanRejectBtn();
-
-  // Disable focused pane input
-  const pane = panes[_planPaneId];
-  if (pane) {
-    pane.inputEl.disabled = true;
-    pane.sendBtn.disabled = true;
-  }
-
-  document.getElementById("plan-overlay").classList.add("active");
-  setTimeout(function () {
-    feedbackEl.focus();
-  }, 50);
-}
-
-function _updatePlanRejectBtn() {
-  const btn = document.getElementById("btn-plan-reject");
-  const hasFeedback =
-    document.getElementById("plan-feedback").value.trim().length > 0;
-  btn.replaceChildren(makeKeyLabel("Esc", hasFeedback ? "Amend" : "Reject"));
-  btn.style.background = hasFeedback ? "var(--accent)" : "";
-  btn.style.color = hasFeedback ? "var(--on-color)" : "";
-  btn.onclick = function () {
-    resolvePlan(hasFeedback ? "" : "reject");
-  };
-}
-
-function resolvePlan(defaultFeedback) {
-  let feedback = document.getElementById("plan-feedback").value.trim();
-  if (!feedback && defaultFeedback) feedback = defaultFeedback;
-  // Removing 'active' synchronously is what lets dismissPlanDialog's
-  // early-return guard treat the server's echoed plan_resolved as a no-op.
-  document.getElementById("plan-overlay").classList.remove("active");
-
-  const pane = panes[_planPaneId];
-  if (pane) {
-    pane.inputEl.disabled = false;
-    pane.sendBtn.disabled = false;
-    pane.inputEl.focus();
-  }
-
-  // Critical: fire the API call first — this unblocks the server.
-  // Use the ws_id captured when the dialog opened, not the current pane
-  // (user may have switched tabs while the dialog was open).
-  const wsId = _planWsId || (pane ? pane.wsId : currentWsId);
-  _planWsId = null;
-  authFetch("/v1/api/plan", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ feedback: feedback, ws_id: wsId }),
-  }).catch(function (err) {
-    if (pane) pane.addErrorMessage("Connection error: " + err.message);
-  });
-
-  // Render plan inline in the chat (best-effort).  `action` is hoisted so
-  // the catch handler can still build a fallback message if the inline
-  // render throws after the action label was computed.
-  let action;
-  try {
-    const isReject = feedback === "reject";
-    const isAmend = feedback && !isReject;
-    action = isReject ? "rejected" : isAmend ? "amending" : "approved";
-    _addInlinePlan(_planContent, action, feedback);
-  } catch (err) {
-    console.error("Failed to render inline plan:", err);
-    if (pane) pane.addInfoMessage("Plan " + action);
-  }
-
-  if (pane) {
-    pane.setBusy(true);
-    pane.addThinkingIndicator();
-  }
-}
-
-function dismissPlanDialog(feedback) {
-  // Sync-dismiss: another client (or the server) already resolved the plan.
-  // Do NOT call /v1/api/plan — the server has already moved on.  The early
-  // return also handles self-receipt: the client that called resolvePlan()
-  // already removed the active class, so this is a no-op for that client.
-  const overlay = document.getElementById("plan-overlay");
-  if (!overlay.classList.contains("active")) return;
-  overlay.classList.remove("active");
-
-  const pane = panes[_planPaneId];
-  if (pane) {
-    pane.inputEl.disabled = false;
-    pane.sendBtn.disabled = false;
-    // Restore keyboard context — but skip on touch so we don't surprise the
-    // mobile user with a soft-keyboard pop after a remote approval.
-    if (!matchMedia("(pointer: coarse)").matches) pane.inputEl.focus();
-  }
-
-  const fb = feedback || "";
-  const isReject = fb === "reject";
-  const isAmend = fb && !isReject;
-  const action = isReject ? "rejected" : isAmend ? "amending" : "approved";
-
-  // Race fallback: if plan_resolved arrives before plan_review (e.g. SSE
-  // reconnect ordering), _planContent is empty and _addInlinePlan early-
-  // returns silently.  Surface a one-line info message so the user sees
-  // what happened.
-  if (_planContent) {
-    try {
-      _addInlinePlan(_planContent, action, fb, "remote");
-    } catch (err) {
-      console.error("Failed to render inline plan:", err);
-      if (pane) pane.addInfoMessage("Plan " + action + " on another device");
-    }
-  } else if (pane) {
-    pane.addInfoMessage("Plan " + action + " on another device");
-  }
-
-  // SR announcement (visible toast styling deferred — #toast already has
-  // aria-live="polite" in markup, this just gives screen-reader parity).
-  _announce("Plan " + action + " on another device");
-
-  if (pane) {
-    pane.setBusy(true);
-    pane.addThinkingIndicator();
-  }
-
-  _planContent = "";
-  _planPaneId = null;
-  _planWsId = null;
-}
-
 function _announce(text) {
   const el = document.getElementById("toast");
   if (!el) return;
@@ -6675,65 +6521,9 @@ function _announce(text) {
   }, 50);
 }
 
-function _addInlinePlan(content, action, feedback, origin) {
-  if (!content) return;
-  const pane = panes[_planPaneId];
-  if (!pane) return;
-
-  const wrapper = document.createElement("div");
-  wrapper.className = "plan-inline";
-
-  const header = document.createElement("div");
-  header.className = "plan-inline-header";
-  let label =
-    action === "rejected"
-      ? "Plan rejected"
-      : action === "amending"
-        ? "Plan \u2014 amending"
-        : "Plan approved";
-  // Disambiguate remote dismissal — otherwise the desktop user sees "Plan
-  // approved" with no attribution and may wonder if the agent self-approved.
-  if (origin === "remote") label += " (synced)";
-  const labelEl = document.createElement("span");
-  labelEl.className = "plan-inline-label plan-" + action;
-  labelEl.textContent = label;
-  header.appendChild(labelEl);
-  wrapper.appendChild(header);
-
-  const body = document.createElement("div");
-  body.className = "plan-inline-body";
-  try {
-    setMarkdown(body, content);
-  } catch (e) {
-    body.textContent = content;
-  }
-  if (content.split("\n").length > 12) {
-    makeCollapsible(body);
-    body.setAttribute(
-      "aria-label",
-      "Plan content (collapsed). Activate to expand.",
-    );
-  }
-  wrapper.appendChild(body);
-
-  if (feedback && action === "amending") {
-    const fb = document.createElement("div");
-    fb.className = "plan-inline-feedback";
-    fb.textContent = "Feedback: " + feedback;
-    wrapper.appendChild(fb);
-  }
-
-  pane.messagesEl.appendChild(wrapper);
-  pane.scrollToBottom();
-}
-
 // ===========================================================================
 //  14. Keyboard shortcuts
 // ===========================================================================
-
-document
-  .getElementById("plan-feedback")
-  .addEventListener("input", _updatePlanRejectBtn);
 
 // Dashboard composer wiring — Enter (no shift) submits, input refreshes the
 // button label, paperclip + drag-drop + paste-image stage files, options
@@ -7466,32 +7256,6 @@ document.addEventListener("keydown", function (e) {
       });
     }
     return;
-  }
-
-  // Plan dialog
-  if (document.getElementById("plan-overlay").classList.contains("active")) {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      resolvePlan("");
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      const hasFb =
-        document.getElementById("plan-feedback").value.trim().length > 0;
-      resolvePlan(hasFb ? "" : "reject");
-    } else if (e.key === "Tab") {
-      const focusable = document.querySelectorAll(
-        "#plan-dialog input, #plan-dialog button",
-      );
-      const first = focusable[0],
-        last = focusable[focusable.length - 1];
-      if (e.shiftKey && document.activeElement === first) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && document.activeElement === last) {
-        e.preventDefault();
-        first.focus();
-      }
-    }
   }
 });
 

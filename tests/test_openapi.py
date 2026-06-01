@@ -37,7 +37,6 @@ class TestServerSpec:
             "/v1/api/workstreams/{ws_id}/events",
             "/v1/api/dashboard",
             "/v1/api/workstreams/saved",
-            "/v1/api/plan",
             "/v1/api/command",
             "/v1/api/events/global",
             "/v1/api/workstreams/new",

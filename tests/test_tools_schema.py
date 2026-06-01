@@ -2,8 +2,6 @@
 
 from turnstone.core.tools import (
     _META,
-    AGENT_AUTO_TOOLS,
-    AGENT_TOOLS,
     PRIMARY_KEY_MAP,
     TASK_AGENT_TOOLS,
     TASK_AUTO_TOOLS,
@@ -47,22 +45,12 @@ class TestToolsSchema:
         names = [t["function"]["name"] for t in TOOLS]
         assert len(names) == len(set(names)), f"Duplicate tool names: {names}"
 
-    def test_agent_tools_subset(self):
-        tool_names = {t["function"]["name"] for t in TOOLS}
-        agent_names = {t["function"]["name"] for t in AGENT_TOOLS}
-        assert agent_names.issubset(tool_names), (
-            f"AGENT_TOOLS has names not in TOOLS: {agent_names - tool_names}"
-        )
-
     def test_task_agent_tools_subset(self):
         tool_names = {t["function"]["name"] for t in TOOLS}
         task_names = {t["function"]["name"] for t in TASK_AGENT_TOOLS}
         assert task_names.issubset(tool_names), (
             f"TASK_AGENT_TOOLS has names not in TOOLS: {task_names - tool_names}"
         )
-
-    def test_agent_tools_not_empty(self):
-        assert len(AGENT_TOOLS) > 0
 
     def test_task_agent_tools_not_empty(self):
         assert len(TASK_AGENT_TOOLS) > 0
@@ -72,16 +60,11 @@ class TestToolsMetadata:
     """Validate the metadata extracted from JSON files."""
 
     def test_tool_count(self):
-        # 19 interactive tools + 12 coordinator tools (was 13 before the
-        # skills tool unification merged `skill` + `list_skills` and made
-        # the unified `skills` tool dual-kind).
-        assert len(TOOLS) == 31
-
-    def test_agent_tools_count(self):
-        assert len(AGENT_TOOLS) == 10
+        # 16 interactive tools + 12 coordinator-only tools.
+        assert len(TOOLS) == 28
 
     def test_task_agent_tools_count(self):
-        assert len(TASK_AGENT_TOOLS) == 13
+        assert len(TASK_AGENT_TOOLS) == 11
 
     def test_coordinator_tools_count(self):
         from turnstone.core.tools import COORDINATOR_TOOLS
@@ -123,8 +106,6 @@ class TestToolsMetadata:
             "read_file",
             "search",
             "diff_file",
-            "math",
-            "man",
             "web_fetch",
             "web_search",
             "notify",
@@ -134,22 +115,18 @@ class TestToolsMetadata:
             "list_nodes",
             "wait_for_workstream",
         }
-        assert expected == AGENT_AUTO_TOOLS
         assert expected == TASK_AUTO_TOOLS
 
     def test_primary_key_map(self):
         expected = {
             "bash": "command",
-            "math": "code",
             "read_file": "path",
             "search": "query",
             "write_file": "content",
             "edit_file": "old_string",
-            "man": "page",
             "web_fetch": "url",
             "web_search": "query",
             "task_agent": "prompt",
-            "plan_agent": "goal",
             "memory": "name",
             "recall": "query",
             "notify": "message",
@@ -173,7 +150,7 @@ class TestToolsMetadata:
 
     def test_no_metadata_in_function_dicts(self):
         """Ensure turnstone metadata keys are stripped from the OpenAI schema."""
-        meta_keys = {"agent", "task_agent", "coordinator", "auto_approve", "primary_key"}
+        meta_keys = {"task_agent", "coordinator", "auto_approve", "primary_key"}
         for tool in TOOLS:
             func = tool["function"]
             leaked = meta_keys & set(func)

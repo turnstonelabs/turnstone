@@ -19,7 +19,6 @@ let _mobileSidebarOpen = false;
 // alias list, and whose empty-string option renders as "(server default)".
 const ALIAS_SETTING_KEYS = [
   "model.default_alias",
-  "model.plan_alias",
   "model.task_alias",
   "channels.default_model_alias",
   "audio.stt_model_alias",
@@ -30,7 +29,7 @@ const ALIAS_SETTING_KEYS = [
 // opposed to "no value" — distinct from the literal "none" choice (e.g.
 // reasoning_effort="none" actually disables reasoning, very different
 // from leaving it unset).
-const INHERIT_EMPTY_LABEL_KEYS = ["model.plan_effort", "model.task_effort"];
+const INHERIT_EMPTY_LABEL_KEYS = ["model.task_effort"];
 
 // ---------------------------------------------------------------------------
 // View switching (called from app.js showHome/drillDown pattern)
@@ -2979,8 +2978,6 @@ function loadSettings() {
       const roleKeys = {
         "coordinator.model_alias": 1,
         "coordinator.reasoning_effort": 1,
-        "model.plan_alias": 1,
-        "model.plan_effort": 1,
         "model.task_alias": 1,
         "model.task_effort": 1,
         "channels.default_model_alias": 1,
@@ -5144,8 +5141,8 @@ let _modelCreateTrigger = null;
 // ``fallbackKind`` controls how the empty/blank option in the alias
 // dropdown is labelled.  Coordinator and Judge fall back to a single
 // well-defined alias (model.default_alias / coordinator alias) so we
-// surface that concrete model in the placeholder.  Plan/Task agents
-// cascade through ``[model].plan_model → [model].agent_model →
+// surface that concrete model in the placeholder.  The Task agent
+// cascades through ``[model].task_model → [model].agent_model →
 // session model`` per turnstone/core/settings_registry.py — there's
 // no single "default" to advertise, so the blank reads "(inherit)"
 // to match the vocabulary of the reasoning-effort dropdowns.
@@ -5171,14 +5168,6 @@ const MODEL_ROLES = [
       "Output-guard judge that semantically evaluates tool results for camouflaged prompt injection (active when judge.output_guard_llm is enabled).",
     aliasKey: "judge.output_guard_model",
     fallbackKind: "default",
-  },
-  {
-    label: "Plan agent",
-    description:
-      "plan_agent sub-agent — produces high-level plans before task dispatch.",
-    aliasKey: "model.plan_alias",
-    effortKey: "model.plan_effort",
-    fallbackKind: "inherit",
   },
   {
     label: "Task agent",

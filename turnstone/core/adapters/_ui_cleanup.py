@@ -36,9 +36,6 @@ def cleanup_session_ui(ws: Workstream) -> None:
         if hasattr(ui, "_approval_event"):
             ui._approval_result = False, None  # type: ignore[attr-defined]
             ui._approval_event.set()
-        if hasattr(ui, "_plan_event"):
-            ui._plan_result = "reject"  # type: ignore[attr-defined]
-            ui._plan_event.set()
         if hasattr(ui, "_fg_event"):
             ui._fg_event.set()
         if hasattr(ui, "_listeners_lock"):

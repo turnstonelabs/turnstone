@@ -283,14 +283,6 @@ class AsyncTurnstoneServer(_BaseClient):
             response_model=StatusResponse,
         )
 
-    async def plan_feedback(self, *, ws_id: str, feedback: str = "") -> StatusResponse:
-        return await self._request(
-            "POST",
-            "/v1/api/plan",
-            json_body={"ws_id": ws_id, "feedback": feedback},
-            response_model=StatusResponse,
-        )
-
     async def command(self, *, ws_id: str, command: str) -> StatusResponse:
         return await self._request(
             "POST",
@@ -688,9 +680,6 @@ class TurnstoneServer:
         return self._runner.run(
             self._async.approve(ws_id=ws_id, approved=approved, feedback=feedback, always=always)
         )
-
-    def plan_feedback(self, *, ws_id: str, feedback: str = "") -> StatusResponse:
-        return self._runner.run(self._async.plan_feedback(ws_id=ws_id, feedback=feedback))
 
     def command(self, *, ws_id: str, command: str) -> StatusResponse:
         return self._runner.run(self._async.command(ws_id=ws_id, command=command))

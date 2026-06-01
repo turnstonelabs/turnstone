@@ -455,13 +455,6 @@ Each item in `items` (shared by `tool_info` and `approve_request`):
 | `cache_creation_tokens`  | int    | Tokens written to prompt cache (Anthropic)           |
 | `cache_read_tokens`      | int    | Tokens served from prompt cache (Anthropic + OpenAI) |
 
-**`plan_review`** -- the model is proposing a plan and wants feedback. The
-client must respond via `POST /v1/api/plan`.
-
-```json
-{"type": "plan_review", "content": "Step 1: ...\nStep 2: ..."}
-```
-
 **`info`** -- an informational message (e.g. command output).
 
 ```json
@@ -768,36 +761,6 @@ an `approve_request` event for the given workstream.
 When `always` is `true` and `approved` is `true`, the workstream's WebUI
 instance sets `auto_approve = True`, causing all subsequent tool calls to be
 automatically approved without prompting.
-
-**Response:**
-
-```json
-{"status": "ok"}
-```
-
-**Error:** `404` with `{"error": "Unknown workstream"}` if `ws_id` is invalid.
-
----
-
-### `POST /v1/api/plan`
-
-Responds to a plan review dialog. The SSE stream must have previously sent a
-`plan_review` event for the given workstream.
-
-**Request body:**
-
-```json
-{"feedback": "", "ws_id": "abc123"}
-```
-
-| Field      | Type   | Required | Description                                             |
-|------------|--------|----------|---------------------------------------------------------|
-| `feedback` | string | yes      | Feedback text; empty string means approval              |
-| `ws_id`    | string | yes      | Target workstream ID                                    |
-
-To approve the plan, send an empty string for `feedback`. To reject or request
-changes, send a non-empty feedback string (e.g. `"reject"` or specific
-revision instructions).
 
 **Response:**
 

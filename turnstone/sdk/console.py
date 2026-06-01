@@ -426,12 +426,6 @@ class AsyncTurnstoneConsole(_BaseClient):
             "POST", f"/v1/api/route/workstreams/{ws_id}/approve", json_body=body
         )
 
-    async def route_plan_feedback(self, *, ws_id: str, feedback: str) -> dict[str, Any]:
-        """Send plan feedback via the routing proxy."""
-        return await self._request(
-            "POST", "/v1/api/route/plan", json_body={"ws_id": ws_id, "feedback": feedback}
-        )
-
     async def route_close(self, ws_id: str) -> dict[str, Any]:
         """Close a workstream via the routing proxy."""
         return await self._request("POST", f"/v1/api/route/workstreams/{ws_id}/close", json_body={})
@@ -1359,9 +1353,6 @@ class TurnstoneConsole:
                 ws_id=ws_id, approved=approved, feedback=feedback, always=always
             )
         )
-
-    def route_plan_feedback(self, *, ws_id: str, feedback: str) -> dict[str, Any]:
-        return self._runner.run(self._async.route_plan_feedback(ws_id=ws_id, feedback=feedback))
 
     def route_close(self, ws_id: str) -> dict[str, Any]:
         return self._runner.run(self._async.route_close(ws_id))

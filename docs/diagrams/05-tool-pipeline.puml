@@ -24,7 +24,7 @@ partition "Phase 1: Prepare" #E8F5E9 {
         :Dispatch to _prepare_{func_name}();
 
         note right
-            **Dispatch table (19 built-in + tool_search):**
+            **Dispatch table (16 built-in + tool_search):**
             ┌───────────────┬──────────────────┐
             │ Tool          │ Needs Approval?  │
             ├───────────────┼──────────────────┤
@@ -34,13 +34,10 @@ partition "Phase 1: Prepare" #E8F5E9 {
             │ edit_file     │ ✓ Yes            │
             │ search        │ ✗ Auto-approve   │
             │ diff_file     │ ✗ Auto-approve   │
-            │ math          │ ✗ Auto-approve   │
-            │ man           │ ✗ Auto-approve   │
             │ web_fetch     │ ✗ Auto-approve   │
             │ web_search    │ ✗ Auto-approve   │
             │ tool_search   │ ✗ Auto-approve   │
             │ task_agent    │ ✓ Yes            │
-            │ plan_agent    │ ✓ Yes            │
             │ memory        │ ✗ Auto-approve   │
             │ recall        │ ✗ Auto-approve   │
             │ notify        │ ✗ Auto-approve   │
@@ -110,13 +107,10 @@ partition "Phase 3: Execute" #E3F2FD {
           ├─ _exec_write_file: makedirs + write
           ├─ _exec_edit_file: find_occurrences + replace
           ├─ _exec_search: grep subprocess
-          ├─ _exec_math: sandboxed subprocess
-          ├─ _exec_man: man/info subprocess
           ├─ _exec_web_fetch: httpx.get + LLM summary
           ├─ _exec_web_search: SearxNG JSON GET (fallback for local models)
           ├─ _exec_tool_search: BM25 search + expand_visible()
           ├─ _exec_task: _run_agent(TASK_AGENT_TOOLS)
-          ├─ _exec_plan: _run_agent(AGENT_TOOLS, read-only)
           ├─ _exec_notify: HTTP POST to channel gateway
           ├─ _exec_memory: structured memory save/search/delete/list
           ├─ _exec_recall: conversation history FTS5 search
@@ -131,11 +125,6 @@ partition "Phase 3: Execute" #E3F2FD {
 
     :bash: ui.on_tool_output_chunk(call_id, line) per stdout line;
     :ui.on_tool_result(call_id, name, output, is_error) for each;
-
-    if (plan tool was executed?) then (yes)
-        :ui.on_plan_review(output);
-        :Block for user review/feedback;
-    endif
 }
 
 :Return (results, user_feedback);

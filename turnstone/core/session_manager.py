@@ -53,7 +53,7 @@ class SessionKindAdapter(Protocol):
 
     - **Session construction**: what UI class wraps the workstream,
       what ``ChatSession`` factory signature applies.
-    - **UI cleanup**: unblocking pending approval / plan / foreground
+    - **UI cleanup**: unblocking pending approval / foreground
       events when a workstream closes.
 
     Lifecycle event fan-out (``ws_created`` / ``ws_state`` /
@@ -906,7 +906,7 @@ class SessionManager:
             self._state_subscribers.remove(callback)
 
     def cancel(self, ws_id: str) -> bool:
-        """Cancel in-flight generation and unblock any pending approval / plan.
+        """Cancel in-flight generation and unblock any pending approval.
 
         Does NOT unload the workstream — use ``close`` for that. The
         session stays live and can receive further messages. Returns
@@ -920,13 +920,9 @@ class SessionManager:
                 ws.session.cancel()
             except Exception:
                 log.debug("session_mgr.cancel_failed ws=%s", ws_id[:8], exc_info=True)
-        if ws.ui is not None:
-            if hasattr(ws.ui, "resolve_approval"):
-                with contextlib.suppress(Exception):
-                    ws.ui.resolve_approval(False, "cancelled")
-            if hasattr(ws.ui, "resolve_plan"):
-                with contextlib.suppress(Exception):
-                    ws.ui.resolve_plan("reject")
+        if ws.ui is not None and hasattr(ws.ui, "resolve_approval"):
+            with contextlib.suppress(Exception):
+                ws.ui.resolve_approval(False, "cancelled")
         return True
 
     def close_idle(self, max_age_seconds: float) -> list[str]:

@@ -180,15 +180,6 @@ export class TurnstoneServer extends BaseClient {
     );
   }
 
-  async planFeedback(opts: {
-    wsId: string;
-    feedback?: string;
-  }): Promise<StatusResponse> {
-    return this.request("POST", "/v1/api/plan", {
-      json: { ws_id: opts.wsId, feedback: opts.feedback ?? "" },
-    });
-  }
-
   async command(opts: {
     wsId: string;
     command: string;

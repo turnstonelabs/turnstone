@@ -1639,28 +1639,25 @@ def test_coord_events_replay_skips_session_block_when_no_session():
     assert out == []
 
 
-def test_coord_events_replay_yields_pending_approval_then_pending_plan():
+def test_coord_events_replay_yields_pending_approval():
     """The lifted coord ``events_replay`` callback yields, after the
-    connected preamble: pending approval (if any) + pending plan
-    review (if any). Pre-lift coord pushed both onto the listener
-    queue via ``put_nowait``; the lift restructures as a generator
-    the lifted body iterates and yields as ``data:`` lines, but the
-    payload identity is preserved. Pure-read — never mutates ``ui``."""
+    connected preamble, the pending approval (if any). Pre-lift coord
+    pushed it onto the listener queue via ``put_nowait``; the lift
+    restructures as a generator the lifted body iterates and yields as
+    ``data:`` lines, but the payload identity is preserved. Pure-read —
+    never mutates ``ui``."""
     from turnstone.console.server import _coord_events_replay
 
     ws, ui, request = _make_coord_replay_mocks(
         _pending_approval={"type": "approve_request", "items": []},
-        _pending_plan_review={"type": "plan_review", "content": "..."},
     )
 
     out = list(_coord_events_replay(ws, ui, request))
     types = [ev["type"] for ev in out]
     # Status preamble is yielded first (no last_usage → no status); the
-    # pending-approval / plan ordering then matches the pre-lift body.
+    # pending-approval re-injection then matches the pre-lift body.
     assert types[0] == "connected"
-    approve_idx = types.index("approve_request")
-    plan_idx = types.index("plan_review")
-    assert approve_idx < plan_idx
+    assert "approve_request" in types
 
 
 def test_coord_events_replay_yields_cached_verdicts_after_pending_approval():

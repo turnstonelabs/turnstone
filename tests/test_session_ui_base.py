@@ -1,6 +1,6 @@
 """Tests for ``SessionUIBase`` — the shared UI scaffolding.
 
-Covers listener fan-out, approval / plan blocking gates, intent-judge
+Covers listener fan-out, approval blocking gates, intent-judge
 verdict bookkeeping, and the approval-cycle reset invariant that
 prevents a late verdict from inheriting the previous round's
 ``user_decision``.
@@ -86,7 +86,7 @@ def test_enqueue_tolerates_full_listener_queue() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Approval / plan gates
+# Approval gates
 # ---------------------------------------------------------------------------
 
 
@@ -106,37 +106,6 @@ def test_resolve_approval_broadcasts_approval_resolved() -> None:
     assert event["type"] == "approval_resolved"
     assert event["approved"] is False
     assert event["feedback"] == "nope"
-
-
-def test_resolve_plan_no_pending_signals_but_does_not_broadcast() -> None:
-    """cancel_generation calls resolve_plan unconditionally — the
-    no-pending path must unblock the event without broadcasting a
-    stale plan_resolved."""
-    ui = _make_ui()
-    ui._pending_plan_review = None
-    ui._plan_event.clear()
-    lq = ui._register_listener()
-    ui.resolve_plan("reject")
-    assert ui._plan_result == "reject"
-    assert ui._plan_event.is_set()
-    assert lq.empty()
-
-
-def test_resolve_plan_with_pending_broadcasts_plan_resolved() -> None:
-    ui = _make_ui()
-    ui._pending_plan_review = {"type": "plan_review", "content": "..."}
-    ui._plan_event.clear()
-    lq = ui._register_listener()
-    ui.resolve_plan("accept")
-    event = lq.get_nowait()
-    assert event == {
-        "type": "plan_resolved",
-        "feedback": "accept",
-        "ws_id": "ws-1",
-        "_event_id": 1,
-    }
-    assert ui._pending_plan_review is None
-    assert ui._plan_event.is_set()
 
 
 # ---------------------------------------------------------------------------

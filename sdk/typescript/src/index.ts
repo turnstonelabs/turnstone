@@ -42,7 +42,6 @@ export type {
   ToolResultEvent,
   ToolOutputChunkEvent,
   StatusEvent,
-  PlanReviewEvent,
   InfoEvent,
   ErrorEvent,
   BusyErrorEvent,
@@ -71,7 +70,6 @@ export {
   isWsStateEvent,
   isApproveRequestEvent,
   isApprovalResolvedEvent,
-  isPlanReviewEvent,
   isCancelledEvent,
 } from "./events.js";
 
@@ -80,7 +78,6 @@ export type {
   SendRequest,
   SendResponse,
   ApproveRequest,
-  PlanFeedbackRequest,
   CommandRequest,
   CreateWorkstreamRequest,
   CreateWorkstreamResponse,

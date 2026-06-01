@@ -120,11 +120,6 @@ export interface ApproveRequest {
   ws_id: string;
 }
 
-export interface PlanFeedbackRequest {
-  feedback: string;
-  ws_id: string;
-}
-
 export interface CommandRequest {
   command: string;
   ws_id: string;

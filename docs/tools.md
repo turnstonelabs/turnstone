@@ -1,6 +1,6 @@
 # Tools Reference
 
-turnstone exposes 19 built-in tools plus any number of external MCP tools to the
+turnstone exposes 16 built-in tools plus any number of external MCP tools to the
 LLM via the OpenAI function-calling interface. Built-in tools are defined as JSON
 files under `turnstone/tools/` and loaded at startup by `turnstone/core/tools.py`.
 MCP tools are discovered from configured MCP servers at startup by
@@ -22,7 +22,6 @@ schema plus turnstone-specific metadata keys:
     "properties": { ... },
     "required": ["param1"]
   },
-  "agent": true,
   "task_agent": true,
   "auto_approve": true,
   "primary_key": "param1"
@@ -33,8 +32,7 @@ schema plus turnstone-specific metadata keys:
 
 | Key            | Type | Meaning |
 |----------------|------|---------|
-| `agent`        | bool | Tool is available to plan/task sub-agents (read-only subset). |
-| `task_agent`   | bool | Tool is available to task sub-agents (broader subset). |
+| `task_agent`   | bool | Tool is available to task sub-agents. |
 | `auto_approve` | bool | Tool runs without user confirmation (read-only, safe operations). |
 | `primary_key`  | str  | When the model sends a bare string instead of JSON args, map it to this parameter name. |
 
@@ -46,12 +44,10 @@ schema plus turnstone-specific metadata keys:
 
 | Name                | Description |
 |---------------------|-------------|
-| `TOOLS`             | All 19 tool definitions (sent to the model). |
-| `AGENT_TOOLS`       | Tools with `agent: true` -- available to plan sub-agents. Read-only tools. |
+| `TOOLS`             | All 28 loaded built-in tool definitions (interactive + coordinator union). Sessions send a kind-specific subset (`INTERACTIVE_TOOLS` or `COORDINATOR_TOOLS`). |
 | `TASK_AGENT_TOOLS`  | Tools with `task_agent: true` -- available to task sub-agents. Includes write operations. |
-| `AGENT_AUTO_TOOLS`  | Set of tool names with `auto_approve: true` -- no user confirmation needed. |
-| `TASK_AUTO_TOOLS`   | Same as `AGENT_AUTO_TOOLS` (identical filter). |
-| `BUILTIN_TOOL_NAMES`| Frozenset of all 19 built-in tool names. Used by tool search to distinguish always-on tools from deferrable MCP tools. |
+| `TASK_AUTO_TOOLS`   | Set of all tool names with `auto_approve: true` -- used by task-agent sub-sessions to skip confirmation for matching available tools. |
+| `BUILTIN_TOOL_NAMES`| Frozenset of all 28 built-in tool names (interactive + coordinator union). Used by tool search to distinguish always-on tools from deferrable MCP tools. |
 | `PRIMARY_KEY_MAP`   | Dict mapping tool name to its `primary_key` parameter name. |
 
 ---
@@ -69,7 +65,7 @@ Tool execution follows a three-phase pipeline inside `ChatSession._execute_tools
 - Parses the JSON arguments (with fallback for malformed JSON).
 - If JSON parsing fails entirely, uses `PRIMARY_KEY_MAP` to map a bare string
   to the correct parameter.
-- Dispatches to the matching `_prepare_{func_name}()` handler. There are 19
+- Dispatches to the matching `_prepare_{func_name}()` handler. There are 16
   built-in tools plus `tool_search` (synthetic, client-side BM25 fallback) and
   the generic `_prepare_mcp_tool()` handler for MCP tools.
 - Validates arguments and builds a preview dict containing:
@@ -111,9 +107,6 @@ Each item's `execute` callable is invoked:
   denials are tracked separately. This removes the need for text-prefix heuristics.
   Other tools deliver results atomically via
   `ui.on_tool_result(call_id, name, output, is_error=...)` only.
-- Special post-execution gate for `plan`: the plan output is shown to the user
-  for review, and the user can reject or annotate it.
-
 ---
 
 ## Tool Approval Flow
@@ -121,7 +114,6 @@ Each item's `execute` callable is invoked:
 **Auto-approved** (no user confirmation needed at runtime):
 - `read_file` -- reads files, no side effects
 - `search` -- grep-style search, no side effects
-- `man` -- reads man pages, no side effects
 - `memory` -- structured persistent memory (save/search/delete/list)
 - `recall` -- searches conversation history
 - `notify` -- sends notifications to linked channels (time-sensitive, auto-approved for urgency)
@@ -130,16 +122,14 @@ Each item's `execute` callable is invoked:
 - `bash` -- arbitrary command execution
 - `write_file` -- creates or overwrites files
 - `edit_file` -- modifies file content
-- `math` -- sandboxed computation (confirmation required despite being sandboxed)
 - `web_fetch` -- fetches a URL (SSRF-protected, but makes network requests)
 - `web_search` -- web search via self-hosted SearxNG (makes network requests)
-- `task` -- spawns an autonomous sub-agent
-- `plan` -- spawns a planning sub-agent, plus post-execution review gate
+- `task_agent` -- spawns an autonomous sub-agent
 
 Note: The JSON schema metadata key `auto_approve` controls membership in
-`AGENT_AUTO_TOOLS`/`TASK_AUTO_TOOLS` (used for agent sub-sessions). The actual
-runtime approval behavior is determined by the `needs_approval` field set in
-each `_prepare_*` method on `ChatSession`. These two mechanisms can differ.
+`TASK_AUTO_TOOLS` (used for task agent sub-sessions). The actual runtime
+approval behavior is determined by the `needs_approval` field set in each
+`_prepare_*` method on `ChatSession`. These two mechanisms can differ.
 
 ---
 
@@ -165,12 +155,9 @@ Every tool defines a `primary_key`. The mapping is:
 | `write_file` | `content`   |
 | `edit_file`  | `old_string`|
 | `search`     | `query`     |
-| `math`       | `code`      |
-| `man`        | `page`      |
 | `web_fetch`  | `url`       |
 | `web_search` | `query`     |
 | `task_agent` | `prompt`    |
-| `plan_agent` | `goal`      |
 | `memory`     | `name`      |
 | `recall`     | `query`     |
 | `notify`     | `message`   |
@@ -194,7 +181,7 @@ Execute a bash command and return stdout + stderr.
 - **What it does**: Runs the command in a subprocess with a configurable timeout. Commands are sanitized and checked against a blocklist (e.g. `rm -rf /`). Environment variables containing secrets are scrubbed (`*_KEY`, `*_SECRET`, `*_TOKEN`, etc.).
 - **Output format**: Stdout is returned directly. Stderr lines are prefixed with `[stderr]` so the model can distinguish them. When the command itself redirects stderr to stdout (`2>&1`), no prefix is added. Output exceeding 256KB is truncated (head + tail preserved, middle replaced with a truncation notice).
 - **Auto-approve**: No -- requires user confirmation.
-- **Agent availability**: `task_agent` only (not available to plan sub-agents).
+- **Agent availability**: `task_agent` only.
 
 ---
 
@@ -212,7 +199,7 @@ base64-encoded image data for supported image formats.
 - **What it does**: For text files, reads and returns content with line numbers. For image files (PNG, JPEG, GIF, WebP, BMP, TIFF, ICO), returns image data as multi-part content when the model supports vision, or a text description when it does not. SVG files are read as text. Images larger than 4 MB are rejected. Must be called before `edit_file` on the same path (the session tracks which files have been read).
 - **Vision support**: Controlled by `ModelCapabilities.supports_vision`. All commercial OpenAI and Anthropic models have vision enabled. Local models (vLLM, llama.cpp, NIM) default to off — enable via `[models.*.capabilities] supports_vision = true` in config.toml.
 - **Auto-approve**: Yes.
-- **Agent availability**: `agent` and `task_agent`.
+- **Agent availability**: `task_agent`.
 
 ---
 
@@ -268,7 +255,7 @@ Show a unified diff between two files, or between a file and a provided string.
 
 - **What it does**: Returns unified diff output using Python's `difflib`. Binary files (containing null bytes) are rejected with a clear error. Files read through `diff_file` satisfy `edit_file`'s read guard — you can diff then edit without a separate `read_file` call. Large diffs are streamed with early cutoff at the tool truncation limit.
 - **Auto-approve**: Yes (read-only).
-- **Agent availability**: `agent` and `task_agent`.
+- **Agent availability**: `task_agent`.
 
 ---
 
@@ -283,43 +270,11 @@ Search file contents for a regex pattern.
 
 - **What it does**: Recursively searches for the pattern using `grep -rn`. Returns matching lines with file paths and line numbers.
 - **Auto-approve**: Yes.
-- **Agent availability**: `agent` and `task_agent`.
-
----
-
-## Computation
-
-### math
-
-Execute Python code for math and computation in a sandbox.
-
-| Parameter | Type   | Required | Description |
-|-----------|--------|----------|-------------|
-| `code`    | string | yes      | Python code to execute. Must use `print()` for output. |
-
-- **What it does**: Runs Python code in a sandboxed environment with pre-imported libraries: `sympy`, `numpy`, `scipy`, `math`, `fractions`, `itertools`, `functools`, `collections`, `decimal`, `operator`, `random`, `re`, `string`. Common sympy names (`symbols`, `solve`, `simplify`, `sqrt`, `Matrix`, etc.) are pre-imported. `pytest` is also available for import.
-- **Installation**: `sympy`, `numpy`, `scipy`, and `pytest` require the `[sandbox]` extras group: `pip install turnstone[sandbox]` (included in `[all]`).
-- **Auto-approve**: Yes.
-- **Agent availability**: `agent` and `task_agent`.
+- **Agent availability**: `task_agent`.
 
 ---
 
 ## Information
-
-### man
-
-Read a man page.
-
-| Parameter | Type   | Required | Description |
-|-----------|--------|----------|-------------|
-| `page`    | string | yes      | The man page name (e.g. `grep`, `socket`, `printf`). |
-| `section` | string | no       | Manual section (e.g. `1` commands, `2` syscalls, `3` library). |
-
-- **What it does**: Returns the full formatted manual entry. Preferred over `bash('man ...')` or `web_search` for command/API documentation.
-- **Auto-approve**: Yes.
-- **Agent availability**: `agent` and `task_agent`.
-
----
 
 ### web_fetch
 
@@ -332,7 +287,7 @@ Fetch a URL and extract specific information from it.
 
 - **What it does**: Fetches the URL, strips HTML to plain text, and uses the LLM to extract the answer to the question from the page content. Protected against SSRF (blocks private/internal IPs).
 - **Auto-approve**: No -- requires user confirmation (makes network requests).
-- **Agent availability**: `agent` and `task_agent`.
+- **Agent availability**: `task_agent`.
 
 ---
 
@@ -351,13 +306,13 @@ Search the web using a text query.
   - **OpenAI search models** (`gpt-5-search-api`): Replaced with `web_search_options` parameter. The model always searches and returns `url_citation` annotations.
   - **Local/vLLM models**: Falls back to a self-hosted [SearxNG](https://searxng.org) instance. Set `searxng_url` in `config.toml` `[tools]` or `$TURNSTONE_SEARXNG_URL` (the docker-compose stack bundles a `searxng` service and points at it by default). Operators with a custom MCP search server can instead set `web_search_backend = "mcp:server:tool"`.
 - **Auto-approve**: Yes (auto-approved for all tool dispatch paths).
-- **Agent availability**: `agent` and `task_agent`.
+- **Agent availability**: `task_agent`.
 
 ---
 
 ## Agent
 
-Tool names use the `_agent` suffix — bare `plan` / `task` collide with
+The tool name uses the `_agent` suffix — bare `task` collides with
 chat-template channel names on some local models.
 
 ### task_agent
@@ -368,23 +323,9 @@ Delegate a general-purpose task to an autonomous sub-agent.
 |-----------|--------|----------|-------------|
 | `prompt`  | string | yes      | Complete task description for the sub-agent. |
 
-- **What it does**: Spawns a sub-agent that inherits the `TASK_AGENT_TOOLS` set (read, write, edit, search, bash, math, man, web tools, memory tools). The sub-agent runs autonomously to completion. Use for work that requires file modifications or command execution.
+- **What it does**: Spawns a sub-agent that inherits the `TASK_AGENT_TOOLS` set (read, write, edit, search, bash, web tools, memory tools). The sub-agent runs autonomously to completion. Use for work that requires file modifications or command execution.
 - **Auto-approve**: No -- requires user confirmation.
-- **Agent availability**: Not available to sub-agents (top-level only).
-
----
-
-### plan_agent
-
-Plan before implementing -- an autonomous agent explores the codebase and writes a structured plan.
-
-| Parameter | Type   | Required | Description |
-|-----------|--------|----------|-------------|
-| `prompt`  | string | yes      | What to plan -- the goal, constraints, and scope. |
-
-- **What it does**: Spawns a planning sub-agent with `AGENT_TOOLS` (read-only tools: `read_file`, `search`, `math`, `man`, `web_fetch`, `web_search`). The agent explores the codebase and writes a structured plan to `.plan-<ws_id>.md` (unique per workstream, so concurrent workstreams never collide). If the `plan` tool has been called before in the same session, the prior plan is passed to the agent as context so it refines rather than restarts. After completion, the user is prompted to review and can accept, reject, or annotate the plan.
-- **Auto-approve**: No -- requires user confirmation, plus post-execution review gate.
-- **Agent availability**: Not available to sub-agents (top-level only).
+- **Agent availability**: Top-level only.
 
 ---
 
@@ -445,7 +386,7 @@ Provide either `username` for user-based targeting or `channel_type` +
 
 - **What it does**: Sends a notification via the channel gateway's HTTP endpoint (`POST /v1/api/notify`). The server queries the `services` table for healthy channel gateways, authenticates with a service JWT (`aud: turnstone-channel`), and delivers to the first healthy gateway. On failure, retries up to 2 additional times with backoff (1s, 3s). Rate-limited to 5 notifications per turn (counter only increments on success).
 - **Auto-approve**: Yes — notifications are time-sensitive and auto-approved so the model can alert users urgently.
-- **Agent availability**: `agent` and `task_agent`.
+- **Agent availability**: `task_agent`.
 
 > See [Channel Integrations: Notifications](channels.md#notifications)
 > for the full delivery flow, service registry details, and security
@@ -521,7 +462,7 @@ data.get("mergedAt") is not None
 - Duplicate names rejected within the same workstream.
 
 - **Auto-approve**: `create` requires approval; `list` and `cancel` are auto-approved.
-- **Agent availability**: Main session only — not available to plan/task sub-agents.
+- **Agent availability**: Main session only — not available to task sub-agents.
 
 > See [Watch Architecture](diagrams/png/18-watch-architecture.png) for the
 > full poll → evaluate → dispatch flow.
@@ -554,33 +495,30 @@ pre-configure skills at workstream creation.
 
 - **Auto-approve**: `load` requires approval (changes session behavior); `search`
   is auto-approved (read-only).
-- **Agent availability**: Main session only — not available to plan/task sub-agents.
+- **Agent availability**: Main session only — not available to task sub-agents.
 
 ---
 
 ## Summary Table
 
-| Tool         | Category   | Auto-approve | agent | task_agent | primary_key |
-|--------------|------------|--------------|-------|------------|-------------|
-| `bash`       | File Ops   | No           | No    | Yes        | `command`   |
-| `read_file`  | File Ops   | Yes          | Yes   | Yes        | `path`      |
-| `write_file` | File Ops   | No           | No    | Yes        | `content`   |
-| `edit_file`  | File Ops   | No           | No    | Yes        | `old_string`|
-| `search`     | File Ops   | Yes          | Yes   | Yes        | `query`     |
-| `math`       | Compute    | No           | Yes   | Yes        | `code`      |
-| `man`        | Info       | Yes          | Yes   | Yes        | `page`      |
-| `web_fetch`  | Info       | No           | Yes   | Yes        | `url`       |
-| `web_search` | Info       | No           | Yes   | Yes        | `query`     |
-| `task_agent` | Agent      | No           | No    | No         | `prompt`    |
-| `plan_agent` | Agent      | No           | No    | No         | `goal`      |
-| `memory`     | Memory     | Yes          | No    | No         | `name`      |
-| `recall`     | Memory     | Yes          | No    | No         | `query`     |
-| `notify`     | Notify     | Yes          | Yes   | Yes        | `message`   |
-| `watch`      | Monitor    | No (create)  | No    | No         | `command`   |
-| `read_resource`| MCP      | No           | Yes   | Yes        | `uri`       |
-| `use_prompt` | MCP        | No           | Yes   | Yes        | `name`      |
-| `skill`      | Skills     | No (load)    | No    | No         | `name`      |
-| `tool_search`| Search     | Yes          | No    | No         | `query`     |
+| Tool         | Category   | Auto-approve | task_agent | primary_key |
+|--------------|------------|--------------|------------|-------------|
+| `bash`       | File Ops   | No           | Yes        | `command`   |
+| `read_file`  | File Ops   | Yes          | Yes        | `path`      |
+| `write_file` | File Ops   | No           | Yes        | `content`   |
+| `edit_file`  | File Ops   | No           | Yes        | `old_string`|
+| `search`     | File Ops   | Yes          | Yes        | `query`     |
+| `web_fetch`  | Info       | No           | Yes        | `url`       |
+| `web_search` | Info       | No           | Yes        | `query`     |
+| `task_agent` | Agent      | No           | No         | `prompt`    |
+| `memory`     | Memory     | Yes          | No         | `name`      |
+| `recall`     | Memory     | Yes          | No         | `query`     |
+| `notify`     | Notify     | Yes          | Yes        | `message`   |
+| `watch`      | Monitor    | No (create)  | No         | `command`   |
+| `read_resource`| MCP      | No           | Yes        | `uri`       |
+| `use_prompt` | MCP        | No           | Yes        | `name`      |
+| `skill`      | Skills     | No (load)    | No         | `name`      |
+| `tool_search`| Search     | Yes          | No         | `query`     |
 
 ---
 
@@ -632,8 +570,9 @@ CLI flags override the config file:
    directly.
 
 2. **Partitioning**: When active, tools are split into two sets:
-   - **Always-on** -- the 19 built-in tools (members of `BUILTIN_TOOL_NAMES`).
-     These are always visible to the model.
+   - **Always-on** -- the built-in tools present in the current session
+     (interactive sessions currently have 16; `BUILTIN_TOOL_NAMES` is the
+     28-tool built-in union). These are always visible to the model.
    - **Deferred** -- all MCP tools. These are not sent in the tool list unless
      the model searches for them.
 
@@ -647,10 +586,10 @@ CLI flags override the config file:
 
 ### Agent exemption
 
-Plan and task sub-agents do not use tool search. They operate on scoped tool
-sets (`AGENT_TOOLS` for plan agents, `TASK_AGENT_TOOLS` for task agents) with
-MCP tools merged in. Tool search is only active for the top-level session,
-where the model can interactively search for tools it needs.
+Task sub-agents do not use tool search. They operate on the scoped tool set
+(`TASK_AGENT_TOOLS`) with MCP tools merged in. Tool search is only active for
+the top-level session, where the model can interactively search for tools it
+needs.
 
 ---
 
@@ -675,7 +614,7 @@ MCP-compatible service.
 3. **Schema conversion**: Each MCP tool's `inputSchema` is converted to OpenAI
    function-calling format. The tool name is prefixed: `mcp__{server}__{tool}`.
 
-4. **Merging**: MCP tools are appended after the 19 built-in tools via
+4. **Merging**: MCP tools are appended after the 16 built-in tools via
    `merge_mcp_tools()`. Built-in tools appear first, giving them natural LLM priority.
    When dynamic tool search is active, MCP tools are deferred rather than directly
    visible -- the model discovers them via search as needed (see
@@ -701,7 +640,6 @@ gives per-tool-type granularity (e.g., all `use_prompt` calls).
 MCP tools are available to:
 - **Main session** — full access
 - **Task sub-agents** — via `self._task_tools` (merged list)
-- **Plan sub-agents** — via `self._agent_tools` (merged list)
 
 ### Naming convention
 
@@ -774,7 +712,7 @@ MCP tool lists stay up-to-date without restart through two mechanisms:
 When tools change, `MCPClientManager` rebuilds its merged tool list using copy-on-write
 (new list/dict objects assigned atomically) and notifies all active `ChatSession`
 instances via registered listener callbacks. Each session rebuilds its `_tools`,
-`_task_tools`, `_agent_tools`, and reconstructs its `ToolSearchManager` (if active),
+`_task_tools`, and reconstructs its `ToolSearchManager` (if active),
 preserving the set of previously expanded (discovered) tools.
 
 ```
@@ -830,7 +768,7 @@ Use read_resource(uri='...') to access the resources listed above.
 
 - **What it does**: Reads the resource from its MCP server via `MCPClientManager.read_resource_sync()`. Returns text content for text resources or base64-encoded data for binary resources. Output is truncated by the standard tool output limiter.
 - **Auto-approve**: No -- requires user confirmation (reads external data).
-- **Agent availability**: `agent` and `task_agent`.
+- **Agent availability**: `task_agent`.
 
 ### Capability guards
 
@@ -872,7 +810,7 @@ the `initialize` handshake. Each prompt is stored with its prefixed name
 
 - **What it does**: Invokes an MCP prompt by name via `MCPClientManager.get_prompt_sync()`, expanding it into messages. Returns the expanded prompt content formatted as `[role]: content` blocks joined with blank lines. The prompt catalog is listed in the system message so the model knows which prompts are available. Output is truncated by the standard tool output limiter.
 - **Auto-approve**: No -- requires user confirmation (invokes external prompt servers).
-- **Agent availability**: `agent` and `task_agent`.
+- **Agent availability**: `task_agent`.
 
 ### Invocation
 

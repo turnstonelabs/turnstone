@@ -194,15 +194,6 @@ async def test_approve():
 
 
 @pytest.mark.anyio
-async def test_plan_feedback():
-    transport = _mock_transport({"POST /v1/api/plan": _json_response({"status": "ok"})})
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
-        client = AsyncTurnstoneServer(httpx_client=hc)
-        resp = await client.plan_feedback(ws_id="ws1", feedback="approved")
-        assert resp.status == "ok"
-
-
-@pytest.mark.anyio
 async def test_command():
     transport = _mock_transport({"POST /v1/api/command": _json_response({"status": "ok"})})
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:

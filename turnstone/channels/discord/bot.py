@@ -2,7 +2,7 @@
 
 :class:`TurnstoneBot` extends ``discord.ext.commands.Bot`` and manages the
 lifecycle of SSE event subscriptions, streaming message edits, and interactive
-approval / plan-review views.
+approval views.
 
 Events are consumed from the server's per-workstream SSE endpoint
 (``GET /v1/api/workstreams/{ws_id}/events``) using httpx-sse.  Inbound
@@ -32,7 +32,6 @@ from turnstone.sdk.events import (
     ContentEvent,
     ErrorEvent,
     IntentVerdictEvent,
-    PlanReviewEvent,
     ServerEvent,
     StreamEndEvent,
     ThinkingStartEvent,
@@ -59,7 +58,7 @@ _THREAD_INVOKER_CAP: int = 4096
 def _thread_owner_id(thread: discord.abc.Messageable) -> str:
     """Return the Discord user ID who owns the thread / DM target.
 
-    Used to gate approval / plan-review button clicks to the session
+    Used to gate approval button clicks to the session
     owner.  For Discord threads this is the thread creator
     (``thread.owner_id``).  For DM channels we use ``recipient.id``.
     Returns ``""`` when the owner cannot be determined — the views
@@ -298,14 +297,13 @@ class TurnstoneBot:
     async def _setup_hook(self) -> None:
         """Called by discord.py after login but before connecting to the gateway."""
         from turnstone.channels.discord.cog import MessageCog
-        from turnstone.channels.discord.views import ApprovalView, PlanReviewView
+        from turnstone.channels.discord.views import ApprovalView
 
         msg_cog = MessageCog(self._bot)
         await self._bot.add_cog(msg_cog._cog)
 
         # Register persistent views so button callbacks survive restarts.
         self._bot.add_view(ApprovalView(self)._view)
-        self._bot.add_view(PlanReviewView(self)._view)
 
         log.info("discord.setup_hook_complete")
 
@@ -498,8 +496,6 @@ class TurnstoneBot:
             await self._handle_tool_result(ws_id, thread, event)
         elif isinstance(event, ApproveRequestEvent):
             await self._handle_approve_request(ws_id, thread, event)
-        elif isinstance(event, PlanReviewEvent):
-            await self._handle_plan_review(ws_id, thread, event)
         elif isinstance(event, IntentVerdictEvent):
             await self._handle_intent_verdict(ws_id, event)
         elif isinstance(event, ApprovalResolvedEvent):
@@ -728,24 +724,6 @@ class TurnstoneBot:
             embed.set_footer(text=f"{ws_id}||{_thread_owner_id(thread)}")
             msg = await thread.send(embed=embed, view=ApprovalView(self)._view)
             self._pending_approval_msgs[ws_id] = msg
-
-    async def _handle_plan_review(
-        self,
-        ws_id: str,
-        thread: discord.abc.Messageable,
-        event: PlanReviewEvent,
-    ) -> None:
-        import discord
-
-        from turnstone.channels.discord.views import PlanReviewView
-
-        embed = discord.Embed(
-            title="Plan Review",
-            description=f"**Plan review requested:**\n\n{event.content}",
-            color=discord.Color.blue(),
-        )
-        embed.set_footer(text=f"{ws_id}||{_thread_owner_id(thread)}")
-        await thread.send(embed=embed, view=PlanReviewView(self)._view)
 
     async def _handle_intent_verdict(
         self,

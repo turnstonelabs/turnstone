@@ -9,7 +9,6 @@ from typing import Any
 
 _TOOLS_DIR = Path(__file__).resolve().parent.parent / "tools"
 _META_KEYS = {
-    "agent",
     "task_agent",
     "coordinator",
     "interactive",
@@ -38,7 +37,7 @@ def _load_tools() -> tuple[list[dict[str, Any]], dict[str, Any]]:
 
     Returns (tool_defs, metadata) where:
       - tool_defs: list of OpenAI function-calling dicts
-      - metadata: dict mapping tool_name -> {agent, task_agent, coordinator,
+      - metadata: dict mapping tool_name -> {task_agent, coordinator,
                   interactive, auto_approve, primary_key, kind_variants}
     """
     tools = []
@@ -89,7 +88,6 @@ def _apply_kind_variant(tool: dict[str, Any], kind: str, meta: dict[str, Any]) -
 
 TOOLS, _META = _load_tools()
 
-AGENT_TOOLS = [t for t in TOOLS if _META[t["function"]["name"]].get("agent")]
 TASK_AGENT_TOOLS = [t for t in TOOLS if _META[t["function"]["name"]].get("task_agent")]
 # COORDINATOR_TOOLS apply the ``coordinator`` kind variant (if any) so a
 # coord session sees the coord-tailored description + parameter schema.
@@ -121,7 +119,6 @@ INTERACTIVE_TOOLS = [
     )
 ]
 INTERACTIVE_TOOL_NAMES = frozenset(t["function"]["name"] for t in INTERACTIVE_TOOLS)
-AGENT_AUTO_TOOLS = {n for n, m in _META.items() if m.get("auto_approve")}
 TASK_AUTO_TOOLS = {n for n, m in _META.items() if m.get("auto_approve")}
 PRIMARY_KEY_MAP = {n: m["primary_key"] for n, m in _META.items() if "primary_key" in m}
 BUILTIN_TOOL_NAMES = frozenset(_META)

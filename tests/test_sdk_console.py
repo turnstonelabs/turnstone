@@ -599,23 +599,6 @@ async def test_route_approve_omits_defaults():
 
 
 @pytest.mark.anyio
-async def test_route_plan_feedback():
-    captured: dict = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["path"] = request.url.path
-        captured["body"] = json.loads(request.content)
-        return _json_response({"status": "ok"})
-
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
-        client = AsyncTurnstoneConsole(httpx_client=hc)
-        await client.route_plan_feedback(ws_id="ws1", feedback="approved")
-        assert captured["path"] == "/v1/api/route/plan"
-        assert captured["body"] == {"ws_id": "ws1", "feedback": "approved"}
-
-
-@pytest.mark.anyio
 async def test_route_close():
     captured: dict = {}
 

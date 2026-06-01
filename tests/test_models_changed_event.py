@@ -190,8 +190,6 @@ def test_reload_emits_models_changed(storage: SQLiteBackend) -> None:
 _EXPECTED_AFFECTING_KEYS = frozenset(
     {
         "model.default_alias",
-        "model.plan_alias",
-        "model.plan_effort",
         "model.task_alias",
         "model.task_effort",
         "coordinator.model_alias",
@@ -208,11 +206,7 @@ def _value_for_key(key: str) -> str:
     ``reasoning_effort`` keys have a fixed choice list; alias-shaped
     keys accept arbitrary strings.  Avoids per-key custom payloads.
     """
-    if (
-        key.endswith("reasoning_effort")
-        or key.endswith("plan_effort")
-        or key.endswith("task_effort")
-    ):
+    if key.endswith("reasoning_effort") or key.endswith("task_effort"):
         return "low"
     return "anything"
 

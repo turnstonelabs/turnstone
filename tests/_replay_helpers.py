@@ -32,8 +32,8 @@ def make_replay_mocks(
             don't have to reach into the nested mock; when ``None``
             (default), the status replay branch stays inert.
         **ui_overrides: Additional attributes set directly on the ``ui``
-            mock (e.g. ``_pending_approval``, ``_pending_plan_review``,
-            ``_llm_verdicts``, ``_ws_turn_tool_calls``, ``_ws_messages``).
+            mock (e.g. ``_pending_approval``, ``_llm_verdicts``,
+            ``_ws_turn_tool_calls``, ``_ws_messages``).
     """
     session = MagicMock()
     session.model = "gpt-5"
@@ -45,7 +45,6 @@ def make_replay_mocks(
     ui = MagicMock()
     ui.auto_approve = False
     ui._pending_approval = None
-    ui._pending_plan_review = None
     ui._llm_verdicts = {}
     ui._ws_lock = threading.Lock()
     ui._ws_turn_tool_calls = 0

@@ -695,7 +695,6 @@ _ROUTE_PROXY_AUDIT_ACTIONS: dict[str, str] = {
     "rewind": "route.rewind",
     "retry": "route.retry",
     "command": "route.command",
-    "plan": "route.plan",
     "close": "route.workstream.close",
 }
 
@@ -2289,8 +2288,8 @@ async def route_proxy(request: Request) -> Response:
     """Generic routing proxy for send/approve/cancel/command/close.
 
     Path-keyed shape: ``POST/DELETE /v1/api/route/workstreams/{ws_id}/<verb>``
-    (or ``POST /v1/api/route/<verb>`` for the body-keyed plan/command
-    legacies still in scope). ``verb`` drives the audit action lookup;
+    (or ``POST /v1/api/route/<verb>`` for the body-keyed ``command``
+    legacy still in scope). ``verb`` drives the audit action lookup;
     DELETE on ``/send`` is treated as dequeue for audit attribution.
     """
     from turnstone.core.auth import require_any_permission
@@ -2306,7 +2305,7 @@ async def route_proxy(request: Request) -> Response:
     # check (the upstream server gates again), but failing fast at the
     # proxy avoids a cluster round-trip on a forbidden request and keeps
     # the 403 attributed to the proxy in audit logs.  Only the two verbs
-    # whose perms exist; other verbs (send/cancel/dequeue/command/plan)
+    # whose perms exist; other verbs (send/cancel/dequeue/command)
     # remain authenticated-only and pre-existing — leaving them alone
     # rather than expanding scope.  ``admin.coordinator`` accepted as
     # an alternative on each so coord sessions driving interactive
@@ -2353,8 +2352,8 @@ async def route_proxy(request: Request) -> Response:
         )
 
     # Path-keyed shape (post-1.5) carries ws_id in the URL; the
-    # legacy plan/command routes still mount at body-keyed URLs and
-    # supply ws_id via the JSON body. Try path first, fall back to body.
+    # legacy command route still mounts at a body-keyed URL and
+    # supplies ws_id via the JSON body. Try path first, fall back to body.
     ws_id = request.path_params.get("ws_id", "") or str(body.get("ws_id") or "")
     if not ws_id:
         return _record_route(
@@ -3260,7 +3259,6 @@ def _coord_events_replay(
        that fired since it surfaced.  Without this replay a refresh
        loses the judge chip on the pending approval until the
        operator re-invokes the action.
-    3. Pending plan-review (if any).
 
     Coord still skips conversation history — the dashboard fetches it
     via a separate ``GET /history`` endpoint and doesn't want a
@@ -3287,9 +3285,6 @@ def _coord_events_replay(
                 cached_verdicts = list(llm_verdicts.values())
             for v in cached_verdicts:
                 yield {"type": "intent_verdict", **v}
-    pending_plan = getattr(ui, "_pending_plan_review", None)
-    if pending_plan is not None:
-        yield pending_plan
 
 
 async def _coord_create_validate_request(
@@ -8454,8 +8449,6 @@ def _emit_models_changed(request: Request) -> None:
 _MODEL_AFFECTING_SETTING_KEYS: frozenset[str] = frozenset(
     {
         "model.default_alias",
-        "model.plan_alias",
-        "model.plan_effort",
         "model.task_alias",
         "model.task_effort",
         "coordinator.model_alias",
@@ -10280,7 +10273,7 @@ def _refresh_coord_registry(app_state: Any, storage: Any) -> None:
         new_registry = load_model_registry(storage=storage, strict=True)
     except ValueError as exc:
         # ModelRegistry.__init__ raises ValueError for several distinct
-        # config issues — empty models, default/fallback/agent/plan/task
+        # config issues — empty models, default/fallback/agent/task
         # alias not present in the loaded set.  Log the actual reason so
         # operators can tell "no enabled rows" from "default alias typo
         # in config.toml".  Existing registry stays in place either way.
@@ -10295,9 +10288,7 @@ def _refresh_coord_registry(app_state: Any, storage: Any) -> None:
             new_registry.default,
             new_registry.fallback,
             new_registry.agent_model,
-            plan_model=new_registry.plan_model,
             task_model=new_registry.task_model,
-            plan_effort=new_registry.plan_effort,
             task_effort=new_registry.task_effort,
         )
     except Exception:
@@ -12749,7 +12740,6 @@ def create_app(
                         methods=["POST"],
                     ),
                     Route("/api/route/command", route_proxy, methods=["POST"]),
-                    Route("/api/route/plan", route_proxy, methods=["POST"]),
                     Route(
                         "/api/route/workstreams/{ws_id}/close",
                         route_proxy,

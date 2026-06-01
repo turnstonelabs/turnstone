@@ -153,9 +153,6 @@ class TestRequiredScope:
     def test_get_events_per_ws_needs_read(self):
         assert required_scope("GET", "/api/workstreams/abc/events") == "read"
 
-    def test_post_plan_needs_write(self):
-        assert required_scope("POST", "/api/plan") == "write"
-
     def test_post_command_needs_write(self):
         assert required_scope("POST", "/api/command") == "write"
 

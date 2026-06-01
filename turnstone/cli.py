@@ -294,25 +294,6 @@ class TerminalUI(SessionUI):
         sys.stdout.write(f"\n  {DIM}[{' · '.join(parts)}]{RESET}\n")
         sys.stdout.flush()
 
-    def on_plan_review(self, content: str) -> str:
-        sys.stdout.write(f"\n{DIM}{'─' * 60}{RESET}\n")
-        for line in content.splitlines():
-            sys.stdout.write(f"  {line}\n")
-        sys.stdout.write(f"{DIM}{'─' * 60}{RESET}\n")
-        sys.stdout.flush()
-        try:
-            prompt_text = (
-                f"    \001{BOLD}\002Plan ready.\001{RESET}\002 "
-                f"\001{DIM}\002[enter to approve, feedback to amend, "
-                f"ctrl-c to reject]\001{RESET}\002 "
-            )
-            resp = input(prompt_text).strip()
-        except EOFError:
-            resp = ""
-        except KeyboardInterrupt:
-            resp = "reject"
-        return resp
-
     def on_info(self, message: str) -> None:
         print(message)
 
@@ -505,16 +486,6 @@ class WorkstreamTerminalUI(TerminalUI):
     def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:
         if self.is_foreground:
             super().on_tool_output_chunk(call_id, chunk)
-
-    def on_plan_review(self, content: str) -> str:
-        # Must wait until foregrounded to show plan review
-        if not self.is_foreground:
-            self._buffer(
-                "info",
-                f"{YELLOW}[Plan ready — switch to this workstream to review]{RESET}",
-            )
-            self._fg_event.wait()
-        return super().on_plan_review(content)
 
     def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]:
         """Block until foregrounded if in background, then show approval prompt."""

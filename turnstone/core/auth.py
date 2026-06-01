@@ -304,7 +304,6 @@ PUBLIC_PREFIXES: tuple[str, ...] = ("/static/", "/shared/", "/acme/")
 
 WRITE_PATHS: frozenset[str] = frozenset(
     {
-        "/api/plan",
         "/api/command",
         "/api/workstreams/new",
         "/api/cluster/workstreams/new",

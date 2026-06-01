@@ -84,17 +84,6 @@ def _build_registry() -> dict[str, SettingDef]:
             "tokens. Per-model overrides can be set in the Models tab.",
         ),
         SettingDef(
-            "model.plan_alias",
-            "str",
-            "",
-            "Model alias for plan_agent (empty = inherit from config / session)",
-            "model",
-            help="Which model the plan_agent sub-agent uses. When empty, falls back to "
-            "[model].plan_model in config.toml, then [model].agent_model, then the session "
-            "model. Plan_agent runs rarely but benefits from a stronger model for "
-            "high-quality plans \u2014 point this at your strongest reasoner.",
-        ),
-        SettingDef(
             "model.task_alias",
             "str",
             "",
@@ -103,20 +92,7 @@ def _build_registry() -> dict[str, SettingDef]:
             help="Which model the task_agent sub-agent uses. When empty, falls back to "
             "[model].task_model in config.toml, then [model].agent_model, then the session "
             "model. Task_agent fires frequently for autonomous subtasks \u2014 point this "
-            "at a cheaper/faster model than your plan_agent.",
-        ),
-        SettingDef(
-            "model.plan_effort",
-            "str",
-            "",
-            "Reasoning effort for plan_agent (empty = inherit from config; default \u2018high\u2019)",
-            "model",
-            choices=["", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
-            help="Reasoning effort for plan_agent specifically. When empty, falls back to "
-            "[model].plan_effort in config.toml, then to the built-in default \u2018high\u2019. "
-            "Use \u2018xhigh\u2019 or \u2018max\u2019 with models that support deeper reasoning "
-            "for higher-quality plans. (Empty here means \u201cinherit\u201d \u2014 use "
-            "\u2018none\u2019 to actually disable reasoning.)",
+            "at a cheaper/faster model than your conversation model.",
         ),
         SettingDef(
             "model.task_effort",
@@ -195,12 +171,12 @@ def _build_registry() -> dict[str, SettingDef]:
             "tools.agent_max_turns",
             "int",
             -1,
-            "Max turns for plan/task agents (-1 = unlimited)",
+            "Max turns for the task agent (-1 = unlimited)",
             "tools",
             min_value=-1,
             max_value=200,
-            help="Limits how many back-and-forth steps a sub-agent can take when executing a plan "
-            "or task. Prevents runaway agents from consuming excessive tokens.",
+            help="Limits how many back-and-forth steps the task sub-agent can take when executing "
+            "a task. Prevents runaway agents from consuming excessive tokens.",
         ),
         SettingDef(
             "tools.skip_permissions",

@@ -15,7 +15,6 @@ interface "SessionUI" as SessionUI <<Protocol>> {
     + on_tool_result(call_id: str, name: str, output: str, *, is_error: bool = False)
     + on_tool_output_chunk(call_id: str, chunk: str)
     + on_status(usage: dict, ctx_window: int, effort: str)
-    + on_plan_review(content: str) → str
     + on_info(message: str)
     + on_error(message: str)
     + on_state_change(state: str)
@@ -43,15 +42,13 @@ class "WorkstreamTerminalUI" as WsTermUI {
 class "WebUI" as WebUI {
     - _listeners: list[Queue]
     - _approval_event: Event
-    - _plan_event: Event
     - _ws_prompt_tokens: int
     - _ws_tool_calls: dict
     + resolve_approval(approved, feedback)
-    + resolve_plan(feedback)
     --
     Enqueues JSON events for SSE.
     Blocks on threading.Event for
-    approval/plan review.
+    approval.
     SSE handlers bridge Queue to
     async via run_in_executor().
     --
@@ -145,7 +142,6 @@ class "ChatSession" as ChatSession {
     + model_alias: str | None {property}
     - _tools: list[dict]
     - _task_tools: list[dict]
-    - _agent_tools: list[dict]
     - _read_files: set[str]
     - system_messages: list[dict]
     --

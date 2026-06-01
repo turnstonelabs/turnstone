@@ -68,7 +68,6 @@ def _make_bot() -> tuple[object, MagicMock, MagicMock]:
     router.get_or_create_workstream = AsyncMock(return_value=("ws-1", True))
     router.send_message = AsyncMock()
     router.send_approval = AsyncMock()
-    router.send_plan_feedback = AsyncMock()
     router.get_node_url = AsyncMock(return_value="http://localhost:8080")
     router.evaluate_tool_policies = AsyncMock(return_value=PolicyVerdict(kind="none"))
     router.delete_route = AsyncMock()
@@ -660,7 +659,6 @@ class TestWsEventDispatch:
         storage = MagicMock()
         router = MagicMock()
         router.send_approval = AsyncMock()
-        router.send_plan_feedback = AsyncMock()
         router.evaluate_tool_policies = AsyncMock(return_value=PolicyVerdict(kind="none"))
         router.resolve_user = AsyncMock(return_value="turnstone-user-1")
         client = AsyncMock()
@@ -836,72 +834,6 @@ class TestWsEventDispatch:
         assert "ws-1" not in bot._pending_approval  # type: ignore[attr-defined]
         client.chat_update.assert_awaited_once()
 
-    def test_plan_review_event_posts_buttons(self) -> None:
-        from turnstone.channels.slack.routes import SlackRoute
-        from turnstone.sdk.events import PlanReviewEvent
-
-        bot, client = self._make_ws_bot()
-        route = SlackRoute(channel="C1", user_id="U12345", thread_ts="123.456")
-
-        event = PlanReviewEvent(ws_id="ws-1", content="1. do thing\n2. do next thing")
-        _run(bot._on_ws_event("ws-1", route, event))  # type: ignore[attr-defined]
-
-        client.chat_postMessage.assert_awaited_once()
-        kwargs = client.chat_postMessage.call_args[1]
-        assert kwargs["text"] == "Plan review required"
-        assert "blocks" in kwargs
-        assert "ws-1" in bot._pending_plan_review_ts  # type: ignore[attr-defined]
-
-    def test_plan_approve_sends_feedback_and_updates_message(self) -> None:
-        bot, client = self._make_ws_bot()
-        # Register pending review with an owner so the new sec-2 gate passes.
-        bot._pending_plan_review_ts["ws-1"] = ("C1", "111.222", "U_OWNER")  # type: ignore[attr-defined]
-        body = {
-            "actions": [{"value": "ws-1"}],
-            "user": {"id": "U_OWNER"},
-            "container": {"channel_id": "C1", "message_ts": "111.222"},
-        }
-
-        _run(bot._on_plan_approve(AsyncMock(), body))  # type: ignore[attr-defined]
-
-        bot.router.send_plan_feedback.assert_awaited_once_with("ws-1", "", "")  # type: ignore[attr-defined]
-        client.chat_update.assert_awaited_once()
-
-    def test_plan_approve_rejects_non_owner(self) -> None:
-        bot, client = self._make_ws_bot()
-        bot._pending_plan_review_ts["ws-1"] = ("C1", "111.222", "U_OWNER")  # type: ignore[attr-defined]
-        body = {
-            "actions": [{"value": "ws-1"}],
-            "user": {"id": "U_OTHER"},
-            "container": {"channel_id": "C1", "message_ts": "111.222"},
-        }
-
-        _run(bot._on_plan_approve(AsyncMock(), body))  # type: ignore[attr-defined]
-
-        bot.router.send_plan_feedback.assert_not_awaited()  # type: ignore[attr-defined]
-        client.chat_postEphemeral.assert_awaited_once()
-
-    def test_plan_feedback_modal_sends_feedback_and_updates_message(self) -> None:
-        bot, client = self._make_ws_bot()
-        bot._pending_plan_review_ts["ws-1"] = ("C1", "111.222", "U_OWNER")  # type: ignore[attr-defined]
-
-        view = {
-            "private_metadata": "ws-1",
-            "state": {
-                "values": {"feedback_block": {"feedback_input": {"value": "please revise step 2"}}}
-            },
-        }
-        body = {"user": {"id": "U_OWNER"}}
-
-        _run(bot._on_plan_feedback_modal(AsyncMock(), body, view))  # type: ignore[attr-defined]
-
-        bot.router.send_plan_feedback.assert_awaited_once_with(  # type: ignore[attr-defined]
-            "ws-1",
-            "",
-            "please revise step 2",
-        )
-        client.chat_update.assert_awaited_once()
-
     def test_link_prefix_does_not_hijack_regular_prompt(self) -> None:
         """`/turnstone linking up the docs` must not misroute into
         _handle_link with `"ing up the docs"` as the token."""
@@ -930,20 +862,6 @@ class TestWsEventDispatch:
             assert bot._allow_link_attempt("U111")  # type: ignore[attr-defined]
         # Next attempt is blocked.
         assert not bot._allow_link_attempt("U111")  # type: ignore[attr-defined]
-
-    def test_plan_feedback_modal_rejects_non_owner(self) -> None:
-        bot, _client = self._make_ws_bot()
-        bot._pending_plan_review_ts["ws-1"] = ("C1", "111.222", "U_OWNER")  # type: ignore[attr-defined]
-
-        view = {
-            "private_metadata": "ws-1",
-            "state": {"values": {"feedback_block": {"feedback_input": {"value": "please revise"}}}},
-        }
-        body = {"user": {"id": "U_OTHER"}}
-
-        _run(bot._on_plan_feedback_modal(AsyncMock(), body, view))  # type: ignore[attr-defined]
-
-        bot.router.send_plan_feedback.assert_not_awaited()  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------

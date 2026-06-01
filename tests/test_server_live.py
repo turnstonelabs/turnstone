@@ -2,7 +2,7 @@
 
 Mock-based tests verify streaming, tool calling, multi-turn conversation,
 and session configuration WITHOUT a running LLM backend.  The mocks replace
-only the OpenAI streaming layer -- tool execution (bash, math, read_file)
+only the OpenAI streaming layer -- tool execution (bash, read_file)
 still runs real subprocesses.
 
 The TestBackendConnectivity class is marked @pytest.mark.live and requires a
@@ -102,9 +102,6 @@ class RecordingUI:
 
     def on_status(self, usage, context_window, effort):
         self.events.append(("status",))
-
-    def on_plan_review(self, content):
-        return ""
 
     def on_info(self, message):
         self.infos.append(message)
@@ -409,33 +406,6 @@ class TestStreamingSession:
 
 class TestToolCalling:
     """Test that mocked tool_calls trigger real tool execution."""
-
-    def test_math_tool(self, tmp_db):
-        """First call returns tool_call for math(code='2+2'), second returns content."""
-        client = _mock_client()
-
-        # First create() call: model requests math tool
-        stream1 = make_mock_stream(
-            tool_calls=[("call_math_1", "math", json.dumps({"code": "2+2"}))],
-        )
-        # Second create() call: model produces final answer
-        stream2 = make_mock_stream(
-            content_tokens=["The result is ", "4"],
-        )
-        client.chat.completions.create.side_effect = [stream1, stream2]
-
-        session, ui = _make_session(client, "mock-model", tmp_db)
-        session._title_generated = True
-
-        session.send("Calculate 2+2")
-
-        # math tool was invoked and returned a result
-        math_results = [r for r in ui.tool_results if r[1] == "math"]
-        assert len(math_results) > 0
-        assert "4" in math_results[0][2]
-
-        # Final content contains the answer
-        assert "4" in ui.full_content
 
     def test_bash_tool(self, tmp_db):
         """First call returns tool_call for bash, second returns content."""

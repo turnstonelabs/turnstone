@@ -28,7 +28,6 @@
     },
     "required": ["message"]
   },
-  "agent": true,
   "task_agent": true,
   "coordinator": true,
   "interactive": true,

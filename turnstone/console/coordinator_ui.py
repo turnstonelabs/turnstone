@@ -5,9 +5,8 @@ Mirrors ``turnstone.server.WebUI`` but scoped to the console's needs:
 - Per-session SSE listener fan-out (inherited from
   :class:`SessionUIBase` — same ``threading.Lock`` + queue list
   pattern WebUI uses).
-- ``threading.Event`` + ``_approval_result`` / ``_plan_result`` for
-  blocking the worker thread until a console endpoint delivers the
-  decision (inherited).
+- ``threading.Event`` + ``_approval_result`` for blocking the worker
+  thread until a console endpoint delivers the decision (inherited).
 - Per-ws metric tracking + turn-content accumulator + activity
   bookkeeping (inherited from :class:`SessionUIBase` post the rich
   ``ws_state`` payload lift). Coord populates the same
@@ -94,27 +93,14 @@ class ConsoleCoordinatorUI(SessionUIBase):
     # ------------------------------------------------------------------
     # SessionUI protocol — approvals
     #
-    # ``approve_tools`` / ``resolve_approval`` / ``resolve_plan`` are
-    # inherited from :class:`SessionUIBase`. The shared body covers
+    # ``approve_tools`` / ``resolve_approval`` are inherited from
+    # :class:`SessionUIBase`. The shared body covers
     # tool-policy gating, per-tool auto-approve, blanket auto-approve,
     # heuristic-verdict persistence, and activity tagging the same way
     # interactive sessions get them. ``__budget_override__`` is
     # interactive-only today; the carve-out in the shared body is a
     # no-op on coord (coord workstreams don't have token budgets).
     # ------------------------------------------------------------------
-
-    def on_plan_review(self, content: str) -> str:
-        # Coordinator sessions don't fire plan_agent (AGENT_TOOLS is []
-        # for coordinator kind) so this path shouldn't normally run.
-        # Implemented defensively for SessionUI protocol compatibility.
-        self._plan_event.clear()
-        self._pending_plan_review = {"type": "plan_review", "content": content}
-        self._enqueue(self._pending_plan_review)
-        if not self._plan_event.wait(timeout=self._APPROVAL_WAIT_TIMEOUT):
-            log.warning("coord_ui.plan_review_timeout ws=%s", self.ws_id)
-            self.resolve_plan("reject")
-        self._pending_plan_review = None
-        return self._plan_result
 
     # ------------------------------------------------------------------
     # SessionUI protocol — broadcast hook + state change + rename

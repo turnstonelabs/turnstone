@@ -533,16 +533,6 @@ _LOW_RULES: list[_HeuristicRule] = [
         reasoning_template="Listing directory contents is a read-only operation.",
     ),
     _HeuristicRule(
-        name="man-tool",
-        risk_level="low",
-        confidence=0.85,
-        recommendation="approve",
-        tool_pattern="man",
-        arg_patterns=[],
-        intent_template="Manual page lookup: {arg_snippet}",
-        reasoning_template="Looking up a man page is a read-only operation.",
-    ),
-    _HeuristicRule(
         name="use-prompt",
         risk_level="low",
         confidence=0.85,
@@ -919,7 +909,7 @@ class IntentJudge:
         # Resolve judge model via ModelRegistry alias, otherwise self-
         # consistency on the session model.  ``judge.model`` is alias-only
         # — same contract as ``coordinator.model_alias`` /
-        # ``model.plan_alias`` / ``model.task_alias``.  A non-alias value
+        # ``model.task_alias``.  A non-alias value
         # used to be accepted as a raw model id pinned onto the session
         # provider, but that path silently broke whenever the session
         # provider didn't speak that model id (e.g. coordinator on

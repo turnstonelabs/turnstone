@@ -139,8 +139,7 @@ group loop [while tool_calls present]
           read_file → open().read() or base64 image
           search → grep subprocess
           edit_file → string replace
-          task/plan → _run_agent() sub-loop
-          math → sandboxed subprocess
+          task → _run_agent() sub-loop
           web_fetch → httpx + LLM summarize
           web_search → provider-native or SearxNG fallback
           memory/recall → SQLite

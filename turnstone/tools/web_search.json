@@ -20,7 +20,6 @@
     },
     "required": ["query"]
   },
-  "agent": true,
   "task_agent": true,
   "auto_approve": true,
   "primary_key": "query"

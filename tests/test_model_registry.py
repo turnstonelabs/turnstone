@@ -205,11 +205,9 @@ class TestModelRegistry:
         reg = self._make_registry(agent_model="cheap")
         assert reg.agent_model == "cheap"
 
-    def test_plan_task_models_default_none(self) -> None:
+    def test_task_model_default_none(self) -> None:
         reg = self._make_registry()
-        assert reg.plan_model is None
         assert reg.task_model is None
-        assert reg.plan_effort is None
         assert reg.task_effort is None
 
     def test_resolve_agent_alias_falls_back_to_agent_model(self) -> None:
@@ -220,7 +218,6 @@ class TestModelRegistry:
     def test_resolve_agent_alias_per_kind_overrides(self) -> None:
         models = {
             "default": ModelConfig("default", "http://x/v1", "k", "m"),
-            "smart": ModelConfig("smart", "http://x/v1", "k", "m"),
             "fast": ModelConfig("fast", "http://x/v1", "k", "m"),
             "shared": ModelConfig("shared", "http://x/v1", "k", "m"),
         }
@@ -228,26 +225,14 @@ class TestModelRegistry:
             models=models,
             default="default",
             agent_model="shared",
-            plan_model="smart",
             task_model="fast",
         )
-        assert reg.resolve_agent_alias("plan") == "smart"
         assert reg.resolve_agent_alias("task") == "fast"
 
     def test_resolve_agent_alias_returns_none_when_unconfigured(self) -> None:
         reg = self._make_registry()
         assert reg.resolve_agent_alias("plan") is None
         assert reg.resolve_agent_alias("task") is None
-
-    def test_resolve_agent_effort_plan_back_compat_default(self) -> None:
-        reg = self._make_registry()
-        assert reg.resolve_agent_effort("plan") == ModelRegistry.PLAN_DEFAULT_EFFORT
-        assert reg.resolve_agent_effort("plan") == "high"
-
-    def test_resolve_agent_effort_plan_override(self) -> None:
-        models = {"a": ModelConfig("a", "x", "x", "x")}
-        reg = ModelRegistry(models=models, default="a", plan_effort="max")
-        assert reg.resolve_agent_effort("plan") == "max"
 
     def test_resolve_agent_effort_task_returns_none_to_inherit(self) -> None:
         reg = self._make_registry()
@@ -286,11 +271,6 @@ class TestModelRegistryValidation:
         models = {"a": ModelConfig("a", "x", "x", "x")}
         with pytest.raises(ValueError, match="Agent model 'bad'"):
             ModelRegistry(models=models, default="a", agent_model="bad")
-
-    def test_invalid_plan_model_raises(self) -> None:
-        models = {"a": ModelConfig("a", "x", "x", "x")}
-        with pytest.raises(ValueError, match="Plan model 'bad'"):
-            ModelRegistry(models=models, default="a", plan_model="bad")
 
     def test_invalid_task_model_raises(self) -> None:
         models = {"a": ModelConfig("a", "x", "x", "x")}
@@ -389,67 +369,58 @@ class TestLoadModelRegistry:
             reg = load_model_registry("http://x/v1", "x", "x")
         assert reg.agent_model is None
 
-    def test_plan_task_models_from_config(self) -> None:
+    def test_task_model_from_config(self) -> None:
         fake_cfg: dict[str, Any] = {
             "models": {
-                "smart": {"base_url": "http://s/v1", "model": "s"},
                 "fast": {"base_url": "http://f/v1", "model": "f"},
             },
             "model": {
-                "plan_model": "smart",
                 "task_model": "fast",
-                "plan_effort": "max",
                 "task_effort": "low",
             },
         }
         with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
             reg = load_model_registry("http://x/v1", "x", "x")
-        assert reg.plan_model == "smart"
         assert reg.task_model == "fast"
-        assert reg.plan_effort == "max"
         assert reg.task_effort == "low"
 
-    def test_invalid_plan_task_models_ignored(self) -> None:
+    def test_invalid_task_model_ignored(self) -> None:
         fake_cfg: dict[str, Any] = {
-            "model": {"plan_model": "nope", "task_model": "alsonope"},
+            "model": {"task_model": "alsonope"},
         }
         with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
             reg = load_model_registry("http://x/v1", "x", "x")
-        assert reg.plan_model is None
         assert reg.task_model is None
 
     def test_invalid_effort_values_dropped_with_warning(self) -> None:
-        """Typos in plan_effort/task_effort shouldn't silently flow to providers."""
+        """Typos in task_effort shouldn't silently flow to providers."""
         fake_cfg: dict[str, Any] = {
-            "model": {"plan_effort": "hihg", "task_effort": "extreme"},
+            "model": {"task_effort": "extreme"},
         }
         with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
             reg = load_model_registry("http://x/v1", "x", "x")
-        assert reg.plan_effort is None
         assert reg.task_effort is None
 
     def test_valid_effort_values_accepted(self) -> None:
         for level in ("none", "minimal", "low", "medium", "high", "xhigh", "max"):
-            fake_cfg: dict[str, Any] = {"model": {"plan_effort": level}}
+            fake_cfg: dict[str, Any] = {"model": {"task_effort": level}}
             with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
                 reg = load_model_registry("http://x/v1", "x", "x")
-            assert reg.plan_effort == level, f"level={level} not accepted"
+            assert reg.task_effort == level, f"level={level} not accepted"
 
     def test_empty_or_whitespace_effort_treated_as_unset(self) -> None:
-        """Operators write `plan_effort = ""` to make "unset" explicit;
+        """Operators write `task_effort = ""` to make "unset" explicit;
         warning on benign empty values would be noise."""
         for value in ("", "  ", "\t"):
-            fake_cfg: dict[str, Any] = {"model": {"plan_effort": value, "task_effort": value}}
+            fake_cfg: dict[str, Any] = {"model": {"task_effort": value}}
             with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
                 reg = load_model_registry("http://x/v1", "x", "x")
-            assert reg.plan_effort is None, f"empty value {value!r} not treated as unset"
-            assert reg.task_effort is None
+            assert reg.task_effort is None, f"empty value {value!r} not treated as unset"
 
     def test_effort_normalised_to_lowercase(self) -> None:
-        fake_cfg: dict[str, Any] = {"model": {"plan_effort": "HIGH", "task_effort": " Low "}}
+        fake_cfg: dict[str, Any] = {"model": {"task_effort": " Low "}}
         with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
             reg = load_model_registry("http://x/v1", "x", "x")
-        assert reg.plan_effort == "high"
         assert reg.task_effort == "low"
 
     def test_invalid_default_falls_back(self) -> None:
@@ -1016,9 +987,6 @@ class _FakeUI:
     def on_tool_result(self, call_id: str, name: str, output: str, **kwargs: Any) -> None: ...
     def on_tool_output_chunk(self, call_id: str, chunk: str) -> None: ...
     def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None: ...
-    def on_plan_review(self, content: str) -> str:
-        return "approve"
-
     def on_info(self, message: str) -> None:
         self.infos.append(message)
 
@@ -1330,13 +1298,6 @@ class TestSessionAgentModel:
             **kwargs,
         )
 
-    def test_plan_model_overrides_agent_model(self) -> None:
-        reg = self._three_model_registry(agent_model="fast", plan_model="smart")
-        session = _make_session(registry=reg, model_alias="main")
-        captured = self._capture(reg, "smart")
-        session._run_agent([{"role": "user", "content": "x"}], label="plan")
-        assert captured["model"] == "smart-model"
-
     def test_task_model_overrides_agent_model(self) -> None:
         reg = self._three_model_registry(agent_model="smart", task_model="fast")
         session = _make_session(registry=reg, model_alias="main")
@@ -1359,22 +1320,6 @@ class TestSessionAgentModel:
         captured = self._capture_on(session.client)
         session._run_agent([{"role": "user", "content": "x"}], label="plan")
         assert captured["model"] == "test-model"
-
-    def test_plan_default_reasoning_effort_is_high(self) -> None:
-        """Back-compat: plan_agent always got "high" before; the default must
-        survive the migration even when no plan_effort is configured."""
-        reg = self._three_model_registry()
-        session = _make_session(registry=reg, model_alias="main")
-        captured = self._capture_on(session.client)
-        session._run_agent([{"role": "user", "content": "x"}], label="plan")
-        assert self._captured_effort(captured) == "high"
-
-    def test_plan_effort_from_registry_overrides_default(self) -> None:
-        reg = self._three_model_registry(plan_effort="max")
-        session = _make_session(registry=reg, model_alias="main")
-        captured = self._capture_on(session.client)
-        session._run_agent([{"role": "user", "content": "x"}], label="plan")
-        assert self._captured_effort(captured) == "max"
 
     def test_task_effort_inherits_session_when_unset(self) -> None:
         # Task with no task_effort override must inherit whatever the SESSION
@@ -1402,11 +1347,11 @@ class TestSessionAgentModel:
         assert task_captured["model"] == "fast-model"
 
     def test_explicit_effort_wins_over_registry(self) -> None:
-        reg = self._three_model_registry(plan_effort="low")
+        reg = self._three_model_registry(task_effort="low")
         session = _make_session(registry=reg, model_alias="main")
         captured = self._capture_on(session.client)
         session._run_agent(
-            [{"role": "user", "content": "x"}], label="plan", reasoning_effort="minimal"
+            [{"role": "user", "content": "x"}], label="task", reasoning_effort="minimal"
         )
         assert self._captured_effort(captured) == "minimal"
 
@@ -1418,15 +1363,6 @@ class TestSessionAgentModel:
         session = _make_session(registry=reg, model_alias="main")
         captured = self._capture(reg, "fast")
         session._run_agent([{"role": "user", "content": "x"}], label="task", agent_alias="fast")
-        assert captured["model"] == "fast-model"
-
-    def test_explicit_alias_overrides_registry_plan_model(self) -> None:
-        """Per-call alias wins over the configured per-kind plan_model."""
-        reg = self._three_model_registry(plan_model="smart")
-        session = _make_session(registry=reg, model_alias="main")
-        # Without override the call would route to "smart"; we ask for "fast".
-        captured = self._capture(reg, "fast")
-        session._run_agent([{"role": "user", "content": "x"}], label="plan", agent_alias="fast")
         assert captured["model"] == "fast-model"
 
     def test_session_fallback_inherits_primary_alias_for_caps(self) -> None:
@@ -1849,22 +1785,22 @@ class TestEffectiveRouting:
     def test_returns_base_when_cs_is_none(self) -> None:
         from turnstone.server import _effective_routing
 
-        result = _effective_routing(None, self._models(), "default", "smart", "fast", "high", "low")
-        assert result == ("default", "smart", "fast", "high", "low")
+        result = _effective_routing(None, self._models(), "default", "fast", "low")
+        assert result == ("default", "fast", "low")
 
     def test_cs_alias_overrides_base(self) -> None:
         from turnstone.server import _effective_routing
 
-        cs = _FakeCS(**{"model.plan_alias": "fast", "model.task_alias": "smart"})
-        result = _effective_routing(cs, self._models(), "default", "smart", "fast", "high", "low")
-        assert result == ("default", "fast", "smart", "high", "low")
+        cs = _FakeCS(**{"model.task_alias": "smart"})
+        result = _effective_routing(cs, self._models(), "default", "fast", "low")
+        assert result == ("default", "smart", "low")
 
     def test_cs_alias_silently_dropped_when_unknown(self) -> None:
         from turnstone.server import _effective_routing
 
-        cs = _FakeCS(**{"model.plan_alias": "nonexistent"})
-        result = _effective_routing(cs, self._models(), "default", "smart", None, None, None)
-        assert result == ("default", "smart", None, None, None)  # falls back to base
+        cs = _FakeCS(**{"model.task_alias": "nonexistent"})
+        result = _effective_routing(cs, self._models(), "default", "smart", None)
+        assert result == ("default", "smart", None)  # falls back to base
 
     def test_cs_empty_string_treated_as_unset(self) -> None:
         from turnstone.server import _effective_routing
@@ -1872,21 +1808,19 @@ class TestEffectiveRouting:
         cs = _FakeCS(
             **{
                 "model.default_alias": "",
-                "model.plan_alias": "",
                 "model.task_alias": "",
-                "model.plan_effort": "",
                 "model.task_effort": "",
             }
         )
-        result = _effective_routing(cs, self._models(), "default", "smart", "fast", "high", "low")
-        assert result == ("default", "smart", "fast", "high", "low")
+        result = _effective_routing(cs, self._models(), "default", "fast", "low")
+        assert result == ("default", "fast", "low")
 
     def test_cs_effort_overrides_base(self) -> None:
         from turnstone.server import _effective_routing
 
-        cs = _FakeCS(**{"model.plan_effort": "max", "model.task_effort": "minimal"})
-        result = _effective_routing(cs, self._models(), "default", None, None, "high", None)
-        assert result == ("default", None, None, "max", "minimal")
+        cs = _FakeCS(**{"model.task_effort": "minimal"})
+        result = _effective_routing(cs, self._models(), "default", None, "high")
+        assert result == ("default", None, "minimal")
 
 
 class TestApplyRoutingOverrides:
@@ -1906,8 +1840,8 @@ class TestApplyRoutingOverrides:
     def test_no_reload_when_cs_matches_registry(self) -> None:
         from turnstone.server import _apply_routing_overrides
 
-        reg = self._registry(plan_model="smart", task_model="fast")
-        cs = _FakeCS(**{"model.plan_alias": "smart", "model.task_alias": "fast"})
+        reg = self._registry(task_model="fast")
+        cs = _FakeCS(**{"model.task_alias": "fast"})
         # Patch reload to detect calls
         called = {"count": 0}
         original_reload = reg.reload
@@ -1924,10 +1858,10 @@ class TestApplyRoutingOverrides:
     def test_reload_when_cs_differs(self) -> None:
         from turnstone.server import _apply_routing_overrides
 
-        reg = self._registry()  # plan_model=None
-        cs = _FakeCS(**{"model.plan_alias": "smart"})
+        reg = self._registry()  # task_model=None
+        cs = _FakeCS(**{"model.task_alias": "fast"})
         assert _apply_routing_overrides(reg, cs) is True
-        assert reg.plan_model == "smart"
+        assert reg.task_model == "fast"
 
     def test_no_reload_when_cs_is_none(self) -> None:
         from turnstone.server import _apply_routing_overrides
@@ -1940,6 +1874,6 @@ class TestApplyRoutingOverrides:
         from turnstone.server import _apply_routing_overrides
 
         reg = self._registry()
-        cs = _FakeCS(**{"model.plan_alias": "nonexistent"})
+        cs = _FakeCS(**{"model.task_alias": "nonexistent"})
         assert _apply_routing_overrides(reg, cs) is False
-        assert reg.plan_model is None  # unchanged
+        assert reg.task_model is None  # unchanged

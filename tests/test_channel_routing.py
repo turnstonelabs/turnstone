@@ -113,28 +113,6 @@ class TestSendApproval:
         mock_approve.assert_awaited_once_with(ws_id="ws-1", approved=True, feedback="", always=True)
 
 
-class TestSendPlanFeedback:
-    @pytest.mark.anyio
-    async def test_calls_server_plan_feedback(
-        self, router: ChannelRouter, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        assert router._server is not None
-        mock_plan = AsyncMock()
-        monkeypatch.setattr(router._server, "plan_feedback", mock_plan)
-        await router.send_plan_feedback("ws-2", "corr-xyz", "looks good")
-        mock_plan.assert_awaited_once_with(ws_id="ws-2", feedback="looks good")
-
-    @pytest.mark.anyio
-    async def test_calls_console_route_plan_feedback(
-        self, console_router: ChannelRouter, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        assert console_router._console is not None
-        mock_plan = AsyncMock()
-        monkeypatch.setattr(console_router._console, "route_plan_feedback", mock_plan)
-        await console_router.send_plan_feedback("ws-2", "corr-xyz", "looks good")
-        mock_plan.assert_awaited_once_with(ws_id="ws-2", feedback="looks good")
-
-
 class TestDeleteRoute:
     @pytest.mark.anyio
     async def test_calls_storage_delete(

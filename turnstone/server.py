@@ -371,16 +371,6 @@ class WebUI(SessionUIBase):
         )
         super().on_aux_usage(usage)
 
-    def on_plan_review(self, content: str) -> str:
-        self._plan_event.clear()
-        self._pending_plan_review = {"type": "plan_review", "content": content}
-        self._enqueue(self._pending_plan_review)
-        if not self._plan_event.wait(timeout=self._APPROVAL_WAIT_TIMEOUT):
-            log.warning("Plan review timed out for ws_id=%s", self.ws_id)
-            self._plan_result = ""
-        self._pending_plan_review = None
-        return self._plan_result
-
     def on_error(self, message: str) -> None:
         """Layer node-only Prometheus error counter on top of the shared body."""
         _metrics.record_error()
@@ -417,10 +407,9 @@ class WebUI(SessionUIBase):
 
     # ``on_output_warning`` inherited from :class:`SessionUIBase`.
 
-    # ``resolve_approval`` / ``resolve_plan`` inherited from
-    # :class:`SessionUIBase`. Intent-verdict decision propagation lives
-    # in the base now — both interactive and coord share the same
-    # bookkeeping.
+    # ``resolve_approval`` inherited from :class:`SessionUIBase`.
+    # Intent-verdict decision propagation lives in the base now — both
+    # interactive and coord share the same bookkeeping.
 
 
 # ---------------------------------------------------------------------------
@@ -727,9 +716,8 @@ def _interactive_events_replay(
 
     Yields a ``connected`` event (model + skip_permissions), a
     ``status`` event with the workstream's last token usage + context %
-    (when a turn has completed), the pending approval prompt + cached
-    intent verdicts (if a prompt is pending), and the pending
-    plan-review (if a review is pending). The lifted
+    (when a turn has completed), and the pending approval prompt + cached
+    intent verdicts (if a prompt is pending). The lifted
     ``make_events_handler`` body delegates that yield sequence to this
     callback so the kind-specific shape stays in this module.
 
@@ -761,11 +749,6 @@ def _interactive_events_replay(
             cached_verdicts = list(ui._llm_verdicts.values())
         for v in cached_verdicts:
             yield {"type": "intent_verdict", **v}
-
-    # Pending plan-review re-injection.
-    pending_plan = getattr(ui, "_pending_plan_review", None)
-    if pending_plan is not None:
-        yield pending_plan
 
 
 def _interactive_open_post_load(request: Request, ws: Workstream) -> None:
@@ -1463,26 +1446,6 @@ async def metrics_endpoint(request: Request) -> Response:
         mcp_info=mcp_info,
     )
     return Response(content, media_type="text/plain; version=0.0.4; charset=utf-8")
-
-
-async def plan_feedback(request: Request) -> JSONResponse:
-    """POST /v1/api/plan — respond to a plan review."""
-    from turnstone.core.web_helpers import read_json_or_400
-
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
-    feedback = body.get("feedback", "")
-    ws_id = body.get("ws_id")
-    mgr = request.app.state.workstreams
-    _owner, err = _require_ws_access(request, str(ws_id or ""), mgr=mgr)
-    if err:
-        return err
-    ws, ui = _get_ws(mgr, ws_id)
-    if not ws or not ui:
-        return JSONResponse({"error": "Unknown workstream"}, status_code=404)
-    ui.resolve_plan(feedback)
-    return JSONResponse({"status": "ok"})
 
 
 def _capture_cancel_forensics(session: Any, ui: Any, *, was_running: bool) -> dict[str, Any]:
@@ -2822,7 +2785,7 @@ def config_reload(request: Request) -> JSONResponse:
         return JSONResponse({"status": "noop"})
     cs.reload()
     # Apply routing overrides to the live registry — admin settings updates
-    # fan out via this endpoint and would otherwise not affect plan/task
+    # fan out via this endpoint and would otherwise not affect task
     # routing until a model-reload or restart.
     registry = getattr(request.app.state, "registry", None)
     if registry is not None:
@@ -3006,13 +2969,11 @@ def _effective_routing(
     cs: Any,
     base_models: dict[str, Any],
     base_default: str,
-    base_plan_model: str | None,
     base_task_model: str | None,
-    base_plan_effort: str | None,
     base_task_effort: str | None,
-) -> tuple[str, str | None, str | None, str | None, str | None]:
-    """Compute (default, plan_model, task_model, plan_effort, task_effort)
-    after layering ConfigStore overrides on top of the supplied base values.
+) -> tuple[str, str | None, str | None]:
+    """Compute (default, task_model, task_effort) after layering ConfigStore
+    overrides on top of the supplied base values.
 
     Aliases require existence in *base_models* (silently dropped otherwise);
     effort values were validated against SettingDef choices on write, so a
@@ -3021,32 +2982,24 @@ def _effective_routing(
     Returns the base values unchanged when *cs* is None.
     """
     eff_default = base_default
-    eff_plan_model = base_plan_model
     eff_task_model = base_task_model
-    eff_plan_effort = base_plan_effort
     eff_task_effort = base_task_effort
     if cs is not None:
         cs_default = cs.get("model.default_alias")
         if cs_default and cs_default in base_models:
             eff_default = cs_default
-        cs_plan_alias = cs.get("model.plan_alias")
-        if cs_plan_alias and cs_plan_alias in base_models:
-            eff_plan_model = cs_plan_alias
         cs_task_alias = cs.get("model.task_alias")
         if cs_task_alias and cs_task_alias in base_models:
             eff_task_model = cs_task_alias
-        cs_plan_effort = cs.get("model.plan_effort")
-        if cs_plan_effort:
-            eff_plan_effort = cs_plan_effort
         cs_task_effort = cs.get("model.task_effort")
         if cs_task_effort:
             eff_task_effort = cs_task_effort
-    return eff_default, eff_plan_model, eff_task_model, eff_plan_effort, eff_task_effort
+    return eff_default, eff_task_model, eff_task_effort
 
 
 def _broadcast_agent_tool_schema_refresh(app_state: Any) -> None:
-    """Tell every active session on this node to re-render its plan_agent /
-    task_agent tool descriptions.  Best-effort: a session that lacks the
+    """Tell every active session on this node to re-render its task_agent
+    tool description.  Best-effort: a session that lacks the
     method (older code path or test stub) is skipped silently.
 
     Called after a registry reload that may have added/removed model
@@ -3084,27 +3037,21 @@ def _apply_routing_overrides(registry: Any, cs: Any) -> bool:
         cs,
         registry.models,
         registry.default,
-        registry.plan_model,
         registry.task_model,
-        registry.plan_effort,
         registry.task_effort,
     )
     if (
         eff[0] != registry.default
-        or eff[1] != registry.plan_model
-        or eff[2] != registry.task_model
-        or eff[3] != registry.plan_effort
-        or eff[4] != registry.task_effort
+        or eff[1] != registry.task_model
+        or eff[2] != registry.task_effort
     ):
         registry.reload(
             registry.models,
             eff[0],
             registry.fallback,
             registry.agent_model,
-            plan_model=eff[1],
-            task_model=eff[2],
-            plan_effort=eff[3],
-            task_effort=eff[4],
+            task_model=eff[1],
+            task_effort=eff[2],
         )
         return True
     return False
@@ -3132,16 +3079,12 @@ def internal_model_reload(request: Request) -> JSONResponse:
     cs = getattr(request.app.state, "config_store", None)
     if cs is not None:
         cs.reload()  # Ensure latest settings from DB
-    eff_default, eff_plan_model, eff_task_model, eff_plan_effort, eff_task_effort = (
-        _effective_routing(
-            cs,
-            new_registry.models,
-            new_registry.default,
-            new_registry.plan_model,
-            new_registry.task_model,
-            new_registry.plan_effort,
-            new_registry.task_effort,
-        )
+    eff_default, eff_task_model, eff_task_effort = _effective_routing(
+        cs,
+        new_registry.models,
+        new_registry.default,
+        new_registry.task_model,
+        new_registry.task_effort,
     )
     if eff_default != new_registry.default:
         log.info(
@@ -3157,9 +3100,7 @@ def internal_model_reload(request: Request) -> JSONResponse:
         and new_registry.fallback == registry.fallback
         and new_registry.agent_model == registry.agent_model
         and eff_default == registry.default
-        and eff_plan_model == registry.plan_model
         and eff_task_model == registry.task_model
-        and eff_plan_effort == registry.plan_effort
         and eff_task_effort == registry.task_effort
     )
     if unchanged:
@@ -3172,9 +3113,7 @@ def internal_model_reload(request: Request) -> JSONResponse:
             eff_default,
             new_registry.fallback,
             new_registry.agent_model,
-            plan_model=eff_plan_model,
             task_model=eff_task_model,
-            plan_effort=eff_plan_effort,
             task_effort=eff_task_effort,
         )
     except ValueError as exc:
@@ -3189,8 +3128,8 @@ def internal_model_reload(request: Request) -> JSONResponse:
             cfg = registry.get_config(alias)
             health_reg.get_tracker(provider=cfg.provider, base_url=cfg.base_url)
 
-    # Push the new alias list into active sessions so plan_agent/task_agent
-    # `model` parameter descriptions reflect the current registry.
+    # Push the new alias list into active sessions so the task_agent
+    # `model` parameter description reflects the current registry.
     _broadcast_agent_tool_schema_refresh(request.app.state)
 
     # Refresh the per-node ``models`` metadata entry the coord reads on
@@ -4002,7 +3941,6 @@ def create_app(
                     *v1_routes,
                     Route("/api/skills", list_skills_summary),
                     Route("/api/models", list_available_models),
-                    Route("/api/plan", plan_feedback, methods=["POST"]),
                     Route("/api/command", command, methods=["POST"]),
                     Route("/api/watches", list_watches),
                     Route("/api/watches/{watch_id}/cancel", cancel_watch, methods=["POST"]),

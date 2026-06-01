@@ -153,15 +153,14 @@ class EventsReplay(Protocol):
     live event loop starts. Each yielded dict gets JSON-serialised
     and sent as a single ``data:`` line to the client.
 
-    Interactive yields five things on connect: ``connected`` (model +
+    Interactive yields four things on connect: ``connected`` (model +
     skip_permissions), ``status`` (token usage + context %, only when
     ``session._last_usage`` exists), ``history`` (replayed conversation),
-    ``pending_approval`` + cached intent verdicts, and
-    ``pending_plan_review``. Coord yields just two: ``pending_approval``
-    and ``pending_plan_review`` (the rest aren't needed because coord's
-    dashboard fetches history via a separate ``/history`` endpoint
-    and doesn't render the per-tab status bar). Kinds that don't
-    need any pre-replay wire ``None`` and the live loop starts
+    and ``pending_approval`` + cached intent verdicts. Coord yields
+    just one: ``pending_approval`` (the rest aren't needed because
+    coord's dashboard fetches history via a separate ``/history``
+    endpoint and doesn't render the per-tab status bar). Kinds that
+    don't need any pre-replay wire ``None`` and the live loop starts
     immediately.
     """
 
@@ -389,9 +388,8 @@ class SessionEndpointConfig:
     # SSE replay payload the lifted ``events`` body yields after
     # registering the per-UI listener queue but before the live
     # event loop. Interactive replays connected + status + history
-    # + pending_approval (with cached intent verdicts) +
-    # pending_plan_review. Coord replays just pending_approval +
-    # pending_plan_review (its dashboard fetches history via a
+    # + pending_approval (with cached intent verdicts). Coord replays
+    # just pending_approval (its dashboard fetches history via a
     # separate ``/history`` endpoint and doesn't render the per-tab
     # status bar). Kinds that don't need pre-replay wire ``None``.
     events_replay: EventsReplay | None = None
@@ -978,12 +976,12 @@ def make_cancel_handler(
     """Lifted body for ``POST {prefix}/{ws_id}/cancel``.
 
     Cancels in-flight generation on a workstream. Sets the cooperative
-    cancel flag on the session, unblocks any pending approval / plan
-    waits, and (when the request body asks for it) force-abandons a
-    stuck worker thread so the UI recovers immediately.
+    cancel flag on the session, unblocks any pending approval, and
+    (when the request body asks for it) force-abandons a stuck worker
+    thread so the UI recovers immediately.
 
     Both kinds share the cancel sequence (``session.cancel`` →
-    ``ui.resolve_approval(False)`` → ``ui.resolve_plan("reject")``).
+    ``ui.resolve_approval(False)``).
     Per-kind divergence captured via the cfg + ``audit_emit``:
 
     - ``cancel_forensics`` (cfg) — when set, the lifted body calls
@@ -1020,14 +1018,7 @@ def make_cancel_handler(
       ``coord_mgr.cancel`` which silently no-op'd on a placeholder;
       the lifted body 400s for parity with interactive's existing
       "No session" branch.
-    - **Interactive ``resolve_plan`` now runs on every cancel** (was
-      gated on ``was_running``). Lifts coord's always-resolve
-      behaviour onto interactive — a stuck plan-pending state from
-      a crashed worker thread can now be cleared via ``cancel``,
-      matching coord's pre-lift recovery path. ``resolve_plan`` has
-      its own internal ``_pending_plan_review is None`` guard, so
-      the call is genuinely no-op when nothing is blocked.
-      ``resolve_approval`` is **gated on ``ui._pending_approval is not None``**
+    - ``resolve_approval`` is **gated on ``ui._pending_approval is not None``**
       because :meth:`SessionUIBase.resolve_approval` is *not*
       idempotent — it always broadcasts ``approval_resolved`` and
       overwrites ``_approval_result``. Without the gate, every idle
@@ -1091,18 +1082,16 @@ def make_cancel_handler(
                 dropped = {}
 
         # Always set the cooperative cancel flag — cheap, no harm if
-        # nothing's running. resolve_approval / resolve_plan are
-        # gated by their respective ``_pending_*`` slots: pre-lift
-        # coord called them unconditionally via ``mgr.cancel`` (which
-        # is recovery-friendly: a stuck approval-pending state from a
+        # nothing's running. resolve_approval is gated on its
+        # ``_pending_approval`` slot: pre-lift coord called it
+        # unconditionally via ``mgr.cancel`` (which is
+        # recovery-friendly: a stuck approval-pending state from a
         # crashed worker can still be cleared), but ``resolve_approval``
         # is NOT idempotent — calling it with no pending approval
         # broadcasts a stale ``approval_resolved`` SSE event and
         # overwrites ``_approval_result``. Gating on the pending slot
         # preserves the recovery semantics for the actual stuck case
-        # while skipping the broadcast on idle cancels. ``resolve_plan``
-        # has its own internal no-pending guard, so the call is
-        # already safe to make unconditionally.
+        # while skipping the broadcast on idle cancels.
         try:
             session.cancel()
         except Exception:
@@ -1113,15 +1102,6 @@ def make_cancel_handler(
             except Exception:
                 log.debug(
                     "ws.cancel.resolve_approval_failed ws=%s",
-                    ws_id[:8],
-                    exc_info=True,
-                )
-        if hasattr(ui, "resolve_plan"):
-            try:
-                ui.resolve_plan("reject")
-            except Exception:
-                log.debug(
-                    "ws.cancel.resolve_plan_failed ws=%s",
                     ws_id[:8],
                     exc_info=True,
                 )

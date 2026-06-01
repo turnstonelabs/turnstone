@@ -52,9 +52,8 @@ anthropic = ["anthropic>=0.39"]
 postgres = ["psycopg[binary]>=3.2"]
 discord = ["discord.py>=2.4"]
 tls = ["lacme>=1.0.5"]
-sandbox = ["sympy>=1.13", "numpy>=2.0", "scipy>=1.14", "pytest>=9.0"]
 slack = ["slack-bolt>=1.18", "aiohttp>=3.9"]
-all = ["turnstone[console,anthropic,postgres,discord,tls,sandbox,slack]"]
+all = ["turnstone[console,anthropic,postgres,discord,tls,slack]"]
 
 [project.scripts]
 turnstone = "turnstone.cli:main"
@@ -102,7 +101,6 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM", "TCH"]
 ignore = ["E501"]
-per-file-ignores = { "turnstone/core/sandbox.py" = ["N802"] }
 
 [tool.ruff.format]
 quote-style = "double"
@@ -131,10 +129,6 @@ exclude_lines = [
     "raise NotImplementedError",
     'if __name__ == "__main__"',
 ]
-
-[[tool.mypy.overrides]]
-module = ["sympy", "sympy.*", "numpy", "numpy.*"]
-ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["mcp", "mcp.*"]

@@ -2,7 +2,7 @@
 
 Every successful ``/v1/api/route/*`` hop emits an ``audit_events`` row
 with action ``route.workstream.{create,send,close,delete}`` /
-``route.{approve,cancel,command,plan}`` and ``detail`` carrying
+``route.{approve,cancel,command}`` and ``detail`` carrying
 ``{src, node_id, coord_ws_id?}``.  Failure paths (4xx/5xx) MUST NOT
 emit, and audit-emission failure MUST NOT break the proxied call.
 """
@@ -271,7 +271,6 @@ class TestRouteProxyAudit:
             ("/v1/api/route/workstreams/abc123/rewind", "route.rewind"),
             ("/v1/api/route/workstreams/abc123/retry", "route.retry"),
             ("/v1/api/route/command", "route.command"),
-            ("/v1/api/route/plan", "route.plan"),
             ("/v1/api/route/workstreams/abc123/close", "route.workstream.close"),
         ],
     )
@@ -283,8 +282,8 @@ class TestRouteProxyAudit:
         client = TestClient(app, raise_server_exceptions=False)
 
         # ws_id in body is still required by the surviving body-keyed
-        # mounts (/route/plan, /route/command); for the path-keyed
-        # workstreams routes the proxy reads ws_id from path_params.
+        # mount (/route/command); for the path-keyed workstreams routes
+        # the proxy reads ws_id from path_params.
         resp = client.post(
             path,
             json={"ws_id": "abc123", "message": "hi"},

@@ -503,33 +503,6 @@
       </div>
     </div>
 
-    <!-- Plan review dialog -->
-    <div id="plan-overlay">
-      <div
-        id="plan-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="plan-dialog-title"
-      >
-        <h3 id="plan-dialog-title">Plan Review</h3>
-        <div id="plan-content"></div>
-        <input
-          type="text"
-          id="plan-feedback"
-          placeholder="feedback (optional)"
-          aria-label="Plan feedback"
-        />
-        <div id="plan-buttons">
-          <button id="btn-plan-reject">
-            <span class="key">Esc</span> Reject
-          </button>
-          <button id="btn-plan-approve" onclick="resolvePlan('')">
-            <span class="key">&crarr;</span> Approve
-          </button>
-        </div>
-      </div>
-    </div>
-
     <div id="toast" role="status" aria-live="polite"></div>
     <script>
       window.TURNSTONE_AUTH_TITLE = "turnstone";

@@ -179,7 +179,6 @@ both and the gateway hosts both adapters in one process.
   see starts a per-user channel session.
 - Tool approvals render as Slack **Block Kit** buttons; only the user
   who owns the workstream can approve/reject.
-- Plan reviews render as a modal with approve / request-changes actions.
 - Notifications and reply routing work identically to Discord.
 - Session recovery: persisted channel routes are re-subscribed when the
   bot restarts, so existing Slack conversations keep flowing.
@@ -234,15 +233,6 @@ config, the bot auto-responds with approval and posts a
 `auto_approve_tools` list is set via the `ChannelConfig.auto_approve_tools`
 field (useful for allowing specific tools like `bash` or `read_file` while
 still requiring manual approval for others).
-
-### Plan Reviews
-
-Plan review requests are displayed as a blue embed with:
-
-- **Approve Plan** (green) button — approves the plan with empty feedback
-- **Request Changes** (gray) button — opens a modal for feedback text
-  (up to 2000 characters)
-- Feedback is forwarded to the server via HTTP
 
 ---
 
@@ -431,9 +421,9 @@ message with a `ws_id` so that user replies can be routed back to the
 originating workstream. Adapters must track the mapping from outgoing
 message ID to `(ws_id, target_user_id)` and handle DM replies.
 
-Platform-specific concerns — approval prompts, plan reviews, message
-edits, thread creation — live inside the adapter implementation and are
-not part of the protocol surface. Each adapter drives those via its
+Platform-specific concerns — approval prompts, message edits, thread
+creation — live inside the adapter implementation and are not part of
+the protocol surface. Each adapter drives those via its
 own `_on_ws_event` dispatcher using SDK-native APIs.
 
 To add a new platform:

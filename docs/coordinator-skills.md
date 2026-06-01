@@ -86,7 +86,7 @@ Explicitly **not** in the coordinator set:
 - `bash` / `edit_file` / `write_file` / `append_file` / `diff_file` — no local FS.
 - `read_file` / `search` — no local FS reads.
 - `web_fetch` / `web_search` — no direct web access.
-- `task_agent` / `plan_agent` — sub-agent tools are zeroed on coord sessions.
+- `task_agent` — sub-agent tool is zeroed on coord sessions.
 - `recall` / `watch` / `read_resource` / `use_prompt` — UX / persistence tools that belong to interactive sessions.  The dual-kind `memory` / `skills` / `notify` tools are available on both kinds (see the table above).
 
 If your skill needs a coordinator to "run a command" or "read a

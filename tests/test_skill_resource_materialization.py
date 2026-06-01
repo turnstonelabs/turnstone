@@ -57,9 +57,6 @@ class NullUI:
     def on_status(self, usage, context_window, effort):
         pass
 
-    def on_plan_review(self, content):
-        return ""
-
     def on_info(self, message):
         pass
 

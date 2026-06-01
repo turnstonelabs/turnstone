@@ -23,8 +23,6 @@ class _StubCoordUI:
     def __init__(self) -> None:
         self._approval_event = threading.Event()
         self._approval_result: tuple[bool, str | None] = (True, "initial")
-        self._plan_event = threading.Event()
-        self._plan_result: str = "accept"
         self._fg_event = threading.Event()
         self._listeners_lock = threading.Lock()
         self._listeners: list[queue.Queue[dict[str, Any]]] = []
@@ -144,7 +142,6 @@ def test_cleanup_ui_unblocks_events_and_broadcasts_to_listeners() -> None:
     adapter, _ = _make_adapter()
     ws = _make_ws()
     ws.ui._approval_event.clear()  # type: ignore[attr-defined]
-    ws.ui._plan_event.clear()  # type: ignore[attr-defined]
     ws.ui._fg_event.clear()  # type: ignore[attr-defined]
     lq: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=5)
     ws.ui._listeners.append(lq)  # type: ignore[attr-defined]
@@ -152,10 +149,8 @@ def test_cleanup_ui_unblocks_events_and_broadcasts_to_listeners() -> None:
     adapter.cleanup_ui(ws)
 
     assert ws.ui._approval_event.is_set()  # type: ignore[attr-defined]
-    assert ws.ui._plan_event.is_set()  # type: ignore[attr-defined]
     assert ws.ui._fg_event.is_set()  # type: ignore[attr-defined]
     assert ws.ui._approval_result == (False, None)  # type: ignore[attr-defined]
-    assert ws.ui._plan_result == "reject"  # type: ignore[attr-defined]
     assert lq.get_nowait() == {"type": "ws_closed"}
     assert ws.ui._listeners == []  # type: ignore[attr-defined]
     assert ws.session.cancelled is True  # type: ignore[attr-defined]

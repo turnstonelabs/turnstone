@@ -47,7 +47,7 @@ class _BrokenStorage(_MockStorage):
 class TestBuiltinsOnly:
     def test_builtin_heuristic_rules_loaded(self) -> None:
         reg = RuleRegistry(storage=None)
-        assert len(reg.heuristic_rules) == 37
+        assert len(reg.heuristic_rules) == 36
 
     def test_builtin_output_patterns_loaded(self) -> None:
         reg = RuleRegistry(storage=None)
@@ -102,7 +102,7 @@ class TestHeuristicMerge:
         names = [r.name for r in reg.heuristic_rules]
         assert "my-custom-rule" in names
         # Built-ins still present
-        assert len(reg.heuristic_rules) == 38
+        assert len(reg.heuristic_rules) == 37
 
     def test_builtin_overridden(self) -> None:
         storage = _MockStorage(
@@ -143,7 +143,7 @@ class TestHeuristicMerge:
         reg = RuleRegistry(storage=storage)
         names = [r.name for r in reg.heuristic_rules]
         assert "rm-root" not in names
-        assert len(reg.heuristic_rules) == 36
+        assert len(reg.heuristic_rules) == 35
 
     def test_custom_rule_disabled_excluded(self) -> None:
         storage = _MockStorage(
@@ -167,12 +167,12 @@ class TestHeuristicMerge:
         reg = RuleRegistry(storage=storage)
         names = [r.name for r in reg.heuristic_rules]
         assert "my-disabled-rule" not in names
-        assert len(reg.heuristic_rules) == 37
+        assert len(reg.heuristic_rules) == 36
 
     def test_reload_updates_rules(self) -> None:
         storage = _MockStorage()
         reg = RuleRegistry(storage=storage)
-        assert len(reg.heuristic_rules) == 37
+        assert len(reg.heuristic_rules) == 36
 
         # Simulate admin adding a rule
         storage._heuristic_rows.append(
@@ -192,7 +192,7 @@ class TestHeuristicMerge:
             }
         )
         reg.reload()
-        assert len(reg.heuristic_rules) == 38
+        assert len(reg.heuristic_rules) == 37
         assert "late-addition" in [r.name for r in reg.heuristic_rules]
 
     def test_version_increments_on_reload(self) -> None:
@@ -292,7 +292,7 @@ class TestEdgeCases:
     def test_storage_error_falls_back_to_builtins(self) -> None:
         storage = _BrokenStorage()
         reg = RuleRegistry(storage=storage)
-        assert len(reg.heuristic_rules) == 37
+        assert len(reg.heuristic_rules) == 36
         total = sum(len(pats) for pats in reg.output_patterns.values())
         assert total == 19
 

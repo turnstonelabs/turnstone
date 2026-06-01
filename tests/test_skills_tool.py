@@ -30,10 +30,10 @@ class TestToolRegistration:
         # tool that's "action", matching the existing ``tasks`` precedent.
         assert PRIMARY_KEY_MAP.get("skills") == "action"
 
-    def test_not_agent_tool(self) -> None:
-        from turnstone.core.tools import AGENT_TOOLS
+    def test_not_task_agent_tool(self) -> None:
+        from turnstone.core.tools import TASK_AGENT_TOOLS
 
-        names = {t["function"]["name"] for t in AGENT_TOOLS}
+        names = {t["function"]["name"] for t in TASK_AGENT_TOOLS}
         assert "skills" not in names
 
     def test_dual_kind_visible_to_both_sessions(self) -> None:

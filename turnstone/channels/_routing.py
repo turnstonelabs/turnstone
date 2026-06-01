@@ -445,19 +445,6 @@ class ChannelRouter:
             approved=approved,
         )
 
-    async def send_plan_feedback(self, ws_id: str, correlation_id: str, feedback: str) -> None:
-        """Respond to a plan review via the server API."""
-        if self._console:
-            await self._console.route_plan_feedback(ws_id=ws_id, feedback=feedback)
-        else:
-            assert self._server is not None
-            await self._server.plan_feedback(ws_id=ws_id, feedback=feedback)
-        log.debug(
-            "channel_router.send_plan_feedback",
-            ws_id=ws_id,
-            correlation_id=correlation_id,
-        )
-
     # -- route management ----------------------------------------------------
 
     async def lookup_ws_id(self, channel_type: str, channel_id: str) -> str | None:

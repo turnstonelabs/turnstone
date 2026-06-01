@@ -156,9 +156,8 @@ def test_coordinator_session_uses_coordinator_tools(coord_session):
         # to ship the message.  Routing is session-kind-agnostic.
         "notify",
     }
-    # Sub-agent tool sets are zeroed on coordinator sessions.
+    # Sub-agent tool set is zeroed on coordinator sessions.
     assert sess._task_tools == []
-    assert sess._agent_tools == []
 
 
 # ---------------------------------------------------------------------------

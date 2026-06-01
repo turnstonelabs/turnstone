@@ -136,9 +136,6 @@ class NullUI:
     def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None:
         pass
 
-    def on_plan_review(self, content: str) -> str:
-        return ""
-
     def on_info(self, message: str) -> None:
         pass
 
@@ -1208,10 +1205,9 @@ against expected tool call sequences.
 Your job: identify SEMANTIC PATTERNS across failures and successes — \
 not just what failed, but WHY, and what the failures have in common.
 
-You have access to `math` (Python with numpy/scipy/collections) and \
-`bash` tools. Use them to compute statistics, build confusion matrices, \
-analyze tool co-occurrence, or quantify patterns — don't just eyeball \
-the data.
+You have access to a `bash` tool. Use it to compute statistics, build \
+confusion matrices, analyze tool co-occurrence, or quantify patterns — \
+don't just eyeball the data.
 
 ## Analysis Framework
 
@@ -1278,8 +1274,8 @@ right and wrong.
 Your job: edit the prompt so more tests pass.
 
 Style — the prompt teaches through patterns and examples, not rules:
-- Good: "Plan a refactor → plan_agent:\\n   plan_agent(goal='...')"
-- Bad: "You MUST call plan_agent. NEVER skip it. ALWAYS use it."
+- Good: "Delegate a subtask → task_agent:\\n   task_agent(prompt='...')"
+- Bad: "You MUST call task_agent. NEVER skip it. ALWAYS use it."
 - If the current prompt contains imperative rules (MUST, NEVER, \
 ALWAYS, ABSOLUTE RULE, etc.), replace them with a pattern that \
 demonstrates the right behavior. Rules are noise — examples teach.
@@ -1730,24 +1726,6 @@ _ANALYST_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "math",
-            "description": (
-                "Execute Python code for analysis. Available: numpy, scipy, "
-                "collections, itertools, math, json, re. Use print() for output. "
-                "Example: print(numpy.mean([0.8, 0.6, 1.0]))"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "code": {"type": "string", "description": "Python code to execute."},
-                },
-                "required": ["code"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "bash",
             "description": "Execute a bash command. Use for jq, awk, sort, uniq, etc.",
             "parameters": {
@@ -1769,12 +1747,7 @@ def _exec_analyst_tool(name: str, arguments: str) -> str:
     except json.JSONDecodeError:
         return f"Invalid JSON arguments: {arguments[:200]}"
 
-    if name == "math":
-        from turnstone.core.sandbox import execute_math_sandboxed
-
-        output, is_error = execute_math_sandboxed(args.get("code", ""), timeout=15.0)
-        return output[:4000]
-    elif name == "bash":
+    if name == "bash":
         import subprocess
 
         try:
@@ -1802,7 +1775,7 @@ def _run_analyst(
 ) -> str:
     """Run the analyst agent to produce a semantic failure analysis.
 
-    Multi-turn agent with math and bash tools for computing statistics.
+    Multi-turn agent with a bash tool for computing statistics.
     Phase 1 of the two-phase optimization: analyst diagnoses patterns,
     then optimizer uses the diagnosis to modify the prompt.
     """
@@ -1878,7 +1851,7 @@ def _run_analyst(
     user_content += (
         "\n\nAnalyze the semantic patterns across these results. "
         "Focus on WHY failures happen and what passing cases have in common. "
-        "Use the math or bash tools if you need to compute statistics, "
+        "Use the bash tool if you need to compute statistics, "
         "build confusion matrices, or analyze distributions."
     )
 
