@@ -4539,6 +4539,34 @@
           >
             Detect
           </button>
+          <button
+            type="button"
+            id="model-recalibrate-btn"
+            class="admin-action-btn"
+            onclick="recalibrateModel()"
+            style="
+              width: auto;
+              padding: 7px 16px;
+              font-size: 12px;
+              margin-left: 8px;
+              display: none;
+            "
+            title="Re-probe this reranker's /rerank endpoint and update its calibrated floor"
+          >
+            Re-calibrate
+          </button>
+          <span
+            id="model-calibration-chip"
+            class="scope-badge"
+            style="
+              display: none;
+              margin-left: 8px;
+              vertical-align: middle;
+              font-size: 11px;
+              text-transform: none;
+              letter-spacing: 0;
+            "
+          ></span>
           <div
             id="model-detect-result"
             role="status"

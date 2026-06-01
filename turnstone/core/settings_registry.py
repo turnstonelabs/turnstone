@@ -337,11 +337,13 @@ def _build_registry() -> dict[str, SettingDef]:
             "tools.rerank_bm25_threshold",
             "float",
             0.0,
-            "Relevance floor (0-1) for proactive memory surfacing; 0 disables",
+            "Fallback relevance floor (0-1) for proactive memory surfacing; 0 disables",
             "tools",
-            help="0-1 relevance-probability floor for PROACTIVE memory surfacing; 0 disables "
-            "it. Reranker scores are normalised to 0-1 first (logit rerankers like bge/TEI are "
-            "sigmoid-mapped), so the scale is uniform across endpoints. Calibrate to pick a value.",
+            help="0-1 relevance-probability FALLBACK floor for PROACTIVE memory surfacing, used "
+            "only when the active reranker model has no per-model calibration (calibrate a "
+            "reranker via the Models tab to set its own floor, which takes precedence); 0 "
+            "disables it. Reranker scores are normalised to 0-1 first (logit rerankers like "
+            "bge/TEI are sigmoid-mapped), so the scale is uniform across endpoints.",
         ),
         # -- server ---------------------------------------------------------
         SettingDef(

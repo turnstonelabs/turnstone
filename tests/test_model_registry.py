@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -513,6 +514,38 @@ class TestLoadModelRegistryWithDB:
         cfg = reg.get_config("cloud-gpt")
         assert cfg.model == "gpt-5"
         assert cfg.source == "db"
+
+    def test_rerank_calibration_caps_survive_db_load(self) -> None:
+        """Phase 3: the three reranker-calibration capability keys round-trip
+        through the DB load and stay in ``cfg.capabilities`` (the raw dict the
+        BM25 floor reads), independent of any dataclass field filtering."""
+        storage = _MockStorage(
+            [
+                {
+                    "alias": "reranker",
+                    "model": "bge-reranker",
+                    "provider": "openai-compatible",
+                    "base_url": "http://localhost:9999/rerank",
+                    "api_key": "sk-db",
+                    "context_window": 0,
+                    "capabilities": json.dumps(
+                        {
+                            "supports_rerank": True,
+                            "rerank_threshold": 0.33,
+                            "rerank_scale": "probability (0-1)",
+                            "rerank_separated": True,
+                        }
+                    ),
+                    "enabled": True,
+                }
+            ]
+        )
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry("http://x/v1", "x", "x", storage=storage)
+        caps = reg.get_config("reranker").capabilities
+        assert caps["rerank_threshold"] == 0.33
+        assert caps["rerank_scale"] == "probability (0-1)"
+        assert caps["rerank_separated"] is True
 
     def test_config_overrides_db(self) -> None:
         """Config.toml entry overrides DB entry with same alias."""

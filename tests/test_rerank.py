@@ -496,3 +496,145 @@ class TestSessionBM25Reranker:
         cs = _FakeConfigStore({"tools.rerank_bm25_threshold": "not-a-number"})
         stub = SimpleNamespace(_config_store=cs)
         assert ChatSession._bm25_rerank_threshold(stub) == 0.0
+
+    # -- per-model calibrated floor precedence (Phase 3) ---------------------
+
+    def _floor_stub(self, *, alias: str, global_thr: float, caps: dict | None):
+        """Stub with a reranker alias selected + a fake registry holding caps.
+
+        ``caps=None`` means the alias is selected but absent from the registry
+        (has_alias False) -> must fall through to the global value, no crash.
+        """
+        cs = _FakeConfigStore(
+            {"tools.reranker_alias": alias, "tools.rerank_bm25_threshold": global_thr}
+        )
+        registry = SimpleNamespace(
+            has_alias=lambda a: caps is not None and a == alias,
+            get_config=lambda a: SimpleNamespace(capabilities=caps or {}),
+        )
+        return SimpleNamespace(_config_store=cs, _registry=registry)
+
+    def test_floor_uses_per_model_when_calibrated_and_separated(self):
+        # Calibrated (rerank_scale set) AND separated -> the per-model floor wins
+        # over the global fallback.
+        caps = {
+            "rerank_scale": "probability (0-1)",
+            "rerank_separated": True,
+            "rerank_threshold": 0.61,
+        }
+        stub = self._floor_stub(alias="rr", global_thr=0.2, caps=caps)
+        assert ChatSession._bm25_rerank_threshold(stub) == 0.61
+
+    def test_floor_zero_when_calibrated_but_not_separated(self):
+        # Calibrated but NO clean separation -> floor disabled (0.0), NOT the
+        # global fallback. Flip rerank_separated to True and this returns 0.61;
+        # the False branch must yield 0.0.
+        caps = {
+            "rerank_scale": "logit (sigmoid-normalised)",
+            "rerank_separated": False,
+            "rerank_threshold": 0.61,
+        }
+        stub = self._floor_stub(alias="rr", global_thr=0.4, caps=caps)
+        assert ChatSession._bm25_rerank_threshold(stub) == 0.0
+
+    def test_floor_falls_back_to_global_when_uncalibrated(self):
+        # Reranker selected but never calibrated (no rerank_scale marker) ->
+        # the global fallback applies.
+        caps = {"supports_rerank": True}
+        stub = self._floor_stub(alias="rr", global_thr=0.4, caps=caps)
+        assert ChatSession._bm25_rerank_threshold(stub) == 0.4
+
+    def test_floor_global_when_no_alias_selected(self):
+        # No reranker_alias -> the alias guard is False, global fallback used
+        # (and the registry is never consulted).
+        cs = _FakeConfigStore({"tools.reranker_alias": "", "tools.rerank_bm25_threshold": 0.33})
+
+        def _boom(_a):  # registry must not be touched without an alias
+            raise AssertionError("registry consulted despite empty alias")
+
+        registry = SimpleNamespace(has_alias=_boom, get_config=_boom)
+        stub = SimpleNamespace(_config_store=cs, _registry=registry)
+        assert ChatSession._bm25_rerank_threshold(stub) == 0.33
+
+    def test_floor_global_when_alias_absent_from_registry(self):
+        # Alias set but not in the registry (has_alias False) -> no crash, falls
+        # through to the global value.
+        stub = self._floor_stub(alias="ghost", global_thr=0.25, caps=None)
+        assert ChatSession._bm25_rerank_threshold(stub) == 0.25
+
+    def test_floor_global_when_registry_is_none(self):
+        # Alias set but no registry attached -> guard on registry None, global.
+        cs = _FakeConfigStore({"tools.reranker_alias": "rr", "tools.rerank_bm25_threshold": 0.15})
+        stub = SimpleNamespace(_config_store=cs, _registry=None)
+        assert ChatSession._bm25_rerank_threshold(stub) == 0.15
+
+    def test_floor_zero_on_garbage_per_model_threshold(self):
+        # Calibrated+separated but the stored threshold is junk -> the
+        # (TypeError, ValueError) guard yields 0.0 rather than propagating.
+        caps = {
+            "rerank_scale": "probability (0-1)",
+            "rerank_separated": True,
+            "rerank_threshold": "nan-ish",
+        }
+        stub = self._floor_stub(alias="rr", global_thr=0.4, caps=caps)
+        assert ChatSession._bm25_rerank_threshold(stub) == 0.0
+
+
+class TestModelCapabilitiesRerankFields:
+    """The Phase 3 reranker-calibration fields on the frozen dataclass."""
+
+    def test_replace_accepts_calibration_fields(self):
+        import dataclasses
+
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        caps = dataclasses.replace(
+            ModelCapabilities(),
+            rerank_threshold=0.33,
+            rerank_scale="probability (0-1)",
+            rerank_separated=True,
+        )
+        assert caps.rerank_threshold == 0.33
+        assert caps.rerank_scale == "probability (0-1)"
+        assert caps.rerank_separated is True
+
+    def test_defaults_mark_uncalibrated(self):
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        caps = ModelCapabilities()
+        # Empty rerank_scale is the "not calibrated" marker the floor logic keys
+        # off of; the numeric/bool defaults are inert.
+        assert caps.rerank_scale == ""
+        assert caps.rerank_threshold == 0.0
+        assert caps.rerank_separated is False
+
+    def test_resolve_capabilities_merges_calibration_overrides(self):
+        """The session field-filter in ``_resolve_capabilities`` now passes the
+        three calibration keys through (they are real dataclass fields), so a
+        per-model caps dict carrying them survives onto the runtime caps."""
+        import dataclasses
+
+        from turnstone.core.providers._protocol import ModelCapabilities
+        from turnstone.core.session import ChatSession
+
+        base = ModelCapabilities()
+        provider = SimpleNamespace(get_capabilities=lambda model: base)
+        cfg = SimpleNamespace(
+            capabilities={
+                "rerank_threshold": 0.5,
+                "rerank_scale": "logit (sigmoid-normalised)",
+                "rerank_separated": True,
+                "not_a_field": "dropped",
+            }
+        )
+        registry = SimpleNamespace(get_config=lambda alias: cfg)
+        stub = SimpleNamespace(_registry=registry)
+        caps = ChatSession._resolve_capabilities(stub, provider, "m", "rr")
+        assert isinstance(caps, ModelCapabilities)
+        assert caps.rerank_threshold == 0.5
+        assert caps.rerank_scale == "logit (sigmoid-normalised)"
+        assert caps.rerank_separated is True
+        # Unknown keys are filtered out (no crash on replace).
+        assert not hasattr(caps, "not_a_field")
+        # Sanity: the dataclasses module is genuinely exercised.
+        assert dataclasses.is_dataclass(caps)

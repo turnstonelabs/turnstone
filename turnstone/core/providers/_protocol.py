@@ -110,6 +110,12 @@ class ModelCapabilities:
     # (Chat Completions / vLLM / llama.cpp / Gemini-compat) is
     # persist-only and doesn't gate on this flag.
     supports_reasoning_replay: bool = False
+    # Phase 3 reranker calibration — populated by calibrate-on-detect; read by
+    # ChatSession._bm25_rerank_threshold. A non-empty rerank_scale is the
+    # "has been calibrated" marker.
+    rerank_threshold: float = 0.0
+    rerank_scale: str = ""
+    rerank_separated: bool = False
 
 
 # Operator-friendly UI cap on reasoning text returned from

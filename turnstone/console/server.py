@@ -10875,6 +10875,38 @@ async def admin_model_reload(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "results": results})
 
 
+def _global_rerank_instruction(app_state: Any) -> str:
+    """The global rerank query instruction (stored setting -> config.toml/env).
+
+    The instruction applies to whichever rerank endpoint resolves, so it is read
+    the same way for calibrate-on-detect and the per-model Re-calibrate endpoint.
+    """
+    from turnstone.core.config import get_rerank_instruction
+
+    cs = getattr(app_state, "config_store", None)
+    stored = str(cs.get("tools.rerank_instruction") or "").strip() if cs is not None else ""
+    return stored or get_rerank_instruction()
+
+
+def _run_rerank_calibration(
+    base_url: str, model: str, api_key: str, instruction: str
+) -> tuple[Any | None, str]:
+    """Build a rerank client and calibrate it (blocking — call via executor).
+
+    Returns ``(CalibrationResult, "")`` on success or ``(None, error)`` on any
+    failure (unreachable endpoint, non-reranker, timeout). Never raises, so the
+    caller can surface a graceful "not calibrated" rather than a 500.
+    """
+    from turnstone.core.rerank_calibrate import calibrate_model
+
+    try:
+        result = calibrate_model(base_url, model, api_key, instruction=instruction, timeout=60.0)
+    except Exception as exc:
+        err = str(exc)
+        return None, (err[:500] + "..." if len(err) > 500 else err)
+    return result, ""
+
+
 async def admin_detect_model(request: Request) -> JSONResponse:
     """POST /v1/api/admin/model-definitions/detect — stateless endpoint probe."""
     import asyncio
@@ -10932,7 +10964,137 @@ async def admin_detect_model(request: Request) -> JSONResponse:
     result = await loop.run_in_executor(
         None, probe_model_endpoint, provider, base_url, api_key, model
     )
+
+    # Calibrate-on-detect: when the target is a reranker (the UI flags it from
+    # the capabilities being edited), ALSO probe the /rerank endpoint with the
+    # labelled set and merge the calibration fields so the client autopopulates
+    # them like context_window. Best-effort — a failure adds a non-fatal note
+    # and omits the fields ("not calibrated"); non-rerank detect is untouched
+    # (no extra round-trip, no slowdown).
+    if bool(body.get("supports_rerank")) and result.get("reachable") and base_url:
+        from turnstone.core.rerank_calibrate import calibration_caps_fields
+
+        instruction = _global_rerank_instruction(request.app.state)
+        try:
+            async with asyncio.timeout(90):
+                cal, cal_err = await loop.run_in_executor(
+                    None, _run_rerank_calibration, base_url, model, api_key, instruction
+                )
+        except TimeoutError:
+            cal, cal_err = None, "calibration timed out"
+        if cal is not None:
+            caps_out = result.get("capabilities")
+            if not isinstance(caps_out, dict):
+                caps_out = {}
+            caps_out.update(calibration_caps_fields(cal))
+            result["capabilities"] = caps_out
+        else:
+            result["rerank_calibration_note"] = f"Reranker not calibrated: {cal_err}"
+
     return JSONResponse(result)
+
+
+async def admin_calibrate_model_definition(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/model-definitions/{definition_id}/calibrate.
+
+    Probe a saved reranker model's /rerank endpoint with the labelled set,
+    persist the three calibration fields onto its capabilities, and return a
+    verdict. A calibration failure is graceful (``error`` set, ``separated``
+    False, nothing persisted) — never a 500.
+    """
+    from turnstone.core.auth import require_permission
+    from turnstone.core.rerank_calibrate import merge_calibration_into_caps
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.models")
+    if err:
+        return err
+
+    definition_id = request.path_params["definition_id"]
+    existing = storage.get_model_definition(definition_id)
+    if existing is None:
+        return JSONResponse({"error": "Model definition not found"}, status_code=404)
+
+    base_url = str(existing.get("base_url") or "").strip()
+    if not base_url:
+        return JSONResponse(
+            {
+                "separated": False,
+                "suggested_threshold": None,
+                "raw_scale": "",
+                "relevant": [0.0, 0.0],
+                "irrelevant": [0.0, 0.0],
+                "applied": False,
+                "error": "Model has no base_url (a reranker's base_url is its /rerank endpoint).",
+            }
+        )
+
+    instruction = _global_rerank_instruction(request.app.state)
+    loop = asyncio.get_running_loop()
+    try:
+        async with asyncio.timeout(90):
+            cal, cal_err = await loop.run_in_executor(
+                None,
+                _run_rerank_calibration,
+                base_url,
+                str(existing.get("model") or ""),
+                str(existing.get("api_key") or ""),
+                instruction,
+            )
+    except TimeoutError:
+        cal, cal_err = None, "calibration timed out"
+
+    if cal is None:
+        return JSONResponse(
+            {
+                "separated": False,
+                "suggested_threshold": None,
+                "raw_scale": "",
+                "relevant": [0.0, 0.0],
+                "irrelevant": [0.0, 0.0],
+                "applied": False,
+                "error": cal_err,
+            }
+        )
+
+    # Merge the calibration fields into the stored capabilities JSON.
+    storage.update_model_definition(
+        definition_id,
+        capabilities=merge_calibration_into_caps(existing.get("capabilities"), cal),
+    )
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "model_definition.calibrate",
+        "model_definition",
+        definition_id,
+        {
+            "separated": cal.separated,
+            "suggested_threshold": cal.suggested_threshold,
+            "raw_scale": cal.raw_scale,
+        },
+        ip,
+    )
+
+    await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
+    _emit_models_changed(request)
+
+    return JSONResponse(
+        {
+            "separated": cal.separated,
+            "suggested_threshold": cal.suggested_threshold,
+            "raw_scale": cal.raw_scale,
+            "relevant": [cal.relevant_min, cal.relevant_max],
+            "irrelevant": [cal.irrelevant_min, cal.irrelevant_max],
+            "applied": True,
+            "error": "",
+        }
+    )
 
 
 async def admin_model_capabilities(request: Request) -> JSONResponse:
@@ -13022,6 +13184,11 @@ def create_app(
                     Route(
                         "/api/admin/model-definitions/detect",
                         admin_detect_model,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/admin/model-definitions/{definition_id}/calibrate",
+                        admin_calibrate_model_definition,
                         methods=["POST"],
                     ),
                     Route(

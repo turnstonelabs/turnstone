@@ -1056,6 +1056,10 @@ class DetectModelRequest(BaseModel):
     api_key: str = ""
     model: str = ""
     definition_id: str = ""
+    # When the model being edited is a reranker, the UI sets this so detect also
+    # runs calibrate-on-detect against the /rerank endpoint and returns the
+    # calibration fields under ``capabilities``.
+    supports_rerank: bool = False
 
 
 class DetectModelResponse(BaseModel):
@@ -1065,6 +1069,21 @@ class DetectModelResponse(BaseModel):
     context_window: int | None = None
     server_type: str | None = None
     error: str | None = None
+    # Present only for calibrate-on-detect of a reranker: the merged calibration
+    # fields (rerank_threshold/rerank_scale/rerank_separated) the client
+    # autopopulates, and a non-fatal note when calibration could not run.
+    capabilities: dict[str, Any] = Field(default_factory=dict)
+    rerank_calibration_note: str | None = None
+
+
+class CalibrateModelResponse(BaseModel):
+    separated: bool = False
+    suggested_threshold: float | None = None
+    raw_scale: str = ""
+    relevant: list[float] = Field(default_factory=list)
+    irrelevant: list[float] = Field(default_factory=list)
+    applied: bool = False
+    error: str = ""
 
 
 class ModelCapabilitiesResponse(BaseModel):

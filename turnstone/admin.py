@@ -440,38 +440,48 @@ def _discover_console_url() -> str:
 
 
 def _cmd_rerank_calibrate(args: argparse.Namespace) -> None:
+    from turnstone.core.config import get_rerank_instruction
     from turnstone.core.config_store import ConfigStore
-    from turnstone.core.model_registry import load_model_registry
-    from turnstone.core.rerank_calibrate import calibrate
-    from turnstone.core.rerank_config import resolve_rerank_client_from
+    from turnstone.core.rerank_calibrate import calibrate_model, merge_calibration_into_caps
 
     storage = _get_storage(args)
     config_store = ConfigStore(storage)
-    try:
-        registry: Any = load_model_registry(storage=storage, allow_empty=True)
-    except Exception:
-        registry = None
-    # Calibration is a manual, one-shot op against a possibly-cold endpoint, so a
-    # generous timeout (vs the per-turn 15s cap) keeps a first-request compile
-    # from failing it; calibrate() also warms the endpoint up first.
-    client = resolve_rerank_client_from(config_store, registry, timeout=60.0)
-    if client is None:
+
+    alias = str(args.model).strip()
+    row = storage.get_model_definition_by_alias(alias)
+    if row is None:
+        print(f"No model definition with alias {alias!r}. Add it in the admin Models tab.")
+        sys.exit(1)
+    base_url = str(row.get("base_url") or "").strip()
+    if not base_url:
         print(
-            "No rerank endpoint configured. Set tools.rerank_url (config.toml [tools] or the "
-            "Settings tab) or select a Reranker model role.",
+            f"Model {alias!r} has no base_url — a reranker's base_url must be a Cohere/Jina-"
+            "compatible /rerank endpoint.",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    alias = str(config_store.get("tools.reranker_alias") or "").strip()
-    label = alias or str(config_store.get("tools.rerank_model") or "") or "(endpoint default)"
+    # The query instruction is global (applies to whichever endpoint resolves):
+    # explicit stored value wins, else config.toml/env.
+    instruction = str(config_store.get("tools.rerank_instruction") or "").strip() or (
+        get_rerank_instruction()
+    )
+    # Calibration is a manual, one-shot op against a possibly-cold endpoint, so a
+    # generous timeout (vs the per-turn 15s cap) keeps a first-request compile
+    # from failing it; calibrate() also warms the endpoint up first.
     try:
-        result = calibrate(client, model=label)
+        result = calibrate_model(
+            base_url,
+            str(row.get("model") or ""),
+            str(row.get("api_key") or ""),
+            instruction=instruction,
+            timeout=60.0,
+        )
     except Exception as e:  # network / endpoint failure surfaces to the operator
         print(f"Calibration failed: {e}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Reranker:        {result.model}")
+    print(f"Reranker:        {alias} ({result.model})")
     print(f"Raw score scale: {result.raw_scale}")
     print(
         f"Relevant   (n={result.n_relevant}): "
@@ -482,21 +492,34 @@ def _cmd_rerank_calibrate(args: argparse.Namespace) -> None:
         f"{result.irrelevant_min:.4f} .. {result.irrelevant_max:.4f}"
     )
     if not result.separated:
+        # A no-separation result is still a valid recorded outcome (the
+        # rerank_scale marker is set, threshold 0) — align with the calibrate
+        # endpoint, which persists the marker on separated=False ("calibrated, no
+        # floor"). Persist on --apply, otherwise just recommend; exit 0 either way.
         print(
             "\nNo clean separation between relevant and irrelevant probes: this endpoint can't "
             "be thresholded reliably (is it a real reranker, and is the model name right?). "
             "Not recommending a floor."
         )
-        sys.exit(1 if args.apply else 0)
+        if args.apply:
+            storage.update_model_definition(
+                row["definition_id"],
+                capabilities=merge_calibration_into_caps(row.get("capabilities"), result),
+            )
+            print(f"Recorded calibration on model {alias!r}: no floor (no clean separation).")
+        else:
+            print(f"Re-run with --apply to record the calibration on model {alias!r}.")
+        return
 
-    print(f"\nSuggested tools.rerank_bm25_threshold = {result.suggested_threshold}")
+    print(f"\nSuggested per-model rerank floor = {result.suggested_threshold}")
     if args.apply:
-        config_store.set(
-            "tools.rerank_bm25_threshold", result.suggested_threshold, changed_by="rerank-calibrate"
+        storage.update_model_definition(
+            row["definition_id"],
+            capabilities=merge_calibration_into_caps(row.get("capabilities"), result),
         )
-        print(f"Applied: tools.rerank_bm25_threshold = {result.suggested_threshold}")
+        print(f"Applied to model {alias!r}: rerank_threshold = {result.suggested_threshold}")
     else:
-        print("Re-run with --apply to write it.")
+        print(f"Re-run with --apply to write it onto model {alias!r}.")
 
 
 def main() -> None:
@@ -585,10 +608,15 @@ def main() -> None:
 
     p_cal = sub.add_parser(
         "rerank-calibrate",
-        help="Probe the configured reranker and recommend tools.rerank_bm25_threshold",
+        help="Probe a reranker model definition and recommend its per-model floor",
     )
     p_cal.add_argument(
-        "--apply", action="store_true", help="Write the suggested threshold to settings"
+        "--model", required=True, help="Alias of the reranker model definition to calibrate"
+    )
+    p_cal.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write the calibration onto the model's capabilities",
     )
 
     args = parser.parse_args()

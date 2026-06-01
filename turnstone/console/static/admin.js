@@ -5131,6 +5131,10 @@ let _modelDefs = [];
 let _modelDefaultAlias = "";
 let _modelCreateTrap = null;
 let _modelCreateTrigger = null;
+// Reranker calibration fields extracted out of the capabilities textarea in the
+// edit modal (like server_compat), held here so they survive an unrelated edit
+// and are re-merged on save. Reset per modal open.
+let _rerankCalFields = {};
 
 // Roles surfaced in the Models → Roles sub-tab.  Each entry maps a
 // settings-registry key onto a UX label.  ``effortKey`` is optional —
@@ -5833,6 +5837,13 @@ function showCreateModelModal() {
   document.getElementById("model-detect-result").style.display = "none";
   document.getElementById("model-detect-btn").disabled = false;
   document.getElementById("model-detect-btn").textContent = "Detect";
+  // Reranker calibration: reset extracted fields and hide the chip + the
+  // Re-calibrate button (edit mode re-shows them after loading the def).
+  _rerankCalFields = {};
+  const _calChip = document.getElementById("model-calibration-chip");
+  if (_calChip) _calChip.style.display = "none";
+  const _recalBtn = document.getElementById("model-recalibrate-btn");
+  if (_recalBtn) _recalBtn.style.display = "none";
   _refreshModelSuggestions();
   _applyProviderDefaults();
   document.getElementById("model-alias").focus();
@@ -5901,6 +5912,20 @@ function showEditModelModal(definitionId) {
       const ebText = JSON.stringify(eb, null, 2);
       document.getElementById("model-extra-body").value =
         ebText === "{}" ? "" : ebText;
+      // Extract reranker calibration fields out of the displayed capabilities
+      // (like server_compat) so an unrelated edit doesn't drop them — held in
+      // _rerankCalFields and re-merged on save. Capture supports_rerank for the
+      // chip/button before it stays in the visible JSON.
+      const isReranker = !!capsObj.supports_rerank;
+      _rerankCalFields = {};
+      ["rerank_threshold", "rerank_scale", "rerank_separated"].forEach(
+        function (k) {
+          if (k in capsObj) {
+            _rerankCalFields[k] = capsObj[k];
+            delete capsObj[k];
+          }
+        },
+      );
       // Remove structured fields from capabilities display — only delete
       // thinking_mode/thinking_param when the UI successfully captured them.
       delete capsObj.server_compat;
@@ -5911,6 +5936,13 @@ function showEditModelModal(definitionId) {
       const capsText = JSON.stringify(capsObj, null, 2);
       document.getElementById("model-capabilities").value =
         capsText === "{}" ? "" : capsText;
+      // Calibration chip + Re-calibrate button: only for rerankers with an id.
+      _paintCalibrationChip(
+        Object.assign({ supports_rerank: isReranker }, _rerankCalFields),
+      );
+      const recalBtn = document.getElementById("model-recalibrate-btn");
+      if (recalBtn)
+        recalBtn.style.display = isReranker ? "inline-block" : "none";
       document.getElementById("model-enabled").checked = m.enabled !== false;
       // Reasoning persistence flags — defaults match the dataclass
       // defaults (persist=true, replay=false) when the API returns
@@ -6019,6 +6051,13 @@ function submitCreateModel() {
     caps.server_compat = serverCompat;
   }
 
+  // Re-merge reranker calibration fields extracted on edit so an unrelated edit
+  // doesn't silently drop the calibration. A field typed directly into the
+  // capabilities JSON wins (operator override).
+  Object.keys(_rerankCalFields).forEach(function (k) {
+    if (!(k in caps)) caps[k] = _rerankCalFields[k];
+  });
+
   const form = {
     alias: alias,
     model: modelName,
@@ -6120,6 +6159,52 @@ function _detectResultLine(text, color) {
   return div;
 }
 
+// Pure: map a capabilities object to the reranker-calibration verdict chip.
+// rerank_scale is the "has been calibrated" marker; with rerank_separated the
+// per-model floor applies, without it the serving is suspect (no clean split).
+function renderCalibrationVerdict(caps) {
+  const c = _isPlainObject(caps) ? caps : {};
+  if (c.rerank_scale && c.rerank_separated) {
+    return {
+      text: "✓ calibrated · floor " + Number(c.rerank_threshold).toFixed(2),
+      cls: "ok",
+    };
+  }
+  if (c.rerank_scale) {
+    return {
+      text: "⚠ no clean separation — check serving (--chat-template?)",
+      cls: "warn",
+    };
+  }
+  return { text: "not calibrated", cls: "muted" };
+}
+
+const _CALIBRATION_CHIP_COLORS = {
+  ok: "var(--green)",
+  warn: "var(--yellow)",
+  muted: "var(--fg-dim)",
+};
+
+// Paint (or hide) the calibration chip from a capabilities object. Hidden when
+// the model is not a reranker (no supports_rerank) so non-rerank models are
+// unaffected.
+function _paintCalibrationChip(caps) {
+  const chip = document.getElementById("model-calibration-chip");
+  if (!chip) return;
+  const c = _isPlainObject(caps) ? caps : {};
+  if (!c.supports_rerank) {
+    chip.style.display = "none";
+    chip.textContent = "";
+    return;
+  }
+  const v = renderCalibrationVerdict(c);
+  chip.textContent = v.text;
+  chip.style.color = _CALIBRATION_CHIP_COLORS[v.cls] || "var(--fg-dim)";
+  chip.style.borderColor =
+    v.cls === "muted" ? "var(--border)" : _CALIBRATION_CHIP_COLORS[v.cls];
+  chip.style.display = "inline-block";
+}
+
 function _clearDetectResult() {
   const rd = document.getElementById("model-detect-result");
   if (rd) {
@@ -6129,12 +6214,27 @@ function _clearDetectResult() {
   }
 }
 
+// Best-effort: is the model being edited a reranker? Reads supports_rerank from
+// the capabilities textarea (the chip/calibration flow keeps it there).
+function _editingReranker() {
+  try {
+    const c = JSON.parse(
+      document.getElementById("model-capabilities").value.trim() || "{}",
+    );
+    return _isPlainObject(c) && !!c.supports_rerank;
+  } catch (e) {
+    return false;
+  }
+}
+
 function detectModel() {
   const btn = document.getElementById("model-detect-btn");
   const resultDiv = document.getElementById("model-detect-result");
+  const isReranker = _editingReranker();
   btn.disabled = true;
   btn.setAttribute("aria-busy", "true");
-  btn.textContent = "Detecting\u2026";
+  // Calibrate-on-detect adds a ~20s endpoint probe, so signal it.
+  btn.textContent = isReranker ? "Calibrating\u2026" : "Detecting\u2026";
   resultDiv.style.display = "none";
   resultDiv.textContent = "";
 
@@ -6147,6 +6247,8 @@ function detectModel() {
   if (apiKey) form.api_key = apiKey;
   const editId = document.getElementById("model-edit-id").value;
   if (editId) form.definition_id = editId;
+  // Tell the server to also calibrate when this is a reranker.
+  if (isReranker) form.supports_rerank = true;
 
   authFetch("/v1/api/admin/model-definitions/detect", {
     method: "POST",
@@ -6273,6 +6375,26 @@ function detectModel() {
           _detectResultLine("\u2713 Compatibility profile suggested", "green"),
         );
       }
+      // Calibrate-on-detect result: merge the returned calibration fields so a
+      // subsequent save persists them, and paint the chip. The note covers the
+      // graceful "could not calibrate" case (endpoint unreachable as a rerank).
+      if (isReranker) {
+        if (_isPlainObject(d.capabilities)) {
+          ["rerank_threshold", "rerank_scale", "rerank_separated"].forEach(
+            function (k) {
+              if (k in d.capabilities) _rerankCalFields[k] = d.capabilities[k];
+            },
+          );
+        }
+        _paintCalibrationChip(
+          Object.assign({ supports_rerank: true }, _rerankCalFields),
+        );
+        if (d.rerank_calibration_note) {
+          resultDiv.appendChild(
+            _detectResultLine("\u26a0 " + d.rerank_calibration_note, "yellow"),
+          );
+        }
+      }
       resultDiv.style.borderColor = "var(--green)";
     })
     .catch(function (e) {
@@ -6286,6 +6408,77 @@ function detectModel() {
       btn.disabled = false;
       btn.removeAttribute("aria-busy");
       btn.textContent = "Detect";
+    });
+}
+
+// Re-calibrate a saved reranker: POST to its calibrate endpoint (persists the
+// floor server-side), then re-render the chip from the verdict.
+function recalibrateModel() {
+  const editId = document.getElementById("model-edit-id").value;
+  if (!editId) return;
+  const btn = document.getElementById("model-recalibrate-btn");
+  const resultDiv = document.getElementById("model-detect-result");
+  btn.disabled = true;
+  btn.setAttribute("aria-busy", "true");
+  btn.textContent = "Calibrating…";
+  authFetch(
+    "/v1/api/admin/model-definitions/" +
+      encodeURIComponent(editId) +
+      "/calibrate",
+    { method: "POST", headers: { "Content-Type": "application/json" } },
+  )
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Calibrate failed");
+        });
+      return r.json();
+    })
+    .then(function (d) {
+      resultDiv.style.display = "block";
+      resultDiv.textContent = "";
+      if (d.error) {
+        resultDiv.appendChild(_detectResultLine("✗ " + d.error, "red"));
+        resultDiv.style.borderColor = "var(--red)";
+        // Nothing was persisted — keep the prior (still-valid) verdict on the
+        // chip by repainting from the retained fields rather than wiping it.
+        _paintCalibrationChip(
+          Object.assign({ supports_rerank: true }, _rerankCalFields),
+        );
+        return;
+      }
+      // Persisted server-side; mirror into _rerankCalFields + the chip.
+      _rerankCalFields.rerank_scale = d.raw_scale;
+      _rerankCalFields.rerank_separated = d.separated;
+      _rerankCalFields.rerank_threshold =
+        d.suggested_threshold != null ? d.suggested_threshold : 0;
+      _paintCalibrationChip(
+        Object.assign({ supports_rerank: true }, _rerankCalFields),
+      );
+      resultDiv.appendChild(
+        _detectResultLine(
+          d.separated
+            ? "✓ Calibrated · floor " +
+                Number(_rerankCalFields.rerank_threshold).toFixed(2)
+            : "⚠ No clean separation — check serving",
+          d.separated ? "green" : "yellow",
+        ),
+      );
+      resultDiv.style.borderColor = d.separated
+        ? "var(--green)"
+        : "var(--yellow)";
+    })
+    .catch(function (e) {
+      if (e.message === "auth") return;
+      resultDiv.style.display = "block";
+      resultDiv.textContent = "";
+      resultDiv.appendChild(_detectResultLine("✗ " + e.message, "red"));
+      resultDiv.style.borderColor = "var(--red)";
+    })
+    .finally(function () {
+      btn.disabled = false;
+      btn.removeAttribute("aria-busy");
+      btn.textContent = "Re-calibrate";
     });
 }
 

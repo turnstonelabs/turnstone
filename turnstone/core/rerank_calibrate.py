@@ -16,7 +16,7 @@ manual prototype of this.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from turnstone.core.rerank import normalize_scores
 
@@ -156,6 +156,70 @@ def calibrate(client: RerankClient, *, model: str = "") -> CalibrationResult:
             relevant.append(by_index[0])
         irrelevant.extend(by_index[idx] for idx in range(1, len(docs)) if idx in by_index)
     return _build_result(model, _raw_scale(raw_all), relevant, irrelevant)
+
+
+def calibration_caps_fields(result: CalibrationResult) -> dict[str, object]:
+    """The three ``ModelCapabilities`` calibration fields for *result*.
+
+    Merged into a reranker model definition's capabilities so
+    ``ChatSession._bm25_rerank_threshold`` can read the per-model floor.
+    ``rerank_scale`` is the "has been calibrated" marker (always set after a
+    successful probe, even with no clean separation, so the UI can warn);
+    ``rerank_threshold`` is 0.0 when the classes overlap (the floor logic
+    disables the floor in that case).
+    """
+    return {
+        "rerank_threshold": float(result.suggested_threshold or 0.0),
+        "rerank_scale": result.raw_scale,
+        "rerank_separated": bool(result.separated),
+    }
+
+
+def merge_calibration_into_caps(raw_caps: str | None, result: CalibrationResult) -> str:
+    """Merge calibration fields into an existing capabilities JSON string -> JSON string.
+
+    Tolerates a missing/malformed existing blob (treated as {}). Shared by the
+    console calibrate endpoint and the rerank-calibrate CLI so the persist
+    contract lives in one place.
+    """
+    import json
+
+    caps: dict[str, Any] = {}
+    if raw_caps:
+        try:
+            parsed = json.loads(raw_caps)
+            if isinstance(parsed, dict):
+                caps = parsed
+        except (TypeError, ValueError):
+            caps = {}
+    caps.update(calibration_caps_fields(result))
+    return json.dumps(caps)
+
+
+def calibrate_model(
+    base_url: str,
+    model: str,
+    api_key: str,
+    *,
+    instruction: str = "",
+    timeout: float = 60.0,
+) -> CalibrationResult:
+    """Build a rerank client for one model definition and calibrate it.
+
+    Shared by the admin Detect path (return-only), the per-model Re-calibrate
+    endpoint (which persists the fields), and the ``rerank-calibrate`` CLI so the
+    client-build + probe lives in one place. A generous default timeout absorbs a
+    cold endpoint's first-request compile (``calibrate`` warms up first). Raises
+    ``ValueError`` when *base_url* is empty (no endpoint to probe).
+    """
+    from turnstone.core.rerank import resolve_rerank_client
+
+    client = resolve_rerank_client(
+        url=base_url, model=model, api_key=api_key, timeout=timeout, instruction=instruction
+    )
+    if client is None:
+        raise ValueError("no rerank endpoint (base_url is empty)")
+    return calibrate(client, model=model or base_url)
 
 
 def _raw_scale(raw: list[float]) -> str:

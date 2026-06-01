@@ -1399,11 +1399,30 @@ class ChatSession:
         return _rank
 
     def _bm25_rerank_threshold(self) -> float:
-        """Configured proactive-memory relevance floor (0.0 = disabled)."""
+        """Configured proactive-memory relevance floor (0.0 = disabled).
+
+        Precedence: the ACTIVE reranker model's per-model calibration (populated
+        by calibrate-on-detect) wins over the global ``tools.rerank_bm25_threshold``
+        fallback. A reranker is "calibrated" once its capabilities carry a
+        non-empty ``rerank_scale``; the calibrated floor is only used when the
+        calibration also found a clean separation (``rerank_separated``) — a
+        calibrated-but-not-separated reranker means no single floor works, so the
+        floor is disabled (0.0) rather than falling back to the global value.
+        Reads the RAW capabilities dict (independent of ``_resolve_capabilities``
+        field filtering) so the marker survives regardless of the dataclass.
+        """
         cs = getattr(self, "_config_store", None)
         if cs is None:
             return 0.0
         try:
+            alias = str(cs.get("tools.reranker_alias") or "").strip()
+            registry = getattr(self, "_registry", None)
+            if alias and registry is not None and registry.has_alias(alias):
+                caps = registry.get_config(alias).capabilities
+                if caps.get("rerank_scale"):  # calibrated marker
+                    if caps.get("rerank_separated"):
+                        return float(caps.get("rerank_threshold") or 0.0)
+                    return 0.0  # calibrated, no clean separation -> no floor
             return float(cs.get("tools.rerank_bm25_threshold") or 0.0)
         except (TypeError, ValueError):
             return 0.0
