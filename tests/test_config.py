@@ -184,35 +184,77 @@ def test_apply_config_model_section(tmp_path):
     assert args.temperature == 0.3
 
 
-def test_tavily_key_from_config(tmp_path, monkeypatch):
-    """get_tavily_key() reads from config.toml [api] tavily_key."""
+def _reset_searxng_cache():
+    config_mod._searxng_url = None
+    config_mod._searxng_url_loaded = False
+    config_mod._searxng_engines = None
+    config_mod._searxng_engines_loaded = False
+
+
+def test_searxng_url_from_config(tmp_path, monkeypatch):
+    """get_searxng_url() reads from config.toml [tools] searxng_url."""
     _reset_cache()
-    config_mod._tavily_key = None
-    config_mod._tavily_key_loaded = False
+    _reset_searxng_cache()
 
     cfg = tmp_path / "config.toml"
-    cfg.write_text('[api]\ntavily_key = "tvly-from-config"\n')
+    cfg.write_text('[tools]\nsearxng_url = "http://searx.local:8080"\n')
     set_config_path(str(cfg))
-    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.delenv("TURNSTONE_SEARXNG_URL", raising=False)
 
-    key = config_mod.get_tavily_key()
-    assert key == "tvly-from-config"
+    assert config_mod.get_searxng_url() == "http://searx.local:8080"
 
 
-def test_tavily_key_fallback_to_env(tmp_path, monkeypatch):
-    """get_tavily_key() falls back to $TAVILY_API_KEY env var."""
+def test_searxng_url_fallback_to_env(tmp_path, monkeypatch):
+    """get_searxng_url() falls back to $TURNSTONE_SEARXNG_URL."""
     _reset_cache()
-    config_mod._tavily_key = None
-    config_mod._tavily_key_loaded = False
+    _reset_searxng_cache()
 
-    # Config exists but no tavily_key in it
+    # Config exists but no searxng_url in it
     cfg = tmp_path / "config.toml"
-    cfg.write_text("[api]\n")
+    cfg.write_text("[tools]\n")
     set_config_path(str(cfg))
-    monkeypatch.setenv("TAVILY_API_KEY", "tvly-from-env")
+    monkeypatch.setenv("TURNSTONE_SEARXNG_URL", "http://env-searx:8080")
 
-    key = config_mod.get_tavily_key()
-    assert key == "tvly-from-env"
+    assert config_mod.get_searxng_url() == "http://env-searx:8080"
+
+
+def test_searxng_url_none_when_unset(tmp_path, monkeypatch):
+    """get_searxng_url() returns None when neither config nor env is set."""
+    _reset_cache()
+    _reset_searxng_cache()
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[tools]\n")
+    set_config_path(str(cfg))
+    monkeypatch.delenv("TURNSTONE_SEARXNG_URL", raising=False)
+
+    assert config_mod.get_searxng_url() is None
+
+
+def test_searxng_engines_config_wins_over_env(tmp_path, monkeypatch):
+    """get_searxng_engines(): config.toml [tools] searxng_engines wins over env."""
+    _reset_cache()
+    _reset_searxng_cache()
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[tools]\nsearxng_engines = "duckduckgo,wikipedia"\n')
+    set_config_path(str(cfg))
+    monkeypatch.setenv("TURNSTONE_SEARXNG_ENGINES", "ignored")
+
+    assert config_mod.get_searxng_engines() == "duckduckgo,wikipedia"
+
+
+def test_searxng_engines_default_empty(tmp_path, monkeypatch):
+    """get_searxng_engines() defaults to '' when nothing is configured."""
+    _reset_cache()
+    _reset_searxng_cache()
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[tools]\n")
+    set_config_path(str(cfg))
+    monkeypatch.delenv("TURNSTONE_SEARXNG_ENGINES", raising=False)
+
+    assert config_mod.get_searxng_engines() == ""
 
 
 def test_apply_config_judge_section(tmp_path):

@@ -184,29 +184,49 @@ _CONFIG_MAP: dict[str, dict[str, str]] = {
     },
 }
 
-# -- Tavily API key (cached) --------------------------------------------------
+# -- SearxNG web search (cached) ----------------------------------------------
 
-_tavily_key: str | None = None
-_tavily_key_loaded: bool = False
+_searxng_url: str | None = None
+_searxng_url_loaded: bool = False
+_searxng_engines: str | None = None
+_searxng_engines_loaded: bool = False
 
 
-def get_tavily_key() -> str | None:
-    """Load Tavily API key (cached after first call).
+def get_searxng_url() -> str | None:
+    """Load the SearxNG base URL (cached after first call).
 
-    Precedence: config.toml [api] tavily_key -> $TAVILY_API_KEY
+    Precedence: config.toml [tools] searxng_url -> $TURNSTONE_SEARXNG_URL.
+    Returns None when neither is set (web_search then has no backend unless
+    the model supports native search). The docker-compose stack sets the env
+    var to the bundled ``searxng`` service.
     """
-    global _tavily_key, _tavily_key_loaded
-    if _tavily_key_loaded:
-        return _tavily_key
-    _tavily_key_loaded = True
-    cfg_key = load_config("api").get("tavily_key", "").strip()
-    if cfg_key:
-        _tavily_key = cfg_key
-        return _tavily_key
-    env_key = os.environ.get("TAVILY_API_KEY", "").strip()
-    if env_key:
-        _tavily_key = env_key
-    return _tavily_key
+    global _searxng_url, _searxng_url_loaded
+    if _searxng_url_loaded:
+        return _searxng_url
+    _searxng_url_loaded = True
+    cfg_url = load_config("tools").get("searxng_url", "").strip()
+    if cfg_url:
+        _searxng_url = cfg_url
+        return _searxng_url
+    env_url = os.environ.get("TURNSTONE_SEARXNG_URL", "").strip()
+    if env_url:
+        _searxng_url = env_url
+    return _searxng_url
+
+
+def get_searxng_engines() -> str:
+    """Load the SearxNG engine list (cached after first call).
+
+    Precedence: config.toml [tools] searxng_engines -> $TURNSTONE_SEARXNG_ENGINES
+    -> "" (use the instance's default engine mix). Comma-separated engine names.
+    """
+    global _searxng_engines, _searxng_engines_loaded
+    if _searxng_engines_loaded:
+        return _searxng_engines or ""
+    _searxng_engines_loaded = True
+    cfg = load_config("tools").get("searxng_engines", "").strip()
+    _searxng_engines = cfg or os.environ.get("TURNSTONE_SEARXNG_ENGINES", "").strip()
+    return _searxng_engines
 
 
 def nonneg_float(val: str) -> float:

@@ -142,7 +142,7 @@ group loop [while tool_calls present]
           task/plan → _run_agent() sub-loop
           math → sandboxed subprocess
           web_fetch → httpx + LLM summarize
-          web_search → provider-native or Tavily fallback
+          web_search → provider-native or SearxNG fallback
           memory/recall → SQLite
         end note
 

@@ -64,7 +64,6 @@ _EXPLICIT_SCRUB: frozenset[str] = frozenset(
     {
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
-        "TAVILY_API_KEY",
         "TURNSTONE_JWT_SECRET",
         "TURNSTONE_DISCORD_TOKEN",
         "TURNSTONE_GITHUB_TOKEN",

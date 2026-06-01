@@ -53,7 +53,7 @@ def _accept_resource(rel_path: str, byte_size: int) -> bool:
 def _split_skills_sh_id(skill_id: str) -> tuple[str, str, str]:
     """Split a skills.sh canonical id into (owner, repo, skill_name).
 
-    skills.sh ids are 3-segment paths like ``tavily-ai/skills/tavily-search``
+    skills.sh ids are 3-segment paths like ``owner/repo/skill-name``
     that map directly to its REST routes (``/api/download/[owner]/[repo]/[skill]``).
     """
     parts = skill_id.strip().strip("/").split("/")

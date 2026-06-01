@@ -102,6 +102,17 @@
 [tools]
 # timeout = 120                # Tool execution timeout in seconds
 # skip_permissions = false     # Auto-approve all tool calls
+#
+# web_search backend (local/vLLM models only — commercial providers use their
+# own native server-side search). The docker-compose stack bundles a SearxNG
+# service and points at it by default.
+# web_search_backend = ""      # "" (auto), "searxng", or "mcp:server:tool"
+# searxng_url = "http://searxng:8080"  # SearxNG base URL; env: TURNSTONE_SEARXNG_URL
+                               # (the admin Settings value, if set, wins; clear it
+                               # there to disable web search)
+# searxng_engines = ""         # comma-separated engines (e.g. "duckduckgo,wikipedia");
+                               # empty = the instance's default mix
+                               # env: TURNSTONE_SEARXNG_ENGINES
 
 # --- Judge (turnstone, node) ---
 

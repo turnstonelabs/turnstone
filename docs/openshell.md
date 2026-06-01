@@ -94,7 +94,7 @@ cannot bypass the proxy.
 |--------|-------|---------|
 | `openai_api` | `api.openai.com` | OpenAI LLM API |
 | `anthropic_api` | `api.anthropic.com` | Anthropic LLM API |
-| `tavily_api` | `api.tavily.com` | Web search fallback |
+| `searxng` | `searxng:8080` (bundled service) | Web search backend |
 | `skills_registry` | `skills.sh` | Skill discovery |
 | `github_api` | `api.github.com` (read-only L7), `raw.githubusercontent.com` | Skill fetch, GitHub API |
 | `mcp_registry` | `registry.modelcontextprotocol.io` (read-only L7) | MCP server discovery |

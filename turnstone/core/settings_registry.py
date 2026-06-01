@@ -241,27 +241,38 @@ def _build_registry() -> dict[str, SettingDef]:
             max_value=50,
         ),
         SettingDef(
-            "tools.tavily_api_key",
+            "tools.searxng_url",
+            "str",
+            "http://searxng:8080",
+            "SearxNG base URL for web search",
+            "tools",
+            help="Base URL of a SearxNG instance for web_search tool calls. The default "
+            "points at the 'searxng' service bundled in the docker-compose stack. The "
+            "instance must have JSON output enabled (search.formats includes 'json'). "
+            "Overrides $TURNSTONE_SEARXNG_URL and config.toml [tools] searxng_url. Empty "
+            "disables the SearxNG backend.",
+            reference_url="https://docs.searxng.org/dev/search_api.html",
+        ),
+        SettingDef(
+            "tools.searxng_engines",
             "str",
             "",
-            "Tavily API key for web search (write-only)",
+            "Comma-separated SearxNG engines (empty = instance default mix)",
             "tools",
-            is_secret=True,
-            help="API key for the Tavily web search service. When set, enables the Tavily "
-            "backend for web_search tool calls (higher quality than DuckDuckGo). "
-            "Overrides $TAVILY_API_KEY and config.toml [api] tavily_key.",
-            reference_url="https://tavily.com",
+            help="Restrict SearxNG web_search to specific engines (e.g. "
+            "'duckduckgo,wikipedia,github'). Empty uses the instance's default engine mix. "
+            "Overrides $TURNSTONE_SEARXNG_ENGINES and config.toml [tools] searxng_engines.",
         ),
         SettingDef(
             "tools.web_search_backend",
             "str",
             "",
-            "Web search backend: '' (auto), 'tavily', 'ddg', or 'mcp:server:tool'",
+            "Web search backend: '' (auto), 'searxng', or 'mcp:server:tool'",
             "tools",
             help="Controls which service handles web_search calls when the model lacks native "
-            "search support. Empty string auto-detects (Tavily if key present, else DuckDuckGo "
-            "if installed). 'ddg' uses DuckDuckGo (free, no API key). 'tavily' forces Tavily. "
-            "'mcp:server:tool' routes to an MCP server (e.g. 'mcp:ddg:search').",
+            "search support. Empty string auto-detects (SearxNG when searxng_url is set). "
+            "'searxng' forces the SearxNG backend. 'mcp:server:tool' routes to an MCP server "
+            "(e.g. 'mcp:search:web_search').",
         ),
         # -- server ---------------------------------------------------------
         SettingDef(

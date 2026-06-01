@@ -16,6 +16,20 @@ Three release tracks are maintained:
 
 ### Added
 
+- **Self-hosted SearxNG web search** — the `web_search` tool's backend for
+  local/vLLM models is now a bundled [SearxNG](https://searxng.org) service
+  (`searxng` in both compose stacks; internal docker network only, JSON API
+  enabled, rate limiter off). Two new settings configure it: `tools.searxng_url`
+  (default `http://searxng:8080`, env `TURNSTONE_SEARXNG_URL`) and
+  `tools.searxng_engines` (env `TURNSTONE_SEARXNG_ENGINES`). Commercial providers
+  (Anthropic, OpenAI) continue to use their own native server-side search and
+  never touch SearxNG; the `mcp:server:tool` backend is unchanged. A persistent
+  `searxng-cache` volume keeps its favicon/internal cache across restarts, and
+  Caddy can serve SearxNG's own web UI on a dedicated port (dev stack:
+  `https://localhost:8444`, localhost-only; production: opt-in). See
+  [docs/docker.md](docs/docker.md) for the AGPL-3.0 §13 note that applies to
+  operators who expose the bundled SearxNG publicly.
+
 - **`turnstone-admin` reads `config.toml`** — the admin CLI now honors
   the same `[database]` section that `turnstone-server` does, with the
   same precedence (`CLI / config.toml > TURNSTONE_DB_* env > defaults`).
@@ -25,6 +39,24 @@ Three release tracks are maintained:
   `sslrootcert`, `sslcert`, `sslkey` — previously the admin CLI
   silently dropped these.  A new `--config PATH` flag mirrors the
   one already on `turnstone-server`.
+
+### Changed
+
+- **`tools.web_search_backend` accepted values** *(BREAKING)* — now `""`
+  (auto), `"searxng"`, or `"mcp:server:tool"`. The old `"tavily"` and `"ddg"`
+  values are gone; a config still set to either disables web search and logs a
+  warning. Auto-detect resolves to SearxNG when `searxng_url` is set, otherwise
+  no client (the `web_search` tool is dropped for models without native search).
+
+### Removed
+
+- **Tavily and DuckDuckGo `web_search` backends** *(BREAKING)* — replaced by the
+  bundled self-hosted SearxNG service (see Added). Removed: the
+  `tools.tavily_api_key` setting, the `$TAVILY_API_KEY` env var, the
+  `[api].tavily_key` config key, and the `ddg` install extra (the `ddgs`
+  dependency). Migration: use the bundled SearxNG (it ships in the compose stacks
+  by default) or point `TURNSTONE_SEARXNG_URL` at an existing instance. No
+  database migration required.
 
 ### Security
 

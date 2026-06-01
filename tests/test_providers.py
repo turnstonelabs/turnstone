@@ -2737,8 +2737,8 @@ class TestOpenAIWebSearch:
         assert "[Result](https://example.com)" in info_chunks[0].info_delta
 
 
-class TestTavilyFallback:
-    """Tests for Tavily fallback when providers don't support native search."""
+class TestClientSearchFallback:
+    """Tests for the client-side web_search fallback when providers lack native search."""
 
     def test_local_model_no_web_search(self) -> None:
         """Local/vLLM models should not have supports_web_search."""

@@ -1,0 +1,38 @@
+# Turnstone-bundled SearxNG configuration.
+#
+# SearxNG provides the web_search backend for local/vLLM models (commercial
+# providers — OpenAI, Anthropic — use their own native server-side search and
+# never touch this service). It runs on the internal docker network only — no
+# port is published — so Turnstone reaches it at http://searxng:8080 and no
+# external user interacts with its UI.
+#
+# This file overrides only what Turnstone needs on top of SearxNG's upstream
+# defaults. `use_default_settings: true` keeps the full ~200-engine default
+# mix (DuckDuckGo, Wikipedia, Stack Overflow, GitHub, arXiv, …); set
+# `tools.searxng_engines` in Turnstone to narrow it per query.
+#
+# Exposing this instance publicly (publishing its port or fronting it with your
+# own reverse proxy)? Then set a real `secret_key`, weigh enabling the limiter
+# (needs a Valkey/Redis instance), and note the AGPL-3.0 §13 source-offer
+# obligation that attaches to operators of a network-reachable SearxNG — see
+# docs/docker.md.
+
+use_default_settings: true
+
+server:
+  # Fixed and intentionally NOT secret: this instance is docker-network-internal,
+  # serves no UI to end users, runs no image_proxy and no sessions, so the
+  # secret_key has no security role in the bundled deployment. Override it if you
+  # expose SearxNG beyond the internal network.
+  secret_key: "turnstone-bundled-searxng-not-secret"
+  # Off by default. The limiter requires a Valkey/Redis instance and would 429
+  # Turnstone's own internal requests. Do NOT enable it without adding one.
+  limiter: false
+  public_instance: false
+
+search:
+  # `json` is REQUIRED for the API — a stock SearxNG ships html-only and returns
+  # 403 for `format=json`, which is the single most common new-deployment failure.
+  formats:
+    - html
+    - json

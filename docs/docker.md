@@ -147,7 +147,8 @@ overrides.
 |----------|---------|-------------|
 | `LLM_BASE_URL` | `http://host.docker.internal:8000/v1` | Bootstrap OpenAI-compatible API URL (real backends go in the UI) |
 | `OPENAI_API_KEY` | `dummy` | API key (`dummy` for local servers) |
-| `TAVILY_API_KEY` | — | Web-search fallback (only for local/vLLM models; Anthropic/OpenAI use native search) |
+| `TURNSTONE_SEARXNG_URL` | `http://searxng:8080` | SearxNG URL for the `web_search` tool (local/vLLM models only; Anthropic/OpenAI use native search). Defaults to the bundled `searxng` service; set to an external instance's URL. To turn web search off, clear `tools.searxng_url` in the admin Settings tab. |
+| `SEARXNG_IMAGE_TAG` | `latest` | Tag for the bundled `searxng/searxng` image |
 | `MODEL` | — | Override the default model alias |
 
 ### Auth & database
@@ -172,12 +173,14 @@ overrides.
 
 ### Ports
 
-Both stacks publish the same two host ports (everything else is reached through
-Caddy or proxied by the console):
+Both stacks publish Caddy (dashboard) and PostgreSQL; the dev stack additionally
+publishes the SearxNG UI on localhost. Everything else is reached through Caddy or
+proxied by the console:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CONSOLE_HTTPS_PORT` | `8443` | Host port for Caddy (dashboard HTTPS) |
+| `SEARXNG_HTTPS_PORT` | `8444` | Host port for the SearxNG UI via Caddy (dev: localhost-only; prod: opt-in) |
 | `POSTGRES_PORT` | `5432` | Host port for PostgreSQL (for bare-metal joins) |
 | `POSTGRES_BIND` | `127.0.0.1` | Interface PostgreSQL binds on; set `0.0.0.0` for LAN access |
 
@@ -192,6 +195,39 @@ Caddy or proxied by the console):
 
 The channel runs HTTP-only with no adapters until a token is set, so it's safe
 to leave running. See [Channel Integrations](channels.md) for app setup.
+
+### Web search (SearxNG)
+
+The `web_search` tool for local/vLLM models is backed by a self-hosted
+[SearxNG](https://searxng.org) metasearch service, bundled into both stacks as the
+`searxng` service. The Turnstone nodes reach it over the internal docker network at
+`http://searxng:8080` — its API port is **not** published. Its config —
+[`turnstone/deploy/searxng/settings.yml`](../turnstone/deploy/searxng/settings.yml),
+mounted read-only — enables the JSON API and leaves the rate limiter off (the
+limiter would need a separate Valkey/Redis instance). A `searxng-cache` volume
+persists its favicon + internal cache across restarts. Commercial providers
+(Anthropic, OpenAI) use their own native search and never touch this service.
+
+Point at an existing SearxNG instead of the bundled one with `TURNSTONE_SEARXNG_URL`,
+or narrow the engines via `tools.searxng_engines` in the admin Settings tab (e.g.
+`duckduckgo,wikipedia`).
+
+**SearxNG web UI.** Caddy can also serve SearxNG's own search/Preferences UI on a
+dedicated port. The dev stack publishes it at **`https://localhost:8444`** bound to
+localhost only; the production stack does **not** publish it by default (uncomment
+the `8444` port on the `caddy` service to opt in). Change the port with
+`SEARXNG_HTTPS_PORT`. **SearxNG has no authentication** — never bind this to a public
+interface, or anyone who can reach it can search through your instance.
+
+> **AGPL note for operators.** SearxNG is licensed AGPL-3.0. Kept on the internal
+> network (or bound to localhost), no external user interacts with it — so the AGPL
+> §13 (remote network interaction) source-offer obligation does not attach. If you
+> publish SearxNG to remote users (bind its port to a public interface, or front it
+> with your own reverse proxy) you become the operator of a network-reachable AGPL
+> service and must offer its corresponding source; that is trivially satisfied by
+> linking to upstream <https://github.com/searxng/searxng>. Turnstone's own license is
+> unaffected: it talks to SearxNG over HTTP as a separate process (mere aggregation),
+> not by linking.
 
 ### Other
 

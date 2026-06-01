@@ -44,7 +44,7 @@ from turnstone.core.attachments import (
     Attachment,
     unreadable_placeholder,
 )
-from turnstone.core.config import get_tavily_key
+from turnstone.core.config import get_searxng_engines, get_searxng_url
 from turnstone.core.edit import find_occurrences, pick_nearest
 from turnstone.core.history_decoration import (
     attach_vllm_chat_reasoning_field,
@@ -1162,7 +1162,7 @@ class ChatSession:
         # Replaces affected tool dicts with deep copies — module-level
         # constants are not mutated.
         self._render_agent_tool_descriptions()
-        # Web search backend (pluggable: auto/tavily/ddg/mcp:server:tool)
+        # Web search backend (pluggable: auto/searxng/mcp:server:tool)
         self._web_search_backend = web_search_backend
         # Dynamic tool search: defer MCP tools when tool count is high
         self._tool_search_setting = tool_search
@@ -1270,22 +1270,42 @@ class ChatSession:
         return self._web_search_backend
 
     def _resolve_search_client(self) -> WebSearchClient | None:
-        """Return a web search client for the configured backend, or None."""
+        """Return a web search client for the configured backend, or None.
+
+        SearxNG URL/engine resolution follows the project precedence
+        ``storage → config.toml → env → registry default``:
+
+          1. An explicit admin (ConfigStore) value wins — including ``""``,
+             which means "disabled" and is NOT overridden by env/config.
+          2. ``config.toml`` / the ``TURNSTONE_SEARXNG_*`` env vars.
+          3. The registry default (``http://searxng:8080``) the store returns
+             for unset keys, so the bundled SearxNG resolves out of the box.
+
+        A bare CLI has no ConfigStore and uses (2) only, disabling the tool
+        when nothing is set. ``stored_keys()`` distinguishes an explicit empty
+        value (deliberate disable) from an unset key (fall through).
+        """
         from turnstone.core.web_search import resolve_web_search_client
 
-        # ConfigStore (DB) takes precedence over config.toml / env var
-        tavily_key: str | None = None
         cs = getattr(self, "_config_store", None)
-        if cs is not None:
-            db_key = cs.get("tools.tavily_api_key")
-            if db_key:
-                tavily_key = str(db_key)
-        if not tavily_key:
-            tavily_key = get_tavily_key()
+        stored = cs.stored_keys() if cs is not None else frozenset()
+
+        def _setting(key: str, env_value: str | None) -> str:
+            if cs is not None and key in stored:  # explicit admin value wins
+                return str(cs.get(key) or "").strip()
+            if env_value:  # config.toml / env var
+                return env_value
+            if cs is not None:  # registry default, surfaced by the store
+                return str(cs.get(key) or "").strip()
+            return ""
+
+        searxng_url = _setting("tools.searxng_url", get_searxng_url()) or None
+        searxng_engines = _setting("tools.searxng_engines", get_searxng_engines())
 
         return resolve_web_search_client(
             backend=self._get_web_search_backend(),
-            tavily_key=tavily_key,
+            searxng_url=searxng_url,
+            searxng_engines=searxng_engines,
             mcp_client=self._mcp_client,
             timeout=self.tool_timeout,
         )
@@ -3179,7 +3199,7 @@ class ChatSession:
 
         Web search gating: ``web_search`` is removed when the model has
         no native search support and no search backend is available
-        (Tavily, DDG, or MCP — see ``_resolve_search_client``).
+        (SearxNG or MCP — see ``_resolve_search_client``).
 
         MCP tool gating: ``read_resource`` is removed when no MCP servers
         expose resources; ``use_prompt`` is removed when none expose prompts.
@@ -6929,7 +6949,7 @@ class ChatSession:
         }
 
     def _prepare_web_search(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
-        """Prepare a web search via Tavily for approval."""
+        """Prepare a web search via the configured backend for approval."""
         query = (args.get("query") or "").strip()
         if not query:
             return {
@@ -6949,8 +6969,8 @@ class ChatSession:
                 "needs_approval": False,
                 "error": (
                     "Error: No web search backend available. "
-                    "Install the ddg extra (`pip install turnstone[ddg]`), "
-                    "configure a Tavily API key, or set tools.web_search_backend."
+                    "Set tools.searxng_url (or $TURNSTONE_SEARXNG_URL) to a SearxNG "
+                    "instance, or set tools.web_search_backend to an MCP search tool."
                 ),
             }
         try:
@@ -6958,7 +6978,7 @@ class ChatSession:
         except (ValueError, TypeError):
             max_results = 5
         topic = args.get("topic", "general") or "general"
-        if topic not in ("general", "news", "finance"):
+        if topic not in ("general", "news"):
             topic = "general"
         q_preview = query[:200] + ("..." if len(query) > 200 else "")
         preview = f"    {q_preview}"
@@ -12575,7 +12595,7 @@ class ChatSession:
         return call_id, answer
 
     def _exec_web_search(self, item: dict[str, Any]) -> tuple[str, str]:
-        """Search the web via the configured backend (Tavily, DDG, or MCP)."""
+        """Search the web via the configured backend (SearxNG or MCP)."""
         self._check_cancelled()
         call_id = item["call_id"]
         query = item["query"]

@@ -895,15 +895,14 @@ class TestWebSearchGating:
         caps = ModelCapabilities(supports_web_search=False)
         with (
             patch.object(session, "_get_capabilities", return_value=caps),
-            patch("turnstone.core.session.get_tavily_key", return_value=None),
-            patch("turnstone.core.web_search._ddg_available", return_value=False),
+            patch("turnstone.core.session.get_searxng_url", return_value=None),
         ):
             tools = session._get_active_tools()
 
         names = [t.get("function", {}).get("name") for t in tools]
         assert "web_search" not in names
 
-    def test_web_search_kept_when_tavily_available(self, tmp_db, mock_openai_client):
+    def test_web_search_kept_when_searxng_configured(self, tmp_db, mock_openai_client):
         from unittest.mock import patch
 
         from turnstone.core.providers._protocol import ModelCapabilities
@@ -921,7 +920,7 @@ class TestWebSearchGating:
         caps = ModelCapabilities(supports_web_search=False)
         with (
             patch.object(session, "_get_capabilities", return_value=caps),
-            patch("turnstone.core.session.get_tavily_key", return_value="tvly-test-key"),
+            patch("turnstone.core.session.get_searxng_url", return_value="http://searxng:8080"),
         ):
             tools = session._get_active_tools()
 
@@ -946,12 +945,62 @@ class TestWebSearchGating:
         caps = ModelCapabilities(supports_web_search=True)
         with (
             patch.object(session, "_get_capabilities", return_value=caps),
-            patch("turnstone.core.session.get_tavily_key", return_value=None),
+            patch("turnstone.core.session.get_searxng_url", return_value=None),
         ):
             tools = session._get_active_tools()
 
         names = [t.get("function", {}).get("name") for t in tools]
         assert "web_search" in names
+
+    def test_resolve_search_client_config_store_precedence(self, tmp_db, mock_openai_client):
+        """ConfigStore (admin Settings) is authoritative over the env/config
+        fallback: an explicit URL resolves a client; an explicit empty string
+        disables web search even when the env var would supply a URL; an unset
+        key falls through to env (storage -> toml -> env -> default)."""
+        from unittest.mock import patch
+
+        from turnstone.core.web_search import SearXNGClient
+
+        class _StubStore:
+            def __init__(self, values):
+                self._v = values
+
+            def stored_keys(self):
+                return frozenset(self._v)
+
+            def get(self, key, default=None):
+                return self._v.get(key, default)
+
+        def _session(values):
+            return ChatSession(
+                client=mock_openai_client,
+                model="local-model",
+                ui=MagicMock(),
+                instructions=None,
+                temperature=0.5,
+                max_tokens=1000,
+                tool_timeout=10,
+                config_store=_StubStore(values),
+            )
+
+        # (a) explicit DB URL wins over a None env fallback
+        s_db = _session({"tools.searxng_url": "http://db-searx:8080"})
+        with patch("turnstone.core.session.get_searxng_url", return_value=None):
+            client = s_db._resolve_search_client()
+        assert isinstance(client, SearXNGClient)
+        assert client._base_url == "http://db-searx:8080"
+
+        # (b) explicit empty string disables, even though env would supply a URL
+        s_off = _session({"tools.searxng_url": ""})
+        with patch("turnstone.core.session.get_searxng_url", return_value="http://env-searx:8080"):
+            assert s_off._resolve_search_client() is None
+
+        # (c) unset key falls through to the env/config layer
+        s_env = _session({})
+        with patch("turnstone.core.session.get_searxng_url", return_value="http://env-searx:8080"):
+            client_env = s_env._resolve_search_client()
+        assert isinstance(client_env, SearXNGClient)
+        assert client_env._base_url == "http://env-searx:8080"
 
 
 class TestMCPToolGating:

@@ -132,7 +132,7 @@ Each item's `execute` callable is invoked:
 - `edit_file` -- modifies file content
 - `math` -- sandboxed computation (confirmation required despite being sandboxed)
 - `web_fetch` -- fetches a URL (SSRF-protected, but makes network requests)
-- `web_search` -- web search via Tavily API (makes network requests)
+- `web_search` -- web search via self-hosted SearxNG (makes network requests)
 - `task` -- spawns an autonomous sub-agent
 - `plan` -- spawns a planning sub-agent, plus post-execution review gate
 
@@ -344,12 +344,12 @@ Search the web using a text query.
 |---------------|---------|----------|-------------|
 | `query`       | string  | yes      | The search query. |
 | `max_results` | integer | no       | Max results to return (default 5, max 20). |
-| `topic`       | string  | no       | Search topic: `general`, `news`, or `finance` (default `general`). |
+| `topic`       | string  | no       | Search topic: `general` or `news` (default `general`). |
 
 - **What it does**: Searches the web and returns ranked results with titles, URLs, and content snippets. Uses provider-native search when available:
-  - **Anthropic**: Replaced at the API boundary with Anthropic's `web_search_20250305` server-side tool. Claude decides when to search; the API executes it and returns results with citations inline. No Tavily key needed.
+  - **Anthropic**: Replaced at the API boundary with Anthropic's `web_search_20250305` server-side tool. Claude decides when to search; the API executes it and returns results with citations inline. No backend needed.
   - **OpenAI search models** (`gpt-5-search-api`): Replaced with `web_search_options` parameter. The model always searches and returns `url_citation` annotations.
-  - **Local/vLLM models**: Falls back to the Tavily API. Requires `tavily_key` in `config.toml` or `$TAVILY_API_KEY`.
+  - **Local/vLLM models**: Falls back to a self-hosted [SearxNG](https://searxng.org) instance. Set `searxng_url` in `config.toml` `[tools]` or `$TURNSTONE_SEARXNG_URL` (the docker-compose stack bundles a `searxng` service and points at it by default). Operators with a custom MCP search server can instead set `web_search_backend = "mcp:server:tool"`.
 - **Auto-approve**: Yes (auto-approved for all tool dispatch paths).
 - **Agent availability**: `agent` and `task_agent`.
 

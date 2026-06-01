@@ -103,13 +103,18 @@ network_policies:
       - path: /usr/bin/python3*
       - path: /usr/local/bin/python3*
 
-  # --- Web search fallback (Tavily) ---
+  # --- Web search (SearxNG) ---
+  # Turnstone talks only to its SearxNG instance over HTTP; SearxNG itself makes
+  # the outbound calls to search engines (and is NOT governed by this policy —
+  # it runs as a separate service). The host/port below is the bundled compose
+  # service name; if your SearxNG runs elsewhere, set it to match
+  # TURNSTONE_SEARXNG_URL.
 
-  tavily_api:
-    name: tavily-search
+  searxng:
+    name: searxng-search
     endpoints:
-      - host: api.tavily.com
-        port: 443
+      - host: searxng
+        port: 8080
     binaries:
       - path: /usr/bin/python3*
       - path: /usr/local/bin/python3*

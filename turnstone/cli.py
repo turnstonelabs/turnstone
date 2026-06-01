@@ -1002,7 +1002,7 @@ def main() -> None:
         "--web-search-backend",
         default="",
         metavar="BACKEND",
-        help="Web search backend: '' (auto), 'tavily', 'ddg', or 'mcp:server:tool'",
+        help="Web search backend: '' (auto), 'searxng', or 'mcp:server:tool'",
     )
     parser.add_argument(
         "--resume",

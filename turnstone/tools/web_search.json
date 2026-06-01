@@ -14,7 +14,7 @@
       },
       "topic": {
         "type": "string",
-        "description": "Search topic: general, news, or finance (default general)."
+        "description": "Search topic: general or news (default general)."
       }
     },
     "required": ["query"]

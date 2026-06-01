@@ -474,7 +474,7 @@ from each schema and builds:
 - `edit_file` -- string replacement in an existing file (requires prior `read_file`)
 - `math` -- execute Python in sandboxed subprocess (via `turnstone.core.sandbox`)
 - `web_fetch` -- fetch a URL (with SSRF protection via `turnstone.core.web`)
-- `web_search` -- search the web (provider-native for Anthropic/OpenAI, Tavily fallback for local models)
+- `web_search` -- search the web (provider-native for Anthropic/OpenAI, self-hosted SearxNG fallback for local models)
 - `notify` -- send a user-facing notification (Discord/Slack, optional reply routing)
 - `watch` -- schedule a recurring poll with condition DSL
 
@@ -650,7 +650,7 @@ annotations are formatted as footnotes. Extended prompt cache retention
 (`prompt_cache_retention: "24h"`) is enabled for GPT-5.x models at no
 additional cost. Cached token counts are extracted from
 `usage.prompt_tokens_details.cached_tokens`. Unknown models (local servers) get
-permissive defaults with `supports_vision=False` and use Tavily for web search.
+permissive defaults with `supports_vision=False` and use SearxNG for web search.
 
 **AnthropicProvider** (`_anthropic.py`): converts OpenAI-format messages to
 Anthropic content blocks, maps `system`/`developer` roles to the `system`

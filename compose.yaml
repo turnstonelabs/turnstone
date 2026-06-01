@@ -59,6 +59,7 @@ volumes:
   postgres-data:
   caddy-data:
   caddy-config:
+  searxng-cache:
 
 # -- Shared values (scalar anchors) -------------------------------------------
 # Defined once here, referenced (*alias) by every service so the dev defaults
@@ -168,6 +169,8 @@ services:
       - console
     ports:
       - "${CONSOLE_HTTPS_PORT:-8443}:443"
+      # SearxNG web UI — localhost-only (it has no auth). Browse https://localhost:8444.
+      - "127.0.0.1:${SEARXNG_HTTPS_PORT:-8444}:8444"
     volumes:
       - ./turnstone/deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data # persist Caddy's local CA across restarts
@@ -204,6 +207,29 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------
+  # searxng — self-hosted metasearch backing the web_search tool.
+  # Internal-network only (no published port): nodes reach it at
+  # http://searxng:8080. Config (JSON output on, limiter off) lives in
+  # turnstone/deploy/searxng/settings.yml, mounted read-only. Commercial
+  # models use native provider search and never hit this; it serves
+  # local/vLLM models. Override the tag with SEARXNG_IMAGE_TAG in .env.
+  # -------------------------------------------------------------------
+  searxng:
+    image: searxng/searxng:${SEARXNG_IMAGE_TAG:-latest}
+    volumes:
+      - ./turnstone/deploy/searxng:/etc/searxng:ro
+      - searxng-cache:/var/cache/searxng # favicon + internal SQLite cache (survives restarts)
+    networks:
+      - turnstone-net
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     restart: unless-stopped
 
   # ===================================================================
@@ -243,7 +269,9 @@ services:
       # Bootstrap LLM defaults — real backends are configured in the console UI.
       LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:8000/v1}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-dummy}
-      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      # web_search backend. Defaults to the bundled searxng service; point at an
+      # external SearxNG by setting TURNSTONE_SEARXNG_URL in .env (empty disables).
+      TURNSTONE_SEARXNG_URL: ${TURNSTONE_SEARXNG_URL:-http://searxng:8080}
       MODEL: ${MODEL:-}
       MCP_CONFIG: ${MCP_CONFIG:-}
       SKIP_PERMISSIONS: ${SKIP_PERMISSIONS:-}
@@ -255,6 +283,8 @@ services:
       - turnstone-net
     depends_on:
       postgres:
+        condition: service_healthy
+      searxng:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "/usr/local/bin/healthcheck.py", "http://127.0.0.1:8080/health"]

@@ -50,12 +50,11 @@ dev = ["ruff>=0.9", "mypy>=1.14"]
 console = ["croniter>=3.0"]
 anthropic = ["anthropic>=0.39"]
 postgres = ["psycopg[binary]>=3.2"]
-ddg = ["ddgs>=9.0"]
 discord = ["discord.py>=2.4"]
 tls = ["lacme>=1.0.5"]
 sandbox = ["sympy>=1.13", "numpy>=2.0", "scipy>=1.14", "pytest>=9.0"]
 slack = ["slack-bolt>=1.18", "aiohttp>=3.9"]
-all = ["turnstone[console,anthropic,postgres,discord,ddg,tls,sandbox,slack]"]
+all = ["turnstone[console,anthropic,postgres,discord,tls,sandbox,slack]"]
 
 [project.scripts]
 turnstone = "turnstone.cli:main"
@@ -89,6 +88,7 @@ include = [
   "turnstone/sdk/py.typed",
   "turnstone/deploy/*.yaml",
   "turnstone/deploy/Caddyfile",
+  "turnstone/deploy/searxng/settings.yml",
 ]
 
 [tool.pytest.ini_options]
@@ -170,10 +170,6 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["frontmatter", "frontmatter.*"]
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = ["ddgs", "ddgs.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

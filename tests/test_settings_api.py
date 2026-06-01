@@ -86,6 +86,28 @@ def client(storage):
     return TestClient(app)
 
 
+@pytest.fixture
+def secret_key():
+    """Register a synthetic ``is_secret`` setting for the duration of a test.
+
+    The settings registry currently has no production ``is_secret`` setting, but
+    the write-only / ``"***"``-sentinel masking machinery remains and must stay
+    covered for the next secret setting that lands. Injecting a test-only def
+    exercises that machinery without coupling the tests to any specific
+    production key.
+    """
+    from turnstone.core import settings_registry as reg
+
+    key = "tools.test_secret"
+    reg.SETTINGS[key] = reg.SettingDef(
+        key, "str", "", "Test-only secret setting", "tools", is_secret=True
+    )
+    try:
+        yield key
+    finally:
+        reg.SETTINGS.pop(key, None)
+
+
 # ---------------------------------------------------------------------------
 # List settings
 # ---------------------------------------------------------------------------
@@ -227,10 +249,10 @@ class TestSettingsSchema:
         by_key = {s["key"]: s for s in r.json()["schema"]}
         assert by_key["tools.search"]["choices"] == ["auto", "on", "off"]
 
-    def test_secret_flag(self, client):
+    def test_secret_flag(self, client, secret_key):
         r = client.get("/v1/api/admin/settings/schema")
         by_key = {s["key"]: s for s in r.json()["schema"]}
-        assert by_key["tools.tavily_api_key"]["is_secret"] is True
+        assert by_key[secret_key]["is_secret"] is True
         assert by_key["tools.timeout"]["is_secret"] is False
 
 
@@ -240,11 +262,11 @@ class TestSettingsSchema:
 
 
 class TestSecretMasking:
-    def test_secret_masked_in_list(self, client, storage):
+    def test_secret_masked_in_list(self, client, storage, secret_key):
         from turnstone.core.settings_registry import serialize_value
 
         storage.upsert_system_setting(
-            key="tools.tavily_api_key",
+            key=secret_key,
             value=serialize_value("sk-real-secret"),
             node_id="",
             is_secret=True,
@@ -252,48 +274,48 @@ class TestSecretMasking:
         )
         r = client.get("/v1/api/admin/settings")
         by_key = {s["key"]: s for s in r.json()["settings"]}
-        assert by_key["tools.tavily_api_key"]["value"] == "***"
+        assert by_key[secret_key]["value"] == "***"
 
-    def test_secret_writable_via_api(self, client):
+    def test_secret_writable_via_api(self, client, secret_key):
         """Secret settings can be written via API (write-only pattern)."""
         r = client.put(
-            "/v1/api/admin/settings/tools.tavily_api_key",
+            f"/v1/api/admin/settings/{secret_key}",
             json={"value": "sk-secret-123"},
         )
         assert r.status_code == 200
         # Response value is masked even for the write confirmation
         assert r.json()["value"] == "***"
 
-    def test_secret_sentinel_preserves_existing(self, client):
+    def test_secret_sentinel_preserves_existing(self, client, secret_key):
         """Submitting '***' for a secret setting is a no-op (preserve existing)."""
         # First write a real value
         r1 = client.put(
-            "/v1/api/admin/settings/tools.tavily_api_key",
+            f"/v1/api/admin/settings/{secret_key}",
             json={"value": "sk-real-key"},
         )
         assert r1.status_code == 200
         # Now submit the sentinel — should return unchanged with full response shape
         r2 = client.put(
-            "/v1/api/admin/settings/tools.tavily_api_key",
+            f"/v1/api/admin/settings/{secret_key}",
             json={"value": "***"},
         )
         assert r2.status_code == 200
         data = r2.json()
         assert data.get("unchanged") is True
-        assert data["key"] == "tools.tavily_api_key"
+        assert data["key"] == secret_key
         assert data["value"] == "***"
         assert data["type"] == "str"
         assert data["is_secret"] is True
 
-    def test_secret_still_masked_in_list(self, client):
+    def test_secret_still_masked_in_list(self, client, secret_key):
         """After writing a secret, list still shows '***'."""
         client.put(
-            "/v1/api/admin/settings/tools.tavily_api_key",
+            f"/v1/api/admin/settings/{secret_key}",
             json={"value": "sk-written-via-api"},
         )
         r = client.get("/v1/api/admin/settings")
         by_key = {s["key"]: s for s in r.json()["settings"]}
-        assert by_key["tools.tavily_api_key"]["value"] == "***"
+        assert by_key[secret_key]["value"] == "***"
 
 
 # ---------------------------------------------------------------------------

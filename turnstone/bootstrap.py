@@ -78,7 +78,9 @@ From inside Docker, use `http://host.docker.internal:<port>/v1` to reach the hos
 authentication, set this to `dummy` (the compose.yaml defaults to `dummy` if unset). \
 For commercial providers (OpenAI, Anthropic-via-proxy), use the real key.
 - `MODEL` — Model name (optional, auto-detected if blank)
-- `TAVILY_API_KEY` — Web search API key (optional)
+- `TURNSTONE_SEARXNG_URL` — Web-search backend URL (optional; defaults to the \
+bundled `searxng` service, so it can usually be left unset. Set it only to point \
+at an external SearxNG instance.)
 
 ### Database
 - `TURNSTONE_DB_BACKEND` — `sqlite` (default) or `postgresql`
@@ -161,8 +163,8 @@ Walk the user through setting up their deployment step by step:
 
 1. **First**: Call `check_docker`, `read_file` on `.env`, and `read_file` on `compose.yaml` \
 to detect existing state. If `compose.yaml` does not exist, call `write_compose` to \
-extract the bundled compose.yaml and its companion Caddyfile. This is essential — \
-without it, `docker compose` will fail.
+extract the bundled compose.yaml and its companion files (the Caddyfile and the \
+SearxNG web-search config). This is essential — without it, `docker compose` will fail.
 2. **LLM provider for the deployment**: Which LLM backend their Turnstone will use \
 (may differ from this wizard's model). Ask for base URL, API key, model name.
 3. **Database**: SQLite (dev/simple) vs PostgreSQL (production). \
@@ -175,7 +177,9 @@ If the user's deployment will use an external identity provider (Okta, Azure AD,
 offer to configure OIDC SSO. Ask for the issuer URL, client ID, and client secret. \
 Optionally configure role mapping and OIDC-only mode.
 5. **Ports**: Check defaults with `check_port`, suggest alternatives if conflicts.
-6. **Optional features**: Discord integration, web search (Tavily key).
+6. **Optional features**: Discord integration. Web search works out of the box \
+via the bundled `searxng` service (no API key) — only ask about it if the user \
+wants to point at an existing external SearxNG instance instead.
 7. **Generate .env**: Call `write_file` with the complete `.env` content. \
 Include `TURNSTONE_IMAGE_TAG` set to the version matching the installed package.
 8. **Generate setup.sh**: Call `write_file` with a post-start script that creates the admin \
@@ -190,8 +194,8 @@ dashboard URL, https://localhost:8443.
 - ALWAYS use `generate_secret` for passwords and secrets — never invent them.
 - When writing files, use `write_file` — the user will see a preview and confirm.
 - If `compose.yaml` is missing, call `write_compose` before anything else (it also \
-writes the Caddyfile the compose mounts). The compose uses pre-built ghcr.io images — \
-no local Docker build is needed.
+writes the Caddyfile and SearxNG config the compose mounts). The compose uses pre-built \
+ghcr.io images — no local Docker build is needed.
 - If an existing .env is detected, summarize what's configured and ask what to change.
 - The `TURNSTONE_DB_URL` for docker compose internal networking uses the hostname `postgres` \
 (e.g., `postgresql+psycopg://turnstone:<password>@postgres:5432/turnstone`).
@@ -350,10 +354,11 @@ TOOLS: list[dict[str, Any]] = [
             "name": "write_compose",
             "description": (
                 "Write the production Docker Compose file (and its companion "
-                "Caddyfile) to the project directory. This extracts the compose.yaml "
-                "bundled with Turnstone, which uses pre-built images from ghcr.io "
-                "(no local Docker build required) and a Caddy reverse proxy that "
-                "fronts the console over HTTPS. The user will see a preview and confirm."
+                "Caddyfile and SearxNG web-search config) to the project directory. "
+                "This extracts the compose.yaml bundled with Turnstone, which uses "
+                "pre-built images from ghcr.io (no local Docker build required), a Caddy "
+                "reverse proxy that fronts the console over HTTPS, and a bundled SearxNG "
+                "service for web search. The user will see a preview and confirm."
             ),
             "parameters": {
                 "type": "object",
@@ -582,37 +587,43 @@ def _tool_check_docker(args: dict[str, Any]) -> str:
 
 
 def _tool_write_compose(project_dir: Path, args: dict[str, Any]) -> str:
-    """Extract the bundled production compose.yaml + Caddyfile to the project dir.
+    """Extract the bundled compose.yaml + Caddyfile + SearxNG settings.
 
-    The compose file's ``caddy`` service bind-mounts ``./Caddyfile``, so the two
-    must land together — otherwise ``docker compose up`` fails to start Caddy.
+    The compose file bind-mounts ``./Caddyfile`` (Caddy) and ``./searxng``
+    (the SearxNG web-search service), so all three must land together —
+    otherwise ``docker compose up`` fails to start those services.
     """
     dest = project_dir / "compose.yaml"
     caddy_dest = project_dir / "Caddyfile"
+    searxng_dest = project_dir / "searxng" / "settings.yml"
 
     # Read the bundled templates
     try:
         deploy = importlib.resources.files("turnstone.deploy")
         content = deploy.joinpath("compose.yaml").read_text(encoding="utf-8")
         caddy_content = deploy.joinpath("Caddyfile").read_text(encoding="utf-8")
+        searxng_content = deploy.joinpath("searxng/settings.yml").read_text(encoding="utf-8")
     except Exception as exc:
         return f"Error: could not read bundled compose templates: {exc}"
 
-    # Skip if both already identical
-    if dest.exists() and caddy_dest.exists():
+    # Skip if all already identical
+    if dest.exists() and caddy_dest.exists() and searxng_dest.exists():
         try:
             if (
                 dest.read_text(encoding="utf-8") == content
                 and caddy_dest.read_text(encoding="utf-8") == caddy_content
+                and searxng_dest.read_text(encoding="utf-8") == searxng_content
             ):
-                return "compose.yaml and Caddyfile already exist with identical content."
+                return "compose.yaml, Caddyfile and searxng/settings.yml already exist."
         except (OSError, UnicodeDecodeError):
             pass  # best-effort duplicate check
 
     line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
 
     # Show preview
-    print(f"\n{YELLOW} Writing compose.yaml ({line_count} lines) + Caddyfile{RESET}")
+    print(
+        f"\n{YELLOW} Writing compose.yaml ({line_count} lines) + Caddyfile + searxng/settings.yml{RESET}"
+    )
     print(f"{DIM}{'─' * 50}{RESET}")
     for line in content.split("\n")[:30]:
         print(f"  {DIM}{line}{RESET}")
@@ -629,11 +640,14 @@ def _tool_write_compose(project_dir: Path, args: dict[str, Any]) -> str:
 
     dest.write_text(content, encoding="utf-8")
     caddy_dest.write_text(caddy_content, encoding="utf-8")
+    searxng_dest.parent.mkdir(parents=True, exist_ok=True)
+    searxng_dest.write_text(searxng_content, encoding="utf-8")
 
     return (
-        f"compose.yaml + Caddyfile written successfully. "
+        f"compose.yaml + Caddyfile + searxng/settings.yml written successfully. "
         f"The compose uses ghcr.io/turnstonelabs/turnstone images; Caddy fronts the "
-        f"console dashboard over HTTPS at https://localhost:8443. "
+        f"console dashboard over HTTPS at https://localhost:8443, and the bundled "
+        f"SearxNG service provides web search. "
         f"Add TURNSTONE_IMAGE_TAG={__version__} to .env to pin the image "
         f"to the currently installed version, or omit it to use 'latest'."
     )

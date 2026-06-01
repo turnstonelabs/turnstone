@@ -2,11 +2,16 @@
 
 ``web_search`` is an abstract capability with swappable clients:
 
-* **TavilyClient** — paid, high quality, requires API key
-* **DuckDuckGoClient** — free, no API key, uses ``ddgs``
+* **SearXNGClient** — self-hosted `SearxNG <https://searxng.org>`_ metasearch,
+  no API key. Aggregates DuckDuckGo, Wikipedia, and ~200 other engines behind a
+  stable JSON API. Bundled into the docker-compose stack as the ``searxng``
+  service.
+* **MCPSearchClient** — delegates to a web-search tool exposed by an MCP server.
 
-Auto-detection (default): Tavily if key present, else DDG if installed,
-else ``None`` (tool removed from tool list).
+Auto-detection (default): SearxNG when a base URL is configured, else ``None``
+(tool removed from the tool list). Native provider-side web search on Anthropic
+and OpenAI search models is handled at the API boundary and never reaches these
+clients.
 """
 
 from __future__ import annotations
@@ -31,43 +36,38 @@ class WebSearchClient(Protocol):
         ...
 
 
-class TavilyClient:
-    """Tavily search backend (paid, requires API key)."""
+class SearXNGClient:
+    """Self-hosted SearxNG metasearch backend (no API key).
 
-    def __init__(self, api_key: str, timeout: float = 120) -> None:
-        self._api_key = api_key
+    Talks to the JSON API (``GET /search?format=json``). The instance MUST have
+    ``json`` enabled in ``search.formats`` — the bundled ``deploy/searxng``
+    config does this; a stock instance returns 403/HTML otherwise.
+    """
+
+    # The web_search tool's ``topic`` arg → SearxNG ``categories``. ``"general"``
+    # is intentionally absent so the param is omitted and SearxNG uses its
+    # default category mix.
+    _TOPIC_CATEGORIES = {"news": "news"}
+
+    def __init__(self, base_url: str, engines: str = "", timeout: float = 120) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._engines = engines.strip()
         self._timeout = timeout
 
     def search(self, query: str, max_results: int = 5, **kwargs: Any) -> str:
-        topic = kwargs.get("topic", "general")
-        resp = httpx.post(
-            "https://api.tavily.com/search",
-            json={
-                "query": query,
-                "max_results": max_results,
-                "topic": topic,
-                "include_answer": True,
-            },
-            headers={"Authorization": f"Bearer {self._api_key}"},
+        params: dict[str, str] = {"q": query, "format": "json"}
+        category = self._TOPIC_CATEGORIES.get(str(kwargs.get("topic", "general")))
+        if category:
+            params["categories"] = category
+        if self._engines:
+            params["engines"] = self._engines
+        resp = httpx.get(
+            f"{self._base_url}/search",
+            params=params,
             timeout=self._timeout,
         )
         resp.raise_for_status()
-        data = resp.json()
-        return _format_tavily(data, query)
-
-
-class DuckDuckGoClient:
-    """DuckDuckGo search backend (free, no API key)."""
-
-    def __init__(self, timeout: float = 120) -> None:
-        self._timeout = timeout
-
-    def search(self, query: str, max_results: int = 5, **kwargs: Any) -> str:
-        from ddgs import DDGS
-
-        with DDGS(timeout=int(self._timeout)) as ddgs:
-            raw = list(ddgs.text(query, max_results=max_results))
-        return _format_ddg(raw, query)
+        return _format_searxng(resp.json(), query, max_results)
 
 
 class MCPSearchClient:
@@ -95,33 +95,51 @@ class MCPSearchClient:
 # ---------------------------------------------------------------------------
 
 
-def _format_tavily(data: dict[str, Any], query: str) -> str:
+def _format_searxng(data: dict[str, Any], query: str, max_results: int = 5) -> str:
     parts: list[str] = []
-    answer = (data.get("answer") or "").strip()
-    if answer:
-        parts.append(f"Answer: {answer}")
+
+    # Instant answers (calculator, Wikipedia summaries, …) — engine-dependent,
+    # often absent. Each entry is a dict (``{"answer": ...}``) on modern
+    # SearxNG, a bare string on older builds.
+    answers: list[str] = []
+    for a in data.get("answers") or []:
+        raw = a.get("answer", "") if isinstance(a, dict) else a
+        text = str(raw or "").strip()  # coerce: some engines return non-str answers
+        if text:
+            answers.append(text)
+    if answers:
+        parts.append("Answer: " + " ".join(answers))
+
+    # Infoboxes (Wikipedia/Wikidata side panels). One is plenty of context.
+    for box in data.get("infoboxes") or []:
+        content = (box.get("content") or "").strip()
+        if content:
+            parts.append(content[:500])
+            break
+
     results = data.get("results") or []
     if results:
         lines = []
-        for i, r in enumerate(results, 1):
+        for i, r in enumerate(results[:max_results], 1):
             title = r.get("title", "")
             url = r.get("url", "")
             content = (r.get("content") or "")[:500]
             lines.append(f"{i}. [{title}]({url})\n   {content}")
         parts.append("\n".join(lines))
-    return "\n\n".join(parts) if parts else f"No results for '{query}'."
 
+    if parts:
+        return "\n\n".join(parts)
 
-def _format_ddg(results: list[dict[str, Any]], query: str) -> str:
-    if not results:
-        return f"No results for '{query}'."
-    lines = []
-    for i, r in enumerate(results, 1):
-        title = r.get("title", "")
-        url = r.get("href", "")
-        body = (r.get("body") or "")[:500]
-        lines.append(f"{i}. [{title}]({url})\n   {body}")
-    return "\n".join(lines)
+    # No usable results. Surface unresponsive engines when present — this is
+    # the tell-tale of an all-rate-limited or misconfigured instance, and a
+    # plain "no results" would otherwise hide it from the operator.
+    unresponsive = data.get("unresponsive_engines") or []
+    if unresponsive:
+        names = ", ".join(
+            str(u[0]) if isinstance(u, (list, tuple)) and u else str(u) for u in unresponsive
+        )
+        return f"No results for '{query}'. Unresponsive engines: {names}."
+    return f"No results for '{query}'."
 
 
 # ---------------------------------------------------------------------------
@@ -129,38 +147,27 @@ def _format_ddg(results: list[dict[str, Any]], query: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _ddg_available() -> bool:
-    """Check if the ddgs package is installed."""
-    try:
-        import ddgs  # noqa: F401
-
-        return True
-    except ImportError:
-        return False
-
-
 def resolve_web_search_client(
     backend: str,
-    tavily_key: str | None,
+    searxng_url: str | None,
+    searxng_engines: str = "",
     mcp_client: Any | None = None,
     timeout: float = 120,
 ) -> WebSearchClient | None:
     """Return a search client based on configuration, or None if unavailable.
 
     Args:
-        backend: ``""`` (auto), ``"tavily"``, ``"ddg"``, or ``"mcp:server:tool"``
-        tavily_key: Tavily API key (None if not configured)
+        backend: ``""`` (auto), ``"searxng"``, or ``"mcp:server:tool"``
+        searxng_url: SearxNG base URL (None/empty if not configured)
+        searxng_engines: comma-separated SearxNG engine list ("" = instance default)
         mcp_client: MCPClientManager instance (for MCP backends)
         timeout: HTTP/tool timeout in seconds
     """
-    if backend == "tavily":
-        if tavily_key:
-            return TavilyClient(tavily_key, timeout=timeout)
-        return None
+    url = (searxng_url or "").strip()
 
-    if backend == "ddg":
-        if _ddg_available():
-            return DuckDuckGoClient(timeout=timeout)
+    if backend == "searxng":
+        if url:
+            return SearXNGClient(url, engines=searxng_engines, timeout=timeout)
         return None
 
     if backend.startswith("mcp:"):
@@ -193,11 +200,10 @@ def resolve_web_search_client(
         return None
 
     if backend == "":
-        # Auto-detect: Tavily > DDG > None
-        if tavily_key:
-            return TavilyClient(tavily_key, timeout=timeout)
-        if _ddg_available():
-            return DuckDuckGoClient(timeout=timeout)
+        # Auto-detect: SearxNG (URL configured) > None. MCP backends are
+        # explicit-only — there is no canonical "the search tool" to pick.
+        if url:
+            return SearXNGClient(url, engines=searxng_engines, timeout=timeout)
         return None
 
     log.warning("Unknown web_search_backend %r — web search disabled", backend)
