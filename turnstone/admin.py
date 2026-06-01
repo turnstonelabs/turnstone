@@ -439,6 +439,66 @@ def _discover_console_url() -> str:
 # ---------------------------------------------------------------------------
 
 
+def _cmd_rerank_calibrate(args: argparse.Namespace) -> None:
+    from turnstone.core.config_store import ConfigStore
+    from turnstone.core.model_registry import load_model_registry
+    from turnstone.core.rerank_calibrate import calibrate
+    from turnstone.core.rerank_config import resolve_rerank_client_from
+
+    storage = _get_storage(args)
+    config_store = ConfigStore(storage)
+    try:
+        registry: Any = load_model_registry(storage=storage, allow_empty=True)
+    except Exception:
+        registry = None
+    # Calibration is a manual, one-shot op against a possibly-cold endpoint, so a
+    # generous timeout (vs the per-turn 15s cap) keeps a first-request compile
+    # from failing it; calibrate() also warms the endpoint up first.
+    client = resolve_rerank_client_from(config_store, registry, timeout=60.0)
+    if client is None:
+        print(
+            "No rerank endpoint configured. Set tools.rerank_url (config.toml [tools] or the "
+            "Settings tab) or select a Reranker model role.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    alias = str(config_store.get("tools.reranker_alias") or "").strip()
+    label = alias or str(config_store.get("tools.rerank_model") or "") or "(endpoint default)"
+    try:
+        result = calibrate(client, model=label)
+    except Exception as e:  # network / endpoint failure surfaces to the operator
+        print(f"Calibration failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Reranker:        {result.model}")
+    print(f"Raw score scale: {result.raw_scale}")
+    print(
+        f"Relevant   (n={result.n_relevant}): "
+        f"{result.relevant_min:.4f} .. {result.relevant_max:.4f}"
+    )
+    print(
+        f"Irrelevant (n={result.n_irrelevant}): "
+        f"{result.irrelevant_min:.4f} .. {result.irrelevant_max:.4f}"
+    )
+    if not result.separated:
+        print(
+            "\nNo clean separation between relevant and irrelevant probes: this endpoint can't "
+            "be thresholded reliably (is it a real reranker, and is the model name right?). "
+            "Not recommending a floor."
+        )
+        sys.exit(1 if args.apply else 0)
+
+    print(f"\nSuggested tools.rerank_bm25_threshold = {result.suggested_threshold}")
+    if args.apply:
+        config_store.set(
+            "tools.rerank_bm25_threshold", result.suggested_threshold, changed_by="rerank-calibrate"
+        )
+        print(f"Applied: tools.rerank_bm25_threshold = {result.suggested_threshold}")
+    else:
+        print("Re-run with --apply to write it.")
+
+
 def main() -> None:
     """Entry point for turnstone-admin CLI."""
     parser = argparse.ArgumentParser(
@@ -523,6 +583,14 @@ def main() -> None:
     )
     p_export.add_argument("--output", "-o", default="-", help="Output file path, or - for stdout")
 
+    p_cal = sub.add_parser(
+        "rerank-calibrate",
+        help="Probe the configured reranker and recommend tools.rerank_bm25_threshold",
+    )
+    p_cal.add_argument(
+        "--apply", action="store_true", help="Write the suggested threshold to settings"
+    )
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -542,5 +610,6 @@ def main() -> None:
         "set-node-metadata": _cmd_set_node_metadata,
         "delete-node-metadata": _cmd_delete_node_metadata,
         "export": _cmd_export,
+        "rerank-calibrate": _cmd_rerank_calibrate,
     }
     dispatch[args.command](args)

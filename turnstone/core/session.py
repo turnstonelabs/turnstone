@@ -1318,48 +1318,11 @@ class ChatSession:
         There is no bundled rerank endpoint, so reranking stays disabled until
         one is configured.
         """
-        from turnstone.core.config import (
-            get_rerank_api_key,
-            get_rerank_model,
-            get_rerank_url,
-        )
-        from turnstone.core.rerank import resolve_rerank_client
+        from turnstone.core.rerank_config import resolve_rerank_client_from
 
-        cs = getattr(self, "_config_store", None)
-        stored = cs.stored_keys() if cs is not None else frozenset()
-
-        # A reranker model definition (capability ``supports_rerank``), picked
-        # via the Reranker role, takes precedence — managed like every other
-        # model. Its base_url is the full Cohere/Jina-compatible rerank endpoint.
-        registry = getattr(self, "_registry", None)
-        if cs is not None and registry is not None:
-            alias = str(cs.get("tools.reranker_alias") or "").strip()
-            if alias:
-                try:
-                    cfg = registry.get_config(alias)
-                except Exception:
-                    cfg = None
-                if cfg is not None and cfg.base_url and cfg.capabilities.get("supports_rerank"):
-                    return resolve_rerank_client(
-                        url=cfg.base_url,
-                        model=cfg.model or "",
-                        api_key=cfg.api_key,
-                        timeout=min(self.tool_timeout, _RERANK_TIMEOUT_CAP_S),
-                    )
-
-        def _setting(key: str, env_value: str) -> str:
-            if cs is not None and key in stored:  # explicit admin value wins
-                return str(cs.get(key) or "").strip()
-            if env_value:  # config.toml / env var
-                return env_value
-            if cs is not None:  # registry default, surfaced by the store
-                return str(cs.get(key) or "").strip()
-            return ""
-
-        return resolve_rerank_client(
-            url=_setting("tools.rerank_url", get_rerank_url()),
-            model=_setting("tools.rerank_model", get_rerank_model()),
-            api_key=_setting("tools.rerank_api_key", get_rerank_api_key()),
+        return resolve_rerank_client_from(
+            getattr(self, "_config_store", None),
+            getattr(self, "_registry", None),
             timeout=min(self.tool_timeout, _RERANK_TIMEOUT_CAP_S),
         )
 
@@ -1410,7 +1373,7 @@ class ChatSession:
         if rc is None:
             return None
 
-        from turnstone.core.rerank import RerankError
+        from turnstone.core.rerank import RerankError, normalize_scores
 
         def _rank(query: str, docs: list[str]) -> list[int]:
             hits = rc.rerank(query, docs)
@@ -1423,7 +1386,15 @@ class ChatSession:
                 # fall back to BM25 order in BOTH modes, instead of the
                 # filter-mode floor honoring it as "nothing relevant".
                 raise RerankError("rerank endpoint returned no scores for non-empty input")
-            return [h.index for h in hits if threshold <= 0 or h.score >= threshold]
+            # Normalise to a 0-1 relevance space (sigmoid for logit endpoints) so
+            # ``threshold`` means the same on every reranker. Sigmoid is monotonic
+            # -> ordering is unchanged; only the floor compare gains a uniform scale.
+            scores = normalize_scores([h.score for h in hits])
+            return [
+                h.index
+                for h, score in zip(hits, scores, strict=True)
+                if threshold <= 0 or score >= threshold
+            ]
 
         return _rank
 

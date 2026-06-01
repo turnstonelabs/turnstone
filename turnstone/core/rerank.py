@@ -21,6 +21,7 @@ default and no fall back to a local model.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -46,6 +47,34 @@ class RerankError(RuntimeError):
     Callers raise this so retrieval falls back to BM25 order rather than
     treating the failure as "nothing relevant".
     """
+
+
+def _sigmoid(x: float) -> float:
+    """Numerically-stable logistic sigmoid (maps a logit to a probability)."""
+    if x >= 0.0:
+        return 1.0 / (1.0 + math.exp(-x))
+    e = math.exp(x)
+    return e / (1.0 + e)
+
+
+def normalize_scores(scores: list[float]) -> list[float]:
+    """Map a batch of raw rerank scores into a 0-1 relevance space.
+
+    Cohere/Jina/Qwen endpoints already return 0-1 relevance; cross-encoders
+    (bge, TEI) return raw logits. If ANY score in the batch falls outside
+    ``[0, 1]`` the batch is treated as logits and squashed with the logistic
+    sigmoid (the canonical logit -> P(relevant) map); otherwise the scores are
+    already probabilities and pass through unchanged. Detection is per-batch
+    because one rerank response comes from one model, and a real batch mixes
+    relevant and irrelevant docs so a logit model reveals out-of-range (often
+    negative) scores. Sigmoid is monotonic, so ranking ORDER is never affected
+    -- only a threshold comparison gains a consistent 0-1 meaning.
+    """
+    if not scores:
+        return []
+    if all(0.0 <= s <= 1.0 for s in scores):
+        return list(scores)
+    return [_sigmoid(s) for s in scores]
 
 
 @dataclass(frozen=True)
@@ -75,18 +104,32 @@ class CohereJinaRerankClient:
     ``relevance_score`` response are shared across all of them.
     """
 
-    def __init__(self, url: str, model: str = "", api_key: str = "", timeout: float = 30) -> None:
+    def __init__(
+        self,
+        url: str,
+        model: str = "",
+        api_key: str = "",
+        timeout: float = 30,
+        instruction: str = "",
+    ) -> None:
         self._url = url
         self._model = model
         self._api_key = api_key
         self._timeout = timeout
+        self._instruction = instruction
 
     def rerank(
         self, query: str, documents: list[str], *, top_n: int | None = None
     ) -> list[RerankHit]:
         if not documents:
             return []
-        payload: dict[str, Any] = {"query": query, "documents": list(documents)}
+        # Instruction-aware rerankers (Qwen3-Reranker) need the instruction in the
+        # query; vLLM's /rerank does not inject it (a bare query can even invert
+        # relevance). Wrap with the model's <Instruct>/<Query> framing — it frames
+        # the <Document> side itself. Empty instruction -> bare query, which is
+        # correct for Cohere/Jina/bge cross-encoders.
+        q = f"<Instruct>: {self._instruction}\n<Query>: {query}" if self._instruction else query
+        payload: dict[str, Any] = {"query": q, "documents": list(documents)}
         if self._model:
             payload["model"] = self._model
         if top_n is not None:
@@ -128,12 +171,13 @@ def _parse_hits(data: Any, n_docs: int) -> list[RerankHit]:
 
 
 def resolve_rerank_client(
-    url: str, model: str = "", api_key: str = "", timeout: float = 30
+    url: str, model: str = "", api_key: str = "", timeout: float = 30, instruction: str = ""
 ) -> RerankClient | None:
     """Return a rerank client, or ``None`` when no endpoint URL is configured.
 
     A missing URL is the "reranking disabled" state (the default) — there is no
-    bundled endpoint and no local-inference fallback.
+    bundled endpoint and no local-inference fallback. ``instruction`` is the
+    optional query instruction for instruction-aware rerankers (Qwen3-Reranker).
     """
     url = (url or "").strip()
     if not url:
@@ -143,4 +187,5 @@ def resolve_rerank_client(
         model=(model or "").strip(),
         api_key=(api_key or "").strip(),
         timeout=timeout,
+        instruction=(instruction or "").strip(),
     )

@@ -12,6 +12,7 @@ from turnstone.core.rerank import (
     CohereJinaRerankClient,
     RerankHit,
     _parse_hits,
+    normalize_scores,
     resolve_rerank_client,
 )
 from turnstone.core.session import ChatSession
@@ -320,6 +321,78 @@ class _FakeRerankClient:
         return self._hits
 
 
+class TestRerankInstruction:
+    """`rerank_instruction` wraps the query for instruction-aware rerankers.
+
+    Drives through the real httpx boundary (MockTransport) and inspects the sent
+    body — for endpoints that don't apply the model's own chat template; vLLM
+    should use --chat-template instead (combining both double-wraps).
+    """
+
+    def _capture(self):
+        sent: dict = {}
+
+        def handler(request):
+            sent["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"results": [{"index": 0, "relevance_score": 0.9}]})
+
+        return sent, handler
+
+    def test_no_instruction_sends_bare_query(self, monkeypatch):
+        sent, handler = self._capture()
+        monkeypatch.setattr("turnstone.core.rerank.httpx.post", _mock_httpx_post(handler))
+        CohereJinaRerankClient("http://x/rerank").rerank("capital of France", ["d0"])
+        assert sent["body"]["query"] == "capital of France"
+
+    def test_instruction_wraps_query(self, monkeypatch):
+        sent, handler = self._capture()
+        monkeypatch.setattr("turnstone.core.rerank.httpx.post", _mock_httpx_post(handler))
+        CohereJinaRerankClient("http://x/rerank", instruction="Find relevant passages").rerank(
+            "capital of France", ["d0"]
+        )
+        assert (
+            sent["body"]["query"]
+            == "<Instruct>: Find relevant passages\n<Query>: capital of France"
+        )
+
+    def test_resolve_threads_instruction(self):
+        client = resolve_rerank_client("http://x/rerank", instruction="X")
+        assert client is not None and client._instruction == "X"
+
+
+class TestNormalizeScores:
+    """`normalize_scores` — per-batch 0-1 mapping (sigmoid for logit batches)."""
+
+    def test_empty(self):
+        assert normalize_scores([]) == []
+
+    def test_all_in_range_pass_through(self):
+        # Probability-scale batch (Cohere/Jina/Qwen) -> identity, no transform.
+        assert normalize_scores([0.9, 0.1, 0.5, 0.0, 1.0]) == [0.9, 0.1, 0.5, 0.0, 1.0]
+
+    def test_negative_triggers_sigmoid(self):
+        out = normalize_scores([2.0, -2.0])
+        assert all(0.0 < s < 1.0 for s in out)
+        assert out[0] > 0.8 and out[1] < 0.2  # sigmoid(2)=0.88, sigmoid(-2)=0.12
+
+    def test_above_one_triggers_sigmoid(self):
+        out = normalize_scores([5.0, 0.5])  # 5.0 > 1 -> the whole batch is sigmoided
+        assert out != [5.0, 0.5]
+        assert all(0.0 < s < 1.0 for s in out)
+
+    def test_sigmoid_is_monotonic(self):
+        # Ranking must be preserved by normalisation (only the scale changes).
+        raw = [3.0, -1.0, 0.0, -5.0, 2.0]
+        out = normalize_scores(raw)
+        assert sorted(range(len(raw)), key=lambda i: out[i]) == sorted(
+            range(len(raw)), key=lambda i: raw[i]
+        )
+
+    def test_extreme_values_do_not_overflow(self):
+        out = normalize_scores([1000.0, -1000.0])
+        assert out[0] == pytest.approx(1.0) and out[1] == pytest.approx(0.0)
+
+
 class TestSessionBM25Reranker:
     """``_bm25_reranker`` / ``_bm25_rerank_threshold`` — the BM25 seam adapters.
 
@@ -399,6 +472,16 @@ class TestSessionBM25Reranker:
         rank = ChatSession._bm25_reranker(self._enabled_stub([]), 0.0)
         assert rank is not None
         assert rank("q", []) == []
+
+    def test_logit_scores_are_normalized_before_floor(self):
+        # Batch has a score outside [0,1] -> treated as logits -> sigmoid. raw
+        # 0.3 fails a 0.5 floor, but sigmoid(0.3)=0.574 clears it; the negative
+        # sibling sigmoid(-2)=0.12 does not. Without normalisation BOTH raw
+        # values fail 0.5 -> []; this proves the closure normalises the batch.
+        hits = [RerankHit(index=0, score=0.3), RerankHit(index=1, score=-2.0)]
+        rank = ChatSession._bm25_reranker(self._enabled_stub(hits), 0.5)
+        assert rank is not None
+        assert rank("q", ["d0", "d1"]) == [0]
 
     def test_threshold_reads_setting(self):
         cs = _FakeConfigStore({"tools.rerank_bm25_threshold": 0.42})

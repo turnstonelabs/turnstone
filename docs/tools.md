@@ -323,13 +323,32 @@ The `rerank_web_search` toggle defaults on once an endpoint is configured. If th
 
 When `rerank_bm25` is enabled, the candidate text for memory, tool, and skill retrieval (memory name/description/content and tool/skill names + descriptions) is also sent to the rerank endpoint — a self-hosted endpoint (vLLM/TEI/llama.cpp) keeps it on your infrastructure, a hosted provider (Cohere/Jina/Voyage) sends it off-box.
 
-Example (vLLM serving a Qwen3 reranker):
+**Serving a Qwen3-Reranker with vLLM.** The model is instruction-aware, so vLLM **must** apply its chat template — pass `--chat-template` explicitly. Without it the bare query produces near-random scores and reranking actively *hurts* retrieval (verified: an irrelevant passage outscored the correct one):
+
+```bash
+vllm serve /models/Qwen3-Reranker-0.6B \
+  --runner pooling \
+  --hf-overrides '{"architectures":["Qwen3ForSequenceClassification"],"classifier_from_token":["no","yes"],"is_original_qwen3_reranker":true}' \
+  --chat-template /models/Qwen3-Reranker-0.6B/chat_template.jinja \
+  --served-model-name qwen3-reranker --port 8000
+```
 
 ```toml
 [tools]
 rerank_url = "http://vllm:8000/rerank"
 rerank_model = "qwen3-reranker"
 ```
+
+For an endpoint that does *not* apply the model's template, set `rerank_instruction` instead — Turnstone then wraps each query as `<Instruct>: {instruction}` / `<Query>: {query}` (Qwen3's own default is `Given a web search query, retrieve relevant passages that answer the query`). Use the chat template **or** the instruction, not both (they double-wrap).
+
+**Picking `rerank_bm25_threshold`.** The relevance floor that gates proactive memory injection is a probability in `[0, 1]`, but the right value differs per model (a sharp 0.6B reranker may want ~0.95; a broader 4B ~0.33). Calibrate it against your endpoint:
+
+```bash
+turnstone-admin rerank-calibrate           # probe the endpoint, recommend a floor
+turnstone-admin rerank-calibrate --apply   # ...and write tools.rerank_bm25_threshold
+```
+
+It reports the score scale, whether the endpoint cleanly separates relevant from irrelevant probes (a **"no clean separation"** result flags a mis-served or weak reranker), and the suggested floor. Leave the threshold at `0` to rerank-without-filtering.
 
 ---
 
