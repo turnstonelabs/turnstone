@@ -142,8 +142,9 @@ if TYPE_CHECKING:
         ModelCapabilities,
         StreamChunk,
     )
+    from turnstone.core.rerank import RerankClient
     from turnstone.core.tool_advisory import ToolAdvisory
-    from turnstone.core.web_search import WebSearchClient
+    from turnstone.core.web_search import Reranker, WebSearchClient
 
 # ---------------------------------------------------------------------------
 # Cancellation support
@@ -1302,6 +1303,89 @@ class ChatSession:
             mcp_client=self._mcp_client,
             timeout=self.tool_timeout,
         )
+
+    def _resolve_rerank_client(self) -> RerankClient | None:
+        """Return a rerank client, or None when reranking is unconfigured.
+
+        Precedence: a reranker **model definition** selected via the Reranker
+        role (``tools.reranker_alias`` → a model with ``supports_rerank``) wins;
+        otherwise the ``tools.rerank_url`` settings (storage → config.toml/env).
+        There is no bundled rerank endpoint, so reranking stays disabled until
+        one is configured.
+        """
+        from turnstone.core.config import (
+            get_rerank_api_key,
+            get_rerank_model,
+            get_rerank_url,
+        )
+        from turnstone.core.rerank import resolve_rerank_client
+
+        cs = getattr(self, "_config_store", None)
+        stored = cs.stored_keys() if cs is not None else frozenset()
+
+        # A reranker model definition (capability ``supports_rerank``), picked
+        # via the Reranker role, takes precedence — managed like every other
+        # model. Its base_url is the full Cohere/Jina-compatible rerank endpoint.
+        registry = getattr(self, "_registry", None)
+        if cs is not None and registry is not None:
+            alias = str(cs.get("tools.reranker_alias") or "").strip()
+            if alias:
+                try:
+                    cfg = registry.get_config(alias)
+                except Exception:
+                    cfg = None
+                if cfg is not None and cfg.base_url and cfg.capabilities.get("supports_rerank"):
+                    return resolve_rerank_client(
+                        url=cfg.base_url,
+                        model=cfg.model or "",
+                        api_key=cfg.api_key,
+                        timeout=self.tool_timeout,
+                    )
+
+        def _setting(key: str, env_value: str) -> str:
+            if cs is not None and key in stored:  # explicit admin value wins
+                return str(cs.get(key) or "").strip()
+            if env_value:  # config.toml / env var
+                return env_value
+            if cs is not None:  # registry default, surfaced by the store
+                return str(cs.get(key) or "").strip()
+            return ""
+
+        return resolve_rerank_client(
+            url=_setting("tools.rerank_url", get_rerank_url()),
+            model=_setting("tools.rerank_model", get_rerank_model()),
+            api_key=_setting("tools.rerank_api_key", get_rerank_api_key()),
+            timeout=self.tool_timeout,
+        )
+
+    def _rerank_enabled_for(self, tool: str) -> bool:
+        """Whether reranking is enabled for ``tool`` ('web_search' | 'web_fetch').
+
+        The per-tool toggles default on; the operative gate is whether an
+        endpoint is configured (``_resolve_rerank_client`` returns None when
+        not). A bare CLI without a ConfigStore inherits the on-by-default toggle.
+        """
+        cs = getattr(self, "_config_store", None)
+        if cs is not None:
+            return bool(cs.get(f"tools.rerank_{tool}"))
+        return True
+
+    def _web_search_reranker(self) -> Reranker | None:
+        """Build a web_search reranker callable, or None when disabled.
+
+        Returns a ``(query, docs) -> ranked indices`` adapter over the configured
+        rerank endpoint; None when reranking is off or no endpoint is set.
+        """
+        if not self._rerank_enabled_for("web_search"):
+            return None
+        rc = self._resolve_rerank_client()
+        if rc is None:
+            return None
+
+        def _rank(query: str, docs: list[str]) -> list[int]:
+            return [hit.index for hit in rc.rerank(query, docs)]
+
+        return _rank
 
     def _resolve_capabilities(
         self,
@@ -12130,7 +12214,12 @@ class ChatSession:
             return call_id, msg
 
         try:
-            output = client.search(query, max_results=max_results, category=category)
+            output = client.search(
+                query,
+                max_results=max_results,
+                category=category,
+                reranker=self._web_search_reranker(),
+            )
         except Exception as e:
             msg = f"Error: web search failed: {e}"
             self._report_tool_result(call_id, "web_search", msg, is_error=True)

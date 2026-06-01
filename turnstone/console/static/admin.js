@@ -5202,6 +5202,15 @@ const MODEL_ROLES = [
     mediaCapability: "supports_speech_synthesis",
     mediaRole: "tts",
   },
+  {
+    label: "Reranker",
+    description:
+      "Reranks web_search results and selects the most relevant chunks of large web_fetch pages. Point at a model whose base_url is a Cohere/Jina-compatible /rerank endpoint and whose capabilities include supports_rerank. Empty falls back to the tools.rerank_url setting (if set).",
+    aliasKey: "tools.reranker_alias",
+    fallbackKind: "disabled",
+    mediaCapability: "supports_rerank",
+    mediaRole: "rerank",
+  },
 ];
 
 // Whether a model definition is eligible for an audio role.  Mirrors

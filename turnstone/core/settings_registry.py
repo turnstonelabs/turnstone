@@ -250,6 +250,62 @@ def _build_registry() -> dict[str, SettingDef]:
             "'searxng' forces the SearxNG backend. 'mcp:server:tool' routes to an MCP server "
             "(e.g. 'mcp:search:web_search').",
         ),
+        SettingDef(
+            "tools.rerank_url",
+            "str",
+            "",
+            "Full rerank endpoint URL (empty = reranking disabled)",
+            "tools",
+            help="Full URL of a Cohere/Jina-compatible rerank endpoint, including the path "
+            "(e.g. 'http://vllm:8000/rerank', 'http://tei:8080/rerank', or "
+            "'https://api.cohere.com/v2/rerank'). Turnstone runs no rerank model itself: "
+            "web_search results and large web_fetch pages are reranked by POSTing to this "
+            "endpoint. Empty disables reranking entirely. Overrides config.toml [tools] "
+            "rerank_url and $TURNSTONE_RERANK_URL.",
+        ),
+        SettingDef(
+            "tools.rerank_model",
+            "str",
+            "",
+            "Reranker model name sent to the endpoint (empty = endpoint default)",
+            "tools",
+            help="Model identifier passed in the rerank request body (e.g. "
+            "'BAAI/bge-reranker-v2-m3', 'rerank-v3.5'). Empty uses the endpoint's default "
+            "model. Overrides config.toml [tools] rerank_model.",
+        ),
+        SettingDef(
+            "tools.rerank_api_key",
+            "str",
+            "",
+            "Bearer token for the rerank endpoint (write-only)",
+            "tools",
+            is_secret=True,
+            help="Sent as 'Authorization: Bearer <key>' to the rerank endpoint. Required for "
+            "hosted providers (Cohere/Jina/Voyage); usually empty for a self-hosted vLLM/TEI "
+            "instance. Write-only: never returned by the API. For non-console deployments set "
+            "it in config.toml [tools] rerank_api_key (secrets belong in config.toml, not env).",
+        ),
+        SettingDef(
+            "tools.rerank_web_search",
+            "bool",
+            True,
+            "Rerank web_search results when a rerank endpoint is configured",
+            "tools",
+            help="When a rerank endpoint is set (tools.rerank_url), re-order web_search "
+            "results by query relevance before returning the top hits. No effect when no "
+            "endpoint is configured. Disable to keep the search backend's native ranking.",
+        ),
+        SettingDef(
+            "tools.reranker_alias",
+            "str",
+            "",
+            "Model alias of the reranker (a model with supports_rerank), or empty",
+            "tools",
+            help="Selects a reranker added in the admin Models tab: create a model definition "
+            'with capability {"supports_rerank": true} and its base_url set to a Cohere/Jina-'
+            "compatible /rerank endpoint, then pick it under Models -> Roles -> Reranker. Takes "
+            "precedence over tools.rerank_url; empty falls back to tools.rerank_url (if set).",
+        ),
         # -- server ---------------------------------------------------------
         SettingDef(
             "server.workstream_idle_timeout",

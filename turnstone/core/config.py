@@ -229,6 +229,57 @@ def get_searxng_engines() -> str:
     return _searxng_engines
 
 
+# -- Rerank endpoint (cached) -------------------------------------------------
+
+_rerank_url: str | None = None
+_rerank_url_loaded: bool = False
+_rerank_model: str | None = None
+_rerank_model_loaded: bool = False
+_rerank_api_key: str | None = None
+_rerank_api_key_loaded: bool = False
+
+
+def get_rerank_url() -> str:
+    """Load the rerank endpoint URL (cached after first call).
+
+    Precedence: config.toml [tools] rerank_url -> $TURNSTONE_RERANK_URL -> ""
+    ("" disables reranking — there is no bundled rerank endpoint).
+    """
+    global _rerank_url, _rerank_url_loaded
+    if not _rerank_url_loaded:
+        _rerank_url_loaded = True
+        cfg = load_config("tools").get("rerank_url", "").strip()
+        _rerank_url = cfg or os.environ.get("TURNSTONE_RERANK_URL", "").strip()
+    return _rerank_url or ""
+
+
+def get_rerank_model() -> str:
+    """Load the rerank model name (cached after first call).
+
+    Precedence: config.toml [tools] rerank_model -> $TURNSTONE_RERANK_MODEL -> ""
+    (use the endpoint's default model).
+    """
+    global _rerank_model, _rerank_model_loaded
+    if not _rerank_model_loaded:
+        _rerank_model_loaded = True
+        cfg = load_config("tools").get("rerank_model", "").strip()
+        _rerank_model = cfg or os.environ.get("TURNSTONE_RERANK_MODEL", "").strip()
+    return _rerank_model or ""
+
+
+def get_rerank_api_key() -> str:
+    """Load the rerank endpoint bearer token (cached after first call).
+
+    Read from config.toml [tools] rerank_api_key only — secrets are never read
+    from the environment.
+    """
+    global _rerank_api_key, _rerank_api_key_loaded
+    if not _rerank_api_key_loaded:
+        _rerank_api_key_loaded = True
+        _rerank_api_key = load_config("tools").get("rerank_api_key", "").strip()
+    return _rerank_api_key or ""
+
+
 def nonneg_float(val: str) -> float:
     """Argparse type for non-negative floats (``>= 0``)."""
     f = float(val)

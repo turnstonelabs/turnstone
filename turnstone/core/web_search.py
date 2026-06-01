@@ -16,6 +16,7 @@ clients.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
@@ -26,6 +27,15 @@ if TYPE_CHECKING:
     from turnstone.core.mcp_client import MCPClientManager
 
 log = get_logger(__name__)
+
+# A reranker reorders candidate documents by relevance to the query, returning
+# their indices best-first. ``web_search`` accepts one so the session can plug
+# in an endpoint-backed reranker without this module depending on rerank.py.
+Reranker = Callable[[str, list[str]], list[int]]
+
+# Max SearxNG results sent to the reranker in one request — the pool re-ordered
+# before the caller's ``max_results`` slice.
+_RERANK_POOL = 50
 
 
 class WebSearchClient(Protocol):
@@ -67,7 +77,7 @@ class SearXNGClient:
             timeout=self._timeout,
         )
         resp.raise_for_status()
-        return _format_searxng(resp.json(), query, max_results)
+        return _format_searxng(resp.json(), query, max_results, reranker=kwargs.get("reranker"))
 
 
 class MCPSearchClient:
@@ -95,7 +105,12 @@ class MCPSearchClient:
 # ---------------------------------------------------------------------------
 
 
-def _format_searxng(data: dict[str, Any], query: str, max_results: int = 5) -> str:
+def _format_searxng(
+    data: dict[str, Any],
+    query: str,
+    max_results: int = 5,
+    reranker: Reranker | None = None,
+) -> str:
     parts: list[str] = []
 
     # Instant answers (calculator, Wikipedia summaries, …) — engine-dependent,
@@ -119,6 +134,8 @@ def _format_searxng(data: dict[str, Any], query: str, max_results: int = 5) -> s
 
     results = data.get("results") or []
     if results:
+        if reranker is not None and len(results) > 1:
+            results = _rerank_results(query, results, reranker)
         lines = []
         for i, r in enumerate(results[:max_results], 1):
             title = r.get("title", "")
@@ -140,6 +157,38 @@ def _format_searxng(data: dict[str, Any], query: str, max_results: int = 5) -> s
         )
         return f"No results for '{query}'. Unresponsive engines: {names}."
     return f"No results for '{query}'."
+
+
+def _rerank_results(
+    query: str, results: list[dict[str, Any]], reranker: Reranker
+) -> list[dict[str, Any]]:
+    """Reorder SearxNG ``results`` by query relevance using ``reranker``.
+
+    Sends at most ``_RERANK_POOL`` results (title + snippet) to the reranker and
+    splices its ordering back in. Falls back to the original SearxNG order on any
+    error or if the reranker returns nothing usable — reranking must never make
+    web_search fail or silently drop results.
+    """
+    pool = results[:_RERANK_POOL]
+    tail = results[_RERANK_POOL:]
+    try:
+        docs = [f"{r.get('title', '')}\n{r.get('content') or ''}".strip() for r in pool]
+        order = reranker(query, docs)
+    except Exception as e:
+        log.warning("rerank failed; using native result order: %s", e)
+        return results
+    seen: set[int] = set()
+    reordered: list[dict[str, Any]] = []
+    for idx in order:
+        if isinstance(idx, int) and 0 <= idx < len(pool) and idx not in seen:
+            seen.add(idx)
+            reordered.append(pool[idx])
+    if not reordered:
+        return results
+    # Keep any pool items the reranker omitted (e.g. a top_n subset), then the
+    # un-reranked tail beyond the pool cap.
+    reordered.extend(pool[i] for i in range(len(pool)) if i not in seen)
+    return reordered + tail
 
 
 # ---------------------------------------------------------------------------

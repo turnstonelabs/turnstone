@@ -109,6 +109,22 @@
 # searxng_engines = ""         # comma-separated engines (e.g. "duckduckgo,wikipedia");
                                # empty = the instance's default mix
                                # env: TURNSTONE_SEARXNG_ENGINES
+#
+# Reranking (optional, disabled by default). Turnstone runs no reranker itself —
+# it POSTs to an external Cohere/Jina-compatible /rerank endpoint (self-hosted
+# vLLM/TEI/llama.cpp, or hosted Cohere/Jina/Voyage) to reorder web_search results
+# by query relevance. Set rerank_url to enable; leave empty to disable. (Alternatively,
+# add a reranker model in the admin Models tab and pick it under Models -> Roles
+# -> Reranker; that selection takes precedence over rerank_url.)
+# rerank_url = ""              # full endpoint URL incl. path, e.g.
+                               # "http://vllm:8000/rerank" or
+                               # "https://api.cohere.com/v2/rerank";
+                               # env: TURNSTONE_RERANK_URL
+# rerank_model = ""            # model name sent in the request; empty = the
+                               # endpoint's default; env: TURNSTONE_RERANK_MODEL
+# rerank_api_key = ""          # bearer token for hosted providers; usually empty
+                               # for self-hosted. config.toml only (never env)
+# rerank_web_search = true     # rerank web_search results (when an endpoint is set)
 
 # --- Judge (turnstone, node) ---
 

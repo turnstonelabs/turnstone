@@ -317,3 +317,94 @@ class TestResolveClient:
             "mcp:static-search:search", searxng_url=None, mcp_client=mcp
         )
         assert isinstance(client, MCPSearchClient)
+
+
+# ---------------------------------------------------------------------------
+# Reranking
+# ---------------------------------------------------------------------------
+
+
+def _results(*titles):
+    return {
+        "results": [
+            {"title": t, "url": f"http://{t.lower()}", "content": f"{t} snippet"} for t in titles
+        ]
+    }
+
+
+class TestWebSearchReranking:
+    def test_reorders_results_by_reranker_output(self):
+        # Reranker promotes index 2, then 0, then 1.
+        out = _format_searxng(
+            _results("A", "B", "C"), "q", max_results=3, reranker=lambda q, d: [2, 0, 1]
+        )
+        assert out.index("[C]") < out.index("[A]") < out.index("[B]")
+
+    def test_reranker_receives_title_and_snippet(self):
+        seen: dict = {}
+
+        def rr(query, docs):
+            seen["query"] = query
+            seen["docs"] = docs
+            return list(range(len(docs)))
+
+        _format_searxng(_results("Py", "X"), "find me", reranker=rr)
+        assert seen["query"] == "find me"
+        assert seen["docs"][0] == "Py\nPy snippet"
+
+    def test_error_falls_back_to_native_order(self):
+        def boom(query, docs):
+            raise RuntimeError("rerank endpoint down")
+
+        out = _format_searxng(_results("A", "B"), "q", reranker=boom)
+        assert out.index("[A]") < out.index("[B]")  # native order preserved
+
+    def test_skipped_for_single_result(self):
+        called = {"n": 0}
+
+        def rr(query, docs):
+            called["n"] += 1
+            return [0]
+
+        _format_searxng(_results("Only"), "q", reranker=rr)
+        assert called["n"] == 0  # <=1 result: nothing to reorder
+
+    def test_answers_and_infoboxes_untouched(self):
+        # Reranking only reorders the results list, never answers/infoboxes.
+        out = _format_searxng(SEARXNG_JSON, "python", reranker=lambda q, d: [1, 0])
+        assert "Answer: Python is a programming language." in out
+        assert "A high-level language." in out
+
+    def test_partial_order_keeps_all_results(self):
+        # A top_n-style reranker returns only a subset; the rest must survive.
+        out = _format_searxng(
+            _results("T0", "T1", "T2"), "q", max_results=3, reranker=lambda q, d: [1]
+        )
+        assert "[T0]" in out and "[T1]" in out and "[T2]" in out
+        assert out.index("[T1]") < out.index("[T0]")  # T1 promoted
+
+    def test_searxng_client_threads_reranker_kwarg(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=_results("A", "B"))
+
+        with patch("turnstone.core.web_search.httpx.get", _mock_httpx_get(handler)):
+            out = SearXNGClient("http://searxng:8080").search("q", reranker=lambda q, d: [1, 0])
+
+        assert out.index("[B]") < out.index("[A]")  # reranker applied via search()
+
+    def test_pool_cap_preserves_tail_beyond_50(self):
+        # >_RERANK_POOL (50) results: only the first 50 are reranked; the tail
+        # must survive, appended in native order after the reranked pool.
+        data = {
+            "results": [
+                {"title": f"R{i}", "url": f"http://r/{i}", "content": f"c{i}"} for i in range(60)
+            ]
+        }
+        # Reranker reverses the 50-item pool it is handed.
+        out = _format_searxng(
+            data, "q", max_results=60, reranker=lambda q, d: list(range(len(d)))[::-1]
+        )
+        assert all(f"[R{i}]" in out for i in range(60))  # nothing dropped
+        assert out.index("[R49]") < out.index("[R0]")  # pool reversed
+        assert out.index("[R0]") < out.index("[R50]")  # reranked pool before the tail
+        assert out.index("[R50]") < out.index("[R59]")  # tail kept in native order
