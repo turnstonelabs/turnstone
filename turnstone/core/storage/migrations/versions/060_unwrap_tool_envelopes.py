@@ -1,4 +1,4 @@
-"""Un-wrap legacy ``<tool_output>`` advisory envelopes; null ``_reminders``.
+"""Un-wrap legacy ``<tool_output>`` advisory envelopes; drop ``_reminders``.
 
 Operator-context (output-guard findings, user interjections, metacognitive
 nudges) used to ride two transient carriers baked into stored rows: a
@@ -7,7 +7,7 @@ nudges) used to ride two transient carriers baked into stored rows: a
 side-channel column.  Both are replaced by first-class ``{"role":"system"}``
 turns, so the legacy carriers are now dead on the read path.
 
-This migration drains the carriers in place — UPDATE only, no row insertion:
+This migration retires both carriers:
 
 * **Envelopes** — every tool row whose ``content`` is a wrapped envelope is
   rewritten to the bare tool output.  The embedded ``<system-reminder>``
@@ -21,11 +21,14 @@ This migration drains the carriers in place — UPDATE only, no row insertion:
   original escape is reversed: re-activating the wrapper-tag escapes
   (``&lt;system-reminder&gt;`` → ``<system-reminder>``) would un-defang
   injection the old escape had neutralised, so those entities are left as-is.
-* **Reminders** — ``conversations._reminders`` is nulled wholesale; nothing
-  writes the column anymore and the read path no longer projects it.
+* **Reminders** — the ``conversations._reminders`` column is dropped outright
+  (``batch_alter_table``, per migration 027).  Nothing writes it and the read
+  path no longer reads it, so carrying it forward would only leave a writable
+  dead column as a foot-gun.
 
-``downgrade()`` is a documented no-op: the un-wrap is lossy (the advisory
-blocks and the reminder JSON are discarded), so the original rows cannot be
+``downgrade()`` re-adds the (empty) ``_reminders`` column so the schema matches
+the 059 state, but does NOT reverse the envelope un-wrap — that is lossy (the
+advisory blocks are discarded), so the original wrapped rows cannot be
 reconstructed.
 
 Revision ID: 060
@@ -114,7 +117,6 @@ def upgrade() -> None:
         "conversations",
         sa.column("id", sa.Integer),
         sa.column("content", sa.Text),
-        sa.column("_reminders", sa.Text),
     )
 
     # (1) Un-wrap legacy ``<tool_output>`` envelopes in place.  Only rows whose
@@ -149,15 +151,20 @@ def upgrade() -> None:
                 .values(content=unwrapped)
             )
 
-    # (2) Null the dead ``_reminders`` side-channel column wholesale.
-    bind.execute(
-        sa.update(conversations)
-        .where(conversations.c._reminders.isnot(None))
-        .values(_reminders=None)
-    )
+    # (2) Drop the dead ``_reminders`` column outright.  Operator context now
+    #     lives in first-class ``system`` turns; nothing writes the column and
+    #     ``reconstruct_messages`` no longer reads it.  Dropping it (rather than
+    #     nulling and carrying it forward) removes the foot-gun of a writable
+    #     dead column.  ``batch_alter_table`` so SQLite (table rebuild) and
+    #     PostgreSQL (native ALTER) both work — see migration 027.
+    with op.batch_alter_table("conversations") as batch_op:
+        batch_op.drop_column("_reminders")
 
 
 def downgrade() -> None:
-    # No-op: the un-wrap discards the advisory blocks and the reminder JSON,
-    # so the original wrapped rows cannot be reconstructed.
-    pass
+    # Re-add the (empty) column so the schema matches the 059 state.  The
+    # envelope un-wrap (step 1) is NOT reversed — it discards the advisory
+    # blocks, so the original wrapped rows cannot be reconstructed; the
+    # re-added column is therefore always NULL.
+    with op.batch_alter_table("conversations") as batch_op:
+        batch_op.add_column(sa.Column("_reminders", sa.Text, nullable=True))

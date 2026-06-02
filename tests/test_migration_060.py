@@ -11,7 +11,8 @@ isolated SQLite database per test, then asserts:
   bare row that merely starts with ``<tool_output>`` — or even one with a
   matching ``</tool_output>`` close but no advisory — is left untouched (the
   known-issue #1 false positive);
-* the ``_reminders`` side-channel column is nulled;
+* the dead ``_reminders`` side-channel column is dropped outright (not nulled
+  and carried forward as a writable foot-gun);
 * the migration is idempotent (a second run is a no-op);
 * a plain non-envelope row is untouched.
 """
@@ -200,7 +201,7 @@ class TestMigration060:
         finally:
             engine.dispose()
 
-    def test_nulls_reminders_column(self, tmp_path: Path) -> None:
+    def test_drops_reminders_column(self, tmp_path: Path) -> None:
         db_path = tmp_path / "060-reminders.db"
         cfg = _alembic_cfg(db_path)
         command.upgrade(cfg, "059")
@@ -208,6 +209,7 @@ class TestMigration060:
         engine = sa.create_engine(f"sqlite:///{db_path}")
         try:
             with engine.begin() as conn:
+                # The column still exists at 059, so a legacy value can be seeded.
                 _seed_row(
                     conn,
                     role="user",
@@ -215,14 +217,23 @@ class TestMigration060:
                     tool_call_id="call_d",
                     _reminders='[{"type":"correction","text":"watch it"}]',
                 )
+            # At 059 the column is present.
+            assert "_reminders" in {
+                c["name"] for c in sa.inspect(engine).get_columns("conversations")
+            }
 
             command.upgrade(cfg, "060")
 
+            # 060 drops it outright (no dead column carried forward); the row
+            # itself survives.
+            cols = {c["name"] for c in sa.inspect(engine).get_columns("conversations")}
+            assert "_reminders" not in cols
+            assert "_source" in cols  # the live sibling stays
             with engine.connect() as conn:
-                reminders = conn.execute(
-                    sa.text("SELECT _reminders FROM conversations WHERE tool_call_id = 'call_d'")
+                content = conn.execute(
+                    sa.text("SELECT content FROM conversations WHERE tool_call_id = 'call_d'")
                 ).scalar_one()
-            assert reminders is None
+            assert content == "hello"
         finally:
             engine.dispose()
 

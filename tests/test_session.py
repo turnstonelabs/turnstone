@@ -4254,35 +4254,6 @@ class TestReminderSidechannelIsolation:
         assert extracted_user == "first message body"
         assert "SECRET_NUDGE_TEXT" not in extracted_user
 
-    def test_wire_pass_does_not_render_legacy_reminders(self, tmp_db):
-        """A pre-migration row whose ``_reminders`` column survived
-        ``load_messages`` must NOT leak onto the wire: the wire transform
-        only folds first-class ``system`` turns and ignores the dead
-        ``_reminders`` side-channel entirely (no envelope splice anymore).
-        """
-        from turnstone.core.memory import register_workstream, save_message
-
-        register_workstream("resume_no_resplice")
-        save_message(
-            "resume_no_resplice",
-            "user",
-            "second turn",
-            reminders=json.dumps(
-                [{"type": "denial", "text": "HISTORICAL_REMINDER_BODY"}],
-                separators=(",", ":"),
-            ),
-        )
-        save_message("resume_no_resplice", "assistant", "ok")
-
-        session = _make_session()
-        assert session.resume("resume_no_resplice") is True
-
-        session.messages.append({"role": "user", "content": "live new turn"})
-        wire = session._prepare_wire_messages(session.messages)
-        rendered = "\n".join(m["content"] for m in wire if isinstance(m.get("content"), str))
-        assert "HISTORICAL_REMINDER_BODY" not in rendered
-        assert "<system-reminder>" not in rendered
-
     def test_fork_preserves_source(self, tmp_db):
         """A forked workstream's resumed transcript carries the wake
         marker (``_source = "system_nudge"``).  The bulk-row builder

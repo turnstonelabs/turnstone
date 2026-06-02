@@ -42,7 +42,6 @@ def save_message(
     provider_data: str | None = None,
     tool_calls: str | None = None,
     source: str | None = None,
-    reminders: str | None = None,
     event_id: int | None = None,
 ) -> int:
     """Log a message to the conversations table.
@@ -50,10 +49,9 @@ def save_message(
     Returns the inserted row id, or ``0`` on failure (preserving the
     module's no-raise contract).
 
-    ``source`` / ``reminders`` mirror the in-memory ``_source`` /
-    ``_reminders`` side-channels (``reminders`` JSON-encoded).  Both
-    default to ``None`` for the common case where no metacog payload
-    rides the row.
+    ``source`` is the persisted twin of the in-memory ``_source``
+    side-channel (which producer synthesised the row); ``None`` for the
+    common case of an ordinary user/assistant/tool row.
 
     ``event_id`` is the per-ws SSE ring-buffer high-water mark at save
     time (``SessionUIBase._event_id``); the caller in ``session.py``
@@ -70,7 +68,6 @@ def save_message(
             provider_data,
             tool_calls=tool_calls,
             source=source,
-            reminders=reminders,
             event_id=event_id,
         )
     except Exception:

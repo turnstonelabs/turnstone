@@ -38,14 +38,14 @@ conversations = sa.Table(
     sa.Column("tool_call_id", sa.Text),
     sa.Column("provider_data", sa.Text),
     sa.Column("tool_calls", sa.Text),
-    # Sibling-key columns mirroring the in-memory ``_source`` /
-    # ``_reminders`` side-channels.  ``_source`` audits which producer
-    # synthesised the row (today only ``"system_nudge"`` for wake-driven
-    # empty user turns); ``_reminders`` stores the JSON-encoded reminder
-    # list ``[{type, text, ...optional}]`` so multi-tab / multi-device
-    # replay sees the same bubble shape the originating tab saw live.
+    # ``_source`` mirrors the in-memory side channel: which producer
+    # synthesised the row — a ``system_nudge`` wake turn, or one of the
+    # operator-context kinds on a first-class ``system`` turn (output_guard /
+    # user_interjection / tool_error / watch_triggered / … — see
+    # ``tool_advisory.SYSTEM_TURN_SOURCES``).  (The sibling ``_reminders`` column
+    # that rode here was dropped in migration 060 — operator context lives in
+    # ``system`` turns now, so it was dead weight.)
     sa.Column("_source", sa.Text),
-    sa.Column("_reminders", sa.Text),
     # SSE ``Last-Event-ID`` resume cursor: the per-ws ``_event_id``
     # ring-buffer high-water mark at the moment this row was saved (see
     # ``SessionUIBase._enqueue``).  Distinct id-space from the ``id`` PK

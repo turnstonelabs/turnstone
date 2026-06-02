@@ -16,13 +16,12 @@ def _row(
     pdata=None,
     tool_calls=None,
     source=None,
-    reminders=None,
 ):
-    """Build a 9-element conversation row tuple (id, role, ...).
+    """Build an 8-element conversation row tuple (id, role, ...).
 
-    Trailing ``source`` / ``reminders`` mirror the persisted twins of
-    the in-memory ``_source`` / ``_reminders`` side-channels added in
-    migration 050.
+    Trailing ``source`` is the persisted twin of the in-memory ``_source``
+    side-channel.  (The ``_reminders`` column that used to ride here was
+    dropped in migration 060 — operator context lives in ``system`` turns.)
     """
     return (
         next(_row_ids),
@@ -33,7 +32,6 @@ def _row(
         pdata,
         tool_calls,
         source,
-        reminders,
     )
 
 

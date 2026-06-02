@@ -2965,8 +2965,8 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
                 )
                 # Final structural projection: flatten nested tool_calls,
                 # collapse multipart content, surface the
-                # ``_source`` / ``_reminders`` / ``_attachments_meta``
-                # side-channels top-level, and derive
+                # ``_source`` / ``_attachments_meta`` side-channels
+                # top-level, and derive
                 # ``denied`` / ``is_error`` / ``pending``.  Runs last (reads
                 # decorate's in-place verdict/advisory mutations + the
                 # stamped ``reasoning``) and returns a fresh list, so the

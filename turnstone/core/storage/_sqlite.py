@@ -324,14 +324,12 @@ class SQLiteBackend:
         provider_data: str | None = None,
         tool_calls: str | None = None,
         source: str | None = None,
-        reminders: str | None = None,
         event_id: int | None = None,
     ) -> int:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         content = sanitize_text(content)
         provider_data = sanitize_text(provider_data)
         source = sanitize_text(source)
-        reminders = sanitize_text(reminders)
         with self._conn() as conn:
             result = conn.execute(
                 sa.insert(conversations),
@@ -345,7 +343,6 @@ class SQLiteBackend:
                     "provider_data": provider_data,
                     "tool_calls": tool_calls,
                     "_source": source,
-                    "_reminders": reminders,
                     "event_id": event_id,
                 },
             )
@@ -391,7 +388,6 @@ class SQLiteBackend:
                     "provider_data": sanitize_text(row.get("provider_data")),
                     "tool_calls": row.get("tool_calls"),
                     "_source": sanitize_text(row.get("source")),
-                    "_reminders": sanitize_text(row.get("reminders")),
                 }
             )
         with self._conn() as conn:
@@ -430,7 +426,6 @@ class SQLiteBackend:
                         conversations.c.provider_data,
                         conversations.c.tool_calls,
                         conversations.c._source,
-                        conversations.c._reminders,
                         conversations.c.event_id,
                     )
                     .where(conversations.c.ws_id == ws_id)
@@ -449,7 +444,6 @@ class SQLiteBackend:
                         conversations.c.provider_data,
                         conversations.c.tool_calls,
                         conversations.c._source,
-                        conversations.c._reminders,
                         conversations.c.event_id,
                     )
                     .where(conversations.c.ws_id == ws_id)

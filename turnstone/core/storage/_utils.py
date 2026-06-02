@@ -336,12 +336,12 @@ def reconstruct_messages(
 ) -> list[dict[str, Any]]:
     """Reconstruct OpenAI message format from stored conversation rows.
 
-    Each *row* is a 9- or 10-tuple ``(id, role, content, tool_name,
-    tool_call_id, provider_data, tool_calls_json, source, reminders_json
-    [, event_id])``, ordered chronologically by row id.  ``source`` /
-    ``reminders_json`` mirror the ``_source`` / ``_reminders`` in-memory
-    side channels so multi-tab / multi-device replay sees the same bubble
-    shape the originating tab saw live.  The optional 10th element
+    Each *row* is an 8- or 9-tuple ``(id, role, content, tool_name,
+    tool_call_id, provider_data, tool_calls_json, source [, event_id])``,
+    ordered chronologically by row id.  ``source`` is rehydrated as the
+    ``_source`` side channel.  (The legacy ``_reminders`` column that used to
+    ride here was dropped in migration 060 — operator context lives in
+    first-class ``system`` turns now.)  The optional 9th element
     ``event_id`` (migration 059, the per-ws SSE ``Last-Event-ID`` resume
     cursor) is surfaced as the ``_event_id`` side-channel; legacy 9-tuple
     fixtures omit it (handled by the defensive unpack below).
@@ -374,15 +374,14 @@ def reconstruct_messages(
             provider_data,
             tool_calls_json,
             source,
-            reminders_json,
-        ) = row[:9]
-        # ``event_id`` (10th column, migration 059) is the per-ws SSE
+        ) = row[:8]
+        # ``event_id`` (9th column, migration 059) is the per-ws SSE
         # ring-buffer high-water mark stamped at save time — the
         # ``Last-Event-ID`` resume cursor space.  Surfaced as the
         # ``_event_id`` side-channel so ``make_history_handler`` can
         # compute the resume cursor + locate the in-flight-turn boundary.
-        # Defensive length check keeps pre-event_id 9-tuple fixtures valid.
-        event_id = row[9] if len(row) > 9 else None
+        # Defensive length check keeps pre-event_id 8-tuple fixtures valid.
+        event_id = row[8] if len(row) > 8 else None
 
         if role == "user":
             parts: list[dict[str, Any]] = []
@@ -412,12 +411,6 @@ def reconstruct_messages(
                 umsg = {"role": "user", "content": content or ""}
             if source:
                 umsg["_source"] = str(source)
-            if reminders_json:
-                # Mirrors the ``provider_data`` / ``tool_calls`` JSON
-                # decode pattern below: malformed JSON in the column is
-                # swallowed silently rather than aborting load.
-                with contextlib.suppress(json.JSONDecodeError, TypeError):
-                    umsg["_reminders"] = json.loads(reminders_json)
             if event_id is not None:
                 umsg["_event_id"] = int(event_id)
             messages.append(umsg)
@@ -440,12 +433,6 @@ def reconstruct_messages(
                 "tool_call_id": tc_id or "",
                 "content": content or "",
             }
-            if reminders_json:
-                # Tool-channel reminders (``tool_error`` / ``repeat``)
-                # ride the same column so replay shows the same below-
-                # the-tool bubble the originating tab rendered live.
-                with contextlib.suppress(json.JSONDecodeError, TypeError):
-                    tmsg["_reminders"] = json.loads(reminders_json)
             if event_id is not None:
                 tmsg["_event_id"] = int(event_id)
             messages.append(tmsg)
