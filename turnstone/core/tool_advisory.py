@@ -5,18 +5,19 @@ interjections, metacognitive nudges) lives in the conversation trajectory as
 first-class ``{"role": "system", "_source": <kind>, "content": ...}`` turns
 (see :func:`make_system_turn`).  At the wire boundary each turn is either kept
 inline (native mid-conversation system messages — claude-opus-4-8) or folded
-into the preceding turn as a nonce-delimited ``<system-reminder>`` block
-(:func:`wrap_system_context`) for every other model.
+into the preceding turn as a nonce-delimited ``<system-reminder_{nonce}>`` fence
+for every other model.  The fence mechanism (mint / neutralise / wrap) lives in
+:mod:`turnstone.core.fence`, shared with the output-guard judge so the two
+trust boundaries cannot drift; ``ChatSession._fold_system_turns`` applies it.
 
 This module also hosts :func:`escape_wrapper_tags` (defence for the few call
-sites that interpolate model-controlled text next to a literal
+sites that interpolate model-controlled text next to a *bare* (un-nonced)
 ``<system-reminder>`` tag — e.g. ``ChatSession._skill_hint``) and
 :func:`parse_priority` (the ``!!!`` priority prefix on queued user messages).
 """
 
 from __future__ import annotations
 
-import secrets
 from typing import Any, Final
 
 # Priority constants
@@ -109,11 +110,12 @@ def make_system_turn(source: str, content: str, **meta: Any) -> dict[str, Any]:
     the validated source can't be silently clobbered.
 
     ``content`` is stored and — on the native mid-conversation-system path
-    (claude-opus-4-8) — sent to the model verbatim, so envelope-escaping is NOT
+    (claude-opus-4-8) — sent to the model verbatim, so fence-escaping is NOT
     done here.  It belongs to the fallback fold step, which wraps the content
-    in a nonce-delimited ``<system-reminder>`` block via
-    :func:`wrap_system_context`.  Escaping in this builder would corrupt the
-    native path, where there is no envelope to break out of.
+    in a nonce-delimited ``<system-reminder_{nonce}>`` fence via
+    :func:`turnstone.core.fence.wrap` (applied in
+    ``ChatSession._fold_system_turns``).  Escaping in this builder would corrupt
+    the native path, where there is no fence to break out of.
     """
     if source not in SYSTEM_TURN_SOURCES:
         raise ValueError(f"unknown system-turn source: {source!r}")
@@ -124,36 +126,3 @@ def make_system_turn(source: str, content: str, **meta: Any) -> dict[str, Any]:
             raise ValueError(f"system-turn meta key {key!r} collides with reserved {norm!r}")
         turn[norm] = value
     return turn
-
-
-def mint_envelope_nonce() -> str:
-    """Mint an unguessable per-session nonce for system-context envelopes.
-
-    Eight hex chars (32 bits) is ample: the untrusted text an envelope wraps is
-    fixed *before* the nonce is minted, so it cannot adaptively guess the token
-    — the nonce only has to be unpredictable to that already-fixed content, not
-    a long-lived secret.  Mint once per session, declare it in the system
-    prompt as the trusted-envelope marker, and reuse it for every fold that
-    session (stable bytes → cache-friendly).
-    """
-    return secrets.token_hex(4)
-
-
-def wrap_system_context(content: str, nonce: str) -> str:
-    """Wrap operator content in a nonce-delimited ``<system-reminder>`` block.
-
-    The *nonce* (from :func:`mint_envelope_nonce`) makes the boundary
-    unforgeable: untrusted text glued nearby cannot open or close the block
-    because it cannot reproduce the suffix.  Both tags carry the nonce, so a
-    bare ``</system-reminder>`` in the body cannot end it.
-
-    No escaping is applied — that is the point: break-out resistance comes from
-    the unguessable nonce, not from neutralising specific literals.  Forgery
-    resistance, however, requires the system prompt to declare this exact nonce
-    as the *sole* trusted ``<system-reminder>`` marker (and instruct the model
-    never to echo it); without that declaration, dropping escaping would let an
-    untrusted body forge a fake reminder.  Use only on the fallback fold path;
-    the native mid-conversation-system path (claude-opus-4-8) sends content
-    verbatim as a real ``{"role":"system"}`` message with no envelope.
-    """
-    return f"<system-reminder-{nonce}>\n{content}\n</system-reminder-{nonce}>"

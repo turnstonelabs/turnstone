@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
 import httpx
 
+from turnstone.core import fence
 from turnstone.core.attachments import (
     IMAGE_SIZE_CAP as _ATTACH_IMAGE_SIZE_CAP,
 )
@@ -104,8 +105,6 @@ from turnstone.core.storage._utils import normalize_search_terms
 from turnstone.core.tool_advisory import (
     escape_wrapper_tags,
     make_system_turn,
-    mint_envelope_nonce,
-    wrap_system_context,
 )
 from turnstone.core.tool_search import ToolSearchManager
 from turnstone.core.tools import (
@@ -1183,12 +1182,16 @@ class ChatSession:
         self._skill_content: str | None = None
         self._skill_resources: dict[str, str] = {}
         self._skill_resources_dir: str | None = None
-        # Per-session nonce for the operator-instruction envelope — the fold
-        # path's ``<system-reminder-{nonce}>`` marker.  Minted once per session,
+        # Per-session nonce for the operator-instruction fence — the fold
+        # path's ``<system-reminder_{nonce}>`` marker.  Minted once per session,
         # declared in the system prompt as the sole trusted marker, and reused by
-        # every fold this session.  Transient/wire-only (not persisted): the fold
-        # re-wraps each build, so a fresh nonce per session-load is fine.
-        self._envelope_nonce = mint_envelope_nonce()
+        # every fold this session (the declaration pins the exact value, so it
+        # must stay stable across the cached prefix — see ``fence`` for why the
+        # judge fence can rotate per-call but this one cannot).  Transient/
+        # wire-only (not persisted): the fold re-wraps each build, so a fresh
+        # nonce per session-load is fine.  64-bit + per-fold host escaping (see
+        # ``_fold_system_turns``) keep a mid-session leak from forging a block.
+        self._envelope_nonce = fence.mint_nonce()
         self._load_skills()
         # Memory selection keys off the recent-user-message query, but a fresh
         # session has no messages yet here -> the first compose would inject
@@ -2699,8 +2702,8 @@ class ChatSession:
         )
         # Operator-instruction trust anchor — declared only on the fold path.
         # The native mid-conversation-system path (claude-opus-4-8) delivers
-        # operator turns as real {"role":"system"} messages with no envelope, so
-        # no <system-reminder-{nonce}> marker appears and no declaration applies.
+        # operator turns as real {"role":"system"} messages with no fence, so
+        # no <system-reminder_{nonce}> marker appears and no declaration applies.
         if caps is not None and not caps.supports_mid_conversation_system:
             dev_parts.append("\n\n" + build_operator_instruction_declaration(self._envelope_nonce))
         # Tool search hint (client-side mode only — native mode needs no hint).
@@ -2890,12 +2893,18 @@ class ChatSession:
         context (advisories / nudges / interjections — see
         ``tool_advisory.make_system_turn``).  Models WITHOUT native
         mid-conversation system support can't take a ``system`` message
-        mid-array, so each such turn is wrapped via
-        :func:`turnstone.core.tool_advisory.wrap_system_context` (nonce-delimited
-        — the system prompt declares the nonce as the sole trusted marker via
-        ``build_operator_instruction_declaration``) and appended to the preceding
-        wire turn's content, then dropped from the list.  No escaping: the nonce
-        makes the block unforgeable.
+        mid-array, so each such turn is wrapped in a nonce-delimited
+        ``<system-reminder_{nonce}>`` fence (:func:`turnstone.core.fence.wrap`)
+        — the system prompt declares the exact nonce as the sole trusted marker
+        via ``build_operator_instruction_declaration`` — and appended to the
+        preceding wire turn's content, then dropped from the list.
+
+        Forgery defence is two-layer: ``fence.wrap`` neutralises the operator
+        body's closing marker (break-out), and before the first fold onto a host
+        we neutralise that (untrusted) host turn's ``<system-reminder>`` markers
+        via :meth:`_neutralize_host` (forge-in).  The host pass runs once per
+        host — re-running it would defang the real fences we append afterwards —
+        so a leaked or guessed nonce still cannot fabricate a trusted block.
 
         Native models (``supports_mid_conversation_system``) keep the turns
         inline — the Anthropic converter emits them as real ``system`` messages.
@@ -2913,18 +2922,57 @@ class ChatSession:
             return messages
         nonce = self._envelope_nonce
         out: list[dict[str, Any]] = []
+        host_escaped = False  # has out[-1] had its untrusted markers defanged?
         for msg in messages:
             if msg.get("role") == "system" and msg.get("_source"):
                 raw = msg.get("content")
                 text = raw if isinstance(raw, str) else str(raw or "")
-                wrapped = wrap_system_context(text, nonce)
+                wrapped = fence.wrap(text, nonce, fence.SYSTEM_REMINDER_TAG)
                 if out:
+                    if not host_escaped:
+                        out[-1] = self._neutralize_host(out[-1])
+                        host_escaped = True
                     out[-1] = self._append_text_block(out[-1], wrapped)
                 else:
                     out.append(msg)
                 continue
             out.append(msg)
+            host_escaped = False
         return out
+
+    @staticmethod
+    def _neutralize_host(msg: dict[str, Any]) -> dict[str, Any]:
+        """Return a copy of *msg* with operator-fence markers defanged in its text.
+
+        Defence-in-depth for the fold path: before a real
+        ``<system-reminder_{nonce}>`` block is appended to this (untrusted) host
+        turn, any literal ``<system-reminder>`` marker already in its content is
+        neutralised via :func:`turnstone.core.fence.neutralize` (opening +
+        closing) so a leaked or guessed nonce cannot be used to forge a trusted
+        block here.  Never mutates *msg* — the fold pass holds the read-only
+        contract (see :meth:`_prepare_wire_messages`).
+        """
+        copy = dict(msg)
+        content = copy.get("content")
+        if isinstance(content, str):
+            copy["content"] = fence.neutralize(content, fence.SYSTEM_REMINDER_TAG, opening=True)
+        elif isinstance(content, list):
+            copy["content"] = [
+                (
+                    {
+                        **p,
+                        "text": fence.neutralize(
+                            p["text"], fence.SYSTEM_REMINDER_TAG, opening=True
+                        ),
+                    }
+                    if isinstance(p, dict)
+                    and p.get("type") == "text"
+                    and isinstance(p.get("text"), str)
+                    else p
+                )
+                for p in content
+            ]
+        return copy
 
     @staticmethod
     def _append_text_block(msg: dict[str, Any], block: str) -> dict[str, Any]:
@@ -5349,6 +5397,7 @@ class ChatSession:
             call_id=call_id,
             budget_seconds=budget,
             patterns=og_patterns,
+            trusted_marker_nonce=self._envelope_nonce,
         )
 
         # Stage 2: LLM judge (opt-in, capability-gated).  The rate limiter

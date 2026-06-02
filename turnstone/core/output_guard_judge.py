@@ -37,13 +37,13 @@ from __future__ import annotations
 
 import json
 import re
-import secrets
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from turnstone.core import fence
 from turnstone.core.log import get_logger
 
 if TYPE_CHECKING:
@@ -217,19 +217,6 @@ def _extract_json(text: str) -> dict[str, Any] | None:
                     break
 
     return None
-
-
-# Closing-tag escape — case-insensitive, applied once on the raw output
-# before the user-prompt fence wrap.  Pre-compiled at module load.  The
-# substituted form (``<\/tool_output``) is still human-readable in logs
-# but cannot match the closing-tag pattern in the surrounding fence, so
-# an attacker injecting ``</tool_output_XYZ>`` text cannot break out of
-# the untrusted-data region — even if they happen to guess the nonce.
-_FENCE_ESCAPE_PATTERN = re.compile(r"</(\s*)tool_output", re.IGNORECASE)
-
-
-def _escape_fence_close(text: str) -> str:
-    return _FENCE_ESCAPE_PATTERN.sub(r"<\\/\1tool_output", text)
 
 
 # ---------------------------------------------------------------------------
@@ -516,12 +503,13 @@ class OutputGuardJudge:
     ) -> str:
         """Build the judge's user message with framing + a nonced fence.
 
-        Wraps ``output`` in ``<tool_output_{nonce}>...</tool_output_{nonce}>``
-        where ``{nonce}`` is per-call random hex.  Before wrapping, any
-        occurrence of ``</tool_output`` in the raw text (case-insensitive)
-        has a backslash inserted (``<\\/tool_output``) so an attacker
-        cannot escape the fence — even if they happen to guess the nonce,
-        the closing tag is no longer recognisable as a tag.
+        Wraps ``output`` in a per-call ``<tool_output_{nonce}>`` fence via
+        :func:`turnstone.core.fence.wrap`, which also neutralises any literal
+        ``</tool_output`` in the body so an attacker cannot escape the fence
+        even by guessing the nonce.  The fence here is per-call (the
+        ``_SYSTEM_PROMPT`` declares the fence *form*, not a specific value), in
+        contrast to the per-session operator fold that reuses one fence
+        (declared by exact value in the cached prefix).
 
         Framing fields (tool name + description + args + heuristic
         verdict + heuristic annotations) precede the fence.  The system
@@ -531,11 +519,7 @@ class OutputGuardJudge:
         are truncated to 500 chars to bound prompt cost while preserving
         shape.
         """
-        # Neutralise any literal closing-tag substring.  Case-insensitive
-        # because some providers normalise case in passthrough.  ``\\/``
-        # leaves the slash visible to a human reader but breaks the tag.
-        safe_output = _escape_fence_close(output)
-        nonce = secrets.token_hex(8)
+        nonce = fence.mint_nonce()
 
         lines: list[str] = []
         if func_name:
@@ -558,7 +542,7 @@ class OutputGuardJudge:
         header = "\n".join(lines)
         if header:
             header = f"{header}\n\n"
-        return f"{header}<tool_output_{nonce}>\n{safe_output}\n</tool_output_{nonce}>"
+        return f"{header}{fence.wrap(output, nonce, fence.TOOL_OUTPUT_TAG)}"
 
     def _normalize_risk(self, raw: Any) -> str:
         if not isinstance(raw, str):

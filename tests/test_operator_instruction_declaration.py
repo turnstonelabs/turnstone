@@ -1,5 +1,5 @@
 """Operator-instruction trust declaration — the fold-path system-prompt anchor
-that lets the nonce-delimited envelope drop escaping safely.
+that pins the per-session nonce as the sole trusted ``<system-reminder>`` marker.
 
 See ``turnstone.prompts.build_operator_instruction_declaration`` and the
 capability-gated emission in ``ChatSession._init_system_messages``.
@@ -20,8 +20,8 @@ if TYPE_CHECKING:
 class TestDeclarationText:
     def test_carries_nonce_on_both_tags(self) -> None:
         out = build_operator_instruction_declaration("7f3a9c2e")
-        assert "<system-reminder-7f3a9c2e>" in out
-        assert "</system-reminder-7f3a9c2e>" in out
+        assert "<system-reminder_7f3a9c2e>" in out
+        assert "</system-reminder_7f3a9c2e>" in out
 
     def test_includes_forgery_and_echo_guidance(self) -> None:
         out = build_operator_instruction_declaration("7f3a9c2e")
@@ -43,7 +43,7 @@ class TestSessionWiring:
         assert s._envelope_nonce  # minted once at construction
         sysmsg = "\n".join(m.get("content", "") for m in s.system_messages)
         assert "## Operator instructions" in sysmsg
-        assert f"<system-reminder-{s._envelope_nonce}>" in sysmsg
+        assert f"<system-reminder_{s._envelope_nonce}>" in sysmsg
 
     def test_native_model_omits_declaration(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # A model with native mid-conversation system support delivers operator
@@ -75,7 +75,7 @@ class TestFoldSystemTurns:
         out = s._fold_system_turns(msgs)
         assert len(out) == 1
         assert out[0]["role"] == "user"
-        assert f"<system-reminder-{nonce}>" in out[0]["content"]
+        assert f"<system-reminder_{nonce}>" in out[0]["content"]
         assert "also update the changelog" in out[0]["content"]
         # Read-only contract: the original predecessor is untouched.
         assert msgs[0]["content"] == "do it"
@@ -91,7 +91,7 @@ class TestFoldSystemTurns:
         out = s._fold_system_turns(msgs)
         assert len(out) == 1
         assert out[0]["role"] == "tool"
-        assert out[0]["content"].count(f"<system-reminder-{nonce}>") == 2
+        assert out[0]["content"].count(f"<system-reminder_{nonce}>") == 2
         assert "first" in out[0]["content"] and "second" in out[0]["content"]
 
     def test_base_prompt_system_message_not_folded(self) -> None:
@@ -135,6 +135,6 @@ class TestFoldSystemTurns:
         out = s._fold_system_turns(msgs)
         assert len(out) == 1
         text_parts = [p for p in out[0]["content"] if p.get("type") == "text"]
-        assert any(f"<system-reminder-{nonce}>" in p["text"] for p in text_parts)
+        assert any(f"<system-reminder_{nonce}>" in p["text"] for p in text_parts)
         # Original list/text part untouched.
         assert msgs[0]["content"][0]["text"] == "look"

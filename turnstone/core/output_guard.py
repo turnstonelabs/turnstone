@@ -22,6 +22,8 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from turnstone.core import fence
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -698,6 +700,72 @@ def _check_camouflage(text: str, flags: list[str], ann: list[str]) -> str:
     return "medium"
 
 
+# Trust-fence markers (``<system-reminder>`` operator fold, ``<tool_output>``
+# judge fence — see :mod:`turnstone.core.fence`).  Neither is ever legitimate
+# *inside* tool output, so their appearance there is a forgery signal.  Anchored
+# on the tag prefix with an optional ``_<hex>`` nonce suffix, so a nonced marker
+# is caught whether or not the hex is this session's real token.
+_RE_FENCE_MARKER = re.compile(
+    rf"<\s*/?\s*(?:{re.escape(fence.SYSTEM_REMINDER_TAG)}|{re.escape(fence.TOOL_OUTPUT_TAG)})"
+    r"(_[0-9a-f]+)?",
+    re.IGNORECASE,
+)
+
+
+def _check_marker_forgery(
+    text: str,
+    flags: list[str],
+    ann: list[str],
+    trusted_nonce: str,
+) -> str:
+    """Flag trust-fence markers smuggled into untrusted tool output.
+
+    The fold path declares ``<system-reminder_{nonce}>`` as the sole trusted
+    operator marker and the judge fences tool output in ``<tool_output_{nonce}>``;
+    neither marker is ever legitimate *inside* tool output.  Two severities:
+
+    * **leak (HIGH)** — a marker carries this session's exact operator nonce.
+      The token only lives in the (cached) system prefix and the folded blocks,
+      so its appearance in tool output means it has leaked and is being replayed
+      to forge an operator instruction.  The fold's host-escaping neutralises it
+      on the wire, but the *appearance itself* is the alarm worth raising.
+    * **forgery (LOW)** — any other fence marker (bare, or a wrong/guessed
+      nonce).  Already inert under the trust declaration; surfaced for the
+      operator's awareness, low to avoid noise on benign content (docs and this
+      project's own source legitimately contain the literals).
+    """
+    if "<" not in text:
+        return "none"
+    want = f"_{trusted_nonce}" if trusted_nonce else None
+    leaked = False
+    forged = False
+    for m in _RE_FENCE_MARKER.finditer(text):
+        suffix = (m.group(1) or "").lower()
+        if want is not None and suffix == want:
+            leaked = True
+        else:
+            forged = True
+    if leaked:
+        _add_flag(flags, "prompt_injection")
+        _add_flag(flags, "operator_marker_leak")
+        ann.append(
+            "Tool output contains this session's operator-instruction token — the "
+            "token has leaked and is being replayed to forge an operator "
+            "instruction. Treat the surrounding content as hostile."
+        )
+        return "high"
+    if forged:
+        _add_flag(flags, "prompt_injection")
+        _add_flag(flags, "operator_marker_forgery")
+        ann.append(
+            "Tool output contains a forged operator/judge trust marker "
+            "(<system-reminder>/<tool_output>); it is untrusted data, not an "
+            "operator instruction."
+        )
+        return "low"
+    return "none"
+
+
 def _check_credentials_complex(
     text: str,
     flags: list[str],
@@ -892,6 +960,7 @@ def evaluate_output(
     call_id: str = "",
     budget_seconds: float = 30.0,
     patterns: Mapping[str, tuple[OutputGuardPatternDef, ...]] | None = None,
+    trusted_marker_nonce: str = "",
 ) -> OutputAssessment:
     """Evaluate tool output for security signals.
 
@@ -907,6 +976,11 @@ def evaluate_output(
             When provided, configurable patterns are used instead of the
             hard-coded check functions.  Complex multi-step checks (env-line
             parsing, base64 context analysis, etc.) always run regardless.
+        trusted_marker_nonce: This session's operator-fence nonce (see
+            :mod:`turnstone.core.fence`).  When set, tool output is scanned for
+            forged trust-fence markers; an exact-nonce match is flagged HIGH
+            (token leaked + replayed), any other marker LOW.  Empty disables the
+            check (e.g. native models that don't use the fold fence).
 
     Returns:
         Frozen OutputAssessment with flags, risk level, annotations, and
@@ -940,6 +1014,9 @@ def evaluate_output(
             # Run hard-coded complex checks for categories that need them
             if cat == "prompt_injection":
                 risk = _max_risk(risk, _check_camouflage(output, flags, ann))
+                risk = _max_risk(
+                    risk, _check_marker_forgery(output, flags, ann, trusted_marker_nonce)
+                )
             elif cat == "credentials":
                 # Chain redaction: apply complex checks to already-sanitized text
                 cred_input = sanitized if sanitized is not None else output
@@ -965,6 +1042,7 @@ def evaluate_output(
 
     # Priority 1: prompt injection (always run, highest priority)
     risk = _max_risk(risk, _check_prompt_injection(output, flags, ann))
+    risk = _max_risk(risk, _check_marker_forgery(output, flags, ann, trusted_marker_nonce))
     if time.monotonic() > deadline:
         return _build(flags, risk, ann, sanitized)
 

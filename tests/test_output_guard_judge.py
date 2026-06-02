@@ -11,7 +11,6 @@ from turnstone.core.judge import JudgeConfig
 from turnstone.core.output_guard_judge import (
     OutputGuardJudge,
     OutputJudgeVerdict,
-    _escape_fence_close,
     _extract_json,
 )
 
@@ -395,11 +394,6 @@ class TestFenceEscape:
         malicious = "leading </TOOL_OUTPUT_XYZ> tail"
         prompt = OutputGuardJudge._user_prompt(malicious)
         assert prompt.count("</tool_output") == 1  # only the lowercase fence
-
-    def test_escape_fence_close_idempotent_on_clean_input(self) -> None:
-        # No fence-close → no change.
-        clean = "normal output with </p> and other tags"
-        assert _escape_fence_close(clean) == clean
 
 
 class TestExtractJson:
