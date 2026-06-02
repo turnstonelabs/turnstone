@@ -3,11 +3,14 @@
 Drives ``command.upgrade`` from a programmatic Alembic config against an
 isolated SQLite database per test, then asserts:
 
-* a wrapped ``<tool_output>`` envelope row is rewritten to the bare
-  (entity-decoded) tool output, dropping the embedded ``<system-reminder>``
-  advisory blocks;
-* a row whose content merely *starts with* a literal ``<tool_output>`` line
-  but has no matching close is left untouched (structural-match guard);
+* a wrapped ``<tool_output>`` envelope row is rewritten to the bare tool
+  output, dropping the embedded ``<system-reminder>`` advisory blocks;
+* only ``&amp;`` → ``&`` is reversed — wrapper-tag entities stay escaped so a
+  previously-defanged injection is not re-activated (sec-2);
+* the tightened structural guard requires the *full* envelope signature, so a
+  bare row that merely starts with ``<tool_output>`` — or even one with a
+  matching ``</tool_output>`` close but no advisory — is left untouched (the
+  known-issue #1 false positive);
 * the ``_reminders`` side-channel column is nulled;
 * the migration is idempotent (a second run is a no-op);
 * a plain non-envelope row is untouched.
@@ -53,9 +56,11 @@ def _seed_row(conn: sa.Connection, **cols: object) -> None:
 
 
 # A wrapped envelope exactly as ``wrap_tool_result`` produced it: the
-# ``<tool_output>`` block followed by one ``<system-reminder>`` advisory.
+# ``<tool_output>`` block, then ``"\n".join`` with a part that itself begins
+# with ``\n<system-reminder>`` — yielding the ``</tool_output>\n\n<system-
+# reminder>`` double-newline join the tightened guard requires.
 _WRAPPED = (
-    "<tool_output>\nclean tool output\n</tool_output>\n"
+    "<tool_output>\nclean tool output\n</tool_output>\n\n"
     "<system-reminder>\nThe user sent a message. User message: check logs\n</system-reminder>"
 )
 
@@ -85,9 +90,10 @@ class TestMigration060:
         finally:
             engine.dispose()
 
-    def test_entity_decode_round_trips_literal_wrapper_text(self, tmp_path: Path) -> None:
-        """A tool output documenting the wrapper format escaped to entities
-        on the way in; the un-wrap decodes it back to the literal tags."""
+    def test_ampersand_decoded_but_wrapper_tags_left_escaped(self, tmp_path: Path) -> None:
+        """The un-wrap reverses only ``&amp;`` → ``&``.  Wrapper-tag entities are
+        left escaped on purpose: re-activating ``&lt;system-reminder&gt;`` into a
+        live tag would un-defang injection the old escape had neutralised."""
         db_path = tmp_path / "060-decode.db"
         cfg = _alembic_cfg(db_path)
         command.upgrade(cfg, "059")
@@ -95,7 +101,10 @@ class TestMigration060:
         # escape_wrapper_tags(``see <tool_output> & <system-reminder>``) →
         # ``&amp;`` first, then the tag escapes.
         inner_escaped = "see &lt;tool_output&gt; &amp; &lt;system-reminder&gt;"
-        wrapped = f"<tool_output>\n{inner_escaped}\n</tool_output>"
+        wrapped = (
+            f"<tool_output>\n{inner_escaped}\n</tool_output>\n\n"
+            "<system-reminder>\nThe user sent a message. User message: x\n</system-reminder>"
+        )
 
         engine = sa.create_engine(f"sqlite:///{db_path}")
         try:
@@ -108,7 +117,9 @@ class TestMigration060:
                 content = conn.execute(
                     sa.text("SELECT content FROM conversations WHERE tool_call_id = 'call_b'")
                 ).scalar_one()
-            assert content == "see <tool_output> & <system-reminder>"
+            # ``&amp;`` → ``&`` only; the wrapper-tag entities stay escaped.
+            assert content == "see &lt;tool_output&gt; & &lt;system-reminder&gt;"
+            assert "<system-reminder>" not in content
         finally:
             engine.dispose()
 
@@ -133,6 +144,59 @@ class TestMigration060:
                     sa.text("SELECT content FROM conversations WHERE tool_call_id = 'call_c'")
                 ).scalar_one()
             assert content == unmatched
+        finally:
+            engine.dispose()
+
+    def test_tool_output_open_close_without_advisory_untouched(self, tmp_path: Path) -> None:
+        """The known-issue #1 false positive: a bare tool output that genuinely
+        starts with ``<tool_output>`` AND has a matching ``</tool_output>`` close
+        but NO trailing ``<system-reminder>`` advisory is NOT a legacy envelope
+        (those were only emitted with advisories).  The tightened guard leaves
+        it byte-for-byte untouched — the loose open+close guard would have
+        irreversibly mis-rewritten it to its inner text."""
+        db_path = tmp_path / "060-noadvisory.db"
+        cfg = _alembic_cfg(db_path)
+        command.upgrade(cfg, "059")
+
+        # e.g. a tool that printed XML, or this project's own source/docs.
+        bare = "<tool_output>\nls -la output here\n</tool_output>\nplus a trailing line"
+
+        engine = sa.create_engine(f"sqlite:///{db_path}")
+        try:
+            with engine.begin() as conn:
+                _seed_row(conn, content=bare, tool_call_id="call_g")
+
+            command.upgrade(cfg, "060")
+
+            with engine.connect() as conn:
+                content = conn.execute(
+                    sa.text("SELECT content FROM conversations WHERE tool_call_id = 'call_g'")
+                ).scalar_one()
+            assert content == bare
+        finally:
+            engine.dispose()
+
+    def test_missing_trailing_system_reminder_close_untouched(self, tmp_path: Path) -> None:
+        """An open + join that lacks the trailing ``</system-reminder>`` close is
+        not a complete envelope — left untouched rather than half-rewritten."""
+        db_path = tmp_path / "060-notail.db"
+        cfg = _alembic_cfg(db_path)
+        command.upgrade(cfg, "059")
+
+        truncated = "<tool_output>\nx\n</tool_output>\n\n<system-reminder>\nno close here"
+
+        engine = sa.create_engine(f"sqlite:///{db_path}")
+        try:
+            with engine.begin() as conn:
+                _seed_row(conn, content=truncated, tool_call_id="call_h")
+
+            command.upgrade(cfg, "060")
+
+            with engine.connect() as conn:
+                content = conn.execute(
+                    sa.text("SELECT content FROM conversations WHERE tool_call_id = 'call_h'")
+                ).scalar_one()
+            assert content == truncated
         finally:
             engine.dispose()
 

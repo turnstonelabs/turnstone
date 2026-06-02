@@ -10,14 +10,17 @@ turns, so the legacy carriers are now dead on the read path.
 This migration drains the carriers in place — UPDATE only, no row insertion:
 
 * **Envelopes** — every tool row whose ``content`` is a wrapped envelope is
-  rewritten to the bare (entity-decoded) tool output.  The embedded
-  ``<system-reminder>`` advisories are intentionally dropped (cosmetic loss of
-  historical nudge / interjection bubbles — the design accepts this rather than
-  resurrecting them as new rows).  The structural-match guard (open prefix AND a
-  matching close) is copied inline from the now-deleted
-  ``history_decoration.extract_advisories_from_tool_envelope`` so a tool output
-  that merely *starts with* a literal ``<tool_output>`` line — with no matching
-  close — is left untouched.
+  rewritten to the bare tool output.  The embedded ``<system-reminder>``
+  advisories are intentionally dropped (cosmetic loss of historical nudge /
+  interjection bubbles — the design accepts this rather than resurrecting them
+  as new rows).  The structural guard requires the *complete* legacy envelope
+  signature (``<tool_output>`` open, the exact ``</tool_output>\\n\\n<system-
+  reminder>\\n`` join, and a trailing ``</system-reminder>``) — not merely a
+  ``<tool_output>`` open + close — so a bare tool row that resembles the open
+  cannot be irreversibly mis-rewritten.  Only the ``&amp;`` → ``&`` half of the
+  original escape is reversed: re-activating the wrapper-tag escapes
+  (``&lt;system-reminder&gt;`` → ``<system-reminder>``) would un-defang
+  injection the old escape had neutralised, so those entities are left as-is.
 * **Reminders** — ``conversations._reminders`` is nulled wholesale; nothing
   writes the column anymore and the read path no longer projects it.
 
@@ -46,40 +49,63 @@ depends_on = None
 _BATCH = 500
 
 
-def _entity_decode_wrapper_tags(text: str) -> str:
-    """Reverse ``tool_advisory.escape_wrapper_tags`` (copied inline).
+def _decode_ampersand(text: str) -> str:
+    """Reverse only the ``&`` → ``&amp;`` half of ``escape_wrapper_tags``.
 
-    Decodes ``&amp;`` last so a body containing the literal string
-    ``&lt;tool_output&gt;`` round-trips identically to its source.
+    The original escape encoded ``&`` first, then the wrapper tags.  We
+    deliberately do NOT reverse the wrapper-tag half: a stored
+    ``&lt;system-reminder&gt;`` is content the old escape *neutralised* from
+    attacker tool output, and turning it back into a live ``<system-reminder>``
+    here would re-activate a previously-defanged injection in replayable
+    history (and ``downgrade`` cannot undo it).  Decoding ``&amp;`` → ``&`` is
+    safe and keeps genuine ampersands (and pre-existing ``&lt;…&gt;`` literals)
+    round-tripping; the cost is purely cosmetic — a tool output that truly
+    contained the literal text ``<tool_output>`` stays shown as the entity.
     """
-    if "&" not in text:
+    if "&amp;" not in text:
         return text
-    return (
-        text.replace("&lt;/tool_output&gt;", "</tool_output>")
-        .replace("&lt;tool_output&gt;", "<tool_output>")
-        .replace("&lt;system-reminder&gt;", "<system-reminder>")
-        .replace("&lt;/system-reminder&gt;", "</system-reminder>")
-        .replace("&amp;", "&")
-    )
+    return text.replace("&amp;", "&")
+
+
+# The legacy envelope (``tool_advisory.wrap_tool_result``) was emitted ONLY when
+# advisories were present, as ``"\n".join`` of a ``<tool_output>`` block and one
+# or more ``<system-reminder>`` blocks.  The exact bytes are therefore:
+#
+#     <tool_output>\n{escaped output}\n</tool_output>\n\n<system-reminder>\n …
+#       … \n</system-reminder>[\n\n<system-reminder>\n … \n</system-reminder>]*
+#
+# We match that full signature — open prefix AND the tool-output close followed
+# immediately by the ``\n\n<system-reminder>\n`` join AND a trailing
+# ``</system-reminder>`` — not just the ``<tool_output>`` open + close.  A bare
+# tool output that merely happens to start with ``<tool_output>`` (or even one
+# that contains a matching close) lacks the trailing advisory structure and is
+# left untouched, so a legit row can never be mis-rewritten.
+_TOOL_OPEN = "<tool_output>\n"
+_ENVELOPE_JOIN = "\n</tool_output>\n\n<system-reminder>\n"
+_ENVELOPE_TAIL = "\n</system-reminder>"
 
 
 def _unwrap_envelope(content: str) -> str | None:
-    """Return the bare tool output for a wrapped envelope, else ``None``.
+    """Return the bare tool output for a wrapped legacy envelope, else ``None``.
 
-    Structural-match guard (copied inline from the deleted
-    ``extract_advisories_from_tool_envelope``): the content must start with
-    the exact ``<tool_output>\\n`` open AND contain a matching
-    ``\\n</tool_output>`` close.  A tool output that merely starts with a
-    literal ``<tool_output>`` line but has no matching close is NOT an
-    envelope — return ``None`` so the caller leaves it untouched.
+    Requires the complete envelope signature (see the module-level constants),
+    not merely a ``<tool_output>`` open + close — the loose guard could
+    irreversibly mis-rewrite a bare tool row that resembled the open.  The
+    embedded ``<system-reminder>`` advisory blocks are intentionally dropped
+    (documented cosmetic loss); only the bare tool output is recovered.
+
+    The escape guarantees the body cannot contain a literal ``\\n</tool_output>``
+    (it was entity-encoded), so the first ``_ENVELOPE_JOIN`` is the real close.
     """
-    if not content.startswith("<tool_output>\n"):
+    if not content.startswith(_TOOL_OPEN):
         return None
-    close = content.find("\n</tool_output>")
-    if close == -1:
+    join = content.find(_ENVELOPE_JOIN)
+    if join == -1:
         return None
-    inner = content[len("<tool_output>\n") : close]
-    return _entity_decode_wrapper_tags(inner)
+    if not content.endswith(_ENVELOPE_TAIL):
+        return None
+    inner = content[len(_TOOL_OPEN) : join]
+    return _decode_ampersand(inner)
 
 
 def upgrade() -> None:
