@@ -1731,12 +1731,12 @@ class TestChannelCLI:
 
 
 # ---------------------------------------------------------------------------
-# Approval / plan-review interaction views — owner-check regression tests
+# Approval interaction views — owner-check regression tests
 # ---------------------------------------------------------------------------
 
 
 def _make_view_interaction(user_id: int, footer: str | None) -> MagicMock:
-    """Build a minimal interaction for ApprovalView / PlanReviewView tests."""
+    """Build a minimal interaction for ApprovalView tests."""
     interaction = MagicMock(spec=discord.Interaction)
     interaction.user = MagicMock()
     interaction.user.id = user_id
@@ -1764,7 +1764,6 @@ def _make_view_bot() -> MagicMock:
     bot.router = MagicMock()
     bot.router.resolve_user = AsyncMock(return_value="turnstone-user-1")
     bot.router.send_approval = AsyncMock()
-    bot.router.send_plan_feedback = AsyncMock()
     bot._pending_approval_msgs = {}
     return bot
 
@@ -1816,50 +1815,6 @@ class TestApprovalViewOwnerCheck:
         _run(view._handle(interaction, approved=True, always=False))
 
         view.bot.router.send_approval.assert_not_awaited()
-
-
-class TestPlanReviewViewOwnerCheck:
-    """PlanReviewView rejects clicks from anyone other than the session owner."""
-
-    def test_owner_approve_allowed(self, monkeypatch):
-        from turnstone.channels.discord.views import PlanReviewView
-
-        monkeypatch.setattr(
-            "turnstone.channels.discord.views._disable_buttons",
-            AsyncMock(),
-        )
-        view = PlanReviewView(_make_view_bot())
-        interaction = _make_view_interaction(user_id=42, footer="ws-1|corr-1|42")
-
-        _run(view._handle_approve(interaction))
-
-        view.bot.router.send_plan_feedback.assert_awaited_once_with(
-            ws_id="ws-1",
-            correlation_id="corr-1",
-            feedback="",
-        )
-
-    def test_non_owner_approve_rejected(self):
-        from turnstone.channels.discord.views import PlanReviewView
-
-        view = PlanReviewView(_make_view_bot())
-        interaction = _make_view_interaction(user_id=999, footer="ws-1|corr-1|42")
-
-        _run(view._handle_approve(interaction))
-
-        view.bot.router.send_plan_feedback.assert_not_awaited()
-        interaction.response.send_message.assert_awaited_once()
-
-    def test_non_owner_changes_modal_rejected(self):
-        from turnstone.channels.discord.views import PlanReviewView
-
-        view = PlanReviewView(_make_view_bot())
-        interaction = _make_view_interaction(user_id=999, footer="ws-1|corr-1|42")
-
-        _run(view._handle_changes(interaction))
-
-        interaction.response.send_modal.assert_not_awaited()
-        interaction.response.send_message.assert_awaited_once()
 
 
 class TestDiscordThreadOwnerCheck:
