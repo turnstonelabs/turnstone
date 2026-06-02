@@ -2943,11 +2943,31 @@ class TestMetacognitiveBuffers:
         specs = session._collect_advisories(
             assessment=None, func_name="bash", is_last_in_batch=True
         )
-        assert specs == [("user_interjection", "hows it going?", {"priority": "notice"})]
+        assert len(specs) == 1
+        source, content, meta = specs[0]
+        assert source == "user_interjection"
+        assert meta == {"priority": "notice"}
+        # Framed as the user's words (known #2 — keeps user, not operator,
+        # authority, especially on the native path), not the raw text.
+        assert content.endswith("User message: hows it going?")
+        assert "while you were working" in content
         # Queue cleared by the drain.
         assert session._queued_messages == {}
         # _collect_advisories itself appends nothing — the caller does.
         assert len(session.messages) == pre_count
+
+    def test_empty_interjection_dropped_on_drain(self, tmp_db):
+        """A queued message that reduces to empty — e.g. a bare ``!!!`` whose
+        priority prefix ``parse_priority`` strips to "" — produces no
+        user_interjection spec (an empty operator turn would fold to an empty
+        fence / paint a blank bubble).  The queue is still drained."""
+        session = _make_session()
+        session.queue_message("!!!", queue_msg_id="qe")
+        specs = session._collect_advisories(
+            assessment=None, func_name="bash", is_last_in_batch=True
+        )
+        assert specs == []
+        assert session._queued_messages == {}
 
     def test_collect_advisories_does_not_drain_queued_when_not_last(self, tmp_db):
         """Mid-batch results must NOT drain the queued message — the
@@ -3062,7 +3082,7 @@ class TestMetacognitiveBuffers:
         # The system turn carries the queued interjection.
         sys_turn = session.messages[3]
         assert sys_turn["_source"] == "user_interjection"
-        assert sys_turn["content"] == "typed during tool"
+        assert sys_turn["content"].endswith("User message: typed during tool")
         # The tool row was saved clean; a system row carries the interjection.
         tool_saves = [
             c for c in save_msg.call_args_list if len(c.args) >= 3 and c.args[1] == "tool"
@@ -3397,7 +3417,7 @@ class TestMetacognitiveBuffers:
         assert text_parts == ["the chart shows X"]
         sys_turn = next(m for m in session.messages if m.get("role") == "system")
         assert sys_turn["_source"] == "user_interjection"
-        assert sys_turn["content"] == "inspect the histogram"
+        assert sys_turn["content"].endswith("User message: inspect the histogram")
 
     def test_start_nudge_fires_through_send(self, tmp_db):
         """Pin the +1 count-shift invariant — `start` must still fire on the

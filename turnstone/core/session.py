@@ -105,6 +105,7 @@ from turnstone.core.storage._utils import normalize_search_terms
 from turnstone.core.tool_advisory import (
     escape_wrapper_tags,
     make_system_turn,
+    render_user_interjection,
 )
 from turnstone.core.tool_search import ToolSearchManager
 from turnstone.core.tools import (
@@ -2155,9 +2156,9 @@ class ChatSession:
             # steering-vector / control-char payloads sourced from
             # arbitrary shell output can't tamper with the envelope at
             # interpolation time.  The remaining fields ride as the
-            # queue entry's ``metadata`` so the frontend can render a
-            # ``.msg.watch-result`` card with command preview + poll
-            # counter.
+            # queue entry's ``metadata`` → sibling keys on the
+            # ``watch_triggered`` system turn, surfaced in the operator
+            # bubble (command preview + poll counter).
             text = reminder.get("text", "") if isinstance(reminder, dict) else ""
             sanitized = sanitize_payload(text)
             if not sanitized:
@@ -2883,8 +2884,46 @@ class ChatSession:
         Messages without a foldable system turn pass through unchanged
         (same object reference) so the common case is allocation-free.
         ``self.messages`` is never mutated.
+
+        After folding, empty-content user turns are dropped: the wake pipeline
+        drives a synthetic empty ``send("")`` so any-channel nudges drain, and on
+        the native path that user turn is left empty (the nudge stays inline) —
+        an empty user message is invalid on every provider wire.  The drop runs
+        *after* the fold so the fold-path wake turn, which the nudge folds into
+        and thereby fills, is kept.
         """
-        return self._fold_system_turns(messages)
+        folded = self._fold_system_turns(messages)
+        return self._drop_empty_user_turns(folded)
+
+    @staticmethod
+    def _is_empty_wire_content(content: Any) -> bool:
+        """True when *content* carries nothing the wire can send.
+
+        ``None`` / blank string / empty list count as empty; a list with any
+        parts (text, image, document) does not.
+        """
+        if content is None:
+            return True
+        if isinstance(content, str):
+            return not content.strip()
+        if isinstance(content, list):
+            return len(content) == 0
+        return False
+
+    @classmethod
+    def _drop_empty_user_turns(cls, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop user turns with empty content (see :meth:`_prepare_wire_messages`).
+
+        Identity-preserving: returns *messages* unchanged when no user turn is
+        empty, so the common path stays allocation-free.
+        """
+
+        def _drop(m: dict[str, Any]) -> bool:
+            return m.get("role") == "user" and cls._is_empty_wire_content(m.get("content"))
+
+        if not any(_drop(m) for m in messages):
+            return messages
+        return [m for m in messages if not _drop(m)]
 
     def _fold_system_turns(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Fold first-class operator-context system turns into the preceding turn.
@@ -5829,7 +5868,16 @@ class ChatSession:
                 queued_items = list(self._queued_messages.values())
                 self._queued_messages.clear()
             for text, priority in queued_items:
-                specs.append(("user_interjection", text, {"priority": priority}))
+                # Drop empty/whitespace interjections (e.g. a bare "!!!" whose
+                # priority prefix ``parse_priority`` strips to "") — an empty
+                # operator turn would fold to an empty fence / paint a blank
+                # bubble.  Frame the rest as the user's words so the turn keeps
+                # user (not operator) authority, including on the native path
+                # where it enters as a real role=system message.
+                if not text.strip():
+                    continue
+                framed = render_user_interjection(text, priority)
+                specs.append(("user_interjection", framed, {"priority": priority}))
 
             # Metacognitive tool-channel drain.  Queued by
             # ``_queue_tool_advisory`` from the tool_error / repeat

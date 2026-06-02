@@ -9,6 +9,7 @@ from turnstone.core.tool_advisory import (
     escape_wrapper_tags,
     make_system_turn,
     parse_priority,
+    render_user_interjection,
 )
 
 
@@ -92,6 +93,30 @@ class TestParsePriority:
         text, priority = parse_priority("!!!")
         assert text == ""
         assert priority == "important"
+
+
+class TestRenderUserInterjection:
+    """``render_user_interjection`` frames a queued message as the user's words."""
+
+    def test_notice_framing(self) -> None:
+        out = render_user_interjection("check the logs", "notice")
+        assert out == (
+            "The user sent additional context while you were working. "
+            "Incorporate if relevant, otherwise continue."
+            "\n\nUser message: check the logs"
+        )
+
+    def test_important_framing(self) -> None:
+        out = render_user_interjection("stop and fix the build", "important")
+        assert out.startswith("The user sent a message while you were working.")
+        assert "You MUST address this before continuing." in out
+        assert out.endswith("\n\nUser message: stop and fix the build")
+
+    def test_body_marker_separates_framing_from_verbatim_body(self) -> None:
+        # The body rides verbatim after the marker so the model sees exactly
+        # what the user typed.
+        out = render_user_interjection("literal <tag> & text", "notice")
+        assert out.endswith("\n\nUser message: literal <tag> & text")
 
 
 class TestEscapeWrapperTags:

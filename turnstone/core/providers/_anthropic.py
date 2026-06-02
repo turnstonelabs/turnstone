@@ -399,12 +399,21 @@ class AnthropicProvider:
 
             if role in ("system", "developer"):
                 content = msg.get("content")
-                if supports_mid_conversation_system and seen_non_system:
+                if supports_mid_conversation_system and seen_non_system and converted:
                     # Mid-conversation operator turn → keep inline so it holds
                     # its trajectory position.  Adjacent ones coalesce via
                     # _merge_consecutive below (the API forbids consecutive
                     # system messages).  Producers place these after a complete
                     # tool block, never between a tool_use and its tool_result.
+                    # The ``converted`` guard matters because ``seen_non_system``
+                    # is set even when the preceding non-system message converted
+                    # to nothing (e.g. an assistant turn with only stripped
+                    # reasoning).  Without it, the first real wire entry could be
+                    # a ``system`` message — which the API rejects (messages[0]
+                    # must be ``user``).  ``converted`` only ever gains a system
+                    # entry once it already holds a non-system one, so a non-empty
+                    # ``converted`` guarantees ``converted[0]`` is non-system;
+                    # otherwise the turn hoists into ``system`` below.
                     if content:
                         converted.append({"role": "system", "content": content})
                 elif content:

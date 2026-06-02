@@ -904,6 +904,25 @@ class TestAnthropicProvider:
         assert [m["role"] for m in converted] == ["user", "assistant", "system"]
         assert converted[-1]["content"] == "from now on, add type hints"
 
+    def test_leading_empty_assistant_then_system_hoists_when_native(self) -> None:
+        # An assistant turn that converts to nothing (empty content, no
+        # tool_calls, no provider_content) still flips seen_non_system, but it
+        # appended nothing — so a following operator system turn must NOT become
+        # messages[0] (the API requires messages[0]=user).  It hoists into the
+        # system param instead.  Guards the bug where ``seen_non_system`` alone
+        # gated inline emission.
+        messages = [
+            {"role": "assistant", "content": ""},
+            {"role": "system", "content": "operator note"},
+            {"role": "user", "content": "hi"},
+        ]
+        system, converted = self.provider._convert_messages(
+            messages, supports_mid_conversation_system=True
+        )
+        assert "operator note" in system
+        assert converted[0]["role"] == "user"
+        assert not any(m["role"] == "system" for m in converted)
+
     def test_consecutive_mid_conversation_system_coalesced_when_native(self) -> None:
         messages = [
             {"role": "user", "content": "go"},
