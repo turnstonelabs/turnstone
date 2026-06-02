@@ -54,14 +54,14 @@ class HistoryEvent(ServerEvent):
     Each entry in ``messages`` is a per-message dict the frontend
     consumes directly. Notable optional keys:
 
-    * ``role`` (``"user"`` / ``"assistant"`` / ``"tool"``)
+    * ``role`` (``"user"`` / ``"assistant"`` / ``"tool"`` / ``"system"``)
     * ``content`` — string for text turns, list for image / document parts
     * ``tool_calls`` — list of ``{id, name, arguments, verdict?,
       output_assessment?}`` (assistant turns)
     * ``tool_call_id`` — the originating call's id (tool turns)
-    * ``reminders`` — metacognitive nudge bubbles (user / tool channels)
-    * ``advisories`` — extracted ``UserInterjection`` payloads (tool
-      turns whose envelope wrapped queued-message advisories)
+    * ``source`` — the operator-context kind on a ``system`` turn
+      (``output_guard`` / ``user_interjection`` / ``tool_error`` / ...),
+      or ``"system_nudge"`` on a wake-driven empty user turn
     * ``reasoning`` — concatenated reasoning text for assistant turns
       that round-tripped a thinking-block lane (Anthropic-with-thinking
       today; OpenAI Responses + Gemini in later phases). Present only

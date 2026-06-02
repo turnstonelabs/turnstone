@@ -642,9 +642,9 @@
 .msg.user {
   color: var(--fg-bright);
 }
-/* .msg.user-reminder lives in shared_static/chat.css so both the
-   interactive UI and the console coord viewer pick up the same
-   yellow themed bubble. */
+/* .msg.system-context (operator-context system turns) lives in
+   shared_static/chat.css so both the interactive UI and the console coord
+   viewer pick up the same yellow themed bubble. */
 /* .msg.assistant / .msg.info / .msg.error alignment + baseline visuals
    come from shared_static/chat.css.  Interactive UI adds a pre-wrap
    override for info messages and a tightened tool-message shape with

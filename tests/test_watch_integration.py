@@ -12,10 +12,8 @@ seam.  The only stub is the LLM provider (patched
   ``sanitize_payload`` + soft-cap check + ``valid_until`` predicate +
   ``NudgeQueue.enqueue("watch_triggered", ..., "any", ...)``
 * ``ChatSession.send`` chat loop short-circuiting metacog detection
-* ``_attach_pending_user_reminders`` draining ``USER_DRAIN`` (which
-  matches ``"any"``)
-* ``_apply_reminders_for_provider`` splicing the rendered envelope onto
-  the user message before the wire boundary
+* ``_emit_pending_user_nudges`` draining ``USER_DRAIN`` (which matches
+  ``"any"``) into a first-class ``system`` turn after the user turn
 
 Per ``feedback_tests_through_boundaries.md``: direct injection tests
 that bypass these boundaries silently mask wiring bugs.  This test is
@@ -61,15 +59,15 @@ def _make_session() -> ChatSession:
 
 def test_watch_fires_then_user_send_drains_envelope(tmp_db, monkeypatch):
     """Pin the cross-PR concern that watch text reaches the model via
-    the unified ``<system-reminder>`` envelope path:
+    the unified operator-context ``system`` turn path:
 
     1. WatchRunner.dispatch fires watch text against the session's
        registered closure (synchronously — no daemon thread).
     2. NudgeQueue holds one ``"watch_triggered"`` entry on ``"any"``.
     3. session.send("ok") runs the chat loop with a stubbed LLM.
-    4. The drain seam drains the watch entry; the wire payload's user
-       message has the watch text spliced into a ``<system-reminder>``
-       envelope.
+    4. The drain seam drains the watch entry into a first-class
+       ``{"role": "system", "_source": "watch_triggered"}`` turn after
+       the user turn.
     """
     session = _make_session()
 
@@ -119,18 +117,17 @@ def test_watch_fires_then_user_send_drains_envelope(tmp_db, monkeypatch):
     # 4. Queue fully drained by the user-message attach seam.
     assert len(session._nudge_queue) == 0
 
-    # The user message that drove the assistant turn has the watch
-    # text in its ``_reminders`` side-channel — the production
-    # ``_apply_reminders_for_provider`` splice consumes that to wrap
-    # the content in ``<system-reminder>`` at the wire boundary.
+    # The watch text lands as a first-class operator-context ``system``
+    # turn following the user turn (the production drain seam now emits
+    # ``make_system_turn`` rather than the legacy ``_reminders`` splice).
     user_msgs = [m for m in session.messages if m.get("role") == "user"]
     assert user_msgs, "expected a user message in history"
-    last_user = user_msgs[-1]
-    reminders = last_user.get("_reminders") or []
+    assert "_reminders" not in user_msgs[-1]
+    sys_turns = [m for m in session.messages if m.get("role") == "system"]
     assert any(
-        r.get("type") == "watch_triggered" and "watch payload body" in r.get("text", "")
-        for r in reminders
-    ), f"expected watch_triggered reminder on user message; got {reminders!r}"
+        m["_source"] == "watch_triggered" and "watch payload body" in m["content"]
+        for m in sys_turns
+    ), f"expected a watch_triggered system turn; got {sys_turns!r}"
 
 
 def test_three_back_to_back_watch_fires_drain_into_one_turn(tmp_db, monkeypatch):
@@ -139,10 +136,10 @@ def test_three_back_to_back_watch_fires_drain_into_one_turn(tmp_db, monkeypatch)
     N back-to-back watch fires used to produce N successive
     ``send()`` turns (each a separate model invocation, capped at
     ``_MAX_WATCH_CHAIN = 5``).  After the switchover, the N entries
-    drain into ONE envelope splice on the next drain seam — one
-    assistant turn responding to all N watch results.  Pinning this
-    behavioural delta protects against accidental regression to
-    the old per-fire-turn shape.
+    drain on the next seam into N operator-context ``system`` turns
+    following ONE user turn — one assistant turn responding to all N
+    watch results.  Pinning this behavioural delta protects against
+    accidental regression to the old per-fire-turn shape.
     """
     session = _make_session()
 
@@ -177,13 +174,15 @@ def test_three_back_to_back_watch_fires_drain_into_one_turn(tmp_db, monkeypatch)
         session._title_generated = True
         session.send("user")
 
-    # All three drained into the single user-message attach.
-    user_msgs = [m for m in session.messages if m.get("role") == "user"]
-    last_user = user_msgs[-1]
-    reminders = last_user.get("_reminders") or []
-    watch_reminders = [r for r in reminders if r.get("type") == "watch_triggered"]
-    assert len(watch_reminders) == 3
-    bodies = [r.get("text", "") for r in watch_reminders]
+    # All three drained into three operator-context system turns after
+    # the single user turn.
+    watch_turns = [
+        m
+        for m in session.messages
+        if m.get("role") == "system" and m.get("_source") == "watch_triggered"
+    ]
+    assert len(watch_turns) == 3
+    bodies = [m["content"] for m in watch_turns]
     assert any("fire one" in b for b in bodies)
     assert any("fire two" in b for b in bodies)
     assert any("fire three" in b for b in bodies)

@@ -1,164 +1,47 @@
-"""Tool result advisory system — inject contextual advisories into tool output.
+"""Operator-context helpers — first-class system turns + envelope escaping.
 
-When advisories are present (output guard findings, queued user messages, etc.),
-the raw tool output is wrapped in ``<tool_output>`` tags and each advisory is
-appended as a ``<system-reminder>`` block.  When there are no advisories, the
-raw output passes through unchanged (zero overhead).
+Operator-level context injected mid-session (output-guard findings, user
+interjections, metacognitive nudges) lives in the conversation trajectory as
+first-class ``{"role": "system", "_source": <kind>, "content": ...}`` turns
+(see :func:`make_system_turn`).  At the wire boundary each turn is either kept
+inline (native mid-conversation system messages — claude-opus-4-8) or folded
+into the preceding turn as a nonce-delimited ``<system-reminder>`` block
+(:func:`wrap_system_context`) for every other model.
 
-The wrapper pattern is intentionally general: any feature that needs to
-communicate out-of-band context to the model at the tool-result boundary can
-produce a ``ToolAdvisory`` and feed it through ``wrap_tool_result()``.
+This module also hosts :func:`escape_wrapper_tags` (defence for the few call
+sites that interpolate model-controlled text next to a literal
+``<system-reminder>`` tag — e.g. ``ChatSession._skill_hint``) and
+:func:`parse_priority` (the ``!!!`` priority prefix on queued user messages).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, Protocol, runtime_checkable
-
-if TYPE_CHECKING:
-    from turnstone.core.output_guard import OutputAssessment
+import secrets
+from typing import Any, Final
 
 # Priority constants
 PRIORITY_IMPORTANT: Final = "important"
 PRIORITY_NOTICE: Final = "notice"
 
 
-# UserInterjection preamble strings — shared between the producer
-# (``UserInterjection.render``) and the replay parser
-# (``history_decoration._classify_advisory``).  Keeping them in one
-# place ensures the parser and producer can never drift on the exact
-# wording the parser uses to disambiguate priority.  Marker is the
-# fixed substring that separates the preamble from the user's body.
-_USER_INTERJECTION_NOTICE_PREAMBLE: Final = (
-    "The user sent additional context while you were working. "
-    "Incorporate if relevant, otherwise continue."
-)
-_USER_INTERJECTION_IMPORTANT_PREAMBLE: Final = (
-    "The user sent a message while you were working. You MUST address this before continuing."
-)
-_USER_INTERJECTION_BODY_MARKER: Final = "\n\nUser message: "
-
-
-# -- Protocol -----------------------------------------------------------------
-
-
-@runtime_checkable
-class ToolAdvisory(Protocol):
-    """Anything that can render advisory text for injection into a tool result."""
-
-    @property
-    def advisory_type(self) -> str: ...
-
-    def render(self) -> str: ...
-
-
-# -- Concrete advisory types --------------------------------------------------
-
-
-@dataclass(frozen=True)
-class GuardAdvisory:
-    """Advisory produced by the output guard when a tool result is flagged."""
-
-    assessment: OutputAssessment
-    func_name: str
-
-    @property
-    def advisory_type(self) -> str:
-        return "output_guard"
-
-    def render(self) -> str:
-        a = self.assessment
-        lines = [
-            f"Output guard: {', '.join(a.flags)} ({a.risk_level.upper()})",
-        ]
-        for ann in a.annotations:
-            lines.append(f"  {ann}")
-        if a.sanitized is not None:
-            lines.append(
-                "Credentials have been redacted. Do not attempt to reconstruct redacted values."
-            )
-        return "\n".join(lines)
-
-
-@dataclass(frozen=True)
-class UserInterjection:
-    """Advisory for a message the user sent while the model was executing.
-
-    Produced by ``ChatSession._collect_advisories`` on the LAST tool
-    result of a batch when ``_queued_messages`` is non-empty (Seam 1 in
-    the queued-message architecture).  Splicing inside the tool-result
-    envelope keeps the role sequence ``assistant -> tool`` intact for
-    strict-template providers and delivers the user's text on the
-    same turn as the tool batch.  The persisted DB row is the wrapped
-    envelope — replay extracts the advisory back out via
-    :func:`history_decoration.decorate_history_messages` and renders
-    it as a proper user bubble in the wire/UI layer, so the queued
-    message survives reconnect / page reload.
-    """
-
-    message: str
-    priority: str = PRIORITY_NOTICE
-
-    @property
-    def advisory_type(self) -> str:
-        return "user_interjection"
-
-    def render(self) -> str:
-        if self.priority == PRIORITY_IMPORTANT:
-            preamble = _USER_INTERJECTION_IMPORTANT_PREAMBLE
-        else:
-            preamble = _USER_INTERJECTION_NOTICE_PREAMBLE
-        return f"{preamble}{_USER_INTERJECTION_BODY_MARKER}{self.message}"
-
-
-@dataclass(frozen=True)
-class MetacognitiveAdvisory:
-    """Advisory carrying a metacognitive nudge attached to a tool result.
-
-    Used for nudges that respond to model behaviour at a tool boundary
-    (``tool_error``, ``repeat``).  Nudges that respond to user behaviour
-    (``correction``, ``denial``, ``resume``, ``start``, ``completion``)
-    splice into the next user message instead, so they share the same
-    ``<system-reminder>`` envelope but skip this advisory path.
-    """
-
-    nudge_type: str
-    message: str
-
-    @property
-    def advisory_type(self) -> str:
-        return f"metacognitive_{self.nudge_type}"
-
-    def render(self) -> str:
-        return self.message
-
-
-# -- Wrapper ------------------------------------------------------------------
-
-
 def escape_wrapper_tags(text: str) -> str:
-    """Neutralise sequences that would break the advisory envelope.
+    """Neutralise sequences that would break a ``<system-reminder>`` envelope.
 
     Replaces ``<tool_output>`` and ``<system-reminder>`` (open and close)
     with their HTML-entity-encoded forms so adjacent untrusted text
-    cannot fabricate or close one of the wrapper blocks. Use this on any
-    untrusted content that is glued next to a wrapper tag — tool output,
-    user message bodies, and (defense-in-depth) advisory render output.
+    cannot fabricate or close one of the wrapper blocks.  Use this on any
+    untrusted content that is glued next to a bare wrapper tag — e.g.
+    ``ChatSession._skill_hint`` interpolates model-controlled skill names
+    into a message that ends with a ``<system-reminder>`` block.
 
-    Round-trip symmetry with :func:`history_decoration._entity_decode_wrapper_tags`
-    requires escaping ``&`` first.  Otherwise a tool output that contains
-    the literal string ``&lt;tool_output&gt;`` (e.g. documentation
-    describing the wrapper format) would round-trip to the bare
-    ``<tool_output>`` tag, fabricating an envelope the wrapper layer
-    never produced.  The short-circuit on ``"<" not in text and "&" not
-    in text`` covers the common case where neither wrapper tag nor any
-    pre-existing entity is present — most tool outputs.
+    Encodes ``&`` first so a pre-existing literal like ``&lt;tool_output&gt;``
+    in the source text becomes ``&amp;lt;tool_output&amp;gt;`` and cannot
+    collide with our wrapper-tag escape strings.  The short-circuit on
+    ``"<" not in text and "&" not in text`` covers the common case where
+    neither a wrapper tag nor any pre-existing entity is present.
     """
     if "<" not in text and "&" not in text:
         return text
-    # Encode ``&`` first so a pre-existing literal like ``&lt;tool_output&gt;``
-    # in the source text becomes ``&amp;lt;tool_output&amp;gt;`` and
-    # cannot collide with our wrapper-tag escape strings.
     return (
         text.replace("&", "&amp;")
         .replace("</tool_output>", "&lt;/tool_output&gt;")
@@ -166,40 +49,6 @@ def escape_wrapper_tags(text: str) -> str:
         .replace("<system-reminder>", "&lt;system-reminder&gt;")
         .replace("</system-reminder>", "&lt;/system-reminder&gt;")
     )
-
-
-def wrap_tool_result(
-    output: str,
-    advisories: list[ToolAdvisory] | None = None,
-) -> str:
-    """Wrap tool output with advisory blocks when advisories are present.
-
-    When *advisories* is empty or ``None`` the raw *output* is returned
-    unchanged — no tags, no overhead.  Both the tool output and each
-    advisory's render text are escaped before interpolation: a future
-    caller wiring user-controlled text through the advisory layer
-    cannot close the ``<system-reminder>`` envelope from inside.
-    """
-    if not advisories:
-        return output
-
-    parts = [f"<tool_output>\n{escape_wrapper_tags(output)}\n</tool_output>"]
-    for advisory in advisories:
-        parts.append(
-            f"\n<system-reminder>\n{escape_wrapper_tags(advisory.render())}\n</system-reminder>"
-        )
-    return "\n".join(parts)
-
-
-def render_system_reminder(text: str) -> str:
-    """Render a standalone ``<system-reminder>`` block.
-
-    For attaching out-of-band guidance to a non-tool message — currently
-    the user-message metacognitive channel.  ``wrap_tool_result`` builds
-    the same envelope inline for tool results; this helper exists so the
-    user-message path uses the exact same envelope and escaping rules.
-    """
-    return f"<system-reminder>\n{escape_wrapper_tags(text)}\n</system-reminder>"
 
 
 def parse_priority(text: str) -> tuple[str, str]:
@@ -212,3 +61,99 @@ def parse_priority(text: str) -> tuple[str, str]:
     if text.startswith("!!!"):
         return text[3:].lstrip(), PRIORITY_IMPORTANT
     return text, PRIORITY_NOTICE
+
+
+# -- First-class system turns -------------------------------------------------
+# Operator-context (output-guard findings, user interjections, metacognitive
+# nudges) lives in the conversation trajectory as real
+# ``{"role": "system", "_source": <kind>, "content": ...}`` messages rather
+# than spliced into a neighbouring turn's ``content``.  At the wire boundary a
+# system turn is either kept inline (native mid-conversation system messages —
+# claude-opus-4-8) or folded into the preceding turn as a ``<system-reminder>``
+# block (every other model).  ``_source`` classifies the turn for UI rendering
+# and replay; it rides the persisted ``_source`` column and is stripped before
+# the LLM wire by ``sanitize_messages``.  See ``ChatSession`` for the producers
+# and the fold-or-keep pass.
+
+# Canonical ``_source`` values.  ``output_guard`` / ``user_interjection`` come
+# from the advisory producers above; the rest mirror the metacognition nudge
+# types (``turnstone.core.metacognition._NUDGE_MAP``) — kept in sync by
+# ``tests/test_tool_advisory.py::TestMakeSystemTurn``.
+SYSTEM_TURN_SOURCES: Final = frozenset(
+    {
+        "output_guard",
+        "user_interjection",
+        "correction",
+        "denial",
+        "resume",
+        "completion",
+        "start",
+        "tool_error",
+        "repeat",
+        "idle_children",
+        "watch_triggered",
+    }
+)
+
+
+def make_system_turn(source: str, content: str, **meta: Any) -> dict[str, Any]:
+    """Build a first-class operator-context system turn for ``self.messages``.
+
+    Returns ``{"role": "system", "_source": source, "content": content}``.
+    *source* must be one of :data:`SYSTEM_TURN_SOURCES`.  Extra keyword *meta*
+    fields are attached as leading-underscore sibling keys (e.g.
+    ``watch_name="ci"`` → ``_watch_name``) so they ride the persisted record
+    and the UI projection but are stripped before the LLM wire by
+    ``sanitize_messages``.  Keys already underscore-prefixed are kept as-is; a
+    meta key that normalises onto a reserved field (``_source``) is rejected so
+    the validated source can't be silently clobbered.
+
+    ``content`` is stored and — on the native mid-conversation-system path
+    (claude-opus-4-8) — sent to the model verbatim, so envelope-escaping is NOT
+    done here.  It belongs to the fallback fold step, which wraps the content
+    in a nonce-delimited ``<system-reminder>`` block via
+    :func:`wrap_system_context`.  Escaping in this builder would corrupt the
+    native path, where there is no envelope to break out of.
+    """
+    if source not in SYSTEM_TURN_SOURCES:
+        raise ValueError(f"unknown system-turn source: {source!r}")
+    turn: dict[str, Any] = {"role": "system", "_source": source, "content": content}
+    for key, value in meta.items():
+        norm = key if key.startswith("_") else f"_{key}"
+        if norm in turn:
+            raise ValueError(f"system-turn meta key {key!r} collides with reserved {norm!r}")
+        turn[norm] = value
+    return turn
+
+
+def mint_envelope_nonce() -> str:
+    """Mint an unguessable per-session nonce for system-context envelopes.
+
+    Eight hex chars (32 bits) is ample: the untrusted text an envelope wraps is
+    fixed *before* the nonce is minted, so it cannot adaptively guess the token
+    — the nonce only has to be unpredictable to that already-fixed content, not
+    a long-lived secret.  Mint once per session, declare it in the system
+    prompt as the trusted-envelope marker, and reuse it for every fold that
+    session (stable bytes → cache-friendly).
+    """
+    return secrets.token_hex(4)
+
+
+def wrap_system_context(content: str, nonce: str) -> str:
+    """Wrap operator content in a nonce-delimited ``<system-reminder>`` block.
+
+    The *nonce* (from :func:`mint_envelope_nonce`) makes the boundary
+    unforgeable: untrusted text glued nearby cannot open or close the block
+    because it cannot reproduce the suffix.  Both tags carry the nonce, so a
+    bare ``</system-reminder>`` in the body cannot end it.
+
+    No escaping is applied — that is the point: break-out resistance comes from
+    the unguessable nonce, not from neutralising specific literals.  Forgery
+    resistance, however, requires the system prompt to declare this exact nonce
+    as the *sole* trusted ``<system-reminder>`` marker (and instruct the model
+    never to echo it); without that declaration, dropping escaping would let an
+    untrusted body forge a fake reminder.  Use only on the fallback fold path;
+    the native mid-conversation-system path (claude-opus-4-8) sends content
+    verbatim as a real ``{"role":"system"}`` message with no envelope.
+    """
+    return f"<system-reminder-{nonce}>\n{content}\n</system-reminder-{nonce}>"

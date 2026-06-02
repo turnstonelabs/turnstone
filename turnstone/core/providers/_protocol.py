@@ -110,6 +110,14 @@ class ModelCapabilities:
     # (Chat Completions / vLLM / llama.cpp / Gemini-compat) is
     # persist-only and doesn't gate on this flag.
     supports_reasoning_replay: bool = False
+    # Mid-conversation system messages: append ``{"role": "system"}`` to the
+    # ``messages`` array (rather than editing the top-level ``system`` field) to
+    # add operator-level instructions partway through a session without
+    # invalidating the cached prefix.  When False, ``system``-role messages must
+    # be hoisted into the top-level ``system`` param (the universal fallback).
+    # Available on the Claude API only (NOT Bedrock / Vertex / Foundry), on
+    # NextOpus (claude-opus-4-8) only; no beta header required.
+    supports_mid_conversation_system: bool = False
     # Phase 3 reranker calibration — populated by calibrate-on-detect; read by
     # ChatSession._bm25_rerank_threshold. A non-empty rerank_scale is the
     # "has been calibrated" marker.

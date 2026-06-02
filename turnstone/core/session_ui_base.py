@@ -2363,49 +2363,23 @@ class SessionUIBase:
     def on_error(self, message: str) -> None:
         self._enqueue({"type": "error", "message": message})
 
-    def on_user_reminder(self, reminders: list[dict[str, Any]], source: str | None = None) -> None:
-        """Surface a metacognitive user-channel nudge as its own UI
-        element.
+    def on_system_turn(self, content: str, source: str) -> None:
+        """Surface a first-class operator-context system turn as its own
+        UI element.
 
-        Reminders live on the user message dict's ``_reminders``
-        side-channel and are spliced into ``content`` only at the
-        provider boundary; this event is what lets every connected
-        SSE consumer (other browser tabs, CLI mirrors, future channel
-        adapters) render the reminder bubble in lockstep with the
-        originating tab.  The history-replay path surfaces the same
-        shape via ``project_history_messages`` (the REST ``/history``
-        projection) so a tab reconnecting later renders the same bubble.
-
-        ``source`` mirrors the user-message dict's ``_source`` field
-        (today only ``"system_nudge"`` for wake-driven reminders).  The
-        frontend uses it to render the thin ``.msg.user.system-nudge``
-        marker before anchoring the reminder bubbles below it.
+        Operator context (output-guard findings, user interjections,
+        metacognitive nudges) lives in the conversation trajectory as a
+        real ``{"role": "system", "_source": <kind>, ...}`` turn (see
+        ``tool_advisory.make_system_turn``).  This event lets every
+        connected SSE consumer (other browser tabs, CLI mirrors, future
+        channel adapters) render the operator bubble in lockstep with the
+        originating tab's optimistic render.  The history-replay path
+        surfaces the same shape via ``project_history_messages`` (the REST
+        ``/history`` projection) so a tab reconnecting later renders the
+        same bubble.  ``source`` carries the turn's ``_source`` kind so
+        the frontend can label / style the bubble.
         """
-        evt: dict[str, Any] = {"type": "user_reminder", "reminders": reminders}
-        if source:
-            evt["source"] = source
-        self._enqueue(evt)
-
-    def on_tool_reminder(self, reminders: list[dict[str, Any]], tool_call_id: str) -> None:
-        """Surface a metacognitive tool-channel nudge (``tool_error`` /
-        ``repeat``) as its own UI element below the tool result that
-        triggered it.
-
-        Tool-channel reminders ride the same ``_reminders``
-        side-channel pattern as the user channel — kept out of
-        ``content`` so compaction / title-gen / channel adapters never
-        see the nudge text, spliced into the wire only via
-        ``_apply_reminders_for_provider``.  ``tool_call_id`` is the
-        anchor the frontend uses to render the bubble below the
-        specific tool result that triggered the batch's reminder.
-        """
-        self._enqueue(
-            {
-                "type": "tool_reminder",
-                "reminders": reminders,
-                "tool_call_id": tool_call_id,
-            }
-        )
+        self._enqueue({"type": "system_turn", "content": content, "source": source})
 
     # ------------------------------------------------------------------
     # Broadcast hooks — kind-specific transport.

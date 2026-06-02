@@ -218,12 +218,12 @@ def build_watch_reminder(
     """Build a structured ``watch_triggered`` reminder dict.
 
     Returns a dict with ``{type, text, watch_name, command, poll_count,
-    max_polls, is_final}`` so the frontend can render a structured
-    ``.msg.watch-result`` card with command preview + poll counter
-    instead of a plain advisory bubble.  The ``text`` field is the
-    formatted body (same content :func:`format_watch_message` produces)
-    so compaction / channel adapters / ``_apply_reminders_for_provider``
-    keep seeing the human-readable shell output as before.
+    max_polls, is_final}``.  The ``text`` field is the formatted body
+    (same content :func:`format_watch_message` produces) and becomes the
+    content of the first-class ``{"role": "system", "_source":
+    "watch_triggered"}`` turn the drain seam emits; the remaining fields
+    ride as sibling metadata.  Compaction / channel adapters keep seeing
+    the human-readable shell output via the ``text`` field.
     """
     return {
         "type": "watch_triggered",

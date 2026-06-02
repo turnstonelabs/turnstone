@@ -12,9 +12,8 @@ is production code:
   ``_wake_source_tag``
 * ``ChatSession.send`` chat loop short-circuiting metacog detection
 * ``_append_user_turn`` stamping ``_source = "system_nudge"``
-* ``_attach_pending_user_reminders`` draining ``USER_DRAIN``
-* ``_apply_reminders_for_provider`` splicing the rendered envelope
-  onto empty content
+* ``_emit_pending_user_nudges`` draining ``USER_DRAIN`` into a
+  first-class ``system`` turn after the synthetic empty user turn
 
 Per ``feedback_tests_through_boundaries.md``: direct injection tests
 that bypass these boundaries silently mask wiring bugs.  This test is
@@ -70,8 +69,8 @@ class _FakeUI:
     def on_state_change(self, state: str) -> None:
         self.events.append(("state", state))
 
-    def on_user_reminder(self, reminders: Any, source: str | None = None) -> None:
-        self.events.append(("user_reminder", reminders, source))
+    def on_system_turn(self, content: str, source: str) -> None:
+        self.events.append(("system_turn", content, source))
 
     def on_error(self, message: str) -> None:
         pass
@@ -253,13 +252,20 @@ def test_idle_event_through_real_session_manager_drives_wake_send(real_mgr, tmp_
         assert len(ws.session._nudge_queue) == 0
 
         # The synthesized empty user message landed in history with the
-        # ``_source`` audit tag and the reminder side-channel populated.
+        # ``_source`` audit tag; the nudge follows it as a first-class
+        # ``system`` turn (no _reminders side-channel).
         user_msgs = [m for m in ws.session.messages if m.get("role") == "user"]
         assert user_msgs, "expected a synthesized user message from the wake"
         wake_msg = user_msgs[-1]
         assert wake_msg["content"] == ""
         assert wake_msg.get("_source") == "system_nudge"
-        assert wake_msg.get("_reminders") == [{"type": "idle_children", "text": "your kids"}]
+        assert "_reminders" not in wake_msg
+        sys_turns = [m for m in ws.session.messages if m.get("role") == "system"]
+        assert {
+            "role": "system",
+            "_source": "idle_children",
+            "content": "your kids",
+        } in sys_turns
 
         # The wake-source tag is reset post-send so subsequent activity
         # behaves normally.
@@ -383,17 +389,17 @@ def test_coord_idle_with_active_children_emits_envelope_via_real_managers(coord_
 
         # Queue drained — the wake delivered the observer's enqueue.
         assert len(coord.session._nudge_queue) == 0
-        # The synthetic empty-user turn landed with a reminder containing
-        # both children.
+        # The synthetic empty-user turn landed; the idle_children nudge
+        # follows it as a first-class ``system`` turn containing both
+        # children.
         user_msgs = [m for m in coord.session.messages if m.get("role") == "user"]
-        # Two real msgs (user + assistant context above) plus the wake.
         wake_msg = user_msgs[-1]
         assert wake_msg["content"] == ""
         assert wake_msg.get("_source") == "system_nudge"
-        reminders = wake_msg.get("_reminders") or []
-        assert len(reminders) == 1
-        assert reminders[0]["type"] == "idle_children"
-        text = reminders[0]["text"]
+        sys_turns = [m for m in coord.session.messages if m.get("role") == "system"]
+        idle_turns = [m for m in sys_turns if m["_source"] == "idle_children"]
+        assert len(idle_turns) == 1
+        text = idle_turns[0]["content"]
         assert "research-pricing" in text
         assert "draft-rfc" in text
         assert "child-a" in text

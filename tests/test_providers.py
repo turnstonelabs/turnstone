@@ -868,6 +868,88 @@ class TestAnthropicProvider:
         system, _ = self.provider._convert_messages(messages)
         assert system == "Part 1.\n\nPart 2."
 
+    def test_mid_conversation_system_hoisted_when_not_native(self) -> None:
+        # Default (supports_mid_conversation_system=False): a system message
+        # after a user turn still hoists — non-native models rely on the fold
+        # pass having stripped operator turns before the converter sees them.
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "operator note"},
+        ]
+        system, converted = self.provider._convert_messages(messages)
+        assert "operator note" in system
+        assert all(m["role"] != "system" for m in converted)
+
+    def test_leading_system_hoists_even_when_native(self) -> None:
+        messages = [
+            {"role": "system", "content": "base prompt"},
+            {"role": "user", "content": "hi"},
+        ]
+        system, converted = self.provider._convert_messages(
+            messages, supports_mid_conversation_system=True
+        )
+        assert system == "base prompt"
+        assert [m["role"] for m in converted] == ["user"]
+
+    def test_mid_conversation_system_inline_when_native(self) -> None:
+        messages = [
+            {"role": "user", "content": "review this"},
+            {"role": "assistant", "content": "done"},
+            {"role": "system", "content": "from now on, add type hints"},
+        ]
+        system, converted = self.provider._convert_messages(
+            messages, supports_mid_conversation_system=True
+        )
+        assert system == ""  # nothing leading to hoist
+        assert [m["role"] for m in converted] == ["user", "assistant", "system"]
+        assert converted[-1]["content"] == "from now on, add type hints"
+
+    def test_consecutive_mid_conversation_system_coalesced_when_native(self) -> None:
+        messages = [
+            {"role": "user", "content": "go"},
+            {"role": "system", "content": "first"},
+            {"role": "system", "content": "second"},
+        ]
+        _, converted = self.provider._convert_messages(
+            messages, supports_mid_conversation_system=True
+        )
+        # _merge_consecutive coalesces the two system turns into one message
+        # (the API forbids consecutive system messages).
+        assert [m["role"] for m in converted] == ["user", "system"]
+        body = converted[1]["content"]
+        flat = (
+            body
+            if isinstance(body, str)
+            else " ".join(p.get("text", "") for p in body if isinstance(p, dict))
+        )
+        assert "first" in flat and "second" in flat
+
+    def test_mid_conversation_system_after_tool_result_when_native(self) -> None:
+        messages = [
+            {"role": "user", "content": "run it"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "run", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            {"role": "system", "content": "user said: also update changelog"},
+        ]
+        _, converted = self.provider._convert_messages(
+            messages, supports_mid_conversation_system=True
+        )
+        # The operator turn lands after the tool_result user turn — a valid slot.
+        roles = [m["role"] for m in converted]
+        assert roles[-1] == "system"
+        assert roles[-2] == "user"  # the packed tool_result turn
+        assert converted[-1]["content"] == "user said: also update changelog"
+
     def test_reasoning_params_mapping(self) -> None:
         assert self.provider._reasoning_params("low", None, max_tokens=32768) == {
             "thinking": {"type": "enabled", "budget_tokens": 1024}
@@ -1282,6 +1364,7 @@ class TestAnthropicHelpers:
         assert caps.supports_tool_search is True
         assert caps.supports_vision is True
         assert caps.supports_reasoning_replay is True
+        assert caps.supports_mid_conversation_system is True
 
     def test_capabilities_opus_4_8_dated(self) -> None:
         from turnstone.core.providers._anthropic import AnthropicProvider
@@ -3141,6 +3224,40 @@ class TestModelCapabilitiesToolSearch:
 
         caps = ModelCapabilities()
         assert caps.supports_tool_search is False
+
+
+class TestMidConversationSystemCapability:
+    """supports_mid_conversation_system — NextOpus (claude-opus-4-8) only."""
+
+    def test_default_is_false(self) -> None:
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        caps = ModelCapabilities()
+        assert caps.supports_mid_conversation_system is False
+
+    def test_opus_4_8_supports_it(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        for model in ("claude-opus-4-8", "claude-opus-4-8-20260601"):
+            caps = provider.get_capabilities(model)
+            assert caps.supports_mid_conversation_system is True, model
+
+    def test_other_claude_models_do_not(self) -> None:
+        """Only NextOpus has it; older/other Claude models and the default off."""
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        for model in (
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
+            "claude-opus-4-5",
+            "claude-unknown-9",  # Anthropic default
+        ):
+            caps = provider.get_capabilities(model)
+            assert caps.supports_mid_conversation_system is False, model
 
 
 # ---------------------------------------------------------------------------

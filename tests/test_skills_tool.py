@@ -1314,6 +1314,13 @@ class TestSkillCatalogDisclosure:
         ui = MagicMock()
         session.ui = ui
         session.model = "test-model"
+        # ``_init_system_messages`` resolves capabilities once (for the
+        # operator-instruction nonce declaration on the fold path); with no
+        # provider it skips the declaration.  ``_envelope_nonce`` /
+        # ``_model_alias`` are set by ``__init__`` (bypassed here).
+        session._provider = None
+        session._model_alias = None
+        session._envelope_nonce = "test1234"
         session._ws_id = "ws-test"
         session._node_id = "node-1"
         session._skill_name = None

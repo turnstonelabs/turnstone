@@ -142,10 +142,7 @@ class NullUI:
     def on_error(self, message: str) -> None:
         pass
 
-    def on_user_reminder(self, reminders: list[dict[str, Any]], source: str | None = None) -> None:
-        pass
-
-    def on_tool_reminder(self, reminders: list[dict[str, Any]], tool_call_id: str) -> None:
+    def on_system_turn(self, content: str, source: str) -> None:
         pass
 
     def on_state_change(self, state: str) -> None:

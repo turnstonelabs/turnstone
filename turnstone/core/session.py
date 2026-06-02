@@ -48,7 +48,6 @@ from turnstone.core.config import get_searxng_engines, get_searxng_url
 from turnstone.core.edit import find_occurrences, pick_nearest
 from turnstone.core.history_decoration import (
     attach_vllm_chat_reasoning_field,
-    extract_advisories_from_tool_envelope,
 )
 from turnstone.core.log import get_logger
 from turnstone.core.memory import (
@@ -102,7 +101,12 @@ from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS
 from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
 from turnstone.core.storage._registry import get_storage
 from turnstone.core.storage._utils import normalize_search_terms
-from turnstone.core.tool_advisory import escape_wrapper_tags, render_system_reminder
+from turnstone.core.tool_advisory import (
+    escape_wrapper_tags,
+    make_system_turn,
+    mint_envelope_nonce,
+    wrap_system_context,
+)
 from turnstone.core.tool_search import ToolSearchManager
 from turnstone.core.tools import (
     BUILTIN_TOOL_NAMES,
@@ -120,6 +124,7 @@ from turnstone.prompts import (
     INTERACTIVE_CONSENT_CLIENT_TYPES,
     ClientType,
     SessionContext,
+    build_operator_instruction_declaration,
     compose_system_message,
 )
 from turnstone.ui.colors import DIM, GRAY, GREEN, RED, RESET, YELLOW, bold, cyan, dim
@@ -143,7 +148,6 @@ if TYPE_CHECKING:
         StreamChunk,
     )
     from turnstone.core.rerank import RerankClient, Reranker
-    from turnstone.core.tool_advisory import ToolAdvisory
     from turnstone.core.web_search import WebSearchClient
 
 # ---------------------------------------------------------------------------
@@ -594,16 +598,6 @@ _SPEC_ARGUMENTS_LITERAL_RE = re.compile(r"\$ARGUMENTS\b(?!\[)")
 # not its earliest.
 _WATCH_QUEUE_SOFT_CAP = 50
 
-# Per-reminder ``text`` field clamp on the persisted ``_reminders``
-# JSON column.  Bounds row width and the FTS5 index against pathological
-# producers (a watch streaming unbounded shell output, a corruption-class
-# steering payload).  The in-memory side-channel keeps the full body —
-# only the persisted JSON is clamped — so the live splice and UI render
-# see the same shape.  Cap is in UTF-8 bytes so non-ASCII payloads
-# (CJK, emoji) can't blow the byte ceiling 4x by living entirely under
-# the codepoint count.
-REMINDER_TEXT_STORAGE_CAP = 8192
-
 _RERANK_TIMEOUT_CAP_S = 15.0  # reranking <=50 short docs is fast; cap so a hung
 # endpoint falls back to BM25 in seconds, not up to tools.timeout (120s default).
 # Per-turn memory rerank makes the long timeout a turn-stall hazard.
@@ -787,10 +781,7 @@ class SessionUI(Protocol):
     def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None: ...
     def on_info(self, message: str) -> None: ...
     def on_error(self, message: str) -> None: ...
-    def on_user_reminder(
-        self, reminders: list[dict[str, Any]], source: str | None = None
-    ) -> None: ...
-    def on_tool_reminder(self, reminders: list[dict[str, Any]], tool_call_id: str) -> None: ...
+    def on_system_turn(self, content: str, source: str) -> None: ...
     def on_state_change(self, state: str) -> None: ...
     def on_rename(self, name: str) -> None: ...
     def on_intent_verdict(self, verdict: dict[str, Any]) -> None:
@@ -1041,12 +1032,13 @@ class ChatSession:
         self._watch_runner: Any = None  # WatchRunner | None
         # Metacognitive nudges: ephemeral prompts for proactive memory use.
         # One ``NudgeQueue`` per session; producers tag each entry with a
-        # channel and consumers drain by filter:
+        # channel and consumers drain by filter, emitting each drained nudge
+        # as a first-class ``{"role": "system"}`` turn (see
+        # ``tool_advisory.make_system_turn``):
         #   - "user" entries drain at the next user-message seam via
-        #     ``_attach_pending_user_reminders`` and splice as
-        #     <system-reminder> blocks
+        #     ``_emit_pending_user_nudges`` (system turn AFTER the user turn)
         #   - "tool" entries drain at the next tool-result batch via
-        #     ``_collect_advisories`` (alongside ``GuardAdvisory``)
+        #     ``_collect_advisories`` (system turns AFTER the tool batch)
         #   - "any" entries drain at whichever seam fires first; used for
         #     wake-trigger-driven nudges that should not pin to a
         #     specific seam
@@ -1057,14 +1049,13 @@ class ChatSession:
         # Wake-trigger plumbing: ``deliver_wake_nudge_from_queue`` sets
         # this tag while sending a synthetic empty user turn so that
         # ``_check_metacognitive_nudge`` and the ``_queue_*_advisory``
-        # producers short-circuit (the wake's reminder text contains
+        # producers short-circuit (the wake's nudge text contains
         # trigger words like "don't" that would otherwise re-fire
-        # correction nudges on top of the envelope) and so the
-        # synthesized user message gets stamped ``_source`` for
-        # audit / replay distinction.
+        # correction nudges on top of it) and so the synthesized user
+        # message gets stamped ``_source`` for audit / replay distinction.
         self._wake_source_tag: str = ""
-        # Reminders pre-drained by ``deliver_wake_nudge_from_queue``
-        # — handed to ``_attach_pending_user_reminders`` so the synthesized
+        # Nudge entries pre-drained by ``deliver_wake_nudge_from_queue``
+        # — handed to ``_emit_pending_user_nudges`` so the synthesized
         # send doesn't re-drain (and so we can bail out before send when
         # every entry's ``valid_until`` predicate dropped its item).
         self._wake_drained_reminders: list[dict[str, Any]] | None = None
@@ -1192,6 +1183,12 @@ class ChatSession:
         self._skill_content: str | None = None
         self._skill_resources: dict[str, str] = {}
         self._skill_resources_dir: str | None = None
+        # Per-session nonce for the operator-instruction envelope — the fold
+        # path's ``<system-reminder-{nonce}>`` marker.  Minted once per session,
+        # declared in the system prompt as the sole trusted marker, and reused by
+        # every fold this session.  Transient/wire-only (not persisted): the fold
+        # re-wraps each build, so a fresh nonce per session-load is fine.
+        self._envelope_nonce = mint_envelope_nonce()
         self._load_skills()
         # Memory selection keys off the recent-user-message query, but a fresh
         # session has no messages yet here -> the first compose would inject
@@ -2125,9 +2122,9 @@ class ChatSession:
         The dispatch closure is the unified pull-model path: each watch
         fire enqueues a ``"watch_triggered"`` entry on ``"any"`` channel,
         and the existing drain seams (USER_DRAIN, TOOL_DRAIN,
-        ``IdleNudgeWatcher`` IDLE wake) splice it into a
-        ``<system-reminder>`` envelope at the wire boundary — uniform
-        with every other metacog nudge.
+        ``IdleNudgeWatcher`` IDLE wake) emit it as a first-class
+        ``{"role": "system"}`` turn — uniform with every other metacog
+        nudge.
 
         The closure carries:
           - a soft cap on per-session ``"watch_triggered"`` depth via
@@ -2472,13 +2469,6 @@ class ChatSession:
         if not fork:
             self._ws_id = ws_id
         self.messages = messages
-        # Loaded reminders are already delivered — the flag is
-        # session-scoped and not persisted, so without this guard the
-        # next user turn would re-splice every historical reminder onto
-        # the wire.
-        for msg in self.messages:
-            if msg.get("_reminders"):
-                msg["_reminders_delivered"] = True
         self._read_files.clear()
         self._repeat_detector.clear()
         self._last_usage = None
@@ -2576,7 +2566,12 @@ class ChatSession:
             for msg in self.messages:
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
-                pd = msg.get("provider_data")
+                # Provider-fidelity blocks ride the in-memory
+                # ``_provider_content`` key (the live save path at
+                # ``_run_loop`` reads the same key); the storage column is
+                # ``provider_data``.  Reading ``provider_data`` here silently
+                # lost the blocks on every fork.
+                pd = msg.get("_provider_content")
                 try:
                     pd_str = json.dumps(pd) if pd and not isinstance(pd, str) else pd
                 except (TypeError, ValueError):
@@ -2592,7 +2587,6 @@ class ChatSession:
                         "tool_calls": tc_json,
                         "provider_data": pd_str,
                         "source": src if isinstance(src, str) and src else None,
-                        "reminders": self._encode_reminders(msg.get("_reminders")),
                     }
                 )
             save_messages_bulk(bulk_rows)
@@ -2692,19 +2686,29 @@ class ChatSession:
                 kind=self._kind,
             )
             dev_parts = [composed]
+        # Capability-gated system-prompt additions.  Resolve caps once here, via
+        # _resolve_capabilities (NOT _get_capabilities) so we don't populate
+        # self._cached_capabilities during __init__ — that would make later
+        # patches of provider.get_capabilities (common in tests) silently no-op
+        # for the primary session model.  Cheap to recompute; no caching needed.
+        # Guarded on _provider for early/edge init paths.
+        caps = (
+            self._resolve_capabilities(self._provider, self.model, self._model_alias)
+            if self._provider is not None
+            else None
+        )
+        # Operator-instruction trust anchor — declared only on the fold path.
+        # The native mid-conversation-system path (claude-opus-4-8) delivers
+        # operator turns as real {"role":"system"} messages with no envelope, so
+        # no <system-reminder-{nonce}> marker appears and no declaration applies.
+        if caps is not None and not caps.supports_mid_conversation_system:
+            dev_parts.append("\n\n" + build_operator_instruction_declaration(self._envelope_nonce))
         # Tool search hint (client-side mode only — native mode needs no hint).
-        # Uses _resolve_capabilities directly rather than _get_capabilities so
-        # we don't populate self._cached_capabilities during __init__; that
-        # would make later patches of provider.get_capabilities (common in
-        # tests) silently no-op for the primary session model.  The flag we
-        # read here is cheap to recompute; no caching is required.
-        if self._tool_search:
-            caps = self._resolve_capabilities(self._provider, self.model, self._model_alias)
-            if not caps.supports_tool_search:
-                dev_parts.append(
-                    "\n\nAdditional tools are available via tool_search. "
-                    "Use it when you need a capability not in your current tool set."
-                )
+        if self._tool_search and caps is not None and not caps.supports_tool_search:
+            dev_parts.append(
+                "\n\nAdditional tools are available via tool_search. "
+                "Use it when you need a capability not in your current tool set."
+            )
         # MCP resource catalog (lets the model know what's available for read_resource)
         if self._mcp_client:
             # Per-user merge: pool entries for ``self._mcp_user_id`` are
@@ -2857,202 +2861,97 @@ class ChatSession:
         """System messages + conversation history."""
         return self.system_messages + self.messages
 
-    @staticmethod
-    def _encode_reminders(
-        reminders: list[dict[str, Any]] | None,
-    ) -> str | None:
-        """JSON-encode a ``_reminders`` list for the storage column.
-
-        Returns ``None`` when *reminders* is empty / falsy so callers can
-        feed the result straight into ``save_message(..., reminders=...)``
-        without a separate empty check.
-
-        Each entry's ``text`` field is clamped to
-        :data:`REMINDER_TEXT_STORAGE_CAP` UTF-8 bytes before encoding;
-        the in-memory dict keeps the full body so the live splice and
-        UI render see the same shape, only the persisted JSON is
-        clamped.  Byte-clamping (rather than codepoint-clamping) keeps
-        the row-width / FTS5-index bound tight for non-ASCII payloads.
-        """
-        if not reminders:
-            return None
-        capped: list[dict[str, Any]] = []
-        for r in reminders:
-            if not isinstance(r, dict):
-                continue
-            text = r.get("text")
-            if isinstance(text, str):
-                encoded = text.encode("utf-8")
-                if len(encoded) > REMINDER_TEXT_STORAGE_CAP:
-                    clamped = dict(r)
-                    clamped["text"] = encoded[:REMINDER_TEXT_STORAGE_CAP].decode(
-                        "utf-8", errors="ignore"
-                    )
-                    capped.append(clamped)
-                    continue
-            capped.append(r)
-        if not capped:
-            return None
-        return json.dumps(capped, separators=(",", ":"))
-
-    def _apply_reminders_for_provider(
+    def _prepare_wire_messages(
         self,
         messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Return a transient copy of *messages* with ``_reminders`` rendered
-        inline for the model.
+        """Return a transient copy of *messages* prepared for the provider wire.
 
-        Metacognitive nudges live on the message dict's ``_reminders``
-        side-channel regardless of role — user messages carry
-        user-channel nudges (correction / denial / resume / start /
-        completion), tool messages carry tool-channel nudges
-        (tool_error / repeat).  Both ride the same side-channel so
-        ``self.messages`` and every downstream consumer (UI replay,
-        compaction, title gen, channel adapters, DB) see clean
-        ``content``; only the wire-bound copy here carries the
-        rendered reminder.
+        Operator-context lives as first-class ``{"role": "system",
+        "_source": ...}`` turns in the conversation trajectory (output-guard
+        findings, user interjections, metacognitive nudges — see
+        :func:`turnstone.core.tool_advisory.make_system_turn`).  This pass
+        folds them for the wire via :meth:`_fold_system_turns`: non-native
+        models get each turn wrapped as a nonce-delimited
+        ``<system-reminder>`` block on the preceding turn; native
+        mid-conversation-system models (claude-opus-4-8) keep them inline
+        for the Anthropic converter to emit as real ``system`` messages.
 
-        For each message that has ``_reminders`` AND has not yet been
-        flagged delivered, build a shallow copy and splice the reminders
-        as ``<system-reminder>`` blocks onto the trailing edge of the
-        copy's ``content`` — string content gets a tail block, list
-        content gets the block on the trailing text part (or a new text
-        part if there isn't one).  Messages without ``_reminders`` (or
-        already delivered) pass through unchanged (same object
-        reference) so the common case is allocation-free.
-
-        **Reminder lifecycle.**  After a successful provider stream
-        ``_mark_reminders_delivered`` flips ``_reminders_delivered`` to
-        ``True`` on every message (user or tool) that carried reminders
-        into that call, so subsequent provider calls skip them — the
-        model sees each reminder once, the turn it advised.  The
-        ``_reminders`` key itself stays on the message dict for the
-        lifetime of the in-memory session so ``/history`` (reconnecting
-        tabs, multi-tab live mirrors) still renders the same nudge
-        bubbles the originating tab saw; only the wire-side replay is
-        suppressed.  Compaction is the natural full drain (it replaces
-        ``self.messages`` wholesale).
-
-        ``sanitize_messages`` later drops both leading-underscore sibling
-        keys (``_reminders`` and ``_reminders_delivered``) on the way to
-        the wire, so the provider sees only ``content`` with the
-        reminder spliced in.
-
-        **Read-only contract on the returned list.**  The pass-through
-        path returns the original ``msg`` by reference; callers must
-        not mutate the returned dicts in place (today's only callers —
-        ``sanitize_messages`` + provider conversion — construct new
-        dicts, so the contract holds).  Mutations on the spliced copy
-        are safe; mutations on a pass-through reference would bleed
-        back into ``self.messages``.
+        Messages without a foldable system turn pass through unchanged
+        (same object reference) so the common case is allocation-free.
+        ``self.messages`` is never mutated.
         """
+        return self._fold_system_turns(messages)
+
+    def _fold_system_turns(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Fold first-class operator-context system turns into the preceding turn.
+
+        First-class ``{"role": "system", "_source": ...}`` turns carry operator
+        context (advisories / nudges / interjections — see
+        ``tool_advisory.make_system_turn``).  Models WITHOUT native
+        mid-conversation system support can't take a ``system`` message
+        mid-array, so each such turn is wrapped via
+        :func:`turnstone.core.tool_advisory.wrap_system_context` (nonce-delimited
+        — the system prompt declares the nonce as the sole trusted marker via
+        ``build_operator_instruction_declaration``) and appended to the preceding
+        wire turn's content, then dropped from the list.  No escaping: the nonce
+        makes the block unforgeable.
+
+        Native models (``supports_mid_conversation_system``) keep the turns
+        inline — the Anthropic converter emits them as real ``system`` messages.
+        Base-prompt system messages (no ``_source``) pass through.  Consecutive
+        operator turns fold onto the shared predecessor in order, so the wire
+        never carries two adjacent ``system`` messages.  An operator turn with no
+        predecessor (should not occur — they follow the turn they relate to) is
+        kept standalone so nothing is silently dropped.
+
+        Returns a transient copy; ``self.messages`` is untouched.
+        """
+        if self._provider is None:
+            return messages
+        if self._get_capabilities().supports_mid_conversation_system:
+            return messages
+        nonce = self._envelope_nonce
         out: list[dict[str, Any]] = []
         for msg in messages:
-            raw_reminders = msg.get("_reminders")
-            if not raw_reminders or msg.get("_reminders_delivered"):
-                out.append(msg)
-                continue
-            # Defensive filter — only dict entries are valid; a string /
-            # None / other shape from corruption or partial state must
-            # not abort the whole send via an AttributeError on .get().
-            # Mirrors the same filter ``project_history_messages``
-            # (turnstone.core.history_decoration) applies on the
-            # wire-out side.
-            reminders = [r for r in raw_reminders if isinstance(r, dict)]
-            if not reminders:
-                out.append(msg)
-                continue
-            block = "\n\n" + "\n\n".join(
-                render_system_reminder(r.get("text", "")) for r in reminders
-            )
-            copy = dict(msg)
-            content = copy.get("content")
-            if isinstance(content, str):
-                # Tool messages whose content already carries a
-                # ``<tool_output>`` envelope (queued-message advisories
-                # via ``wrap_tool_result``, output_guard findings) must
-                # not be re-escaped — the wrapper has already escaped
-                # the raw body, and re-escaping would entity-encode the
-                # envelope's literal ``<tool_output>`` and
-                # ``<system-reminder>`` tags so the model sees
-                # ``&lt;tool_output&gt;...`` instead of a parseable
-                # envelope.  Append the metacog block as a trailing
-                # ``<system-reminder>`` (same shape ``wrap_tool_result``
-                # produces when stacking multiple advisories).
-                #
-                # Detect the wrap by *parsing* the envelope structure
-                # (open + matching close + zero or more system-reminder
-                # blocks) rather than a bare ``startswith`` prefix
-                # check — a tool emitting a literal ``<tool_output>\n``
-                # prefix without the matching close tag would otherwise
-                # bypass ``escape_wrapper_tags`` and let unescaped
-                # wrapper-tag literals from untrusted tool output reach
-                # the model.
-                if extract_advisories_from_tool_envelope(content) is not None:
-                    copy["content"] = content + block
+            if msg.get("role") == "system" and msg.get("_source"):
+                raw = msg.get("content")
+                text = raw if isinstance(raw, str) else str(raw or "")
+                wrapped = wrap_system_context(text, nonce)
+                if out:
+                    out[-1] = self._append_text_block(out[-1], wrapped)
                 else:
-                    copy["content"] = escape_wrapper_tags(content) + block
-            elif isinstance(content, list):
-                # Shallow-copy the parts list and any text parts we'll
-                # mutate so the original list/dicts in self.messages stay
-                # untouched.
-                new_parts = [
-                    dict(p) if isinstance(p, dict) and p.get("type") == "text" else p
-                    for p in content
-                ]
-                text_parts = [
-                    p for p in new_parts if isinstance(p, dict) and p.get("type") == "text"
-                ]
-                for part in text_parts:
-                    text = part.get("text", "")
-                    # Skip escape on text parts that already carry a
-                    # ``<tool_output>`` envelope — those are produced by
-                    # ``wrap_tool_result`` (Seam 1 splice for list-typed
-                    # tool output appends the envelope as its own text
-                    # part).  The wrapper has already escaped the inner
-                    # body; re-escaping here would entity-encode the
-                    # envelope's literal ``<tool_output>`` and
-                    # ``<system-reminder>`` tags so the model sees
-                    # ``&lt;tool_output&gt;...`` instead of a parseable
-                    # envelope.  Mirrors the string-branch detection
-                    # above and uses structural parsing (open + matching
-                    # close) instead of a prefix check so a tool
-                    # emitting a literal ``<tool_output>\n`` text part
-                    # without a matching close can't bypass the escape.
-                    if extract_advisories_from_tool_envelope(text) is not None:
-                        continue
-                    part["text"] = escape_wrapper_tags(text)
-                if text_parts:
-                    text_parts[-1]["text"] = text_parts[-1]["text"] + block
-                else:
-                    new_parts.append({"type": "text", "text": block})
-                copy["content"] = new_parts
-            else:
-                # Unexpected shape (None, etc.) — attach as a text-only
-                # content rather than dropping the reminder silently.
-                copy["content"] = block.lstrip()
-            out.append(copy)
+                    out.append(msg)
+                continue
+            out.append(msg)
         return out
 
-    def _mark_reminders_delivered(self) -> None:
-        """Flag every message's ``_reminders`` as delivered.
+    @staticmethod
+    def _append_text_block(msg: dict[str, Any], block: str) -> dict[str, Any]:
+        """Return a copy of *msg* with *block* appended to its content as text.
 
-        Role-agnostic — both user-channel reminders (set by
-        ``_attach_pending_user_reminders`` on user messages) and
-        tool-channel reminders (set by the per-result loop on tool
-        messages) ride the same ``_reminders`` side-channel and the
-        same delivered flag.  Called after a successful provider
-        stream; subsequent calls to ``_apply_reminders_for_provider``
-        skip messages with this flag, so the model sees each reminder
-        exactly once (the turn it advised).  The flag is a sibling key
-        like ``_reminders`` itself; ``sanitize_messages`` strips both
-        before the wire and ``project_history_messages`` ignores the
-        delivered flag entirely so UI replay parity is preserved across
-        reconnects.
+        String content gets a tail block; list content appends to the trailing
+        text part (or a new text part).  Never mutates *msg* — the fold pass
+        holds the read-only contract on the entries it threads through (see
+        :meth:`_prepare_wire_messages`).
         """
-        for msg in self.messages:
-            if msg.get("_reminders") and not msg.get("_reminders_delivered"):
-                msg["_reminders_delivered"] = True
+        copy = dict(msg)
+        content = copy.get("content")
+        if isinstance(content, str):
+            copy["content"] = f"{content}\n\n{block}" if content else block
+        elif isinstance(content, list):
+            new_parts = [
+                dict(p) if isinstance(p, dict) and p.get("type") == "text" else p for p in content
+            ]
+            text_parts = [p for p in new_parts if isinstance(p, dict) and p.get("type") == "text"]
+            if text_parts:
+                text_parts[-1]["text"] = f"{text_parts[-1]['text']}\n\n{block}"
+            else:
+                new_parts.append({"type": "text", "text": block})
+            copy["content"] = new_parts
+        else:
+            copy["content"] = block
+        return copy
 
     def _emit_state(self, state: str) -> None:
         """Notify UI of a workstream state transition.
@@ -3694,7 +3593,6 @@ class ChatSession:
                 }
                 for a in attachments
             ]
-        self._attach_pending_user_reminders(user_msg)
         self.messages.append(user_msg)
         self._msg_tokens.append(max(1, int(self._msg_char_count(user_msg) / self._chars_per_token)))
         # DB row stores the raw text only; attachments are joined back in
@@ -3703,18 +3601,17 @@ class ChatSession:
         # leaves pending rows that the UI's chip rehydration can still
         # surface so the user can clear or resend them.
         #
-        # The wake's synthesised empty turn carries ``_source`` /
-        # ``_reminders`` onto the row so reconnecting tabs render the
-        # marker + bubbles instead of an unanchored assistant reply.
+        # The wake's synthesised empty turn carries ``_source`` onto the
+        # row so reconnecting tabs render the marker instead of an
+        # unanchored assistant reply.  Drained user-channel nudges no
+        # longer ride this row — the caller appends them as first-class
+        # ``system`` turns AFTER this user turn (uniform attach rule).
         source = user_msg.get("_source")
-        reminders_payload = user_msg.get("_reminders")
-        reminders_json = self._encode_reminders(reminders_payload)
         message_id = save_message(
             self._ws_id,
             "user",
             user_input,
             source=source if isinstance(source, str) and source else None,
-            reminders=reminders_json,
             event_id=self._ui_event_id(),
         )
         if attachments and message_id:
@@ -3726,6 +3623,45 @@ class ChatSession:
                 reserved_for_msg_id=send_id,
             )
         return message_id
+
+    def _append_system_turn(self, source: str, content: str, **meta: Any) -> None:
+        """Append a first-class operator-context system turn and persist it.
+
+        Operator context (output-guard findings, user interjections,
+        metacognitive nudges) lives in the conversation trajectory as a
+        real ``{"role": "system", "_source": <source>, ...}`` turn (see
+        :func:`turnstone.core.tool_advisory.make_system_turn`) rather than
+        spliced into a neighbouring turn's ``content``.  Uniform attach
+        rule: a system turn FOLLOWS the turn it relates to — callers append
+        it after the user / tool / assistant turn it advises.
+
+        Mirrors :meth:`_append_user_turn`'s bookkeeping: pushes a
+        ``_msg_tokens`` estimate (parallel to ``self.messages``), persists
+        the row via ``save_message(ws, "system", content, source=source)``
+        so reconnecting tabs replay the same bubble, and fires the live
+        ``on_system_turn`` SSE hook so multi-tab mirrors render it in
+        lockstep.  Hook failures are logged and swallowed — the in-memory
+        append + persist are the load-bearing ops; a UI implementation
+        throwing here must not abort the turn.
+
+        *source* must be one of :data:`tool_advisory.SYSTEM_TURN_SOURCES`;
+        extra *meta* rides as leading-underscore sibling keys (stripped
+        before the wire by ``sanitize_messages``).
+        """
+        turn = make_system_turn(source, content, **meta)
+        self.messages.append(turn)
+        self._msg_tokens.append(max(1, int(self._msg_char_count(turn) / self._chars_per_token)))
+        save_message(
+            self._ws_id,
+            "system",
+            content,
+            source=source,
+            event_id=self._ui_event_id(),
+        )
+        try:
+            self.ui.on_system_turn(content, source)
+        except Exception:
+            log.warning("ui.on_system_turn failed; system turn still appended", exc_info=True)
 
     # -- Main generation loop ------------------------------------------------
 
@@ -3780,12 +3716,16 @@ class ChatSession:
         # Metacognitive nudge: check for correction/completion signals
         # before _append_user_turn so any fired nudge (plus any nudges
         # queued earlier — e.g. denial during the previous tool batch,
-        # resume on rehydrate) splice into this user message body.
+        # resume on rehydrate) is drained right after the user turn.
         nudge = self._check_metacognitive_nudge(user_input)
         if nudge:
             self._queue_user_advisory(*nudge)
 
         self._append_user_turn(user_input, attachments or (), send_id=send_id, from_wake=from_wake)
+        # Drained user-channel nudges become first-class ``system`` turns
+        # appended AFTER the user turn (uniform attach rule), replacing the
+        # legacy per-message ``_reminders`` side-channel splice.
+        self._emit_pending_user_nudges()
 
         # A fresh session composed its system prefix at __init__ with an empty
         # history, so memory selection fell back to recency (no query, no rerank).
@@ -3802,7 +3742,7 @@ class ChatSession:
         try:
             while True:
                 self._check_cancelled(my_generation)
-                msgs = self._apply_reminders_for_provider(self._full_messages())
+                msgs = self._prepare_wire_messages(self._full_messages())
 
                 if self.debug:
                     self._debug_print_request(msgs)
@@ -3846,7 +3786,7 @@ class ChatSession:
                         self.ui.on_thinking_stop()
                         try:
                             self._compact_messages(auto=True)
-                            msgs = self._apply_reminders_for_provider(self._full_messages())
+                            msgs = self._prepare_wire_messages(self._full_messages())
                             self.ui.on_thinking_start()
                             stream = self._create_stream_with_retry(msgs)
                         except Exception:
@@ -3869,18 +3809,11 @@ class ChatSession:
                     return
 
                 # Reuse the wire-bound ``msgs`` we already built for the
-                # stream call instead of re-applying the reminder splice
-                # (perf-2).  After mark-delivered runs below, a fresh
-                # _apply_reminders_for_provider would skip the
-                # just-rendered reminders and undercount; passing the
-                # already-rendered list keeps calibration char count
-                # aligned with what the provider actually counted.
+                # stream call instead of re-folding the system turns
+                # (perf-2); passing the already-prepared list keeps the
+                # calibration char count aligned with what the provider
+                # actually counted.
                 self._update_token_table(assistant_msg, msgs=msgs)
-                # Reminders that rode this stream have now reached the
-                # model; flag delivered so the next provider call skips
-                # them (one-shot semantics for the wire; UI replay still
-                # surfaces ``_reminders`` for reconnect parity).
-                self._mark_reminders_delivered()
                 self._print_status_line()  # Report usage for EVERY API call
                 self.messages.append(assistant_msg)
                 # Clear per-turn inflight buffers — the assistant
@@ -3961,8 +3894,6 @@ class ChatSession:
                 self._apply_post_execute_advisories(tool_calls, results)
 
                 # Map tool_call_id → tool name for logging
-                from turnstone.core.tool_advisory import wrap_tool_result
-
                 _tc_names = {c["id"]: c.get("function", {}).get("name", "") for c in tool_calls}
                 # Tool arguments (JSON string) per call_id — threaded into the
                 # LLM judge so it can reason about output-vs-request plausibility.
@@ -4019,6 +3950,16 @@ class ChatSession:
                         ]
                     )
 
+                # Operator-context system turns are accumulated across the
+                # per-result loop and emitted AFTER the whole tool batch (see
+                # the flush below).  This keeps every system turn after the
+                # COMPLETE tool block — the placement the Anthropic native
+                # mid-conversation-system path requires (a system turn must
+                # never land between a ``tool_use`` and its ``tool_result``,
+                # and the converter packs the batch's tool results into one
+                # user turn).
+                pending_system_turns: list[tuple[str, str, dict[str, Any]]] = []
+
                 for _ri, (tc_id, output) in enumerate(results):
                     # Output guard: evaluate tool result before it enters context
                     assessment: OutputAssessment | None = None
@@ -4051,32 +3992,19 @@ class ChatSession:
                                     if _part_assess is not None:
                                         assessment = _part_assess
 
-                    # Advisory injection: persistent advisories — output
-                    # guard findings AND queued user messages (Seam 1)
-                    # — wrap into the tool-result envelope and stay in
-                    # self.messages.  Metacognitive tool-channel
-                    # reminders (tool_error / repeat) ride a side-
-                    # channel — never inside content — so the model
-                    # sees the splice only at the wire boundary via
-                    # _apply_reminders_for_provider, while UI/replay
-                    # surfaces them as a themed bubble below the tool
-                    # result.
-                    persistent_advisories, metacog_reminders = self._collect_advisories(
+                    # Operator context for this result: output-guard
+                    # findings + queued user messages (Seam 1), plus
+                    # tool-channel metacog nudges (tool_error / repeat) and
+                    # any-channel nudges (watch_triggered / idle_children).
+                    # All of them are now emitted as first-class
+                    # ``{"role": "system"}`` turns AFTER this clean tool
+                    # message (uniform attach rule) — the tool message content
+                    # stays the raw tool output.  Accumulated here and flushed
+                    # after the batch so every system turn lands after the
+                    # COMPLETE tool block (the native-path placement rule).
+                    result_advisories = self._collect_advisories(
                         assessment, _tc_names.get(tc_id, ""), _ri == _last_idx
                     )
-                    raw_output = output
-                    if isinstance(output, str):
-                        output = wrap_tool_result(output, persistent_advisories)
-                    elif isinstance(output, list) and persistent_advisories:
-                        # Structured/image output — append advisories as a
-                        # text part so they aren't silently dropped.
-                        output = [
-                            *output,
-                            {
-                                "type": "text",
-                                "text": wrap_tool_result("", persistent_advisories),
-                            },
-                        ]
 
                     tool_msg: dict[str, Any] = {
                         "role": "tool",
@@ -4085,15 +4013,6 @@ class ChatSession:
                     }
                     if self._tool_error_flags.pop(tc_id, False):
                         tool_msg["is_error"] = True
-                    if metacog_reminders:
-                        tool_msg["_reminders"] = metacog_reminders
-                        try:
-                            self.ui.on_tool_reminder(metacog_reminders, tc_id)
-                        except Exception:
-                            log.warning(
-                                "ui.on_tool_reminder failed; reminder still attached",
-                                exc_info=True,
-                            )
                     self.messages.append(tool_msg)
 
                     # Token estimation — image content uses a fixed heuristic
@@ -4110,59 +4029,43 @@ class ChatSession:
                         tok_est = max(1, int(len(output) / self._chars_per_token))
                     self._msg_tokens.append(tok_est)
 
-                    # Log tool result.  Store the WRAPPED output so the
-                    # persisted row matches ``self.messages[i]['content']``
-                    # exactly — when ``persistent_advisories`` is empty
-                    # ``wrap_tool_result`` no-ops and the row carries
-                    # bare text, when non-empty the row carries the
-                    # ``<tool_output>`` envelope so replay's
-                    # ``decorate_history_messages`` can extract the
-                    # advisory back out.  Size is already bounded by
-                    # ``_truncate_output`` above (per-turn context
-                    # budget); no second cap needed.
-                    #
-                    # List-typed output (image / structured MCP results)
-                    # has no native string projection, so we rebuild the
-                    # envelope from the joined PRE-wrap text parts plus
-                    # the same advisories.  Joining the POST-wrap parts
-                    # would put the original raw text first and the
-                    # already-wrapped advisory text second, producing a
-                    # ``<raw> <tool_output>...`` shape that
-                    # ``extract_advisories_from_tool_envelope``'s
-                    # ``startswith("<tool_output>\n")`` prefix check
-                    # rejects on replay — the raw envelope XML would
-                    # leak into the rendered tool bubble.  Round-trip
-                    # works because ``wrap_tool_result(text, [])``
-                    # returns ``text`` unchanged when there are no
-                    # advisories.
+                    # Log the clean tool result.  Store the joined text for
+                    # list-typed output (image / structured MCP results), the
+                    # string verbatim otherwise — the persisted row matches
+                    # ``self.messages[i]['content']`` (no envelope).  Size is
+                    # already bounded by ``_truncate_output`` above (per-turn
+                    # context budget); no second cap needed.
                     _tname = _tc_names.get(tc_id, "")
-                    if isinstance(raw_output, list):
-                        raw_text = " ".join(
+                    if isinstance(output, list):
+                        store_text: str = " ".join(
                             p.get("text", "")
-                            for p in raw_output
+                            for p in output
                             if isinstance(p, dict) and p.get("type") == "text"
                         )
-                        store_text: str = wrap_tool_result(raw_text, persistent_advisories)
                     else:
-                        # ``raw_output`` was a string, so the post-wrap
-                        # ``output`` is also a string (envelope or raw).
-                        assert isinstance(output, str)
                         store_text = output
-                    # Mirror the user-channel persistence: tool-channel
-                    # reminders (``tool_error`` / ``repeat``) ride the same
-                    # ``_reminders`` JSON column so a tab reconnecting via
-                    # /history sees the below-the-tool bubble the
-                    # originating tab rendered live.
-                    tool_reminders_json = self._encode_reminders(metacog_reminders)
                     save_message(
                         self._ws_id,
                         "tool",
                         store_text,
                         _tname,
                         tool_call_id=tc_id,
-                        reminders=tool_reminders_json,
                         event_id=self._ui_event_id(),
                     )
+
+                    # Accumulate this result's operator context (guard
+                    # findings per-result; queued interjections + metacog
+                    # nudges only on the last result).  Flushed as system
+                    # turns after the batch.
+                    pending_system_turns.extend(result_advisories)
+
+                # Flush accumulated operator context as first-class system
+                # turns AFTER the complete tool batch.  Each
+                # ``_append_system_turn`` persists its own row + fires the live
+                # ``on_system_turn`` SSE hook + pushes a ``_msg_tokens`` entry,
+                # so multi-tab mirrors and the token budget stay in lockstep.
+                for source, content, meta in pending_system_turns:
+                    self._append_system_turn(source, content, **meta)
                 # Fold ``user_feedback`` (text typed alongside an approval,
                 # e.g. "y, use full path") and any queued messages that
                 # raced past Seam 1's drain into a single trailing user
@@ -4838,13 +4741,9 @@ class ChatSession:
 
         *msgs* (optional) is the wire-bound message list already built
         for the stream call — passing it avoids a redundant
-        ``_apply_reminders_for_provider`` walk and, more importantly,
-        ensures the char count matches the bytes the provider counted
-        even after ``_mark_reminders_delivered`` has flipped the flag
-        on the reminders that rode the stream.  When *msgs* is None the
-        caller didn't pre-build (rare path) — fall back to applying
-        the splice on the fly, but be aware the result will be
-        reminder-free if delivered flags are already set.
+        ``_prepare_wire_messages`` walk and ensures the char count matches
+        the bytes the provider counted.  When *msgs* is None the caller
+        didn't pre-build (rare path) — fall back to folding on the fly.
         """
         if not self._last_usage:
             return
@@ -4859,11 +4758,9 @@ class ChatSession:
         # must reflect what the provider actually counted in
         # ``prompt_tokens``: when called from the loop with the
         # pre-built ``msgs``, that's exact; without it, fall back to
-        # applying the splice fresh (post-mark-delivered the result
-        # may undercount, but no caller currently takes this path
-        # after a successful stream).
+        # folding the system turns fresh.
         all_msgs = (
-            msgs if msgs is not None else self._apply_reminders_for_provider(self._full_messages())
+            msgs if msgs is not None else self._prepare_wire_messages(self._full_messages())
         )  # system + self.messages (before append)
         active_tools = self._get_active_tools() or []
         tool_def_chars = sum(len(json.dumps(t)) for t in active_tools)
@@ -5554,7 +5451,8 @@ class ChatSession:
         if d is None:
             return output, None
 
-        # Context-facing annotations (what the MODEL sees via GuardAdvisory):
+        # Context-facing annotations (what the MODEL sees via the
+        # output_guard operator-context system turn):
         # the heuristic findings, plus the LLM's reasoning ONLY when the LLM
         # ESCALATED (flagged something itself).  We deliberately never inject
         # the judge's "benign" reasoning into the model context — a judge
@@ -5828,101 +5726,69 @@ class ChatSession:
         self._append_user_turn(content, ())
         return True
 
-    def _drain_queued_messages_to_advisories(self) -> list[ToolAdvisory]:
-        """Drain ``_queued_messages`` into ``UserInterjection`` advisories.
-
-        Mirrors the swap-and-clear pattern in
-        :meth:`_flush_queued_messages` but produces wire-bound
-        ``UserInterjection`` instances rather than appending a user
-        turn — the splice path used by Seam 1 (queued message rides
-        inside the last tool-result envelope of a batch).  Held under
-        ``_queued_lock`` to keep the read+clear atomic against a
-        concurrent ``queue_message`` from the SSE worker.
-        """
-        from turnstone.core.tool_advisory import UserInterjection
-
-        with self._queued_lock:
-            queued_items = list(self._queued_messages.values())
-            self._queued_messages.clear()
-        return [
-            UserInterjection(message=text, priority=priority) for text, priority in queued_items
-        ]
-
     def _collect_advisories(
         self,
         assessment: OutputAssessment | None,
         func_name: str,
         is_last_in_batch: bool,
-    ) -> tuple[list[ToolAdvisory], list[dict[str, Any]]]:
-        """Gather advisories to attach to a tool result message.
+    ) -> list[tuple[str, str, dict[str, Any]]]:
+        """Gather operator context for a tool result as system-turn specs.
 
-        Returns ``(persistent, metacog_reminders)``:
+        Returns a list of ``(source, content, meta)`` tuples — one per
+        operator-context item that should be appended as a first-class
+        ``{"role": "system"}`` turn AFTER the tool message (the caller
+        feeds each through :meth:`_append_system_turn`):
 
-        - ``persistent`` — guard findings and queued user messages
-          (Seam 1) that ride inside the tool-result envelope via
-          ``wrap_tool_result``.  These are conversation history and
-          must persist in ``self.messages``.
-        - ``metacog_reminders`` — list of ``{"type", "text", ...optional}``
-          dicts for ``tool_error`` / ``repeat`` nudges that the caller
-          attaches to the tool message dict's ``_reminders`` side-channel.
-          The optional fields ride from the producer's ``metadata`` dict
-          (today only ``watch_triggered`` populates it).  Like user-
-          channel reminders, the dicts are spliced into ``content`` only
-          at the wire boundary by ``_apply_reminders_for_provider`` and
-          surfaced separately on the UI as a themed bubble below the
-          tool result.
+        - **Output guard** findings (``source="output_guard"``) — rendered
+          inline here (flags + risk level + annotations + the
+          redaction notice).  Attach per-result.
+        - **Queued user messages** (Seam 1, ``source="user_interjection"``)
+          — drained on the LAST result of a batch.  ``meta`` carries the
+          ``priority`` so the UI can frame important interjections
+          distinctly.  Cancel / exception / no-tool-call paths drain the
+          queue as a real user row instead (Seams 2 and 3).
+        - **Metacognitive tool-channel nudges** (``tool_error`` / ``repeat``)
+          and any-channel nudges (``watch_triggered`` / ``idle_children``)
+          — drained on the last result.  ``meta`` carries the producer's
+          optional fields (e.g. ``watch_triggered``'s ``watch_name``).
 
-        Queued user messages drain into a :class:`UserInterjection`
-        advisory on the LAST result of a batch — Seam 1 in the
-        queued-message architecture.  The wrapped envelope persists
-        on the tool row; replay extracts it back out via
-        :func:`history_decoration.decorate_history_messages` and the
-        wire layer ships it as ``advisories`` so the UI renders a
-        proper user bubble after the tool block.  Cancel / exception /
-        no-tool-call paths drain the queue as a real user row instead
-        (Seams 2 and 3), since there is no envelope to splice into.
-
-        Both lists are empty when no advisories apply (common case).
-        Guard advisories attach per-result; queued messages and
-        metacognitive nudges drain on the last result in the batch
-        only — single splice envelope per batch, no duplication
-        across N tool results.
+        Empty when no advisories apply (common case).  Guard findings
+        attach per-result; queued messages and metacognitive nudges drain
+        on the last result only — no duplication across N tool results.
         """
-        from turnstone.core.tool_advisory import GuardAdvisory
+        specs: list[tuple[str, str, dict[str, Any]]] = []
 
-        persistent: list[ToolAdvisory] = []
-        metacog_reminders: list[dict[str, Any]] = []
-
-        # Output guard advisory — persists with the tool result.
+        # Output guard advisory — rendered inline (the wire/UI content the
+        # model and operator see).  Mirrors the legacy GuardAdvisory.render.
         if assessment is not None:
-            persistent.append(GuardAdvisory(assessment=assessment, func_name=func_name))
+            lines = [
+                f"Output guard: {', '.join(assessment.flags)} ({assessment.risk_level.upper()})"
+            ]
+            for ann in assessment.annotations:
+                lines.append(f"  {ann}")
+            if assessment.sanitized is not None:
+                lines.append(
+                    "Credentials have been redacted. Do not attempt to reconstruct redacted values."
+                )
+            specs.append(("output_guard", "\n".join(lines), {}))
 
         # Last-result-in-batch drain seams: queued user messages (Seam 1)
-        # and tool-channel metacog nudges (tool_error / repeat).  Both
-        # fire once per batch so a parallel fan-out doesn't paint the
-        # same advisory N times.  Queue-drain is delegated to a named
-        # helper so the swap-and-clear pattern lives next to
-        # ``_flush_queued_messages``'s identical pattern, and the
-        # side-effect is documented at the call site rather than buried
-        # mid-function.
+        # and tool/any-channel metacog nudges.  Both fire once per batch so a
+        # parallel fan-out doesn't paint the same advisory N times.
         if is_last_in_batch:
-            persistent.extend(self._drain_queued_messages_to_advisories())
+            with self._queued_lock:
+                queued_items = list(self._queued_messages.values())
+                self._queued_messages.clear()
+            for text, priority in queued_items:
+                specs.append(("user_interjection", text, {"priority": priority}))
 
             # Metacognitive tool-channel drain.  Queued by
             # ``_queue_tool_advisory`` from the tool_error / repeat
-            # detection paths just before this loop.  Lands on the
-            # tool message dict's ``_reminders`` side-channel
-            # (caller's responsibility) so it stays out of persisted
-            # content and rides the wire only via the transient-copy
-            # splice.
-            drained = self._nudge_queue.drain(TOOL_DRAIN)
-            for nt, text, meta in drained:
-                entry: dict[str, Any] = {"type": nt, "text": text}
-                if meta:
-                    entry.update(meta)
-                metacog_reminders.append(entry)
+            # detection paths just before this loop.
+            for nt, text, meta in self._nudge_queue.drain(TOOL_DRAIN):
+                specs.append((nt, text, dict(meta) if meta else {}))
 
-        return persistent, metacog_reminders
+        return specs
 
     # -- Two-phase tool execution -----------------------------------------------
     #
@@ -7453,95 +7319,73 @@ class ChatSession:
     def _queue_user_advisory(self, nudge_type: str, text: str) -> None:
         """Queue a metacognitive nudge for the next user turn.
 
-        Drains in ``_attach_pending_user_reminders`` onto the user
-        message dict's ``_reminders`` side-channel.  Used for nudges
-        that respond to user behaviour: ``correction``, ``denial``,
-        ``resume``, ``start``, ``completion``.
+        Drains in ``_emit_pending_user_nudges`` and is appended as a
+        first-class ``{"role": "system"}`` turn AFTER the user turn.  Used
+        for nudges that respond to user behaviour: ``correction``,
+        ``denial``, ``resume``, ``start``, ``completion``.
 
         No-ops while the session is inside a wake-driven turn
         (``_wake_source_tag`` set) so model behaviour during the wake
         send (e.g. denying a tool the wake suggested, hitting a
         repeat / tool_error) doesn't queue a nudge that would land on
-        top of the wake's own envelope or on the user's next real
+        top of the wake's own turn or on the user's next real
         turn referencing a context the user never saw.
         """
         if self._wake_source_tag:
             return
         self._nudge_queue.enqueue(nudge_type, text, "user")
 
-    def _attach_pending_user_reminders(self, user_msg: dict[str, Any]) -> None:
-        """Drain user-channel nudges from :class:`NudgeQueue` onto
-        *user_msg*'s ``_reminders`` sibling key (a side-channel, never
-        inside ``content``).
+    def _emit_pending_user_nudges(self) -> None:
+        """Drain user-channel nudges from :class:`NudgeQueue` and append each
+        as a first-class operator-context ``system`` turn AFTER the user turn.
 
         Drains entries whose ``channel`` is in ``{"user", "any"}``;
         ``"tool"`` entries stay queued for the next tool-result batch.
 
-        Mutates *user_msg* in place — the caller appends it after.  The
-        rendered ``<system-reminder>`` envelope is built later in
-        ``_apply_reminders_for_provider`` against a transient copy, so
-        the model still sees the reminder spliced into ``content`` at
-        the wire boundary while ``self.messages`` and every downstream
-        consumer (UI replay, compaction, title gen, channel adapters,
-        DB) see clean user text.
+        Called by ``send`` immediately after :meth:`_append_user_turn`, so
+        the system turns sit after the user turn they advise (uniform attach
+        rule).  Each drained nudge becomes one ``{"role": "system",
+        "_source": <nudge_type>, ...}`` turn via :meth:`_append_system_turn`
+        — the source is the nudge type (``correction`` / ``denial`` /
+        ``resume`` / ``start`` / ``completion`` / ``idle_children`` /
+        ``watch_triggered``) and any optional metadata (e.g.
+        ``watch_triggered``'s ``watch_name``) rides as sibling keys.
+        ``_append_system_turn`` persists each row and fires the live
+        ``on_system_turn`` SSE hook so reconnecting / multi-tab consumers
+        render the same operator bubble.
 
-        ``_reminders`` rides the leading-underscore convention used by
-        other internal sibling metadata (``_attachments_meta``,
-        ``_provider_content``); ``sanitize_messages`` strips it before
-        the wire on its own pass.
-
-        When ``deliver_wake_nudge_from_queue`` is the caller, it has
-        already drained the queue and stashed the reminders on
-        ``self._wake_drained_reminders``; we use that list directly
-        rather than draining again (the predicate-aware drain runs
-        once, in deliver_wake_nudge_from_queue).
-
-        Also fires the live ``on_user_reminder`` UI hook so any open
-        SSE consumers (other browser tabs, CLI mirrors, eventual
-        channel adapters) can render the reminder bubble in lockstep
-        with the originating tab's optimistic render.  Hook failures
-        are logged and swallowed: the side-channel write is the
-        load-bearing op, and a UI implementation throwing here must
-        not abort the user's send (which would otherwise drop both the
-        user message and the queued nudges).
+        When ``deliver_wake_nudge_from_queue`` is the caller, it has already
+        drained the queue and stashed the entries on
+        ``self._wake_drained_reminders``; we consume that list directly
+        rather than draining again (the predicate-aware drain runs once, in
+        ``deliver_wake_nudge_from_queue``).
         """
         if self._wake_drained_reminders is not None:
-            reminders = self._wake_drained_reminders
+            entries = self._wake_drained_reminders
             self._wake_drained_reminders = None  # consume — only delivered once
         else:
             items = self._nudge_queue.drain(USER_DRAIN)
-            if not items:
-                return
-            reminders = []
+            entries = []
             for nudge_type, text, meta in items:
                 entry: dict[str, Any] = {"type": nudge_type, "text": text}
                 if meta:
                     entry.update(meta)
-                reminders.append(entry)
-        if not reminders:
-            return
-        user_msg["_reminders"] = reminders
-
-        # Forward ``_source`` (today only ``"system_nudge"`` for wake
-        # turns) so non-originating SSE consumers can render the thin
-        # ``.msg.user.system-nudge`` marker before the reminder bubble.
-        # Without it, a non-originating tab anchors the bubble below
-        # whichever stale prior user message exists.
-        source_tag = user_msg.get("_source")
-        source_arg: str | None = source_tag if isinstance(source_tag, str) and source_tag else None
-        try:
-            self.ui.on_user_reminder(reminders, source=source_arg)
-        except Exception:
-            log.warning("ui.on_user_reminder failed; reminder still attached", exc_info=True)
+                entries.append(entry)
+        for entry in entries:
+            source = str(entry.get("type") or "")
+            if not source:
+                continue
+            meta = {k: v for k, v in entry.items() if k not in ("type", "text")}
+            self._append_system_turn(source, str(entry.get("text") or ""), **meta)
 
     def _queue_tool_advisory(self, nudge_type: str, text: str) -> None:
         """Queue a metacognitive nudge for the next tool-result batch.
 
-        Drains in ``_collect_advisories`` alongside guard findings, then
-        rides the tool message dict's ``_reminders`` side-channel —
-        spliced into wire content only at the provider boundary by
-        ``_apply_reminders_for_provider``.  Used for nudges that respond
-        to model behaviour at a tool boundary: ``tool_error``, ``repeat``.
+        Drains in ``_collect_advisories`` alongside guard findings, then is
+        emitted as a first-class ``{"role": "system"}`` turn AFTER the tool
+        batch (see the per-result loop in ``_run_loop``).  Used for nudges
+        that respond to model behaviour at a tool boundary: ``tool_error``,
+        ``repeat``.
 
         No-ops while the session is inside a wake-driven turn (see
         ``_queue_user_advisory`` for the rationale).
@@ -7553,14 +7397,14 @@ class ChatSession:
     def deliver_wake_nudge_from_queue(self) -> None:
         """Drive a synthetic empty user turn so any-channel nudges drain.
 
-        The standard side-channel pipeline does the rendering: the
-        ``send("")`` we trigger lands at ``_append_user_turn`` which
-        attaches drained reminders onto the empty user message via
-        ``_attach_pending_user_reminders``.  ``_apply_reminders_for_provider``
-        then splices the rendered ``<system-reminder>`` block onto the
-        trailing edge of the empty content — wire content becomes the
-        envelope alone, providers accept it as a normal user turn.
-        See foundation §F4 of the design doc.
+        The standard pipeline does the rendering: the ``send("")`` we
+        trigger lands at ``_append_user_turn`` (which stamps
+        ``_source = "system_nudge"`` on the synthetic empty user message),
+        then ``_emit_pending_user_nudges`` appends each drained nudge as a
+        first-class ``{"role": "system"}`` turn after it.  Those turns are
+        real conversation history — folded to a ``<system-reminder>`` block
+        on the preceding (empty user) turn for non-native providers, or kept
+        inline for native mid-conversation-system models.
 
         ``_wake_source_tag`` is set for the duration of the synthetic
         send so:
@@ -7575,28 +7419,22 @@ class ChatSession:
         * ``_append_user_turn`` stamps ``_source = "system_nudge"``
           on the synthesized user message for audit / replay parity
 
-        On post-retry stream failure the just-attached ``_reminders``
-        get marked delivered before the exception propagates, so a
-        stale envelope doesn't re-fire on the user's next real turn —
-        operator intervention is required for the underlying failure
-        anyway and a haunted nudge would be noise.
-
         Drains the queue inline (running every entry's ``valid_until``
         predicate) BEFORE synthesizing the empty user turn — bails if
         no entry survives the predicate check.  Without this, the
         watcher's ``len(queue)`` peek can succeed on entries whose
-        predicate later drops them inside
-        ``_attach_pending_user_reminders``'s drain, leaving us
-        synthesizing an empty user turn with no reminder context (and
-        risking provider rejection of empty user content).  The
-        drained items get handed to ``_attach_pending_user_reminders``
-        via ``_wake_drained_reminders`` instead of re-draining the
-        queue from inside ``send``.
+        predicate later drops them inside ``_emit_pending_user_nudges``'s
+        drain, leaving us synthesizing an empty user turn with no nudge
+        context (and risking provider rejection of empty user content).
+        The drained items are handed to ``_emit_pending_user_nudges`` via
+        ``_wake_drained_reminders`` instead of re-draining the queue from
+        inside ``send``.  System turns are persistent (not one-shot), so a
+        post-retry stream failure leaves them in place — operator
+        intervention is required for the underlying failure anyway.
         """
         items = self._nudge_queue.drain(USER_DRAIN)
         if not items:
             return
-        pre_len = len(self.messages)
         self._wake_source_tag = "system_nudge"
         wake_reminders: list[dict[str, Any]] = []
         for nudge_type, text, meta in items:
@@ -7607,11 +7445,6 @@ class ChatSession:
         self._wake_drained_reminders = wake_reminders
         try:
             self.send("", from_wake=True)
-        except Exception:
-            for msg in self.messages[pre_len:]:
-                if msg.get("_reminders"):
-                    msg["_reminders_delivered"] = True
-            raise
         finally:
             self._wake_source_tag = ""
             self._wake_drained_reminders = None
@@ -7627,11 +7460,9 @@ class ChatSession:
         appended to a tool's text output.  Updates ``self._repeat_detector``,
         ``self._nudge_queue`` (via ``_queue_tool_advisory``), and
         ``self._metacog_state`` (cooldown timestamp via ``should_nudge``).
-        The operator-visible
-        signal is the themed ``tool_reminder`` bubble below the tool
-        block — emitted by the per-result loop downstream when the
-        drained metacog reminders attach to the tool message dict's
-        ``_reminders`` side-channel.
+        The operator-visible signal is the first-class operator-context
+        ``{"role": "system"}`` turn the per-result loop downstream emits
+        after the tool batch when the drained metacog nudges flush.
 
         Repeat detection's job is to nudge a flaky local model out of a
         loop where it keeps making the same tool call ("``bash(cmd='echo
@@ -7671,11 +7502,10 @@ class ChatSession:
                             "Try a different approach."
                         )
                         results[i] = (tc_id, output)
-                    # The themed ``tool_reminder`` bubble below the tool
-                    # block carries the operator-visible signal; the
-                    # tool-name context comes from the visible tool
-                    # block immediately above the bubble, so a separate
-                    # diagnostic info line would just duplicate it.
+                    # The operator-context system turn after the tool batch
+                    # carries the operator-visible signal; the tool-name
+                    # context comes from the tool block above it, so a
+                    # separate diagnostic info line would just duplicate it.
 
         if _repeat_detected:
             # Reset so the model gets a clean slate after the warning.
@@ -7689,10 +7519,10 @@ class ChatSession:
             ):
                 self._queue_tool_advisory("repeat", format_nudge("repeat"))
 
-        # Tool-error nudge — queued so the MetacognitiveAdvisory rides
-        # the same _collect_advisories drain pass as guard findings.
-        # Cooldown gating in should_nudge keeps this to one nudge per
-        # batch even with many failing tools.
+        # Tool-error nudge — queued so it rides the same _collect_advisories
+        # drain pass as guard findings and is emitted as a system turn after
+        # the tool batch.  Cooldown gating in should_nudge keeps this to one
+        # nudge per batch even with many failing tools.
         if (
             self._mem_cfg.nudges
             and any(self._tool_error_flags.get(tc_id) for tc_id, _ in results)

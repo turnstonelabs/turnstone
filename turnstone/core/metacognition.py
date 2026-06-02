@@ -235,9 +235,10 @@ def format_idle_children_nudge(children: list[dict[str, str]]) -> str:
 
     *children* is a list of dicts with ``ws_id``, ``name``, ``state``
     keys — the row-mapping shape coordinator-side storage exposes.
-    Returns raw text *without* the ``<system-reminder>`` envelope; the
-    side-channel :func:`_apply_reminders_for_provider` splice wraps it
-    at the wire boundary.
+    Returns raw text *without* any envelope; the nudge is emitted as a
+    first-class ``{"role": "system"}`` turn whose content is this text
+    (folded to a ``<system-reminder>`` block at the wire boundary on
+    non-native models).
 
     User-controlled ``name`` strings get sanitized via
     :func:`sanitize_name` before interpolation so a workstream

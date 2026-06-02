@@ -309,22 +309,15 @@ def test_coordinator_js_handle_child_state_no_longer_reads_sse_pending_approval_
     )
 
 
-def test_coord_history_renders_user_interjection_advisory_after_tool_block():
-    """Queued user messages spliced into the last tool-result envelope
-    of a batch (Seam 1) persist on the tool DB row as a wrapped
-    ``<tool_output>`` envelope.  ``decorate_history_messages`` extracts
-    the advisory back out and the wire layer projects it onto
-    ``m.advisories``; the coord history loop must invoke the shared
-    ``replayAdvisoriesAfterTool`` helper (defined in
-    ``shared/utils.js``) so each ``user_interjection`` renders through
-    ``appendUserMessageWithAttachments`` and the bubble looks identical
-    to a Seam 2/3 user row.
+def test_coord_history_renders_system_turn_via_msg_variants():
+    """First-class operator-context ``system`` turns (output-guard findings,
+    user interjections, metacognitive nudges) replay through the coord
+    history loop's ``system``-role branch, labelled with the turn's
+    ``source`` and styled via the ``system`` ``_MSG_VARIANTS`` entry.  The
+    legacy ``replayAdvisoriesAfterTool`` envelope path is gone.
 
-    This test pins the call site so a refactor that drops the helper
-    invocation regresses the queued-during-batch replay shape silently.
     Mirrors ``test_app_js.py``'s same-shape pin on interactive's
     ``replayHistory``."""
-    import re
     from pathlib import Path
 
     coord_js = Path(__file__).resolve().parent.parent / (
@@ -332,20 +325,20 @@ def test_coord_history_renders_user_interjection_advisory_after_tool_block():
     )
     body = coord_js.read_text(encoding="utf-8")
 
-    assert "replayAdvisoriesAfterTool(m.advisories" in body, (
-        "Coord history loop must invoke replayAdvisoriesAfterTool with "
-        "m.advisories so queued messages spliced into the tool envelope "
-        "render as user bubbles after the tool block."
+    # The advisory-envelope replay helper is gone.
+    assert "replayAdvisoriesAfterTool" not in body, (
+        "replayAdvisoriesAfterTool should be deleted — operator context now "
+        "rides first-class system rows, not the tool envelope."
     )
-    # The renderer callback routes through appendUserMessageWithAttachments
-    # so the bubble matches a normal user-row replay.
-    assert re.search(
-        r"appendUserMessageWithAttachments\(\s*text",
-        body,
-    ), (
-        "Coord history loop's renderer callback must route the extracted "
-        "advisory text through appendUserMessageWithAttachments so the "
-        "rendered bubble matches a normal user-row replay."
+    # The coord history loop has an explicit system-role branch labelling
+    # the bubble with the turn's source kind.
+    assert 'role === "system"' in body, (
+        "coord history loop must have a system-role branch for first-class operator-context turns."
+    )
+    # The ``system`` _MSG_VARIANTS entry gives the bubble operator styling.
+    assert 'system: "system-context"' in body, (
+        "coordinator.js must map the system role to the .msg.system-context "
+        "variant so operator-context turns get the operator styling."
     )
 
 

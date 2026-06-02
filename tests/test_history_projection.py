@@ -36,48 +36,29 @@ class TestSourceSurfacing:
         assert "source" not in history[0]
 
 
-class TestRemindersWidening:
-    def test_watch_triggered_optional_fields_propagate(self) -> None:
-        """The widened payload carries watch_name / command / poll_count /
-        max_polls / is_final on each ``watch_triggered`` reminder so the
-        frontend renders ``.msg.watch-result``.
-        """
+class TestSystemTurnProjection:
+    """First-class operator-context ``system`` rows project ``_source`` →
+    ``source`` so the frontend can label/style the operator bubble.  The
+    legacy ``_reminders`` side-channel projection is gone (operator context
+    no longer rides that column)."""
+
+    def test_system_turn_source_projects(self) -> None:
         history = project_history_messages(
             [
                 {
-                    "role": "user",
-                    "content": "",
-                    "_source": "system_nudge",
-                    "_reminders": [
-                        {
-                            "type": "watch_triggered",
-                            "text": "$ ls\nfile.txt",
-                            "watch_name": "w1",
-                            "command": "ls",
-                            "poll_count": 2,
-                            "max_polls": 100,
-                            "is_final": False,
-                        }
-                    ],
+                    "role": "system",
+                    "_source": "user_interjection",
+                    "content": "check the logs",
                 }
             ]
         )
-        assert history[0]["source"] == "system_nudge"
-        assert history[0]["reminders"] == [
-            {
-                "type": "watch_triggered",
-                "text": "$ ls\nfile.txt",
-                "watch_name": "w1",
-                "command": "ls",
-                "poll_count": 2,
-                "max_polls": 100,
-                "is_final": False,
-            }
-        ]
+        assert history[0]["role"] == "system"
+        assert history[0]["source"] == "user_interjection"
+        assert history[0]["content"] == "check the logs"
 
-    def test_legacy_two_field_reminders_still_work(self) -> None:
-        """Producers without optional fields (correction / denial /
-        idle_children) keep the legacy ``{type, text}`` shape."""
+    def test_legacy_reminders_column_not_projected(self) -> None:
+        """A pre-migration row that still carries ``_reminders`` must NOT
+        surface a ``reminders`` field — the projection dropped that lane."""
         history = project_history_messages(
             [
                 {
@@ -87,51 +68,7 @@ class TestRemindersWidening:
                 }
             ]
         )
-        assert history[0]["reminders"] == [{"type": "correction", "text": "watch out"}]
-
-    def test_unknown_keys_are_dropped(self) -> None:
-        """The wire-layer filter projects on a known set of keys so a
-        future producer accidentally stuffing arbitrary fields can't leak
-        them through replay."""
-        history = project_history_messages(
-            [
-                {
-                    "role": "user",
-                    "content": "x",
-                    "_reminders": [
-                        {
-                            "type": "correction",
-                            "text": "hi",
-                            "secret": "leak-me",
-                            "internal_id": 42,
-                        }
-                    ],
-                }
-            ]
-        )
-        clean = history[0]["reminders"][0]
-        assert "secret" not in clean
-        assert "internal_id" not in clean
-        assert clean == {"type": "correction", "text": "hi"}
-
-    def test_malformed_reminder_skipped(self) -> None:
-        """A non-dict / empty entry is filtered out instead of breaking the
-        rest of the list (mirrors the defensive filter in
-        ``_apply_reminders_for_provider``)."""
-        history = project_history_messages(
-            [
-                {
-                    "role": "user",
-                    "content": "x",
-                    "_reminders": [
-                        "garbage string",
-                        {"type": "", "text": ""},  # empty type + text → drop
-                        {"type": "denial", "text": "ok"},
-                    ],
-                }
-            ]
-        )
-        assert history[0]["reminders"] == [{"type": "denial", "text": "ok"}]
+        assert "reminders" not in history[0]
 
 
 class TestReasoningSurfacing:
@@ -277,8 +214,9 @@ class TestProjectHistoryMessages:
         assert out[0]["content"] == "hi"
         assert out[0]["attachments"][0]["filename"] == "p.png"  # _attachments_meta wins
         assert out[0]["source"] == "system_nudge"
-        assert [r["type"] for r in out[0]["reminders"]] == ["correction"]  # empty filtered
-        assert "secret" not in out[0]["reminders"][0]  # unknown key stripped
+        # The legacy ``_reminders`` lane is gone — operator context rides
+        # first-class ``system`` rows now, not a projected ``reminders`` field.
+        assert "reminders" not in out[0]
         # reasoning passes through (already stamped upstream)
         assert out[1]["reasoning"] == "think"
         # derived + propagated flags (the storage shape pre-sets none)

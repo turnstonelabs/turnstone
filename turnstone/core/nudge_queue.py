@@ -3,11 +3,12 @@
 Replaces the dual ``_pending_user_advisories`` / ``_pending_tool_advisories``
 list pair with a single channel-tagged queue per session.  Producers
 (`_queue_user_advisory`, `_queue_tool_advisory`,
-`CoordinatorIdleObserver`, the future watch dispatcher) all enqueue onto
+`CoordinatorIdleObserver`, the watch dispatcher) all enqueue onto
 the same queue with an explicit ``channel``; consumers
-(`_attach_pending_user_reminders` on user-message attach,
-`_collect_advisories` on tool-result wrap,
-`IdleNudgeWatcher` on workstream-IDLE) drain by channel filter.
+(`_emit_pending_user_nudges` on user-message attach,
+`_collect_advisories` on tool-result batch,
+`IdleNudgeWatcher` on workstream-IDLE) drain by channel filter and emit
+each drained nudge as a first-class ``{"role": "system"}`` turn.
 
 Channels:
     * ``"user"`` — only drains at user-turn seams.

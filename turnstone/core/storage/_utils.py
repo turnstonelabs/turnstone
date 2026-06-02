@@ -353,8 +353,10 @@ def reconstruct_messages(
     When ``repair`` is True (default) the result is post-processed to
     produce a wire-shape valid for an LLM round-trip: the trailing
     ``assistant(tool_calls)`` turn is dropped if not all tool_call ids
-    have a matching tool result, and any mid-conversation orphaned
-    tool_calls are filled with synthetic cancellation results.  Callers
+    have a matching tool result (trailing operator-context ``system``
+    turns are looked through and stripped with it), and any
+    mid-conversation orphaned tool_calls are filled with synthetic
+    cancellation results.  Callers
     that consume the messages as LLM context (e.g. ``session.resume``)
     must keep this on.  Callers reading for *display* (the ``/history``
     REST endpoint) should pass ``repair=False`` so the user sees the
@@ -448,21 +450,51 @@ def reconstruct_messages(
                 tmsg["_event_id"] = int(event_id)
             messages.append(tmsg)
 
+        elif role in ("system", "developer"):
+            # First-class operator-context turn (advisory / nudge /
+            # interjection — see tool_advisory.make_system_turn), persisted
+            # mid-history.  The base system prompt is never stored (it is
+            # recomposed by _init_system_messages), so any system/developer
+            # row here is operator context; ``_source`` classifies it for the
+            # fold-or-keep wire pass and UI replay.
+            smsg: dict[str, Any] = {"role": role, "content": content or ""}
+            if source:
+                smsg["_source"] = str(source)
+            if event_id is not None:
+                smsg["_event_id"] = int(event_id)
+            messages.append(smsg)
+        # Genuinely unknown roles are intentionally dropped (no ``else``): the
+        # roles above are exhaustive for stored conversations, so an
+        # unrecognised role is anomalous and must not be forwarded to a
+        # provider.  ``system``/``developer`` are handled above precisely so
+        # they are NOT dropped — that silent drop was the bug this fixes.
+
     if not repair:
         # Both passes below are LLM-context corrections — trailing-turn
         # strip and orphan synthesis.  Display callers want neither; see
         # the reconstruct_messages docstring.
         return messages
 
-    # Repair: strip trailing incomplete tool call turns
+    # Repair: strip trailing incomplete tool call turns.  Walk back past
+    # trailing tool results AND operator-context system turns (which follow
+    # the turn they relate to) to locate the turn's assistant head; if its
+    # tool calls are incomplete, strip from the assistant onward — dropping
+    # the trailing tools and system turns with it.  Skipping system turns keeps
+    # the strip working when a nudge/interjection was appended after an
+    # interrupted tool-call turn (otherwise the orphaned assistant survives).
     while messages:
         tail_tools = 0
-        for j in range(len(messages) - 1, -1, -1):
-            if messages[j].get("role") == "tool":
+        idx = len(messages) - 1
+        while idx >= 0:
+            tail_role = messages[idx].get("role")
+            if tail_role == "tool":
                 tail_tools += 1
+                idx -= 1
+            elif tail_role in ("system", "developer"):
+                idx -= 1
             else:
                 break
-        asst_idx = len(messages) - 1 - tail_tools
+        asst_idx = idx
         if asst_idx < 0:
             break
         asst = messages[asst_idx]
@@ -482,13 +514,28 @@ def reconstruct_messages(
         msg = messages[i]
         if msg.get("role") == "assistant" and msg.get("tool_calls"):
             expected_ids = [tc.get("id", "") for tc in msg["tool_calls"] if tc.get("id")]
-            # Collect tool result IDs that follow
+            # Collect the tool-result ids that follow, looking *through* any
+            # operator-context system/developer turns interspersed in the block
+            # (they follow the turn they relate to and must not be mistaken for
+            # the end of the tool-result run — the same skip pass 1 applies).
+            # ``insert_at`` tracks the slot right after the last real tool
+            # result so synthesized results stay contiguous with the real ones
+            # (Anthropic requires every tool_result adjacent to its tool_use);
+            # without this, a synthetic spliced after a trailing system turn
+            # would split the block.
             j = i + 1
             result_ids: set[str] = set()
-            while j < len(messages) and messages[j].get("role") == "tool":
-                tc_id = messages[j].get("tool_call_id", "")
-                if tc_id:
-                    result_ids.add(tc_id)
+            insert_at = i + 1
+            while j < len(messages) and messages[j].get("role") in (
+                "tool",
+                "system",
+                "developer",
+            ):
+                if messages[j].get("role") == "tool":
+                    tc_id = messages[j].get("tool_call_id", "")
+                    if tc_id:
+                        result_ids.add(tc_id)
+                    insert_at = j + 1
                 j += 1
             # Synthesize results for any missing IDs
             orphaned = [uid for uid in expected_ids if uid not in result_ids]
@@ -502,10 +549,9 @@ def reconstruct_messages(
                     }
                     for uid in orphaned
                 ]
-                # Insert after the last existing tool result (or after assistant)
-                messages[j:j] = synthetic
+                messages[insert_at:insert_at] = synthetic
             if orphaned:
-                i = j + len(orphaned)  # skip past spliced synthetics
+                i = j + len(orphaned)  # skip past the (now longer) block
             elif j > i + 1:
                 i = j  # skip past existing tool block
             else:

@@ -243,63 +243,36 @@ def test_refetch_history_seeds_resume_cursor_only_on_initial_connect() -> None:
     )
 
 
-def test_shared_utils_defines_replay_advisories_after_tool() -> None:
-    """The shared ``replayAdvisoriesAfterTool`` helper in
-    ``shared_static/utils.js`` is the single source of advisory-walk +
-    type-filter logic for both ``app.js`` (interactive) and
-    ``coordinator.js`` (coord).  A refactor that drops the helper
-    breaks both surfaces, so guard its definition + filter shape here.
+def test_shared_utils_no_longer_defines_replay_advisories_after_tool() -> None:
+    """Operator context (interjections / guard findings / nudges) no longer
+    rides the tool envelope — it is first-class ``{"role": "system"}`` rows
+    — so the ``replayAdvisoriesAfterTool`` advisory-walk helper is gone.
+    Guard its removal so a stale re-introduction is caught.
     """
     utils_js = Path(__file__).resolve().parent.parent / "turnstone/shared_static/utils.js"
     body = utils_js.read_text(encoding="utf-8")
-    assert "function replayAdvisoriesAfterTool" in body, (
-        "shared/utils.js must define replayAdvisoriesAfterTool — "
-        "interactive and coord both invoke it."
-    )
-    # The type filter — ``adv.type !== 'user_interjection'`` — must
-    # remain in the helper so a future advisory shape (output_guard,
-    # metacognitive nudge, etc.) doesn't silently render as a user
-    # bubble.
-    assert 'adv.type !== "user_interjection"' in body, (
-        "replayAdvisoriesAfterTool must filter by advisory type so a "
-        "future non-user_interjection advisory shape doesn't silently "
-        "render as a user bubble."
+    assert "replayAdvisoriesAfterTool" not in body, (
+        "replayAdvisoriesAfterTool should be deleted — operator context now "
+        "rides first-class system rows, not the tool envelope."
     )
 
 
-def test_replay_renders_user_interjection_advisory_after_tool_block() -> None:
-    """Queued user messages spliced into the last tool-result envelope
-    of a batch (Seam 1) persist on the tool DB row as a wrapped
-    ``<tool_output>`` envelope.  ``decorate_history_messages`` extracts
-    the advisory back out and the wire layer projects it onto
-    ``msg.advisories``; ``replayHistory`` must invoke the shared
-    ``replayAdvisoriesAfterTool`` helper (defined in
-    ``shared/utils.js``) so each ``user_interjection`` renders through
-    ``addUserMessage`` and the bubble looks identical to a Seam 2/3
-    user row.
-
-    This test pins the call site so a refactor that drops the helper
-    invocation regresses the queued-during-batch replay shape
-    silently."""
+def test_replay_renders_system_turn_via_add_system_context() -> None:
+    """First-class operator-context ``system`` turns (output-guard findings,
+    user interjections, metacognitive nudges) replay through the ``system``
+    branch of ``replayHistory``, rendering an operator bubble via
+    ``addSystemContext``.  Pins the call site so a refactor that drops the
+    branch regresses the operator-context replay shape silently."""
     body = _APP_JS.read_text(encoding="utf-8")
     start = _pane_method_offset(body, "replayHistory")
     end = _pane_method_offset(body, "_attachRetryToLastAssistant")
     fn = body[start:end]
-    # The replay loop must invoke the shared helper, passing
-    # ``msg.advisories`` and a renderer that routes through
-    # ``addUserMessage``.  The helper itself filters on
-    # ``adv.type !== "user_interjection"``; that branch lives in
-    # ``shared/utils.js`` (test_shared_utils_js or runtime smoke covers
-    # the helper's body).
-    assert "replayAdvisoriesAfterTool(msg.advisories" in fn, (
-        "replayHistory must invoke replayAdvisoriesAfterTool with "
-        "msg.advisories so queued messages spliced into the tool "
-        "envelope render as user bubbles after the tool block."
+    assert 'msg.role === "system"' in fn, (
+        "replayHistory must have a system-role branch for first-class operator-context turns."
     )
-    assert "addUserMessage(text" in fn, (
-        "replayHistory's renderer callback must route the extracted "
-        "advisory text through addUserMessage so the rendered bubble "
-        "matches a normal user-row replay."
+    assert "addSystemContext(msg.content" in fn, (
+        "the system-role branch must route the turn through addSystemContext "
+        "so it renders as an operator bubble."
     )
 
 

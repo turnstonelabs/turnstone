@@ -237,9 +237,11 @@ class TestEdgeCases:
         assert msgs[1]["tool_call_id"] == ""
 
     def test_unknown_role_ignored(self):
+        """Genuinely unknown roles are dropped; ``system``/``developer`` are
+        first-class and reconstructed (see TestSystemTurns)."""
         rows = [
             _row("user", "hi"),
-            _row("system", "you are helpful"),
+            _row("weird", "???"),
             _row("assistant", "hello"),
         ]
         msgs = reconstruct_messages(rows, "ws1")
@@ -334,3 +336,126 @@ class TestMidConversationOrphanRepair:
         # Trailing strip removes the assistant message entirely
         assert len(msgs) == 1
         assert msgs[0]["role"] == "user"
+
+
+class TestSystemTurns:
+    """First-class operator-context system turns round-trip and respect repair."""
+
+    def test_system_row_reconstructed(self):
+        rows = [
+            _row("user", "hi"),
+            _row("assistant", "hello"),
+            _row(
+                "system",
+                "User sent while you worked: also update the changelog",
+                source="user_interjection",
+            ),
+        ]
+        msgs = reconstruct_messages(rows, "ws1")
+        assert len(msgs) == 3
+        assert msgs[2] == {
+            "role": "system",
+            "content": "User sent while you worked: also update the changelog",
+            "_source": "user_interjection",
+        }
+
+    def test_developer_row_reconstructed(self):
+        rows = [
+            _row("user", "hi"),
+            _row("assistant", "x"),
+            _row("developer", "be terse", source="output_guard"),
+        ]
+        msgs = reconstruct_messages(rows, "ws1")
+        assert msgs[2]["role"] == "developer"
+        assert msgs[2]["content"] == "be terse"
+        assert msgs[2]["_source"] == "output_guard"
+
+    def test_system_turn_without_source(self):
+        # Missing source shouldn't happen for operator context, but must not crash.
+        rows = [_row("user", "hi"), _row("assistant", "x"), _row("system", "note")]
+        msgs = reconstruct_messages(rows, "ws1")
+        assert msgs[2]["role"] == "system"
+        assert "_source" not in msgs[2]
+
+    def test_trailing_system_after_incomplete_assistant_strips_both(self):
+        """A nudge appended after an interrupted tool-call turn must not leave
+        the orphaned assistant — the strip walks through the trailing system
+        turn (regression guard for the repair-loop fix)."""
+        tc = json.dumps([{"id": "c1", "function": {"name": "bash", "arguments": "{}"}}])
+        rows = [
+            _row("user", "do it"),
+            _row("assistant", "Running...", tool_calls=tc),  # no tool result
+            _row("system", "tool was cancelled", source="tool_error"),
+        ]
+        msgs = reconstruct_messages(rows, "ws1")
+        assert len(msgs) == 1
+        assert msgs[0]["role"] == "user"
+
+    def test_trailing_system_after_complete_turn_kept(self):
+        """A system turn after a complete tool batch is preserved (no strip)."""
+        tc = json.dumps([{"id": "c1", "function": {"name": "bash", "arguments": "{}"}}])
+        rows = [
+            _row("user", "do it"),
+            _row("assistant", "Running...", tool_calls=tc),
+            _row("tool", "ok", tc_id="c1"),
+            _row("system", "you repeated a call", source="repeat"),
+        ]
+        msgs = reconstruct_messages(rows, "ws1")
+        assert [m["role"] for m in msgs] == ["user", "assistant", "tool", "system"]
+
+    def test_trailing_system_after_text_turn_kept(self):
+        rows = [
+            _row("user", "hi"),
+            _row("assistant", "all done"),
+            _row("system", "wrapping up?", source="completion"),
+        ]
+        msgs = reconstruct_messages(rows, "ws1")
+        assert [m["role"] for m in msgs] == ["user", "assistant", "system"]
+
+    def test_system_between_tool_use_and_result_not_double_synthesized(self):
+        """A system turn between an assistant(tool_calls) and its real result
+        must not make the answered call look orphaned — pass 2 looks through
+        system turns, so no duplicate synthetic cancellation is spliced."""
+        tc = json.dumps([{"id": "c1", "function": {"name": "bash", "arguments": "{}"}}])
+        rows = [
+            _row("user", "do it"),
+            _row("assistant", "", tool_calls=tc),
+            _row("system", "guard note", source="output_guard"),
+            _row("tool", "ok", tc_id="c1"),
+            _row("user", "thanks"),
+        ]
+        msgs = reconstruct_messages(rows, "ws1")
+        tool_msgs = [m for m in msgs if m["role"] == "tool"]
+        assert len(tool_msgs) == 1
+        assert tool_msgs[0]["tool_call_id"] == "c1"
+        assert tool_msgs[0].get("is_error") is not True
+        assert [m["role"] for m in msgs] == ["user", "assistant", "system", "tool", "user"]
+
+    def test_synthetic_result_stays_adjacent_to_real_results_past_system(self):
+        """When a call IS orphaned and a system turn follows the real results,
+        the synthetic is inserted adjacent to the real block (before the system
+        turn), keeping the tool-result block contiguous."""
+        tc = json.dumps(
+            [
+                {"id": "c1", "function": {"name": "bash", "arguments": "{}"}},
+                {"id": "c2", "function": {"name": "bash", "arguments": "{}"}},
+            ]
+        )
+        rows = [
+            _row("user", "do it"),
+            _row("assistant", "", tool_calls=tc),
+            _row("tool", "ok", tc_id="c1"),
+            _row("system", "guard note", source="output_guard"),
+            _row("user", "skip c2"),  # c2 never resulted
+        ]
+        msgs = reconstruct_messages(rows, "ws1")
+        assert [m["role"] for m in msgs] == [
+            "user",
+            "assistant",
+            "tool",
+            "tool",
+            "system",
+            "user",
+        ]
+        assert msgs[2]["tool_call_id"] == "c1" and msgs[2].get("is_error") is not True
+        assert msgs[3]["tool_call_id"] == "c2" and msgs[3]["is_error"] is True

@@ -98,6 +98,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_temperature=False,
         thinking_display="summarized",
         supports_reasoning_replay=True,
+        supports_mid_conversation_system=True,
     ),
     "claude-opus-4-7": ModelCapabilities(
         context_window=1000000,
@@ -340,6 +341,7 @@ class AnthropicProvider:
         messages: list[dict[str, Any]],
         *,
         replay_reasoning_to_model: bool = True,
+        supports_mid_conversation_system: bool = False,
     ) -> tuple[str, list[dict[str, Any]]]:
         """Convert internal (OpenAI-like) messages to Anthropic format.
 
@@ -360,6 +362,17 @@ class AnthropicProvider:
         (``ChatSession._try_stream`` / ``_utility_completion``) always
         pass the resolved flag explicitly.
 
+        ``supports_mid_conversation_system`` (claude-opus-4-8) makes the
+        system-role handling position-aware: leading system/developer
+        messages (the base prompt) still hoist into the top-level
+        ``system`` param, but a system message appearing AFTER a
+        non-system turn is a mid-conversation operator turn (see
+        ``ChatSession._fold_system_turns``) and is emitted inline as a
+        ``{"role": "system"}`` message so it keeps its trajectory
+        position.  When False (every other model) all system messages
+        hoist, as before — the fold pass has already removed any
+        mid-conversation operator turns for those models.
+
         Foreign-shaped blocks (OpenAI ``reasoning``, Gemini thought
         parts, the synthetic ``reasoning_text`` from path-3 capture) are
         dropped per-block; valid Anthropic blocks in the same message
@@ -373,6 +386,11 @@ class AnthropicProvider:
         system_parts: list[str] = []
         converted: list[dict[str, Any]] = []
         pending_orphan_results: list[dict[str, Any]] = []
+        # Leading system/developer messages are the base prompt → hoist into the
+        # top-level ``system`` param; a system message AFTER the first non-system
+        # turn is a mid-conversation operator turn (present only on the native
+        # path — the fold pass strips them for every other model).
+        seen_non_system = False
 
         i = 0
         while i < len(messages):
@@ -380,10 +398,21 @@ class AnthropicProvider:
             role = msg["role"]
 
             if role in ("system", "developer"):
-                if msg.get("content"):
-                    system_parts.append(msg["content"])
+                content = msg.get("content")
+                if supports_mid_conversation_system and seen_non_system:
+                    # Mid-conversation operator turn → keep inline so it holds
+                    # its trajectory position.  Adjacent ones coalesce via
+                    # _merge_consecutive below (the API forbids consecutive
+                    # system messages).  Producers place these after a complete
+                    # tool block, never between a tool_use and its tool_result.
+                    if content:
+                        converted.append({"role": "system", "content": content})
+                elif content:
+                    system_parts.append(content)
                 i += 1
                 continue
+
+            seen_non_system = True
 
             if role == "assistant":
                 # Safety: flush any unconsumed synthetic results from a prior
@@ -747,7 +776,9 @@ class AnthropicProvider:
         _ensure_anthropic()
         caps = capabilities or self.get_capabilities(model)
         system_prompt, converted_msgs = self._convert_messages(
-            messages, replay_reasoning_to_model=replay_reasoning_to_model
+            messages,
+            replay_reasoning_to_model=replay_reasoning_to_model,
+            supports_mid_conversation_system=caps.supports_mid_conversation_system,
         )
         kwargs = self._build_thinking_and_kwargs(
             caps,
@@ -957,7 +988,9 @@ class AnthropicProvider:
         _ensure_anthropic()
         caps = capabilities or self.get_capabilities(model)
         system_prompt, converted_msgs = self._convert_messages(
-            messages, replay_reasoning_to_model=replay_reasoning_to_model
+            messages,
+            replay_reasoning_to_model=replay_reasoning_to_model,
+            supports_mid_conversation_system=caps.supports_mid_conversation_system,
         )
         kwargs = self._build_thinking_and_kwargs(
             caps,

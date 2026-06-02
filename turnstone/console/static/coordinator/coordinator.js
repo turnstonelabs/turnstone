@@ -352,6 +352,11 @@
     tool: "tool",
     error: "error",
     info: "info",
+    // First-class operator-context system turn — styled by the shared
+    // `.msg.system-context` rule (turnstone/shared_static/chat.css).  The
+    // generic history-replay branch already renders unknown roles via
+    // appendText("system", …); this variant gives it the operator styling.
+    system: "system-context",
   };
 
   function appendMsg(role, html, opts) {
@@ -423,104 +428,11 @@
     return el;
   }
 
-  // Build a structured ``.msg.watch-result`` card for a
-  // ``watch_triggered`` reminder — full-width treatment with
-  // command preview header + shell output body + poll counter footer.
-  // First-pass functional rendering; bespoke design polish lives in a
-  // future workstream.  All text goes through ``textContent`` so shell
-  // output containing angle brackets / scripts / steering bytes
-  // renders inertly.
-  function buildWatchResultBubble(r) {
-    const el = document.createElement("div");
-    el.className = "msg watch-result";
-    el.setAttribute("role", "article");
-    el.setAttribute("data-ts-role", "watch");
-    el.setAttribute("aria-label", "watch");
-    const header = document.createElement("div");
-    header.className = "msg-watch-header";
-    header.textContent =
-      "watch" + (r.watch_name ? " · " + String(r.watch_name) : "");
-    el.appendChild(header);
-    if (r.command) {
-      const cmd = document.createElement("div");
-      cmd.className = "msg-watch-cmd";
-      cmd.textContent = "$ " + String(r.command);
-      el.appendChild(cmd);
-    }
-    const body = document.createElement("pre");
-    body.className = "msg-watch-body";
-    body.textContent = r.text || "";
-    el.appendChild(body);
-    if (r.poll_count != null && r.max_polls != null) {
-      const footer = document.createElement("div");
-      footer.className = "msg-watch-footer";
-      const finalSuffix = r.is_final ? " · final" : "";
-      footer.textContent =
-        "poll " +
-        String(r.poll_count) +
-        "/" +
-        String(r.max_polls) +
-        finalSuffix;
-      el.appendChild(footer);
-    }
-    return el;
-  }
-
-  // Default ``.msg.user-reminder`` bubble — yellow themed advisory used
-  // for every metacog nudge other than ``watch_triggered``.
-  function buildDefaultReminderBubble(r) {
-    const el = document.createElement("div");
-    el.className = "msg user-reminder";
-    el.setAttribute("role", "article");
-    el.setAttribute("data-ts-role", "metacognition");
-    el.setAttribute("aria-label", "metacognition");
-    const body = document.createElement("div");
-    body.className = "msg-body";
-    const labelEl = document.createElement("span");
-    labelEl.className = "msg-user-reminder-label";
-    labelEl.textContent =
-      "metacognition" + (r.type ? " · " + String(r.type) : "");
-    const textEl = document.createElement("span");
-    textEl.className = "msg-user-reminder-text";
-    textEl.textContent = r.text || "";
-    body.appendChild(labelEl);
-    body.appendChild(textEl);
-    el.appendChild(body);
-    return el;
-  }
-
-  // Metacognitive reminder bubble (user-channel correction / denial /
-  // resume / start / completion AND tool-channel tool_error / repeat).
-  // Mirrors Pane.addUserReminder / addToolReminder in the
-  // interactive UI — yellow themed bubble slotted directly below the
-  // message it advises.  ``watch_triggered`` reminders branch off into
-  // the structured ``.msg.watch-result`` card.  ``anchor`` is the DOM
-  // element to anchor below; when null, append at the bottom of
-  // messagesEl.
-  function appendReminderBubble(reminders, anchor) {
-    if (!Array.isArray(reminders) || !reminders.length) return;
-    let cursor = anchor;
-    for (let i = 0; i < reminders.length; i++) {
-      const r = reminders[i] || {};
-      const el =
-        r.type === "watch_triggered"
-          ? buildWatchResultBubble(r)
-          : buildDefaultReminderBubble(r);
-      if (cursor) {
-        cursor.insertAdjacentElement("afterend", el);
-        cursor = el;
-      } else {
-        messagesEl.appendChild(el);
-      }
-    }
-    _scheduleScroll();
-  }
-
-  // Thin ``.msg.user.system-nudge`` marker rendered as the anchor for
-  // wake-driven reminder bubbles.  Replaces the previously-invisible
-  // synthetic empty user turn with a visible-but-subtle DOM element so
-  // the bubble below it lands in the right place even when the wake
-  // fires long after the user's last real message.
+  // Thin ``.msg.user.system-nudge`` marker rendered for a wake-driven
+  // empty user turn.  Replaces the previously-invisible synthetic empty
+  // user turn with a visible-but-subtle DOM element; the nudges it
+  // carried are now first-class operator-context ``system`` turns that
+  // follow it and render via the ``system`` ``_MSG_VARIANTS`` styling.
   function appendSystemNudgeMarker() {
     const el = document.createElement("div");
     el.className = "msg user system-nudge";
@@ -529,48 +441,6 @@
     el.textContent = "system nudge";
     messagesEl.appendChild(el);
     return el;
-  }
-
-  // Live SSE for user-channel reminders — anchors below the most
-  // recent user message.  On a non-originating tab there may be no
-  // user message rendered yet; we append and the next /history reload
-  // corrects.  (Same caveat as the interactive UI; tracked there.)
-  //
-  // ``source`` widens the live SSE event to carry the wake's
-  // ``"system_nudge"`` tag so the marker renders on every connected
-  // tab — without this, only the originating tab (which sees the
-  // synthesised empty user turn live) would render the wake bubble in
-  // the right place.
-  function appendUserReminderLive(reminders, source) {
-    if (source === "system_nudge") {
-      const marker = appendSystemNudgeMarker();
-      appendReminderBubble(reminders, marker);
-      return;
-    }
-    const userMsgs = messagesEl.querySelectorAll(
-      ".msg.user:not(.system-nudge)",
-    );
-    const anchor = userMsgs.length ? userMsgs[userMsgs.length - 1] : null;
-    appendReminderBubble(reminders, anchor);
-  }
-
-  // Live SSE for tool-channel reminders — anchors below the
-  // .coord-tool-batch construct that produced the tool result.  Looks
-  // up the row by data-call-id and walks to the parent batch; falls
-  // back to the most recent batch if not found.
-  function appendToolReminderLive(reminders, toolCallId) {
-    let anchor = null;
-    if (toolCallId) {
-      const entry = toolRows.get(toolCallId);
-      if (entry && entry.batch) {
-        anchor = entry.batch;
-      }
-    }
-    if (!anchor) {
-      const batches = messagesEl.querySelectorAll(".coord-tool-batch");
-      if (batches.length) anchor = batches[batches.length - 1];
-    }
-    appendReminderBubble(reminders, anchor);
   }
 
   // Build a tool-batch item from a persisted assistant
@@ -2379,23 +2249,16 @@
         // styling which mis-categorised them as tool calls.
         appendText("info", ev.message || "", { label: "info" });
         break;
-      case "user_reminder":
-        // Metacognitive user-channel nudge — render below the most
-        // recent user message as a yellow themed bubble.  Same shape
-        // as the interactive UI's case.  When ``source === "system_nudge"``
-        // (wake-driven), render the thin .msg.user.system-nudge
-        // marker first so the bubble anchors below it.
-        if (Array.isArray(ev.reminders) && ev.reminders.length) {
-          appendUserReminderLive(ev.reminders, ev.source || "");
-        }
-        break;
-      case "tool_reminder":
-        // Metacognitive tool-channel nudge — render below the
-        // .coord-tool-batch that produced the tool result identified
-        // by ev.tool_call_id.
-        if (Array.isArray(ev.reminders) && ev.reminders.length) {
-          appendToolReminderLive(ev.reminders, ev.tool_call_id || "");
-        }
+      case "system_turn":
+        // First-class operator-context system turn (output-guard finding,
+        // user interjection, metacognitive nudge — see make_system_turn).
+        // Consolidates the legacy user_reminder / tool_reminder events into
+        // one operator bubble rendered in trajectory sequence (it FOLLOWS
+        // the turn it advises).  ``ev.source`` carries the kind; the
+        // ``system`` _MSG_VARIANTS entry gives it the operator styling.
+        appendText("system", ev.content || "", {
+          label: ev.source || "system",
+        });
         break;
       case "connected":
         // First yield from _coord_events_replay — populates the
@@ -4404,12 +4267,13 @@
     const old = messagesEl.querySelectorAll(".msg.assistant .msg-actions");
     for (let i = 0; i < old.length; i++) old[i].parentNode.removeChild(old[i]);
     // Skip retry when the most recent semantic turn is tool-only (last DOM
-    // child is a .coord-tool-batch construct); walk back past .user-reminder
-    // bubbles first so the guard still fires when the tool turn carried a
-    // reminder. (Coord's batch class is .coord-tool-batch — the interactive
-    // pane uses .ts-approval, which does not exist in coord's DOM.)
+    // child is a .coord-tool-batch construct); walk back past .system-context
+    // operator bubbles first so the guard still fires when the tool turn
+    // carried a nudge / guard finding. (Coord's batch class is
+    // .coord-tool-batch — the interactive pane uses .ts-approval, which does
+    // not exist in coord's DOM.)
     let lastChild = messagesEl.lastElementChild;
-    while (lastChild && lastChild.classList.contains("user-reminder")) {
+    while (lastChild && lastChild.classList.contains("system-context")) {
       lastChild = lastChild.previousElementSibling;
     }
     if (lastChild && lastChild.classList.contains("coord-tool-batch")) {
@@ -4682,26 +4546,10 @@
           (callId && toolNameByCallId.get(callId)) || m.tool_name || "tool";
         const isError = callOutcomes.get(callId) === "error";
         appendToolResult(toolName, callId, content || "", isError);
-        // Tool-channel metacog reminders ride the same _reminders
-        // side-channel as the user channel; surface as a themed
-        // bubble below the .coord-tool-batch construct.
-        if (Array.isArray(m.reminders) && m.reminders.length) {
-          appendToolReminderLive(m.reminders, callId);
-        }
-        // Queued user messages spliced into the last tool-result
-        // envelope of a batch (Seam 1) replay as proper user bubbles
-        // after the tool block.  ``decorate_history_messages``
-        // extracts the user_interjection advisory from the persisted
-        // envelope and the wire layer projects it onto
-        // ``m.advisories``; rendering through
-        // ``appendUserMessageWithAttachments`` matches the live shape
-        // a Seam 2/3 message would produce.  The walk/filter is
-        // shared via ``replayAdvisoriesAfterTool`` in
-        // ``shared/utils.js`` so coord and interactive can never drift
-        // on advisory-shape filtering.
-        replayAdvisoriesAfterTool(m.advisories, function (text) {
-          appendUserMessageWithAttachments(text, [], { label: "user" });
-        });
+        // Tool-channel metacog nudges + queued interjections that used to
+        // splice into the tool result now follow it as first-class
+        // operator-context ``system`` rows and render via the ``system``
+        // branch below in sequence.
       } else if (role === "assistant") {
         // Reasoning bubble (Phase 1 reasoning persistence) — render
         // BEFORE the content card so the visual order matches the
@@ -4767,23 +4615,22 @@
           const isSystemNudge = m.source === "system_nudge";
           if (isSystemNudge) {
             // Wake-driven empty user turn: render the thin marker
-            // (replaces the previously-skipped synthetic empty
-            // bubble) and anchor reminder bubbles below it.
-            const marker = appendSystemNudgeMarker();
-            if (Array.isArray(m.reminders) && m.reminders.length) {
-              appendReminderBubble(m.reminders, marker);
-            }
+            // (replaces the previously-skipped synthetic empty bubble).
+            // The nudges it carried are now first-class operator-context
+            // ``system`` rows that follow it and render below.
+            appendSystemNudgeMarker();
             return;
           }
           if (!content && userAttachments.length === 0) return;
           appendUserMessageWithAttachments(content, userAttachments, {
             label: role,
           });
-          // User-channel metacog reminders attach to the just-appended
-          // user bubble (the most recent .msg.user in messagesEl).
-          if (Array.isArray(m.reminders) && m.reminders.length) {
-            appendUserReminderLive(m.reminders);
-          }
+        } else if (role === "system") {
+          // First-class operator-context system turn — label with the
+          // ``source`` kind (output_guard / user_interjection / ...);
+          // the ``system`` _MSG_VARIANTS entry gives it operator styling.
+          if (!content) return;
+          appendText(role, content, { label: m.source || "system" });
         } else {
           if (!content) return;
           appendText(role, content, { label: role });

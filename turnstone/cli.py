@@ -301,30 +301,16 @@ class TerminalUI(SessionUI):
         sys.stdout.write(f"{RED}{message}{RESET}\n")
         sys.stdout.flush()
 
-    def _print_reminder(self, reminders: list[dict[str, Any]]) -> None:
-        """Render a metacognitive reminder list as ``[metacognition · type] text``
-        lines in the terminal — the CLI's equivalent of the web UI's
-        yellow themed bubble.  Used by both ``on_user_reminder`` and
-        ``on_tool_reminder``; the rendering is identical because
-        terminal output is anchor-by-flow rather than DOM-by-anchor.
+    def on_system_turn(self, content: str, source: str) -> None:
+        """Render a first-class operator-context system turn as an
+        ``[operator · source] text`` line in the terminal — the CLI's
+        equivalent of the web UI's operator bubble.  Terminal output is
+        anchored by flow (the line lands directly after the turn it
+        relates to), so no DOM anchoring is needed.
         """
-        for r in reminders:
-            nt = str(r.get("type", "") or "")
-            text = str(r.get("text", "") or "")
-            label = "metacognition" + (f" · {nt}" if nt else "")
-            sys.stdout.write(f"{YELLOW}[{label}]{RESET} {text}\n")
+        label = "operator" + (f" · {source}" if source else "")
+        sys.stdout.write(f"{YELLOW}[{label}]{RESET} {content}\n")
         sys.stdout.flush()
-
-    def on_user_reminder(self, reminders: list[dict[str, Any]], source: str | None = None) -> None:
-        # ``source`` ignored — the CLI doesn't render a wake marker
-        # (terminal output is anchored by sequence, not anchor element).
-        self._print_reminder(reminders)
-
-    def on_tool_reminder(self, reminders: list[dict[str, Any]], tool_call_id: str) -> None:
-        # tool_call_id ignored — the CLI anchors by output sequence
-        # (the line lands directly after the tool result that
-        # triggered the batch's reminder).
-        self._print_reminder(reminders)
 
     def on_state_change(self, state: str) -> None:
         pass  # base TerminalUI ignores state changes
